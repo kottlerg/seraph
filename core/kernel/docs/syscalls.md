@@ -183,6 +183,13 @@ return `UnknownSyscall`.
 
 ## Error Codes
 
+A syscall that inserts a capability into a CSpace (every `SYS_CAP_CREATE_*`, `SYS_CAP_COPY`,
+`SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_MOVE`, and the split syscalls) leaves the
+destination's IPC receive reserve (`CSPACE_IPC_RECV_RESERVE` free slots) untouched. Its
+"slot-page pool exhausted" `OutOfMemory`, and its structural-ceiling `QuotaExceeded`, therefore
+arise while that many slots are still free; only IPC capability transfer takes them
+([capability-internals.md](capability-internals.md) § IPC Receive Reserve).
+
 All syscalls return one of these error codes on failure. The value is negative in
 `rax`/`a0`. Zero and positive values are success.
 
@@ -241,8 +248,9 @@ pub enum SyscallError
     /// backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
-    /// directory is full). Unlike `OutOfMemory`, donating memory (augment
-    /// mode) cannot satisfy the request.
+    /// directory is full, or the object a new capability or a retype would
+    /// reference already holds 2^31 references). Unlike `OutOfMemory`,
+    /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
 }
 ```
@@ -296,7 +304,8 @@ when the message carries capabilities.
 its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-transfer), `Interrupted` (the call was cancelled while blocked, including by the receiving thread
+transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^31 ceiling),
+`Interrupted` (the call was cancelled while blocked, including by the receiving thread
 receiving again before it replied; see `SYS_IPC_RECV`). Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
@@ -355,7 +364,8 @@ stale), `InvalidArgument` (a cap slot repeated in one reply, or
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
 `QuotaExceeded` (caller's CSpace
-directory structurally full for reply cap transfer), `OutOfMemory`
+directory structurally full for reply cap transfer, or a transferred cap's object has its
+reference count at its 2^31 ceiling), `OutOfMemory`
 (slot-page pool exhausted); a `data_count` or `cap_count` above its maximum is clamped, not
 refused, and the call never blocks, so it never returns `Interrupted`. Every payload or cap
 failure while
@@ -405,13 +415,18 @@ Endpoint capability bound by `SYS_THREAD_SET_FAULT_HANDLER` (see
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
-directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (slot-page pool
-exhausted) — both checked before the receive parks, whether or not a message carries caps
+directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (fewer than
+`MSG_CAP_SLOTS_MAX` slots free and the slot-page pool exhausted) — both checked before the
+receive parks, whether or not a message carries caps. The free slots counted include the IPC
+receive reserve that general allocations leave free
+([capability-internals.md](capability-internals.md) § IPC Receive Reserve), so only received
+caps that have spent the reserve fail a receive
 (see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
 `Interrupted`. If an already-queued sender's cap transfer is refused (a source slot went stale
-or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, or
-the server's CSpace cannot supply the destination slots, which the pre-park grow makes unlikely
-but does not reserve), the message is still delivered — with zero caps; the sender keeps its
+or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
+cap's object has its reference count at its 2^31 ceiling, or the server's CSpace cannot supply the
+destination slots, which the pre-park grow makes unlikely but does not reserve), the message is
+still delivered — with zero caps; the sender keeps its
 capabilities (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format and
 § Receive-Failure Policy).
 
@@ -587,7 +602,8 @@ Send + Receive + Grant rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+(caller's CSpace directory structurally full, or the Memory object's reference count is at
+its 2^31 ceiling).
 
 ---
 
@@ -608,7 +624,8 @@ Notify + Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+(caller's CSpace directory structurally full, or the Memory object's reference count is at
+its 2^31 ceiling).
 
 ---
 
@@ -628,10 +645,11 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 
 **Capability requirement:** `memory_cap` must have Retype rights.
 
-**Errors:** `InvalidArgument` (the low 32 bits of `capacity`, the only bits the kernel
-reads, are 0 or exceed `EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
+**Errors:** `InvalidArgument` (`capacity`, the full register, is 0 or exceeds
+`EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
-or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full,
+or the Memory object's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -671,7 +689,7 @@ address space's mappings is inherently trusted to create threads that execute wi
 respectively, or `priority` is outside `sched_cap`'s band), `InvalidArgument` (nonzero
 `priority` without a `SchedControl` cap, or `priority` > `PRIORITY_MAX`), `OutOfMemory`
 (Memory cap region or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
-directory structurally full).
+directory structurally full, or the Memory object's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -709,7 +727,8 @@ the pool, so a one-page donation can leave the budget unchanged. Read the budget
 **Errors:** `InvalidArgument` (`init_pages` 0, overflow, or create-mode `init_pages < 2`),
 `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
 target lacks Map), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace directory structurally full).
+`QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
+count is at its 2^31 ceiling).
 
 ---
 
@@ -743,7 +762,8 @@ target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhaust
 in create-mode, every id of the kernel's `CSpace` registry live, which the registry's
 one id per DRAM page puts past the memory that pays for the `CSpace`s; see
 [capability-internals.md](capability-internals.md) § CSpace Registry),
-`QuotaExceeded` (caller's CSpace directory structurally full).
+`QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
+count is at its 2^31 ceiling).
 
 ---
 
@@ -764,7 +784,8 @@ Retype a Memory capability into a new wait set.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+(caller's CSpace directory structurally full, or the Memory object's reference count is at
+its 2^31 ceiling).
 
 ---
 
@@ -800,8 +821,9 @@ leaving the new capability an unlinked derivation root.
 `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight
 on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio` or `IoPort` source,
 the kernel's SEED reserve cannot back the fresh object), `QuotaExceeded` (caller's CSpace
-directory structurally full, or, for an `Mmio` or `IoPort` source, its range already has
-`RANGE_COPY_LIMIT` (64) live copies).
+directory structurally full; for an `Mmio` or `IoPort` source, its range already has
+`RANGE_COPY_LIMIT` (64) live copies; for any other source, the object's reference count is at its
+2^31 ceiling).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -878,8 +900,9 @@ source and destination slots the same way (see
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke, a move, or an IPC
 capability transfer is already in flight on this slot, or a corrupted derivation link
 was found — the revoke is incomplete and the dangling chain was cut); `Interrupted`
-(liveness backstop: sustained concurrent derivation kept extending the subtree — everything revoked
-so far stays revoked; retry to continue).
+(liveness backstop, after `MAX_REVOKE_BATCHES` batches: the subtree was larger than they cover, or
+concurrent derivation kept extending it — everything revoked so far stays revoked; retry to
+continue).
 
 ---
 
@@ -1833,7 +1856,7 @@ caller waited).
 ### `SYS_IRQ_ACK` (29)
 
 Acknowledge a hardware interrupt line after handling. Re-enables the line at the
-interrupt controller.
+interrupt controller when a notification is registered on it.
 
 **Arguments:**
 
@@ -1847,8 +1870,9 @@ The kernel masks the interrupt line before delivering the notification to the dr
 (see [docs/architecture.md](../../../docs/architecture.md) — Driver Model). The driver
 must call `SYS_IRQ_ACK` to re-enable the line. `SYS_IRQ_REGISTER` leaves the line
 masked, so the driver's first `SYS_IRQ_ACK` after registering is what enables delivery;
-`SYS_IRQ_ACK` unmasks the line unconditionally, whether or not an interrupt has been
-delivered since the last acknowledgement.
+`SYS_IRQ_ACK` unmasks a registered line whether or not an interrupt has been delivered
+since the last acknowledgement; a line with no registered notification (never registered,
+or its registration cleared) stays masked, and the call still returns 0.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
 specific line.
@@ -1874,19 +1898,24 @@ the registered notification.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Only one notification may be registered per interrupt line at a time. A second call
-replaces the previous registration. The kernel masks the interrupt line before
-delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it
-(see [architecture.md](../../../docs/architecture.md) § Driver Model).
+replaces the previous registration, and returns once no delivery to the replaced
+notification is still in flight. The kernel routes the line to one CPU, the next in turn
+([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked, and it masks
+the line again before each delivery of the notification; the driver MUST call
+`SYS_IRQ_ACK` to re-enable it (see [architecture.md](../../../docs/architecture.md)
+§ Driver Model).
 
 **Capability requirements:** `irq_cap` (Notify rights; single-line), `notification_cap`
 (Notify rights).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
-`InvalidArgument` (IRQ cap covers more than one line, or names an id outside the
-routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–22 on x86-64, the GSIs with an IDT gate,
-where the root Interrupt cap spans 256 GSIs; PLIC sources 1–127 on RISC-V, where the root
-Interrupt cap spans the PLIC's 1024-id space; see
-[arch-interface.md](arch-interface.md) § Module-level constants and free functions).
+`InvalidArgument` (IRQ cap covers more than one line, or names an id no discovered
+interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the root
+Interrupt cap spans 2048 GSIs; on RISC-V a source outside the PLIC's reported
+`1..=riscv,ndev`, where the root Interrupt cap spans the PLIC's 1024-id space; see
+[arch-interface.md](arch-interface.md) § Module-level constants and free functions),
+`QuotaExceeded` (x86-64: every device IDT vector, 217 of them, is assigned to another
+routed GSI; a vector is freed when its line's route is cleared).
 
 ---
 
@@ -2093,8 +2122,8 @@ to it is stopped and the call never returns (see
 capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
 or SEED cannot back an `Mmio` or `IoPort` copy's object), `QuotaExceeded` (dst CSpace directory
-structurally full, or an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
-copies).
+structurally full, an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
+copies, or any other source's object has its reference count at its 2^31 ceiling).
 
 ---
 
@@ -2144,7 +2173,9 @@ and the call never returns (see
 capability while the move was in flight), `InsufficientRights` (dst CSpace
 lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
-structurally full), `InvalidState` (a `SYS_CAP_REVOKE`, another `SYS_CAP_MOVE`, or an IPC
+structurally full, or the object's reference count is at its 2^31 ceiling: the destination takes
+its reference before the source releases its own), `InvalidState` (a `SYS_CAP_REVOKE`, another
+`SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source slot; or the destination slot was
 freed while the move was in flight — the source keeps the capability),
 `Interrupted` (liveness backstop, per above).
@@ -2460,6 +2491,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 |---|---|---|
 | `MSG_DATA_WORDS_MAX` | 64 | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
+| `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
+| `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |

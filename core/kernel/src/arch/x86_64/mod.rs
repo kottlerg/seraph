@@ -28,11 +28,11 @@ pub const ARCH_NAME: &str = "x86_64";
 /// ELF machine type of userspace images this kernel loads (init/ktest).
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_X86_64;
 
-/// Maximum GSI (Global System Interrupt) number the IRQ id range admits on x86-64: 22, the
-/// last GSI with an IDT gate (`ioapic::DEVICE_GSI_COUNT`, vectors 33-55, dispatched by
-/// `idt::irq_dispatch`). `SYS_IRQ_REGISTER` refuses an id above it, so no GSI is routed to an
-/// ungated or reserved vector.
-pub const MAX_IRQ_ID: u32 = ioapic::DEVICE_GSI_COUNT - 1;
+/// Maximum GSI (Global System Interrupt) number the IRQ id range admits on x86-64: the last
+/// id of the Interrupt id space ([`ROOT_IRQ_COUNT`]). `SYS_IRQ_REGISTER` refuses an id above
+/// it; within it, `irq::register` refuses a GSI no discovered I/O APIC implements, and
+/// `interrupts::route_device_irq` assigns a routed GSI a device vector.
+pub const MAX_IRQ_ID: u32 = ROOT_IRQ_COUNT - 1;
 
 /// Minimum valid GSI number on x86-64. GSI 0 (PIT timer) is a legitimate
 /// platform resource; nothing is reserved at the low end.
@@ -47,12 +47,15 @@ pub const HAS_IO_PORTS: bool = true;
 /// x86-64 has no SBI firmware interface; `SbiControl` is a RISC-V-only concept.
 pub const HAS_SBI: bool = false;
 
-/// Width of the root `Interrupt` range capability minted at Phase 7: GSI 0..256, matching the
-/// `irq` routing table (`irq::MAX_IRQ`). The discovered I/O APICs cover only their reported
-/// pins, and the IDT dispatches only GSIs 0-22 ([`MAX_IRQ_ID`]): a split names the ids above
-/// it, `SYS_IRQ_REGISTER` refuses them, and the Interrupt teardown leaves their routing
-/// untouched.
-pub const ROOT_IRQ_COUNT: u32 = 256;
+/// Width of the root `Interrupt` range capability minted at Phase 7, the GSI id space:
+/// `MAX_IOAPICS` I/O APICs of `ioapic::IOAPIC_MAX_PINS` (256) pins each, 2048 GSIs. The
+/// discovered I/O APICs cover only their reported pins, which size the `irq` routing table;
+/// a split can name the other ids, `SYS_IRQ_REGISTER` refuses them, and the Interrupt
+/// teardown leaves the routing untouched for them. A GSI an I/O APIC reports above this
+/// space is logged at boot and not routable.
+// cast_possible_truncation: MAX_IOAPICS is 8, so the product fits u32.
+#[allow(clippy::cast_possible_truncation)]
+pub const ROOT_IRQ_COUNT: u32 = boot_protocol::MAX_IOAPICS as u32 * ioapic::IOAPIC_MAX_PINS;
 
 /// Size of the I/O Permission Bitmap in bytes (re-exported from gdt for use
 /// in architecture-independent code such as `ThreadControlBlock`).

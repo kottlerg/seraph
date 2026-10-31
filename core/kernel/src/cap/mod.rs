@@ -1276,11 +1276,11 @@ fn populate_cspace(
     use init_protocol::CapType;
 
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
-    /// interrupt-controller spec maximum (`arch::current::ROOT_IRQ_COUNT`: 256
-    /// GSIs on x86-64; on RISC-V the PLIC's 1024-entry id space, sources
-    /// 1-1023). `SYS_IRQ_REGISTER` refuses an id outside
-    /// `MIN_IRQ_ID..=MAX_IRQ_ID` and the Interrupt teardown touches the routing
-    /// table only for ids inside it, so oversizing is safe.
+    /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 2048 GSIs on x86-64,
+    /// eight I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
+    /// sources 1-1023). `SYS_IRQ_REGISTER` refuses an id no discovered controller
+    /// implements, and the routing table ignores one past its discovered size,
+    /// so oversizing is safe.
     const ROOT_IRQ_COUNT: u32 = crate::arch::current::ROOT_IRQ_COUNT;
 
     /// Maximum number of `AcpiReclaimable` regions to mint caps for.
@@ -1338,10 +1338,12 @@ fn populate_cspace(
                 ptr,
                 "Phase 7: cannot allocate Memory capability for usable memory",
             );
-            if memory_count == 0
-            {
-                memory_base = slot;
-            }
+            extend_slot_run_or_fatal(
+                &mut memory_base,
+                memory_count,
+                slot,
+                "Phase 7: RAM Memory caps are not in consecutive slots",
+            );
             push_descriptor(
                 &mut desc_count,
                 CapDescriptor {
@@ -1395,10 +1397,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Memory capability for usable memory",
         );
-        if memory_count == 0
-        {
-            memory_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut memory_base,
+            memory_count,
+            slot,
+            "Phase 7: RAM Memory caps are not in consecutive slots",
+        );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -1436,10 +1440,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Mmio capability for console UART",
         );
-        if hw_cap_count == 0
-        {
-            hw_cap_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut hw_cap_base,
+            hw_cap_count,
+            slot,
+            "Phase 7: hardware caps are not in consecutive slots",
+        );
         hw_cap_count += 1;
         push_descriptor(
             &mut desc_count,
@@ -1462,10 +1468,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Mmio capability for aperture",
         );
-        if hw_cap_count == 0
-        {
-            hw_cap_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut hw_cap_base,
+            hw_cap_count,
+            slot,
+            "Phase 7: hardware caps are not in consecutive slots",
+        );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -1509,13 +1517,13 @@ fn populate_cspace(
     // this arch. Userspace narrows it to single-IRQ children via
     // `SYS_IRQ_SPLIT` and delegates one per device.
     //
-    // x86-64: 256 GSI lines covers every IOAPIC pin in the currently
-    // targeted systems. RISC-V: the PLIC's 1024-entry id space (sources
+    // x86-64: 2048 GSI lines, every pin of the eight I/O APICs the boot
+    // protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
     // 1-1023) is the spec maximum; most platforms expose far fewer (e.g.
-    // 128). Sizing the root at the spec max is safe because
-    // `SYS_IRQ_REGISTER` refuses an id outside `MIN_IRQ_ID..=MAX_IRQ_ID` and
-    // the Interrupt teardown touches the routing table only for ids inside it
-    // (see `ROOT_IRQ_COUNT` above).
+    // 95). Sizing the root at the id space is safe because
+    // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
+    // the routing table ignores one past its discovered size (see
+    // `ROOT_IRQ_COUNT` above).
     let irq_ptr = mint_phase7_body(InterruptObject {
         header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
         start: 0,
@@ -1583,10 +1591,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Memory capability for ACPI region",
         );
-        if acpi_region_memory_count == 0
-        {
-            acpi_region_memory_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut acpi_region_memory_base,
+            acpi_region_memory_count,
+            slot,
+            "Phase 7: ACPI region Memory caps are not in consecutive slots",
+        );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -2055,7 +2065,7 @@ fn mint_reclaim_pass(
         // Register the range as managed-but-not-free so the buddy's
         // `total_pages` ledger accounts for it. These pages were never in
         // `total_pages` — `mm::init::collect_usable_ranges` filters
-        // `Loaded`-typed regions out of the buddy at Phase 2 — so
+        // `Loaded`-typed regions out of the free ranges at Phase 2 — so
         // `register_owned_range` is the correct ledger entry (not
         // `add_region`, which would also push them onto the free list). The
         // cap routes to memmgr via reap and is not destroyed in the kernel;
@@ -2376,6 +2386,45 @@ pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a:
     }
 }
 
+/// Whether `slot` may join the published slot run `[base, base + count)`: any
+/// slot starts an empty run, and a later one must be `base + count`.
+fn extends_slot_run(base: u32, count: u32, slot: u32) -> bool
+{
+    count == 0 || base.checked_add(count) == Some(slot)
+}
+
+/// Record `slot` as the next member of the slot run `base`/`count` (setting
+/// `base` for the first), calling [`crate::fatal`] (a panic in host tests)
+/// when it breaks the run. `InitInfo` hands these runs to init as
+/// `[base, base + count)` ranges, so a gap would name a slot outside the run;
+/// the free list's ascending order keeps boot inserts consecutive
+/// (core/kernel/docs/capability-internals.md § Free Slot Tracking).
+pub(crate) fn extend_slot_run_or_fatal(base: &mut u32, count: u32, slot: u32, msg: &'static str)
+{
+    if !extends_slot_run(*base, count, slot)
+    {
+        #[cfg(not(test))]
+        {
+            crate::kprintln!(
+                "{}: slot {} where the run expected {}",
+                msg,
+                slot,
+                base.saturating_add(count)
+            );
+            crate::fatal(msg);
+        }
+        #[cfg(test)]
+        panic!(
+            "{msg}: slot {slot} where the run expected {}",
+            *base + count
+        );
+    }
+    if count == 0
+    {
+        *base = slot;
+    }
+}
+
 /// Insert a capability, calling [`crate::fatal`] on error.
 ///
 /// The tag is derived from the typed rights argument, so a mint site cannot
@@ -2402,6 +2451,49 @@ fn insert_or_fatal<K: slot::CapKind>(
 mod tests
 {
     use super::*;
+
+    // ── published slot runs ───────────────────────────────────────────────────
+
+    #[test]
+    fn slot_run_accepts_any_first_slot_then_only_the_next()
+    {
+        assert!(extends_slot_run(0, 0, 77));
+        assert!(extends_slot_run(77, 1, 78));
+        assert!(extends_slot_run(77, 5, 82));
+    }
+
+    #[test]
+    fn slot_run_rejects_a_gap_a_repeat_and_an_overflow()
+    {
+        assert!(
+            !extends_slot_run(77, 5, 83),
+            "a skipped slot breaks the run"
+        );
+        assert!(
+            !extends_slot_run(77, 5, 81),
+            "a repeated slot breaks the run"
+        );
+        assert!(
+            !extends_slot_run(u32::MAX, 1, 0),
+            "a wrapped base + count breaks the run"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not in consecutive slots")]
+    fn extending_a_run_past_a_gap_is_fatal()
+    {
+        let mut base = 10;
+        extend_slot_run_or_fatal(&mut base, 3, 14, "runs: not in consecutive slots");
+    }
+
+    #[test]
+    fn extending_an_empty_run_sets_its_base()
+    {
+        let mut base = 0;
+        extend_slot_run_or_fatal(&mut base, 0, 42, "runs: not in consecutive slots");
+        assert_eq!(base, 42);
+    }
 
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────
 

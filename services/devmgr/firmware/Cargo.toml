@@ -7,5 +7,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+# `VirtioPciStartupInfo`, filled in by the configuration-space walk.
+virtio-core = { path = "../../drivers/virtio/core" }
+
 [lints]
 workspace = true

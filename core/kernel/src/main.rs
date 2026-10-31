@@ -35,6 +35,7 @@ static APS_READY: AtomicU32 = AtomicU32::new(0);
 use boot_protocol::BootInfo;
 
 mod arch;
+mod bounded_wait;
 mod cap;
 mod console;
 mod cpu_mask;
@@ -451,6 +452,11 @@ unsafe fn kernel_entry_post_rebase(
         arch::current::interrupts::init();
     }
     kprintln!("interrupts ok");
+    // Size the IRQ routing table from the interrupt controllers the init above
+    // discovered (x86-64: the I/O APICs' GSIs; riscv64: the PLIC's sources),
+    // before any line is routed (Phase 9 on).
+    #[cfg(not(test))]
+    irq::init_table(arch::current::interrupts::irq_line_count(), allocator);
     // Install per-CPU GS-base (x86-64) / tp (RISC-V) for the BSP.
     // Must be before timer::init() — the timer ISR calls current_cpu() which
     // reads GS-base. Without this, a timer interrupt before init_bsp reads
@@ -834,10 +840,14 @@ unsafe fn kernel_entry_post_rebase(
                     .insert_cap_typed(rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Memory cap"));
                 cap::note_owns_memory_minted(size_aligned);
-                if i == 0
-                {
-                    seg_base = slot.get();
-                }
+                // seg_count is segment_count (a u32) widened, so i fits.
+                #[allow(clippy::cast_possible_truncation)]
+                cap::extend_slot_run_or_fatal(
+                    &mut seg_base,
+                    i as u32,
+                    slot.get(),
+                    "Phase 9: init segment Memory caps are not in consecutive slots",
+                );
             }
             kprintln!(
                 "init: aspace cap={} + {} memory caps",
@@ -1077,10 +1087,14 @@ unsafe fn kernel_entry_post_rebase(
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
-                if pg == 0
-                {
-                    info_memory_base_slot = slot.get();
-                }
+                // pg < info_pages, bounded by INIT_INFO_MAX_PAGES.
+                #[allow(clippy::cast_possible_truncation)]
+                cap::extend_slot_run_or_fatal(
+                    &mut info_memory_base_slot,
+                    pg as u32,
+                    slot.get(),
+                    "Phase 9: InitInfo Memory caps are not in consecutive slots",
+                );
             }
 
             // Patch the just-written InitInfo header with the self-
@@ -1180,10 +1194,14 @@ unsafe fn kernel_entry_post_rebase(
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
-                if i == 0
-                {
-                    base_slot = slot.get();
-                }
+                // i < STACK_PAGES, a small constant.
+                #[allow(clippy::cast_possible_truncation)]
+                cap::extend_slot_run_or_fatal(
+                    &mut base_slot,
+                    i as u32,
+                    slot.get(),
+                    "Phase 9: init stack Memory caps are not in consecutive slots",
+                );
             }
             // The guard page (one page below the stack) is intentionally left
             // unmapped: accessing it will fault, catching stack overflows.

@@ -447,8 +447,8 @@ pub fn run_all(ctx: &TestContext)
         ipc::call_four_caps_transfer(ctx)
     );
     run_test!(
-        "ipc::recv_oom_returns_cleanly",
-        ipc::recv_oom_returns_cleanly(ctx)
+        "ipc::recv_succeeds_on_exhausted_general_slots",
+        ipc::recv_succeeds_on_exhausted_general_slots(ctx)
     );
 
     // ── Thread syscalls ───────────────────────────────────────────────────────
@@ -589,6 +589,7 @@ pub fn run_all(ctx: &TestContext)
         "hw::irq_register_unroutable_id_err",
         hw::irq_register_unroutable_id_err(ctx)
     );
+    run_test!("hw::irq_register_high_id", hw::irq_register_high_id(ctx));
     run_test!("hw::irq_split_carves", hw::irq_split_carves(ctx));
     run_test!(
         "hw::irq_split_wrong_tag_err",

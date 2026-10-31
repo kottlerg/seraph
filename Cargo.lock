@@ -139,6 +139,7 @@ version = "0.1.1"
 dependencies = [
  "ipc",
  "syscall",
+ "syscall-abi",
 ]
 
 [[package]]
@@ -296,6 +297,9 @@ dependencies = [
 [[package]]
 name = "devmgr-firmware"
 version = "0.1.1"
+dependencies = [
+ "virtio-core",
+]
 
 [[package]]
 name = "dispatch2"

@@ -29,10 +29,12 @@ pub const ARCH_NAME: &str = "riscv64";
 /// type when Phase 9 applies init's `.rela.dyn` fix-ups (`mm::init_reloc`).
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
 
-/// Maximum PLIC source number the kernel programs (`interrupts::PLIC_NUM_SOURCES`).
-/// Sources 1–`MAX_IRQ_ID` are usable; source 0 is reserved by the PLIC spec.
-/// `SYS_IRQ_REGISTER` refuses an id outside them.
-pub const MAX_IRQ_ID: u32 = 127;
+/// Maximum PLIC source number the IRQ id range admits: the PLIC specification's last
+/// source, 1023 (`interrupts::PLIC_MAX_SOURCES`); source 0 is reserved by the spec.
+/// `SYS_IRQ_REGISTER` refuses an id outside `MIN_IRQ_ID..=MAX_IRQ_ID`; within it,
+/// `irq::register` refuses a source past the PLIC's reported count
+/// (`platform::plic_ndev`).
+pub const MAX_IRQ_ID: u32 = interrupts::PLIC_MAX_SOURCES;
 
 /// Minimum valid PLIC source number. PLIC source 0 is reserved and never
 /// wired to a real device.
@@ -50,10 +52,9 @@ pub const HAS_SBI: bool = true;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7: the
 /// PLIC's 1024-entry id space (id 0 reserved, sources 1–1023); most platforms
-/// expose far fewer. The cap spans ids the kernel does not program; a split can
-/// name them, `SYS_IRQ_REGISTER` refuses any outside `MIN_IRQ_ID..=MAX_IRQ_ID`
-/// with `InvalidArgument`, and the teardown of a cap naming one leaves the
-/// routing table and the PLIC untouched.
+/// expose far fewer. The cap spans ids the PLIC does not implement; a split can
+/// name them, `SYS_IRQ_REGISTER` refuses them with `InvalidArgument`, and the
+/// teardown of a cap naming one leaves the routing table and the PLIC untouched.
 pub const ROOT_IRQ_COUNT: u32 = 1024;
 
 /// Size of the I/O Permission Bitmap (re-exported from gdt for use in

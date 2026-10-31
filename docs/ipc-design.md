@@ -66,7 +66,8 @@ A message consists of:
   begins with the message (the sender loses access as each completes), or none
   does. A refused transfer — a source slot gone stale, repeated within the
   message, or pinned by an in-flight revocation, move, or IPC capability
-  transfer, a sender's or receiver's CSpace already torn down, or a receiving
+  transfer, a capability whose object already holds its ceiling of 2^31
+  references, a sender's or receiver's CSpace already torn down, or a receiving
   CSpace (the server's on a call, the caller's on a reply) that cannot supply the
   destination slots — never delivers a partial set. On the call/receive
   direction a refusal detectable up front rejects the sender before blocking;
@@ -197,13 +198,17 @@ caller's role and the handler services it with the ordinary receive/reply cycle.
 
 ## Receive-Failure Policy
 
-`SYS_IPC_RECV` grows the receiver's CSpace to `MSG_CAP_SLOTS_MAX` free slots before parking,
-which makes a destination OOM on delivery unlikely but reserves nothing: a slot a sibling thread
-sharing the CSpace consumes in between can still fail the transfer after the sender is
-committed, and the message is then delivered with zero capabilities, per
-[§ Message Format](#message-format). The consequence: a receiver whose CSpace cannot grow to
-that headroom fails the receive *before* blocking. A structural-ceiling failure is not
-transient — an unguarded `loop { ipc_recv }` retries at syscall rate, indefinitely.
+`SYS_IPC_RECV` grows the receiver's CSpace to `MSG_CAP_SLOTS_MAX` free slots before parking.
+Every CSpace keeps that many free slots back from general allocations (the IPC receive reserve,
+[capability-model.md](capability-model.md) § Address-space and CSpace growth budgets), so the
+pre-park check succeeds even when the receiver's general slots are exhausted: those
+allocations fail first, with `OutOfMemory`, and receives keep delivering caps into the reserve.
+The check takes nothing for the receive: a slot a sibling thread sharing the CSpace consumes in
+between can still fail the transfer after the sender is committed, and the message is then
+delivered with zero capabilities, per [§ Message Format](#message-format). Once received caps
+have spent the reserve and the pool cannot grow, a receive fails *before* blocking. That
+failure is not transient — an unguarded `loop { ipc_recv }` retries at syscall rate,
+indefinitely.
 
 Two mechanisms make the condition diagnosable:
 

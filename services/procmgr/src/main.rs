@@ -151,8 +151,10 @@ fn main() -> !
     // level-triggered wait set that keeps reporting ready while the recv in
     // dispatch_ipc keeps failing. Only a successful recv counts as progress.
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut headroom_warned = false;
     loop
     {
+        hold_cspace_headroom(startup.self_cspace, &mut headroom_warned);
         let badge = match syscall::wait_set_wait(ws_cap)
         {
             Ok(badge) => badge,
@@ -372,6 +374,38 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64
     {
         let _ = syscall::cap_delete(cap);
         None
+    }
+}
+
+/// General-allocation headroom of procmgr's `CSpace` below which it tops the
+/// pool up. procmgr holds several caps per live child, so a burst of spawns
+/// draws slots quickly; the mark leaves room for a full spawn even if the
+/// top-up itself fails once.
+const CSPACE_LOW_WATER: u64 = 256;
+
+/// Headroom a top-up funds: about 18 slot pages.
+const CSPACE_TOPUP_SLOTS: u64 = 1024;
+
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
+/// its allocations never meet an exhausted `CSpace` and its receives keep the
+/// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). A
+/// failed top-up is retried on the next loop pass; `warned` limits the log
+/// to the first failure of a streak.
+fn hold_cspace_headroom(self_cspace: u32, warned: &mut bool)
+{
+    if std::os::seraph::cspace_slot_headroom(self_cspace) >= CSPACE_LOW_WATER
+    {
+        *warned = false;
+        return;
+    }
+    if std::os::seraph::fund_cspace_slot_budget(self_cspace, CSPACE_TOPUP_SLOTS)
+    {
+        *warned = false;
+    }
+    else if !*warned
+    {
+        *warned = true;
+        std::os::seraph::log!("CSpace headroom top-up failed; retrying each pass");
     }
 }
 

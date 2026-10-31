@@ -1368,7 +1368,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 10;
+pub const DEVMGR_LABELS_VERSION: u32 = 11;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1378,11 +1378,17 @@ pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
     ///
-    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on
-    /// `blk_ep` to the caller. Caller's badge must have
-    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise, and `INVALID_REQUEST` when no block driver
-    /// is running or the derivation fails.
+    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on the
+    /// service endpoint of one block driver to the caller. devmgr spawns a
+    /// driver for every block device it enumerates and can give a private
+    /// IRQ line (one whose line another device already holds is not served,
+    /// #664); `data[1]`, when sent, selects which: an ordinal over the
+    /// running block drivers in PCI segment, bus, device, function order,
+    /// not stable across boots (a device added, removed, or failing its
+    /// spawn shifts the ones after it). An absent `data[1]` is 0, the first.
+    /// Caller's badge must have [`BLOCK_DEVICE_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise, and `INVALID_REQUEST` when no block
+    /// driver runs at that ordinal or the derivation fails.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
@@ -1469,8 +1475,8 @@ pub mod devmgr_labels
     /// (missing binary, ELF corrupt, carve failure, OOM, etc.),
     /// devmgr marks the driver permanently unavailable for this boot
     /// and replies [`super::devmgr_errors::NO_DEVICE`] to subsequent
-    /// [`QUERY_RTC_DEVICE`] / [`QUERY_INPUT_DEVICE`] queries; clients MUST
-    /// NOT retry-loop.
+    /// [`QUERY_RTC_DEVICE`] / [`QUERY_INPUT_DEVICE`] queries; the retry
+    /// rule is [`super::devmgr_errors::NO_DEVICE`]'s.
     pub const SET_DRIVERS_DIR: u64 = 6;
 
     /// Locate an ACPI table and serve a read-only view of it.
@@ -1539,12 +1545,16 @@ pub mod devmgr_labels
     /// Query for the keyboard/input device endpoint.
     ///
     /// Mints an `input_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on
-    /// the input driver's service endpoint to the caller. Caller's badge
-    /// must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise. Like [`QUERY_RTC_DEVICE`], it replies
-    /// `NO_DEVICE` until the on-disk driver is spawned, and for the rest of
-    /// the boot if no input device was enumerated or the spawn failed;
-    /// `INVALID_REQUEST` when the derivation fails. The verb
+    /// the service endpoint of one input driver to the caller. devmgr spawns
+    /// a driver for every input device it enumerates; `data[1]`, when sent,
+    /// selects which: an ordinal over the running input drivers in PCI
+    /// segment, bus, device, function order, not stable across boots. An
+    /// absent `data[1]` is 0, the first. Caller's badge must have
+    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
+    /// otherwise. Like [`QUERY_RTC_DEVICE`], it replies `NO_DEVICE` until
+    /// the on-disk drivers are spawned, and for the rest of the boot when
+    /// no input driver runs at that ordinal (none enumerated there, or its
+    /// spawn failed); `INVALID_REQUEST` when the derivation fails. The verb
     /// is transport-agnostic: any keyboard backend (virtio-input today,
     /// USB HID / PS-2 later) registers this one slot, so consumers never
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
@@ -2365,11 +2375,16 @@ pub mod devmgr_errors
     /// has not yet spawned the on-disk driver (no
     /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet), or (b) attempted the
     /// lazy disk-walked spawn and failed (missing binary, ELF corrupt,
-    /// hardware carve failed, OOM, etc.); case (b) is sticky for the boot,
-    /// since a single attempt is made. Clients (timed) MUST treat it as
-    /// terminal and fall through to their no-device path; they MUST NOT
-    /// retry-loop. Also returned by `QUERY_ACPI_TABLE` (table not found)
-    /// and `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
+    /// hardware carve failed, OOM, etc.), or, for `QUERY_INPUT_DEVICE`, no
+    /// input driver runs at the requested instance ordinal. Case (a) is
+    /// transient: it ends once the `SET_DRIVERS_DIR` spawns complete, so a
+    /// client that cannot proceed without the device MAY retry with a
+    /// bounded number of attempts. Case (b) is sticky for the boot, since a
+    /// single attempt is made, and a client cannot tell (a) from (b): a
+    /// client with a no-device path (timed) MUST treat the reply as
+    /// terminal and take that path, and no client MAY retry without a
+    /// bound. Also returned by `QUERY_ACPI_TABLE` (table not found) and
+    /// `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
     pub const NO_DEVICE: u64 = 4;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
@@ -2851,7 +2866,8 @@ impl IpcMessageBuilder
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
 /// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
-/// (`InvalidState`), or the call is interrupted. Cap-slot problems are
+/// (`InvalidState`), a cap's object has its reference count at its 2^31
+/// ceiling (`QuotaExceeded`), or the call is interrupted. Cap-slot problems are
 /// rejected before blocking; a refusal arising only afterwards delivers the
 /// message with zero caps (the caller keeps its capabilities).
 #[inline]
@@ -2920,7 +2936,8 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
 /// stale, repeated, pinned by an in-flight revoke, move, or IPC capability
-/// transfer, or unacceptable to its `CSpace`), and when none was pending
+/// transfer, naming an object at its reference ceiling, or unacceptable to
+/// its `CSpace`), and when none was pending
 /// there is nothing to wake — in both cases the reply must not be retried.
 ///
 /// # Safety
@@ -2932,8 +2949,10 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
 /// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
 /// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-/// transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace`
-/// cannot accept the reply caps). The reply never blocks, so it never returns
+/// transfer), `QuotaExceeded` (the caller's `CSpace` directory cannot accept
+/// the reply caps, or a reply cap's object has its reference count at its
+/// 2^31 ceiling), or `OutOfMemory` (the caller's `CSpace` slot pool cannot
+/// back them). The reply never blocks, so it never returns
 /// `Interrupted`; the message's counts are within the kernel's maxima by
 /// construction (the kernel clamps larger ones rather than rejecting them).
 #[inline]

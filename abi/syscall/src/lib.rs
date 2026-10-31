@@ -492,8 +492,9 @@ pub enum SyscallError
     /// backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
-    /// directory is full). Unlike `OutOfMemory`, donating memory (augment
-    /// mode) cannot satisfy the request.
+    /// directory is full, or the object a new capability or a retype would
+    /// reference already holds 2^31 references). Unlike `OutOfMemory`,
+    /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
 }
 
@@ -537,6 +538,23 @@ pub const MSG_DATA_WORDS_MAX: usize = 64;
 /// transfer: every protocol that moves more caps iterates over rounds, as the
 /// `shared/ipc` bootstrap rounds and procmgr's `DONATE_MEMORY_CAPS` rounds do.
 pub const MSG_CAP_SLOTS_MAX: usize = 4;
+
+/// Free slots every `CSpace` keeps back from general allocations for IPC
+/// capability transfer: one message's worth ([`MSG_CAP_SLOTS_MAX`]). A
+/// general allocation (a `cap_create_*`, `cap_copy`, `cap_derive`, a
+/// split, a `cap_move`) fails with `OutOfMemory` (or `QuotaExceeded` at the
+/// structural ceiling) while only this many slots are free and the slot-page
+/// pool cannot grow; the slots stay free for the caps a received message or
+/// reply carries, so `SYS_IPC_RECV` still succeeds. Headroom a process
+/// funds for its own general allocations is therefore
+/// `CAP_INFO_CSPACE_CAPACITY - CAP_INFO_CSPACE_USED - CSPACE_IPC_RECV_RESERVE`.
+pub const CSPACE_IPC_RECV_RESERVE: u64 = MSG_CAP_SLOTS_MAX as u64;
+
+/// Capability slots one `CSpace` slot-page backs: each page an augment-mode
+/// `cap_create_cspace` donates adds this many slots to
+/// [`CAP_INFO_CSPACE_CAPACITY`] (less an occasional page spent on a
+/// directory page past the direct region).
+pub const CSPACE_SLOTS_PER_PAGE: u64 = 56;
 
 // The two-word transfer layout (`pack_cap_handles` / `unpack_cap_handles`)
 // holds exactly four 32-bit fields; raising MSG_CAP_SLOTS_MAX past 4 would

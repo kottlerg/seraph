@@ -333,17 +333,77 @@ static mut OWED_WAKE_LAST: [(u32, u8); OWED_WAKE_MAX] = [(0, 0); OWED_WAKE_MAX];
 #[cfg(not(test))]
 static mut OWED_WAKE_LAST_COUNT: usize = 0;
 
-/// Per-CPU `timer::current_tick()` stamp of the most recent `timer_tick`
-/// entry. Written by the owning CPU only (one Relaxed store per tick); read
-/// by the cross-CPU heartbeat detectors. Slot 0 (the BSP) hosts the
-/// sleep-list waker and every watchdog scan, so each AP cross-checks it in
-/// `bsp_stall_check`; the BSP symmetrically scans AP slots in
-/// `ap_silence_check`. `current_tick()` derives from a globally consistent
-/// counter on both arches (TSC / `time` CSR), so cross-CPU age comparisons
-/// are sound.
+/// One CPU's softlockup-watchdog breadcrumbs, held in the `cpu_count`-sized
+/// `CPU_DIAG` slab. Each field is written by its own CPU only and read by the
+/// watchdog on another. Diagnostic-only: no field gates control flow.
 #[cfg(not(test))]
-static TICK_HEARTBEAT: [core::sync::atomic::AtomicU64; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+pub(crate) struct CpuDiag
+{
+    /// `timer::current_tick()` stamp of this CPU's most recent `timer_tick`
+    /// entry (one Relaxed store per tick), read by the cross-CPU heartbeat
+    /// detectors. CPU 0 (the BSP) hosts the sleep-list waker and every
+    /// watchdog scan, so each AP cross-checks it in `bsp_stall_check`; the BSP
+    /// symmetrically scans the APs in `ap_silence_check`. `current_tick()`
+    /// derives from a globally consistent counter on both arches (TSC /
+    /// `time` CSR), so cross-CPU age comparisons are sound.
+    tick_heartbeat: core::sync::atomic::AtomicU64,
+    /// The bounded protocol-spin this CPU is executing ([`spin_site_enter`];
+    /// [`SPIN_SITE_NONE`] when not spinning). A wedged CPU (no non-idle
+    /// dispatch for the threshold) stuck in a `dealloc_object(Thread)` gate
+    /// shows the gate here, turning an opaque `current = Exited` dump into a
+    /// named site (#351). The reporting sites are the three
+    /// `dealloc_object(Thread)` gates (the first of which
+    /// `stop_threads_bound_to`'s phase-2 spin shares), the
+    /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate
+    /// the Notification, `EventQueue`, and Thread dealloc arms share, the IRQ
+    /// route drain (`irq::register`, `irq::unregister`,
+    /// `irq::unregister_notification`), the `sys_thread_start` settle loop
+    /// (`start_under_all_locks`), the register-access wait
+    /// (`with_held_frame`), the `sys_thread_stop` save wait
+    /// (`await_stopped_save`), and the `schedule()` context-saved dispatch
+    /// barrier: the protocol spins that can wedge a CPU silently (the
+    /// `sys_thread_stop` drain carries its own overlong-duration warning).
+    spin_site: core::sync::atomic::AtomicU32,
+    /// The kind ([`LockKind`]) of the bare spin lock this CPU is waiting for
+    /// ([`lock_wait_enter`]). These locks spin with interrupts masked (syscall
+    /// context), inside a preempt-disabled window, or inside the idle thread's
+    /// deferred reclaim, so a CPU wedged on one shows no protocol spin site
+    /// and looks silent or idle; this breadcrumb and `lock_wait_word` name the
+    /// lock and its state word's address for the dump. Recorded only once the
+    /// first acquisition attempt fails, so the uncontended fast path stores
+    /// nothing.
+    lock_wait_kind: core::sync::atomic::AtomicU32,
+    /// Address of the state word of the lock `lock_wait_kind` names.
+    lock_wait_word: core::sync::atomic::AtomicU64,
+    /// The last syscall number entered on this CPU (`u64::MAX` before the
+    /// first), stamped by the syscall dispatcher ([`note_cpu_syscall`]): it
+    /// names the last syscall entered on a stalled CPU, which need not be the
+    /// one it is executing, without reading another CPU's TCB or frame.
+    syscall_nr: core::sync::atomic::AtomicU64,
+}
+
+/// Base of the `CPU_DIAG` slab: `CPU_COUNT` [`CpuDiag`] records, null until
+/// `init_per_cpu_storage` (Phase 4). Breadcrumbs stored before then are
+/// dropped, which loses nothing: no watchdog runs that early.
+#[cfg(not(test))]
+static CPU_DIAG_PTR: core::sync::atomic::AtomicPtr<CpuDiag> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// CPU `cpu`'s breadcrumb record, or `None` before the slab exists or for an
+/// index at or past `CPU_COUNT`.
+#[cfg(not(test))]
+fn cpu_diag(cpu: usize) -> Option<&'static CpuDiag>
+{
+    let base = CPU_DIAG_PTR.load(core::sync::atomic::Ordering::Acquire);
+    // CPU_COUNT is stored before the Release that publishes `base`.
+    if base.is_null() || cpu >= CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    {
+        return None;
+    }
+    // SAFETY: base is non-null and cpu < CPU_COUNT; the slab covers CPU_COUNT
+    // initialised records and is never freed.
+    Some(unsafe { &*base.add(cpu) })
+}
 
 // ── Per-CPU spin-site breadcrumb ──────────────────────────────────────────────
 
@@ -384,26 +444,6 @@ pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 /// Notification dealloc arm's `irq::unregister_notification`).
 pub const SPIN_SITE_IRQ_ROUTE_DRAIN: u32 = 10;
 
-/// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
-/// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
-/// for the threshold) stuck in a `dealloc_object(Thread)` gate shows the gate
-/// here, turning an opaque `current = Exited` dump into a named site (#351).
-/// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
-/// The reporting sites are the three `dealloc_object(Thread)` gates (the
-/// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
-/// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
-/// Notification, `EventQueue`, and Thread dealloc arms share, the IRQ route
-/// drain (`irq::register`, `irq::unregister`, `irq::unregister_notification`), the
-/// `sys_thread_start` settle loop (`start_under_all_locks`), the register-access
-/// wait (`with_held_frame`), the `sys_thread_stop` save wait
-/// (`await_stopped_save`), and the
-/// `schedule()` context-saved dispatch barrier — the protocol spins that can
-/// wedge a CPU silently (the `sys_thread_stop` drain carries its own
-/// overlong-duration warning). Diagnostic-only — never gates control flow.
-#[cfg(not(test))]
-static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
-
 /// Record that the current CPU has entered bounded protocol-spin `site`. The
 /// gates that call this run preempt-disabled, so the CPU index is stable across
 /// the spin.
@@ -411,9 +451,10 @@ static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
 pub fn spin_site_enter(site: u32)
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu < MAX_CPUS
+    if let Some(diag) = cpu_diag(cpu)
     {
-        SPIN_SITE[cpu].store(site, core::sync::atomic::Ordering::Relaxed);
+        diag.spin_site
+            .store(site, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -422,9 +463,10 @@ pub fn spin_site_enter(site: u32)
 pub fn spin_site_exit()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu < MAX_CPUS
+    if let Some(diag) = cpu_diag(cpu)
     {
-        SPIN_SITE[cpu].store(SPIN_SITE_NONE, core::sync::atomic::Ordering::Relaxed);
+        diag.spin_site
+            .store(SPIN_SITE_NONE, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -529,42 +571,17 @@ impl LockKind
 #[cfg(not(test))]
 const LOCK_WAIT_NONE: u32 = 0;
 
-/// Per-CPU breadcrumb naming the bare spin lock a CPU is currently waiting
-/// for, for the softlockup watchdog: the lock kind (every [`LockKind`]) and
-/// the address of its state word. These locks spin with interrupts masked
-/// (syscall context), inside a preempt-disabled window, or inside the idle
-/// thread's deferred reclaim, so a CPU wedged on one shows no protocol spin
-/// site and looks silent or idle; this breadcrumb names the lock and its
-/// state word's address for the dump. Recorded only once the first acquisition
-/// attempt fails, so the uncontended fast path stores nothing.
-/// Diagnostic-only — never gates control flow.
-#[cfg(not(test))]
-static LOCK_WAIT_KIND: [core::sync::atomic::AtomicU32; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU32::new(LOCK_WAIT_NONE) }; MAX_CPUS];
-/// Address of the state word the CPU is waiting on; see [`LOCK_WAIT_KIND`].
-#[cfg(not(test))]
-static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
-
-/// Per-CPU stamp of the last syscall number entered on that CPU
-/// (`u64::MAX` before the first), written by the syscall dispatcher, for the
-/// softlockup watchdog: it names the last syscall entered on a stalled CPU,
-/// which need not be the one it is executing, without reading another CPU's
-/// TCB or frame. Diagnostic-only — never gates control flow.
-#[cfg(not(test))]
-static CPU_SYSCALL_NR: [core::sync::atomic::AtomicU64; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; MAX_CPUS];
-
-/// Stamp `nr` as the last syscall entered on the current CPU; see
-/// [`CPU_SYSCALL_NR`]. Called with interrupts masked (syscall entry), so the
+/// Stamp `nr` as the last syscall entered on the current CPU (the
+/// [`CpuDiag`] stamp). Called with interrupts masked (syscall entry), so the
 /// CPU index is stable.
 #[cfg(not(test))]
 pub fn note_cpu_syscall(nr: u64)
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu < MAX_CPUS
+    if let Some(diag) = cpu_diag(cpu)
     {
-        CPU_SYSCALL_NR[cpu].store(nr, core::sync::atomic::Ordering::Relaxed);
+        diag.syscall_nr
+            .store(nr, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -577,10 +594,12 @@ pub fn note_cpu_syscall(nr: u64)
 pub fn lock_wait_enter(kind: LockKind, word: usize)
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu < MAX_CPUS
+    if let Some(diag) = cpu_diag(cpu)
     {
-        LOCK_WAIT_WORD[cpu].store(word as u64, core::sync::atomic::Ordering::Relaxed);
-        LOCK_WAIT_KIND[cpu].store(kind as u32, core::sync::atomic::Ordering::Release);
+        diag.lock_wait_word
+            .store(word as u64, core::sync::atomic::Ordering::Relaxed);
+        diag.lock_wait_kind
+            .store(kind as u32, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -591,10 +610,12 @@ pub fn lock_wait_enter(kind: LockKind, word: usize)
 pub fn lock_wait_exit()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu < MAX_CPUS
+    if let Some(diag) = cpu_diag(cpu)
     {
-        LOCK_WAIT_KIND[cpu].store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Release);
-        LOCK_WAIT_WORD[cpu].store(0, core::sync::atomic::Ordering::Relaxed);
+        diag.lock_wait_kind
+            .store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Release);
+        diag.lock_wait_word
+            .store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -995,13 +1016,16 @@ fn ap_silence_check(cpu_count: usize)
         return;
     }
     let stall = heartbeat_stall_ticks(tps);
-    for (cpu, slot) in TICK_HEARTBEAT
-        .iter()
-        .enumerate()
-        .take(cpu_count.min(MAX_CPUS))
-        .skip(1)
+    for cpu in 1..cpu_count
     {
-        let hb = slot.load(core::sync::atomic::Ordering::Relaxed);
+        let Some(diag) = cpu_diag(cpu)
+        else
+        {
+            break;
+        };
+        let hb = diag
+            .tick_heartbeat
+            .load(core::sync::atomic::Ordering::Relaxed);
         if hb != 0 && now_tick > hb.saturating_add(stall) && watchdog_claim_dump()
         {
             crate::kprintln!(
@@ -1033,7 +1057,9 @@ fn bsp_stall_check(own_heartbeat: u64)
     {
         return;
     }
-    let hb0 = TICK_HEARTBEAT[0].load(core::sync::atomic::Ordering::Relaxed);
+    let hb0 = cpu_diag(0).map_or(0, |d| {
+        d.tick_heartbeat.load(core::sync::atomic::Ordering::Relaxed)
+    });
     if hb0 == 0 || own_heartbeat <= hb0.saturating_add(heartbeat_stall_ticks(tps))
     {
         return;
@@ -1198,14 +1224,10 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
 {
     let last_tick =
         last_non_idle_tick(cpu).map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
-    let heartbeat = if cpu < MAX_CPUS
-    {
-        TICK_HEARTBEAT[cpu].load(core::sync::atomic::Ordering::Relaxed)
-    }
-    else
-    {
-        0
-    };
+    let diag = cpu_diag(cpu);
+    let heartbeat = diag.map_or(0, |d| {
+        d.tick_heartbeat.load(core::sync::atomic::Ordering::Relaxed)
+    });
     // SAFETY: cpu < CPU_COUNT (the caller's loop); slab initialised.
     let mask = unsafe { scheduler_for(cpu) }.non_empty_mask();
     let idle_age = now.saturating_sub(last_tick);
@@ -1271,7 +1293,9 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     // Name the bounded protocol-spin this CPU is wedged in, if any. A CPU
     // whose `current` is `Exited` but which never returned to the scheduler
     // is stuck in one of these gates (#351) — the breadcrumb says which.
-    let spin = SPIN_SITE[cpu].load(core::sync::atomic::Ordering::Relaxed);
+    let spin = diag.map_or(SPIN_SITE_NONE, |d| {
+        d.spin_site.load(core::sync::atomic::Ordering::Relaxed)
+    });
     if spin != SPIN_SITE_NONE
     {
         crate::kprintln!("    spinning in {}", spin_site_name(spin));
@@ -1286,9 +1310,12 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     // reported only if both reads agree. The lock word itself is not
     // read: a breadcrumb gone stale meanwhile can name storage since
     // recycled to another object.
-    let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
-    let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+    let kind_of = |d: &CpuDiag| d.lock_wait_kind.load(core::sync::atomic::Ordering::Acquire);
+    let kind_before = diag.map_or(LOCK_WAIT_NONE, kind_of);
+    let word = diag.map_or(0, |d| {
+        d.lock_wait_word.load(core::sync::atomic::Ordering::Relaxed)
+    }) as usize;
+    let kind_after = diag.map_or(LOCK_WAIT_NONE, kind_of);
     if let Some(lock_kind) = LockKind::from_code(kind_before)
         && kind_after == kind_before
         && word != 0
@@ -1301,7 +1328,9 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     }
     // The last syscall entered on this CPU, from the dispatcher's per-CPU
     // stamp; the stalled thread's frame and TCB are not read.
-    let syscall_nr = CPU_SYSCALL_NR[cpu].load(core::sync::atomic::Ordering::Relaxed);
+    let syscall_nr = diag.map_or(u64::MAX, |d| {
+        d.syscall_nr.load(core::sync::atomic::Ordering::Relaxed)
+    });
     if syscall_nr != u64::MAX
     {
         crate::kprintln!("    last syscall on this cpu: nr={}", syscall_nr);
@@ -2505,8 +2534,10 @@ pub unsafe fn init(cpu_count: u32) -> u32
 }
 
 /// Allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
-/// TCBs, idle kernel stacks and their tops, watchdog ticks, per-CPU arch data,
-/// and the x86 AP GDT/TSS/IST tables), publish `CPU_COUNT`, and arm the BSP
+/// TCBs, idle kernel stacks and their tops, watchdog ticks and breadcrumbs
+/// (`CPU_DIAG`), per-CPU arch data, the TLB-shootdown request slots, and the x86
+/// AP GDT/TSS/IST tables and NMI-backtrace storage), publish `CPU_COUNT`, and
+/// arm the BSP
 /// boot transient. Must run before Phase 5 (timer arm) so that the timer
 /// ISR's first read of `SCHEDULERS_PTR` is non-null.
 ///
@@ -2593,6 +2624,20 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     );
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
 
+    // Per-CPU watchdog breadcrumbs. Zero is every field's idle value except
+    // the last-syscall stamp, whose "none yet" is `u64::MAX`.
+    let diag_bytes = n * core::mem::size_of::<CpuDiag>();
+    let diag_ptr = alloc_zeroed_slab::<CpuDiag>(diag_bytes, allocator, "CPU_DIAG");
+    for cpu in 0..n
+    {
+        // SAFETY: the slab covers n zeroed records (zero is a valid atomic);
+        // cpu < n; no other CPU reads the slab before its publication below.
+        unsafe { &*diag_ptr.add(cpu) }
+            .syscall_nr
+            .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
+    CPU_DIAG_PTR.store(diag_ptr, core::sync::atomic::Ordering::Release);
+
     // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
     crate::percpu::init_storage(n, allocator);
 
@@ -2603,6 +2648,10 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 
 /// Allocate `bytes` of contiguous physical pages, zero-fill, return a
 /// typed pointer to the start. Halts on buddy exhaustion.
+///
+/// A slab may span several buddy blocks
+/// ([`BuddyAllocator::alloc_contiguous`]), so no per-CPU slab size, and no
+/// CPU count, is capped by the buddy's largest block.
 #[cfg(not(test))]
 pub(crate) fn alloc_zeroed_slab<T>(
     bytes: usize,
@@ -2610,34 +2659,14 @@ pub(crate) fn alloc_zeroed_slab<T>(
     label: &'static str,
 ) -> *mut T
 {
-    let pages = bytes.div_ceil(PAGE_SIZE);
-    let order = {
-        let mut o = 0;
-        while (1usize << o) < pages
-        {
-            o += 1;
-        }
-        o
-    };
-    // Distinguish an over-cap request from genuine exhaustion: `alloc` returns
-    // `None` for both, and "out of memory" misdirects the diagnosis (#376).
-    if order > crate::mm::buddy::MAX_ORDER
-    {
-        crate::kprintln!(
-            "alloc_zeroed_slab: {label} needs {bytes} bytes (order {order}), \
-             but MAX_ORDER is {}",
-            crate::mm::buddy::MAX_ORDER
-        );
-        crate::fatal("alloc_zeroed_slab: slab exceeds the largest buddy block");
-    }
-    let phys = allocator.alloc(order).unwrap_or_else(|| {
-        crate::kprintln!("alloc_zeroed_slab: out of memory for {label}");
+    let pages = bytes.div_ceil(PAGE_SIZE).max(1);
+    let phys = allocator.alloc_contiguous(pages).unwrap_or_else(|| {
+        crate::kprintln!("alloc_zeroed_slab: no {pages} contiguous free pages for {label}");
         crate::fatal("alloc_zeroed_slab: buddy exhausted")
     });
     let virt = phys_to_virt(phys) as *mut T;
-    let alloc_bytes = (1usize << order) * PAGE_SIZE;
-    // SAFETY: virt covers alloc_bytes (>= bytes) of mapped, kernel-owned RAM.
-    unsafe { core::ptr::write_bytes(virt.cast::<u8>(), 0, alloc_bytes) };
+    // SAFETY: virt covers `pages` pages (>= bytes) of mapped, kernel-owned RAM.
+    unsafe { core::ptr::write_bytes(virt.cast::<u8>(), 0, pages * PAGE_SIZE) };
     virt
 }
 
@@ -6136,11 +6165,12 @@ pub unsafe fn timer_tick()
     );
 
     // Cross-CPU liveness heartbeat (one Relaxed store), plus the BSP
-    // cross-check on APs. See [`TICK_HEARTBEAT`].
-    if cpu < MAX_CPUS
+    // cross-check on APs. See [`CpuDiag::tick_heartbeat`].
+    if let Some(diag) = cpu_diag(cpu)
     {
         let heartbeat = crate::arch::current::timer::current_tick();
-        TICK_HEARTBEAT[cpu].store(heartbeat, core::sync::atomic::Ordering::Relaxed);
+        diag.tick_heartbeat
+            .store(heartbeat, core::sync::atomic::Ordering::Relaxed);
         if cpu != 0
         {
             bsp_stall_check(heartbeat);

@@ -32,6 +32,14 @@ use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(not(test))]
 static APS_READY: AtomicU32 = AtomicU32::new(0);
 
+/// Time one AP may take, from its start request to its `APS_READY` increment,
+/// before the BSP halts the boot naming it. A healthy AP answers in
+/// milliseconds; the budget covers a host that runs the guest's vCPUs at 32x
+/// oversubscription (the 512-vCPU boundary boot), where every step of the
+/// AP's bringup waits for a host core. It bounds no capacity.
+#[cfg(not(test))]
+const AP_ONLINE_BUDGET_US: u64 = 10_000_000;
+
 use boot_protocol::BootInfo;
 
 mod arch;
@@ -243,15 +251,25 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // new tables (later phases reach it through the direct map). All
     // further uses of `info` must be resolved before activate.
     let fb_phys = info.framebuffer.physical_base;
-    if let Err(_e) = mm::paging::init_kernel_page_tables(info)
+    match mm::paging::init_kernel_page_tables(info)
     {
-        fatal("Phase 3: boot page table pool exhausted (RAM > 248 GiB?)");
+        Ok(()) =>
+        {}
+        Err(mm::paging::BootTableError::NoTableCarve) =>
+        {
+            fatal("Phase 3: no free RAM range holds the page-table carve");
+        }
+        Err(mm::paging::BootTableError::OutOfFrames) =>
+        {
+            fatal("Phase 3: boot page-table frames exhausted");
+        }
     }
 
     // Rebase the boot stack pointer from identity-mapped (VA == PA) to the
     // direct physical map (VA == direct_map_base() + PA). The identity mapping
-    // covers only 64 KiB around SP and can be exhausted by later phases;
-    // the direct map covers all physical RAM with no size limit.
+    // covers only the handoff stack's window (`HANDOFF_STACK_BYTES`) and
+    // retires with it; the direct map covers all physical RAM with no size
+    // limit.
     //
     // Call into the bulk of `kernel_entry` through an `#[inline(never)]`
     // boundary so LLVM cannot hoist sp-derived local-address
@@ -387,8 +405,9 @@ unsafe fn kernel_entry_post_rebase(
     //
     // Bootloader transient page-table frames are reclaimed through
     // `BootInfo.reclaim_ranges` (core/kernel/docs/initialization.md § Phase 3
-    // and § Phase 7). `BOOT_TABLE_POOL` (BSS array) is part of the kernel image
-    // and cannot be freed to buddy; its unused portion is accepted waste.
+    // and § Phase 7). `BOOT_TABLE_POOL` (the BSS seed of the Phase 3 tables) is
+    // part of the kernel image and cannot be freed to buddy; its unused portion
+    // is accepted waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
@@ -419,10 +438,13 @@ unsafe fn kernel_entry_post_rebase(
     // core/kernel/docs/memory-internals.md § Frame Map Table) before the
     // Phase-7 drain, while the buddy still holds 1 MiB blocks, and before
     // Phase 9 installs the first user mapping.
-    let (dram_bottom, dram_top) = mm::init::dram_bounds();
+    let (_, dram_top) = mm::init::dram_bounds();
+    // SAFETY: boot_info_phys was validated in Phase 0 and the direct map covers
+    // it and the memory map since Phase 3.
+    let memory_map = unsafe { mm::init::memory_map(boot_info_phys) };
     // SAFETY: the single boot thread, once, after Phase 3 and before any user
     // mapping or the Phase-7 drain.
-    unsafe { mm::frame_map::init(allocator, dram_bottom, dram_top) };
+    unsafe { mm::frame_map::init(allocator, memory_map, dram_top) };
 
     // Carve the CSpace registry arena (one id per DRAM page,
     // core/kernel/docs/capability-internals.md § CSpace Registry) for the same
@@ -636,16 +658,30 @@ unsafe fn kernel_entry_post_rebase(
                     // A listed CPU that cannot be started is fatal
                     // (core/kernel/docs/initialization.md § Phase 8); on x86-64
                     // SIPI delivery is unacknowledged, so `start_ap` cannot
-                    // report one and a CPU that never answers leaves the wait
-                    // below spinning.
+                    // report one, and a CPU that never answers is caught by the
+                    // bounded wait below.
                     if !ok
                     {
                         fatal("smp: start_ap failed; a listed CPU cannot be brought online");
                     }
 
-                    while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
+                    // Bounded in time, not spins: an AP that never answers
+                    // (an unacknowledged SIPI, a hart the SBI started into a
+                    // fault) halts the boot naming it instead of hanging it.
+                    let online = bounded_wait::spin_until(
+                        || APS_READY.load(Ordering::Acquire) >= cpu_idx as u32,
+                        arch::current::timer::elapsed_us,
+                        AP_ONLINE_BUDGET_US,
+                    );
+                    if !online
                     {
-                        core::hint::spin_loop();
+                        kprintln!(
+                            "smp: CPU {} (hardware id {:#x}) did not come online within {} ms",
+                            cpu_idx,
+                            hw_id,
+                            AP_ONLINE_BUDGET_US / 1_000
+                        );
+                        fatal("smp: a listed CPU did not come online");
                     }
                 }
 
@@ -1834,16 +1870,17 @@ unsafe fn panic_context_dump()
 /// them as probable return addresses (resolve offline with addr2line against the
 /// kernel ELF). Frame pointers are not forced (opt-level = 2 in both profiles;
 /// opt-level = 1 under `cargo xtask build --debug kernel`), so this is a heuristic
-/// scan, not an exact unwind. Bounded by
-/// `stack_top` (the thread's kernel-stack base) and a hard cap, and read-only, so
-/// it cannot fault during the panic.
+/// scan, not an exact unwind. Bounded by `stack_top` (the top of the thread's
+/// kernel stack), so it covers every live frame whatever the stack's size, and
+/// read-only, so it cannot fault during the panic; `MAX_HITS` caps the output.
+/// A stack pointer outside the thread's `KERNEL_STACK_PAGES` stack prints no
+/// scan.
 ///
 /// # Safety
 /// `stack_top` must be the current thread's `kernel_stack_top`.
 #[cfg(not(test))]
 unsafe fn backtrace_scan(stack_top: u64)
 {
-    const MAX_BYTES: usize = 8 * 1024;
     // A diagnostic output cap; it bounds no capacity.
     const MAX_HITS: usize = 24;
 
@@ -1854,9 +1891,14 @@ unsafe fn backtrace_scan(stack_top: u64)
 
     let text_start = core::ptr::addr_of!(__text_start) as usize;
     let text_end = core::ptr::addr_of!(__text_end) as usize;
-    let top = usize::try_from(stack_top)
-        .unwrap_or(usize::MAX)
-        .min(sp.saturating_add(MAX_BYTES));
+    let top = usize::try_from(stack_top).unwrap_or(usize::MAX);
+    // A panic taken on another stack (an IST stack, or the boot stack before
+    // the first thread runs) has no frames between `sp` and this thread's
+    // stack top; scanning that gap could read unmapped memory.
+    if sp >= top || top - sp > sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE
+    {
+        return;
+    }
     // SAFETY: panic path; lock-bypassing serial write.
     unsafe {
         console::panic_write_fmt(format_args!(

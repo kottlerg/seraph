@@ -6,10 +6,8 @@ each with a completion criterion and a defined failure mode.
 
 A phase failure halts the kernel with a diagnostic message unless the phase's
 failure mode states otherwise: Phase 0 halts silently (no console yet), a headless boot
-continues (§ Phase 1), a bad aperture entry is skipped and valid entries beyond
-`MAX_MMIO_APERTURES` are dropped (§ Phase 6), an entropy self-test FAIL is reported and the
-boot continues, and a started CPU that never announces itself leaves the BSP waiting at
-`APS_READY` (both § Phase 8).
+continues (§ Phase 1), a bad aperture entry is skipped (§ Phase 6), and an entropy self-test
+FAIL is reported and the boot continues (§ Phase 8).
 
 For the boot protocol contract (CPU state and register contents, BootInfo
 layout) that Phase 0 depends on, see
@@ -89,13 +87,9 @@ has accepted the platform.
 ## Phase 2: Memory Map Parsing
 
 ```
-1. Iterate boot_info.memory_map.entries
-2. For each entry with memory_type == MemoryType::Usable:
-   a. Align start address up to PAGE_SIZE boundary
-   b. Align end address down to PAGE_SIZE boundary
-   c. Skip ranges smaller than PAGE_SIZE
-   d. Add to candidate pool
-3. Remove from the candidate pool:
+1. Define the free memory: every boot_info.memory_map entry with
+   memory_type == MemoryType::Usable, its start aligned up and its end aligned down to
+   PAGE_SIZE, less the boot payload:
    a. Frames containing the kernel image
       (boot_info.kernel_physical_base .. kernel_physical_base + kernel_size)
    b. Frames containing init segments
@@ -104,12 +98,15 @@ has accepted the platform.
       (boot_info.modules.entries[i].physical_base + size for each i)
    d. Frames containing the BootInfo structure itself
    e. The AP trampoline page (boot_info.ap_trampoline_page, when non-zero)
-   Exclusions are rounded outward to page boundaries.
-4. Keep the surviving ranges, boot_info.device_tree, and the direct-mapped span
-   (compute_max_physical_address) for the buddy population in Phase 3
+   Exclusions are rounded outward to page boundaries. The subtraction streams: each usable
+   entry is cut against the exclusions as it is read (mm::init::for_each_payload_free_piece),
+   so no list of ranges or exclusions is kept and no count of memory-map entries, usable
+   ranges, or boot modules is bounded.
+2. Check that free memory survives, and record the BootInfo address, boot_info.device_tree,
+   and the direct-mapped span (compute_max_physical_address) for Phase 3
    (mm::init::init_physical_memory). Nothing is written to free RAM: the bootloader's
    tables do not map it.
-5. Emit the merged memory map and a DRAM summary (usable, loaded, firmware-reserved,
+3. Emit the merged memory map and a DRAM summary (usable, loaded, firmware-reserved,
    ACPI-reclaimable, plus persistent and MMIO-window totals when present) in scaled
    KiB/MiB/GiB units (mm::init::print_memory_map)
 ```
@@ -123,26 +120,40 @@ once the direct map is live, in Phase 3.
 **Failure mode:** If total usable RAM is zero after exclusions, halt with message
 "FATAL: no usable physical memory after exclusions". This indicates a corrupt memory map.
 
-**Completion criterion:** The surviving free ranges are recorded and hold usable frames.
+**Completion criterion:** Free memory survives the boot payload, and Phase 3 can derive it
+again from the recorded BootInfo address.
 
 ---
 
 ## Phase 3: Kernel Page Tables
 
 ```
-1. Allocate a root page table frame from the BSS `BOOT_TABLE_POOL` (BOOT_TABLE_POOL_SIZE =
-   256 frames); every Phase 3 page-table frame comes from this pool, not the buddy allocator
-2. Zero the frame
-3. Map the kernel image at its virtual addresses:
+1. Allocate a root page table frame from the BSS seed `BOOT_TABLE_POOL`
+   (BOOT_TABLE_POOL_SIZE = 64 frames) and zero it. No Phase 3 page-table frame comes from
+   the buddy allocator, which is populated in step 9.
+2. Size the stage-2 carve: an upper bound on the table frames step 5 allocates
+   (mm::paging::stage2_table_bound), and take that many frames from the start of the
+   first free piece that holds them (mm::init::find_boot_table_carve; Phase 2's free
+   memory, also avoiding everything from the device tree blob to the end of the run of
+   address-contiguous memory-map entries that holds it, since the blob's size is not
+   readable yet). No such piece is fatal.
+3. Stage 1, from the seed: map the kernel image at its virtual addresses —
    - Text segment: readable, executable, not writable
    - Rodata segment: readable, not writable, not executable
    - Data/BSS segment: readable, writable, not executable
    (Section bounds from the linker-script symbols __text_start..__bss_end; physical
    addresses from the BootInfo kernel_virtual_base / kernel_physical_base offset; 4 KiB pages)
-4. Map the direct physical map:
+   — the identity window (VA == PA) that holds the handoff stack, used until the stack is
+   rebased onto the direct map right after Phase 3 (wide enough to hold the HANDOFF_STACK_BYTES
+   of stack the entry contract guarantees below the entry stack pointer, whatever its
+   alignment), and the direct map of the
+   2 MiB chunks covering the carve.
+4. Activate the tables: arch::current::paging::activate(root_phys). From here nothing
+   reads BootInfo until step 9: everything later steps map was read from it before.
+5. Stage 2, from the carve, reached through the direct map: map the direct physical map —
    - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
      AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
-     — at direct_map_base() + phys
+     — at direct_map_base() + phys, less the carve's chunks mapped in step 3
    - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used, except that a
      2 MiB chunk holding an arch kernel MMIO page (xAPIC or I/O APIC on x86-64) is mapped as
      4 KiB pages, the MMIO pages uncacheable
@@ -150,20 +161,19 @@ once the direct map is live, in Phase 3.
    direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
    1 GiB-aligned base at or above the paging mode's kernel-half floor
    (0xFFFF800000000000 on x86-64 / Sv48), published by init_paging_mode
-   at kernel entry after validation. Before mapping, a guard re-checks that
+   at kernel entry after validation. Before step 1's mappings, a guard re-checks that
    the whole direct map (RAM plus any framebuffer / kernel MMIO above the RAM
    ceiling — the shared boot_protocol::direct_map_ceiling) ends at or below
    the kernel image base; overlap is fatal.
-5. Map the remaining boot-time windows: a 64 KiB identity window (VA == PA) around the boot
-   stack pointer, used until the stack is rebased onto the direct map right after
-   activation; the framebuffer at direct_map_base() + phys when it lies above the RAM
-   ceiling; the arch kernel MMIO regions above that ceiling, uncacheable (xAPIC and I/O APIC
-   on x86-64; none on RISC-V, whose PLIC and UART take their memory type from the platform
-   PMAs); and the AP trampoline page as a 4 KiB RWX identity page, retired in
-   Phase 8. BootInfo and boot modules are not mapped: after activation the kernel reaches
-   them through the direct map.
-6. Install the new page table:
-   arch::current::paging::activate(root_phys)
+   Then map the remaining boot-time windows: the framebuffer at direct_map_base() + phys
+   when it lies above the RAM ceiling; the arch kernel MMIO regions above that ceiling,
+   uncacheable (xAPIC and I/O APIC on x86-64; none on RISC-V, whose PLIC and UART take
+   their memory type from the platform PMAs); and the AP trampoline page as a 4 KiB RWX
+   identity page, retired in Phase 8. BootInfo and boot modules are not mapped: after
+   activation the kernel reaches them through the direct map.
+6. Activate the root again, which drops any translation cached while stage 2 filled
+   entries stage 1 left empty, and record the carve frames stage 2 used
+   (mm::init::record_boot_table_carve); the unused tail of the carve stays free memory.
 7. The bootloader page table is no longer referenced; its frames are
    recorded in `BootInfo.reclaim_ranges` (boot protocol v7) and minted
    as reclaimable Memory caps into init's CSpace during Phase 7 by
@@ -182,18 +192,18 @@ once the direct map is live, in Phase 3.
    a. If boot_info.device_tree is non-zero, read the FDT header through the direct map
       and size the blob from its totalsize. The only bounds are the FDT format's (a u32
       totalsize no smaller than the 40-byte header) and the direct-mapped span; a blob
-      outside them halts the boot. Subtract the blob's pages, rounded outward, from the
-      Phase 2 ranges and record the extent for the Phase 7 DTB Memory cap.
+      outside them halts the boot. Record the extent, rounded outward to pages, for the
+      Phase 7 DTB Memory cap.
    b. The buddy allocator is the static mm::FRAME_ALLOCATOR, built at compile time by the
       const BuddyAllocator::new(); orders run from 0 (one 4 KiB page) to the compile-time
-      constant `MAX_ORDER` = 11 (2048 pages = 8 MiB), sized so the largest per-CPU boot
-      slab at `MAX_CPUS` fits one block. For each range, call
-      BuddyAllocator::add_region(phys_start, phys_end), which writes each block's
-      free-list header through the direct map.
+      constant `MAX_ORDER` = 11 (2048 pages = 8 MiB). Stream Phase 2's free memory again,
+      through the direct map, less the blob and the step-6 carve, and call
+      BuddyAllocator::add_region(phys_start, phys_end) for each piece, which writes each
+      block's free-list header through the direct map.
    c. Emit: "buddy allocator: N free pages"
 ```
 
-`MAX_ORDER` and the per-CPU boot slab sizing it accommodates are specified in
+`MAX_ORDER` and the boot allocations larger than one block are specified in
 [memory-internals.md](memory-internals.md) § Buddy Allocator.
 
 The direct-map page sizes, the kernel-half floor, and the KASLR placement of the direct map
@@ -206,8 +216,12 @@ rule is recorded in [cross-boundary-disclosure.md](cross-boundary-disclosure.md)
 After this phase, the kernel can access any physical frame at `direct_map_base() + phys`.
 All kernel pointers derived from physical addresses use this translation.
 
-**Failure mode:** Exhausting `BOOT_TABLE_POOL` during page table construction is fatal:
-"FATAL: Phase 3: boot page table pool exhausted (RAM > 248 GiB?)". A direct map that would
+**Failure mode:** No free piece holding the carve is fatal before the switch:
+"FATAL: Phase 3: no free RAM range holds the page-table carve". Running out of table frames
+is fatal: "FATAL: Phase 3: boot page-table frames exhausted"; in stage 1 it means a seed too
+small for the kernel image, and stage 2 cannot run out, since the carve is an upper bound
+(a host test checks the bound against the tables a large direct map allocates). A direct
+map that would
 overlap the kernel image window halts with
 "FATAL: Phase 3: direct map would overlap the kernel image window". A
 `boot_info.device_tree` naming no valid FDT blob inside the direct-mapped span halts with
@@ -234,15 +248,16 @@ address, the reason, and the span's end.
 4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): the scheduler
    slabs (per-CPU schedulers, idle TCBs, idle-stack tops plus one idle kernel stack per
-   CPU, watchdog ticks), the PerCpuData and APIC-ID slabs, and on x86-64 the per-AP
+   CPU, watchdog ticks and breadcrumbs), the PerCpuData, APIC-ID and TLB-shootdown request
+   slabs, and on x86-64 the per-AP
    GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
    entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
    self-test sample slab (`entropy::init_storage`)
-5. Allocate the frame map table, one 1 MiB chunk of per-frame user-mapping counts for each GiB
-   the DRAM span touches (`mm::frame_map::init`; see
-   [memory-internals.md](memory-internals.md) § Frame Map Table)
-6. Allocate the `CSpace` registry arena, one 1 MiB chunk of 65,536 registry entries per
-   65,536 pages of DRAM (`cap::init_cspace_registry`; see
+5. Allocate the frame map table: a chunk table with one slot per GiB of the DRAM span,
+   and one 1 MiB chunk of per-frame user-mapping counts for each GiB that holds RAM
+   (`mm::frame_map::init`; see [memory-internals.md](memory-internals.md) § Frame Map Table)
+6. Allocate the `CSpace` registry arena: a chunk table sized from DRAM, and one 1 MiB chunk
+   of 65,536 registry entries per 65,536 pages of DRAM (`cap::init_cspace_registry`; see
    [capability-internals.md](capability-internals.md) § CSpace Registry)
 7. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
    can name the BSP by its hardware id (the riscv64 PLIC context)
@@ -253,7 +268,7 @@ Retype-based kernel object memory, which replaces a kernel heap, is specified in
 subsystem's per-CPU state is described in [entropy.md](entropy.md).
 
 **Failure mode:** a failed per-CPU storage, frame map table, or `CSpace` registry allocation
-halts the kernel, as does DRAM reaching past the frame map table's 256 GiB.
+halts the kernel.
 
 **Completion criterion:** per-CPU storage, the frame map table, and the `CSpace` registry are
 allocated; there is no kernel allocator to activate.
@@ -335,11 +350,13 @@ the PLIC's sources on RISC-V), before any line is routed; its failure is fatal.
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
 extensions, then enables hardware address-space tags (x86-64 PCID with INVPCID where present,
-RISC-V ASID, whose absence is fatal) and allocates the per-CPU tag-state slab
-(`PER_CPU_TAG_STATE`), sized to the boot CPU count, from the buddy allocator. Where
+RISC-V ASID, whose absence is fatal) and allocates the tag pool, sized to the probed tag
+count, and the per-CPU tag-state slab (`PER_CPU_TAG_STATE`), sized to the boot CPU count and
+trimmed to `TAG_STATE_BUDGET_BYTES` but never below more tags than CPUs, from the buddy
+allocator. Where
 PCID/INVPCID is absent (x86-64), or the tags are too few for the CPU count (either
-architecture), no slab is allocated and context switch keeps the full-flush path; a RISC-V
-hart without ASIDs is refused. The slab is a fixed kernel reserve allocated before the
+architecture), neither is allocated and context switch keeps the full-flush path; a RISC-V
+hart without ASIDs is refused. Both are fixed kernel reserves allocated before the
 Phase 7 drain; see
 [memory-model.md](../../../docs/memory-model.md) § TLB Management.
 
@@ -383,10 +400,10 @@ Validates `mmio_apertures` before Phase 7 mints capabilities from it
      compliant bootloader never emits one (abi/boot-protocol § Contract for a
      compliant bootloader); an Mmio cap over RAM would let its holder map and
      write frames outside Memory-cap accounting.
-   - Accept at most MAX_MMIO_APERTURES (64) valid entries; any further valid entry is
-     dropped and counted.
-5. Emit: "mmio apertures: N validated (M skipped)", or "mmio apertures: N validated
-   (M skipped, D dropped — exceeded MAX_MMIO_APERTURES)" when entries were dropped.
+   - Every other entry is accepted. Nothing is copied: Phase 7 mints from the BootInfo
+     list through the same filter (platform::ValidatedApertures), so no aperture count is
+     bounded.
+5. Emit: "mmio apertures: N validated (M skipped)".
 ```
 
 **Failure mode:** Null `entries` when `count > 0` halts with
@@ -395,7 +412,7 @@ wholly inside Usable/Loaded memory halts with
 "FATAL: Phase 6: mmio_apertures slice falls outside Usable/Loaded memory". Individual bad
 entries (malformed, or intersecting RAM): emit a warning and skip; each counts as skipped.
 
-**Completion criterion:** The validated aperture list is available to
+**Completion criterion:** The validated aperture view is available to
 Phase 7.
 
 ---
@@ -522,7 +539,8 @@ The scratch pages and bundle layout are described in
    c. Spin on an Acquire load of APS_READY until it reaches this AP's index (the AP
       increments it with a Release fetch_add once online) before launching the next AP
       (the Acquire load doubles as the barrier guaranteeing the AP has
-      jumped from the trampoline page to its kernel-VA entry)
+      jumped from the trampoline page to its kernel-VA entry). The spin is bounded by
+      elapsed time, AP_ONLINE_BUDGET_US per AP.
 5. Run the entropy power-on self-test across all online CPUs: each CPU captured
    a sample from its generator during bringup, and the BSP now checks per-CPU
    independence and basic sanity, printing PASS/FAIL.
@@ -566,12 +584,13 @@ reported is assumed online from Phase 8 on (IPI targets, scheduler placement, af
 CPU that cannot be started halts the boot with a descriptive message.
 On x86-64, a kernel root page table above 4 GiB is fatal before the first SIPI: the AP trampoline
 loads CR3 with a 32-bit move.
-A started CPU that never announces itself leaves the BSP waiting at
-`APS_READY` on either architecture; on x86-64 that wait is the only signal,
-since SIPI delivery is unacknowledged and `start_ap` cannot report a delivery failure.
-An AP that provides fewer hardware TLB tags than the BSP configured halts itself with
-"AP provides fewer hardware TLB tags than the BSP configured" before announcing itself,
-which leaves the BSP waiting at `APS_READY`. On riscv64 an AP whose PLIC S-mode context
+A started CPU that does not announce itself within `AP_ONLINE_BUDGET_US` (10 s) halts the
+boot with "FATAL: smp: a listed CPU did not come online", after a line naming the CPU's
+index and hardware id; on x86-64 that wait is the only signal, since SIPI delivery is
+unacknowledged and `start_ap` cannot report a delivery failure. An AP that provides fewer
+hardware TLB tags than the BSP configured halts itself with
+"AP provides fewer hardware TLB tags than the BSP configured" before announcing itself, so
+the BSP's wait then expires the same way. On riscv64 an AP whose PLIC S-mode context
 registers lie outside the PLIC window (a firmware hart id too large for the window
 `plic_size` reports) halts itself the same way, before announcing itself.
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
@@ -754,12 +773,12 @@ through its drain until a teardown commits `Exited` over it (see
 | 0 | Validate BootInfo version | Silent halt |
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Free physical ranges from memory map | Halt: no usable RAM |
-| 3 | Kernel page tables + direct map; buddy allocator populated | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window; BootInfo.device_tree names no valid FDT blob |
-| 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed, or DRAM past 256 GiB |
+| 3 | Kernel page tables + direct map; buddy allocator populated | Halt: no free range holds the page-table carve; table frames exhausted; direct map would overlap the kernel image window; BootInfo.device_tree names no valid FDT blob |
+| 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
-| 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
+| 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents exceed MAX_DRAIN_BLOCKS |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself, or an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window), leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace); a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

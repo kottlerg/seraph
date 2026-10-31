@@ -6,8 +6,9 @@
 //! RISC-V page table operations, parameterized over the active paging mode.
 //!
 //! Mirrors the x86-64 interface. [`map_page`] and [`map_large_page`] (kernel
-//! page-table construction) draw intermediate frames from the BSS-resident
-//! boot pool supplied via [`PoolState`]. The user-mapping functions draw them
+//! page-table construction) draw intermediate frames from the [`PoolState`]
+//! the caller supplies: the BSS-resident seed, then the Phase 3 carve of RAM,
+//! each resolved by `PoolState::phys_to_virt`. The user-mapping functions draw them
 //! from `crate::mm::kernel_pt_pool` ([`map_user_page`]) or the address space's
 //! growth pool ([`map_user_page_pooled`]).
 //!

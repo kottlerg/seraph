@@ -189,6 +189,20 @@ impl<W: PhysWindow> BuddyAllocator<W>
         // Track the running total of installed pages this allocator manages.
         self.total_pages += ((end - start) / PAGE_SIZE as u64) as usize;
 
+        // SAFETY: the caller's region is free RAM reachable through W and
+        // accessed by nothing else.
+        unsafe { self.push_span(start, end) };
+    }
+
+    /// Insert the page-aligned span `[start, end)` into the free lists as
+    /// maximally-sized, naturally aligned blocks, leaving `total_pages` as is.
+    ///
+    /// # Safety
+    ///
+    /// The span is free RAM the allocator owns (added by `add_region`, or
+    /// returned unused by an allocation), reachable through `W`.
+    unsafe fn push_span(&mut self, start: u64, end: u64)
+    {
         let mut cursor = start;
         while cursor < end
         {
@@ -202,8 +216,8 @@ impl<W: PhysWindow> BuddyAllocator<W>
                 })
                 .unwrap_or(0);
 
-            // SAFETY: the block lies in the caller's region, which is free RAM
-            // reachable through W and accessed by nothing else.
+            // SAFETY: the block lies in the caller's span (this function's
+            // contract).
             unsafe { self.push_block(order, cursor) };
             cursor += (PAGE_SIZE << order) as u64;
         }
@@ -255,6 +269,86 @@ impl<W: PhysWindow> BuddyAllocator<W>
         // header slot and nothing else accesses it yet.
         unsafe { W::header(block).write(FreeHeader { next: 0, order: 0 }) };
         Some(block)
+    }
+
+    /// Allocate `pages` physically contiguous pages, which may exceed one
+    /// `2^MAX_ORDER` block.
+    ///
+    /// A request that fits one block is served by [`alloc`][Self::alloc] at the
+    /// smallest covering order. A larger one takes a run of address-adjacent
+    /// `MAX_ORDER` blocks, found by sorting that order's free list, and returns
+    /// the run's unused tail to the free lists, so it costs exactly `pages`.
+    /// The first page's header bytes are zeroed, as `alloc` zeroes them; the
+    /// run's other blocks keep their stale headers, which the caller
+    /// overwrites. Boot-time use: the sort is linear-logarithmic in the number
+    /// of free `MAX_ORDER` blocks.
+    ///
+    /// Returns `None` when `pages` is zero or no free run is long enough.
+    pub fn alloc_contiguous(&mut self, pages: usize) -> Option<u64>
+    {
+        let max_pages = 1usize << MAX_ORDER;
+        if pages == 0
+        {
+            return None;
+        }
+        if pages <= max_pages || !self.populated
+        {
+            return self.alloc(pages.next_power_of_two().trailing_zeros() as usize);
+        }
+        let blocks = pages.div_ceil(max_pages) as u64;
+        let block_bytes = (PAGE_SIZE << MAX_ORDER) as u64;
+
+        let sorted = self.sort_orders(MAX_ORDER, MAX_ORDER);
+        let run = Self::find_run(sorted, blocks, block_bytes);
+        let (run_lo, run_hi) = run.map_or((NONE, NONE), |b| (b, b + blocks * block_bytes));
+
+        // Re-list every block outside the run.
+        let mut cursor = sorted;
+        while cursor != NONE
+        {
+            // SAFETY: `cursor` is a free block on the sorted chain; its link is
+            // read before `push_block` rewrites it.
+            let next = unsafe { (*W::header(cursor)).next };
+            if cursor < run_lo || cursor >= run_hi
+            {
+                // SAFETY: a free MAX_ORDER block taken off its list by the sort.
+                unsafe { self.push_block(MAX_ORDER, cursor) };
+            }
+            cursor = next;
+        }
+
+        let base = run?;
+        // SAFETY: the run's tail past `pages` is free RAM taken off the free
+        // list above; nothing else references it.
+        unsafe { self.push_span(base + (pages * PAGE_SIZE) as u64, run_hi) };
+        // SAFETY: `base` was free until taken off the list; the caller now owns it.
+        unsafe { W::header(base).write(FreeHeader { next: 0, order: 0 }) };
+        Some(base)
+    }
+
+    /// The lowest base of `blocks` address-adjacent blocks of `block_bytes`
+    /// on the address-sorted chain at `head`, read without modifying it.
+    fn find_run(head: u64, blocks: u64, block_bytes: u64) -> Option<u64>
+    {
+        let mut base = NONE;
+        let mut len = 0u64;
+        let mut cursor = head;
+        while cursor != NONE
+        {
+            if len == 0 || base + len * block_bytes != cursor
+            {
+                base = cursor;
+                len = 0;
+            }
+            len += 1;
+            if len == blocks
+            {
+                return Some(base);
+            }
+            // SAFETY: `cursor` is a free block on the sorted chain.
+            cursor = unsafe { (*W::header(cursor)).next };
+        }
+        None
     }
 
     /// Free a block of `2^order` pages at the given physical address.
@@ -542,8 +636,15 @@ impl<W: PhysWindow> BuddyAllocator<W>
     /// stack of [`SORT_BINS`] list heads.
     fn drain_sorted(&mut self) -> u64
     {
+        self.sort_orders(0, MAX_ORDER)
+    }
+
+    /// Empty the free lists of orders `lo..=hi` into one chain sorted by
+    /// address and return its head; each block's header keeps its order.
+    fn sort_orders(&mut self, lo: usize, hi: usize) -> u64
+    {
         let mut bins = [NONE; SORT_BINS];
-        for order in 0..=MAX_ORDER
+        for order in lo..=hi
         {
             while let Some(block) = self.pop_block(order)
             {
@@ -791,11 +892,73 @@ mod tests
     #[test]
     fn add_region_packs_single_max_order_block()
     {
-        // The per-CPU boot slabs depend on one MAX_ORDER block per aligned
-        // 8 MiB (see #376).
+        // An aligned 2^MAX_ORDER-page region packs as one block, not as
+        // smaller ones, so the largest order stays allocatable.
         let mut alloc = with_region(1 << MAX_ORDER);
         assert_eq!(alloc.alloc(MAX_ORDER), Some(BASE));
         assert_eq!(alloc.free_page_count(), 0);
+    }
+
+    /// Pages in one MAX_ORDER block.
+    const M: u64 = 1 << MAX_ORDER;
+
+    // Defect caught: a per-CPU slab larger than one buddy block halting the
+    // boot (the former one-block rule), or a run that leaks its unused tail.
+    #[test]
+    fn a_contiguous_request_past_one_block_takes_a_run_and_returns_its_tail()
+    {
+        let mut alloc = with_region(3 * M);
+        let base = alloc.alloc_contiguous((M + 1) as usize).expect("run");
+        assert_eq!(base, BASE);
+        assert_eq!(alloc.free_page_count() as u64, 3 * M - (M + 1));
+        // The tail past the request is allocatable again, right after it.
+        assert_eq!(alloc.alloc(0), Some(BASE + pages(M + 1)));
+    }
+
+    #[test]
+    fn a_contiguous_run_skips_blocks_that_are_not_adjacent()
+    {
+        let mut alloc = Alloc::new();
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe {
+            alloc.add_region(BASE, BASE + pages(M));
+            alloc.add_region(BASE + pages(2 * M), BASE + pages(4 * M));
+        }
+        let base = alloc.alloc_contiguous((2 * M) as usize).expect("run");
+        assert_eq!(base, BASE + pages(2 * M));
+        assert_eq!(alloc.alloc(MAX_ORDER), Some(BASE));
+        assert_eq!(alloc.free_page_count(), 0);
+    }
+
+    #[test]
+    fn a_contiguous_request_with_no_long_enough_run_fails_and_keeps_every_block()
+    {
+        let mut alloc = Alloc::new();
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe {
+            alloc.add_region(BASE, BASE + pages(M));
+            alloc.add_region(BASE + pages(2 * M), BASE + pages(3 * M));
+        }
+        assert_eq!(alloc.alloc_contiguous((M + 1) as usize), None);
+        assert_eq!(alloc.free_page_count() as u64, 2 * M);
+        assert!(alloc.alloc(MAX_ORDER).is_some());
+        assert!(alloc.alloc(MAX_ORDER).is_some());
+    }
+
+    #[test]
+    fn a_contiguous_request_within_one_block_rounds_to_its_order()
+    {
+        let mut alloc = with_region(8);
+        assert_eq!(alloc.alloc_contiguous(3), Some(BASE));
+        assert_eq!(alloc.free_page_count(), 4);
+    }
+
+    #[test]
+    fn a_contiguous_request_for_no_pages_is_refused()
+    {
+        let mut alloc = with_region(8);
+        assert_eq!(alloc.alloc_contiguous(0), None);
+        assert_eq!(alloc.free_page_count(), 8);
     }
 
     #[test]

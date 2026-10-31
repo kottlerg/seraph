@@ -406,7 +406,7 @@ changed line that names one of these items as a whole identifier or lies within 
   one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
   CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
   `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, and `TlbShootdownRequest` (`git grep -n -E
+  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
   'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the single-slot
   entropy pool slab, which is not per-CPU). A change that alters an element type's size is on the
   surface whether it edits the type's own fields or a type or constant the element holds by value
@@ -459,7 +459,7 @@ git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percp
     'core/kernel/src/arch/*/ap_trampoline.rs'
 S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
-S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|TlbShootdownRequest|CpuTopology"
+S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
 S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
@@ -512,19 +512,21 @@ guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
 `core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
 within the definition of, one of these items: the boot memory map and the direct map
 (`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
-`init_kernel_page_tables`, and `BOOT_TABLE_POOL_SIZE`), and the drain of RAM into Memory caps
+`init_kernel_page_tables`, `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve,
+`stage2_table_bound` and `find_boot_table_carve`), and the drain of RAM into Memory caps
 (`drain_and_install_seed`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
-`frame_map::init`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
+`frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
 boundary one does:
 
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
-M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed"
+M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
+M="$M|drain_and_install_seed"
 M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
-M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|CHUNK_ORDER"
+M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
@@ -601,11 +603,10 @@ list as the tracking Issues move):
 - x86_64 > 256 CPUs ([#376](https://github.com/kottlerg/seraph/issues/376),
   fixed): the per-CPU boot slabs (`AP_IST_STACKS`, `AP_TSS`) exceeded the
   buddy allocator's old `MAX_ORDER = 10` single-allocation cap (4 MiB) at
-  257+ CPUs, failing Phase 4 regardless of guest memory size. `MAX_ORDER`
-  is now 11 (8 MiB — exactly `AP_IST_STACKS` at `MAX_CPUS = 512`), with
-  compile-time asserts at the slab consumer sites so the envelope breaks
-  the build, not the boot. The full 512-vCPU width is exercised by the
-  MAX_CPUS boundary run above.
+  257+ CPUs, failing Phase 4 regardless of guest memory size. A per-CPU slab
+  may now span several buddy blocks (`alloc_zeroed_slab` through
+  `BuddyAllocator::alloc_contiguous`), so no block size caps the CPU count.
+  The full 512-vCPU width is exercised by the MAX_CPUS boundary run above.
 - riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377),
   fixed): boot died in UEFI (`ConvertPages: Incompatible memory types`) while
   loading the kernel ELF, because the bootloader requested the image at a fixed

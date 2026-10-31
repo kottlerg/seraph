@@ -58,13 +58,13 @@ out with their headers in place, and its caller zeroes every drained extent befo
 ([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated
 memory).
 
-`MAX_ORDER` is 11 (largest single allocation: 2048 pages = 8 MiB). It is sized
-so the largest per-CPU boot slab at `boot_protocol::MAX_CPUS` — `AP_IST_STACKS`,
-512 × 16 KiB = 8 MiB — fits one block, since `alloc_zeroed_slab` rounds every
-slab to a single power-of-two block. Compile-time asserts at the consumer sites
-(`arch/x86_64/ap_trampoline.rs`, `arch/x86_64/gdt.rs`) enforce that envelope:
-growing `MAX_CPUS` or a per-CPU slab element past it fails the build rather
-than the boot.
+`MAX_ORDER` is 11 (largest single block: 2048 pages = 8 MiB). It bounds no allocation's
+size: `alloc_contiguous` serves a boot-time request larger than one block from a run of
+address-adjacent `MAX_ORDER` blocks, found by sorting that order's free list, and returns the
+run's unused tail to the free lists. The per-CPU boot slabs (`sched::alloc_zeroed_slab`) and
+the RAM-sized tables (the frame map's and the `CSpace` registry's chunk tables, the tag pool)
+are allocated through it, so neither a CPU count nor a RAM size is capped by the largest
+block; a boot that finds no long enough run halts naming the slab.
 
 ### Zone Management
 
@@ -97,9 +97,10 @@ the full count.
 ### Thread Safety
 
 The allocator is protected by a single spinlock (`FRAME_ALLOC_LOCK`, taken by
-`mm::with_frame_allocator`). It serves boot only: the Phase 7 drain empties it, and `seal`
-arms a debug tripwire on later frees, so no runtime path allocates from it and contention is
-not a concern.
+`mm::with_frame_allocator`); a wait for it longer than `bounded_wait::DEADLOCK_BUDGET_US` of elapsed
+time halts the kernel naming the lock. It serves boot only: the Phase 7 drain empties it, and `seal`
+arms a debug tripwire on later frees, so no runtime path allocates from it and contention is not a
+concern.
 
 ---
 
@@ -202,12 +203,13 @@ issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the coun
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
 the map installs. The query reads one count per page of the region, at most 512 pages.
 
-**Storage.** The table is two-level: 256 chunk pointers in BSS, one per GiB of physical address
-space (covering the ~248 GiB the boot table pool can direct-map), each naming a 1 MiB buddy block
-of 262144 counters. Phase 4 allocates a chunk for every GiB the DRAM span touches, before the
-Phase-7 drain, so the table costs 1 MiB per GiB of DRAM span (0.1%; 1 MiB on a 512 MiB guest). A
-frame in a GiB with no chunk, device memory outside DRAM, is untracked: its count never moves and
-reads as zero. A count saturated at `u32::MAX` refuses a further map with `OutOfMemory`.
+**Storage.** The table is two-level: a chunk table with one pointer per GiB below the top of DRAM,
+allocated from the buddy, each pointer naming a 1 MiB buddy block of 262144 counters. Phase 4 sizes
+the chunk table from the DRAM span and allocates a chunk for every GiB a DRAM-typed memory-map entry
+touches, before the Phase-7 drain, so the table costs 8 B per GiB of span plus 1 MiB per GiB that
+holds RAM (0.1%; 1 MiB on a 512 MiB guest), with no ceiling of its own. A frame in a GiB with no
+chunk, device memory or a hole between RAM ranges, is untracked: its count never moves and reads as
+zero. A count saturated at `u32::MAX` refuses a further map with `OutOfMemory`.
 
 **Cost.** Each user leaf install and each removal performs one `SeqCst` read-modify-write on its
 frame's count; `SYS_MEM_MAP` adds a pin and an unpin per page (two more), and a map or unmap of a

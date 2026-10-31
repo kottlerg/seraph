@@ -13,8 +13,8 @@
 //! # Protocol
 //!
 //! The protocol is defined in `core/kernel/docs/memory-internals.md` § SMP TLB
-//! Shootdown. Each CPU owns one request slot in `TLB_REQUESTS`, indexed by its
-//! logical CPU id; [`shootdown_range`] is the initiator side and
+//! Shootdown. Each CPU owns one request slot in the `cpu_count`-sized request
+//! slab ([`init_storage`]), indexed by its logical CPU id; [`shootdown_range`] is the initiator side and
 //! [`service_shootdowns`] the target side.
 //!
 //! # The acknowledgement bit is the liveness badge
@@ -50,10 +50,9 @@
 //! - **Release** on a remote CPU's bit clear ensures its TLB flush completes
 //!   before the initiator observes the acknowledgement.
 
-use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering};
 
 use crate::cpu_mask::{AtomicCpuMask, CpuMask};
-use crate::sched::MAX_CPUS;
 
 /// Largest span (in 4 KiB pages) invalidated per-page rather than by full
 /// flush. Each per-VA invalidation walks the TLB's tags, while a full flush
@@ -109,12 +108,41 @@ impl TlbShootdownRequest
     }
 }
 
-/// One request slot per logical CPU, indexed by initiator CPU id.
-///
-/// ~96 bytes per slot; a static sized to `MAX_CPUS`, so it needs no runtime
-/// allocation and is available from the first shootdown onward.
-static TLB_REQUESTS: [TlbShootdownRequest; MAX_CPUS] =
-    [const { TlbShootdownRequest::new() }; MAX_CPUS];
+/// Base of the request slab: one slot per booted CPU, indexed by initiator CPU
+/// id. Null until [`init_storage`] (Phase 4); no shootdown targets another CPU
+/// before the APs start in Phase 8.
+static TLB_REQUESTS_PTR: AtomicPtr<TlbShootdownRequest> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the request slab for `cpu_count` CPUs and publish it. Called once
+/// from `percpu::init_storage` (Phase 4), on the BSP, before any AP starts.
+pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    let bytes = cpu_count * core::mem::size_of::<TlbShootdownRequest>();
+    let base =
+        crate::sched::alloc_zeroed_slab::<TlbShootdownRequest>(bytes, allocator, "TLB_REQUESTS");
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: the slab covers cpu_count slots and nothing reads it before
+        // the Release publication below.
+        unsafe { core::ptr::write(base.add(cpu), TlbShootdownRequest::new()) };
+    }
+    TLB_REQUESTS_PTR.store(base, Ordering::Release);
+}
+
+/// The request slots of every booted CPU; empty before [`init_storage`].
+fn requests() -> &'static [TlbShootdownRequest]
+{
+    let base = TLB_REQUESTS_PTR.load(Ordering::Acquire);
+    if base.is_null()
+    {
+        return &[];
+    }
+    // CPU_COUNT is stored (Phase 4, `sched::init_storage`) before the slab is
+    // allocated and published.
+    let n = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+    // SAFETY: the slab holds CPU_COUNT initialised slots for the kernel's life.
+    unsafe { core::slice::from_raw_parts(base, n) }
+}
 
 /// Whether any CPU currently has a shootdown awaiting acknowledgement.
 ///
@@ -123,10 +151,8 @@ static TLB_REQUESTS: [TlbShootdownRequest; MAX_CPUS] =
 /// stall that is really a slow ack.
 pub fn any_pending() -> bool
 {
-    let n = (crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize).min(MAX_CPUS);
-    TLB_REQUESTS
+    requests()
         .iter()
-        .take(n)
         .any(|r| !r.pending_cpus.is_empty(Ordering::Acquire))
 }
 
@@ -151,12 +177,12 @@ pub fn any_pending() -> bool
 /// (ring 0 / S-mode), where issuing TLB flushes is valid.
 pub unsafe fn service_shootdowns(my_cpu: usize)
 {
-    let n = (crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize).min(MAX_CPUS);
+    let slots = requests();
     // Slot indexes serviced this pass (slots are per-CPU, so a CpuMask
     // indexes them; 64 bytes of stack, independent of request sizes).
     let mut serviced = CpuMask::empty();
     let mut batch_open = false;
-    for (slot, req) in TLB_REQUESTS.iter().enumerate().take(n)
+    for (slot, req) in slots.iter().enumerate()
     {
         // Acquire: pairs with the initiator's Release store of pending_cpus, so
         // seeing our bit also makes the matching root/va visible below.
@@ -225,7 +251,7 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
     // visible before any initiator observes its acknowledgement.
     for slot in serviced.iter()
     {
-        TLB_REQUESTS[slot]
+        slots[slot]
             .pending_cpus
             .clear_cpu(my_cpu, Ordering::Release);
     }
@@ -292,7 +318,12 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     // This CPU's own request slot. No lock: the slot is owned by this CPU and
     // the previous shootdown drained it (pending_cpus empty) before we returned.
     let me = crate::arch::current::cpu::current_cpu() as usize;
-    let req = &TLB_REQUESTS[me];
+    // A non-empty target set means the APs are up, so the slab exists.
+    let Some(req) = requests().get(me)
+    else
+    {
+        crate::fatal("tlb_shootdown: remote shootdown before the request slab exists");
+    };
 
     // Publish the request. Release ordering pairs with the Acquire bit test in
     // service_shootdowns; the stores are globally visible before the IPI by

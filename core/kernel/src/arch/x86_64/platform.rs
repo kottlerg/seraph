@@ -23,6 +23,12 @@ pub use boot_protocol::layout::collect_mmio_direct_map_regions;
 use boot_protocol::layout::{DEFAULT_IOAPIC_BASE, DEFAULT_LAPIC_BASE};
 use boot_protocol::{IoApicEntry, KernelMmio};
 
+/// Most entries [`collect_mmio_direct_map_regions`] writes: the LAPIC window
+/// plus one window per I/O APIC `BootInfo.kernel_mmio` can describe. Derived
+/// from the producer's own bounds, so a larger `MAX_IOAPICS` grows the Phase 3
+/// buffer with it and no region is dropped.
+pub const MMIO_DIRECT_MAP_REGIONS: usize = 1 + boot_protocol::MAX_IOAPICS;
+
 static CACHED_LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Local APIC physical base.

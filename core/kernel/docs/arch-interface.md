@@ -780,7 +780,8 @@ The `SYS_SBI_CALL` handler's rights check and `HAS_SBI` gate are specified in
 These items in otherwise arch-private submodules are also contract surface, because
 architecture-neutral code calls them:
 `gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, init_ap, bsp_tss_ptr, IOPB_SIZE}`,
-`platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions}`,
+`platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions,
+MMIO_DIRECT_MAP_REGIONS}`,
 `fpu::{switch_out_save, switch_in_restore}`, `idt::load`, and
 `ap_trampoline::{setup_trampoline, start_ap}` (the `gdt` items are stubs on RISC-V); the rest
 of those modules is arch-private:
@@ -826,6 +827,9 @@ pub fn platform::uart_base_for_boot_info(km: &KernelMmio) -> u64;
 /// RAM ceiling into `out` and return their count: the LAPIC and every I/O APIC
 /// on x86-64; 0 on RISC-V (PLIC and UART lie inside the RAM direct map).
 pub fn platform::collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) -> usize;
+/// The most regions `collect_mmio_direct_map_regions` writes, which sizes the
+/// Phase 3 buffer: `1 + MAX_IOAPICS` on x86-64, 0 on RISC-V.
+pub const platform::MMIO_DIRECT_MAP_REGIONS: usize;
 
 /// Copy the AP trampoline into the page at `trampoline_pa`; call once before
 /// the first `start_ap`.

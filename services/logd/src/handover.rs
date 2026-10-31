@@ -72,11 +72,13 @@ pub unsafe fn transfer(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTable)
 {
     // Bound on chunks per drain. A first drain sends 1 header + up to
-    // MAX_SENDERS (32) slots + up to HISTORY_RING_LEN (512) lines + 1
-    // DONE, about 550 chunks; slots resent after a rename and lines pushed
-    // during the drain add to that only while senders keep renaming or
-    // logging. 2048 leaves ample headroom for both, and also ends a
-    // malformed reply stream that never sends DONE.
+    // init-logd's MAX_SENDERS (32) slots + its history ring's lines + 1
+    // DONE. The ring packs lines by length, so it holds at most one line per
+    // `history::RECORD_HEADER_BYTES + 1` bytes of its 16 KiB, about 860;
+    // slots resent after a rename and lines pushed during the drain add to
+    // that only while senders keep renaming or logging. 2048 leaves headroom
+    // for both, and also ends a malformed reply stream that never sends
+    // DONE.
     const MAX_ITERS: usize = 2048;
 
     for _ in 0..MAX_ITERS
@@ -110,7 +112,8 @@ unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTa
     }
 }
 
-/// Ask init-logd to terminate, retrying until a call is delivered.
+/// Ask init-logd to terminate, retrying until a call is delivered or
+/// [`wire::RELEASE_RETRY_BUDGET_US`] of wall-clock time has passed.
 ///
 /// Issued once [`pull_all`] settles (DONE, abort, or iteration cap).
 /// Init-logd's thread terminates on an acknowledged release — not on the
@@ -123,31 +126,32 @@ unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTa
 /// [`Release::Pending`] when init-logd defers the release because a name
 /// changed after its slot was sent. The retry recovers a release whose
 /// request was dropped (init-logd never saw it, so it is still serving).
-/// The cap bounds the loop; a genuinely unreachable init-logd is left
-/// serving (procmgr reaps init only on init-logd's natural exit), never
-/// wedged by an unbounded spin here.
+/// The time budget bounds the loop, whatever the system load does to the
+/// pace of attempts; a genuinely unreachable init-logd is left serving
+/// (procmgr reaps init only on init-logd's natural exit), never wedged by
+/// an unbounded spin here.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
 unsafe fn send_release(handover_send_cap: u32, ipc_buf: *mut u64) -> Release
 {
-    const MAX_RETRIES: usize = 64;
     let req = IpcMessage::new(HANDOVER_RELEASE);
-    for _ in 0..MAX_RETRIES
-    {
+    let attempt = || {
         // SAFETY: caller's invariant — ipc_buf is the registered IPC buffer.
-        if let Ok(reply) = unsafe { ipc::ipc_call(handover_send_cap, &req, ipc_buf) }
-        {
-            return if wire::is_release_pending(reply.label)
-            {
-                Release::Pending
-            }
-            else
-            {
-                Release::Acked
-            };
-        }
-        let _ = syscall::thread_yield();
+        unsafe { ipc::ipc_call(handover_send_cap, &req, ipc_buf) }.ok()
+    };
+    let delivered = wire::retry_within(
+        wire::RELEASE_RETRY_BUDGET_US,
+        || syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).ok(),
+        attempt,
+        || {
+            let _ = syscall::thread_yield();
+        },
+    );
+    match delivered
+    {
+        Some(reply) if wire::is_release_pending(reply.label) => Release::Pending,
+        Some(_) => Release::Acked,
+        None => Release::Unreached,
     }
-    Release::Unreached
 }

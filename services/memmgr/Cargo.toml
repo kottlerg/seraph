@@ -10,10 +10,13 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-# Pure free-pool allocator + region-interval logic, extracted so it is
-# host-testable; the bin injects memory_merge/memory_split as closures.
+# Pure bookkeeping logic (arena, free pool, process index, region intervals),
+# extracted so it is host-testable; the bin supplies the mapped storage and
+# injects memory_merge/memory_split as closures.
 free_pool = { path = "free-pool", package = "memmgr-free-pool" }
 process-abi = { path = "../../abi/process-abi" }
+# Zone-map constants memmgr's private VA windows are asserted against.
+process-layout = { workspace = true }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

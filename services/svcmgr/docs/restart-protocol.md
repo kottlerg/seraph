@@ -17,7 +17,18 @@ kernel posts `(correlator << 32) | exit_reason` to `deaths_eq` (per
 The WaitSet has two members: the service endpoint (badge 0) and the
 deaths queue (badge 1). On wakeup svcmgr drains the queue and routes
 each payload to its `ServiceEntry` via the correlator, then dispatches
-through [`restart::handle_death`](../src/restart.rs).
+through [`restart::handle_death`](../src/restart.rs). The service table
+grows on the heap and never reuses a slot, so an index names one service
+for svcmgr's lifetime; a post whose service's current thread the kernel
+reports live (`CAP_INFO_THREAD_STATE`) is a dead instance's that a resync
+already handled, and is dropped.
+
+`deaths_eq` has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64), not
+one sized from the service count. The kernel drops a post to a full queue,
+so a drain that takes a full queue's worth of events or more resyncs: it
+routes a death for every active service whose thread the kernel reports
+exited. A dropped post leaves a full queue of events behind it for that
+drain or the next, so the resync runs after the drop.
 
 Exit reason encoding (owned by
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)), and
@@ -48,11 +59,15 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      (a fault or `EXIT_KILLED`; voluntary codes do not restart; per
      [service-definitions.md](service-definitions.md#restart)).
    * `POLICY_ALWAYS` → restart unconditionally.
-   * The restart-count budget (`MAX_RESTARTS`, currently `1`) is
-     enforced here; an exhausted budget reports "max restarts reached"
-     and returns false (`permanent_death_outcome` then logs the outcome).
-   * A missing restart source (`vfs_path_len == 0`) reports
+   * A missing restart source (an empty `vfs_path`) reports
      "no restart source" and returns false.
+   * The windowed restart budget (`svcmgr_defs::RestartBudget`) is
+     charged here: at most `RESTART_BURST` (3) restarts within one
+     `RESTART_WINDOW_NS` (60 s) window, the window opening at the first
+     restart after the previous one has passed. A spent window reports
+     "restart budget spent for this window" and returns false
+     (`permanent_death_outcome` then logs the outcome); a service that
+     crashes less often than the budget allows restarts every time.
 2. **Restart not permitted** → mark service inactive; route to
    `permanent_death_outcome`:
    * `system_critical` (`critical = yes`, per
@@ -81,7 +96,8 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      `seed` names from the discovery registry in declaration order.
    * Rebind death-notification on the new thread cap using the same
      correlator so subsequent crashes route back to the same entry.
-   * On success: increment `restart_count`, return `Restarted`.
+   * On success: increment `restart_count` (a lifetime count for the
+     restart log line), return `Restarted`.
    * On failure: any failure after `CREATE_FROM_FILE` destroys the new
      child via `DESTROY_PROCESS`, as first launch does; then route
      through `permanent_death_outcome`. A create whose reply caps never
@@ -148,26 +164,27 @@ the next restart without code changes.
 
 ## Recipe storage
 
-svcmgr records the parsed `.svc` recipe across two index-aligned tables
-at reconciliation time. The recipe-derived fixed-size fields live on
-`ServiceEntry` (which also carries the runtime state `restart_count`, `active`,
-`bootstrap_badge`, and `provided_endpoint`):
+svcmgr records the parsed `.svc` recipe across two index-aligned heap
+tables at reconciliation time. The recipe-derived fields live on
+`ServiceEntry` (which also carries the runtime state `restart_count`,
+`restart_budget`, `active`, `bootstrap_badge`, and `provided_endpoint`), each
+string at its own length:
 
 | Field | Source |
 |---|---|
-| `name` / `name_len` | `<name>.svc` filename |
-| `vfs_path` / `vfs_path_len` | `binary = ...` |
+| `name` | `<name>.svc` filename |
+| `vfs_path` | `binary = ...` |
 | `restart_policy` | `restart = never \| on_failure \| always` |
 | `system_critical` | `critical = yes \| no` |
 | `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
 
-The launch surfaces svcmgr replays beyond the fixed record (the
-heap-backed argv / env / cwd / seed, plus the log-sink flag and
+The launch surfaces svcmgr replays beyond that record (the
+argv / env / cwd / seed, plus the log-sink flag and
 scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
-(`SvcmgrState.recipes`), index-aligned with `services[]` via the death
+(`ServiceTable.recipes`), index-aligned with `services` via the death
 correlator:
 
 | Field | Source |

@@ -16,7 +16,6 @@ use ipc::{devmgr_labels, procmgr_labels};
 use registry::{Resolver, Visibility};
 
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
-use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
 use crate::restart::{
     CreatedProcess, RestartCtx, StartupBlobs, destroy_partial_child, start_process,
@@ -190,7 +189,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32
 fn publish_provided(
     provided_endpoint: u32,
     provides: &[ProvidedName],
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
     svc_name: &str,
 )
 {
@@ -248,7 +247,7 @@ fn assemble_provided_boot_caps(
     def: &Definition,
     created: &CreatedProcess,
     ctx: &RestartCtx,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 ) -> Option<(u32, Vec<u32>)>
 {
     let provided_endpoint = if def.provides.is_empty()
@@ -326,7 +325,7 @@ fn assemble_provided_boot_caps(
 pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
     bind_target: Option<(u32, u32)>,
 ) -> Option<Launched>
 {
@@ -426,7 +425,7 @@ pub fn launch(
 pub(crate) fn resolve_seeds(
     seed: &[String],
     svc_name: &str,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 ) -> Vec<u32>
 {
     let mut caps: Vec<u32> = Vec::with_capacity(seed.len());

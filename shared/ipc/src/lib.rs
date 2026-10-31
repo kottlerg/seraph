@@ -79,7 +79,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 3;
+pub const PROCMGR_LABELS_VERSION: u32 = 4;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -286,6 +286,20 @@ pub mod procmgr_labels
     /// § `REGISTER_DEATH_EQ` — install logd's death observer.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
+    /// List the badges of the live processes procmgr tracks, one page per
+    /// call, for real-logd's death-queue resync; callers whose badge is not
+    /// [`DEATH_EQ_AUTHORITY`] are refused. `data[0]` is 0 to start the walk
+    /// or 1 to resume after the badge in `data[1]`. The reply carries the
+    /// page's count in `data[0]` and the badges, in ascending order, in
+    /// `data[1..=count]`, at most [`LIVE_PROCESSES_PAGE`]; a page shorter
+    /// than that ends the walk. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `QUERY_LIVE_PROCESSES`.
+    pub const QUERY_LIVE_PROCESSES: u64 = 18;
+
+    /// Badges one [`QUERY_LIVE_PROCESSES`] reply carries at most: every data
+    /// word after the count.
+    pub const LIVE_PROCESSES_PAGE: usize = super::MSG_DATA_WORDS_MAX - 1;
+
     /// Hand init's kernel-object caps and reclaimable Memory caps to
     /// procmgr for the reap after init exits; init calls it on its exit
     /// path, then `sys_thread_exit`s. The rounds, the death-EQ binding on
@@ -409,7 +423,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 5;
+pub const MEMMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -612,46 +626,37 @@ pub mod memmgr_errors
 /// pool bounds arrive over a single bootstrap round on memmgr's creator
 /// endpoint plus one auxiliary read-only Memory cap (`caps[1]` of that round) —
 /// the "phys-table" page. This module is the single source of truth for the
-/// payload layout; init writes it and memmgr reads it.
+/// payload layout; init writes it and memmgr reads it. It versions with
+/// [`MEMMGR_LABELS_VERSION`].
 ///
 /// Round (`ipc::bootstrap` caps + data words):
 /// * `caps[0]` — memmgr's own service endpoint (full rights; its RECV side).
 /// * `caps[1]` — read-only Memory cap covering the phys-table page (below).
-/// * `data[0]` — `frame_base`: first `CSpace` slot of the free RAM Memory caps
+/// * `data[0]` — `memory_base`: first `CSpace` slot of the free RAM Memory caps
 ///   init copied into memmgr's `CSpace`.
-/// * `data[1]` — `frame_count`: number of consecutive free RAM frames.
+/// * `data[1]` — `memory_count`: number of consecutive free RAM Memory caps.
+///   No protocol bound applies: memmgr reads each cap's size and physical base
+///   from the kernel (`cap_info`), so the round carries slot numbers only.
 /// * `data[2]` — `procmgr_badge`: badge init burned into procmgr's badged
 ///   SEND on memmgr's endpoint; gates the procmgr-only labels.
-/// * `data[3..3 + frame_count.div_ceil(2)]` — `page_count` per free frame,
-///   packed two per word (low 32 bits = even index, high 32 = odd index).
 ///
 /// Phys-table page (`u64`-indexed; one 4 KiB page = 512 slots):
-/// * `[0, frame_count)` — `phys_base` per free frame, parallel to the
-///   `page_count` words above.
 /// * `FACTS_*` — the kernel's immutable RAM-accounting facts.
 /// * `IN_USE_*` — the in-use bootstrap arenas (memmgr's, procmgr's, and init's
 ///   own backing), forwarded so memmgr's `pool_total` spans every page of RAM
 ///   it owns, not only the free runs and reap donations.
 pub mod memmgr_bootstrap
 {
-    use syscall_abi::MSG_DATA_WORDS_MAX;
-
-    /// Maximum free RAM frames init delivers in the round's data words:
-    /// `MSG_DATA_WORDS_MAX` minus the 3-word prefix, two `page_count`s per
-    /// remaining word.
-    pub const MAX_MEMORY_CAPS: usize = (MSG_DATA_WORDS_MAX - 3) * 2;
-
     /// Phys-table `u64` index of the first immutable fact
-    /// (`system_ram_bytes`). Sits past the `MAX_MEMORY_CAPS`-entry `phys_base`
-    /// table (`MAX_MEMORY_CAPS * 8 = 976 B`) so the two regions never overlap.
-    pub const FACTS_SYSTEM_RAM_IDX: usize = 128;
+    /// (`system_ram_bytes`).
+    pub const FACTS_SYSTEM_RAM_IDX: usize = 0;
     /// Phys-table `u64` index of `kernel_reserved_bytes`.
-    pub const FACTS_KERNEL_RESERVED_IDX: usize = 129;
+    pub const FACTS_KERNEL_RESERVED_IDX: usize = 1;
 
     /// Phys-table `u64` index of the in-use arena count.
-    pub const IN_USE_COUNT_IDX: usize = 130;
+    pub const IN_USE_COUNT_IDX: usize = 2;
     /// Phys-table `u64` index of the first in-use arena descriptor.
-    pub const IN_USE_BASE_IDX: usize = 131;
+    pub const IN_USE_BASE_IDX: usize = 3;
     /// `u64` words per in-use arena descriptor:
     /// * word 0 — `cap_slot` (low 32 bits) | `page_count` (high 32 bits).
     /// * word 1 — `phys_base`.
@@ -661,6 +666,9 @@ pub mod memmgr_bootstrap
     /// `IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS` must stay within the
     /// 512-slot page.
     pub const MAX_IN_USE: usize = 4;
+
+    // The in-use descriptors end inside the one phys-table page.
+    const _: () = core::assert!(IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS <= 512);
 
     /// In-use arena owner kind: memmgr's own bootstrap backing.
     pub const IN_USE_KIND_MEMMGR: u64 = 0;
@@ -699,10 +707,73 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 9;
+pub const SVCMGR_LABELS_VERSION: u32 = 10;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
+    // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
+    // defines functions, imports the prelude the crate root imports.
+    #[cfg(feature = "rustc-dep-of-std")]
+    #[allow(unused_imports)]
+    use core::prelude::rust_2024::*;
+
+    /// The one name limit of the svcmgr protocol, in bytes: a service name
+    /// (a `.svc` file's stem and a `SUBSTRATE` round's name), a published
+    /// registry name, and a `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` name. Set
+    /// by the encoding, not by a pool: [`NAME_WORDS`] words beside the label
+    /// and the round header fit one message with room to spare, and every
+    /// holder stores a name at its own length or in one per-entry buffer.
+    /// The longest name in use is 15 bytes.
+    pub const NAME_MAX: usize = 64;
+
+    /// Data words a [`NAME_MAX`]-byte name occupies, packed by
+    /// [`pack_name`].
+    pub const NAME_WORDS: usize = NAME_MAX.div_ceil(8);
+
+    const _: () = core::assert!(NAME_WORDS + 2 <= super::MSG_DATA_WORDS_MAX);
+
+    /// Pack `name` into data words (byte `i` occupies bits `(i%8)*8..` of
+    /// word `i/8`), overwriting all of `out`, the encoding every svcmgr name
+    /// rides in. Returns the number of words used, or `None` (leaving `out`
+    /// zeroed) when `name` is longer than [`NAME_MAX`]; [`unpack_name`] is
+    /// its inverse.
+    #[must_use]
+    pub fn pack_name(name: &[u8], out: &mut [u64; NAME_WORDS]) -> Option<usize>
+    {
+        *out = [0; NAME_WORDS];
+        if name.len() > NAME_MAX
+        {
+            return None;
+        }
+        for (i, &b) in name.iter().enumerate()
+        {
+            out[i / 8] |= u64::from(b) << ((i % 8) * 8);
+        }
+        Some(name.len().div_ceil(8))
+    }
+
+    /// Unpack a `len`-byte name from `words` as [`pack_name`] packed it,
+    /// returning the name zero-padded to [`NAME_MAX`]. `None` when `len` is 0
+    /// or over [`NAME_MAX`], or `words` holds fewer than its words; the name
+    /// is wire input, so nothing is read past either bound.
+    #[must_use]
+    pub fn unpack_name(words: &[u64], len: usize) -> Option<[u8; NAME_MAX]>
+    {
+        if len == 0 || len > NAME_MAX || words.len() < len.div_ceil(8)
+        {
+            return None;
+        }
+        let mut out = [0u8; NAME_MAX];
+        for (i, byte) in out.iter_mut().take(len).enumerate()
+        {
+            // Truncation to the addressed byte is the decoding.
+            #[allow(clippy::cast_possible_truncation)]
+            let b = (words[i / 8] >> ((i % 8) * 8)) as u8;
+            *byte = b;
+        }
+        Some(out)
+    }
+
     // The services init started before svcmgr existed (memmgr, procmgr,
     // devmgr, vfsd) are handed to svcmgr over init's bootstrap-round
     // endowment, not a dedicated label (svcmgr launches logd itself, from
@@ -777,19 +848,20 @@ pub mod svcmgr_labels
     ///
     /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
     /// bytes packed little-endian. `caps[0]` is the endpoint the name
-    /// resolves to. The 16-bit field exceeds `registry::NAME_MAX`, so that
+    /// resolves to. The 16-bit field exceeds [`NAME_MAX`], so that
     /// constant, not the field width, bounds a name.
     pub const PUBLISH_ENDPOINT: u64 = 3;
     /// Look up a named public endpoint; on success the reply carries a
     /// freshly derived SEND cap.
     ///
     /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
-    /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`]
-    /// (`registry-client`'s `pack_name` is the reference encoder). Reply
-    /// attaches a freshly derived SEND cap on success. On failure it carries
-    /// no cap and returns `svcmgr_errors::INVALID_NAME` if `name_len` is 0
-    /// or exceeds `registry::NAME_MAX`; `svcmgr_errors::UNKNOWN_NAME` on
-    /// miss and for a seed-only name (one whose cap carries authority, or
+    /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`] ([`pack_name`]
+    /// is the reference encoder). Reply attaches a freshly derived SEND cap
+    /// on success. On failure it carries no cap and returns
+    /// `svcmgr_errors::INVALID_NAME` if `name_len` is 0 or exceeds
+    /// [`NAME_MAX`], or the message carries fewer data words than `name_len`
+    /// needs; `svcmgr_errors::UNKNOWN_NAME` on miss and for a seed-only name
+    /// (one whose cap carries authority, or
     /// [`crate::published_names::VFSD_DENY`], svctest's test twin, which
     /// carries none; a seed-only name reaches only the recipes seeding it;
     /// see [`crate::published_names`]);
@@ -2194,7 +2266,7 @@ pub mod log_labels
     /// Sent by real-logd on the same single-use SEND cap after its
     /// [`HANDOVER_PULL`] drain settles (whether the drain ran to `DONE`,
     /// aborted on an IPC error, or hit its iteration cap); a call that
-    /// fails is retried a bounded number of times until one is delivered
+    /// fails is retried, within a wall-clock budget, until one is delivered
     /// (see `services/logd/docs/handover-protocol.md` § Termination).
     /// Init-logd replies with a status in the label:
     ///
@@ -2485,8 +2557,13 @@ pub mod blk_errors
 
 // ── Protocol constants ─────────────────────────────────────────────────────
 
-/// Maximum path length in bytes (6 IPC data words = 48 bytes).
-pub const MAX_PATH_LEN: usize = 48;
+/// The one path limit of svcmgr's recipes, in bytes: a `.svc` `binary`
+/// path and a `namespace = subtree:<path>` path. It bounds no pool: no
+/// message carries a whole path, since svcmgr walks each one a component at
+/// a time and stores each at its own length, so the value (the POSIX
+/// `PATH_MAX`) only refuses a recipe whose path is longer than any recipe
+/// written for this tree, whose paths are tens of bytes.
+pub const MAX_PATH_LEN: usize = 4096;
 
 /// Maximum argv blob size in bytes across an IPC. Constrained by
 /// `MSG_DATA_WORDS_MAX * 8 = 512` (full data area). 256 comfortably fits
@@ -3103,5 +3180,33 @@ mod tests
     fn empty_bytes_at_an_out_of_range_start_panics()
     {
         let _ = IpcMessage::builder(1).bytes(MSG_DATA_WORDS_MAX + 1, &[]);
+    }
+
+    #[test]
+    fn svcmgr_name_round_trips_at_every_length_to_name_max()
+    {
+        use svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name, unpack_name};
+        let source: [u8; NAME_MAX] = core::array::from_fn(|i| b'a' + (i % 26) as u8);
+        for len in 1..=NAME_MAX
+        {
+            let mut words = [u64::MAX; NAME_WORDS];
+            assert_eq!(pack_name(&source[..len], &mut words), Some(len.div_ceil(8)));
+            let back = unpack_name(&words, len).expect("packed name unpacks");
+            assert_eq!(&back[..len], &source[..len]);
+            assert!(back[len..].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn svcmgr_name_codec_refuses_lengths_outside_one_to_name_max()
+    {
+        use svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name, unpack_name};
+        let mut words = [u64::MAX; NAME_WORDS];
+        assert_eq!(pack_name(&[b'a'; NAME_MAX + 1], &mut words), None);
+        assert_eq!(words, [0; NAME_WORDS]);
+        assert_eq!(unpack_name(&words, 0), None);
+        assert_eq!(unpack_name(&words, NAME_MAX + 1), None);
+        // A length whose words the message does not carry.
+        assert_eq!(unpack_name(&words[..1], 9), None);
     }
 }

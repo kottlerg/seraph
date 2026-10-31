@@ -78,8 +78,9 @@ An entry an existing open Issue already names cites it in the recommendation.
   in the one-page `BootInfo`, and shipping two-socket servers already exceed 512 logical CPUs.
 - **Process ceiling.** Live processes stop at 32 (procmgr `MAX_PROCESSES`), then 64 (memmgr);
   the kernel's `CSpace` registry is sized from RAM and does not bind first. Behind those sit
-  the per-process `u32` death correlator, `badge as u32` in procmgr, logd and svcmgr, which
-  collides once tables grow, and the cap handle's 8-bit wrapping generation.
+  the 32-bit death correlator procmgr, logd and svcmgr still pass (`badge as u32`) where
+  the kernel carries a `u64` one, which collides once tables grow, and the cap handle's 8-bit
+  wrapping generation.
 - **Per-process address space.** One static VA map sized to Sv39's 2^38 is used on every
   architecture. It caps each process's heap at 1 GiB, its reservation arena at 256 MiB, and its
   main stack at 1 MiB.
@@ -230,7 +231,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `LOAD_BALANCE_IMBALANCE_THRESHOLD` | `core/kernel/src/sched/mod.rs` | 2 | tuning | none | correct as is | None |
 | `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits) | per CPU | correct as is | None |
 | `MAX_DEATH_OBSERVERS` (`ThreadControlBlock.death_observers`) | `core/kernel/src/sched/thread.rs` | 4 | current peak plus headroom (three binders) | 64 B per TCB | make pay-as-you-go | Chain caller-funded observer nodes |
-| `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u32` correlator, low 32 bits of the reason | encoding artefact (one-word EQ entry) | embedded | needs a design | Userspace passes `badge as u32` as an identity; widen before process tables grow |
+| `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u64` correlator, full `u64` reason (one two-word EQ entry) | ABI width | embedded | correct as is | Userspace still passes `badge as u32` as an identity; it adopts the full width under #643 |
 | `ThreadControlBlock.thread_id` | `core/kernel/src/sched/thread.rs` | random `u32` | provably unreachable as an identity (diagnostic only; no lookup, not exposed) | 4 B per TCB | correct as is | Widen if ever exposed |
 | `park_seq`, `start_seq`, `park_episode`, `deposit_episode` | `core/kernel/src/sched/thread.rs` | `u32` | provably unreachable (freshness inside one short window) | embedded | correct as is | None |
 | `ThreadControlBlock.cspace_epoch` | `core/kernel/src/sched/thread.rs` | `u32` | encoding artefact (mirrors the registry epoch) | 4 B per TCB | correct as is | None |
@@ -400,7 +401,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | reserve `MAX_FREE_RUNS` (`Arena.runs`) | `runtime/ruststd/src/sys/reserve/seraph.rs` | 64 | unknown | about 1.5 KiB static | make pay-as-you-go | A full table leaks freed VA silently |
 | `REAPER_SLOTS` (`Registry.slots`) | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 | unknown | about 6 KiB static | make pay-as-you-go | Detached threads past 64 leak until exit |
 | thread `EQ_CAPACITY` | `runtime/ruststd/src/sys/thread/seraph.rs` | 128 | unknown | about 1 KiB retype | raise | Overflow drops death posts |
-| `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (`u32` payload half) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
+| `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (packed in 32 bits of the `u64` correlator) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
 | `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
 | `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | unknown | VA only | raise | A frame over 4 KiB can step over it |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |
@@ -431,7 +432,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, r
 | `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 48 | unknown (the "6 IPC words" rationale is stale) | 96 B per svcmgr service | raise | One path limit |
 | `CREATE_SCHED_FIELD_MASK` | `shared/ipc/src/lib.rs` | 5 bits | ABI width (32 priority levels) | none | correct as is | None |
 | `BASELINE_PRIORITY_MAX`, `DEVMGR_BAND_MAX` | `shared/ipc/src/lib.rs` | 28 / 26 | encoding artefact (policy placement in 32 levels) | none | correct as is | None |
-| `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u32` | ABI width (kernel death correlator) | none | needs a design | Collides once tables grow (#638) |
+| `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u32` | userspace choice (the kernel correlator is `u64`) | none | needs a design | Collides once tables grow; adopt the `u64` correlator (#643) |
 | `memmgr_grant_layout` caps per reply | `shared/ipc/src/lib.rs` | `MSG_CAP_SLOTS_MAX` | ABI width (4 caps per reply); a request spread over more runs fails | none | needs a design | memmgr returns a partial best-effort grant and callers loop (#642) |
 | `memmgr_bootstrap::MAX_MEMORY_CAPS` | `shared/ipc/src/lib.rs` | `(MSG_DATA_WORDS_MAX - 3) * 2` = 122 | encoding artefact (one bootstrap round) | none | needs a design | Overflow spills through init's reap donation; confirm it loses nothing (#642) |
 | phys-table index constants (`FACTS_*`, `IN_USE_*`) | `shared/ipc/src/lib.rs` | 128 to 131 | encoding artefact (one-page layout) | none | correct as is | Pin `MAX_MEMORY_CAPS <= FACTS_SYSTEM_RAM_IDX` with a const assert |
@@ -524,7 +525,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `MAX_PROCESSES` (`ProcessTable.entries`) | `services/procmgr/process-table/src/lib.rs` | 32 | current peak plus headroom | about 2.8 KiB stack | make pay-as-you-go | Caps live user processes at 32; growable table after the correlator widening |
 | death EQ capacity | `services/procmgr/src/main.rs` | `MAX_PROCESSES * 2` | provably unreachable while the table is fixed | about 0.6 KiB | needs a design | Growable or resync-on-full with a dynamic table |
 | `RECENT_EXITS_SLOTS` | `services/procmgr/process-table/src/lib.rs` | 16 | unknown | 384 B | raise | Rotation turns a query into UNKNOWN; size from the death rate |
-| death correlator `badge as u32` | `services/procmgr/src/process.rs`, `process-table/src/lib.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Accepted at 32 live; collides as the table grows (#638) |
+| death correlator `badge as u32` | `services/procmgr/src/process.rs`, `process-table/src/lib.rs` | low 32 bits | userspace choice (the kernel correlator is `u64`) | none | needs a design | Accepted at 32 live; collides as the table grows; pass the full badge (#643) |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | `CreateBlobs.args_buf`, `env_buf` | `services/procmgr/process-table/src/create_blobs.rs` | 256 B each | encoding artefact (one message) | about 530 B stack | needs a design | argv and env through a Memory cap |
 | blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design |
@@ -581,8 +582,8 @@ device block-size query and fs-fat's sector size).
 The entries left open are tracked by the Issue each recommendation names: memmgr's page-table
 seed by [#642](https://github.com/kottlerg/seraph/issues/642), the ACPI region caps by
 [#637](https://github.com/kottlerg/seraph/issues/637), the service-name packing and logd's death
-queue by [#643](https://github.com/kottlerg/seraph/issues/643), and logd's eviction by the low 32
-correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
+queue and logd's eviction by the low 32 correlator bits by
+[#643](https://github.com/kottlerg/seraph/issues/643).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -608,7 +609,7 @@ correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
 | `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | procmgr `MAX_PROCESSES * 2` = 64 | follows procmgr's own death queue (a burst procmgr's queue absorbs fits, if logd drains before more deaths arrive) | about 0.6 KiB | needs a design | A full queue still drops, with a post-hoc diagnostic, and the slot leaks; a resync path replaces the coupling once procmgr's table grows (#643) |
-| eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Evicts every slot sharing the low bits (#638) |
+| eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | userspace choice (the kernel correlator is `u64`) | none | needs a design | Evicts every slot sharing the low bits; compare the full badge (#643) |
 | death exit reason | `services/logd/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |
 | `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |

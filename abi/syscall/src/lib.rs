@@ -161,12 +161,13 @@ pub const WAIT_SET_RETYPE_BYTES: u64 = 464;
 
 /// Raw retype debit of one `EventQueue` of user-visible `capacity` entries, in
 /// bytes: the 24-byte wrapper, the 56-byte queue state, and `capacity + 1`
-/// eight-byte ring slots, all inline in the retype slot. `capacity` is one the
-/// kernel accepts, `1..=EVENT_QUEUE_MAX_CAPACITY`; a larger value can overflow.
+/// sixteen-byte ring slots (one two-word entry each), all inline in the retype
+/// slot. `capacity` is one the kernel accepts, `1..=EVENT_QUEUE_MAX_CAPACITY`;
+/// a larger value can overflow.
 #[must_use]
 pub const fn event_queue_retype_bytes(capacity: u64) -> u64
 {
-    24 + 56 + (capacity + 1) * 8
+    24 + 56 + (capacity + 1) * 16
 }
 
 // ── Syscall numbers ───────────────────────────────────────────────────────────
@@ -804,8 +805,8 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
-// The exit reason is the value a death notification delivers (low 32 bits) when
-// a thread or process dies. It is a single flat space partitioned into disjoint
+// The exit reason is the value a death notification delivers (the payload word
+// of its two-word entry) when a thread or process dies. It is a single flat space partitioned into disjoint
 // ranges, kernel-owned so userspace can never forge a fault or kill reason:
 //
 //   | Reason            | Class               | Meaning                            |

@@ -1143,6 +1143,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 cspace_epoch: new_cs_epoch,
                 ipc_buffer: 0,
                 wakeup_value: 0,
+                wakeup_tag: 0,
                 timed_out: false,
                 iopb: core::ptr::null_mut(),
                 blocked_on_object: core::ptr::null_mut(),
@@ -2445,11 +2446,12 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
     // Layout (matches `cap::retype::event_queue_raw_bytes`):
     //   offset  0: EventQueueObject (24 B)
     //   offset 24: EventQueueState  (56 B)
-    //   offset 80: ring buffer ((capacity + 1) * 8 B)
+    //   offset 80: ring buffer ((capacity + 1) * 16 B, one EventEntry each)
     let eq_obj_ptr = block_virt as *mut EventQueueObject;
     let state_offset = core::mem::size_of::<EventQueueObject>() as u64;
     let eq_state_ptr = (block_virt + state_offset) as *mut EventQueueState;
-    let ring_ptr = (block_virt + EVENT_QUEUE_RING_OFFSET) as *mut u64;
+    let ring_ptr =
+        (block_virt + EVENT_QUEUE_RING_OFFSET) as *mut crate::ipc::event_queue::EventEntry;
     let ring_len = (capacity as usize) + 1;
 
     let ancestor = memory_obj_nn;

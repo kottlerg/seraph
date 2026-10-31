@@ -672,15 +672,17 @@ fn dispatch_death(
 {
     loop
     {
-        let Ok(payload) = syscall::event_try_recv(death_eq)
+        let Ok(death) = syscall::event_try_recv_death(death_eq)
         else
         {
             return;
         };
-        // The kernel packs the correlator into the high half of the `u64`
-        // event payload, leaving the exit reason the low 32 bits.
-        let correlator = (payload >> 32) as u32;
-        let exit_reason = payload & 0xFFFF_FFFF;
+        // Every bind passes a 32-bit value widened to u64, so the low word is
+        // the whole correlator.
+        // cast_possible_truncation: see above; the high word is always zero.
+        #[allow(clippy::cast_possible_truncation)]
+        let correlator = death.correlator as u32;
+        let exit_reason = death.exit_reason;
         if correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
             // An init thread exited. `run_reap` counts down the two init

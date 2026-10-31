@@ -332,8 +332,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     self_log(buf.as_str());
 }
 
-/// Non-blocking drain of the death event queue. Each payload encodes
-/// `(process_badge as u32) << 32 | exit_reason`. We evict the
+/// Non-blocking drain of the death event queue. Each death event carries
+/// the exit reason and the correlator procmgr bound, `process_badge as u32`
+/// widened to `u64` (`syscall::DeathEvent`). We evict the
 /// matching slot from the badge table. A drain that takes a full queue's
 /// worth of events reports it: the queue may have filled, and a post to a
 /// full queue is dropped, leaving that sender's slot unevicted.
@@ -342,7 +343,7 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
     let mut drained: u32 = 0;
     loop
     {
-        let Ok(payload) = syscall::event_try_recv(death_eq)
+        let Ok(death) = syscall::event_try_recv_death(death_eq)
         else
         {
             if drained >= DEATH_EQ_CAPACITY
@@ -358,11 +359,13 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
             return;
         };
         drained = drained.saturating_add(1);
-        let correlator = (payload >> 32) as u32;
-        let exit_reason = payload as u32;
-        // Badge in logd's slot map is the full u64; the correlator
-        // procmgr binds is `process_badge as u32`. Match against the
-        // low 32 bits.
+        // procmgr binds `process_badge as u32` widened to u64, so the low
+        // word is the whole correlator; badges in the slot map are the full
+        // u64, so match against their low 32 bits.
+        // cast_possible_truncation: see above; the high word is always zero.
+        #[allow(clippy::cast_possible_truncation)]
+        let correlator = death.correlator as u32;
+        let exit_reason = death.exit_reason;
         let dead: Vec<u64> = table
             .slots
             .keys()

@@ -18,7 +18,7 @@
 
 use syscall::{
     aspace_bind_notification, cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete,
-    event_queue_create, event_try_recv, thread_configure, thread_start,
+    event_queue_create, event_try_recv, event_try_recv_death, thread_configure, thread_start,
 };
 use syscall_abi::{EXIT_FAULT_BASE, SyscallError};
 
@@ -33,7 +33,7 @@ const UNMAPPED_STACK: u64 = 0x3E_2000_8000;
 
 /// Distinct, non-zero correlator so a dropped/misrouted event surfaces as a
 /// wrong high word rather than a coincidental zero.
-const CORR: u32 = 0x4444;
+const CORR: u64 = 0xA5FA_0000_0000_4444;
 
 /// Poll bound: ~2 s at 1 ms/poll before declaring the thread never faulted.
 /// Applied through [`crate::scaled_polls`], which stretches it past
@@ -75,11 +75,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     aspace_bind_notification(aspace, eq, CORR)
         .map_err(|_| "aspace_fault_notification_late_bind: bind onto faulted aspace failed")?;
 
-    let payload = event_try_recv(eq).map_err(|_| {
+    let death = event_try_recv_death(eq).map_err(|_| {
         "aspace_fault_notification_late_bind: no event delivered to late-bound observer (dropped)"
     })?;
-    let expected = (u64::from(CORR) << 32) | fault_reason;
-    if payload != expected
+    if death.correlator != CORR || death.exit_reason != fault_reason
     {
         return Err("aspace_fault_notification_late_bind: late-bound observer got wrong payload");
     }

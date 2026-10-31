@@ -19,7 +19,7 @@
 //! - `ipc_buffer`: virtual address of the per-thread IPC buffer page (0 = none).
 //! - `wakeup_value`: value deposited by the waker that claims this thread's IPC
 //!   wait (notification bits, event payload, wait-set badge, or 0 for a timeout
-//!   or drain).
+//!   or drain); `wakeup_tag` carries an event entry's second word beside it.
 //!
 //! Each field that is neither atomic nor a lock names its owner in its rustdoc,
 //! as the bare-field exception of docs/coding-standards.md § Concurrency
@@ -53,9 +53,9 @@ pub struct DeathObserver
 {
     /// Target event queue object. `null` means this slot is unused.
     pub eq: *mut crate::cap::object::EventQueueObject,
-    /// Caller-chosen routing tag. Delivered as the upper 32 bits of the
-    /// posted payload. Opaque to the kernel.
-    pub correlator: u32,
+    /// Caller-chosen routing tag. Delivered as the tag word of the posted
+    /// death entry. Opaque to the kernel.
+    pub correlator: u64,
 }
 
 impl DeathObserver
@@ -766,6 +766,15 @@ pub struct ThreadControlBlock
     /// exception of docs/coding-standards.md § Concurrency).
     pub wakeup_value: u64,
 
+    /// Second word of an event-queue entry delivered with the wake: the tag
+    /// word `event_queue_post` writes beside `claim_waiter`'s `wakeup_value`
+    /// when it hands an entry straight to a blocked receiver (a death event's
+    /// correlator). Owned by the source lock, as `wakeup_value` is; the
+    /// resuming `sys_event_recv` reads and then clears it with no lock, before
+    /// the thread can park again (the bare-field exception of
+    /// docs/coding-standards.md § Concurrency).
+    pub wakeup_tag: u64,
+
     /// Out-of-band timeout marker. True iff the most recent wake came from
     /// the sleep-list timer arm in `sleep_check_wakeups`. Owned by the source
     /// lock: the timer claim sets it under `eq.lock`; the resuming syscall
@@ -861,16 +870,16 @@ pub struct ThreadControlBlock
     /// Observers to notify when this thread exits or faults.
     ///
     /// Each observer pairs an `EventQueueState` pointer (post target) with a
-    /// caller-chosen `correlator: u32`. On death, the kernel posts a packed
-    /// payload `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
-    /// each observer's queue. Observers past `death_observer_count` are
+    /// caller-chosen `correlator: u64`. On death, the kernel posts a two-word
+    /// entry to each observer's queue: the exit reason as the payload word,
+    /// the correlator as the tag word. Observers past `death_observer_count` are
     /// invalid.
     ///
     /// Correlator semantics: opaque to the kernel, scoped to one
     /// `(EventQueue, binder)` pair. Not a system-wide identifier, not a PID;
     /// it is whatever the binder needs to route the event to its own
-    /// bookkeeping (e.g. procmgr passes the low 32 bits of its process badge).
-    /// Passing `0` makes the payload equal to `exit_reason`.
+    /// bookkeeping (e.g. procmgr passes its process badge). The kernel never
+    /// reads it.
     ///
     /// Multiple binders (e.g. procmgr auto-reap + svcmgr restart manager)
     /// can each install their own observer; all fire on death independently.

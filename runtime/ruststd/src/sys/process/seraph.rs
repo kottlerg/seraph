@@ -73,9 +73,9 @@ use ipc::{procmgr_errors, procmgr_labels};
 
 /// Sentinel `event_post` payload used by `Process::Drop` to unblock the
 /// bridge thread cleanly when the spawner discards the child without
-/// waiting. Real death payloads pack `(correlator << 32) | exit_reason`
-/// and the spawner uses correlator=0 (the high 32 bits are always zero
-/// on a real death), so `u64::MAX` is unambiguous.
+/// waiting. A real death entry carries the exit reason in its payload word,
+/// an `EXIT_*`-range value far below `u64::MAX`, so the sentinel is
+/// unambiguous.
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
 use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
@@ -1233,8 +1233,8 @@ fn bridge_main(h: BridgeHandles) {
         // Spawner is dropping the Process; do not fire any wakes.
         return;
     }
-    let reason = payload & 0xFFFF_FFFF;
-    h.exit_reason.store(reason, Ordering::Release);
+    // The death entry's payload word is the whole exit reason.
+    h.exit_reason.store(payload, Ordering::Release);
     h.peer_dead.store(true, Ordering::Release);
     for sig in h.pipe_notifications.iter().flatten() {
         // Any non-zero bits — the wake is just a kick; the reader /

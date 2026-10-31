@@ -25,10 +25,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_derive, event_queue_create,
-    event_recv, notification_send, notification_wait, notification_wait_timeout, sched_split,
-    system_info, thread_bind_notification, thread_configure, thread_exit, thread_read_regs,
-    thread_set_affinity, thread_set_priority, thread_sleep, thread_start, thread_stop,
-    thread_write_regs,
+    notification_send, notification_wait, notification_wait_timeout, sched_split, system_info,
+    thread_bind_notification, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
+    thread_set_priority, thread_sleep, thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -1761,11 +1760,14 @@ extern "C" fn bind_notif_exit_entry(_arg: u64) -> !
     thread_exit()
 }
 
-/// `thread_bind_notification(child, eq, correlator)` causes a payload
-/// carrying `correlator` to be posted to `eq` when the child thread exits.
+/// `thread_bind_notification(child, eq, correlator)` causes a death entry
+/// carrying the full `u64` `correlator` to be posted to `eq` when the child
+/// thread exits, delivered straight to the receiver blocked on `eq`.
 pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
 {
-    const CORRELATOR: u32 = 0xCAFEu32;
+    // Bits in both halves: a correlator truncated to 32 bits, or a tag word
+    // lost on the blocked-receiver handoff, fails the compare.
+    const CORRELATOR: u64 = 0xCAFE_0000_0000_CAFE;
 
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "thread::bind_notification_fires_on_exit: event_queue_create failed")?;
@@ -1785,12 +1787,12 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::bind_notification_fires_on_exit: configure_and_start failed")?;
 
     // Block until the death notification arrives.
-    let payload =
-        event_recv(eq).map_err(|_| "thread::bind_notification_fires_on_exit: event_recv failed")?;
+    let entry = syscall::event_recv_entry(eq, 0)
+        .map_err(|_| "thread::bind_notification_fires_on_exit: event_recv failed")?;
 
-    // Payload layout: core/kernel/docs/syscalls.md § SYS_THREAD_BIND_NOTIFICATION.
-    let observed = (payload >> 32) as u32;
-    if observed != CORRELATOR
+    // Entry layout: core/kernel/docs/syscalls.md § SYS_THREAD_BIND_NOTIFICATION.
+    let death = syscall::DeathEvent::from_entry(entry);
+    if death.correlator != CORRELATOR || death.exit_reason != 0
     {
         return Err("thread::bind_notification_fires_on_exit: wrong correlator on death payload");
     }

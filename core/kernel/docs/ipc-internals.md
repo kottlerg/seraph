@@ -429,11 +429,18 @@ bit-63-set bitmasks with negative-Err codes.
 ### Object Structure
 
 ```rust
+/// One entry: the two words SYS_EVENT_POST takes and SYS_EVENT_RECV returns.
+pub struct EventEntry
+{
+    pub payload: u64,
+    pub tag: u64,
+}
+
 pub struct EventQueueState
 {
     /// Ring body, inline after this struct in the retype slot (set at
     /// construction).
-    pub ring: *mut u64,
+    pub ring: *mut EventEntry,
 
     /// Capacity of the ring (fixed at creation).
     pub capacity: u32,
@@ -464,7 +471,7 @@ pub struct EventQueueState
 ```
 
 When the user requests capacity N, the kernel reserves a ring buffer of N+1
-entries laid out **inline within the same retype slot** that holds the
+two-word entries laid out **inline within the same retype slot** that holds the
 `EventQueueState` (layout: `cap::retype::event_queue_raw_bytes` and
 `EVENT_QUEUE_RING_OFFSET`; see
 [memory-internals.md § Kernel Object Memory](memory-internals.md#kernel-object-memory-capretypers)).
@@ -484,14 +491,15 @@ wholesale with the wrapper on `dealloc_object(EventQueue)`.
 2. if waiters is non-empty:
    // Deliver directly to the longest-waiting receiver, bypassing the ring
    a. tcb = waiters.pop()
-   b. claim_waiter(tcb, payload): wake_in_flight = 1,
-      tcb.wakeup_value = payload, and if tcb.sleep_deadline != 0
-      sleep_list_remove(tcb) (clears the deadline with the entry)
+   b. claim_waiter(tcb, entry.payload): wake_in_flight = 1,
+      tcb.wakeup_value = entry.payload, and if tcb.sleep_deadline != 0
+      sleep_list_remove(tcb) (clears the deadline with the entry);
+      tcb.wakeup_tag = entry.tag
    c. Release eq.lock; return the woken tcb (ring untouched)
    d. Syscall handler: select_target_cpu + enqueue_and_wake(tcb)
 3. if count >= capacity:
    Release eq.lock; return QueueFull
-4. ring[write_idx] = payload; write_idx = (write_idx + 1) % (capacity + 1)
+4. ring[write_idx] = entry; write_idx = (write_idx + 1) % (capacity + 1)
 5. count += 1 (Release); on the 0 -> 1 transition, waitset_notify
 6. Release eq.lock
 ```
@@ -513,9 +521,9 @@ level-readiness witness.
    // wakeable and never enters the scheduler.
 2. Acquire eq.lock (event_queue_recv)
 3. if count > 0:
-   a. payload = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
+   a. entry = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
    b. count -= 1 (Release)
-   c. Release eq.lock; return payload
+   c. Release eq.lock; return entry
 4. else, still under eq.lock:
    // Queue the caller at the tail of eq.waiters
    a. context_saved = 0; waiters.push(current_tcb)
@@ -531,14 +539,15 @@ level-readiness witness.
    if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
                                  destroyed under the waiter),
    else if tcb.timed_out      -> return WouldBlock,
-   else                       -> return payload from wakeup_value
+   else                       -> return the entry from wakeup_value and
+                                 wakeup_tag
 ```
 
 The try-once mode never takes the park path, per
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 8.
 
 The `tcb.timed_out` flag is the out-of-band timeout marker — required
-because event-queue payloads may be any `u64` (including 0), so an
+because event-queue entry words may be any `u64` (including 0), so an
 in-band sentinel on `wakeup_value` is unavailable. The flag is set by
 the `BlockedOnEventQueue` arm of `sleep_check_wakeups` when the timer
 arbitrates against `event_queue_post` and wins; cleared by the resuming

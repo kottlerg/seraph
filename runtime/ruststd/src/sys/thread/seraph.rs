@@ -568,9 +568,9 @@ mod reaper {
     /// drops a post to a full queue).
     const EQ_CAPACITY: u32 = 128;
     /// Correlator bit split: low `GEN_BITS` are the generation, the rest the
-    /// slot index (6 bits → 64 slots). The split is an encoding artefact of
-    /// the `u32` correlator `thread_bind_notification` carries; the
-    /// generation is freshness-only, so its wrap needs no wider field.
+    /// slot index (6 bits → 64 slots), packed in the low 32 bits of the `u64`
+    /// correlator `thread_bind_notification` carries. The generation is
+    /// freshness-only, so its wrap needs no wider field.
     const GEN_BITS: u32 = 26;
     const GEN_MASK: u32 = (1 << GEN_BITS) - 1;
 
@@ -709,8 +709,8 @@ mod reaper {
 
         let (slot, generation) = reserved?;
         // Bind the observer. On failure, release the slot and fall back.
-        if syscall::thread_bind_notification(thread_cap, eq, correlator(slot, generation)).is_err()
-        {
+        let tag = u64::from(correlator(slot, generation));
+        if syscall::thread_bind_notification(thread_cap, eq, tag).is_err() {
             release(slot, generation);
             return None;
         }
@@ -782,12 +782,14 @@ mod reaper {
             return;
         }
         loop {
-            let payload = match syscall::event_try_recv(eq) {
-                Ok(p) => p,
+            let death = match syscall::event_try_recv_death(eq) {
+                Ok(d) => d,
                 // WouldBlock (empty) or the queue is gone — nothing more to do.
                 Err(_) => break,
             };
-            let (slot, generation) = split((payload >> 32) as u32);
+            // The bind passed a u32 correlator widened to u64; the low word is
+            // all of it.
+            let (slot, generation) = split(death.correlator as u32);
 
             REAPER.lock.lock();
             // SAFETY: lock held; single mutator.

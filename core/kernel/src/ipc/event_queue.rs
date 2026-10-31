@@ -5,8 +5,9 @@
 
 //! Event queue IPC — ordered, non-coalescing ring buffer.
 //!
-//! An event queue holds a fixed-capacity ring of `u64` payloads. Senders
-//! append entries (non-blocking; `QueueFull` if full). Receivers dequeue in
+//! An event queue holds a fixed-capacity ring of two-word entries
+//! ([`EventEntry`]: a payload word and a tag word). Senders append entries
+//! (non-blocking; `QueueFull` if full). Receivers dequeue in
 //! FIFO order, blocking if empty; blocked receivers queue in arrival order
 //! ([`WaitQueue`](crate::ipc::WaitQueue)) and each post wakes the head.
 //!
@@ -19,6 +20,22 @@
 //! All operations serialise internally on `eq.lock`; callers must not hold it.
 
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
+
+// ── EventEntry ────────────────────────────────────────────────────────────────
+
+/// One event-queue entry: the two words `SYS_EVENT_POST` takes and
+/// `SYS_EVENT_RECV` returns (core/kernel/docs/syscalls.md § `SYS_EVENT_POST`).
+/// A death event carries the exit reason in `payload` and the observer's
+/// correlator in `tag`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct EventEntry
+{
+    /// First word: returned in the secondary return register.
+    pub payload: u64,
+    /// Second word: returned in the tertiary return register.
+    pub tag: u64,
+}
 
 // ── EventQueueState ───────────────────────────────────────────────────────────
 
@@ -36,10 +53,10 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 /// bare-field exception of docs/coding-standards.md § Concurrency).
 pub struct EventQueueState
 {
-    /// Raw pointer to the inline ring buffer of `capacity + 1` `u64`
-    /// slots. Owned by the surrounding retype slot, not by this struct;
+    /// Raw pointer to the inline ring buffer of `capacity + 1`
+    /// [`EventEntry`] slots. Owned by the surrounding retype slot, not by this struct;
     /// no separate free is required at drop.
-    pub ring: *mut u64,
+    pub ring: *mut EventEntry,
     /// User-visible capacity (max concurrent entries). `u32` holds it and the
     /// `count`, `write_idx` and `read_idx` it bounds: `sys_cap_create_event_queue`
     /// refuses a capacity above `EVENT_QUEUE_MAX_CAPACITY`.
@@ -88,15 +105,16 @@ impl EventQueueState
 {
     /// Construct a new empty event queue against a caller-supplied ring.
     ///
-    /// `ring` must point to `capacity + 1` zeroed `u64` slots and remain
+    /// `ring` must point to `capacity + 1` zeroed [`EventEntry`] slots and remain
     /// valid for the lifetime of the `EventQueueState`. The retype path
     /// places the ring inline in the same slot as the state; reclaim
     /// frees both regions together via `retype_free`.
     ///
     /// # Safety
     /// `ring` must be 8-byte aligned, point to writable memory of at
-    /// least `(capacity + 1) * 8` bytes, and outlive this state.
-    pub unsafe fn new(capacity: u32, ring: *mut u64) -> Self
+    /// least `(capacity + 1) * size_of::<EventEntry>()` bytes, and outlive
+    /// this state.
+    pub unsafe fn new(capacity: u32, ring: *mut EventEntry) -> Self
     {
         Self {
             ring,
@@ -114,9 +132,10 @@ impl EventQueueState
 
 // ── Operations ────────────────────────────────────────────────────────────────
 
-/// Append `payload` to the event queue.
+/// Append `entry` to the event queue.
 ///
-/// - If a thread is blocked on recv, it is woken immediately with the payload.
+/// - If a thread is blocked on recv, it is woken immediately with the entry
+///   (`wakeup_value` carries the payload word, `wakeup_tag` the tag word).
 ///   Returns `Ok(Some(woken_tcb))` — caller must enqueue the woken thread.
 /// - If the queue has space and no waiter, enqueues the payload.
 ///   Returns `Ok(None)`.
@@ -134,7 +153,7 @@ impl EventQueueState
 #[cfg(not(test))]
 pub unsafe fn event_queue_post(
     eq: *mut EventQueueState,
-    payload: u64,
+    entry: EventEntry,
 ) -> Result<Option<*mut ThreadControlBlock>, ()>
 {
     // SAFETY: caller guarantees eq is valid.
@@ -154,8 +173,13 @@ pub unsafe fn event_queue_post(
         // sleep-list entry goes with it
         // (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
         // Invariants, invariant 7).
+        // The tag word rides beside the claim's payload deposit; both are
+        // written under eq.lock before the waker's enqueue_and_wake.
         // SAFETY: waiter is the valid TCB just removed from the queue.
-        unsafe { crate::ipc::claim_waiter(waiter, payload) };
+        unsafe {
+            crate::ipc::claim_waiter(waiter, entry.payload);
+            (*waiter).wakeup_tag = entry.tag;
+        }
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
         return Ok(Some(waiter));
@@ -172,9 +196,9 @@ pub unsafe fn event_queue_post(
     // Enqueue into ring.
     let ring_len = eq.capacity + 1;
     // SAFETY: write_idx < ring_len (invariant maintained by modulo arithmetic);
-    // ring is the retype slot's ring of ring_len u64 slots.
+    // ring is the retype slot's ring of ring_len entry slots.
     unsafe {
-        *eq.ring.add(eq.write_idx as usize) = payload;
+        *eq.ring.add(eq.write_idx as usize) = entry;
     }
     eq.write_idx = (eq.write_idx + 1) % ring_len;
     // Release: publishes the new level to the lockless `source_is_ready` reader.
@@ -194,7 +218,7 @@ pub unsafe fn event_queue_post(
 
 /// Pop the ring head, or `None` if empty. Caller MUST hold `eq.lock`.
 #[cfg(not(test))]
-fn pop_entry_locked(eq: &mut EventQueueState) -> Option<u64>
+fn pop_entry_locked(eq: &mut EventQueueState) -> Option<EventEntry>
 {
     // Relaxed suffices for the occupancy read: `eq.lock` orders it.
     if eq.count.load(core::sync::atomic::Ordering::Relaxed) == 0
@@ -203,19 +227,19 @@ fn pop_entry_locked(eq: &mut EventQueueState) -> Option<u64>
     }
     let ring_len = eq.capacity + 1;
     // SAFETY: read_idx < ring_len (invariant maintained by the modulo
-    // arithmetic below); ring is a valid allocation of ring_len u64 slots.
-    let payload = unsafe { *eq.ring.add(eq.read_idx as usize) };
+    // arithmetic below); ring is a valid allocation of ring_len entry slots.
+    let entry = unsafe { *eq.ring.add(eq.read_idx as usize) };
     eq.read_idx = (eq.read_idx + 1) % ring_len;
     // Release: publishes the drained level (possibly →0) to the lockless
     // `source_is_ready` reader so it cannot see a stale non-empty.
     eq.count.fetch_sub(1, core::sync::atomic::Ordering::Release);
-    Some(payload)
+    Some(entry)
 }
 
 /// Dequeue the next entry without blocking — the non-blocking recv mode
 /// behind `SYS_EVENT_RECV`'s `u64::MAX` try-once sentinel.
 ///
-/// Returns `Some(payload)`, or `None` if the ring is empty. Takes NO TCB:
+/// Returns `Some(entry)`, or `None` if the ring is empty. Takes NO TCB:
 /// this path is type-incapable of registering a waiter, setting
 /// `wake_in_flight`, or committing `Blocked` — a non-blocking poll must
 /// never make the caller wakeable (#352).
@@ -224,7 +248,7 @@ fn pop_entry_locked(eq: &mut EventQueueState) -> Option<u64>
 /// `eq` must be a valid pointer; acquires `eq.lock` internally — the caller
 /// must not hold it.
 #[cfg(not(test))]
-pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
+pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<EventEntry>
 {
     // SAFETY: caller guarantees eq is valid.
     let eq = unsafe { &mut *eq };
@@ -238,11 +262,11 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
 
 /// Dequeue the next entry from the event queue.
 ///
-/// - If an entry is available, returns `Ok(Some(payload))`.
+/// - If an entry is available, returns `Ok(Some(entry))`.
 /// - If empty, queues `caller` at the tail of the waiters, arms a non-zero
 ///   `deadline` (a timed wait) on the sleep list in the same critical
 ///   section, and returns `Err(())`. Syscall handler must call `schedule()`
-///   then read `wakeup_value`.
+///   then read `wakeup_value` and `wakeup_tag`.
 /// - A timed wait that finds the sleep list full is withdrawn and returns
 ///   `Ok(None)`, an immediate timeout.
 ///
@@ -254,7 +278,7 @@ pub unsafe fn event_queue_recv(
     eq: *mut EventQueueState,
     caller: *mut ThreadControlBlock,
     deadline: u64,
-) -> Result<Option<u64>, ()>
+) -> Result<Option<EventEntry>, ()>
 {
     // SAFETY: caller guarantees eq is valid.
     let eq = unsafe { &mut *eq };
@@ -262,11 +286,11 @@ pub unsafe fn event_queue_recv(
     // SAFETY: lock serialises post/recv; paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
 
-    if let Some(payload) = pop_entry_locked(eq)
+    if let Some(entry) = pop_entry_locked(eq)
     {
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
-        return Ok(Some(payload));
+        return Ok(Some(entry));
     }
 
     // Queue empty — block caller.

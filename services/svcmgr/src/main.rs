@@ -681,22 +681,25 @@ fn handle_query_endpoint(
 }
 
 /// Drain all pending death notifications from the shared queue. Each
-/// payload encodes the dying service's table index in the high 32 bits
-/// (set as the correlator at `thread_bind_notification` time) and the
-/// exit reason in the low 32. The wait-set notifies once per
+/// death event carries the dying service's table index as its correlator
+/// (set at `thread_bind_notification` time) and the exit reason. The wait-set notifies once per
 /// not-empty → empty transition, so a single wakeup may cover several
 /// deaths; the try-recv loop runs until the queue empties.
 fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     loop
     {
-        let Ok(payload) = syscall::event_try_recv(deaths_eq)
+        let Ok(death) = syscall::event_try_recv_death(deaths_eq)
         else
         {
             return;
         };
-        let correlator = (payload >> 32) as u32;
-        let exit_reason = payload & 0xFFFF_FFFF;
+        // Every bind passes the service index widened to u64, so the low word
+        // is the whole correlator.
+        // cast_possible_truncation: see above; the high word is always zero.
+        #[allow(clippy::cast_possible_truncation)]
+        let correlator = death.correlator as u32;
+        let exit_reason = death.exit_reason;
         let idx = correlator as usize;
 
         if idx >= state.service_count

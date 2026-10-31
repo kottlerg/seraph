@@ -151,6 +151,15 @@ impl UserFrame
         unsafe { (*self.0.as_ptr()).set_ipc_return(primary, label) };
     }
 
+    /// Write the three-register return (primary, secondary, tertiary): rax,
+    /// rdx, rsi on x86-64; a0, a1, a2 on RISC-V. `SYS_EVENT_RECV` returns an
+    /// entry's payload and tag words through it.
+    pub fn set_ipc_return_with_badge(self, primary: u64, label: u64, badge: u64)
+    {
+        // SAFETY: as for `set_return`.
+        unsafe { (*self.0.as_ptr()).set_ipc_return_with_badge(primary, label, badge) };
+    }
+
     /// Write the `SYS_IPC_CALL` return registers.
     pub fn set_ipc_call_return(self, primary: u64, reply_label: u64, reply_word_count: u64)
     {
@@ -566,12 +575,11 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = Thread cap slot (CONTROL right required).
 /// arg1 = `EventQueue` cap slot (POST right required).
-/// arg2 = caller-chosen `correlator: u32` (opaque routing tag).
+/// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
-/// When the target thread exits or faults, the kernel posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to the bound
-/// `EventQueue`. Passing `correlator = 0` makes the payload equal to the
-/// exit reason.
+/// When the target thread exits or faults, the kernel posts the two-word
+/// entry `(exit_reason, correlator)` to the bound `EventQueue`: the exit
+/// reason as the payload word, the correlator as the tag word.
 ///
 /// Binding onto a thread that has *already* exited posts the retained
 /// `exit_reason` to the `EventQueue` immediately. The bind serialises on the
@@ -590,8 +598,8 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 /// per-thread observer array is full (only reachable while the thread is
 /// still live — a bind onto an already-exited thread consumes no slot).
 #[cfg(not(test))]
-// cast_possible_truncation: cap handles and the correlator are u32 by ABI
-// contract; the truncation discards any upper bits a caller sets.
+// cast_possible_truncation: cap handles are u32 by ABI contract; the
+// truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -600,7 +608,7 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let thread_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
-    let correlator = tf.arg(2) as u32;
+    let correlator = tf.arg(2);
 
     // SAFETY: current_tcb valid in syscall context.
     let caller = unsafe { current_tcb() };
@@ -695,7 +703,7 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = `AddressSpace` cap slot index (`CONTROL` right required).
 /// arg1 = `EventQueue` cap slot index (`POST` right required).
-/// arg2 = caller-chosen `correlator` (opaque routing tag).
+/// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
 /// On a terminal fault by any thread in the address space (no handler bound,
 /// the handler replied `KILL`, or the fault episode was cancelled by
@@ -706,8 +714,8 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// fault, cancelling the episode before any reply claims it or keeping a
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
-/// the kernel posts the terminal-fault reason (with the observer's correlator
-/// in the high 32 bits) to each bound observer. The kernel only notifies; it
+/// the kernel posts the entry `(terminal-fault reason, correlator)` to each
+/// bound observer. The kernel only notifies; it
 /// never enumerates or terminates threads, and normal `thread_exit` does NOT
 /// fire these observers.
 ///
@@ -721,8 +729,8 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// not miss the fault. Returns `OutOfMemory` if the per-address-space observer
 /// array is full (only reachable before the first fault).
 #[cfg(not(test))]
-// cast_possible_truncation: cap handles and the correlator are u32 by ABI
-// contract; the truncation discards any upper bits a caller sets.
+// cast_possible_truncation: cap handles are u32 by ABI contract; the
+// truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -730,7 +738,7 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let aspace_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
-    let correlator = tf.arg(2) as u32;
+    let correlator = tf.arg(2);
 
     // SAFETY: current_tcb valid in syscall context.
     let caller = unsafe { current_tcb() };

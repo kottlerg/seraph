@@ -358,7 +358,8 @@ pub fn launch(
     // post-start death is captured. Thread is suspended at this
     // point — no userspace code has run yet.
     if let Some((deaths_eq, correlator)) = bind_target
-        && syscall::thread_bind_notification(created.thread_cap, deaths_eq, correlator).is_err()
+        && syscall::thread_bind_notification(created.thread_cap, deaths_eq, u64::from(correlator))
+            .is_err()
     {
         std::os::seraph::log!("launch {}: thread_bind_notification failed", def.name);
         destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);

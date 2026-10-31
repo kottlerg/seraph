@@ -65,7 +65,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
 | Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d |
-| Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
+| Exit / death reason encoding + death entry `(reason, correlator)` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
 | Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |

@@ -267,8 +267,8 @@ fn handle_definition(
     // EQ (never in an IPC body, cap, or logged value), and consumed directly as
     // `services[idx]` on death dispatch. With no untrusted observer there is
     // nothing to enumerate, and a (random-epoch, index) split would buy nothing.
-    // `idx` is below `MAX_SERVICES`, so the cast to the kernel's 32-bit
-    // correlator is lossless.
+    // `idx` is below `MAX_SERVICES`, so the cast to the 32-bit correlator
+    // svcmgr's death dispatch compares is lossless.
     let correlator = idx as u32;
 
     let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))
@@ -312,7 +312,7 @@ fn bind_only(
         return;
     }
     let idx = *service_count;
-    if syscall::thread_bind_notification(thread_cap, deaths_eq, idx as u32).is_err()
+    if syscall::thread_bind_notification(thread_cap, deaths_eq, u64::from(idx as u32)).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);

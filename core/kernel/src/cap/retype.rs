@@ -1153,13 +1153,14 @@ pub const NOTIFICATION_RAW_BYTES: u64 =
 pub const EVENT_QUEUE_STATE_BYTES: u64 = 56;
 
 /// Compute the inline byte cost of an `EventQueue` retype slot for a
-/// user-visible `capacity`: wrapper + state + (capacity + 1) ring slots,
-/// padded so the ring starts at a `u64` boundary.
+/// user-visible `capacity`: wrapper + state + (capacity + 1) two-word ring
+/// slots, padded so the ring starts at a `u64` boundary.
 pub const fn event_queue_raw_bytes(capacity: u64) -> u64
 {
     let header = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE_STATE_BYTES;
     // Both 24 and 56 are 8-byte multiples, so no extra alignment padding.
-    let ring_bytes = (capacity + 1) * 8;
+    let ring_bytes =
+        (capacity + 1) * core::mem::size_of::<crate::ipc::event_queue::EventEntry>() as u64;
     header + ring_bytes
 }
 
@@ -1205,7 +1206,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             split: false,
         }),
         // EventQueue: 24 wrapper + EventQueueState (56 B, EVENT_QUEUE_STATE_BYTES)
-        // + (size_arg + 1) u64 ring slots, all inline in the retype slot, the
+        // + (size_arg + 1) two-word ring slots, all inline in the retype slot, the
         // ABI's `event_queue_retype_bytes` (pinned below). Sub-page
         // in-place for small rings; page-aligned split when the total exceeds the
         // 512 B sub-page bin. The exact byte count here must match the
@@ -1424,21 +1425,21 @@ mod tests
     #[test]
     fn dispatch_event_queue()
     {
-        // Inline ring: 24 wrapper + 56 state + (capacity+1)*8.
-        // capacity=4 → 80 + 40 = 120 → BIN_128, in-place.
-        let small = dispatch_for(ObjectType::EventQueue, 4).unwrap();
+        // Inline ring: 24 wrapper + 56 state + (capacity+1)*16.
+        // capacity=1 → 80 + 32 = 112 → BIN_128, in-place.
+        let small = dispatch_for(ObjectType::EventQueue, 1).unwrap();
         assert!(!small.split);
-        assert_eq!(small.raw_bytes, 120);
+        assert_eq!(small.raw_bytes, 112);
         assert_eq!(round_to_class(small.raw_bytes), BIN_128);
-        // capacity=32 → 80 + 33*8 = 344 → BIN_512, in-place.
-        let medium = dispatch_for(ObjectType::EventQueue, 32).unwrap();
+        // capacity=16 → 80 + 17*16 = 352 → BIN_512, in-place.
+        let medium = dispatch_for(ObjectType::EventQueue, 16).unwrap();
         assert!(!medium.split);
-        assert_eq!(medium.raw_bytes, 344);
+        assert_eq!(medium.raw_bytes, 352);
         assert_eq!(round_to_class(medium.raw_bytes), BIN_512);
-        // capacity=64 → 80 + 65*8 = 600 → exceeds BIN_512 → split.
+        // capacity=64 → 80 + 65*16 = 1120 → exceeds BIN_512 → split.
         let large = dispatch_for(ObjectType::EventQueue, 64).unwrap();
         assert!(large.split);
-        assert_eq!(large.raw_bytes, 600);
+        assert_eq!(large.raw_bytes, 1120);
     }
 
     #[test]

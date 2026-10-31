@@ -2490,6 +2490,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     cspace_epoch: 0,
                     ipc_buffer: 0,
                     wakeup_value: 0,
+                    wakeup_tag: 0,
                     timed_out: false,
                     iopb: core::ptr::null_mut(),
                     blocked_on_object: core::ptr::null_mut(),
@@ -5984,7 +5985,8 @@ pub unsafe fn schedule(requeue: Requeue)
 
 // ── Death notification ───────────────────────────────────────────────────────
 
-/// Post one death payload to `eq` and route any woken receiver through
+/// Post one death entry to `eq` — the exit reason as the payload word, the
+/// full `u64` correlator as the tag word — and route any woken receiver through
 /// [`select_target_cpu`] so the #289 save-window pin holds.
 ///
 /// Shared by the death walk ([`post_death_notification`]) and the late-bind
@@ -6002,7 +6004,7 @@ pub unsafe fn schedule(requeue: Requeue)
 #[cfg(not(test))]
 pub(crate) unsafe fn post_one_death_event(
     eq: *mut crate::cap::object::EventQueueObject,
-    correlator: u32,
+    correlator: u64,
     exit_reason: u64,
 )
 {
@@ -6010,11 +6012,14 @@ pub(crate) unsafe fn post_one_death_event(
     {
         return;
     }
-    let payload = (u64::from(correlator) << 32) | (exit_reason & 0xFFFF_FFFF);
+    let entry = crate::ipc::event_queue::EventEntry {
+        payload: exit_reason,
+        tag: correlator,
+    };
 
     // SAFETY: eq is a live EventQueueObject (contract); its state is inline in
     // the same retype slot; event_queue_post acquires its own lock.
-    let result = unsafe { crate::ipc::event_queue::event_queue_post((*eq).state, payload) };
+    let result = unsafe { crate::ipc::event_queue::event_queue_post((*eq).state, entry) };
     if let Ok(Some(woken_tcb)) = result
     {
         // Route through `select_target_cpu` like every other waker so the
@@ -6036,8 +6041,8 @@ pub(crate) unsafe fn post_one_death_event(
 /// Post a death notification for a thread that is about to exit or has faulted.
 ///
 /// Snapshots the thread's `death_observers` under `sched_lock`, then posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each
-/// registered `EventQueue` outside the lock via [`post_one_death_event`].
+/// the entry `(exit_reason, correlator)` to each registered `EventQueue`
+/// outside the lock via [`post_one_death_event`].
 /// Snapshotting under the lock serialises against a late
 /// `sys_thread_bind_notification` on a still-live thread, which takes the
 /// same lock and appends only while the thread is not yet `Exited`.
@@ -6079,9 +6084,8 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 ///
 /// Mirrors [`post_death_notification`]: it records the terminal-fault reason on
 /// the address space (first fault wins) and snapshots the observer set under
-/// the space's `death_lock`, then posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each registered
-/// `EventQueue` outside the lock. A bind that arrives after the fault receives
+/// the space's `death_lock`, then posts the entry `(exit_reason, correlator)`
+/// to each registered `EventQueue` outside the lock. A bind that arrives after the fault receives
 /// the retained reason via `AddressSpace::bind_or_retained`. The kernel only
 /// notifies here — it does not enumerate or terminate the address space's
 /// threads.

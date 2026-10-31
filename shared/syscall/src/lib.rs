@@ -75,8 +75,8 @@ pub use syscall_abi::{
 mod arch;
 
 use arch::current::{
-    syscall1_ret4, syscall2, syscall3, syscall4, syscall4_any, syscall5, syscall5_ret2, syscall6,
-    syscall6_ret3,
+    syscall1_ret4, syscall2, syscall2_ret3, syscall3, syscall4, syscall4_any, syscall5,
+    syscall5_ret2, syscall6, syscall6_ret3,
 };
 
 /// Issue syscall `nr` with three argument registers exactly as given, bypassing
@@ -1695,7 +1695,44 @@ pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Append `payload` to an event queue (non-blocking).
+/// One event-queue entry: the two words `SYS_EVENT_POST` appends and
+/// `SYS_EVENT_RECV` returns (core/kernel/docs/syscalls.md § `SYS_EVENT_POST`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventEntry
+{
+    /// First word (the secondary return register on receive).
+    pub payload: u64,
+    /// Second word (the tertiary return register on receive).
+    pub tag: u64,
+}
+
+/// A death event as the kernel posts it to a death observer's queue
+/// (`thread_bind_notification`, `aspace_bind_notification`): the exit reason
+/// in the payload word and the binder's full `u64` correlator in the tag word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeathEvent
+{
+    /// The thread's exit reason (`encode_exit_code` range, `EXIT_FAULT_BASE +
+    /// vector`, or the other `EXIT_*` values), every bit kept.
+    pub exit_reason: u64,
+    /// The correlator the observer was bound with.
+    pub correlator: u64,
+}
+
+impl DeathEvent
+{
+    /// Decode a death event from a received entry.
+    #[must_use]
+    pub const fn from_entry(entry: EventEntry) -> Self
+    {
+        Self {
+            exit_reason: entry.payload,
+            correlator: entry.tag,
+        }
+    }
+}
+
+/// Append the entry `(payload, 0)` to an event queue (non-blocking).
 ///
 /// Returns `SyscallError::QueueFull` (-13) if the queue is at capacity.
 ///
@@ -1705,16 +1742,61 @@ pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 #[inline]
 pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; queue_cap is cap index as u64, payload
-    // is opaque data; kernel validates cap and enqueues payload (non-blocking).
-    let ret = unsafe { syscall2(SYS_EVENT_POST, u64::from(queue_cap), payload) };
+    event_post_entry(queue_cap, EventEntry { payload, tag: 0 })
+}
+
+/// Append a two-word entry to an event queue (non-blocking).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (cap lacks Post), or `QueueFull` (the queue is at
+/// capacity).
+#[inline]
+pub fn event_post_entry(queue_cap: u32, entry: EventEntry) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; queue_cap is cap index as u64, the
+    // two words are opaque data; kernel validates cap and enqueues the entry (non-blocking).
+    let ret = unsafe {
+        syscall3(
+            SYS_EVENT_POST,
+            u64::from(queue_cap),
+            entry.payload,
+            entry.tag,
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Dequeue one entry, under `SYS_EVENT_RECV`'s `timeout_ms` policy: `0`
+/// blocks indefinitely, `u64::MAX` is a non-blocking poll, and any other value
+/// blocks for up to `timeout_ms` milliseconds.
+///
+/// # Errors
+/// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
+/// (`Interrupted`) if the caller is stopped while waiting or the queue is
+/// destroyed under it; or another negative `i64` error code if the queue cap
+/// is invalid or lacks Recv rights.
+#[inline]
+pub fn event_recv_entry(queue_cap: u32, timeout_ms: u64) -> Result<EventEntry, i64>
+{
+    // SAFETY: syscall2_ret3 issues raw syscall instruction; arg1 carries the
+    // timeout sentinel directly to the kernel, which returns the payload word
+    // in the secondary register and the tag word in the tertiary one.
+    let (ret, payload, tag) =
+        unsafe { syscall2_ret3(SYS_EVENT_RECV, u64::from(queue_cap), timeout_ms) };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        Ok(EventEntry { payload, tag })
+    }
 }
 
 /// Dequeue the next entry from an event queue, blocking until a post arrives.
 ///
-/// Returns the payload word. The primary return register holds 0 on success;
-/// the payload is in the secondary return register (rdx / a1).
+/// Returns the entry's payload word; [`event_recv_entry`] returns both words.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the queue cap is invalid or lacks
@@ -1723,14 +1805,11 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
-    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = 0 is the
-    // "block forever" sentinel for `SYS_EVENT_RECV` (matches `SYS_NOTIFICATION_WAIT`).
-    let (ret, payload) = unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), 0, 0, 0, 0) };
-    if ret < 0 { Err(ret) } else { Ok(payload) }
+    event_recv_entry(queue_cap, 0).map(|e| e.payload)
 }
 
 /// Non-blocking dequeue. Returns `Err(-6)` (`WouldBlock`) when the queue is
-/// empty; otherwise returns the payload.
+/// empty; otherwise returns the entry's payload word.
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) if the queue is empty, or `InvalidCapability`
@@ -1738,18 +1817,25 @@ pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 #[inline]
 pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 {
-    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = u64::MAX
-    // is the "non-blocking try-once" sentinel for `SYS_EVENT_RECV`.
-    let (ret, payload) =
-        unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), u64::MAX, 0, 0, 0) };
-    if ret < 0 { Err(ret) } else { Ok(payload) }
+    event_recv_entry(queue_cap, u64::MAX).map(|e| e.payload)
+}
+
+/// Non-blocking dequeue of a death event from a death observer's queue.
+///
+/// # Errors
+/// As [`event_try_recv`].
+#[inline]
+pub fn event_try_recv_death(queue_cap: u32) -> Result<DeathEvent, i64>
+{
+    event_recv_entry(queue_cap, u64::MAX).map(DeathEvent::from_entry)
 }
 
 /// Dequeue with a timeout. `timeout_ms == 0` blocks indefinitely (same as
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived
-/// (at once if the kernel's sleep list is full when the wait parks).
+/// (at once if the kernel's sleep list is full when the wait parks). Returns
+/// the entry's payload word.
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
@@ -1759,11 +1845,7 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 #[inline]
 pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 {
-    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 carries the
-    // timeout sentinel directly to the kernel.
-    let (ret, payload) =
-        unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), timeout_ms, 0, 0, 0) };
-    if ret < 0 { Err(ret) } else { Ok(payload) }
+    event_recv_entry(queue_cap, timeout_ms).map(|e| e.payload)
 }
 
 // ── Wait Set wrappers ─────────────────────────────────────────────────────────
@@ -2375,12 +2457,11 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 
 /// Register a death-notification observer on a thread.
 ///
-/// When the target thread exits (clean or fault), the kernel posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
-/// `event_queue_cap`. Passing `correlator = 0` keeps the payload equal to
-/// the bare exit reason (low 32 bits). If the thread has already exited, the
-/// kernel posts the retained reason to `event_queue_cap` at once and the call
-/// still succeeds.
+/// When the target thread exits (clean or fault), the kernel posts the
+/// two-word entry `(exit_reason, correlator)` to `event_queue_cap` (decode it
+/// with [`DeathEvent::from_entry`]); every bit of both is kept. If the thread
+/// has already exited, the kernel posts the retained reason to
+/// `event_queue_cap` at once and the call still succeeds.
 ///
 /// Multiple observers can be registered on the same thread — up to the
 /// kernel's per-TCB cap. Returns `SyscallError::OutOfMemory` (-8) if the
@@ -2402,7 +2483,7 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 pub fn thread_bind_notification(
     thread_cap: u32,
     event_queue_cap: u32,
-    correlator: u32,
+    correlator: u64,
 ) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; cap indices and
@@ -2412,7 +2493,7 @@ pub fn thread_bind_notification(
             SYS_THREAD_BIND_NOTIFICATION,
             u64::from(thread_cap),
             u64::from(event_queue_cap),
-            u64::from(correlator),
+            correlator,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
@@ -2421,8 +2502,8 @@ pub fn thread_bind_notification(
 /// Register a terminal-fault death-notification observer on an address space.
 ///
 /// When a thread in the target address space takes a *terminal* fault, the
-/// kernel posts `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
-/// `event_queue_cap`, where `exit_reason` is the fault class
+/// kernel posts the two-word entry `(exit_reason, correlator)` to
+/// `event_queue_cap` (see [`DeathEvent`]), where `exit_reason` is the fault class
 /// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
 /// riscv64). A terminal fault is any kill outcome of the fault protocol:
 ///
@@ -2440,9 +2521,8 @@ pub fn thread_bind_notification(
 /// fault takes effect, and is posted, only if the thread is started again
 /// (docs/fault-handling.md § Delivery, Resume, and Kill).
 ///
-/// Normal `thread_exit` does NOT post to these observers. Passing
-/// `correlator = 0` keeps the payload equal to the bare fault class (low 32
-/// bits). If the address space has already faulted terminally, the kernel
+/// Normal `thread_exit` does NOT post to these observers. If the address
+/// space has already faulted terminally, the kernel
 /// posts the retained reason to `event_queue_cap` at once and the call still
 /// succeeds.
 ///
@@ -2465,7 +2545,7 @@ pub fn thread_bind_notification(
 pub fn aspace_bind_notification(
     aspace_cap: u32,
     event_queue_cap: u32,
-    correlator: u32,
+    correlator: u64,
 ) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; cap indices and
@@ -2475,7 +2555,7 @@ pub fn aspace_bind_notification(
             SYS_ASPACE_BIND_NOTIFICATION,
             u64::from(aspace_cap),
             u64::from(event_queue_cap),
-            u64::from(correlator),
+            correlator,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }

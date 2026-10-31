@@ -492,14 +492,16 @@ them at once, ahead of any queued waiter.
 ### `SYS_EVENT_POST` (5)
 
 Append one entry to an event queue. Non-blocking; returns `QueueFull` if at capacity
-(see [ipc-design.md](../../../docs/ipc-design.md) § Event Queues).
+(see [ipc-design.md](../../../docs/ipc-design.md) § Event Queues). An entry is two words, a
+payload word and a tag word; any value of either, 0 included, is valid.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `queue_cap` | Event queue capability with Post rights |
-| 1 | `payload` | Word-sized payload to append |
+| 1 | `payload` | Payload word of the entry |
+| 2 | `tag` | Tag word of the entry |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -532,7 +534,8 @@ is specific to `SYS_EVENT_RECV`):
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: dequeued payload word (valid on success)
+- `rdx`/`a1`: payload word of the dequeued entry (valid on success)
+- `rsi`/`a2`: tag word of the dequeued entry (valid on success)
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
@@ -1747,7 +1750,9 @@ which returns `OutOfMemory`).
 ### `SYS_THREAD_BIND_NOTIFICATION` (47)
 
 Register a death observer on a thread. When the target exits or faults terminally, the
-kernel posts `(correlator << 32) | (exit_reason & 0xFFFFFFFF)` to the bound event queue.
+kernel posts the two-word entry `(exit_reason, correlator)` to the bound event queue: the full
+`u64` exit reason as the payload word and the full `u64` correlator as the tag word
+(§ `SYS_EVENT_POST` (5)).
 
 **Arguments:**
 
@@ -1755,7 +1760,7 @@ kernel posts `(correlator << 32) | (exit_reason & 0xFFFFFFFF)` to the bound even
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) to observe |
 | 1 | `eventq_cap` | Event queue capability (Post rights) the death notification is posted to |
-| 2 | `correlator` | Caller-chosen `u32` routing tag (`0` makes the payload equal the exit reason) |
+| 2 | `correlator` | Caller-chosen `u64` routing tag, delivered unchanged as the tag word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the target has
 already exited, the retained reason is delivered immediately and the call still returns 0.
@@ -2213,7 +2218,8 @@ Translate a user virtual address to its mapped physical address.
 
 Bind a terminal-fault death observer to an address space. When any thread in the space faults
 terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
-for the triggers), the kernel posts the fault reason to the bound event queue. Voluntary
+for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the bound
+event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. Voluntary
 `SYS_THREAD_EXIT` does not fire these observers (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
@@ -2223,7 +2229,7 @@ for the triggers), the kernel posts the fault reason to the bound event queue. V
 |---|---|---|
 | 0 | `aspace_cap` | AddressSpace capability (Control rights) to observe |
 | 1 | `eventq_cap` | Event queue capability (Post rights) the fault notification is posted to |
-| 2 | `correlator` | Caller-chosen `u32` routing tag |
+| 2 | `correlator` | Caller-chosen `u64` routing tag, delivered unchanged as the tag word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the space has
 already terminal-faulted, the retained reason is delivered immediately and the call

@@ -998,8 +998,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 }
 
 /// Correlators for the death observers in `cspace_delete_stops_bound_thread`.
-const STOP_CORR_EARLY: u32 = 0x5701;
-const STOP_CORR_LATE: u32 = 0x5702;
+const STOP_CORR_EARLY: u64 = 0x5701;
+const STOP_CORR_LATE: u64 = 0x5702;
 
 /// Death-event side of a teardown stop: the observer bound before the stop
 /// (`early`) received nothing, and a fresh observer bound now receives the
@@ -1010,8 +1010,11 @@ fn check_stop_observers(ctx: &TestContext, thread: u32, early: u32) -> TestResul
         .map_err(|_| "stop_bound: event_queue_create (late) failed")?;
     thread_bind_notification(thread, late, STOP_CORR_LATE)
         .map_err(|_| "stop_bound: thread_bind_notification (late) failed")?;
-    let expected = (u64::from(STOP_CORR_LATE) << 32) | syscall_abi::EXIT_KILLED;
-    let result = if event_try_recv(late) != Ok(expected)
+    let expected = syscall::DeathEvent {
+        exit_reason: syscall_abi::EXIT_KILLED,
+        correlator: STOP_CORR_LATE,
+    };
+    let result = if syscall::event_try_recv_death(late) != Ok(expected)
     {
         Err("stop_bound: late-bound observer did not receive EXIT_KILLED")
     }

@@ -493,7 +493,7 @@ impl AddressSpace
     pub unsafe fn bind_or_retained(
         this: *mut Self,
         eq: *mut crate::cap::object::EventQueueObject,
-        correlator: u32,
+        correlator: u64,
     ) -> Result<Option<u64>, ()>
     {
         // SAFETY: this validated by caller; lock_raw is paired with an

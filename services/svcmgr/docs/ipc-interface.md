@@ -264,8 +264,8 @@ bound to `deaths_eq` with `correlator = service_table_index`. The
 WaitSet has two members: the service endpoint (badge 0) and the
 deaths queue (badge 1).
 
-When a thread exits (clean or fault), the kernel posts
-`(correlator << 32) | exit_reason` to `deaths_eq` (see
+When a thread exits (clean or fault), the kernel posts the death entry
+`(exit_reason, correlator)` to `deaths_eq` (see
 [restart-protocol.md](restart-protocol.md#death-detection)). svcmgr drains the
 queue and routes each payload to its `ServiceEntry` via the
 correlator, then dispatches through

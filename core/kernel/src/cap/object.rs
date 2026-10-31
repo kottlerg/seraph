@@ -2277,16 +2277,21 @@ pub unsafe fn object_for_new_slot(
 /// function rather than by recursion: each arm pushes the freshly-orphaned
 /// ancestor into the worklist, and the outer loop processes it on the next
 /// iteration. Recursion would risk deadlock if a future change introduced a
-/// lock above this point. Two arms nevertheless re-enter this function with
-/// no lock held, because their fan-out is unbounded and the worklist is
-/// not: the `CSpaceObj` arm for the objects a dying `CSpace`'s slots
-/// reference, and the `AddressSpace` and `CSpaceObj` arms' `free_donation`
-/// (nested in `dealloc_object_one`) for a pool donation's Memory object that
-/// reaches zero. Neither re-entry can reach a `CSpace`: a nested `CSpace`
-/// whose last reference a dying one held is linked, through its
-/// `deferred_next` field, onto this call's pending list instead, and the
-/// outer loop below tears it down once the worklist is empty. The re-entry
-/// depth is therefore one frame whatever the nesting depth of `CSpace`s
+/// lock above this point. Four fan-outs nevertheless re-enter this function
+/// with no lock held, because their width is unbounded or caller-chosen and
+/// the worklist is not: the `CSpaceObj` arm for the objects a dying
+/// `CSpace`'s slots reference; the `AddressSpace` and `CSpaceObj` arms'
+/// `free_donation` (nested in `dealloc_object_one`) for a pool donation's
+/// Memory object that reaches zero; the `WaitSet` arm for each member source
+/// whose last reference the membership held; and `release_death_observers`,
+/// from the Thread and `AddressSpace` arms, for each observer queue that
+/// reaches zero. No re-entry can reach a `CSpace`: a nested `CSpace` whose
+/// last reference a dying one held is linked, through its `deferred_next`
+/// field, onto this call's pending list instead, and the outer loop below
+/// tears it down once the worklist is empty. A `CSpace` slot's Thread,
+/// `AddressSpace` or `WaitSet` may itself re-enter once more for its queues,
+/// sources or donations, whose objects re-enter no further, so the re-entry
+/// depth is at most two frames whatever the nesting depth of `CSpace`s
 /// (core/kernel/docs/capability-internals.md § Teardown).
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
@@ -3405,7 +3410,9 @@ unsafe fn dealloc_object_one(
                 // chain of CSpaces each holding the last reference to the
                 // next is torn down iteratively, not one recursion per level.
                 // No other type's teardown can release a CSpace, so the
-                // re-entry below is one frame deep.
+                // re-entry below adds one frame, and a slot's Thread,
+                // AddressSpace or WaitSet at most one more (see
+                // `dealloc_object`).
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {

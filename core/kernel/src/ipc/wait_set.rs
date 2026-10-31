@@ -838,6 +838,8 @@ mod tests
     {
         fn new() -> Self
         {
+            // The ring holds capacity + 1 slots, as `WaitSetState::new` requires.
+            const { assert!(RING == CAP + 1) };
             Self {
                 members: [const { WaitSetMember::vacant() }; CAP],
                 ring: [0; RING],

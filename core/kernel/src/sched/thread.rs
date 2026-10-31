@@ -45,16 +45,25 @@ use crate::arch::current::context::SavedState;
 /// through the binding however the queue's capabilities are deleted
 /// (core/kernel/docs/capability-internals.md § Kernel Object Reference
 /// Counting).
+///
+/// `next` and `correlator` are bare fields owned by the lock of the list
+/// holding the node: the queue's `lock` while the node is on its free list,
+/// the owner thread's `sched_lock` or the owner address space's `death_lock`
+/// while it is bound (the bare-field exception of docs/coding-standards.md
+/// § Concurrency; core/kernel/docs/ipc-internals.md § Event Queue). A death
+/// walk reads a bound node's fields without the lock, after reading the chain
+/// head under it, because a linked node is never rewritten until the owner's
+/// teardown takes the chain. `eq` is fixed at the queue's creation.
 pub struct DeathObserver
 {
     /// Next node in the owner's chain, or in the queue's free list; null at
-    /// the end. Written only while the node is on no list, or by the holder of
-    /// the list's lock.
+    /// the end. Owned by the lock of the list holding the node (see above).
     pub next: *mut DeathObserver,
     /// The event queue object this node belongs to and posts to. Fixed at the
     /// queue's creation.
     pub eq: *mut crate::cap::object::EventQueueObject,
-    /// Caller-chosen routing tag, set at bind. Delivered as the tag word of
+    /// Caller-chosen routing tag, set at bind under the owner's lock and reset
+    /// on return under the queue's (see above). Delivered as the tag word of
     /// the posted death entry. Opaque to the kernel.
     pub correlator: u64,
 }

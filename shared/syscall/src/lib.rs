@@ -1608,7 +1608,9 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 /// - `CAP_INFO_TLB_ELIDED` and `CAP_INFO_TLB_PERFORMED` are system-wide
 ///   counters: they accept any live slot, whatever its tag.
 /// - All other selectors are tag-specific:
-///   - `CAP_INFO_MEMORY_*` require `CapTag::Memory`.
+///   - `CAP_INFO_MEMORY_*` require `CapTag::Memory`. `CAP_INFO_MEMORY_MAPPINGS`
+///     is always refused through this wrapper, which passes an empty window;
+///     query it with [`cap_info_memory_mappings`].
 ///   - `CAP_INFO_ASPACE_*` require `CapTag::AddressSpace`.
 ///   - `CAP_INFO_CSPACE_*` require `CapTag::CSpace`.
 ///   - `CAP_INFO_THREAD_STATE` requires `CapTag::Thread`.
@@ -1620,20 +1622,20 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle is
 /// null, out of range, or stale, the slot is empty, or the object the slot
-/// references is gone; `InvalidArgument` if the selector is unknown or
-/// requires a different capability tag.
+/// references is gone; `InvalidArgument` if the selector is unknown,
+/// requires a different capability tag, or is `CAP_INFO_MEMORY_MAPPINGS`.
 // cast_sign_loss: ret is proven non-negative in the Ok branch.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; slot is a cap handle as u64,
-    // field is one of the CAP_INFO_* selectors. The kernel performs all validation
-    // (slot bounds and generation, tag match for tag-specific fields, selector
-    // recognition) and returns the requested field value.
-    // The window registers are zeroed: `CAP_INFO_MEMORY_MAPPINGS` reads its
-    // window from them and refuses an empty one, so a call through this
-    // wrapper is refused rather than counting an undefined window.
+    // SAFETY: syscall4 issues raw syscall instruction; slot is a cap handle as u64,
+    // field is one of the CAP_INFO_* selectors, and the two window registers are
+    // zeroed (`CAP_INFO_MEMORY_MAPPINGS` reads its window from them and refuses an
+    // empty one, so it is refused here rather than counting an undefined window).
+    // The kernel performs all validation (slot bounds and generation, tag match
+    // for tag-specific fields, selector recognition) and returns the requested
+    // field value.
     let ret = unsafe { syscall4(SYS_CAP_INFO, u64::from(slot), field, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }

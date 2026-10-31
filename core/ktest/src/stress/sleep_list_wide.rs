@@ -54,7 +54,9 @@ const ROUNDS: u64 = 8;
 const HOLD_MS: u64 = 600_000;
 
 /// The controller's pause after the last holder counts itself, in
-/// milliseconds, so every holder's sleep is listed before the wakers start.
+/// milliseconds, so the holders' sleeps are very likely listed before the
+/// wakers start. A holder not yet listed only narrows the cell's coverage;
+/// it cannot fail the cell.
 const SETTLE_MS: u64 = 20;
 
 /// The controller's timed waits, in milliseconds.
@@ -144,8 +146,8 @@ fn spawn_children(
                 "stress::sleep_list_wide: the holders never slept",
             )?;
             // A holder counts itself just before its sleep syscall; a short
-            // sleep of the controller's own lets the last ones reach the
-            // list before the wakers start.
+            // sleep of the controller's own makes it very likely the last
+            // ones reach the list before the wakers start.
             let _ = thread_sleep(SETTLE_MS);
         }
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)

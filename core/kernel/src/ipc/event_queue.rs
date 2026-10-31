@@ -496,9 +496,11 @@ mod tests
     use super::*;
     use crate::sched::thread::DeathObserver;
 
-    fn pool(count: usize) -> (EventQueueState, Vec<DeathObserver>, [EventEntry; 2])
+    /// A capacity-1 queue over a ring the test owns, and `count` nodes for
+    /// its pool. The ring is boxed so its address survives the return.
+    fn pool(count: usize) -> (EventQueueState, Vec<DeathObserver>, Box<[EventEntry; 2]>)
     {
-        let ring = [EventEntry { payload: 0, tag: 0 }; 2];
+        let mut ring = Box::new([EventEntry { payload: 0, tag: 0 }; 2]);
         let nodes = (0..count)
             .map(|_| DeathObserver {
                 next: core::ptr::null_mut(),
@@ -506,8 +508,9 @@ mod tests
                 correlator: 7,
             })
             .collect();
-        // SAFETY: the ring pointer is not dereferenced by the pool test.
-        let eq = unsafe { EventQueueState::new(1, core::ptr::null_mut()) };
+        // SAFETY: the boxed ring holds capacity + 1 = 2 aligned, writable
+        // entries and is returned beside the state, so it outlives its use.
+        let eq = unsafe { EventQueueState::new(1, ring.as_mut_ptr()) };
         (eq, nodes, ring)
     }
 

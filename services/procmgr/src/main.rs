@@ -211,9 +211,6 @@ fn main() -> !
 /// a full queue's worth of events; the table itself has no fixed size.
 const DEATH_EQ_CAPACITY: u32 = 256;
 
-/// The main wait set's member capacity: the service endpoint and the death queue.
-const WS_MEMBERS: u32 = 2;
-
 /// Death-observer nodes in procmgr's death queue: each live process binds two
 /// (its main thread and its address space) and the init reap binds init's
 /// two threads; a node returns when its thread or address space is destroyed.
@@ -221,6 +218,9 @@ const WS_MEMBERS: u32 = 2;
 /// live processes at about half of it, well above the live processes memmgr
 /// allows.
 const DEATH_EQ_OBSERVERS: u32 = 1024;
+
+/// The main wait set's member capacity: the service endpoint and the death queue.
+const WS_MEMBERS: u32 = 2;
 
 /// Monotonic time since the first call, in nanoseconds, for the
 /// recent-exits retention window and the init-reap probe budget. Saturates

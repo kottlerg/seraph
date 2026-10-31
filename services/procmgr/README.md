@@ -200,11 +200,11 @@ The process table lives on procmgr's heap, sorted by badge, and grows with the
 live process count. A spawn fails when the heap cannot grow it, or when procmgr's
 death queue has no free observer node for the child's main thread: the queue's
 pool of `DEATH_EQ_OBSERVERS` (1024) nodes, two per live process, is fixed at
-creation (#643 grows it). The kernel's
-death correlator is a `u64`, but procmgr still binds each child's death observers
-with the low 32 bits of its `u64` badge (adopting the full width is #643), and
-procmgr redraws a minted badge whose low 32 bits a live process already holds: the
-correlator names one live process however large the table grows.
+creation (#643 grows it). The kernel's death correlator is a `u64`, but procmgr
+still binds each child's death observers with the low 32 bits of its `u64` badge
+(adopting the full width is #643), and procmgr redraws a minted badge whose low 32
+bits a live process already holds: the correlator names one live process however
+large the table grows.
 
 Every child's main thread and address space post to one shared death
 `EventQueue` of a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256). The kernel

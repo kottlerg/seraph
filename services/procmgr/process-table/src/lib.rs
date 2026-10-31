@@ -226,10 +226,10 @@ pub enum InsertError
 /// The table grows with the number of live processes and holds no fixed
 /// ceiling of its own; a spawn fails when the heap cannot grow it, or when
 /// procmgr's death queue has no free observer node (`DEATH_EQ_OBSERVERS`,
-/// #643). Lookups by badge
-/// are binary searches. The death correlator procmgr binds is still the
-/// badge's low 32 bits ([`correlator_of`]), and [`Self::insert`] keeps those unique
-/// among live entries, so a death event resolves to one process; once the
+/// #643). Lookups by badge are binary searches. The death correlator procmgr
+/// binds is still the badge's low 32 bits ([`correlator_of`]), and
+/// [`Self::insert`] keeps those unique among live entries, so a death event
+/// resolves to one process; once the
 /// correlator carries the full badge, the correlator lookup becomes the badge
 /// lookup and the low-word rule stays as defence in depth.
 #[derive(Default)]

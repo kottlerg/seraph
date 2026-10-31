@@ -44,14 +44,14 @@ use std::os::seraph::{StartupInfo, startup_info};
 /// took a full queue's worth of events; the service table has no fixed size.
 const DEATHS_EQ_CAPACITY: u32 = 64;
 
-/// The main wait set's member capacity: the service endpoint and the deaths queue.
-const WS_MEMBERS: u32 = 2;
-
 /// Death-observer nodes in the deaths queue: one per supervised service's
 /// main thread, and a restarted service binds its new thread before the old
 /// one's node returns. A bind past the pool fails the launch, restart, or
 /// adoption (#643 grows the pool).
 const DEATHS_EQ_OBSERVERS: u32 = 256;
+
+/// The main wait set's member capacity: the service endpoint and the deaths queue.
+const WS_MEMBERS: u32 = 2;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.

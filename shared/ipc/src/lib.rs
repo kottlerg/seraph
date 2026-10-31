@@ -48,6 +48,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
 //     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
+//                             and blk_labels::BLK_GET_GEOMETRY
+//                             (vfsd, fatfs ↔ virtio-blk)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
 //     SVCMGR_LABELS_VERSION — every svcmgr handover endowment `CAPS` round,
 //                             in `data[1]` after the round kind (init ↔ svcmgr)
@@ -1656,7 +1658,7 @@ pub mod device_info_kind
 
 /// Wire-protocol version of [`blk_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const BLK_LABELS_VERSION: u32 = 2;
+pub const BLK_LABELS_VERSION: u32 = 3;
 /// IPC labels for block device drivers.
 pub mod blk_labels
 {
@@ -1683,23 +1685,25 @@ pub mod blk_labels
     /// `services/drivers/virtio/blk/README.md` § Label 2:
     /// `REGISTER_PARTITION`.
     pub const REGISTER_PARTITION: u64 = 2;
-    /// Read one or more contiguous sectors into a caller-supplied Memory cap,
-    /// which the reply moves back. Specified, with its caps and replies, in
-    /// `services/drivers/virtio/blk/README.md` § Label 3:
+    /// Read one or more contiguous blocks into a caller-supplied Memory cap,
+    /// which the reply moves back. LBAs and counts are in the device's
+    /// logical blocks ([`BLK_GET_GEOMETRY`]). Specified, with its caps and
+    /// replies, in `services/drivers/virtio/blk/README.md` § Label 3:
     /// `BLK_READ_INTO_MEMORY`.
     pub const BLK_READ_INTO_MEMORY: u64 = 3;
-    /// Write one or more contiguous sectors from a caller-supplied Memory cap.
+    /// Write one or more contiguous blocks from a caller-supplied Memory cap.
     ///
     /// Mirror of [`BLK_READ_INTO_MEMORY`] for the write direction. The
     /// caller fills the source page, then issues the request; the
-    /// driver reads `count * 512` bytes starting at offset 0 and writes
-    /// them to disk.
+    /// driver reads `count * block_size` bytes starting at offset 0 and
+    /// writes them to disk.
     ///
-    /// Request: `data[0]` = starting LBA, `data[1]` = sector count
-    /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// source Memory cap (`MAP` rights; the driver reads `count * 512` bytes
-    /// starting at offset 0 of the page, packed contiguously). The page
-    /// must be at least `count * 512` bytes; the driver rejects with
+    /// Request: `data[0]` = starting LBA, `data[1]` = block count
+    /// (`>= 1`; defaults to `1` if `data[1]` is absent), both in the
+    /// device's logical blocks. Caps: `caps[0]` = source Memory cap (`MAP`
+    /// rights; the driver reads `count * block_size` bytes starting at
+    /// offset 0 of the page, packed contiguously). The page must be at
+    /// least `count * block_size` bytes; the driver rejects with
     /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
     /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
@@ -1708,6 +1712,17 @@ pub mod blk_labels
     /// Memory cap is moved back to the caller in `caps[0]` of the reply (same
     /// discipline as the read path).
     pub const BLK_WRITE_FROM_MEMORY: u64 = 4;
+    /// Report the device's logical block size and the caller's addressable
+    /// length in blocks: the whole device for a [`MOUNT_AUTHORITY`] badge,
+    /// the registered partition for a partition badge.
+    ///
+    /// Request: `data[0]` = caller's `BLK_LABELS_VERSION`. Reply: label
+    /// `SUCCESS`, `data[0]` = logical block size in bytes (a power of two,
+    /// 512 to 4096), `data[1]` = length in blocks; `OUT_OF_BOUNDS` for a
+    /// badge the driver registered no range for; `LABEL_VERSION_MISMATCH`.
+    /// Specified in `services/drivers/virtio/blk/README.md` § Label 5:
+    /// `BLK_GET_GEOMETRY`.
+    pub const BLK_GET_GEOMETRY: u64 = 5;
 }
 
 /// Wire-protocol version of [`serial_labels`]; bumped as the block comment above
@@ -2440,20 +2455,21 @@ pub mod blk_errors
     pub const DEVICE_STATUS_UNSUPP: u64 = 2;
     /// Read LBA is outside the bounds registered for the caller's badge.
     pub const OUT_OF_BOUNDS: u64 = 3;
-    /// Partition registration rejected (no authority, table full, or bad args).
+    /// Partition registration rejected (no authority or bad args).
     pub const REGISTER_REJECTED: u64 = 4;
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
-    /// `MAP` rights, smaller than `count * 512` bytes, or absent;
-    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`
+    /// `MAP` rights, smaller than `count * block_size` bytes, or absent;
+    /// also returned when `count` is 0 or `count * block_size` exceeds `u32::MAX`
     /// (an overflowing multiply included). The `u32` limit is the length
     /// field of a `VirtIO` descriptor; a larger transfer takes more requests.
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
-    /// `REGISTER_PARTITION` is the handshake entry point and carries the
-    /// caller's version as `data[0]` (with `base_lba` shifted to `data[1]`
-    /// and `length_lba` to `data[2]`); mismatch here means the caller was
-    /// built against a different revision of `shared/ipc`.
+    /// `REGISTER_PARTITION` and `BLK_GET_GEOMETRY` are the handshake entry
+    /// points and carry the caller's version as `data[0]` (with
+    /// `REGISTER_PARTITION`'s `base_lba` shifted to `data[1]` and
+    /// `length_lba` to `data[2]`); mismatch here means the caller was built
+    /// against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 6;
     /// The request got no usable completion: the device did not complete it
     /// within the driver's timeout, published a malformed completion, wrote a

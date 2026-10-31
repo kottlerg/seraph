@@ -27,6 +27,7 @@ use ipc::{
     IpcMessage, devmgr_labels, input_errors, input_labels, keysym, memmgr_errors, memmgr_labels,
 };
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
+use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
@@ -202,7 +203,10 @@ fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Op
 /// bits the driver needs beyond `VIRTIO_F_VERSION_1`.
 fn init_device(transport: &PciTransport)
 {
-    if !transport.try_reset()
+    // The reset wait is bounded on the monotonic clock
+    // (`virtio_core::pci::RESET_TIMEOUT`).
+    let start = Instant::now();
+    if !transport.try_reset(|| start.elapsed())
     {
         std::os::seraph::log!("device reset unacknowledged");
         syscall::thread_exit();

@@ -8,14 +8,43 @@
 //! Provides register-level access to the four `VirtIO` PCI capability regions
 //! (common cfg, notification, ISR, device cfg) mapped via MMIO BARs.
 
+use core::time::Duration;
+
 use crate::{STATUS_FEATURES_OK, VirtioPciStartupInfo};
 
-/// Status-register polls [`PciTransport::try_reset`] allows for a reset to
-/// complete. QEMU completes a reset within the status write; the bound only
-/// keeps a wedged device from parking the driver in the poll. Each poll is
-/// one MMIO read, so the time the bound spans depends on the platform's
-/// MMIO-read cost.
-pub const RESET_POLL_LIMIT: u32 = 1_000_000;
+/// How long [`PciTransport::try_reset`] waits, on the caller's clock, for a
+/// reset to complete. QEMU completes a reset within the status write; the
+/// bound only keeps a wedged device from parking the driver in the poll. A
+/// wall-clock bound, so the time it spans does not depend on the platform's
+/// MMIO-read cost. A tuning value that bounds no capacity: it decides only
+/// when an unacknowledged reset is given up on.
+pub const RESET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll `done` until it holds or `elapsed` reaches `timeout`, returning
+/// whether it held.
+///
+/// `done` is probed once more after the deadline passes, so a thread
+/// descheduled across the whole window still sees a condition that became
+/// true meanwhile rather than reporting a timeout it never polled through.
+pub fn poll_until(
+    timeout: Duration,
+    elapsed: impl Fn() -> Duration,
+    mut done: impl FnMut() -> bool,
+) -> bool
+{
+    loop
+    {
+        if done()
+        {
+            return true;
+        }
+        if elapsed() >= timeout
+        {
+            return done();
+        }
+        core::hint::spin_loop();
+    }
+}
 
 /// Modern PCI transport backed by MMIO-mapped BAR regions.
 ///
@@ -239,8 +268,10 @@ impl PciTransport
 
     // ── Device negotiation (`VirtIO` 1.2 §3.1.1) ───────────────────────
 
-    /// Reset the device (write 0 to status), polling the status register at
-    /// most [`RESET_POLL_LIMIT`] times for the reset to complete.
+    /// Reset the device (write 0 to status), polling the status register for
+    /// at most [`RESET_TIMEOUT`] for the reset to complete. `elapsed` is the
+    /// time since the call began, on the caller's monotonic clock (this
+    /// crate is `no_std` and has none of its own).
     ///
     /// Returns `true` once the status reads 0. From then on the device sends
     /// no notifications and does not interact with the queues until the
@@ -251,18 +282,10 @@ impl PciTransport
     /// status is device-written, so the wait is bounded rather than trusted
     /// to end.
     #[must_use]
-    pub fn try_reset(&self) -> bool
+    pub fn try_reset(&self, elapsed: impl Fn() -> Duration) -> bool
     {
         self.set_status(0);
-        for _ in 0..RESET_POLL_LIMIT
-        {
-            if self.get_status() == 0
-            {
-                return true;
-            }
-            core::hint::spin_loop();
-        }
-        false
+        poll_until(RESET_TIMEOUT, elapsed, || self.get_status() == 0)
     }
 
     /// Run the standard feature negotiation sequence.
@@ -351,6 +374,46 @@ impl PciTransport
 mod tests
 {
     use super::*;
+
+    use core::cell::Cell;
+
+    #[test]
+    fn poll_until_gives_up_at_the_deadline_whatever_the_poll_count()
+    {
+        // A fake clock advancing 1 s per reading: the wait ends on time, not
+        // after a fixed number of polls.
+        let now = Cell::new(0u64);
+        let elapsed = || {
+            now.set(now.get() + 1);
+            Duration::from_secs(now.get())
+        };
+        let polls = Cell::new(0u32);
+        let held = poll_until(Duration::from_secs(5), elapsed, || {
+            polls.set(polls.get() + 1);
+            false
+        });
+        assert!(!held);
+        // Five clock readings below the deadline each followed a poll, plus
+        // the final probe after it.
+        assert_eq!(polls.get(), 6);
+    }
+
+    #[test]
+    fn poll_until_reports_a_condition_that_held_by_the_final_probe()
+    {
+        // The clock is past the deadline at its first reading (the thread
+        // was descheduled), and the condition became true meanwhile.
+        let polls = Cell::new(0u32);
+        let held = poll_until(
+            Duration::from_secs(5),
+            || Duration::from_secs(60),
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() == 2
+            },
+        );
+        assert!(held);
+    }
 
     #[test]
     fn notify_addr_offset_scales_queue_offset_by_multiplier()

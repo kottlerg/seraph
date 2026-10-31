@@ -8,8 +8,9 @@
 //! Receives BAR MMIO cap, IRQ cap, and `VirtioPciStartupInfo` startup message
 //! from devmgr. Initialises the `VirtIO` device via the modern PCI transport,
 //! sets up a split virtqueue, and serves block reads
-//! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`), and
-//! partition registration (`REGISTER_PARTITION`) over IPC.
+//! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`),
+//! partition registration (`REGISTER_PARTITION`), and the device geometry
+//! (`BLK_GET_GEOMETRY`) over IPC.
 
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
 // are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
@@ -19,8 +20,9 @@ mod io;
 
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
+use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
-use virtio_blk::IoOutcome;
+use virtio_blk::{Geometry, IoOutcome, PartitionTable};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
@@ -31,104 +33,17 @@ use crate::io::IoLayout;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// Queue size we request (must be <= device max).
-const QUEUE_SIZE: u16 = 128;
-
-/// Maximum number of badged partitions this driver can serve concurrently.
+/// Queue size we request (capped to the device max, which a split ring
+/// keeps a power of two).
 ///
-/// Partition identity is the caller's cap badge. vfsd registers one entry
-/// per mount; 16 is ample for early boot (typical disk has 1–2 partitions).
-const PARTITION_TABLE_SIZE: usize = 16;
-
-/// Per-badge partition bound: absolute LBA range the caller is permitted
-/// to access. Badge 0 is reserved for the un-badged (whole-disk) endpoint
-/// and is never stored here.
-#[derive(Clone, Copy)]
-struct PartitionBound
-{
-    badge: u64,
-    base_lba: u64,
-    length_lba: u64,
-}
-
-/// Fixed-capacity partition table. Open-addressed linear scan; expected
-/// depth ≤ number of mounted partitions. Lookups and inserts are O(n) over
-/// `PARTITION_TABLE_SIZE` but n is bounded and small.
-struct PartitionTable
-{
-    entries: [Option<PartitionBound>; PARTITION_TABLE_SIZE],
-}
-
-impl PartitionTable
-{
-    const fn new() -> Self
-    {
-        Self {
-            entries: [None; PARTITION_TABLE_SIZE],
-        }
-    }
-
-    /// Return the bound for `badge`, or `None` if no entry is registered.
-    fn lookup(&self, badge: u64) -> Option<PartitionBound>
-    {
-        if badge == 0
-        {
-            return None;
-        }
-        for b in self.entries.iter().flatten()
-        {
-            if b.badge == badge
-            {
-                return Some(*b);
-            }
-        }
-        None
-    }
-
-    /// Insert a bound. Fails if `badge == 0`, a duplicate badge exists, or
-    /// the table is full.
-    fn insert(&mut self, bound: PartitionBound) -> Result<(), ()>
-    {
-        if bound.badge == 0 || bound.length_lba == 0
-        {
-            return Err(());
-        }
-        let mut empty_idx: Option<usize> = None;
-        for (i, entry) in self.entries.iter().enumerate()
-        {
-            match entry
-            {
-                Some(b) if b.badge == bound.badge => return Err(()),
-                None if empty_idx.is_none() => empty_idx = Some(i),
-                _ =>
-                {}
-            }
-        }
-        match empty_idx
-        {
-            Some(i) =>
-            {
-                self.entries[i] = Some(bound);
-                Ok(())
-            }
-            None => Err(()),
-        }
-    }
-
-    /// Remove the entry matching `badge`, if any. Used to roll back an
-    /// insert when downstream cap derivation fails.
-    fn remove(&mut self, badge: u64)
-    {
-        for entry in &mut self.entries
-        {
-            if matches!(entry, Some(b) if b.badge == badge)
-            {
-                *entry = None;
-                return;
-            }
-        }
-    }
-}
+/// The driver keeps one request in flight: the service loop receives one
+/// IPC request, submits its three-descriptor chain, waits for that chain's
+/// completion, and replies before it receives the next. The request depth is
+/// 1 by design, so the queue is sized to one chain (three descriptors,
+/// rounded up to the power of two four), and the rings fit one page. Deeper
+/// queueing would need replies decoupled from the receive loop, which no
+/// client's synchronous `ipc_call` would use.
+const QUEUE_SIZE: u16 = 4;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
@@ -290,11 +205,21 @@ fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Op
 
 // ── Device initialisation ──────────────────────────────────────────────────
 
-/// Initialise the `VirtIO` device through the standard sequence (`VirtIO` 1.2
-/// section 3.1.1): reset, acknowledge, negotiate features, read capacity.
-fn init_device(transport: &PciTransport) -> u64
+/// Reset the device, waiting at most `virtio_core::pci::RESET_TIMEOUT` on
+/// the monotonic clock for the reset to be acknowledged.
+fn reset_device(transport: &PciTransport) -> bool
 {
-    if !transport.try_reset()
+    let start = Instant::now();
+    transport.try_reset(|| start.elapsed())
+}
+
+/// Initialise the `VirtIO` device through the standard sequence (`VirtIO` 1.2
+/// section 3.1.1): reset, acknowledge, negotiate features, and read the
+/// geometry: the capacity, and the logical block size when the device
+/// offers `VIRTIO_BLK_F_BLK_SIZE`.
+fn init_device(transport: &PciTransport) -> Geometry
+{
+    if !reset_device(transport)
     {
         std::os::seraph::log!("device reset unacknowledged");
         syscall::thread_exit();
@@ -303,16 +228,26 @@ fn init_device(transport: &PciTransport) -> u64
     transport.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
     let features = transport.negotiate_features(|device_features| {
-        // Accept only VIRTIO_F_VERSION_1 (bit 32) — required for modern devices.
-        device_features & (1 << 32)
+        // VIRTIO_F_VERSION_1 (bit 32), required for modern devices, and the
+        // block-size report when the device offers it.
+        device_features & ((1 << 32) | virtio_blk::VIRTIO_BLK_F_BLK_SIZE)
     });
-    if features.is_none()
+    let Some(features) = features
+    else
     {
         std::os::seraph::log!("feature negotiation failed");
         syscall::thread_exit();
-    }
+    };
 
-    transport.config_read_u64(0)
+    let blk_size = (features & virtio_blk::VIRTIO_BLK_F_BLK_SIZE != 0)
+        .then(|| transport.config_read_u32(virtio_blk::CONFIG_BLK_SIZE_OFFSET));
+    let Some(geometry) = Geometry::new(transport.config_read_u64(0), blk_size)
+    else
+    {
+        std::os::seraph::log!("unsupported logical block size {blk_size:?}");
+        syscall::thread_exit();
+    };
+    geometry
 }
 
 /// Negotiate the virtqueue size against the device maximum and apply it.
@@ -505,12 +440,9 @@ pub struct BlkRuntime<'a>
     /// MOUNT_AUTHORITY-badged cap).
     pub service_ep: u32,
     partitions: PartitionTable,
-    capacity: u64,
-    /// Monotonic counter for partition-identity badges. The
-    /// `MOUNT_AUTHORITY` bit lives at `1 << 63`; this counter stays in
-    /// the low bits and so is bit-disjoint by construction. Reaching that bit
-    /// takes 2^63 registrations, which no device lifetime issues.
-    next_partition_badge: u64,
+    /// Logical block size and capacity; every wire LBA and count is in
+    /// these blocks.
+    geometry: Geometry,
     /// Set once [`quiesce_device`] has reset the device after a lost
     /// request; every later transfer is answered `DEVICE_FAULT`.
     device_faulted: bool,
@@ -566,6 +498,10 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             {
                 handle_register_partition(&msg, ipc_buf, rt);
             }
+            blk_labels::BLK_GET_GEOMETRY =>
+            {
+                handle_get_geometry(&msg, ipc_buf, rt);
+            }
             _ =>
             {
                 let reply = IpcMessage::new(ipc::blk_errors::UNKNOWN_OPCODE);
@@ -581,9 +517,9 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 ///
 /// `caps[0]` is the data-segment Memory cap: the read target, which needs
 /// `MAP|WRITE` rights, or the write source, which needs `MAP`. The device
-/// DMAs `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
-/// into or out of the cap at offset 0, packed contiguously; the cap must be
-/// at least `count * 512` bytes or the driver rejects with
+/// DMAs `data[1]` consecutive logical blocks (default 1) starting at LBA
+/// `data[0]` into or out of the cap at offset 0, packed contiguously; the cap
+/// must be at least `count * block_size` bytes or the driver rejects with
 /// `INVALID_MEMORY_CAP`.
 ///
 /// `caps[1]` and `caps[2]` are reserved IPC-shape slots and remain null
@@ -636,7 +572,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     };
     // VirtIO descriptor length is u32; this also bounds total transfer well
     // below any plausible per-cap ask.
-    let Some(data_len) = virtio_blk::transfer_len(sector_count)
+    let Some(data_len) = rt.geometry.transfer_len(sector_count)
     else
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
@@ -664,7 +600,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     let outcome = io::submit_and_wait(
         rt.layout,
         dir,
-        absolute_sector,
+        rt.geometry.device_sector(absolute_sector),
         phys_base,
         data_len,
         rt.vq,
@@ -737,7 +673,7 @@ fn resolve_run(badge: u64, sector: u64, sector_count: u64, rt: &BlkRuntime) -> R
 /// of returning to a caller who could reuse the memory.
 fn quiesce_device(rt: &mut BlkRuntime)
 {
-    if !rt.transport.try_reset()
+    if !reset_device(rt.transport)
     {
         std::os::seraph::log!("request lost and device reset unacknowledged; exiting");
         syscall::thread_exit();
@@ -770,7 +706,7 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
     {
         // MOUNT_AUTHORITY holders read the whole disk directly,
         // bounded only by device capacity.
-        if sector >= rt.capacity
+        if sector >= rt.geometry.capacity
         {
             return Err(ipc::blk_errors::OUT_OF_BOUNDS);
         }
@@ -787,7 +723,7 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
     let absolute = bound.base_lba.saturating_add(sector);
-    if absolute >= rt.capacity
+    if absolute >= rt.geometry.capacity
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
@@ -801,11 +737,12 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 /// latter is already partition-scoped and has no authority to create
 /// additional scopes.
 ///
-/// Data words: `[BLK_LABELS_VERSION, base_lba, length_lba]`. The
-/// driver allocates a fresh partition-identity badge from its monotonic
-/// counter, inserts the bound, derives a badged `SEND_GRANT` cap on its
-/// own service endpoint scoped to that badge, and returns the cap in
-/// `caps[0]` of the reply. Server-side derivation is required because
+/// Data words: `[BLK_LABELS_VERSION, base_lba, length_lba]`, in logical
+/// blocks. The driver registers the range in its [`PartitionTable`], which
+/// returns the badge of an identical range already registered or a fresh
+/// one, derives a badged `SEND_GRANT` cap on its own service endpoint
+/// scoped to that badge, and returns the cap in `caps[0]` of the reply.
+/// Server-side derivation is required because
 /// [`MOUNT_AUTHORITY`] caps are badged and the kernel rejects
 /// re-badging of a badged source — the caller cannot mint partition
 /// caps itself.
@@ -840,43 +777,26 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
 
     // Bound must fit inside device capacity.
     let end = base_lba.saturating_add(length_lba);
-    if end > rt.capacity || length_lba == 0
+    if end > rt.geometry.capacity
     {
         reject(ipc_buf);
         return;
     }
 
-    let new_badge = rt.next_partition_badge;
-    // Saturating increment so a (theoretical) wrap collides with the
-    // MOUNT_AUTHORITY bit instead of silently aliasing a live partition
-    // badge to a verb-bit value.
-    if new_badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
-    {
-        reject(ipc_buf);
-        return;
-    }
-    rt.next_partition_badge = new_badge.saturating_add(1);
-
-    if rt
-        .partitions
-        .insert(PartitionBound {
-            badge: new_badge,
-            base_lba,
-            length_lba,
-        })
-        .is_err()
-    {
-        reject(ipc_buf);
-        return;
-    }
-
-    let Ok(partition_cap) =
-        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
+    let Some(badge) = rt.partitions.register(base_lba, length_lba)
     else
     {
-        // Roll back the partition insert so the table doesn't grow a
-        // bound the caller has no cap to address.
-        rt.partitions.remove(new_badge);
+        reject(ipc_buf);
+        return;
+    };
+
+    // A failed derivation leaves the range registered: the entry may be one
+    // an earlier registration's cap still uses, and a fresh one is reused by
+    // the caller's retry, so the table still holds one entry per range.
+    let Ok(partition_cap) =
+        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND_GRANT, badge)
+    else
+    {
         reject(ipc_buf);
         return;
     };
@@ -884,6 +804,45 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
     let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
         .cap(partition_cap)
         .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Handle a `BLK_GET_GEOMETRY` request: reply the logical block size and
+/// the caller's addressable length in blocks, the whole device for a
+/// [`MOUNT_AUTHORITY`] badge and the registered range for a partition badge.
+///
+/// `data[0]` carries the caller's `BLK_LABELS_VERSION`; a mismatch is
+/// answered `LABEL_VERSION_MISMATCH`, and a badge naming no range (unbadged,
+/// or never registered) `OUT_OF_BOUNDS`. The geometry is fixed for the
+/// device's life, so a client reads it once.
+///
+/// [`MOUNT_AUTHORITY`]: ipc::blk_labels::MOUNT_AUTHORITY
+fn handle_get_geometry(msg: &IpcMessage, ipc_buf: *mut u64, rt: &BlkRuntime)
+{
+    let reply = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        let length = if msg.badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
+        {
+            Some(rt.geometry.capacity)
+        }
+        else
+        {
+            rt.partitions.lookup(msg.badge).map(|b| b.length_lba)
+        };
+        match length
+        {
+            Some(length) => IpcMessage::builder(ipc::blk_errors::SUCCESS)
+                .word(0, u64::from(rt.geometry.block_size))
+                .word(1, length)
+                .build(),
+            None => IpcMessage::new(ipc::blk_errors::OUT_OF_BOUNDS),
+        }
+    }
+    else
+    {
+        IpcMessage::new(ipc::blk_errors::LABEL_VERSION_MISMATCH)
+    };
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
@@ -962,8 +921,12 @@ fn main() -> !
 
     // Create PCI transport and initialise device.
     let transport = PciTransport::new(bar_va, &pci_info);
-    let capacity = init_device(&transport);
-    std::os::seraph::log!("capacity (sectors)={capacity:#018x}");
+    let geometry = init_device(&transport);
+    std::os::seraph::log!(
+        "capacity (blocks)={:#018x} block size={}",
+        geometry.capacity,
+        geometry.block_size
+    );
 
     // Set up virtqueue and data buffer.
     let (mut vq, queue_notify_off) = setup_virtqueue(&transport, &caps, ipc_buf);
@@ -1024,8 +987,7 @@ fn main() -> !
         irq_cap,
         service_ep: caps.service_ep,
         partitions: PartitionTable::new(),
-        capacity,
-        next_partition_badge: 1,
+        geometry,
         device_faulted: false,
     };
     service_loop(caps.service_ep, ipc_buf, &mut rt);

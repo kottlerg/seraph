@@ -11,8 +11,9 @@
 //!
 //! `IoLayout` owns the driver's permanent 1-page DMA buffer. The request
 //! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
-//! there permanently. The data segment, `count * 512` bytes for a request
-//! of `count` sectors, is supplied per-request by the caller as a Memory
+//! there permanently. The data segment, `count * block_size` bytes for a
+//! request of `count` logical blocks, is supplied per-request by the caller
+//! as a Memory
 //! cap; [`IoLayout::read_chain`] / [`IoLayout::write_chain`] parameterise
 //! the data segment's physical address and length. The driver's own page
 //! never holds bulk data.
@@ -50,8 +51,8 @@ pub struct VirtioBlkReqHeader
 /// Physical/virtual layout for the driver's permanent DMA page.
 ///
 /// Hosts the request header (offset 0, 16 bytes) and status byte (offset
-/// 1024, 1 byte). The data segment, `count * 512` bytes for a request of
-/// `count` sectors, is supplied per-request (address and length) via
+/// 1024, 1 byte). The data segment, `count * block_size` bytes for a request
+/// of `count` logical blocks, is supplied per-request (address and length) via
 /// [`read_chain`](IoLayout::read_chain) and
 /// [`write_chain`](IoLayout::write_chain).
 pub struct IoLayout
@@ -76,7 +77,7 @@ impl IoLayout
 
     /// Descriptor chain for a block read request whose data segment lands at
     /// `data_phys` and is `data_len` bytes long (`data_len` must be a
-    /// non-zero multiple of 512).
+    /// non-zero multiple of the logical block size).
     ///
     /// Three-element chain: header (readable), data (writable, at the
     /// caller-supplied physical address), status (writable). The header and
@@ -95,7 +96,7 @@ impl IoLayout
 
     /// Descriptor chain for a block write request whose data segment is
     /// sourced from `data_phys` and is `data_len` bytes long (`data_len`
-    /// must be a non-zero multiple of 512).
+    /// must be a non-zero multiple of the logical block size).
     ///
     /// Mirror of [`Self::read_chain`] with the data segment's writable
     /// flag flipped: the device reads from the caller-supplied memory cap and
@@ -112,7 +113,8 @@ impl IoLayout
         ]
     }
 
-    /// Prepare a read or write request for the given sector.
+    /// Prepare a read or write request starting at `VirtIO` sector `sector`
+    /// (512-byte units, whatever the logical block size).
     ///
     /// Writes the block request header and resets the status byte.
     pub fn prepare(&self, dir: IoDirection, sector: u64)
@@ -162,6 +164,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 /// over the expected wake and three orders under [`REQUEST_TIMEOUT`].
 const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
+/// How long each iteration polls the used ring before parking on the IRQ
+/// notification, on the monotonic clock. A wall-clock window, so the time it
+/// spans does not depend on the cost of a poll; QEMU completes a request in
+/// well under it, so the fast path never parks. A tuning value that bounds
+/// no capacity: a completion it misses is seen after the next wait.
+const POLL_BURST: Duration = Duration::from_micros(500);
+
 /// Submit a read or write request and wait for its completion via IRQ
 /// notification, returning how the request ended.
 ///
@@ -175,9 +184,9 @@ const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 ///
 /// `data_phys` is the physical address of the caller-supplied memory cap's
 /// data segment (offset 0 of the memory cap per the `BLK_READ_INTO_MEMORY` /
-/// `BLK_WRITE_FROM_MEMORY` contract). `data_len` is `count * 512` for
-/// `count` consecutive sectors starting at `sector`; the device
-/// transfers the entire run in one descriptor chain.
+/// `BLK_WRITE_FROM_MEMORY` contract). `data_len` is `count * block_size`
+/// for `count` consecutive logical blocks starting at `VirtIO` sector
+/// `sector`; the device transfers the entire run in one descriptor chain.
 ///
 /// Blocks on a bounded `notification_wait_timeout` per iteration until the device
 /// raises an interrupt or the per-iteration timeout elapses, then reads the
@@ -247,7 +256,8 @@ pub fn submit_and_wait(
         // to the PLIC but never picked up by the kernel (suspected TCG/PLIC
         // behaviour with concurrent claim from multiple harts); this burst
         // makes the driver tolerant of those lost IRQs.
-        for _ in 0..100_000u32
+        let burst = Instant::now();
+        while burst.elapsed() < POLL_BURST
         {
             if let Some(outcome) = completion(vq, head, layout)
             {

@@ -14,12 +14,7 @@
 
 use std::collections::HashMap;
 
-/// Per-sender line-buffer size. Lines longer than this are flushed
-/// without a trailing newline (preserves the prefix attribution).
-pub const LINE_BUF_SIZE: usize = 256;
-
-/// Maximum per-slot display-name length in bytes.
-pub const MAX_NAME_LEN: usize = 48;
+pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
 /// Number of completed log lines retained per slot for future query
 /// surfaces. Bounded to keep total memory predictable at ~10k senders

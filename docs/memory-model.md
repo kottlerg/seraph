@@ -100,7 +100,11 @@ the direct-map randomization window (falling back to the kernel-half floor when
 fewer than two 1 GiB slots remain).
 All fixed userspace-layout zones sit below 2^38, the smallest user half, so
 one static userspace layout is canonical in every mode
-([userspace-memory-model.md](userspace-memory-model.md)).
+([userspace-memory-model.md](userspace-memory-model.md)). The one private
+zone above it is memmgr's metadata-arena high zone, which exists only in a
+mode with a wider user half and which the arena grows into after its low zone
+(see [services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+§ Metadata Arena).
 
 ### Userspace Layout
 

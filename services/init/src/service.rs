@@ -1206,9 +1206,14 @@ fn serve_substrate_rounds(
         {
             continue;
         }
-        let mut name_words = [0u64; 2];
-        let nw = pack_svc_name(name, &mut name_words);
-        let mut data = [0u64; 2 + 2];
+        let mut name_words = [0u64; ipc::svcmgr_labels::NAME_WORDS];
+        let Some(nw) = ipc::svcmgr_labels::pack_name(name, &mut name_words)
+        else
+        {
+            log("phase 3: substrate name exceeds svcmgr's NAME_MAX; not endowed");
+            continue;
+        };
+        let mut data = [0u64; 2 + ipc::svcmgr_labels::NAME_WORDS];
         data[0] = svcmgr_endowment::kind::SUBSTRATE;
         data[1] = name.len() as u64;
         data[2..2 + nw].copy_from_slice(&name_words[..nw]);
@@ -1624,18 +1629,4 @@ fn finish_init_reap_handoff(
         {}
         _ => log("reap-handoff: INIT_TEARDOWN_DONE IPC failed (reap may not run)"),
     }
-}
-
-// ── svcmgr endowment name packing ───────────────────────────────────────────
-
-/// Pack a short ASCII name into IPC data words, little-endian within each
-/// word. Matches svcmgr's unpack in `service::ingest_substrate` /
-/// `read_tail_name_from_msg`. Returns the word count used.
-fn pack_svc_name(name: &[u8], out: &mut [u64; 2]) -> usize
-{
-    for (i, &b) in name.iter().enumerate()
-    {
-        out[i / 8] |= u64::from(b) << ((i % 8) * 8);
-    }
-    name.len().div_ceil(8)
 }

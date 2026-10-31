@@ -8,7 +8,6 @@ publish.workspace = true
 # the std overlay's `seraph::log!` macro. Its only consumer is std, which
 # re-exports it so std-built services reach it through `std::os::seraph`.
 [lib]
-test = false
 doctest = false
 
 [dependencies]

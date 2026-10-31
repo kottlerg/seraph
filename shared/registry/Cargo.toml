@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# no_std: fixed-capacity name→endpoint-cap registry used by supervisors
+# no_std: growable name→endpoint-cap registry used by supervisors
 # (svcmgr today; devmgr/vfsd when they need it) to answer QUERY_ENDPOINT.
 [lib]
 doctest = false
 
 [dependencies]
+# `ipc::svcmgr_labels::NAME_MAX`: the one svcmgr name limit.
+ipc = { path = "../ipc" }
 
 [lints]
 workspace = true

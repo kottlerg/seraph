@@ -116,9 +116,12 @@ communicates them via `ProcessInfo` / `InitInfo`.
 - **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`
   crate aborts through `handle_alloc_error` (std's abort path, which
   traps on seraph): a terminal fault that tears down the whole process
-  (procmgr reaps it on the address-space death notification). svcmgr
-  observes the death via its event queue and applies restart policy. No
-  kernel panic.
+  (procmgr reaps it on the address-space death notification; when its
+  full death queue dropped that post, a worker thread's fault is reaped
+  only once the main thread exits, see
+  [services/procmgr/README.md](../services/procmgr/README.md) § Process
+  table and death queue). svcmgr observes the death via its event queue
+  and applies restart policy. No kernel panic.
 - **Thread safety.** A spinlock guards the allocator. Multi-threaded
   services share one allocator instance.
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have
@@ -152,8 +155,13 @@ The page-reservation allocator is a `std::sys::seraph` concern and is
 not exposed to non-std runtimes. `init` and `memmgr` carry small
 private VA choices for whatever scratch regions they need; memmgr draws
 its metadata-arena and phys-table scratch bases per boot from fixed
-windows of its own, while init's short-lived bootstrap scratch stays
-deterministic (init exits at reap and serves no untrusted input).
+windows of its own, places its process-index bucket array in a fixed
+deterministic window (it holds only arena indices), and continues its
+arena above 2^38 in a paging mode whose user half allows it, while init's
+short-lived bootstrap scratch stays deterministic (init exits at reap and
+serves no untrusted input). memmgr's windows are specified in
+[`services/memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md)
+§ Metadata Arena and § Per-Process Tracking.
 
 ### Bootstrap Cross-Boundary VAs
 
@@ -286,12 +294,18 @@ memmgr serves frame requests over IPC. The contract:
 - **`REQUIRE_CONTIGUOUS` reply.** A single Memory cap covering exactly
   `want_pages`, or a `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS` error.
 - **Best-effort reply.** One or more Memory caps whose page counts sum
-  to `want_pages`. The reply carries each returned cap's page count
+  to at most `want_pages`. The reply carries each returned cap's page count
   alongside it. memmgr prefers fewer caps over many.
 - **Reply cap-count bound.** A reply carries at most `MSG_CAP_SLOTS_MAX`
   (4) Memory caps, the IPC reply-side cap-slot capacity; a best-effort
   request no single free run covers is served largest-first across at
-  most that many runs, else fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
+  most that many runs. When those runs fall short of `want_pages` but the
+  pool's free pages cover it, the reply is a **partial grant**: success with
+  fewer pages than asked. When the free pages do not cover `want_pages`, the
+  request fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
+- **Caller loops.** A best-effort caller MUST compare the granted page total
+  with `want_pages` and request the remainder again (or release what it
+  cannot use); a single reply is not guaranteed to cover the request.
 - **Caller maps.** Every returned Memory cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).

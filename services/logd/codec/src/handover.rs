@@ -7,9 +7,9 @@
 //!
 //! Both ends build against these definitions: init-logd
 //! (`services/init/src/logging.rs`) packs replies with the `encode_*`
-//! functions, walks its history ring with [`next_history_seq`], and tracks
-//! the names it must send again ([`NameResend`]); real-logd
-//! (`services/logd/src/handover.rs`) decodes replies with [`decode`]. The
+//! functions and tracks the names it must send again ([`NameResend`]);
+//! real-logd (`services/logd/src/handover.rs`) decodes replies with
+//! [`decode`] and retries its release with [`retry_within`]. The
 //! wire format is specified in
 //! [handover-protocol.md](../../docs/handover-protocol.md).
 
@@ -167,21 +167,47 @@ pub fn encode_done() -> IpcMessage
     IpcMessage::new(REPLY_DONE)
 }
 
-/// The next history-ring sequence number init-logd sends, or `None` when the
-/// drain has caught up.
-///
-/// Sequence numbers are absolute push counts: sequence `s` lives in ring slot
-/// `s % ring_len` until `ring_len` later pushes overwrite it, so with `total`
-/// lines ever pushed the live sequences are
-/// `total.saturating_sub(ring_len)..total`. `next` is the first sequence not
-/// yet sent. A sequence overwritten before it was sent is skipped, and lines
-/// pushed after the drain caught up are returned by a later call, so a
-/// deferred release's further drain carries them.
+/// Wall-clock budget, in microseconds, real-logd spends retrying a
+/// `HANDOVER_RELEASE` call that fails before it leaves init-logd serving.
+/// Time-based, not an attempt count, so a loaded system that runs each
+/// attempt slowly gets the same window as an idle one. A tuning bound: it
+/// bounds no capacity, and running out costs only the benign hold
+/// [handover-protocol.md](../../docs/handover-protocol.md) § Failure modes
+/// describes.
+pub const RELEASE_RETRY_BUDGET_US: u64 = 1_000_000;
+
+/// Call `attempt` until it returns `Some`, or until `budget_us` microseconds
+/// have passed since the first call, by the clock `now_us`; `between` runs
+/// after each failed attempt (real-logd yields there). The first attempt is
+/// always made, and a clock that cannot be read (`None`) ends the retry as a
+/// spent budget would, so a failing clock cannot make it unbounded. Returns
+/// the successful attempt's value, or `None` once the budget is spent.
 #[must_use]
-pub fn next_history_seq(next: u64, total: u64, ring_len: u64) -> Option<u64>
+pub fn retry_within<T>(
+    budget_us: u64,
+    mut now_us: impl FnMut() -> Option<u64>,
+    mut attempt: impl FnMut() -> Option<T>,
+    mut between: impl FnMut(),
+) -> Option<T>
 {
-    let seq = next.max(total.saturating_sub(ring_len));
-    (seq < total).then_some(seq)
+    let start = now_us();
+    loop
+    {
+        if let Some(v) = attempt()
+        {
+            return Some(v);
+        }
+        let (Some(start), Some(now)) = (start, now_us())
+        else
+        {
+            return None;
+        };
+        if now.saturating_sub(start) >= budget_us
+        {
+            return None;
+        }
+        between();
+    }
 }
 
 /// `bytes`, clipped to the payload area from data word `start_word` to the
@@ -445,25 +471,75 @@ mod tests
     }
 
     #[test]
-    fn history_seq_walks_an_unwrapped_ring_in_order()
+    fn release_retry_outlasts_any_attempt_count_until_the_budget_is_spent()
     {
-        assert_eq!(next_history_seq(0, 3, 4), Some(0));
-        assert_eq!(next_history_seq(2, 3, 4), Some(2));
-        assert_eq!(next_history_seq(3, 3, 4), None);
+        // A clock that advances 1 us per reading: far more than 64 attempts
+        // fit in the budget, and the retry stops once the budget is spent.
+        let mut clock = 0u64;
+        let mut attempts = 0u32;
+        let got: Option<()> = retry_within(
+            1000,
+            || {
+                clock += 1;
+                Some(clock)
+            },
+            || {
+                attempts += 1;
+                None
+            },
+            || {},
+        );
+        assert_eq!(got, None);
+        assert!(attempts > 64);
+        assert!(clock >= 1000);
     }
 
     #[test]
-    fn history_seq_skips_lines_overwritten_before_they_were_sent()
+    fn release_retry_returns_the_first_delivered_attempt()
     {
-        // Ten pushes into a four-slot ring leave sequences 6..10 live.
-        assert_eq!(next_history_seq(1, 10, 4), Some(6));
+        let mut attempts = 0u32;
+        let got = retry_within(
+            10,
+            || Some(0),
+            || {
+                attempts += 1;
+                (attempts == 3).then_some(attempts)
+            },
+            || {},
+        );
+        assert_eq!(got, Some(3));
     }
 
     #[test]
-    fn history_seq_returns_lines_pushed_after_the_drain_caught_up()
+    fn release_retry_makes_one_attempt_on_a_spent_budget()
     {
-        assert_eq!(next_history_seq(10, 10, 4), None);
-        assert_eq!(next_history_seq(10, 11, 4), Some(10));
+        let mut attempts = 0u32;
+        let got: Option<()> = retry_within(
+            0,
+            || Some(0),
+            || {
+                attempts += 1;
+                None
+            },
+            || {},
+        );
+        assert_eq!((got, attempts), (None, 1));
+    }
+
+    #[test]
+    fn release_retry_ends_when_the_clock_cannot_be_read()
+    {
+        let mut attempts = 0u32;
+        let got: Option<()> = retry_within(
+            u64::MAX,
+            || None,
+            || {
+                attempts += 1;
+                None
+            },
+            || {},
+        );
+        assert_eq!((got, attempts), (None, 1));
     }
 
     #[test]

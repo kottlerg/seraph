@@ -3,7 +3,7 @@
 
 // shared/registry/src/lib.rs
 
-//! Fixed-capacity name→endpoint-cap registry for supervisor services.
+//! Growable name→endpoint-cap registry for supervisor services.
 //!
 //! Each supervisor (svcmgr today) holds a [`Registry`] that maps
 //! short byte-string names to capability-slot indices in its own `CSpace`. Callers
@@ -13,14 +13,20 @@
 //! only for the supervisor's own resolution ([`Resolver::Seed`]), never for
 //! a `QUERY_ENDPOINT` caller ([`Resolver::Query`]).
 //!
-//! Storage is statically sized (`N` entries, `NAME_MAX`-byte names) and the crate
-//! needs no allocator. A full bytewise match is
+//! Entries live on the heap and the table grows with what is published, so
+//! it holds no fixed count; a publish fails only when the heap cannot grow
+//! it. Names are at most [`NAME_MAX`] bytes. A full bytewise match is
 //! required — no prefix or glob matching.
 
 #![cfg_attr(not(test), no_std)]
 
-/// Maximum registered name length in bytes.
-pub const NAME_MAX: usize = 16;
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+/// Maximum registered name length in bytes: the svcmgr protocol's one name
+/// limit, shared with every client and the `.svc` parser.
+pub const NAME_MAX: usize = ipc::svcmgr_labels::NAME_MAX;
 
 /// Which resolvers an entry answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +57,8 @@ pub struct Entry
 {
     /// Name bytes, zero-padded to `NAME_MAX`.
     pub name: [u8; NAME_MAX],
-    /// Active length of `name` (the entry is in use iff `cap != 0`). At most
-    /// `NAME_MAX`, so the `u8` never truncates.
+    /// Active length of `name`. At most `NAME_MAX`, so the `u8` never
+    /// truncates.
     pub name_len: u8,
     /// Capability slot index in the supervisor's `CSpace`; `u32` is the cap
     /// handle width of the syscall ABI.
@@ -82,20 +88,20 @@ impl Entry
     }
 }
 
-/// Fixed-capacity name→cap registry. `N` caps the table size.
-pub struct Registry<const N: usize>
+/// Growable name→cap registry, one heap entry per published name.
+pub struct Registry
 {
-    entries: [Entry; N],
+    entries: Vec<Entry>,
 }
 
-impl<const N: usize> Registry<N>
+impl Registry
 {
     /// Create an empty registry.
     #[must_use]
     pub const fn new() -> Self
     {
         Self {
-            entries: [Entry::empty(); N],
+            entries: Vec::new(),
         }
     }
 
@@ -110,10 +116,7 @@ impl<const N: usize> Registry<N>
         {
             return None;
         }
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.cap != 0 && e.name_matches(name))?;
+        let entry = self.entries.iter().find(|e| e.name_matches(name))?;
         if entry.visibility == Visibility::SeedOnly && resolver == Resolver::Query
         {
             return None;
@@ -123,12 +126,12 @@ impl<const N: usize> Registry<N>
 
     /// Publish `name → cap` with `visibility`.
     ///
-    /// `cap == 0` is rejected — the zero slot marks an empty entry.
+    /// `cap == 0`, the null slot, is rejected.
     ///
     /// # Errors
-    /// Returns `Err(())` if the table is full, `name` is empty or exceeds
-    /// [`NAME_MAX`], the cap is zero, or the name is already registered
-    /// (at either visibility).
+    /// Returns `Err(())` if the heap cannot grow the table, `name` is empty
+    /// or exceeds [`NAME_MAX`], the cap is zero, or the name is already
+    /// registered (at either visibility).
     // A unit error: every rejection gets the same reply on the wire
     // (`REGISTER_REJECTED`), so the cause carries no information.
     #[allow(clippy::result_unit_err)]
@@ -138,30 +141,18 @@ impl<const N: usize> Registry<N>
         {
             return Err(());
         }
-        let mut empty_idx: Option<usize> = None;
-        for (i, e) in self.entries.iter().enumerate()
+        if self.entries.iter().any(|e| e.name_matches(name))
         {
-            if e.cap == 0
-            {
-                if empty_idx.is_none()
-                {
-                    empty_idx = Some(i);
-                }
-                continue;
-            }
-            if e.name_matches(name)
-            {
-                return Err(());
-            }
+            return Err(());
         }
-        let idx = empty_idx.ok_or(())?;
         let name_len = u8::try_from(name.len()).map_err(|_| ())?;
+        self.entries.try_reserve(1).map_err(|_| ())?;
         let mut entry = Entry::empty();
         entry.name[..name.len()].copy_from_slice(name);
         entry.name_len = name_len;
         entry.cap = cap;
         entry.visibility = visibility;
-        self.entries[idx] = entry;
+        self.entries.push(entry);
         Ok(())
     }
 
@@ -173,20 +164,12 @@ impl<const N: usize> Registry<N>
         {
             return None;
         }
-        for e in &mut self.entries
-        {
-            if e.cap != 0 && e.name_matches(name)
-            {
-                let cap = e.cap;
-                *e = Entry::empty();
-                return Some(cap);
-            }
-        }
-        None
+        let idx = self.entries.iter().position(|e| e.name_matches(name))?;
+        Some(self.entries.swap_remove(idx).cap)
     }
 }
 
-impl<const N: usize> Default for Registry<N>
+impl Default for Registry
 {
     fn default() -> Self
     {
@@ -202,7 +185,7 @@ mod tests
     #[test]
     fn public_entry_resolves_for_query_and_seed()
     {
-        let mut r = Registry::<4>::new();
+        let mut r = Registry::new();
         r.publish(b"timed", 7, Visibility::Public).unwrap();
         assert_eq!(r.lookup(b"timed", Resolver::Query), Some(7));
         assert_eq!(r.lookup(b"timed", Resolver::Seed), Some(7));
@@ -211,7 +194,7 @@ mod tests
     #[test]
     fn seed_only_entry_resolves_for_seed_but_not_query()
     {
-        let mut r = Registry::<4>::new();
+        let mut r = Registry::new();
         r.publish(b"devmgr.shutdown", 9, Visibility::SeedOnly)
             .unwrap();
         assert_eq!(r.lookup(b"devmgr.shutdown", Resolver::Query), None);
@@ -221,7 +204,7 @@ mod tests
     #[test]
     fn unknown_empty_and_overlong_names_resolve_to_none()
     {
-        let mut r = Registry::<4>::new();
+        let mut r = Registry::new();
         r.publish(b"a", 1, Visibility::Public).unwrap();
         assert_eq!(r.lookup(b"b", Resolver::Seed), None);
         assert_eq!(r.lookup(b"", Resolver::Seed), None);
@@ -232,7 +215,7 @@ mod tests
     fn name_of_exactly_name_max_bytes_is_published_resolved_and_removed()
     {
         let name = [b'a'; NAME_MAX];
-        let mut r = Registry::<1>::new();
+        let mut r = Registry::new();
         r.publish(&name, 7, Visibility::Public).unwrap();
         assert_eq!(r.lookup(&name, Resolver::Query), Some(7));
         assert_eq!(r.remove(&name), Some(7));
@@ -245,7 +228,7 @@ mod tests
     #[test]
     fn publish_rejects_zero_cap_and_invalid_names()
     {
-        let mut r = Registry::<2>::new();
+        let mut r = Registry::new();
         assert!(r.publish(b"a", 0, Visibility::Public).is_err());
         assert!(r.publish(b"", 1, Visibility::Public).is_err());
         assert!(
@@ -257,7 +240,7 @@ mod tests
     #[test]
     fn publish_rejects_a_name_registered_at_either_visibility()
     {
-        let mut r = Registry::<4>::new();
+        let mut r = Registry::new();
         r.publish(b"a", 1, Visibility::SeedOnly).unwrap();
         assert!(r.publish(b"a", 2, Visibility::Public).is_err());
         r.publish(b"b", 3, Visibility::Public).unwrap();
@@ -265,18 +248,26 @@ mod tests
     }
 
     #[test]
-    fn publish_fails_when_the_table_is_full()
+    fn registry_grows_past_any_fixed_count_and_resolves_every_name()
     {
-        let mut r = Registry::<2>::new();
-        r.publish(b"a", 1, Visibility::Public).unwrap();
-        r.publish(b"b", 2, Visibility::SeedOnly).unwrap();
-        assert!(r.publish(b"c", 3, Visibility::Public).is_err());
+        let mut r = Registry::new();
+        let names: Vec<[u8; 3]> = (0..300u16)
+            .map(|i| [b'n', b'a' + (i / 26) as u8, b'a' + (i % 26) as u8])
+            .collect();
+        for (i, name) in names.iter().enumerate()
+        {
+            r.publish(name, i as u32 + 1, Visibility::Public).unwrap();
+        }
+        for (i, name) in names.iter().enumerate()
+        {
+            assert_eq!(r.lookup(name, Resolver::Query), Some(i as u32 + 1));
+        }
     }
 
     #[test]
     fn remove_frees_the_slot_and_returns_the_cap()
     {
-        let mut r = Registry::<1>::new();
+        let mut r = Registry::new();
         r.publish(b"a", 5, Visibility::SeedOnly).unwrap();
         assert_eq!(r.remove(b"a"), Some(5));
         assert_eq!(r.remove(b"a"), None);

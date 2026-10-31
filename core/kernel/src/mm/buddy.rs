@@ -951,7 +951,14 @@ mod tests
         let mut alloc = with_region(8);
         assert_eq!(alloc.alloc_contiguous(3), Some(BASE));
         assert_eq!(alloc.free_page_count(), 4);
+    }
+
+    #[test]
+    fn a_contiguous_request_for_no_pages_is_refused()
+    {
+        let mut alloc = with_region(8);
         assert_eq!(alloc.alloc_contiguous(0), None);
+        assert_eq!(alloc.free_page_count(), 8);
     }
 
     #[test]

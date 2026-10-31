@@ -337,7 +337,6 @@ static mut OWED_WAKE_LAST_COUNT: usize = 0;
 /// `CPU_DIAG` slab. Each field is written by its own CPU only and read by the
 /// watchdog on another. Diagnostic-only: no field gates control flow.
 #[cfg(not(test))]
-#[repr(C)]
 pub(crate) struct CpuDiag
 {
     /// `timer::current_tick()` stamp of this CPU's most recent `timer_tick`
@@ -2535,8 +2534,9 @@ pub unsafe fn init(cpu_count: u32) -> u32
 }
 
 /// Allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
-/// TCBs, idle kernel stacks and their tops, watchdog ticks, per-CPU arch data,
-/// and the x86 AP GDT/TSS/IST tables), publish `CPU_COUNT`, and arm the BSP
+/// TCBs, idle kernel stacks and their tops, watchdog ticks and breadcrumbs
+/// (`CPU_DIAG`), per-CPU arch data, the TLB-shootdown request slots, and the x86
+/// AP GDT/TSS/IST tables), publish `CPU_COUNT`, and arm the BSP
 /// boot transient. Must run before Phase 5 (timer arm) so that the timer
 /// ISR's first read of `SCHEDULERS_PTR` is non-null.
 ///

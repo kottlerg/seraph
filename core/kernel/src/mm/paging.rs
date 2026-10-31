@@ -438,16 +438,22 @@ pub fn span_table_bound(start: u64, end: u64, leaf_shift: u32) -> u64
 /// its carve: the direct map of `[0, direct_top)` in 2 MiB leaves, one leaf
 /// table per kernel-MMIO region below `direct_top` (its 2 MiB chunk is split),
 /// and 4 KiB mappings of every region above it, of the framebuffer span
-/// `fb` when it lies above, and of the AP trampoline page.
+/// `fb` when it lies above, and of the AP trampoline page (identity-mapped).
+///
+/// The tables are indexed by virtual address, `dm_base + phys` in the direct
+/// map, and `dm_base` is only 1 GiB-aligned, so every span is counted at its
+/// virtual address: a span can touch one more 512 GiB block virtually than
+/// physically.
 #[must_use]
 pub fn stage2_table_bound(
+    dm_base: u64,
     direct_top: u64,
     mmio_regions: &[(u64, u64)],
     fb: Option<(u64, u64)>,
     trampoline: u64,
 ) -> u64
 {
-    let mut frames = span_table_bound(0, direct_top, 21);
+    let mut frames = span_table_bound(dm_base, dm_base.saturating_add(direct_top), 21);
     for &(base, size) in mmio_regions
     {
         frames += if base < direct_top
@@ -456,12 +462,14 @@ pub fn stage2_table_bound(
         }
         else
         {
-            span_table_bound(base, base.saturating_add(size), 12)
+            let va = dm_base.saturating_add(base);
+            span_table_bound(va, va.saturating_add(size), 12)
         };
     }
     if let Some((base, size)) = fb
     {
-        frames += span_table_bound(base, base.saturating_add(size), 12);
+        let va = dm_base.saturating_add(base);
+        frames += span_table_bound(va, va.saturating_add(size), 12);
     }
     if trampoline != 0
     {
@@ -634,7 +642,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     // switch the bootloader's identity map of `info` is gone.
     let fb = framebuffer_above(info, max_phys_rounded);
     let trampoline = info.ap_trampoline_page;
-    let carve_frames = stage2_table_bound(max_phys_rounded, mmio_regions, fb, trampoline);
+    let carve_frames = stage2_table_bound(dm_base, max_phys_rounded, mmio_regions, fb, trampoline);
     let carve = crate::mm::init::find_boot_table_carve(info, carve_frames)
         .ok_or(BootTableError::NoTableCarve)?;
     let carve_end = carve + carve_frames * PAGE_SIZE as u64;
@@ -891,12 +899,11 @@ fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
 /// stack stays usable after the page-table switch until `kernel_entry`
 /// rebases it into the direct map.
 ///
-/// The handoff stack is [`HANDOFF_STACK_BYTES`] long, 4 KiB-aligned, and the
-/// stack pointer lies inside it (core/boot/docs/kernel-handoff.md), so its top
-/// is above `sp` and at most that many bytes above the page holding `sp`:
-/// [`handoff_stack_window`] covers every such placement. It also maps up to
-/// one stack's worth of pages beside the stack, which are never accessed
-/// through this low-half alias.
+/// The entry contract guarantees [`HANDOFF_STACK_BYTES`] of stack below the
+/// entry stack pointer (core/boot/docs/kernel-handoff.md);
+/// [`handoff_stack_window`] covers that region from the current `sp` alone. It
+/// also maps up to one stack's worth of pages beside the stack, which are never
+/// accessed through this low-half alias.
 ///
 /// If the stack pointer is already within the kernel image mapping (unlikely
 /// but possible), this is a no-op.
@@ -932,12 +939,13 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
     Ok(())
 }
 
-/// The page-aligned `[lo, hi)` that holds every [`HANDOFF_STACK_BYTES`]-long,
-/// page-aligned stack containing `sp`.
+/// The page-aligned `[lo, hi)` that holds the guaranteed handoff stack, given
+/// the current stack pointer `sp` deeper in the same stack.
 ///
-/// The stack's top `t` is a page boundary with `sp < t <= sp + S`, so
-/// `page(sp) + 4 KiB <= t <= page(sp) + S`, and its base `t - S` is at least
-/// `page(sp) + 4 KiB - S`.
+/// With `S` = [`HANDOFF_STACK_BYTES`] and `e` the entry stack pointer, the
+/// stack the boot phases may use is `[e - S, e)`. The frames between `sp` and
+/// `e` lie in it, so `sp < e <= sp + S`; then `e - S > sp - S >= page(sp) - S`
+/// and `e <= sp + S < page(sp) + 4 KiB + S`.
 ///
 /// [`HANDOFF_STACK_BYTES`]: boot_protocol::layout::HANDOFF_STACK_BYTES
 fn handoff_stack_window(sp: u64) -> (u64, u64)
@@ -946,8 +954,8 @@ fn handoff_stack_window(sp: u64) -> (u64, u64)
     let page = PAGE_SIZE as u64;
     let sp_page = sp & !(page - 1);
     (
-        (sp_page + page).saturating_sub(stack),
-        sp_page.saturating_add(stack),
+        sp_page.saturating_sub(stack),
+        sp_page.saturating_add(stack + page),
     )
 }
 
@@ -1137,19 +1145,21 @@ mod tests
     // Defect caught: the former 64 KiB-aligned window around SP, which leaves
     // the low part of a stack that is only 4 KiB-aligned unmapped.
     #[test]
-    fn the_stack_window_covers_every_page_aligned_stack_holding_sp()
+    fn the_stack_window_covers_the_guaranteed_stack_from_any_deeper_sp()
     {
         let size = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
-        // A stack straddling a 64 KiB boundary, its base only 4 KiB-aligned.
-        let base = 0x4_3000;
-        for sp in [base, base + 0x10, base + size / 2, base + size - 8]
+        // Entry SPs that are not page-aligned, straddling a 64 KiB boundary.
+        for entry in [0x5_3000u64, 0x5_3008, 0x5_2ff8]
         {
-            let (lo, hi) = handoff_stack_window(sp);
-            assert!(
-                lo <= base && base + size <= hi,
-                "sp {sp:#x}: {lo:#x}..{hi:#x}"
-            );
-            assert_eq!(hi - lo, 2 * size - 0x1000);
+            // The guaranteed stack is [entry - size, entry); sp is anywhere in it.
+            for sp in [entry - 8, entry - 0x1000, entry - size / 2, entry - size]
+            {
+                let (lo, hi) = handoff_stack_window(sp);
+                assert!(
+                    lo <= entry - size && entry <= hi,
+                    "entry {entry:#x}, sp {sp:#x}: {lo:#x}..{hi:#x}"
+                );
+            }
         }
     }
 
@@ -1176,12 +1186,14 @@ mod tests
         let fb = (top + (7 << 30), 8 << 20);
         let trampoline = 0x8000;
         let regions = [lapic, high_mmio];
-        let bound = stage2_table_bound(top, &regions, Some(fb), trampoline);
+        // A KASLR base that is 1 GiB- but not 512 GiB-aligned, so the virtual
+        // spans touch more 512 GiB blocks than the physical ones.
+        let dm = 0xFFFF_8000_0000_0000 + (511 << 30);
+        let bound = stage2_table_bound(dm, top, &regions, Some(fb), trampoline);
         let frames = bound as usize + 1; // plus the root
         let buf = make_test_pool_buf(frames);
         let mut pool = PoolState::new_for_test(aligned_start(&buf), frames);
         let (root_va, _) = pool.alloc_frame().unwrap();
-        let dm = direct_map_base();
         let map = crate::arch::current::paging::map_page;
         let mut phys = 0;
         while phys < top

@@ -143,8 +143,9 @@ again from the recorded BootInfo address.
    (Section bounds from the linker-script symbols __text_start..__bss_end; physical
    addresses from the BootInfo kernel_virtual_base / kernel_physical_base offset; 4 KiB pages)
    — the identity window (VA == PA) that holds the handoff stack, used until the stack is
-   rebased onto the direct map right after Phase 3 (the shared HANDOFF_STACK_BYTES stack
-   containing the stack pointer, whatever its 4 KiB alignment), and the direct map of the
+   rebased onto the direct map right after Phase 3 (wide enough to hold the HANDOFF_STACK_BYTES
+   of stack the entry contract guarantees below the entry stack pointer, whatever its
+   alignment), and the direct map of the
    2 MiB chunks covering the carve.
 4. Activate the tables: arch::current::paging::activate(root_phys). From here nothing
    reads BootInfo until step 9: everything later steps map was read from it before.
@@ -776,7 +777,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents exceed MAX_DRAIN_BLOCKS |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace); a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

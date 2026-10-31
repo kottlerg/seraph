@@ -6,9 +6,10 @@
 //! x86-64 four-level (PML4 → PDPT → PD → PT) page table operations.
 //!
 //! [`map_page`] and [`map_large_page`] (kernel page-table construction) draw
-//! intermediate frames from the BSS-resident boot pool supplied via
-//! [`PoolState`], whose physical addresses convert to virtual addresses with
-//! the kernel VA/PA offset embedded in `PoolState`. The user-mapping functions
+//! intermediate frames from the [`PoolState`] the caller supplies: the
+//! BSS-resident seed, reached through the kernel image, then the Phase 3 carve
+//! of RAM, reached through the direct map; [`PoolState::phys_to_virt`]
+//! resolves a frame of either. The user-mapping functions
 //! draw them from `crate::mm::kernel_pt_pool` ([`map_user_page`]) or the
 //! address space's growth pool ([`map_user_page_pooled`]).
 //!
@@ -197,23 +198,27 @@ pub fn map_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    // SAFETY: root_va is the boot-pool VA of the kernel PML4 under construction
-    // (caller's contract); child tables are reached only through present entries.
+    // SAFETY: root_va is the VA of the kernel PML4 under construction, a frame
+    // `pool` handed out (caller's contract); child tables are reached only
+    // through present entries.
     let pml4 = unsafe { table_at(root_va) };
     let pdpt_pa = walk_or_alloc(&mut pml4[pml4_index(virt)], pool)?;
 
-    // SAFETY: the entry is present and points at a boot-pool frame;
-    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
+    // SAFETY: the entry is present and names a table frame `pool` handed out;
+    // PoolState::phys_to_virt resolves it (a seed frame through the image, a
+    // carve frame through the direct map, which stage 1 maps over the carve).
     let pdpt = unsafe { table_at(pool.phys_to_virt(pdpt_pa)) };
     let pd_pa = walk_or_alloc(&mut pdpt[pdpt_index(virt)], pool)?;
 
-    // SAFETY: the entry is present and points at a boot-pool frame;
-    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
+    // SAFETY: the entry is present and names a table frame `pool` handed out;
+    // PoolState::phys_to_virt resolves it (a seed frame through the image, a
+    // carve frame through the direct map, which stage 1 maps over the carve).
     let pd = unsafe { table_at(pool.phys_to_virt(pd_pa)) };
     let pt_pa = walk_or_alloc(&mut pd[pd_index(virt)], pool)?;
 
-    // SAFETY: the entry is present and points at a boot-pool frame;
-    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
+    // SAFETY: the entry is present and names a table frame `pool` handed out;
+    // PoolState::phys_to_virt resolves it (a seed frame through the image, a
+    // carve frame through the direct map, which stage 1 maps over the carve).
     let pt = unsafe { table_at(pool.phys_to_virt(pt_pa)) };
     pt[pt_index(virt)] = PageTableEntry::new_page(phys, flags);
     Ok(())
@@ -234,18 +239,21 @@ pub fn map_large_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    // SAFETY: root_va is the boot-pool VA of the kernel PML4 under construction
-    // (caller's contract); child tables are reached only through present entries.
+    // SAFETY: root_va is the VA of the kernel PML4 under construction, a frame
+    // `pool` handed out (caller's contract); child tables are reached only
+    // through present entries.
     let pml4 = unsafe { table_at(root_va) };
     let pdpt_pa = walk_or_alloc(&mut pml4[pml4_index(virt)], pool)?;
 
-    // SAFETY: the entry is present and points at a boot-pool frame;
-    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
+    // SAFETY: the entry is present and names a table frame `pool` handed out;
+    // PoolState::phys_to_virt resolves it (a seed frame through the image, a
+    // carve frame through the direct map, which stage 1 maps over the carve).
     let pdpt = unsafe { table_at(pool.phys_to_virt(pdpt_pa)) };
     let pd_pa = walk_or_alloc(&mut pdpt[pdpt_index(virt)], pool)?;
 
-    // SAFETY: the entry is present and points at a boot-pool frame;
-    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
+    // SAFETY: the entry is present and names a table frame `pool` handed out;
+    // PoolState::phys_to_virt resolves it (a seed frame through the image, a
+    // carve frame through the direct map, which stage 1 maps over the carve).
     let pd = unsafe { table_at(pool.phys_to_virt(pd_pa)) };
     pd[pd_index(virt)] = PageTableEntry::new_large_page(phys, flags);
     Ok(())

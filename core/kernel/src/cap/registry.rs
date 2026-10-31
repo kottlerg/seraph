@@ -36,6 +36,10 @@ pub const ENTRIES_PER_CHUNK: usize =
 /// can hold beside everything else; a bound of the id width, not of RAM.
 pub const MAX_ID_CHUNKS: usize = (u32::MAX as usize - 1) / ENTRIES_PER_CHUNK;
 
+// Every id the arena can back, and the `NO_NEXT` sentinel above them, fit
+// `CSpaceId`.
+const _: () = assert!(MAX_ID_CHUNKS * ENTRIES_PER_CHUNK < u32::MAX as usize);
+
 const _: () = assert!(core::mem::size_of::<RegistryEntry>() == 16);
 
 /// `next_free` sentinel: end of the free list.
@@ -533,7 +537,6 @@ mod tests
         let per_chunk = ENTRIES_PER_CHUNK as u64 * crate::mm::PAGE_SIZE as u64;
         assert_eq!(chunks_for_ram(4 * tib) as u64, 4 * tib / per_chunk);
         assert_eq!(chunks_for_ram(64 * tib), MAX_ID_CHUNKS);
-        assert!(MAX_ID_CHUNKS * ENTRIES_PER_CHUNK < u32::MAX as usize);
     }
 
     #[test]

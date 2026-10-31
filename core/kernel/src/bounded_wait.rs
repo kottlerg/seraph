@@ -8,8 +8,9 @@
 //! A kernel spin on a hardware or cross-CPU condition is bounded in time, not in loop
 //! iterations, because an iteration's cost depends on the CPU and on the device (see
 //! docs/limits.md § Cross-Cutting Findings, spin-count timeouts). The clock is whatever
-//! the caller passes: microseconds from `timer::elapsed_us` for the IPI waits, raw TSC
-//! ticks for the x86-64 PIT calibration poll. When the clock gives no reading (the timer is
+//! the caller passes: microseconds from `timer::elapsed_us` for the IPI waits, the frame
+//! allocator and tag-pool lock waits, the tag eviction retry, and the boot's wait for each AP
+//! to come online; raw TSC ticks for the x86-64 PIT calibration poll. When the clock gives no reading (the timer is
 //! not yet calibrated), the elapsed time is estimated from the spin count at
 //! [`MAX_SPINS_PER_UNIT`]. That estimate is never larger than the true time on any
 //! plausible CPU, so the fallback can wait longer than the budget but never times out

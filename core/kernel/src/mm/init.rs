@@ -396,8 +396,9 @@ pub fn init_physical_memory(info: &BootInfo)
 /// Phase 3 page-table carve, or `None`.
 ///
 /// A free piece here also avoids everything from the device tree blob's start
-/// to the end of its range: the blob's size is in its header, which Phase 3
-/// cannot read before its own tables are active.
+/// to the end of the memory-map entry that holds it ([`dtb_tail`]): the blob's
+/// size is in its header, which Phase 3 cannot read before its own tables are
+/// active.
 ///
 /// Called on the single boot thread while the bootloader's identity map still
 /// covers `info`, its memory map, and its module list.
@@ -405,14 +406,12 @@ pub fn init_physical_memory(info: &BootInfo)
 pub fn find_boot_table_carve(info: &BootInfo, frames: u64) -> Option<u64>
 {
     let want = frames * PAGE_SIZE as u64;
-    let dtb_tail = if info.device_tree == 0
-    {
-        (0, 0)
-    }
-    else
-    {
-        (align_down(info.device_tree, PAGE_SIZE as u64), u64::MAX)
+    // SAFETY: Phase 0 validated the memory map; the bootloader's identity map
+    // covers it at this point (the caller's contract).
+    let entries = unsafe {
+        core::slice::from_raw_parts(info.memory_map.entries, info.memory_map.count as usize)
     };
+    let dtb_tail = dtb_tail(info.device_tree, entries);
     let mut found = None;
     for_each_payload_free_piece(
         info,
@@ -429,6 +428,36 @@ pub fn find_boot_table_carve(info: &BootInfo, frames: u64) -> Option<u64>
         },
     );
     found
+}
+
+/// The span from the page holding the device tree blob at `dtb` to the end of
+/// the run of address-contiguous memory-map entries that holds it (the blob may
+/// run across adjacent entries), `(0, 0)` when there is no blob or no entry
+/// holds it (a blob outside RAM is never carved over). `entries` is sorted by
+/// base, as the boot protocol guarantees.
+fn dtb_tail(dtb: u64, entries: &[MemoryMapEntry]) -> (u64, u64)
+{
+    if dtb == 0
+    {
+        return (0, 0);
+    }
+    let Some(first) = entries
+        .iter()
+        .position(|e| e.physical_base <= dtb && dtb < e.physical_base.saturating_add(e.size))
+    else
+    {
+        return (0, 0);
+    };
+    let mut end = 0;
+    for e in &entries[first..]
+    {
+        if end != 0 && e.physical_base != end
+        {
+            break;
+        }
+        end = e.physical_base.saturating_add(e.size);
+    }
+    (align_down(dtb, PAGE_SIZE as u64), end)
 }
 
 /// Record the `frames` frames at `base` Phase 3 used for its page tables, so
@@ -879,6 +908,143 @@ mod tests
         let out = pieces(0x1000, 0x1000 + 0x2000 * 200, &excl);
         assert_eq!(out.len(), 200);
         assert!(out.iter().all(|&(s, e)| e - s == 0x1000));
+    }
+
+    use boot_protocol::{BootModule, MemoryMapEntry, MemoryMapSlice, ModuleSlice};
+
+    fn usable(base: u64, size: u64) -> MemoryMapEntry
+    {
+        MemoryMapEntry {
+            physical_base: base,
+            size,
+            memory_type: MemoryType::Usable,
+        }
+    }
+
+    /// A `BootInfo` naming `map` and `modules`, otherwise zero. Valid while
+    /// both slices live.
+    fn boot_info(map: &[MemoryMapEntry], modules: &[BootModule]) -> BootInfo
+    {
+        // SAFETY: every BootInfo field is an integer, a raw pointer, or a fieldless
+        // enum with a 0 discriminant, so the all-zero pattern is valid.
+        let mut info = unsafe { core::mem::zeroed::<BootInfo>() };
+        info.memory_map = MemoryMapSlice {
+            entries: map.as_ptr(),
+            count: map.len() as u64,
+        };
+        info.modules = ModuleSlice {
+            entries: modules.as_ptr(),
+            count: modules.len() as u64,
+        };
+        info
+    }
+
+    fn module(base: u64, size: u64) -> BootModule
+    {
+        BootModule {
+            name: [0; boot_protocol::BOOT_MODULE_NAME_LEN],
+            physical_base: base,
+            size,
+        }
+    }
+
+    /// The free pieces of `info`, identity-mapped as on the host.
+    fn free_pieces(info: &BootInfo, extra: &[(u64, u64)]) -> Vec<(u64, u64)>
+    {
+        let mut out = Vec::new();
+        let info_phys = core::ptr::from_ref(info) as u64;
+        for_each_payload_free_piece(info, info_phys, |p| p, extra, |s, e| out.push((s, e)));
+        out
+    }
+
+    // Defect caught: a boot payload extent left in the buddy, whose live data
+    // the allocator would then hand out.
+    #[test]
+    fn every_boot_payload_extent_is_cut_from_usable_ram()
+    {
+        let map = [usable(0x10_0000, 0x10_0000)];
+        let mods = [module(0x18_0800, 0x100)];
+        let mut info = boot_info(&map, &mods);
+        info.kernel_physical_base = 0x11_0000;
+        info.kernel_size = 0x1800;
+        info.init_image.segment_count = 1;
+        info.init_image.segments[0].phys_addr = 0x14_0000;
+        info.init_image.segments[0].size = 0x1000;
+        info.ap_trampoline_page = 0x1F_F000;
+        assert_eq!(
+            free_pieces(&info, &[(0x16_0000, 0x16_2000)]),
+            [
+                (0x10_0000, 0x11_0000),
+                (0x11_2000, 0x14_0000),
+                (0x14_1000, 0x16_0000),
+                (0x16_2000, 0x18_0000),
+                (0x18_1000, 0x1F_F000),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_usable_entries_are_free()
+    {
+        let map = [
+            usable(0x10_0000, 0x1000),
+            MemoryMapEntry {
+                physical_base: 0x20_0000,
+                size: 0x1000,
+                memory_type: MemoryType::Loaded,
+            },
+        ];
+        assert_eq!(
+            free_pieces(&boot_info(&map, &[]), &[]),
+            [(0x10_0000, 0x10_1000)]
+        );
+    }
+
+    #[test]
+    fn the_carve_is_the_first_piece_that_fits_and_never_frame_zero()
+    {
+        // [0, 0x3000) holds 3 frames, but frame 0 is never handed out.
+        let map = [
+            usable(0, 0x3000),
+            usable(0x10_0000, 0x4000),
+            usable(0x20_0000, 0x10_0000),
+        ];
+        let info = boot_info(&map, &[]);
+        assert_eq!(find_boot_table_carve(&info, 2), Some(0x1000));
+        assert_eq!(find_boot_table_carve(&info, 3), Some(0x10_0000));
+        assert_eq!(find_boot_table_carve(&info, 5), Some(0x20_0000));
+    }
+
+    // Defect caught: a carve laid over the device tree blob, whose header the
+    // stage-2 tables would overwrite before `populate_buddy` reads it.
+    #[test]
+    fn the_carve_avoids_everything_from_the_device_tree_onward()
+    {
+        let map = [usable(0x10_0000, 0x10_0000), usable(0x40_0000, 0x10_0000)];
+        let mut info = boot_info(&map, &[]);
+        info.device_tree = 0x10_8800;
+        // 8 frames fit below the blob; 9 do not, nor anywhere in its range.
+        assert_eq!(find_boot_table_carve(&info, 8), Some(0x10_0000));
+        assert_eq!(find_boot_table_carve(&info, 9), Some(0x40_0000));
+    }
+
+    #[test]
+    fn the_device_tree_tail_runs_through_adjacent_entries()
+    {
+        let map = [
+            usable(0x10_0000, 0x1000),
+            usable(0x10_1000, 0x1000),
+            usable(0x20_0000, 0x1000),
+        ];
+        assert_eq!(dtb_tail(0x10_0800, &map), (0x10_0000, 0x10_2000));
+        assert_eq!(dtb_tail(0x30_0000, &map), (0, 0));
+    }
+
+    #[test]
+    fn no_carve_is_found_when_no_piece_holds_it()
+    {
+        let map = [usable(0x10_0000, 0x4000)];
+        assert_eq!(find_boot_table_carve(&boot_info(&map, &[]), 5), None);
     }
 
     #[test]

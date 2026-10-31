@@ -658,8 +658,8 @@ unsafe fn kernel_entry_post_rebase(
                     // A listed CPU that cannot be started is fatal
                     // (core/kernel/docs/initialization.md § Phase 8); on x86-64
                     // SIPI delivery is unacknowledged, so `start_ap` cannot
-                    // report one and a CPU that never answers leaves the wait
-                    // below spinning.
+                    // report one, and a CPU that never answers is caught by the
+                    // bounded wait below.
                     if !ok
                     {
                         fatal("smp: start_ap failed; a listed CPU cannot be brought online");

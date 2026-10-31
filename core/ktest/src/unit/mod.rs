@@ -332,6 +332,10 @@ pub fn run_all(ctx: &TestContext)
     // ── Event queue syscalls ──────────────────────────────────────────────────
     run_test!("event::create", event::create(ctx));
     run_test!("event::post_recv_fifo", event::post_recv_fifo(ctx));
+    run_test!(
+        "event::post_recv_entry_round_trips_both_words",
+        event::post_recv_entry_round_trips_both_words(ctx)
+    );
     run_test!("event::queue_full_err", event::queue_full_err(ctx));
     run_test!(
         "event::recv_blocks_until_post",
@@ -367,6 +371,10 @@ pub fn run_all(ctx: &TestContext)
     );
 
     // ── Wait set syscalls ─────────────────────────────────────────────────────
+    run_test!(
+        "wait_set::capacity_is_caller_sized",
+        wait_set::capacity_is_caller_sized(ctx)
+    );
     run_test!(
         "wait_set::add_notification_immediate",
         wait_set::add_notification_immediate(ctx)
@@ -564,6 +572,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "thread::bind_notification_fires_on_exit",
         thread::bind_notification_fires_on_exit(ctx)
+    );
+    run_test!(
+        "thread::bind_notification_nodes_come_from_the_queue",
+        thread::bind_notification_nodes_come_from_the_queue(ctx)
     );
     run_test!(
         "thread::bind_notification_invalid_cap_err",

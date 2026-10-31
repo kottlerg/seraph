@@ -438,8 +438,9 @@ delivery, fault delivery, a death post) keeps that source live until its wake co
 
 ### Exit reason
 
-The kernel records a single 32-bit **exit reason** at death and delivers it
-(low 32 bits) through the thread death-observer surface. It is a flat,
+The kernel records a single **exit reason** at death, every value of which fits
+32 bits, and delivers it whole, as the payload word of the death entry, through the
+thread death-observer surface. It is a flat,
 kernel-owned space partitioned into disjoint ranges so userspace can never forge
 a fault or kill reason — defined once in `syscall_abi`:
 

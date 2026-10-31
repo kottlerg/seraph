@@ -465,14 +465,14 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity); a wait that finds the kernel's sleep list full times out at once, returning `0` bits ([thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
+| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity; the kernel's sleep list has no capacity to refuse the wait, [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
-  because `SYS_NOTIFICATION_SEND` rejects zero-bit sends; `0` when the wait
-  times out: the timeout elapsed, or the sleep list was full when it parked)
+  because `SYS_NOTIFICATION_SEND` rejects zero-bit sends; `0` when the wait's
+  timeout elapsed)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
@@ -492,14 +492,16 @@ them at once, ahead of any queued waiter.
 ### `SYS_EVENT_POST` (5)
 
 Append one entry to an event queue. Non-blocking; returns `QueueFull` if at capacity
-(see [ipc-design.md](../../../docs/ipc-design.md) § Event Queues).
+(see [ipc-design.md](../../../docs/ipc-design.md) § Event Queues). An entry is two words, a
+payload word and a tag word; any value of either, 0 included, is valid.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `queue_cap` | Event queue capability with Post rights |
-| 1 | `payload` | Word-sized payload to append |
+| 1 | `payload` | Payload word of the entry |
+| 2 | `tag` | Tag word of the entry |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -527,12 +529,13 @@ is specific to `SYS_EVENT_RECV`):
 |-------------------|-----------------------------------------------------------------|
 | `0`               | Block forever until a post arrives                              |
 | `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
-| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse (`WouldBlock` at once if the kernel's sleep list is full when the wait parks) |
+| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: dequeued payload word (valid on success)
+- `rdx`/`a1`: payload word of the dequeued entry (valid on success)
+- `rsi`/`a2`: tag word of the dequeued entry (valid on success)
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
@@ -541,15 +544,14 @@ stopped, or the queue was destroyed while the caller was parked).
 
 Blocked receivers queue in arrival order; each post wakes the longest-waiting one.
 
-`WouldBlock` covers both the try-once-empty case and the timer-fired case
-(including the immediate timeout on a full sleep list);
+`WouldBlock` covers both the try-once-empty case and the timer-fired case;
 the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
 — contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
 0 bits because `SYS_NOTIFICATION_SEND` rejects zero-bit sends, so a `0` result
-means the wait timed out (the timeout elapsed, or the sleep list was full).
+means the wait's timeout elapsed.
 
 ---
 
@@ -631,7 +633,8 @@ its 2^31 ceiling).
 
 ### `SYS_CAP_CREATE_EVENT_Q` (9)
 
-Retype a Memory capability into a new event queue with a fixed capacity.
+Retype a Memory capability into a new event queue with a fixed capacity and a fixed pool of
+death-observer nodes.
 
 **Arguments:**
 
@@ -639,6 +642,12 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 |---|---|---|
 | 0 | `memory_cap` | Memory capability (Retype rights) the event queue is carved from |
 | 1 | `capacity` | Ring buffer capacity in entries (1–EVENT_QUEUE_MAX_CAPACITY) |
+| 2 | `observers` | Death-observer nodes in the queue's pool (0–EVENT_QUEUE_MAX_CAPACITY) |
+
+The retype debit is `event_queue_retype_bytes(capacity, observers)`: the ring, and one node per
+observer, live inline in the queue's retype slot. Each `SYS_THREAD_BIND_NOTIFICATION` or
+`SYS_ASPACE_BIND_NOTIFICATION` onto the queue holds one node while its binding lives; a queue that
+receives no death posts takes `observers = 0`.
 
 **Return:** `rax`/`a0`: new capability descriptor (Post + Recv rights) on success;
 `SyscallError` on failure.
@@ -646,7 +655,7 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 **Capability requirement:** `memory_cap` must have Retype rights.
 
 **Errors:** `InvalidArgument` (`capacity`, the full register, is 0 or exceeds
-`EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
+`EVENT_QUEUE_MAX_CAPACITY`, or `observers` exceeds it), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
 or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full,
 or the Memory object's reference count is at its 2^31 ceiling).
@@ -769,21 +778,26 @@ count is at its 2^31 ceiling).
 
 ### `SYS_CAP_CREATE_WAIT_SET` (13)
 
-Retype a Memory capability into a new wait set.
+Retype a Memory capability into a new wait set of a fixed member capacity.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `memory_cap` | Memory capability (Retype rights) the wait set is carved from |
+| 1 | `capacity` | Member capacity (1–`WAIT_SET_MAX_MEMBERS`, 1024) |
+
+The retype debit is `wait_set_retype_bytes(capacity)`: the member slots and the ready ring live
+inline in the set's retype slot. `SYS_WAIT_SET_ADD` past `capacity` members is refused.
 
 **Return:** `rax`/`a0`: new wait set capability (Modify + Wait rights) on success;
 `SyscallError` on failure.
 
 **Capability requirement:** `memory_cap` must have Retype rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
-`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
+**Errors:** `InvalidArgument` (`capacity`, the full register, is 0 or exceeds
+`WAIT_SET_MAX_MEMBERS`), `InvalidCapability`, `InsufficientRights` (source Memory cap lacks
+Retype), `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
 (caller's CSpace directory structurally full, or the Memory object's reference count is at
 its 2^31 ceiling).
 
@@ -987,27 +1001,30 @@ selected by a field code. Read-only inquiry.
 |---|---|---|
 | 0 | `cap` | Capability handle to inspect |
 | 1 | `field` | Field selector (`CAP_INFO_*` constant) |
+| 2 | `first_page` | `CAP_INFO_MEMORY_MAPPINGS` only: first page of the window, from the region's base |
+| 3 | `pages` | `CAP_INFO_MEMORY_MAPPINGS` only: window length in pages (1–`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`) |
 
 **Return:** `rax`/`a0`: the requested field value on success; `SyscallError` on failure.
 Some fields pack two values into the word — e.g. `TAG_RIGHTS` returns `(tag << 32) |
 rights`, and `THREAD_STATE` returns `(state << 32) | (exit_reason & 0xFFFFFFFF)`.
 
 `CAP_INFO_MEMORY_MAPPINGS` (12) returns, for a Memory cap, the number of user page-table
-leaves in every address space that name a frame of its region, summed over the region's
-frames (the frame map table's counts; see
+leaves in every address space that name a frame of the queried window of its region, summed over
+the window's frames (the frame map table's counts; see
 [memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)). A frame's
 count falls only once every CPU has dropped the leaf, so a value equal to the mappings the
 caller itself holds means no other address space can reach the region; the value is a
 snapshot, which stays current only while no one else holds a capability that can map the
-region. The kernel answers only through a Memory cap the caller holds, and only for a region
-of at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the walk stays bounded.
+region. The kernel answers only through a Memory cap the caller holds, and counts only the
+window arguments 2 and 3 name, at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the
+walk stays bounded; a larger region is read window by window.
 
 **Capability requirement:** None — `cap_info` reads the slot without a rights check.
 
 **Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target
 object is gone), `InvalidArgument` (field requires a different capability type, the
-selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` region is larger than
-`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages).
+selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
+`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region).
 
 ---
 
@@ -1357,11 +1374,8 @@ fault first keeps that reply's outcome: when next started it resumes its faultin
 `FAULT_REPLY_RESUME` and is killed on `FAULT_REPLY_KILL` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
-cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker,
-the sleep timer, or the target's own full-list withdrawal claimed it first). A full-list
-withdrawal is a timed wait or sleep that found the kernel's sleep list full; it reports its timeout
-or `OutOfMemory` (invariant 4 of
-[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
+cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker
+or the sleep timer claimed it first).
 A target that blocks while the stop is in progress is cancelled the same way, never left registered
 as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
 Cross-CPU Stop Protocol). A target waiting on an endpoint (queued to send or receive), a
@@ -1737,17 +1751,19 @@ Plain-Sleep Path), so a caller that needs the full duration re-checks elapsed ti
 
 No capability is required — this syscall acts on the calling thread implicitly.
 
-**Errors:** `InvalidCapability` (no current thread), `OutOfMemory` (kernel sleep list at
-capacity), `Interrupted` (the thread was stopped before or during the sleep, unless the timer had
-already claimed its elapsed deadline, or the sleep found the sleep list full and withdrew first,
-which returns `OutOfMemory`).
+**Errors:** `InvalidCapability` (no current thread), `Interrupted` (the thread was stopped before or
+during the sleep, unless the timer had already claimed its elapsed deadline). The kernel's sleep
+list has no capacity to exhaust, so a sleep never fails for room ([thread-lifecycle-and-sleep.md §
+Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4).
 
 ---
 
 ### `SYS_THREAD_BIND_NOTIFICATION` (47)
 
 Register a death observer on a thread. When the target exits or faults terminally, the
-kernel posts `(correlator << 32) | (exit_reason & 0xFFFFFFFF)` to the bound event queue.
+kernel posts the two-word entry `(exit_reason, correlator)` to the bound event queue: the full
+`u64` exit reason as the payload word and the full `u64` correlator as the tag word
+(§ `SYS_EVENT_POST` (5)).
 
 **Arguments:**
 
@@ -1755,7 +1771,7 @@ kernel posts `(correlator << 32) | (exit_reason & 0xFFFFFFFF)` to the bound even
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) to observe |
 | 1 | `eventq_cap` | Event queue capability (Post rights) the death notification is posted to |
-| 2 | `correlator` | Caller-chosen `u32` routing tag (`0` makes the payload equal the exit reason) |
+| 2 | `correlator` | Caller-chosen `u64` routing tag, delivered unchanged as the tag word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the target has
 already exited, the retained reason is delivered immediately and the call still returns 0.
@@ -1770,8 +1786,13 @@ Object Reference Counting).
 
 **Capability requirements:** `thread_cap` (Control), `eventq_cap` (Post).
 
+**Observer nodes:** each live binding holds one death-observer node of `eventq_cap`'s pool
+(§ `SYS_CAP_CREATE_EVENT_Q` (9), argument 2) until the target thread is destroyed; a bind onto an
+already-exited thread takes none.
+
 **Errors:** `InvalidCapability`, `InsufficientRights` (thread lacks Control or event
-queue lacks Post), `OutOfMemory` (target's observer array is full).
+queue lacks Post), `OutOfMemory` (the event queue has no free observer node), `QuotaExceeded`
+(the event queue's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -1799,7 +1820,8 @@ right matching its type: Receive on an Endpoint, Wait on a Notification, Recv on
 EventQueue).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (wait set lacks Modify, or source
-lacks Receive/Wait/Recv), `InvalidArgument` (wait set full, or source already in a wait set).
+lacks Receive/Wait/Recv), `InvalidArgument` (every member slot of the wait set's capacity is
+occupied, or source already in a wait set).
 
 ---
 
@@ -2213,7 +2235,8 @@ Translate a user virtual address to its mapped physical address.
 
 Bind a terminal-fault death observer to an address space. When any thread in the space faults
 terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
-for the triggers), the kernel posts the fault reason to the bound event queue. Voluntary
+for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the bound
+event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. Voluntary
 `SYS_THREAD_EXIT` does not fire these observers (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
@@ -2223,7 +2246,7 @@ for the triggers), the kernel posts the fault reason to the bound event queue. V
 |---|---|---|
 | 0 | `aspace_cap` | AddressSpace capability (Control rights) to observe |
 | 1 | `eventq_cap` | Event queue capability (Post rights) the fault notification is posted to |
-| 2 | `correlator` | Caller-chosen `u32` routing tag |
+| 2 | `correlator` | Caller-chosen `u64` routing tag, delivered unchanged as the tag word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the space has
 already terminal-faulted, the retained reason is delivered immediately and the call
@@ -2238,8 +2261,13 @@ Object Reference Counting).
 
 **Capability requirements:** `aspace_cap` (Control), `eventq_cap` (Post).
 
+**Observer nodes:** each live binding holds one death-observer node of `eventq_cap`'s pool
+(§ `SYS_CAP_CREATE_EVENT_Q` (9), argument 2) until the address space is destroyed; a bind onto an
+already-faulted space takes none.
+
 **Errors:** `InvalidCapability`, `InsufficientRights` (address space lacks Control or
-event queue lacks Post), `OutOfMemory` (the address space's observer array is full).
+event queue lacks Post), `OutOfMemory` (the event queue has no free observer node),
+`QuotaExceeded` (the event queue's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -2474,9 +2502,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
-  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first, or a timed wait
-  or sleep that found the kernel's sleep list full withdrew itself first (it then reports its
-  timeout or `OutOfMemory`). `SYS_IPC_CALL` and
+  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
   `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
@@ -2495,7 +2521,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
-| `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
+| `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
 | `BOOT_PROTOCOL_VERSION` | 14 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

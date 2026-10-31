@@ -5,8 +5,8 @@
 
 //! Wait set — multiplexed blocking on multiple IPC sources.
 //!
-//! A wait set aggregates up to `WAIT_SET_MAX_MEMBERS` IPC sources (endpoints,
-//! notifications, event queues). A caller blocks on the wait set and is woken when
+//! A wait set aggregates up to its creator-chosen capacity of IPC sources
+//! (endpoints, notifications, event queues). A caller blocks on the wait set and is woken when
 //! any member becomes ready. The caller receives the opaque `badge` it chose
 //! at `sys_wait_set_add` time, then reads from the source normally.
 //!
@@ -36,22 +36,24 @@
 //! Every operation serialises on the set's own `lock`; a notifying source's
 //! lock is outer to it (see [`WaitSetState::lock`]).
 //!
-//! # Extending member capacity
-//! The arrays are sized by `WAIT_SET_MAX_MEMBERS`, which must fit in a u8
-//! index. A larger value must keep `WaitSetState` within the budget
-//! `cap::retype::dispatch_for(WaitSet)` declares (asserted below), or move
-//! the object to a larger retype bin.
+//! # Member capacity
+//! The caller sizes the set at `SYS_CAP_CREATE_WAIT_SET` (`1..=
+//! WAIT_SET_MAX_MEMBERS`) and pays for it: the member array and the ready
+//! ring live inline after [`WaitSetState`] in the set's retype slot
+//! (`cap::retype::wait_set_dispatch`), as an `EventQueue`'s ring does.
 
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
-/// Maximum number of sources a wait set can monitor simultaneously.
-/// Must be ≤ 255 (`member_idx` is u8). Both procmgr and svcmgr
-/// multiplex per-child death notifications onto a single shared
-/// `EventQueue` (correlator-routed in payload), so wait-set width is
-/// bounded by the number of distinct sources, not the number of
-/// monitored entities. The current ceiling is the IPC service
-/// endpoint plus a handful of `EventQueue`s.
-pub const WAIT_SET_MAX_MEMBERS: usize = 16;
+/// Largest member capacity a wait set can be created with; the ABI's
+/// `WAIT_SET_MAX_MEMBERS`. The set is caller-funded, so the ceiling protects
+/// no shared pool. It bounds the level-readiness walk `waitset_wait` makes
+/// over every member under the set's lock, with interrupts off. A server with
+/// more sources splits them across sets and waiting threads.
+pub const WAIT_SET_MAX_MEMBERS: usize = syscall::WAIT_SET_MAX_MEMBERS as usize;
+
+// A member index travels as a `u16` (`wait_set_member_idx` on every source,
+// the ready ring's entries), and the ring holds `capacity + 1` of them.
+const _: () = assert!(WAIT_SET_MAX_MEMBERS < u16::MAX as usize);
 
 // ── Member tag ────────────────────────────────────────────────────────────────
 
@@ -122,8 +124,7 @@ unsafe fn source_header(state_ptr: *mut u8) -> *mut crate::cap::object::KernelOb
 /// flag into the pointer keeps the struct at 24 B aligned and the
 /// member array at `N * 24` rather than `N * 32` (the size an outer
 /// `Option<WaitSetMember>` would need without a niche). This is what
-/// lets `WaitSetState` fit inside the 512 B retype bin alongside its
-/// fixed metadata.
+/// keeps the per-member debit `wait_set_retype_bytes` charges at 24 B.
 pub struct WaitSetMember
 {
     /// Raw pointer to the source's state struct (`EndpointState` / `NotificationState` /
@@ -163,17 +164,16 @@ impl WaitSetMember
 
 /// Kernel state backing a `WaitSet` capability.
 ///
-/// Sized to fit, together with the 24 B `WaitSetObject` wrapper, inside
-/// the 512 B retype bin (≈ 440 B: 16 × 24 B members, plus ready ring,
-/// waiter-queue tail, and bookkeeping). The cap-create path constructs
-/// both objects in place inside the source `Memory` cap's region;
-/// nothing else is allocated. `lock` serialises every field that changes
-/// after construction (the bare-field exception of docs/coding-standards.md
-/// § Concurrency).
+/// The member array (`capacity` entries) and the ready ring (`capacity + 1`
+/// `u16` member indices) live inline after this struct in the same retype
+/// slot, which the cap-create path sizes from the caller's capacity and
+/// constructs in place; nothing else is allocated. `lock` serialises every
+/// field that changes after construction, and the inline arrays (the
+/// bare-field exception of docs/coding-standards.md § Concurrency).
 pub struct WaitSetState
 {
     /// Per-`WaitSetState` spinlock. Serialises every mutation of the
-    /// fields below — `members`, `member_count`, `ready_ring`, `waiters`,
+    /// fields below — the members, `member_count`, the ready ring, `waiters`,
     /// and the read/write pointers. Acquired by `waitset_wait`, `waitset_notify`,
     /// `waitset_add`, `waitset_remove`, and `wait_set_drop`.
     ///
@@ -181,25 +181,28 @@ pub struct WaitSetState
     /// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 2;
     /// `wait_set_drop` clears source back-pointers before taking this lock.
     ///
-    /// Source liveness during member dispatch is now guaranteed by the
+    /// Source liveness during member dispatch is guaranteed by the
     /// membership refcount (see module docs); the lock-order discipline
     /// continues to govern back-pointer consistency and the side channels
     /// between `notification_send`/`event_queue_post`/`endpoint_call` and
     /// `waitset_notify`.
     pub lock: crate::sync::Spinlock,
-    /// Registered members. A slot with `source_ptr.is_null()` is vacant.
-    pub members: [WaitSetMember; WAIT_SET_MAX_MEMBERS],
+    /// Inline member array of `capacity` slots. A slot with
+    /// `source_ptr.is_null()` is vacant. Fixed at construction.
+    members: *mut WaitSetMember,
+    /// Inline circular buffer of `capacity + 1` pending member indices; one
+    /// slot stays empty to tell full from empty, so it holds up to `capacity`
+    /// entries. Stale entries (after removal) are silently skipped during pop.
+    /// Fixed at construction.
+    ready_ring: *mut u16,
+    /// Member capacity, chosen by the creator. Fixed at construction.
+    capacity: u16,
     /// Number of occupied member slots.
-    pub member_count: u8,
-    /// Circular buffer of pending member indices.
-    ///
-    /// Entries are member indices `[0, WAIT_SET_MAX_MEMBERS)`. Stale entries
-    /// (after removal) are silently skipped during pop.
-    pub ready_ring: [u8; WAIT_SET_MAX_MEMBERS],
-    /// Read pointer into `ready_ring` (next index to pop).
-    pub ready_head: u8,
-    /// Write pointer into `ready_ring` (next index to push).
-    pub ready_tail: u8,
+    member_count: u16,
+    /// Read pointer into the ready ring (next index to pop).
+    ready_head: u16,
+    /// Write pointer into the ready ring (next index to push).
+    ready_tail: u16,
     /// The thread blocked on `sys_wait_set_wait`, if any. At most one: a wait
     /// while another thread waits is refused (`WaitSetPending::Occupied`).
     /// Held as a [`WaitQueue`](crate::ipc::WaitQueue) so its claims share the
@@ -207,35 +210,79 @@ pub struct WaitSetState
     pub waiters: crate::ipc::WaitQueue,
 }
 
-// SAFETY: WaitSetState is internally synchronised by `WaitSetState.lock`.
+// SAFETY: WaitSetState is internally synchronised by `WaitSetState.lock`; the
+// inline arrays it points at belong to the same retype slot.
 unsafe impl Send for WaitSetState {}
 // SAFETY: WaitSetState is internally synchronised by `WaitSetState.lock`.
 unsafe impl Sync for WaitSetState {}
 
-// Hold the niche-packing invariant: a WaitSetMember must remain 24 B
-// (3 × usize) so the 16-slot member array is 384 B and the full state
-// fits, with the 24 B WaitSetObject wrapper, in the 512 B retype bin.
-// `cap::retype::dispatch_for(WaitSet)` declares 24 + 440 raw bytes;
-// regressions here must be matched there or rerouted to a larger bin.
+// A WaitSetMember stays 24 B (3 × usize; the vacancy flag folds into the
+// pointer), which the ABI's `wait_set_retype_bytes` charges per member, and
+// the state is the size `cap::retype::WAIT_SET_STATE_BYTES` declares; both are
+// pinned against the ABI formula in core/kernel/src/cap/retype.rs.
 const _: () = {
     assert!(core::mem::size_of::<WaitSetMember>() == 24);
-    assert!(core::mem::size_of::<WaitSetState>() <= 440);
+    assert!(
+        core::mem::size_of::<WaitSetState>() as u64 == crate::cap::retype::WAIT_SET_STATE_BYTES
+    );
 };
 
 impl WaitSetState
 {
-    /// Create a new, empty wait set with no members and no waiter.
-    pub fn new() -> Self
+    /// Create a new, empty wait set of `capacity` members over the inline
+    /// arrays at `members` and `ready_ring`, initialising both.
+    ///
+    /// # Safety
+    /// `capacity` is in `1..=WAIT_SET_MAX_MEMBERS`. `members` must point to
+    /// writable, 8-byte-aligned memory for `capacity` `WaitSetMember`s and
+    /// `ready_ring` to writable memory for `capacity + 1` `u16`s, both inside
+    /// the set's retype slot, unaliased, and outliving the state.
+    pub unsafe fn new(capacity: u16, members: *mut WaitSetMember, ready_ring: *mut u16) -> Self
     {
+        for i in 0..usize::from(capacity)
+        {
+            // SAFETY: i < capacity; the slot lies in the array (contract).
+            unsafe { core::ptr::write(members.add(i), WaitSetMember::vacant()) };
+        }
+        // SAFETY: the ring has capacity + 1 u16 slots (contract).
+        unsafe { core::ptr::write_bytes(ready_ring, 0, usize::from(capacity) + 1) };
         Self {
             lock: crate::sync::Spinlock::new(),
-            members: [const { WaitSetMember::vacant() }; WAIT_SET_MAX_MEMBERS],
+            members,
+            ready_ring,
+            capacity,
             member_count: 0,
-            ready_ring: [0u8; WAIT_SET_MAX_MEMBERS],
             ready_head: 0,
             ready_tail: 0,
             waiters: crate::ipc::WaitQueue::new(),
         }
+    }
+
+    /// Member capacity the set was created with.
+    pub fn capacity(&self) -> u16
+    {
+        self.capacity
+    }
+
+    /// The inline member array.
+    fn members(&self) -> &[WaitSetMember]
+    {
+        // SAFETY: members points at `capacity` initialised slots that live as
+        // long as the state (`new`'s contract); `&self` excludes a writer.
+        unsafe { core::slice::from_raw_parts(self.members, usize::from(self.capacity)) }
+    }
+
+    /// The inline member array, mutably.
+    fn members_mut(&mut self) -> &mut [WaitSetMember]
+    {
+        // SAFETY: as `members`; `&mut self` makes the borrow exclusive.
+        unsafe { core::slice::from_raw_parts_mut(self.members, usize::from(self.capacity)) }
+    }
+
+    /// Ring length: `capacity + 1` slots.
+    fn ring_len(&self) -> u16
+    {
+        self.capacity + 1
     }
 
     /// Return true if the ready ring has pending entries.
@@ -247,18 +294,17 @@ impl WaitSetState
 
     /// Push `member_idx` onto the ready ring.
     ///
-    /// A push to a full ring (`WAIT_SET_MAX_MEMBERS - 1` pending entries) is
-    /// dropped; the lost edge is recovered by `waitset_wait`'s level-readiness
-    /// walk, per core/kernel/docs/ipc-internals.md § Multiple Ready Sources.
+    /// A push to a full ring (`capacity` pending entries) is dropped; the lost
+    /// edge is recovered by `waitset_wait`'s level-readiness walk, per
+    /// core/kernel/docs/ipc-internals.md § Multiple Ready Sources.
     #[inline]
-    fn push_ready(&mut self, member_idx: u8)
+    fn push_ready(&mut self, member_idx: u16)
     {
-        // cast_possible_truncation: WAIT_SET_MAX_MEMBERS (16) fits in u8.
-        #[allow(clippy::cast_possible_truncation)]
-        let next = (self.ready_tail + 1) % WAIT_SET_MAX_MEMBERS as u8;
+        let next = (self.ready_tail + 1) % self.ring_len();
         if next != self.ready_head
         {
-            self.ready_ring[self.ready_tail as usize] = member_idx;
+            // SAFETY: ready_tail < ring_len; the ring has ring_len slots.
+            unsafe { *self.ready_ring.add(usize::from(self.ready_tail)) = member_idx };
             self.ready_tail = next;
         }
     }
@@ -271,12 +317,10 @@ impl WaitSetState
     {
         while self.has_ready()
         {
-            let idx = self.ready_ring[self.ready_head as usize] as usize;
-            // cast_possible_truncation: WAIT_SET_MAX_MEMBERS (16) fits in u8.
-            #[allow(clippy::cast_possible_truncation)]
-            let next = (self.ready_head + 1) % WAIT_SET_MAX_MEMBERS as u8;
-            self.ready_head = next;
-            let m = &self.members[idx];
+            // SAFETY: ready_head < ring_len; the ring has ring_len slots.
+            let idx = usize::from(unsafe { *self.ready_ring.add(usize::from(self.ready_head)) });
+            self.ready_head = (self.ready_head + 1) % self.ring_len();
+            let m = &self.members()[idx];
             if m.is_occupied()
             {
                 return Some(m.badge);
@@ -304,7 +348,7 @@ impl WaitSetState
 /// source's lock is expected to already be held by the caller (see the
 /// lock-ordering note on [`WaitSetState::lock`]).
 #[cfg(not(test))]
-pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
+pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
 {
     // SAFETY: caller guarantees ws_opaque is a valid *mut WaitSetState.
     // cast_ptr_alignment: WaitSetState lives 24 B (the WaitSetObject wrapper)
@@ -327,7 +371,7 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     // Snapshot under ws.lock, release, then enqueue_and_wake — see
     // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
     let badge = {
-        let m = &ws.members[member_idx as usize];
+        let m = &ws.members()[usize::from(member_idx)];
         if m.is_occupied() { m.badge } else { 0 }
     };
     // Claim the head waiter for wake before releasing ws.lock; dealloc's
@@ -405,9 +449,9 @@ pub unsafe fn waitset_wait(
     // Level-state self-heal: return the first member whose source is
     // level-ready now; see core/kernel/docs/ipc-internals.md § Wait Path
     // (Wait Set) step 3.
-    for idx in 0..ws.members.len()
+    for idx in 0..usize::from(ws.capacity)
     {
-        let m = &ws.members[idx];
+        let m = &ws.members()[idx];
         if !m.is_occupied()
         {
             continue;
@@ -494,7 +538,7 @@ pub unsafe fn waitset_add(
     source_ptr: *mut u8,
     source_tag: WaitSetSourceTag,
     badge: u64,
-) -> Result<u8, ()>
+) -> Result<u16, ()>
 {
     // SAFETY: ws valid for &mut access for the duration; cap pins it.
     let ws = unsafe { &mut *ws };
@@ -503,14 +547,14 @@ pub unsafe fn waitset_add(
     let saved = unsafe { ws.lock.lock_raw() };
 
     // Find a free slot.
-    let Some(idx) = ws.members.iter().position(|m| !m.is_occupied())
+    let Some(idx) = ws.members().iter().position(|m| !m.is_occupied())
     else
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
         return Err(());
     };
-    ws.members[idx] = WaitSetMember {
+    ws.members_mut()[idx] = WaitSetMember {
         source_ptr,
         source_tag,
         badge,
@@ -523,9 +567,9 @@ pub unsafe fn waitset_add(
     let mut deferred_wake: Option<(*mut ThreadControlBlock, usize)> = None;
     if already_ready
     {
-        // cast_possible_truncation: WAIT_SET_MAX_MEMBERS = 16; idx fits in u8.
+        // cast_possible_truncation: idx < capacity, a u16.
         #[allow(clippy::cast_possible_truncation)]
-        ws.push_ready(idx as u8);
+        ws.push_ready(idx as u16);
         // Snapshot the wake; enqueue_and_wake runs after unlock per
         // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
         if !ws.waiters.is_empty()
@@ -548,9 +592,9 @@ pub unsafe fn waitset_add(
         unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
     }
 
-    // cast_possible_truncation: idx < WAIT_SET_MAX_MEMBERS = 16.
+    // cast_possible_truncation: idx < capacity, a u16.
     #[allow(clippy::cast_possible_truncation)]
-    Ok(idx as u8)
+    Ok(idx as u16)
 }
 
 /// Remove a source from the wait set by its raw state pointer.
@@ -574,7 +618,7 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
     let saved = unsafe { ws.lock.lock_raw() };
 
     let Some(idx) = ws
-        .members
+        .members()
         .iter()
         .position(|m| m.is_occupied() && m.source_ptr == source_ptr)
     else
@@ -584,7 +628,7 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
         return Err(());
     };
 
-    ws.members[idx] = WaitSetMember::vacant();
+    ws.members_mut()[idx] = WaitSetMember::vacant();
     ws.member_count -= 1;
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
@@ -595,14 +639,13 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 ///
 /// Clears back-pointers on all registered sources so they stop notifying,
 /// then `dec_ref`s the +1 cap-level reference that wait-set membership held
-/// on each source. Finally wakes every blocked waiter with its park stamped
-/// `PARK_DISPOSITION_INTERRUPTED`.
+/// on each source, handing each source whose count reaches 0 (the member's
+/// +1 was the last cap-level reference) to `on_zero`. Finally wakes every
+/// blocked waiter with its park stamped `PARK_DISPOSITION_INTERRUPTED`.
 ///
-/// Returns the set of source headers whose `dec_ref` returned 0 (i.e. the
-/// member's +1 was the last cap-level reference). The caller — the `WaitSet`
-/// arm of `cap::object::dealloc_object_one` — pushes each of these onto
-/// the dealloc cascade worklist. Returned in the same slot ordering as
-/// `WaitSetState::members`; vacant entries are `None`.
+/// The caller — the `WaitSet` arm of `cap::object::dealloc_object_one` —
+/// reclaims each source `on_zero` receives. `on_zero` runs with no lock held,
+/// once per zeroed source, in member order.
 ///
 /// # Safety
 /// `ws` must be a valid pointer. After this call `ws` itself is NOT freed —
@@ -614,63 +657,51 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 /// members under `ws.lock` while taking source locks would invert that
 /// order. By clearing back-pointers first we guarantee no future
 /// `waitset_notify` call references this ws; we then take `ws.lock` only
-/// to wake the blocked waiters. The `dec_ref` calls happen after
-/// `clear_source_backpointer` returns, so they do not hold any source IPC
-/// lock — required because a `dec_ref` that drops the refcount to zero
-/// reports back to the cascade worklist (the actual reclaim happens
-/// outside this function, after `wait_set_drop` returns).
+/// to wake the blocked waiters. The `dec_ref` calls, and `on_zero`, happen
+/// after `clear_source_backpointer` returns, so they hold no source IPC
+/// lock.
 #[cfg(not(test))]
 pub unsafe fn wait_set_drop(
     ws: *mut WaitSetState,
-) -> [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>; WAIT_SET_MAX_MEMBERS]
+    mut on_zero: impl FnMut(core::ptr::NonNull<crate::cap::object::KernelObjectHeader>),
+)
 {
     // SAFETY: ws valid for &mut access for the duration; the caller is
     // dealloc_object on a refcount==0 cap, no other syscall path can hold
     // ws_state at this point.
     let ws_ref = unsafe { &mut *ws };
 
-    // Snapshot the occupied members without ws.lock: the back-pointer clears
+    // Walk the occupied members without ws.lock: the back-pointer clears
     // below take each source's lock, and holding ws.lock across them would
     // invert the source.lock → ws.lock order. Once cleared, no concurrent
     // notification_send / event_queue_post / endpoint_call can reach
-    // waitset_notify for this wait set.
-    let mut snap: [Option<(*mut u8, WaitSetSourceTag)>; WAIT_SET_MAX_MEMBERS] =
-        [None; WAIT_SET_MAX_MEMBERS];
-    for (i, slot) in ws_ref.members.iter().enumerate()
+    // waitset_notify for this wait set; nothing else writes the members of a
+    // set whose refcount is 0.
+    for idx in 0..usize::from(ws_ref.capacity)
     {
-        if slot.is_occupied()
-        {
-            snap[i] = Some((slot.source_ptr, slot.source_tag));
-        }
-    }
-
-    // Drop the +1 cap-level ref each membership held on its source. A
-    // source whose refcount reaches 0 here is returned to the caller for
-    // cascade-reclaim (the wait-set was the source's last referent).
-    let mut zeroed: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
-        WAIT_SET_MAX_MEMBERS] = [None; WAIT_SET_MAX_MEMBERS];
-    for (i, entry) in snap.iter().enumerate()
-    {
-        let Some((source_ptr, source_tag)) = *entry
-        else
+        let slot = &ws_ref.members()[idx];
+        if !slot.is_occupied()
         {
             continue;
-        };
+        }
+        let (source_ptr, source_tag) = (slot.source_ptr, slot.source_tag);
         // SAFETY: source_ptr is a valid pointer to the source's state
         // struct; clear_source_backpointer takes the source's own lock.
         unsafe { clear_source_backpointer(source_ptr, source_tag) };
 
+        // Drop the +1 cap-level ref the membership held on its source. A
+        // source whose refcount reaches 0 here goes to `on_zero` (the wait set
+        // was its last referent).
         // SAFETY: source is retype-backed (production invariant — see
         // source_header docstring); header sits at `source_ptr - 24`.
         let header_ptr = unsafe { source_header(source_ptr) };
         // SAFETY: header_ptr points to the wrapper's KernelObjectHeader,
         // pinned alive by the +1 ref we are now releasing.
-        let new_rc = unsafe { (*header_ptr).dec_ref() };
-        if new_rc == 0
+        if unsafe { (*header_ptr).dec_ref() } == 0
         {
             // SAFETY: header_ptr is non-null (computed from a non-null
-            // state_ptr); refcount reached 0 — caller cascades reclaim.
-            zeroed[i] = Some(unsafe { core::ptr::NonNull::new_unchecked(header_ptr) });
+            // state_ptr); refcount reached 0.
+            on_zero(unsafe { core::ptr::NonNull::new_unchecked(header_ptr) });
         }
     }
 
@@ -681,15 +712,13 @@ pub unsafe fn wait_set_drop(
     let saved = unsafe { ws_ref.lock.lock_raw() };
     // SAFETY: ws.lock held; no scheduler or sleep-list lock held.
     unsafe { crate::ipc::interrupt_all_waiters(&mut ws_ref.waiters) };
-    for slot in &mut ws_ref.members
+    for slot in ws_ref.members_mut()
     {
         *slot = WaitSetMember::vacant();
     }
     ws_ref.member_count = 0;
     // SAFETY: paired with lock_raw above.
     unsafe { ws_ref.lock.unlock_raw(saved) };
-
-    zeroed
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -788,5 +817,114 @@ unsafe fn clear_source_backpointer(source_ptr: *mut u8, tag: WaitSetSourceTag)
                 (*eq).lock.unlock_raw(saved);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A set of `CAP` members over local arrays, every member occupied with
+    /// badge `100 + index`. The source pointers are never dereferenced by the
+    /// ring operations under test.
+    struct Fixture<const CAP: usize, const RING: usize>
+    {
+        members: [WaitSetMember; CAP],
+        ring: [u16; RING],
+    }
+
+    impl<const CAP: usize, const RING: usize> Fixture<CAP, RING>
+    {
+        fn new() -> Self
+        {
+            // The ring holds capacity + 1 slots, as `WaitSetState::new` requires.
+            const { assert!(RING == CAP + 1) };
+            Self {
+                members: [const { WaitSetMember::vacant() }; CAP],
+                ring: [0; RING],
+            }
+        }
+
+        fn set(&mut self) -> WaitSetState
+        {
+            // SAFETY: the arrays hold CAP members and CAP + 1 ring slots and
+            // outlive the state within each test.
+            let mut ws = unsafe {
+                WaitSetState::new(
+                    CAP as u16,
+                    self.members.as_mut_ptr(),
+                    self.ring.as_mut_ptr(),
+                )
+            };
+            for (i, m) in ws.members_mut().iter_mut().enumerate()
+            {
+                *m = WaitSetMember {
+                    source_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                    source_tag: WaitSetSourceTag::Notification,
+                    badge: 100 + i as u64,
+                };
+            }
+            ws
+        }
+    }
+
+    // Defect guarded: a ring that holds one entry fewer than its capacity, or
+    // overwrites at full, or loses order across the wrap, drops or reorders
+    // ready members of a caller-sized set.
+    #[test]
+    fn ring_holds_capacity_entries_drops_the_next_and_pops_in_order_across_the_wrap()
+    {
+        let mut fx = Fixture::<3, 4>::new();
+        let mut ws = fx.set();
+        for idx in [0, 1, 2]
+        {
+            ws.push_ready(idx);
+        }
+        ws.push_ready(0);
+        assert_eq!(ws.pop_ready(), Some(100));
+        assert_eq!(ws.pop_ready(), Some(101));
+        assert_eq!(ws.pop_ready(), Some(102));
+        assert_eq!(ws.pop_ready(), None);
+        // The indices now wrap past the ring's end.
+        ws.push_ready(2);
+        ws.push_ready(0);
+        ws.push_ready(1);
+        assert_eq!(ws.pop_ready(), Some(102));
+        assert_eq!(ws.pop_ready(), Some(100));
+        assert_eq!(ws.pop_ready(), Some(101));
+        assert_eq!(ws.pop_ready(), None);
+    }
+
+    // Defect guarded: a pop that returned a removed member's badge would wake
+    // the waiter for a source no longer in the set.
+    #[test]
+    fn pop_skips_entries_of_removed_members()
+    {
+        let mut fx = Fixture::<2, 3>::new();
+        let mut ws = fx.set();
+        ws.push_ready(0);
+        ws.push_ready(1);
+        ws.members_mut()[0] = WaitSetMember::vacant();
+        assert_eq!(ws.pop_ready(), Some(101));
+        assert_eq!(ws.pop_ready(), None);
+    }
+
+    // Defect guarded: a set constructed with leftover member contents would
+    // report phantom members before any add.
+    #[test]
+    fn a_new_set_has_every_member_vacant_and_nothing_ready()
+    {
+        let mut stale = [const { WaitSetMember::vacant() }; 4];
+        for m in &mut stale
+        {
+            m.source_ptr = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        }
+        let mut ring = [9u16; 5];
+        // SAFETY: the arrays hold 4 members and 5 ring slots and outlive ws.
+        let mut ws = unsafe { WaitSetState::new(4, stale.as_mut_ptr(), ring.as_mut_ptr()) };
+        assert!(ws.members().iter().all(|m| !m.is_occupied()));
+        assert_eq!(ws.pop_ready(), None);
+        assert_eq!(ws.capacity(), 4);
     }
 }

@@ -137,8 +137,10 @@ not how many times or in what order.
 
 ### Event Queues
 
-An event queue is a fixed-capacity ring buffer. Each entry carries a word-sized payload.
-The capacity is chosen at creation time and does not change.
+An event queue is a fixed-capacity ring buffer. Each entry carries two words, a payload and a
+tag; a death notification carries the exit reason and the observer's correlator. The capacity is
+chosen at creation time and does not change, and so is the queue's pool of death-observer nodes,
+one per thread or address space that may bind the queue as its death observer.
 
 **Delivery:** The sender appends an entry to the ring. If the ring is full, the send
 returns an error — it is the sender's responsibility to handle backpressure. Delivery
@@ -162,12 +164,12 @@ cause correctness problems.
 
 ## Waiting on Multiple Sources
 
-A **wait set** aggregates any combination of endpoints, notifications, and event queues.
-A thread waits on the set and is woken when any member becomes ready; the result
-identifies which source triggered the wake. A wait set takes one waiting thread at a time: a
-second thread's wait on the same set is refused with `InvalidState`. Destroying the set wakes
-its waiter with `Interrupted`. See
-[syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
+A **wait set** aggregates any combination of endpoints, notifications, and event queues, up to the
+member capacity its creator chose and paid for. A thread waits on the set and is woken when any
+member becomes ready; the result identifies which source triggered the wake. A wait set takes one
+waiting thread at a time: a second thread's wait on the same set is refused with `InvalidState`.
+Destroying the set wakes its waiter with `Interrupted`. See [syscalls.md §
+`SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
 
 ---
 

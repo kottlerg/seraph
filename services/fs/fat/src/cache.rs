@@ -59,7 +59,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
 use std::sync::{Mutex, OnceLock, PoisonError};
-use syscall_abi::{CAP_INFO_MEMORY_MAPPINGS, MAP_WRITABLE, PAGE_SIZE};
+use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bpb::SECTOR_SIZE;
 
@@ -542,7 +542,7 @@ impl PageCache
             return false;
         }
         // An unreadable count is treated as still mapped.
-        if syscall::cap_info(cap, CAP_INFO_MEMORY_MAPPINGS) == Ok(1)
+        if syscall::cap_info_memory_mappings(cap, 0, 1) == Ok(1)
         {
             slot.exposed.store(false, Ordering::Release);
             return true;
@@ -689,7 +689,7 @@ impl Quarantine
         while i < self.held.len()
         {
             if syscall::cap_revoke_all(self.held[i]).is_ok()
-                && syscall::cap_info(self.held[i], CAP_INFO_MEMORY_MAPPINGS) == Ok(0)
+                && syscall::cap_info_memory_mappings(self.held[i], 0, 1) == Ok(0)
             {
                 let cap = self.held.swap_remove(i);
                 self.spare.push(cap);

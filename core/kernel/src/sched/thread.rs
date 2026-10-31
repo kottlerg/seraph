@@ -19,7 +19,7 @@
 //! - `ipc_buffer`: virtual address of the per-thread IPC buffer page (0 = none).
 //! - `wakeup_value`: value deposited by the waker that claims this thread's IPC
 //!   wait (notification bits, event payload, wait-set badge, or 0 for a timeout
-//!   or drain).
+//!   or drain); `wakeup_tag` carries an event entry's second word beside it.
 //!
 //! Each field that is neither atomic nor a lock names its owner in its rustdoc,
 //! as the bare-field exception of docs/coding-standards.md § Concurrency
@@ -30,56 +30,157 @@ use crate::arch::current::context::SavedState;
 
 // ── Death notification observers ─────────────────────────────────────────────
 
-/// Maximum number of independent death observers a single thread may have.
+/// One death-observer node: an event queue, a caller-chosen correlator, and
+/// the link that chains it into its owner's observer list
+/// ([`DeathObserverChain`]).
 ///
-/// A child thread can in practice be watched by: (1) procmgr for auto-reap,
-/// (2) svcmgr for service-restart policy, (3) the spawner's
-/// `std::process::Child::wait`. Three is the realistic upper bound. Four
-/// gives headroom for a future terminal / session manager binding without
-/// needing dynamic allocation per TCB.
-pub const MAX_DEATH_OBSERVERS: usize = 4;
-
-/// A single registered death observer: an event queue plus a caller-chosen
-/// correlator. See `ThreadControlBlock::death_observers`.
-///
-/// A populated observer owns one reference on its `EventQueueObject`, taken at
-/// bind under the owner's lock and released by the owner's teardown (the
-/// `dealloc_object` Thread and `AddressSpace` arms), so the queue outlives
-/// every post through the binding however its capabilities are deleted
+/// Nodes are funded by the queue that receives the posts: an `EventQueue`
+/// created with an observer count carries that many nodes inline in its
+/// retype slot, on a free list under its lock
+/// (`ipc::event_queue::event_queue_take_observer`). A bind takes one and links
+/// it into the thread's or address space's chain; the owner's teardown (the
+/// `dealloc_object` Thread and `AddressSpace` arms) returns it. A linked node
+/// owns one reference on its `EventQueueObject`, taken at bind and released by
+/// that teardown, so the queue, and the node inside it, outlive every post
+/// through the binding however the queue's capabilities are deleted
 /// (core/kernel/docs/capability-internals.md § Kernel Object Reference
 /// Counting).
-#[derive(Clone, Copy)]
+///
+/// `next` and `correlator` are bare fields owned by the lock of the list
+/// holding the node: the queue's `lock` while the node is on its free list,
+/// the owner thread's `sched_lock` or the owner address space's `death_lock`
+/// while it is bound (the bare-field exception of docs/coding-standards.md
+/// § Concurrency; core/kernel/docs/ipc-internals.md § Event Queue). A death
+/// walk reads a bound node's fields without the lock, after reading the chain
+/// head under it, because a linked node is never rewritten until the owner's
+/// teardown takes the chain. `eq` is fixed at the queue's creation.
 pub struct DeathObserver
 {
-    /// Target event queue object. `null` means this slot is unused.
+    /// Next node in the owner's chain, or in the queue's free list; null at
+    /// the end. Owned by the lock of the list holding the node (see above).
+    pub next: *mut DeathObserver,
+    /// The event queue object this node belongs to and posts to. Fixed at the
+    /// queue's creation.
     pub eq: *mut crate::cap::object::EventQueueObject,
-    /// Caller-chosen routing tag. Delivered as the upper 32 bits of the
-    /// posted payload. Opaque to the kernel.
-    pub correlator: u32,
+    /// Caller-chosen routing tag, set at bind under the owner's lock and reset
+    /// on return under the queue's (see above). Delivered as the tag word of
+    /// the posted death entry. Opaque to the kernel.
+    pub correlator: u64,
 }
 
-impl DeathObserver
-{
-    /// An unused observer slot: null queue, zero correlator.
-    pub const fn empty() -> Self
-    {
-        Self {
-            eq: core::ptr::null_mut(),
-            correlator: 0,
-        }
-    }
-}
-
-// SAFETY: `DeathObserver` is a plain (pointer, correlator) pair. The arrays
-// holding it are read and written only under their owner's lock (the thread's
-// `sched_lock` for `ThreadControlBlock::death_observers`, the address space's
-// `death_lock` for `AddressSpace::death_observers`), or by the owner's
-// teardown once nothing else reaches the owner; `eq` is dereferenced only by
-// `post_one_death_event`, on a snapshot taken under that lock, while the
-// observer's own reference keeps the queue live.
+// SAFETY: a node is a (link, queue, correlator) triple. It is written only on
+// no list or under the lock of the list holding it (the queue's `lock` on its
+// free list, the thread's `sched_lock` or the address space's `death_lock` on
+// an owner chain), and read by a death walk only after the owner's lock
+// published it; `eq` is dereferenced only while the node's reference keeps
+// the queue live.
 unsafe impl Send for DeathObserver {}
 // SAFETY: same rationale as `Send`.
 unsafe impl Sync for DeathObserver {}
+
+/// An owner's list of bound death observers, linked through
+/// [`DeathObserver::next`]. Binds push at the head; a death walk reads the
+/// head under the owner's lock and then follows links without it, which is
+/// sound because a linked node's `next` never changes until the owner's
+/// teardown takes the whole chain.
+pub struct DeathObserverChain
+{
+    head: *mut DeathObserver,
+}
+
+// SAFETY: the chain is a single head pointer owned by the owner's lock (see
+// `DeathObserver`).
+unsafe impl Send for DeathObserverChain {}
+// SAFETY: same rationale as `Send`.
+unsafe impl Sync for DeathObserverChain {}
+
+impl DeathObserverChain
+{
+    /// An empty chain.
+    pub const fn new() -> Self
+    {
+        Self {
+            head: core::ptr::null_mut(),
+        }
+    }
+
+    /// Link `node` at the head.
+    ///
+    /// # Safety
+    /// `node` must be valid, on no list, and outlive its membership; the
+    /// caller holds the owner's lock.
+    pub unsafe fn push(&mut self, node: *mut DeathObserver)
+    {
+        // SAFETY: node valid and unlinked (contract).
+        unsafe { (*node).next = self.head };
+        self.head = node;
+    }
+
+    /// The first node, or null when empty. The caller follows `next` links
+    /// from it.
+    pub fn first(&self) -> *mut DeathObserver
+    {
+        self.head
+    }
+
+    /// Empty the chain, returning its former first node; the caller owns
+    /// every node reachable from it.
+    pub fn take(&mut self) -> *mut DeathObserver
+    {
+        core::mem::replace(&mut self.head, core::ptr::null_mut())
+    }
+}
+
+/// Call `f` on each node of the chain starting at `first`, reading each
+/// node's `next` before `f` runs so `f` may relink the node.
+///
+/// # Safety
+/// Every node reachable from `first` must be valid until `f` returns for it,
+/// and no other path may change their links during the walk.
+pub unsafe fn for_each_observer(first: *mut DeathObserver, mut f: impl FnMut(*mut DeathObserver))
+{
+    let mut node = first;
+    while !node.is_null()
+    {
+        // SAFETY: node valid (contract); next is read before f may relink it.
+        let next = unsafe { (*node).next };
+        f(node);
+        node = next;
+    }
+}
+
+// ── Sleep-list expiry snapshot ────────────────────────────────────────────────
+
+/// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at the timer pop
+/// and linked into that pop's batch (`ThreadControlBlock::sleep_expiry`). The
+/// claim loop dispatches off this snapshot rather than the TCB's live binding,
+/// which may have changed since the pop. The timed IPC arms read the TCB's
+/// wait-queue tag and `park_seq` under the snapshotted source's lock; the TCB
+/// stays allocated because `dealloc_object(Thread)` waits in
+/// `sched::sleep_wakeups_quiesce` for the batch to end before the free.
+#[derive(Clone, Copy)]
+pub struct SleepExpiry
+{
+    /// Next TCB of the batch, or null at its end.
+    pub next: *mut ThreadControlBlock,
+    /// The popped park's binding: its IPC state.
+    pub ipc_state: IpcThreadState,
+    /// The popped park's binding: the source it is parked on, or null.
+    pub blocked_on: *mut u8,
+    /// `park_seq` of the popped park: a timed-wait claim requires it unchanged.
+    pub park_seq: u32,
+}
+
+impl SleepExpiry
+{
+    /// No snapshot.
+    pub const EMPTY: Self = Self {
+        next: core::ptr::null_mut(),
+        ipc_state: IpcThreadState::None,
+        blocked_on: core::ptr::null_mut(),
+        park_seq: 0,
+    };
+}
 
 // ── ExtendedState ─────────────────────────────────────────────────────────────
 
@@ -766,6 +867,15 @@ pub struct ThreadControlBlock
     /// exception of docs/coding-standards.md § Concurrency).
     pub wakeup_value: u64,
 
+    /// Second word of an event-queue entry delivered with the wake: the tag
+    /// word `event_queue_post` writes beside `claim_waiter`'s `wakeup_value`
+    /// when it hands an entry straight to a blocked receiver (a death event's
+    /// correlator). Owned by the source lock, as `wakeup_value` is; the
+    /// resuming `sys_event_recv` reads and then clears it with no lock, before
+    /// the thread can park again (the bare-field exception of
+    /// docs/coding-standards.md § Concurrency).
+    pub wakeup_tag: u64,
+
     /// Out-of-band timeout marker. True iff the most recent wake came from
     /// the sleep-list timer arm in `sleep_check_wakeups`. Owned by the source
     /// lock: the timer claim sets it under `eq.lock`; the resuming syscall
@@ -858,31 +968,24 @@ pub struct ThreadControlBlock
     pub wake_in_flight: core::sync::atomic::AtomicU32,
 
     // === Death notification ===
-    /// Observers to notify when this thread exits or faults.
-    ///
-    /// Each observer pairs an `EventQueueState` pointer (post target) with a
-    /// caller-chosen `correlator: u32`. On death, the kernel posts a packed
-    /// payload `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
-    /// each observer's queue. Observers past `death_observer_count` are
-    /// invalid.
+    /// Observers to notify when this thread exits or faults: a chain of
+    /// [`DeathObserver`] nodes, each drawn from the observing queue's node
+    /// pool at bind. On death, the kernel posts a two-word entry to each
+    /// node's queue: the exit reason as the payload word, the node's
+    /// correlator as the tag word.
     ///
     /// Correlator semantics: opaque to the kernel, scoped to one
     /// `(EventQueue, binder)` pair. Not a system-wide identifier, not a PID;
     /// it is whatever the binder needs to route the event to its own
-    /// bookkeeping (e.g. procmgr passes the low 32 bits of its process badge).
-    /// Passing `0` makes the payload equal to `exit_reason`.
+    /// bookkeeping (e.g. a process badge). The kernel never reads it.
     ///
     /// Multiple binders (e.g. procmgr auto-reap + svcmgr restart manager)
     /// can each install their own observer; all fire on death independently.
     ///
     /// Owned by [`sched_lock`](Self::sched_lock): `sys_thread_bind_notification`
-    /// appends under it and `post_death_notification` snapshots under it (the
-    /// Death observers row).
-    pub death_observers: [DeathObserver; MAX_DEATH_OBSERVERS],
-    /// Number of populated entries in `death_observers`
-    /// (`0..=MAX_DEATH_OBSERVERS`). Owned by [`sched_lock`](Self::sched_lock),
-    /// as `death_observers` is. A `u8` holds it: `MAX_DEATH_OBSERVERS` is 4.
-    pub death_observer_count: u8,
+    /// pushes under it and `post_death_notification` reads the head under it
+    /// (the Death observers row); the Thread teardown takes the chain.
+    pub death_observers: DeathObserverChain,
 
     /// Exit reason recorded by the kernel at the moment this thread became
     /// `Exited`, under the same all-locks hold as that commit
@@ -916,6 +1019,18 @@ pub struct ThreadControlBlock
     /// waker prechecks read it under a source lock, not that lock.
     /// See core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
     pub sleep_deadline: core::sync::atomic::AtomicU64,
+    /// This thread's node in the sleep list, the global deadline heap
+    /// (`sched::deadline_heap`); linked exactly while the thread has a
+    /// sleep-list entry. Owned by `SLEEP_LIST_LOCK`: linked by
+    /// `sleep_list_add`, unlinked by the timer pop or `sleep_list_remove`,
+    /// together with the deadline's clear.
+    pub sleep_node: crate::sched::deadline_heap::DeadlineNode,
+    /// The timer pop's snapshot of this thread's popped entry, and its link in
+    /// the pop's expired batch. Written by the pop under `SLEEP_LIST_LOCK` and
+    /// read by the same batch after it releases the lock, both on CPU0's
+    /// non-reentrant timer path; batches run one at a time, and a thread is
+    /// in at most one, so nothing else reads or writes it.
+    pub sleep_expiry: SleepExpiry,
 
     // === FPU / SIMD / Vector extended state ===
     /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /
@@ -952,3 +1067,73 @@ pub const TCB_MAGIC: u64 = 0xDEAD_BEEF_CAFE_F00D;
 // fields follows the owning lock or atomic discipline of the field's group
 // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).
 unsafe impl Send for ThreadControlBlock {}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn node(correlator: u64) -> DeathObserver
+    {
+        DeathObserver {
+            next: core::ptr::null_mut(),
+            eq: core::ptr::null_mut(),
+            correlator,
+        }
+    }
+
+    fn walk(first: *mut DeathObserver) -> Vec<u64>
+    {
+        let mut seen = Vec::new();
+        // SAFETY: every node is a live local of the calling test.
+        unsafe { for_each_observer(first, |n| seen.push((*n).correlator)) };
+        seen
+    }
+
+    // Defect guarded: a push that drops or reorders earlier nodes would lose
+    // a bound observer's death post.
+    #[test]
+    fn chain_visits_every_pushed_node_newest_first()
+    {
+        let mut nodes = [node(1), node(2), node(3)];
+        let mut chain = DeathObserverChain::new();
+        assert!(chain.first().is_null());
+        for n in &mut nodes
+        {
+            // SAFETY: n is unlinked and outlives the chain.
+            unsafe { chain.push(n) };
+        }
+        assert_eq!(walk(chain.first()), [3, 2, 1]);
+    }
+
+    // Defect guarded: a teardown that relinks each node onto a free list
+    // while walking would cut the walk short if the walk read `next` after
+    // the callback, leaking the remaining nodes and their references.
+    #[test]
+    fn take_empties_the_chain_and_a_relinking_walk_still_visits_every_node()
+    {
+        let mut nodes = [node(10), node(20), node(30)];
+        let mut chain = DeathObserverChain::new();
+        for n in &mut nodes
+        {
+            // SAFETY: n is unlinked and outlives the chain.
+            unsafe { chain.push(n) };
+        }
+        let first = chain.take();
+        assert!(chain.first().is_null());
+
+        let mut free: *mut DeathObserver = core::ptr::null_mut();
+        let mut visited = 0;
+        // SAFETY: the nodes are live locals; the callback relinks only the
+        // node it is given.
+        unsafe {
+            for_each_observer(first, |n| {
+                (*n).next = free;
+                free = n;
+                visited += 1;
+            });
+        }
+        assert_eq!(visited, 3);
+        assert_eq!(walk(free), [10, 20, 30]);
+    }
+}

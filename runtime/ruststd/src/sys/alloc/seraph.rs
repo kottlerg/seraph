@@ -975,8 +975,8 @@ pub fn slab_release_fresh(phys: u64) {
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the upcoming
 /// retype, the object wrapper plus its state (`syscall_abi::ENDPOINT_RETYPE_BYTES`,
-/// `NOTIFICATION_RETYPE_BYTES`, `WAIT_SET_RETYPE_BYTES`,
-/// `event_queue_retype_bytes(capacity)`, or a
+/// `NOTIFICATION_RETYPE_BYTES`, `wait_set_retype_bytes(capacity)`,
+/// `event_queue_retype_bytes(capacity, observers)`, or a
 /// page-granular object's byte size); it is rounded up to the kernel's size
 /// class, so the request covers the debit. `retype` is
 /// called at most once with a Memory-cap slot whose `available_bytes` covers

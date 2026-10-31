@@ -772,17 +772,20 @@ pub const ENDPOINT_RETYPE_BYTES: u64 = syscall_abi::ENDPOINT_RETYPE_BYTES;
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub const NOTIFICATION_RETYPE_BYTES: u64 = syscall_abi::NOTIFICATION_RETYPE_BYTES;
 
-/// Raw retype debit of one `WaitSet`, in bytes (`syscall_abi`'s
-/// `WAIT_SET_RETYPE_BYTES`).
-#[stable(feature = "seraph_ext", since = "1.0.0")]
-pub const WAIT_SET_RETYPE_BYTES: u64 = syscall_abi::WAIT_SET_RETYPE_BYTES;
-
-/// Raw retype debit of one `EventQueue` of `capacity` entries, in bytes
-/// (`syscall_abi`'s `event_queue_retype_bytes`).
+/// Raw retype debit of one `WaitSet` of `capacity` members, in bytes
+/// (`syscall_abi`'s `wait_set_retype_bytes`).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 #[must_use]
-pub fn event_queue_retype_bytes(capacity: u64) -> u64 {
-    syscall_abi::event_queue_retype_bytes(capacity)
+pub fn wait_set_retype_bytes(capacity: u64) -> u64 {
+    syscall_abi::wait_set_retype_bytes(capacity)
+}
+
+/// Raw retype debit of one `EventQueue` of `capacity` entries and `observers`
+/// death-observer nodes, in bytes (`syscall_abi`'s `event_queue_retype_bytes`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[must_use]
+pub fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64 {
+    syscall_abi::event_queue_retype_bytes(capacity, observers)
 }
 
 /// Retype one kernel object out of the runtime's object-slab machinery.
@@ -790,7 +793,8 @@ pub fn event_queue_retype_bytes(capacity: u64) -> u64 {
 /// `min_bytes` is the full raw debit the kernel charges for the object the
 /// caller is about to create, the object wrapper plus its state:
 /// [`ENDPOINT_RETYPE_BYTES`], [`NOTIFICATION_RETYPE_BYTES`],
-/// [`WAIT_SET_RETYPE_BYTES`], or [`event_queue_retype_bytes`]`(capacity)`, or
+/// [`wait_set_retype_bytes`]`(capacity)`, or
+/// [`event_queue_retype_bytes`]`(capacity, observers)`, or
 /// the byte size of a page-granular object. The runtime rounds it up to the
 /// kernel's size class, so the request covers the kernel's debit. `retype` is
 /// called at most once with a Memory-cap slot whose `available_bytes` covers

@@ -146,10 +146,10 @@ impl IoLayout
 }
 
 /// How long a request may take before it is treated as timed out, measured
-/// on the monotonic clock: a per-iteration wait that returns early (the
-/// kernel times a wait out at once when its sleep list is full) costs a
-/// re-poll, not part of the budget. A tuning value that bounds no capacity:
-/// it decides only when a lost request is given up on.
+/// on the monotonic clock: a per-iteration wait that returns early (a stop
+/// and restart interrupts it) costs a re-poll, not part of the budget. A
+/// tuning value that bounds no capacity: it decides only when a lost request
+/// is given up on.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Per-iteration timeout on the IRQ-notification wait, in milliseconds.

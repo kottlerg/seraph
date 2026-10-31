@@ -274,13 +274,13 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
     if syscall::thread_bind_notification(
         main_thread,
         death_eq,
-        procmgr_labels::INIT_REAP_CORRELATOR,
+        u64::from(procmgr_labels::INIT_REAP_CORRELATOR),
     )
     .is_err()
         || syscall::thread_bind_notification(
             logd_thread,
             death_eq,
-            procmgr_labels::INIT_REAP_CORRELATOR,
+            u64::from(procmgr_labels::INIT_REAP_CORRELATOR),
         )
         .is_err()
     {

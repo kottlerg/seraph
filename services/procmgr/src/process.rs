@@ -154,7 +154,8 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
     table.for_each(|entry| {
         let correlator = process_table::correlator_of(entry.badge);
-        if syscall::thread_bind_notification(entry.thread_cap, logd_eq, correlator).is_err()
+        if syscall::thread_bind_notification(entry.thread_cap, logd_eq, u64::from(correlator))
+            .is_err()
         {
             std::os::seraph::log!(
                 "install_logd_death_eq: bind failed for entry badge={} (logd will miss its death event; procmgr observer unaffected)",
@@ -1309,7 +1310,7 @@ fn finalize_creation(
     // Bind procmgr's shared death queue as an observer on the child's
     // main thread. Correlator = low 32 bits of the table badge; on death,
     // dispatch_death recovers the entry via `take_by_correlator`.
-    let correlator = process_table::correlator_of(badge);
+    let correlator = u64::from(process_table::correlator_of(badge));
     syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
 
     // Also bind procmgr's death queue as an address-space observer with the

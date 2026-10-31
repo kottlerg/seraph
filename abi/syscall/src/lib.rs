@@ -154,19 +154,37 @@ pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
 
-/// Raw retype debit of one `WaitSet`, in bytes: the 24-byte wrapper plus the
-/// kernel's declared 440-byte budget for the wait-set state, which the
-/// state's real size never exceeds.
-pub const WAIT_SET_RETYPE_BYTES: u64 = 464;
+/// Largest member capacity of a `WaitSet` (`SYS_CAP_CREATE_WAIT_SET` arg1 is
+/// in `1..=WAIT_SET_MAX_MEMBERS`).
+///
+/// The set is caller-funded ([`wait_set_retype_bytes`]), so the ceiling
+/// protects no shared pool. It bounds the level-readiness walk a wait makes
+/// over every member with interrupts off; a server with more sources splits
+/// them across sets and waiting threads, so the bound only splits work.
+pub const WAIT_SET_MAX_MEMBERS: u32 = 1024;
 
-/// Raw retype debit of one `EventQueue` of user-visible `capacity` entries, in
-/// bytes: the 24-byte wrapper, the 56-byte queue state, and `capacity + 1`
-/// eight-byte ring slots, all inline in the retype slot. `capacity` is one the
-/// kernel accepts, `1..=EVENT_QUEUE_MAX_CAPACITY`; a larger value can overflow.
+/// Raw retype debit of one `WaitSet` of `capacity` members, in bytes: the
+/// 24-byte wrapper, the 40-byte wait-set state, one 24-byte member slot per
+/// member, and the ready ring of `capacity + 1` two-byte member indices
+/// rounded up to eight bytes, all inline in the retype slot. `capacity` is
+/// one the kernel accepts, `1..=WAIT_SET_MAX_MEMBERS`.
 #[must_use]
-pub const fn event_queue_retype_bytes(capacity: u64) -> u64
+pub const fn wait_set_retype_bytes(capacity: u64) -> u64
 {
-    24 + 56 + (capacity + 1) * 8
+    24 + 40 + capacity * 24 + ((capacity + 1) * 2).div_ceil(8) * 8
+}
+
+/// Raw retype debit of one `EventQueue` of user-visible `capacity` entries and
+/// `observers` death-observer nodes, in bytes: the 24-byte wrapper, the 64-byte
+/// queue state, `capacity + 1` sixteen-byte ring slots (one two-word entry
+/// each), and one 24-byte node per observer, all inline in the retype slot.
+/// Both counts are ones the kernel accepts (`capacity` in
+/// `1..=EVENT_QUEUE_MAX_CAPACITY`, `observers` in
+/// `0..=EVENT_QUEUE_MAX_CAPACITY`); larger values can overflow.
+#[must_use]
+pub const fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64
+{
+    24 + 64 + (capacity + 1) * 16 + observers * 24
 }
 
 // ── Syscall numbers ───────────────────────────────────────────────────────────
@@ -369,14 +387,18 @@ pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
 /// page-table leaves that name it (or that a CPU may still hold in its TLB).
 /// A frame's count falls only once every CPU has dropped the leaf, so a value
 /// equal to the mappings the caller itself holds means no other address space
-/// can reach the region. A region larger than
-/// [`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`] pages, or a non-Memory slot, returns
-/// [`SyscallError::InvalidArgument`]. Used by a server that hands a page to a
-/// client and must know the client's mapping is gone before reusing the page.
+/// can reach the region. The query covers a window of the region: argument 2
+/// is its first page and argument 3 its page count, `1..=`
+/// [`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`]. A window that is empty, too long,
+/// or runs past the region, or a non-Memory slot, returns
+/// [`SyscallError::InvalidArgument`]; a larger region is read window by
+/// window. Used by a server that hands a page to a client and must know the
+/// client's mapping is gone before reusing the page.
 pub const CAP_INFO_MEMORY_MAPPINGS: u64 = 12;
 
-/// Largest Memory region, in pages, [`CAP_INFO_MEMORY_MAPPINGS`] answers for:
+/// Longest window, in pages, one [`CAP_INFO_MEMORY_MAPPINGS`] query reads:
 /// the query reads one count per page, so the bound keeps the syscall short.
+/// A batch size: a larger region is read in more queries.
 pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
 
 // ── CapTag discriminants ─────────────────────────────────────────────────────
@@ -514,9 +536,16 @@ pub const PRIORITY_MAX: u8 = 30;
 
 // ── Event Queue constants ─────────────────────────────────────────────────────
 
-/// Maximum capacity (entry count) for an event queue created via
-/// `SYS_CAP_CREATE_EVENT_Q`. Must be in the range `1..=EVENT_QUEUE_MAX_CAPACITY`.
-pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 4096;
+/// Maximum capacity (entry count), and maximum death-observer node count, for
+/// an event queue created via `SYS_CAP_CREATE_EVENT_Q`: capacity in
+/// `1..=EVENT_QUEUE_MAX_CAPACITY`, observers in `0..=EVENT_QUEUE_MAX_CAPACITY`.
+///
+/// The ring and the node pool are caller-funded per queue, so the ceiling
+/// protects no shared pool. It bounds the work one create does in the kernel
+/// before returning, which zeroes the ring and links every node: at 2^20 that
+/// is at most 16 MiB of ring and 24 MiB of nodes. A supervisor that needs more
+/// splits its observers across queues, so the bound only splits work.
+pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 1 << 20;
 
 // ── Message constants ─────────────────────────────────────────────────────────
 
@@ -804,9 +833,10 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
-// The exit reason is the value a death notification delivers (low 32 bits) when
-// a thread or process dies. It is a single flat space partitioned into disjoint
-// ranges, kernel-owned so userspace can never forge a fault or kill reason:
+// The exit reason is the value a death notification delivers (the payload word
+// of its two-word entry) when a thread or process dies. It is a single flat
+// space partitioned into disjoint ranges, kernel-owned so userspace can never
+// forge a fault or kill reason:
 //
 //   | Reason            | Class               | Meaning                            |
 //   |-------------------|---------------------|------------------------------------|

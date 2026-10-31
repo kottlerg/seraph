@@ -201,14 +201,26 @@ fn main() -> !
 /// count sizes the queue.
 const DEATH_EQ_CAPACITY: u32 = 128;
 
+/// Death-observer nodes in logd's death queue: procmgr binds one per live
+/// process's main thread, and a node returns only when that thread is
+/// destroyed. A bind past the pool fails: silently at spawn, logged by
+/// procmgr's retroactive bind. logd then gets no death post for that process,
+/// so its slot stays until a later full-queue resync from procmgr's live list
+/// evicts it, if one runs (#643 grows the pool). Sized well above the live
+/// processes memmgr allows.
+const DEATH_EQ_OBSERVERS: u32 = 1024;
+
 /// Allocate the slab and create the death-notification `EventQueue` of
-/// [`DEATH_EQ_CAPACITY`].
+/// [`DEATH_EQ_CAPACITY`] entries and [`DEATH_EQ_OBSERVERS`] observer nodes.
 fn create_death_eq() -> Option<u32>
 {
-    // The kernel's raw EventQueue debit for that capacity.
-    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
+    // The kernel's raw EventQueue debit for that capacity and node count.
+    let slab_bytes = std::os::seraph::event_queue_retype_bytes(
+        u64::from(DEATH_EQ_CAPACITY),
+        u64::from(DEATH_EQ_OBSERVERS),
+    );
     std::os::seraph::object_slab_retype(slab_bytes, |slab| {
-        syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
+        syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS).ok()
     })
 }
 
@@ -226,10 +238,12 @@ fn create_resync_note() -> Option<u32>
 /// (`WS_BADGE_RESYNC`).
 fn create_wait_set(log_ep_recv: u32, death_eq: u32, resync_note: u32) -> Option<u32>
 {
-    let Some(ws) =
-        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
-            syscall::wait_set_create(slab).ok()
-        })
+    // The set's member capacity: the three members above.
+    const WS_MEMBERS: u32 = 3;
+    let Some(ws) = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+    )
     else
     {
         let mut buf = SerialFmt::new();
@@ -540,19 +554,24 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     self_log(buf.as_str());
 }
 
-/// Non-blocking drain of the death event queue. Each payload encodes
-/// `(process_badge as u32) << 32 | exit_reason`. We evict the
+/// Non-blocking drain of the death event queue. Each death event carries
+/// the exit reason and the correlator procmgr bound, `process_badge as u32`
+/// widened to `u64` (`syscall::DeathEvent`). We evict the
 /// matching slot from the badge table. Returns whether the drain took a full
 /// queue's worth of events: the queue may then have filled, and a post to a
 /// full queue is dropped, so the caller starts a [`Resync`].
 fn drain_deaths(death_eq: u32, table: &mut SlotTable) -> bool
 {
     let mut drained: u32 = 0;
-    while let Ok(payload) = syscall::event_try_recv(death_eq)
+    while let Ok(death) = syscall::event_try_recv_death(death_eq)
     {
         drained = drained.saturating_add(1);
-        let correlator = (payload >> 32) as u32;
-        let exit_reason = payload as u32;
+        // procmgr binds the badge's low 32 bits widened to u64, so the low
+        // word is the whole correlator.
+        // cast_possible_truncation: see above; the high word is always zero.
+        #[allow(clippy::cast_possible_truncation)]
+        let correlator = death.correlator as u32;
+        let exit_reason = death.exit_reason;
         // Badge in logd's slot map is the full u64; the correlator
         // procmgr binds is `process_badge as u32`, unique among live
         // processes. Match against the low 32 bits.

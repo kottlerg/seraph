@@ -36,7 +36,7 @@ pub struct EndpointState
     /// Wait-set back-pointer (null if not in any wait set) and this
     /// endpoint's member index in that set.
     wait_set: *mut u8,
-    wait_set_member_idx: u8,
+    wait_set_member_idx: u16,
 
     /// Serialises every non-atomic field that changes after construction:
     /// the two queues, the call/recv rendezvous, and the wait-set
@@ -246,14 +246,13 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `dealloc_object(Thread)` dying-client detach arms | `reply_tcb` CAS | **no stamp** — the claimed thread is the one being freed; it never resumes |
 | `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink means one of: a caller already deposited into `ipc_msg` (its delivery stands); the endpoint's dealloc drain stamped the park `INTERRUPTED`; a concurrent cancel already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | INTERRUPTED |
 | `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | removal of the snapshotted park (`park_seq` equal to the cancel's snapshot) from the source's waiter queue under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
-| `cancel_ipc_block` plain-sleep cleanup | `sleep_list_remove` returning `true` under the target's `sched_lock` (the deadline was still pending; the timer pop clears it under the same `SLEEP_LIST_LOCK`, and a commit→add window cancel makes the later add refuse; on a full list the sleeper's own withdrawal makes the same `sleep_list_remove` claim, so a cancel that wins leaves the sleeper descheduled with the stamp, which a stopped sleeper returns as `Interrupted` when restarted) | INTERRUPTED |
+| `cancel_ipc_block` plain-sleep cleanup | `sleep_list_remove` returning `true` under the target's `sched_lock` (the deadline was still pending; the timer pop clears it under the same `SLEEP_LIST_LOCK`, and a commit→add window cancel makes the later add refuse) | INTERRUPTED |
 | `dealloc_object(Notification)` wake of every waiter (`interrupt_all_waiters`) | removal from the waiter queue under `sig.lock` | INTERRUPTED |
 | `event_queue_drop` (`dealloc_object(EventQueue)`) wake of every waiter | removal from the waiter queue under `eq.lock` | INTERRUPTED |
 | `wait_set_drop` (`dealloc_object(WaitSet)`) wake of every waiter | removal from the waiter queue under `ws.lock` | INTERRUPTED |
 | `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the queued entry | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
-| full-list timed withdrawal (`notification_wait`, `event_queue_recv`) | source lock held continuously from push to withdrawal (`sched::withdraw_uncontested_park`) — no waker or cancel can have claimed the queued entry | none — the wait returns an immediate timeout (`0` bits, `WouldBlock`) |
 
 **Resume (call/fault episodes — fail-closed).** `sys_ipc_call` consumes the
 disposition: REPLY reads `ipc_msg`; INTERRUPTED returns `Interrupted` without
@@ -316,7 +315,7 @@ pub struct NotificationState
 
     /// Optional wait-set back-pointer (null if not in any wait set).
     pub wait_set: *mut u8,
-    pub wait_set_member_idx: u8,
+    pub wait_set_member_idx: u16,
 
     /// Lock-free fast-path flag: non-zero iff a waiter or wait-set is registered.
     /// Read with a SeqCst fence in the notification_send fast path; the Dekker pair
@@ -401,12 +400,9 @@ deliveries.
 6. commit_blocked_under_local_lock(tcb, BlockedOnNotification, sig)
    (a refusal dequeues the caller again, under the same sig.lock hold);
    on a committed timed wait, arm_timed_park(tcb, deadline): set
-   sleep_deadline and sleep_list_add, still under sig.lock. If the sleep
-   list is full: waiters.remove(tcb); recompute has_observer;
-   sched::withdraw_uncontested_park(tcb); release sig.lock;
-   tf.set_ipc_return(primary = 0, secondary = 0); return Ok(0) (an
-   immediate timeout, never parked; thread-lifecycle-and-sleep.md § Sleep
-   List Invariants, invariant 4)
+   sleep_deadline and sleep_list_add, still under sig.lock (the list has
+   no capacity to refuse it; thread-lifecycle-and-sleep.md § Sleep List
+   Invariants, invariant 4)
 7. Release sig.lock
 8. Block current thread; return when woken
 9. On wakeup: if the park is INTERRUPTED (a stop, or the notification
@@ -429,11 +425,18 @@ bit-63-set bitmasks with negative-Err codes.
 ### Object Structure
 
 ```rust
+/// One entry: the two words SYS_EVENT_POST takes and SYS_EVENT_RECV returns.
+pub struct EventEntry
+{
+    pub payload: u64,
+    pub tag: u64,
+}
+
 pub struct EventQueueState
 {
     /// Ring body, inline after this struct in the retype slot (set at
     /// construction).
-    pub ring: *mut u64,
+    pub ring: *mut EventEntry,
 
     /// Capacity of the ring (fixed at creation).
     pub capacity: u32,
@@ -454,17 +457,22 @@ pub struct EventQueueState
     /// Wait-set back-pointer (null if not in any wait set) and this queue's
     /// member index in that set.
     pub wait_set: *mut u8,
-    pub wait_set_member_idx: u8,
+    pub wait_set_member_idx: u16,
+
+    /// Free death-observer nodes (the pool inline after the ring) and the
+    /// pool's size, fixed at creation.
+    pub observer_free: *mut DeathObserver,
+    pub observer_count: u32,
 
     /// Serialises every non-atomic field that changes after construction:
-    /// the ring contents, `write_idx`, `read_idx`, `waiters`, and the
-    /// wait-set back-pointer pair.
+    /// the ring contents, `write_idx`, `read_idx`, `waiters`, the
+    /// wait-set back-pointer pair, and the observer free list.
     pub lock: Spinlock,
 }
 ```
 
 When the user requests capacity N, the kernel reserves a ring buffer of N+1
-entries laid out **inline within the same retype slot** that holds the
+two-word entries laid out **inline within the same retype slot** that holds the
 `EventQueueState` (layout: `cap::retype::event_queue_raw_bytes` and
 `EVENT_QUEUE_RING_OFFSET`; see
 [memory-internals.md § Kernel Object Memory](memory-internals.md#kernel-object-memory-capretypers)).
@@ -475,6 +483,22 @@ are occupied at any time (the extra slot is never needed for full/empty
 detection) and the user observes exactly N usable slots. The ring is reclaimed
 wholesale with the wrapper on `dealloc_object(EventQueue)`.
 
+The queue's death-observer nodes follow the ring in the same slot
+(`cap::retype::event_queue_observer_offset`), as many as `SYS_CAP_CREATE_EVENT_Q` argument 2
+asks for, all on `observer_free` at creation. A thread or address-space bind takes one under
+`eq.lock` alone (`event_queue_take_observer`) before it takes the owner's lock, links it into the
+owner's chain, and takes a checked reference on the queue (`try_inc_ref`); the owner's teardown
+returns the node under `eq.lock` (`event_queue_return_observer`) and only then drops that
+reference. `eq.lock` is therefore never held with a thread's `sched_lock` or an address space's
+`death_lock`, and a queue whose count reaches zero has every node back on its free list. A node's
+`next` and `correlator` are bare fields owned by the lock of the list that holds the node: the
+queue's `lock` while it is free, the owner thread's `sched_lock` or the owner address space's
+`death_lock` while it is bound (the bare-field exception of
+[coding-standards.md § Concurrency](../../../docs/coding-standards.md#concurrency)); a death walk
+reads a bound node's links without the lock, after reading the chain head under it, because a
+linked node's links never change until the owner's teardown takes the chain. `eq` is fixed at
+creation.
+
 ### Post Path
 
 `SYS_EVENT_POST`:
@@ -484,14 +508,15 @@ wholesale with the wrapper on `dealloc_object(EventQueue)`.
 2. if waiters is non-empty:
    // Deliver directly to the longest-waiting receiver, bypassing the ring
    a. tcb = waiters.pop()
-   b. claim_waiter(tcb, payload): wake_in_flight = 1,
-      tcb.wakeup_value = payload, and if tcb.sleep_deadline != 0
-      sleep_list_remove(tcb) (clears the deadline with the entry)
+   b. claim_waiter(tcb, entry.payload): wake_in_flight = 1,
+      tcb.wakeup_value = entry.payload, and if tcb.sleep_deadline != 0
+      sleep_list_remove(tcb) (clears the deadline with the entry);
+      tcb.wakeup_tag = entry.tag
    c. Release eq.lock; return the woken tcb (ring untouched)
    d. Syscall handler: select_target_cpu + enqueue_and_wake(tcb)
 3. if count >= capacity:
    Release eq.lock; return QueueFull
-4. ring[write_idx] = payload; write_idx = (write_idx + 1) % (capacity + 1)
+4. ring[write_idx] = entry; write_idx = (write_idx + 1) % (capacity + 1)
 5. count += 1 (Release); on the 0 -> 1 transition, waitset_notify
 6. Release eq.lock
 ```
@@ -513,32 +538,30 @@ level-readiness witness.
    // wakeable and never enters the scheduler.
 2. Acquire eq.lock (event_queue_recv)
 3. if count > 0:
-   a. payload = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
+   a. entry = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
    b. count -= 1 (Release)
-   c. Release eq.lock; return payload
+   c. Release eq.lock; return entry
 4. else, still under eq.lock:
    // Queue the caller at the tail of eq.waiters
    a. context_saved = 0; waiters.push(current_tcb)
    b. commit_blocked_under_local_lock(tcb, BlockedOnEventQueue)
       (eq.lock outer -> sched_lock inner; a refusal dequeues the caller)
    c. if committed and timeout_ms in 1..=MAX-1: arm_timed_park(tcb,
-      deadline): set sleep_deadline and sleep_list_add, still under eq.lock;
-      if the sleep list is full: waiters.remove(tcb);
-      sched::withdraw_uncontested_park(tcb); release eq.lock; return
-      WouldBlock (an immediate timeout, never parked)
+      deadline): set sleep_deadline and sleep_list_add, still under eq.lock
    d. Release eq.lock
 5. schedule(); on resume:
    if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
                                  destroyed under the waiter),
    else if tcb.timed_out      -> return WouldBlock,
-   else                       -> return payload from wakeup_value
+   else                       -> return the entry from wakeup_value and
+                                 wakeup_tag
 ```
 
 The try-once mode never takes the park path, per
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 8.
 
 The `tcb.timed_out` flag is the out-of-band timeout marker — required
-because event-queue payloads may be any `u64` (including 0), so an
+because event-queue entry words may be any `u64` (including 0), so an
 in-band sentinel on `wakeup_value` is unavailable. The flag is set by
 the `BlockedOnEventQueue` arm of `sleep_check_wakeups` when the timer
 arbitrates against `event_queue_post` and wins; cleared by the resuming
@@ -558,28 +581,32 @@ path — sequential, not nested, so no cycle.
 ### Object Structure
 
 ```rust
-/// Maximum number of sources a single wait set may contain.
-pub const WAIT_SET_MAX_MEMBERS: usize = 16;
+/// Largest member capacity a wait set may be created with (the ABI's).
+pub const WAIT_SET_MAX_MEMBERS: usize = 1024;
 
 pub struct WaitSetState
 {
-    /// Serialises every field that changes after construction: `members`,
-    /// `member_count`, `ready_ring`, `ready_head`, `ready_tail`, and
+    /// Serialises every field that changes after construction: the members,
+    /// `member_count`, the ready ring, `ready_head`, `ready_tail`, and
     /// `waiters`. Inner to every source's lock (see § Lock Ordering).
     lock: Spinlock,
 
-    /// Registered members. A slot whose `source_ptr` is null is vacant.
-    /// Fixed capacity; SYS_WAIT_SET_ADD returns InvalidArgument when full.
-    members: [WaitSetMember; WAIT_SET_MAX_MEMBERS],
+    /// Registered members, `capacity` slots inline after this struct. A slot
+    /// whose `source_ptr` is null is vacant. SYS_WAIT_SET_ADD returns
+    /// InvalidArgument when every slot is occupied.
+    members: *mut WaitSetMember,
 
-    /// Number of occupied member slots.
-    member_count: u8,
+    /// Ring buffer of pending member indices, `capacity + 1` slots inline
+    /// after the members. One slot stays empty to tell full from empty, so it
+    /// holds at most `capacity` entries.
+    ready_ring: *mut u16,
 
-    /// Ring buffer of pending member indices. One slot stays empty to tell
-    /// full from empty, so it holds at most WAIT_SET_MAX_MEMBERS - 1 entries.
-    ready_ring: [u8; WAIT_SET_MAX_MEMBERS],
-    ready_head: u8,
-    ready_tail: u8,
+    /// Member capacity, fixed at creation; occupied member slots.
+    capacity: u16,
+    member_count: u16,
+
+    ready_head: u16,
+    ready_tail: u16,
 
     /// The thread blocked in SYS_WAIT_SET_WAIT, if any (at most one; a second
     /// wait is refused). A WaitQueue so its claims share the source code.
@@ -608,13 +635,13 @@ enum WaitSetSourceTag
 }
 ```
 
-Folding vacancy into a null `source_ptr` keeps each `WaitSetMember` at 24 B, so
-the 16-slot member array is 384 B and `WaitSetState` (at most 440 B) fits,
-with its 24 B `WaitSetObject` wrapper, in the 512 B retype bin; `wait_set.rs`
-asserts both sizes at compile time.
+Folding vacancy into a null `source_ptr` keeps each `WaitSetMember` at 24 B, the
+per-member debit of `wait_set_retype_bytes`; `wait_set.rs` asserts the member and state
+sizes at compile time, and `cap/retype.rs` pins the layout to the ABI formula.
 
-The arrays are fixed-capacity because the kernel runs no heap (see
-§ Kernel Object Memory in
+The member array and the ready ring are sized by the capacity the creator passes to
+`SYS_CAP_CREATE_WAIT_SET` (`1..=WAIT_SET_MAX_MEMBERS`, 1024) and live inline after the
+state in the set's retype slot, because the kernel runs no heap (see § Kernel Object Memory in
 [memory-internals.md](memory-internals.md#kernel-object-memory-capretypers)): a
 wait set's membership storage is part of the object carved at creation, and
 `waitset_notify`, under the source object lock, touches only the member it is given and
@@ -732,7 +759,7 @@ returns `Interrupted`.
 ### Multiple Ready Sources
 
 If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ring`
-buffers their member indices in arrival order, up to `WAIT_SET_MAX_MEMBERS - 1`
+buffers their member indices in arrival order, up to the set's capacity in
 entries; it does not deduplicate, and a push to a full ring is dropped.
 Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it is
 empty, per [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
@@ -780,19 +807,14 @@ send path is therefore one atomic read-modify-write, one fence, and one load
 
 The IPC paths interact with the scheduler through its park and wake primitives:
 `commit_blocked_under_local_lock` to park, `commit_reply_rebind_under_local_lock` to rebind an
-already parked sender to its reply, `withdraw_uncontested_park` to un-commit a timed park the full
-sleep list refused, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule` to switch away,
-and `sleep_list_add` and `sleep_list_remove` for timed waits (see § Waking the Recipient). The
-un-commit is the sanctioned exception that rule 8 of
-[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
-makes for a park no waker can have claimed; its rules are
-[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants),
-invariant 4. The IPC paths also use the `sched::thread` park-episode helpers `open_park_episode`,
+already parked sender to its reply, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule`
+to switch away, and `sleep_list_add` and `sleep_list_remove` for timed waits (see § Waking the
+Recipient). The IPC paths also use the `sched::thread` park-episode helpers `open_park_episode`,
 `stamp_park_deposit`, `stamp_cancelled_deposit` and `consume_park_interrupted` (see § Park
 Dispositions and Episodes). The dependency is not one-way: the scheduler's timer path
-`sleep_check_wakeups` dispatches on `IpcThreadState` and claims timed notification and
-event-queue waiters under the source lock, and `post_one_death_event` posts death payloads
-through `event_queue_post`.
+`sleep_check_wakeups` dispatches on `IpcThreadState` and claims timed notification and event-queue
+waiters under the source lock, and `post_one_death_event` posts death payloads through
+`event_queue_post`.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
 masks interrupts, and every IPC object lock is an IRQ-disabling

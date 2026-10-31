@@ -9,7 +9,7 @@
 //! This is the only file in this crate permitted to contain
 //! `#[cfg(target_arch)]` guards (`docs/coding-standards.md` § C. Architecture
 //! Invariants). Every architecture defines the same wrappers: `syscall2` to
-//! `syscall6` (primary return only), `syscall5_ret2`, `syscall1_ret4`,
+//! `syscall6` (primary return only), `syscall5_ret2`, `syscall2_ret3`, `syscall1_ret4`,
 //! `syscall6_ret3`, and `syscall4_any` (every argument register declared
 //! clobbered, behind the untyped `raw_syscall3` and `raw_syscall4`).
 //!

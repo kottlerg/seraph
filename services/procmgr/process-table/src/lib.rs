@@ -51,7 +51,7 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 
 /// The death-EQ correlator of a process badge: its low 32 bits.
 ///
-/// The kernel's death correlator is a `u32` today, so procmgr binds each
+/// The kernel carries a `u64` death correlator, but procmgr still binds each
 /// child's observers with the low word of its `u64` badge, and logd keys its
 /// eviction on the same word. [`ProcessTable::insert`] refuses a badge whose
 /// low word a live entry already holds, so the correlator names exactly one
@@ -59,8 +59,7 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 #[must_use]
 pub const fn correlator_of(badge: u64) -> u32
 {
-    // The low-32 extraction is the point: it is the correlator the kernel
-    // carries.
+    // The low-32 extraction is the point: it is the correlator procmgr binds.
     #[allow(clippy::cast_possible_truncation)]
     let low = badge as u32;
     low
@@ -225,10 +224,12 @@ pub enum InsertError
 /// procmgr's live processes, kept on the heap and sorted by badge.
 ///
 /// The table grows with the number of live processes and holds no fixed
-/// ceiling; a spawn fails only when the heap cannot grow it. Lookups by badge
-/// are binary searches. The kernel's death correlator is still the badge's
-/// low 32 bits ([`correlator_of`]), and [`Self::insert`] keeps those unique
-/// among live entries, so a death event resolves to one process; once the
+/// ceiling of its own; a spawn fails when the heap cannot grow it, or when
+/// procmgr's death queue has no free observer node (`DEATH_EQ_OBSERVERS`,
+/// #643). Lookups by badge are binary searches. The death correlator procmgr
+/// binds is still the badge's low 32 bits ([`correlator_of`]), and
+/// [`Self::insert`] keeps those unique among live entries, so a death event
+/// resolves to one process; once the
 /// correlator carries the full badge, the correlator lookup becomes the badge
 /// lookup and the low-word rule stays as defence in depth.
 #[derive(Default)]
@@ -465,7 +466,7 @@ pub fn resolve_spawn_sched(
 /// Whether a candidate badge may be handed out as a process badge.
 ///
 /// The low 32 bits of a process badge serve double duty — the death-EQ
-/// correlator (the binding API takes a `u32`) and the logd source badge — so
+/// correlator procmgr binds and the logd source badge — so
 /// they must clear every reserved low-word value:
 /// - **below `min_low`** — the reserved log-badge range. `log_badges` reserves
 ///   `0..LOG_BADGE_FIRST_CHILD` for system specials: the kernel's `0`

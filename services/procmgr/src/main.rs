@@ -107,20 +107,22 @@ fn main() -> !
     let mut recent = process::RecentExits::new();
 
     // Death-EQ slab request: the kernel's raw EventQueue debit for
-    // `DEATH_EQ_CAPACITY`.
-    let death_eq_slab_bytes =
-        std::os::seraph::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
+    // `DEATH_EQ_CAPACITY` entries and `DEATH_EQ_OBSERVERS` observer nodes.
+    let death_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
+        u64::from(DEATH_EQ_CAPACITY),
+        u64::from(DEATH_EQ_OBSERVERS),
+    );
     let Some(death_eq) = std::os::seraph::object_slab_retype(death_eq_slab_bytes, |slab| {
-        syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
+        syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS).ok()
     })
     else
     {
         syscall::thread_exit();
     };
-    let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
-            syscall::wait_set_create(slab).ok()
-        })
+    let Some(ws_cap) = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+    )
     else
     {
         syscall::thread_exit();
@@ -208,6 +210,17 @@ fn main() -> !
 /// [`resync_deaths`], which [`dispatch_death`] runs after any drain that took
 /// a full queue's worth of events; the table itself has no fixed size.
 const DEATH_EQ_CAPACITY: u32 = 256;
+
+/// Death-observer nodes in procmgr's death queue: each live process binds two
+/// (its main thread and its address space) and the init reap binds init's
+/// two threads; a node returns when its thread or address space is destroyed.
+/// A spawn whose main-thread bind finds the pool empty fails, so this caps
+/// live processes at about half of it, well above the live processes memmgr
+/// allows.
+const DEATH_EQ_OBSERVERS: u32 = 1024;
+
+/// The main wait set's member capacity: the service endpoint and the death queue.
+const WS_MEMBERS: u32 = 2;
 
 /// Monotonic time since the first call, in nanoseconds, for the
 /// recent-exits retention window and the init-reap probe budget. Saturates
@@ -750,13 +763,15 @@ fn dispatch_death(
 )
 {
     let mut drained: u32 = 0;
-    while let Ok(payload) = syscall::event_try_recv(death_eq)
+    while let Ok(death) = syscall::event_try_recv_death(death_eq)
     {
         drained = drained.saturating_add(1);
-        // The kernel packs the correlator into the high half of the `u64`
-        // event payload, leaving the exit reason the low 32 bits.
-        let correlator = (payload >> 32) as u32;
-        let exit_reason = payload & 0xFFFF_FFFF;
+        // Every bind passes a 32-bit value widened to u64, so the low word is
+        // the whole correlator.
+        // cast_possible_truncation: see above; the high word is always zero.
+        #[allow(clippy::cast_possible_truncation)]
+        let correlator = death.correlator as u32;
+        let exit_reason = death.exit_reason;
         if correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
             // An init thread exited. `run_reap` counts down the two init

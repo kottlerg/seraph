@@ -568,9 +568,9 @@ mod reaper {
     /// drops a post to a full queue).
     const EQ_CAPACITY: u32 = 128;
     /// Correlator bit split: low `GEN_BITS` are the generation, the rest the
-    /// slot index (6 bits → 64 slots). The split is an encoding artefact of
-    /// the `u32` correlator `thread_bind_notification` carries; the
-    /// generation is freshness-only, so its wrap needs no wider field.
+    /// slot index (6 bits → 64 slots), packed in the low 32 bits of the `u64`
+    /// correlator `thread_bind_notification` carries. The generation is
+    /// freshness-only, so its wrap needs no wider field.
     const GEN_BITS: u32 = 26;
     const GEN_MASK: u32 = (1 << GEN_BITS) - 1;
 
@@ -660,9 +660,12 @@ mod reaper {
         if cur != 0 {
             return cur;
         }
-        let want = syscall_abi::event_queue_retype_bytes(u64::from(EQ_CAPACITY));
+        // As many observer nodes as entries: at most REAPER_SLOTS threads are
+        // bound at once, and a node returns when its thread is destroyed.
+        let want =
+            syscall_abi::event_queue_retype_bytes(u64::from(EQ_CAPACITY), u64::from(EQ_CAPACITY));
         let made = crate::sys::alloc::seraph::object_slab_retype(want, |slab| {
-            syscall::event_queue_create(slab, EQ_CAPACITY).ok()
+            syscall::event_queue_create_observed(slab, EQ_CAPACITY, EQ_CAPACITY).ok()
         });
         let Some(eq) = made else {
             return 0;
@@ -709,8 +712,8 @@ mod reaper {
 
         let (slot, generation) = reserved?;
         // Bind the observer. On failure, release the slot and fall back.
-        if syscall::thread_bind_notification(thread_cap, eq, correlator(slot, generation)).is_err()
-        {
+        let tag = u64::from(correlator(slot, generation));
+        if syscall::thread_bind_notification(thread_cap, eq, tag).is_err() {
             release(slot, generation);
             return None;
         }
@@ -782,12 +785,14 @@ mod reaper {
             return;
         }
         loop {
-            let payload = match syscall::event_try_recv(eq) {
-                Ok(p) => p,
+            let death = match syscall::event_try_recv_death(eq) {
+                Ok(d) => d,
                 // WouldBlock (empty) or the queue is gone — nothing more to do.
                 Err(_) => break,
             };
-            let (slot, generation) = split((payload >> 32) as u32);
+            // The bind passed a u32 correlator widened to u64; the low word is
+            // all of it.
+            let (slot, generation) = split(death.correlator as u32);
 
             REAPER.lock.lock();
             // SAFETY: lock held; single mutator.
@@ -933,13 +938,12 @@ pub fn set_name(_name: &CStr) {
 
 pub fn sleep(dur: Duration) {
     // `thread_sleep` can end before `dur` elapses: a stop and restart of this
-    // thread returns `Interrupted`, a full kernel sleep list returns
-    // `OutOfMemory`, and a park refused by a coalesced wake returns `Ok`
-    // without sleeping. `sleep` cannot report any of these and must never
-    // sleep less than `dur`, so every return, `Ok` included, retries for
-    // whatever remains; an error other than `Interrupted` yields first so a
-    // full sleep list can drain rather than spinning on the syscall. The loop
-    // returns only once `dur` has elapsed since the first call.
+    // thread returns `Interrupted`, and a park refused by a coalesced wake
+    // returns `Ok` without sleeping. `sleep` cannot report either and must
+    // never sleep less than `dur`, so every return, `Ok` included, retries for
+    // whatever remains; any other error yields first rather than spinning on
+    // the syscall. The loop returns only once `dur` has elapsed since the
+    // first call.
     let start = crate::time::Instant::now();
     let mut left = dur;
     loop {

@@ -73,9 +73,9 @@ use ipc::{procmgr_errors, procmgr_labels};
 
 /// Sentinel `event_post` payload used by `Process::Drop` to unblock the
 /// bridge thread cleanly when the spawner discards the child without
-/// waiting. Real death payloads pack `(correlator << 32) | exit_reason`
-/// and the spawner uses correlator=0 (the high 32 bits are always zero
-/// on a real death), so `u64::MAX` is unambiguous.
+/// waiting. A real death entry carries the exit reason in its payload word,
+/// an `EXIT_*`-range value far below `u64::MAX`, so the sentinel is
+/// unambiguous.
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
 use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
@@ -440,9 +440,16 @@ impl Command {
         // death observer, `kill`'s `EXIT_KILLED`, and the bridge's drop
         // sentinel.
         const DEATH_EQ_CAPACITY: u32 = 4;
-        let bytes = syscall_abi::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
+        // Two observer nodes: the main-thread binding below and procmgr's
+        // address-space binding of the relay.
+        const DEATH_EQ_OBSERVERS: u32 = 2;
+        let bytes = syscall_abi::event_queue_retype_bytes(
+            u64::from(DEATH_EQ_CAPACITY),
+            u64::from(DEATH_EQ_OBSERVERS),
+        );
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-            syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
+            syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS)
+                .ok()
         })
         .ok_or_else(|| {
                 // The child does not exist yet; just drop the file cap we
@@ -1233,8 +1240,8 @@ fn bridge_main(h: BridgeHandles) {
         // Spawner is dropping the Process; do not fire any wakes.
         return;
     }
-    let reason = payload & 0xFFFF_FFFF;
-    h.exit_reason.store(reason, Ordering::Release);
+    // The death entry's payload word is the whole exit reason.
+    h.exit_reason.store(payload, Ordering::Release);
     h.peer_dead.store(true, Ordering::Release);
     for sig in h.pipe_notifications.iter().flatten() {
         // Any non-zero bits — the wake is just a kick; the reader /

@@ -224,28 +224,18 @@ pub(crate) unsafe fn claim_waiter(tcb: *mut ThreadControlBlock, value: u64)
     }
 }
 
-/// Set once [`arm_timed_park`] has reported a full sleep list. A caller that
-/// meets a full list retries at once, so the report is once per boot rather
-/// than once per wait.
-#[cfg(not(test))]
-static FULL_LIST_REPORTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// Arm the sleep-list entry of `tcb`'s just-committed timed park with
 /// `deadline`, under the source lock that has held `tcb` queued since its push,
 /// so no claim can have run yet (core/kernel/docs/thread-lifecycle-and-sleep.md
-/// § Sleep List Invariants, invariant 8). Returns `false`, with the deadline cleared,
-/// when the sleep list is full: the caller then dequeues the waiter, withdraws
-/// the park ([`crate::sched::withdraw_uncontested_park`]) and reports an
-/// immediate timeout, so a timed wait never waits past its bound. `wait`
-/// names the wait in the one-time diagnostic.
+/// § Sleep List Invariants, invariant 8). The sleep list has no capacity to
+/// exhaust, so the arm always lists the entry. `wait` names the wait in the
+/// debug assertion.
 ///
 /// # Safety
 /// `tcb` is the running caller, committed `Blocked` on a source whose lock the
 /// caller holds; no scheduler or sleep-list lock is held.
 #[cfg(not(test))]
 pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64, wait: &str)
--> bool
 {
     // SAFETY: tcb is the running caller per the contract.
     let added = unsafe {
@@ -257,27 +247,9 @@ pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64,
     // Every canceller clears the deadline only after claiming the waiter under
     // the source lock, which the caller holds with tcb still queued.
     debug_assert!(
-        added != Err(crate::sched::SleepAddError::Cancelled),
+        added.is_ok(),
         "{wait}: timed arm cancelled under the source lock"
     );
-    if added != Err(crate::sched::SleepAddError::Full)
-    {
-        return true;
-    }
-    if !FULL_LIST_REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed)
-    {
-        crate::kprintln!(
-            "sleep_list capacity reached ({}); {wait} and later timed waits time out at once",
-            crate::sched::MAX_SLEEPING,
-        );
-    }
-    // SAFETY: tcb valid; the source lock is held.
-    unsafe {
-        (*tcb)
-            .sleep_deadline
-            .store(0, core::sync::atomic::Ordering::Relaxed);
-    }
-    false
 }
 
 /// Empty `queue` for the destruction of its source: pop every waiter, claim it

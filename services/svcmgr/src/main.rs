@@ -44,6 +44,15 @@ use std::os::seraph::{StartupInfo, startup_info};
 /// took a full queue's worth of events; the service table has no fixed size.
 const DEATHS_EQ_CAPACITY: u32 = 64;
 
+/// Death-observer nodes in the deaths queue: one per supervised service's
+/// main thread, and a restarted service binds its new thread before the old
+/// one's node returns. A bind past the pool fails the launch, restart, or
+/// adoption (#643 grows the pool).
+const DEATHS_EQ_OBSERVERS: u32 = 256;
+
+/// The main wait set's member capacity: the service endpoint and the deaths queue.
+const WS_MEMBERS: u32 = 2;
+
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
 pub(crate) fn now_ns() -> u64
@@ -115,22 +124,25 @@ fn main() -> !
         halt_loop();
     }
 
-    let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
-            syscall::wait_set_create(slab).ok()
-        })
+    let Some(ws_cap) = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+    )
     else
     {
         std::os::seraph::log!("failed to create wait set");
         halt_loop();
     };
 
-    // One shared death-notification queue of `DEATHS_EQ_CAPACITY`; the slab
-    // request is the kernel's raw EventQueue debit for that capacity.
-    let deaths_eq_slab_bytes =
-        std::os::seraph::event_queue_retype_bytes(u64::from(DEATHS_EQ_CAPACITY));
+    // One shared death-notification queue of `DEATHS_EQ_CAPACITY` entries and
+    // `DEATHS_EQ_OBSERVERS` observer nodes; the slab request is the kernel's
+    // raw EventQueue debit for both.
+    let deaths_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
+        u64::from(DEATHS_EQ_CAPACITY),
+        u64::from(DEATHS_EQ_OBSERVERS),
+    );
     let Some(deaths_eq) = std::os::seraph::object_slab_retype(deaths_eq_slab_bytes, |slab| {
-        syscall::event_queue_create(slab, DEATHS_EQ_CAPACITY).ok()
+        syscall::event_queue_create_observed(slab, DEATHS_EQ_CAPACITY, DEATHS_EQ_OBSERVERS).ok()
     })
     else
     {
@@ -644,9 +656,8 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 }
 
 /// Drain all pending death notifications from the shared queue. Each
-/// payload encodes the dying service's table index in the high 32 bits
-/// (set as the correlator at `thread_bind_notification` time) and the
-/// exit reason in the low 32. The wait-set notifies once per
+/// death event carries the dying service's table index as its correlator
+/// (set at `thread_bind_notification` time) and the exit reason. The wait-set notifies once per
 /// not-empty → empty transition, so a single wakeup may cover several
 /// deaths; the try-recv loop runs until the queue empties.
 ///
@@ -657,11 +668,15 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     let mut drained: u32 = 0;
-    while let Ok(payload) = syscall::event_try_recv(deaths_eq)
+    while let Ok(death) = syscall::event_try_recv_death(deaths_eq)
     {
         drained = drained.saturating_add(1);
-        let correlator = (payload >> 32) as u32;
-        let exit_reason = payload & 0xFFFF_FFFF;
+        // Every bind passes the service index widened to u64, so the low word
+        // is the whole correlator.
+        // cast_possible_truncation: see above; the high word is always zero.
+        #[allow(clippy::cast_possible_truncation)]
+        let correlator = death.correlator as u32;
+        let exit_reason = death.exit_reason;
         route_death(correlator, exit_reason, state, ctx);
     }
     if drained >= DEATHS_EQ_CAPACITY

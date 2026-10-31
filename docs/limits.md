@@ -385,7 +385,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `DEFAULT_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 8 | default (per-binary override exists) | 32 KiB per process | correct as is | None |
 | `MAX_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 256 (1 MiB) | unknown | none | raise | Raise (VA-only cost) and reject instead of clamping (#46) |
 | `PROCESS_MAIN_TLS_MAX_PAGES` | `abi/process-abi/src/lib.rs` | 4 | unknown | none | raise | Size from `PT_TLS` |
-| `ProcessInfo` page (argv and env blobs share it) | `abi/process-abi/src/lib.rs` | 4096 B less the struct | BSS budget (one page) | 4 KiB per process | needs a design | See the argv entries in the procmgr section (#643) |
+| `ProcessInfo` page (argv and env blobs share it) | `abi/process-abi/src/lib.rs` | 4096 B less the struct | BSS budget (one page) | 4 KiB per process | needs a design | See the argv entries in the procmgr section (#672) |
 | `ProcessInfo.initial_priority` | `abi/process-abi/src/lib.rs` | `u8` | ABI width (`PRIORITY_MAX` 30) | none | correct as is | None |
 | `ProcessInfo` cap fields | `abi/process-abi/src/lib.rs` | `u32` | ABI width (cap handle) | embedded | correct as is | Follows the handle-width decision (#637) |
 | `HEAP_BASE_SLOTS_LOG2` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 19 | encoding artefact (ASLR window) | none | correct as is | Revisit with `HEAP_SPAN` |
@@ -420,14 +420,14 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 
 ### Shared IPC and protocol crates
 
-Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, registry, elf),
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 [#641](https://github.com/kottlerg/seraph/issues/641) (shmem), and
 [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `ARGS_BLOB_MAX` | `shared/ipc/src/lib.rs` | 256 B | current peak plus headroom; inline in one message | none | needs a design | argv and env through a Memory cap |
-| CREATE_FROM_FILE `args_bytes`, `env_bytes` | `shared/ipc/src/lib.rs` | `u16` | encoding artefact (label bit packing) | none | needs a design | Widen with the blob design |
+| `ARGS_BLOB_MAX` | `shared/ipc/src/lib.rs` | 256 B | current peak plus headroom; inline in one message | none | needs a design | argv and env through a Memory cap (#672) |
+| CREATE_FROM_FILE `args_bytes`, `env_bytes` | `shared/ipc/src/lib.rs` | `u16` | encoding artefact (label bit packing) | none | needs a design | Widen with the blob design (#672) |
 | CREATE_FROM_FILE `args_count`, `env_count` | `shared/ipc/src/lib.rs` | `u8` | encoding artefact (label bit packing) | none | needs a design | Unreachable at 256 B blobs; binds once blobs grow |
 | `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 4096 | encoding artefact (the POSIX `PATH_MAX` convention; no message carries a whole path, and svcmgr stores each at its length) | none | correct as is | None: svcmgr's one recipe path limit |
 | `svcmgr_labels::NAME_MAX`, `NAME_WORDS` | `shared/ipc/src/lib.rs` | 64 B / 8 words | encoding artefact (a name beside the label and round header fits one message; longest name in use 15 B) | none | correct as is | None: the one svcmgr name limit, which the registry, its client, svcmgr, its parser and init's endowment share with the `pack_name` codec |
@@ -520,7 +520,8 @@ Tracked by [#642](https://github.com/kottlerg/seraph/issues/642).
 
 ### procmgr
 
-Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
+[#638](https://github.com/kottlerg/seraph/issues/638) (the correlator width).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -529,8 +530,8 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
 | death correlator `correlator_of` | `services/procmgr/process-table/src/lib.rs` | low 32 bits, unique among live processes | ABI width (kernel correlator) | none | needs a design | Minting redraws a live low word; widening is #638 |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
-| `CreateBlobs.args_buf`, `env_buf` | `services/procmgr/process-table/src/create_blobs.rs` | 256 B each | encoding artefact (one message) | about 530 B stack | needs a design | argv and env through a Memory cap |
-| blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design |
+| `CreateBlobs.args_buf`, `env_buf` | `services/procmgr/process-table/src/create_blobs.rs` | 256 B each | encoding artefact (one message) | about 530 B stack | needs a design | argv and env through a Memory cap (#672) |
+| blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design (#672) |
 | `VFS_CHUNK_SIZE` | `services/procmgr/src/process.rs` | 504 | ABI width (`MSG_DATA_WORDS_MAX - 1` words) | none | correct as is | Derive from the ABI constant |
 | `RELA_CHUNK_RECORDS` | `services/procmgr/src/process.rs` | 128 | batch size (streaming chunk) | 3 KiB stack | correct as is | None |
 | `MAX_PROCESS_STACK_PAGES` clamp | `services/procmgr/src/process.rs` | 256 | see the process-layout section | none | raise | Reject, do not clamp (#641) |
@@ -544,7 +545,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 
 ### svcmgr and registry
 
-Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -555,7 +556,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `RESTART_BURST`, `RESTART_WINDOW_NS` (`RestartBudget`) | `services/svcmgr/svc-defs/src/restart_budget.rs` | 3 restarts per 60 s window | tuning (stops a crash loop; a rarer crash always restarts) | 16 B per service | correct as is | None (#262 for clean cap-holder restart) |
 | `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
-| svc-defs argv and env limits | `services/svcmgr/svc-defs/src/parse.rs` | 255 / 256 B / 64 words | encoding artefact (procmgr wire) | none | needs a design | Follows the blob design |
+| svc-defs argv and env limits | `services/svcmgr/svc-defs/src/parse.rs` | 255 / 256 B / 64 words | encoding artefact (procmgr wire) | none | needs a design | Follows the blob design (#672) |
 | restart create word check | `services/svcmgr/src/restart.rs` | `MSG_DATA_WORDS_MAX` | ABI width | none | correct as is | None |
 | reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | table index, `u32` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its live thread state) | none | correct as is | None |
 | endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 6 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |

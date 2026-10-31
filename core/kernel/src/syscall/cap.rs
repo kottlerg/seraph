@@ -2754,18 +2754,21 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             #[allow(clippy::cast_ptr_alignment)]
             let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
             // Read-lock the region so a concurrent split cannot shrink it
-            // between the bound check and the walk.
+            // between the window check and the walk.
             let _guard = crate::cap::object::MemoryReadGuard::acquire(memory);
-            if memory.size > CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES * crate::mm::PAGE_SIZE as u64
-            {
-                return Err(SyscallError::InvalidArgument);
-            }
+            let (offset, len) = mappings_window(
+                tf.arg(2),
+                tf.arg(3),
+                memory.size,
+                CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
+            )
+            .ok_or(SyscallError::InvalidArgument)?;
             // Order the caller's earlier revokes before the count reads, the
             // issuer's side of the revocation/map boundary that
             // `sys_mem_map`'s second handle lookup closes
             // (core/kernel/docs/memory-internals.md § Frame Map Table).
             core::sync::atomic::fence(Ordering::SeqCst);
-            Ok(crate::mm::frame_map::mappings_in(memory.base, memory.size))
+            Ok(crate::mm::frame_map::mappings_in(memory.base + offset, len))
         }
         CAP_INFO_THREAD_STATE =>
         {
@@ -2987,6 +2990,31 @@ pub fn sys_cap_create_wait_set(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
+/// The byte window `(offset, len)` of a `CAP_INFO_MEMORY_MAPPINGS` query: pages
+/// `first_page .. first_page + pages` of a region of `region_bytes`, or `None`
+/// when `pages` is 0 or above `max_pages`, or the window runs past the region.
+/// Every product and sum is checked, so no register value wraps into range.
+fn mappings_window(
+    first_page: u64,
+    pages: u64,
+    region_bytes: u64,
+    max_pages: u64,
+) -> Option<(u64, u64)>
+{
+    if pages == 0 || pages > max_pages
+    {
+        return None;
+    }
+    let page = crate::mm::PAGE_SIZE as u64;
+    let offset = first_page.checked_mul(page)?;
+    let len = pages.checked_mul(page)?;
+    if offset.checked_add(len)? > region_bytes
+    {
+        return None;
+    }
+    Some((offset, len))
+}
+
 /// The `SYS_CAP_CREATE_EVENT_QUEUE` observer-node count argument as a `u32`, or
 /// `None` when the full 64-bit register exceeds `EVENT_QUEUE_MAX_CAPACITY`.
 /// Checked on the register before narrowing, as [`event_queue_capacity`] is.
@@ -3015,7 +3043,32 @@ fn event_queue_capacity(raw: u64) -> Option<u32>
 #[cfg(test)]
 mod tests
 {
-    use super::{event_queue_capacity, event_queue_observers};
+    use super::{event_queue_capacity, event_queue_observers, mappings_window};
+
+    // Defect guarded: a window check that wrapped, accepted an empty or
+    // over-long window, or let a window run past the region would count
+    // frames outside the caller's Memory cap or walk unboundedly.
+    #[test]
+    fn mappings_window_accepts_windows_inside_the_region_and_refuses_the_rest()
+    {
+        let page = crate::mm::PAGE_SIZE as u64;
+        let region = 1024 * page;
+        assert_eq!(mappings_window(0, 512, region, 512), Some((0, 512 * page)));
+        assert_eq!(
+            mappings_window(512, 512, region, 512),
+            Some((512 * page, 512 * page))
+        );
+        assert_eq!(
+            mappings_window(1023, 1, region, 512),
+            Some((1023 * page, page))
+        );
+        assert_eq!(mappings_window(0, 0, region, 512), None);
+        assert_eq!(mappings_window(0, 513, region, 512), None);
+        assert_eq!(mappings_window(513, 512, region, 512), None);
+        assert_eq!(mappings_window(1024, 1, region, 512), None);
+        assert_eq!(mappings_window(u64::MAX / page + 1, 1, region, 512), None);
+        assert_eq!(mappings_window(u64::MAX / page, 1, u64::MAX, 512), None);
+    }
 
     // Defect guarded: an observer count narrowed before its range check, or a
     // zero count refused, would size the node pool wrongly or reject a plain

@@ -1637,6 +1637,34 @@ pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// Count the user leaf mappings, across every address space, of pages
+/// `first_page .. first_page + pages` of the Memory region `memory_cap` names
+/// (`CAP_INFO_MEMORY_MAPPINGS`). `pages` is `1..=CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`;
+/// a larger region is read window by window.
+///
+/// # Errors
+/// `InvalidCapability` for a null or stale handle; `InvalidArgument` if the
+/// slot is not a Memory cap or the window is empty, too long, or runs past
+/// the region.
+// cast_sign_loss: ret is checked non-negative before the cast.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn cap_info_memory_mappings(memory_cap: u32, first_page: u64, pages: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall4 issues raw syscall instruction; the arguments are a cap
+    // handle, the selector, and the window; the kernel validates all of them.
+    let ret = unsafe {
+        syscall4(
+            SYS_CAP_INFO,
+            u64::from(memory_cap),
+            CAP_INFO_MEMORY_MAPPINGS,
+            first_page,
+            pages,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
 /// Translate a virtual address in an address space to its mapped physical address.
 ///
 /// `aspace_cap` — capability handle (slot index plus generation) of the

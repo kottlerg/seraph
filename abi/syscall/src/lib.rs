@@ -372,14 +372,18 @@ pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
 /// page-table leaves that name it (or that a CPU may still hold in its TLB).
 /// A frame's count falls only once every CPU has dropped the leaf, so a value
 /// equal to the mappings the caller itself holds means no other address space
-/// can reach the region. A region larger than
-/// [`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`] pages, or a non-Memory slot, returns
-/// [`SyscallError::InvalidArgument`]. Used by a server that hands a page to a
-/// client and must know the client's mapping is gone before reusing the page.
+/// can reach the region. The query covers a window of the region: argument 2
+/// is its first page and argument 3 its page count, `1..=`
+/// [`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`]. A window that is empty, too long,
+/// or runs past the region, or a non-Memory slot, returns
+/// [`SyscallError::InvalidArgument`]; a larger region is read window by
+/// window. Used by a server that hands a page to a client and must know the
+/// client's mapping is gone before reusing the page.
 pub const CAP_INFO_MEMORY_MAPPINGS: u64 = 12;
 
-/// Largest Memory region, in pages, [`CAP_INFO_MEMORY_MAPPINGS`] answers for:
+/// Longest window, in pages, one [`CAP_INFO_MEMORY_MAPPINGS`] query reads:
 /// the query reads one count per page, so the bound keeps the syscall short.
+/// A batch size: a larger region is read in more queries.
 pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
 
 // ── CapTag discriminants ─────────────────────────────────────────────────────

@@ -997,27 +997,30 @@ selected by a field code. Read-only inquiry.
 |---|---|---|
 | 0 | `cap` | Capability handle to inspect |
 | 1 | `field` | Field selector (`CAP_INFO_*` constant) |
+| 2 | `first_page` | `CAP_INFO_MEMORY_MAPPINGS` only: first page of the window, from the region's base |
+| 3 | `pages` | `CAP_INFO_MEMORY_MAPPINGS` only: window length in pages (1–`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`) |
 
 **Return:** `rax`/`a0`: the requested field value on success; `SyscallError` on failure.
 Some fields pack two values into the word — e.g. `TAG_RIGHTS` returns `(tag << 32) |
 rights`, and `THREAD_STATE` returns `(state << 32) | (exit_reason & 0xFFFFFFFF)`.
 
 `CAP_INFO_MEMORY_MAPPINGS` (12) returns, for a Memory cap, the number of user page-table
-leaves in every address space that name a frame of its region, summed over the region's
-frames (the frame map table's counts; see
+leaves in every address space that name a frame of the queried window of its region, summed over
+the window's frames (the frame map table's counts; see
 [memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)). A frame's
 count falls only once every CPU has dropped the leaf, so a value equal to the mappings the
 caller itself holds means no other address space can reach the region; the value is a
 snapshot, which stays current only while no one else holds a capability that can map the
-region. The kernel answers only through a Memory cap the caller holds, and only for a region
-of at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the walk stays bounded.
+region. The kernel answers only through a Memory cap the caller holds, and counts only the
+window arguments 2 and 3 name, at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the
+walk stays bounded; a larger region is read window by window.
 
 **Capability requirement:** None — `cap_info` reads the slot without a rights check.
 
 **Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target
 object is gone), `InvalidArgument` (field requires a different capability type, the
-selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` region is larger than
-`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages).
+selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
+`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region).
 
 ---
 

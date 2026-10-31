@@ -40,7 +40,10 @@ devmgr's responsibilities are:
   UART, the platform RTC chip — `cmos-rtc` on x86-64, `goldfish-rtc`
   on RISC-V) spawn through a simpler path that delivers a service
   endpoint and one arch authority cap (`IoPort` for COM1 and
-  CMOS, `Mmio` for an NS16550 or the goldfish RTC at `0x101000`).
+  CMOS, `Mmio` for an NS16550 or the goldfish RTC at `0x101000`). The
+  `cmos-rtc` round also carries one data word: the CMOS RAM index of the
+  century register the FADT's `CENTURY` field names, or 0 when it names
+  none.
   Drivers that need physical-base addresses for device DMA
   programming obtain them from memmgr's `REQUEST_MEMORY_CAPS` reply alongside
   the Memory caps. No IOMMU support exists, so every DMA-capable driver runs
@@ -102,8 +105,9 @@ devmgr's responsibilities are:
   and one over the 8042 reset port, or a Reset-only `SbiControl` derivation
   on RISC-V. pwrmgr names the PM1a port it computed from the FADT, and devmgr
   serves it only when it equals the FADT's `PM1a_CNT_BLK`, which devmgr reads
-  itself (the only table-body field it reads beside the MCFG allocation
-  entries it locates the ECAM windows from). On every call the caps are re-derived from the
+  itself (with the FADT's `CENTURY` field, the only table-body fields it reads
+  beside the MCFG allocation entries it locates the ECAM windows from). On every
+  call the caps are re-derived from the
   `IoPort` / `SbiControl` caps devmgr holds, so nothing is consumed and a
   restarted pwrmgr re-acquires them cleanly. devmgr runs no shutdown logic;
   it brokers the hardware, pwrmgr interprets and actuates. `QUERY_ACPI_TABLE`

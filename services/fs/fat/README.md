@@ -10,7 +10,8 @@ Seraph FAT16 / FAT32 filesystem driver, one process per mount.
 fat/
 ├── Cargo.toml
 ├── README.md
-├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds
+├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds,
+│                               #   name encoding and tails, node slab, cache bounds
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction
@@ -76,9 +77,12 @@ carry no rights (a parent with none of the file rights) is refused with
 ## Storage layout
 
 The driver's storage engine is a cluster allocator (`src/alloc.rs`), directory mutation
-(`src/dir.rs`), a 128-slot write-through page cache (`src/cache.rs`), a node table that dedupes by
-on-disk slot (`src/backend.rs`), and a cooperative-release eviction worker (`src/eviction.rs`). Each
-component's behavior is specified in [docs/storage-layout.md](docs/storage-layout.md).
+(`src/dir.rs`), a write-through page cache of up to 128 slots taken on first use (`src/cache.rs`), a
+node table that dedupes by on-disk slot and recycles the nodes of removed or renamed entries
+(`src/backend.rs`), and a
+cooperative-release eviction worker (`src/eviction.rs`). Sectors are the device's logical blocks,
+512 to 4096 bytes. Each component's behavior is specified in
+[docs/storage-layout.md](docs/storage-layout.md).
 
 ---
 

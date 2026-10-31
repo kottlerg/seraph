@@ -9,8 +9,13 @@
 //! split virtqueue. The caller is responsible for allocating DMA-capable
 //! memory and providing physical addresses.
 
-/// Maximum supported queue size. QEMU `virtio-blk` defaults to 256.
-pub const MAX_QUEUE_SIZE: u16 = 256;
+use alloc::vec::Vec;
+
+/// Largest queue size a split virtqueue may have (`VirtIO` 1.2 §2.7: the
+/// maximum Queue Size is 32768). A hardware-specification bound: the
+/// driver-private bookkeeping is sized to the queue the device negotiates,
+/// so a smaller queue pays only for its own descriptors.
+pub const MAX_QUEUE_SIZE: u16 = 32768;
 
 /// A used-ring completion [`SplitVirtqueue::poll_used`] refused.
 ///
@@ -116,7 +121,7 @@ pub struct SplitVirtqueue
     /// Descriptor count of the chain each outstanding head starts, indexed
     /// by head; 0 marks an index that heads no outstanding chain.
     /// [`poll_used`](Self::poll_used) checks a device-written `id` against it.
-    chain_len: [u16; MAX_QUEUE_SIZE as usize],
+    chain_len: Vec<u16>,
     /// Driver-private link of each descriptor, indexed by descriptor: the
     /// next free descriptor while it is free, the next descriptor of its
     /// chain while it is outstanding. Every value stored is below
@@ -124,16 +129,20 @@ pub struct SplitVirtqueue
     /// is never followed: `num_free` stops `alloc_desc` at the free list's
     /// end, and `chain_len` stops `free_chain` at a chain's tail, whose link
     /// may still hold the terminator or a stale free-list link.
-    links: [u16; MAX_QUEUE_SIZE as usize],
+    links: Vec<u16>,
 }
 
 impl SplitVirtqueue
 {
     /// Initialise a virtqueue over pre-allocated DMA memory.
     ///
-    /// Returns `None` when `queue_size` is 0 (the device offers no queue)
-    /// or exceeds [`MAX_QUEUE_SIZE`]; the size derives from the device's
-    /// `queue_size` register, so it is checked rather than assumed.
+    /// Returns `None` when `queue_size` is 0 (the device offers no queue),
+    /// is not a power of two (a split ring's size always is, and the ring
+    /// indices rely on it: `% queue_size` of a wrapping `u16` index is exact
+    /// only then), or exceeds [`MAX_QUEUE_SIZE`]. The size derives from the
+    /// device's `queue_size` register, so it is checked rather than assumed.
+    /// The driver-private bookkeeping is allocated at `queue_size` entries;
+    /// `None` also when the heap cannot hold it.
     ///
     /// # Safety
     ///
@@ -152,18 +161,20 @@ impl SplitVirtqueue
         queue_size: u16,
     ) -> Option<Self>
     {
-        if queue_size == 0 || queue_size > MAX_QUEUE_SIZE
+        if !queue_size.is_power_of_two() || queue_size > MAX_QUEUE_SIZE
         {
             return None;
         }
 
         // Build the free list in driver memory: each descriptor links to the
         // following one; the last link (queue_size) terminates the list.
-        let mut links = [0u16; MAX_QUEUE_SIZE as usize];
-        for (i, link) in (1..=queue_size).zip(links.iter_mut())
-        {
-            *link = i;
-        }
+        let size = usize::from(queue_size);
+        let mut links: Vec<u16> = Vec::new();
+        let mut chain_len: Vec<u16> = Vec::new();
+        links.try_reserve_exact(size).ok()?;
+        chain_len.try_reserve_exact(size).ok()?;
+        links.extend(1..=queue_size);
+        chain_len.resize(size, 0);
 
         Some(Self {
             desc_va,
@@ -173,7 +184,7 @@ impl SplitVirtqueue
             free_head: 0,
             num_free: queue_size,
             last_used_idx: 0,
-            chain_len: [0; MAX_QUEUE_SIZE as usize],
+            chain_len,
             links,
         })
     }
@@ -536,14 +547,32 @@ mod tests
     }
 
     #[test]
-    fn new_rejects_zero_and_oversized_queue_sizes()
+    fn new_rejects_zero_non_power_of_two_and_oversized_queue_sizes()
     {
         let mut empty = Rings::new(1);
         assert!(empty.queue(0).is_none());
+        // `% queue_size` of the wrapping u16 ring index skips or repeats
+        // slots at the 65536 wrap unless the size is a power of two.
+        let mut odd = Rings::new(3);
+        assert!(odd.queue(3).is_none());
         let mut oversized = Rings::new(MAX_QUEUE_SIZE + 1);
         assert!(oversized.queue(MAX_QUEUE_SIZE + 1).is_none());
-        let mut max = Rings::new(MAX_QUEUE_SIZE);
-        assert!(max.queue(MAX_QUEUE_SIZE).is_some());
+    }
+
+    #[test]
+    fn spec_maximum_queue_takes_a_chain_of_every_descriptor_and_frees_it()
+    {
+        // The bookkeeping is sized to the negotiated queue: at the spec's
+        // 32768 a chain may use every descriptor, and its completion frees
+        // every one again.
+        let mut rings = Rings::new(MAX_QUEUE_SIZE);
+        let mut vq = rings.queue(MAX_QUEUE_SIZE).expect("spec maximum");
+        let full: Vec<(u64, u32, bool)> = vec![(0x1000, 1, false); usize::from(MAX_QUEUE_SIZE)];
+        let head = vq.add_chain(&full).expect("every descriptor free");
+        assert!(vq.add_chain(&[(0x2000, 1, false)]).is_none());
+        rings.publish_used(0, u32::from(head), 1, 1);
+        assert_eq!(vq.poll_used(), Ok(Some((head, 1))));
+        assert!(vq.add_chain(&full).is_some());
     }
 
     #[test]

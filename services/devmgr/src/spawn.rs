@@ -444,16 +444,17 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 }
 
 /// Spawn a non-PCI platform device driver with a minimal capability set: a
-/// RECV-rights copy of `service_ep` plus the device's arch authority cap
-/// (`hw_cap`). Unlike [`spawn_driver`] there is no BAR or IRQ.
+/// RECV-rights copy of `service_ep`, the device's arch authority cap
+/// (`hw_cap`), and an optional IRQ cap (`irq_cap`, the serial UART's).
+/// Unlike [`spawn_driver`] there is no BAR.
 ///
 /// `devmgr_query_ep` is an optional badged SEND on devmgr's
 /// registry-query endpoint, delivered as a round-2 cap so the driver can
-/// fetch runtime metadata via `QUERY_DEVICE_INFO`. Pass `0` to omit
-/// (single terminal round `[service, hw_cap]`, behaviour identical to
-/// the pre-extension shape used by drivers that need no runtime
-/// platform metadata). When non-zero a two-round protocol is served:
-///   Round 1 (non-terminal): `[service, hw_cap]`
+/// fetch runtime metadata via `QUERY_DEVICE_INFO`. Pass `0` to omit it, for
+/// drivers that need no runtime platform metadata: one terminal round
+/// `[service, hw_cap, irq_cap?]` carrying `round1_words`. When non-zero a
+/// two-round protocol is served:
+///   Round 1 (non-terminal): `[service, hw_cap, irq_cap?]`, `round1_words`
 ///   Round 2 (terminal):     `[devmgr_query_ep]`
 ///
 /// The `devmgr_query_ep` is a generic mechanism — any future simple
@@ -463,7 +464,10 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 ///
 /// devmgr retains `service_ep` to mint client SEND caps on query; the
 /// `hw_cap` is *moved* into the child (delivered directly, not copied), so
-/// devmgr holds no device-specific authority after a successful spawn. The
+/// devmgr holds no device-specific authority after a successful spawn.
+/// `round1_words` ride round 1 as its data words: the CMOS RTC's century
+/// register index, and empty for every other device. `irq_cap`, when
+/// non-zero, rides round 1 after `hw_cap`. The
 /// caller transfers ownership of `hw_cap` to this function — it is moved to
 /// the child on success and deleted on failure. Returns `false` on any
 /// spawn-path failure.
@@ -486,6 +490,7 @@ pub fn spawn_simple_device(
     hw_cap: u32,
     irq_cap: u32,
     devmgr_query_ep: u32,
+    round1_words: &[u64],
     priority: u8,
     ipc_buf: *mut u64,
 ) -> bool
@@ -665,6 +670,8 @@ pub fn spawn_simple_device(
     // non-terminal [service, hw_cap, irq_cap?], round 2 terminal [query_ep].
     // irq_cap rides round 1 only when present (the serial driver); other
     // simple devices pass 0 and the round carries the bare [service, hw_cap].
+    // `round1_words` ride round 1 as its data words (the CMOS RTC's century
+    // register index; empty for every other device).
     let round1_done = devmgr_query_ep == 0;
     let round1_caps: [u32; 3] = [service_copy, hw_cap, irq_cap];
     let round1_len = if irq_cap != 0 { 3 } else { 2 };
@@ -676,7 +683,7 @@ pub fn spawn_simple_device(
             ipc_buf,
             round1_done,
             &round1_caps[..round1_len],
-            &[],
+            round1_words,
         )
     }
     .is_err()

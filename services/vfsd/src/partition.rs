@@ -14,17 +14,22 @@
 //! Block reads use [`BLK_READ_INTO_MEMORY`](ipc::blk_labels::BLK_READ_INTO_MEMORY):
 //! a single scratch Memory cap (allocated via [`alloc_scratch`] at startup) is
 //! reused across every read, moved out and back through IPC each call. The
-//! sector lands at offset 0 of the scratch page per the wire contract; vfsd
-//! memcpys 512 B from there into a stack buffer.
+//! block lands at offset 0 of the scratch page per the wire contract; vfsd
+//! copies one logical block from there into a stack buffer. The logical
+//! block size, the unit of every GPT LBA, comes from the driver's
+//! [`BLK_GET_GEOMETRY`](ipc::blk_labels::BLK_GET_GEOMETRY) before the header
+//! is read.
 
 use std::os::seraph::reserve_pages;
 
-use gpt::{GptEntry, GptError, GptHeader, SECTOR_SIZE, ScanStop, collect_partitions, parse_header};
+use gpt::{
+    GptEntry, GptError, GptHeader, MAX_BLOCK_SIZE, ScanStop, collect_partitions, parse_header,
+};
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use syscall_abi::MAP_WRITABLE;
 
 /// Offset within the scratch page where `BLK_READ_INTO_MEMORY` deposits the
-/// 512-byte sector (per the wire contract).
+/// block (per the wire contract).
 const SECTOR_OFFSET_IN_MEMORY: u64 = 0;
 
 /// Allocate one scratch Memory cap from memmgr, reserve a 1-page VA window,
@@ -67,7 +72,31 @@ fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
     reply.caps().first().copied()
 }
 
-/// Read a single sector from the block device via `BLK_READ_INTO_MEMORY`.
+/// The device's logical block size, from `BLK_GET_GEOMETRY` on the
+/// whole-disk cap, or `None` when the driver refuses or replies a size the
+/// GPT parser does not take.
+fn query_block_size(blk_ep: u32, ipc_buf: *mut u64) -> Option<usize>
+{
+    let msg = IpcMessage::builder(blk_labels::BLK_GET_GEOMETRY)
+        .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(blk_ep, &msg, ipc_buf) }.ok()?;
+    for &cap in reply.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    if reply.label != blk_errors::SUCCESS
+    {
+        return None;
+    }
+    let size = usize::try_from(reply.word(0)).ok()?;
+    (size.is_power_of_two() && (gpt::MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&size))
+        .then_some(size)
+}
+
+/// Read one logical block, `buf.len()` bytes, from the block device via
+/// `BLK_READ_INTO_MEMORY`.
 ///
 /// `scratch_cap` is moved out to the driver and moved back in the reply; the
 /// slot index of the returned cap may differ from the input, so the caller's
@@ -76,7 +105,7 @@ fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 fn read_block_sector(
     blk_ep: u32,
     sector: u64,
-    buf: &mut [u8; SECTOR_SIZE],
+    buf: &mut [u8],
     scratch_cap: &mut u32,
     scratch_va: u64,
     ipc_buf: *mut u64,
@@ -105,18 +134,21 @@ fn read_block_sector(
         return false;
     }
     // SAFETY: scratch_va is a writable single-page mapping owned by vfsd. The
-    // driver has just DMAed 512 B at offset SECTOR_OFFSET_IN_MEMORY.
+    // driver has just DMAed one block, at most MAX_BLOCK_SIZE (one page), at
+    // offset SECTOR_OFFSET_IN_MEMORY; `buf` is a distinct buffer of that
+    // block's length.
     unsafe {
         core::ptr::copy_nonoverlapping(
             (scratch_va + SECTOR_OFFSET_IN_MEMORY) as *const u8,
             buf.as_mut_ptr(),
-            SECTOR_SIZE,
+            buf.len(),
         );
     }
     true
 }
 
-/// Read the GPT header at LBA 1 and validate it via the pure parser.
+/// Read the GPT header at LBA 1, one logical block of the device's size, and
+/// validate it via the pure parser.
 fn read_and_validate_header(
     blk_ep: u32,
     scratch_cap: &mut u32,
@@ -124,12 +156,14 @@ fn read_and_validate_header(
     ipc_buf: *mut u64,
 ) -> Result<GptHeader, GptError>
 {
-    let mut sector = [0u8; SECTOR_SIZE];
-    if !read_block_sector(blk_ep, 1, &mut sector, scratch_cap, scratch_va, ipc_buf)
+    let block_size = query_block_size(blk_ep, ipc_buf).ok_or(GptError::IoError)?;
+    let mut block = [0u8; MAX_BLOCK_SIZE];
+    let block = &mut block[..block_size];
+    if !read_block_sector(blk_ep, 1, block, scratch_cap, scratch_va, ipc_buf)
     {
         return Err(GptError::IoError);
     }
-    parse_header(&sector)
+    parse_header(block)
 }
 
 /// Parse the GPT and return every used partition entry, in on-disk order.

@@ -90,8 +90,8 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
   (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
-  `GEN_BITS`, the ktest mirrors of
-  `MAX_SLEEPING` and `L2_SIZE`, and the svctest mirrors of the fs-fat cache constants.
+  `GEN_BITS`, the ktest mirrors of `MAX_SLEEPING` and `L2_SIZE`, and vfsd gpt's `MAX_BLOCK_SIZE`
+  and virtio-blk's.
 - **Spin-count timeouts.** Several deadlock detectors and device polls are counted in loop
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
   model.
@@ -443,8 +443,8 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 | FS_READ_MEMORY, FS_WRITE_MEMORY | `shared/ipc/src/lib.rs` | one page per call | encoding artefact (one slot cap per reply) | none | correct as is | Callers iterate; batching is a throughput question (#229) |
 | FS_READ_MEMORY release cookie | `shared/ipc/src/lib.rs` | `u64`, client-chosen | ABI width | none | correct as is | None (#530) |
 | QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled once delivered) | none | correct as is | None |
-| `blk_labels` partition badges | `shared/ipc/src/lib.rs` | `u64`, monotonic | ABI width | none | correct as is | None |
-| `INVALID_MEMORY_CAP` byte limit | `shared/ipc/src/lib.rs` | `count * 512 <= u32::MAX` | hardware spec (VirtIO descriptor `u32` length) | none | correct as is | 4 GiB per request |
+| `blk_labels` partition badges | `shared/ipc/src/lib.rs` | `u64`, one per distinct registered range | ABI width | none | correct as is | None |
+| `INVALID_MEMORY_CAP` byte limit | `shared/ipc/src/lib.rs` | `count * block_size <= u32::MAX` | hardware spec (VirtIO descriptor `u32` length) | none | correct as is | 4 GiB per request |
 | serial, framebuffer and stream byte counts | `shared/ipc/src/lib.rs` | 512 B per call | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | Callers iterate |
 | `INPUT_MAX_EVENTS_PER_READ` | `shared/ipc/src/lib.rs` | 32 | per-message bound (readers loop) | 256 B stack | correct as is | Could use 63 words at no cost |
 | `keysym::pack_event` widths | `shared/ipc/src/lib.rs` | 32 / 31 bits | encoding artefact (one word per event) | none | correct as is | None |
@@ -567,8 +567,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
 
 ### vfsd and namespace
 
-Tracked by [#647](https://github.com/kottlerg/seraph/issues/647) (gpt `SECTOR_SIZE`, with the
-device block-size query and fs-fat's sector size).
+Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -577,7 +576,7 @@ device block-size query and fs-fat's sector size).
 | tree component limit (`validate_name`) | `services/vfsd/root-backend/src/lib.rs` | `MAX_NAME_LEN` (255) | ABI width (the namespace protocol's name rule) | none (names are heap-allocated to their length) | correct as is | None |
 | `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
 | `collect_partitions` entry list | `services/vfsd/gpt/src/lib.rs` | heap `Vec`, every used entry of the header's `num_parts` array | hardware spec (UEFI GPT: `parse_header` requires the array to lie between LBA 2 and the header's own `first_usable_lba`); a header that also inflates `first_usable_lba` is bounded by the device capacity, and a read or allocation failure stops the walk with a log | none | correct as is | None |
-| gpt `SECTOR_SIZE` | `services/vfsd/gpt/src/lib.rs` | 512 | hardware spec (512-byte logical sector only) | 512 B stack | needs a design | 4Kn disks; query the device block size (#647) |
+| gpt `MAX_BLOCK_SIZE` | `services/vfsd/gpt/src/lib.rs` | 4096; the block size itself comes from `BLK_GET_GEOMETRY` | hardware spec (the block driver's `MAX_BLOCK_SIZE`, one page) | 4 KiB stack during a walk | correct as is | None (4Kn boot: #669) |
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
 | `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
@@ -665,59 +664,61 @@ Tracked by [#661](https://github.com/kottlerg/seraph/issues/661) and
 
 ### Drivers
 
-Tracked by [#647](https://github.com/kottlerg/seraph/issues/647).
+Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_QUEUE_SIZE` | `services/drivers/virtio/core/src/virtqueue.rs` | 256 | current peak plus headroom (QEMU default) | 1 KiB per queue | make pay-as-you-go | The spec allows 32768; size to the negotiated queue |
-| `last_used_idx`, `avail.idx` | `services/drivers/virtio/core/src/virtqueue.rs` | `u16` | hardware spec (VirtIO split ring) | none | correct as is | Assert a power-of-two queue size |
-| `RESET_POLL_LIMIT` | `services/drivers/virtio/core/src/pci.rs` | 1 000 000 | unknown (spin count) | none | needs a design | Wall-clock bound |
-| virtio-blk `QUEUE_SIZE` | `services/drivers/virtio/blk/src/main.rs` | 128 | unknown | two ring pages | needs a design | Effective depth is 1 |
-| `PARTITION_TABLE_SIZE` | `services/drivers/virtio/blk/src/main.rs` | 16, cumulative | current peak plus headroom | 512 B | needs a design | No unregister path; recycle on cap death |
-| `next_partition_badge` | `services/drivers/virtio/blk/src/main.rs` | `u64`, monotonic | provably unreachable (2^63 registrations) | none | correct as is | None |
-| `transfer_len` bound | `services/drivers/virtio/blk/src/lib.rs` | `u32::MAX / 512` sectors | hardware spec (VirtIO descriptor length) | none | correct as is | None |
+| `MAX_QUEUE_SIZE` | `services/drivers/virtio/core/src/virtqueue.rs` | 32768; the bookkeeping is sized to the negotiated queue | hardware spec (VirtIO split ring) | 4 B per negotiated descriptor | correct as is | None |
+| `last_used_idx`, `avail.idx` | `services/drivers/virtio/core/src/virtqueue.rs` | `u16` | hardware spec (VirtIO split ring; `new` refuses a queue size that is not a power of two) | none | correct as is | None |
+| `RESET_TIMEOUT` | `services/drivers/virtio/core/src/pci.rs` | 5 s on the monotonic clock | tuning | none | correct as is | None |
+| virtio-blk `QUEUE_SIZE` | `services/drivers/virtio/blk/src/main.rs` | 4 | provably unreachable (one request in flight by design; one three-descriptor chain) | one ring page | correct as is | None |
+| `PartitionTable.entries` | `services/drivers/virtio/blk/src/lib.rs` | heap `Vec`, one entry per distinct registered range (a remount reuses its entry) | per-instance | none | correct as is | None |
+| `PartitionTable.next_badge` | `services/drivers/virtio/blk/src/lib.rs` | `u64`, one per distinct range | provably unreachable (2^63 ranges) | none | correct as is | None |
+| `MAX_BLOCK_SIZE` | `services/drivers/virtio/blk/src/lib.rs` | 4096 | hardware spec (one page, the unit clients read into) | none | correct as is | None |
+| `transfer_len` bound | `services/drivers/virtio/blk/src/lib.rs` | `u32::MAX / block_size` blocks | hardware spec (VirtIO descriptor length) | none | correct as is | None |
 | `REQUEST_TIMEOUT` | `services/drivers/virtio/blk/src/io.rs` | 50 s | tuning | none | correct as is | None |
 | `IRQ_WAIT_TIMEOUT_MS` | `services/drivers/virtio/blk/src/io.rs` | 50 ms | tuning | none | correct as is | None |
-| poll burst | `services/drivers/virtio/blk/src/io.rs` | 100 000 spins | unknown (spin count) | none | needs a design | Wall-clock bound |
+| `POLL_BURST` | `services/drivers/virtio/blk/src/io.rs` | 500 us on the monotonic clock | tuning | none | correct as is | None |
 | `EVENT_QUEUE_SIZE` | `services/drivers/virtio/input/src/input.rs` | 64 | BSS budget (64 x 8 B buffers in one DMA page) | one DMA page | correct as is | None |
 | `POLL_INTERVAL_MS` | `services/drivers/virtio/input/src/main.rs` | 20 | tuning (human input rate) | none | correct as is | None |
 | `MAX_READ_BYTES` | `services/drivers/serial/src/main.rs` | 512 | ABI width (`MSG_DATA_WORDS_MAX * 8`) | 512 B stack | correct as is | Derive from the constant |
 | serial and framebuffer write `byte_len` | `services/drivers/serial/src/main.rs`, `services/drivers/framebuffer/src/main.rs` | 16 bits | encoding artefact | none | correct as is | None |
 | cmos `MAX_ATTEMPTS` | `services/drivers/cmos/src/lib.rs` | 16 | hardware spec (MC146818 update cadence) | none | correct as is | None |
 | cmos `UIP_POLL_LIMIT` | `services/drivers/cmos/src/lib.rs` | 10 000 | hardware spec (UIP held at most about 2 ms) | none | correct as is | None |
-| cmos century fallback | `services/drivers/cmos/src/main.rs` | 2000 to 2099 without a century register | hardware spec (QEMU) | none | needs a design | Read the FADT `CENTURY` index |
+| cmos `FALLBACK_CENTURY` | `services/drivers/cmos/src/lib.rs` | 2000 to 2099, only without a century register (FADT `CENTURY` 0) | hardware spec (two-digit year) | none | correct as is | None |
 | test-orphan `RESERVE_BYTES` | `services/drivers/test-orphan/src/main.rs` | 1 MiB | test fixture | 1 MiB heap | correct as is | None |
 
 ### fs-fat
 
-Tracked by [#647](https://github.com/kottlerg/seraph/issues/647).
+Tracked by [#637](https://github.com/kottlerg/seraph/issues/637) (the `SLOT_COUNT` raise).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_NODES` (`NodeTable.entries`) | `services/fs/fat/src/backend.rs` | 128, cumulative | current peak plus headroom | about 5 KiB stack | needs a design | Every lookup fails after 128 distinct entries (#27) |
+| `node_slab::MAX_ENTRIES` (`NodeTable`) | `services/fs/fat/fat-parse/src/node_slab.rs` | 2^24 - 1 live nodes, one per distinct live entry looked up; freed when the entry is removed or renamed and recycled under a 16-bit generation, retired at wrap | encoding artefact (40-bit `NodeId`) | heap, per live node | correct as is | None |
 | `NO_OPEN_SLOT` | `services/fs/fat/src/backend.rs` | `u32::MAX` | provably unreachable | none | correct as is | None |
-| `MAX_OPEN_FILES` | `services/fs/fat/src/file.rs` | 8 | current peak plus headroom | about 4.2 KiB | make pay-as-you-go | A 9th concurrent file is refused (#530) |
-| `MAX_OUTSTANDING` | `services/fs/fat/src/file.rs` | 16 pages per file | current peak plus headroom | about 512 B per file | raise | Scale with the cache |
-| `MAX_PENDING_EVICTIONS` | `services/fs/fat/src/eviction.rs` | `MAX_OPEN_FILES * MAX_OUTSTANDING` | provably unreachable (each entry is queued at most once) | about 4 KiB | correct as is | Follows its factors |
-| `RELEASE_TIMEOUT_MS` | `services/fs/fat/src/eviction.rs` | 100 ms | tuning | none | needs a design | Each timeout leaks one watchdog thread (#31) |
-| `SLOT_COUNT` (`PageCache.slots`) | `services/fs/fat/src/cache.rs` | 128 pages | BSS budget | 512 KiB per mount | make pay-as-you-go | Grow lazily to a RAM-scaled ceiling (#52) |
-| `QUARANTINE_MAX` | `services/fs/fat/src/cache.rs` | 32 | tuning (bounds what non-unmapping clients cost) | 256 B | correct as is | None (#52) |
+| open-file table | `services/fs/fat/src/main.rs` | heap `Vec`, at most one slot per live node, closed slots reused | per-instance | none | correct as is | Key by open instance (#530) |
+| `MAX_OUTSTANDING` | `services/fs/fat/src/file.rs` | `SLOT_COUNT` pages per file, the table grown on demand | follows the cache | none | correct as is | None |
+| eviction queue | `services/fs/fat/src/eviction.rs` | heap `VecDeque`, one entry per outstanding page at most | provably unreachable (each page is queued at most once) | none | correct as is | None |
+| `RELEASE_TIMEOUT_MS` | `services/fs/fat/src/eviction.rs` | 100 ms | tuning | none | correct as is | None |
+| `MAX_WATCHDOGS` | `services/fs/fat/src/eviction.rs` | 4 watchdog threads alive at once | tuning (past it a release skips the advisory round trip) | none | correct as is | Cancel a blocked call (#31) |
+| `SLOT_COUNT` (`PageCache.slots`) | `services/fs/fat/fat-parse/src/lib.rs` | 128 pages, each taken from memmgr on its slot's first use | current peak plus headroom | the slots filled | raise | A RAM-scaled ceiling (#637) |
+| `QUARANTINE_MAX` | `services/fs/fat/fat-parse/src/lib.rs` | 32 | tuning (bounds what non-unmapping clients cost) | 256 B | correct as is | None (#52) |
 | `CACHE_CSPACE_FUNDING` | `services/fs/fat/src/cache.rs` | `SLOT_COUNT + QUARANTINE_MAX + 1 + 64` slots | follows its factors, plus run-time headroom | the slot pages it funds | correct as is | None |
-| `SECTORS_PER_PAGE` | `services/fs/fat/src/cache.rs` | 8 | hardware spec (page over 512 B sector) | none | correct as is | None |
+| `PageCache::sectors_per_page` | `services/fs/fat/src/cache.rs` | `PAGE_SIZE` over the device block size, 1 to 8 | hardware spec (page over sector) | none | correct as is | None |
 | `SCRATCH_MEMORY` | `services/fs/fat/src/cache.rs` | one page | encoding artefact (block DMA from offset 0) | one page | correct as is | None (#83) |
-| `FatState.cached_fat_sector` | `services/fs/fat/src/bpb.rs` | one sector | tuning (memo above the cache) | 512 B | correct as is | None |
+| `FatState.cached_fat_sector` | `services/fs/fat/src/bpb.rs` | one sector | tuning (memo above the cache) | 4 KiB | correct as is | None |
 | `NEXT_BADGE` | `services/fs/fat/src/main.rs` | `u64`, monotonic | provably unreachable | none | correct as is | None |
 | FS_READ reply size | `services/fs/fat/src/main.rs` | 504 B | ABI width | 512 B stack | correct as is | None |
 | memory verbs | `services/fs/fat/src/main.rs` | one page per call | encoding artefact | none | correct as is | None |
 | cluster-chain walk | `services/fs/fat/src/main.rs`, `fat.rs` | at most file size over cluster size | encoding artefact (`u32` file size) | none | correct as is | Add a cycle guard |
 | `next_dir_cluster` step guard | `services/fs/fat/src/dir.rs` | `total_clusters` | provably unreachable (longer chains must cycle) | none | correct as is | None |
 | allocator scans | `services/fs/fat/src/alloc.rs` | `total_clusters`, one wrap | encoding artefact | none | correct as is | None |
-| `MAX_NUMERIC_TAIL` | `services/fs/fat/src/dir.rs` | 6 | current peak plus headroom | none | raise | The 7th colliding long name fails |
+| `MAX_NUMERIC_TAIL` | `services/fs/fat/fat-parse/src/lib.rs` | 999 999, the lowest free tail taken | hardware spec (FAT numeric tail; a directory's 65536 entries always leave one) | 8 KiB heap per insert | correct as is | None |
 | on-disk `u32` fields | `services/fs/fat/src/dir.rs` | `u32` | hardware spec (FAT32) | none | correct as is | None |
-| ASCII-only LFN write | `services/fs/fat/src/dir.rs` | ASCII | unknown | 510 B stack | needs a design | UCS-2 encoding |
+| LFN write (`encode_lfn`) | `services/fs/fat/fat-parse/src/lib.rs` | 255 UTF-16 code units | hardware spec (FAT LFN) | 510 B stack | correct as is | None |
 | `MAX_LFN_CHARS`, `MAX_LFN_UTF8` | `services/fs/fat/fat-parse/src/lib.rs` | 255 / 765 | hardware spec (FAT LFN) | embedded | correct as is | None |
 | `MAX_SLOT_RUN` | `services/fs/fat/fat-parse/src/lib.rs` | 21 | hardware spec (FAT LFN) | embedded | correct as is | None |
-| fat-parse `SECTOR_SIZE` | `services/fs/fat/fat-parse/src/lib.rs` | 512 | encoding artefact (block IPC addresses 512 B sectors) | none | needs a design | 4Kn volumes are refused |
+| fat-parse `MAX_SECTOR_SIZE` | `services/fs/fat/fat-parse/src/lib.rs` | 4096; the volume's sector size must equal the device block size | hardware spec (FAT sector sizes 512 to 4096) | 4 KiB per sector buffer | correct as is | None (4Kn boot: #669) |
 
 ### Test harnesses
 
@@ -743,7 +744,7 @@ production value is raised.
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |
 | `DEPTH` | `core/ktest/src/integration/cspace_nested_teardown.rs` | 256 | test fixture (past the kernel-stack recursion depth) | none | correct as is | None |
 | `CHILDREN` | `core/ktest/src/integration/cap_transfer_large.rs` | 300 | test fixture (more than one reparent batch) | none | correct as is | None |
-| `FATFS_SLOT_COUNT`, `FATFS_QUARANTINE_MAX` | `services/svctest/src/phases/fs_ipc.rs` | 128 / 32 | mirror of fs-fat | none | correct as is | Import or assert (#647) |
+| `FATFS_SLOT_COUNT`, `FATFS_QUARANTINE_MAX` | `services/svctest/src/phases/fs_ipc.rs` | fs-fat's `SLOT_COUNT` / `QUARANTINE_MAX`, imported | follows fs-fat | none | correct as is | None |
 | `INLINE_CHUNK` | `services/svctest/src/phases/fs_ipc.rs` | 504 | ABI width | none | correct as is | Use the derived constant |
 | `SYSTEM_TIME_BEFORE_2100_SECS` | `services/svctest/src/phases/timed.rs` | 4 102 444 800 | mirror of the cmos century fallback | none | correct as is | None |
 | svctest poll counts | `services/svctest/src/phases/*.rs` | 256 to 5000 | test fixture | none | correct as is | None |

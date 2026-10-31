@@ -106,6 +106,10 @@ pub fn phases_pre_relative() -> &'static [Phase]
             name: "fs_mapping_survives_slot_reuse",
             run: fs_mapping_survives_slot_reuse_phase,
         },
+        Phase {
+            name: "fs_removed_node_id_stays_dead",
+            run: fs_removed_node_id_stays_dead_phase,
+        },
     ]
 }
 
@@ -188,6 +192,57 @@ pub fn fs_release_on_close_phase(_: &Caps)
     }
 
     std::os::seraph::log!("fs_release_on_close phase passed (8 cycles)");
+}
+
+/// A node cap closed and kept past its file's removal never reaches the
+/// node that reuses its id. fatfs frees a node when `FS_REMOVE` unlinks its
+/// entry and reuses the freed index for the next new node, under a new
+/// generation: file A's cap, used once file B has taken A's index (the free
+/// list hands back the most recently freed index first), must be refused
+/// rather than read B. Without the generation, A's badge would name B's node
+/// and the read would return B's bytes. A's `FS_CLOSE` before the removal
+/// covers the close-then-use order: a close frees no node, and the removal
+/// still invalidates the cap.
+pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let svctest = svctest_dir_cap(ipc_buf);
+    let (name_a, name_b): (&[u8], &[u8]) = (b"epocha.bin", b"epochb.bin");
+    let _ = fs_remove(svctest, name_a, ipc_buf);
+    let _ = fs_remove(svctest, name_b, ipc_buf);
+
+    let (cap_a, _) = fs_create(svctest, name_a, ipc_buf).expect("FS_CREATE epocha failed");
+    fs_write_inline(cap_a, 0, b"AAAA", ipc_buf).expect("FS_WRITE epocha failed");
+    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(cap_a, &close, ipc_buf) }.expect("FS_CLOSE ipc_call");
+    assert_eq!(reply.label, ipc::fs_errors::SUCCESS, "FS_CLOSE epocha");
+    assert_eq!(
+        fs_read_bytes(cap_a, 0, 4, ipc_buf).expect("FS_READ epocha after close"),
+        b"AAAA",
+        "a closed cap still reaches its own file"
+    );
+    fs_remove(svctest, name_a, ipc_buf).expect("FS_REMOVE epocha");
+
+    let (cap_b, _) = fs_create(svctest, name_b, ipc_buf).expect("FS_CREATE epochb failed");
+    fs_write_inline(cap_b, 0, b"BBBB", ipc_buf).expect("FS_WRITE epochb failed");
+
+    assert_eq!(
+        fs_read_bytes(cap_a, 0, 4, ipc_buf),
+        Err(ipc::fs_errors::INVALID_BADGE),
+        "a removed node's cap read another node's content"
+    );
+    assert_eq!(
+        fs_read_bytes(cap_b, 0, 4, ipc_buf).expect("FS_READ epochb"),
+        b"BBBB",
+        "the node that reused the id"
+    );
+
+    let _ = syscall::cap_delete(cap_a);
+    let _ = syscall::cap_delete(cap_b);
+    fs_remove(svctest, name_b, ipc_buf).expect("cleanup epochb");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_removed_node_id_stays_dead phase passed");
 }
 
 pub fn fs_crossover_bench_phase(_: &Caps)
@@ -1128,15 +1183,18 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     std::os::seraph::log!("fs_carried_caps_dropped phase passed");
 }
 
-/// fatfs's cache slots (`services/fs/fat/src/cache.rs` `SLOT_COUNT`).
-const FATFS_SLOT_COUNT: usize = 128;
+/// fatfs's cache slots, the one definition fatfs itself uses.
+const FATFS_SLOT_COUNT: usize = fat_parse::SLOT_COUNT;
 
-/// fatfs's quarantine bound (`services/fs/fat/src/cache.rs` `QUARANTINE_MAX`).
-const FATFS_QUARANTINE_MAX: usize = 32;
+/// fatfs's quarantine bound, the one definition fatfs itself uses.
+const FATFS_QUARANTINE_MAX: usize = fat_parse::QUARANTINE_MAX;
 
 /// Pages of the slot-reuse file: more than fatfs's slots plus its quarantine
 /// bound, so holding pages until fatfs refuses one ends before the file does.
 const SLOT_REUSE_PAGES: usize = 200;
+
+// The slot-reuse phase's bound check needs a file that outlasts the cache.
+const _: () = assert!(SLOT_REUSE_PAGES > FATFS_SLOT_COUNT + FATFS_QUARANTINE_MAX);
 
 /// Pages the first case holds mapped: more than the quarantine bound, so
 /// some still-mapped slots must stay out of service instead of being given a

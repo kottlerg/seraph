@@ -102,6 +102,14 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
     carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
+/// The data word the RTC driver's bootstrap round carries: none. No-op on
+/// riscv64: the goldfish RTC counts nanoseconds since the epoch, so it has
+/// no century register for firmware to name.
+pub fn rtc_bootstrap_word(_caps: &DevmgrCaps) -> Option<u64>
+{
+    None
+}
+
 /// Carve the platform RTC's hardware-authority cap: the QEMU `virt`
 /// goldfish-RTC page at `0x101000`. The base is platform-static and
 /// hardcoded pending #165, which replaces all such hardcoded per-driver

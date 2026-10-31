@@ -74,7 +74,7 @@ targets; only the one-time init-logd history pull
   posts to it; a worker thread's exit does not (see
   [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)).
   When a process exits, logd's EQ receives
-  `(process_badge << 32) | exit_reason`; logd evicts the matching
+  `(process_badge as u32) << 32 | exit_reason`; logd evicts the matching
   slot from its hash-keyed badge table (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md)). The EQ has a fixed
   tuning capacity. A death posted to a full EQ is dropped, so a drain that

@@ -859,11 +859,12 @@ pub mod svcmgr_labels
     /// freshly derived SEND cap.
     ///
     /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
-    /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`]
-    /// (`registry-client`'s `pack_name` is the reference encoder). Reply
-    /// attaches a freshly derived SEND cap on success. On failure it carries
-    /// no cap and returns `svcmgr_errors::INVALID_NAME` if `name_len` is 0
-    /// or exceeds `registry::NAME_MAX`; `svcmgr_errors::UNKNOWN_NAME` on
+    /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`] ([`pack_name`]
+    /// is the reference encoder). Reply attaches a freshly derived SEND cap
+    /// on success. On failure it carries no cap and returns
+    /// `svcmgr_errors::INVALID_NAME` if `name_len` is 0 or exceeds
+    /// [`NAME_MAX`], or the message carries fewer data words than `name_len`
+    /// needs; `svcmgr_errors::UNKNOWN_NAME` on
     /// miss and for a seed-only name (one whose cap carries authority, or
     /// [`crate::published_names::VFSD_DENY`], svctest's test twin, which
     /// carries none; a seed-only name reaches only the recipes seeding it;

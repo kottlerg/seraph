@@ -314,6 +314,16 @@ pub fn bootstrap_caps(
     caps
 }
 
+/// Copy `s` into a new `String`, or `None` when the heap cannot hold it:
+/// the fallible copy every name and path svcmgr stores goes through.
+pub fn try_string(s: &str) -> Option<String>
+{
+    let mut out = String::new();
+    out.try_reserve_exact(s.len()).ok()?;
+    out.push_str(s);
+    Some(out)
+}
+
 /// Park one substrate `(name, thread_cap)` round in `pending`. Releases the
 /// delivered thread cap on any reject (invalid name, heap exhausted) so a
 /// malformed round cannot leak a cap.
@@ -332,30 +342,32 @@ fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<Pe
         let _ = syscall::cap_delete(cap);
     };
     let name_len = round.data[1] as usize;
-    let name = round
+    let Some(bytes) = round
         .data
         .get(2..round.data_words)
         .and_then(|words| ipc::svcmgr_labels::unpack_name(words, name_len))
-        .and_then(|bytes| {
-            core::str::from_utf8(&bytes[..name_len])
-                .ok()
-                .map(str::to_owned)
-        });
-    let Some(name) = name
     else
     {
         std::os::seraph::log!("bootstrap: substrate name invalid");
         reject(thread_cap);
         return;
     };
-    if pending.try_reserve(1).is_err()
+    let Ok(name) = core::str::from_utf8(&bytes[..name_len])
+    else
+    {
+        std::os::seraph::log!("bootstrap: substrate name invalid");
+        reject(thread_cap);
+        return;
+    };
+    let Some(name) = try_string(name).filter(|_| pending.try_reserve(1).is_ok())
+    else
     {
         std::os::seraph::log!(
             "bootstrap: no memory for a pending registration; dropping substrate"
         );
         reject(thread_cap);
         return;
-    }
+    };
     std::os::seraph::log!("endowed: {name}");
     pending.push(PendingRegistration {
         name,

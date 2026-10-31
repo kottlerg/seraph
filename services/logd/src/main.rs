@@ -371,6 +371,10 @@ struct Resync
     /// The walk in flight: the slot snapshot taken before it began and the
     /// channel its live list arrives on (`None` when the walk failed).
     in_flight: Option<(Vec<u64>, LiveReceiver)>,
+    /// A drain crossed the capacity while a walk was in flight. That walk's
+    /// snapshot and list may miss the deaths dropped then, so another walk
+    /// starts once it ends.
+    pending: bool,
 }
 
 /// The channel the resync helper sends its walk's live badges on; `None`
@@ -385,17 +389,25 @@ impl Resync
             procmgr_send,
             note,
             in_flight: None,
+            pending: false,
         }
     }
 
-    /// Snapshot the child slots and start the helper's walk, unless one is
-    /// already in flight (its own drain covers the deaths it misses).
+    /// Snapshot the child slots and start the helper's walk. With one
+    /// already in flight, mark another due instead: [`Self::finish`] starts
+    /// it once the current walk ends.
     fn start(&mut self, table: &SlotTable)
     {
-        if self.in_flight.is_some() || self.procmgr_send == 0
+        if self.procmgr_send == 0
         {
             return;
         }
+        if self.in_flight.is_some()
+        {
+            self.pending = true;
+            return;
+        }
+        self.pending = false;
         let mut snapshot: Vec<u64> = Vec::new();
         if snapshot.try_reserve(table.slots.len()).is_err()
         {
@@ -424,7 +436,8 @@ impl Resync
     }
 
     /// Consume the helper's signal and, once its result is in, evict every
-    /// snapshot slot the walk did not list.
+    /// snapshot slot the walk did not list, then start the walk a drain
+    /// marked due meanwhile.
     fn finish(&mut self, table: &mut SlotTable)
     {
         // Clear the signalled bits: the wait set reports the notification
@@ -447,20 +460,29 @@ impl Resync
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
         };
-        let Some(live) = live
-        else
+        match live
         {
-            self_log("resync: live-process walk failed; slots kept");
-            return;
-        };
-        for badge in logd_codec::resync::evictable(&snapshot, &live)
+            Some(live) => evict_missing(&snapshot, &live, table),
+            None => self_log("resync: live-process walk failed; slots kept"),
+        }
+        if self.pending
         {
-            if table.evict(badge)
-            {
-                let mut buf = SerialFmt::new();
-                let _ = write!(buf, "reclaim (resync): badge={badge}");
-                self_log(buf.as_str());
-            }
+            self.start(table);
+        }
+    }
+}
+
+/// Evict every `snapshot` slot whose badge the walk's ascending `live` list
+/// lacks.
+fn evict_missing(snapshot: &[u64], live: &[u64], table: &mut SlotTable)
+{
+    for badge in logd_codec::resync::evictable(snapshot, live)
+    {
+        if table.evict(badge)
+        {
+            let mut buf = SerialFmt::new();
+            let _ = write!(buf, "reclaim (resync): badge={badge}");
+            self_log(buf.as_str());
         }
     }
 }

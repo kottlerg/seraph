@@ -209,8 +209,11 @@ drops a post to a full queue, so a drain that takes a full queue's worth of
 events or more rescans the table and reaps every entry whose main thread the
 kernel reports exited (`CAP_INFO_THREAD_STATE`). Any dropped post leaves a full
 queue of events behind it for that drain or the next, so the rescan runs after
-the drop. A reaped child stays in a recent-exits record for 30 s, so
-`QUERY_PROCESS` answers `EXITED` for it (see
+the drop. The rescan recovers main-thread deaths only: a dropped address-space
+terminal-fault post, for a worker thread's fault while the main thread runs, is
+not recovered, since the kernel exposes no address-space fault state to read
+back; that process is reaped when its main thread exits. A reaped child stays in
+a recent-exits record for 30 s, so `QUERY_PROCESS` answers `EXITED` for it (see
 [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9: `QUERY_PROCESS`).
 
 ---

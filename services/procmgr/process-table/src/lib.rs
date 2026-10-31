@@ -652,12 +652,12 @@ mod tests
     }
 
     #[test]
-    fn take_by_badge_removes_matching_entry_and_leaves_slot_empty()
+    fn take_by_badge_removes_matching_entry_and_returns_it()
     {
         let mut table = ProcessTable::new();
         assert_eq!(table.insert(entry_with_badge(16)), Ok(()));
         assert_eq!(table.take_by_badge(16).map(|e| e.badge), Some(16));
-        // Slot is now free: a second take misses and find no longer sees it.
+        // The entry is gone: a second take misses and find no longer sees it.
         assert!(table.take_by_badge(16).is_none());
         assert!(table.find_mut_by_badge(16).is_none());
     }

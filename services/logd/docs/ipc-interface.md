@@ -169,8 +169,9 @@ a resync:
    list. A slot created after the snapshot is no candidate, so a sender that
    starts during the walk keeps its slot. A failed walk evicts nothing.
 
-One walk runs at a time; a drain that crosses the capacity while one is in flight
-starts none.
+One walk runs at a time. A drain that crosses the capacity while one is in
+flight marks another due, and it starts as soon as the current walk ends, so the
+deaths dropped during a walk are covered by the next one.
 
 logd's main thread never calls procmgr after startup. `seraph::log!` is a
 synchronous `ipc_call` on the master log endpoint, so while procmgr logs it is

@@ -44,7 +44,7 @@ use std::os::seraph::{StartupInfo, startup_info};
 /// took a full queue's worth of events; the service table has no fixed size.
 const DEATHS_EQ_CAPACITY: u32 = 64;
 
-/// Monotonic time since svcmgr started, in nanoseconds, for the windowed
+/// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
 pub(crate) fn now_ns() -> u64
 {
@@ -693,13 +693,16 @@ fn route_death(
     }
     // A slot's correlator outlives its instances, so a post can arrive for
     // an instance [`resync_deaths`] already routed and restarted. The kernel
-    // reports the current instance's thread state; a live thread means the
-    // post is the dead instance's, already handled.
-    if syscall::cap_info(svc.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
-        .is_ok_and(|packed| (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED)
+    // reports the current instance's thread state: a live thread means the
+    // post is the dead instance's, already handled; an exited one is routed
+    // with the reason the kernel recorded for it, not the post's, which may
+    // be the earlier instance's.
+    let exit_reason = match syscall::cap_info(svc.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
     {
-        return;
-    }
+        Ok(packed) if (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED => return,
+        Ok(packed) => packed & 0xFFFF_FFFF,
+        Err(_) => exit_reason,
+    };
 
     // Split disjoint field borrows so handle_death gets the entry, its
     // restart recipe, and the registry (for seed re-resolution) at once.

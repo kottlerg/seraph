@@ -429,7 +429,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 | `ARGS_BLOB_MAX` | `shared/ipc/src/lib.rs` | 256 B | current peak plus headroom; inline in one message | none | needs a design | argv and env through a Memory cap (#672) |
 | CREATE_FROM_FILE `args_bytes`, `env_bytes` | `shared/ipc/src/lib.rs` | `u16` | encoding artefact (label bit packing) | none | needs a design | Widen with the blob design (#672) |
 | CREATE_FROM_FILE `args_count`, `env_count` | `shared/ipc/src/lib.rs` | `u8` | encoding artefact (label bit packing) | none | needs a design | Unreachable at 256 B blobs; binds once blobs grow |
-| `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 4096 | encoding artefact (the POSIX `PATH_MAX` convention; no message carries a whole path, and svcmgr stores each at its length) | none | correct as is | None: svcmgr's one recipe path limit |
+| `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 4096 | provably unreachable (above the deepest recipe path the tree's 255-byte component names could plausibly form; no message carries a whole path, and svcmgr stores each at its length) | none | correct as is | None: svcmgr's one recipe path limit, the POSIX `PATH_MAX` value |
 | `svcmgr_labels::NAME_MAX`, `NAME_WORDS` | `shared/ipc/src/lib.rs` | 64 B / 8 words | encoding artefact (a name beside the label and round header fits one message; longest name in use 15 B) | none | correct as is | None: the one svcmgr name limit, which the registry, its client, svcmgr, its parser and init's endowment share with the `pack_name` codec |
 | `QUERY_LIVE_PROCESSES` page | `shared/ipc/src/lib.rs` (`LIVE_PROCESSES_PAGE`) | `MSG_DATA_WORDS_MAX - 1` = 63 badges | per-message bound (the caller pages on) | none | correct as is | None |
 | `CREATE_SCHED_FIELD_MASK` | `shared/ipc/src/lib.rs` | 5 bits | ABI width (32 priority levels) | none | correct as is | None |
@@ -481,7 +481,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 | ns-client `hop_count` | `shared/ns-client/src/lib.rs` | unbounded `usize` | provably unreachable (bounded by the path length) | none | correct as is | None |
 | `cap_revoke_all` `MAX_RETRIES` | `shared/syscall/src/lib.rs` | 4096 | provably unreachable (only an adversarial deriver exhausts it) | none | correct as is | None |
 | syscall wrapper argument widths | `shared/syscall/src/lib.rs` | `u32`, `u16`, `u8` | ABI width (syscall ABI) | none | correct as is | None |
-| `MAX_RELA_TABLE_SIZE` | `shared/elf/src/lib.rs` | 4 MiB, applied only by the kernel to init's table | current peak plus headroom (init is an in-tree binary; its table size arrives from the bootloader) | none | correct as is | None: the table locators bound a table by its `PT_LOAD` file data and the file instead |
+| `MAX_RELA_TABLE_SIZE` | `shared/elf/src/lib.rs` | 4 MiB, applied only by the kernel to init's table | provably unreachable (init is an in-tree binary with a few thousand relocations; its table size arrives from the bootloader) | none | correct as is | None: the table locators bound a table by its `PT_LOAD` file data and the file instead |
 | `MAX_STREAMING_DYNAMIC`, `MAX_STREAMING_STRTAB`, `MAX_STREAMING_NOTE` | `shared/elf/src/lib.rs` | 4096 / 4096 / 64 | provably unreachable (lld output is far smaller; only fixed sections) | stack | correct as is | None |
 | `Elf64Ehdr.e_phnum`, `e_shnum` | `shared/elf/src/lib.rs` | `u16` | hardware spec (ELF64 header) | none | correct as is | None |
 | ed25519 `MSG_SCRATCH` | `shared/crypto/src/ed25519.rs` | 1024 | provably unreachable (largest RFC 8032 vector 1023 B) | 2 KiB stack | correct as is | None |
@@ -526,7 +526,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `ProcessTable.entries` | `services/procmgr/process-table/src/lib.rs` | heap `Vec` sorted by badge | per-instance (a spawn fails only when the heap cannot grow it) | none | correct as is | None |
-| `DEATH_EQ_CAPACITY` | `services/procmgr/src/main.rs` | 256 | tuning (a drain of a full queue's worth rescans every live entry's thread state, recovering any dropped post) | about 2 KiB | correct as is | None |
+| `DEATH_EQ_CAPACITY` | `services/procmgr/src/main.rs` | 256 | tuning (a drain of a full queue's worth rescans every live entry's main-thread state, recovering any dropped main-thread post) | about 2 KiB | needs a design | A dropped address-space terminal-fault post (a worker thread's fault) is not recovered: no kernel state reports an address space's terminal fault (#673) |
 | `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
 | death correlator `correlator_of` | `services/procmgr/process-table/src/lib.rs` | low 32 bits, unique among live processes | ABI width (kernel correlator) | none | needs a design | Minting redraws a live low word; widening is #638 |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
@@ -584,8 +584,7 @@ device block-size query and fs-fat's sector size).
 
 The entries left open are tracked by the Issue each recommendation names: memmgr's page-table
 seed by [#642](https://github.com/kottlerg/seraph/issues/642), the ACPI region caps by
-[#637](https://github.com/kottlerg/seraph/issues/637), the service-name packing and logd's death
-queue by [#643](https://github.com/kottlerg/seraph/issues/643), and logd's eviction by the low 32
+[#637](https://github.com/kottlerg/seraph/issues/637), and logd's eviction by the low 32
 correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |

@@ -29,7 +29,9 @@ use std::os::seraph::log;
 use super::parse::parse;
 use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch};
 use crate::restart::RestartCtx;
-use crate::service::{POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
+use crate::service::{
+    POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
+};
 
 /// Entry in svcmgr's pending-registration table populated from init's
 /// handover endowment (one substrate `SUBSTRATE` round each). Each entry
@@ -280,12 +282,25 @@ fn handle_definition(
         return;
     };
 
-    table.services[idx] = build_entry(
+    let Some(entry) = build_entry(
         def,
         launched.thread_cap,
         launched.process_handle,
         launched.provided_endpoint,
-    );
+    )
+    else
+    {
+        // The instance runs, but its slot stays inactive, so svcmgr does not
+        // supervise it; its published endpoint stays with its consumers.
+        log!(
+            "svcmgr: no memory for {}'s entry; running unsupervised",
+            def.name
+        );
+        let _ = syscall::cap_delete(launched.thread_cap);
+        let _ = syscall::cap_delete(launched.process_handle);
+        return;
+    };
+    table.services[idx] = entry;
     table.recipes[idx] = Some(recipe_from(def));
 }
 
@@ -317,14 +332,21 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     }
-    table.services[idx] = build_entry(def, thread_cap, 0, 0);
+    let Some(entry) = build_entry(def, thread_cap, 0, 0)
+    else
+    {
+        log!("svcmgr: no memory for {}'s entry; dropping it", def.name);
+        let _ = syscall::cap_delete(thread_cap);
+        return;
+    };
+    table.services[idx] = entry;
     table.recipes[idx] = Some(recipe_from(def));
 }
 
-/// Clone the launch surfaces the fixed record cannot hold from a parsed
-/// definition so the restart path can replay them: argv/env/cwd/seed
-/// byte-for-byte, the log-sink flag, and the scheduling fields. The fixed
-/// fields (name/binary/policy/namespace) live on the `ServiceEntry`.
+/// Clone the launch surfaces the restart path replays from a parsed
+/// definition: argv/env/cwd/seed byte-for-byte, the log-sink flag, and the
+/// scheduling fields. The name, binary, policy and namespace live on the
+/// `ServiceEntry` instead ([`build_entry`]).
 fn recipe_from(def: &Definition) -> RestartRecipe
 {
     RestartRecipe {
@@ -341,23 +363,23 @@ fn recipe_from(def: &Definition) -> RestartRecipe
 /// Construct a `ServiceEntry` from the parsed definition.
 /// Maps the `.svc` `restart`/`critical`/`namespace` values onto the
 /// in-memory `ServiceEntry` representation `restart::handle_death`
-/// reads.
+/// reads. `None` when the heap cannot hold the entry's name or paths.
 fn build_entry(
     def: &Definition,
     thread_cap: u32,
     process_handle: u32,
     provided_endpoint: u32,
-) -> ServiceEntry
+) -> Option<ServiceEntry>
 {
     let mut entry = ServiceEntry::empty();
 
-    entry.name.clone_from(&def.name);
+    entry.name = try_string(&def.name)?;
 
     entry.thread_cap = thread_cap;
     entry.provided_endpoint = provided_endpoint;
     entry.process_handle = process_handle;
 
-    entry.vfs_path.clone_from(&def.binary);
+    entry.vfs_path = try_string(&def.binary)?;
 
     entry.restart_policy = match def.restart
     {
@@ -381,12 +403,12 @@ fn build_entry(
         NamespaceShape::Subtree { path, rights } =>
         {
             entry.ns_policy_kind = ipc::svcmgr_labels::NS_POLICY_SUBTREE;
-            entry.ns_subtree_path.clone_from(path);
+            entry.ns_subtree_path = try_string(path)?;
             entry.ns_subtree_rights = *rights;
         }
     }
 
-    entry
+    Some(entry)
 }
 
 /// Log every entry in `pending` that was never matched by a `.svc`

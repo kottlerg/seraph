@@ -209,8 +209,8 @@ fn main() -> !
 /// a full queue's worth of events; the table itself has no fixed size.
 const DEATH_EQ_CAPACITY: u32 = 256;
 
-/// Monotonic time since procmgr started, in nanoseconds, for the
-/// recent-exits retention window. Saturates rather than wraps (a `u64` of
+/// Monotonic time since the first call, in nanoseconds, for the
+/// recent-exits retention window and the init-reap probe budget. Saturates rather than wraps (a `u64` of
 /// nanoseconds covers about 584 years).
 pub(crate) fn now_ns() -> u64
 {
@@ -784,10 +784,17 @@ fn dispatch_death(
 }
 
 /// Reap every live entry whose main thread the kernel reports exited: the
-/// recovery for death posts a full queue dropped. Reads each entry's thread
-/// state (`CAP_INFO_THREAD_STATE`), which the kernel records before it posts,
-/// so a process whose post was dropped is found here. A process that exits
-/// after the scan posts to a queue this drain has emptied.
+/// recovery for main-thread death posts a full queue dropped. Reads each
+/// entry's thread state (`CAP_INFO_THREAD_STATE`), which the kernel records
+/// before it posts, so a process whose main-thread post was dropped is found
+/// here. A process that exits after the scan posts to a queue this drain has
+/// emptied.
+///
+/// An address-space terminal-fault post (a worker thread's fault, with the
+/// main thread still running) that the full queue dropped is not recovered:
+/// the kernel exposes no address-space fault state to read back, so that
+/// process keeps running with the faulted thread gone until its main thread
+/// exits, when this path or its own post reaps it.
 ///
 /// An init death the full queue dropped is not recovered here; init's reap
 /// then waits, the benign hold of a handover that never completes

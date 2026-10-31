@@ -486,6 +486,7 @@ pub fn spawn_simple_device(
     hw_cap: u32,
     irq_cap: u32,
     devmgr_query_ep: u32,
+    round1_words: &[u64],
     priority: u8,
     ipc_buf: *mut u64,
 ) -> bool
@@ -665,6 +666,8 @@ pub fn spawn_simple_device(
     // non-terminal [service, hw_cap, irq_cap?], round 2 terminal [query_ep].
     // irq_cap rides round 1 only when present (the serial driver); other
     // simple devices pass 0 and the round carries the bare [service, hw_cap].
+    // `round1_words` ride round 1 as its data words (the CMOS RTC's century
+    // register index; empty for every other device).
     let round1_done = devmgr_query_ep == 0;
     let round1_caps: [u32; 3] = [service_copy, hw_cap, irq_cap];
     let round1_len = if irq_cap != 0 { 3 } else { 2 };
@@ -676,7 +679,7 @@ pub fn spawn_simple_device(
             ipc_buf,
             round1_done,
             &round1_caps[..round1_len],
-            &[],
+            round1_words,
         )
     }
     .is_err()

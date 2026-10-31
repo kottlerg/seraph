@@ -331,10 +331,11 @@ A procmgr donation always succeeds. memmgr validates each cap with
 deleted and not counted. Each accepted cap is owned by memmgr for the rest of its life: it
 is added to `pool_total` (see Label 6) at its whole size, read with `cap_info`
 (a page count of any width), and placed in the free pool, coalescing where
-possible. Only a failure to carve an arena page for the run's node (both
-arena zones spent, a failed split, or a failed map) leaves it owned and
-counted but out of circulation (see
-[`memory-pool.md`](memory-pool.md) §"Metadata Arena").
+possible. When no arena node is free outside the arena's reserve and none can
+be carved, the run takes the reserved node; it stays owned and counted but
+out of circulation only when that reserve is already spent and the arena
+cannot grow (see [`memory-pool.md`](memory-pool.md) §"Free-Pool Data
+Structure").
 
 ### Label 6: `QUERY_POOL_STATUS`
 

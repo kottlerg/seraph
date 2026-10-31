@@ -26,7 +26,7 @@ pub enum RegionError
 {
     /// The range overlaps a region the process already registered.
     Overlap,
-    /// The arena has no free slot.
+    /// The arena has no free slot outside its reserve.
     NoSlot,
     /// The record slot named holds no process record.
     NoRecord,
@@ -85,8 +85,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Add a record for `badge` with empty lists. `None` when the arena has
-    /// no free slot or the index has no bucket storage; nothing is left
-    /// allocated then.
+    /// no free slot outside its reserve or the index has no bucket storage;
+    /// nothing is left allocated then.
     pub fn insert_process(&mut self, badge: u64) -> Option<NodeIdx>
     {
         let rec = self.arena.alloc(
@@ -129,7 +129,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Account `frame` to `rec`. Returns `false` when the arena has no free
-    /// slot.
+    /// slot outside its reserve.
     pub fn push_frame(&mut self, rec: NodeIdx, frame: FrameDesc) -> bool
     {
         let Some(mut r) = self.record(rec)

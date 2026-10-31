@@ -864,8 +864,8 @@ pub mod svcmgr_labels
     /// on success. On failure it carries no cap and returns
     /// `svcmgr_errors::INVALID_NAME` if `name_len` is 0 or exceeds
     /// [`NAME_MAX`], or the message carries fewer data words than `name_len`
-    /// needs; `svcmgr_errors::UNKNOWN_NAME` on
-    /// miss and for a seed-only name (one whose cap carries authority, or
+    /// needs; `svcmgr_errors::UNKNOWN_NAME` on miss and for a seed-only name
+    /// (one whose cap carries authority, or
     /// [`crate::published_names::VFSD_DENY`], svctest's test twin, which
     /// carries none; a seed-only name reaches only the recipes seeding it;
     /// see [`crate::published_names`]);
@@ -2548,10 +2548,11 @@ pub mod blk_errors
 // ── Protocol constants ─────────────────────────────────────────────────────
 
 /// The one path limit of svcmgr's recipes, in bytes: a `.svc` `binary`
-/// path and a `namespace = subtree:<path>` path. Set by convention (the
-/// POSIX `PATH_MAX` value), not by a pool: no message carries a whole path,
-/// since svcmgr walks each one a component at a time, and svcmgr stores each
-/// at its own length.
+/// path and a `namespace = subtree:<path>` path. It bounds no pool: no
+/// message carries a whole path, since svcmgr walks each one a component at
+/// a time and stores each at its own length, so the value (the POSIX
+/// `PATH_MAX`) only refuses a recipe whose path is longer than any recipe
+/// written for this tree, whose paths are tens of bytes.
 pub const MAX_PATH_LEN: usize = 4096;
 
 /// Maximum argv blob size in bytes across an IPC. Constrained by

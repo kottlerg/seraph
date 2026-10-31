@@ -11,6 +11,8 @@
 //! reply checked by [`decode_live_page`]), and evicts the snapshot badges the
 //! walk did not list ([`evictable`]). A slot created after the snapshot is
 //! never a candidate, so a sender that starts during the walk keeps its slot.
+//! [`WalkGate`] decides when a walk runs: one at a time, and one more after
+//! it when a drain asked for a resync meanwhile.
 //! The protocol is in `services/logd/docs/ipc-interface.md`
 //! § Death-queue resync.
 
@@ -72,6 +74,67 @@ pub fn evictable<'a>(snapshot: &'a [u64], live: &'a [u64]) -> impl Iterator<Item
         {}
         live.peek() != Some(&&badge)
     })
+}
+
+/// When logd's live-process walks run: at most one at a time, and, when a
+/// drain asks for a resync while one is in flight, exactly one more once it
+/// ends, since the running walk's snapshot and list may miss the deaths
+/// dropped meanwhile. Requests made during a walk coalesce into that one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkGate
+{
+    /// A walk has started and not yet ended.
+    in_flight: bool,
+    /// A resync was asked for while a walk was in flight.
+    due: bool,
+}
+
+impl WalkGate
+{
+    /// A gate with no walk in flight and none due.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            in_flight: false,
+            due: false,
+        }
+    }
+
+    /// A drain asks for a resync. Returns `true` when the caller is to start
+    /// a walk now (the gate then counts it in flight); `false` when one is in
+    /// flight, which marks another due.
+    pub fn request(&mut self) -> bool
+    {
+        if self.in_flight
+        {
+            self.due = true;
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    /// The walk the gate let start could not begin (no memory for the
+    /// snapshot, or the helper thread did not spawn): nothing is in flight.
+    pub fn abandon(&mut self)
+    {
+        self.in_flight = false;
+    }
+
+    /// The in-flight walk ended. Returns `true` when the caller is to start
+    /// the walk marked due meanwhile, which the gate then counts in flight.
+    pub fn finished(&mut self) -> bool
+    {
+        self.in_flight = false;
+        if self.due
+        {
+            self.due = false;
+            self.in_flight = true;
+            return true;
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -148,5 +211,48 @@ mod tests
         assert_eq!(ev(&[16, 40], &[]), [16, 40]);
         assert!(ev(&[], &[16]).is_empty());
         assert!(ev(&[16, 40], &[16, 40]).is_empty());
+    }
+
+    #[test]
+    fn an_idle_gate_starts_a_walk_and_a_quiet_finish_starts_none()
+    {
+        let mut gate = WalkGate::new();
+        assert!(gate.request());
+        assert!(!gate.finished());
+        // Idle again: the next request starts a walk.
+        assert!(gate.request());
+    }
+
+    #[test]
+    fn requests_during_a_walk_coalesce_into_one_more_walk()
+    {
+        let mut gate = WalkGate::new();
+        assert!(gate.request());
+        assert!(!gate.request());
+        assert!(!gate.request());
+        // The walk ends: exactly one more starts, and its end starts none.
+        assert!(gate.finished());
+        assert!(!gate.finished());
+    }
+
+    #[test]
+    fn a_request_during_the_follow_up_walk_is_honoured_too()
+    {
+        let mut gate = WalkGate::new();
+        assert!(gate.request());
+        assert!(!gate.request());
+        assert!(gate.finished());
+        assert!(!gate.request());
+        assert!(gate.finished());
+        assert!(!gate.finished());
+    }
+
+    #[test]
+    fn an_abandoned_walk_leaves_the_gate_idle()
+    {
+        let mut gate = WalkGate::new();
+        assert!(gate.request());
+        gate.abandon();
+        assert!(gate.request());
     }
 }

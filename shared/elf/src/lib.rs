@@ -102,6 +102,8 @@ const DYN_ENTRY_SIZE: usize = 16;
 /// Upper bound the kernel applies to init's `.rela.dyn` table
 /// (≈175k relocations; `core/kernel/src/mm/init_reloc.rs`), whose size
 /// arrives from the bootloader rather than from an image the kernel holds.
+/// Unreachable by a valid init: init is an in-tree binary whose table holds
+/// a few thousand relocations, so the bound refuses only a corrupt size.
 /// The table locators here ([`rela_table`], [`rela_table_metadata`]) apply
 /// no such cap: a table must lie inside one `PT_LOAD` segment's file data
 /// and the file, so the file's size bounds it, and the streaming loaders

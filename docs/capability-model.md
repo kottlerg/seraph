@@ -801,7 +801,12 @@ effect, and is posted, only if the thread is started again (see
 
 procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
 just the main thread — drives procmgr's teardown of the whole process. Normal thread exit does not
-fire these observers.
+fire these observers. The one exception is a post procmgr's death queue drops because it is full:
+procmgr then recovers the main-thread deaths it missed from the kernel's thread states, but no
+kernel state reports an address space's terminal fault, so a process whose worker-fault post was
+dropped is torn down only when its main thread exits
+([#666](https://github.com/kottlerg/seraph/issues/666); see
+[services/procmgr/README.md](../services/procmgr/README.md) § Process table and death queue).
 
 ---
 

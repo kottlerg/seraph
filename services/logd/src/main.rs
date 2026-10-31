@@ -24,7 +24,7 @@ mod handover;
 mod slot;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -111,7 +111,7 @@ fn main() -> !
     // serial driver is resolved lazily on first emit via
     // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
     // covered the pre-driver window) while history still accrues.
-    serial_init(caps.devmgr_registry_ep, ipc_buf);
+    serial_init(caps.devmgr_registry_ep);
 
     // logd serves the log endpoint, so it must never emit through it. Route
     // panic / alloc-error / precondition output to the serial driver (the
@@ -371,10 +371,8 @@ struct Resync
     /// The walk in flight: the slot snapshot taken before it began and the
     /// channel its live list arrives on (`None` when the walk failed).
     in_flight: Option<(Vec<u64>, LiveReceiver)>,
-    /// A drain crossed the capacity while a walk was in flight. That walk's
-    /// snapshot and list may miss the deaths dropped then, so another walk
-    /// starts once it ends.
-    pending: bool,
+    /// Whether a walk runs now or is due after the current one.
+    gate: logd_codec::resync::WalkGate,
 }
 
 /// The channel the resync helper sends its walk's live badges on; `None`
@@ -389,29 +387,30 @@ impl Resync
             procmgr_send,
             note,
             in_flight: None,
-            pending: false,
+            gate: logd_codec::resync::WalkGate::new(),
         }
     }
 
-    /// Snapshot the child slots and start the helper's walk. With one
-    /// already in flight, mark another due instead: [`Self::finish`] starts
-    /// it once the current walk ends.
+    /// Ask for a resync: start the helper's walk now, or, with one already
+    /// in flight, mark another due, which [`Self::finish`] starts once the
+    /// current walk ends.
     fn start(&mut self, table: &SlotTable)
     {
-        if self.procmgr_send == 0
+        if self.procmgr_send != 0 && self.gate.request()
         {
-            return;
+            self.begin(table);
         }
-        if self.in_flight.is_some()
-        {
-            self.pending = true;
-            return;
-        }
-        self.pending = false;
+    }
+
+    /// Snapshot the child slots and spawn the helper's walk; the gate has
+    /// already counted it in flight, and is told when it cannot begin.
+    fn begin(&mut self, table: &SlotTable)
+    {
         let mut snapshot: Vec<u64> = Vec::new();
         if snapshot.try_reserve(table.slots.len()).is_err()
         {
             self_log("resync skipped: no memory for the slot snapshot");
+            self.gate.abandon();
             return;
         }
         snapshot.extend(
@@ -428,10 +427,14 @@ impl Resync
             let _ = tx.send(walk_live_processes(procmgr_send));
             let _ = syscall::notification_send(note, 1);
         });
-        match spawned
+        if spawned.is_ok()
         {
-            Ok(_) => self.in_flight = Some((snapshot, rx)),
-            Err(_) => self_log("resync skipped: helper thread spawn failed"),
+            self.in_flight = Some((snapshot, rx));
+        }
+        else
+        {
+            self_log("resync skipped: helper thread spawn failed");
+            self.gate.abandon();
         }
     }
 
@@ -465,9 +468,9 @@ impl Resync
             Some(live) => evict_missing(&snapshot, &live, table),
             None => self_log("resync: live-process walk failed; slots kept"),
         }
-        if self.pending
+        if self.gate.finished()
         {
-            self.start(table);
+            self.begin(table);
         }
     }
 }
@@ -711,18 +714,22 @@ static FB_CAP: AtomicU32 = AtomicU32::new(0);
 /// `log_ep` → logd, while logd blocks here on devmgr's reply — so the attempt
 /// is made exactly once. `u32::MAX` is never a valid `CSpace` slot.
 const FB_UNAVAILABLE: u32 = u32::MAX;
-/// logd's registered IPC buffer pointer, stashed so the emit path can issue
-/// the serial `ipc_call` without threading it through every formatter.
-static IPC_BUF_PTR: AtomicU64 = AtomicU64::new(0);
-
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` (one full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
-/// Record the devmgr-registry cap and IPC buffer for the emit path.
-fn serial_init(devmgr_registry_ep: u32, ipc_buf: *mut u64)
+/// Record the devmgr-registry cap for the emit path.
+fn serial_init(devmgr_registry_ep: u32)
 {
     DEVMGR_REGISTRY_EP.store(devmgr_registry_ep, Ordering::Release);
-    IPC_BUF_PTR.store(ipc_buf as u64, Ordering::Release);
+}
+
+/// The calling thread's registered IPC buffer, for the emit path's
+/// `ipc_call`s: the main thread's and the resync helper's each own one, so
+/// output from either thread (the panic sink included) uses its own page.
+/// Null before the thread has one; the emit path then drops the bytes.
+fn emit_ipc_buf() -> *mut u64
+{
+    std::os::seraph::current_ipc_buf()
 }
 
 /// Resolve (and cache) the serial driver's SEND cap via devmgr's
@@ -744,7 +751,7 @@ fn resolve_serial_cap(ipc_buf: *mut u64) -> u32
     let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_SERIAL_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
     else
     {
@@ -769,7 +776,7 @@ fn resolve_serial_cap(ipc_buf: *mut u64) -> u32
 /// not yet resolvable.
 fn serial_write(bytes: &[u8])
 {
-    let ipc_buf = IPC_BUF_PTR.load(Ordering::Acquire) as *mut u64;
+    let ipc_buf = emit_ipc_buf();
     if ipc_buf.is_null()
     {
         return;
@@ -786,7 +793,7 @@ fn serial_write(bytes: &[u8])
         let chunk = &bytes[off..end];
         let label = ipc::serial_labels::SERIAL_WRITE_BYTES | ((chunk.len() as u64) << 16);
         let msg = IpcMessage::builder(label).bytes(0, chunk).build();
-        // SAFETY: ipc_buf is the registered IPC buffer page. Nested IPC is
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page. Nested IPC is
         // safe here: a received `STREAM_BYTES` is already snapshotted into a
         // stack `IpcMessage`, and the kernel preserves the pending reply to
         // the log sender across this call (same pattern as vfsd → blk).
@@ -821,7 +828,7 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
     let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
     else
     {
@@ -860,7 +867,7 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
 /// (CI scrapes serial; the framebuffer is an on-screen convenience).
 fn fb_write(bytes: &[u8])
 {
-    let ipc_buf = IPC_BUF_PTR.load(Ordering::Acquire) as *mut u64;
+    let ipc_buf = emit_ipc_buf();
     if ipc_buf.is_null()
     {
         return;
@@ -877,7 +884,7 @@ fn fb_write(bytes: &[u8])
         let chunk = &bytes[off..end];
         let label = ipc::fb_labels::FB_WRITE_BYTES | ((chunk.len() as u64) << 16);
         let msg = IpcMessage::builder(label).bytes(0, chunk).build();
-        // SAFETY: ipc_buf is the registered IPC buffer page. Same nested-IPC
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page. Same nested-IPC
         // reasoning as serial_write: the received STREAM_BYTES is already
         // snapshotted and the kernel preserves the pending reply to the log
         // sender across this call.
@@ -1021,10 +1028,9 @@ fn emit_line(_badge: u64, name: &[u8], line: &[u8])
 /// driver — never through the log endpoint logd serves. Forwards raw bytes
 /// (std frames the panic message); `serial_write` silent-drops until the
 /// driver is resolvable. Must stay non-allocating and panic-free: it runs
-/// from the panic path. Correct only while logd is single-threaded:
-/// `serial_write` issues its `ipc_call` against the cached `IPC_BUF_PTR`
-/// (logd's main-thread IPC buffer), so a panic on a future worker thread
-/// would target the wrong IPC page.
+/// from the panic path. `serial_write` issues its `ipc_call` on the calling
+/// thread's own IPC buffer ([`emit_ipc_buf`]), so a panic or allocation
+/// failure on the resync helper thread never touches the main thread's.
 fn panic_to_serial(bytes: &[u8])
 {
     serial_write(bytes);

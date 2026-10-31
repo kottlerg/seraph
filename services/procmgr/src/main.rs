@@ -210,8 +210,8 @@ fn main() -> !
 const DEATH_EQ_CAPACITY: u32 = 256;
 
 /// Monotonic time since the first call, in nanoseconds, for the
-/// recent-exits retention window and the init-reap probe budget. Saturates rather than wraps (a `u64` of
-/// nanoseconds covers about 584 years).
+/// recent-exits retention window and the init-reap probe budget. Saturates
+/// rather than wraps (a `u64` of nanoseconds covers about 584 years).
 pub(crate) fn now_ns() -> u64
 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

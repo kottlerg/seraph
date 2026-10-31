@@ -275,6 +275,16 @@ fn handle_definition(
         return;
     };
 
+    // Build the entry before launching, so a heap that cannot hold its name
+    // and paths launches nothing rather than an instance svcmgr could not
+    // supervise.
+    let Some(mut entry) = build_entry(def)
+    else
+    {
+        log!("svcmgr: no memory for {}'s entry; not launched", def.name);
+        return;
+    };
+
     let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))
     else
     {
@@ -282,24 +292,9 @@ fn handle_definition(
         return;
     };
 
-    let Some(entry) = build_entry(
-        def,
-        launched.thread_cap,
-        launched.process_handle,
-        launched.provided_endpoint,
-    )
-    else
-    {
-        // The instance runs, but its slot stays inactive, so svcmgr does not
-        // supervise it; its published endpoint stays with its consumers.
-        log!(
-            "svcmgr: no memory for {}'s entry; running unsupervised",
-            def.name
-        );
-        let _ = syscall::cap_delete(launched.thread_cap);
-        let _ = syscall::cap_delete(launched.process_handle);
-        return;
-    };
+    entry.thread_cap = launched.thread_cap;
+    entry.process_handle = launched.process_handle;
+    entry.provided_endpoint = launched.provided_endpoint;
     table.services[idx] = entry;
     table.recipes[idx] = Some(recipe_from(def));
 }
@@ -326,19 +321,25 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     };
+    let Some(mut entry) = build_entry(def)
+    else
+    {
+        log!(
+            "svcmgr: no memory for {}'s entry; running unsupervised",
+            def.name
+        );
+        let _ = syscall::cap_delete(thread_cap);
+        return;
+    };
     if syscall::thread_bind_notification(thread_cap, deaths_eq, correlator).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);
         return;
     }
-    let Some(entry) = build_entry(def, thread_cap, 0, 0)
-    else
-    {
-        log!("svcmgr: no memory for {}'s entry; dropping it", def.name);
-        let _ = syscall::cap_delete(thread_cap);
-        return;
-    };
+    // `process_handle` stays 0: init created this instance and kept its
+    // handle (see `restart::restart_process`).
+    entry.thread_cap = thread_cap;
     table.services[idx] = entry;
     table.recipes[idx] = Some(recipe_from(def));
 }
@@ -360,24 +361,16 @@ fn recipe_from(def: &Definition) -> RestartRecipe
     }
 }
 
-/// Construct a `ServiceEntry` from the parsed definition.
+/// Construct a `ServiceEntry` from the parsed definition, with no caps yet:
+/// the caller fills the thread cap, process handle and provided endpoint.
 /// Maps the `.svc` `restart`/`critical`/`namespace` values onto the
 /// in-memory `ServiceEntry` representation `restart::handle_death`
 /// reads. `None` when the heap cannot hold the entry's name or paths.
-fn build_entry(
-    def: &Definition,
-    thread_cap: u32,
-    process_handle: u32,
-    provided_endpoint: u32,
-) -> Option<ServiceEntry>
+fn build_entry(def: &Definition) -> Option<ServiceEntry>
 {
     let mut entry = ServiceEntry::empty();
 
     entry.name = try_string(&def.name)?;
-
-    entry.thread_cap = thread_cap;
-    entry.provided_endpoint = provided_endpoint;
-    entry.process_handle = process_handle;
 
     entry.vfs_path = try_string(&def.binary)?;
 

@@ -236,10 +236,12 @@ fn create_resync_note() -> Option<u32>
 /// (`WS_BADGE_RESYNC`).
 fn create_wait_set(log_ep_recv: u32, death_eq: u32, resync_note: u32) -> Option<u32>
 {
-    let Some(ws) =
-        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
-            syscall::wait_set_create(slab, 2).ok()
-        })
+    // The set's member capacity: the three members above.
+    const WS_MEMBERS: u32 = 3;
+    let Some(ws) = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+    )
     else
     {
         let mut buf = SerialFmt::new();

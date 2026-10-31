@@ -16,14 +16,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
-/// Maximum per-slot display-name length in bytes. Sized for typical
-/// contextual names like `"fatfs /some/deeply/nested/mount"`. Longer names
-/// are truncated.
-pub const MAX_NAME_LEN: usize = 48;
-
-/// Per-sender line-buffer size. A line longer than this is flushed without
-/// a trailing newline.
-pub const LINE_BUF_SIZE: usize = 256;
+// The receivers' shared line and name widths: real-logd keeps the same per
+// sender, so a name or line survives the handover unclipped.
+pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
 /// One sender's state: its badge (opaque identity; `0` marks a free slot),
 /// its registered display name, and the bytes accumulated since its last

@@ -655,13 +655,11 @@ pub struct InUseArena
 /// Result of [`finalize_memmgr`] — bootstrap-IPC payload init sends
 /// to memmgr in its first `request_round` reply.
 ///
-/// Page counts are packed two per `u64` (low 32 bits = even index,
-/// high 32 bits = odd index) so the 64-word IPC data field can carry
-/// up to `ipc::memmgr_bootstrap::MAX_MEMORY_CAPS` entries after the 3-word
-/// prefix. Physical bases travel out-of-band via a read-only Memory cap
-/// (`caps[1]` in the bootstrap reply); init writes `phys_bases` into the
-/// page before deriving the RO cap. Memmgr maps the page, copies the
-/// values into its `FreeRun` records, and drops the cap.
+/// The round names the delegated RAM caps by slot range only; memmgr reads
+/// each cap's size and physical base from the kernel (`cap_info`), so no
+/// per-cap table travels and the round bounds no cap count. The in-use
+/// arenas travel out-of-band in the read-only phys-table page (`caps[1]` in
+/// the bootstrap reply).
 pub struct MemmgrFinalize
 {
     /// First slot of the RAM Memory caps init copied into memmgr's
@@ -669,12 +667,6 @@ pub struct MemmgrFinalize
     pub mm_memory_base: u32,
     /// Number of RAM memory caps delegated to memmgr.
     pub mm_memory_count: u32,
-    /// Page count for each delegated memory cap, in slot order.
-    pub page_counts: [u32; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS],
-    /// Physical base address for each delegated memory cap, in slot order.
-    /// Sourced from `CapDescriptor.aux0` of the underlying RAM Memory
-    /// caps minted by the kernel at boot.
-    pub phys_bases: [u64; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS],
     /// In-use bootstrap arenas (memmgr's, procmgr's, and init's own
     /// backing) copied into memmgr's `CSpace`. Init writes these into the
     /// phys-table page's in-use section; memmgr records them against
@@ -994,41 +986,42 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
     })
 }
 
-/// Forward a single Memory cap covering `pages` free pages into memmgr's
-/// `CSpace` as a free run: derive a full-rights intermediary, copy it into
-/// `mm_cspace`, and append the run to the parallel `page_counts`/`phys_bases`
-/// tables (advancing `count`, recording `base` on the first run). Used for the
+/// Forward a single Memory cap into memmgr's `CSpace` as a free run: derive a
+/// full-rights intermediary, copy it into `mm_cspace`, and count it
+/// (advancing `count`, recording `base` on the first run). Used for the
 /// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
 /// products with no `InitInfo` descriptor, which the reap donation walk does
 /// not reach, so unforwarded they would stay in init's `CSpace` until the reap
 /// frees it and then free into the sealed post-handoff buddy, tripping the
 /// kernel's post-seal `debug_assert` in a debug build.
-fn push_free_run(
-    src_cap: u32,
-    pages: u32,
-    mm_cspace: u32,
-    page_counts: &mut [u32],
-    phys_bases: &mut [u64],
-    base: &mut u32,
-    count: &mut u32,
-)
+fn push_free_run(src_cap: u32, mm_cspace: u32, base: &mut u32, count: &mut u32)
 {
-    if pages == 0 || (*count as usize) >= page_counts.len()
-    {
-        return;
-    }
-    if let Ok(phys_base) = syscall::cap_info(src_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
-        && let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
+    if let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
         && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL)
     {
         if *count == 0
         {
             *base = dst_slot;
         }
-        page_counts[*count as usize] = pages;
-        phys_bases[*count as usize] = phys_base;
         *count += 1;
     }
+}
+
+/// General slots of memmgr's `CSpace` the bootstrap forwarding leaves free:
+/// room for the `MemoryAlloc` tail, the phys-table page, and the in-use arenas
+/// (which must ride the round), and for memmgr's own splits before its first
+/// self-funded `CSpace` top-up. Twice memmgr's own low-water mark.
+const MEMMGR_FORWARD_HEADROOM: u64 = 512;
+
+/// Free slots of `cspace` a general allocation may take: capacity less
+/// populated slots less the IPC receive reserve. Zero when the queries fail.
+fn cspace_general_headroom(cspace: u32) -> u64
+{
+    let capacity = syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
+    let used = syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(capacity);
+    capacity
+        .saturating_sub(used)
+        .saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
 }
 
 /// Assert init's arena retype front never crossed its reserve into the
@@ -1087,44 +1080,29 @@ pub fn finalize_memmgr(
     phys_table_memory: u32,
 ) -> Option<MemmgrFinalize>
 {
-    // The bootstrap-IPC payload to memmgr packs 2 page_counts per word after
-    // a 3-word prefix; `ipc::memmgr_bootstrap::MAX_MEMORY_CAPS` entries fit, of
-    // which the loop below claims at most `MAX_MEMORY_CAPS - 2` for regular memory
-    // memory caps and leaves two for the MemoryAlloc tail and the phys-table page.
-    // That is enough to seed memmgr's pool for procmgr's first allocations;
-    // any regular memory caps beyond the cap (the buddy can drain into more blocks
-    // than fit when the memory map is fragmented) are delivered later via the
-    // reap-donation route (`handoff_to_procmgr_reap` → procmgr →
-    // `DONATE_MEMORY_CAPS`), which streams without a per-round cap. So this bound is
-    // a round-size limit, not a ceiling on total RAM forwarded — the reap floor
-    // below picks up the rest. (The tail and phys-table page have no InitInfo
-    // descriptor, so the reap walk cannot reach them; they must ride here.)
-    let mut page_counts = [0u32; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS];
-    let mut phys_bases = [0u64; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS];
+    // The bootstrap round names the forwarded RAM caps by slot range only
+    // (memmgr reads each cap's size and physical base from the kernel), so it
+    // carries every remaining RAM cap while memmgr's `CSpace` keeps
+    // [`MEMMGR_FORWARD_HEADROOM`] general slots. A cap past that headroom, or one
+    // the copy cannot take, ends the forwarded prefix; that cap and every later
+    // one reach memmgr's pool through the reap donation
+    // (`finish_init_reap_handoff` → procmgr → `DONATE_MEMORY_CAPS`) instead.
+    // (The MemoryAlloc tail and the phys-table page have no InitInfo
+    // descriptor, so the reap walk cannot reach them; they must ride here, in
+    // the headroom the loop leaves.)
     let mut mm_memory_base: u32 = 0;
     let mut mm_memory_count: u32 = 0;
     let total_remaining = info.memory_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
-        // Reserve two payload slots for the MemoryAlloc tail and the phys-table
-        // page forwarded below. Both are `memory_split` products with no
-        // InitInfo descriptor, so the reap walk cannot reach them — they MUST
-        // ride this bootstrap round. Regular memory caps that no longer fit are
-        // delivered to memmgr's pool via reap instead.
-        if mm_memory_count as usize >= ipc::memmgr_bootstrap::MAX_MEMORY_CAPS - 2
+        let src_slot = info.memory_base + alloc.next_idx + i;
+        // Keep the forwarded set a contiguous prefix: stop here and let the
+        // reap route donate this memory cap and everything after it.
+        if descriptor_for(info, src_slot).is_none()
+            || cspace_general_headroom(mm.mm_cspace) < MEMMGR_FORWARD_HEADROOM
         {
             break;
         }
-        let src_slot = info.memory_base + alloc.next_idx + i;
-        let Some(desc) = descriptor_for(info, src_slot)
-        else
-        {
-            // Keep the forwarded set a contiguous prefix: stop here and let
-            // the reap route donate this memory cap and everything after it.
-            break;
-        };
-        let bytes = desc.aux1;
-        let phys_base = desc.aux0;
         // Every RAM Memory cap init forwards to memmgr MUST carry
         // `MemRights::RETYPE`. The kernel stamps RETYPE on usable RAM at
         // Phase-7 mint (`core/kernel/src/cap/mod.rs`); init holds these
@@ -1158,8 +1136,6 @@ pub fn finalize_memmgr(
         {
             mm_memory_base = dst_slot;
         }
-        page_counts[mm_memory_count as usize] = (bytes / PAGE_SIZE) as u32;
-        phys_bases[mm_memory_count as usize] = phys_base;
         mm_memory_count += 1;
     }
     // Advance only past the memory caps actually forwarded this round (a
@@ -1180,13 +1156,9 @@ pub fn finalize_memmgr(
     // free RAM, so it joins memmgr's pool as a run like any forwarded memory cap.
     if alloc.remaining >= PAGE_SIZE
     {
-        let tail_pages = (alloc.remaining / PAGE_SIZE) as u32;
         push_free_run(
             alloc.current,
-            tail_pages,
             mm.mm_cspace,
-            &mut page_counts,
-            &mut phys_bases,
             &mut mm_memory_base,
             &mut mm_memory_count,
         );
@@ -1200,10 +1172,7 @@ pub fn finalize_memmgr(
     // after the read the page is allocatable like any other.
     push_free_run(
         phys_table_memory,
-        1,
         mm.mm_cspace,
-        &mut page_counts,
-        &mut phys_bases,
         &mut mm_memory_base,
         &mut mm_memory_count,
     );
@@ -1250,8 +1219,6 @@ pub fn finalize_memmgr(
     Some(MemmgrFinalize {
         mm_memory_base,
         mm_memory_count,
-        page_counts,
-        phys_bases,
         in_use,
         in_use_count,
     })
@@ -1274,11 +1241,6 @@ pub unsafe fn write_memmgr_aux_memory(
 {
     use ipc::memmgr_bootstrap as mb;
 
-    for i in 0..(mm_final.mm_memory_count as usize)
-    {
-        // SAFETY: i < mm_memory_count <= MAX_MEMORY_CAPS; within the mapped page.
-        unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
-    }
     // SAFETY: the facts and in-use-count indices lie within the mapped page.
     unsafe {
         core::ptr::write_volatile(

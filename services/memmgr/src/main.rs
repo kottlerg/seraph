@@ -7,22 +7,27 @@
 //!
 //! memmgr serves memory-cap allocation, release, and per-process accounting over
 //! IPC. See `services/memmgr/docs/{memory-pool,ipc-interface}.md` for the authoritative
-//! contracts. memmgr is `no_std` and uses statically-bounded data structures
-//! only — it cannot bootstrap a heap against itself.
+//! contracts. memmgr is `no_std` and cannot bootstrap a heap against itself;
+//! its bookkeeping lives in a self-hosted arena of pages carved from its own
+//! pool (`memmgr-free-pool`).
 
 #![no_std]
 #![no_main]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
-use free_pool::{DemandRegion, FreePool, FreeRun, chunk_for, region_contains, regions_overlap};
+use free_pool::{
+    ArenaLayout, DemandRegion, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NODE_NULL, Node,
+    NodeIdx, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk_for,
+};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
-use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE};
+use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError};
 
-// memmgr's bootstrap parser carries page-count buffers on stack and
-// pushes deeper through `bootstrap_from_init`; declare a 12-page
-// (48 KiB) main-thread stack instead of the default 8 (32 KiB).
+// memmgr's handlers grow the arena and fund its page tables from inside a
+// request (a grant, a fault), nesting the growth path under the handler's
+// own frames; declare a 12-page (48 KiB) main-thread stack instead of the
+// default 8 (32 KiB).
 process_abi::stack_pages!(12);
 
 // ── Bespoke runtime ─────────────────────────────────────────────────────────
@@ -90,9 +95,6 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-/// Maximum concurrent processes memmgr will track.
-const MAX_PROCESSES: usize = 64;
-
 /// Rights every pool frame MUST carry. A pool frame is general anonymous RAM:
 /// memmgr derives an R / RW / RX inner from it on demand (`cap_derive`, which
 /// only narrows), so the outer must hold `RIGHTS_MEM_WRITE` and
@@ -105,698 +107,461 @@ const MAX_PROCESSES: usize = 64;
 const POOL_FRAME_RIGHTS: u64 =
     syscall::RIGHTS_MEM_WRITE | syscall::RIGHTS_MEM_EXECUTE | syscall::RIGHTS_MEM_RETYPE;
 
-// ── Metadata arena ────────────────────────────────────────────────────────────
-//
-// Per-process region and frame descriptors are not statically arrayed: each is
-// a node drawn from a self-hosted arena of pool-backed pages, threaded onto a
-// per-process intrusive list. Per-process region and frame capacity is thereby
-// bounded by RAM, not by a compile-time constant — the demand-paged thread-stack
-// consumer is the first O(threads) region/frame user and would overrun any fixed
-// array.
-//
-// The arena only grows. A page, once carved into nodes, is permanent
-// memmgr-owned metadata: it was counted in `pool_total` at ingest and is never
-// returned, so the all-RAM-accounted identity is preserved. Growth stops at the
-// peak concurrent node count — freed nodes return to the arena's own free list
-// and are reused — so spawn/die churn leaks no pages.
-
-/// Sentinel node index: empty list / free-list tail. `u32::MAX` is reserved, so
-/// the arena addresses up to `u32::MAX - 1` nodes (far past any RAM-bound need).
-const NODE_NULL: u32 = u32::MAX;
-
-/// `va` stamped on a frame node memmgr did **not** map itself
+/// `va` stamped on a frame descriptor memmgr did **not** map itself
 /// (`REQUEST_MEMORY_CAPS` grants and bootstrap arenas): the caller owns the
 /// mapping, so `UNREGISTER_REGION` must never unmap it. Demand-fault frames
 /// carry their mapped page base instead.
 const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 
-/// One arena node: a demand-paged region descriptor, a backing-frame
-/// descriptor, or a free slot. Stored in pool-backed arena pages and reached by
-/// index via [`slot_ptr`].
-#[derive(Clone, Copy)]
-enum Node
-{
-    Free,
-    Region
-    {
-        va_base: u64,
-        len: u64,
-        prot: u64,
-    },
-    Frame
-    {
-        cap_slot: u32,
-        page_count: u32,
-        phys_base: u64,
-        va: u64,
-    },
-}
+// ── Private VA zones ─────────────────────────────────────────────────────────
+//
+// memmgr is `no_std`: it has no byte heap and no reservation arena, so the
+// `process-layout` zones below the bootstrap windows (the std heap and
+// reservation-arena zones) are free in its address space. memmgr's private
+// windows, in address order, all below `MAIN_TLS_WINDOW.base`:
+//
+//   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
+//   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
+//   metadata arena      [drawn base, META_ARENA_LOW_END)    arena pages, then
+//   arena high zone     [META_ARENA_HIGH_BASE, ...)          above the shared
+//                                                            layout ceiling
+//
+// The high zone exists only where the paging mode's user half is wider than
+// the shared 2^38 layout ceiling (x86-64 4-level, Sv48, Sv57); under Sv39 the
+// kernel refuses the map and the arena ends at the low zone, which outlasts
+// the RAM such a machine can hold.
 
-/// An arena slot: a [`Node`] payload plus the index of the next slot in the
-/// singly-linked list this slot currently belongs to (a per-process region or
-/// frame list, or the global free list). `NODE_NULL` terminates the list.
-#[derive(Clone, Copy)]
-struct Slot
-{
-    node: Node,
-    next: u32,
-}
+/// Degraded-fallback scratch VA in memmgr's address space for mapping the
+/// bootstrap phys-table memory cap, and the base of its per-boot draw
+/// window (ASLR, #39). One page; mapped RO during `bootstrap_from_init`,
+/// unmapped before the dispatch loop entry.
+const PHYS_TABLE_TEMP_VA: u64 = 0x0000_0002_0000_0000;
 
-/// Degraded-fallback base VA of the metadata arena in memmgr's own address
-/// space, and the base of its per-boot draw window (ASLR, #39). The whole
-/// arena zone sits in the free scratch band above [`PHYS_TABLE_TEMP_VA`]'s
-/// window and below the creator-drawn stack / `ProcessInfo` / IPC-buffer
-/// windows, keeping every memmgr VA under the 2^38 layout ceiling (the
-/// Sv39 user half) shared with `process-layout`.
-const META_ARENA_BASE_DEFAULT: u64 = 0x0000_0004_4000_0000;
+/// Log2 of the number of page-aligned phys-table scratch slots (= bits of
+/// base entropy): the drawn VA lies in an 8 GiB window above the default.
+const PHYS_TABLE_TEMP_SLOTS_LOG2: u32 = 21;
+
+/// Base of the process index's bucket array (`ProcessIndex`), grown one page
+/// at a time from the pool. Deterministic: it holds only arena indices.
+const PROCESS_INDEX_VA: u64 = 0x0000_0004_0000_0000;
+
+/// Exclusive end of the bucket-array window (1 GiB, 2^27 buckets). Past it
+/// the index stops splitting and its chains lengthen; it bounds no capacity.
+const PROCESS_INDEX_END: u64 = 0x0000_0004_4000_0000;
+
+/// Degraded-fallback base VA of the metadata arena, and the base of its
+/// per-boot draw window (ASLR, #39).
+const META_ARENA_BASE_DEFAULT: u64 = PROCESS_INDEX_END;
 
 /// Log2 of the number of page-aligned arena-base slots (= bits of base
-/// entropy): the drawn base lies in an 8 GiB window above the default.
-/// It sizes only the ASLR window, not the arena; the zone-map assert below
-/// proves the worst-case draw stays under [`META_ARENA_CEILING`].
+/// entropy): the drawn base lies in an 8 GiB window above the default. It
+/// sizes only the ASLR window, not the arena.
 const META_ARENA_SLOTS_LOG2: u32 = 21;
 
-/// Exclusive ceiling for arena growth: the base of the std reservation-arena
-/// zone (`process-layout`'s zone map), the next zone above memmgr's scratch
-/// band. `arena_grow` refuses to map past it, bounding the arena to >= 39 GiB
-/// of headroom above any base draw — hundreds of millions of nodes.
-const META_ARENA_CEILING: u64 = 0x0000_0010_0000_0000;
+/// Exclusive end of the arena's low zone: the lowest bootstrap window
+/// `process-layout` draws in memmgr's address space.
+const META_ARENA_LOW_END: u64 = process_layout::MAIN_TLS_WINDOW.base;
 
-// Zone-map invariants for memmgr's private windows, mirroring the
-// const-asserted discipline in `shared/process-layout`: the phys-table
-// scratch window ends below the arena window, and the arena's worst-case
-// base draw stays under the growth ceiling.
+/// Base of the arena's high zone: the shared layout ceiling, above which no
+/// `process-layout` zone lies.
+const META_ARENA_HIGH_BASE: u64 = process_layout::LAYOUT_VA_CEILING;
+
+/// Exclusive end of the arena's high zone: the largest user half among the
+/// supported paging modes (Sv57 and 5-level paging). The boot's own mode
+/// refuses the map earlier where its user half is smaller.
+const META_ARENA_HIGH_END: u64 = 1 << 56;
+
+// Zone-map invariants: each window ends before the next begins, and the
+// arena's worst-case base draw leaves its low zone non-empty.
 const _: () = {
-    assert!(
-        PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= META_ARENA_BASE_DEFAULT
-    );
-    assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_CEILING);
+    assert!(PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= PROCESS_INDEX_VA);
+    assert!(PROCESS_INDEX_END <= META_ARENA_BASE_DEFAULT);
+    assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_LOW_END);
+    assert!(META_ARENA_LOW_END <= META_ARENA_HIGH_BASE);
 };
 
-/// Bytes per arena slot.
-const NODE_SIZE: usize = core::mem::size_of::<Slot>();
-
-/// Slots per arena page. The page remainder (`PAGE_SIZE % NODE_SIZE`) is unused
-/// so no slot straddles a page boundary and index→VA stays a clean
-/// (page, slot) split.
-const NODES_PER_PAGE: usize = PAGE_SIZE as usize / NODE_SIZE;
-
-// Arena allocator state. Single-threaded service — plain statics suffice; access
-// is `unsafe` only because the storage is raw mapped memory, not for concurrency.
-static mut ARENA_FREE_HEAD: u32 = NODE_NULL;
-static mut ARENA_PAGES: u32 = 0;
-static mut ARENA_SELF_ASPACE: u32 = 0;
-static mut ARENA_BASE_VA: u64 = META_ARENA_BASE_DEFAULT;
-
-/// Record memmgr's own `AddressSpace` cap for arena page mapping and draw the
-/// arena base (ASLR, #39). Called once at boot, before any node allocation. A
-/// failed draw — a kernel-contract violation once the pool is seeded —
-/// degrades to the deterministic default base.
-fn arena_init(self_aspace: u32)
+/// Arena slot storage: the arena's mapped pages at the boot's [`ArenaLayout`].
+struct MappedSlots
 {
-    let base = match syscall::random_u64()
+    layout: ArenaLayout,
+}
+
+impl SlotStore for MappedSlots
+{
+    unsafe fn read(&self, idx: NodeIdx) -> Slot
+    {
+        let Some(va) = self.layout.slot_va(idx)
+        else
+        {
+            return Slot {
+                node: Node::Free,
+                next: NODE_NULL,
+            };
+        };
+        // SAFETY: the caller's contract puts `idx` in a carved arena page,
+        // which `arena_grow` mapped writable at `layout.page_va` before
+        // carving; slots are 8-aligned and never straddle a page.
+        unsafe { core::ptr::read(va as *const Slot) }
+    }
+
+    unsafe fn write(&mut self, idx: NodeIdx, slot: Slot)
+    {
+        if let Some(va) = self.layout.slot_va(idx)
+        {
+            // SAFETY: as in `read`.
+            unsafe { core::ptr::write(va as *mut Slot, slot) };
+        }
+    }
+}
+
+/// Bucket-head storage: the index's mapped pages from [`PROCESS_INDEX_VA`].
+struct MappedWords;
+
+impl WordStore for MappedWords
+{
+    unsafe fn read(&self, i: u64) -> u64
+    {
+        // SAFETY: the caller's contract puts word `i` in a page `index_grow`
+        // mapped writable at `PROCESS_INDEX_VA + page * PAGE_SIZE`.
+        unsafe { core::ptr::read((PROCESS_INDEX_VA + i * 8) as *const u64) }
+    }
+
+    unsafe fn write(&mut self, i: u64, v: u64)
+    {
+        // SAFETY: as in `read`.
+        unsafe { core::ptr::write((PROCESS_INDEX_VA + i * 8) as *mut u64, v) };
+    }
+}
+
+type MemLedger = Ledger<MappedSlots, MappedWords>;
+
+/// Layout the ledger starts with; [`ledger_init`] replaces it with the drawn
+/// one before any page is carved.
+const LAYOUT_DEFAULT: ArenaLayout = ArenaLayout {
+    low_base: META_ARENA_BASE_DEFAULT,
+    low_end: META_ARENA_LOW_END,
+    high_base: META_ARENA_HIGH_BASE,
+    high_end: META_ARENA_HIGH_END,
+};
+
+// All bookkeeping (arena, free pool, process index) lives in one ledger so it
+// never lands on a syscall stack frame. memmgr is single-threaded: its only
+// thread runs the dispatch loop and owns the ledger exclusively, so the
+// `static mut` access is sound. Each handler takes the ledger once, through
+// `ledger_mut()`, and passes it down; nothing takes it twice at a time.
+static mut LEDGER: MemLedger = Ledger::new(
+    MappedSlots {
+        layout: LAYOUT_DEFAULT,
+    },
+    MappedWords,
+);
+
+/// memmgr's own `AddressSpace` cap, for arena and index page maps and their
+/// page-table funding. Set once at boot.
+static mut SELF_ASPACE: u32 = 0;
+
+#[allow(static_mut_refs)]
+fn ledger_mut() -> &'static mut MemLedger
+{
+    // SAFETY: single-threaded service; each handler holds the only reference
+    // it takes for the handler's duration.
+    unsafe { &mut LEDGER }
+}
+
+fn self_aspace() -> u32
+{
+    // SAFETY: single-threaded; written once in `ledger_init`.
+    unsafe { SELF_ASPACE }
+}
+
+/// Record memmgr's own `AddressSpace` cap and draw the arena base (ASLR,
+/// #39). Called once at boot, before any page is carved. A failed draw — a
+/// kernel-contract violation once the pool is seeded — degrades to the
+/// deterministic default base.
+fn ledger_init(self_aspace_cap: u32)
+{
+    let low_base = match syscall::random_u64()
     {
         Ok(r) => META_ARENA_BASE_DEFAULT + ((r & ((1 << META_ARENA_SLOTS_LOG2) - 1)) << 12),
         Err(_) => META_ARENA_BASE_DEFAULT,
     };
-    // SAFETY: single-threaded; called once before the dispatch loop.
-    unsafe {
-        ARENA_SELF_ASPACE = self_aspace;
-        ARENA_BASE_VA = base;
-    }
+    // SAFETY: single-threaded; called once before any other ledger use.
+    unsafe { SELF_ASPACE = self_aspace_cap };
+    *ledger_mut() = Ledger::new(
+        MappedSlots {
+            layout: ArenaLayout {
+                low_base,
+                ..LAYOUT_DEFAULT
+            },
+        },
+        MappedWords,
+    );
 }
 
-/// Raw pointer to slot `idx`. The slot's page is mapped for any index ever
-/// returned by [`node_alloc`].
-fn slot_ptr(idx: u32) -> *mut Slot
+// ── Pool primitives ──────────────────────────────────────────────────────────
+
+/// The kernel's `memory_split` as the pool's injected split.
+fn split(cap: u32, offset: u64) -> Option<u32>
 {
-    let page = idx as usize / NODES_PER_PAGE;
-    let slot = idx as usize % NODES_PER_PAGE;
-    // SAFETY: single-threaded; set once in `arena_init` before any allocation.
-    let base = unsafe { ARENA_BASE_VA };
-    (base as usize + page * PAGE_SIZE as usize + slot * NODE_SIZE) as *mut Slot
+    syscall::memory_split(cap, offset).ok()
 }
 
-/// Map one pool frame as the next arena page and thread its slots onto the free
-/// list. Returns `false` if the pool cannot spare a page (system RAM exhausted)
-/// or the self-map fails.
-fn arena_grow(pool: &mut FreePool) -> bool
+/// Coalesce the free pool through the kernel's `memory_merge`.
+fn coalesce(l: &mut MemLedger)
 {
-    let Ok((granted, _)) = select_memory_caps(pool, 1, true)
+    l.pool.coalesce_with(&mut l.arena, |parent, tail| {
+        syscall::memory_merge(parent, tail).is_ok()
+    });
+}
+
+/// Select runs for `want` pages (see `FreePool::select`), mapping a failure to
+/// its `memmgr_errors` code.
+fn select(l: &mut MemLedger, want: u32, contiguous: bool) -> Result<Grant, u64>
+{
+    l.pool
+        .select(&mut l.arena, want, contiguous, split)
+        .map_err(|e| match e
+        {
+            SelectError::Contiguous => memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            SelectError::BestEffort => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
+        })
+}
+
+/// Pool pages one page-table top-up donates. A donation can keep one page for
+/// the kernel's donation bookkeeping, so a top-up is never a single page.
+const ASPACE_TOPUP_PAGES: u32 = 4;
+
+/// Page-table top-ups one self-map attempts before giving up.
+const PT_FUND_ROUNDS: u32 = 4;
+
+/// Fund memmgr's own page-table growth pool from its free pool: donate a
+/// contiguous run of [`ASPACE_TOPUP_PAGES`] (or two pages when no such run is
+/// free) with augment-mode `cap_create_aspace` against its own `AddressSpace`,
+/// then delete the frame's cap (the donation holds its own reference). The
+/// pages leave the pool for good and stay in `pool_total` as memmgr-owned
+/// metadata. A refused donation returns the run to the pool.
+fn fund_self_page_tables(l: &mut MemLedger) -> bool
+{
+    let Ok(grant) = select(l, ASPACE_TOPUP_PAGES, true).or_else(|_| select(l, 2, true))
     else
     {
         return false;
     };
-    let (outer, _pages, phys) = granted[0];
-    // SAFETY: single-threaded; set at boot / tracked here.
-    let (self_aspace, page_idx, arena_base) =
-        unsafe { (ARENA_SELF_ASPACE, ARENA_PAGES, ARENA_BASE_VA) };
-    let va = arena_base + u64::from(page_idx) * PAGE_SIZE;
-    let mapped = va < META_ARENA_CEILING && {
-        // SAFETY: `va` is the arena's next unmapped page, in memmgr's private
-        // arena zone below `META_ARENA_CEILING`, which only `arena_grow` maps
-        // and where no image, stack, or IPC page lies (the zone map above).
-        unsafe { syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }.is_ok()
-    };
-    if !mapped
+    let (outer, pages, phys) = grant.entries[0];
+    if syscall::cap_create_aspace(outer, self_aspace(), u64::from(pages)).is_ok()
     {
-        // Return the unusable frame to the pool; it stays owned and counted.
-        let _ = pool.push(FreeRun {
+        let _ = syscall::cap_delete(outer);
+        return true;
+    }
+    // The run's own slot was freed by the take, so the push finds a slot; if
+    // not, the run stays owned and counted but out of circulation.
+    let _ = l.pool.push(
+        &mut l.arena,
+        FreeRun {
             cap_slot: outer,
-            page_count: 1,
+            page_count: u64::from(pages),
             phys_base: phys,
-        });
+        },
+    );
+    false
+}
+
+/// Map the one-page Memory cap `cap` read-write at `va` in memmgr's own
+/// address space, funding its page tables from the pool when the kernel
+/// reports the page-table pool exhausted.
+///
+/// `va` MUST be the next unmapped page of the arena or the index window.
+fn map_self_page(l: &mut MemLedger, cap: u32, va: u64) -> bool
+{
+    for _ in 0..=PT_FUND_ROUNDS
+    {
+        // SAFETY: `va` is the next unmapped page of memmgr's private arena or
+        // index window (the zone map above), which only this function maps
+        // and where no image, stack, or IPC page lies.
+        match unsafe { syscall::mem_map(cap, self_aspace(), va, 0, 1, MAP_READ | MAP_WRITABLE) }
+        {
+            Ok(()) => return true,
+            Err(e) if e == SyscallError::OutOfMemory as i64 =>
+            {}
+            Err(_) => return false,
+        }
+        if !fund_self_page_tables(l)
+        {
+            return false;
+        }
+    }
+    false
+}
+
+/// Map one pool frame as the next arena page and carve it into free slots.
+/// Returns `false` if the pool cannot spare a page, both arena zones are
+/// spent, or the map fails.
+fn arena_grow(l: &mut MemLedger) -> bool
+{
+    let Some(va) = l.arena.store().layout.page_va(l.arena.pages())
+    else
+    {
+        return false;
+    };
+    let Ok(grant) = select(l, 1, true)
+    else
+    {
+        return false;
+    };
+    let (outer, _, phys) = grant.entries[0];
+    if !map_self_page(l, outer, va)
+    {
+        let _ = l.pool.push(
+            &mut l.arena,
+            FreeRun {
+                cap_slot: outer,
+                page_count: 1,
+                phys_base: phys,
+            },
+        );
         return false;
     }
-    // Carve the freshly-mapped page into free slots, prepended to the free list.
-    // Every slot is fully initialized here, so later reads never touch
-    // uninitialized arena memory.
-    let first = page_idx as usize * NODES_PER_PAGE;
-    for j in 0..NODES_PER_PAGE
+    // SAFETY: page `pages()` of the arena layout is now mapped read-write at
+    // `va` and is used by nothing but the arena.
+    unsafe { l.arena.add_page() };
+    true
+}
+
+/// Grow the arena until it has `n` free slots. `false` when it cannot (RAM
+/// exhausted or the arena's zones spent).
+fn ensure_slots(l: &mut MemLedger, n: u64) -> bool
+{
+    while l.arena.free_count() < n
     {
-        let idx = (first + j) as u32;
-        let next = if j + 1 < NODES_PER_PAGE
+        if !arena_grow(l)
         {
-            (first + j + 1) as u32
+            return false;
         }
-        else
-        {
-            // SAFETY: single-threaded.
-            unsafe { ARENA_FREE_HEAD }
-        };
-        // SAFETY: idx lies in the page just mapped at `va`; the pointer is in
-        // range and 8-aligned. `ptr::write` initializes without reading prior
-        // (uninitialized) bytes.
-        unsafe {
-            core::ptr::write(
-                slot_ptr(idx),
-                Slot {
-                    node: Node::Free,
-                    next,
-                },
-            );
-        }
-    }
-    // SAFETY: single-threaded.
-    unsafe {
-        ARENA_FREE_HEAD = first as u32;
-        ARENA_PAGES = page_idx + 1;
     }
     true
 }
 
-/// Pop a free slot, growing the arena if the free list is empty. Returns the
-/// slot index for the caller to populate, or `None` on RAM exhaustion.
-fn node_alloc(pool: &mut FreePool) -> Option<u32>
+/// Give the process index another page of buckets when it wants one. A
+/// refused growth past the first page only lengthens chains; with no page at
+/// all, `insert_process` refuses.
+fn ensure_index(l: &mut MemLedger)
 {
-    // SAFETY: single-threaded.
-    let mut head = unsafe { ARENA_FREE_HEAD };
-    if head == NODE_NULL
+    if !l.index.wants_page()
     {
-        if !arena_grow(pool)
-        {
-            return None;
-        }
-        // SAFETY: arena_grow set a non-null head.
-        head = unsafe { ARENA_FREE_HEAD };
+        return;
     }
-    // SAFETY: head is a valid, mapped slot.
-    let next = unsafe { (*slot_ptr(head)).next };
-    // SAFETY: single-threaded.
-    unsafe { ARENA_FREE_HEAD = next };
-    Some(head)
-}
-
-/// Return slot `idx` to the free list.
-fn node_free(idx: u32)
-{
-    // SAFETY: single-threaded; idx is a valid, mapped slot.
-    unsafe {
-        core::ptr::write(
-            slot_ptr(idx),
-            Slot {
-                node: Node::Free,
-                next: ARENA_FREE_HEAD,
+    let va = PROCESS_INDEX_VA + l.index.pages() * PAGE_SIZE;
+    if va >= PROCESS_INDEX_END
+    {
+        return;
+    }
+    let Ok(grant) = select(l, 1, true)
+    else
+    {
+        return;
+    };
+    let (outer, _, phys) = grant.entries[0];
+    if map_self_page(l, outer, va)
+    {
+        // SAFETY: index page `pages()` is now mapped read-write at `va` and
+        // is used by nothing but the index.
+        unsafe { l.index.add_page(&mut l.arena) };
+    }
+    else
+    {
+        let _ = l.pool.push(
+            &mut l.arena,
+            FreeRun {
+                cap_slot: outer,
+                page_count: 1,
+                phys_base: phys,
             },
         );
-        ARENA_FREE_HEAD = idx;
     }
 }
 
-/// Process accounting record: badge plus the heads of this process's intrusive
-/// region and backing-frame lists. The list nodes live in the metadata arena.
-struct ProcessRecord
+/// Return `run` to the free pool. When the arena has no free slot and the
+/// pool cannot fund an arena page, the arena page is carved from the front of
+/// `run` itself (all of it, for a one-page run), so an insert fails only when
+/// the self-map fails; the run then stays owned and counted in `pool_total`
+/// but out of circulation. This is also how the first ingested run seeds the
+/// arena, before the pool holds anything.
+fn insert_run(l: &mut MemLedger, run: FreeRun)
 {
-    badge: u64,
-    /// Head of the backing-frame list (`NODE_NULL` = empty).
-    frame_head: u32,
-    /// Head of the demand-paged region list (`NODE_NULL` = empty).
-    region_head: u32,
-    /// Demand-paged child `AddressSpace` cap delegated by procmgr, or `0` when
-    /// the process is not demand-paged. memmgr maps fault-backing frames into
-    /// it.
-    aspace_cap: u32,
-}
-
-impl ProcessRecord
-{
-    const fn new(badge: u64) -> Self
+    if ensure_slots(l, 1)
     {
-        Self {
-            badge,
-            frame_head: NODE_NULL,
-            region_head: NODE_NULL,
-            aspace_cap: 0,
-        }
+        let _ = l.pool.push(&mut l.arena, run);
+        return;
     }
-
-    /// Reuse this free slot for `badge`. A slot reaches `badge == 0` either
-    /// never-used (lists already empty) or via [`Self::reclaim_all`], which
-    /// frees every node before the badge is cleared; the heads are therefore
-    /// already `NODE_NULL`. Re-assert defensively.
-    fn reset(&mut self, badge: u64)
+    let Some(va) = l.arena.store().layout.page_va(l.arena.pages())
+    else
     {
-        self.badge = badge;
-        self.frame_head = NODE_NULL;
-        self.region_head = NODE_NULL;
-        self.aspace_cap = 0;
-    }
-
-    /// Record a backing frame against this process. `va` is the page base memmgr
-    /// mapped the frame at (demand fault), or [`FRAME_VA_UNMAPPED`] when the
-    /// caller owns the mapping. Returns `Err` if the arena cannot grow.
-    fn push_frame(
-        &mut self,
-        cap_slot: u32,
-        page_count: u32,
-        phys_base: u64,
-        va: u64,
-        pool: &mut FreePool,
-    ) -> Result<(), ()>
+        return;
+    };
+    let rest = if run.page_count > 1
     {
-        let idx = node_alloc(pool).ok_or(())?;
-        // SAFETY: idx is a fresh slot now owned by this record.
-        unsafe {
-            core::ptr::write(
-                slot_ptr(idx),
-                Slot {
-                    node: Node::Frame {
-                        cap_slot,
-                        page_count,
-                        phys_base,
-                        va,
-                    },
-                    next: self.frame_head,
-                },
-            );
-        }
-        self.frame_head = idx;
-        Ok(())
-    }
-
-    /// Undo the most recent [`Self::push_frame`] (LIFO), returning the node to
-    /// the arena. The frame cap itself is the caller's to return to the pool.
-    fn pop_frame(&mut self)
-    {
-        if self.frame_head != NODE_NULL
+        let Some(tail) = split(run.cap_slot, PAGE_SIZE)
+        else
         {
-            let idx = self.frame_head;
-            // SAFETY: idx is a live frame node.
-            self.frame_head = unsafe { (*slot_ptr(idx)).next };
-            node_free(idx);
-        }
+            return;
+        };
+        Some(FreeRun {
+            cap_slot: tail,
+            page_count: run.page_count - 1,
+            phys_base: run.phys_base + PAGE_SIZE,
+        })
     }
-
-    /// Register a demand-paged region, rejecting overlap. Returns the
-    /// `memmgr_errors` code to reply with on failure.
-    fn add_region(&mut self, region: DemandRegion, pool: &mut FreePool) -> Result<(), u64>
+    else
     {
-        let mut cur = self.region_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live region node.
-            let s = unsafe { *slot_ptr(cur) };
-            if let Node::Region { va_base, len, .. } = s.node
-                && regions_overlap(region.va_base, region.len, va_base, len)
-            {
-                return Err(memmgr_errors::INVALID_ARGUMENT);
-            }
-            cur = s.next;
-        }
-        let idx = node_alloc(pool).ok_or(memmgr_errors::QUOTA)?;
-        // SAFETY: idx is a fresh slot now owned by this record.
-        unsafe {
-            core::ptr::write(
-                slot_ptr(idx),
-                Slot {
-                    node: Node::Region {
-                        va_base: region.va_base,
-                        len: region.len,
-                        prot: region.prot,
-                    },
-                    next: self.region_head,
-                },
-            );
-        }
-        self.region_head = idx;
-        Ok(())
-    }
-
-    /// Find the registered region containing `va`, if any.
-    fn region_for(&self, va: u64) -> Option<DemandRegion>
-    {
-        let mut cur = self.region_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live region node.
-            let s = unsafe { *slot_ptr(cur) };
-            if let Node::Region { va_base, len, prot } = s.node
-                && region_contains(va_base, len, va)
-            {
-                return Some(DemandRegion { va_base, len, prot });
-            }
-            cur = s.next;
-        }
         None
-    }
-
-    /// True if a memmgr-mapped frame (chunk) already covers `page_base` — the
-    /// page is backed, so a (re-)fault on it should resume without allocating.
-    /// Guards against a stale-TLB redelivery of a page another fault's chunk
-    /// already mapped.
-    fn frame_covering(&self, page_base: u64) -> bool
+    };
+    if !map_self_page(l, run.cap_slot, va)
     {
-        let mut cur = self.frame_head;
-        while cur != NODE_NULL
+        if let Some(rest) = rest
         {
-            // SAFETY: cur is a live frame node.
-            let s = unsafe { *slot_ptr(cur) };
-            if let Node::Frame { va, page_count, .. } = s.node
-                && va != FRAME_VA_UNMAPPED
-                && page_base >= va
-                && page_base < va + u64::from(page_count) * PAGE_SIZE
-            {
-                return true;
-            }
-            cur = s.next;
+            let _ = syscall::memory_merge(run.cap_slot, rest.cap_slot);
         }
-        false
+        return;
     }
-
-    /// Remove the region exactly matching `[va_base, va_base + len)`, freeing
-    /// its node. Returns the removed descriptor, or `None` if no exact match.
-    fn remove_region(&mut self, va_base: u64, len: u64) -> Option<DemandRegion>
+    // SAFETY: page `pages()` of the arena layout is now mapped read-write at
+    // `va` and is used by nothing but the arena.
+    unsafe { l.arena.add_page() };
+    if let Some(rest) = rest
     {
-        let mut prev = NODE_NULL;
-        let mut cur = self.region_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live region node.
-            let s = unsafe { *slot_ptr(cur) };
-            if let Node::Region {
-                va_base: rb,
-                len: rl,
-                prot,
-            } = s.node
-                && rb == va_base
-                && rl == len
-            {
-                if prev == NODE_NULL
-                {
-                    self.region_head = s.next;
-                }
-                else
-                {
-                    // SAFETY: prev is a live region node.
-                    unsafe { (*slot_ptr(prev)).next = s.next };
-                }
-                node_free(cur);
-                return Some(DemandRegion {
-                    va_base: rb,
-                    len: rl,
-                    prot,
-                });
-            }
-            prev = cur;
-            cur = s.next;
-        }
-        None
-    }
-
-    /// Return to the pool every memmgr-mapped frame whose page base lies in
-    /// `[base, end)`, freeing its tracking node. Used by `UNREGISTER_REGION`:
-    /// the caller has already cleared the span's leaf PTEs and reclaimed the
-    /// intermediate page tables via `mem_unmap_reclaim`, so this only re-pools
-    /// the backing frames. Frames the caller mapped ([`FRAME_VA_UNMAPPED`]) are
-    /// left untouched.
-    fn return_frames_in(&mut self, base: u64, end: u64, pool: &mut FreePool)
-    {
-        let mut prev = NODE_NULL;
-        let mut cur = self.frame_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live frame node.
-            let s = unsafe { *slot_ptr(cur) };
-            let next = s.next;
-            if let Node::Frame {
-                cap_slot,
-                page_count,
-                phys_base,
-                va,
-            } = s.node
-                && va != FRAME_VA_UNMAPPED
-                && va >= base
-                && va < end
-            {
-                let _ = pool.push_or_coalesce(FreeRun {
-                    cap_slot,
-                    page_count,
-                    phys_base,
-                });
-                if prev == NODE_NULL
-                {
-                    self.frame_head = next;
-                }
-                else
-                {
-                    // SAFETY: prev is a live frame node.
-                    unsafe { (*slot_ptr(prev)).next = next };
-                }
-                node_free(cur);
-                cur = next;
-                continue;
-            }
-            prev = cur;
-            cur = next;
-        }
-    }
-
-    /// Return a single caller-owned grant — identified by `phys` — to the pool
-    /// mid-life, freeing its tracking node. Matches the first `Node::Frame`
-    /// with `phys_base == phys` and `va == FRAME_VA_UNMAPPED`: only frames
-    /// issued via `REQUEST_MEMORY_CAPS` (caller owns the mapping) are
-    /// releasable this way; demand-mapped chunks (`va != FRAME_VA_UNMAPPED`)
-    /// are reclaimed only via `UNREGISTER_REGION` / `PROCESS_DIED` and are
-    /// skipped. Returns whether a grant matched.
-    ///
-    /// The run may be "dirty": its `MemoryObject` keeps the retype bump pointer
-    /// advanced even after the caller's retype was freed. `push_or_coalesce` is
-    /// sound regardless — `coalesce`'s `memory_merge` guards every join with
-    /// `.is_err()` and the kernel refuses to merge a non-virgin tail
-    /// (`sys_memory_merge`) or split past the bump (`sys_memory_split`), so a
-    /// dirty run is parked discrete and re-granted whole, reusing the kernel's
-    /// retype free-list. A varied-size workload that releases dirty runs may
-    /// see mild fragmentation (no sub-splitting until the run goes virgin);
-    /// same-size churn (the Thread-retype slab) is unaffected.
-    fn release_frame_by_phys(&mut self, phys: u64, pool: &mut FreePool) -> bool
-    {
-        let mut prev = NODE_NULL;
-        let mut cur = self.frame_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live frame node.
-            let s = unsafe { *slot_ptr(cur) };
-            if let Node::Frame {
-                cap_slot,
-                page_count,
-                phys_base,
-                va,
-            } = s.node
-                && va == FRAME_VA_UNMAPPED
-                && phys_base == phys
-            {
-                let _ = pool.push_or_coalesce(FreeRun {
-                    cap_slot,
-                    page_count,
-                    phys_base,
-                });
-                if prev == NODE_NULL
-                {
-                    self.frame_head = s.next;
-                }
-                else
-                {
-                    // SAFETY: prev is a live frame node.
-                    unsafe { (*slot_ptr(prev)).next = s.next };
-                }
-                node_free(cur);
-                return true;
-            }
-            prev = cur;
-            cur = s.next;
-        }
-        false
-    }
-
-    /// Reclaim every frame and region node on process death: each frame cap
-    /// returns to the pool (the kernel's cspace-revoke cascade, run by procmgr
-    /// before this point, already tore down the child's mappings, so no unmap
-    /// is needed here), and every node returns to the arena.
-    fn reclaim_all(&mut self, pool: &mut FreePool)
-    {
-        let mut cur = self.frame_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live frame node.
-            let s = unsafe { *slot_ptr(cur) };
-            if let Node::Frame {
-                cap_slot,
-                page_count,
-                phys_base,
-                ..
-            } = s.node
-            {
-                let _ = pool.push_or_coalesce(FreeRun {
-                    cap_slot,
-                    page_count,
-                    phys_base,
-                });
-            }
-            node_free(cur);
-            cur = s.next;
-        }
-        self.frame_head = NODE_NULL;
-
-        let mut cur = self.region_head;
-        while cur != NODE_NULL
-        {
-            // SAFETY: cur is a live region node.
-            let next = unsafe { (*slot_ptr(cur)).next };
-            node_free(cur);
-            cur = next;
-        }
-        self.region_head = NODE_NULL;
-    }
-}
-
-/// Process tracking table: dense array of records keyed by a random
-/// per-process ledger badge (memmgr-minted in `REGISTER_PROCESS`, returned to
-/// the registrant and threaded back as its memmgr / fault badge). Records are
-/// found by equality scan, not array index.
-struct ProcessTable
-{
-    /// Slots are stored inline; a slot is free iff `badge == 0` (every minted
-    /// badge is nonzero). Inserts and frees reset in place — the per-process
-    /// region and frame lists live in the arena, not in the record.
-    records: [ProcessRecord; MAX_PROCESSES],
-}
-
-impl ProcessTable
-{
-    // Const-evaluated at static-initialization time; never a stack frame.
-    const fn new() -> Self
-    {
-        const EMPTY: ProcessRecord = ProcessRecord::new(0);
-        Self {
-            records: [EMPTY; MAX_PROCESSES],
-        }
-    }
-
-    /// Claim a free slot for `badge`, resetting it in place. Returns `None`
-    /// when the table is full.
-    fn insert(&mut self, badge: u64) -> Option<&mut ProcessRecord>
-    {
-        let slot = self.records.iter_mut().find(|slot| slot.badge == 0)?;
-        slot.reset(badge);
-        Some(slot)
-    }
-
-    fn find_mut(&mut self, badge: u64) -> Option<&mut ProcessRecord>
-    {
-        self.records.iter_mut().find(|slot| slot.badge == badge)
-    }
-
-    /// Mark the slot owned by `badge` free (reusable) in place. The caller has
-    /// already reclaimed the record's resources.
-    fn free(&mut self, badge: u64)
-    {
-        if let Some(rec) = self.find_mut(badge)
-        {
-            rec.badge = 0;
-        }
+        let _ = l.pool.push(&mut l.arena, rest);
     }
 }
 
 /// Mint a fresh memmgr-minted process-identity badge: a random `u64` from the
 /// kernel entropy pool, redrawn off the reserved values a live record must
-/// never alias — `0` (the free-slot marker; see `ProcessTable`) and the
-/// well-known reserved records `MEMMGR_SELF_BADGE` / `INIT_SELF_BADGE`. Random
+/// never alias — the well-known reserved records `MEMMGR_SELF_BADGE` /
+/// `INIT_SELF_BADGE` — and off `0`, which no badged cap carries. Random
 /// rather than monotonic so the process-registration count it would otherwise
-/// leak across the `REGISTER_PROCESS` boundary stays unguessable; the badge is
-/// matched by equality scan, never used as an array index. Returns `None` if
-/// the entropy draw fails (a kernel-contract violation). The `u64` width is
-/// the kernel badge word `cap_derive_badge` stamps, so the space never runs
-/// out and a draw aliases one live badge with probability 2^-64.
-fn mint_process_badge() -> Option<u64>
+/// leak across the `REGISTER_PROCESS` boundary stays unguessable. Returns
+/// `None` if the entropy draw fails (a kernel-contract violation). The `u64`
+/// width is the kernel badge word `cap_derive_badge` stamps, so the space
+/// never runs out; a draw that aliases a live badge is redrawn.
+fn mint_process_badge(l: &MemLedger) -> Option<u64>
 {
     loop
     {
         let b = syscall::random_u64().ok()?;
-        if b != 0 && b != MEMMGR_SELF_BADGE && b != INIT_SELF_BADGE
+        if b != 0 && b != MEMMGR_SELF_BADGE && b != INIT_SELF_BADGE && l.find(b).is_none()
         {
             return Some(b);
         }
     }
 }
 
-// Per-process tracking and the free pool live in statics so the bookkeeping
-// never lands on a syscall stack frame. memmgr is single-threaded — its only
-// thread runs the main dispatch loop and owns these tables exclusively, so the
-// `static mut` reads/writes are sound.
-//
-// Access is gated through `pool_mut()` and `table_mut()` to keep the
-// `unsafe` to one place per access.
-
-static mut FREE_POOL: FreePool = FreePool::new();
-static mut PROCESS_TABLE: ProcessTable = ProcessTable::new();
-
-#[allow(static_mut_refs)]
-fn pool_mut() -> &'static mut FreePool
-{
-    // SAFETY: single-threaded service; no concurrent access.
-    unsafe { &mut FREE_POOL }
-}
-
-#[allow(static_mut_refs)]
-fn table_mut() -> &'static mut ProcessTable
-{
-    // SAFETY: single-threaded service; no concurrent access.
-    unsafe { &mut PROCESS_TABLE }
-}
-
 // ── Bootstrap protocol ───────────────────────────────────────────────────────
 //
 // The init → memmgr bootstrap payload layout (round caps + data words and the
 // auxiliary phys-table page) is defined in `ipc::memmgr_bootstrap`. memmgr
-// reads the free-run prefix from the data words and, from the phys-table page,
-// the per-cap physical bases plus the in-use bootstrap arenas (memmgr's,
-// procmgr's, and init's own backing). The arenas are recorded against per-owner
-// process records so `pool_total` spans every page of RAM memmgr owns, not only
-// the free runs and reap donations.
-
-/// Maximum free RAM memory caps init delivers in one bootstrap round; see
-/// `ipc::memmgr_bootstrap::MAX_MEMORY_CAPS`.
-const BOOTSTRAP_MAX_MEMORY_CAPS: usize = ipc::memmgr_bootstrap::MAX_MEMORY_CAPS;
+// reads the free RAM caps' slot range from the data words and, from the
+// phys-table page, the kernel's RAM facts plus the in-use bootstrap arenas
+// (memmgr's, procmgr's, and init's own backing). The arenas are recorded
+// against per-owner process records so `pool_total` spans every page of RAM
+// memmgr owns, not only the free runs and reap donations.
 
 /// Reserved process-table badge for memmgr's own bootstrap-backing record.
 /// `mint_process_badge` explicitly excludes this value, so no
@@ -808,19 +573,6 @@ const MEMMGR_SELF_BADGE: u64 = u64::MAX;
 /// parked and accounted here. Like `MEMMGR_SELF_BADGE`, excluded from
 /// `mint_process_badge`, so no minted badge can collide.
 const INIT_SELF_BADGE: u64 = u64::MAX - 1;
-
-/// Degraded-fallback scratch VA in memmgr's address space for mapping the
-/// bootstrap phys-table memory cap, and the base of its per-boot draw
-/// window (ASLR, #39). One page; mapped RO during `bootstrap_from_init`,
-/// unmapped before the dispatch loop entry. Below the 2^38 layout ceiling
-/// (the Sv39 user half) and below [`META_ARENA_BASE_DEFAULT`]'s window.
-const PHYS_TABLE_TEMP_VA: u64 = 0x0000_0002_0000_0000;
-
-/// Log2 of the number of page-aligned phys-table scratch slots (= bits of
-/// base entropy): the drawn VA lies in an 8 GiB window above the default.
-/// It sizes only the ASLR window for one page; the zone-map assert proves
-/// the window ends below [`META_ARENA_BASE_DEFAULT`].
-const PHYS_TABLE_TEMP_SLOTS_LOG2: u32 = 21;
 
 /// One in-use bootstrap arena delivered by init: a Memory cap covering a
 /// tier-1 service's whole backing (retype slabs + offset-mapped pages),
@@ -841,8 +593,6 @@ struct InitBootstrap
     procmgr_badge: u64,
     memory_base: u32,
     memory_count: u32,
-    page_counts: [u32; BOOTSTRAP_MAX_MEMORY_CAPS],
-    phys_bases: [u64; BOOTSTRAP_MAX_MEMORY_CAPS],
     // Cannot fill: init forwards one arena each for memmgr, procmgr and
     // itself, one under `MAX_IN_USE`.
     in_use: [BootInUse; ipc::memmgr_bootstrap::MAX_IN_USE],
@@ -853,7 +603,7 @@ struct InitBootstrap
 
 fn bootstrap_from_init(
     creator_ep: u32,
-    self_aspace: u32,
+    self_aspace_cap: u32,
     ipc_buf: *mut u64,
 ) -> Option<InitBootstrap>
 {
@@ -869,45 +619,22 @@ fn bootstrap_from_init(
     {
         return None;
     }
-    let memory_count = round.data[1] as u32;
-    let packed_words = (memory_count as usize).div_ceil(2);
-    if (memory_count as usize) > BOOTSTRAP_MAX_MEMORY_CAPS || 3 + packed_words > round.data_words
-    {
-        return None;
-    }
-    // Unpack 2 page_counts per word: low 32 bits = even index, high 32
-    // bits = odd index.
-    let mut page_counts = [0u32; BOOTSTRAP_MAX_MEMORY_CAPS];
-    for w in 0..packed_words
-    {
-        let word = round.data[3 + w];
-        let lo = word as u32;
-        let hi = (word >> 32) as u32;
-        let i0 = w * 2;
-        page_counts[i0] = lo;
-        if i0 + 1 < memory_count as usize
-        {
-            page_counts[i0 + 1] = hi;
-        }
-    }
 
     // Map the phys-table memory cap at a per-boot drawn scratch VA (ASLR,
-    // #39; degrades to the deterministic default on a failed draw) and copy
-    // out memory_count u64 entries.
+    // #39; degrades to the deterministic default on a failed draw).
     let phys_table_va = match syscall::random_u64()
     {
         Ok(r) => PHYS_TABLE_TEMP_VA + ((r & ((1 << PHYS_TABLE_TEMP_SLOTS_LOG2) - 1)) << 12),
         Err(_) => PHYS_TABLE_TEMP_VA,
     };
     let phys_table_cap = round.caps[1];
-    let mut phys_bases = [0u64; BOOTSTRAP_MAX_MEMORY_CAPS];
     // SAFETY: `phys_table_va` lies in memmgr's private phys-table scratch
     // window, which nothing else maps and where no image, stack, or IPC page
-    // lies (the zone map above `META_ARENA_BASE_DEFAULT`).
+    // lies (the zone map above).
     if unsafe {
         syscall::mem_map(
             phys_table_cap,
-            self_aspace,
+            self_aspace_cap,
             phys_table_va,
             0,
             1,
@@ -918,23 +645,13 @@ fn bootstrap_from_init(
     {
         return None;
     }
-    // SAFETY: phys_table_va is mapped RO, one page. Init wrote the
-    // first `memory_count` u64 entries; the rest is zero. The pointer is
-    // page-aligned (4 KiB) so u64 alignment is satisfied.
+    // SAFETY: phys_table_va is mapped RO, one page, page-aligned (4 KiB), so
+    // u64 alignment is satisfied.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_ptr = phys_table_va as *const u64;
-    for (i, slot) in phys_bases
-        .iter_mut()
-        .enumerate()
-        .take(memory_count as usize)
-    {
-        // SAFETY: i < memory_count <= BOOTSTRAP_MAX_MEMORY_CAPS = 122; 122 * 8 =
-        // 976 B fits in one 4 KiB page.
-        *slot = unsafe { core::ptr::read_volatile(phys_ptr.add(i)) };
-    }
 
     // Read the in-use bootstrap arenas from the phys-table page's in-use
-    // section (above the phys-base table and the immutable facts).
+    // section.
     // SAFETY: IN_USE_COUNT_IDX is within the mapped 4 KiB page.
     let in_use_count = (unsafe { core::ptr::read_volatile(phys_ptr.add(mb::IN_USE_COUNT_IDX)) }
         as usize)
@@ -963,8 +680,7 @@ fn bootstrap_from_init(
     // phys-table indices. They form the left side of the all-RAM-accounted
     // identity (`system_ram == kernel_reserved + pool_total`) surfaced via
     // `QUERY_POOL_STATUS`.
-    // SAFETY: both indices are within the mapped 4 KiB page and past the
-    // phys-base table.
+    // SAFETY: both indices are within the mapped 4 KiB page.
     let (system_ram_bytes, kernel_reserved_bytes) = unsafe {
         (
             core::ptr::read_volatile(phys_ptr.add(mb::FACTS_SYSTEM_RAM_IDX)),
@@ -974,16 +690,14 @@ fn bootstrap_from_init(
 
     // SAFETY: the same scratch page, read above only through raw volatile
     // reads; no Rust reference into it is live.
-    let _ = unsafe { syscall::mem_unmap(self_aspace, phys_table_va, 1) };
+    let _ = unsafe { syscall::mem_unmap(self_aspace_cap, phys_table_va, 1) };
     let _ = syscall::cap_delete(phys_table_cap);
 
     Some(InitBootstrap {
         service_ep: round.caps[0],
         procmgr_badge: round.data[2],
         memory_base: round.data[0] as u32,
-        memory_count,
-        page_counts,
-        phys_bases,
+        memory_count: round.data[1] as u32,
         in_use,
         in_use_count,
         system_ram_bytes,
@@ -991,43 +705,7 @@ fn bootstrap_from_init(
     })
 }
 
-// ── Allocation primitives ────────────────────────────────────────────────────
-
-/// Binds the free pool's platform-injected merge/split operations to the real
-/// kernel syscalls. The pure allocator in `free_pool` takes `memory_merge` /
-/// `memory_split` as closures so it stays host-testable; this trait re-presents
-/// the bound `coalesce` / `push_or_coalesce` so every call site keeps its
-/// original shape. `memory_merge`'s `Ok` is the pure-logic "join accepted".
-trait PoolExt
-{
-    fn coalesce(&mut self);
-    fn push_or_coalesce(&mut self, run: FreeRun) -> Result<(), ()>;
-}
-
-impl PoolExt for FreePool
-{
-    fn coalesce(&mut self)
-    {
-        self.coalesce_with(|parent, tail| syscall::memory_merge(parent, tail).is_ok());
-    }
-
-    fn push_or_coalesce(&mut self, run: FreeRun) -> Result<(), ()>
-    {
-        self.push_or_coalesce_with(run, |parent, tail| {
-            syscall::memory_merge(parent, tail).is_ok()
-        })
-    }
-}
-
-/// Peel exactly `want` pages off the run at index `idx`, binding the kernel's
-/// `memory_split` (Option-D: shrink in place, return the tail cap) to the
-/// pool's injected split closure.
-fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)>
-{
-    pool.take_exactly(idx, want, |cap, offset| {
-        syscall::memory_split(cap, offset).ok()
-    })
-}
+// ── IPC handlers ─────────────────────────────────────────────────────────────
 
 /// Derive an inner copy of the outer cap to hand to the caller. The outer
 /// cap (`outer_slot`) stays in memmgr's `CSpace` as the per-process tracking
@@ -1043,122 +721,38 @@ fn derive_for_caller(outer_slot: u32) -> Option<u32>
     syscall::cap_derive(outer_slot, syscall::RIGHTS_ALL).ok()
 }
 
-// ── IPC handlers ─────────────────────────────────────────────────────────────
-
-/// Reply slot count for `REQUEST_MEMORY_CAPS`. Per-cap page counts pack into
-/// `data[1..1+count]`; `data[0]` holds the count itself.
-const MAX_REPLY_CAPS: usize = syscall_abi::MSG_CAP_SLOTS_MAX;
-
-/// One peeled selection entry: `(outer_cap_slot, page_count, phys_base)`.
-type GrantEntry = (u32, u32, u64);
-
-/// Result of a single `select_memory_caps` call: the array of peeled entries
-/// plus the count of valid entries.
-type GrantArray = [GrantEntry; MAX_REPLY_CAPS];
-
-/// Pool selection for a single `REQUEST_MEMORY_CAPS` call. Returns the array of
-/// peeled `(outer_cap, page_count, phys_base)` entries plus their count, or
-/// an error code on failure. On error the pool is unchanged; on success the
-/// caller owns each outer cap and is responsible for either accounting it
-/// to a process record or pushing it back via `pool.push`.
-fn select_memory_caps(
-    pool: &mut FreePool,
-    want_pages: u32,
-    contiguous: bool,
-) -> Result<(GrantArray, usize), u64>
+/// Roll back a grant: return its first `entries` runs to the pool and delete
+/// the inner derivations already minted.
+fn rollback_grant(l: &mut MemLedger, grant: &Grant, inner: &[u32])
 {
-    let mut granted: GrantArray = [(0, 0, 0); MAX_REPLY_CAPS];
-
-    if contiguous
+    for &(o, p, phys) in grant.entries()
     {
-        let idx = pool
-            .smallest_fit(want_pages)
-            .ok_or(memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS)?;
-        let (outer, phys) =
-            take_exactly(pool, idx, want_pages).ok_or(memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS)?;
-        granted[0] = (outer, want_pages, phys);
-        return Ok((granted, 1));
-    }
-
-    // Best-effort: a single best-fit run satisfies the request with the fewest
-    // caps and reuses a freed run of the requested size instead of re-splitting
-    // a larger one, so churn that frees and re-requests a fixed size cycles the
-    // same run (and the same anchor slot) rather than leaking one per request.
-    // Fall back to greedy largest-first only when no single run is large enough.
-    if let Some(idx) = pool.smallest_fit(want_pages)
-        && let Some((outer, phys)) = take_exactly(pool, idx, want_pages)
-    {
-        granted[0] = (outer, want_pages, phys);
-        return Ok((granted, 1));
-    }
-
-    // Fallback: greedy, largest-first across multiple runs, bounded by reply slots.
-    let mut count: usize = 0;
-    let mut remaining = want_pages;
-    while remaining > 0 && count < MAX_REPLY_CAPS
-    {
-        let Some(idx) = pool.largest()
-        else
-        {
-            break;
-        };
-        let avail = pool.runs[idx].map_or(0, |r| r.page_count);
-        if avail == 0
-        {
-            break;
-        }
-        let take_pages = avail.min(remaining);
-        let Some((outer, phys)) = take_exactly(pool, idx, take_pages)
-        else
-        {
-            break;
-        };
-        granted[count] = (outer, take_pages, phys);
-        count += 1;
-        remaining -= take_pages;
-    }
-    if remaining > 0
-    {
-        for &(outer, pages, phys) in granted.iter().take(count)
-        {
-            let _ = pool.push(FreeRun {
-                cap_slot: outer,
-                page_count: pages,
+        insert_run(
+            l,
+            FreeRun {
+                cap_slot: o,
+                page_count: u64::from(p),
                 phys_base: phys,
-            });
-        }
-        return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+            },
+        );
     }
-    Ok((granted, count))
-}
-
-/// Roll back a partial selection: push each outer back onto the pool and
-/// delete any inner derivations already minted.
-fn rollback_selection(
-    pool: &mut FreePool,
-    granted: &GrantArray,
-    granted_count: usize,
-    inner: &[u32; MAX_REPLY_CAPS],
-    inner_count: usize,
-)
-{
-    for &(o, p, phys) in granted.iter().take(granted_count)
-    {
-        let _ = pool.push(FreeRun {
-            cap_slot: o,
-            page_count: p,
-            phys_base: phys,
-        });
-    }
-    for &slot in inner.iter().take(inner_count)
+    for &slot in inner
     {
         let _ = syscall::cap_delete(slot);
     }
 }
 
+/// Undo the frame descriptors of `n` grant entries pushed onto `rec`.
+fn pop_frames(l: &mut MemLedger, rec: NodeIdx, n: usize)
+{
+    for _ in 0..n
+    {
+        let _ = l.pop_frame(rec);
+    }
+}
+
 fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    let badge = req.badge;
     let arg = req.word(0);
     // `data[0]` packs `want_pages` in its low half and the flags in its high
     // half, so one request asks for at most `u32::MAX` pages; a larger need
@@ -1172,36 +766,31 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(badge)
+    let l = ledger_mut();
+    let Some(rec) = l.find(req.badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    // Every slot the grant's frame descriptors take, before any run leaves the
+    // pool, so a full arena fails the request whole.
+    if !ensure_slots(l, MAX_GRANT_RUNS as u64)
+    {
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    }
 
     let contiguous = flags & memmgr_labels::REQUIRE_CONTIGUOUS != 0;
-    let (granted, granted_count) = match select_memory_caps(pool, want_pages, contiguous)
+    let grant = match select(l, want_pages, contiguous)
     {
-        Ok(v) => v,
+        Ok(g) => g,
         Err(code) =>
         {
-            let mut total_pages: u64 = 0;
-            let mut run_count: u32 = 0;
-            let mut max_run: u32 = 0;
-            for r in pool.runs.iter().flatten()
-            {
-                total_pages += u64::from(r.page_count);
-                run_count += 1;
-                if r.page_count > max_run
-                {
-                    max_run = r.page_count;
-                }
-            }
             let reply = IpcMessage::builder(code)
-                .word(0, total_pages)
-                .word(1, u64::from(run_count))
-                .word(2, u64::from(max_run))
+                .word(0, l.pool.free_pages())
+                .word(1, l.pool.run_count())
+                .word(2, l.pool.largest_pages(&l.arena))
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1211,34 +800,31 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 
     // Account each peeled outer to the caller's record, then derive the
     // inner copy that ships in the reply. On any failure, roll the entire
-    // selection back to the pool.
-    let mut inner: [u32; MAX_REPLY_CAPS] = [0; MAX_REPLY_CAPS];
-    for (i, &(outer, pages, phys)) in granted.iter().take(granted_count).enumerate()
+    // grant back to the pool.
+    let mut inner = [0u32; MAX_GRANT_RUNS];
+    for (i, &(outer, pages, phys)) in grant.entries().iter().enumerate()
     {
-        if record
-            .push_frame(outer, pages, phys, FRAME_VA_UNMAPPED, pool)
-            .is_err()
+        let frame = FrameDesc {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+            va: FRAME_VA_UNMAPPED,
+        };
+        if !l.push_frame(rec, frame)
         {
-            // Entries before `i` already have frame nodes on the record;
-            // their outers go back to the pool below, so the nodes must come
-            // off too or process-death reclaim would double-push the caps.
-            for _ in 0..i
-            {
-                record.pop_frame();
-            }
-            rollback_selection(pool, &granted, granted_count, &inner, i);
+            // Entries before `i` already have frame descriptors on the record;
+            // their outers go back to the pool below, so the descriptors must
+            // come off too or process-death reclaim would double-pool the caps.
+            pop_frames(l, rec, i);
+            rollback_grant(l, &grant, &inner[..i]);
             reply_label(ipc_buf, memmgr_errors::QUOTA);
             return;
         }
         let Some(d) = derive_for_caller(outer)
         else
         {
-            // Entries 0..=i have frame nodes pushed (this one included).
-            for _ in 0..=i
-            {
-                record.pop_frame();
-            }
-            rollback_selection(pool, &granted, granted_count, &inner, i);
+            pop_frames(l, rec, i + 1);
+            rollback_grant(l, &grant, &inner[..i]);
             reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
             return;
         };
@@ -1250,13 +836,16 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     //   data[1..1+count]         = page_count_for_cap_i (u32 in low half)
     //   data[1+count..1+2*count] = phys_base_for_cap_i (u64)
     //   caps[0..count]           = Memory caps (RIGHTS_ALL derivations)
-    let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, granted_count as u64);
-    for (i, &(_, pages, phys)) in granted.iter().take(granted_count).enumerate()
+    // A best-effort grant MAY cover fewer pages than asked (a partial grant);
+    // the caller requests the rest.
+    let count = grant.count;
+    let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, count as u64);
+    for (i, &(_, pages, phys)) in grant.entries().iter().enumerate()
     {
         builder = builder.word(1 + i, u64::from(pages));
-        builder = builder.word(1 + granted_count + i, phys);
+        builder = builder.word(1 + count + i, phys);
     }
-    for &slot in inner.iter().take(granted_count)
+    for &slot in &inner[..count]
     {
         builder = builder.cap(slot);
     }
@@ -1270,11 +859,8 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         // and the grant never landed: undo it entirely, or the inners stay
         // stranded in memmgr's CSpace and the frames stay accounted to a
         // caller that never received them.
-        for _ in 0..granted_count
-        {
-            record.pop_frame();
-        }
-        rollback_selection(pool, &granted, granted_count, &inner, granted_count);
+        pop_frames(l, rec, count);
+        rollback_grant(l, &grant, &inner[..count]);
     }
 }
 
@@ -1282,8 +868,8 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     // Any inner caps the caller handed back were deleted by `dispatch`: a
     // release names regions by `phys_base`, never by cap.
-    let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(req.badge)
+    let l = ledger_mut();
+    let Some(rec) = l.find(req.badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -1298,14 +884,12 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     let count = (req.word(0) as usize).min(req.word_count().saturating_sub(1));
     for i in 0..count
     {
-        let phys = req.word(1 + i);
-        let _ = record.release_frame_by_phys(phys, pool);
+        let _ = l.release_frame_by_phys(rec, req.word(1 + i), FRAME_VA_UNMAPPED);
     }
-    // Restore contiguity across the released runs. As in `handle_unregister_region`,
-    // `push_or_coalesce` only coalesces under slot pressure, so a release-heavy
-    // churn (ruststd returning Thread-retype slabs on join/reap) would otherwise
-    // fragment the pool monotonically.
-    pool.coalesce();
+    // Restore contiguity across the released runs, so a release-heavy churn
+    // (ruststd returning Thread-retype slabs on join/reap) does not fragment
+    // the pool monotonically.
+    coalesce(l);
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
@@ -1323,8 +907,8 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         return;
     }
 
-    let table = table_mut();
-    let Some(new_badge) = mint_process_badge()
+    let l = ledger_mut();
+    let Some(new_badge) = mint_process_badge(l)
     else
     {
         // Unreachable: the entropy pool is seeded before any userspace runs.
@@ -1333,7 +917,10 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         return;
     };
 
-    if table.insert(new_badge).is_none()
+    // The record is an arena node and the index grows with it, so the table
+    // refuses only when the arena cannot grow: system RAM is exhausted.
+    ensure_index(l);
+    if !ensure_slots(l, 1) || l.insert_process(new_badge).is_none()
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
@@ -1343,8 +930,7 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
     else
     {
-        // Roll back the table insertion.
-        table.free(new_badge);
+        let _ = l.remove_process(new_badge);
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     };
@@ -1359,9 +945,9 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         // The reply did not reach procmgr (it is gone, or its CSpace could not
         // take the cap), so the cap was not moved and no process will ever
         // carry this badge: drop both, or the cap stays in memmgr's CSpace and
-        // the record holds a table slot no `PROCESS_DIED` will free.
+        // the record holds a node no `PROCESS_DIED` will free.
         let _ = syscall::cap_delete(send_cap);
-        table.free(new_badge);
+        let _ = l.remove_process(new_badge);
     }
 }
 
@@ -1393,38 +979,30 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // which is more state than memmgr's record carries; the ktest
     // `integration::retype_reclaim` covers the same invariant on a
     // dedicated source cap.
-    let pool = pool_mut();
-    if let Some(record) = table_mut().find_mut(dead_badge)
+    //
+    // `remove_process` returns every backing frame to the pool (its
+    // descriptor slot becomes the run's slot, so the return cannot fail) and
+    // frees every region slot and the record. Reachability-only for the
+    // identity: these pages were already counted in pool_total at
+    // acquisition. The kernel's cspace-revoke cascade (run by procmgr before
+    // this message) already tore down the child's mappings, so no unmap is
+    // performed.
+    //
+    // memmgr's delegated address-space cap is NOT deleted here. It is a
+    // `cap_derive` child of the child's AddressSpace cap (procmgr's
+    // `DELEGATE_ASPACE` derivation), so procmgr's `cap_revoke` of that
+    // AddressSpace during child teardown — which runs before this
+    // `PROCESS_DIED` — has already revoked memmgr's copy and freed its CSpace
+    // slot. The record's `aspace_cap` is by then a stale slot index that
+    // memmgr's allocator may have reused for an unrelated cap (e.g. a pool-run
+    // tail); deleting it would free that cap and corrupt the free pool.
+    let l = ledger_mut();
+    if l.remove_process(dead_badge).is_some()
     {
-        // Return every backing frame to the pool and free all region and frame
-        // nodes to the arena. Reachability-only for the identity: these pages
-        // were already counted in pool_total at acquisition, so a parked run
-        // here cannot break it. The kernel's cspace-revoke cascade (run by
-        // procmgr before this message) already tore down the child's mappings,
-        // so no unmap is performed.
-        record.reclaim_all(pool);
-        // Restore contiguity across all reclaimed runs in one pass (the
-        // per-frame `push_or_coalesce` above only fires `coalesce` under slot
-        // pressure). Without coalescing, fragmentation accumulates
-        // monotonically: every spawn-and-die cycle leaves the pool with
-        // smaller runs than it started, until the array fills and
-        // `push_or_coalesce` parks reclaimed memory caps (unreachable for
-        // allocation, though still owned and accounted).
-        pool.coalesce();
-
-        // Do NOT delete memmgr's delegated address-space cap here. It is a
-        // `cap_derive` child of the child's AddressSpace cap (procmgr's
-        // `DELEGATE_ASPACE` derivation), so procmgr's `cap_revoke` of that
-        // AddressSpace during child teardown — which runs before this
-        // `PROCESS_DIED` — has already revoked memmgr's copy and freed its
-        // CSpace slot. By this point `record.aspace_cap` is a stale slot index
-        // that memmgr's allocator may have already reused for an unrelated cap
-        // (e.g. a pool-run tail); deleting it would free that unrelated cap and
-        // corrupt the free pool. The delegated copy's teardown is owned by
-        // procmgr's revocation of the parent aspace.
-        record.aspace_cap = 0;
-        // Free the slot in place (mark reusable); no by-value move.
-        record.badge = 0;
+        // Restore contiguity across all reclaimed runs in one pass, so every
+        // spawn-and-die cycle does not leave the pool more fragmented than it
+        // found it.
+        coalesce(l);
     }
     // Idempotent: missing badge is not an error.
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
@@ -1455,70 +1033,29 @@ fn handle_donate_memory_caps(badge: u64, caps: &[u32], ipc_buf: *mut u64, procmg
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
-    let pool = pool_mut();
+    let l = ledger_mut();
     let mut accepted_caps: u32 = 0;
     let mut accepted_pages: u64 = 0;
     for &slot in caps
     {
-        // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
-        // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE).
-        // Required: contiguous run (we read the whole cap as one run).
-        let Ok(packed) = syscall::cap_info(slot, syscall::CAP_INFO_TAG_RIGHTS)
+        let Some(run) = pool_run_of(slot)
         else
         {
             let _ = syscall::cap_delete(slot);
             continue;
         };
-        if packed & POOL_FRAME_RIGHTS != POOL_FRAME_RIGHTS
-        {
-            // Under-rights frame: cannot derive the R/RW/RX inner a demand
-            // fault or REQUEST_MEMORY_CAPS consumer needs (cap_derive only
-            // narrows). Reject rather than poison the pool — a pool frame that
-            // silently lacks WRITE/EXECUTE surfaces later as an intermittent
-            // consumer fault when allocation order happens to draw it. The
-            // kernel mints every donatable RAM cap full-rights
-            // (`core/kernel/src/main.rs`, `core/kernel/src/cap/mod.rs`), so this
-            // only fires on a mint-rights regression.
-            let _ = syscall::cap_delete(slot);
-            continue;
-        }
-        let Ok(size_bytes) = syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_SIZE)
-        else
-        {
-            let _ = syscall::cap_delete(slot);
-            continue;
-        };
-        let Ok(phys_base) = syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_PHYS_BASE)
-        else
-        {
-            let _ = syscall::cap_delete(slot);
-            continue;
-        };
-        // cast_possible_truncation: page_count fits u32 for any single
-        // run we accept (4 GiB max ≈ 1M pages, well under u32::MAX).
-        #[allow(clippy::cast_possible_truncation)]
-        let page_count = (size_bytes / 4096) as u32;
         // The cap is valid and now permanently owned by memmgr (it is never
-        // deleted past this point). Count it on ownership, not on pool-slot
+        // deleted past this point). Count it on ownership, not on pool
         // residency: pool_total must equal the live owned set whether the run
-        // lands in a free slot or is parked because the array is full.
+        // reaches the pool or stays out of circulation.
         accepted_caps += 1;
-        accepted_pages += u64::from(page_count);
-        pool_total_add(u64::from(page_count));
-        // Best-effort placement. On failure (array full even after a coalesce
-        // retry) the cap stays owned (counted above) but has no free-pool
-        // slot, unreachable for allocation until a later coalesce frees one:
-        // a reachability leak only, never an identity residual. The structural
-        // fix is a non-fixed free pool (tracked separately).
-        let _ = pool.push_or_coalesce(FreeRun {
-            cap_slot: slot,
-            page_count,
-            phys_base,
-        });
+        accepted_pages += run.page_count;
+        pool_total_add(run.page_count);
+        insert_run(l, run);
     }
     if accepted_caps > 0
     {
-        pool.coalesce();
+        coalesce(l);
     }
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, u64::from(accepted_caps))
@@ -1529,17 +1066,46 @@ fn handle_donate_memory_caps(badge: u64, caps: &[u32], ipc_buf: *mut u64, procmg
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// The free run a RAM Memory cap in `slot` describes, read from the kernel:
+/// its whole size (any size, as a `u64` page count) and physical base.
+/// `None` when the slot is not a Memory cap, lacks the full pool-frame
+/// rights ([`POOL_FRAME_RIGHTS`]), or covers no whole page.
+fn pool_run_of(slot: u32) -> Option<FreeRun>
+{
+    // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
+    // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE). An
+    // under-rights frame cannot yield the R/RW/RX inner a demand fault or
+    // REQUEST_MEMORY_CAPS consumer needs (cap_derive only narrows); it is
+    // rejected rather than poisoning the pool, where it would surface later as
+    // an intermittent consumer fault. The kernel mints every RAM cap
+    // full-rights (`core/kernel/src/main.rs`, `core/kernel/src/cap/mod.rs`),
+    // so this only fires on a mint-rights regression.
+    let packed = syscall::cap_info(slot, syscall::CAP_INFO_TAG_RIGHTS).ok()?;
+    if packed & POOL_FRAME_RIGHTS != POOL_FRAME_RIGHTS
+    {
+        return None;
+    }
+    let size_bytes = syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_SIZE).ok()?;
+    let phys_base = syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_PHYS_BASE).ok()?;
+    let page_count = size_bytes / PAGE_SIZE;
+    (page_count > 0).then_some(FreeRun {
+        cap_slot: slot,
+        page_count,
+        phys_base,
+    })
+}
+
 /// Reply with the all-RAM-accounted identity terms plus the current free total
 /// (all in bytes): `system_ram`, `kernel_reserved`, `pool_total`, `free`.
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
-/// the subset currently parked in free runs (lent to no process), which falls
-/// on allocation and rises on reclamation. The identity facts arrive verbatim
+/// the subset currently in free runs (lent to no process), which falls on
+/// allocation and rises on reclamation. The identity facts arrive verbatim
 /// from the kernel.
 fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 {
     let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
-    let free_bytes = pool_mut().free_pages().saturating_mul(PAGE_SIZE);
+    let free_bytes = ledger_mut().pool.free_pages().saturating_mul(PAGE_SIZE);
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, boot.system_ram_bytes)
         .word(1, boot.kernel_reserved_bytes)
@@ -1575,18 +1141,26 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(req.badge)
+    let l = ledger_mut();
+    let Some(rec) = l.find(req.badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    match record.add_region(DemandRegion { va_base, len, prot }, pool)
+    let region = DemandRegion { va_base, len, prot };
+    let mut result = l.add_region(rec, region);
+    if result == Err(RegionError::NoSlot) && ensure_slots(l, 1)
     {
-        Ok(()) => reply_label(ipc_buf, memmgr_errors::SUCCESS),
-        Err(code) => reply_label(ipc_buf, code),
+        result = l.add_region(rec, region);
     }
+    let code = match result
+    {
+        Ok(()) => memmgr_errors::SUCCESS,
+        Err(RegionError::Overlap) => memmgr_errors::INVALID_ARGUMENT,
+        Err(RegionError::NoSlot) => memmgr_errors::QUOTA,
+    };
+    reply_label(ipc_buf, code);
 }
 
 /// Unregister a demand-paged region for the calling process, reclaiming every
@@ -1594,30 +1168,30 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
 ///
 /// Attributed by `req.badge`; words are `[va_base, len_bytes]`. The range must
 /// match a previously [`handle_register_region`]'d region exactly. memmgr
-/// unmaps each backing frame from the child `AddressSpace`, returns it to the
-/// pool, and frees the region. The reverse of registration plus the frames
-/// [`handle_fault`] mapped. Reply: [`memmgr_errors::SUCCESS`], or
+/// unmaps the region span from the child `AddressSpace`, returns each backing
+/// frame to the pool, and frees the region. The reverse of registration plus
+/// the frames [`handle_fault`] mapped. Reply: [`memmgr_errors::SUCCESS`], or
 /// `INVALID_ARGUMENT` (unknown badge or no exact-match region).
 fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let va_base = req.word(0);
     let len = req.word(1);
 
-    let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(req.badge)
+    let l = ledger_mut();
+    let Some(rec) = l.find(req.badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let Some(region) = record.remove_region(va_base, len)
+    let Some(region) = l.remove_region(rec, va_base, len)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
     let end = region.va_base.saturating_add(region.len);
-    let aspace_cap = record.aspace_cap;
+    let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
     // Tear down the whole region span in the child AS in one call: clear every
     // leaf PTE and reclaim the now-empty intermediate page tables to the child's
     // PT growth pool (one coarse shootdown, plus the span invalidations of the
@@ -1628,13 +1202,10 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     // memmgr runs on.
     let _ =
         unsafe { syscall::mem_unmap_reclaim(aspace_cap, region.va_base, region.len / PAGE_SIZE) };
-    record.return_frames_in(region.va_base, end, pool);
-    // Restore contiguity across the reclaimed runs. The per-frame
-    // `push_or_coalesce` only fires `coalesce` under slot pressure, so a churn
-    // working set that never fills the array would otherwise leave the pool more
-    // fragmented after each register/unregister cycle, drifting the run (and
-    // tracking-anchor) count up monotonically across a long run.
-    pool.coalesce();
+    l.return_frames_in(rec, region.va_base, end, FRAME_VA_UNMAPPED);
+    // Restore contiguity across the reclaimed runs, so a register/unregister
+    // churn does not drift the run (and tracking-anchor) count up.
+    coalesce(l);
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
@@ -1657,7 +1228,8 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u32], ipc_buf: *mut u64, pro
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let Some(record) = table_mut().find_mut(child_badge)
+    let l = ledger_mut();
+    let Some(rec) = l.find(child_badge)
     else
     {
         let _ = syscall::cap_delete(as_cap);
@@ -1665,11 +1237,12 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u32], ipc_buf: *mut u64, pro
         return;
     };
     // Replace any prior delegation, dropping the stale cap.
-    if record.aspace_cap != 0
+    let prior = l.record(rec).map_or(0, |r| r.aspace_cap);
+    if prior != 0
     {
-        let _ = syscall::cap_delete(record.aspace_cap);
+        let _ = syscall::cap_delete(prior);
     }
-    record.aspace_cap = as_cap;
+    l.set_aspace_cap(rec, as_cap);
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
@@ -1686,11 +1259,10 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u32], ipc_buf: *mut u64, pro
 /// the faulting page — one contiguous Memory cap mapped across up to
 /// `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]. Backing a chunk rather than a single
-/// page bounds cap-slot consumption (one cap per chunk) so a deep demand stack
-/// cannot exhaust memmgr's `CSpace`. Every other case — non-VM fault, unknown
-/// process, address outside every region, no delegated AS, or any
-/// allocation/map failure — replies [`syscall_abi::FAULT_REPLY_KILL`],
-/// preserving default segfault semantics.
+/// page bounds cap-slot consumption (one cap per chunk). Every other case —
+/// non-VM fault, unknown process, address outside every region, no delegated
+/// AS, or any allocation/map failure — replies
+/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics.
 ///
 /// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /
 /// `UNREGISTER_REGION` like any issued cap); `pool_total` is unchanged because
@@ -1705,53 +1277,65 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     let va = req.word(1);
     let page_base = va & !(PAGE_SIZE - 1);
 
-    let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(req.badge)
+    let l = ledger_mut();
+    let Some(rec) = l.find(req.badge)
     else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     };
-    let Some(region) = record.region_for(va)
+    let Some(region) = l.region_for(rec, va)
     else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     };
-    if record.aspace_cap == 0
+    let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
+    if aspace_cap == 0
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
     // Already backed by an earlier chunk (stale-TLB redelivery): resume.
-    if record.frame_covering(page_base)
+    if l.frame_covering(rec, page_base, FRAME_VA_UNMAPPED)
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
         return;
     }
 
-    // Back the whole chunk containing the faulting page with one Memory cap.
+    // Back the whole chunk containing the faulting page with one Memory cap,
+    // after securing the slot its descriptor takes.
     let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
-    let Ok((granted, _count)) = select_memory_caps(pool, chunk_pages, true)
+    if !ensure_slots(l, 1)
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    }
+    let Ok(grant) = select(l, chunk_pages, true)
     else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     };
-    let (outer, pages, phys) = granted[0];
+    let (outer, pages, phys) = grant.entries[0];
+    let run = FreeRun {
+        cap_slot: outer,
+        page_count: u64::from(pages),
+        phys_base: phys,
+    };
 
     // Account the chunk so it is reclaimed on death/unregister; roll back to the
     // pool on any subsequent failure. `chunk_base` is the chunk's mapped VA so
     // UNREGISTER_REGION can find and unmap it.
-    if record
-        .push_frame(outer, pages, phys, chunk_base, pool)
-        .is_err()
+    let frame = FrameDesc {
+        cap_slot: outer,
+        page_count: pages,
+        phys_base: phys,
+        va: chunk_base,
+    };
+    if !l.push_frame(rec, frame)
     {
-        let _ = pool.push(FreeRun {
-            cap_slot: outer,
-            page_count: pages,
-            phys_base: phys,
-        });
+        insert_run(l, run);
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
@@ -1761,13 +1345,13 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // directly (the kernel grants read at every map, and W^X is enforced); no
     // per-fault inner derivation is needed. The kernel holds the mapping
     // independently of the cap, which stays in memmgr as the reclaim anchor.
-    // SAFETY: `record.aspace_cap` is a client address space procmgr
-    // delegated (`DELEGATE_ASPACE`), never memmgr's own, so the map changes
-    // nothing memmgr runs on.
+    // SAFETY: `aspace_cap` is a client address space procmgr delegated
+    // (`DELEGATE_ASPACE`), never memmgr's own, so the map changes nothing
+    // memmgr runs on.
     let mapped = unsafe {
         syscall::mem_map(
             outer,
-            record.aspace_cap,
+            aspace_cap,
             chunk_base,
             0,
             u64::from(pages),
@@ -1776,12 +1360,8 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     };
     if mapped.is_err()
     {
-        record.pop_frame();
-        let _ = pool.push(FreeRun {
-            cap_slot: outer,
-            page_count: pages,
-            phys_base: phys,
-        });
+        let _ = l.pop_frame(rec);
+        insert_run(l, run);
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
@@ -1796,9 +1376,9 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 ///
 /// Ownership — and therefore the count — is taken when memmgr *retains* a cap
 /// (a donation that passes validation and is not deleted), independent of
-/// whether the run finds a free-pool slot. A run parked because the slot array
-/// is full is still owned and still counted; counting MUST NOT be gated on
-/// `push` success, or the identity under-counts owned-but-parked RAM.
+/// whether the run reaches the free pool. A run kept out of circulation
+/// because its insert failed is still owned and still counted; counting MUST
+/// NOT be gated on pool residency, or the identity under-counts owned RAM.
 ///
 /// This is the `pool_total` of the all-RAM-accounted identity
 /// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
@@ -1864,24 +1444,20 @@ fn cspace_headroom(self_cspace: u32) -> u64
 /// in `pool_total` as memmgr-owned metadata. memmgr cannot ask anyone else
 /// for this memory, which is why it funds itself from its own pool. A
 /// failed top-up (no contiguous run, or the augment refused) is retried
-/// before the next receive; a refused augment returns the frame to the pool,
-/// or, when the pool has no run slot even after coalescing, leaves it owned
-/// but out of circulation.
+/// before the next receive; a refused augment returns the frame to the pool.
 fn hold_cspace_headroom(self_cspace: u32)
 {
     if cspace_headroom(self_cspace) >= CSPACE_LOW_WATER
     {
         return;
     }
-    let pool = pool_mut();
-    let selected = select_memory_caps(pool, CSPACE_TOPUP_PAGES, true)
-        .or_else(|_| select_memory_caps(pool, 1, true));
-    let Ok((granted, _)) = selected
+    let l = ledger_mut();
+    let Ok(grant) = select(l, CSPACE_TOPUP_PAGES, true).or_else(|_| select(l, 1, true))
     else
     {
         return;
     };
-    let (outer, pages, phys) = granted[0];
+    let (outer, pages, phys) = grant.entries[0];
     if syscall::cap_create_cspace(outer, self_cspace, u64::from(pages)).is_ok()
     {
         // The donation holds its own reference on the frame's Memory object;
@@ -1890,64 +1466,46 @@ fn hold_cspace_headroom(self_cspace: u32)
     }
     else
     {
-        // Return the frame to the pool, coalescing to make room. If the pool
-        // still has no run slot for it, the frame stays owned and counted
-        // but out of circulation (its cap stays in memmgr's CSpace, so
-        // nothing is freed into the sealed buddy); memmgr has no log channel
-        // to report it on.
-        let _ = pool.push_or_coalesce(FreeRun {
-            cap_slot: outer,
-            page_count: pages,
-            phys_base: phys,
-        });
+        insert_run(
+            l,
+            FreeRun {
+                cap_slot: outer,
+                page_count: u64::from(pages),
+                phys_base: phys,
+            },
+        );
     }
 }
 
 fn ingest_pool(boot: &InitBootstrap)
 {
-    let pool = pool_mut();
-    for i in 0..(boot.memory_count as usize)
+    let l = ledger_mut();
+    for i in 0..boot.memory_count
     {
-        let cap_slot = boot.memory_base + i as u32;
+        let cap_slot = boot.memory_base + i;
         // Every RAM Memory cap memmgr ingests from init MUST carry the full
         // pool-frame rights ([`POOL_FRAME_RIGHTS`]: WRITE | EXECUTE | RETYPE).
         // The kernel stamps these on usable RAM at Phase-7 mint
         // (`core/kernel/src/cap/mod.rs`), and init's `finalize_memmgr` forwards
-        // caps through `cap_derive(_, RIGHTS_ALL)` which preserves them. If this
-        // ever fires, memmgr cannot derive the writable/executable inner a
-        // consumer needs (nor retype on its behalf) and the pool contract is
-        // broken — fail fast at boot rather than surface as an intermittent
-        // consumer fault. The check fires for at least the first cap (gating
-        // panic on i == 0); the kernel mints them as a uniform batch so one is
-        // sufficient.
-        if i == 0
+        // caps through `cap_derive(_, RIGHTS_ALL)` which preserves them. If the
+        // first cap lacks them, memmgr cannot derive the writable/executable
+        // inner a consumer needs (nor retype on its behalf) and the pool
+        // contract is broken — fail fast at boot rather than surface as an
+        // intermittent consumer fault. The kernel mints them as a uniform
+        // batch, so the first is sufficient.
+        let Some(run) = pool_run_of(cap_slot)
+        else
         {
-            // `packed` is `(tag << 32) | rights`; low 32 bits are rights, and
-            // every bit in `POOL_FRAME_RIGHTS` is a low-bit-position right so the
-            // mask comparison against the full u64 is exact. cap_info(slot,
-            // TAG_RIGHTS) cannot fail on a non-null slot — init has just
-            // forwarded the cap, so an Err here means the cap-routing graph
-            // is broken and the bootstrap invariant fails.
-            let Ok(packed) = syscall::cap_info(cap_slot, syscall::CAP_INFO_TAG_RIGHTS)
-            else
-            {
-                panic!("memmgr: cap_info failed on bootstrap Memory cap");
-            };
             assert!(
-                packed & POOL_FRAME_RIGHTS == POOL_FRAME_RIGHTS,
-                "memmgr: ingested RAM Memory cap missing pool-frame rights (WRITE|EXECUTE|RETYPE)",
+                i != 0,
+                "memmgr: first bootstrap Memory cap missing pool-frame rights"
             );
-        }
-        // Ownership is taken on ingest — count on ownership, place best-effort
-        // (mirrors `handle_donate_memory_caps`). Bootstrap never overflows the pool,
-        // but `pool_total` must equal owned RAM uniformly across every ingest
-        // site, never gated on free-slot residency.
-        pool_total_add(u64::from(boot.page_counts[i]));
-        let _ = pool.push_or_coalesce(FreeRun {
-            cap_slot,
-            page_count: boot.page_counts[i],
-            phys_base: boot.phys_bases[i],
-        });
+            continue;
+        };
+        // Ownership is taken on ingest — count on ownership, place
+        // best-effort (mirrors `handle_donate_memory_caps`).
+        pool_total_add(run.page_count);
+        insert_run(l, run);
     }
 }
 
@@ -1955,12 +1513,12 @@ fn ingest_pool(boot: &InitBootstrap)
 /// service's process record so the arena's pages count toward `pool_total`.
 /// The arenas are retype-pinned and offset-mapped for the immortal service's
 /// life — memmgr never allocates from or frees them; this is pure accounting.
-/// Both owner records (procmgr, memmgr-self) must already exist. Frames carry
-/// [`FRAME_VA_UNMAPPED`]: memmgr did not map them, so no `UNREGISTER_REGION`
-/// path ever unmaps them.
+/// The owner records (procmgr, memmgr-self, init-self) must already exist.
+/// Frames carry [`FRAME_VA_UNMAPPED`]: memmgr did not map them, so no
+/// `UNREGISTER_REGION` path ever unmaps them.
 fn ingest_in_use(boot: &InitBootstrap)
 {
-    let pool = pool_mut();
+    let l = ledger_mut();
     for entry in boot.in_use.iter().take(boot.in_use_count)
     {
         let badge = match entry.kind
@@ -1974,17 +1532,36 @@ fn ingest_in_use(boot: &InitBootstrap)
         // best-effort tracking (these arenas are immortal, never reclaimed), so
         // a record miss must not under-count `pool_total`.
         pool_total_add(u64::from(entry.page_count));
-        if let Some(record) = table_mut().find_mut(badge)
+        if let Some(rec) = l.find(badge)
+            && ensure_slots(l, 1)
         {
-            let _ = record.push_frame(
-                entry.cap_slot,
-                entry.page_count,
-                entry.phys_base,
-                FRAME_VA_UNMAPPED,
-                pool,
+            let _ = l.push_frame(
+                rec,
+                FrameDesc {
+                    cap_slot: entry.cap_slot,
+                    page_count: entry.page_count,
+                    phys_base: entry.phys_base,
+                    va: FRAME_VA_UNMAPPED,
+                },
             );
         }
     }
+}
+
+/// Insert the boot-time records: procmgr's (so `REQUEST_MEMORY_CAPS` against
+/// procmgr's badged SEND succeeds — procmgr's own std heap-bootstrap is the
+/// first IPC memmgr serves), and the memmgr-self and init-self records that
+/// hold the bootstrap arenas. procmgr and memmgr never die; init exits at reap
+/// but its arena stays parked, so none of these records is ever reclaimed.
+fn insert_boot_records(procmgr_badge: u64) -> bool
+{
+    let l = ledger_mut();
+    [procmgr_badge, MEMMGR_SELF_BADGE, INIT_SELF_BADGE]
+        .into_iter()
+        .all(|badge| {
+            ensure_index(l);
+            ensure_slots(l, 1) && l.insert_process(badge).is_some()
+        })
 }
 
 /// Delete every cap in `caps` from memmgr's `CSpace`.
@@ -2099,30 +1676,20 @@ fn main(startup: &StartupInfo) -> !
         syscall::thread_exit();
     };
 
-    // The metadata arena maps its pages into memmgr's own AS; record the cap
-    // before any per-process node is allocated (the first is in `ingest_in_use`).
-    arena_init(startup.self_aspace);
+    // The ledger maps arena and index pages into memmgr's own AS; record the
+    // cap and draw the arena base before the first run is ingested (whose
+    // insert carves the first arena page).
+    ledger_init(startup.self_aspace);
 
     ingest_pool(&boot);
 
-    // Auto-register procmgr's record so `REQUEST_MEMORY_CAPS` against
-    // procmgr's badged SEND succeeds — procmgr's own std heap-bootstrap
-    // is the first IPC memmgr serves after entering the loop. The
-    // procmgr_badge cap doubles as the auth gate for the procmgr-only labels
-    // (`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`,
+    // The procmgr_badge cap doubles as the auth gate for the procmgr-only
+    // labels (`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`,
     // `DELEGATE_ASPACE`); each code path still checks the message badge
-    // against `boot.procmgr_badge` independently of the table entry.
-    //
-    // Register memmgr-self and init-self records too: `ingest_in_use` files
-    // memmgr's, procmgr's, and init's bootstrap arenas against them so every
-    // arena's pages join `pool_total`. procmgr and memmgr never die; init exits
-    // at reap but its arena stays parked, so none of these records is ever
-    // reclaimed.
-    if table_mut().insert(boot.procmgr_badge).is_none()
-        || table_mut().insert(MEMMGR_SELF_BADGE).is_none()
-        || table_mut().insert(INIT_SELF_BADGE).is_none()
+    // against `boot.procmgr_badge` independently of the record.
+    if !insert_boot_records(boot.procmgr_badge)
     {
-        // Process table full at boot — fatal; refuse to enter dispatch.
+        // No RAM for the boot records — fatal; refuse to enter dispatch.
         syscall::thread_exit();
     }
     ingest_in_use(&boot);

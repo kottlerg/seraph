@@ -83,8 +83,8 @@ replies `INVALID_ARGUMENT`.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
-Allocate one or more Memory capabilities covering at least `want_pages`
-pages. Privilege: universal.
+Allocate one or more Memory capabilities covering `want_pages` pages, or,
+for a best-effort partial grant, fewer. Privilege: universal.
 
 **Request:**
 
@@ -111,9 +111,14 @@ pages. Privilege: universal.
 | data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous page run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
 | cap[0..returned_cap_count] | Memory capabilities carrying every right of their pool frames (derived with `RIGHTS_ALL`; pool frames carry WRITE, EXECUTE, and RETYPE, see [`memory-pool.md`](memory-pool.md) §"Pool Ingest") |
 
-The cumulative `sum(page_count_for_cap_i) == want_pages` for both
-contiguous and best-effort replies. With `REQUIRE_CONTIGUOUS` the reply
-always carries exactly one cap with `page_count_for_cap_0 == want_pages`.
+With `REQUIRE_CONTIGUOUS` the reply always carries exactly one cap with
+`page_count_for_cap_0 == want_pages`. A best-effort reply has
+`sum(page_count_for_cap_i) <= want_pages`: when no single run covers the
+request, memmgr takes the largest runs, at most `MSG_CAP_SLOTS_MAX` of them,
+and when those fall short while the pool's free pages still cover
+`want_pages`, the reply is a partial grant. The caller MUST compare the sum
+with `want_pages` and request the remainder (see
+[`memory-pool.md`](memory-pool.md) §"Allocation").
 
 The `phys_base_for_cap_i` field is the host physical address of the
 first page of the i-th returned cap. It is what DMA-issuing drivers
@@ -139,7 +144,7 @@ Best-effort replies may use the full reply-side capacity.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Pool cannot cover `want_pages` even fragmented |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, or deriving the caller's copy failed |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
@@ -235,7 +240,7 @@ the eventual `PROCESS_DIED`.
 | Code | Name | Meaning |
 |---|---|---|
 | 5 | `UNAUTHORIZED` | Caller is not procmgr |
-| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry, the badge draw failed, or the reply cap could not be derived |
+| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry (its record node could not be allocated: system RAM exhausted), the badge draw failed, or the reply cap could not be derived |
 | 7 | `LABEL_VERSION_MISMATCH` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
 
 ### Label 4: `PROCESS_DIED`
@@ -287,7 +292,7 @@ memmgr does not check a donated cap's provenance, and the RAM Memory caps a
 client holds derive from memmgr's own grants, so a client's donation would
 alias frames memmgr has already lent out back into the free pool and count
 them in `pool_total` twice. Used by procmgr's init reap to hand over
-init's reclaimed memory: the usable-RAM caps that did not fit memmgr's
+init's reclaimed memory: the usable-RAM caps init did not forward in memmgr's
 bootstrap round, the free remainders `MemoryAlloc` abandoned, ELF segments,
 `InitInfo`, stack, the bootloader/bundle reclaim ranges, the AP-trampoline
 frame, and boot-module ELF sources. See
@@ -324,10 +329,11 @@ frame, and boot-module ELF sources. See
 A procmgr donation always succeeds. memmgr validates each cap with
 `cap_info`; a cap that is not a Memory cap or lacks a required right is
 deleted and not counted. Each accepted cap is owned by memmgr for the rest of its life: it
-is added to `pool_total` (see Label 6) and placed in the free pool,
-coalescing where possible. A donated cap that finds no free-pool slot stays
-owned and counted but is unreachable for allocation until a later coalesce
-frees a slot.
+is added to `pool_total` (see Label 6) at its whole size, read with `cap_info`
+(a page count of any width), and placed in the free pool, coalescing where
+possible. Only a failure to map an arena page for the run's node leaves it
+owned and counted but out of circulation (see
+[`memory-pool.md`](memory-pool.md) §"Metadata Arena").
 
 ### Label 6: `QUERY_POOL_STATUS`
 
@@ -345,7 +351,7 @@ state change.
 | data[0] | `system_ram_bytes` — total installed RAM the kernel computed at boot |
 | data[1] | `kernel_reserved_bytes` — the fixed kernel reserve |
 | data[2] | `pool_total_bytes` — every page memmgr owns (free runs, in-use arenas, reap donations); monotonic |
-| data[3] | `free_bytes` — subset of `pool_total_bytes` parked in free runs, lent to no process |
+| data[3] | `free_bytes` — subset of `pool_total_bytes` in free runs, lent to no process |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned

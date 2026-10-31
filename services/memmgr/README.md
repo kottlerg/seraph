@@ -5,10 +5,10 @@ allocates Memory capabilities to all std-built services on demand, tracks
 per-process memory-cap ownership, and reclaims memory caps when a process dies.
 
 memmgr is a `no_std` binary: it cannot bootstrap a general heap against
-itself, so it has none. Its free pool and process table are statically
-sized; per-process frame and region descriptors live in a self-hosted
-metadata arena carved from its own pool (see
-[`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). After memmgr
+itself, so it has none. Its free pool, process table, and per-process frame
+and region descriptors all live in a self-hosted metadata arena carved from
+its own pool (see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata
+Arena"). After memmgr
 is in place, the only `no_std` userspace services in the system are `init`
 and `memmgr` (see [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md)
 §"Userspace Boot Order").
@@ -21,8 +21,8 @@ and `memmgr` (see [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md)
 memmgr/
 ├── Cargo.toml                  # Workspace member; no_std binary
 ├── README.md
-├── free-pool/                  # `memmgr-free-pool` crate:
-│                               # pure host-tested allocator + region logic
+├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
+│                               # arena, free pool, process index, region logic
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
@@ -45,7 +45,9 @@ Allocation Contract").
 ## Responsibilities
 
 - **Memory-cap allocation** — serve the `REQUEST_MEMORY_CAPS` IPC, returning one or
-  more Memory caps that cumulatively cover the requested page count. Honour
+  more Memory caps that cumulatively cover the requested page count, or, when
+  the free RAM is spread over more runs than one reply carries, a partial
+  grant the caller requests again for the rest. Honour
   the `REQUIRE_CONTIGUOUS` flag for callers that need a single multi-page
   cap (DMA buffers, large heap grow operations). Wire shape in
   [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 1: `REQUEST_MEMORY_CAPS`".
@@ -114,32 +116,27 @@ The full memmgr IPC specification is in
 
 ## Sizing constants
 
-Per-process region and frame descriptors are RAM-bound, not capped by a
-constant: they are nodes in a self-hosted metadata arena carved from memmgr's
-own pool (see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena").
-The two remaining fixed bounds below are picked for current early-boot
-workloads; they are documented here so the revisit triggers are easy to find
-when those workloads grow.
+memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
+process records, and per-process region and frame descriptors are nodes in a
+self-hosted metadata arena carved from memmgr's own pool, indexed by `u64`
+(see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records
+are found through a linear-hash index that grows with them. The arena grows
+until RAM is exhausted or its address-space zones are spent; the high zone,
+above the shared 2^38 layout ceiling, exists on paging modes whose user half
+is wider. memmgr funds its own `CSpace` and page-table growth from its pool,
+so neither init-seeded budget bounds it. A failed growth surfaces as `QUOTA`
+(or `TOO_MANY_PROCESSES` from `REGISTER_PROCESS`).
 
-| Constant | Value | Surface effect on overflow | Revisit when |
-|---|---|---|---|
-| `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TOO_MANY_PROCESSES` (see [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 3: `REGISTER_PROCESS`") | a workload approaches ~50 concurrent processes |
-| `MAX_FREE_RUNS` | 512 | `push_or_coalesce` parks the run after a coalesce retry: still owned and counted in `pool_total`, but with no free-pool slot (unreachable for allocation until a later coalesce frees one) | post-coalesce free-run count regularly approaches 512 |
+The remaining constants are tuning values that bound no capacity:
 
-Donation and reclamation push through `push_or_coalesce`, which coalesces
-and retries before parking, so the `MAX_FREE_RUNS` park path is reachable
-only if fragmentation exceeds what coalescing can recover. A parked run is
-an allocatability degradation only — it never breaks the all-RAM-accounted
-identity, because `pool_total` counts owned RAM regardless of slot residency.
+| Constant | Value | Role |
+|---|---|---|
+| `DEMAND_CHUNK_PAGES` | 16 | Pages one demand fault backs |
+| `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | 256 slots, 16 pages | `CSpace` self-funding mark and step |
+| `ASPACE_TOPUP_PAGES` | 4 | Page-table self-funding step |
 
-Both remaining constants are fixed static bounds: any value is permanently
-either undersized (parks RAM / rejects work under load) or oversized
-(wastes static RAM), so neither can scale to a hardware-bound process count.
-Eliminating them via the same self-hosted, dynamically-sized bookkeeping the
-per-process descriptors now use is tracked as a separate redesign rather than
-resolved by raising a number. The former `MAX_PER_PROC` and
-`MAX_REGIONS_PER_PROC` per-process caps were removed when per-process
-descriptors moved to the metadata arena.
+The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)
+§"memmgr".
 
 ---
 
@@ -158,17 +155,18 @@ so procmgr's heap-bootstrap path reaches memmgr on its first IPC.
 Authoritative description of the boot order, capability flow, and
 ProcessInfo handover lives in [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md).
 
-### Bootstrap-IPC memory-cap-count cap
+### Bootstrap-IPC round
 
-Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round,
-packed two page-counts per `u64` after a three-word prefix, so a round holds
-`ipc::memmgr_bootstrap::MAX_MEMORY_CAPS` entries. Two are reserved for the
-`MemoryAlloc` tail and the phys-table page, which have no `InitInfo`
-descriptor and must ride this round; the round therefore carries at most
-`MAX_MEMORY_CAPS - 2` regular RAM caps. Any RAM caps beyond that are not
-lost: init donates them at its reap, and procmgr forwards them to memmgr's
-pool via `DONATE_MEMORY_CAPS`, which has no per-round cap. The round's place
-in the boot sequence is described in
+Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round that
+names them by slot range only (`ipc::memmgr_bootstrap`); memmgr reads each
+cap's size and physical base from the kernel (`cap_info`), so the round bounds
+neither the cap count nor a cap's size. Init forwards every remaining RAM cap
+while memmgr's `CSpace` keeps the headroom the `MemoryAlloc` tail, the
+phys-table page, and the in-use arenas need (they have no `InitInfo`
+descriptor and must ride this round). Any RAM caps beyond that are not lost:
+init donates them at its reap, and procmgr forwards them to memmgr's pool via
+`DONATE_MEMORY_CAPS`, which has no per-round cap. The round's place in the
+boot sequence is described in
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Init → memmgr",
 and the donation in §"Init reap".
 

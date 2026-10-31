@@ -19,13 +19,16 @@ Capability Distribution" and
 [`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#ownership-boundaries)
 §"Ownership Boundaries"). Memory cap sizes vary — they reflect the firmware
 memory map and may span many MiB each. Init copies the RAM caps left after its
-own bootstrap allocations into memmgr's CSpace via the derive-twice pattern, as
-many as one bootstrap IPC round carries, forwards the memmgr/procmgr/init
-bootstrap arenas as in-use runs, and transfers the slot range
-`(memory_base, memory_count)` to memmgr in that round; the remaining RAM caps
-join the pool through the init-reap donation below (see
+own bootstrap allocations into memmgr's CSpace via the derive-twice pattern
+(every one while memmgr's CSpace keeps the headroom init leaves it), forwards
+the memmgr/procmgr/init bootstrap arenas as in-use runs, and transfers the slot
+range `(memory_base, memory_count)` to memmgr in its bootstrap IPC round; any
+RAM caps init did not forward join the pool through the init-reap donation
+below (see
 [`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md#init--memmgr)
-§"Init → memmgr").
+§"Init → memmgr"). memmgr reads each ingested cap's size and physical base
+from the kernel (`cap_info`), as it does for a donation, so the round bounds
+neither the cap count nor a cap's size; a run's page count is a `u64`.
 
 memmgr does not split the ingested memory caps eagerly. The free pool retains
 each ingested cap at its native size; splitting happens on the
@@ -57,12 +60,11 @@ surfacing as an intermittent consumer fault.
 
 ## Free-Pool Data Structure
 
-memmgr is `no_std` and has no general allocator; the free pool itself is
-sized at compile time (per-process descriptors instead live in the
-RAM-backed metadata arena below). It is a fixed array of at most
-`MAX_FREE_RUNS` slots (512), each holding one run: a Memory cap, its page
-count, and its physical base. Slot order is irrelevant and every selection
-scans the array linearly:
+Each free run (a Memory cap, its page count, and its physical base) is a node
+in the metadata arena (below), linked on one list sorted by physical base. The
+run count is therefore bounded by RAM, not by a constant: no run is ever
+turned away for want of a slot. The pool keeps running totals of its free
+pages and runs. Selection walks the list:
 
 - **Smallest fit.** The smallest run covering at least `N` pages serves a
   `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
@@ -70,9 +72,15 @@ scans the array linearly:
 - **Largest run.** Best-effort allocation falls back to repeatedly taking the
   largest run when no single run is large enough.
 
-A run that finds no empty slot after a coalesce retry stays owned and counted
-in `pool_total` but is unreachable for allocation until a later coalesce
-frees a slot (see [Coalescing](#coalescing)).
+Taking a whole run frees its node; splitting one keeps the node for the
+remainder, whose sorted position does not change. Returning a run inserts it
+at its sorted position. A reclaimed frame's descriptor node is rewritten into
+the run's node in place, so reclamation never allocates and cannot fail. When
+the arena has no free node and the pool cannot fund an arena page, the
+returned run funds it itself: its first page (all of it, for a one-page run)
+becomes the arena page. A run stays owned and counted in `pool_total` but out
+of circulation only if that page cannot be mapped (memmgr's page tables
+cannot be funded).
 
 ---
 
@@ -93,9 +101,12 @@ frees a slot (see [Coalescing](#coalescing)).
    re-requests a fixed size (e.g. ruststd's per-thread Thread-retype slab)
    cycles the same run — and the same tracking anchor — rather than minting
    a fresh anchor each request. Only when no single run is large enough,
-   fall back to satisfying the request greedily from multiple runs, largest
-   first. Bound the returned-cap count by the IPC reply-side cap-slot limit;
-   if the pool cannot satisfy `want_pages` within that bound, return
+   fall back, when the pool's free pages cover `want_pages`, to taking runs
+   largest first, at most as many as the IPC reply-side cap-slot limit
+   allows. When those runs cover less than `want_pages`, the reply is a
+   **partial grant**: success with fewer pages, which the caller requests
+   again for the remainder (the RAM exists, spread over more runs than one
+   reply carries). When the free pages do not cover `want_pages`, return
    `OUT_OF_MEMORY_BEST_EFFORT`. The same code is returned if deriving the
    caller's copy of a selected cap fails. A failure of pool selection carries
    three diagnostic data words (total free pages, free-run count, and the
@@ -132,29 +143,56 @@ per-process array would cap thread count at a small constant. Allocation fails
 only when the arena cannot grow because system RAM is exhausted, surfaced as
 `QUOTA`.
 
-The table itself is statically bounded by the maximum number of
-concurrently-tracked processes (`MAX_PROCESSES`). `REGISTER_PROCESS` returns
-`TOO_MANY_PROCESSES` if the table is full (three of its slots hold the
-reserved procmgr, memmgr-self, and init-self records). Lifting that bound to a
-hardware-bound process count, reusing this arena, is tracked separately.
+Each record is itself an arena node, so the number of tracked processes is
+bounded by RAM, not by a constant. Records are found by badge through a
+linear-hash index: a bucket array of arena indices, in its own window of
+memmgr's address space, that grows one page of buckets at a time from the pool.
+Linear hashing splits one bucket per step once the mean chain length passes
+two, so the array only ever appends and lookup stays constant-time on average;
+when the window is spent, buckets stop splitting and chains lengthen, which
+costs lookup time and bounds no capacity. `REGISTER_PROCESS` returns
+`TOO_MANY_PROCESSES` only when the record's node cannot be allocated: system
+RAM is exhausted.
 
 ---
 
 ## Metadata Arena
 
-Per-process frame and region descriptors are nodes drawn from a self-hosted
-arena rather than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap
-a general heap against itself, but it *can* host fixed-size descriptor nodes in
-pages carved from its own pool:
+All of memmgr's bookkeeping — free runs, process records, and per-process
+frame and region descriptors — is nodes drawn from a self-hosted arena rather
+than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap a general
+heap against itself, but it *can* host fixed-size nodes in pages carved from
+its own pool:
 
-- Nodes are fixed-size `Slot`s (a tagged region/frame/free payload plus a `next`
-  index) reached by index from a contiguous VA window in memmgr's own address
-  space.
-- A global free list threads the unused slots. Allocation pops the head; free
-  pushes it back.
+- Nodes are fixed-size `Slot`s (a tagged run/process/region/frame/free payload
+  plus a `next` index) reached by a `u64` index, so the index never bounds the
+  arena before the address space does.
+- A free list threads the unused slots. Allocation pops the head; free pushes
+  it back.
 - When the free list is empty, memmgr pulls one frame from the pool
-  (`select_memory_caps`, contiguous, one page), maps it at the next arena page
-  in its own address space, and carves it into free slots.
+  (contiguous, one page), maps it at the next arena page in its own address
+  space, and carves it into free slots. When the pool itself is empty (the
+  first ingest, before it holds anything), the run being inserted funds the
+  page (see [Free-Pool Data Structure](#free-pool-data-structure)).
+
+Arena pages lie in two zones of memmgr's address space. The low zone runs from
+a per-boot drawn base (ASLR) up to the lowest bootstrap window
+`shared/process-layout` draws, past the std heap and reservation-arena zones,
+which memmgr, having no std runtime, does not use. The high zone continues
+above the shared 2^38 layout ceiling and exists only where the boot's paging
+mode has a wider user half (x86-64 4-level paging, Sv48, Sv57); under Sv39 the
+kernel refuses the map and the arena ends with the low zone, which outlasts any
+RAM such a machine holds. Growth stops when neither zone has a page left or RAM
+is exhausted, surfaced as `QUOTA`.
+
+Each arena or index page memmgr maps can need new page-table pages in its own
+`AddressSpace`, whose page-table pool init seeds at creation. When the kernel
+reports that pool exhausted, memmgr funds it from its own free pool: it donates
+a contiguous run of `ASPACE_TOPUP_PAGES` (4) frames, or two when no such run is
+free, with augment-mode `cap_create_aspace` against its own `AddressSpace`,
+deletes the frame's cap (the donation holds its own reference), and retries the
+map. Like arena pages, donated frames leave the free pool for good and stay in
+`pool_total` as memmgr-owned metadata.
 
 The arena only grows, and a page once carved is permanent memmgr-owned metadata.
 This preserves the all-RAM-accounted identity: the page was counted in
@@ -162,8 +200,32 @@ This preserves the all-RAM-accounted identity: the page was counted in
 arena. Growth stops at the peak concurrent node count — freed nodes return to
 the arena's own free list and are reused — so spawn/grow/die churn leaks no
 pages. Refilling the free list can draw a pool frame and map it from inside a
-fault handler; this is bounded (one frame, no recursion into per-process
-accounting) and never breaks the identity.
+fault handler; this is bounded (one frame, plus its page-table funding, with no
+recursion into per-process accounting) and never breaks the identity.
+
+---
+
+## Concurrency
+
+memmgr is single-threaded today: one receive loop owns all bookkeeping. The
+bookkeeping is shaped so the SMP pager
+([#266](https://github.com/kottlerg/seraph/issues/266)), over per-thread IPC
+buffers ([#254](https://github.com/kottlerg/seraph/issues/254)), is a
+service-internal change rather than a rewrite of this layer:
+
+- The arena, the free pool, and the process index are plain values with no
+  global state, mutated only through exclusive references, and held together
+  in one ledger; every growth path that needs a syscall sits outside them.
+- Several ledgers can coexist, each with its own arena and free pool, so a
+  pool shard per CPU or NUMA node is one ledger per shard.
+
+The sharded pager is design intent; not yet implemented. Its intended rules:
+each shard's ledger sits behind its own lock, taken for one request and never
+held across an IPC; a request that needs a second shard (a refill from a
+neighbour, or a record whose frames came from several shards) takes shard
+locks in ascending shard order; and the all-RAM-accounted identity is the sum
+over shards, with `pool_total` kept in one counter updated under any shard's
+lock with an atomic add.
 
 ---
 
@@ -181,9 +243,8 @@ budgets). memmgr cannot request memory from anyone else, so it funds its own slo
   frames from the pool, or a single frame when no such run is free, and donates it with
   augment-mode `cap_create_cspace` against its own `CSpace` cap. It then deletes the frame's cap:
   the donation holds its own reference on the frame.
-- A refused donation returns the frame to the pool (coalescing to make room; with no run slot even
-  then, the frame stays owned and counted but out of circulation), and the check runs again before
-  the next receive.
+- A refused donation returns the frame to the pool, and the check runs again before the next
+  receive.
 
 Like arena pages, donated frames leave the free pool for good and stay in `pool_total` as
 memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
@@ -194,15 +255,15 @@ memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
 
 On `PROCESS_DIED(badge)` from procmgr:
 
-1. Look up the per-process entry. If absent (untracked badge), return
-   silently — the death notification is idempotent.
-2. For each frame node in the entry's frame list:
-   a. Insert the retained Memory cap into the appropriate free-pool bucket.
-   b. Return the node to the arena free list.
-3. Return every region node to the arena free list.
+1. Remove the per-process record from the index. If absent (untracked
+   badge), return silently — the death notification is idempotent.
+2. For each frame node in the record's frame list, rewrite the node into a
+   free run of the retained Memory cap and insert it into the free pool at
+   its sorted position (no fresh node, so the step cannot fail).
+3. Return every region node and the record's own node to the arena free
+   list.
 4. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
-5. Clear the per-process entry.
 
 No unmap is performed: the dead process's CSpace is torn down by procmgr
 (which revokes the AddressSpace cap; see
@@ -261,27 +322,26 @@ cap. Eligibility:
 
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins
-its physical neighbours immediately rather than parking discrete until the
-free-pool array fills. Together with best-fit best-effort selection (above),
-this bounds the pool's run count under long spawn/free/die churn, and with it
-the per-run tracking anchor memmgr holds in its own CSpace: best-fit keeps a
-fixed-size churn cycling one run, and the explicit merge keeps residual
-fragmentation from drifting the run (and anchor) count up over time. Left
-un-coalesced, reclaimed runs park discrete and their anchors persist, slowly
-consuming memmgr's CSpace even while its RAM footprint stays bounded. The
-per-insert push still folds opportunistically when the array is full; the
-explicit pass is what holds the steady state under churn that never fills it. A
-"dirty" released run — one whose source `MemoryObject` kept its retype bump
-pointer advanced — declines `memory_merge` (the kernel requires a virgin tail;
-see [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
-§"`SYS_MEMORY_MERGE`") and stays a discrete, re-grantable-whole run. Coalescing
-cost scales with the live run count, which best-fit and this pass jointly keep small, so the
-per-reclamation merge is negligible.
+its physical neighbours immediately rather than staying discrete. Together
+with best-fit best-effort selection (above), this bounds the pool's run count
+under long spawn/free/die churn, and with it the per-run tracking anchor
+memmgr holds in its own CSpace: best-fit keeps a fixed-size churn cycling one
+run, and the explicit merge keeps residual fragmentation from drifting the run
+(and anchor) count up over time. Left un-coalesced, reclaimed runs stay
+discrete and their anchors persist, slowly consuming memmgr's CSpace and arena
+even while its RAM footprint stays bounded. A "dirty" released run — one whose
+source `MemoryObject` kept its retype bump pointer advanced — declines
+`memory_merge` (the kernel requires a virgin tail; see
+[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
+§"`SYS_MEMORY_MERGE`") and stays a discrete, re-grantable-whole run.
+Coalescing cost scales with the live run count, which best-fit and this pass
+jointly keep small, so the per-reclamation merge is negligible.
 
-memmgr does not pre-filter for eligibility: it sorts the free runs by physical
-base and attempts `memory_merge` on every adjacent pair, and the kernel declines
-any pair that fails the preconditions above. A declined pair stays as two
-discrete runs.
+The free-run list is sorted by physical base, so mergeable runs are list
+neighbours: memmgr attempts `memory_merge` on each pair of physically adjacent
+neighbours (`base_a + size_a == base_b`) and skips every other pair without a
+syscall; the kernel declines any attempted pair that fails the remaining
+preconditions above. A declined pair stays as two discrete runs.
 
 ---
 
@@ -290,9 +350,9 @@ discrete runs.
 | Failure | Cause | Caller observation |
 |---|---|---|
 | `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS` | Reply with error label; caller may retry without the flag, or fail |
-| `OUT_OF_MEMORY_BEST_EFFORT` | Pool cannot cover `want_pages` even fragmented | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages` | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `TOO_MANY_PROCESSES` | Per-process table at static cap | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
+| `TOO_MANY_PROCESSES` | A process record could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built

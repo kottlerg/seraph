@@ -93,14 +93,18 @@ Init creates memmgr's `AddressSpace`, `CSpace`, and `Thread` via raw
 syscalls. It loads memmgr's ELF (from a boot module Memory cap), maps
 the segments into memmgr's address space, populates memmgr's
 `ProcessInfo`, copies the RAM Memory caps left after init's own bootstrap
-allocations into memmgr's CSpace using derive-twice (as many as one bootstrap
-round carries; the remainder reaches memmgr via the init-reap donation),
-forwards the memmgr/procmgr/init bootstrap arenas as in-use runs, and starts
-memmgr's thread (`finalize_memmgr`).
+allocations into memmgr's CSpace using derive-twice (every one while memmgr's
+CSpace keeps the headroom the caps that must ride the round need; the
+remainder reaches memmgr via the init-reap donation), forwards the
+memmgr/procmgr/init bootstrap arenas as in-use runs, and starts memmgr's
+thread (`finalize_memmgr`).
 
 Init then serves a single bootstrap-IPC round to memmgr carrying the
 Memory slot range `(memory_base, memory_count)` so memmgr
-knows where in its own CSpace the pool lives.
+knows where in its own CSpace the pool lives. The round carries no per-cap
+size or base: memmgr reads both from the kernel (`cap_info`), so the round
+bounds neither the cap count nor a cap's size (layout in
+`ipc::memmgr_bootstrap`).
 
 After this step, memmgr is ready to serve its labels, including
 `REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`, and the procmgr-only
@@ -197,8 +201,8 @@ boot-module ELF sources) in further `REGISTER_INIT_TEARDOWN` rounds, sends
 `INIT_TEARDOWN_DONE`, then
 `sys_thread_exit`s. The usable-RAM prefix init consumed or forwarded at
 `finalize_memmgr` (already memmgr's) and the firmware read-only caps
-(RSDP/ACPI/DTB) are excluded; the usable-RAM tail that did not fit memmgr's
-bootstrap round and the free remainders `MemoryAlloc` abandoned while
+(RSDP/ACPI/DTB) are excluded; the usable-RAM tail init did not forward in
+memmgr's bootstrap round and the free remainders `MemoryAlloc` abandoned while
 carving bootstrap arenas are donated with the set above. init's own
 bootstrap backing — its endpoint and log-thread retype slabs plus the
 offset-mapped IPC buffer and log-thread stack/IPC — is not in this set:

@@ -511,7 +511,7 @@ Every entry here is `correct as is`; none is tracked.
 | `FrameDesc.page_count`, REQUEST_MEMORY_CAPS `want_pages` | `services/memmgr/free-pool/src/arena.rs`, `services/memmgr/src/main.rs` | `u32` pages per grant | encoding artefact (wire packs a request's pages in 32 bits) | none | correct as is | Callers loop |
 | `MAX_GRANT_RUNS` (`Grant`) | `services/memmgr/free-pool/src/pool.rs` | `MSG_CAP_SLOTS_MAX` | ABI width | 64 B stack | correct as is | None: a grant over more runs is partial and the caller loops |
 | `MEMMGR_FORWARD_HEADROOM`, `INIT_FORWARD_HEADROOM` | `services/init/src/bootstrap.rs` | 512 slots each, in memmgr's and init's `CSpace` | tuning (caps past either reach memmgr at init's reap) | none | correct as is | None |
-| `ARENA_RETURN_RESERVE` | `services/memmgr/src/main.rs` | 1 slot | provably unreachable (one return per growth attempt reaches it) | one arena slot | correct as is | None |
+| `ARENA_RETURN_RESERVE` | `services/memmgr/src/main.rs` | 1 slot | tuning (held back from every other allocation, so the arena grows first; spent only when growth is ruled out, when a further last-resort return leaves one run out of circulation) | one arena slot | correct as is | None |
 | `InitBootstrap.in_use` | `services/memmgr/src/main.rs` | `MAX_IN_USE` = 4 | provably unreachable (three tier-1 producers) | 96 B stack | correct as is | None |
 | process badges | `services/memmgr/src/main.rs` | random `u64` | ABI width | none | correct as is | None |
 | `POOL_TOTAL_PAGES` | `services/memmgr/src/main.rs` | `u64`, saturating | ABI width | 8 B | correct as is | None |

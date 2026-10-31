@@ -138,15 +138,36 @@ impl FreePool
             .map_or(0, |r| r.page_count)
     }
 
-    /// Insert `run` at its sorted position in a fresh slot.
+    /// Insert `run` at its sorted position in a fresh slot outside the arena's
+    /// reserve.
     ///
     /// # Errors
-    /// Returns the run back when the arena has no free slot; the owner grows
-    /// the arena and retries.
+    /// Returns the run back when the arena has no free slot outside its
+    /// reserve; the owner grows the arena and retries.
     pub fn push<S: SlotStore>(&mut self, arena: &mut Arena<S>, run: FreeRun)
     -> Result<(), FreeRun>
     {
         let Some(idx) = arena.alloc(Node::Run(run), NODE_NULL)
+        else
+        {
+            return Err(run);
+        };
+        self.link_sorted(arena, idx, run);
+        Ok(())
+    }
+
+    /// Insert `run` like [`FreePool::push`], but into a reserved slot when
+    /// no other is free: for the returns the arena's reserve exists for.
+    ///
+    /// # Errors
+    /// Returns the run back when the arena has no free slot at all.
+    pub fn push_reserved<S: SlotStore>(
+        &mut self,
+        arena: &mut Arena<S>,
+        run: FreeRun,
+    ) -> Result<(), FreeRun>
+    {
+        let Some(idx) = arena.alloc_reserved(Node::Run(run), NODE_NULL)
         else
         {
             return Err(run);
@@ -785,5 +806,25 @@ mod tests
         assert!(pool.absorb_front(&mut a, back, |p, t| (p, t) == (1, 7)));
         assert_eq!(runs(&pool, &a), [run(1, 4, 0x1000)]);
         assert_eq!((pool.free_pages(), pool.run_count()), (4, 1));
+    }
+
+    #[test]
+    fn push_reserved_takes_the_reserve_push_leaves()
+    {
+        let mut a = Arena::new(VecStore::default());
+        a.set_reserve(1);
+        // SAFETY: VecStore grows on write.
+        unsafe { a.add_page() };
+        let mut pool = FreePool::new();
+        let mut i = 0u32;
+        while pool.push(&mut a, run(i, 1, u64::from(i) * 0x10000)).is_ok()
+        {
+            i += 1;
+        }
+        assert_eq!(a.free_count(), 1);
+        let last = run(9999, 1, 0xFFFF_0000);
+        assert!(pool.push_reserved(&mut a, last).is_ok());
+        assert_eq!(pool.push_reserved(&mut a, last).unwrap_err(), last);
+        assert_eq!(pool.run_count(), u64::from(i) + 1);
     }
 }

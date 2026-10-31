@@ -103,6 +103,10 @@ pub trait SlotStore
 
 /// The slot allocator: a free list over every carved slot.
 ///
+/// The last `reserve` free slots are held back from [`Arena::alloc`]; only
+/// [`Arena::alloc_reserved`] takes them, so a caller can keep slots for a
+/// path that must not fail while every other path sees the arena as full.
+///
 /// Holds no global state, so several arenas (one per pool shard) can coexist.
 pub struct Arena<S>
 {
@@ -110,6 +114,7 @@ pub struct Arena<S>
     free_head: NodeIdx,
     free_count: u64,
     carved: u64,
+    reserve: u64,
 }
 
 impl<S: SlotStore> Arena<S>
@@ -122,7 +127,21 @@ impl<S: SlotStore> Arena<S>
             free_head: NODE_NULL,
             free_count: 0,
             carved: 0,
+            reserve: 0,
         }
+    }
+
+    /// Hold back the last `reserve` free slots for [`Arena::alloc_reserved`].
+    pub fn set_reserve(&mut self, reserve: u64)
+    {
+        self.reserve = reserve;
+    }
+
+    /// Free slots [`Arena::alloc`] may take: the free list less the reserve.
+    #[must_use]
+    pub const fn available(&self) -> u64
+    {
+        self.free_count.saturating_sub(self.reserve)
     }
 
     /// The backing store, for the layout queries its owner needs.
@@ -183,9 +202,21 @@ impl<S: SlotStore> Arena<S>
         self.free_count += SLOTS_PER_PAGE;
     }
 
-    /// Take a free slot and fill it with `node` and `next`. `None` when the
-    /// free list is empty; the owner grows the arena and retries.
+    /// Take a free slot outside the reserve and fill it with `node` and
+    /// `next`. `None` when only reserved slots (or none) are free; the owner
+    /// grows the arena and retries.
     pub fn alloc(&mut self, node: Node, next: NodeIdx) -> Option<NodeIdx>
+    {
+        if self.available() == 0
+        {
+            return None;
+        }
+        self.alloc_reserved(node, next)
+    }
+
+    /// Take any free slot, the reserve included. `None` when the free list
+    /// is empty.
+    pub fn alloc_reserved(&mut self, node: Node, next: NodeIdx) -> Option<NodeIdx>
     {
         let idx = self.free_head;
         if idx == NODE_NULL
@@ -358,6 +389,21 @@ mod tests
         assert_eq!(arena.free_count(), 0);
         arena.free(taken[3]);
         assert_eq!(arena.alloc(Node::Free, NODE_NULL), Some(taken[3]));
+    }
+
+    #[test]
+    fn alloc_leaves_the_reserve_to_alloc_reserved()
+    {
+        let mut arena = Arena::new(VecStore::default());
+        arena.set_reserve(2);
+        // SAFETY: VecStore grows on write.
+        unsafe { arena.add_page() };
+        while arena.alloc(Node::Free, NODE_NULL).is_some()
+        {}
+        assert_eq!((arena.free_count(), arena.available()), (2, 0));
+        assert!(arena.alloc_reserved(Node::Free, NODE_NULL).is_some());
+        assert!(arena.alloc_reserved(Node::Free, NODE_NULL).is_some());
+        assert!(arena.alloc_reserved(Node::Free, NODE_NULL).is_none());
     }
 
     #[test]

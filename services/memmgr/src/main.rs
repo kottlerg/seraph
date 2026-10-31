@@ -289,7 +289,8 @@ fn ledger_init(self_aspace_cap: u32)
     };
     // SAFETY: single-threaded; called once before any other ledger use.
     unsafe { SELF_ASPACE = self_aspace_cap };
-    *ledger_mut() = Ledger::new(
+    let l = ledger_mut();
+    *l = Ledger::new(
         MappedSlots {
             layout: ArenaLayout {
                 low_base,
@@ -298,6 +299,7 @@ fn ledger_init(self_aspace_cap: u32)
         },
         MappedWords,
     );
+    l.arena.set_reserve(ARENA_RETURN_RESERVE);
 }
 
 // ── Pool primitives ──────────────────────────────────────────────────────────
@@ -333,23 +335,29 @@ fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
         })
 }
 
-/// Free arena slots [`ensure_slots`] keeps beyond what its caller asks for,
-/// for [`return_taken`] alone. A growth path that takes a run and cannot use
-/// it returns the run while the arena may be full; one return per growth
-/// attempt reaches this slot (a nested page-table funding return merges back
-/// into its split remainder or reuses the node its own take freed), so one
-/// slot is enough.
+/// Free arena slots held back from every allocation but the last-resort
+/// pool returns ([`return_taken`], and [`insert_run`] when it cannot carve a
+/// page), set as the arena's reserve at boot. A growth path that takes a run
+/// and cannot use it returns the run while the arena may be full; at most one
+/// such return per growth attempt needs a slot (a nested page-table funding
+/// return merges back into its split remainder or reuses the node its own
+/// take freed), so one slot covers it. Every other allocation sees the arena
+/// as full before the reserve and grows it.
 const ARENA_RETURN_RESERVE: u64 = 1;
+
+/// Return `run` to the pool through the arena's reserve: the last resort
+/// once growth is ruled out. When even the reserve is spent, the run stays
+/// owned and counted in `pool_total` but out of circulation.
+fn push_last_resort(l: &mut MemLedger, run: FreeRun)
+{
+    let _ = l.pool.push_reserved(&mut l.arena, run);
+}
 
 /// Hand one selected entry back to the pool without growing the arena (the
 /// callers run when the arena may have no free slot): first merged back into
 /// the remainder of the split that produced it, which needs no slot and so
 /// leaves a slot an enclosing take freed for that take's own return; else
-/// into a free slot (the node an exact take freed, or the
-/// [`ARENA_RETURN_RESERVE`] slot). The run stays owned and counted in
-/// `pool_total` but out of circulation only if both fail: no remainder to
-/// merge into, and the reserve spent by an earlier return the arena could not
-/// yet replace (the arena itself could not grow in between).
+/// into a free slot, the reserve included ([`push_last_resort`]).
 fn return_taken(l: &mut MemLedger, cap_slot: u32, pages: u32, phys_base: u64)
 {
     let run = FreeRun {
@@ -359,7 +367,7 @@ fn return_taken(l: &mut MemLedger, cap_slot: u32, pages: u32, phys_base: u64)
     };
     if !l.pool.absorb_front(&mut l.arena, run, merge)
     {
-        let _ = l.pool.push(&mut l.arena, run);
+        push_last_resort(l, run);
     }
 }
 
@@ -451,12 +459,11 @@ fn arena_grow(l: &mut MemLedger) -> bool
     true
 }
 
-/// Grow the arena until it has `n` free slots beyond the
-/// [`ARENA_RETURN_RESERVE`]. `false` when it cannot (RAM exhausted or the
-/// arena's zones spent).
+/// Grow the arena until `n` slots outside its reserve are free. `false` when
+/// it cannot (RAM exhausted or the arena's zones spent).
 fn ensure_slots(l: &mut MemLedger, n: u64) -> bool
 {
-    while l.arena.free_count() < n + ARENA_RETURN_RESERVE
+    while l.arena.available() < n
     {
         if !arena_grow(l)
         {
@@ -500,13 +507,14 @@ fn ensure_index(l: &mut MemLedger)
     }
 }
 
-/// Return `run` to the free pool. When the arena has no free slot and the
-/// pool cannot fund an arena page, the arena page is carved from the front of
-/// `run` itself (all of it, for a one-page run). This is also how the first
-/// ingested run seeds the arena, before the pool holds anything. The run stays
-/// owned and counted in `pool_total` but out of circulation only when that
-/// carve fails: both arena zones are spent, the split of the run's first page
-/// fails, or the self-map fails.
+/// Return `run` to the free pool. When the arena has no free slot outside its
+/// reserve and the pool cannot fund an arena page, the arena page is carved
+/// from the front of `run` itself (all of it, for a one-page run). This is
+/// also how the first ingested run seeds the arena, before the pool holds
+/// anything. When that carve fails (both arena zones spent, the split of the
+/// run's first page refused, or the self-map failing), the run goes into the
+/// arena's reserve ([`push_last_resort`]); only with the reserve spent too
+/// does it stay owned and counted in `pool_total` but out of circulation.
 fn insert_run(l: &mut MemLedger, run: FreeRun)
 {
     if ensure_slots(l, 1)
@@ -517,6 +525,7 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
     let Some(va) = l.arena.store().layout.page_va(l.arena.pages())
     else
     {
+        push_last_resort(l, run);
         return;
     };
     let rest = if run.page_count > 1
@@ -524,6 +533,7 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
         let Some(tail) = split(run.cap_slot, PAGE_SIZE)
         else
         {
+            push_last_resort(l, run);
             return;
         };
         Some(FreeRun {
@@ -539,9 +549,21 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
     // SAFETY: `va` is arena page `pages()`, the next one, not yet mapped.
     if !unsafe { map_self_page(l, run.cap_slot, va) }
     {
-        if let Some(rest) = rest
+        match rest
         {
-            let _ = syscall::memory_merge(run.cap_slot, rest.cap_slot);
+            Some(rest) if merge(run.cap_slot, rest.cap_slot) => push_last_resort(l, run),
+            Some(rest) =>
+            {
+                push_last_resort(
+                    l,
+                    FreeRun {
+                        page_count: 1,
+                        ..run
+                    },
+                );
+                push_last_resort(l, rest);
+            }
+            None => push_last_resort(l, run),
         }
         return;
     }

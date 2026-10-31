@@ -135,6 +135,7 @@ The remaining constants are tuning values that bound no capacity:
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | 256 slots, 16 pages | `CSpace` self-funding mark and step |
 | `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table self-funding step and retries per map |
 | `MAX_LOAD` | 2 | Mean index chain length before a bucket split |
+| `ARENA_RETURN_RESERVE` | 1 slot | Arena slot kept for last-resort returns of a run to the pool |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)
@@ -163,9 +164,10 @@ Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round that
 names them by slot range only (`ipc::memmgr_bootstrap`); memmgr reads each
 cap's size and physical base from the kernel (`cap_info`), so the round bounds
 neither the cap count nor a cap's size. Init forwards every remaining RAM cap
-while memmgr's `CSpace` and its own keep the headroom the `MemoryAlloc` tail, the
-phys-table page, and the in-use arenas need (they have no `InitInfo`
-descriptor and must ride this round). Any RAM caps beyond that are not lost:
+while memmgr's `CSpace` and init's own keep the headroom the `MemoryAlloc`
+tail, the phys-table page, and the in-use arenas need (they have no
+`InitInfo` descriptor and must ride this round), and, in init's, the rest of
+init's bootstrap. Any RAM caps beyond that are not lost:
 init donates them at its reap, and procmgr forwards them to memmgr's pool via
 `DONATE_MEMORY_CAPS`, which has no per-round cap. The round's place in the
 boot sequence is described in

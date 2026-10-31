@@ -77,17 +77,16 @@ Taking a whole run frees its node; splitting one keeps the node for the
 remainder, whose sorted position does not change. Returning a run inserts it
 at its sorted position. A reclaimed frame's descriptor node is rewritten into
 the run's node in place, so reclamation never allocates and cannot fail. When
-the arena has no free node and the pool cannot fund an arena page, the
-returned run funds it itself: its first page (all of it, for a one-page run)
-becomes the arena page. A run stays owned and counted in `pool_total` but out
-of circulation only when that page cannot be carved: both arena zones are
-spent, the split of its first page fails, or the page cannot be mapped
-(memmgr's page tables cannot be funded). A run a growth path takes from the
-pool and cannot use goes back without growing the arena: merged back into
-the remainder its split left, else into a free node, either the one its take
-freed or one node the arena keeps in reserve for these returns. Such a run
-stays out of circulation only when it has no remainder to merge into and the
-reserve is spent by an earlier return the arena could not yet replace.
+the arena has no free node outside its reserve (below) and the pool cannot
+fund an arena page, the returned run funds it itself: its first page (all of
+it, for a one-page run) becomes the arena page. When that carve fails (both
+arena zones are spent, the split of its first page fails, or the page cannot
+be mapped because memmgr's page tables cannot be funded), the run takes a
+reserved node. A run a growth path takes from the pool and cannot use goes
+back without growing the arena: merged back into the remainder its split
+left, else into a free node, the reserve included. A run stays owned and
+counted in `pool_total` but out of circulation only when it reaches the
+reserve with the reserve already spent and the arena unable to grow.
 
 ---
 
@@ -177,7 +176,11 @@ its own pool:
   arena before the address space does.
 - A free list threads the unused slots. Allocation pops the head; free pushes
   it back.
-- When the free list is empty, memmgr pulls one frame from the pool
+- The last `ARENA_RETURN_RESERVE` (1) free slot is held back from every
+  allocation except a last-resort return of a run to the pool (above), so
+  every other allocation sees the arena as full while that slot is still free,
+  and the arena grows first.
+- When no slot outside the reserve is free, memmgr pulls one frame from the pool
   (contiguous, one page), maps it at the next arena page in its own address
   space, and carves it into free slots. When the pool itself is empty (the
   first ingest, before it holds anything), the run being inserted funds the
@@ -401,6 +404,7 @@ terminal fault tears down the whole process (see
 
 [abi/process-abi/README.md](../../../abi/process-abi/README.md),
 [Memory Model](../../../docs/memory-model.md),
-[Process Lifecycle](../../../docs/process-lifecycle.md), [services/memmgr/README.md](../README.md),
-[memmgr IPC Interface](ipc-interface.md),
-[Userspace Memory Model](../../../docs/userspace-memory-model.md)
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[services/memmgr/README.md](../README.md),
+[memmgr IPC Interface](ipc-interface.md)

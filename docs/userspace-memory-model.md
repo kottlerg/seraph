@@ -116,12 +116,12 @@ communicates them via `ProcessInfo` / `InitInfo`.
 - **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`
   crate aborts through `handle_alloc_error` (std's abort path, which
   traps on seraph): a terminal fault that tears down the whole process
-  (procmgr reaps it on the address-space death notification, unless its
-  full death queue dropped that post; see
+  (procmgr reaps it on the address-space death notification; when its
+  full death queue dropped that post, a worker thread's fault is reaped
+  only once the main thread exits, see
   [services/procmgr/README.md](../services/procmgr/README.md) § Process
-  table and death queue). svcmgr
-  observes the death via its event queue and applies restart policy. No
-  kernel panic.
+  table and death queue). svcmgr observes the death via its event queue
+  and applies restart policy. No kernel panic.
 - **Thread safety.** A spinlock guards the allocator. Multi-threaded
   services share one allocator instance.
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have

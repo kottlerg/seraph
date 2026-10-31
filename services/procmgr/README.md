@@ -276,6 +276,7 @@ yet implemented (#26) (see
 ## Summarized By
 
 [Architecture Overview](../../docs/architecture.md),
+[Capability Model](../../docs/capability-model.md),
 [Namespace Model](../../docs/namespace-model.md),
 [Process Lifecycle](../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),

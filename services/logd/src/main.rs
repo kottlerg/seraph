@@ -107,7 +107,7 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Record the devmgr-registry cap + IPC buffer for the emit path. The
+    // Record the devmgr-registry cap for the emit path. The
     // serial driver is resolved lazily on first emit via
     // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
     // covered the pre-driver window) while history still accrues.

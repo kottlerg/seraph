@@ -33,6 +33,10 @@ use syscall::RIGHTS_EQ_POST;
 
 use crate::slot::{LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
 
+/// `WaitSet` badge for logd's resync notification, signalled by the resync
+/// helper thread when its walk of procmgr's live badges ends.
+const WS_BADGE_RESYNC: u64 = 2;
+
 /// `WaitSet` badge for the master log endpoint.
 const WS_BADGE_LOG: u64 = 0;
 /// `WaitSet` badge for the death-notification event queue.
@@ -50,8 +54,8 @@ struct BootCaps
     /// init-logd. Deleted after handover.
     log_ep_handover_send: u32,
     /// `SEND|GRANT` cap on procmgr carrying `DEATH_EQ_AUTHORITY`, used to
-    /// call `REGISTER_DEATH_EQ`. Kept across the lifetime of
-    /// real-logd in case re-registration is ever needed.
+    /// call `REGISTER_DEATH_EQ` at startup and, from the resync helper
+    /// thread, `QUERY_LIVE_PROCESSES`. Kept across the lifetime of real-logd.
     procmgr_death_auth_send: u32,
     /// SEND cap on devmgr's registry endpoint carrying
     /// `REGISTRY_QUERY_AUTHORITY`. logd resolves the serial driver's
@@ -135,7 +139,13 @@ fn main() -> !
         syscall::thread_exit();
     };
     register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
-    let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq)
+    let Some(resync_note) = create_resync_note()
+    else
+    {
+        self_log("FATAL: resync notification create failed; halting");
+        syscall::thread_exit();
+    };
+    let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq, resync_note)
     else
     {
         self_log("FATAL: wait_set create failed; halting");
@@ -173,18 +183,23 @@ fn main() -> !
         self_log("started (restart); no handover source, serving fresh");
     }
 
-    event_loop(ws_cap, death_eq, caps.log_ep_recv, ipc_buf, &mut table);
+    let mut resync = Resync::new(caps.procmgr_death_auth_send, resync_note);
+    event_loop(
+        ws_cap,
+        death_eq,
+        caps.log_ep_recv,
+        ipc_buf,
+        &mut table,
+        &mut resync,
+    );
 }
 
-/// Capacity of logd's death-notification `EventQueue`: procmgr's own death
-/// queue's (`MAX_PROCESSES * 2`, `services/procmgr/src/main.rs`), so a burst
-/// of deaths procmgr's queue absorbs fits here too, provided logd drains
-/// before more deaths arrive, and the capacity follows procmgr's process
-/// table as it grows. The two queues drain independently, so a slow logd
-/// drain can still fill this one: the kernel then drops the post, the
-/// sender's slot is never evicted, and [`drain_deaths`] reports the full
-/// drain after the fact.
-const DEATH_EQ_CAPACITY: u32 = (procmgr_process_table::MAX_PROCESSES * 2) as u32;
+/// Capacity of logd's death-notification `EventQueue`: a tuning value, not
+/// a process ceiling. The kernel drops a post to a full queue, so a drain
+/// that takes this many events or more starts a resync ([`Resync`]), which
+/// evicts the slots of senders procmgr no longer lists as live; no process
+/// count sizes the queue.
+const DEATH_EQ_CAPACITY: u32 = 128;
 
 /// Allocate the slab and create the death-notification `EventQueue` of
 /// [`DEATH_EQ_CAPACITY`].
@@ -197,9 +212,19 @@ fn create_death_eq() -> Option<u32>
     })
 }
 
-/// Build a 2-member wait set: the log endpoint (`WS_BADGE_LOG`) and
-/// the death event queue (`WS_BADGE_DEATH`).
-fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
+/// Create the notification the resync helper thread signals when its walk
+/// ends.
+fn create_resync_note() -> Option<u32>
+{
+    std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+        syscall::cap_create_notification(slab).ok()
+    })
+}
+
+/// Build a 3-member wait set: the log endpoint (`WS_BADGE_LOG`), the death
+/// event queue (`WS_BADGE_DEATH`), and the resync notification
+/// (`WS_BADGE_RESYNC`).
+fn create_wait_set(log_ep_recv: u32, death_eq: u32, resync_note: u32) -> Option<u32>
 {
     let Some(ws) =
         std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
@@ -223,6 +248,13 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "wait_set_add(death) err={e}");
+        self_log(buf.as_str());
+        return None;
+    }
+    if let Err(e) = syscall::wait_set_add(ws, resync_note, WS_BADGE_RESYNC)
+    {
+        let mut buf = SerialFmt::new();
+        let _ = write!(buf, "wait_set_add(resync) err={e}");
         self_log(buf.as_str());
         return None;
     }
@@ -285,6 +317,7 @@ fn event_loop(
     log_ep_recv: u32,
     ipc_buf: *mut u64,
     table: &mut SlotTable,
+    resync: &mut Resync,
 ) -> !
 {
     // One guard covers both spin shapes: a failing wait_set_wait, and a
@@ -302,14 +335,164 @@ fn event_loop(
                 continue;
             }
         };
-        drain_deaths(death_eq, table);
-        // Only WS_BADGE_LOG warrants service action; deaths were
-        // already drained above. WS_BADGE_DEATH and unknown badges
-        // fall through silently.
-        if badge == WS_BADGE_LOG
+        if drain_deaths(death_eq, table)
         {
-            dispatch_log(log_ep_recv, ipc_buf, table, &mut guard);
+            resync.start(table);
         }
+        match badge
+        {
+            WS_BADGE_LOG => dispatch_log(log_ep_recv, ipc_buf, table, &mut guard),
+            WS_BADGE_RESYNC => resync.finish(table),
+            // Deaths were already drained above; an unknown badge has no
+            // action.
+            _ => (),
+        }
+    }
+}
+
+/// logd's death-queue resync (`services/logd/docs/ipc-interface.md`
+/// § Death-queue resync): after a drain that may have followed a full queue,
+/// evict the slots of children procmgr no longer lists as live.
+///
+/// The walk of procmgr's live badges (`QUERY_LIVE_PROCESSES`) runs on a
+/// helper thread, never on the main thread. A synchronous call from the main
+/// thread to procmgr deadlocks whenever procmgr is itself blocked in a
+/// `seraph::log!` call to logd, since then neither receives; with the walk on
+/// a helper, the main thread keeps serving procmgr's log calls. The helper
+/// sends its result over a channel and signals the resync notification, and
+/// the main thread evicts from the snapshot it took before the walk began.
+struct Resync
+{
+    /// `DEATH_EQ_AUTHORITY` SEND on procmgr the helper walks through; zero
+    /// disables resync.
+    procmgr_send: u32,
+    /// Notification in the wait set the helper signals when it is done.
+    note: u32,
+    /// The walk in flight: the slot snapshot taken before it began and the
+    /// channel its live list arrives on (`None` when the walk failed).
+    in_flight: Option<(Vec<u64>, LiveReceiver)>,
+}
+
+/// The channel the resync helper sends its walk's live badges on; `None`
+/// when the walk failed.
+type LiveReceiver = std::sync::mpsc::Receiver<Option<Vec<u64>>>;
+
+impl Resync
+{
+    fn new(procmgr_send: u32, note: u32) -> Self
+    {
+        Self {
+            procmgr_send,
+            note,
+            in_flight: None,
+        }
+    }
+
+    /// Snapshot the child slots and start the helper's walk, unless one is
+    /// already in flight (its own drain covers the deaths it misses).
+    fn start(&mut self, table: &SlotTable)
+    {
+        if self.in_flight.is_some() || self.procmgr_send == 0
+        {
+            return;
+        }
+        let mut snapshot: Vec<u64> = Vec::new();
+        if snapshot.try_reserve(table.slots.len()).is_err()
+        {
+            self_log("resync skipped: no memory for the slot snapshot");
+            return;
+        }
+        snapshot.extend(
+            table
+                .slots
+                .keys()
+                .copied()
+                .filter(|&b| logd_codec::resync::is_resync_candidate(b)),
+        );
+        snapshot.sort_unstable();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (procmgr_send, note) = (self.procmgr_send, self.note);
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let _ = tx.send(walk_live_processes(procmgr_send));
+            let _ = syscall::notification_send(note, 1);
+        });
+        match spawned
+        {
+            Ok(_) => self.in_flight = Some((snapshot, rx)),
+            Err(_) => self_log("resync skipped: helper thread spawn failed"),
+        }
+    }
+
+    /// Consume the helper's signal and, once its result is in, evict every
+    /// snapshot slot the walk did not list.
+    fn finish(&mut self, table: &mut SlotTable)
+    {
+        // Clear the signalled bits: the wait set reports the notification
+        // ready while any are set. The wake means they are, so this returns
+        // at once.
+        let _ = syscall::notification_wait_timeout(self.note, 1);
+        let Some((snapshot, rx)) = self.in_flight.take()
+        else
+        {
+            return;
+        };
+        let live = match rx.try_recv()
+        {
+            Ok(live) => live,
+            Err(std::sync::mpsc::TryRecvError::Empty) =>
+            {
+                // Signalled before the result landed; wait for the next one.
+                self.in_flight = Some((snapshot, rx));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let Some(live) = live
+        else
+        {
+            self_log("resync: live-process walk failed; slots kept");
+            return;
+        };
+        for badge in logd_codec::resync::evictable(&snapshot, &live)
+        {
+            if table.evict(badge)
+            {
+                let mut buf = SerialFmt::new();
+                let _ = write!(buf, "reclaim (resync): badge={badge}");
+                self_log(buf.as_str());
+            }
+        }
+    }
+}
+
+/// Walk procmgr's live badges (`QUERY_LIVE_PROCESSES`) page by page on the
+/// calling thread's IPC buffer; runs on the resync helper thread only.
+/// `None` when a call fails or a reply does not decode.
+fn walk_live_processes(procmgr_send: u32) -> Option<Vec<u64>>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        return None;
+    }
+    let mut live: Vec<u64> = Vec::new();
+    let mut after: Option<u64> = None;
+    loop
+    {
+        let msg = IpcMessage::builder(procmgr_labels::QUERY_LIVE_PROCESSES)
+            .word(0, u64::from(after.is_some()))
+            .word(1, after.unwrap_or(0))
+            .build();
+        // SAFETY: ipc_buf is this thread's registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(procmgr_send, &msg, ipc_buf) }.ok()?;
+        let (page, more) = logd_codec::resync::decode_live_page(&reply, after)?;
+        live.try_reserve(page.len()).ok()?;
+        live.extend_from_slice(page);
+        if !more
+        {
+            return Some(live);
+        }
+        after = live.last().copied();
     }
 }
 
@@ -334,35 +517,20 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 /// Non-blocking drain of the death event queue. Each payload encodes
 /// `(process_badge as u32) << 32 | exit_reason`. We evict the
-/// matching slot from the badge table. A drain that takes a full queue's
-/// worth of events reports it: the queue may have filled, and a post to a
-/// full queue is dropped, leaving that sender's slot unevicted.
-fn drain_deaths(death_eq: u32, table: &mut SlotTable)
+/// matching slot from the badge table. Returns whether the drain took a full
+/// queue's worth of events: the queue may then have filled, and a post to a
+/// full queue is dropped, so the caller starts a [`Resync`].
+fn drain_deaths(death_eq: u32, table: &mut SlotTable) -> bool
 {
     let mut drained: u32 = 0;
-    loop
+    while let Ok(payload) = syscall::event_try_recv(death_eq)
     {
-        let Ok(payload) = syscall::event_try_recv(death_eq)
-        else
-        {
-            if drained >= DEATH_EQ_CAPACITY
-            {
-                let mut buf = SerialFmt::new();
-                let _ = write!(
-                    buf,
-                    "death queue drained {drained} events (capacity {DEATH_EQ_CAPACITY}); \
-                     deaths may have been dropped"
-                );
-                self_log(buf.as_str());
-            }
-            return;
-        };
         drained = drained.saturating_add(1);
         let correlator = (payload >> 32) as u32;
         let exit_reason = payload as u32;
         // Badge in logd's slot map is the full u64; the correlator
-        // procmgr binds is `process_badge as u32`. Match against the
-        // low 32 bits.
+        // procmgr binds is `process_badge as u32`, unique among live
+        // processes. Match against the low 32 bits.
         let dead: Vec<u64> = table
             .slots
             .keys()
@@ -379,6 +547,17 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
             }
         }
     }
+    if drained < DEATH_EQ_CAPACITY
+    {
+        return false;
+    }
+    let mut buf = SerialFmt::new();
+    let _ = write!(
+        buf,
+        "death queue drained {drained} events (capacity {DEATH_EQ_CAPACITY}); resyncing"
+    );
+    self_log(buf.as_str());
+    true
 }
 
 fn dispatch_log(

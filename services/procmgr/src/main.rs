@@ -107,7 +107,7 @@ fn main() -> !
     let mut recent = process::RecentExits::new();
 
     // Death-EQ slab request: the kernel's raw EventQueue debit for
-    // `DEATH_EQ_CAPACITY`.
+    // `DEATH_EQ_CAPACITY` entries and `DEATH_EQ_OBSERVERS` observer nodes.
     let death_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
         u64::from(DEATH_EQ_CAPACITY),
         u64::from(DEATH_EQ_OBSERVERS),
@@ -119,10 +119,10 @@ fn main() -> !
     {
         syscall::thread_exit();
     };
-    let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
-            syscall::wait_set_create(slab, 2).ok()
-        })
+    let Some(ws_cap) = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+    )
     else
     {
         syscall::thread_exit();
@@ -210,6 +210,9 @@ fn main() -> !
 /// [`resync_deaths`], which [`dispatch_death`] runs after any drain that took
 /// a full queue's worth of events; the table itself has no fixed size.
 const DEATH_EQ_CAPACITY: u32 = 256;
+
+/// The main wait set's member capacity: the service endpoint and the death queue.
+const WS_MEMBERS: u32 = 2;
 
 /// Death-observer nodes in procmgr's death queue: each live process binds two
 /// (its main thread and its address space) and the init reap binds init's

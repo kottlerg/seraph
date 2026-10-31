@@ -44,9 +44,13 @@ use std::os::seraph::{StartupInfo, startup_info};
 /// took a full queue's worth of events; the service table has no fixed size.
 const DEATHS_EQ_CAPACITY: u32 = 64;
 
+/// The main wait set's member capacity: the service endpoint and the deaths queue.
+const WS_MEMBERS: u32 = 2;
+
 /// Death-observer nodes in the deaths queue: one per supervised service's
 /// main thread, and a restarted service binds its new thread before the old
-/// one's node returns. A bind past the pool fails the launch or restart.
+/// one's node returns. A bind past the pool fails the launch, restart, or
+/// adoption (#643 grows the pool).
 const DEATHS_EQ_OBSERVERS: u32 = 256;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
@@ -120,18 +124,19 @@ fn main() -> !
         halt_loop();
     }
 
-    let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
-            syscall::wait_set_create(slab, 2).ok()
-        })
+    let Some(ws_cap) = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+    )
     else
     {
         std::os::seraph::log!("failed to create wait set");
         halt_loop();
     };
 
-    // One shared death-notification queue of `DEATHS_EQ_CAPACITY`; the slab
-    // request is the kernel's raw EventQueue debit for that capacity.
+    // One shared death-notification queue of `DEATHS_EQ_CAPACITY` entries and
+    // `DEATHS_EQ_OBSERVERS` observer nodes; the slab request is the kernel's
+    // raw EventQueue debit for both.
     let deaths_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
         u64::from(DEATHS_EQ_CAPACITY),
         u64::from(DEATHS_EQ_OBSERVERS),

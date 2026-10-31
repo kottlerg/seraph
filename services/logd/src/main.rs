@@ -203,16 +203,18 @@ const DEATH_EQ_CAPACITY: u32 = 128;
 
 /// Death-observer nodes in logd's death queue: procmgr binds one per live
 /// process's main thread, and a node returns only when that thread is
-/// destroyed. A bind past the pool fails, and procmgr then logs that logd
-/// will miss that process's death (the resync from procmgr's live list still
-/// evicts its slot). Sized well above the live processes memmgr allows.
+/// destroyed. A bind past the pool fails: silently at spawn, logged by
+/// procmgr's retroactive bind. logd then gets no death post for that process,
+/// so its slot stays until a later full-queue resync from procmgr's live list
+/// evicts it, if one runs (#643 grows the pool). Sized well above the live
+/// processes memmgr allows.
 const DEATH_EQ_OBSERVERS: u32 = 1024;
 
 /// Allocate the slab and create the death-notification `EventQueue` of
-/// [`DEATH_EQ_CAPACITY`].
+/// [`DEATH_EQ_CAPACITY`] entries and [`DEATH_EQ_OBSERVERS`] observer nodes.
 fn create_death_eq() -> Option<u32>
 {
-    // The kernel's raw EventQueue debit for that capacity.
+    // The kernel's raw EventQueue debit for that capacity and node count.
     let slab_bytes = std::os::seraph::event_queue_retype_bytes(
         u64::from(DEATH_EQ_CAPACITY),
         u64::from(DEATH_EQ_OBSERVERS),

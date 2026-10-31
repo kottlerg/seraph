@@ -197,7 +197,10 @@ no `main()` of either shape `abi/process-abi` describes.
 ## Process table and death queue
 
 The process table lives on procmgr's heap, sorted by badge, and grows with the
-live process count; a spawn fails only when the heap cannot grow it. The kernel's
+live process count. A spawn fails when the heap cannot grow it, or when procmgr's
+death queue has no free observer node for the child's main thread: the queue's
+pool of `DEATH_EQ_OBSERVERS` (1024) nodes, two per live process, is fixed at
+creation (#643 grows it). The kernel's
 death correlator is a `u64`, but procmgr still binds each child's death observers
 with the low 32 bits of its `u64` badge (adopting the full width is #643), and
 procmgr redraws a minted badge whose low 32 bits a live process already holds: the

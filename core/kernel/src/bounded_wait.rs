@@ -22,6 +22,14 @@
 /// the TSC-tick clock of the PIT poll always reads.
 pub const MAX_SPINS_PER_UNIT: u64 = 10_000;
 
+/// Time, in microseconds, a kernel spin on a lock or a cross-CPU condition that
+/// another CPU releases within microseconds may last before the waiter declares a
+/// deadlock and halts. Matches the never-acked step of the IPI ack ladder: a
+/// healthy holder, even one whose host core the hypervisor deschedules, releases
+/// far sooner, so reaching the budget means the holder will never release. It
+/// bounds no capacity.
+pub const DEADLOCK_BUDGET_US: u64 = 5_000_000;
+
 /// Elapsed-time tracker for one bounded wait.
 ///
 /// [`WaitTimer::start`] records the clock at the start of the wait. Each
@@ -66,10 +74,6 @@ impl WaitTimer
 /// `now` reads the clock (`None` when it gives no reading; see the module doc for the
 /// fallback). `cond` is evaluated before each elapsed-time check, so a condition that
 /// already holds returns `true` without spinning.
-// dead_code: fires in riscv64 builds, whose arch code polls no hardware register
-// with a clock bound (the callers are the x86-64 `wait_icr_idle` and PIT poll); a
-// `target_arch` gate is not permitted outside an arch module (coding-standards § C).
-#[allow(dead_code)]
 pub fn spin_until(
     mut cond: impl FnMut() -> bool,
     mut now: impl FnMut() -> Option<u64>,

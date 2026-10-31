@@ -476,7 +476,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
     // RISC-V, whose PLIC and UART take their device memory type from the
     // platform PMAs). Bases come from `BootInfo.kernel_mmio` directly because
     // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
-    let mut mmio_regions = [(0u64, 0u64); 16];
+    let mut mmio_regions = [(0u64, 0u64); crate::arch::current::platform::MMIO_DIRECT_MAP_REGIONS];
     let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
         &info.kernel_mmio,
         &mut mmio_regions,

@@ -43,35 +43,44 @@
 //! tag under the lock and frees it only while the pool still records the dying
 //! space as its owner.
 
-/// Maximum number of tags the pool tracks. The configured count is
-/// `NUM_TAGS = min(hardware tags, TAG_CAP, slab-fit limit)` (see [`enable`]),
-/// sized from the hardware at boot, so this is just an upper bound on the static
-/// pool arrays and the per-CPU tag-state slab stride. Set to the x86-64 PCID
-/// maximum (4096) so all PCIDs are usable; RISC-V uses its detected ASID count.
-/// Memory: the pool's `owners`/`claimed_at` arrays are `TAG_CAP * 8` bytes each
-/// (~64 KiB total, in BSS), and the per-CPU slab is `NUM_TAGS * 16` bytes per
-/// CPU. `enable` additionally caps `NUM_TAGS` so the single slab allocation
-/// (`cpu_count * NUM_TAGS * 16`) fits the buddy's largest block, trimming the
-/// tag count on high-CPU-count machines instead of overflowing the allocator.
-pub const TAG_CAP: usize = 4096;
+/// Most hardware tags any supported CPU provides: RISC-V `satp.ASID` is 16 bits
+/// wide (x86-64 PCIDs are 12). Every tag fits the `u16` that
+/// `AddressSpace.tag` and the shootdown request carry, so this is a hardware
+/// bound, not a pool size: `enable` sizes the pool to the probed count.
+pub const MAX_HW_TAGS: usize = 1 << 16;
 
-/// Number of `u64` words in the in-use bitmap.
-const BITMAP_WORDS: usize = TAG_CAP / 64;
+/// Bytes the per-CPU tag-state records may take in total
+/// (`cpu_count * tags * size_of::<TagState>()`). `enable` trims the tag count
+/// to fit, down to the gate below which tagging stays off. It is a cost budget,
+/// not a capacity: a claim always succeeds (it evicts the least-recently-claimed
+/// inactive tag), so fewer tags only means more evictions and tag flushes.
+/// 8 MiB keeps every tag of a 12-bit PCID on up to 128 CPUs.
+pub const TAG_STATE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of pool storage [`TagPool::over`] needs for `num_tags` tags: the
+/// in-use bitmap, then the owner and claim-generation arrays.
+#[must_use]
+pub const fn pool_storage_bytes(num_tags: usize) -> usize
+{
+    num_tags.div_ceil(64) * 8 + num_tags * 8 + num_tags * 8
+}
 
 // ── Pure pool state ────────────────────────────────────────────────────────────
 
 /// The tag pool's pure bookkeeping: which tags are in use, who owns each, and
 /// when each was claimed. Separated from the global glue so it can be unit
-/// tested without a live `AddressSpace`.
+/// tested without a live `AddressSpace`. Its arrays live in storage sized to
+/// the configured tag count ([`TagPool::over`]); the pool before `enable` has
+/// none.
 struct TagPool
 {
-    /// Bit `t` set ⇒ tag `t` is in use. Tag 0 is never allocated.
-    in_use: [u64; BITMAP_WORDS],
+    /// Bit `t` set means tag `t` is in use. Tag 0 is never allocated.
+    in_use: &'static mut [u64],
     /// Owner badge per tag (an `*const AddressSpace` as `usize`; `0` = free).
-    owners: [usize; TAG_CAP],
+    owners: &'static mut [usize],
     /// `alloc_gen` value stamped when each tag was last claimed (`0` = free).
     /// Unique per claim, so it doubles as the least-recently-claimed key.
-    claimed_at: [u64; TAG_CAP],
+    claimed_at: &'static mut [u64],
     /// Number of usable tags; tags `1..num_tags` may be allocated.
     num_tags: usize,
     /// Monotonic claim counter; never reused (64-bit). A `u64` cannot wrap: at
@@ -81,25 +90,46 @@ struct TagPool
 
 impl TagPool
 {
-    // large_stack_arrays: this is the initializer for the `static mut TAG_POOL`,
-    // so the TAG_CAP-sized arrays live in BSS, not on the stack. The only stack
-    // instantiation is in the host unit tests, whose stacks are ample.
-    #[allow(clippy::large_stack_arrays)]
+    /// The pool before `enable`: no tags, no storage.
+    // dead_code: the only caller is the kernel's `TAG_POOL` initializer, which
+    // host test builds compile out (the tests build pools with `over`).
+    #[cfg_attr(test, allow(dead_code))]
     const fn new() -> Self
     {
         Self {
-            in_use: [0; BITMAP_WORDS],
-            owners: [0; TAG_CAP],
-            claimed_at: [0; TAG_CAP],
+            in_use: &mut [],
+            owners: &mut [],
+            claimed_at: &mut [],
             num_tags: 0,
             alloc_gen: 0,
         }
     }
 
-    /// Set the number of usable tags (clamped to `[0, TAG_CAP]`).
-    fn configure(&mut self, num_tags: usize)
+    /// A pool of `num_tags` tags (clamped to [`MAX_HW_TAGS`]) over the zeroed
+    /// `storage`, which must hold at least [`pool_storage_bytes`]`(num_tags)`
+    /// bytes; `None` when it does not.
+    fn over(storage: &'static mut [u64], num_tags: usize) -> Option<Self>
     {
-        self.num_tags = num_tags.min(TAG_CAP);
+        let n = num_tags.min(MAX_HW_TAGS);
+        if storage.len() * 8 < pool_storage_bytes(n)
+        {
+            return None;
+        }
+        let (in_use, rest) = storage.split_at_mut(n.div_ceil(64));
+        let (owners, rest) = rest.split_at_mut(n);
+        let (claimed_at, _) = rest.split_at_mut(n);
+        // SAFETY: `owners` is `n` initialised (zeroed) u64s, exclusively
+        // borrowed for 'static; `usize` has the size and alignment of `u64` on
+        // every 64-bit target, and zero is a valid `usize`.
+        let owners =
+            unsafe { core::slice::from_raw_parts_mut(owners.as_mut_ptr().cast::<usize>(), n) };
+        Some(Self {
+            in_use,
+            owners,
+            claimed_at,
+            num_tags: n,
+            alloc_gen: 0,
+        })
     }
 
     /// Allocate the next unique claim generation.
@@ -115,20 +145,25 @@ impl TagPool
         self.in_use[t / 64] & (1u64 << (t % 64)) != 0
     }
 
-    /// First free tag in `1..num_tags`, or `None` if the pool is full.
-    // cast_possible_truncation: t < num_tags <= TAG_CAP <= u16::MAX.
+    /// First free tag in `1..num_tags`, or `None` if the pool is full. Scans the
+    /// bitmap a word at a time, so a nearly full pool of 2^16 tags costs 1024
+    /// word reads, not 65536 bit tests.
+    // cast_possible_truncation: t < num_tags <= MAX_HW_TAGS, so t <= u16::MAX.
     #[allow(clippy::cast_possible_truncation)]
     fn find_free(&self) -> Option<u16>
     {
-        (1..self.num_tags)
-            .map(|t| t as u16)
-            .find(|&tag| !self.is_used(tag))
+        self.in_use.iter().enumerate().find_map(|(w, &word)| {
+            // Tag 0 is reserved: its bit always reads as used.
+            let word = if w == 0 { word | 1 } else { word };
+            let t = w * 64 + (!word).trailing_zeros() as usize;
+            (word != u64::MAX && t < self.num_tags).then_some(t as u16)
+        })
     }
 
     /// The in-use tag with the smallest `claimed_at` strictly greater than
     /// `floor`, with that `claimed_at`. Used to iterate eviction candidates
     /// least-recently-claimed first while skipping candidates already tried.
-    // cast_possible_truncation: t < num_tags <= TAG_CAP <= u16::MAX.
+    // cast_possible_truncation: t < num_tags <= MAX_HW_TAGS, so t <= u16::MAX.
     #[allow(clippy::cast_possible_truncation)]
     fn oldest_used_above(&self, floor: u64) -> Option<(u16, u64)>
     {
@@ -166,7 +201,7 @@ impl TagPool
     /// whether it did. A tag eviction has reissued to another space is left as
     /// recorded, so a release by a space that lost its tag cannot free the new
     /// owner's live tag; tag 0 (an untagged space) is never in use. `tag` must
-    /// be below [`TAG_CAP`] (every `AddressSpace.tag` value comes from the pool).
+    /// be below `num_tags` (every `AddressSpace.tag` value comes from the pool).
     fn release(&mut self, tag: u16, owner: usize) -> bool
     {
         let t = tag as usize;
@@ -181,6 +216,31 @@ impl TagPool
     }
 }
 
+/// The tag count [`enable`](glue::enable) configures for `hw_tags` hardware
+/// tags on `cpu_count` CPUs, or `None` when tagging stays off.
+///
+/// Usable tags are `1..n`; tagging needs strictly more of them than CPUs, so a
+/// claim always finds an inactive victim (core/kernel/docs/memory-internals.md
+/// § Context Switch TLB Handling). Within that gate the count is trimmed so the
+/// per-CPU tag state fits [`TAG_STATE_BUDGET_BYTES`], but never below the gate:
+/// the budget costs flushes, never the tagged path.
+#[must_use]
+pub fn tag_count(hw_tags: usize, cpu_count: usize) -> Option<usize>
+{
+    let cpus = cpu_count.max(1);
+    let hw = hw_tags.min(MAX_HW_TAGS);
+    let gate = cpus + 2;
+    if hw < gate
+    {
+        return None;
+    }
+    let fit = TAG_STATE_BUDGET_BYTES / (cpus * TAG_STATE_BYTES);
+    Some(hw.min(fit).max(gate))
+}
+
+/// Size of one per-CPU, per-tag record (`TagState`: two `u64` generations).
+const TAG_STATE_BYTES: usize = 16;
+
 // ── Global pool, lock, and per-CPU state (kernel-only) ──────────────────────────
 
 #[cfg(not(test))]
@@ -191,7 +251,7 @@ mod glue
 {
     use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-    use super::{TAG_CAP, TagPool};
+    use super::{TagPool, tag_count};
     use crate::mm::address_space::AddressSpace;
 
     /// The global tag pool. Accessed only through [`with_tag_pool`].
@@ -208,23 +268,22 @@ mod glue
     /// `TagPool::num_tags`); also the per-CPU tag-state slab stride.
     static NUM_TAGS: AtomicUsize = AtomicUsize::new(0);
 
+    /// Spin until `TAG_POOL_LOCK` is taken, halting if it stays held past
+    /// [`crate::bounded_wait::DEADLOCK_BUDGET_US`] of elapsed time.
     fn acquire_tag_pool_lock()
     {
-        let mut spins = 0u64;
-        while TAG_POOL_LOCK
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+        let acquired = crate::bounded_wait::spin_until(
+            || {
+                TAG_POOL_LOCK
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            },
+            crate::arch::current::timer::elapsed_us,
+            crate::bounded_wait::DEADLOCK_BUDGET_US,
+        );
+        if !acquired
         {
-            spins += 1;
-            if spins > 500_000
-            {
-                crate::kprintln!("[tag_alloc] DEADLOCK after {}k spins", spins / 1000);
-                loop
-                {
-                    core::hint::spin_loop();
-                }
-            }
-            core::hint::spin_loop();
+            crate::fatal("tag_allocator: TAG_POOL_LOCK held past the deadlock budget");
         }
     }
 
@@ -333,7 +392,8 @@ mod glue
     /// allocating the per-CPU tag-state slab for `cpu_count` CPUs.
     ///
     /// Call once on the BSP, before any AP runs a user thread. `hw_tags` is the
-    /// hardware tag count (`1 << PCID/ASID width`), clamped to [`TAG_CAP`].
+    /// hardware tag count (`1 << PCID/ASID width`); the pool takes the count
+    /// [`tag_count`] derives from it.
     ///
     /// Tagging is enabled only when the usable tag count (`n - 1`; tag 0 is
     /// reserved) strictly exceeds `cpu_count`, so [`claim`] never runs a user space
@@ -352,20 +412,11 @@ mod glue
         allocator: &mut crate::mm::BuddyAllocator,
     )
     {
-        // The per-CPU tag-state slab is one `cpu_count * n * size_of::<TagState>()`
-        // allocation, which must fit the buddy's largest single block
-        // (`2^MAX_ORDER` pages). Cap `n` so it always does — on a high-CPU-count
-        // machine this trims the tag count (down to the `< cpu_count + 2` gate,
-        // where tagging disables) rather than overflowing the allocator at boot.
-        let max_slab_bytes = (1usize << crate::mm::buddy::MAX_ORDER) * crate::mm::PAGE_SIZE;
-        let max_fit = max_slab_bytes / (cpu_count.max(1) * core::mem::size_of::<TagState>());
-        let n = hw_tags.min(TAG_CAP).min(max_fit);
-        // Usable tags are `1..n` (n - 1 of them); require strictly more than the
-        // CPU count so claim always succeeds (see the doc above).
-        if n < cpu_count + 2
+        let Some(n) = tag_count(hw_tags, cpu_count)
+        else
         {
             return;
-        }
+        };
 
         // Zero-filled slab: owner_gen 0 never matches a real tag_gen, so the
         // first activate of any tag on any CPU flushes it.
@@ -374,7 +425,15 @@ mod glue
             crate::sched::alloc_zeroed_slab::<TagState>(bytes, allocator, "PER_CPU_TAG_STATE");
         PER_CPU_TAG_STATE.store(slab, Ordering::Release);
 
-        with_tag_pool(|pool| pool.configure(n));
+        // The pool's arrays, sized to `n` tags; zeroed, so every tag starts free.
+        let pool_bytes = super::pool_storage_bytes(n);
+        let storage = crate::sched::alloc_zeroed_slab::<u64>(pool_bytes, allocator, "TAG_POOL");
+        // SAFETY: the slab is `pool_bytes` zeroed, 8-byte-aligned bytes owned
+        // by the tag pool for the kernel's lifetime.
+        let storage = unsafe { core::slice::from_raw_parts_mut(storage, pool_bytes / 8) };
+        let pool = TagPool::over(storage, n)
+            .unwrap_or_else(|| crate::fatal("tag_allocator: pool storage too small"));
+        with_tag_pool(|p| *p = pool);
         NUM_TAGS.store(n, Ordering::Release);
         TAGGING_ENABLED.store(true, Ordering::Release);
     }
@@ -419,7 +478,8 @@ mod glue
             // activating between selection and the active check (the least-recently-
             // claimed tag is almost always inactive, so the first pass succeeds in
             // practice).
-            let mut spins = 0u64;
+            let mut timer =
+                crate::bounded_wait::WaitTimer::start(crate::arch::current::timer::elapsed_us());
             loop
             {
                 let mut floor = 0u64;
@@ -467,14 +527,15 @@ mod glue
                 }
 
                 // A whole pass found every in-use tag transiently active. Given
-                // the gate this is a rare race, not exhaustion; retry. The guard
-                // mirrors the frame-allocator deadlock guard and fires only if
-                // the gate invariant is somehow violated.
-                spins += 1;
-                if spins > 10_000_000
+                // the gate this is a rare race, not exhaustion; retry. The bound
+                // is elapsed time, as for the pool lock, and fires only if the
+                // gate invariant is somehow violated.
+                if timer.elapsed(crate::arch::current::timer::elapsed_us())
+                    >= crate::bounded_wait::DEADLOCK_BUDGET_US
                 {
                     crate::fatal("tag_allocator: eviction found no inactive victim");
                 }
+                core::hint::spin_loop();
             }
         })
     }
@@ -507,11 +568,18 @@ mod tests
 {
     use super::*;
 
+    /// A pool of `n` tags over leaked, zeroed host storage.
+    fn pool_of(n: usize) -> TagPool
+    {
+        let words = pool_storage_bytes(n).div_ceil(8);
+        let storage: &'static mut [u64] = Vec::leak(vec![0u64; words]);
+        TagPool::over(storage, n).unwrap()
+    }
+
     #[test]
     fn find_free_skips_tag_zero_and_used()
     {
-        let mut pool = TagPool::new();
-        pool.configure(4); // tags 1..4 usable
+        let mut pool = pool_of(4); // tags 1..4 usable
         assert_eq!(pool.find_free(), Some(1));
         let g = pool.next_gen();
         pool.record(1, 0x1000, g);
@@ -526,7 +594,7 @@ mod tests
     #[test]
     fn gen_is_monotonic_and_unique()
     {
-        let mut pool = TagPool::new();
+        let mut pool = pool_of(2);
         assert_eq!(
             (pool.next_gen(), pool.next_gen(), pool.next_gen()),
             (1, 2, 3)
@@ -536,8 +604,7 @@ mod tests
     #[test]
     fn oldest_used_above_orders_by_claim_generation()
     {
-        let mut pool = TagPool::new();
-        pool.configure(4);
+        let mut pool = pool_of(4);
         // Claim 1, then 3, then 2 — claim order, not tag order, sets age.
         let g = pool.next_gen();
         pool.record(1, 0x1, g); // gen 1
@@ -557,8 +624,7 @@ mod tests
     #[test]
     fn release_by_owner_returns_tag_to_free_pool()
     {
-        let mut pool = TagPool::new();
-        pool.configure(3);
+        let mut pool = pool_of(3);
         let g = pool.next_gen();
         pool.record(1, 0x1, g);
         let g = pool.next_gen();
@@ -574,8 +640,7 @@ mod tests
     #[test]
     fn release_by_non_owner_leaves_tag_recorded()
     {
-        let mut pool = TagPool::new();
-        pool.configure(3);
+        let mut pool = pool_of(3);
         let g = pool.next_gen();
         pool.record(1, 0xA, g);
         // Eviction reissues tag 1 from space 0xA to space 0xB.
@@ -587,11 +652,46 @@ mod tests
         assert_eq!(pool.claimed_at[1], g);
     }
 
+    // Defect caught: a hidden fixed pool size (the former 4096) clipping a
+    // 16-bit ASID space, or a word scan that stops at the first full word.
     #[test]
-    fn configure_clamps_to_cap()
+    fn a_pool_sized_past_4096_hands_out_its_high_tags()
     {
-        let mut pool = TagPool::new();
-        pool.configure(TAG_CAP * 4);
-        assert_eq!(pool.num_tags, TAG_CAP);
+        let n = MAX_HW_TAGS;
+        let mut pool = pool_of(n);
+        for t in 1..n - 1
+        {
+            let tag = u16::try_from(t).unwrap();
+            pool.record(tag, t, 1);
+        }
+        assert_eq!(pool.find_free(), u16::try_from(n - 1).ok());
+        pool.record(u16::try_from(n - 1).unwrap(), 1, 1);
+        assert_eq!(pool.find_free(), None);
+    }
+
+    #[test]
+    fn storage_smaller_than_the_tag_count_needs_is_refused()
+    {
+        let storage: &'static mut [u64] = Vec::leak(vec![0u64; 4]);
+        assert!(TagPool::over(storage, 4096).is_none());
+    }
+
+    #[test]
+    fn tag_count_needs_more_usable_tags_than_cpus()
+    {
+        // 4 CPUs need 6 tags (5 usable after tag 0).
+        assert_eq!(tag_count(5, 4), None);
+        assert_eq!(tag_count(6, 4), Some(6));
+    }
+
+    #[test]
+    fn tag_count_trims_to_the_budget_but_never_below_the_gate()
+    {
+        // 4 CPUs, a 16-bit ASID: every tag fits the 8 MiB budget.
+        assert_eq!(tag_count(1 << 16, 4), Some(1 << 16));
+        // 512 CPUs, 12-bit PCID: the budget fits 1024 tags per CPU.
+        assert_eq!(tag_count(4096, 512), Some(1024));
+        // 2048 CPUs: the budget fits 256, below the gate, so the gate wins.
+        assert_eq!(tag_count(1 << 16, 2048), Some(2050));
     }
 }

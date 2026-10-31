@@ -32,6 +32,14 @@ use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(not(test))]
 static APS_READY: AtomicU32 = AtomicU32::new(0);
 
+/// Time one AP may take, from its start request to its `APS_READY` increment,
+/// before the BSP halts the boot naming it. A healthy AP answers in
+/// milliseconds; the budget covers a host that runs the guest's vCPUs at 32x
+/// oversubscription (the 512-vCPU boundary boot), where every step of the
+/// AP's bringup waits for a host core. It bounds no capacity.
+#[cfg(not(test))]
+const AP_ONLINE_BUDGET_US: u64 = 10_000_000;
+
 use boot_protocol::BootInfo;
 
 mod arch;
@@ -643,9 +651,23 @@ unsafe fn kernel_entry_post_rebase(
                         fatal("smp: start_ap failed; a listed CPU cannot be brought online");
                     }
 
-                    while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
+                    // Bounded in time, not spins: an AP that never answers
+                    // (an unacknowledged SIPI, a hart the SBI started into a
+                    // fault) halts the boot naming it instead of hanging it.
+                    let online = bounded_wait::spin_until(
+                        || APS_READY.load(Ordering::Acquire) >= cpu_idx as u32,
+                        arch::current::timer::elapsed_us,
+                        AP_ONLINE_BUDGET_US,
+                    );
+                    if !online
                     {
-                        core::hint::spin_loop();
+                        kprintln!(
+                            "smp: CPU {} (hardware id {:#x}) did not come online within {} ms",
+                            cpu_idx,
+                            hw_id,
+                            AP_ONLINE_BUDGET_US / 1_000
+                        );
+                        fatal("smp: a listed CPU did not come online");
                     }
                 }
 
@@ -1834,16 +1856,17 @@ unsafe fn panic_context_dump()
 /// them as probable return addresses (resolve offline with addr2line against the
 /// kernel ELF). Frame pointers are not forced (opt-level = 2 in both profiles;
 /// opt-level = 1 under `cargo xtask build --debug kernel`), so this is a heuristic
-/// scan, not an exact unwind. Bounded by
-/// `stack_top` (the thread's kernel-stack base) and a hard cap, and read-only, so
-/// it cannot fault during the panic.
+/// scan, not an exact unwind. Bounded by `stack_top` (the top of the thread's
+/// kernel stack), so it covers every live frame whatever the stack's size, and
+/// read-only, so it cannot fault during the panic; `MAX_HITS` caps the output.
+/// A stack pointer outside the thread's `KERNEL_STACK_PAGES` stack prints no
+/// scan.
 ///
 /// # Safety
 /// `stack_top` must be the current thread's `kernel_stack_top`.
 #[cfg(not(test))]
 unsafe fn backtrace_scan(stack_top: u64)
 {
-    const MAX_BYTES: usize = 8 * 1024;
     // A diagnostic output cap; it bounds no capacity.
     const MAX_HITS: usize = 24;
 
@@ -1854,9 +1877,14 @@ unsafe fn backtrace_scan(stack_top: u64)
 
     let text_start = core::ptr::addr_of!(__text_start) as usize;
     let text_end = core::ptr::addr_of!(__text_end) as usize;
-    let top = usize::try_from(stack_top)
-        .unwrap_or(usize::MAX)
-        .min(sp.saturating_add(MAX_BYTES));
+    let top = usize::try_from(stack_top).unwrap_or(usize::MAX);
+    // A panic taken on another stack (an IST stack, or the boot stack before
+    // the first thread runs) has no frames between `sp` and this thread's
+    // stack top; scanning that gap could read unmapped memory.
+    if sp >= top || top - sp > sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE
+    {
+        return;
+    }
     // SAFETY: panic path; lock-bypassing serial write.
     unsafe {
         console::panic_write_fmt(format_args!(

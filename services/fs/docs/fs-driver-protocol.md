@@ -493,8 +493,8 @@ entry of that name), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED` (the
 badge lacks `MUTATE_DIR`, or it carries none of `STAT`, `READ`, `WRITE`,
 and `EXEC`, so the new file's cap would carry no rights; the driver
 refuses before writing anything, and no entry is created),
-`TOO_MANY_OPEN` (the driver's node table is full; the entry was
-created).
+`TOO_MANY_OPEN` (the driver's node table is full or the heap cannot grow
+it; the entry was created).
 
 ---
 

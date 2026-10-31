@@ -78,7 +78,8 @@ carry no rights (a parent with none of the file rights) is refused with
 
 The driver's storage engine is a cluster allocator (`src/alloc.rs`), directory mutation
 (`src/dir.rs`), a write-through page cache of up to 128 slots taken on first use (`src/cache.rs`), a
-node table that dedupes by on-disk slot and recycles closed nodes (`src/backend.rs`), and a
+node table that dedupes by on-disk slot and recycles the nodes of removed or renamed entries
+(`src/backend.rs`), and a
 cooperative-release eviction worker (`src/eviction.rs`). Sectors are the device's logical blocks,
 512 to 4096 bytes. Each component's behavior is specified in
 [docs/storage-layout.md](docs/storage-layout.md).

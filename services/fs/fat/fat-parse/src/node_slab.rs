@@ -14,9 +14,11 @@
 //! a client that keeps using a cap after its file was removed gets "no such
 //! node", never the node that later reuses the index. An index whose
 //! generation would wrap is retired instead of reused. The table grows on
-//! the heap with the live entries, and every growth is fallible.
+//! the heap with the live entries, every growth fallible, and finds a key
+//! through a hash index in O(1) expected time.
 
 use alloc::vec::Vec;
+use core::hash::{Hash, Hasher};
 
 /// Bits of a node identifier holding the slab index plus one (0 is the
 /// root's identifier, which the slab never issues).
@@ -47,11 +49,22 @@ pub struct NodeSlab<K, T>
     /// Indices of freed slots whose generation has not wrapped. Its capacity
     /// is kept at least `slots.len()`, so a free never allocates.
     free: Vec<u32>,
-    /// Live entries as `(key, index)`, sorted by key, for deduplication.
-    by_key: Vec<(K, u32)>,
+    /// Key index for deduplication: an open-addressing hash table (linear
+    /// probing, backward-shift deletion) of slot indices, [`EMPTY`] in an
+    /// unused bucket. Its length is zero or a power of two, at least twice
+    /// the live entries, so a lookup or insert costs O(1) expected.
+    buckets: Vec<u32>,
+    /// Live entries.
+    len: usize,
 }
 
-impl<K: Ord + Copy, T> Default for NodeSlab<K, T>
+/// An unused bucket of [`NodeSlab::buckets`].
+const EMPTY: u32 = u32::MAX;
+
+/// Buckets of the first key index the slab allocates.
+const MIN_BUCKETS: usize = 16;
+
+impl<K: Hash + Eq + Copy, T> Default for NodeSlab<K, T>
 {
     fn default() -> Self
     {
@@ -59,7 +72,7 @@ impl<K: Ord + Copy, T> Default for NodeSlab<K, T>
     }
 }
 
-impl<K: Ord + Copy, T> NodeSlab<K, T>
+impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
 {
     #[must_use]
     pub const fn new() -> Self
@@ -67,7 +80,8 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
         Self {
             slots: Vec::new(),
             free: Vec::new(),
-            by_key: Vec::new(),
+            buckets: Vec::new(),
+            len: 0,
         }
     }
 
@@ -79,16 +93,15 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
     /// heap cannot grow the table.
     pub fn acquire(&mut self, key: K, make: impl FnOnce() -> T) -> Option<u64>
     {
-        let pos = match self.by_key.binary_search_by(|(k, _)| k.cmp(&key))
+        if let Some(bucket) = self.find(&key)
         {
-            Ok(pos) =>
-            {
-                let idx = self.by_key[pos].1;
-                return Some(identifier(idx, self.slots[idx as usize].generation));
-            }
-            Err(pos) => pos,
-        };
-        self.by_key.try_reserve(1).ok()?;
+            let idx = self.buckets[bucket];
+            return Some(identifier(idx, self.slots[idx as usize].generation));
+        }
+        if (self.len + 1) * 2 > self.buckets.len()
+        {
+            self.grow()?;
+        }
         let idx = if let Some(idx) = self.free.pop()
         {
             idx
@@ -112,8 +125,10 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
         };
         let slot = &mut self.slots[idx as usize];
         slot.entry = Some((key, make()));
-        self.by_key.insert(pos, (key, idx));
-        Some(identifier(idx, slot.generation))
+        let generation = slot.generation;
+        self.place(&key, idx);
+        self.len += 1;
+        Some(identifier(idx, generation))
     }
 
     /// The value `id` names, while the entry it was issued for is live.
@@ -135,8 +150,10 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
     /// issued for it stops resolving.
     pub fn remove_key(&mut self, key: &K) -> Option<T>
     {
-        let pos = self.by_key.binary_search_by(|(k, _)| k.cmp(key)).ok()?;
-        let (_, idx) = self.by_key.remove(pos);
+        let bucket = self.find(key)?;
+        let idx = self.buckets[bucket];
+        self.unplace(bucket);
+        self.len -= 1;
         let slot = &mut self.slots[idx as usize];
         let (_, value) = slot.entry.take()?;
         // Retire an index whose generation would wrap: reissuing generation 0
@@ -154,14 +171,117 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
     #[must_use]
     pub fn len(&self) -> usize
     {
-        self.by_key.len()
+        self.len
     }
 
     /// Whether the slab holds no live entry.
     #[must_use]
     pub fn is_empty(&self) -> bool
     {
-        self.by_key.is_empty()
+        self.len == 0
+    }
+
+    /// The key of the live slot `idx`.
+    fn key_of(&self, idx: u32) -> Option<&K>
+    {
+        self.slots[idx as usize].entry.as_ref().map(|(k, _)| k)
+    }
+
+    /// The bucket `key` hashes to in a table of `mask + 1` buckets.
+    fn home(key: &K, mask: usize) -> usize
+    {
+        let mut h = Fnv1a(FNV_OFFSET);
+        key.hash(&mut h);
+        // Cast is range-safe: the result is masked to a bucket index.
+        #[allow(clippy::cast_possible_truncation)]
+        let home = h.finish() as usize & mask;
+        home
+    }
+
+    /// The bucket holding `key`'s slot index, if `key` is live.
+    fn find(&self, key: &K) -> Option<usize>
+    {
+        if self.buckets.is_empty()
+        {
+            return None;
+        }
+        let mask = self.buckets.len() - 1;
+        let mut b = Self::home(key, mask);
+        loop
+        {
+            let idx = self.buckets[b];
+            if idx == EMPTY
+            {
+                return None;
+            }
+            if self.key_of(idx) == Some(key)
+            {
+                return Some(b);
+            }
+            b = (b + 1) & mask;
+        }
+    }
+
+    /// Record live slot `idx` under `key` in the first free bucket of its
+    /// probe run. The table has room: it is at least twice the live entries.
+    fn place(&mut self, key: &K, idx: u32)
+    {
+        let mask = self.buckets.len() - 1;
+        let mut b = Self::home(key, mask);
+        while self.buckets[b] != EMPTY
+        {
+            b = (b + 1) & mask;
+        }
+        self.buckets[b] = idx;
+    }
+
+    /// Empty bucket `hole`, shifting each later entry of its probe run back
+    /// into it when the entry's home does not lie between the hole and it, so
+    /// every live key stays reachable from its home without tombstones.
+    fn unplace(&mut self, mut hole: usize)
+    {
+        let mask = self.buckets.len() - 1;
+        self.buckets[hole] = EMPTY;
+        let mut b = (hole + 1) & mask;
+        loop
+        {
+            let idx = self.buckets[b];
+            if idx == EMPTY
+            {
+                return;
+            }
+            let start = self.key_of(idx).map_or(b, |k| Self::home(k, mask));
+            // Distance from home to b, and from home to the hole, along the
+            // probe direction.
+            let from_home = b.wrapping_sub(start) & mask;
+            let to_hole = hole.wrapping_sub(start) & mask;
+            if to_hole <= from_home
+            {
+                self.buckets[hole] = idx;
+                self.buckets[b] = EMPTY;
+                hole = b;
+            }
+            b = (b + 1) & mask;
+        }
+    }
+
+    /// Double the key index (or allocate its first [`MIN_BUCKETS`]) and
+    /// rehash the live entries into it; `None` when the heap cannot hold it.
+    fn grow(&mut self) -> Option<()>
+    {
+        let size = (self.buckets.len() * 2).max(MIN_BUCKETS);
+        let mut table = Vec::new();
+        table.try_reserve_exact(size).ok()?;
+        table.resize(size, EMPTY);
+        let old = core::mem::replace(&mut self.buckets, table);
+        for idx in old.into_iter().filter(|&i| i != EMPTY)
+        {
+            if let Some(key) = self.key_of(idx).copied()
+            {
+                self.place(&key, idx);
+            }
+        }
+        Some(())
     }
 
     /// The slot index `id` names, when its generation is the slot's current
@@ -172,6 +292,30 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
         let generation = id >> INDEX_BITS;
         let slot = self.slots.get(idx)?;
         (u64::from(slot.generation) == generation && slot.entry.is_some()).then_some(idx)
+    }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a over the key's bytes: the key index's hash. Keys are on-disk slot
+/// positions the driver reads, not client-chosen bytes, so the hash needs
+/// no keying against collision floods.
+struct Fnv1a(u64);
+
+impl Hasher for Fnv1a
+{
+    fn finish(&self) -> u64
+    {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8])
+    {
+        for &b in bytes
+        {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FNV_PRIME);
+        }
     }
 }
 
@@ -242,6 +386,36 @@ mod tests
         let next = slab.acquire(1, || 1).expect("room");
         assert_ne!(next & INDEX_MASK, first & INDEX_MASK);
         assert_eq!(slab.get(first), None);
+    }
+
+    #[test]
+    fn interleaved_inserts_and_removals_keep_every_live_key_reachable()
+    {
+        // Enough keys to grow the index several times and to wrap probe runs;
+        // removals in a scattered order exercise the backward shift.
+        let mut slab: NodeSlab<(u32, usize), u32> = NodeSlab::new();
+        let mut live = std::collections::BTreeMap::new();
+        for i in 0..2000u32
+        {
+            let key = (i.wrapping_mul(2_654_435_761) % 997, (i % 16) as usize * 32);
+            let id = slab.acquire(key, || i).expect("room");
+            live.entry(key).or_insert((id, i));
+            if i % 3 == 0
+            {
+                let gone = (i.wrapping_mul(40_503) % 997, (i % 7) as usize * 32);
+                if let Some((gid, _)) = live.remove(&gone)
+                {
+                    assert!(slab.remove_key(&gone).is_some());
+                    assert_eq!(slab.get(gid), None);
+                }
+            }
+        }
+        assert_eq!(slab.len(), live.len());
+        for (key, (id, v)) in &live
+        {
+            assert_eq!(slab.get(*id), Some(v), "key {key:?}");
+            assert_eq!(slab.acquire(*key, || u32::MAX), Some(*id));
+        }
     }
 
     #[test]

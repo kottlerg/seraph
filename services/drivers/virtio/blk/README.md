@@ -206,11 +206,13 @@ that chain, polling and parking on the IRQ notification, for at most
 50 seconds. The depth of 1 is the design: the service loop receives one
 request, waits for its completion, and replies before it receives the next,
 so the virtqueue is sized to one three-descriptor chain (four descriptors,
-one ring page). A request the device loses, by timing out or by publishing a
-used-ring element the virtqueue refuses (an id heading no outstanding
-chain) or one naming another chain, may still be
-in flight, so its Memory cap cannot go back while the device can still
-DMA into or out of it. The driver resets the device first: once the
+one ring page). A device whose queue cannot hold three descriptors is
+refused at setup: the driver logs and exits.
+
+A request the device loses, by timing out or by publishing a used-ring
+element the virtqueue refuses (an id heading no outstanding chain) or one
+naming another chain, may still be in flight, so its Memory cap cannot go
+back while the device can still DMA into or out of it. The driver resets the device first: once the
 reset is acknowledged, the device no longer accesses the virtqueue or
 the buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies
 `DEVICE_FAULT` with the cap moved back, and fails stop: every later read

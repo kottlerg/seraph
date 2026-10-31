@@ -99,9 +99,12 @@ fn node_key(loc: DirEntryLocation) -> NodeKey
 pub struct NodeTable
 {
     slab: NodeSlab<NodeKey, FatNode>,
-    /// Open-file slots of nodes [`Self::invalidate_for_loc`] freed, which the
-    /// dispatch loop releases under the open-file table's lock.
-    orphaned_open_slots: Vec<u32>,
+    /// Open-file slot of the node [`Self::invalidate_for_loc`] last freed,
+    /// which the dispatch loop releases under the open-file table's lock
+    /// after the request. One request frees at most one node (its
+    /// `FS_REMOVE` or `FS_RENAME` unlinks one entry), so one slot suffices
+    /// and holding it allocates nothing.
+    orphaned_open_slot: Option<u32>,
 }
 
 impl NodeTable
@@ -110,7 +113,7 @@ impl NodeTable
     {
         Self {
             slab: NodeSlab::new(),
-            orphaned_open_slots: Vec::new(),
+            orphaned_open_slot: None,
         }
     }
 
@@ -160,32 +163,26 @@ impl NodeTable
     /// stops resolving, and a follow-on `FS_CREATE` that lands at the same
     /// disk slot gets a fresh node rather than the stale one. The freed
     /// node's open-file slot, if it had one, is kept for
-    /// [`Self::take_orphaned_open_slots`].
+    /// [`Self::take_orphaned_open_slot`].
     pub fn invalidate_for_loc(&mut self, loc: DirEntryLocation)
     {
         if let Some(node) = self.slab.remove_key(&node_key(loc))
             && node.open_slot != NO_OPEN_SLOT
         {
-            if self.orphaned_open_slots.try_reserve(1).is_ok()
-            {
-                self.orphaned_open_slots.push(node.open_slot);
-            }
-            else
-            {
-                std::os::seraph::log!(
-                    "no memory to release open-file slot {} of a removed node",
-                    node.open_slot
-                );
-            }
+            debug_assert!(
+                self.orphaned_open_slot.is_none(),
+                "two nodes freed by one request"
+            );
+            self.orphaned_open_slot = Some(node.open_slot);
         }
     }
 
-    /// The open-file slots of nodes removed or renamed away since the last
-    /// call, for the dispatch loop to release: no cap resolves to their nodes
-    /// any more, so no `FS_CLOSE` would reach them.
-    pub fn take_orphaned_open_slots(&mut self) -> Vec<u32>
+    /// The open-file slot of the node a removal or rename freed since the
+    /// last call, for the dispatch loop to release: no cap resolves to the
+    /// node any more, so no `FS_CLOSE` would reach it.
+    pub fn take_orphaned_open_slot(&mut self) -> Option<u32>
     {
-        core::mem::take(&mut self.orphaned_open_slots)
+        self.orphaned_open_slot.take()
     }
 
     /// Update the cluster and size fields of a non-root node entry.

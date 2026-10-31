@@ -416,8 +416,9 @@ pub fn free_cluster_chain(
 /// `u32::MAX` sentinel; the allocator falls back to scanning from
 /// cluster 2.
 ///
-/// A failed read or a signature mismatch is logged and treated as "no
-/// `FSInfo` sector": the hints stay at the sentinel and `fsinfo_sector`
+/// A failed read, a signature mismatch, or no memory for the sector
+/// buffer is logged and treated as "no `FSInfo` sector": the hints stay at
+/// the sentinel and `fsinfo_sector`
 /// is reset to `u32::MAX`, so [`flush_fsinfo`] never writes hints into a
 /// sector that is not an `FSInfo` sector. The allocator still operates
 /// from the FAT itself.

@@ -253,24 +253,24 @@ pub fn collect_partitions(
             }),
         };
     }
-    let sector = &mut block[..block_size];
-    let entries_per_sector = header.block_size / header.entry_size;
+    let block_buf = &mut block[..block_size];
+    let entries_per_block = header.block_size / header.entry_size;
     let mut remaining = header.num_parts;
     let mut lba = header.part_entry_lba;
     while remaining > 0
     {
-        if !read_block(lba, sector)
+        if !read_block(lba, block_buf)
         {
             return PartitionScan {
                 entries,
                 stop: Some(ScanStop::ReadFailed { lba }),
             };
         }
-        let in_sector = remaining.min(entries_per_sector);
-        for e in 0..in_sector
+        let in_block = remaining.min(entries_per_block);
+        for e in 0..in_block
         {
             let off = (e * header.entry_size) as usize;
-            if let Some(entry) = parse_entry(&sector[off..])
+            if let Some(entry) = parse_entry(&block_buf[off..])
             {
                 if entries.try_reserve(1).is_err()
                 {
@@ -282,7 +282,7 @@ pub fn collect_partitions(
                 entries.push(entry);
             }
         }
-        remaining -= in_sector;
+        remaining -= in_block;
         if remaining == 0
         {
             break;

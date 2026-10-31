@@ -444,8 +444,9 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 }
 
 /// Spawn a non-PCI platform device driver with a minimal capability set: a
-/// RECV-rights copy of `service_ep` plus the device's arch authority cap
-/// (`hw_cap`). Unlike [`spawn_driver`] there is no BAR or IRQ.
+/// RECV-rights copy of `service_ep`, the device's arch authority cap
+/// (`hw_cap`), and an optional IRQ cap (`irq_cap`, the serial UART's).
+/// Unlike [`spawn_driver`] there is no BAR.
 ///
 /// `devmgr_query_ep` is an optional badged SEND on devmgr's
 /// registry-query endpoint, delivered as a round-2 cap so the driver can

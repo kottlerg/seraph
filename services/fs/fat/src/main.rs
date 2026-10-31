@@ -997,8 +997,8 @@ fn release_open_file(files: &mut [OpenFile], slot: u32, cache: &PageCache)
     *file = OpenFile::empty();
 }
 
-/// Release the open-file slots of nodes an `FS_REMOVE` or `FS_RENAME` freed
-/// ([`NodeTable::take_orphaned_open_slots`]), under the open-file lock the
+/// Release the open-file slot of the node an `FS_REMOVE` or `FS_RENAME` freed
+/// ([`NodeTable::take_orphaned_open_slot`]), under the open-file lock the
 /// eviction worker shares.
 fn release_orphaned_open_files(
     nodes: &mut NodeTable,
@@ -1006,16 +1006,13 @@ fn release_orphaned_open_files(
     cache: &PageCache,
 )
 {
-    let orphaned = nodes.take_orphaned_open_slots();
-    if orphaned.is_empty()
+    let Some(slot) = nodes.take_orphaned_open_slot()
+    else
     {
         return;
-    }
+    };
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    for slot in orphaned
-    {
-        release_open_file(&mut files_g, slot, cache);
-    }
+    release_open_file(&mut files_g, slot, cache);
 }
 
 // ── Write / mutation handlers ──────────────────────────────────────────────

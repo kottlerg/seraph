@@ -206,9 +206,9 @@ fn find_in_fat16_root(
 /// Like [`find_in_directory`], but also returns the on-disk location of
 /// the matching 8.3 entry, used by callers that intend to patch the
 /// entry's metadata fields (`size`, `first_cluster`) later. `None`
-/// covers a failed directory or FAT read and a corrupt or cyclic chain
-/// as well as an absent name, so its callers reply `NOT_FOUND` in each
-/// case.
+/// covers a failed directory or FAT read, a corrupt or cyclic chain, and
+/// no memory for a sector buffer as well as an absent name, so its callers
+/// reply `NOT_FOUND` in each case.
 pub fn find_in_directory_with_location(
     dir_cluster: u32,
     name: &[u8],

@@ -111,12 +111,13 @@ logd.
 
 ## Wait-set
 
-logd's main loop waits on a 2-member `WaitSet`:
+logd's main loop waits on a 3-member `WaitSet`:
 
 | Badge | Source | Purpose |
 |---|---|---|
 | `WS_BADGE_LOG` (0) | RECV on the master log endpoint | `STREAM_BYTES` / `STREAM_REGISTER_NAME` arrivals |
 | `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained per loop iteration before service dispatch |
+| `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | the resync helper thread's walk has ended (§ Death-queue resync) |
 
 Death events are drained inside every loop iteration (before
 servicing the log endpoint) so a recently-died sender's slot is
@@ -144,7 +145,44 @@ catches them up.
 logd's drain consumes each event as
 `(process_badge as u32) << 32 | exit_reason` and evicts the
 matching slot from the hash-keyed badge table. Idempotent on
-already-evicted badges.
+already-evicted badges. procmgr keeps the low 32 bits unique among live
+processes, so a death evicts only the dead sender's slot.
+
+## Death-queue resync
+
+logd's death `EventQueue` has a fixed tuning capacity (`DEATH_EQ_CAPACITY`,
+128), not one sized from any process count. The kernel drops a post to a full
+queue, which would leave that sender's slot unevicted. A drain that takes a full
+queue's worth of events or more may have followed such a drop (a dropped post
+leaves a full queue of events behind it for that drain or the next), so it starts
+a resync:
+
+1. logd snapshots the badges of its child slots: every badge at or above
+   `log_badges::LOG_BADGE_FIRST_CHILD`, which only procmgr-spawned children
+   carry.
+2. A helper thread walks procmgr's live badges with
+   [`QUERY_LIVE_PROCESSES`](../../procmgr/docs/ipc-interface.md) through the
+   `DEATH_EQ_AUTHORITY` cap, page by page, checking that each page ascends past
+   the cursor, sends the list back over a channel, and signals the resync
+   notification.
+3. On that wake the main thread evicts every snapshot badge the walk did not
+   list. A slot created after the snapshot is no candidate, so a sender that
+   starts during the walk keeps its slot. A failed walk evicts nothing.
+
+One walk runs at a time. A drain that crosses the capacity while one is in
+flight marks another due, and it starts as soon as the current walk ends, so the
+deaths dropped during a walk are covered by the next one.
+
+logd's main thread never calls procmgr after startup. `seraph::log!` is a
+synchronous `ipc_call` on the master log endpoint, so while procmgr logs it is
+blocked until logd's main thread receives; a call from that thread to procmgr at
+the same moment would leave each blocked on the other, with no receiver on
+either endpoint. The walk therefore runs on the helper thread, and the main
+thread keeps receiving procmgr's log calls throughout; procmgr answers the walk
+whether or not it logs meanwhile. The one call the main thread makes,
+`REGISTER_DEATH_EQ`, precedes the handover pull, before procmgr has a reason to
+log to real-logd (see [handover-protocol.md](handover-protocol.md) § Startup
+ordering).
 
 ---
 

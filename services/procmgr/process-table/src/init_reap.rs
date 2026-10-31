@@ -215,6 +215,36 @@ impl<T> Default for InitReap<T>
     }
 }
 
+/// Retry `attempt` until it succeeds or `budget_ns` of `now_ns` time has
+/// passed since the first try, calling `pause` between tries. Returns whether
+/// an attempt succeeded.
+///
+/// The bound is wall-clock time, not a count of tries, so a loaded system
+/// that stretches each pause does not exhaust it early; the first try always
+/// runs, whatever the budget. procmgr's init reap waits out the release of
+/// init's `CSpace` with it.
+pub fn poll_within(
+    budget_ns: u64,
+    mut now_ns: impl FnMut() -> u64,
+    mut attempt: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> bool
+{
+    let start = now_ns();
+    loop
+    {
+        if attempt()
+        {
+            return true;
+        }
+        if now_ns().saturating_sub(start) >= budget_ns
+        {
+            return false;
+        }
+        pause();
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -323,5 +353,66 @@ mod tests
     fn death_with_no_open_handoff_is_ignored()
     {
         assert_eq!(InitReap::<u32>::new().death(), DeathOutcome::Ignored);
+    }
+
+    #[test]
+    fn poll_within_outlasts_any_try_count_until_the_budget_is_spent()
+    {
+        // The clock advances one unit per pause: 10_000 tries fit a budget of
+        // 10_000 units, far past the former 64-try bound.
+        let clock = core::cell::Cell::new(0u64);
+        let mut tries = 0u32;
+        let ok = poll_within(
+            10_000,
+            || clock.get(),
+            || {
+                tries += 1;
+                tries == 10_000
+            },
+            || clock.set(clock.get() + 1),
+        );
+        assert!(ok);
+        assert_eq!(tries, 10_000);
+    }
+
+    #[test]
+    fn poll_within_gives_up_once_the_budget_has_passed()
+    {
+        let clock = core::cell::Cell::new(0u64);
+        let mut tries = 0u32;
+        let ok = poll_within(
+            5,
+            || clock.get(),
+            || {
+                tries += 1;
+                false
+            },
+            || clock.set(clock.get() + 2),
+        );
+        assert!(!ok);
+        // Tries at t = 0, 2, 4, 6; the check after the fourth sees 6 >= 5.
+        assert_eq!(tries, 4);
+    }
+
+    #[test]
+    fn poll_within_tries_once_on_a_zero_budget()
+    {
+        let mut tries = 0u32;
+        assert!(!poll_within(
+            0,
+            || 7,
+            || {
+                tries += 1;
+                false
+            },
+            || {}
+        ));
+        assert_eq!(tries, 1);
+        assert!(poll_within(
+            0,
+            || 7,
+            || true,
+            || panic!("no pause after success")
+        ));
     }
 }

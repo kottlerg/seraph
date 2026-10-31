@@ -49,9 +49,10 @@ svcmgr/
 │   └── arch/                      # Per-arch halt() entry
 ├── svc-defs/                      # `svcmgr-defs` crate: host-tested `.svc`
 │                                  # Definition types, parser, argv/env
-│                                  # wire-blob encoder (`build_blob`), and
-│                                  # the `cwd_rights` / `handover_permitted`
-│                                  # decisions
+│                                  # wire-blob encoder (`build_blob`), the
+│                                  # `cwd_rights` / `handover_permitted`
+│                                  # decisions, and the windowed
+│                                  # `RestartBudget`
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see
@@ -98,8 +99,12 @@ svcmgr/
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
 - **Health monitoring** — bind every supervised service's main
   thread to one shared `deaths_eq` with `correlator =
-  service_index`. Detect crashes via async notifications
-  ([docs/restart-protocol.md](docs/restart-protocol.md) § Death detection).
+  service_index`. Detect crashes via async notifications, resyncing from
+  the kernel's thread states after a drain that may have followed a full
+  queue ([docs/restart-protocol.md](docs/restart-protocol.md) § Death
+  detection). The service table, its restart recipes, the pending
+  registrations, and the discovery registry all grow on the heap, with no
+  fixed count.
 - **Restart management** — on detected crash, route through
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
   re-spawn the service from the recorded recipe. The `.svc` file is the
@@ -224,11 +229,12 @@ tree.
 ## Restart policy
 
 Each `.svc` carries `restart = never | on_failure | always`. Restarts
-are counted per service over its lifetime (no window, no reset). Once
-`MAX_RESTARTS` (currently `1`) restarts have run, the service's next
-death leaves it permanently down — degraded, or a graceful shutdown for
-`critical = yes`. See
-[docs/restart-protocol.md](docs/restart-protocol.md).
+are budgeted per window: three (`RESTART_BURST`) within one 60 s window
+(`RESTART_WINDOW_NS`), held per service in a `RestartBudget` from the
+`svc-defs` crate. A death once the open window's restarts are spent leaves
+the service permanently down — degraded, or a graceful shutdown for
+`critical = yes`; a service that crashes less often restarts every time.
+See [docs/restart-protocol.md](docs/restart-protocol.md).
 
 ---
 

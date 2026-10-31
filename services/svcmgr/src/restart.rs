@@ -18,13 +18,12 @@
 //! log and procmgr endpoints arrive via `ProcessInfo`, so they are not part
 //! of the restart cap set.
 
-use crate::REGISTRY_CAPACITY;
 use crate::definitions::launch::{
     LaunchKind, assemble_boot_caps, delete_caps, mint_logd_boot_caps, resolve_seeds,
     serve_boot_slots,
 };
 use crate::definitions::{build_blob, cwd_rights};
-use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
+use crate::service::{POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
@@ -301,7 +300,7 @@ pub fn handle_death(
     ctx: &RestartCtx,
     correlator: u32,
     recipe: Option<&RestartRecipe>,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 ) -> DeathOutcome
 {
     std::os::seraph::log!("service died: {}", svc.name_str());
@@ -354,8 +353,8 @@ fn permanent_death_outcome(svc: &ServiceEntry) -> DeathOutcome
 }
 
 /// Determine whether a service should be restarted based on its policy and
-/// restart count.
-fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
+/// its windowed restart budget, charging the budget when it is restarted.
+fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
 {
     let restart = match svc.restart_policy
     {
@@ -370,15 +369,15 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
         return false;
     }
 
-    if svc.restart_count >= MAX_RESTARTS
+    if svc.vfs_path.is_empty()
     {
-        std::os::seraph::log!("max restarts reached");
+        std::os::seraph::log!("no restart source (vfs_path), cannot restart");
         return false;
     }
 
-    if svc.vfs_path_len == 0
+    if !svc.restart_budget.try_charge(crate::now_ns())
     {
-        std::os::seraph::log!("no restart source (vfs_path), cannot restart");
+        std::os::seraph::log!("restart budget spent for this window");
         return false;
     }
 
@@ -394,7 +393,7 @@ fn restart_process(
     ctx: &RestartCtx,
     correlator: u32,
     recipe: Option<&RestartRecipe>,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 ) -> bool
 {
     // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
@@ -493,7 +492,7 @@ fn restart_boot_caps(
     svc: &ServiceEntry,
     ctx: &RestartCtx,
     recipe: Option<&RestartRecipe>,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 ) -> Option<Vec<u32>>
 {
     if matches!(recipe, Some(r) if r.log_sink)
@@ -535,13 +534,12 @@ fn create_process(
     ctx: &RestartCtx,
 ) -> Option<(u32, u32, u64)>
 {
-    if svc.vfs_path_len == 0
+    if svc.vfs_path.is_empty()
     {
         std::os::seraph::log!("restart: no vfs_path source for {}", svc.name_str());
         return None;
     }
-    let path_bytes = &svc.vfs_path[..svc.vfs_path_len as usize];
-    let path_str = core::str::from_utf8(path_bytes).ok()?;
+    let path_str = svc.vfs_path.as_str();
     // Replay argv/env from the stored recipe so the respawned child gets the
     // same startup surfaces first launch built. The blobs must outlive the
     // create call — `StartupBlobs` borrows them.
@@ -642,14 +640,7 @@ pub fn apply_namespace_policy(
         }
         ipc::svcmgr_labels::NS_POLICY_SUBTREE =>
         {
-            let path = &svc.ns_subtree_path[..svc.ns_subtree_path_len as usize];
-            let Ok(path_str) = core::str::from_utf8(path)
-            else
-            {
-                std::os::seraph::log!("ns policy: subtree path not UTF-8");
-                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-                return false;
-            };
+            let path_str = svc.ns_subtree_path.as_str();
             match std::os::seraph::namespace_lookup_dir(
                 root_cap,
                 path_str,

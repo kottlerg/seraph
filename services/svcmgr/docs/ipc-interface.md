@@ -55,7 +55,7 @@ no change to the encoding.
 | slot 5 | `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.deny`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `9`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `10`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -81,7 +81,7 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | caps[0] | the service's main thread cap (Control right) for death-notification binding |
 | data[0] | `2` (`SUBSTRATE`) |
 | data[1] | `name_len` (byte length of the service name) |
-| data[2..] | service name bytes packed LE into `u64` words (≤ 32 bytes) |
+| data[2..] | service name bytes packed LE into `u64` words (`svcmgr_labels::pack_name`; at most `svcmgr_labels::NAME_MAX` = 64 bytes) |
 
 **Final round — `LOGD_SOURCES` (`data[0] = 3`, terminal):**
 
@@ -192,9 +192,9 @@ publisher MUST NOT publish a verb-bit cap through this label.
 |---|---|
 | `0` (`SUCCESS`) | Stored |
 | `UNAUTHORIZED` | Caller's badge lacks `PUBLISH_AUTHORITY` |
-| `INVALID_NAME` | `name_len` is 0 or exceeds `registry::NAME_MAX` |
+| `INVALID_NAME` | `name_len` is 0 or exceeds `svcmgr_labels::NAME_MAX` (64), or the message carries fewer name words than `name_len` needs |
 | `INSUFFICIENT_CAPS` | `caps[0]` missing or zero |
-| `REGISTER_REJECTED` | Registry is full or name already registered |
+| `REGISTER_REJECTED` | Name already registered, or svcmgr's heap cannot grow the registry |
 
 ### Label 4: `QUERY_ENDPOINT`
 
@@ -227,7 +227,7 @@ through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 | `0` (`SUCCESS`) | `[derived_send]` | Name resolved; cap transferred |
 | `UNKNOWN_NAME` | — | No mapping for `name`, or `name` is seed-only |
 | `INSUFFICIENT_CAPS` | — | Stored cap could not be derived (publisher gone); entry evicted |
-| `INVALID_NAME` | — | `name_len` is 0 or exceeds `registry::NAME_MAX` |
+| `INVALID_NAME` | — | `name_len` is 0 or exceeds `svcmgr_labels::NAME_MAX` (64), or the message carries fewer name words than `name_len` needs |
 
 ---
 
@@ -296,11 +296,10 @@ See [service-definitions.md](service-definitions.md#restart) for the
 | `POLICY_ON_FAILURE` | Restart only when `exit_reason >= EXIT_FAULT_BASE` |
 | `POLICY_ALWAYS` | Restart on every exit |
 
-Restarts are counted per service over its lifetime (no window, no
-reset). Once `MAX_RESTARTS` restarts have run, the service's next death
-leaves it permanently down — degraded, or a graceful shutdown for
-`critical = yes` — see
-[restart-protocol.md](restart-protocol.md).
+Restarts are budgeted per window (`svcmgr_defs::RestartBudget`: three per
+60 s). A death once the open window's restarts are spent leaves the service
+permanently down — degraded, or a graceful shutdown for `critical = yes` —
+see [restart-protocol.md](restart-protocol.md).
 
 ---
 

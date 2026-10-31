@@ -1408,9 +1408,9 @@ whose ack-waits cover every CPU's slice expiries starves all stamps and
 false-fires the detector (the dump's serial output then stalls the acks it
 misdiagnosed). The BSP `timer_tick` increments a global tick counter and
 fires if every CPU's last dispatch is older than
-`WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed ~1 ms tick).
+`WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at `ticks_per_second()`).
 
-**2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_TICKS` ≈ 0.5 s).** Detects a single
+**2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_MS`, 0.5 s).** Detects a single
 `Blocked` thread whose wake is provably owed but never arrived — the lost-wakeup wedge signature
 (#375), invisible to the all-idle check whenever any other thread keeps any CPU busy. Walks the
 live-thread registry reading each thread's fields under its `sched_lock`, try-locked (a thread whose
@@ -1424,7 +1424,8 @@ wake survived the park commit that must consume it). The `wake_in_flight` rule e
 as the dealloc gate (#160), so it is steady-state there rather than an in-flight wake — a client
 parked in a long blocking RPC (a console read held by its server until input arrives) must not fire
 the rule. The deadline rule is debounced by its grace window; the other two must persist across two
-consecutive scans (`OWED_WAKE_LAST`) so a legitimately mid-wake observation cannot false-positive.
+consecutive scans (`OWED_WAKE_LAST`, keyed by TCB pointer) so a legitimately mid-wake observation
+cannot false-positive.
 Indefinite waits (endpoint recv loops, reply waits) match no rule. Each park commit stamps
 `park_started_tick` for the age checks.
 

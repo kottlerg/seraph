@@ -211,7 +211,12 @@ pub fn take_reschedule_pending(cpu: usize) -> bool
 // Mechanism, cost, and limitations are specified in
 // core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
 
-const WATCHDOG_THRESHOLD_TICKS: u64 = 3_000; // ~3 s at the observed ~1 ms BSP tick.
+/// All-idle softlockup threshold: the detector fires when no CPU has dispatched
+/// a non-idle thread for this long. Converted to BSP ticks at
+/// `ticks_per_second()` ([`ticks_for_ms`]), so it holds at any tick rate. A
+/// tuning threshold; it bounds no capacity.
+#[cfg(not(test))]
+const WATCHDOG_THRESHOLD_SECONDS: u64 = 3;
 
 /// Base pointer for the `[AtomicU64; cpu_count]` per-CPU last-non-idle-tick
 /// array allocated in [`init_per_cpu_storage`]. Slot `cpu` records the global
@@ -260,10 +265,21 @@ fn watchdog_claim_dump() -> bool
         .is_ok()
 }
 
-/// Cadence of the owed-wake and AP-silence detector scans, in BSP ticks
-/// (~0.5 s at the observed ~1 ms tick).
+/// Cadence of the owed-wake and AP-silence detector scans, in milliseconds,
+/// converted to BSP ticks at `ticks_per_second()` ([`ticks_for_ms`]). A tuning
+/// threshold; it bounds no capacity.
 #[cfg(not(test))]
-const DETECTOR_SCAN_INTERVAL_TICKS: u64 = 512;
+const DETECTOR_SCAN_INTERVAL_MS: u64 = 500;
+
+/// `ms` milliseconds in BSP timer ticks at the timer's `ticks_per_second()`,
+/// never 0: before the timer is calibrated the rate reads 0, and a zero
+/// interval or threshold would fire (or divide) on every tick.
+#[cfg(not(test))]
+fn ticks_for_ms(ms: u64) -> u64
+{
+    let tps = crate::arch::current::timer::ticks_per_second();
+    (ms.saturating_mul(tps) / 1000).max(1)
+}
 
 /// Grace period before a `Blocked` thread's owed wake is considered lost and
 /// before a silent timer heartbeat is considered stalled. The heartbeat
@@ -322,13 +338,15 @@ const CS_SPIN_WARN_US: u64 = 100_000;
 static WAKE_PENDING_CLEAR_TRIPPED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Owed-wake suspects `(thread_id, rule)` recorded by the previous scan, for
-/// the two-scan persistence requirement of the `wake_in_flight` /
-/// `wake_pending` rules. BSP-only access from `owed_wake_scan` (CPU0 timer
+/// Owed-wake suspects `(tcb, rule)` recorded by the previous scan, for the
+/// two-scan persistence requirement of the `wake_in_flight` / `wake_pending`
+/// rules. Keyed by TCB pointer, which no two live threads share (the random
+/// `thread_id` can collide); the pointer is only compared, never dereferenced. BSP-only access from `owed_wake_scan` (CPU0 timer
 /// context behind an interrupt gate, non-reentrant) — the same single-writer
 /// CPU0-static idiom as `EXPIRED_SCRATCH`.
 #[cfg(not(test))]
-static mut OWED_WAKE_LAST: [(u32, u8); OWED_WAKE_MAX] = [(0, 0); OWED_WAKE_MAX];
+static mut OWED_WAKE_LAST: [(*mut ThreadControlBlock, u8); OWED_WAKE_MAX] =
+    [(core::ptr::null_mut(), 0); OWED_WAKE_MAX];
 /// Number of live entries in [`OWED_WAKE_LAST`].
 #[cfg(not(test))]
 static mut OWED_WAKE_LAST_COUNT: usize = 0;
@@ -805,7 +823,7 @@ fn watchdog_tick_and_check()
     }
 
     // Coarse-cadence detectors first; each claims the shared latch itself.
-    if now.is_multiple_of(DETECTOR_SCAN_INTERVAL_TICKS)
+    if now.is_multiple_of(ticks_for_ms(DETECTOR_SCAN_INTERVAL_MS))
     {
         owed_wake_scan();
         ap_silence_check(cpu_count);
@@ -816,6 +834,7 @@ fn watchdog_tick_and_check()
     }
 
     // All CPUs must have last_dispatch older than threshold.
+    let threshold = ticks_for_ms(WATCHDOG_THRESHOLD_SECONDS.saturating_mul(1000));
     for cpu in 0..cpu_count
     {
         let Some(slot) = last_non_idle_tick(cpu)
@@ -824,7 +843,7 @@ fn watchdog_tick_and_check()
             return;
         };
         let last = slot.load(core::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(last) < WATCHDOG_THRESHOLD_TICKS
+        if now.saturating_sub(last) < threshold
         {
             return;
         }
@@ -865,7 +884,7 @@ fn owed_wake_scan()
     }
     let grace = WEDGE_GRACE_SECONDS.saturating_mul(tps);
 
-    let mut suspects = [(0u32, 0u8); OWED_WAKE_MAX];
+    let mut suspects = [(core::ptr::null_mut::<ThreadControlBlock>(), 0u32, 0u8); OWED_WAKE_MAX];
     let mut count = 0usize;
     let collect = |t: *mut ThreadControlBlock| {
         if count >= OWED_WAKE_MAX
@@ -928,7 +947,7 @@ fn owed_wake_scan()
         {
             return;
         };
-        suspects[count] = (tid, rule);
+        suspects[count] = (t, tid, rule);
         count += 1;
     };
     // SAFETY: the closure registers and unregisters no thread, and the only
@@ -942,12 +961,12 @@ fn owed_wake_scan()
     }
 
     let mut fire: Option<(u32, u8)> = None;
-    for &(tid, rule) in suspects.iter().take(count)
+    for &(t, tid, rule) in suspects.iter().take(count)
     {
         // SAFETY: CPU0-static idiom — single writer/reader (this function, on
         // the BSP, behind an interrupt gate).
         let persistent = rule == OWED_RULE_EXPIRED_DEADLINE
-            || unsafe { OWED_WAKE_LAST[..OWED_WAKE_LAST_COUNT].contains(&(tid, rule)) };
+            || unsafe { OWED_WAKE_LAST[..OWED_WAKE_LAST_COUNT].contains(&(t, rule)) };
         if persistent
         {
             fire = Some((tid, rule));
@@ -957,7 +976,11 @@ fn owed_wake_scan()
 
     // SAFETY: CPU0-static idiom as above.
     unsafe {
-        OWED_WAKE_LAST[..count].copy_from_slice(&suspects[..count]);
+        let last = &mut *core::ptr::addr_of_mut!(OWED_WAKE_LAST);
+        for (entry, &(t, _, rule)) in last.iter_mut().zip(&suspects[..count])
+        {
+            *entry = (t, rule);
+        }
         OWED_WAKE_LAST_COUNT = count;
     }
 

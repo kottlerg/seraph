@@ -222,9 +222,9 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 512 (`boot_protocol::MAX_CPUS`) | ABI width (boot protocol) | see the per-CPU rows | needs a design | See the boot section |
 | `TICK_HEARTBEAT`, `SPIN_SITE`, `LOCK_WAIT_KIND`, `LOCK_WAIT_WORD`, `CPU_SYSCALL_NR` | `core/kernel/src/sched/mod.rs` | `[_; MAX_CPUS]` | ABI width (`MAX_CPUS`) | about 16 KiB BSS | make pay-as-you-go | Move into the per-CPU slab (#636) |
 | `stop_threads_bound_to` `prod` | `core/kernel/src/sched/mod.rs` | `[bool; MAX_CPUS]` | ABI width (`MAX_CPUS`) | 512 B kernel stack | make pay-as-you-go | Use a `CpuMask` (#636) |
-| `WATCHDOG_THRESHOLD_TICKS`, `DETECTOR_SCAN_INTERVAL_TICKS` | `core/kernel/src/sched/mod.rs` | 3000 / 512 ticks | unknown (assumes a 1 ms tick) | none | needs a design | Express in seconds times `ticks_per_second()` |
+| `WATCHDOG_THRESHOLD_SECONDS`, `DETECTOR_SCAN_INTERVAL_MS` | `core/kernel/src/sched/mod.rs` | 3 s / 500 ms, converted at `ticks_per_second()` | tuning (a diagnostic threshold at any tick rate) | none | correct as is | None |
 | `WEDGE_GRACE_SECONDS` | `core/kernel/src/sched/mod.rs` | 8, scaled per 128 CPUs | tuning (scales with CPU count) | none | correct as is | None |
-| `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | 64 B BSS | needs a design | Keyed by a random `u32` thread id; key by TCB pointer |
+| `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8, keyed by TCB pointer | diagnostic output cap | 128 B BSS | correct as is | None |
 | `WATCHDOG_SLEEP_ENTRIES` | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | about 128 B stack | correct as is | None |
 | `CS_SPIN_WARN_US` | `core/kernel/src/sched/mod.rs` | 100 000 us | diagnostic threshold | none | correct as is | None |
 | `LOAD_BALANCE_IMBALANCE_THRESHOLD` | `core/kernel/src/sched/mod.rs` | 2 | tuning | none | correct as is | None |

@@ -784,14 +784,26 @@ pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `event_queue_create(EVENT_QUEUE_MAX_CAPACITY + 1)` must return
-/// `InvalidArgument` (see core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_Q`).
+/// `event_queue_create(EVENT_QUEUE_MAX_CAPACITY + 1)`, and an observer count
+/// past the same ceiling, must return `InvalidArgument` (see
+/// core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_Q`).
 pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 {
-    let err = event_queue_create(ctx.memory_base, 4097);
+    let err = event_queue_create(ctx.memory_base, syscall_abi::EVENT_QUEUE_MAX_CAPACITY + 1);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("event_queue_create(4097) did not return InvalidArgument");
+        return Err("event_queue_create(MAX + 1) did not return InvalidArgument");
+    }
+    let err = syscall::event_queue_create_observed(
+        ctx.memory_base,
+        1,
+        syscall_abi::EVENT_QUEUE_MAX_CAPACITY + 1,
+    );
+    if err != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err(
+            "event_queue_create_observed(observers MAX + 1) did not return InvalidArgument",
+        );
     }
     Ok(())
 }

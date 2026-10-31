@@ -2518,7 +2518,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
-| `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
+| `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
 | `BOOT_PROTOCOL_VERSION` | 14 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

@@ -517,9 +517,16 @@ pub const PRIORITY_MAX: u8 = 30;
 
 // ── Event Queue constants ─────────────────────────────────────────────────────
 
-/// Maximum capacity (entry count) for an event queue created via
-/// `SYS_CAP_CREATE_EVENT_Q`. Must be in the range `1..=EVENT_QUEUE_MAX_CAPACITY`.
-pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 4096;
+/// Maximum capacity (entry count), and maximum death-observer node count, for
+/// an event queue created via `SYS_CAP_CREATE_EVENT_Q`: capacity in
+/// `1..=EVENT_QUEUE_MAX_CAPACITY`, observers in `0..=EVENT_QUEUE_MAX_CAPACITY`.
+///
+/// The ring and the node pool are caller-funded per queue, so the ceiling
+/// protects no shared pool. It bounds the work one create does in the kernel
+/// before returning, which zeroes the ring and links every node: at 2^20 that
+/// is at most 16 MiB of ring and 24 MiB of nodes. A supervisor that needs more
+/// splits its observers across queues, so the bound only splits work.
+pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 1 << 20;
 
 // ── Message constants ─────────────────────────────────────────────────────────
 

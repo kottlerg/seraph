@@ -320,7 +320,7 @@ generation by [#637](https://github.com/kottlerg/seraph/issues/637).
 | `MSG_DATA_WORDS_MAX` | `abi/syscall/src/lib.rs` | 64 | ABI width (IPC buffer layout) | about 550 B per TCB | correct as is | Bulk data moves through Memory caps (#36, #40) |
 | IPC buffer layout | `abi/syscall/src/lib.rs` | data words 0..64, count at 64, handles 65..69, in one page | ABI width | 4 KiB per thread | correct as is | None |
 | `CAP_INDEX_BITS + 8 <= 32` assert | `abi/syscall/src/lib.rs` | compile time | ABI width | none | correct as is | Keep |
-| `EVENT_QUEUE_MAX_CAPACITY` | `abi/syscall/src/lib.rs` | 4096 | unknown (the ring is caller-funded) | none | raise | A supervisor watching more deaths drops posts; raise to the retype limit |
+| `EVENT_QUEUE_MAX_CAPACITY` | `abi/syscall/src/lib.rs` | 2^20 entries and observer nodes | per-call bound (one create zeroes the ring and links the nodes in the kernel; the queue is caller-funded) | none | correct as is | More is had with more queues |
 | `PRIORITY_MIN`, `PRIORITY_MAX` | `abi/syscall/src/lib.rs` | 1 / 30 | ABI width (32-level mask: 0 idle, 31 reserved) | none | correct as is | None (#215) |
 | `MAX_GETRANDOM_LEN` | `abi/syscall/src/lib.rs` | 256 B | per-call bound (callers loop; it bounds the interrupts-off window) | 256 B stack | correct as is | None |
 | `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` | `abi/syscall/src/lib.rs` | 512 pages | per-call bound on the `frame_map` scan | none | raise | A Memory cap over 2 MiB is refused; take an offset window |

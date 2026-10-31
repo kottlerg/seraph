@@ -1663,7 +1663,8 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 
 // ── Event Queue wrappers ──────────────────────────────────────────────────────
 
-/// Retype a Memory cap into a new `EventQueue` with the given capacity (1..=4096)
+/// Retype a Memory cap into a new `EventQueue` with the given capacity
+/// (`1..=EVENT_QUEUE_MAX_CAPACITY`)
 /// and no death-observer nodes; [`event_queue_create_observed`] adds them.
 ///
 /// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE`; the wrapper, state, and ring

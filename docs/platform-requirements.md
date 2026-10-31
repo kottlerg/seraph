@@ -270,8 +270,10 @@ budget in TSC ticks expires.
 Independent of the feature classification, the kernel imposes fixed platform limits:
 
 - **Page size** is 4 KiB ([memory-model.md](memory-model.md)).
-- **Maximum RAM** is approximately 248 GiB. The kernel's boot-time direct-map pool is a fixed-size
-  table sized for that ceiling; a platform with more RAM is refused at boot
+- **Maximum RAM** is what the paging mode's kernel half can direct-map: 128 TiB under x86-64
+  4-level paging and riscv64 Sv48, 254 GiB under Sv39 ([memory-model.md](memory-model.md)); a
+  platform whose RAM reaches past it is refused at boot. No kernel table bounds RAM below that:
+  the Phase 3 page tables come from a carve of RAM sized to the machine
   (`core/kernel/src/mm/paging.rs`).
 - **CPU count** is at most `boot_protocol::MAX_CPUS` (512); CPUs beyond it are not brought up.
 - **riscv64 vector length** is at most VLEN 512 (`MAX_VLENB`); a wider boot hart is refused at boot.

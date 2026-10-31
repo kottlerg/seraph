@@ -64,7 +64,7 @@ rather than proceed with a mismatched structure (see
 | Interrupts | Disabled (`IF` = 0) |
 | Direction flag | Clear (`DF` = 0) |
 | Paging | Enabled; kernel mapped at intended virtual addresses |
-| Stack | Valid: the handoff stack, `HANDOFF_STACK_BYTES` (64 KiB, `boot_protocol::layout`), page-aligned, with the stack pointer inside it |
+| Stack | Valid; at least `HANDOFF_STACK_BYTES` (64 KiB, `boot_protocol::layout`) available |
 | `rdi` | Physical address of `BootInfo` structure |
 | Floating point | Not initialised; kernel must not use SSE/AVX before enabling |
 | GDT | UEFI firmware's (bootloader installs none); kernel replaces it in Phase 5 |
@@ -77,7 +77,7 @@ rather than proceed with a mismatched structure (see
 | Privilege level | Supervisor mode |
 | Interrupts | Disabled (`sstatus.SIE` = 0) |
 | MMU | Enabled under the negotiated paging mode (Sv39/Sv48/Sv57, recoverable from `satp.MODE`); kernel mapped at intended virtual addresses |
-| Stack | Valid: the handoff stack, `HANDOFF_STACK_BYTES` (64 KiB, `boot_protocol::layout`), page-aligned, with the stack pointer inside it |
+| Stack | Valid; at least `HANDOFF_STACK_BYTES` (64 KiB, `boot_protocol::layout`) available |
 | `a0` | Physical address of `BootInfo` structure |
 | `a1` | Hart ID of the booting hart (obtained via `EFI_RISCV_BOOT_PROTOCOL`; 0 when the protocol is absent or its call fails) |
 | Floating point | Not initialised |

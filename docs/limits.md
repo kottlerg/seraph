@@ -134,7 +134,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `DEFAULT_INIT_INFO_VA`, `DEFAULT_INIT_STACK_TOP` | `core/kernel/src/mm/address_space.rs` | fixed VAs under the Sv39 user top | encoding artefact (fallback layout) | none | correct as is | Not a count |
 | `INIT_MAX_SEGMENTS` RELRO split | `core/kernel/src/mm/init_reloc.rs` | 8 | ABI width (boot protocol) | none | correct as is | A split past 8 is a clean error |
 | `kernel_pt_pool` seed | `core/kernel/src/mm/kernel_pt_pool.rs` | 64 pages (`POOL_SEED_PAGES`), never returned | current peak plus headroom | 256 KiB | needs a design | Also the fallback for address spaces with no donation; confirm it is unreachable after boot |
-| x86_64 4-level paging (`user_va_top`) | `core/kernel/src/arch/x86_64/paging.rs` | user 128 TiB, kernel half 128 TiB | hardware spec (4-level paging; LA57 not yet implemented) | none | raise | Below the #177 target of 526 TB; decided: opportunistic LA57, as riscv64 Sv57 (docs/platform-requirements.md) |
+| x86_64 4-level paging (`user_va_top`) | `core/kernel/src/arch/x86_64/paging.rs` | user 128 TiB, kernel half 128 TiB | hardware spec (4-level paging; LA57 not yet implemented) | none | raise | Below the #177 target of 526 TB; decided: opportunistic LA57, as riscv64 Sv57 (docs/platform-requirements.md); tracked by #675 |
 | `PerCpuData`, `CPU_APIC_IDS` slabs | `core/kernel/src/percpu.rs` | `cpu_count`-sized | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x about 76 B | correct as is | Already pay-as-you-go |
 | `CPU_APIC_IDS` element | `core/kernel/src/percpu.rs` | `u32` | ABI width (`BootInfo.cpu_ids`; x2APIC IDs are 32-bit) | 4 B per CPU | correct as is | riscv64 `mhartid` is XLEN-wide; a hart id above 2^32 is refused |
 | `PerCpuData.cpu_id`, `preempt_count` | `core/kernel/src/percpu.rs` | `u32` | provably unreachable (CPUs and nesting are far below 2^32) | embedded | correct as is | None |
@@ -219,7 +219,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `MAX_SLEEPING` (`SLEEP_LIST`, `EXPIRED_SCRATCH`) | `core/kernel/src/sched/mod.rs` | 128 | current peak plus headroom | about 5 KiB BSS | needs a design | Caps sleepers and timed IPC waits system-wide; intrusive per-CPU deadline structure |
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |
 | `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning | none | correct as is | None |
-| `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget (call depth unaudited) | 4 pages per thread, caller-funded | needs a design | Audit kernel call depth and the stack locals that scale with `MAX_CPUS` (#636) |
+| `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget (call depth unaudited) | 4 pages per thread, caller-funded | needs a design | Measure the kernel call depth and state the bound at the constant (#676) |
 | `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 512 (`boot_protocol::MAX_CPUS`) | ABI width (boot protocol) | see the per-CPU rows | needs a design | See the boot section |
 | Watchdog breadcrumbs (`CpuDiag`, `CPU_DIAG_PTR`) | `core/kernel/src/sched/mod.rs` | `cpu_count`-sized slab | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x 32 B | correct as is | Already pay-as-you-go |
 | `stop_threads_bound_to` `prod` | `core/kernel/src/sched/mod.rs` | `[bool; MAX_CPUS]` | ABI width (`MAX_CPUS`) | 512 B kernel stack | make pay-as-you-go | Use a `CpuMask` (#636) |
@@ -350,7 +350,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 | `InitInfo` size assert | `abi/init-protocol/src/lib.rs` | at most `INIT_INFO_MAX_PAGES` pages | ABI width | none | correct as is | Also assert the header fits page 1 |
 | `MAX_MODULES` (`ModulesLoad.modules`) | `core/boot/src/main.rs` | 16 | current peak plus headroom (8 in use) | 768 B stack | raise | The output page holds 85; unify with `INIT_MAX_NAMED_MODULES` (#183) |
 | `MEM_MAP_ENTRY_PAGES` | `core/boot/src/main.rs` | 4 (about 682 entries) | unknown | 16 KiB, reclaimed | raise | `translate_memory_map` truncates silently; size from the firmware count |
-| `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget (the kernel runs its boot phases on this stack; depth unaudited) | 64 KiB | needs a design | Audit with the kernel stack (#636) |
+| `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget (the kernel runs its boot phases on this stack; depth unaudited) | 64 KiB | needs a design | Measure with the kernel stack (#676); its size is the shared `HANDOFF_STACK_BYTES` |
 | `MAX_IDENTITY_REGIONS` | `core/boot/src/main.rs` | 64 | provably unreachable (`MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 at most) | 1 KiB stack | correct as is | Pin the sum with a const assert |
 | `MAX_APERTURE_SEEDS` | `core/boot/src/main.rs` | 64 | unknown | 1 KiB stack | raise | Silent drop past `out.len()` |
 | `MAX_HEURISTIC_SEEDS` | `core/boot/src/main.rs` | 16 | current peak plus headroom | 256 B stack | raise | More than about 7 MCFG segments drop windows |

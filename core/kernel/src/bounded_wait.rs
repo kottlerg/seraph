@@ -12,10 +12,9 @@
 //! allocator and tag-pool lock waits, the tag eviction retry, and the boot's wait for each
 //! AP to come online; raw TSC ticks for the x86-64 PIT calibration poll. When the clock
 //! gives no reading (the timer is not yet calibrated), the elapsed time is estimated from
-//! the spin count at
-//! [`MAX_SPINS_PER_UNIT`]. That estimate is never larger than the true time on any
-//! plausible CPU, so the fallback can wait longer than the budget but never times out
-//! early.
+//! the spin count at [`MAX_SPINS_PER_UNIT`]. That estimate is never larger than the true
+//! time on any plausible CPU, so the fallback can wait longer than the budget but never
+//! times out early.
 
 /// Upper bound on spin iterations per clock unit, used to estimate elapsed time when the
 /// clock gives no reading. One iteration is at least one cycle, and 10 000 cycles per

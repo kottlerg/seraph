@@ -242,7 +242,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
 - Stream every reclaimable Memory cap init solely owns (ELF segments,
   user stack pages, `InitInfo` pages, the bootloader/bundle reclaim
   ranges, the AP-trampoline memory cap, the boot-module ELF sources, the
-  usable-RAM caps that did not fit the bootstrap round, and
+  usable-RAM caps the bootstrap round did not forward (past memmgr's
+  `CSpace` headroom), and
   `MemoryAlloc`'s orphaned remainders) to procmgr in further
   `REGISTER_INIT_TEARDOWN` rounds, then send `INIT_TEARDOWN_DONE`
   (`finish_init_reap_handoff` in `../src/service.rs`). The usable-RAM

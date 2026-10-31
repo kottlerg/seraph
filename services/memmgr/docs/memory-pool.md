@@ -20,7 +20,8 @@ Capability Distribution" and
 §"Ownership Boundaries"). Memory cap sizes vary — they reflect the firmware
 memory map and may span many MiB each. Init copies the RAM caps left after its
 own bootstrap allocations into memmgr's CSpace via the derive-twice pattern
-(every one while memmgr's CSpace keeps the headroom init leaves it), forwards
+(every one while both memmgr's CSpace and init's own keep the headroom init
+reserves in each), forwards
 the memmgr/procmgr/init bootstrap arenas as in-use runs, and transfers the slot
 range `(memory_base, memory_count)` to memmgr in its bootstrap IPC round; any
 RAM caps init did not forward join the pool through the init-reap donation
@@ -82,8 +83,11 @@ becomes the arena page. A run stays owned and counted in `pool_total` but out
 of circulation only when that page cannot be carved: both arena zones are
 spent, the split of its first page fails, or the page cannot be mapped
 (memmgr's page tables cannot be funded). A run a growth path takes from the
-pool and cannot use goes back without a fresh node: into the node its take
-freed, or merged back into the remainder its split left.
+pool and cannot use goes back without growing the arena: merged back into
+the remainder its split left, else into a free node, either the one its take
+freed or one node the arena keeps in reserve for these returns. Such a run
+stays out of circulation only when it has no remainder to merge into and the
+reserve is spent by an earlier return the arena could not yet replace.
 
 ---
 
@@ -153,7 +157,8 @@ memmgr's address space, that grows one page of buckets at a time from the pool.
 Linear hashing splits one bucket per step once the mean chain length passes
 two, so the array only ever appends and lookup stays constant-time on average;
 when the window is spent, buckets stop splitting and chains lengthen, which
-costs lookup time and bounds no capacity. `REGISTER_PROCESS` returns
+costs lookup time and bounds no capacity. The window's base is fixed, not
+drawn per boot like the arena's: the array holds only arena indices. `REGISTER_PROCESS` returns
 `TOO_MANY_PROCESSES` only when the record's node cannot be allocated: system
 RAM is exhausted.
 
@@ -395,5 +400,7 @@ terminal fault tears down the whole process (see
 ## Summarized By
 
 [abi/process-abi/README.md](../../../abi/process-abi/README.md),
+[Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md), [services/memmgr/README.md](../README.md),
-[memmgr IPC Interface](ipc-interface.md)
+[memmgr IPC Interface](ipc-interface.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md)

@@ -92,10 +92,11 @@ so procmgr's deletion of the last one at the reap frees it and releases those ca
 Init creates memmgr's `AddressSpace`, `CSpace`, and `Thread` via raw
 syscalls. It loads memmgr's ELF (from a boot module Memory cap), maps
 the segments into memmgr's address space, populates memmgr's
-`ProcessInfo`, copies the RAM Memory caps left after init's own bootstrap
-allocations into memmgr's CSpace using derive-twice (every one while memmgr's
-CSpace keeps the headroom the caps that must ride the round need; the
-remainder reaches memmgr via the init-reap donation), forwards the
+`ProcessInfo`, copies the RAM Memory caps left after init's own
+bootstrap allocations into memmgr's CSpace using derive-twice (every one
+while memmgr's CSpace and init's own keep the headroom the caps that
+must ride the round, and init's later bootstrap, need; the remainder
+reaches memmgr via the init-reap donation), forwards the
 memmgr/procmgr/init bootstrap arenas as in-use runs, and starts memmgr's
 thread (`finalize_memmgr`).
 

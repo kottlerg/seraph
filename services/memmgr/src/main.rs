@@ -333,11 +333,23 @@ fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
         })
 }
 
+/// Free arena slots [`ensure_slots`] keeps beyond what its caller asks for,
+/// for [`return_taken`] alone. A growth path that takes a run and cannot use
+/// it returns the run while the arena may be full; one return per growth
+/// attempt reaches this slot (a nested page-table funding return merges back
+/// into its split remainder or reuses the node its own take freed), so one
+/// slot is enough.
+const ARENA_RETURN_RESERVE: u64 = 1;
+
 /// Hand one selected entry back to the pool without growing the arena (the
-/// callers run when the arena may have no free slot): into a free slot when
-/// there is one (an exact take freed its own), else merged back into the
-/// remainder of the split that produced it. Only when both fail does the run
-/// stay owned and counted in `pool_total` but out of circulation.
+/// callers run when the arena may have no free slot): first merged back into
+/// the remainder of the split that produced it, which needs no slot and so
+/// leaves a slot an enclosing take freed for that take's own return; else
+/// into a free slot (the node an exact take freed, or the
+/// [`ARENA_RETURN_RESERVE`] slot). The run stays owned and counted in
+/// `pool_total` but out of circulation only if both fail: no remainder to
+/// merge into, and the reserve spent by an earlier return the arena could not
+/// yet replace (the arena itself could not grow in between).
 fn return_taken(l: &mut MemLedger, cap_slot: u32, pages: u32, phys_base: u64)
 {
     let run = FreeRun {
@@ -345,9 +357,9 @@ fn return_taken(l: &mut MemLedger, cap_slot: u32, pages: u32, phys_base: u64)
         page_count: u64::from(pages),
         phys_base,
     };
-    if let Err(run) = l.pool.push(&mut l.arena, run)
+    if !l.pool.absorb_front(&mut l.arena, run, merge)
     {
-        let _ = l.pool.absorb_front(&mut l.arena, run, merge);
+        let _ = l.pool.push(&mut l.arena, run);
     }
 }
 
@@ -439,11 +451,12 @@ fn arena_grow(l: &mut MemLedger) -> bool
     true
 }
 
-/// Grow the arena until it has `n` free slots. `false` when it cannot (RAM
-/// exhausted or the arena's zones spent).
+/// Grow the arena until it has `n` free slots beyond the
+/// [`ARENA_RETURN_RESERVE`]. `false` when it cannot (RAM exhausted or the
+/// arena's zones spent).
 fn ensure_slots(l: &mut MemLedger, n: u64) -> bool
 {
-    while l.arena.free_count() < n
+    while l.arena.free_count() < n + ARENA_RETURN_RESERVE
     {
         if !arena_grow(l)
         {

@@ -159,7 +159,9 @@ windows of its own, places its process-index bucket array in a fixed
 deterministic window (it holds only arena indices), and continues its
 arena above 2^38 in a paging mode whose user half allows it, while init's
 short-lived bootstrap scratch stays deterministic (init exits at reap and
-serves no untrusted input).
+serves no untrusted input). memmgr's windows are specified in
+[`services/memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md)
+§ Metadata Arena and § Per-Process Tracking.
 
 ### Bootstrap Cross-Boundary VAs
 

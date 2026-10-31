@@ -163,7 +163,7 @@ Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round that
 names them by slot range only (`ipc::memmgr_bootstrap`); memmgr reads each
 cap's size and physical base from the kernel (`cap_info`), so the round bounds
 neither the cap count nor a cap's size. Init forwards every remaining RAM cap
-while memmgr's `CSpace` keeps the headroom the `MemoryAlloc` tail, the
+while memmgr's `CSpace` and its own keep the headroom the `MemoryAlloc` tail, the
 phys-table page, and the in-use arenas need (they have no `InitInfo`
 descriptor and must ride this round). Any RAM caps beyond that are not lost:
 init donates them at its reap, and procmgr forwards them to memmgr's pool via

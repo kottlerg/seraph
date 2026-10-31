@@ -152,8 +152,11 @@ The page-reservation allocator is a `std::sys::seraph` concern and is
 not exposed to non-std runtimes. `init` and `memmgr` carry small
 private VA choices for whatever scratch regions they need; memmgr draws
 its metadata-arena and phys-table scratch bases per boot from fixed
-windows of its own, while init's short-lived bootstrap scratch stays
-deterministic (init exits at reap and serves no untrusted input).
+windows of its own, places its process-index bucket array in a fixed
+deterministic window (it holds only arena indices), and continues its
+arena above 2^38 in a paging mode whose user half allows it, while init's
+short-lived bootstrap scratch stays deterministic (init exits at reap and
+serves no untrusted input).
 
 ### Bootstrap Cross-Boundary VAs
 

@@ -79,8 +79,11 @@ the run's node in place, so reclamation never allocates and cannot fail. When
 the arena has no free node and the pool cannot fund an arena page, the
 returned run funds it itself: its first page (all of it, for a one-page run)
 becomes the arena page. A run stays owned and counted in `pool_total` but out
-of circulation only if that page cannot be mapped (memmgr's page tables
-cannot be funded).
+of circulation only when that page cannot be carved: both arena zones are
+spent, the split of its first page fails, or the page cannot be mapped
+(memmgr's page tables cannot be funded). A run a growth path takes from the
+pool and cannot use goes back without a fresh node: into the node its take
+freed, or merged back into the remainder its split left.
 
 ---
 

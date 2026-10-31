@@ -1009,9 +1009,20 @@ fn push_free_run(src_cap: u32, mm_cspace: u32, base: &mut u32, count: &mut u32)
 
 /// General slots of memmgr's `CSpace` the bootstrap forwarding leaves free:
 /// room for the `MemoryAlloc` tail, the phys-table page, and the in-use arenas
-/// (which must ride the round), and for memmgr's own splits before its first
-/// self-funded `CSpace` top-up. Twice memmgr's own low-water mark.
+/// (which must ride the round), and for the splits memmgr makes while it
+/// ingests the pool, before its first receive tops its `CSpace` up from its
+/// own pool. A few dozen slots cover those; the margin is deliberate.
 const MEMMGR_FORWARD_HEADROOM: u64 = 512;
+
+/// General slots of init's own root `CSpace` the bootstrap forwarding leaves
+/// free. Each forwarded RAM cap keeps its full-rights intermediary in init's
+/// `CSpace`, which init never augments, so the forward stops here and the
+/// remaining caps reach memmgr at init's reap. The reserve covers what init
+/// still mints after the loop: the `MemoryAlloc` tail and phys-table page
+/// forwards, the in-use arena forwards, the phys-table read-only derive, and
+/// the rest of init's bootstrap (procmgr's and svcmgr's endowments, the reap
+/// hand-off).
+const INIT_FORWARD_HEADROOM: u64 = 512;
 
 /// Free slots of `cspace` a general allocation may take: capacity less
 /// populated slots less the IPC receive reserve. Zero when the queries fail.
@@ -1066,11 +1077,6 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
 /// run — its keep-alive moves to memmgr's pool copy, and after memmgr reads it
 /// through the read-only `caps[1]` derivation the page becomes allocatable like
 /// any other.
-// similar_names: the parallel payload arrays and their cursors are named for
-// what they index (`mm_memory_base` / `mm_memory_count`, `in_use` /
-// `in_use_count`). too_many_lines: the payload is built in one pass over
-// those arrays, whose cursors every step advances.
-#[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
@@ -1083,7 +1089,8 @@ pub fn finalize_memmgr(
     // The bootstrap round names the forwarded RAM caps by slot range only
     // (memmgr reads each cap's size and physical base from the kernel), so it
     // carries every remaining RAM cap while memmgr's `CSpace` keeps
-    // [`MEMMGR_FORWARD_HEADROOM`] general slots. A cap past that headroom, or one
+    // [`MEMMGR_FORWARD_HEADROOM`] general slots and init's own keeps
+    // [`INIT_FORWARD_HEADROOM`]. A cap past either headroom, or one
     // the copy cannot take, ends the forwarded prefix; that cap and every later
     // one reach memmgr's pool through the reap donation
     // (`finish_init_reap_handoff` → procmgr → `DONATE_MEMORY_CAPS`) instead.
@@ -1100,6 +1107,7 @@ pub fn finalize_memmgr(
         // reap route donate this memory cap and everything after it.
         if descriptor_for(info, src_slot).is_none()
             || cspace_general_headroom(mm.mm_cspace) < MEMMGR_FORWARD_HEADROOM
+            || cspace_general_headroom(info.cspace_cap) < INIT_FORWARD_HEADROOM
         {
             break;
         }
@@ -1225,8 +1233,8 @@ pub fn finalize_memmgr(
 }
 
 /// Write memmgr's bootstrap aux (phys-table) page from `mm_final`: the
-/// per-free-run physical bases, the kernel's immutable RAM-accounting facts
-/// (from `info`), and the in-use bootstrap arena descriptors. The layout is
+/// kernel's immutable RAM-accounting facts (from `info`) and the in-use
+/// bootstrap arena descriptors. The layout is
 /// defined in `ipc::memmgr_bootstrap`; memmgr's `bootstrap_from_init` reads it
 /// back through the read-only cap init derives from the same page.
 ///

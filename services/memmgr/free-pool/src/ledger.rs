@@ -28,6 +28,18 @@ pub enum RegionError
     Overlap,
     /// The arena has no free slot.
     NoSlot,
+    /// The record slot named holds no process record.
+    NoRecord,
+}
+
+/// How many matching frames [`Ledger::return_frames_where`] moves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Take
+{
+    /// The first match only.
+    First,
+    /// Every match.
+    Every,
 }
 
 /// The bookkeeping state.
@@ -155,13 +167,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Register a demand-paged region on `rec`, rejecting overlap.
     ///
     /// # Errors
-    /// [`RegionError::Overlap`] or [`RegionError::NoSlot`].
+    /// [`RegionError::Overlap`], [`RegionError::NoSlot`], or
+    /// [`RegionError::NoRecord`].
     pub fn add_region(&mut self, rec: NodeIdx, region: DemandRegion) -> Result<(), RegionError>
     {
         let Some(mut r) = self.record(rec)
         else
         {
-            return Err(RegionError::NoSlot);
+            return Err(RegionError::NoRecord);
         };
         let mut cur = r.region_head;
         while let Node::Region(have) = self.arena.get(cur).node
@@ -258,7 +271,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         &mut self,
         rec: NodeIdx,
         pick: impl Fn(&FrameDesc) -> bool,
-        first_only: bool,
+        take: Take,
     ) -> u64
     {
         let Some(mut r) = self.record(rec)
@@ -299,7 +312,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             );
             self.pool.push_node(&mut self.arena, cur);
             moved += 1;
-            if first_only
+            if take == Take::First
             {
                 break;
             }
@@ -313,7 +326,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// unmapped`) based at `phys` to the pool. Returns whether one matched.
     pub fn release_frame_by_phys(&mut self, rec: NodeIdx, phys: u64, unmapped: u64) -> bool
     {
-        self.return_frames_where(rec, |f| f.va == unmapped && f.phys_base == phys, true) == 1
+        self.return_frames_where(
+            rec,
+            |f| f.va == unmapped && f.phys_base == phys,
+            Take::First,
+        ) == 1
     }
 
     /// Return every frame of `rec` memmgr mapped at a page base in `[base,
@@ -323,7 +340,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.return_frames_where(
             rec,
             |f| f.va != unmapped && f.va >= base && f.va < end,
-            false,
+            Take::Every,
         );
     }
 
@@ -331,7 +348,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// leaving both lists empty.
     pub fn reclaim_all(&mut self, rec: NodeIdx)
     {
-        self.return_frames_where(rec, |_| true, false);
+        self.return_frames_where(rec, |_| true, Take::Every);
         let Some(mut r) = self.record(rec)
         else
         {
@@ -515,5 +532,44 @@ mod tests
         let rec = l.insert_process(1).unwrap();
         assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
         assert!(!l.frame_covering(rec, 0x1000, UNMAPPED));
+    }
+
+    /// Take every free slot, leaving the arena full.
+    fn fill_arena(l: &mut Ledger<VecStore, VecWords>)
+    {
+        while l.arena.alloc(Node::Free, NODE_NULL).is_some()
+        {}
+    }
+
+    #[test]
+    fn push_frame_refuses_on_a_full_arena_leaving_the_record_unchanged()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1).unwrap();
+        assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
+        let before = l.record(rec);
+        fill_arena(&mut l);
+        assert!(!l.push_frame(rec, frame(2, 1, 0x2000, UNMAPPED)));
+        assert_eq!(l.record(rec), before);
+        assert_eq!(l.pop_frame(rec).map(|f| f.cap_slot), Some(1));
+    }
+
+    #[test]
+    fn add_region_reports_a_full_arena_and_a_missing_record()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1).unwrap();
+        let before = l.record(rec);
+        fill_arena(&mut l);
+        assert_eq!(
+            l.add_region(rec, region(0x1000, 0x1000)),
+            Err(RegionError::NoSlot)
+        );
+        assert_eq!(l.record(rec), before);
+        assert!(l.region_for(rec, 0x1000).is_none());
+        assert_eq!(
+            l.add_region(NODE_NULL, region(0x1000, 0x1000)),
+            Err(RegionError::NoRecord)
+        );
     }
 }

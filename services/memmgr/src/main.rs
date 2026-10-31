@@ -17,8 +17,8 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use free_pool::{
-    ArenaLayout, DemandRegion, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NODE_NULL, Node,
-    NodeIdx, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk_for,
+    ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NODE_NULL,
+    Node, NodeIdx, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk_for,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -260,6 +260,8 @@ static mut LEDGER: MemLedger = Ledger::new(
 /// page-table funding. Set once at boot.
 static mut SELF_ASPACE: u32 = 0;
 
+// static_mut_refs: `LEDGER` is reached only through this accessor, and memmgr
+// is single-threaded, so the one `&mut` each handler takes is never aliased.
 #[allow(static_mut_refs)]
 fn ledger_mut() -> &'static mut MemLedger
 {
@@ -306,25 +308,47 @@ fn split(cap: u32, offset: u64) -> Option<u32>
     syscall::memory_split(cap, offset).ok()
 }
 
+/// The kernel's `memory_merge` as the pool's injected merge.
+fn merge(parent: u32, tail: u32) -> bool
+{
+    syscall::memory_merge(parent, tail).is_ok()
+}
+
 /// Coalesce the free pool through the kernel's `memory_merge`.
 fn coalesce(l: &mut MemLedger)
 {
-    l.pool.coalesce_with(&mut l.arena, |parent, tail| {
-        syscall::memory_merge(parent, tail).is_ok()
-    });
+    l.pool.coalesce_with(&mut l.arena, merge);
 }
 
 /// Select runs for `want` pages (see `FreePool::select`), mapping a failure to
 /// its `memmgr_errors` code.
-fn select(l: &mut MemLedger, want: u32, contiguous: bool) -> Result<Grant, u64>
+fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 {
     l.pool
-        .select(&mut l.arena, want, contiguous, split)
+        .select(&mut l.arena, want, fit, split)
         .map_err(|e| match e
         {
             SelectError::Contiguous => memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
             SelectError::BestEffort => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
         })
+}
+
+/// Hand one selected entry back to the pool without growing the arena (the
+/// callers run when the arena may have no free slot): into a free slot when
+/// there is one (an exact take freed its own), else merged back into the
+/// remainder of the split that produced it. Only when both fail does the run
+/// stay owned and counted in `pool_total` but out of circulation.
+fn return_taken(l: &mut MemLedger, cap_slot: u32, pages: u32, phys_base: u64)
+{
+    let run = FreeRun {
+        cap_slot,
+        page_count: u64::from(pages),
+        phys_base,
+    };
+    if let Err(run) = l.pool.push(&mut l.arena, run)
+    {
+        let _ = l.pool.absorb_front(&mut l.arena, run, merge);
+    }
 }
 
 /// Pool pages one page-table top-up donates. A donation can keep one page for
@@ -342,7 +366,8 @@ const PT_FUND_ROUNDS: u32 = 4;
 /// metadata. A refused donation returns the run to the pool.
 fn fund_self_page_tables(l: &mut MemLedger) -> bool
 {
-    let Ok(grant) = select(l, ASPACE_TOPUP_PAGES, true).or_else(|_| select(l, 2, true))
+    let Ok(grant) =
+        select(l, ASPACE_TOPUP_PAGES, Fit::Contiguous).or_else(|_| select(l, 2, Fit::Contiguous))
     else
     {
         return false;
@@ -353,16 +378,7 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
         let _ = syscall::cap_delete(outer);
         return true;
     }
-    // The run's own slot was freed by the take, so the push finds a slot; if
-    // not, the run stays owned and counted but out of circulation.
-    let _ = l.pool.push(
-        &mut l.arena,
-        FreeRun {
-            cap_slot: outer,
-            page_count: u64::from(pages),
-            phys_base: phys,
-        },
-    );
+    return_taken(l, outer, pages, phys);
     false
 }
 
@@ -370,14 +386,16 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
 /// address space, funding its page tables from the pool when the kernel
 /// reports the page-table pool exhausted.
 ///
-/// `va` MUST be the next unmapped page of the arena or the index window.
-fn map_self_page(l: &mut MemLedger, cap: u32, va: u64) -> bool
+/// # Safety
+/// `va` MUST be the next unmapped page of the arena layout or of the index
+/// window: a page of memmgr's private zones (the zone map above) that nothing
+/// maps yet and where no image, stack, or IPC page lies.
+unsafe fn map_self_page(l: &mut MemLedger, cap: u32, va: u64) -> bool
 {
     for _ in 0..=PT_FUND_ROUNDS
     {
-        // SAFETY: `va` is the next unmapped page of memmgr's private arena or
-        // index window (the zone map above), which only this function maps
-        // and where no image, stack, or IPC page lies.
+        // SAFETY: the caller's contract makes `va` an unmapped page of
+        // memmgr's private zones, so the map changes nothing memmgr runs on.
         match unsafe { syscall::mem_map(cap, self_aspace(), va, 0, 1, MAP_READ | MAP_WRITABLE) }
         {
             Ok(()) => return true,
@@ -403,22 +421,16 @@ fn arena_grow(l: &mut MemLedger) -> bool
     {
         return false;
     };
-    let Ok(grant) = select(l, 1, true)
+    let Ok(grant) = select(l, 1, Fit::Contiguous)
     else
     {
         return false;
     };
     let (outer, _, phys) = grant.entries[0];
-    if !map_self_page(l, outer, va)
+    // SAFETY: `va` is arena page `pages()`, the next one, not yet mapped.
+    if !unsafe { map_self_page(l, outer, va) }
     {
-        let _ = l.pool.push(
-            &mut l.arena,
-            FreeRun {
-                cap_slot: outer,
-                page_count: 1,
-                phys_base: phys,
-            },
-        );
+        return_taken(l, outer, 1, phys);
         return false;
     }
     // SAFETY: page `pages()` of the arena layout is now mapped read-write at
@@ -455,13 +467,15 @@ fn ensure_index(l: &mut MemLedger)
     {
         return;
     }
-    let Ok(grant) = select(l, 1, true)
+    let Ok(grant) = select(l, 1, Fit::Contiguous)
     else
     {
         return;
     };
     let (outer, _, phys) = grant.entries[0];
-    if map_self_page(l, outer, va)
+    // SAFETY: `va` is index page `pages()`, the next one, below
+    // `PROCESS_INDEX_END` and not yet mapped.
+    if unsafe { map_self_page(l, outer, va) }
     {
         // SAFETY: index page `pages()` is now mapped read-write at `va` and
         // is used by nothing but the index.
@@ -469,23 +483,17 @@ fn ensure_index(l: &mut MemLedger)
     }
     else
     {
-        let _ = l.pool.push(
-            &mut l.arena,
-            FreeRun {
-                cap_slot: outer,
-                page_count: 1,
-                phys_base: phys,
-            },
-        );
+        return_taken(l, outer, 1, phys);
     }
 }
 
 /// Return `run` to the free pool. When the arena has no free slot and the
 /// pool cannot fund an arena page, the arena page is carved from the front of
-/// `run` itself (all of it, for a one-page run), so an insert fails only when
-/// the self-map fails; the run then stays owned and counted in `pool_total`
-/// but out of circulation. This is also how the first ingested run seeds the
-/// arena, before the pool holds anything.
+/// `run` itself (all of it, for a one-page run). This is also how the first
+/// ingested run seeds the arena, before the pool holds anything. The run stays
+/// owned and counted in `pool_total` but out of circulation only when that
+/// carve fails: both arena zones are spent, the split of the run's first page
+/// fails, or the self-map fails.
 fn insert_run(l: &mut MemLedger, run: FreeRun)
 {
     if ensure_slots(l, 1)
@@ -515,7 +523,8 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
     {
         None
     };
-    if !map_self_page(l, run.cap_slot, va)
+    // SAFETY: `va` is arena page `pages()`, the next one, not yet mapped.
+    if !unsafe { map_self_page(l, run.cap_slot, va) }
     {
         if let Some(rest) = rest
         {
@@ -781,8 +790,15 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    let contiguous = flags & memmgr_labels::REQUIRE_CONTIGUOUS != 0;
-    let grant = match select(l, want_pages, contiguous)
+    let fit = if flags & memmgr_labels::REQUIRE_CONTIGUOUS == 0
+    {
+        Fit::BestEffort
+    }
+    else
+    {
+        Fit::Contiguous
+    };
+    let grant = match select(l, want_pages, fit)
     {
         Ok(g) => g,
         Err(code) =>
@@ -1157,7 +1173,9 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
     let code = match result
     {
         Ok(()) => memmgr_errors::SUCCESS,
-        Err(RegionError::Overlap) => memmgr_errors::INVALID_ARGUMENT,
+        // `rec` came from `find` above, so `NoRecord` cannot arise; it would
+        // mean an unknown caller, which is an invalid argument too.
+        Err(RegionError::Overlap | RegionError::NoRecord) => memmgr_errors::INVALID_ARGUMENT,
         Err(RegionError::NoSlot) => memmgr_errors::QUOTA,
     };
     reply_label(ipc_buf, code);
@@ -1311,7 +1329,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
-    let Ok(grant) = select(l, chunk_pages, true)
+    let Ok(grant) = select(l, chunk_pages, Fit::Contiguous)
     else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
@@ -1452,7 +1470,8 @@ fn hold_cspace_headroom(self_cspace: u32)
         return;
     }
     let l = ledger_mut();
-    let Ok(grant) = select(l, CSPACE_TOPUP_PAGES, true).or_else(|_| select(l, 1, true))
+    let Ok(grant) =
+        select(l, CSPACE_TOPUP_PAGES, Fit::Contiguous).or_else(|_| select(l, 1, Fit::Contiguous))
     else
     {
         return;

@@ -491,21 +491,21 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, r
 
 ### memmgr
 
-Tracked by [#642](https://github.com/kottlerg/seraph/issues/642).
+Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| process table (`ProcessIndex`, `Node::Process`) | `services/memmgr/free-pool/src/index.rs` | arena-backed records, linear-hash badge index | RAM (arena growth) | none | correct as is | None |
+| process table (`ProcessIndex`, `Node::Process`) | `services/memmgr/free-pool/src/index.rs` | arena-backed records, linear-hash badge index | provably unreachable (no constant: records are arena nodes, grown from the pool) | none | correct as is | None |
 | `PROCESS_INDEX_VA`, `PROCESS_INDEX_END` | `services/memmgr/src/main.rs` | 1 GiB bucket window (2^27 buckets) | tuning (past it buckets stop splitting and chains lengthen; bounds no capacity) | none | correct as is | None |
 | `MAX_LOAD` | `services/memmgr/free-pool/src/index.rs` | 2 | tuning (mean chain length before a split) | none | correct as is | None |
-| Arena node index (`NodeIdx`, `NODE_NULL`) | `services/memmgr/free-pool/src/arena.rs` | `u64`, sentinel `u64::MAX` | ABI width | 8 B per link | correct as is | None |
+| Arena node index (`NodeIdx`, `NODE_NULL`) | `services/memmgr/free-pool/src/arena.rs` | `u64`, sentinel `u64::MAX` | provably unreachable (2^64 slots exceed any address space) | 8 B per link | correct as is | None |
 | `META_ARENA_LOW_END`, `META_ARENA_HIGH_BASE`, `META_ARENA_HIGH_END` | `services/memmgr/src/main.rs` | low zone to `MAIN_TLS_WINDOW.base` (about 115 GiB of VA), high zone from 2^38 to the boot's user-half top | hardware spec (the paging mode's user half) | none | correct as is | None |
 | `META_ARENA_SLOTS_LOG2`, `PHYS_TABLE_TEMP_SLOTS_LOG2` | `services/memmgr/src/main.rs` | 21 | encoding artefact (ASLR window, asserted) | none | correct as is | None |
 | zone-map assert | `services/memmgr/src/main.rs` | compile time | encoding artefact | none | correct as is | None |
 | `SLOTS_PER_PAGE`, `SLOT_SIZE` | `services/memmgr/free-pool/src/arena.rs` | `PAGE_SIZE / size_of::<Slot>()` | encoding artefact (no slot straddles a page) | none | correct as is | None |
-| free pool (`FreePool`, `Node::Run`) | `services/memmgr/free-pool/src/pool.rs` | arena-backed runs sorted by physical base | RAM (arena growth) | none | correct as is | None |
+| free pool (`FreePool`, `Node::Run`) | `services/memmgr/free-pool/src/pool.rs` | arena-backed runs sorted by physical base | provably unreachable (no constant: runs are arena nodes, grown from the pool) | none | correct as is | None |
 | `DEMAND_CHUNK_PAGES` | `services/memmgr/free-pool/src/lib.rs` | 16 | tuning (fault-around window) | none | correct as is | Adaptive window is #236 |
-| `FreeRun.page_count` | `services/memmgr/free-pool/src/lib.rs` | `u64` pages | ABI width | embedded | correct as is | None |
+| `FreeRun.page_count` | `services/memmgr/free-pool/src/lib.rs` | `u64` pages | provably unreachable (2^64 pages exceed any physical address space) | embedded | correct as is | None |
 | `FrameDesc.page_count`, REQUEST_MEMORY_CAPS `want_pages` | `services/memmgr/free-pool/src/arena.rs`, `services/memmgr/src/main.rs` | `u32` pages per grant | encoding artefact (wire packs a request's pages in 32 bits) | none | correct as is | Callers loop |
 | `MAX_GRANT_RUNS` (`Grant`) | `services/memmgr/free-pool/src/pool.rs` | `MSG_CAP_SLOTS_MAX` | ABI width | 64 B stack | correct as is | None: a grant over more runs is partial and the caller loops |
 | `MEMMGR_FORWARD_HEADROOM` | `services/init/src/bootstrap.rs` | 512 slots | tuning (caps past it reach memmgr at init's reap) | none | correct as is | None |
@@ -580,8 +580,7 @@ device block-size query and fs-fat's sector size).
 
 ### init and logd
 
-The entries left open are tracked by the Issue each recommendation names: memmgr's page-table
-seed by [#642](https://github.com/kottlerg/seraph/issues/642), the ACPI region caps by
+The entries left open are tracked by the Issue each recommendation names: the ACPI region caps by
 [#637](https://github.com/kottlerg/seraph/issues/637), the service-name packing and logd's death
 queue by [#643](https://github.com/kottlerg/seraph/issues/643), and logd's eviction by the low 32
 correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).

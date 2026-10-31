@@ -8,10 +8,10 @@ memmgr is a `no_std` binary: it cannot bootstrap a general heap against
 itself, so it has none. Its free pool, process table, and per-process frame
 and region descriptors all live in a self-hosted metadata arena carved from
 its own pool (see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata
-Arena"). After memmgr
-is in place, the only `no_std` userspace services in the system are `init`
-and `memmgr` (see [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md)
-§"Userspace Boot Order").
+Arena"). After memmgr is in place, the only `no_std` userspace services in the
+system are `init` and `memmgr` (see
+[`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Userspace
+Boot Order").
 
 ---
 
@@ -47,9 +47,9 @@ Allocation Contract").
 - **Memory-cap allocation** — serve the `REQUEST_MEMORY_CAPS` IPC, returning one or
   more Memory caps that cumulatively cover the requested page count, or, when
   the free RAM is spread over more runs than one reply carries, a partial
-  grant the caller requests again for the rest. Honour
-  the `REQUIRE_CONTIGUOUS` flag for callers that need a single multi-page
-  cap (DMA buffers, large heap grow operations). Wire shape in
+  grant the caller requests again for the rest. Honour the `REQUIRE_CONTIGUOUS`
+  flag for callers that need a single multi-page cap (DMA buffers, large heap
+  grow operations). Wire shape in
   [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 1: `REQUEST_MEMORY_CAPS`".
 - **Per-process tracking** — maintain a per-process record of the Memory
   caps memmgr has handed out, keyed on a per-process badge (memmgr-minted at
@@ -133,7 +133,9 @@ The remaining constants are tuning values that bound no capacity:
 |---|---|---|
 | `DEMAND_CHUNK_PAGES` | 16 | Pages one demand fault backs |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | 256 slots, 16 pages | `CSpace` self-funding mark and step |
-| `ASPACE_TOPUP_PAGES` | 4 | Page-table self-funding step |
+| `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table self-funding step and retries per map |
+| `MAX_LOAD` | 2 | Mean index chain length before a bucket split |
+| `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)
 §"memmgr".

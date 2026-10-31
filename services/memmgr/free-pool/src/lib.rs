@@ -27,7 +27,7 @@ pub use arena::{
 };
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
 pub use ledger::{Ledger, RegionError};
-pub use pool::{FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
+pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 
 use syscall_abi::PAGE_SIZE;
 

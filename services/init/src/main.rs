@@ -648,8 +648,8 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // Populate the phys-table page: free-run physical bases, the kernel's
-    // immutable RAM-accounting facts, and the in-use bootstrap arenas. The
+    // Populate the phys-table page: the kernel's immutable RAM-accounting
+    // facts and the in-use bootstrap arenas. The
     // page is mapped writable at TEMP_MAP_BASE; memmgr reads it back via the
     // RO cap derived below. See `bootstrap::write_memmgr_aux_memory`.
     // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.

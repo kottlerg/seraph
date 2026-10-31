@@ -548,12 +548,19 @@ unsafe extern "C" {
 /// - Kernel sections are mapped with W^X permissions.
 /// - The boot stack remains accessible at its current virtual address.
 ///
-/// Every frame this function needs comes from the static boot pool
-/// ([`BOOT_TABLE_POOL_SIZE`]), not the buddy allocator.
+/// Every frame this function needs comes from the BSS seed
+/// ([`BOOT_TABLE_POOL_SIZE`]) or the carve of free RAM it sizes with
+/// [`stage2_table_bound`] (see the module documentation), not the buddy
+/// allocator, which is populated after it returns.
 ///
 /// # Errors
-/// `PagingError::OutOfFrames` if the 256-frame BSS pool is exhausted.
-/// The caller should `fatal()` on this error; it indicates > 248 GiB of RAM.
+/// - [`BootTableError::NoTableCarve`] when no free RAM range holds the carve;
+///   returned before the switch.
+/// - [`BootTableError::OutOfFrames`] when the seed runs out in stage 1 (a seed
+///   too small for the kernel image), or the carve in stage 2 (a defect in the
+///   bound).
+///
+/// The caller should `fatal()` on either.
 ///
 /// In test builds this is a no-op stub so `main.rs` compiles unchanged.
 #[cfg(test)]
@@ -1071,8 +1078,7 @@ mod tests
 
     /// `Reserved` entries (e.g. 64-bit PCIe MMIO windows reported by UEFI
     /// firmware) must not inflate `max_phys`, otherwise Phase 3 would direct-map
-    /// the aperture with 2 MiB pages and exhaust the boot page-table pool
-    /// ([`BOOT_TABLE_POOL_SIZE`]).
+    /// the aperture with 2 MiB pages, sizing its page-table carve for it.
     #[test]
     fn max_phys_reserved_entries_are_excluded()
     {

@@ -139,11 +139,16 @@ Each feature is classified per architecture as one of:
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.
+- **LA57 (5-level paging)** — a larger-VA expansion above 4-level paging, the x86-64 analogue of
+  riscv64's Sv57: the bootloader enables it when CPUID reports it, and the kernel takes the
+  paging depth from `CR4.LA57` at entry, as riscv64 takes its mode from `satp` (design intent;
+  not yet implemented: the kernel uses 4-level paging, whose 128 TiB halves cap direct-mapped
+  RAM and each process's virtual address space below the 526 TB target of
+  [#177](https://github.com/kottlerg/seraph/issues/177)).
 
 ### Unsupported
 
 - **AVX-512 / x86-64-v4** — server-class; never required, never depended upon.
-- **LA57 (5-level paging)** — the kernel uses 4-level paging.
 - **1 GiB huge pages, global pages (`PGE`), MTRR reprogramming, HPET, the legacy 8259 PIC** —
   not used. (The kernel relies on firmware's default PAT and leaves the 8259 masked.)
 - **`FSGSBASE`** — kept disabled: the kernel clears `CR4.FSGSBASE` on every CPU, because its

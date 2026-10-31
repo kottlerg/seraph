@@ -212,9 +212,11 @@ The registry maps a `CSpaceId` to its live `CSpace` and current epoch. It is an 
 entries (pointer, epoch, free-list link), one per 4 KiB page of DRAM
 (`mm::init::system_ram_bytes`), so the id space never runs out before the memory that pays for
 the `CSpace`s does: every `CSpace` costs its creator at least one wrapper page. Storage is
-two-level: `MAX_REGISTRY_CHUNKS` (1024) chunk pointers in BSS, each naming one 1 MiB buddy block
-of 65,536 entries (`REGISTRY_CHUNK_ORDER`), which covers the 256 GiB of DRAM the frame map table
-admits. `cap::init_cspace_registry` carves the chunks in Phase 4
+two-level: a chunk table sized from DRAM (`chunks_for_ram`) and allocated from the buddy, each
+slot naming one 1 MiB buddy block of 65,536 entries (`REGISTRY_CHUNK_ORDER`), so no RAM size
+exhausts it; the count stops only at `MAX_ID_CHUNKS`, past 16 TiB of DRAM, where the `u32`
+`CSpaceId` width holds no more ids. `cap::init_cspace_registry` carves the table and the chunks
+in Phase 4
 ([initialization.md](initialization.md) § Phase 4), after the Phase-2 exclusions and before the
 Phase-7 drain; a short buddy is fatal.
 

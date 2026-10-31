@@ -1428,16 +1428,14 @@ consecutive scans (`OWED_WAKE_LAST`) so a legitimately mid-wake observation cann
 Indefinite waits (endpoint recv loops, reply waits) match no rule. Each park commit stamps
 `park_started_tick` for the age checks.
 
-**3. Timer-heartbeat cross-checks.** Every CPU stamps `TICK_HEARTBEAT[cpu]`
-with `timer::current_tick()` on each `timer_tick` entry (`current_tick`
-derives from a globally consistent counter on both arches — TSC / `time`
-CSR — so cross-CPU age comparison is sound). Each AP compares the BSP's
-stamp against its own (`bsp_stall_check`): a BSP wedged interrupts-off
-kills the sleep-list waker and every BSP-hosted detector at once — total
-silence — so the AP-side check is the only detector that can name that
-state (#375). Symmetrically the BSP scans AP stamps
-(`ap_silence_check`) and fires on an AP silent past the grace window.
-Both defer to an in-flight TLB shootdown, as below.
+**3. Timer-heartbeat cross-checks.** Every CPU stamps its `CpuDiag.tick_heartbeat` (its record in
+the per-CPU `CPU_DIAG` slab) with `timer::current_tick()` on each `timer_tick` entry (`current_tick`
+derives from a globally consistent counter on both arches — TSC / `time` CSR — so cross-CPU age
+comparison is sound). Each AP compares the BSP's stamp against its own (`bsp_stall_check`): a BSP
+wedged interrupts-off kills the sleep-list waker and every BSP-hosted detector at once — total
+silence — so the AP-side check is the only detector that can name that state (#375). Symmetrically
+the BSP scans AP stamps (`ap_silence_check`) and fires on an AP silent past the grace window. Both
+defer to an in-flight TLB shootdown, as below.
 
 The heartbeat checks measure staleness in wall time, so their grace scales
 with CPU count (`heartbeat_stall_ticks`, stepping at multiples of 128 CPUs:

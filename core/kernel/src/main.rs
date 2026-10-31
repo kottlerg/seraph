@@ -405,8 +405,9 @@ unsafe fn kernel_entry_post_rebase(
     //
     // Bootloader transient page-table frames are reclaimed through
     // `BootInfo.reclaim_ranges` (core/kernel/docs/initialization.md § Phase 3
-    // and § Phase 7). `BOOT_TABLE_POOL` (BSS array) is part of the kernel image
-    // and cannot be freed to buddy; its unused portion is accepted waste.
+    // and § Phase 7). `BOOT_TABLE_POOL` (the BSS seed of the Phase 3 tables) is
+    // part of the kernel image and cannot be freed to buddy; its unused portion
+    // is accepted waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read

@@ -95,9 +95,7 @@ The physical direct map is placed at a 1 GiB-aligned base at or above the active
 mode's kernel-half base (randomized per boot, KASLR); the kernel image slides
 within the top 2 GiB, canonical in every mode. Under Sv39 the kernel half is
 256 GiB total, so the direct map cannot exceed 254 GiB without overlapping the image
-window, and the kernel refuses to boot rather than overlap (the Phase-3 boot page-table
-pool, `BOOT_TABLE_POOL_SIZE`, independently limits direct-mapped RAM to about 248 GiB in
-every mode); a near-full Sv39 half narrows
+window, and the kernel refuses to boot rather than overlap; a near-full Sv39 half narrows
 the direct-map randomization window (falling back to the kernel-half floor when
 fewer than two 1 GiB slots remain).
 All fixed userspace-layout zones sit below 2^38, the smallest user half, so
@@ -236,7 +234,7 @@ At boot, the bootloader provides a memory map via the `BootInfo` structure
 [core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md)) describing which physical
 address ranges are usable RAM, reserved, or used by firmware. The kernel parses this map in
 Phase 2, excluding the frames the boot payload occupies, and populates the buddy allocator from
-the surviving ranges once its own page tables map all RAM, at Phase 3; see
+the free memory that leaves once its own page tables map all RAM, at Phase 3; see
 [initialization.md](../core/kernel/docs/initialization.md) § Phase 2 and § Phase 3.
 
 ### Bootloader Scratch Reclamation

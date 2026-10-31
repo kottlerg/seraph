@@ -26,11 +26,12 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// Mint a fresh process badge: a random `u64` drawn from the kernel entropy
 /// pool ([`syscall::random_u64`]). The same value is procmgr's process-table
 /// key, the badged SEND-cap badge on the log endpoint (logd keys slots by the
-/// full `u64`), and procmgr's death-EQ correlator (low 32 bits). Drawing it at
-/// random — rather than the former monotonic counter — keeps the per-process
-/// identifier and the spawn rate it would otherwise leak unguessable; the
-/// capability is still the sole authority, so this is defense-in-depth.
-/// The `u64` width is the kernel badge word, so the space never runs out.
+/// full `u64`), and procmgr's death-EQ correlator (low 32 bits,
+/// [`process_table::correlator_of`]). Drawing it at random — rather than the
+/// former monotonic counter — keeps the per-process identifier and the spawn
+/// rate it would otherwise leak unguessable; the capability is still the sole
+/// authority, so this is defense-in-depth. The `u64` width is the kernel
+/// badge word, so the space never runs out.
 ///
 /// Single allocation point so the value threads to `populate_child_info`
 /// (writes the badged SEND derivation into `pi.log_send_cap`) AND
@@ -40,14 +41,12 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// badge out of the reserved log-badge / no-correlator range that the old
 /// monotonic counter held structurally by starting at 16 — and avoid the
 /// reserved init-reap correlator, and until no verb bit
-/// (`ipc::VERB_BIT_MASK`) is set; see [`badge_is_acceptable`]. Because the
-/// death-EQ correlator is only the low 32 bits, two *live* processes can collide
-/// there at ~2⁻³² (≤`MAX_PROCESSES` live), which `take_by_correlator` resolves
-/// to the first match: an accepted, vanishingly-rare narrowing of the former
-/// monotonic uniqueness. Returns `None` if the entropy draw fails (a
-/// kernel-contract violation), failing the spawn rather than minting a weak
-/// badge.
-fn next_process_badge() -> Option<u64>
+/// (`ipc::VERB_BIT_MASK`) is set; see [`badge_is_acceptable`]. It also
+/// redraws a candidate whose low 32 bits a live process already holds, so the
+/// `u32` death correlator names one live process however large the table
+/// grows. Returns `None` if the entropy draw fails (a kernel-contract
+/// violation), failing the spawn rather than minting a weak badge.
+fn next_process_badge(table: &ProcessTable) -> Option<u64>
 {
     loop
     {
@@ -57,7 +56,7 @@ fn next_process_badge() -> Option<u64>
             ipc::log_badges::LOG_BADGE_FIRST_CHILD,
             ipc::procmgr_labels::INIT_REAP_CORRELATOR,
             ipc::VERB_BIT_MASK,
-        )
+        ) && !table.correlator_in_use(process_table::correlator_of(t))
         {
             return Some(t);
         }
@@ -154,8 +153,9 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     // forward; only the pre-existing table is subject to this.
     LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
     table.for_each(|entry| {
-        let correlator = u64::from(entry.badge as u32);
-        if syscall::thread_bind_notification(entry.thread_cap, logd_eq, correlator).is_err()
+        let correlator = process_table::correlator_of(entry.badge);
+        if syscall::thread_bind_notification(entry.thread_cap, logd_eq, u64::from(correlator))
+            .is_err()
         {
             std::os::seraph::log!(
                 "install_logd_death_eq: bind failed for entry badge={} (logd will miss its death event; procmgr observer unaffected)",
@@ -170,13 +170,13 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
 // (`ChildArgs`, `ChildEnv`, `CreateBlobs`) lives in the host-testable
 // `procmgr-process-table` crate; the syscall/IPC-bearing operations below
 // stay in the service and drive its lookups. Re-exported so the
-// `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
+// `process::{ProcessTable, ProcessEntry, RecentExits}` paths
 // `main.rs` uses, and its `process::CreateBlobs::extract` and
 // `process::split_create_from_file_caps` call sites in the create handlers,
 // resolve through this module.
 pub use process_table::{
-    ChildArgs, ChildEnv, CreateBlobs, MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits,
-    badge_is_acceptable, resolve_spawn_sched, split_create_from_file_caps,
+    ChildArgs, ChildEnv, CreateBlobs, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
+    resolve_spawn_sched, split_create_from_file_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -1310,7 +1310,7 @@ fn finalize_creation(
     // Bind procmgr's shared death queue as an observer on the child's
     // main thread. Correlator = low 32 bits of the table badge; on death,
     // dispatch_death recovers the entry via `take_by_correlator`.
-    let correlator = u64::from(badge as u32);
+    let correlator = u64::from(process_table::correlator_of(badge));
     syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
 
     // Also bind procmgr's death queue as an address-space observer with the
@@ -1343,26 +1343,29 @@ fn finalize_creation(
         return None;
     };
 
-    if !table.insert(ProcessEntry {
-        badge,
-        aspace_cap: child_aspace,
-        cspace_cap: child_cspace,
-        thread_cap: child_thread,
-        pi_memory_cap,
-        tls_memory_cap: main_tls.memory_cap,
-        memmgr_send_cap,
-        memmgr_badge,
-        namespace_override: 0,
-        cwd_override: 0,
-        band_max,
-        entry_point,
-        tls_base_va: main_tls.base_va,
-        stack_top_vaddr: layout.stack_top,
-        process_info_va: layout.process_info_va,
-        started: false,
-    })
+    if table
+        .insert(ProcessEntry {
+            badge,
+            aspace_cap: child_aspace,
+            cspace_cap: child_cspace,
+            thread_cap: child_thread,
+            pi_memory_cap,
+            tls_memory_cap: main_tls.memory_cap,
+            memmgr_send_cap,
+            memmgr_badge,
+            namespace_override: 0,
+            cwd_override: 0,
+            band_max,
+            entry_point,
+            tls_base_va: main_tls.base_va,
+            stack_top_vaddr: layout.stack_top,
+            process_info_va: layout.process_info_va,
+            started: false,
+        })
+        .is_err()
     {
-        // Table full: drop the caps we minted for the caller; the caller's
+        // Heap exhausted (the badge's correlator was checked free when it was
+        // minted, and nothing ran since): drop the caps we minted for the caller; the caller's
         // guards still own the child kernel objects and per-child memory caps
         // and will release them when finalize returns None.
         let _ = syscall::cap_delete(thread_for_caller);
@@ -1644,7 +1647,7 @@ fn create_process_from_bytes(
 
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
-    let process_badge = next_process_badge()?;
+    let process_badge = next_process_badge(table)?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let pi_memory = CapGuard::new(unsafe {
@@ -2568,7 +2571,7 @@ pub fn create_process_from_file(
         demand_paged,
         self_memmgr_ep: ctx.memmgr_ep,
     };
-    let process_badge = next_process_badge().ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let process_badge = next_process_badge(table).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let pi_memory_cap = unsafe {

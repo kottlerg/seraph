@@ -28,10 +28,9 @@ use std::os::seraph::log;
 
 use super::parse::parse;
 use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch};
-use crate::REGISTRY_CAPACITY;
 use crate::restart::RestartCtx;
 use crate::service::{
-    MAX_SERVICES, POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry,
+    POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
 };
 
 /// Entry in svcmgr's pending-registration table populated from init's
@@ -40,8 +39,9 @@ use crate::service::{
 /// death-notification on once the matching `.svc` definition is found.
 pub struct PendingRegistration
 {
-    pub name: [u8; 32],
-    pub name_len: u8,
+    /// The service name the substrate round carried, at most
+    /// `ipc::svcmgr_labels::NAME_MAX` bytes.
+    pub name: String,
     pub thread_cap: u32,
     /// Cleared to `true` once a `.svc` definition has consumed this
     /// entry. Entries still `false` after the file scan get the
@@ -51,24 +51,52 @@ pub struct PendingRegistration
 
 impl PendingRegistration
 {
-    pub const fn empty() -> Self
-    {
-        Self {
-            name: [0; 32],
-            name_len: 0,
-            thread_cap: 0,
-            consumed: false,
-        }
-    }
-
     pub fn name_str(&self) -> &str
     {
-        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("???")
+        &self.name
     }
 
     pub fn matches(&self, name: &str) -> bool
     {
-        self.name_str() == name
+        self.name == name
+    }
+}
+
+/// The service table and its index-aligned restart recipes, grown together.
+///
+/// A slot is never reused, so its index is a stable death correlator for
+/// every instance the slot supervises; a launch that fails leaves its
+/// reserved slot inactive. Both vectors grow on the heap with no fixed count.
+pub struct ServiceTable
+{
+    pub services: Vec<ServiceEntry>,
+    /// `None` for a slot with no recipe (a reserved slot whose launch failed).
+    pub recipes: Vec<Option<RestartRecipe>>,
+}
+
+impl ServiceTable
+{
+    pub const fn new() -> Self
+    {
+        Self {
+            services: Vec::new(),
+            recipes: Vec::new(),
+        }
+    }
+
+    /// Reserve the next slot, inactive, and return its index and the death
+    /// correlator that names it. `None`, changing nothing, when the heap
+    /// cannot grow either vector or the index does not fit the 32-bit
+    /// correlator svcmgr binds.
+    fn reserve(&mut self) -> Option<(usize, u32)>
+    {
+        let idx = self.services.len();
+        let correlator = u32::try_from(idx).ok()?;
+        self.services.try_reserve(1).ok()?;
+        self.recipes.try_reserve(1).ok()?;
+        self.services.push(ServiceEntry::empty());
+        self.recipes.push(None);
+        Some((idx, correlator))
     }
 }
 
@@ -82,13 +110,10 @@ impl PendingRegistration
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
-    pending_count: usize,
-    services: &mut [ServiceEntry; MAX_SERVICES],
-    recipes: &mut [Option<RestartRecipe>; MAX_SERVICES],
-    service_count: &mut usize,
+    table: &mut ServiceTable,
     deaths_eq: u32,
     ctx: &RestartCtx,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 )
 {
     log!("svcmgr: scanning {SERVICES_DIR}");
@@ -101,7 +126,7 @@ pub fn reconcile_and_launch(
             log!("svcmgr: cannot open {SERVICES_DIR}: {e}");
             // Still report pending-without-def errors so a missing
             // /config/svcmgr/services/ does not silently swallow them.
-            report_orphans(pending, pending_count);
+            report_orphans(pending);
             return;
         }
     };
@@ -168,41 +193,26 @@ pub fn reconcile_and_launch(
 
     for def in &defs
     {
-        handle_definition(
-            def,
-            pending,
-            pending_count,
-            services,
-            recipes,
-            service_count,
-            deaths_eq,
-            ctx,
-            registry,
-        );
+        handle_definition(def, pending, table, deaths_eq, ctx, registry);
     }
 
-    report_orphans(pending, pending_count);
+    report_orphans(pending);
 }
 
 /// Route one parsed `Definition` to the bind-only or launch path.
-#[allow(clippy::too_many_arguments)]
 fn handle_definition(
     def: &Definition,
     pending: &mut [PendingRegistration],
-    pending_count: usize,
-    services: &mut [ServiceEntry; MAX_SERVICES],
-    recipes: &mut [Option<RestartRecipe>; MAX_SERVICES],
-    service_count: &mut usize,
+    table: &mut ServiceTable,
     deaths_eq: u32,
     ctx: &RestartCtx,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
 )
 {
     // Match against pending registrations parked from init's
     // handover endowment.
     if let Some(slot) = pending
         .iter_mut()
-        .take(pending_count)
         .find(|p| !p.consumed && p.matches(&def.name))
     {
         slot.consumed = true;
@@ -212,14 +222,7 @@ fn handle_definition(
         // `restart::restart_process`. Bind happens after the fact (the
         // thread has been running since its bootstrap spawn); `bind_only`
         // states why a death in that window is still delivered.
-        bind_only(
-            def,
-            slot.thread_cap,
-            services,
-            recipes,
-            service_count,
-            deaths_eq,
-        );
+        bind_only(def, slot.thread_cap, table, deaths_eq);
         return;
     }
 
@@ -252,24 +255,35 @@ fn handle_definition(
     // CONFIGURE_NAMESPACE and START_PROCESS (thread still suspended)
     // so any immediate post-start death is captured cleanly.
     // On launch failure the slot is "burned" (stays at default,
-    // active=false); dispatch_deaths' `!active` guard skips it.
-    // Burning consumes one of MAX_SERVICES=16 slots in the failure
-    // case; healthy boots never burn.
-    if *service_count >= MAX_SERVICES
+    // active=false); dispatch_deaths' `!active` guard skips it. Slots are
+    // never reused, so a burned slot costs one heap entry; healthy boots
+    // never burn.
+    //
+    // The correlator is deliberately the service-table index, not a
+    // randomized value (#249): it is opaque to the kernel, delivered only to
+    // svcmgr's own private death EQ (never in an IPC body, cap, or logged
+    // value), and consumed directly as `services[idx]` on death dispatch.
+    // With no untrusted observer there is nothing to enumerate, and a
+    // (random-epoch, index) split would buy nothing.
+    let Some((idx, correlator)) = table.reserve()
+    else
     {
-        log!("svcmgr: service table full; dropping {}", def.name);
+        log!(
+            "svcmgr: no memory for a service-table slot; dropping {}",
+            def.name
+        );
         return;
-    }
-    let idx = *service_count;
-    *service_count += 1;
-    // Deliberately the service-table index, not a randomized correlator (#249):
-    // it is opaque to the kernel, delivered only to svcmgr's own private death
-    // EQ (never in an IPC body, cap, or logged value), and consumed directly as
-    // `services[idx]` on death dispatch. With no untrusted observer there is
-    // nothing to enumerate, and a (random-epoch, index) split would buy nothing.
-    // `idx` is below `MAX_SERVICES`, so the cast to the 32-bit correlator
-    // svcmgr's death dispatch compares is lossless.
-    let correlator = idx as u32;
+    };
+
+    // Build the entry before launching, so a heap that cannot hold its name
+    // and paths launches nothing rather than an instance svcmgr could not
+    // supervise.
+    let Some(mut entry) = build_entry(def)
+    else
+    {
+        log!("svcmgr: no memory for {}'s entry; not launched", def.name);
+        return;
+    };
 
     let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))
     else
@@ -278,13 +292,11 @@ fn handle_definition(
         return;
     };
 
-    services[idx] = build_entry(
-        def,
-        launched.thread_cap,
-        launched.process_handle,
-        launched.provided_endpoint,
-    );
-    recipes[idx] = Some(recipe_from(def));
+    entry.thread_cap = launched.thread_cap;
+    entry.process_handle = launched.process_handle;
+    entry.provided_endpoint = launched.provided_endpoint;
+    table.services[idx] = entry;
+    table.recipes[idx] = Some(recipe_from(def));
 }
 
 /// Bind-only path: bind death-notification on a thread init already
@@ -297,36 +309,45 @@ fn handle_definition(
 /// serialises on the thread's `sched_lock`. A death in the window between
 /// init's spawn and this bind is therefore delivered to `deaths_eq` when the
 /// bind lands on the already-exited thread, not dropped (#106 Window 2).
-fn bind_only(
-    def: &Definition,
-    thread_cap: u32,
-    services: &mut [ServiceEntry; MAX_SERVICES],
-    recipes: &mut [Option<RestartRecipe>; MAX_SERVICES],
-    service_count: &mut usize,
-    deaths_eq: u32,
-)
+fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths_eq: u32)
 {
-    if *service_count >= MAX_SERVICES
+    let Some((idx, correlator)) = table.reserve()
+    else
     {
-        log!("svcmgr: service table full; dropping {}", def.name);
+        log!(
+            "svcmgr: no memory for a service-table slot; dropping {}",
+            def.name
+        );
+        let _ = syscall::cap_delete(thread_cap);
         return;
-    }
-    let idx = *service_count;
-    if syscall::thread_bind_notification(thread_cap, deaths_eq, u64::from(idx as u32)).is_err()
+    };
+    let Some(mut entry) = build_entry(def)
+    else
+    {
+        log!(
+            "svcmgr: no memory for {}'s entry; running unsupervised",
+            def.name
+        );
+        let _ = syscall::cap_delete(thread_cap);
+        return;
+    };
+    if syscall::thread_bind_notification(thread_cap, deaths_eq, u64::from(correlator)).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);
         return;
     }
-    services[idx] = build_entry(def, thread_cap, 0, 0);
-    recipes[idx] = Some(recipe_from(def));
-    *service_count += 1;
+    // `process_handle` stays 0: init created this instance and kept its
+    // handle (see `restart::restart_process`).
+    entry.thread_cap = thread_cap;
+    table.services[idx] = entry;
+    table.recipes[idx] = Some(recipe_from(def));
 }
 
-/// Clone the launch surfaces the fixed record cannot hold from a parsed
-/// definition so the restart path can replay them: argv/env/cwd/seed
-/// byte-for-byte, the log-sink flag, and the scheduling fields. The fixed
-/// fields (name/binary/policy/namespace) live on the `ServiceEntry`.
+/// Clone the launch surfaces the restart path replays from a parsed
+/// definition: argv/env/cwd/seed byte-for-byte, the log-sink flag, and the
+/// scheduling fields. The name, binary, policy and namespace live on the
+/// `ServiceEntry` instead ([`build_entry`]).
 fn recipe_from(def: &Definition) -> RestartRecipe
 {
     RestartRecipe {
@@ -340,32 +361,18 @@ fn recipe_from(def: &Definition) -> RestartRecipe
     }
 }
 
-/// Construct a fixed-size `ServiceEntry` from the parsed definition.
+/// Construct a `ServiceEntry` from the parsed definition, with no caps yet:
+/// the caller fills the thread cap, process handle and provided endpoint.
 /// Maps the `.svc` `restart`/`critical`/`namespace` values onto the
 /// in-memory `ServiceEntry` representation `restart::handle_death`
-/// reads.
-fn build_entry(
-    def: &Definition,
-    thread_cap: u32,
-    process_handle: u32,
-    provided_endpoint: u32,
-) -> ServiceEntry
+/// reads. `None` when the heap cannot hold the entry's name or paths.
+fn build_entry(def: &Definition) -> Option<ServiceEntry>
 {
     let mut entry = ServiceEntry::empty();
 
-    let name_bytes = def.name.as_bytes();
-    let copy_len = name_bytes.len().min(entry.name.len());
-    entry.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-    entry.name_len = copy_len as u8;
+    entry.name = try_string(&def.name)?;
 
-    entry.thread_cap = thread_cap;
-    entry.provided_endpoint = provided_endpoint;
-    entry.process_handle = process_handle;
-
-    let bin_bytes = def.binary.as_bytes();
-    let bin_copy = bin_bytes.len().min(entry.vfs_path.len());
-    entry.vfs_path[..bin_copy].copy_from_slice(&bin_bytes[..bin_copy]);
-    entry.vfs_path_len = bin_copy as u8;
+    entry.vfs_path = try_string(&def.binary)?;
 
     entry.restart_policy = match def.restart
     {
@@ -389,15 +396,12 @@ fn build_entry(
         NamespaceShape::Subtree { path, rights } =>
         {
             entry.ns_policy_kind = ipc::svcmgr_labels::NS_POLICY_SUBTREE;
-            let pb = path.as_bytes();
-            let plen = pb.len().min(entry.ns_subtree_path.len());
-            entry.ns_subtree_path[..plen].copy_from_slice(&pb[..plen]);
-            entry.ns_subtree_path_len = plen as u8;
+            entry.ns_subtree_path = try_string(path)?;
             entry.ns_subtree_rights = *rights;
         }
     }
 
-    entry
+    Some(entry)
 }
 
 /// Log every entry in `pending` that was never matched by a `.svc`
@@ -406,9 +410,9 @@ fn build_entry(
 /// running for the services that did resolve cleanly. Releasing the
 /// thread cap here avoids leaking a slot per orphaned registration
 /// over svcmgr's lifetime.
-fn report_orphans(pending: &[PendingRegistration], pending_count: usize)
+fn report_orphans(pending: &[PendingRegistration])
 {
-    for slot in pending.iter().take(pending_count)
+    for slot in pending
     {
         if !slot.consumed
         {

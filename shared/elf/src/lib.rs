@@ -99,9 +99,15 @@ pub const RELA_ENTRY_SIZE: usize = 24;
 /// Size in bytes of one `Elf64_Dyn` entry.
 const DYN_ENTRY_SIZE: usize = 16;
 
-/// Upper bound on an accepted `.rela.dyn` table (≈175k relocations).
-/// In-tree binaries carry a few thousand; the cap bounds loader work on a
-/// malformed or hostile image.
+/// Upper bound the kernel applies to init's `.rela.dyn` table
+/// (≈175k relocations; `core/kernel/src/mm/init_reloc.rs`), whose size
+/// arrives from the bootloader rather than from an image the kernel holds.
+/// Unreachable by a valid init: init is an in-tree binary whose table holds
+/// a few thousand relocations, so the bound refuses only a corrupt size.
+/// The table locators here ([`rela_table`], [`rela_table_metadata`]) apply
+/// no such cap: a table must lie inside one `PT_LOAD` segment's file data
+/// and the file, so the file's size bounds it, and the streaming loaders
+/// apply it in fixed chunks.
 pub const MAX_RELA_TABLE_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Upper bound on the `PT_DYNAMIC` segment size accepted by the streaming
@@ -1124,7 +1130,7 @@ pub struct RelaTable
     /// the `PT_LOAD` segment whose file data contains the table.
     pub file_offset: u64,
     /// Table size in bytes (`DT_RELASZ`); a multiple of [`RELA_ENTRY_SIZE`],
-    /// at most [`MAX_RELA_TABLE_SIZE`].
+    /// inside the file.
     pub size: u64,
 }
 
@@ -1229,7 +1235,6 @@ fn resolve_rela_table(
     };
     if summary.relaent != Some(RELA_ENTRY_SIZE as u64)
         || !size.is_multiple_of(RELA_ENTRY_SIZE as u64)
-        || size > MAX_RELA_TABLE_SIZE
     {
         return Err(ElfError::MalformedDynamic);
     }
@@ -1302,9 +1307,8 @@ fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Result<Option<(u64, 
 /// - [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`.
 /// - [`ElfError::MalformedDynamic`] for structural failures: `PT_DYNAMIC`
 ///   out of file bounds, a missing counterpart tag, `DT_RELAENT` ≠
-///   [`RELA_ENTRY_SIZE`], `DT_RELASZ` not a multiple of it or above
-///   [`MAX_RELA_TABLE_SIZE`], or a table not fully backed by one `PT_LOAD`
-///   segment's file data.
+///   [`RELA_ENTRY_SIZE`], `DT_RELASZ` not a multiple of it, or a table not
+///   fully backed by one `PT_LOAD` segment's file data.
 pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, ElfError>
 {
     let Some((offset, filesz)) = find_dynamic_phdr(ehdr, data)?
@@ -1844,9 +1848,9 @@ mod tests
     }
 
     #[test]
-    fn rejects_oversized_table()
+    fn rejects_a_table_larger_than_its_file_data()
     {
-        // A multiple of 24 above the cap, so only the cap check can fire.
+        // A well-formed size that no `PT_LOAD` file data of the image backs.
         let img = build_image(
             ET_DYN,
             &[
@@ -1857,6 +1861,34 @@ mod tests
             ],
         );
         assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn accepts_a_table_of_any_size_its_file_data_backs()
+    {
+        // Above the 4 MiB the locators once capped tables at: a large PIE's
+        // table is accepted once a `PT_LOAD` segment and the file hold it.
+        let size = (4 * 1024 * 1024 / RELA_ENTRY_SIZE as u64 + 1) * RELA_ENTRY_SIZE as u64;
+        let mut img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, RELA_OFF),
+                dyn_entry(DT_RELASZ, size),
+                dyn_entry(DT_RELAENT, 24),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        let filesz = size + 0x200;
+        img.resize((0x200 + filesz) as usize, 0);
+        put(
+            &mut img,
+            64 + 56,
+            &phdr_bytes(PT_LOAD, PF_R | PF_W, 0x200, 0x200, filesz, filesz),
+        );
+        assert_eq!(
+            rela_of(&img).map(|t| t.map(|t| (t.file_offset, t.size))),
+            Ok(Some((RELA_OFF, size)))
+        );
     }
 
     #[test]

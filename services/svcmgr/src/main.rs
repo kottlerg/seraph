@@ -31,51 +31,39 @@ mod definitions;
 mod restart;
 mod service;
 
-use definitions::reconcile::PendingRegistration;
+use definitions::reconcile::{PendingRegistration, ServiceTable};
 use ipc::{IpcMessage, svcmgr_labels};
 use registry::{Resolver, Visibility};
-use service::{MAX_SERVICES, RestartRecipe, ServiceEntry, bootstrap_caps};
+use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
 
-/// Global discovery registry size. Enough for the well-known names svcmgr
-/// publishes itself and the providers' `provides` names, plus slack.
-const REGISTRY_CAPACITY: usize = 16;
+/// Capacity of svcmgr's shared death `EventQueue`: a tuning value, not a
+/// service ceiling. The kernel drops a death post to a full queue, so a burst
+/// of more deaths than this between drains is recovered by
+/// [`resync_deaths`], which [`dispatch_deaths`] runs after any drain that
+/// took a full queue's worth of events; the service table has no fixed size.
+const DEATHS_EQ_CAPACITY: u32 = 64;
 
-/// Maximum services init may pre-register before
-/// [`svcmgr_labels::HANDOVER_COMPLETE`] runs reconciliation. Sized to
-/// match [`MAX_SERVICES`] — svcmgr cannot supervise more entries
-/// than its `ServiceEntry` table can hold.
-const MAX_PENDING_REGISTRATIONS: usize = MAX_SERVICES;
+/// Death-observer nodes in the deaths queue: one per supervised service's
+/// main thread, and a restarted service binds its new thread before the old
+/// one's node returns. A bind past the pool fails the launch or restart.
+const DEATHS_EQ_OBSERVERS: u32 = 256;
 
-/// Read a short name packed into IPC data words starting at `first_word`.
-fn read_tail_name_from_msg(
-    msg: &IpcMessage,
-    first_word: usize,
-    name_len: usize,
-) -> [u8; registry::NAME_MAX]
+/// Monotonic time since the first call, in nanoseconds, for the windowed
+/// restart budget. Saturates rather than wraps.
+pub(crate) fn now_ns() -> u64
 {
-    let mut out = [0u8; registry::NAME_MAX];
-    read_packed_bytes(msg, first_word, name_len, &mut out);
-    out
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Unpack `byte_len` bytes from IPC data words starting at `first_word`
-/// into `out`. Caller must ensure `byte_len <= out.len()`.
-fn read_packed_bytes(msg: &IpcMessage, first_word: usize, byte_len: usize, out: &mut [u8])
+/// Read a name of `name_len` bytes packed into IPC data words from word 0,
+/// as `svcmgr_labels::pack_name` packs it. `None` when the length is 0 or
+/// past `svcmgr_labels::NAME_MAX`, or the message carries too few words.
+fn read_name_from_msg(msg: &IpcMessage, name_len: usize) -> Option<[u8; svcmgr_labels::NAME_MAX]>
 {
-    let words = byte_len.div_ceil(8);
-    for w in 0..words
-    {
-        let word = msg.word(first_word + w);
-        for b in 0..8
-        {
-            let idx = w * 8 + b;
-            if idx < byte_len && idx < out.len()
-            {
-                out[idx] = (word >> (b * 8)) as u8;
-            }
-        }
-    }
+    svcmgr_labels::unpack_name(msg.words(), name_len)
 }
 
 // ── Halt ───────────────────────────────────────────────────────────────────
@@ -107,16 +95,13 @@ fn main() -> !
     // can park the substrate `(name, thread_cap)` pairs directly in
     // `state.pending`; `HANDOVER_COMPLETE` reconciles them later.
     let mut state = SvcmgrState {
-        services: [const { ServiceEntry::empty() }; MAX_SERVICES],
-        recipes: [const { None }; MAX_SERVICES],
-        service_count: 0,
-        pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
-        pending_count: 0,
+        table: ServiceTable::new(),
+        pending: Vec::new(),
         registry: registry::Registry::new(),
         handover_done: false,
     };
 
-    let Some(caps) = bootstrap_caps(info, ipc_buf, &mut state.pending, &mut state.pending_count)
+    let Some(caps) = bootstrap_caps(info, ipc_buf, &mut state.pending)
     else
     {
         syscall::thread_exit();
@@ -135,7 +120,6 @@ fn main() -> !
         halt_loop();
     }
 
-    // Two members: the service endpoint and the deaths queue.
     let Some(ws_cap) =
         std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
             syscall::wait_set_create(slab, 2).ok()
@@ -146,21 +130,14 @@ fn main() -> !
         halt_loop();
     };
 
-    // One shared death-notification queue, capacity sized so a burst of
-    // simultaneous service crashes (worst case `MAX_SERVICES`) cannot
-    // overflow before svcmgr drains. The slab request is the kernel's raw
-    // EventQueue debit for that capacity, with as many observer nodes: one
-    // per supervised main thread, and a restarted service binds its new
-    // thread before the old one's node returns.
-    let deaths_eq_slab_bytes =
-        std::os::seraph::event_queue_retype_bytes(MAX_SERVICES as u64 * 2, MAX_SERVICES as u64 * 2);
+    // One shared death-notification queue of `DEATHS_EQ_CAPACITY`; the slab
+    // request is the kernel's raw EventQueue debit for that capacity.
+    let deaths_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
+        u64::from(DEATHS_EQ_CAPACITY),
+        u64::from(DEATHS_EQ_OBSERVERS),
+    );
     let Some(deaths_eq) = std::os::seraph::object_slab_retype(deaths_eq_slab_bytes, |slab| {
-        syscall::event_queue_create_observed(
-            slab,
-            (MAX_SERVICES as u32) * 2,
-            (MAX_SERVICES as u32) * 2,
-        )
-        .ok()
+        syscall::event_queue_create_observed(slab, DEATHS_EQ_CAPACITY, DEATHS_EQ_OBSERVERS).ok()
     })
     else
     {
@@ -196,10 +173,7 @@ fn main() -> !
 /// `registry.publish` calls (no `PUBLISH_AUTHORITY` badge — svcmgr owns
 /// the registry). Each provider's own `provides` names are published
 /// separately on the launch path ([`definitions::launch`]).
-fn publish_well_known(
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
-    caps: &service::SvcmgrCaps,
-)
+fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrCaps)
 {
     // rootfs.root — SEND on the root filesystem's namespace endpoint,
     // endowed pre-derived by init. Seed-only: the whole-filesystem namespace
@@ -263,7 +237,7 @@ fn publish_well_known(
 /// `registry_lookup_derived` re-derives a SEND per consumer and the badge
 /// survives. Logs and skips when the cap is absent; deletes it when the
 /// publish fails.
-fn publish_endowed_send(registry: &mut registry::Registry<REGISTRY_CAPACITY>, cap: u32, name: &[u8])
+fn publish_endowed_send(registry: &mut registry::Registry, cap: u32, name: &[u8])
 {
     let shown = core::str::from_utf8(name).unwrap_or("?");
     if cap == 0
@@ -282,7 +256,7 @@ fn publish_endowed_send(registry: &mut registry::Registry<REGISTRY_CAPACITY>, ca
 /// endowed devmgr-registry `source`; logs and skips when the source is
 /// absent or the derive or publish fails.
 fn publish_devmgr_registry_send(
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
     source: u32,
     name: &[u8],
     badge: u64,
@@ -404,15 +378,12 @@ const WS_BADGE_DEATHS: u64 = 1;
 /// re-used.
 pub struct SvcmgrState
 {
-    pub services: [ServiceEntry; MAX_SERVICES],
-    /// Heap-backed restart surfaces, index-aligned with `services` via
-    /// the death correlator. `None` for slots with no svcmgr-launched
-    /// recipe. See [`RestartRecipe`].
-    pub recipes: [Option<RestartRecipe>; MAX_SERVICES],
-    pub service_count: usize,
-    pub pending: [PendingRegistration; MAX_PENDING_REGISTRATIONS],
-    pub pending_count: usize,
-    pub registry: registry::Registry<REGISTRY_CAPACITY>,
+    /// Supervised services and their restart recipes, index-aligned via the
+    /// death correlator; grows on the heap with no fixed count.
+    pub table: ServiceTable,
+    /// Substrate registrations parked from init's endowment.
+    pub pending: Vec<PendingRegistration>,
+    pub registry: registry::Registry,
     /// Set by the one `HANDOVER_COMPLETE` svcmgr honours; a repeat is
     /// rejected so reconciliation cannot launch a second instance of every
     /// defined service.
@@ -528,17 +499,14 @@ fn dispatch_ipc(
             std::os::seraph::log!("handover complete; scanning /config/svcmgr/services/");
             definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
-                state.pending_count,
-                &mut state.services,
-                &mut state.recipes,
-                &mut state.service_count,
+                &mut state.table,
                 ctx.deaths_eq,
                 ctx,
                 &mut state.registry,
             );
             std::os::seraph::log!(
                 "monitoring {} service(s) after reconciliation",
-                state.service_count
+                state.table.services.len()
             );
         }
         svcmgr_labels::PUBLISH_ENDPOINT =>
@@ -563,11 +531,8 @@ fn dispatch_ipc(
 
 /// Handle `PUBLISH_ENDPOINT`: add a `name → cap` mapping to the discovery
 /// registry. The name is packed into data words 0.. per
-/// [`read_tail_name_from_msg`]; the cap arrives as the first received cap.
-fn handle_publish_endpoint(
-    msg: &IpcMessage,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
-) -> u64
+/// [`read_name_from_msg`]; the cap arrives as the first received cap.
+fn handle_publish_endpoint(msg: &IpcMessage, registry: &mut registry::Registry) -> u64
 {
     // IPC delivers caps into svcmgr's CSpace before dispatch — every
     // reject path must release the delivered value cap, otherwise a
@@ -596,15 +561,15 @@ fn handle_publish_endpoint(
         return reject(ipc::svcmgr_errors::UNAUTHORIZED);
     }
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    if name_len == 0 || name_len > registry::NAME_MAX
+    let Some(name) = read_name_from_msg(msg, name_len)
+    else
     {
         return reject(ipc::svcmgr_errors::INVALID_NAME);
-    }
+    };
     if delivered_cap == 0
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
-    let name = read_tail_name_from_msg(msg, 0, name_len);
     if registry
         .publish(&name[..name_len], delivered_cap, Visibility::Public)
         .is_err()
@@ -626,7 +591,7 @@ fn handle_publish_endpoint(
 /// each `.svc` `seed = ...` name on the launch and restart paths, and the
 /// `pwrmgr.shutdown` cap of a graceful shutdown).
 pub(crate) fn registry_lookup_derived(
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry,
     name: &[u8],
     resolver: Resolver,
 ) -> Result<u32, u64>
@@ -648,21 +613,17 @@ pub(crate) fn registry_lookup_derived(
 
 /// Handle `QUERY_ENDPOINT`: look up a name in the discovery registry and
 /// reply with a derived SEND cap if found.
-fn handle_query_endpoint(
-    msg: &IpcMessage,
-    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
-    ipc_buf: *mut u64,
-)
+fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ipc_buf: *mut u64)
 {
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    if name_len == 0 || name_len > registry::NAME_MAX
+    let Some(name) = read_name_from_msg(msg, name_len)
+    else
     {
         let reply = IpcMessage::new(ipc::svcmgr_errors::INVALID_NAME);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
-    }
-    let name = read_tail_name_from_msg(msg, 0, name_len);
+    };
     match registry_lookup_derived(registry, &name[..name_len], Resolver::Query)
     {
         Ok(derived) =>
@@ -694,53 +655,117 @@ fn handle_query_endpoint(
 /// (set at `thread_bind_notification` time) and the exit reason. The wait-set notifies once per
 /// not-empty → empty transition, so a single wakeup may cover several
 /// deaths; the try-recv loop runs until the queue empties.
+///
+/// A drain that takes [`DEATHS_EQ_CAPACITY`] events or more may have
+/// followed a full queue, whose dropped posts leave a full queue's worth of
+/// events behind them for this drain or the next; the drain that crosses the
+/// capacity then runs [`resync_deaths`].
 fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    loop
+    let mut drained: u32 = 0;
+    while let Ok(death) = syscall::event_try_recv_death(deaths_eq)
     {
-        let Ok(death) = syscall::event_try_recv_death(deaths_eq)
-        else
-        {
-            return;
-        };
+        drained = drained.saturating_add(1);
         // Every bind passes the service index widened to u64, so the low word
         // is the whole correlator.
         // cast_possible_truncation: see above; the high word is always zero.
         #[allow(clippy::cast_possible_truncation)]
         let correlator = death.correlator as u32;
         let exit_reason = death.exit_reason;
-        let idx = correlator as usize;
+        route_death(correlator, exit_reason, state, ctx);
+    }
+    if drained >= DEATHS_EQ_CAPACITY
+    {
+        std::os::seraph::log!("death queue drained {drained} events; resyncing services");
+        resync_deaths(state, ctx);
+    }
+}
 
-        if idx >= state.service_count
+/// Route one death to its `ServiceEntry` by correlator (the table index) and
+/// run the restart decision for an active entry.
+fn route_death(
+    correlator: u32,
+    exit_reason: u64,
+    state: &mut SvcmgrState,
+    ctx: &restart::RestartCtx,
+)
+{
+    let idx = correlator as usize;
+    if idx >= state.table.services.len()
+    {
+        std::os::seraph::log!("death notification with unknown correlator");
+        return;
+    }
+    let svc = &state.table.services[idx];
+    if !svc.active
+    {
+        return;
+    }
+    // A slot's correlator outlives its instances, so a post can arrive for
+    // an instance [`resync_deaths`] already routed and restarted. The kernel
+    // reports the current instance's thread state: a live thread means the
+    // post is the dead instance's, already handled; an exited one is routed
+    // with the reason the kernel recorded for it, not the post's, which may
+    // be the earlier instance's.
+    let exit_reason = match syscall::cap_info(svc.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+    {
+        Ok(packed) if (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED => return,
+        Ok(packed) => packed & 0xFFFF_FFFF,
+        Err(_) => exit_reason,
+    };
+
+    // Split disjoint field borrows so handle_death gets the entry, its
+    // restart recipe, and the registry (for seed re-resolution) at once.
+    let SvcmgrState {
+        table, registry, ..
+    } = state;
+    let outcome = restart::handle_death(
+        &mut table.services[idx],
+        exit_reason,
+        ctx,
+        correlator,
+        table.recipes[idx].as_ref(),
+        registry,
+    );
+    if matches!(outcome, restart::DeathOutcome::Unrecoverable)
+    {
+        initiate_graceful_shutdown(state, ctx, idx);
+    }
+}
+
+/// Route a death for every active service whose thread the kernel reports
+/// exited (`CAP_INFO_THREAD_STATE`): the recovery for death posts a full
+/// queue dropped. The kernel records the state before it posts, so a service
+/// whose post was lost is found here; a restart rebinds the new instance,
+/// whose own death posts to the queue this drain has emptied. A post for a
+/// service routed here that does arrive later is the dead instance's, and
+/// [`route_death`] drops it because the entry's current thread is live.
+fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
+{
+    for idx in 0..state.table.services.len()
+    {
+        let svc = &state.table.services[idx];
+        if !svc.active || svc.thread_cap == 0
         {
-            std::os::seraph::log!("death notification with unknown correlator");
             continue;
         }
-        if !state.services[idx].active
+        let Ok(packed) = syscall::cap_info(svc.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        else
+        {
+            continue;
+        };
+        if (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
         {
             continue;
         }
-
-        // Split disjoint field borrows so handle_death gets the entry, its
-        // restart recipe, and the registry (for seed re-resolution) at once.
-        let SvcmgrState {
-            services,
-            recipes,
-            registry,
-            ..
-        } = state;
-        let outcome = restart::handle_death(
-            &mut services[idx],
-            exit_reason,
-            ctx,
-            correlator,
-            recipes[idx].as_ref(),
-            registry,
-        );
-        if matches!(outcome, restart::DeathOutcome::Unrecoverable)
+        // `idx` came from the table, whose slots each have a `u32`
+        // correlator (`ServiceTable::reserve`).
+        let Ok(correlator) = u32::try_from(idx)
+        else
         {
-            initiate_graceful_shutdown(state, ctx, idx);
-        }
+            continue;
+        };
+        route_death(correlator, packed & 0xFFFF_FFFF, state, ctx);
     }
 }
 
@@ -755,7 +780,7 @@ fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::Resta
 /// recovery story for procmgr / memmgr death.
 fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx, dying_idx: usize)
 {
-    let name = state.services[dying_idx].name_str();
+    let name = state.table.services[dying_idx].name_str();
     if name == "pwrmgr"
     {
         std::os::seraph::log!(

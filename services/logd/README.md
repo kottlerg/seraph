@@ -76,13 +76,14 @@ targets; only the one-time init-logd history pull
   When a process exits, logd's EQ receives the death entry
   `(exit_reason, process_badge as u32)`; logd evicts the matching
   slot from its hash-keyed badge table (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md)). The EQ's capacity is
-  procmgr's own death queue's, `MAX_PROCESSES * 2`, read from procmgr's
-  `procmgr-process-table` crate: a build-time coupling to procmgr's
-  internals, not an IPC contract. A death posted to a full EQ is dropped and
-  its slot is never evicted; logd reports a drain that took a full queue's
-  worth. Once procmgr's table is growable the coupling gives way to a
-  liveness or resync path ([#643](https://github.com/kottlerg/seraph/issues/643)).
+  [`docs/ipc-interface.md`](docs/ipc-interface.md)). The EQ has a fixed
+  tuning capacity. A death posted to a full EQ is dropped, so a drain that
+  took a full queue's worth starts a resync: a helper thread walks procmgr's
+  live badges (`QUERY_LIVE_PROCESSES`) and logd evicts the slots it snapshotted
+  before the walk that the walk did not list. The walk runs off the main thread,
+  which never calls procmgr after startup, since procmgr's own synchronous log
+  calls would deadlock against it (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+  § Death-queue resync).
 
 ## Out of scope (follow-up issues)
 
@@ -97,8 +98,9 @@ logd/
 ├── README.md
 ├── codec/                      # logd-codec, its own component shared
 │                               # with init-logd: handover wire contract,
-│                               # init-logd's history ring, the shared
-│                               # line and name widths, and BoundedStr
+│                               # init-logd's history ring, the resync
+│                               # decisions, the shared line and name
+│                               # widths, and BoundedStr
 │                               # (see codec/README.md)
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
@@ -144,7 +146,7 @@ the devmgr-registry cap for its lifetime (see
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client and a framebuffer-driver consumer |
 | [services/init/README.md](../init/README.md) | init-logd's role + termination, and the reserved log-sink sources init endows svcmgr |
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
-| [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind |
+| [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with and the `BoundedStr` diagnostic formatter |

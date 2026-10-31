@@ -409,7 +409,7 @@ pub unsafe fn relocate_kernel(
     let link_virt = info.virtual_base;
     if info.rela_size > 0
     {
-        // rela_size → usize: 64-bit targets only; bounded by MAX_RELA_TABLE_SIZE.
+        // rela_size → usize: 64-bit targets only; bounded by the image's size.
         #[allow(clippy::cast_possible_truncation)]
         // SAFETY: rela_phys/rela_size name table bytes inside the span
         // allocation (resolved by load_kernel), identity-mapped and unaliased.

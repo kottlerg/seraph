@@ -800,8 +800,13 @@ effect, and is posted, only if the thread is started again (see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)).
 
 procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
-just the main thread — drives procmgr's teardown of the whole process. Normal thread exit does not
-fire these observers.
+just the main thread — drives procmgr's teardown of the whole process. A worker's fault fails to
+drive that teardown at once only when procmgr's full death queue drops its post: procmgr recovers
+the main-thread deaths it missed from the kernel's thread states, but no kernel state reports an
+address space's terminal fault, so that process is torn down when its main thread exits
+([#666](https://github.com/kottlerg/seraph/issues/666); see
+[services/procmgr/README.md](../services/procmgr/README.md) § Process table and death queue).
+Normal thread exit does not fire these observers.
 
 ---
 

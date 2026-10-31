@@ -88,12 +88,9 @@ fn check_blob(
     Ok(blob.len().div_ceil(8))
 }
 
-/// Bound a `binary` or `subtree:<path>` value against `ipc::MAX_PATH_LEN`.
-/// svcmgr keeps both paths in fixed `MAX_PATH_LEN` buffers on the
-/// `ServiceEntry` it restarts from (see
-/// `services/svcmgr/docs/restart-protocol.md` § Recipe storage); a longer path
-/// would launch once from the recipe string and then restart along a
-/// truncated path, so the recipe is refused here instead.
+/// Bound a `binary` or `subtree:<path>` value against `ipc::MAX_PATH_LEN`,
+/// the one recipe path limit (`services/svcmgr/docs/service-definitions.md`
+/// § Keys).
 fn check_path_len(lineno: usize, path: &str, too_long: &'static str) -> Result<(), ParseError>
 {
     if path.len() > ipc::MAX_PATH_LEN
@@ -141,7 +138,9 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// # Errors
 ///
 /// Returns a [`ParseError`] naming the offending line when the contents
-/// violate the grammar or a semantic rule: a missing `=`, an unknown or
+/// violate the grammar or a semantic rule: a service `name` that is empty or
+/// over `ipc::svcmgr_labels::NAME_MAX` bytes ([`ParseError::InvalidValue`]
+/// on line 0), a missing `=`, an unknown or
 /// duplicated key, a missing mandatory key, a malformed value, an
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
 /// root under `namespace = universal`, a `cwd` outside a
@@ -159,6 +158,13 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 #[allow(clippy::too_many_lines)]
 pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 {
+    if name.is_empty() || name.len() > ipc::svcmgr_labels::NAME_MAX
+    {
+        return Err(ParseError::InvalidValue(
+            0,
+            "service name exceeds NAME_MAX bytes",
+        ));
+    }
     let mut binary: Option<String> = None;
     let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
@@ -346,7 +352,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                         }
                         None => (tok, 0),
                     };
-                    if name.is_empty() || name.len() > registry::NAME_MAX
+                    if name.is_empty() || name.len() > ipc::svcmgr_labels::NAME_MAX
                     {
                         return Err(ParseError::InvalidValue(
                             lineno,
@@ -988,6 +994,23 @@ sched_max = 12\n";
         assert!(matches!(
             parse_with(&env),
             Err(ParseError::TooLarge(5, why)) if why.ends_with("255 tokens")
+        ));
+    }
+
+    #[test]
+    fn service_name_is_bounded_by_the_one_name_limit()
+    {
+        let recipe = "binary = /x\nrestart = never\ncritical = no\nnamespace = none\n";
+        let at = "a".repeat(ipc::svcmgr_labels::NAME_MAX);
+        assert_eq!(parse(&at, recipe).expect("name at NAME_MAX").name, at);
+        let over = "a".repeat(ipc::svcmgr_labels::NAME_MAX + 1);
+        assert!(matches!(
+            parse(&over, recipe),
+            Err(ParseError::InvalidValue(0, _))
+        ));
+        assert!(matches!(
+            parse("", recipe),
+            Err(ParseError::InvalidValue(0, _))
         ));
     }
 }

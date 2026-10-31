@@ -194,6 +194,30 @@ no `main()` of either shape `abi/process-abi` describes.
 
 ---
 
+## Process table and death queue
+
+The process table lives on procmgr's heap, sorted by badge, and grows with the
+live process count; a spawn fails only when the heap cannot grow it. The kernel's
+death correlator is a `u64`, but procmgr still binds each child's death observers
+with the low 32 bits of its `u64` badge (adopting the full width is #643), and
+procmgr redraws a minted badge whose low 32 bits a live process already holds: the
+correlator names one live process however large the table grows.
+
+Every child's main thread and address space post to one shared death
+`EventQueue` of a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256). The kernel
+drops a post to a full queue, so a drain that takes a full queue's worth of
+events or more rescans the table and reaps every entry whose main thread the
+kernel reports exited (`CAP_INFO_THREAD_STATE`). Any dropped post leaves a full
+queue of events behind it for that drain or the next, so the rescan runs after
+the drop. The rescan recovers main-thread deaths only: a dropped address-space
+terminal-fault post, for a worker thread's fault while the main thread runs, is
+not recovered, since the kernel exposes no address-space fault state to read
+back; that process is reaped when its main thread exits. A reaped child stays in
+a recent-exits record for 30 s, so `QUERY_PROCESS` answers `EXITED` for it (see
+[docs/ipc-interface.md](docs/ipc-interface.md) § Label 9: `QUERY_PROCESS`).
+
+---
+
 ## CSpace headroom
 
 procmgr holds several capabilities per live child (its address space, CSpace, thread, slab, and
@@ -252,6 +276,7 @@ yet implemented (#26) (see
 ## Summarized By
 
 [Architecture Overview](../../docs/architecture.md),
+[Capability Model](../../docs/capability-model.md),
 [Namespace Model](../../docs/namespace-model.md),
 [Process Lifecycle](../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),

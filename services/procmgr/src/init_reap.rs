@@ -42,7 +42,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
-use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal};
+use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_PHYS_BASE, MSG_CAP_SLOTS_MAX};
 
 /// Whether the reap has run, for `QUERY_INIT_REAP`.
@@ -52,11 +52,13 @@ static REAPED: AtomicBool = AtomicBool::new(false);
 /// value), for `QUERY_INIT_REAP`.
 static PROBE_OUTCOME: AtomicU64 = AtomicU64::new(procmgr_labels::INIT_REAP_PROBE_UNCHECKED);
 
-/// Reads of the probe page after the deletion before the probe is judged
-/// held. The kernel normally frees init's `CSpace` inside procmgr's
-/// `cap_delete`; a concurrent syscall pin on it defers the free to that
-/// pin's release, which the yields wait out.
-const PROBE_SETTLE_READS: u32 = 64;
+/// Wall-clock time procmgr reads the probe page for after the deletion before
+/// the probe is judged held: 500 ms. The kernel normally frees init's `CSpace`
+/// inside procmgr's `cap_delete`; a concurrent syscall pin on it defers the
+/// free to that pin's release, which the yields between reads wait out. The
+/// bound is time rather than a count of yields, so a loaded system that
+/// stretches each yield does not run it out while a pin is still releasing.
+const PROBE_SETTLE_BUDGET_NS: u64 = 500_000_000;
 
 /// An Endpoint procmgr retypes from a fresh one-page grant and moves into
 /// init's `CSpace` just before deleting its cap on that `CSpace`. Freeing the
@@ -122,15 +124,21 @@ impl ReleaseProbe
     /// object.
     fn settle(self, memmgr_ep: u32, ipc_buf: *mut u64) -> u64
     {
-        for _ in 0..PROBE_SETTLE_READS
+        let released = poll_within(
+            PROBE_SETTLE_BUDGET_NS,
+            crate::now_ns,
+            || {
+                syscall::cap_info(self.page, CAP_INFO_MEMORY_AVAILABLE)
+                    .is_ok_and(|after| after > self.available_before)
+            },
+            || {
+                let _ = syscall::thread_yield();
+            },
+        );
+        if released
         {
-            if syscall::cap_info(self.page, CAP_INFO_MEMORY_AVAILABLE)
-                .is_ok_and(|after| after > self.available_before)
-            {
-                release_page(memmgr_ep, self.page, self.phys_base, ipc_buf);
-                return procmgr_labels::INIT_REAP_PROBE_RELEASED;
-            }
-            let _ = syscall::thread_yield();
+            release_page(memmgr_ep, self.page, self.phys_base, ipc_buf);
+            return procmgr_labels::INIT_REAP_PROBE_RELEASED;
         }
         let _ = syscall::cap_delete(self.page);
         procmgr_labels::INIT_REAP_PROBE_HELD

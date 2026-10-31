@@ -1,15 +1,16 @@
 # shared/registry
 
-Fixed-capacity name-to-endpoint-cap registry for supervisor services.
+Growable name-to-endpoint-cap registry for supervisor services.
 
 ---
 
 ## Overview
 
-A supervisor (svcmgr) holds a `Registry<N>` that maps short byte-string names (at most
-`NAME_MAX` = 16 bytes) to capability-slot indices in its own CSpace. Storage is statically sized
-(`N` entries of `NAME_MAX`-byte names) and the crate needs no allocator. A lookup requires a full
-bytewise name match, with no prefix or glob matching.
+A supervisor (svcmgr) holds a `Registry` that maps short byte-string names (at most `NAME_MAX` =
+64 bytes, the svcmgr protocol's one name limit `ipc::svcmgr_labels::NAME_MAX`) to
+capability-slot indices in its own CSpace. Entries live on the heap, one per published name, so
+the table has no fixed count; a publish fails only when the heap cannot grow it. A lookup
+requires a full bytewise name match, with no prefix or glob matching.
 
 Each entry is published `Public` or `SeedOnly`. A lookup names its resolver: `Query` (a
 `QUERY_ENDPOINT` caller) sees only `Public` entries, and `Seed` (the supervisor itself: its
@@ -18,7 +19,8 @@ recipes that seed it (per
 [services/svcmgr/docs/ipc-interface.md](../../services/svcmgr/docs/ipc-interface.md)
 § Label 4: `QUERY_ENDPOINT`).
 
-`no_std` outside host tests, no dependencies.
+`no_std` outside host tests, with `alloc`; its one dependency is `shared/ipc`, for the name
+limit.
 
 ---
 
@@ -29,7 +31,7 @@ shared/registry/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs                  # NAME_MAX, Visibility, Resolver, Entry, Registry<N>; host tests
+    └── lib.rs                  # NAME_MAX, Visibility, Resolver, Entry, Registry; host tests
 ```
 
 ---

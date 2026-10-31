@@ -529,7 +529,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 |---|---|---|---|---|---|---|
 | `ProcessTable.entries` | `services/procmgr/process-table/src/lib.rs` | heap `Vec` sorted by badge | per-instance (a spawn fails only when the heap cannot grow it) | none | correct as is | None |
 | `DEATH_EQ_CAPACITY` | `services/procmgr/src/main.rs` | 256 | tuning (a drain of a full queue's worth rescans every live entry's main-thread state, recovering any dropped main-thread post) | about 2 KiB | needs a design | A dropped address-space terminal-fault post (a worker thread's fault) is not recovered: no kernel state reports an address space's terminal fault (#666) |
-| `DEATH_EQ_OBSERVERS` | `services/procmgr/src/main.rs` | 1024 nodes | current peak plus headroom (two per live process, above memmgr's 64) | 24 KiB | make pay-as-you-go | A spawn past half of it fails its main-thread bind; add a death queue when the pool runs low |
+| `DEATH_EQ_OBSERVERS` | `services/procmgr/src/main.rs` | 1024 nodes | current peak plus headroom (two per live process, above memmgr's 64) | 24 KiB | make pay-as-you-go | A spawn past half of it fails its main-thread bind; add a death queue when the pool runs low (#643) |
 | `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
 | death correlator `correlator_of` | `services/procmgr/process-table/src/lib.rs` | low 32 bits, unique among live processes | userspace choice (the kernel correlator is `u64`) | none | needs a design | Minting redraws a live low word; pass the full badge (#643) |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
@@ -556,7 +556,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
 | `SvcmgrState.registry` | `services/svcmgr/src/main.rs` | growable `Registry` | per-instance | none | correct as is | None (#75) |
 | `SvcmgrState.pending` | `services/svcmgr/src/main.rs` | heap `Vec`, one per substrate round | per-instance | none | correct as is | None |
 | `DEATHS_EQ_CAPACITY` | `services/svcmgr/src/main.rs` | 64 | tuning (a drain of a full queue's worth rescans every active service's thread state) | about 0.5 KiB | correct as is | None |
-| `DEATHS_EQ_OBSERVERS` | `services/svcmgr/src/main.rs` | 256 nodes | current peak plus headroom (one per supervised service, plus restarts in flight) | 6 KiB | make pay-as-you-go | A launch or restart past it fails its bind; add a death queue when the pool runs low |
+| `DEATHS_EQ_OBSERVERS` | `services/svcmgr/src/main.rs` | 256 nodes | current peak plus headroom (one per supervised service, plus restarts in flight) | 6 KiB | make pay-as-you-go | A launch or restart past it fails its bind; add a death queue when the pool runs low (#643) |
 | `RESTART_BURST`, `RESTART_WINDOW_NS` (`RestartBudget`) | `services/svcmgr/svc-defs/src/restart_budget.rs` | 3 restarts per 60 s window | tuning (stops a crash loop; a rarer crash always restarts) | 16 B per service | correct as is | None (#262 for clean cap-holder restart) |
 | `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
@@ -615,7 +615,7 @@ correlator bits by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
 | `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 1 KiB | correct as is | None |
-| `DEATH_EQ_OBSERVERS` | `services/logd/src/main.rs` | 1024 nodes | current peak plus headroom (one per live process) | 24 KiB | make pay-as-you-go | A bind past it leaves that death to the resync from procmgr's live list |
+| `DEATH_EQ_OBSERVERS` | `services/logd/src/main.rs` | 1024 nodes | current peak plus headroom (one per live process) | 24 KiB | make pay-as-you-go | A bind past it leaves that death to the resync from procmgr's live list (#643) |
 | eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | userspace choice (the kernel correlator is `u64`) | none | needs a design | Evicts every slot sharing the low bits; compare the full badge (#643) |
 | death exit reason | `services/logd/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |

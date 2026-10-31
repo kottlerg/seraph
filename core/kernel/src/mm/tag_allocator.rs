@@ -91,9 +91,6 @@ struct TagPool
 impl TagPool
 {
     /// The pool before `enable`: no tags, no storage.
-    // dead_code: the only caller is the kernel's `TAG_POOL` initializer, which
-    // host test builds compile out (the tests build pools with `over`).
-    #[cfg_attr(test, allow(dead_code))]
     const fn new() -> Self
     {
         Self {
@@ -139,10 +136,12 @@ impl TagPool
         self.alloc_gen
     }
 
+    /// Whether `tag` is in use. A tag past the pool, every tag of the pool
+    /// before `enable` (which has no storage), is not.
     fn is_used(&self, tag: u16) -> bool
     {
         let t = tag as usize;
-        self.in_use[t / 64] & (1u64 << (t % 64)) != 0
+        t < self.num_tags && self.in_use[t / 64] & (1u64 << (t % 64)) != 0
     }
 
     /// First free tag in `1..num_tags`, or `None` if the pool is full. Scans the
@@ -666,6 +665,17 @@ mod tests
         }
         assert_eq!(pool.find_free(), u16::try_from(n - 1).ok());
         pool.record(u16::try_from(n - 1).unwrap(), 1, 1);
+        assert_eq!(pool.find_free(), None);
+    }
+
+    // Defect caught: an address-space teardown on a boot with tagging off
+    // (no PCID under TCG) indexing the storage-less pool.
+    #[test]
+    fn the_pool_before_enable_releases_nothing_and_holds_no_tag()
+    {
+        let mut pool = TagPool::new();
+        assert!(!pool.release(0, 0x1000));
+        assert!(!pool.is_used(5));
         assert_eq!(pool.find_free(), None);
     }
 

@@ -176,16 +176,24 @@ fn main() -> !
     event_loop(ws_cap, death_eq, caps.log_ep_recv, ipc_buf, &mut table);
 }
 
-/// Allocate the slab and create the death-notification `EventQueue`.
-/// Capacity sized so a burst of simultaneous child deaths fits before
-/// logd's next drain (`MAX_DEATHS_PER_BURST`).
+/// Capacity of logd's death-notification `EventQueue`: procmgr's own death
+/// queue's (`MAX_PROCESSES * 2`, `services/procmgr/src/main.rs`), so a burst
+/// of deaths procmgr's queue absorbs fits here too, provided logd drains
+/// before more deaths arrive, and the capacity follows procmgr's process
+/// table as it grows. The two queues drain independently, so a slow logd
+/// drain can still fill this one: the kernel then drops the post, the
+/// sender's slot is never evicted, and [`drain_deaths`] reports the full
+/// drain after the fact.
+const DEATH_EQ_CAPACITY: u32 = (procmgr_process_table::MAX_PROCESSES * 2) as u32;
+
+/// Allocate the slab and create the death-notification `EventQueue` of
+/// [`DEATH_EQ_CAPACITY`].
 fn create_death_eq() -> Option<u32>
 {
-    const MAX_DEATHS_PER_BURST: u32 = 64;
     // The kernel's raw EventQueue debit for that capacity.
-    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(MAX_DEATHS_PER_BURST));
+    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
     std::os::seraph::object_slab_retype(slab_bytes, |slab| {
-        syscall::event_queue_create(slab, MAX_DEATHS_PER_BURST).ok()
+        syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
     })
 }
 
@@ -326,16 +334,30 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 /// Non-blocking drain of the death event queue. Each payload encodes
 /// `(process_badge as u32) << 32 | exit_reason`. We evict the
-/// matching slot from the badge table.
+/// matching slot from the badge table. A drain that takes a full queue's
+/// worth of events reports it: the queue may have filled, and a post to a
+/// full queue is dropped, leaving that sender's slot unevicted.
 fn drain_deaths(death_eq: u32, table: &mut SlotTable)
 {
+    let mut drained: u32 = 0;
     loop
     {
         let Ok(payload) = syscall::event_try_recv(death_eq)
         else
         {
+            if drained >= DEATH_EQ_CAPACITY
+            {
+                let mut buf = SerialFmt::new();
+                let _ = write!(
+                    buf,
+                    "death queue drained {drained} events (capacity {DEATH_EQ_CAPACITY}); \
+                     deaths may have been dropped"
+                );
+                self_log(buf.as_str());
+            }
             return;
         };
+        drained = drained.saturating_add(1);
         let correlator = (payload >> 32) as u32;
         let exit_reason = payload as u32;
         // Badge in logd's slot map is the full u64; the correlator

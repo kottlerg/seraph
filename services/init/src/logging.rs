@@ -36,11 +36,13 @@ use crate::PAGE_SIZE;
 use crate::arch;
 use crate::bootstrap::BootArena;
 use init_protocol::InitInfo;
-use init_sender_table::{LINE_BUF_SIZE, SenderSlot, SenderTable};
+use init_sender_table::{SenderSlot, SenderTable};
 
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::stream_labels::STREAM_BYTES;
+use logd_codec::LINE_BUF_SIZE;
 use logd_codec::handover::{self, NameResend};
+use logd_codec::history::{HistoryCursor, HistoryRing};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 //
@@ -70,41 +72,13 @@ const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 /// new boot-time services.
 const MAX_SENDERS: usize = 32;
 
-/// Number of completed log lines retained in the handover ring. Sized
-/// so the pre-mount window — every line emitted between boot and Phase
-/// 2's `phase 2: launching logd` — fits without wrapping in practice
-/// (today: ~50 lines). Lines beyond the ring eject the oldest entry
-/// (FIFO drop). Real-logd treats the ring as the captured history it
-/// inherits at handover.
-const HISTORY_RING_LEN: usize = 512;
-
-/// Per-line history entry. Stores the byte payload (no `\n`, no
-/// `[name]` prefix — real-logd re-renders if it wants), the sender's
-/// badge (kernel-delivered identity), and the receipt timestamp in
-/// microseconds since boot. Names are looked up out of band on
-/// handover by walking the slot table.
-#[derive(Clone, Copy)]
-struct HistoryLine
-{
-    badge: u64,
-    us: u64,
-    bytes: [u8; LINE_BUF_SIZE],
-    // At most `LINE_BUF_SIZE` (256), which a `u16` always holds.
-    used: u16,
-}
-
-impl HistoryLine
-{
-    const fn empty() -> Self
-    {
-        Self {
-            badge: 0,
-            us: 0,
-            bytes: [0u8; LINE_BUF_SIZE],
-            used: 0,
-        }
-    }
-}
+/// Bytes of init-logd's captured-history ring. Lines are packed by length
+/// (`logd_codec::history`), so the ring holds about 160 lines of the 80-odd
+/// bytes boot lines run to, against a pre-handover peak of about 50, and
+/// still more than 50 lines at the full `LINE_BUF_SIZE`. A full ring drops
+/// its oldest lines (FIFO), losing only boot history real-logd would
+/// otherwise inherit, never a sender or a live line.
+const HISTORY_RING_BYTES: usize = 16 * 1024;
 
 // ── Mutable state (sender side, main-thread bound) ──────────────────────────
 
@@ -376,28 +350,12 @@ extern "C" fn log_thread_entry(arg: u64) -> !
 /// thread is its only user; `log_receive_loop` takes the one reference to it.
 static mut SENDERS: SenderTable<MAX_SENDERS> = SenderTable::new();
 
-/// Bounded ring of completed log lines, written on every `flush_line`
-/// for handover to real-logd. Wraps FIFO; oldest entry dropped on
-/// overflow. Lives on the log thread's stack? No — too large for the
-/// 16 KiB stack. Allocated as a `static mut` so it sits in init's BSS.
-/// The only mutator is the log thread; no synchronisation needed.
-static mut HISTORY: [HistoryLine; HISTORY_RING_LEN] = [HistoryLine::empty(); HISTORY_RING_LEN];
-
-/// Write cursor: the push sequence number of the next line, which lands in
-/// slot `HISTORY_HEAD % HISTORY_RING_LEN`. `history_push` advances it before
-/// writing the slot and [`HISTORY_TOTAL`] after, both on the log thread, which
-/// also runs the handover; so the two are equal whenever the handover reads
-/// them, and it reads sequence `s` from `HISTORY[s % HISTORY_RING_LEN]` for
-/// every `s < HISTORY_TOTAL` still live. `usize` is 64 bits on both targets,
-/// so the cursor is as wide as [`HISTORY_TOTAL`] and cannot wrap first.
-static HISTORY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Total lines ever pushed (monotonic, never reset): the exclusive upper
-/// bound of the push sequence numbers. The live (not yet overwritten) lines
-/// are sequences `HISTORY_TOTAL.saturating_sub(HISTORY_RING_LEN)..HISTORY_TOTAL`
-/// (`logd_codec::handover::next_history_seq`). The `u64` is that handover
-/// sequence width, and a line count cannot wrap it within any boot.
-static HISTORY_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Captured history: the completed log lines `consume_bytes` records for
+/// handover to real-logd, oldest dropped first when full. Too large for the
+/// log thread's 16 KiB stack, so it sits in init's BSS like [`SENDERS`]. The
+/// log thread is its only user; `log_receive_loop` takes the one reference
+/// to it.
+static mut HISTORY: HistoryRing<HISTORY_RING_BYTES> = HistoryRing::new();
 
 /// Set when init-logd acknowledges real-logd's `HANDOVER_RELEASE`. The
 /// receive loop checks this on the next iteration and exits cleanly via
@@ -405,30 +363,12 @@ static HISTORY_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static HANDOVER_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Push a completed line into the history ring. Called from
-/// `flush_line` for every newline-terminated or buffer-full payload.
-fn history_push(slot: &SenderSlot)
+/// Record a completed line in the history ring. Called from `consume_bytes`
+/// for every newline-terminated or buffer-full payload.
+fn history_push(history: &mut HistoryRing<HISTORY_RING_BYTES>, slot: &SenderSlot)
 {
-    use core::sync::atomic::Ordering;
-
-    let line = slot.line();
-    if line.is_empty()
-    {
-        return;
-    }
-    let head = HISTORY_HEAD.fetch_add(1, Ordering::Relaxed) % HISTORY_RING_LEN;
     let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    // SAFETY: log thread is the only mutator of HISTORY; head is unique
-    // per call.
-    unsafe {
-        let entry = &mut HISTORY[head];
-        entry.badge = slot.badge();
-        entry.us = us;
-        let n = line.len().min(LINE_BUF_SIZE);
-        entry.bytes[..n].copy_from_slice(&line[..n]);
-        entry.used = n as u16;
-    }
-    HISTORY_TOTAL.fetch_add(1, Ordering::Relaxed);
+    history.push(slot.badge(), us, slot.line());
 }
 
 /// `RecvGuard` diagnostic hook. Init's serial sink is direct, so emit
@@ -460,14 +400,9 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     // SAFETY: the log thread runs this loop once and never returns from it,
     // and nothing else names SENDERS, so this is the only reference to it.
     let senders = unsafe { &mut *core::ptr::addr_of_mut!(SENDERS) };
-    // Handover cursor: 0 until the HANDOVER_PULL header is sent, then one
-    // more than the next history push sequence to send.
-    let mut handover_cursor: u64 = 0;
-    // Cursor into the slot table for staged HANDOVER_PULL replies.
-    let mut handover_slot_idx: usize = 0;
-    // Slots whose name changed after the handover's slot pass began; the
-    // drain sends them again before it reports DONE or acks the release.
-    let mut name_resend: NameResend<MAX_SENDERS> = NameResend::new();
+    // SAFETY: as for SENDERS: nothing else names HISTORY.
+    let history = unsafe { &mut *core::ptr::addr_of_mut!(HISTORY) };
+    let mut drain = HandoverDrain::new();
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
@@ -495,7 +430,7 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
         if label_id == STREAM_BYTES
         {
-            consume_bytes(senders, &recv, recv.badge, byte_len);
+            consume_bytes(senders, history, &recv, recv.badge, byte_len);
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
@@ -503,20 +438,16 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         {
             if let Some(slot_idx) = register_sender_name(senders, &recv, recv.badge, byte_len)
             {
-                name_resend.note_name_change(slot_idx);
+                drain.name_resend.note_name_change(slot_idx);
             }
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
         else if label_id == HANDOVER_PULL
         {
-            handle_handover_pull(
-                senders.slots(),
-                &mut handover_cursor,
-                &mut handover_slot_idx,
-                &mut name_resend,
-                ipc_buf_raw,
-            );
+            let reply = drain.next_chunk(senders.slots(), history);
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf_raw) };
         }
         else if label_id == HANDOVER_RELEASE
         {
@@ -526,7 +457,7 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
             // real-logd pulls again and the drain sends that slot. Otherwise
             // ack and set the flag; the next loop iteration self-terminates
             // the thread.
-            let status = name_resend.release_status();
+            let status = drain.name_resend.release_status();
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(status), ipc_buf_raw) };
             if status == handover::RELEASE_ACK
@@ -543,89 +474,83 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     }
 }
 
-/// Stage one chunk of handover state into the reply. Cursor state
-/// (`hist_cursor`, `slot_idx`, `name_resend`) advances across calls so
-/// each pull returns a fresh chunk: the header, every occupied slot, every
-/// slot whose name changed after the slot pass began, then the history
-/// lines. On the last entry, replies with `DONE`, meaning only "no more
-/// data" — the init-logd thread terminates on a separate acknowledged
-/// [`HANDOVER_RELEASE`], not on this `DONE`.
-fn handle_handover_pull(
-    slots: &[SenderSlot; MAX_SENDERS],
-    hist_cursor: &mut u64,
-    slot_idx: &mut usize,
-    name_resend: &mut NameResend<MAX_SENDERS>,
-    ipc_buf: *mut u64,
-)
+/// init-logd's progress through real-logd's `HANDOVER_PULL` drain, kept
+/// across pulls so each returns a fresh chunk.
+struct HandoverDrain
 {
-    let reply = next_handover_chunk(slots, hist_cursor, slot_idx, name_resend);
-    // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    /// Whether the `HEADER` chunk has been sent.
+    header_sent: bool,
+    /// The next slot-table index the slot pass sends.
+    slot_idx: usize,
+    /// The next history line to send.
+    history: HistoryCursor,
+    /// Slots whose name changed after the slot pass began; the drain sends
+    /// them again before it reports `DONE` or acks the release.
+    name_resend: NameResend<MAX_SENDERS>,
 }
 
-/// Build the next `HANDOVER_PULL` reply chunk and advance the cursors past
-/// it, in the order [`handle_handover_pull`] documents.
-fn next_handover_chunk(
-    slots: &[SenderSlot; MAX_SENDERS],
-    hist_cursor: &mut u64,
-    slot_idx: &mut usize,
-    name_resend: &mut NameResend<MAX_SENDERS>,
-) -> ipc::IpcMessage
+impl HandoverDrain
 {
-    use core::sync::atomic::Ordering;
-
-    // First chunk: header. `hist_cursor` is 0 until it is sent, then one
-    // more than the next history sequence number to send.
-    if *hist_cursor == 0
+    const fn new() -> Self
     {
-        let total = HISTORY_TOTAL.load(Ordering::Acquire);
-        let active = slots.iter().filter(|s| s.badge() != 0).count() as u64;
-        *hist_cursor = 1;
-        // From here a name change can land behind the slot pass; record it
-        // so the drain sends that slot again.
-        name_resend.start();
-        return handover::encode_header(total, active);
-    }
-
-    // Slot table, then any slot whose name changed after the pass began.
-    while *slot_idx < MAX_SENDERS
-    {
-        let slot = &slots[*slot_idx];
-        *slot_idx += 1;
-        if slot.badge() != 0
-        {
-            return slot_chunk(slot);
-        }
-    }
-    while let Some(i) = name_resend.take_next()
-    {
-        if slots[i].badge() != 0
-        {
-            return slot_chunk(&slots[i]);
+        Self {
+            header_sent: false,
+            slot_idx: 0,
+            history: HistoryCursor::new(),
+            name_resend: NameResend::new(),
         }
     }
 
-    // History ring, by absolute push sequence: a line overwritten before it
-    // was sent is skipped, and lines pushed after the drain caught up are
-    // sent by a later pull (a deferred release's further drain).
-    let total = HISTORY_TOTAL.load(Ordering::Acquire);
-    if let Some(seq) = handover::next_history_seq(*hist_cursor - 1, total, HISTORY_RING_LEN as u64)
+    /// Build the next `HANDOVER_PULL` reply chunk and advance past it: the
+    /// header, every occupied slot, every slot whose name changed after the
+    /// slot pass began, then the history lines. On the last entry, the reply
+    /// is `DONE`, meaning only "no more data": the init-logd thread
+    /// terminates on a separate acknowledged [`HANDOVER_RELEASE`], not on
+    /// this `DONE`, so a dropped data chunk cannot wedge init-logd (which
+    /// would block procmgr's reap of init's memory caps).
+    fn next_chunk(
+        &mut self,
+        slots: &[SenderSlot; MAX_SENDERS],
+        history: &HistoryRing<HISTORY_RING_BYTES>,
+    ) -> ipc::IpcMessage
     {
-        *hist_cursor = seq + 2;
-        // SAFETY: the log thread is the only mutator of HISTORY, and sequence
-        // `seq` is live (pushed and not yet overwritten), so its slot is fully
-        // initialised.
-        let entry = unsafe { &HISTORY[(seq % HISTORY_RING_LEN as u64) as usize] };
-        return handover::encode_line(entry.badge, entry.us, &entry.bytes[..entry.used as usize]);
-    }
+        if !self.header_sent
+        {
+            let active = slots.iter().filter(|s| s.badge() != 0).count() as u64;
+            self.header_sent = true;
+            // From here a name change can land behind the slot pass; record
+            // it so the drain sends that slot again.
+            self.name_resend.start();
+            return handover::encode_header(history.total(), active);
+        }
 
-    // Drained. Final reply marks DONE — data only. The thread does NOT exit
-    // here: real-logd issues HANDOVER_RELEASE once its drain settles, and the
-    // receive loop terminates on an acknowledged release. Decoupling
-    // termination from the multi-chunk drain keeps a dropped data chunk from
-    // wedging init-logd (which would block procmgr's reap of init's memory
-    // caps).
-    handover::encode_done()
+        while self.slot_idx < MAX_SENDERS
+        {
+            let slot = &slots[self.slot_idx];
+            self.slot_idx += 1;
+            if slot.badge() != 0
+            {
+                return slot_chunk(slot);
+            }
+        }
+        while let Some(i) = self.name_resend.take_next()
+        {
+            if slots[i].badge() != 0
+            {
+                return slot_chunk(&slots[i]);
+            }
+        }
+
+        // History, by absolute push sequence: a line evicted before it was
+        // sent is skipped, and lines pushed after the drain caught up are
+        // sent by a later pull (a deferred release's further drain).
+        let mut line = [0u8; LINE_BUF_SIZE];
+        if let Some(entry) = history.read_next(&mut self.history, &mut line)
+        {
+            return handover::encode_line(entry.badge, entry.us, &line[..entry.len]);
+        }
+        handover::encode_done()
+    }
 }
 
 /// The `SLOT` handover chunk carrying `slot`'s badge and display name.
@@ -788,6 +713,7 @@ fn flush_synthetic_logd_line(payload: &[u8])
 /// ([`SenderTable::find_or_alloc`]), whose partial line is dropped.
 fn consume_bytes(
     senders: &mut SenderTable<MAX_SENDERS>,
+    history: &mut HistoryRing<HISTORY_RING_BYTES>,
     msg: &ipc::IpcMessage,
     badge: u64,
     byte_len: usize,
@@ -807,19 +733,18 @@ fn consume_bytes(
         // prefix visible.
         if b == b'\n' || slot.push_byte(b)
         {
+            history_push(history, slot);
             flush_line(slot);
             slot.clear_line();
         }
     }
 }
 
-/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port,
-/// and record the line in the handover ring for real-logd. `[name]`
-/// uses the display name registered via `STREAM_REGISTER_NAME`;
+/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port.
+/// `[name]` uses the display name registered via `STREAM_REGISTER_NAME`;
 /// senders that have not registered yet render as `[?]`.
 fn flush_line(slot: &SenderSlot)
 {
-    history_push(slot);
     // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
     //
     // Source: `SYS_SYSTEM_INFO(ElapsedUs)` — kernel handler returns

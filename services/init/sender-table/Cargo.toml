@@ -7,5 +7,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+# `LINE_BUF_SIZE` and `MAX_NAME_LEN`, shared with real-logd.
+logd-codec = { path = "../../logd/codec" }
+
 [lints]
 workspace = true

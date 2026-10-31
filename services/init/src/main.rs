@@ -172,12 +172,19 @@ pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) 
 
 // ── Simple memory-cap allocator ──────────────────────────────────────────────────
 
-/// Upper bound on Memory caps `advance_cap` can abandon with pages still free.
-/// One orphan is recorded per memory cap `MemoryAlloc` moves off while it still has
-/// a usable remainder; with the drain's high→low ordering init carves its
-/// arenas from the largest memory caps and abandons only a handful of leftovers.
-/// Overflowing this is a hard error (it would silently leak), not a drop.
-const MAX_ORPHAN_MEMORY_CAPS: usize = 64;
+/// Upper bound on Memory caps `advance_cap` can abandon with pages still free,
+/// and on the usable-RAM caps `MemoryAlloc` walks: the most `CapDescriptor`s
+/// the kernel can fit in the `InitInfo` region. `advance_cap` records at most
+/// one orphan per cap it moves to, and every usable-RAM cap has a descriptor,
+/// so the orphans never outnumber `InitInfo.memory_count` and the table holds
+/// them on any firmware map the kernel can describe. The table lives in init's
+/// BSS (about 2.7 KiB), whose pages memmgr's pool takes at init's reap.
+const MAX_ORPHAN_MEMORY_CAPS: usize =
+    INIT_INFO_MAX_PAGES * PAGE_SIZE as usize / core::mem::size_of::<CapDescriptor>();
+
+/// Storage for `MemoryAlloc`'s orphan table: too large for init's 16 KiB
+/// stack, so it sits in BSS. `run` takes the one reference to it.
+static mut ORPHAN_SLOTS: [u32; MAX_ORPHAN_MEMORY_CAPS] = [0; MAX_ORPHAN_MEMORY_CAPS];
 
 /// Bump allocator over init's memory-cap pool.
 ///
@@ -191,7 +198,8 @@ pub(crate) struct MemoryAlloc
     remaining: u64,
     /// Index into the memory-cap range for the next memory cap to use.
     pub(crate) next_idx: u32,
-    /// [`InitInfo`] fields copied out for reference.
+    /// [`InitInfo`] fields copied out for reference; `memory_count` is
+    /// clamped to [`MAX_ORPHAN_MEMORY_CAPS`], which bounds the orphan count.
     memory_base: u32,
     memory_count: u32,
     /// Free Memory caps `advance_cap` moved off while they still held pages —
@@ -199,21 +207,29 @@ pub(crate) struct MemoryAlloc
     /// too small for a pending multi-page request, both below the reap floor.
     /// Nothing else can reach them, so they are streamed to memmgr's pool at
     /// reap via [`orphan_memory_caps`].
-    orphan_slots: [u32; MAX_ORPHAN_MEMORY_CAPS],
+    orphan_slots: &'static mut [u32; MAX_ORPHAN_MEMORY_CAPS],
     orphan_count: usize,
 }
 
 impl MemoryAlloc
 {
-    fn new(info: &InitInfo) -> Self
+    /// An allocator over `info`'s usable-RAM caps, recording its orphans in
+    /// `orphan_slots`. A `memory_count` past [`MAX_ORPHAN_MEMORY_CAPS`] (which
+    /// the kernel's `InitInfo` bound already excludes) is clamped: the caps
+    /// past it are not carved from, and reach memmgr with the rest of the
+    /// unconsumed tail.
+    fn new(info: &InitInfo, orphan_slots: &'static mut [u32; MAX_ORPHAN_MEMORY_CAPS]) -> Self
     {
+        // At most a few hundred, from a usize constant; fits a u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let max = MAX_ORPHAN_MEMORY_CAPS as u32;
         Self {
             current: 0,
             remaining: 0,
             next_idx: 0,
             memory_base: info.memory_base,
-            memory_count: info.memory_count,
-            orphan_slots: [0; MAX_ORPHAN_MEMORY_CAPS],
+            memory_count: info.memory_count.min(max),
+            orphan_slots,
             orphan_count: 0,
         }
     }
@@ -226,16 +242,17 @@ impl MemoryAlloc
     }
 
     /// Record a Memory cap `advance_cap` is moving off while it still holds at
-    /// least one free page. Halts if the fixed orphan table overflows: a cap
-    /// silently dropped from it would stay in init's `CSpace` until the reap
+    /// least one free page. The table cannot overflow: `advance_cap` records
+    /// at most one orphan per index it consumes, and the indices stop at the
+    /// clamped `memory_count`. The assert guards that invariant, since a cap
+    /// dropped from the table would stay in init's `CSpace` until the reap
     /// frees that `CSpace`, then free into the sealed post-handoff buddy
-    /// instead of reaching memmgr's pool, tripping the kernel's post-seal
-    /// `debug_assert` in a debug build.
+    /// instead of reaching memmgr's pool.
     fn record_orphan(&mut self, slot: u32)
     {
         assert!(
             self.orphan_count < MAX_ORPHAN_MEMORY_CAPS,
-            "init: MemoryAlloc orphan table overflow — raise MAX_ORPHAN_MEMORY_CAPS"
+            "init: MemoryAlloc orphan table overflow"
         );
         self.orphan_slots[self.orphan_count] = slot;
         self.orphan_count += 1;
@@ -397,7 +414,10 @@ fn run(info_ptr: u64) -> !
     // Set up serial output (FATAL pre-IPC errors fall back to this).
     arch::current::serial_init(info, info.thread_cap);
 
-    let mut alloc = MemoryAlloc::new(info);
+    // SAFETY: `run` executes once, on init's main thread, and nothing else
+    // names ORPHAN_SLOTS, so this is the only reference to it.
+    let orphan_slots = unsafe { &mut *core::ptr::addr_of_mut!(ORPHAN_SLOTS) };
+    let mut alloc = MemoryAlloc::new(info, orphan_slots);
 
     // Carve init's own bootstrap arena: one contiguous Memory cap backing every
     // page init allocates for itself. Its front reserve absorbs init's

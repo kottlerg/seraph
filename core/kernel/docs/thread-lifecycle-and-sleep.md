@@ -34,7 +34,7 @@ invariants.
 In scope (this document is the authoritative reference consulted before any change that
 touches these):
 
--  `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
+- `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
   `sleep_wakeups_quiesce`, `sleep_deadline_after_ms`, `commit_cancelling_park`,
   `start_under_all_locks`, `with_held_frame`, `post_death_notification`,
   `set_state_under_all_locks`, `exit_under_all_locks`, `wait_until_off_cpu` (drain steps 8-9),

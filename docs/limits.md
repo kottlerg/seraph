@@ -195,7 +195,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `INLINE_RECORDS` (`PagePool.inline`) | `core/kernel/src/cap/object.rs` | 16 | encoding artefact (spills to record pages beyond) | 384 B per pool | correct as is | Unbounded through record pages |
 | `SEED_BATCH_PAGES` | `core/kernel/src/cap/object.rs` | 64 | batch size (lock-hold bound) | none | correct as is | The total window is #434 |
 | `RECORDS_PER_PAGE` | `core/kernel/src/cap/object.rs` | 170 | encoding artefact | none | correct as is | None |
-| `MAX_CASCADE` (`dealloc_object` worklist) | `core/kernel/src/cap/object.rs` | 32 | current peak plus headroom (fan-out 16 plus ancestors) | 256 B stack | needs a design | Overflow drops entries silently; make the worklist intrusive or const-assert the fan-out sum |
+| `MAX_CASCADE` (`dealloc_object` worklist) | `core/kernel/src/cap/object.rs` | 32 | current peak plus headroom (ancestor chains; the unbounded fan-outs reclaim through nested cascades) | 256 B stack | needs a design | Overflow drops entries silently; make the worklist intrusive or const-assert the fan-out sum |
 | `MAX_DRAIN_EDITS` | `core/kernel/src/cap/object.rs` | 256 | batch size | none | correct as is | None |
 | `FRAME_WRITE_LOCKED` reader count | `core/kernel/src/cap/object.rs` | `u32` | provably unreachable (readers at most CPUs) | embedded | correct as is | None |
 

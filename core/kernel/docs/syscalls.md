@@ -471,8 +471,8 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
-  because `SYS_NOTIFICATION_SEND` rejects zero-bit sends; `0` when the wait
-  times out: the timeout elapsed, or the sleep list was full when it parked)
+  because `SYS_NOTIFICATION_SEND` rejects zero-bit sends; `0` when the wait's
+  timeout elapsed)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
@@ -551,7 +551,7 @@ out-of-band marker (`tcb.timed_out`) rather than an in-band
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
 — contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
 0 bits because `SYS_NOTIFICATION_SEND` rejects zero-bit sends, so a `0` result
-means the wait timed out (the timeout elapsed, or the sleep list was full).
+means the wait's timeout elapsed.
 
 ---
 

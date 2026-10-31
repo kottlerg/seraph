@@ -271,13 +271,17 @@ Teardown walks the record pages newest first, returning each page's other record
 record 0 (whose donation holds the page), then the inline records, the create-time slab last. A
 donation's Memory object that reaches zero there is reclaimed through its own nested cascade, not
 the bounded worklist the dealloc cascade otherwise uses, since the number of donations is
-unbounded. The cascade's other re-entry is the `CSpace` arm's release of the objects its slots
-reference. A nested `CSpace` that release drops to zero is not torn down in that frame: it is
-linked, through its deferred-reclaim link, onto a pending list the outermost `dealloc_object` call
-drains once its worklist is empty, so a chain of `CSpace`s each holding the last reference to the
-next is torn down iteratively. No other object's teardown can release a `CSpace`, so each re-entry
-is one frame deep and the teardown's stack use is bounded by a constant, whatever the nesting
-depth.
+unbounded. The cascade re-enters for three other fan-outs whose width is unbounded or
+caller-chosen: the `CSpace` arm's release of the objects its slots reference, the `WaitSet` arm's
+release of each member source whose last reference the membership held, and an owner's release of
+its death-observer queues (`release_death_observers`, from the Thread and `AddressSpace` arms). A
+nested `CSpace` that a release drops to zero is not torn down in that frame: it is linked, through
+its deferred-reclaim link, onto a pending list the outermost `dealloc_object` call drains once its
+worklist is empty, so a chain of `CSpace`s each holding the last reference to the next is torn down
+iteratively. No re-entry can reach a `CSpace`, and the only re-entries that nest are a `CSpace`
+slot's Thread, `AddressSpace` or `WaitSet` releasing its queues, sources or donations, whose objects
+re-enter no further. So the re-entry depth is at most two frames, and the teardown's stack use is
+bounded by a constant, whatever the nesting depth.
 
 The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
 its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
@@ -529,7 +533,8 @@ The principal kernel-internal owners:
   `SYS_ASPACE_BIND_NOTIFICATION` take a reference on the bound EventQueue, under the owner's
   lock (the thread's `sched_lock`, the address space's `death_lock`), held for the binding's
   lifetime. The owner's teardown (the `dealloc_object` Thread and `AddressSpace` arms)
-  releases each through the cascade worklist; a death walk runs on the dying thread or on a
+  returns each observer node to its queue's pool and then releases the reference, reclaiming a
+  queue it drops to zero through a nested cascade; a death walk runs on the dying thread or on a
   faulting thread of the live address space, so the owner, and with it every observer
   reference, outlives every post. A bind after the death posts at once under the binder's
   syscall pin and takes no reference.

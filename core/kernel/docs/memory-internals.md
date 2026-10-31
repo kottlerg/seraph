@@ -200,7 +200,8 @@ Memory handle a second time, and it refuses the map with `InvalidCapability` if 
 longer names the same object. A revoke clears the slot under its CSpace's lock before the
 issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the counts. Either the
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
-the map installs. The query reads one count per page of the region, at most 512 pages.
+the map installs. The query reads one count per page of the window it names, at most 512 pages
+of the region; a larger region is read window by window.
 
 **Storage.** The table is two-level: 256 chunk pointers in BSS, one per GiB of physical address
 space (covering the ~248 GiB the boot table pool can direct-map), each naming a 1 MiB buddy block

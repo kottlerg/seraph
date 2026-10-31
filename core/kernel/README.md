@@ -109,6 +109,7 @@ core/kernel/
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
 │   ├── sched/                  # Scheduler
 │   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol
+│   │   ├── deadline_heap.rs    # Intrusive deadline heap: the sleep list's storage
 │   │   ├── thread.rs           # Thread control block (TCB) definition
 │   │   ├── thread_registry.rs  # Live-thread registry: teardown stops, watchdog walks
 │   │   └── run_queue.rs        # Per-CPU run queues and priority levels

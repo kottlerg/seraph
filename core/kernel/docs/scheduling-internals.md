@@ -199,8 +199,8 @@ skipping levels, risks deadlock.
    every CPU's tick with interrupts disabled, and blocking there lets every idle CPU queue on one
    victim's lock — the FIFO ticket convoy that livelocked the guest system-wide under vCPU
    oversubscription (#375). The wait-set cascade rule is unchanged in spirit: `wait_set_drop`
-   releases its source/ws locks before reporting any zero-refcount source back to
-   `dealloc_object_one`'s cascade worklist, so the source's own dealloc runs after every IPC
+   releases its source/ws locks before handing any zero-refcount source to the `WaitSet` arm,
+   which reclaims it through a nested cascade, so the source's own dealloc runs after every IPC
    source/ws lock has been released.
 
 6. **Derivation tree lock is ordered after IPC object locks.** `SYS_CAP_REVOKE` MUST NOT acquire IPC
@@ -268,8 +268,8 @@ skipping levels, risks deadlock.
    row). Each reply-arm site holds exactly one TCB's `sched_lock` and runs a wait-free CAS on the
    other TCB, preserving the never-two-`sched_lock`s rule.
 
-8.  **Blocking commit MUST go through `commit_blocked_under_local_lock`.** A primitive that parks
-   the calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `endpoint_recv`,
+8. **Blocking commit MUST go through `commit_blocked_under_local_lock`.** A primitive that parks the
+   calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `endpoint_recv`,
    `waitset_wait`, `sys_thread_sleep`) MUST commit the `Running → Blocked` transition via
    `crate::sched::commit_blocked_under_local_lock(tcb, ipc_state, blocked_on)`. The helper acquires
    `(*tcb).sched_lock` (NOT the CPU lock), reads `state`, and writes `Blocked` only if `state ∈
@@ -1298,17 +1298,19 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
    cap-level reference on the source's `KernelObjectHeader`. `sys_wait_set_add` performs the
    `inc_ref` under the source's lock together with the back-pointer publication;
    `sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. A source whose
-   `dec_ref` drops to zero inside `wait_set_drop` is returned to the WaitSet arm of
-   `dealloc_object_one` and pushed onto the cascade worklist — the source's own dealloc therefore
-   runs after every IPC source/ws lock has been released, satisfying rule 5 of the Lock Hierarchy.
+   `dec_ref` drops to zero inside `wait_set_drop` is handed to the WaitSet arm of
+   `dealloc_object_one`, which reclaims it through a nested cascade (a set's members outnumber the
+   bounded worklist) — the source's own dealloc therefore runs after every IPC source/ws lock has
+   been released, satisfying rule 5 of the Lock Hierarchy.
    Sources can no longer be reclaimed while a member references them, so `waitset_wait` cannot
    dereference a dangling `source_ptr`. The member structure and add/remove paths are in
    [ipc-internals.md](ipc-internals.md) § Wait Set Add/Remove; the reference counting is in
    [capability-internals.md](capability-internals.md) § Kernel Object Reference Counting.
 
 4. **Thread death observers fire from the dying thread's exit path** (`post_death_notification`,
-   `core/kernel/src/sched/mod.rs`). Each observer is an `(EventQueueState*, correlator: u64)` pair;
-   the kernel posts the two-word entry `(exit_reason, correlator)` to each observer's queue. This
+   `core/kernel/src/sched/mod.rs`). Each observer is a node of the observing queue's pool, holding
+   the queue's `EventQueueObject*`, a `u64` correlator, and its chain link; the kernel posts the
+   two-word entry `(exit_reason, correlator)` to each node's queue. This
    mechanism is the procmgr/svcmgr-facing API; it does not interact with the parked-thread protocol
    above.
    `sys_thread_bind_notification` and `post_death_notification` serialise on the target thread's

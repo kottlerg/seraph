@@ -9,7 +9,8 @@
 //! reply, chunk-kind, and release-status codes, the sender's chunk encoders,
 //! tracker of names that change after their slot was sent, and release-retry
 //! deadline, and the receiver's chunk decoder; init-logd's captured-history
-//! byte ring ([`history`]); and the line and name widths both log receivers
+//! byte ring ([`history`]); logd's death-queue resync decisions
+//! ([`resync`]); and the line and name widths both log receivers
 //! use ([`LINE_BUF_SIZE`], [`MAX_NAME_LEN`]).
 //! Also holds [`BoundedStr`], the fixed-capacity formatter logd uses for its
 //! own diagnostics. None of this touches a syscall, IPC, or `std::os::seraph`
@@ -23,6 +24,7 @@
 
 pub mod handover;
 pub mod history;
+pub mod resync;
 
 mod bounded_str;
 

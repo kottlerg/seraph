@@ -19,6 +19,8 @@ recipe travels on the wire.
   the service is reconciled with svcmgr — for a substrate service, the
   `name` carried in its
   [handover-endowment `SUBSTRATE` round](ipc-interface.md#handover-endowment-bootstrap-rounds).
+  `<name>` is 1 to `ipc::svcmgr_labels::NAME_MAX` (64) bytes, the svcmgr
+  protocol's one name limit; a longer name is a parser error.
   Filenames are ASCII; case-sensitive `.svc` suffix.
 * Files are shipped via `rootfs/config/svcmgr/services/` and installed
   into the sysroot by xtask's recursive `install_rootfs` copy (see
@@ -51,7 +53,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount v
 
 | Key | Required | Value |
 |---|---|---|
-| `binary` | yes | Absolute path under svcmgr's root, at most `ipc::MAX_PATH_LEN` (48) bytes: the entry svcmgr restarts from holds it in a fixed buffer (see [Restart Protocol](restart-protocol.md#recipe-storage)), so a longer path is a parser error. Walked from `system_root_cap` at launch / restart. |
+| `binary` | yes | Absolute path under svcmgr's root, at most `ipc::MAX_PATH_LEN` (4096) bytes, the one recipe path limit; a longer path is a parser error. The entry svcmgr restarts from holds it at its own length (see [Restart Protocol](restart-protocol.md#recipe-storage)). Walked from `system_root_cap` at launch / restart. |
 | `argv` | no | Space-separated tokens. Becomes NUL-separated, NUL-terminated bytes on the wire. Bounded; see [`argv` / `env`](#argv--env). |
 | `env` | no | Space-separated `KEY=VAL` tokens. Same NUL packing and bounds as `argv`. |
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
@@ -97,11 +99,13 @@ that message:
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
-Restarts are counted per service over its lifetime: the count has no
-window and is never reset. Once `service::MAX_RESTARTS` (currently `1`)
-restarts have run, the next death leaves the service permanently down:
-degraded, or a graceful shutdown for `critical = yes` (see
-[`critical`](#critical)). See [restart-protocol.md](restart-protocol.md).
+Restarts are budgeted per window: a service may restart three times
+(`RESTART_BURST`) within one 60 s window (`RESTART_WINDOW_NS`), the window
+opening at the first restart after the previous one has passed. A death
+once the open window's restarts are spent leaves the service permanently
+down: degraded, or a graceful shutdown for `critical = yes` (see
+[`critical`](#critical)). A service that crashes less often than that
+restarts every time. See [restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 
@@ -139,7 +143,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority. The recipes that declare it are `svctest` (the namespace tester), `usertest`, and `terminal`, which resolve and spawn programs; the recipes of the init-bootstrapped substrate services declare `none`, since init, not svcmgr, spawned them. |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (4096) bytes, the same bound as `binary`; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 

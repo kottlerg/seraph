@@ -621,7 +621,8 @@ fn hello_file() -> (u32, u64)
 /// procmgr refuses requests whose sender or shape its wire contract does not
 /// admit, and deletes every cap they carried (see
 /// `services/procmgr/docs/ipc-interface.md` § Capability Transfer):
-/// `REGISTER_DEATH_EQ` from a sender without the `DEATH_EQ_AUTHORITY` badge,
+/// `REGISTER_DEATH_EQ` and `QUERY_LIVE_PROCESSES` (whose badge list names
+/// process handles) from a sender without the `DEATH_EQ_AUTHORITY` badge,
 /// the init-reap labels (`REGISTER_INIT_TEARDOWN`, `INIT_TEARDOWN_DONE`) from
 /// any badged sender, an unknown opcode, a `CREATE_FROM_FILE` that sets
 /// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap, and a
@@ -645,6 +646,15 @@ pub fn procmgr_refusals_phase(_: &Caps)
                 .build(),
             procmgr_errors::UNAUTHORIZED,
             "REGISTER_DEATH_EQ without DEATH_EQ_AUTHORITY",
+        );
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::QUERY_LIVE_PROCESSES)
+                .word(0, 0)
+                .cap(spare_cap())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "QUERY_LIVE_PROCESSES without DEATH_EQ_AUTHORITY",
         );
         expect_reply(
             procmgr,

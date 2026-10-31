@@ -43,14 +43,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::{IpcMessage, svcmgr_errors, svcmgr_labels};
 
-/// Maximum registered-name length in bytes. Source of truth lives in
-/// `shared/registry::NAME_MAX`; this constant must be kept in sync with
-/// it. Inlined rather than imported because `registry` does not build
-/// inside std's dependency graph (it has no `rustc-dep-of-std` feature).
-pub const NAME_MAX: usize = 16;
-
-/// Word-count of the on-wire name buffer (8 bytes per u64 word).
-pub const NAME_WORDS: usize = NAME_MAX.div_ceil(8);
+/// The svcmgr protocol's one name limit and its packing, shared with svcmgr,
+/// its registry, and init's endowment: a name longer than [`NAME_MAX`] is
+/// refused before any IPC.
+pub use ipc::svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name};
 
 /// Per-process cached SEND cap on svcmgr's service endpoint. Zero means
 /// "no registry available" — `_start` did not install one, or the
@@ -69,26 +65,6 @@ pub fn install_registry_cap(cap: u32)
 pub fn registry_cap() -> u32
 {
     REGISTRY_CAP.load(Ordering::Acquire)
-}
-
-/// Pack `name` into IPC data words (little-endian-by-byte; byte `i`
-/// occupies bits `(i%8)*8..(i%8)*8+8` of word `i/8`), overwriting all of
-/// `out`. Returns the number of words consumed, or `None` (leaving `out`
-/// zeroed) when `name` is longer than [`NAME_MAX`]; matches
-/// `svcmgr::read_tail_name_from_msg`.
-#[must_use]
-pub fn pack_name(name: &[u8], out: &mut [u64; NAME_WORDS]) -> Option<usize>
-{
-    *out = [0; NAME_WORDS];
-    if name.len() > NAME_MAX
-    {
-        return None;
-    }
-    for (i, &b) in name.iter().enumerate()
-    {
-        out[i / 8] |= u64::from(b) << ((i % 8) * 8);
-    }
-    Some(name.len().div_ceil(8))
 }
 
 /// Look up `name` in svcmgr's discovery registry. Returns `Some(cap)`
@@ -126,41 +102,4 @@ pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u32>
         return None;
     }
     reply.caps().first().copied().filter(|&c| c != 0)
-}
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn pack_name_refuses_a_name_past_name_max()
-    {
-        let mut out = [0u64; NAME_WORDS];
-        assert_eq!(pack_name(&[b'a'; NAME_MAX + 1], &mut out), None);
-        assert_eq!(out, [0; NAME_WORDS]);
-    }
-
-    #[test]
-    fn pack_name_fills_both_words_at_name_max()
-    {
-        let name = *b"0123456789abcdef";
-        let mut out = [0u64; NAME_WORDS];
-        assert_eq!(pack_name(&name, &mut out), Some(2));
-        assert_eq!(
-            out,
-            [
-                u64::from_le_bytes(*b"01234567"),
-                u64::from_le_bytes(*b"89abcdef")
-            ]
-        );
-    }
-
-    #[test]
-    fn pack_name_overwrites_a_dirty_buffer()
-    {
-        let mut out = [u64::MAX; NAME_WORDS];
-        assert_eq!(pack_name(b"timed", &mut out), Some(1));
-        assert_eq!(out, [u64::from_le_bytes(*b"timed\0\0\0"), 0]);
-    }
 }

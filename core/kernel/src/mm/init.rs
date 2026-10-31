@@ -396,9 +396,9 @@ pub fn init_physical_memory(info: &BootInfo)
 /// Phase 3 page-table carve, or `None`.
 ///
 /// A free piece here also avoids everything from the device tree blob's start
-/// to the end of the memory-map entry that holds it ([`dtb_tail`]): the blob's
-/// size is in its header, which Phase 3 cannot read before its own tables are
-/// active.
+/// to the end of the run of address-contiguous memory-map entries that holds it
+/// ([`dtb_tail`]): the blob's size is in its header, which Phase 3 cannot read
+/// before its own tables are active.
 ///
 /// Called on the single boot thread while the bootloader's identity map still
 /// covers `info`, its memory map, and its module list.
@@ -1018,7 +1018,7 @@ mod tests
     // Defect caught: a carve laid over the device tree blob, whose header the
     // stage-2 tables would overwrite before `populate_buddy` reads it.
     #[test]
-    fn the_carve_avoids_everything_from_the_device_tree_onward()
+    fn the_carve_avoids_the_device_tree_to_the_end_of_its_ram_run()
     {
         let map = [usable(0x10_0000, 0x10_0000), usable(0x40_0000, 0x10_0000)];
         let mut info = boot_info(&map, &[]);
@@ -1037,6 +1037,12 @@ mod tests
             usable(0x20_0000, 0x1000),
         ];
         assert_eq!(dtb_tail(0x10_0800, &map), (0x10_0000, 0x10_2000));
+    }
+
+    #[test]
+    fn a_device_tree_outside_every_entry_excludes_nothing()
+    {
+        let map = [usable(0x10_0000, 0x1000)];
         assert_eq!(dtb_tail(0x30_0000, &map), (0, 0));
     }
 

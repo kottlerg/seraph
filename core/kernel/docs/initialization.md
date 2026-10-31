@@ -134,8 +134,9 @@ again from the recorded BootInfo address.
 2. Size the stage-2 carve: an upper bound on the table frames step 5 allocates
    (mm::paging::stage2_table_bound), and take that many frames from the start of the
    first free piece that holds them (mm::init::find_boot_table_carve; Phase 2's free
-   memory, also avoiding everything from the device tree blob to the end of its range,
-   since the blob's size is not readable yet). No such piece is fatal.
+   memory, also avoiding everything from the device tree blob to the end of the run of
+   address-contiguous memory-map entries that holds it, since the blob's size is not
+   readable yet). No such piece is fatal.
 3. Stage 1, from the seed: map the kernel image at its virtual addresses —
    - Text segment: readable, executable, not writable
    - Rodata segment: readable, not writable, not executable

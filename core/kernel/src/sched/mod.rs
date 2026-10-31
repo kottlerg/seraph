@@ -2536,7 +2536,8 @@ pub unsafe fn init(cpu_count: u32) -> u32
 /// Allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
 /// TCBs, idle kernel stacks and their tops, watchdog ticks and breadcrumbs
 /// (`CPU_DIAG`), per-CPU arch data, the TLB-shootdown request slots, and the x86
-/// AP GDT/TSS/IST tables), publish `CPU_COUNT`, and arm the BSP
+/// AP GDT/TSS/IST tables and NMI-backtrace storage), publish `CPU_COUNT`, and
+/// arm the BSP
 /// boot transient. Must run before Phase 5 (timer arm) so that the timer
 /// ISR's first read of `SCHEDULERS_PTR` is non-null.
 ///

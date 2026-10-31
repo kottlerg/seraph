@@ -902,8 +902,8 @@ fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
 /// The entry contract guarantees [`HANDOFF_STACK_BYTES`] of stack below the
 /// entry stack pointer (core/boot/docs/kernel-handoff.md);
 /// [`handoff_stack_window`] covers that region from the current `sp` alone. It
-/// also maps up to one stack's worth of pages beside the stack, which are never
-/// accessed through this low-half alias.
+/// also maps up to `HANDOFF_STACK_BYTES` + 4 KiB of pages beside the stack,
+/// which are never accessed through this low-half alias.
 ///
 /// If the stack pointer is already within the kernel image mapping (unlikely
 /// but possible), this is a no-op.
@@ -1148,7 +1148,7 @@ mod tests
     fn the_stack_window_covers_the_guaranteed_stack_from_any_deeper_sp()
     {
         let size = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
-        // Entry SPs that are not page-aligned, straddling a 64 KiB boundary.
+        // Entry SPs on and off a page boundary, straddling a 64 KiB boundary.
         for entry in [0x5_3000u64, 0x5_3008, 0x5_2ff8]
         {
             // The guaranteed stack is [entry - size, entry); sp is anywhere in it.
@@ -1173,6 +1173,22 @@ mod tests
         // One 4 KiB leaf adds its PT.
         assert_eq!(span_table_bound(0x1000, 0x2000, 12), 4);
         assert_eq!(span_table_bound(0x1000, 0x1000, 12), 0);
+    }
+
+    // Defect caught: a bound counted over physical spans, which misses the
+    // extra 512 GiB block a direct map at a 1 GiB-aligned KASLR base touches.
+    #[test]
+    fn the_stage2_bound_counts_the_blocks_the_virtual_span_touches()
+    {
+        let top: u64 = 600 << 30;
+        let aligned = 0xFFFF_8000_0000_0000;
+        let misaligned = aligned + (511 << 30);
+        // [511 GiB, 1111 GiB) touches three 512 GiB blocks; [0, 600 GiB) two.
+        assert_eq!(
+            stage2_table_bound(misaligned, top, &[], None, 0)
+                - stage2_table_bound(aligned, top, &[], None, 0),
+            1
+        );
     }
 
     // Defect caught: a carve sized below what stage 2 allocates, which would

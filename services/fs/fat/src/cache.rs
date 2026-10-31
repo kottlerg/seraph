@@ -5,18 +5,20 @@
 
 //! Page-granular sector cache for FAT block I/O.
 //!
-//! 128 single-page slots, each backed by a Memory cap mapped into the fs
-//! process's address space at a fixed VA. Each slot holds one *page* of
-//! contiguous on-disk sectors (`SECTORS_PER_PAGE` = 8 for a 4 KiB page).
-//! Slots are keyed on the page-aligned LBA-base (`lba & !7`); a single
-//! cache miss fills all 8 sectors via one `BLK_READ_INTO_MEMORY` IPC,
-//! amortising the round-trip cost over the page. LRU eviction by
-//! monotonic sequence counter; only slots with `refcount == 0` are
-//! eviction candidates.
+//! Up to [`SLOT_COUNT`] single-page slots, each backed by a Memory cap mapped
+//! into the fs process's address space at a fixed VA. Each slot holds one
+//! *page* of contiguous on-disk sectors: [`PageCache::sectors_per_page`],
+//! `PAGE_SIZE` over the sector size (8 for 512-byte sectors, 1 for 4 KiB
+//! ones). A sector is one logical block of the device, whose size mount sets
+//! with [`PageCache::set_sector_size`] before the first read. Slots are keyed
+//! on the page-aligned LBA-base; a single cache miss fills the whole page via
+//! one `BLK_READ_INTO_MEMORY` IPC, amortising the round-trip cost over the
+//! page. LRU eviction by monotonic sequence counter; only slots with
+//! `refcount == 0` are eviction candidates.
 //!
 //! Fill path: issue `BLK_READ_INTO_MEMORY` with `data[0]` = page-base LBA
-//! and `data[1]` = `SECTORS_PER_PAGE`, transferring the slot's Memory cap
-//! as `caps[0]`. The driver DMAs `SECTORS_PER_PAGE * 512` bytes directly
+//! and `data[1]` = sectors per page, transferring the slot's Memory cap
+//! as `caps[0]`. The driver DMAs one page directly
 //! into the slot's memory cap at offset 0 (per the wire contract) and returns
 //! the cap in the reply. The cap may land at a different `CSpace` slot
 //! index on return, so the slot's `memory_cap` is updated from
@@ -24,11 +26,14 @@
 //! through the move, and the existing AS mapping at the slot's VA
 //! continues to point at the same physical pages.
 //!
-//! Slot caps are minted once at startup via memmgr `REQUEST_MEMORY_CAPS` with
-//! the `REQUIRE_CONTIGUOUS` flag (one IPC per slot — slot count is bounded
-//! and the round-trip cost is paid once). Each slot's VA window is held for
-//! the fs process's lifetime; the reservation is intentionally leaked
-//! (`ReservedRange` has no `Drop`).
+//! The cache grows on demand: a slot takes its page from memmgr
+//! `REQUEST_MEMORY_CAPS` (`REQUIRE_CONTIGUOUS`, one IPC per slot) the first
+//! time a miss finds every provisioned slot in use or none provisioned, up to
+//! [`SLOT_COUNT`] slots, so an idle mount pays for no page it never fills. A
+//! miss evicts the least recently used unreferenced slot only once all
+//! [`SLOT_COUNT`] are provisioned or memmgr refuses a page. The VA window for
+//! every slot is reserved at init and held for the fs process's lifetime; the
+//! reservation is intentionally leaked (`ReservedRange` has no `Drop`).
 //!
 //! ## Reuse of a page a client mapped
 //!
@@ -54,14 +59,14 @@
 //! ordinary cache pressure. Clients that never unmap can therefore cost the
 //! fs at most `QUARANTINE_MAX` extra pages before the cache starts to shrink.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use syscall_abi::{CAP_INFO_MEMORY_MAPPINGS, MAP_WRITABLE, PAGE_SIZE};
 
-use crate::bpb::SECTOR_SIZE;
+pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT};
 
 /// Process-static scratch memory cap used for single-sector writeback in
 /// [`PageCache::write_sector`] and single-sector device reads in
@@ -69,10 +74,10 @@ use crate::bpb::SECTOR_SIZE;
 ///
 /// virtio-blk DMAs sector data starting at offset 0 of the supplied
 /// memory cap, so we cannot pass a cache page directly when only one of its
-/// eight sectors has been dirtied (the device would over-write the
-/// other seven on the disk side using whatever happened to be in the
-/// page). The scratch memory cap holds a single 512-byte sector copy per
-/// write or device read and is reused across calls; [`PageCache::init`]
+/// sectors has been dirtied (the device would over-write the others on
+/// the disk side using whatever happened to be in the page). The scratch
+/// memory cap holds a single sector copy per write or device read and is
+/// reused across calls; [`PageCache::init`]
 /// allocates it, and it is held for the process lifetime.
 static SCRATCH_MEMORY: OnceLock<ScratchMemory> = OnceLock::new();
 
@@ -88,35 +93,25 @@ struct ScratchMemory
     va: u64,
 }
 
-/// Number of cache slots.
-pub const SLOT_COUNT: usize = 128;
-
-/// Most pages the cache holds beyond [`SLOT_COUNT`]: it requests a replacement
-/// page from memmgr only while its quarantined pages (still mapped by a
-/// client) and clean spares number fewer than this.
-pub const QUARANTINE_MAX: usize = 32;
-
 /// General capability slots [`PageCache::init`] funds in the fs process's
 /// own `CSpace` before filling the cache: one per slot page, one per page
 /// the quarantine may add, the scratch page, and headroom for the caps the
 /// fs takes at run time (per-read derivations, block-device replies).
 const CACHE_CSPACE_FUNDING: u64 = (SLOT_COUNT + QUARANTINE_MAX) as u64 + 1 + 64;
 
-/// Number of consecutive sectors held in one cache slot. Fixed by the
-/// page size and the FAT sector size: `PAGE_SIZE / SECTOR_SIZE` = 8.
-pub const SECTORS_PER_PAGE: u64 = PAGE_SIZE / SECTOR_SIZE as u64;
+/// Sector size before mount sets the device's ([`PageCache::set_sector_size`]).
+const DEFAULT_SECTOR_SIZE: u32 = 512;
 
-/// Sentinel for an unfilled slot. Page-base LBAs are always
-/// `SECTORS_PER_PAGE`-aligned; `u64::MAX` cannot collide with any valid
-/// page base.
+/// Sentinel for an unfilled slot. Page-base LBAs are always multiples of
+/// the sectors per page; `u64::MAX` cannot collide with any valid page base.
 const PAGE_BASE_EMPTY: u64 = u64::MAX;
 
-/// One cache slot. Holds `SECTORS_PER_PAGE` consecutive sectors starting
-/// at `page_lba_base`, packed contiguously from offset 0 of the slot's
-/// memory cap.
+/// One cache slot. Holds one page of consecutive sectors starting at
+/// `page_lba_base`, packed contiguously from offset 0 of the slot's memory
+/// cap.
 struct CacheSlot
 {
-    /// Page-aligned starting LBA (`SECTORS_PER_PAGE`-multiple) of the
+    /// Page-aligned starting LBA (a multiple of the sectors per page) of the
     /// sector run cached here. `PAGE_BASE_EMPTY` if unfilled.
     page_lba_base: AtomicU64,
     /// `CSpace` slot index of the Memory cap backing this cache page.
@@ -149,7 +144,14 @@ struct Quarantine
 /// Process-wide page cache.
 pub struct PageCache
 {
+    /// Every slot the cache may hold. Only `slots[..provisioned]` has a
+    /// page; the rest are VA windows waiting for one.
     slots: [CacheSlot; SLOT_COUNT],
+    /// Slots that have taken their page, in index order. Written only by the
+    /// dispatch thread, the one that fills slots.
+    provisioned: AtomicUsize,
+    /// Bytes per sector: the device's logical block size, set at mount.
+    sector_size: AtomicU32,
     next_seq: AtomicU64,
     /// memmgr endpoint replacement pages are requested from.
     memmgr_ep: u32,
@@ -176,9 +178,10 @@ pub enum InitError
 
 impl PageCache
 {
-    /// Fund the fs process's own `cspace` for the cache's caps, allocate `SLOT_COUNT`
-    /// single-page Memory caps, reserve a contiguous VA window, map each
-    /// memory cap into its slot's VA, and return the process-static cache.
+    /// Fund the fs process's own `cspace` for the cache's caps, reserve a
+    /// contiguous VA window for [`SLOT_COUNT`] slots, allocate and map the
+    /// scratch page, and return the process-static cache. Slot pages come
+    /// later, one per slot on first use.
     pub fn init(
         memmgr_ep: u32,
         self_aspace: u32,
@@ -191,7 +194,7 @@ impl PageCache
             return Err(InitError::NoMemmgr);
         }
         // The slot pages and their quarantine replacements are one Memory cap
-        // each; fund the slots up front so filling the cache never meets an
+        // each; fund the slots up front so growing the cache never meets an
         // exhausted CSpace.
         if !std::os::seraph::fund_cspace_slot_budget(cspace, CACHE_CSPACE_FUNDING)
         {
@@ -215,6 +218,8 @@ impl PageCache
                 lru_seq: AtomicU64::new(0),
                 exposed: AtomicBool::new(false),
             }),
+            provisioned: AtomicUsize::new(0),
+            sector_size: AtomicU32::new(DEFAULT_SECTOR_SIZE),
             next_seq: AtomicU64::new(1),
             memmgr_ep,
             self_aspace,
@@ -223,20 +228,6 @@ impl PageCache
                 spare: Vec::with_capacity(QUARANTINE_MAX),
             }),
         }));
-
-        for slot in &mut cache.slots
-        {
-            let cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
-            // Cache init is a process-fatal precondition; on partial
-            // failure here previously-acquired caps are released by
-            // process exit (no caller-side cleanup needed).
-            // SAFETY: slot.va is a page of the `SLOT_COUNT`-page window
-            // reserved above from the per-process arena and owned by the
-            // cache: VA no Rust object or IPC page occupies.
-            unsafe { syscall::mem_map(cap, self_aspace, slot.va, 0, 1, MAP_WRITABLE) }
-                .map_err(|_| InitError::Map)?;
-            slot.memory_cap.store(cap, Ordering::Release);
-        }
 
         // Allocate and map the single-page scratch memory cap used for
         // single-sector writeback in `write_sector` and single-sector reads
@@ -260,7 +251,70 @@ impl PageCache
         Ok(&*cache)
     }
 
-    /// Write one 512-byte sector through the cache (write-through).
+    /// Set the sector size, the device's logical block size. Mount calls it
+    /// once, before the first read; every cached page is keyed and laid out
+    /// in this unit.
+    pub fn set_sector_size(&self, bytes: u32)
+    {
+        self.sector_size.store(bytes, Ordering::Release);
+    }
+
+    /// Bytes per sector ([`Self::set_sector_size`]).
+    fn sector_bytes(&self) -> usize
+    {
+        self.sector_size.load(Ordering::Acquire) as usize
+    }
+
+    /// Sectors one cache page holds: `PAGE_SIZE` over the sector size.
+    pub fn sectors_per_page(&self) -> u64
+    {
+        PAGE_SIZE / u64::from(self.sector_size.load(Ordering::Acquire))
+    }
+
+    /// The page-aligned LBA-base for `lba`: the first LBA of the page-sized
+    /// sector run that contains it.
+    pub fn page_base_of(&self, lba: u64) -> u64
+    {
+        lba - (lba % self.sectors_per_page())
+    }
+
+    /// Byte offset of sector `lba` within the cache page starting at
+    /// `page_base`, which MUST be `page_base_of(lba)`.
+    fn sector_offset_in_page(&self, lba: u64, page_base: u64) -> u64
+    {
+        (lba - page_base) * u64::from(self.sector_size.load(Ordering::Acquire))
+    }
+
+    /// The slots that hold a page: the provisioned prefix of `slots`.
+    fn live_slots(&self) -> &[CacheSlot]
+    {
+        &self.slots[..self.provisioned.load(Ordering::Acquire)]
+    }
+
+    /// Give the next unprovisioned slot its page, returning its index, or
+    /// `None` when every slot has one or memmgr refuses a page. Called only
+    /// by the dispatch thread on a miss, so slots are provisioned in index
+    /// order with no race on `provisioned`.
+    fn provision_next(&self, ipc_buf: *mut u64) -> Option<usize>
+    {
+        let idx = self.provisioned.load(Ordering::Acquire);
+        let slot = self.slots.get(idx)?;
+        let cap = request_one_page(self.memmgr_ep, ipc_buf)?;
+        // SAFETY: slot.va is a page of the `SLOT_COUNT`-page window reserved
+        // at init from the per-process arena and owned by the cache, and no
+        // page is mapped there yet: VA no Rust object or IPC page occupies.
+        if unsafe { syscall::mem_map(cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_err()
+        {
+            let _ = syscall::cap_delete(cap);
+            return None;
+        }
+        slot.memory_cap.store(cap, Ordering::Release);
+        self.provisioned.store(idx + 1, Ordering::Release);
+        Some(idx)
+    }
+
+    /// Write one sector, the first sector-size bytes of `data`, through the
+    /// cache (write-through).
     ///
     /// Acquires the page covering `lba`, updates the affected sector in
     /// place within the cached page (so any outstanding `FS_READ_MEMORY`
@@ -276,43 +330,40 @@ impl PageCache
     /// flushed as a unit because the unmodified neighbouring sectors
     /// have no known-good source if the write fails mid-flight.
     ///
-    /// Returns `false` on cache acquire failure, missing scratch memory cap
-    /// (cache init never ran), or block-driver error.
-    pub fn write_sector(
-        &self,
-        lba: u64,
-        block_dev: u32,
-        data: &[u8; SECTOR_SIZE],
-        ipc_buf: *mut u64,
-    ) -> bool
+    /// Returns `false` when `data` is shorter than a sector, on cache acquire
+    /// failure, missing scratch memory cap (cache init never ran), or
+    /// block-driver error.
+    pub fn write_sector(&self, lba: u64, block_dev: u32, data: &[u8], ipc_buf: *mut u64) -> bool
     {
+        let len = self.sector_bytes();
         let Some(scratch) = SCRATCH_MEMORY.get()
         else
         {
             return false;
         };
-        let page_base = page_base_of(lba);
+        if data.len() < len
+        {
+            return false;
+        }
+        let page_base = self.page_base_of(lba);
         let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
         else
         {
             return false;
         };
-        let sector_va = self.slots[idx].va + sector_offset_in_page(lba, page_base);
-        let mut previous = Box::new([0u8; SECTOR_SIZE]);
+        let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
+        let mut previous = Box::new([0u8; fat_parse::MAX_SECTOR_SIZE]);
 
         // SAFETY: refcount > 0 for the duration of these borrows. The
         // cache page is single-process owned and mapped writable; the
         // scratch memory-cap VA is process-static and mapped writable. All
-        // three are 512-byte sector copies between pages this process owns
-        // and a heap buffer.
+        // three are sector copies of `len` bytes (at most one page, and the
+        // sector lies inside its cache page) between pages this process owns
+        // and heap or caller buffers at least `len` long.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                sector_va as *const u8,
-                previous.as_mut_ptr(),
-                SECTOR_SIZE,
-            );
-            core::ptr::copy_nonoverlapping(data.as_ptr(), sector_va as *mut u8, SECTOR_SIZE);
-            core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(sector_va as *const u8, previous.as_mut_ptr(), len);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), sector_va as *mut u8, len);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, len);
         }
 
         let ok = writeback_via_block_dev(scratch, lba, block_dev, ipc_buf);
@@ -320,18 +371,14 @@ impl PageCache
         {
             // SAFETY: as above; the slot is still referenced.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    previous.as_ptr(),
-                    sector_va as *mut u8,
-                    SECTOR_SIZE,
-                );
+                core::ptr::copy_nonoverlapping(previous.as_ptr(), sector_va as *mut u8, len);
             }
         }
         self.release(idx);
         ok
     }
 
-    /// Read one 512-byte sector from the block device into `buf`, bypassing
+    /// Read one sector from the block device into `buf`, bypassing
     /// the cache, and refresh the cached copy of that sector when its page
     /// is cached.
     ///
@@ -341,77 +388,77 @@ impl PageCache
     /// One `BLK_READ_INTO_MEMORY` of one sector lands in the scratch memory
     /// cap and is copied out from there.
     ///
-    /// Returns `false` when the scratch memory cap is missing or the read
-    /// fails; `buf` and the cache are then unchanged.
-    pub fn reload_sector(
-        &self,
-        lba: u64,
-        block_dev: u32,
-        buf: &mut [u8; SECTOR_SIZE],
-        ipc_buf: *mut u64,
-    ) -> bool
+    /// Returns `false` when `buf` is shorter than a sector, the scratch
+    /// memory cap is missing, or the read fails; `buf` and the cache are then
+    /// unchanged.
+    pub fn reload_sector(&self, lba: u64, block_dev: u32, buf: &mut [u8], ipc_buf: *mut u64)
+    -> bool
     {
+        let len = self.sector_bytes();
         let Some(scratch) = SCRATCH_MEMORY.get()
         else
         {
             return false;
         };
-        if !read_one_via_block_dev(scratch, lba, block_dev, ipc_buf)
+        if buf.len() < len || !read_one_via_block_dev(scratch, lba, block_dev, ipc_buf)
         {
             return false;
         }
         // SAFETY: the scratch VA is process-static and mapped for one page;
-        // the read filled its first sector.
+        // the read filled its first sector, `len` bytes, and `buf` holds at
+        // least that many.
         unsafe {
-            core::ptr::copy_nonoverlapping(scratch.va as *const u8, buf.as_mut_ptr(), SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(scratch.va as *const u8, buf.as_mut_ptr(), len);
         }
-        let page_base = page_base_of(lba);
+        let page_base = self.page_base_of(lba);
         if let Some(idx) = self.lookup_cached(page_base)
         {
-            let sector_va = self.slots[idx].va + sector_offset_in_page(lba, page_base);
+            let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
             // SAFETY: `lookup_cached` took a reference on the slot, whose
-            // page is mapped writable for this process's lifetime.
+            // page is mapped writable for this process's lifetime, and the
+            // sector lies inside it.
             unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), sector_va as *mut u8, SECTOR_SIZE);
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), sector_va as *mut u8, len);
             }
             self.release(idx);
         }
         true
     }
 
-    /// Read one 512-byte sector through the cache into `buf`. Single-call
-    /// helper for callers that don't need the underlying memory cap: handles
-    /// page-fill-on-miss, hit refcounting, and release.
-    pub fn read_sector(
-        &self,
-        lba: u64,
-        block_dev: u32,
-        buf: &mut [u8; SECTOR_SIZE],
-        ipc_buf: *mut u64,
-    ) -> bool
+    /// Read one sector through the cache into the first sector-size bytes of
+    /// `buf`. Single-call helper for callers that don't need the underlying
+    /// memory cap: handles page-fill-on-miss, hit refcounting, and release.
+    /// Returns `false` when `buf` is shorter than a sector or the fill fails.
+    pub fn read_sector(&self, lba: u64, block_dev: u32, buf: &mut [u8], ipc_buf: *mut u64) -> bool
     {
-        let page_base = page_base_of(lba);
+        let len = self.sector_bytes();
+        if buf.len() < len
+        {
+            return false;
+        }
+        let page_base = self.page_base_of(lba);
         let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
         else
         {
             return false;
         };
-        let sector_va = self.slots[idx].va + sector_offset_in_page(lba, page_base);
+        let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
         // SAFETY: refcount > 0 for the duration of this borrow; slot.va
-        // was mapped writable for one page at startup and is owned by
-        // this process. The page holds SECTORS_PER_PAGE contiguous
-        // sectors at offsets [0, 512, ..., (N-1)*512].
+        // was mapped writable for one page when the slot was provisioned
+        // and is owned by this process. The page holds the sectors per page
+        // contiguously, `len` bytes each, so the sector lies inside it, and
+        // `buf` holds at least `len` bytes.
         unsafe {
-            core::ptr::copy_nonoverlapping(sector_va as *const u8, buf.as_mut_ptr(), SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(sector_va as *const u8, buf.as_mut_ptr(), len);
         }
         self.release(idx);
         true
     }
 
     /// Acquire a cache slot containing the page starting at
-    /// `page_lba_base`, filling on miss. `page_lba_base` MUST be
-    /// `SECTORS_PER_PAGE`-aligned; callers that have an arbitrary LBA
-    /// should pass `page_base_of(lba)`.
+    /// `page_lba_base`, filling on miss. `page_lba_base` MUST be a multiple
+    /// of the sectors per page; callers that have an arbitrary LBA should
+    /// pass [`Self::page_base_of`].
     ///
     /// Bumps the slot's refcount; the caller must drop it via
     /// [`release_slot`] when done. On any failure path the refcount is
@@ -423,7 +470,7 @@ impl PageCache
         ipc_buf: *mut u64,
     ) -> Option<usize>
     {
-        debug_assert!(page_lba_base.is_multiple_of(SECTORS_PER_PAGE));
+        debug_assert!(page_lba_base.is_multiple_of(self.sectors_per_page()));
         self.get_or_fill(page_lba_base, block_dev, ipc_buf)
     }
 
@@ -457,7 +504,9 @@ impl PageCache
         {
             return Some(i);
         }
-        let victim = self.pick_victim(ipc_buf)?;
+        let victim = self
+            .free_or_new_slot(ipc_buf)
+            .or_else(|| self.pick_victim(ipc_buf))?;
         let slot = &self.slots[victim];
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.
@@ -466,7 +515,13 @@ impl PageCache
         // slot without correct contents, so it must not satisfy a hit
         // lookup even by stale page-base match.
         slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
-        if !fill_via_block_dev(slot, page_lba_base, block_dev, ipc_buf)
+        if !fill_via_block_dev(
+            slot,
+            page_lba_base,
+            self.sectors_per_page(),
+            block_dev,
+            ipc_buf,
+        )
         {
             slot.refcount.fetch_sub(1, Ordering::AcqRel);
             return None;
@@ -476,11 +531,28 @@ impl PageCache
         Some(victim)
     }
 
+    /// A provisioned slot that has never held a page and is unreferenced,
+    /// else a newly provisioned one ([`Self::provision_next`]): the cache
+    /// grows before it evicts. `None` when every slot is provisioned and
+    /// filled, or memmgr refuses a page.
+    fn free_or_new_slot(&self, ipc_buf: *mut u64) -> Option<usize>
+    {
+        self.live_slots()
+            .iter()
+            .position(|s| {
+                s.page_lba_base.load(Ordering::Acquire) == PAGE_BASE_EMPTY
+                    && s.refcount.load(Ordering::Acquire) == 0
+                    && s.memory_cap.load(Ordering::Acquire) != 0
+                    && !s.exposed.load(Ordering::Acquire)
+            })
+            .or_else(|| self.provision_next(ipc_buf))
+    }
+
     /// The slot holding the page at `page_lba_base`, with a reference taken
     /// on it, or `None` when the page is not cached.
     fn lookup_cached(&self, page_lba_base: u64) -> Option<usize>
     {
-        for (i, slot) in self.slots.iter().enumerate()
+        for (i, slot) in self.live_slots().iter().enumerate()
         {
             if slot.page_lba_base.load(Ordering::Acquire) == page_lba_base
             {
@@ -627,7 +699,7 @@ impl PageCache
     fn lru_unreferenced(&self, skipped: &[bool; SLOT_COUNT]) -> Option<usize>
     {
         let mut best: Option<(usize, u64)> = None;
-        for (i, slot) in self.slots.iter().enumerate()
+        for (i, slot) in self.live_slots().iter().enumerate()
         {
             if skipped[i] || slot.refcount.load(Ordering::Acquire) != 0
             {
@@ -702,21 +774,7 @@ impl Quarantine
     }
 }
 
-/// Return the page-aligned LBA-base for `lba` (the first LBA in the
-/// `SECTORS_PER_PAGE`-sector run that contains `lba`).
-pub fn page_base_of(lba: u64) -> u64
-{
-    lba - (lba % SECTORS_PER_PAGE)
-}
-
-/// Byte offset of sector `lba` within the cache page starting at
-/// `page_base`, which MUST be `page_base_of(lba)`.
-fn sector_offset_in_page(lba: u64, page_base: u64) -> u64
-{
-    (lba - page_base) * SECTOR_SIZE as u64
-}
-
-/// Fill `slot` with `SECTORS_PER_PAGE` consecutive sectors starting at
+/// Fill `slot` with `sectors_per_page` consecutive sectors starting at
 /// `page_lba_base`, by issuing one `BLK_READ_INTO_MEMORY` against the
 /// block device.
 ///
@@ -736,6 +794,7 @@ fn sector_offset_in_page(lba: u64, page_base: u64) -> u64
 fn fill_via_block_dev(
     slot: &CacheSlot,
     page_lba_base: u64,
+    sectors_per_page: u64,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> bool
@@ -747,7 +806,7 @@ fn fill_via_block_dev(
     }
     let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_MEMORY)
         .word(0, page_lba_base)
-        .word(1, SECTORS_PER_PAGE)
+        .word(1, sectors_per_page)
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.

@@ -21,7 +21,7 @@
 //! Bad-cluster entries (`0xFFF7` / `0x0FFF_FFF7`) are *never* allocated
 //! and never freed by this module.
 
-use crate::bpb::{FatState, FatType, SECTOR_SIZE};
+use crate::bpb::{FatState, FatType, sector_buffer};
 use crate::cache::PageCache;
 use crate::fat::chain_next;
 
@@ -157,7 +157,7 @@ pub fn update_fat_entry(
     }
     let (first_fat_sector, ent_off) = fat_entry_location(state, cluster);
 
-    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut sector_buf = sector_buffer();
 
     for fat_idx in 0..u32::from(state.num_fats)
     {
@@ -426,7 +426,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
     {
         return;
     }
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer();
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
         std::os::seraph::log!("`FSInfo` sector read failed; allocator falls back to FAT scan");
@@ -465,7 +465,7 @@ pub fn flush_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc
     {
         return;
     }
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer();
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
         std::os::seraph::log!("`FSInfo` flush: sector read failed");

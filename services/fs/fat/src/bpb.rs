@@ -9,9 +9,19 @@
 //! populates a [`FatState`] with geometry fields needed by the rest of the
 //! driver (cluster size, FAT start, data region start, FAT type).
 
-// SECTOR_SIZE and FatType are decoded by the pure, host-testable fat_parse
+// MAX_SECTOR_SIZE and FatType are defined by the pure, host-testable fat_parse
 // crate; the geometry/state machine and block I/O below consume them.
-pub use fat_parse::{FatType, SECTOR_SIZE};
+pub use fat_parse::{FatType, MAX_SECTOR_SIZE};
+
+/// A zeroed heap buffer of [`MAX_SECTOR_SIZE`] bytes, which holds a sector of
+/// any size the driver mounts; a sector occupies its first
+/// [`FatState::sector_bytes`]. On the heap to keep the write-path frames
+/// within the default thread stack when release LTO inlines the nested
+/// helpers.
+pub fn sector_buffer() -> Box<[u8]>
+{
+    vec![0u8; MAX_SECTOR_SIZE].into_boxed_slice()
+}
 
 /// Parsed FAT filesystem geometry and cached FAT sector.
 pub struct FatState
@@ -31,8 +41,9 @@ pub struct FatState
     pub data_start_sector: u32,
     /// Cached FAT sector number (avoids re-reads for sequential access).
     pub cached_fat_sector: u32,
-    /// Cached FAT sector data.
-    pub cached_fat_data: [u8; SECTOR_SIZE],
+    /// Cached FAT sector data; the first `bytes_per_sector` bytes hold the
+    /// sector.
+    pub cached_fat_data: [u8; MAX_SECTOR_SIZE],
     /// Total cluster count (data-region size / cluster size). Used by
     /// the cluster allocator to bound its FAT scan and by mount-time
     /// validation. `cached_fat_sector` and the FAT array index range
@@ -70,7 +81,7 @@ impl FatState
             root_cluster: 2,
             data_start_sector: 0,
             cached_fat_sector: u32::MAX,
-            cached_fat_data: [0; SECTOR_SIZE],
+            cached_fat_data: [0; MAX_SECTOR_SIZE],
             total_clusters: 0,
             fsinfo_sector: u32::MAX,
             next_free_hint: u32::MAX,
@@ -110,6 +121,20 @@ impl FatState
     {
         u32::from(self.sectors_per_cluster) * u32::from(self.bytes_per_sector)
     }
+
+    /// Bytes per sector, as a buffer length: the volume's `BPB_BytsPerSec`,
+    /// which mount checked equals the device's logical block size.
+    pub fn sector_bytes(&self) -> usize
+    {
+        usize::from(self.bytes_per_sector)
+    }
+
+    /// Sectors of the FAT16 fixed root directory: `root_entry_count` 32-byte
+    /// entries, rounded up to whole sectors (0 on FAT32).
+    pub fn root_dir_sectors(&self) -> u32
+    {
+        (u32::from(self.root_entry_count) * 32).div_ceil(u32::from(self.bytes_per_sector))
+    }
 }
 
 /// Parse the BIOS Parameter Block from sector 0 into `state`.
@@ -118,11 +143,11 @@ impl FatState
 /// `state`, and emits the detection and geometry log lines the driver has
 /// always produced. Returns `false` after logging the reason on an invalid
 /// boot signature, a zero `bytes_per_sector` / `sectors_per_cluster`, a
-/// sector size other than [`SECTOR_SIZE`], an inconsistent geometry, or a
-/// FAT12 cluster count.
-pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
+/// sector size other than the device's logical block size `block_size`, an
+/// inconsistent geometry, or a FAT12 cluster count.
+pub fn parse_bpb(sector_data: &[u8], block_size: u32, state: &mut FatState) -> bool
 {
-    let geom = match fat_parse::parse_bpb_geometry(sector_data)
+    let geom = match fat_parse::parse_bpb_geometry(sector_data, block_size)
     {
         Ok(geom) => geom,
         Err(fat_parse::BpbError::BadSignature) =>
@@ -137,7 +162,9 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
         }
         Err(fat_parse::BpbError::UnsupportedSectorSize) =>
         {
-            std::os::seraph::log!("unsupported BPB: bytes_per_sector is not {SECTOR_SIZE}");
+            std::os::seraph::log!(
+                "unsupported BPB: bytes_per_sector is not the device block size {block_size}"
+            );
             return false;
         }
         Err(fat_parse::BpbError::BadGeometry) =>

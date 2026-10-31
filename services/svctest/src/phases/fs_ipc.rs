@@ -1128,15 +1128,18 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     std::os::seraph::log!("fs_carried_caps_dropped phase passed");
 }
 
-/// fatfs's cache slots (`services/fs/fat/src/cache.rs` `SLOT_COUNT`).
-const FATFS_SLOT_COUNT: usize = 128;
+/// fatfs's cache slots, the one definition fatfs itself uses.
+const FATFS_SLOT_COUNT: usize = fat_parse::SLOT_COUNT;
 
-/// fatfs's quarantine bound (`services/fs/fat/src/cache.rs` `QUARANTINE_MAX`).
-const FATFS_QUARANTINE_MAX: usize = 32;
+/// fatfs's quarantine bound, the one definition fatfs itself uses.
+const FATFS_QUARANTINE_MAX: usize = fat_parse::QUARANTINE_MAX;
 
 /// Pages of the slot-reuse file: more than fatfs's slots plus its quarantine
 /// bound, so holding pages until fatfs refuses one ends before the file does.
 const SLOT_REUSE_PAGES: usize = 200;
+
+// The slot-reuse phase's bound check needs a file that outlasts the cache.
+const _: () = assert!(SLOT_REUSE_PAGES > FATFS_SLOT_COUNT + FATFS_QUARANTINE_MAX);
 
 /// Pages the first case holds mapped: more than the quarantine bound, so
 /// some still-mapped slots must stay out of service instead of being given a

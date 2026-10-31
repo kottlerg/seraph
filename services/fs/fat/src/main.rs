@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use alloc::{FatError, allocate_cluster};
 use backend::{FatfsBackend, NO_OPEN_SLOT, NodeTable};
-use bpb::{FatState, SECTOR_SIZE};
+use bpb::{FatState, MAX_SECTOR_SIZE, sector_buffer};
 use cache::PageCache;
 use dir::{
     DeviceSlotState, NewEntryKind, RemovedEntry, directory_is_empty, free_entry_data, insert_entry,
@@ -183,23 +183,61 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 /// Validate the BPB by reading sector 0 through the block cap. Updates
 /// `state` in place; returns the IPC reply label to use.
 ///
+/// The device's logical block size comes first, from `BLK_GET_GEOMETRY`:
+/// the cache addresses one device block per sector, and the BPB's
+/// `BytsPerSec` must equal it ([`fat_parse::parse_bpb_geometry`]).
+///
 /// On a successful FAT32 parse, also loads the `FSInfo` sector (advisory
 /// next-free / free-count hints) so the cluster allocator can seed its
 /// scan; FAT16 and FAT32 without `FSInfo` leave the hints at the
 /// `u32::MAX` sentinel and the allocator scans from cluster 2.
 fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf: *mut u64) -> u64
 {
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let Some(block_size) = query_block_size(caps.block_dev, ipc_buf)
+    else
+    {
+        return ipc::fs_errors::IO_ERROR;
+    };
+    cache.set_sector_size(block_size);
+    let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
     if !cache.read_sector(0, caps.block_dev, &mut sector_buf, ipc_buf)
     {
         return ipc::fs_errors::IO_ERROR;
     }
-    if !bpb::parse_bpb(&sector_buf, state)
+    // cast_possible_truncation: block_size is at most MAX_SECTOR_SIZE.
+    #[allow(clippy::cast_possible_truncation)]
+    let block_bytes = block_size as usize;
+    if !bpb::parse_bpb(&sector_buf[..block_bytes], block_size, state)
     {
         return ipc::fs_errors::NOT_FOUND;
     }
     alloc::load_fsinfo(state, cache, caps.block_dev, ipc_buf);
     ipc::fs_errors::SUCCESS
+}
+
+/// The block device's logical block size, from `BLK_GET_GEOMETRY` on the
+/// partition cap, or `None` when the driver refuses or reports a size that
+/// is no FAT sector size ([`fat_parse::is_sector_size`]).
+fn query_block_size(block_dev: u32, ipc_buf: *mut u64) -> Option<u32>
+{
+    let msg = IpcMessage::builder(ipc::blk_labels::BLK_GET_GEOMETRY)
+        .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) }.ok()?;
+    drop_caps(reply.caps());
+    if reply.label != ipc::blk_errors::SUCCESS
+    {
+        std::os::seraph::log!("BLK_GET_GEOMETRY refused (label={})", reply.label);
+        return None;
+    }
+    let size = u32::try_from(reply.word(0)).ok()?;
+    if !fat_parse::is_sector_size(size as usize)
+    {
+        std::os::seraph::log!("unsupported device block size {size}");
+        return None;
+    }
+    Some(size)
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -512,7 +550,7 @@ fn handle_read_node_cap(
     // remaining MSG_DATA_WORDS_MAX - 1 words.
     let max_len = msg.word(1).min(((MSG_DATA_WORDS_MAX - 1) * 8) as u64);
 
-    let mut out = [0u8; SECTOR_SIZE];
+    let mut out = [0u8; MAX_SECTOR_SIZE];
     let bytes_read = match read_file_data(
         &fat::FileRead {
             start_cluster: node.cluster,
@@ -632,13 +670,13 @@ fn read_memory_at_slot(
         }
     }
     let sector = u64::from(state.cluster_to_sector(cluster) + sector_in_cluster);
-    let page_base = cache::page_base_of(sector);
+    let page_base = cache.page_base_of(sector);
     // The file's byte at `offset` lives at memory-cap offset
-    // `(sector - page_base) * SECTOR_SIZE + byte_in_sector` within the
+    // `(sector - page_base) * bytes_per_sector + byte_in_sector` within the
     // returned slot. For sector- and page-aligned data areas this folds
     // to zero; for misaligned data areas (data area starting mid-page)
     // the sector-position term is non-zero on the page boundary.
-    let memory_data_offset = (sector - page_base) * SECTOR_SIZE as u64 + byte_in_sector;
+    let memory_data_offset = (sector - page_base) * bytes_per_sector + byte_in_sector;
 
     let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
     else
@@ -1114,8 +1152,8 @@ fn write_file_bytes(
         // write-path frame within the default 32 KiB stack envelope
         // when release LTO inlines the nested helpers
         // (`insert_entry → write_dir_slot → ...`).
-        let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
-        let full_sector_overwrite = byte_in_sector == 0 && bytes_to_write == SECTOR_SIZE;
+        let mut sector_buf = sector_buffer();
+        let full_sector_overwrite = byte_in_sector == 0 && bytes_to_write == state.sector_bytes();
         if !full_sector_overwrite
             && !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
         {

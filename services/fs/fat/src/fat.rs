@@ -11,7 +11,7 @@
 //! the block driver per the per-badge bound vfsd registered at mount.
 
 use crate::alloc::FatError;
-use crate::bpb::{FatState, FatType, SECTOR_SIZE};
+use crate::bpb::{FatState, FatType, MAX_SECTOR_SIZE};
 use crate::cache::PageCache;
 
 /// Look up the next cluster in the FAT chain, for a reader: `None` for
@@ -180,7 +180,7 @@ pub fn read_file_data(
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-    out: &mut [u8; SECTOR_SIZE],
+    out: &mut [u8],
 ) -> Result<usize, FatError>
 {
     if req.offset >= u64::from(req.file_size)
@@ -193,9 +193,9 @@ pub fn read_file_data(
     }
 
     let remaining = u64::from(req.file_size) - req.offset;
-    // cast_possible_truncation: `to_read` is at most SECTOR_SIZE.
+    // cast_possible_truncation: `to_read` is at most MAX_SECTOR_SIZE.
     #[allow(clippy::cast_possible_truncation)]
-    let to_read = req.max_len.min(remaining).min(SECTOR_SIZE as u64) as usize;
+    let to_read = req.max_len.min(remaining).min(MAX_SECTOR_SIZE as u64) as usize;
 
     let cluster_size = state.cluster_size();
     let cluster_idx = req.offset / u64::from(cluster_size);
@@ -216,14 +216,14 @@ pub fn read_file_data(
     }
 
     let sector = state.cluster_to_sector(cluster) + sector_in_cluster;
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
     if !cache.read_sector(u64::from(sector), block_dev, &mut sector_buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
 
     // Extract bytes from the sector.
-    let available = SECTOR_SIZE - offset_in_sector;
+    let available = state.sector_bytes() - offset_in_sector;
     let copy_len = to_read.min(available);
     out[..copy_len].copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + copy_len]);
 

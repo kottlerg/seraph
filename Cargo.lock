@@ -1073,6 +1073,7 @@ dependencies = [
 name = "svctest"
 version = "0.1.1"
 dependencies = [
+ "fatfs-parse",
  "ipc",
  "namespace-protocol",
  "process-abi",

@@ -14,14 +14,16 @@
 //! objects (docs/capability-model.md § Typed Memory), and whose per-region sum
 //! `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_MAPPINGS` reports to a Memory cap's holder.
 //!
-//! Storage is two-level: [`MAX_CHUNKS`] chunk pointers in BSS, each naming a
-//! 1 MiB buddy block of [`FRAMES_PER_CHUNK`] `AtomicU32` counters that covers
-//! one GiB of physical address space. [`init`] allocates a chunk for every GiB
-//! the DRAM span touches during Phase 4, before the Phase-7 user-cap drain. A
-//! frame in a GiB with no chunk (device memory outside DRAM) is untracked:
-//! raising or lowering its count does nothing, and it never reads as mapped.
+//! Storage is two-level: a table of chunk pointers, one per GiB below the top
+//! of DRAM, each naming a 1 MiB buddy block of [`FRAMES_PER_CHUNK`]
+//! `AtomicU32` counters that covers that GiB. [`init`] sizes the table from the
+//! DRAM span and allocates a chunk for every GiB that holds RAM during Phase 4,
+//! before the Phase-7 user-cap drain, so the cost is 8 B per GiB of span plus
+//! 1 MiB per GiB of RAM, whatever the machine's size. A frame in a GiB with no
+//! chunk (device memory, or a hole between RAM ranges) is untracked: raising or
+//! lowering its count does nothing, and it never reads as mapped.
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use crate::mm::PAGE_SIZE;
 
@@ -37,22 +39,39 @@ const FRAMES_PER_CHUNK: usize = 1 << (CHUNK_SHIFT - 12);
 const CHUNK_ORDER: usize = 8;
 
 // Chunk geometry is an encoding artefact, not a capacity: one GiB of frames is
-// exactly one order-`CHUNK_ORDER` buddy block of counters; `MAX_CHUNKS` bounds the span.
+// exactly one order-`CHUNK_ORDER` buddy block of counters.
 #[cfg(not(test))]
 const _: () = assert!(FRAMES_PER_CHUNK * 4 == PAGE_SIZE << CHUNK_ORDER);
 
-/// Chunk slots: the table covers physical addresses below 256 GiB, above the
-/// ~248 GiB the boot table pool can direct-map (`BOOT_TABLE_POOL_SIZE`), so
-/// every RAM frame the kernel can address has a slot.
-pub const MAX_CHUNKS: usize = 256;
+/// The chunk-table slots covering `[0, dram_top)`: one per GiB the span
+/// touches.
+#[must_use]
+pub fn chunk_slots(dram_top: u64) -> usize
+{
+    usize::try_from(dram_top.div_ceil(1 << CHUNK_SHIFT)).unwrap_or(usize::MAX)
+}
+
+/// The GiB indexes `[first, last]` the non-empty range `[base, base + size)`
+/// touches, or `None` for an empty range.
+fn chunks_touched(base: u64, size: u64) -> Option<(usize, usize)>
+{
+    let last_byte = base.checked_add(size.checked_sub(1)?)?;
+    Some((
+        usize::try_from(base >> CHUNK_SHIFT).ok()?,
+        usize::try_from(last_byte >> CHUNK_SHIFT).ok()?,
+    ))
+}
 
 /// Per-frame user-mapping counters, chunked per GiB of physical address space.
 pub struct FrameMap
 {
-    /// Chunk `i` covers `[i << CHUNK_SHIFT, (i + 1) << CHUNK_SHIFT)`; null when
-    /// that GiB holds no DRAM. Written once each during single-threaded Phase 4
-    /// and read-only afterwards.
-    chunks: [AtomicPtr<AtomicU32>; MAX_CHUNKS],
+    /// The chunk table: `slots` pointers, entry `i` covering
+    /// `[i << CHUNK_SHIFT, (i + 1) << CHUNK_SHIFT)` and null when that GiB
+    /// holds no RAM. Null with `slots == 0` until [`FrameMap::install_table`];
+    /// written once during single-threaded Phase 4 and read-only afterwards.
+    table: AtomicPtr<AtomicPtr<AtomicU32>>,
+    /// Entries of `table`.
+    slots: AtomicUsize,
 }
 
 impl FrameMap
@@ -62,26 +81,100 @@ impl FrameMap
     pub const fn new() -> Self
     {
         Self {
-            chunks: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CHUNKS],
+            table: AtomicPtr::new(core::ptr::null_mut()),
+            slots: AtomicUsize::new(0),
         }
     }
 
-    /// Install `counters` as the chunk covering GiB `index`.
+    /// Install the chunk table of `slots` entries at `table`.
+    ///
+    /// # Safety
+    /// `table` points at `slots` null `AtomicPtr`s (zeroed memory) that live
+    /// for the rest of the kernel's life and nothing else uses; no other CPU
+    /// reads the map yet, and no table is installed.
+    unsafe fn install_table(&self, table: *mut AtomicPtr<AtomicU32>, slots: usize)
+    {
+        self.slots.store(slots, Ordering::Relaxed);
+        self.table.store(table, Ordering::Release);
+    }
+
+    /// The table entry for GiB `index`, or `None` past the table.
+    fn slot(&self, index: usize) -> Option<&AtomicPtr<AtomicU32>>
+    {
+        let table = self.table.load(Ordering::Acquire);
+        if table.is_null() || index >= self.slots.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        // SAFETY: a non-null table holds `slots` live entries for the kernel's
+        // lifetime (install_table's contract), and index is below it.
+        Some(unsafe { &*table.add(index) })
+    }
+
+    /// Install `counters` as the chunk covering GiB `index`; `false` when the
+    /// index is past the table or the GiB already has a chunk.
     ///
     /// # Safety
     /// `counters` points at [`FRAMES_PER_CHUNK`] zeroed `AtomicU32`s that live
     /// for the rest of the kernel's life and nothing else uses; no other CPU
     /// reads the table yet.
-    unsafe fn install_chunk(&self, index: usize, counters: *mut AtomicU32)
+    unsafe fn install_chunk(&self, index: usize, counters: *mut AtomicU32) -> bool
     {
-        self.chunks[index].store(counters, Ordering::Release);
+        let Some(slot) = self.slot(index)
+        else
+        {
+            return false;
+        };
+        slot.compare_exchange(
+            core::ptr::null_mut(),
+            counters,
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    }
+
+    /// Give every GiB that one of `ram` ranges `(base, size)` touches a chunk
+    /// from `alloc_chunk`, once each. Returns `Err(())` when `alloc_chunk`
+    /// fails; a range past the table is ignored (the table covers DRAM).
+    ///
+    /// # Safety
+    /// Each pointer `alloc_chunk` returns meets [`Self::install_chunk`]'s
+    /// contract; the boot thread is alone.
+    unsafe fn populate(
+        &self,
+        ram: impl Iterator<Item = (u64, u64)>,
+        mut alloc_chunk: impl FnMut() -> Option<*mut AtomicU32>,
+    ) -> Result<(), ()>
+    {
+        for (base, size) in ram
+        {
+            let Some((first, last)) = chunks_touched(base, size)
+            else
+            {
+                continue;
+            };
+            for index in first..=last
+            {
+                if self
+                    .slot(index)
+                    .is_none_or(|s| !s.load(Ordering::Relaxed).is_null())
+                {
+                    continue;
+                }
+                let counters = alloc_chunk().ok_or(())?;
+                // SAFETY: caller's contract; the slot is in range and empty.
+                unsafe { self.install_chunk(index, counters) };
+            }
+        }
+        Ok(())
     }
 
     /// The counter of the frame holding `phys`, or `None` when it is untracked.
     fn counter(&self, phys: u64) -> Option<&AtomicU32>
     {
         let index = usize::try_from(phys >> CHUNK_SHIFT).ok()?;
-        let chunk = self.chunks.get(index)?.load(Ordering::Acquire);
+        let chunk = self.slot(index)?.load(Ordering::Acquire);
         if chunk.is_null()
         {
             return None;
@@ -200,43 +293,51 @@ impl Default for FrameMap
 /// The kernel's frame map table.
 pub static FRAME_MAP: FrameMap = FrameMap::new();
 
-/// Allocate and install a zeroed chunk for every GiB that `[dram_bottom,
-/// dram_top)` touches. Fatal when DRAM reaches past [`MAX_CHUNKS`] GiB or the
-/// buddy cannot supply a chunk.
+/// Size the chunk table from `dram_top` (one slot per GiB of span) and
+/// allocate and install a zeroed chunk for every GiB a DRAM-typed entry of
+/// `memory_map` touches. Fatal when the buddy cannot supply the table or a
+/// chunk.
 ///
 /// # Safety
-/// The single boot thread, once, after Phase 3 (the chunks are zeroed through
-/// the direct map) and before the Phase-7 drain and any user mapping.
+/// The single boot thread, once, after Phase 3 (the table and chunks are
+/// zeroed through the direct map) and before the Phase-7 drain and any user
+/// mapping.
 #[cfg(not(test))]
-pub unsafe fn init(alloc: &mut crate::mm::BuddyAllocator, dram_bottom: u64, dram_top: u64)
+pub unsafe fn init(
+    alloc: &mut crate::mm::BuddyAllocator,
+    memory_map: &[boot_protocol::MemoryMapEntry],
+    dram_top: u64,
+)
 {
-    if dram_top <= dram_bottom
+    let slots = chunk_slots(dram_top);
+    if slots == 0
     {
         return;
     }
-    // Lossless: dram_top is checked against MAX_CHUNKS GiB right below.
-    #[allow(clippy::cast_possible_truncation)]
-    let (first, last) = (
-        (dram_bottom >> CHUNK_SHIFT) as usize,
-        ((dram_top - 1) >> CHUNK_SHIFT) as usize,
+    let table = crate::sched::alloc_zeroed_slab::<AtomicPtr<AtomicU32>>(
+        slots * core::mem::size_of::<AtomicPtr<AtomicU32>>(),
+        alloc,
+        "FRAME_MAP_TABLE",
     );
-    if last >= MAX_CHUNKS
-    {
-        crate::fatal("Phase 4: DRAM extends past the frame map table's 256 GiB");
-    }
-    for index in first..=last
-    {
-        let Some(phys) = alloc.alloc(CHUNK_ORDER)
-        else
-        {
-            crate::fatal("Phase 4: buddy exhausted allocating the frame map table");
-        };
+    // SAFETY: the slab holds `slots` zeroed (null) pointers owned by the map
+    // for the kernel's life; the boot thread is alone.
+    unsafe { FRAME_MAP.install_table(table, slots) };
+    let ram = memory_map
+        .iter()
+        .filter(|e| crate::mm::init::is_dram(e.memory_type))
+        .map(|e| (e.physical_base, e.size));
+    let alloc_chunk = || {
+        let phys = alloc.alloc(CHUNK_ORDER)?;
         let virt = crate::mm::paging::phys_to_virt(phys);
         // SAFETY: the block is freshly allocated, owned here for the kernel's
         // life, and reached through the direct map active since Phase 3.
         unsafe { core::ptr::write_bytes(virt as *mut u8, 0, PAGE_SIZE << CHUNK_ORDER) };
-        // SAFETY: zeroed, permanently owned, and the boot thread is alone.
-        unsafe { FRAME_MAP.install_chunk(index, virt as *mut AtomicU32) };
+        Some(virt as *mut AtomicU32)
+    };
+    // SAFETY: each chunk is zeroed and permanently owned; the boot thread is alone.
+    if unsafe { FRAME_MAP.populate(ram, alloc_chunk) }.is_err()
+    {
+        crate::fatal("Phase 4: buddy exhausted allocating the frame map table");
     }
 }
 
@@ -348,19 +449,87 @@ mod tests
 
     const P: u64 = PAGE_SIZE as u64;
 
-    /// A table whose chunk 1 (physical GiB 1) is backed by a leaked host buffer.
-    fn table_with_gib_one() -> &'static FrameMap
+    /// A leaked, zeroed host chunk of counters.
+    fn host_chunk() -> *mut AtomicU32
     {
-        let map: &'static FrameMap = Box::leak(Box::new(FrameMap::new()));
         let counters: &'static mut [AtomicU32] = Box::leak(
             (0..FRAMES_PER_CHUNK)
                 .map(|_| AtomicU32::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         );
-        // SAFETY: zeroed, leaked for the test's life, used only through `map`.
-        unsafe { map.install_chunk(1, counters.as_mut_ptr()) };
+        counters.as_mut_ptr()
+    }
+
+    /// A map whose table spans `slots` GiB, every chunk empty.
+    fn map_of(slots: usize) -> &'static FrameMap
+    {
+        let map: &'static FrameMap = Box::leak(Box::new(FrameMap::new()));
+        let table: &'static mut [AtomicPtr<AtomicU32>] = Box::leak(
+            (0..slots)
+                .map(|_| AtomicPtr::new(core::ptr::null_mut()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        // SAFETY: null entries leaked for the test's life, used only via `map`.
+        unsafe { map.install_table(table.as_mut_ptr(), slots) };
         map
+    }
+
+    /// A map spanning 2 GiB whose chunk 1 (physical GiB 1) is backed.
+    fn table_with_gib_one() -> &'static FrameMap
+    {
+        let map = map_of(2);
+        // SAFETY: zeroed, leaked for the test's life, used only through `map`.
+        assert!(unsafe { map.install_chunk(1, host_chunk()) });
+        map
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    // Defect caught: a fixed table length (the former 256 GiB) refusing DRAM
+    // past it, or a chunk allocated for a hole between RAM ranges.
+    #[test]
+    fn population_gives_a_chunk_to_each_ram_gib_and_none_to_holes()
+    {
+        let slots = chunk_slots(600 * GIB);
+        assert_eq!(slots, 600);
+        let map = map_of(slots);
+        let mut allocated = 0;
+        // RAM in GiB 0, GiBs 1-2 (a range straddling them, twice), and GiB 599.
+        let ram = [
+            (0, GIB / 2),
+            (GIB + GIB / 2, GIB),
+            (GIB + GIB / 2, GIB),
+            (599 * GIB, GIB),
+        ];
+        // SAFETY: host chunks are zeroed and leaked.
+        unsafe {
+            map.populate(ram.into_iter(), || {
+                allocated += 1;
+                Some(host_chunk())
+            })
+        }
+        .unwrap();
+        assert_eq!(allocated, 4, "GiBs 0, 1, 2 and 599, each once");
+        map.raise(599 * GIB + P).unwrap();
+        assert!(
+            map.any_mapped(599 * GIB + P, P),
+            "a frame past 256 GiB is tracked"
+        );
+        map.raise(300 * GIB).unwrap();
+        assert!(!map.any_mapped(300 * GIB, P), "a hole GiB is untracked");
+    }
+
+    #[test]
+    fn a_failed_chunk_allocation_fails_population()
+    {
+        let map = map_of(1);
+        // SAFETY: no chunk is installed.
+        assert_eq!(
+            unsafe { map.populate([(0, GIB)].into_iter(), || None) },
+            Err(())
+        );
     }
 
     #[test]

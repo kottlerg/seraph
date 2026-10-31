@@ -251,15 +251,25 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // new tables (later phases reach it through the direct map). All
     // further uses of `info` must be resolved before activate.
     let fb_phys = info.framebuffer.physical_base;
-    if let Err(_e) = mm::paging::init_kernel_page_tables(info)
+    match mm::paging::init_kernel_page_tables(info)
     {
-        fatal("Phase 3: boot page table pool exhausted (RAM > 248 GiB?)");
+        Ok(()) =>
+        {}
+        Err(mm::paging::BootTableError::NoTableCarve) =>
+        {
+            fatal("Phase 3: no free RAM range holds the page-table carve");
+        }
+        Err(mm::paging::BootTableError::OutOfFrames) =>
+        {
+            fatal("Phase 3: boot page-table frames exhausted");
+        }
     }
 
     // Rebase the boot stack pointer from identity-mapped (VA == PA) to the
     // direct physical map (VA == direct_map_base() + PA). The identity mapping
-    // covers only 64 KiB around SP and can be exhausted by later phases;
-    // the direct map covers all physical RAM with no size limit.
+    // covers only the handoff stack's window (`HANDOFF_STACK_BYTES`) and
+    // retires with it; the direct map covers all physical RAM with no size
+    // limit.
     //
     // Call into the bulk of `kernel_entry` through an `#[inline(never)]`
     // boundary so LLVM cannot hoist sp-derived local-address
@@ -427,10 +437,13 @@ unsafe fn kernel_entry_post_rebase(
     // core/kernel/docs/memory-internals.md § Frame Map Table) before the
     // Phase-7 drain, while the buddy still holds 1 MiB blocks, and before
     // Phase 9 installs the first user mapping.
-    let (dram_bottom, dram_top) = mm::init::dram_bounds();
+    let (_, dram_top) = mm::init::dram_bounds();
+    // SAFETY: boot_info_phys was validated in Phase 0 and the direct map covers
+    // it and the memory map since Phase 3.
+    let memory_map = unsafe { mm::init::memory_map(boot_info_phys) };
     // SAFETY: the single boot thread, once, after Phase 3 and before any user
     // mapping or the Phase-7 drain.
-    unsafe { mm::frame_map::init(allocator, dram_bottom, dram_top) };
+    unsafe { mm::frame_map::init(allocator, memory_map, dram_top) };
 
     // Carve the CSpace registry arena (one id per DRAM page,
     // core/kernel/docs/capability-internals.md § CSpace Registry) for the same

@@ -19,12 +19,26 @@
 
 use core::mem::size_of;
 
-use boot_protocol::{BootInfo, MemoryType};
+use boot_protocol::{BootInfo, BootModule, MemoryMapEntry, MemoryType};
 
 use super::buddy::{BuddyAllocator, PAGE_SIZE};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::kprintln;
+
+/// Whether a memory-map entry of type `ty` is DRAM (`Usable`, `Loaded`,
+/// `AcpiReclaimable`, `Persistent`), as opposed to a `Reserved` window.
+#[must_use]
+pub fn is_dram(ty: MemoryType) -> bool
+{
+    matches!(
+        ty,
+        MemoryType::Usable
+            | MemoryType::Loaded
+            | MemoryType::AcpiReclaimable
+            | MemoryType::Persistent
+    )
+}
 
 /// Lowest and highest physical addresses among entries that represent
 /// actual DRAM (`Usable`, `Loaded`, `AcpiReclaimable`, `Persistent`).
@@ -43,13 +57,7 @@ fn compute_dram_bounds(entries: &[boot_protocol::MemoryMapEntry]) -> (u64, u64)
         {
             continue;
         }
-        if matches!(
-            entry.memory_type,
-            MemoryType::Usable
-                | MemoryType::Loaded
-                | MemoryType::AcpiReclaimable
-                | MemoryType::Persistent
-        )
+        if is_dram(entry.memory_type)
         {
             let start = entry.physical_base;
             let end = start + entry.size;
@@ -300,26 +308,10 @@ fn memory_type_name(ty: MemoryType) -> &'static str
     }
 }
 
-/// Maximum usable physical ranges tracked during init. Memory maps are
-/// typically small; 64 entries is generous for real hardware.
-const MAX_RANGES: usize = 64;
-
-/// Maximum exclusion regions: kernel, `BootInfo`, each init segment (up to
-/// `INIT_MAX_SEGMENTS`, 8), up to 16 boot modules, and the AP trampoline
-/// page — 27 at most, so 32 is sufficient. The DTB blob is subtracted
-/// separately, at population.
-const MAX_EXCL: usize = 32;
-
-/// Capacity of the surviving-range list. The usable ranges are disjoint, so
-/// each subtracted extent lies strictly inside at most one of them and adds
-/// at most one piece: the `MAX_RANGES` usable ranges, one piece per
-/// `MAX_EXCL` exclusion, and one for the DTB blob bound the count.
-const FREE_RANGE_CAP: usize = MAX_RANGES + MAX_EXCL + 1;
-
-/// Surviving free ranges, written once in Phase 2 by
-/// [`init_physical_memory`] and consumed once by [`populate_buddy`], both on
-/// the single boot thread.
-static mut FREE_RANGES: RangeList<FREE_RANGE_CAP> = RangeList::new();
+/// Physical address of the `BootInfo` struct (the kernel entry argument),
+/// recorded in Phase 2 so [`populate_buddy`] can re-read it, and the memory
+/// map and module list it points to, through the direct map.
+static BOOT_INFO_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Physical address of the device tree blob from `BootInfo.device_tree`
 /// (0 when none), recorded in Phase 2 for [`populate_buddy`].
@@ -333,12 +325,40 @@ static DIRECT_MAP_TOP: AtomicU64 = AtomicU64::new(0);
 /// written by [`populate_buddy`].
 static DTB_EXTENT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Phase 2: collect the free physical ranges derived from `info`.
+/// The `(base, size)` of the RAM Phase 3 carved for its page tables
+/// ([`record_boot_table_carve`]), `(0, 0)` when it carved none; kept out of the
+/// buddy by [`populate_buddy`].
+static BOOT_TABLE_CARVE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The boot memory map, read through the direct map.
 ///
-/// Filters for [`MemoryType::Usable`] entries and subtracts the kernel image,
-/// init segments, boot modules, the `BootInfo` struct, and the AP trampoline
-/// page. The surviving page-aligned ranges are kept for [`populate_buddy`];
-/// nothing is written to free RAM, which the bootloader's tables do not map
+/// # Safety
+/// `boot_info_phys` is the Phase-0-validated `BootInfo` address, and the
+/// direct map (Phase 3) covers it and the map it points to.
+#[must_use]
+pub unsafe fn memory_map(boot_info_phys: u64) -> &'static [MemoryMapEntry]
+{
+    // SAFETY: caller's contract.
+    let info = unsafe { &*(super::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
+    // SAFETY: Phase 0 validated entries and count; the direct map covers them.
+    unsafe {
+        core::slice::from_raw_parts(
+            super::paging::phys_to_virt(info.memory_map.entries as u64) as *const MemoryMapEntry,
+            info.memory_map.count as usize,
+        )
+    }
+}
+
+/// Phase 2: check that free physical memory survives the boot payload, and
+/// record what [`populate_buddy`] needs to find it again.
+///
+/// The free memory is every [`MemoryType::Usable`] entry less the kernel
+/// image, init segments, boot modules, the `BootInfo` struct, and the AP
+/// trampoline page (the boot payload); Phase 3 subtracts the device tree blob
+/// and its own page-table carve as well. Nothing is stored per range: the
+/// subtraction streams over the memory map ([`for_each_free_piece`]), so no
+/// count of memory-map entries, usable ranges, or boot modules is bounded.
+/// Nothing is written to free RAM, which the bootloader's tables do not map
 /// (core/boot/docs/page-tables.md § What Gets Mapped).
 ///
 /// Calls [`crate::fatal`] and halts if no usable memory survives.
@@ -347,33 +367,81 @@ static DTB_EXTENT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// map still covers `info` and its memory map.
 pub fn init_physical_memory(info: &BootInfo)
 {
-    let usable = collect_usable_ranges(info);
-    let excl = collect_exclusions(info);
-
-    let mut free = RangeList::<FREE_RANGE_CAP>::new();
-    for &(r_start, r_end) in usable.iter().filter(|&&(s, e)| s < e)
-    {
-        add_surviving_subranges(&mut free, r_start, r_end, excl.as_slice());
-    }
-
-    // Frame 0 never reaches the buddy (`BuddyAllocator::add_region`).
-    if free.iter().all(|&(s, e)| e <= s.max(PAGE_SIZE as u64))
+    let mut survives = false;
+    // Identity-mapped at this point: a physical address is its own pointer.
+    for_each_payload_free_piece(
+        info,
+        core::ptr::from_ref(info) as u64,
+        |p| p,
+        &[],
+        |s, e| {
+            // Frame 0 never reaches the buddy (`BuddyAllocator::add_region`).
+            survives |= e > s.max(PAGE_SIZE as u64);
+        },
+    );
+    if !survives
     {
         crate::fatal("no usable physical memory after exclusions");
     }
 
+    BOOT_INFO_PHYS.store(core::ptr::from_ref(info) as u64, Ordering::Relaxed);
     DTB_PHYS.store(info.device_tree, Ordering::Relaxed);
     DIRECT_MAP_TOP.store(
         super::paging::compute_max_physical_address(info),
         Ordering::Relaxed,
     );
-    // SAFETY: single boot thread; FREE_RANGES is written only here, before
-    // `populate_buddy` reads it.
-    unsafe { *core::ptr::addr_of_mut!(FREE_RANGES) = free };
 }
 
-/// First act of Phase 3 after the page-table switch: subtract the device tree
-/// blob from the Phase-2 free ranges and populate `alloc` with the rest.
+/// The first page-aligned free piece of at least `frames` frames, for the
+/// Phase 3 page-table carve, or `None`.
+///
+/// A free piece here also avoids everything from the device tree blob's start
+/// to the end of its range: the blob's size is in its header, which Phase 3
+/// cannot read before its own tables are active.
+///
+/// Called on the single boot thread while the bootloader's identity map still
+/// covers `info`, its memory map, and its module list.
+#[must_use]
+pub fn find_boot_table_carve(info: &BootInfo, frames: u64) -> Option<u64>
+{
+    let want = frames * PAGE_SIZE as u64;
+    let dtb_tail = if info.device_tree == 0
+    {
+        (0, 0)
+    }
+    else
+    {
+        (align_down(info.device_tree, PAGE_SIZE as u64), u64::MAX)
+    };
+    let mut found = None;
+    for_each_payload_free_piece(
+        info,
+        core::ptr::from_ref(info) as u64,
+        |p| p,
+        &[dtb_tail],
+        |s, e| {
+            // Frame 0 is never handed out (it is the buddy's list end marker).
+            let s = s.max(PAGE_SIZE as u64);
+            if found.is_none() && e > s && e - s >= want
+            {
+                found = Some(s);
+            }
+        },
+    );
+    found
+}
+
+/// Record the `frames` frames at `base` Phase 3 used for its page tables, so
+/// [`populate_buddy`] keeps them out of the buddy.
+pub fn record_boot_table_carve(base: u64, frames: u64)
+{
+    BOOT_TABLE_CARVE[0].store(base, Ordering::Relaxed);
+    BOOT_TABLE_CARVE[1].store(frames * PAGE_SIZE as u64, Ordering::Relaxed);
+}
+
+/// First act of Phase 3 after the page-table switch: populate `alloc` with the
+/// free physical memory, less the device tree blob and the Phase 3 page-table
+/// carve.
 ///
 /// The blob is sized from its FDT header, read through the direct map
 /// ([`fdt_extent`]); a `BootInfo.device_tree` that does not name a valid blob
@@ -387,9 +455,12 @@ pub fn init_physical_memory(info: &BootInfo)
 /// active; `alloc` is empty and nothing has allocated from it.
 pub unsafe fn populate_buddy(alloc: &mut BuddyAllocator)
 {
-    // SAFETY: single boot thread; `init_physical_memory` finished writing.
-    let mut free = unsafe { core::ptr::read(core::ptr::addr_of!(FREE_RANGES)) };
+    let info_phys = BOOT_INFO_PHYS.load(Ordering::Relaxed);
+    // SAFETY: recorded in Phase 2 from the validated entry argument; the
+    // direct map covers it.
+    let info = unsafe { &*(super::paging::phys_to_virt(info_phys) as *const BootInfo) };
 
+    let mut dtb = (0, 0);
     let dtb_phys = DTB_PHYS.load(Ordering::Relaxed);
     if dtb_phys != 0
     {
@@ -403,16 +474,21 @@ pub unsafe fn populate_buddy(alloc: &mut BuddyAllocator)
         .unwrap_or_else(|e| dtb_fatal(dtb_phys, &e));
         DTB_EXTENT[0].store(extent.0, Ordering::Relaxed);
         DTB_EXTENT[1].store(extent.1, Ordering::Relaxed);
-        free = subtract(&free, extent.0, extent.0 + extent.1);
+        dtb = (extent.0, extent.0 + extent.1);
     }
+    let carve_base = BOOT_TABLE_CARVE[0].load(Ordering::Relaxed);
+    let carve = (
+        carve_base,
+        carve_base + BOOT_TABLE_CARVE[1].load(Ordering::Relaxed),
+    );
 
-    for &(start, end) in free.iter()
-    {
-        // SAFETY: these ranges are usable RAM holding no live data (the
-        // exclusion subtraction above and in Phase 2), reachable through the
-        // direct map the caller guarantees is live.
+    let to_ptr = |phys: u64| super::paging::phys_to_virt(phys);
+    for_each_payload_free_piece(info, info_phys, to_ptr, &[dtb, carve], |start, end| {
+        // SAFETY: the piece is usable RAM holding no live data (every boot
+        // payload extent, the blob and the page-table carve are subtracted),
+        // reachable through the direct map the caller guarantees is live.
         unsafe { alloc.add_region(start, end) };
-    }
+    });
 
     if alloc.free_page_count() == 0
     {
@@ -429,86 +505,18 @@ pub fn dtb_extent() -> Option<(u64, u64)>
     (size != 0).then(|| (DTB_EXTENT[0].load(Ordering::Relaxed), size))
 }
 
-// ── Helper types ─────────────────────────────────────────────────────────────
+// ── Free-memory streaming ─────────────────────────────────────────────────────
 
-/// A fixed-size list of physical address ranges.
-struct RangeList<const N: usize>
-{
-    data: [(u64, u64); N],
-    len: usize,
-}
-
-impl<const N: usize> RangeList<N>
-{
-    const fn new() -> Self
-    {
-        Self {
-            data: [(0, 0); N],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, start: u64, end: u64)
-    {
-        if start < end && self.len < N
-        {
-            self.data[self.len] = (start, end);
-            self.len += 1;
-        }
-    }
-
-    /// Push a range whose slot [`FREE_RANGE_CAP`]'s count guarantees.
-    fn push_counted(&mut self, start: u64, end: u64)
-    {
-        debug_assert!(
-            start >= end || self.len < N,
-            "free-range count exceeds its proven bound"
-        );
-        self.push(start, end);
-    }
-
-    fn as_slice(&self) -> &[(u64, u64)]
-    {
-        &self.data[..self.len]
-    }
-
-    fn iter(&self) -> core::slice::Iter<'_, (u64, u64)>
-    {
-        self.as_slice().iter()
-    }
-}
-
-// ── Collection helpers ────────────────────────────────────────────────────────
-
-/// Collect page-aligned usable ranges from the memory map.
-fn collect_usable_ranges(info: &BootInfo) -> RangeList<MAX_RANGES>
-{
-    let mut ranges = RangeList::new();
-
-    // SAFETY: Phase 0 validated entries is non-null and count > 0. The memory
-    // map region is identity-mapped by the bootloader at handoff.
-    let entries = unsafe {
-        core::slice::from_raw_parts(info.memory_map.entries, info.memory_map.count as usize)
-    };
-
-    for entry in entries
-    {
-        if entry.memory_type != MemoryType::Usable
-        {
-            continue;
-        }
-        let start = align_up(entry.physical_base, PAGE_SIZE as u64);
-        let end = align_down(entry.physical_base + entry.size, PAGE_SIZE as u64);
-        ranges.push(start, end);
-    }
-
-    ranges
-}
-
-/// Build the exclusion list: all physical ranges that must not be allocated.
+/// Call `emit(start, end)` for every page-aligned piece of a `Usable` entry of
+/// `info`'s memory map that no boot payload extent and no `extra` extent
+/// covers.
 ///
-/// Exclusion boundaries are rounded outward (start down, end up) to page
-/// granularity so no live data sits on a partially-excluded page.
+/// `info_phys` is the `BootInfo` struct's own physical address (an exclusion);
+/// `to_ptr` turns a physical address from `info` into a readable pointer (the
+/// identity before Phase 3, the direct map after). The exclusions are the
+/// kernel image, the init segments, every boot module, the `BootInfo` struct,
+/// and the AP trampoline page, rounded outward to whole pages so no live data
+/// sits on a partly excluded page.
 ///
 /// The `BootInfo` and AP-trampoline exclusions are redundant guards: the
 /// bootloader allocates both as `EfiLoaderData`, which the memory map reports
@@ -516,64 +524,121 @@ fn collect_usable_ranges(info: &BootInfo) -> RangeList<MAX_RANGES>
 /// reclamation mechanism for bootloader scratch pages is
 /// `BootInfo.reclaim_ranges` (`core/kernel/docs/initialization.md` § Phase 7:
 /// Capability System).
-fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
+fn for_each_payload_free_piece(
+    info: &BootInfo,
+    info_phys: u64,
+    to_ptr: impl Fn(u64) -> u64,
+    extra: &[(u64, u64)],
+    mut emit: impl FnMut(u64, u64),
+)
 {
-    let mut excl = RangeList::new();
-
-    let mut add = |start: u64, end: u64| {
-        excl.push(
-            align_down(start, PAGE_SIZE as u64),
-            align_up(end, PAGE_SIZE as u64),
-        );
+    // SAFETY: Phase 0 validated the memory map; `to_ptr` reaches it.
+    let entries = unsafe {
+        core::slice::from_raw_parts(
+            to_ptr(info.memory_map.entries as u64) as *const MemoryMapEntry,
+            info.memory_map.count as usize,
+        )
     };
-
-    // Kernel image.
-    add(
-        info.kernel_physical_base,
-        info.kernel_physical_base + info.kernel_size,
-    );
-
-    // Init ELF segments (pre-parsed by the bootloader).
-    let seg_count = info.init_image.segment_count as usize;
-    for seg in &info.init_image.segments[..seg_count]
+    let modules: &[BootModule] = if info.modules.entries.is_null() || info.modules.count == 0
     {
-        add(seg.phys_addr, seg.phys_addr + seg.size);
+        &[]
     }
-
-    // Boot modules.
-    if !info.modules.entries.is_null() && info.modules.count > 0
+    else
     {
-        // SAFETY: entries is non-null and the region is identity-mapped.
-        let modules = unsafe {
-            core::slice::from_raw_parts(info.modules.entries, info.modules.count as usize)
-        };
-        for m in modules
-        {
-            add(m.physical_base, m.physical_base + m.size);
+        // SAFETY: a non-null module list from the validated BootInfo, which
+        // `to_ptr` reaches.
+        unsafe {
+            core::slice::from_raw_parts(
+                to_ptr(info.modules.entries as u64) as *const BootModule,
+                info.modules.count as usize,
+            )
         }
-    }
-
-    // The BootInfo struct itself (pointed to by the kernel entry parameter).
-    let boot_info_addr = core::ptr::addr_of!(*info) as u64;
-    add(
-        boot_info_addr,
-        boot_info_addr + size_of::<BootInfo>() as u64,
-    );
-
-    // AP trampoline page (SIPI on x86-64, SBI HSM hart_start on riscv64). The
-    // bootloader allocates it as EfiLoaderData, so the memory map reports it as
-    // `Loaded` and it never lies in a `Usable` range; this exclusion is a guard.
-    // The page is reclaimed in Phase 8 (core/kernel/docs/initialization.md
-    // § Phase 8: Scheduler and SMP Bringup).
-    if info.ap_trampoline_page != 0
+    };
+    let seg_count = (info.init_image.segment_count as usize).min(info.init_image.segments.len());
+    let segments = &info.init_image.segments[..seg_count];
+    let trampoline = if info.ap_trampoline_page == 0
     {
-        add(
+        (0, 0)
+    }
+    else
+    {
+        (
             info.ap_trampoline_page,
             info.ap_trampoline_page + PAGE_SIZE as u64,
-        );
-    }
+        )
+    };
+    let fixed = [
+        (
+            info.kernel_physical_base,
+            info.kernel_physical_base + info.kernel_size,
+        ),
+        (info_phys, info_phys + size_of::<BootInfo>() as u64),
+        trampoline,
+    ];
+    let page = PAGE_SIZE as u64;
+    let exclusions = || {
+        fixed
+            .iter()
+            .copied()
+            .chain(segments.iter().map(|s| (s.phys_addr, s.phys_addr + s.size)))
+            .chain(
+                modules
+                    .iter()
+                    .map(|m| (m.physical_base, m.physical_base + m.size)),
+            )
+            .chain(extra.iter().copied())
+            .map(move |(s, e)| (align_down(s, page), align_up_saturating(e, page)))
+    };
 
-    excl
+    for entry in entries
+        .iter()
+        .filter(|e| e.memory_type == MemoryType::Usable)
+    {
+        let start = align_up_saturating(entry.physical_base, page);
+        let end = align_down(entry.physical_base.saturating_add(entry.size), page);
+        for_each_free_piece(start, end, &exclusions, &mut emit);
+    }
+}
+
+/// Call `emit` for every maximal sub-range of `[start, end)` that no range
+/// `exclusions()` yields covers, in ascending order.
+///
+/// The exclusions may be unsorted, overlapping, or empty, and are re-iterated
+/// once per piece, so nothing is stored and no count of either bounds the
+/// subtraction: the cost is the number of pieces times the number of
+/// exclusions.
+fn for_each_free_piece<I>(
+    start: u64,
+    end: u64,
+    exclusions: &impl Fn() -> I,
+    emit: &mut impl FnMut(u64, u64),
+) where
+    I: Iterator<Item = (u64, u64)>,
+{
+    let mut cursor = start;
+    while cursor < end
+    {
+        // The lowest-starting exclusion that still overlaps [cursor, end).
+        let next = exclusions()
+            .filter(|&(s, e)| s < e && s < end && e > cursor)
+            .min_by_key(|&(s, _)| s);
+        match next
+        {
+            None =>
+            {
+                emit(cursor, end);
+                return;
+            }
+            Some((s, e)) =>
+            {
+                if s > cursor
+                {
+                    emit(cursor, s);
+                }
+                cursor = e;
+            }
+        }
+    }
 }
 
 /// FDT magic in big-endian: bytes `d0 0d fe ed`.
@@ -674,65 +739,20 @@ fn dtb_fatal(phys: u64, err: &DtbError) -> !
     crate::fatal("Phase 3: BootInfo.device_tree names no valid FDT blob")
 }
 
-// ── Range subtraction ─────────────────────────────────────────────────────────
-
-/// Append to `free` the sub-ranges of `[r_start, r_end)` that don't overlap
-/// any exclusion in `excls`.
-fn add_surviving_subranges(
-    free: &mut RangeList<FREE_RANGE_CAP>,
-    r_start: u64,
-    r_end: u64,
-    excls: &[(u64, u64)],
-)
-{
-    // `work` holds the set of ranges still available after applying each
-    // exclusion in turn. A fixed-size array needs no allocation.
-    let mut work = RangeList::<MAX_RANGES>::new();
-    work.push(r_start, r_end);
-
-    for &(e_start, e_end) in excls
-    {
-        let mut next = RangeList::<MAX_RANGES>::new();
-
-        for &(w_start, w_end) in work.iter()
-        {
-            // Left sub-range: portion of [w_start, w_end) before the exclusion.
-            let left_end = w_end.min(e_start);
-            next.push(w_start, left_end);
-
-            // Right sub-range: portion after the exclusion.
-            let right_start = w_start.max(e_end);
-            next.push(right_start, w_end);
-        }
-
-        work = next;
-    }
-
-    for &(start, end) in work.iter()
-    {
-        free.push_counted(start, end);
-    }
-}
-
-/// `list` with `[e_start, e_end)` removed.
-fn subtract(list: &RangeList<FREE_RANGE_CAP>, e_start: u64, e_end: u64)
--> RangeList<FREE_RANGE_CAP>
-{
-    let mut out = RangeList::new();
-    for &(start, end) in list.iter()
-    {
-        out.push_counted(start, end.min(e_start));
-        out.push_counted(start.max(e_end), end);
-    }
-    out
-}
-
 // ── Alignment utilities ───────────────────────────────────────────────────────
 
 /// Round `val` up to the next multiple of `align`. `align` must be a power of two.
 fn align_up(val: u64, align: u64) -> u64
 {
     (val + align - 1) & !(align - 1)
+}
+
+/// Round `val` up to the next multiple of `align`, saturating at the highest
+/// multiple below `u64::MAX`. `align` must be a power of two.
+fn align_up_saturating(val: u64, align: u64) -> u64
+{
+    val.checked_add(align - 1)
+        .map_or(!(align - 1), |v| v & !(align - 1))
 }
 
 /// Round `val` down to the nearest multiple of `align`. `align` must be a power of two.
@@ -809,16 +829,62 @@ mod tests
         );
     }
 
-    #[test]
-    fn subtract_splits_only_the_range_holding_the_extent()
+    /// The pieces `for_each_free_piece` emits for `[start, end)` less `excl`.
+    fn pieces(start: u64, end: u64, excl: &[(u64, u64)]) -> Vec<(u64, u64)>
     {
-        let mut list = RangeList::<FREE_RANGE_CAP>::new();
-        list.push(0x1000, 0x9000);
-        list.push(0x10000, 0x20000);
-        let out = subtract(&list, 0x3000, 0x5000);
+        let mut out = Vec::new();
+        for_each_free_piece(start, end, &|| excl.iter().copied(), &mut |s, e| {
+            out.push((s, e));
+        });
+        out
+    }
+
+    #[test]
+    fn free_pieces_skip_unsorted_and_overlapping_exclusions()
+    {
+        let excl = [
+            (0x6000, 0x8000),
+            (0x2000, 0x3000),
+            (0x2800, 0x4000),
+            (0x7000, 0x7800),
+        ];
         assert_eq!(
-            out.as_slice(),
-            &[(0x1000, 0x3000), (0x5000, 0x9000), (0x10000, 0x20000)]
+            pieces(0x1000, 0x9000, &excl),
+            [(0x1000, 0x2000), (0x4000, 0x6000), (0x8000, 0x9000)]
         );
+    }
+
+    #[test]
+    fn free_pieces_of_a_fully_excluded_range_are_none()
+    {
+        assert!(pieces(0x1000, 0x3000, &[(0, 0x2000), (0x2000, 0x4000)]).is_empty());
+    }
+
+    #[test]
+    fn free_pieces_ignore_empty_and_outside_exclusions()
+    {
+        let excl = [(0x5000, 0x5000), (0, 0x1000), (0x9000, 0xa000)];
+        assert_eq!(pieces(0x1000, 0x9000, &excl), [(0x1000, 0x9000)]);
+    }
+
+    // Defect caught: the former 64-entry range and 32-entry exclusion lists
+    // dropping RAM, or exclusions, past their bound.
+    #[test]
+    fn free_pieces_need_no_bound_on_the_exclusion_count()
+    {
+        // 200 one-page holes, one every other page.
+        let excl: Vec<(u64, u64)> = (0..200u64)
+            .map(|i| (0x1000 + 0x2000 * i, 0x2000 + 0x2000 * i))
+            .collect();
+        let out = pieces(0x1000, 0x1000 + 0x2000 * 200, &excl);
+        assert_eq!(out.len(), 200);
+        assert!(out.iter().all(|&(s, e)| e - s == 0x1000));
+    }
+
+    #[test]
+    fn saturating_alignment_never_wraps_to_zero()
+    {
+        assert_eq!(align_up_saturating(u64::MAX - 5, 0x1000), !0xFFF);
+        assert_eq!(align_up_saturating(0x1001, 0x1000), 0x2000);
     }
 }

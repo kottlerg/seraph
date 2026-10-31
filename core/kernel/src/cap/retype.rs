@@ -1152,6 +1152,44 @@ pub const NOTIFICATION_RAW_BYTES: u64 =
 /// in that module). Update both sides together.
 pub const EVENT_QUEUE_STATE_BYTES: u64 = 64;
 
+/// `WaitSetState` body bytes, kept in sync with the struct in
+/// `core/kernel/src/ipc/wait_set.rs` (anchored by the const assertion in that
+/// module).
+pub const WAIT_SET_STATE_BYTES: u64 = 40;
+
+/// Offset of a `WaitSet`'s inline member array from the start of its retype
+/// slot: directly after the wrapper and the state, both 8-byte multiples.
+pub const WAIT_SET_MEMBERS_OFFSET: u64 = 24 + WAIT_SET_STATE_BYTES;
+
+/// Offset of a `WaitSet`'s inline ready ring from the start of its retype
+/// slot: directly after the `capacity` member slots.
+pub const fn wait_set_ring_offset(capacity: u64) -> u64
+{
+    WAIT_SET_MEMBERS_OFFSET
+        + capacity * core::mem::size_of::<crate::ipc::wait_set::WaitSetMember>() as u64
+}
+
+/// Inline byte cost of a `WaitSet` retype slot of `capacity` members: wrapper
+/// + state + members + the `capacity + 1` `u16` ready ring, padded to 8 bytes.
+pub const fn wait_set_raw_bytes(capacity: u64) -> u64
+{
+    wait_set_ring_offset(capacity) + ((capacity + 1) * 2).div_ceil(8) * 8
+}
+
+/// Byte cost and allocation mode of a `WaitSet` of `capacity` members:
+/// sub-page in place while it fits the 512 B bin, page-aligned split beyond.
+/// The construction in `sys_cap_create_wait_set` and the reclaim in
+/// `dealloc_object_one`'s `WaitSet` arm use the same formula, the ABI's
+/// `wait_set_retype_bytes` (pinned below).
+pub const fn wait_set_dispatch(capacity: u64) -> DispatchEntry
+{
+    let raw_bytes = syscall::wait_set_retype_bytes(capacity);
+    DispatchEntry {
+        raw_bytes,
+        split: raw_bytes > BIN_512,
+    }
+}
+
 /// Bytes of one death-observer node in an `EventQueue`'s inline pool.
 const EVENT_QUEUE_OBSERVER_BYTES: u64 =
     core::mem::size_of::<crate::sched::thread::DeathObserver>() as u64;
@@ -1224,13 +1262,6 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: syscall::NOTIFICATION_RETYPE_BYTES,
             split: false,
         }),
-        // WaitSet: 24 wrapper + 440 (the asserted upper bound on WaitSetState)
-        // → BIN_512; sizing per core/kernel/docs/ipc-internals.md § Wait Set,
-        // pinned by the const assertion in core/kernel/src/ipc/wait_set.rs.
-        ObjectType::WaitSet => Some(DispatchEntry {
-            raw_bytes: syscall::WAIT_SET_RETYPE_BYTES,
-            split: false,
-        }),
         // Thread: KERNEL_STACK_PAGES kstack pages + 1 page holding the
         // ThreadObject wrapper and the TCB + 1 page for the per-thread
         // extended-state save area. Layout: pages 0..N are kstack
@@ -1260,9 +1291,10 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: size_arg.saturating_mul(PAGE_SIZE as u64),
             split: true,
         }),
-        // Boot-minted only; and EventQueue, sized by capacity and observer
-        // count together through `event_queue_dispatch`.
+        // Boot-minted only; and the caller-sized EventQueue and WaitSet,
+        // looked up through `event_queue_dispatch` and `wait_set_dispatch`.
         ObjectType::EventQueue
+        | ObjectType::WaitSet
         | ObjectType::Mmio
         | ObjectType::Interrupt
         | ObjectType::IoPort
@@ -1283,10 +1315,13 @@ const _: () = {
             == syscall::ENDPOINT_RETYPE_BYTES
     );
     assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
-    // The WaitSet debit is a declared budget: the real state must fit it.
+    // The WaitSet formula, at one member, two (the ring padding changes),
+    // and the largest.
+    assert!(wait_set_raw_bytes(1) == syscall::wait_set_retype_bytes(1));
+    assert!(wait_set_raw_bytes(4) == syscall::wait_set_retype_bytes(4));
     assert!(
-        24 + core::mem::size_of::<crate::ipc::wait_set::WaitSetState>() as u64
-            <= syscall::WAIT_SET_RETYPE_BYTES
+        wait_set_raw_bytes(syscall::WAIT_SET_MAX_MEMBERS as u64)
+            == syscall::wait_set_retype_bytes(syscall::WAIT_SET_MAX_MEMBERS as u64)
     );
     assert!(event_queue_raw_bytes(0, 0) == syscall::event_queue_retype_bytes(0, 0));
     assert!(event_queue_raw_bytes(1, 0) == syscall::event_queue_retype_bytes(1, 0));
@@ -1438,9 +1473,16 @@ mod tests
 
         // WaitSetState is niche-packed to fit, with the wrapper, inside
         // the 512 B sub-page bin.
-        let w = dispatch_for(ObjectType::WaitSet, 0).unwrap();
+        // WaitSet: 64 header + 24 per member + the u16 ring padded to 8.
+        // 16 members → 64 + 384 + 40 = 488 → BIN_512, in place.
+        let w = wait_set_dispatch(16);
         assert!(!w.split);
+        assert_eq!(w.raw_bytes, 488);
         assert_eq!(round_to_class(w.raw_bytes), BIN_512);
+        // 17 members → 64 + 408 + 40 = 512, still in place; 18 → split.
+        assert!(!wait_set_dispatch(17).split);
+        assert!(wait_set_dispatch(18).split);
+        assert!(dispatch_for(ObjectType::WaitSet, 0).is_none());
     }
 
     #[test]

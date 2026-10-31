@@ -129,9 +129,10 @@ fn main() -> !
     {
         syscall::thread_exit();
     };
+    // Two members: the service endpoint and the death queue.
     let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
-            syscall::wait_set_create(slab).ok()
+        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
+            syscall::wait_set_create(slab, 2).ok()
         })
     else
     {

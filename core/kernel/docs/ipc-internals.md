@@ -581,28 +581,32 @@ path — sequential, not nested, so no cycle.
 ### Object Structure
 
 ```rust
-/// Maximum number of sources a single wait set may contain.
-pub const WAIT_SET_MAX_MEMBERS: usize = 16;
+/// Largest member capacity a wait set may be created with (the ABI's).
+pub const WAIT_SET_MAX_MEMBERS: usize = 1024;
 
 pub struct WaitSetState
 {
-    /// Serialises every field that changes after construction: `members`,
-    /// `member_count`, `ready_ring`, `ready_head`, `ready_tail`, and
+    /// Serialises every field that changes after construction: the members,
+    /// `member_count`, the ready ring, `ready_head`, `ready_tail`, and
     /// `waiters`. Inner to every source's lock (see § Lock Ordering).
     lock: Spinlock,
 
-    /// Registered members. A slot whose `source_ptr` is null is vacant.
-    /// Fixed capacity; SYS_WAIT_SET_ADD returns InvalidArgument when full.
-    members: [WaitSetMember; WAIT_SET_MAX_MEMBERS],
+    /// Registered members, `capacity` slots inline after this struct. A slot
+    /// whose `source_ptr` is null is vacant. SYS_WAIT_SET_ADD returns
+    /// InvalidArgument when every slot is occupied.
+    members: *mut WaitSetMember,
 
-    /// Number of occupied member slots.
-    member_count: u8,
+    /// Ring buffer of pending member indices, `capacity + 1` slots inline
+    /// after the members. One slot stays empty to tell full from empty, so it
+    /// holds at most `capacity` entries.
+    ready_ring: *mut u16,
 
-    /// Ring buffer of pending member indices. One slot stays empty to tell
-    /// full from empty, so it holds at most WAIT_SET_MAX_MEMBERS - 1 entries.
-    ready_ring: [u8; WAIT_SET_MAX_MEMBERS],
-    ready_head: u8,
-    ready_tail: u8,
+    /// Member capacity, fixed at creation; occupied member slots.
+    capacity: u16,
+    member_count: u16,
+
+    ready_head: u16,
+    ready_tail: u16,
 
     /// The thread blocked in SYS_WAIT_SET_WAIT, if any (at most one; a second
     /// wait is refused). A WaitQueue so its claims share the source code.
@@ -631,13 +635,13 @@ enum WaitSetSourceTag
 }
 ```
 
-Folding vacancy into a null `source_ptr` keeps each `WaitSetMember` at 24 B, so
-the 16-slot member array is 384 B and `WaitSetState` (at most 440 B) fits,
-with its 24 B `WaitSetObject` wrapper, in the 512 B retype bin; `wait_set.rs`
-asserts both sizes at compile time.
+Folding vacancy into a null `source_ptr` keeps each `WaitSetMember` at 24 B, the
+per-member debit of `wait_set_retype_bytes`; `wait_set.rs` asserts the member and state
+sizes at compile time, and `cap/retype.rs` pins the layout to the ABI formula.
 
-The arrays are fixed-capacity because the kernel runs no heap (see
-§ Kernel Object Memory in
+The member array and the ready ring are sized by the capacity the creator passes to
+`SYS_CAP_CREATE_WAIT_SET` (`1..=WAIT_SET_MAX_MEMBERS`, 1024) and live inline after the
+state in the set's retype slot, because the kernel runs no heap (see § Kernel Object Memory in
 [memory-internals.md](memory-internals.md#kernel-object-memory-capretypers)): a
 wait set's membership storage is part of the object carved at creation, and
 `waitset_notify`, under the source object lock, touches only the member it is given and
@@ -755,7 +759,7 @@ returns `Interrupted`.
 ### Multiple Ready Sources
 
 If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ring`
-buffers their member indices in arrival order, up to `WAIT_SET_MAX_MEMBERS - 1`
+buffers their member indices in arrival order, up to the set's capacity in
 entries; it does not deduplicate, and a push to a full ring is dropped.
 Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it is
 empty, per [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).

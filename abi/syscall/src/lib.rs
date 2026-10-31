@@ -154,10 +154,25 @@ pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
 
-/// Raw retype debit of one `WaitSet`, in bytes: the 24-byte wrapper plus the
-/// kernel's declared 440-byte budget for the wait-set state, which the
-/// state's real size never exceeds.
-pub const WAIT_SET_RETYPE_BYTES: u64 = 464;
+/// Largest member capacity of a `WaitSet` (`SYS_CAP_CREATE_WAIT_SET` arg1 is
+/// in `1..=WAIT_SET_MAX_MEMBERS`).
+///
+/// The set is caller-funded ([`wait_set_retype_bytes`]), so the ceiling
+/// protects no shared pool. It bounds the level-readiness walk a wait makes
+/// over every member with interrupts off; a server with more sources splits
+/// them across sets and waiting threads, so the bound only splits work.
+pub const WAIT_SET_MAX_MEMBERS: u32 = 1024;
+
+/// Raw retype debit of one `WaitSet` of `capacity` members, in bytes: the
+/// 24-byte wrapper, the 40-byte wait-set state, one 24-byte member slot per
+/// member, and the ready ring of `capacity + 1` two-byte member indices
+/// rounded up to eight bytes, all inline in the retype slot. `capacity` is
+/// one the kernel accepts, `1..=WAIT_SET_MAX_MEMBERS`.
+#[must_use]
+pub const fn wait_set_retype_bytes(capacity: u64) -> u64
+{
+    24 + 40 + capacity * 24 + ((capacity + 1) * 2).div_ceil(8) * 8
+}
 
 /// Raw retype debit of one `EventQueue` of user-visible `capacity` entries and
 /// `observers` death-observer nodes, in bytes: the 24-byte wrapper, the 64-byte

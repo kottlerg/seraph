@@ -210,11 +210,11 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `EventQueueState` counters | `core/kernel/src/ipc/event_queue.rs` | `u32` | encoding artefact (capacity at most `EVENT_QUEUE_MAX_CAPACITY`) | embedded | correct as is | None |
 | `NotificationState.bits` | `core/kernel/src/ipc/notification.rs` | `u64` | ABI width (64 signal bits) | embedded | correct as is | None |
 | Endpoint, Notification, EventQueue state size asserts | `core/kernel/src/ipc/*.rs` | 128 B bin | encoding artefact | none | correct as is | Keep |
-| `WAIT_SET_MAX_MEMBERS` | `core/kernel/src/ipc/wait_set.rs` | 16 | BSS budget (512 B retype bin) | about 400 B per wait set | make pay-as-you-go | Caller-sized at create, as EventQueue capacity is |
-| Wait-set member indices | `core/kernel/src/ipc/wait_set.rs` | `u8` | encoding artefact (at most 255 members) | embedded | correct as is | Widen with caller-sized sets |
+| `WAIT_SET_MAX_MEMBERS` | `abi/syscall/src/lib.rs` | 1024, caller-sized below it | per-call bound (the interrupts-off level-readiness walk over every member) | 24 B per member, caller-funded | correct as is | A server with more sources splits them across sets |
+| Wait-set member indices | `core/kernel/src/ipc/wait_set.rs` | `u16` | encoding artefact (above `WAIT_SET_MAX_MEMBERS`, asserted) | embedded | correct as is | None |
 | `WaitSetState.waiters` | `core/kernel/src/ipc/wait_set.rs` | 1 | unknown | none | needs a design | A second waiter is refused (#464) |
 | One wait set per source | `core/kernel/src/ipc/wait_set.rs` | 1 | design choice (bounds no capacity) | 8 B per source | correct as is | None |
-| Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state at most 440 B | encoding artefact | none | correct as is | Keep |
+| Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state 40 B | encoding artefact | none | correct as is | Keep |
 | Bound-source backoff | `core/kernel/src/ipc/mod.rs` | 64 spins | tuning (a backoff, not a bound) | none | correct as is | None |
 | `MAX_SLEEPING` (`SLEEP_LIST`, `EXPIRED_SCRATCH`) | `core/kernel/src/sched/mod.rs` | 128 | current peak plus headroom | about 5 KiB BSS | needs a design | Caps sleepers and timed IPC waits system-wide; intrusive per-CPU deadline structure |
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |

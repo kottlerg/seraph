@@ -1634,10 +1634,9 @@ unsafe impl Sync for EventQueueObject {}
 
 /// Kernel object for a wait set (`WaitSet` capability).
 ///
-/// `WaitSetState` is the body (at most 440 bytes, asserted in
-/// `ipc/wait_set.rs`) holding member slots and the ready
-/// ring; it lives inline immediately after the 24-byte wrapper within a single
-/// `BIN_512` retype slot.
+/// `WaitSetState` is the body, inline immediately after the 24-byte wrapper,
+/// followed by the caller-sized member slots and ready ring, all in one retype
+/// slot (`cap::retype::wait_set_dispatch`).
 #[repr(C)]
 pub struct WaitSetObject
 {
@@ -2051,32 +2050,30 @@ fn push_cascade(
 }
 
 /// Return each death-observer node of the chain starting at `first` to its
-/// queue's pool and release the `EventQueueObject` reference the node held,
-/// queueing a queue whose last reference this was on the cascade worklist
-/// (its dealloc then runs from the caller's loop, not by recursion). Called
-/// by an owner's teardown (the Thread and `AddressSpace` arms) with the chain
-/// it took, once no death walk can read it.
+/// queue's pool and release the `EventQueueObject` reference the node held.
+/// A queue whose last reference this was is reclaimed through its own nested
+/// cascade, not the caller's bounded worklist: a chain may hold any number of
+/// nodes, each of a distinct queue (the re-entry `free_donation` makes).
+/// Called by an owner's teardown (the Thread and `AddressSpace` arms) with the
+/// chain it took, once no death walk can read it.
+///
+/// # Safety
+/// The caller owns every node of the chain and holds no lock: the nested
+/// cascade takes its own.
 #[cfg(not(test))]
-fn release_death_observers(
-    first: *mut crate::sched::thread::DeathObserver,
-    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
-    head: &mut usize,
-)
+unsafe fn release_death_observers(first: *mut crate::sched::thread::DeathObserver)
 {
     // SAFETY: the caller took the chain, so it owns every node; each lives in
     // its queue, which the node's reference keeps live until the dec_ref
-    // below, issued after the node is back in the pool.
+    // below, issued after the node is back in the pool. A queue at zero has no
+    // capability or binding left, as dealloc_object requires.
     unsafe {
         crate::sched::thread::for_each_observer(first, |node| {
             let eq = (*node).eq;
             crate::ipc::event_queue::event_queue_return_observer((*eq).state, node);
             if (*eq).header.dec_ref() == 0
             {
-                push_cascade(
-                    worklist,
-                    head,
-                    NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()),
-                );
+                dealloc_object(NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()));
             }
         });
     }
@@ -2296,14 +2293,12 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {
     /// Maximum nested-cascade depth handled. Real-world derivation chains
     /// (memmgr-memory → child-bootstrap split → kernel object) sit at depth
-    /// `<= 4`; the `WaitSet` arm can additionally fan out to
-    /// `WAIT_SET_MAX_MEMBERS` (= 16) source headers in one pop when their
-    /// final +1 cap-level ref came from wait-set membership, so headroom is
-    /// sized to absorb the fan-out plus the wait-set's own ancestor Memory cap.
-    /// Thirty-two entries fit comfortably on the kernel stack (256 B).
-    /// Donation ancestors of an `AddressSpace` or `CSpace` pool, whose
-    /// number is unbounded, do not go through this worklist: `free_donation`
-    /// runs each one that reaches zero through its own nested cascade.
+    /// `<= 4`, and each arm pushes at most a few entries per pop. Thirty-two
+    /// entries fit comfortably on the kernel stack (256 B). The fan-outs whose
+    /// width is unbounded or caller-chosen do not go through this worklist:
+    /// `free_donation` runs each pool donation ancestor that reaches zero
+    /// through its own nested cascade, and so do the `WaitSet` arm for each
+    /// member source and `release_death_observers` for each observer's queue.
     const MAX_CASCADE: usize = 32;
 
     let mut worklist: [Option<core::ptr::NonNull<KernelObjectHeader>>; MAX_CASCADE] =
@@ -3044,7 +3039,8 @@ unsafe fn dealloc_object_one(
                 // SAFETY: tcb valid (not yet freed) and unreachable by any
                 // other path.
                 let first = unsafe { (*tcb).death_observers.take() };
-                release_death_observers(first, worklist, head);
+                // SAFETY: the chain was just taken; no lock is held here.
+                unsafe { release_death_observers(first) };
 
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
@@ -3267,7 +3263,8 @@ unsafe fn dealloc_object_one(
                 // SAFETY: as_ptr valid and uniquely owned; death_lock not held.
                 let first =
                     unsafe { crate::mm::address_space::AddressSpace::take_death_observers(as_ptr) };
-                release_death_observers(first, worklist, head);
+                // SAFETY: the chain was just taken; no lock is held here.
+                unsafe { release_death_observers(first) };
 
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic
@@ -3830,21 +3827,33 @@ unsafe fn dealloc_object_one(
             // SAFETY: ptr points to a WaitSetObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<WaitSetObject>()) };
             let state = obj.state;
+            // Read the capacity before any drop; it sizes the slot.
+            let capacity = if state.is_null()
+            {
+                0
+            }
+            else
+            {
+                // SAFETY: state is the live in-place WaitSetState.
+                unsafe { (*state).capacity() }
+            };
 
             if !state.is_null()
             {
                 // wait_set_drop wakes any blocked waiter, clears every source
                 // back-pointer, and drops the +1 cap-level ref each member
-                // held on its source. Any source whose ref drops to zero is
-                // returned for cascade-reclaim on this worklist — performed
-                // here rather than inside `wait_set_drop` so the source
-                // dealloc runs after every source/ws IPC lock has been
-                // released (see scheduling-internals.md § Lock Hierarchy).
-                // SAFETY: state non-null and live.
-                let zeroed = unsafe { crate::ipc::wait_set::wait_set_drop(state) };
-                for entry in zeroed.iter().copied().flatten()
-                {
-                    push_cascade(worklist, head, entry);
+                // held on its source. A source whose ref drops to zero is
+                // reclaimed only after its back-pointer clear released every
+                // source/ws IPC lock (see scheduling-internals.md § Lock
+                // Hierarchy). A set may hold up to WAIT_SET_MAX_MEMBERS last
+                // references, more than the bounded worklist, so each zeroed
+                // source is reclaimed through its own nested cascade (the
+                // re-entry `free_donation` makes); `wait_set_drop` calls back
+                // with no lock held.
+                // SAFETY: state non-null and live; each zeroed header has no
+                // capability or membership left, as dealloc_object requires.
+                unsafe {
+                    crate::ipc::wait_set::wait_set_drop(state, |source| dealloc_object(source));
                 }
             }
 
@@ -3852,9 +3861,9 @@ unsafe fn dealloc_object_one(
                 !ancestor_ptr.is_null(),
                 "WaitSet: every production cap is retype-backed via cap_create_wait_set"
             );
-            use crate::cap::retype::{dispatch_for, retype_free};
-            let raw_bytes = dispatch_for(ObjectType::WaitSet, 0)
-                .map_or(syscall::WAIT_SET_RETYPE_BYTES, |e| e.raw_bytes);
+            use crate::cap::retype::retype_free;
+            // The same ABI formula `wait_set_dispatch` debited at creation.
+            let raw_bytes = syscall::wait_set_retype_bytes(u64::from(capacity));
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);

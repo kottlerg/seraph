@@ -348,7 +348,8 @@ stated explicitly.
     thread still on its send queue. Then take the death_observers chain and,
     for each node, return it to its queue's pool under that queue's lock and
     release the EventQueue reference it held (`release_death_observers`),
-    queueing a queue whose count reaches 0 on the same worklist. The TCB is
+    reclaiming a queue whose count reaches 0 through its own nested cascade
+    (the chain's queues are unbounded in number, the worklist is not). The TCB is
     read without its lock: tcb is off every CPU (steps 8-9), so its death walk
     is over or never runs, and its refcount is 0, so no binder can pin it to
     link a node.

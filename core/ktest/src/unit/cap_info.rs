@@ -364,7 +364,7 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
     cap_delete(eq).map_err(|_| "creation_masks: cap_delete(event queue) failed")?;
     r?;
 
-    let ws = syscall::wait_set_create(ctx.memory_base)
+    let ws = syscall::wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
         .map_err(|_| "creation_masks: wait_set_create failed")?;
     let r = check_mask(
         ws,

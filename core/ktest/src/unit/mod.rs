@@ -372,6 +372,10 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Wait set syscalls ─────────────────────────────────────────────────────
     run_test!(
+        "wait_set::capacity_is_caller_sized",
+        wait_set::capacity_is_caller_sized(ctx)
+    );
+    run_test!(
         "wait_set::add_notification_immediate",
         wait_set::add_notification_immediate(ctx)
     );

@@ -114,7 +114,7 @@ pub fn create_wait_set(ctx: &TestContext) -> TestResult
 // the underlying syscall number is `SYS_CAP_CREATE_WAIT_SET`.
 fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create(memory_cap)
+    syscall::wait_set_create(memory_cap, crate::WS_CAPACITY)
 }
 
 // ── SYS_CAP_COPY ─────────────────────────────────────────────────────────────

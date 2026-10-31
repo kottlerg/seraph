@@ -779,21 +779,26 @@ count is at its 2^31 ceiling).
 
 ### `SYS_CAP_CREATE_WAIT_SET` (13)
 
-Retype a Memory capability into a new wait set.
+Retype a Memory capability into a new wait set of a fixed member capacity.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `memory_cap` | Memory capability (Retype rights) the wait set is carved from |
+| 1 | `capacity` | Member capacity (1–`WAIT_SET_MAX_MEMBERS`, 1024) |
+
+The retype debit is `wait_set_retype_bytes(capacity)`: the member slots and the ready ring live
+inline in the set's retype slot. `SYS_WAIT_SET_ADD` past `capacity` members is refused.
 
 **Return:** `rax`/`a0`: new wait set capability (Modify + Wait rights) on success;
 `SyscallError` on failure.
 
 **Capability requirement:** `memory_cap` must have Retype rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
-`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
+**Errors:** `InvalidArgument` (`capacity`, the full register, is 0 or exceeds
+`WAIT_SET_MAX_MEMBERS`), `InvalidCapability`, `InsufficientRights` (source Memory cap lacks
+Retype), `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
 (caller's CSpace directory structurally full, or the Memory object's reference count is at
 its 2^31 ceiling).
 
@@ -1819,7 +1824,8 @@ right matching its type: Receive on an Endpoint, Wait on a Notification, Recv on
 EventQueue).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (wait set lacks Modify, or source
-lacks Receive/Wait/Recv), `InvalidArgument` (wait set full, or source already in a wait set).
+lacks Receive/Wait/Recv), `InvalidArgument` (every member slot of the wait set's capacity is
+occupied, or source already in a wait set).
 
 ---
 

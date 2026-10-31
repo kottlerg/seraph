@@ -2522,18 +2522,28 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Memory cap into a new `WaitSet`.
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked).
+/// arg1 = member capacity (`1..=WAIT_SET_MAX_MEMBERS`).
 /// The Memory cap MUST carry `MemRights::RETYPE` and have at least
-/// `dispatch_for(WaitSet, 0).raw_bytes` of `available_bytes`.
+/// `wait_set_retype_bytes(capacity)` of `available_bytes`, rounded to its
+/// size class.
 #[cfg(not(test))]
 pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType, WaitSetObject};
-    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
+    use crate::cap::retype::{
+        WAIT_SET_MEMBERS_OFFSET, retype_allocate, retype_free, wait_set_dispatch,
+        wait_set_ring_offset,
+    };
     use crate::cap::slot::{MemRights, WsRights};
-    use crate::ipc::wait_set::WaitSetState;
+    use crate::ipc::wait_set::{WaitSetMember, WaitSetState};
     use core::ptr::NonNull;
 
     let memory_slot = tf.arg(0) as u32;
+    let Some(capacity) = wait_set_capacity(tf.arg(1))
+    else
+    {
+        return Err(SyscallError::InvalidArgument);
+    };
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -2556,23 +2566,31 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: lookup_cap returned a live Memory slot.
     let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
-    let entry = dispatch_for(ObjectType::WaitSet, 0).ok_or(SyscallError::InvalidArgument)?;
+    let entry = wait_set_dispatch(u64::from(capacity));
 
     let offset = retype_allocate(memory, entry.raw_bytes)?;
 
     let block_phys = memory.base + offset;
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
-    // Layout: WaitSetObject at offset 0; WaitSetState at offset 24.
+    // Layout (matches `cap::retype::wait_set_raw_bytes`): WaitSetObject at
+    // offset 0, WaitSetState at offset 24, the `capacity` member slots at
+    // WAIT_SET_MEMBERS_OFFSET, then the `capacity + 1` u16 ready ring.
     let ws_obj_ptr = block_virt as *mut WaitSetObject;
     let state_offset = core::mem::size_of::<WaitSetObject>() as u64;
     let ws_state_ptr = (block_virt + state_offset) as *mut WaitSetState;
+    let members_ptr = (block_virt + WAIT_SET_MEMBERS_OFFSET) as *mut WaitSetMember;
+    let ring_ptr = (block_virt + wait_set_ring_offset(u64::from(capacity))) as *mut u16;
 
     let ancestor = memory_obj_nn;
 
-    // SAFETY: pointers are inside the freshly-allocated retype slot.
+    // SAFETY: pointers are inside the freshly-allocated retype slot, sized for
+    // `capacity` members and the ring by `wait_set_dispatch`.
     unsafe {
-        core::ptr::write(ws_state_ptr, WaitSetState::new());
+        core::ptr::write(
+            ws_state_ptr,
+            WaitSetState::new(capacity, members_ptr, ring_ptr),
+        );
         core::ptr::write(
             ws_obj_ptr,
             WaitSetObject {
@@ -2990,6 +3008,17 @@ pub fn sys_cap_create_wait_set(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
+/// The `SYS_CAP_CREATE_WAIT_SET` capacity argument as a `u16`, or `None` when
+/// the full 64-bit register lies outside `1..=WAIT_SET_MAX_MEMBERS`.
+fn wait_set_capacity(raw: u64) -> Option<u16>
+{
+    if raw == 0 || raw > u64::from(syscall::WAIT_SET_MAX_MEMBERS)
+    {
+        return None;
+    }
+    u16::try_from(raw).ok()
+}
+
 /// The byte window `(offset, len)` of a `CAP_INFO_MEMORY_MAPPINGS` query: pages
 /// `first_page .. first_page + pages` of a region of `region_bytes`, or `None`
 /// when `pages` is 0 or above `max_pages`, or the window runs past the region.
@@ -3043,7 +3072,20 @@ fn event_queue_capacity(raw: u64) -> Option<u32>
 #[cfg(test)]
 mod tests
 {
-    use super::{event_queue_capacity, event_queue_observers, mappings_window};
+    use super::{event_queue_capacity, event_queue_observers, mappings_window, wait_set_capacity};
+
+    // Defect guarded: a capacity narrowed before its range check, or a zero
+    // capacity accepted, would size a set the walk and ring cannot index.
+    #[test]
+    fn wait_set_capacity_refuses_zero_and_out_of_range_registers()
+    {
+        let max = u64::from(syscall::WAIT_SET_MAX_MEMBERS);
+        assert_eq!(wait_set_capacity(1), Some(1));
+        assert_eq!(wait_set_capacity(max), u16::try_from(max).ok());
+        assert_eq!(wait_set_capacity(0), None);
+        assert_eq!(wait_set_capacity(max + 1), None);
+        assert_eq!(wait_set_capacity(0x1_0000_0001), None);
+    }
 
     // Defect guarded: a window check that wrapped, accepted an empty or
     // over-long window, or let a window run past the region would count

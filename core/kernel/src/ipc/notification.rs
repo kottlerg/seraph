@@ -47,7 +47,7 @@ pub struct NotificationState
     /// `crate::ipc::wait_set::waitset_notify`.
     pub wait_set: *mut u8,
     /// Index of this notification's entry in `WaitSetState::members`.
-    pub wait_set_member_idx: u8,
+    pub wait_set_member_idx: u16,
     /// Non-zero when a waiter or wait set is registered.
     ///
     /// `notification_send` uses this as a lock-free fast-path check: when zero,

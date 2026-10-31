@@ -1908,14 +1908,17 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 
 // ── Wait Set wrappers ─────────────────────────────────────────────────────────
 
-/// Retype a Memory cap into a new `WaitSet` with `MODIFY | WAIT` rights.
+/// Retype a Memory cap into a new `WaitSet` of `capacity` members
+/// (`1..=WAIT_SET_MAX_MEMBERS`) with `MODIFY | WAIT` rights.
 ///
-/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have ≥ 512 bytes of
-/// `available_bytes` (the `BIN_512` size class debited from the ledger).
+/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have the
+/// `syscall_abi::wait_set_retype_bytes(capacity)` debit, rounded to its size
+/// class, in `available_bytes`. An add past `capacity` members is refused.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_MEM_RETYPE`, or the `CSpace`'s slot pool cannot back a fresh slot
+/// `RIGHTS_MEM_RETYPE`, `capacity` is out of range (`InvalidArgument`), or
+/// the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
 /// also means the Memory object's reference count is at its 2^31 ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
@@ -1923,11 +1926,17 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 // so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn wait_set_create(memory_cap: u32) -> Result<u32, i64>
+pub fn wait_set_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Memory
-    // cap slot. Kernel retypes the region.
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_WAIT_SET, u64::from(memory_cap), 0) };
+    // cap slot, arg1 = member capacity. Kernel retypes the region.
+    let ret = unsafe {
+        syscall2(
+            SYS_CAP_CREATE_WAIT_SET,
+            u64::from(memory_cap),
+            u64::from(capacity),
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 

@@ -78,7 +78,7 @@ pub struct EventQueueState
     /// or null. Type-erased to avoid a circular import; cast only in `wait_set.rs`.
     pub wait_set: *mut u8,
     /// Index of this queue's entry in `WaitSetState::members`.
-    pub wait_set_member_idx: u8,
+    pub wait_set_member_idx: u16,
     /// Free death-observer nodes, linked through `DeathObserver::next`; null
     /// when every node is bound or the queue has none. Protected by `lock`.
     pub observer_free: *mut crate::sched::thread::DeathObserver,

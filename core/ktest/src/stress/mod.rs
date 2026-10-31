@@ -35,7 +35,7 @@ mod mutual_stop;
 mod priority_dealloc_race;
 mod reply_caller_delete;
 mod retype_concurrent;
-mod sleep_list_full;
+mod sleep_list_wide;
 mod split_delete_race;
 mod stop_claimed_delete;
 mod stop_fault_sender;
@@ -57,10 +57,8 @@ use crate::{ChildStack, TestContext, run_integration_test};
 
 /// Number of shared child stacks, and so the maximum children a stress cell
 /// runs on [`STRESS_STACKS`] stacks at once.
-/// `sleep_list_full`, which needs one sleeper per sleep-list slot
-/// (`MAX_SLEEPING` = 128), draws one `STRESS_STACKS` stack for its victims
-/// and carries its own 128 × 8 KiB filler stacks (1 MiB more BSS), so it runs
-/// 129 concurrent children, past this cap.
+/// `sleep_list_wide` carries its own 256 × 4 KiB child stacks (1 MiB more
+/// BSS), so it runs 256 concurrent children, past this cap.
 ///
 /// 64 matches the width of the `u64` notification bitmask used by tests that
 /// allocate one bit per worker (`concurrent_notification`, `retype_concurrent`,
@@ -143,7 +141,7 @@ pub fn run_all(ctx: &TestContext)
         configure_start_race::run(ctx)
     );
     run_integration_test!("stress::stop_sleep_window", stop_sleep_window::run(ctx));
-    run_integration_test!("stress::sleep_list_full", sleep_list_full::run(ctx));
+    run_integration_test!("stress::sleep_list_wide", sleep_list_wide::run(ctx));
     run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
     run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
     run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));

@@ -1356,6 +1356,8 @@ unsafe fn kernel_entry_post_rebase(
                         death_observers: sched::thread::DeathObserverChain::new(),
                         exit_reason: 0,
                         sleep_deadline: core::sync::atomic::AtomicU64::new(0),
+                        sleep_node: crate::sched::deadline_heap::DeadlineNode::new(),
+                        sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
                         extended: sched::thread::ExtendedState::from_raw(init_extended_area),
                         registry_next: core::ptr::null_mut(),
                         registry_prev: core::ptr::null_mut(),

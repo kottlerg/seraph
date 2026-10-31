@@ -1153,6 +1153,8 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 death_observers: crate::sched::thread::DeathObserverChain::new(),
                 exit_reason: 0,
                 sleep_deadline: core::sync::atomic::AtomicU64::new(0),
+                sleep_node: crate::sched::deadline_heap::DeadlineNode::new(),
+                sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
                 extended: crate::sched::thread::ExtendedState::from_raw(extended_area),
                 registry_next: core::ptr::null_mut(),
                 registry_prev: core::ptr::null_mut(),

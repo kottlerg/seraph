@@ -224,8 +224,7 @@ fn race(
         "stress::timed_wait_source_delete: the waiter never reported ready",
     )?;
     // Any outcome serves: the sleep only staggers the destroy around the
-    // waiter's deadlines, and the spin below varies it further (a sleep
-    // refused with `OutOfMemory` on a full sleep list destroys earlier).
+    // waiter's deadlines, and the spin below varies it further.
     let _ = thread_sleep(WAIT_MS);
     for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 18)
     {

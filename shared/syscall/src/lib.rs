@@ -420,8 +420,6 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 /// on timeout.
 ///
 /// `timeout_ms == 0` is equivalent to [`notification_wait`] — block indefinitely.
-/// If the kernel's sleep list is full when the wait parks, it returns `Ok(0)`
-/// at once, as a timeout.
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
@@ -1891,9 +1889,8 @@ pub fn event_try_recv_death(queue_cap: u32) -> Result<DeathEvent, i64>
 /// Dequeue with a timeout. `timeout_ms == 0` blocks indefinitely (same as
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
-/// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived
-/// (at once if the kernel's sleep list is full when the wait parks). Returns
-/// the entry's payload word.
+/// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
+/// Returns the entry's payload word.
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
@@ -2140,10 +2137,8 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 ///
 /// If the thread was blocked (on IPC or in [`thread_sleep`]), or blocks while
 /// the stop is in progress, the blocking syscall returns `Interrupted` once
-/// the thread is restarted, unless its wake was claimed first, or a timed
-/// wait or sleep that found the kernel's sleep list full withdrew itself
-/// first (it then returns its timeout or `OutOfMemory`); the full contract is
-/// in `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`. A thread may stop
+/// the thread is restarted, unless its wake was claimed first; the full
+/// contract is in `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`. A thread may stop
 /// itself (pass its own thread cap).
 ///
 /// If the thread is blocked on a fault, its fault episode is cancelled with a
@@ -2511,9 +2506,8 @@ pub fn sbi_call(
 /// # Errors
 /// Returns `-16` (`Interrupted`) if the thread is stopped before or during
 /// the sleep (and restarted), unless the timer had already claimed the
-/// elapsed deadline (the sleep returns `Ok`), `-8` (`OutOfMemory`) if the
-/// kernel's sleep list is full (even when a stop then lands, if the sleep
-/// withdrew first), or another negative `i64` error code on failure.
+/// elapsed deadline (the sleep returns `Ok`), or another negative `i64` error
+/// code on failure.
 #[inline]
 pub fn thread_sleep(ms: u64) -> Result<(), i64>
 {

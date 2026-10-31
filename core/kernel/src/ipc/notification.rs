@@ -217,9 +217,7 @@ pub unsafe fn notification_send(
 /// at the tail of the waiters and commits the park; a refused commit dequeues
 /// the caller again. Either way returns `Err(())`, and the caller must then
 /// call the scheduler to yield the CPU. A committed timed wait (non-zero
-/// `deadline`) is armed on the sleep list in the same critical section; if
-/// the sleep list is full the park is withdrawn and the call returns `Ok(0)`,
-/// an immediate timeout.
+/// `deadline`) is armed on the sleep list in the same critical section.
 ///
 /// # Dekker ordering
 /// The waiter is registered and `has_observer` set before the bits swap; the
@@ -318,22 +316,7 @@ pub unsafe fn notification_wait(
     else if deadline != 0
     {
         // SAFETY: caller committed Blocked; sig.lock held since the push.
-        let armed = unsafe { crate::ipc::arm_timed_park(caller, deadline, "notification_wait") };
-        if !armed
-        {
-            // Sleep list full: withdraw the park and report an immediate
-            // timeout (0 bits), so the wait never outlives its bound.
-            // sig.lock has held the caller queued since the push, so no
-            // waker or cancel claimed it.
-            // SAFETY: caller was pushed above; sig.lock held throughout.
-            unsafe {
-                sig.waiters.remove(caller);
-                sig.refresh_observer();
-                crate::sched::withdraw_uncontested_park(caller);
-                sig.lock.unlock_raw(saved);
-            }
-            return Ok(0);
-        }
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "notification_wait") };
     }
 
     // SAFETY: paired with lock_raw above.

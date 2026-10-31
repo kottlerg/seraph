@@ -253,7 +253,6 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                   ▼
                                 Ready
 
-Blocked ──(full-list withdrawal: SYS_THREAD_SLEEP, timed notification / event wait)──► Running
 Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
 Stopped ──(SYS_THREAD_START)──► Ready
 Running ──(SYS_THREAD_EXIT / SYS_PROCESS_EXIT)──► Exited (TCB freed at its last cap delete)
@@ -262,8 +261,7 @@ any state ──(object teardown / terminal fault)──► Exited
 
 Every `Exited` transition, and the rule for each, is listed in
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)
-§ Lifecycle State Machine; the full-list withdrawal and the stop are specified in its
-[§ Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants) (invariant 4) and
+§ Lifecycle State Machine; the stop is specified in its
 [§ `sys_thread_stop` Cross-CPU Stop Protocol](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol).
 
 State transitions are governed by the per-field-group ownership rules in

@@ -938,13 +938,12 @@ pub fn set_name(_name: &CStr) {
 
 pub fn sleep(dur: Duration) {
     // `thread_sleep` can end before `dur` elapses: a stop and restart of this
-    // thread returns `Interrupted`, a full kernel sleep list returns
-    // `OutOfMemory`, and a park refused by a coalesced wake returns `Ok`
-    // without sleeping. `sleep` cannot report any of these and must never
-    // sleep less than `dur`, so every return, `Ok` included, retries for
-    // whatever remains; an error other than `Interrupted` yields first so a
-    // full sleep list can drain rather than spinning on the syscall. The loop
-    // returns only once `dur` has elapsed since the first call.
+    // thread returns `Interrupted`, and a park refused by a coalesced wake
+    // returns `Ok` without sleeping. `sleep` cannot report either and must
+    // never sleep less than `dur`, so every return, `Ok` included, retries for
+    // whatever remains; any other error yields first rather than spinning on
+    // the syscall. The loop returns only once `dur` has elapsed since the
+    // first call.
     let start = crate::time::Instant::now();
     let mut left = dur;
     loop {

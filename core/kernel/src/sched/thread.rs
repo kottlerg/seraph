@@ -140,6 +140,38 @@ pub unsafe fn for_each_observer(first: *mut DeathObserver, mut f: impl FnMut(*mu
     }
 }
 
+// ── Sleep-list expiry snapshot ────────────────────────────────────────────────
+
+/// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at the timer pop
+/// and linked into that pop's batch (`ThreadControlBlock::sleep_expiry`). The
+/// claim loop dispatches off this snapshot rather than the TCB's live binding,
+/// which may have changed since the pop. The timed IPC arms read the TCB's
+/// wait-queue tag and `park_seq` under the snapshotted source's lock; the TCB
+/// stays allocated because `dealloc_object(Thread)` waits in
+/// `sched::sleep_wakeups_quiesce` for the batch to end before the free.
+#[derive(Clone, Copy)]
+pub struct SleepExpiry
+{
+    /// Next TCB of the batch, or null at its end.
+    pub next: *mut ThreadControlBlock,
+    /// The popped park's binding.
+    pub ipc_state: IpcThreadState,
+    pub blocked_on: *mut u8,
+    /// `park_seq` of the popped park: a timed-wait claim requires it unchanged.
+    pub park_seq: u32,
+}
+
+impl SleepExpiry
+{
+    /// No snapshot.
+    pub const EMPTY: Self = Self {
+        next: core::ptr::null_mut(),
+        ipc_state: IpcThreadState::None,
+        blocked_on: core::ptr::null_mut(),
+        park_seq: 0,
+    };
+}
+
 // ── ExtendedState ─────────────────────────────────────────────────────────────
 
 /// Per-thread extended-state save-area pointer for the FPU/SIMD/V
@@ -977,6 +1009,18 @@ pub struct ThreadControlBlock
     /// waker prechecks read it under a source lock, not that lock.
     /// See core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
     pub sleep_deadline: core::sync::atomic::AtomicU64,
+    /// This thread's node in the sleep list, the global deadline heap
+    /// (`sched::deadline_heap`); linked exactly while the thread has a
+    /// sleep-list entry. Owned by `SLEEP_LIST_LOCK`: linked by
+    /// `sleep_list_add`, unlinked by the timer pop or `sleep_list_remove`,
+    /// together with the deadline's clear.
+    pub sleep_node: crate::sched::deadline_heap::DeadlineNode,
+    /// The timer pop's snapshot of this thread's popped entry, and its link in
+    /// the pop's expired batch. Written by the pop under `SLEEP_LIST_LOCK` and
+    /// read by the same batch after it releases the lock, both on CPU0's
+    /// non-reentrant timer path; batches run one at a time, and a thread is
+    /// in at most one, so nothing else reads or writes it.
+    pub sleep_expiry: SleepExpiry,
 
     // === FPU / SIMD / Vector extended state ===
     /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /

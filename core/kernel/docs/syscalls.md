@@ -465,7 +465,7 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity); a wait that finds the kernel's sleep list full times out at once, returning `0` bits ([thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
+| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity; the kernel's sleep list has no capacity to refuse the wait, [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
 
 **Return:**
 
@@ -529,7 +529,7 @@ is specific to `SYS_EVENT_RECV`):
 |-------------------|-----------------------------------------------------------------|
 | `0`               | Block forever until a post arrives                              |
 | `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
-| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse (`WouldBlock` at once if the kernel's sleep list is full when the wait parks) |
+| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse |
 
 **Return:**
 
@@ -544,8 +544,7 @@ stopped, or the queue was destroyed while the caller was parked).
 
 Blocked receivers queue in arrival order; each post wakes the longest-waiting one.
 
-`WouldBlock` covers both the try-once-empty case and the timer-fired case
-(including the immediate timeout on a full sleep list);
+`WouldBlock` covers both the try-once-empty case and the timer-fired case;
 the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
@@ -1375,11 +1374,8 @@ fault first keeps that reply's outcome: when next started it resumes its faultin
 `FAULT_REPLY_RESUME` and is killed on `FAULT_REPLY_KILL` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
-cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker,
-the sleep timer, or the target's own full-list withdrawal claimed it first). A full-list
-withdrawal is a timed wait or sleep that found the kernel's sleep list full; it reports its timeout
-or `OutOfMemory` (invariant 4 of
-[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
+cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker
+or the sleep timer claimed it first).
 A target that blocks while the stop is in progress is cancelled the same way, never left registered
 as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
 Cross-CPU Stop Protocol). A target waiting on an endpoint (queued to send or receive), a
@@ -1755,10 +1751,10 @@ Plain-Sleep Path), so a caller that needs the full duration re-checks elapsed ti
 
 No capability is required — this syscall acts on the calling thread implicitly.
 
-**Errors:** `InvalidCapability` (no current thread), `OutOfMemory` (kernel sleep list at
-capacity), `Interrupted` (the thread was stopped before or during the sleep, unless the timer had
-already claimed its elapsed deadline, or the sleep found the sleep list full and withdrew first,
-which returns `OutOfMemory`).
+**Errors:** `InvalidCapability` (no current thread), `Interrupted` (the thread was stopped before or
+during the sleep, unless the timer had already claimed its elapsed deadline). The kernel's sleep
+list has no capacity to exhaust, so a sleep never fails for room ([thread-lifecycle-and-sleep.md §
+Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4).
 
 ---
 
@@ -2506,9 +2502,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
-  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first, or a timed wait
-  or sleep that found the kernel's sleep list full withdrew itself first (it then reports its
-  timeout or `OutOfMemory`). `SYS_IPC_CALL` and
+  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
   `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or

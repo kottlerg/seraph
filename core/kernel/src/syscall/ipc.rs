@@ -1298,16 +1298,12 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = notification cap index (WAIT right).
 /// arg1 = `timeout_ms`. `0` blocks indefinitely. `> 0` blocks until bits
-///        are delivered *or* `timeout_ms` milliseconds have elapsed (at once
-///        if the sleep list is full;
-///        core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
-///        Invariants, invariant 4).
+///        are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). A notification wake always carries non-zero bits because
 /// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
-/// means the wait timed out: its timeout elapsed, or it found the sleep list
-/// full and returned at once. A stop of the caller, or the destruction of the
+/// means the wait's timeout elapsed. A stop of the caller, or the destruction of the
 /// notification while the caller is parked, returns `Interrupted`. The split
 /// is required because the bitmask is an unrestricted `u64`: an in-band
 /// encoding via `cast_signed` would alias bit-63-set payloads with the
@@ -1365,8 +1361,7 @@ pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
 
     if let Ok(bits) = result
     {
-        // Bits were already set, or (0 bits) a timed wait met a full sleep
-        // list and timed out at once; deliver the bitmask in the secondary
+        // Bits were already set; deliver the bitmask in the secondary
         // register.
         tf.set_ipc_return(0, bits);
         return Ok(0);
@@ -1484,9 +1479,7 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 ///          the caller is never registered as a waiter and never enters
 ///          the scheduler.
 ///        - `1 .. u64::MAX-1` blocks until a post arrives or the timeout
-///          elapses, whichever comes first (at once if the sleep list is
-///          full; core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
-///          List Invariants, invariant 4). On timeout returns `WouldBlock`
+///          elapses, whichever comes first. On timeout returns `WouldBlock`
 ///          (same code as the try-once-empty case — both mean "no payload
 ///          available").
 ///
@@ -1562,18 +1555,11 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: eq_state extracted from validated EventQueue object.
     let result = unsafe { crate::ipc::event_queue::event_queue_recv(eq_state, tcb, deadline) };
 
-    match result
+    if let Ok(entry) = result
     {
-        Ok(Some(entry)) =>
-        {
-            // Entry available immediately; deliver it in the return registers.
-            set_event_return(tf, entry);
-            return Ok(0);
-        }
-        // A timed wait that met a full sleep list: an immediate timeout.
-        Ok(None) => return Err(SyscallError::WouldBlock),
-        Err(()) =>
-        {}
+        // Entry available immediately; deliver it in the return registers.
+        set_event_return(tf, entry);
+        return Ok(0);
     }
 
     // Queue was empty; `event_queue_recv` queued `tcb` on `eq.waiters` (or a

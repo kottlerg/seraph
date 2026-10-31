@@ -90,8 +90,8 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
   (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
-  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, the ktest mirrors of
-  `MAX_SLEEPING` and `L2_SIZE`, and the svctest mirrors of the fs-fat cache constants.
+  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, the ktest mirror of
+  `L2_SIZE`, and the svctest mirrors of the fs-fat cache constants.
 - **Spin-count timeouts.** Several deadlock detectors and device polls are counted in loop
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
   model.
@@ -216,7 +216,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | One wait set per source | `core/kernel/src/ipc/wait_set.rs` | 1 | design choice (bounds no capacity) | 8 B per source | correct as is | None |
 | Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state 40 B | encoding artefact | none | correct as is | Keep |
 | Bound-source backoff | `core/kernel/src/ipc/mod.rs` | 64 spins | tuning (a backoff, not a bound) | none | correct as is | None |
-| `MAX_SLEEPING` (`SLEEP_LIST`, `EXPIRED_SCRATCH`) | `core/kernel/src/sched/mod.rs` | 128 | current peak plus headroom | about 5 KiB BSS | needs a design | Caps sleepers and timed IPC waits system-wide; intrusive per-CPU deadline structure |
+| `SLEEP_LIST` (deadline heap) | `core/kernel/src/sched/mod.rs` | unbounded, one node per TCB | none (intrusive through the TCB) | about 72 B per TCB (heap node and expiry snapshot) | correct as is | One global heap under `SLEEP_LIST_LOCK`, popped on the BSP |
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |
 | `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning | none | correct as is | None |
 | `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget (call depth unaudited) | 4 pages per thread, caller-funded | needs a design | Audit kernel call depth and the stack locals that scale with `MAX_CPUS` (#636) |
@@ -732,7 +732,7 @@ production value is raised.
 | `await_all` mask | `core/ktest/src/tally.rs` | 64 children | ABI width (notification word) | none | correct as is | None |
 | `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
 | `SLOTS_PER_PAGE`, `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 56 / 4097 | mirror of kernel `L2_SIZE`; one past the former 4096-entry registry | about 16 KiB BSS | correct as is | Reference or assert against `L2_SIZE` |
-| `FILLERS` | `core/ktest/src/stress/sleep_list_full.rs` | 128 | mirror of kernel `MAX_SLEEPING` | 1 MiB BSS | correct as is | Reference or assert against `MAX_SLEEPING` (#638) |
+| `HOLDERS`, `WAKERS` | `core/ktest/src/stress/sleep_list_wide.rs` | 192 / 64 | test fixture (past the former 128-entry sleep list) | 1 MiB BSS | correct as is | None |
 | `MAX_PINNED` | `core/ktest/src/bench/tlb.rs` | 7 | test fixture | 224 KiB BSS | correct as is | None |
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |

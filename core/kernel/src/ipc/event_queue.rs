@@ -369,13 +369,11 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<EventEntr
 
 /// Dequeue the next entry from the event queue.
 ///
-/// - If an entry is available, returns `Ok(Some(entry))`.
+/// - If an entry is available, returns `Ok(entry)`.
 /// - If empty, queues `caller` at the tail of the waiters, arms a non-zero
 ///   `deadline` (a timed wait) on the sleep list in the same critical
 ///   section, and returns `Err(())`. Syscall handler must call `schedule()`
 ///   then read `wakeup_value` and `wakeup_tag`.
-/// - A timed wait that finds the sleep list full is withdrawn and returns
-///   `Ok(None)`, an immediate timeout.
 ///
 /// # Safety
 /// `eq` and `caller` must be valid pointers; acquires `eq.lock` internally —
@@ -385,7 +383,7 @@ pub unsafe fn event_queue_recv(
     eq: *mut EventQueueState,
     caller: *mut ThreadControlBlock,
     deadline: u64,
-) -> Result<Option<EventEntry>, ()>
+) -> Result<EventEntry, ()>
 {
     // SAFETY: caller guarantees eq is valid.
     let eq = unsafe { &mut *eq };
@@ -397,7 +395,7 @@ pub unsafe fn event_queue_recv(
     {
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
-        return Ok(Some(entry));
+        return Ok(entry);
     }
 
     // Queue empty — block caller.
@@ -450,21 +448,7 @@ pub unsafe fn event_queue_recv(
     else if deadline != 0
     {
         // SAFETY: caller committed Blocked; eq.lock held since the push.
-        let armed = unsafe { crate::ipc::arm_timed_park(caller, deadline, "event_recv") };
-        if !armed
-        {
-            // Sleep list full: withdraw the park and report an immediate
-            // timeout, so the wait never outlives its bound.
-            // eq.lock has held the caller queued since the push, so no
-            // waker or cancel claimed it.
-            // SAFETY: caller was pushed above; eq.lock held throughout.
-            unsafe {
-                eq.waiters.remove(caller);
-                crate::sched::withdraw_uncontested_park(caller);
-                eq.lock.unlock_raw(saved);
-            }
-            return Ok(None);
-        }
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "event_recv") };
     }
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };

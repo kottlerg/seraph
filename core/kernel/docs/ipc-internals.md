@@ -253,7 +253,6 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the queued entry | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
-| full-list timed withdrawal (`notification_wait`, `event_queue_recv`) | source lock held continuously from push to withdrawal (`sched::withdraw_uncontested_park`) — no waker or cancel can have claimed the queued entry | none — the wait returns an immediate timeout (`0` bits, `WouldBlock`) |
 
 **Resume (call/fault episodes — fail-closed).** `sys_ipc_call` consumes the
 disposition: REPLY reads `ipc_msg`; INTERRUPTED returns `Interrupted` without
@@ -401,12 +400,9 @@ deliveries.
 6. commit_blocked_under_local_lock(tcb, BlockedOnNotification, sig)
    (a refusal dequeues the caller again, under the same sig.lock hold);
    on a committed timed wait, arm_timed_park(tcb, deadline): set
-   sleep_deadline and sleep_list_add, still under sig.lock. If the sleep
-   list is full: waiters.remove(tcb); recompute has_observer;
-   sched::withdraw_uncontested_park(tcb); release sig.lock;
-   tf.set_ipc_return(primary = 0, secondary = 0); return Ok(0) (an
-   immediate timeout, never parked; thread-lifecycle-and-sleep.md § Sleep
-   List Invariants, invariant 4)
+   sleep_deadline and sleep_list_add, still under sig.lock (the list has
+   no capacity to refuse it; thread-lifecycle-and-sleep.md § Sleep List
+   Invariants, invariant 4)
 7. Release sig.lock
 8. Block current thread; return when woken
 9. On wakeup: if the park is INTERRUPTED (a stop, or the notification
@@ -544,10 +540,7 @@ level-readiness witness.
    b. commit_blocked_under_local_lock(tcb, BlockedOnEventQueue)
       (eq.lock outer -> sched_lock inner; a refusal dequeues the caller)
    c. if committed and timeout_ms in 1..=MAX-1: arm_timed_park(tcb,
-      deadline): set sleep_deadline and sleep_list_add, still under eq.lock;
-      if the sleep list is full: waiters.remove(tcb);
-      sched::withdraw_uncontested_park(tcb); release eq.lock; return
-      WouldBlock (an immediate timeout, never parked)
+      deadline): set sleep_deadline and sleep_list_add, still under eq.lock
    d. Release eq.lock
 5. schedule(); on resume:
    if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
@@ -807,19 +800,14 @@ send path is therefore one atomic read-modify-write, one fence, and one load
 
 The IPC paths interact with the scheduler through its park and wake primitives:
 `commit_blocked_under_local_lock` to park, `commit_reply_rebind_under_local_lock` to rebind an
-already parked sender to its reply, `withdraw_uncontested_park` to un-commit a timed park the full
-sleep list refused, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule` to switch away,
-and `sleep_list_add` and `sleep_list_remove` for timed waits (see § Waking the Recipient). The
-un-commit is the sanctioned exception that rule 8 of
-[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
-makes for a park no waker can have claimed; its rules are
-[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants),
-invariant 4. The IPC paths also use the `sched::thread` park-episode helpers `open_park_episode`,
+already parked sender to its reply, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule`
+to switch away, and `sleep_list_add` and `sleep_list_remove` for timed waits (see § Waking the
+Recipient). The IPC paths also use the `sched::thread` park-episode helpers `open_park_episode`,
 `stamp_park_deposit`, `stamp_cancelled_deposit` and `consume_park_interrupted` (see § Park
 Dispositions and Episodes). The dependency is not one-way: the scheduler's timer path
-`sleep_check_wakeups` dispatches on `IpcThreadState` and claims timed notification and
-event-queue waiters under the source lock, and `post_one_death_event` posts death payloads
-through `event_queue_post`.
+`sleep_check_wakeups` dispatches on `IpcThreadState` and claims timed notification and event-queue
+waiters under the source lock, and `post_one_death_event` posts death payloads through
+`event_queue_post`.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
 masks interrupts, and every IPC object lock is an IRQ-disabling

@@ -159,15 +159,17 @@ pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
 /// state's real size never exceeds.
 pub const WAIT_SET_RETYPE_BYTES: u64 = 464;
 
-/// Raw retype debit of one `EventQueue` of user-visible `capacity` entries, in
-/// bytes: the 24-byte wrapper, the 56-byte queue state, and `capacity + 1`
-/// sixteen-byte ring slots (one two-word entry each), all inline in the retype
-/// slot. `capacity` is one the kernel accepts, `1..=EVENT_QUEUE_MAX_CAPACITY`;
-/// a larger value can overflow.
+/// Raw retype debit of one `EventQueue` of user-visible `capacity` entries and
+/// `observers` death-observer nodes, in bytes: the 24-byte wrapper, the 64-byte
+/// queue state, `capacity + 1` sixteen-byte ring slots (one two-word entry
+/// each), and one 24-byte node per observer, all inline in the retype slot.
+/// Both counts are ones the kernel accepts (`capacity` in
+/// `1..=EVENT_QUEUE_MAX_CAPACITY`, `observers` in
+/// `0..=EVENT_QUEUE_MAX_CAPACITY`); larger values can overflow.
 #[must_use]
-pub const fn event_queue_retype_bytes(capacity: u64) -> u64
+pub const fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64
 {
-    24 + 56 + (capacity + 1) * 16
+    24 + 64 + (capacity + 1) * 16 + observers * 24
 }
 
 // ── Syscall numbers ───────────────────────────────────────────────────────────

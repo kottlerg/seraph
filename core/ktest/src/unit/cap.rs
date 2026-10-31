@@ -1068,7 +1068,7 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     notification_wait(ready).map_err(|_| "stop_bound: wait ready failed")?;
 
     // Observer bound before the stop: the teardown walk posts nothing to it.
-    let early = event_queue_create(ctx.memory_base, 4)
+    let early = syscall::event_queue_create_observed(ctx.memory_base, 4, 1)
         .map_err(|_| "stop_bound: event_queue_create (early) failed")?;
     thread_bind_notification(child.th, early, STOP_CORR_EARLY)
         .map_err(|_| "stop_bound: thread_bind_notification (early) failed")?;

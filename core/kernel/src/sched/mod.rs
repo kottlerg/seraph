@@ -2497,8 +2497,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     thread_id: alloc_thread_id(),
                     context_saved: core::sync::atomic::AtomicU32::new(1),
                     wake_in_flight: core::sync::atomic::AtomicU32::new(0),
-                    death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
-                    death_observer_count: 0,
+                    death_observers: thread::DeathObserverChain::new(),
                     exit_reason: 0,
                     sleep_deadline: core::sync::atomic::AtomicU64::new(0),
                     extended: thread::ExtendedState::empty(),
@@ -6040,12 +6039,14 @@ pub(crate) unsafe fn post_one_death_event(
 
 /// Post a death notification for a thread that is about to exit or has faulted.
 ///
-/// Snapshots the thread's `death_observers` under `sched_lock`, then posts
-/// the entry `(exit_reason, correlator)` to each registered `EventQueue`
-/// outside the lock via [`post_one_death_event`].
-/// Snapshotting under the lock serialises against a late
-/// `sys_thread_bind_notification` on a still-live thread, which takes the
-/// same lock and appends only while the thread is not yet `Exited`.
+/// Reads the head of the thread's `death_observers` chain under
+/// `sched_lock`, then walks the chain outside the lock, posting the entry
+/// `(exit_reason, correlator)` to each node's `EventQueue` via
+/// [`post_one_death_event`]. Reading the head under the lock serialises
+/// against a late `sys_thread_bind_notification` on a still-live thread,
+/// which takes the same lock and links only while the thread is not yet
+/// `Exited`; the links behind the head never change until the thread's
+/// teardown takes the chain.
 ///
 /// # Safety
 /// `tcb` must be a valid, non-null TCB pointer. Must be called without
@@ -6054,27 +6055,25 @@ pub(crate) unsafe fn post_one_death_event(
 #[cfg(not(test))]
 pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit_reason: u64)
 {
-    // Snapshot the observer set under `sched_lock` so a concurrent late bind
-    // cannot mutate `death_observers`/`death_observer_count` mid-read; post
-    // after release to avoid holding the lock across event_queue_post /
-    // enqueue_and_wake. The whole fixed-size array is `Copy`, so snapshot it by
-    // value — no reference taken into the TCB.
+    // Read the chain head under `sched_lock`; post after release to avoid
+    // holding the lock across event_queue_post / enqueue_and_wake. A bind
+    // racing this read pushes a new head and leaves the read chain intact.
     // SAFETY: tcb validated by caller; caller does not hold sched_lock.
-    let (observers, count) = unsafe {
+    let first = unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        let snapshot = (*tcb).death_observers;
-        let count = (*tcb).death_observer_count as usize;
+        let first = (*tcb).death_observers.first();
         (*tcb).sched_lock.unlock_raw(saved);
-        (snapshot, count)
+        first
     };
 
-    for observer in &observers[..count]
-    {
-        // SAFETY: observer.eq is null (unused slot) or an EventQueueObject the
-        // observer's own reference keeps live: only this thread's teardown
-        // releases it, and that waits until the thread runs on no CPU.
-        // sched_lock is released.
-        unsafe { post_one_death_event(observer.eq, observer.correlator, exit_reason) };
+    // SAFETY: every node reachable from `first` lives in its queue, which the
+    // node's own reference keeps live; only this thread's teardown returns the
+    // nodes and releases the references, and that waits until the thread runs
+    // on no CPU, so no link changes during the walk. sched_lock is released.
+    unsafe {
+        thread::for_each_observer(first, |node| {
+            post_one_death_event((*node).eq, (*node).correlator, exit_reason);
+        });
     }
 }
 
@@ -6085,7 +6084,7 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 /// Mirrors [`post_death_notification`]: it records the terminal-fault reason on
 /// the address space (first fault wins) and snapshots the observer set under
 /// the space's `death_lock`, then posts the entry `(exit_reason, correlator)`
-/// to each registered `EventQueue` outside the lock. A bind that arrives after the fault receives
+/// to each bound node's `EventQueue` outside the lock. A bind that arrives after the fault receives
 /// the retained reason via `AddressSpace::bind_or_retained`. The kernel only
 /// notifies here — it does not enumerate or terminate the address space's
 /// threads.
@@ -6111,21 +6110,23 @@ pub unsafe fn post_aspace_death_notification(
     }
 
     // Record the terminal fault (so an observer bound after it still learns of
-    // the death) and snapshot the observer set under the space's death_lock;
-    // post outside the lock.
+    // the death) and read the observer chain's head under the space's
+    // death_lock; post outside the lock.
     // SAFETY: as_ptr validated non-null; not called holding death_lock.
-    let (observers, count) = unsafe {
+    let first = unsafe {
         crate::mm::address_space::AddressSpace::record_fault_and_snapshot(as_ptr, exit_reason)
     };
 
-    for observer in &observers[..count]
-    {
-        // SAFETY: observer.eq is null (unused slot) or an EventQueueObject the
-        // observer's own reference keeps live: only the address space's
-        // teardown releases it, and that first stops every bound thread,
-        // this faulting one included, and waits until it runs on no CPU. Not
-        // called holding a thread's sched_lock.
-        unsafe { post_one_death_event(observer.eq, observer.correlator, exit_reason) };
+    // SAFETY: every node reachable from `first` lives in its queue, which the
+    // node's own reference keeps live: only the address space's teardown
+    // returns the nodes and releases the references, and that first stops
+    // every bound thread, this faulting one included, and waits until it runs
+    // on no CPU, so no link changes during the walk. Not called holding a
+    // thread's sched_lock.
+    unsafe {
+        thread::for_each_observer(first, |node| {
+            post_one_death_event((*node).eq, (*node).correlator, exit_reason);
+        });
     }
 }
 

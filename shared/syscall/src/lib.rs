@@ -1663,11 +1663,12 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 
 // ── Event Queue wrappers ──────────────────────────────────────────────────────
 
-/// Retype a Memory cap into a new `EventQueue` with the given capacity (1..=4096).
+/// Retype a Memory cap into a new `EventQueue` with the given capacity (1..=4096)
+/// and no death-observer nodes; [`event_queue_create_observed`] adds them.
 ///
 /// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE`; the wrapper, state, and ring
 /// buffer all live inline in the same retype slot. Sub-page in-place when
-/// the total fits in `BIN_512` (capacity ≤ 53), page-aligned split for
+/// the total fits in `BIN_512` (capacity ≤ 25), page-aligned split for
 /// larger rings.
 ///
 /// # Errors
@@ -1683,13 +1684,41 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 #[inline]
 pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Memory
-    // cap slot, arg1 = capacity. Kernel retypes the region.
+    event_queue_create_observed(memory_cap, capacity, 0)
+}
+
+/// Retype a Memory cap into a new `EventQueue` with the given capacity and
+/// `observers` death-observer nodes (`0..=EVENT_QUEUE_MAX_CAPACITY`).
+///
+/// Each node funds one binding of this queue as a death observer
+/// ([`thread_bind_notification`], [`aspace_bind_notification`]); a bind
+/// beyond them returns `OutOfMemory` until a bound thread or address space is
+/// destroyed and its node returns. The debit is
+/// `syscall_abi::event_queue_retype_bytes(capacity, observers)`.
+///
+/// # Errors
+/// As [`event_queue_create`], and `InvalidArgument` if `observers` is out of
+/// range.
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[inline]
+pub fn event_queue_create_observed(
+    memory_cap: u32,
+    capacity: u32,
+    observers: u32,
+) -> Result<u32, i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; arg0 = source Memory
+    // cap slot, arg1 = capacity, arg2 = observer-node count. Kernel retypes
+    // the region.
     let ret = unsafe {
-        syscall2(
+        syscall3(
             SYS_CAP_CREATE_EVENT_Q,
             u64::from(memory_cap),
             u64::from(capacity),
+            u64::from(observers),
         )
     };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
@@ -2463,9 +2492,11 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// has already exited, the kernel posts the retained reason to
 /// `event_queue_cap` at once and the call still succeeds.
 ///
-/// Multiple observers can be registered on the same thread — up to the
-/// kernel's per-TCB cap. Returns `SyscallError::OutOfMemory` (-8) if the
-/// target thread's observer array is full.
+/// Multiple observers can be registered on the same thread; each binding
+/// takes one death-observer node from `event_queue_cap`'s pool
+/// ([`event_queue_create_observed`]) until the thread is destroyed. Returns
+/// `SyscallError::OutOfMemory` (-8) if the queue has no free node; a bind
+/// onto an already-exited thread takes none.
 ///
 /// `correlator` is opaque to the kernel. Its meaning is scoped to one
 /// `(event queue, binder)` pair — not a system-wide identifier, not a
@@ -2478,7 +2509,7 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,
 /// `InsufficientRights` (the thread lacks Control or the event queue lacks
-/// Post), or `OutOfMemory` (the target's observer array is full).
+/// Post), or `OutOfMemory` (the event queue has no free observer node).
 #[inline]
 pub fn thread_bind_notification(
     thread_cap: u32,
@@ -2527,9 +2558,10 @@ pub fn thread_bind_notification(
 /// succeeds.
 ///
 /// `aspace_cap` requires the `CONTROL` right; `event_queue_cap` requires the
-/// `POST` right. Multiple observers can be registered — up to the kernel's
-/// per-address-space cap. The kernel only notifies; it never enumerates or
-/// terminates threads.
+/// `POST` right. Multiple observers can be registered; each binding takes one
+/// death-observer node from `event_queue_cap`'s pool until the address space
+/// is destroyed (a bind after the fault takes none). The kernel only
+/// notifies; it never enumerates or terminates threads.
 ///
 /// `correlator` is opaque to the kernel. Its meaning is scoped to one
 /// `(event queue, binder)` pair — not a system-wide identifier, not a
@@ -2539,8 +2571,8 @@ pub fn thread_bind_notification(
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,
 /// `InsufficientRights` (the address space lacks Control or the event queue
-/// lacks Post), or `OutOfMemory` (the address space's observer array is
-/// full).
+/// lacks Post), or `OutOfMemory` (the event queue has no free observer
+/// node).
 #[inline]
 pub fn aspace_bind_notification(
     aspace_cap: u32,

@@ -107,12 +107,23 @@ fn main() -> !
     let mut recent = process::RecentExits::new();
 
     // Death-EQ slab request: the kernel's raw EventQueue debit for the
-    // capacity. Capacity is `MAX_PROCESSES * 2` to absorb a simultaneous-crash
-    // burst without dropping notifications between drain calls.
-    let death_eq_slab_bytes =
-        std::os::seraph::event_queue_retype_bytes(process::MAX_PROCESSES as u64 * 2);
+    // capacity and observer nodes. Capacity is `MAX_PROCESSES * 2` to absorb a
+    // simultaneous-crash burst without dropping notifications between drain
+    // calls. Each live process binds two observers (main thread and address
+    // space) and the init reap binds init's two threads, so that many nodes
+    // cover every binding.
+    let death_eq_observers = (process::MAX_PROCESSES as u32) * 2 + 2;
+    let death_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
+        process::MAX_PROCESSES as u64 * 2,
+        u64::from(death_eq_observers),
+    );
     let Some(death_eq) = std::os::seraph::object_slab_retype(death_eq_slab_bytes, |slab| {
-        syscall::event_queue_create(slab, (process::MAX_PROCESSES as u32) * 2).ok()
+        syscall::event_queue_create_observed(
+            slab,
+            (process::MAX_PROCESSES as u32) * 2,
+            death_eq_observers,
+        )
+        .ok()
     })
     else
     {

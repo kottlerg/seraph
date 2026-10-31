@@ -634,7 +634,8 @@ its 2^31 ceiling).
 
 ### `SYS_CAP_CREATE_EVENT_Q` (9)
 
-Retype a Memory capability into a new event queue with a fixed capacity.
+Retype a Memory capability into a new event queue with a fixed capacity and a fixed pool of
+death-observer nodes.
 
 **Arguments:**
 
@@ -642,6 +643,12 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 |---|---|---|
 | 0 | `memory_cap` | Memory capability (Retype rights) the event queue is carved from |
 | 1 | `capacity` | Ring buffer capacity in entries (1–EVENT_QUEUE_MAX_CAPACITY) |
+| 2 | `observers` | Death-observer nodes in the queue's pool (0–EVENT_QUEUE_MAX_CAPACITY) |
+
+The retype debit is `event_queue_retype_bytes(capacity, observers)`: the ring, and one node per
+observer, live inline in the queue's retype slot. Each `SYS_THREAD_BIND_NOTIFICATION` or
+`SYS_ASPACE_BIND_NOTIFICATION` onto the queue holds one node while its binding lives; a queue that
+receives no death posts takes `observers = 0`.
 
 **Return:** `rax`/`a0`: new capability descriptor (Post + Recv rights) on success;
 `SyscallError` on failure.
@@ -649,7 +656,7 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 **Capability requirement:** `memory_cap` must have Retype rights.
 
 **Errors:** `InvalidArgument` (`capacity`, the full register, is 0 or exceeds
-`EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
+`EVENT_QUEUE_MAX_CAPACITY`, or `observers` exceeds it), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
 or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full,
 or the Memory object's reference count is at its 2^31 ceiling).
@@ -1775,8 +1782,13 @@ Object Reference Counting).
 
 **Capability requirements:** `thread_cap` (Control), `eventq_cap` (Post).
 
+**Observer nodes:** each live binding holds one death-observer node of `eventq_cap`'s pool
+(§ `SYS_CAP_CREATE_EVENT_Q` (9), argument 2) until the target thread is destroyed; a bind onto an
+already-exited thread takes none.
+
 **Errors:** `InvalidCapability`, `InsufficientRights` (thread lacks Control or event
-queue lacks Post), `OutOfMemory` (target's observer array is full).
+queue lacks Post), `OutOfMemory` (the event queue has no free observer node), `QuotaExceeded`
+(the event queue's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -2244,8 +2256,13 @@ Object Reference Counting).
 
 **Capability requirements:** `aspace_cap` (Control), `eventq_cap` (Post).
 
+**Observer nodes:** each live binding holds one death-observer node of `eventq_cap`'s pool
+(§ `SYS_CAP_CREATE_EVENT_Q` (9), argument 2) until the address space is destroyed; a bind onto an
+already-faulted space takes none.
+
 **Errors:** `InvalidCapability`, `InsufficientRights` (address space lacks Control or
-event queue lacks Post), `OutOfMemory` (the address space's observer array is full).
+event queue lacks Post), `OutOfMemory` (the event queue has no free observer node),
+`QuotaExceeded` (the event queue's reference count is at its 2^31 ceiling).
 
 ---
 

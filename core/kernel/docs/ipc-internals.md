@@ -463,9 +463,14 @@ pub struct EventQueueState
     pub wait_set: *mut u8,
     pub wait_set_member_idx: u8,
 
+    /// Free death-observer nodes (the pool inline after the ring) and the
+    /// pool's size, fixed at creation.
+    pub observer_free: *mut DeathObserver,
+    pub observer_count: u32,
+
     /// Serialises every non-atomic field that changes after construction:
-    /// the ring contents, `write_idx`, `read_idx`, `waiters`, and the
-    /// wait-set back-pointer pair.
+    /// the ring contents, `write_idx`, `read_idx`, `waiters`, the
+    /// wait-set back-pointer pair, and the observer free list.
     pub lock: Spinlock,
 }
 ```
@@ -481,6 +486,15 @@ advance modulo N+1, so every slot is written in rotation, but at most N slots
 are occupied at any time (the extra slot is never needed for full/empty
 detection) and the user observes exactly N usable slots. The ring is reclaimed
 wholesale with the wrapper on `dealloc_object(EventQueue)`.
+
+The queue's death-observer nodes follow the ring in the same slot
+(`cap::retype::event_queue_observer_offset`), as many as `SYS_CAP_CREATE_EVENT_Q` argument 2
+asks for, all on `observer_free` at creation. A thread or address-space bind takes one under
+`eq.lock` alone (`event_queue_take_observer`) before it takes the owner's lock, links it into the
+owner's chain, and takes a checked reference on the queue (`try_inc_ref`); the owner's teardown
+returns the node under `eq.lock` (`event_queue_return_observer`) and only then drops that
+reference. `eq.lock` is therefore never held with a thread's `sched_lock` or an address space's
+`death_lock`, and a queue whose count reaches zero has every node back on its free list.
 
 ### Post Path
 

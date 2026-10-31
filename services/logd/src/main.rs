@@ -187,13 +187,18 @@ fn main() -> !
 const DEATH_EQ_CAPACITY: u32 = (procmgr_process_table::MAX_PROCESSES * 2) as u32;
 
 /// Allocate the slab and create the death-notification `EventQueue` of
-/// [`DEATH_EQ_CAPACITY`].
+/// [`DEATH_EQ_CAPACITY`], with as many observer nodes: procmgr binds one per
+/// process main thread, and a node returns only when that thread is
+/// destroyed, so the headroom over `MAX_PROCESSES` covers teardown lag.
 fn create_death_eq() -> Option<u32>
 {
-    // The kernel's raw EventQueue debit for that capacity.
-    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
+    // The kernel's raw EventQueue debit for that capacity and node count.
+    let slab_bytes = std::os::seraph::event_queue_retype_bytes(
+        u64::from(DEATH_EQ_CAPACITY),
+        u64::from(DEATH_EQ_CAPACITY),
+    );
     std::os::seraph::object_slab_retype(slab_bytes, |slab| {
-        syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
+        syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_CAPACITY).ok()
     })
 }
 

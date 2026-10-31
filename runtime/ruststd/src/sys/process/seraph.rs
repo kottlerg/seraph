@@ -440,9 +440,16 @@ impl Command {
         // death observer, `kill`'s `EXIT_KILLED`, and the bridge's drop
         // sentinel.
         const DEATH_EQ_CAPACITY: u32 = 4;
-        let bytes = syscall_abi::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
+        // Two observer nodes: the main-thread binding below and procmgr's
+        // address-space binding of the relay.
+        const DEATH_EQ_OBSERVERS: u32 = 2;
+        let bytes = syscall_abi::event_queue_retype_bytes(
+            u64::from(DEATH_EQ_CAPACITY),
+            u64::from(DEATH_EQ_OBSERVERS),
+        );
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-            syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
+            syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS)
+                .ok()
         })
         .ok_or_else(|| {
                 // The child does not exist yet; just drop the file cap we

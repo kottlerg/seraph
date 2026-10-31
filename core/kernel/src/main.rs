@@ -1353,9 +1353,7 @@ unsafe fn kernel_entry_post_rebase(
                         thread_id: 1,
                         context_saved: core::sync::atomic::AtomicU32::new(1),
                         wake_in_flight: core::sync::atomic::AtomicU32::new(0),
-                        death_observers: [sched::thread::DeathObserver::empty();
-                            sched::thread::MAX_DEATH_OBSERVERS],
-                        death_observer_count: 0,
+                        death_observers: sched::thread::DeathObserverChain::new(),
                         exit_reason: 0,
                         sleep_deadline: core::sync::atomic::AtomicU64::new(0),
                         extended: sched::thread::ExtendedState::from_raw(init_extended_area),

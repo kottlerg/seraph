@@ -237,23 +237,19 @@ pub struct AddressSpace
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) tlb_gen: AtomicU64,
     /// Observers to notify when a thread in this address space takes a
-    /// terminal fault, each pairing an `EventQueueState` post target with a
-    /// caller-chosen `correlator` (mirroring
-    /// `ThreadControlBlock::death_observers`). Semantics are defined in
-    /// `docs/capability-model.md` § "Kill process" pattern and
-    /// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_BIND_NOTIFICATION`. Entries
-    /// past `death_observer_count` are invalid. Owned by `death_lock`.
-    death_observers:
-        [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
-    /// Number of populated entries in `death_observers`
-    /// (`0..=MAX_DEATH_OBSERVERS`). Owned by `death_lock`.
-    death_observer_count: u8,
-    /// Serialises `death_observers`/`death_observer_count` and the retained
+    /// terminal fault: a chain of death-observer nodes, each drawn from the
+    /// observing queue's pool at bind and carrying its caller-chosen
+    /// `correlator` (mirroring `ThreadControlBlock::death_observers`).
+    /// Semantics are defined in `docs/capability-model.md` § "Kill process"
+    /// pattern and `core/kernel/docs/syscalls.md` §
+    /// `SYS_ASPACE_BIND_NOTIFICATION`. Owned by `death_lock`.
+    death_observers: crate::sched::thread::DeathObserverChain,
+    /// Serialises `death_observers` and the retained
     /// terminal-fault state below against a concurrent bind
     /// (`sys_aspace_bind_notification`) and the terminal-fault post
     /// (`post_aspace_death_notification`) — the address-space analogue of a
     /// thread's `sched_lock` role for `ThreadControlBlock::death_observers`.
-    /// Those four fields are bare under the exception of
+    /// Those three fields are bare under the exception of
     /// docs/coding-standards.md § Concurrency, with this lock as their owner
     /// (core/kernel/docs/memory-internals.md § Address Space Objects).
     death_lock: crate::sync::Spinlock,
@@ -430,9 +426,7 @@ impl AddressSpace
             tag: AtomicU16::new(0),
             tag_gen: AtomicU64::new(0),
             tlb_gen: AtomicU64::new(0),
-            death_observers: [crate::sched::thread::DeathObserver::empty();
-                crate::sched::thread::MAX_DEATH_OBSERVERS],
-            death_observer_count: 0,
+            death_observers: crate::sched::thread::DeathObserverChain::new(),
             death_lock: crate::sync::Spinlock::new(),
             terminal_faulted: false,
             terminal_fault_reason: 0,
@@ -476,25 +470,26 @@ impl AddressSpace
     /// dropped — closing the bind-after-fault window for an observer bound after
     /// the space was already running.
     ///
-    /// Returns `Ok(None)` if the observer was appended, holding a reference on
-    /// `eq` that the address space's teardown releases
+    /// Returns `Ok(None)` if `node` was linked, holding a reference on `eq`
+    /// that the address space's teardown releases
     /// ([`Self::take_death_observers`]); `Ok(Some(reason))` if the space
-    /// already faulted (the caller posts `reason` to `eq`; no reference is
-    /// taken); or `Err(())` if the observer array is full.
+    /// already faulted (the caller posts `reason` to `eq` and returns `node`
+    /// to its pool; no reference is taken); `Err(OutOfMemory)` if `node` is
+    /// null (the queue had no free node) and the space has not faulted; or
+    /// `Err(QuotaExceeded)` if `eq`'s reference count is at its limit.
     ///
     /// # Safety
     /// `this` must be a valid `AddressSpace` pointer and `eq` a live
-    /// `EventQueueObject` the caller pins for the call. The caller must NOT
-    /// hold `death_lock`.
+    /// `EventQueueObject` the caller pins for the call; `node` must be null or
+    /// a node of `eq`'s pool on no list. The caller must NOT hold
+    /// `death_lock`.
     #[cfg(not(test))]
-    // cast_possible_truncation: the usize→u8 `death_observer_count` store is
-    // bounded by `MAX_DEATH_OBSERVERS`, checked immediately before it.
-    #[allow(clippy::cast_possible_truncation)]
     pub unsafe fn bind_or_retained(
         this: *mut Self,
         eq: *mut crate::cap::object::EventQueueObject,
+        node: *mut crate::sched::thread::DeathObserver,
         correlator: u64,
-    ) -> Result<Option<u64>, ()>
+    ) -> Result<Option<u64>, syscall::SyscallError>
     {
         // SAFETY: this validated by caller; lock_raw is paired with an
         // unlock_raw on every path.
@@ -502,27 +497,26 @@ impl AddressSpace
         // SAFETY: terminal_faulted/terminal_fault_reason read under death_lock.
         let (faulted, reason) =
             unsafe { ((*this).terminal_faulted, (*this).terminal_fault_reason) };
-        if faulted
+        let result = if faulted
         {
-            // SAFETY: paired with the lock_raw above.
-            unsafe { (*this).death_lock.unlock_raw(saved) };
-            return Ok(Some(reason));
+            Ok(Some(reason))
         }
-        // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS. The
-        // binding's reference is taken while the caller's pin holds `eq`.
-        let result = unsafe {
-            let count = (*this).death_observer_count as usize;
-            if count >= crate::sched::thread::MAX_DEATH_OBSERVERS
-            {
-                Err(())
-            }
-            else
-            {
-                (*eq).header.inc_ref();
-                (*this).death_observers[count] =
-                    crate::sched::thread::DeathObserver { eq, correlator };
-                (*this).death_observer_count = (count + 1) as u8;
-                Ok(None)
+        else if node.is_null()
+        {
+            Err(syscall::SyscallError::OutOfMemory)
+        }
+        else
+        {
+            // The binding's reference is checked against REF_COUNT_LIMIT, as
+            // the thread bind's is, and taken while the caller's pin holds
+            // `eq`.
+            // SAFETY: lock held; node is eq's and unlinked (contract).
+            unsafe {
+                (*eq).header.try_inc_ref().map(|()| {
+                    (*node).correlator = correlator;
+                    (*this).death_observers.push(node);
+                    None
+                })
             }
         };
         // SAFETY: paired with the lock_raw above.
@@ -530,10 +524,12 @@ impl AddressSpace
         result
     }
 
-    /// Record a terminal fault (first fault wins) and snapshot the observer set
-    /// under `death_lock`. The terminal-fault post path posts to the returned
-    /// snapshot outside the lock; recording the reason lets a later
-    /// `bind_or_retained` deliver it to an observer bound after the fault.
+    /// Record a terminal fault (first fault wins) and return the first node of
+    /// the observer chain, read under `death_lock`. The terminal-fault post
+    /// path walks the chain from it outside the lock (a linked node's links
+    /// never change until the teardown takes the chain); recording the reason
+    /// lets a later `bind_or_retained` deliver it to an observer bound after
+    /// the fault, and stops any further link.
     ///
     /// # Safety
     /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
@@ -542,13 +538,10 @@ impl AddressSpace
     pub unsafe fn record_fault_and_snapshot(
         this: *mut Self,
         reason: u64,
-    ) -> (
-        [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
-        usize,
-    )
+    ) -> *mut crate::sched::thread::DeathObserver
     {
-        // SAFETY: this validated by caller; the observer array is Copy, so it is
-        // snapshotted by value with no reference taken into the address space.
+        // SAFETY: this validated by caller; fields read and written under
+        // death_lock.
         unsafe {
             let saved = (*this).death_lock.lock_raw();
             if !(*this).terminal_faulted
@@ -556,16 +549,16 @@ impl AddressSpace
                 (*this).terminal_faulted = true;
                 (*this).terminal_fault_reason = reason;
             }
-            let snapshot = (*this).death_observers;
-            let count = (*this).death_observer_count as usize;
+            let first = (*this).death_observers.first();
             (*this).death_lock.unlock_raw(saved);
-            (snapshot, count)
+            first
         }
     }
 
-    /// Empty the observer set for the address space's teardown, returning the
-    /// observers whose `EventQueueObject` references the caller now owns and
-    /// MUST release.
+    /// Empty the observer chain for the address space's teardown, returning
+    /// its first node; the caller now owns every node reachable from it and
+    /// the `EventQueueObject` reference each holds, and MUST return each node
+    /// and release each reference.
     ///
     /// # Safety
     /// `this` must be a valid `AddressSpace` whose teardown is running: no
@@ -573,24 +566,16 @@ impl AddressSpace
     /// or terminal-fault post can race the call. The caller must NOT hold
     /// `death_lock`.
     #[cfg(not(test))]
-    pub unsafe fn take_death_observers(
-        this: *mut Self,
-    ) -> (
-        [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
-        usize,
-    )
+    pub unsafe fn take_death_observers(this: *mut Self)
+    -> *mut crate::sched::thread::DeathObserver
     {
         // SAFETY: this is valid (contract); death_lock is taken for the
         // field-ownership rule though nothing can contend it here.
         unsafe {
             let saved = (*this).death_lock.lock_raw();
-            let taken = (*this).death_observers;
-            let count = (*this).death_observer_count as usize;
-            (*this).death_observers = [crate::sched::thread::DeathObserver::empty();
-                crate::sched::thread::MAX_DEATH_OBSERVERS];
-            (*this).death_observer_count = 0;
+            let taken = (*this).death_observers.take();
             (*this).death_lock.unlock_raw(saved);
-            (taken, count)
+            taken
         }
     }
 

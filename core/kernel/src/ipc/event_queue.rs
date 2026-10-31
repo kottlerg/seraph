@@ -42,8 +42,9 @@ pub struct EventEntry
 /// Kernel state backing an `EventQueue` capability.
 ///
 /// The ring buffer body lives inline in the same retype slot — directly
-/// after this struct, at `cap::retype::EVENT_QUEUE_RING_OFFSET` (the slot size
-/// comes from `cap::retype::dispatch_for(EventQueue, capacity)`). `capacity` is the
+/// after this struct, at `cap::retype::EVENT_QUEUE_RING_OFFSET` — followed by
+/// the queue's death-observer node pool (the slot size comes from
+/// `cap::retype::event_queue_dispatch(capacity, observers)`). `capacity` is the
 /// user-visible max entry count; the ring has `capacity + 1` slots, and full
 /// and empty are detected from `count`. The ring
 /// pointer is set at construction by `EventQueueState::new` and remains
@@ -78,6 +79,12 @@ pub struct EventQueueState
     pub wait_set: *mut u8,
     /// Index of this queue's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
+    /// Free death-observer nodes, linked through `DeathObserver::next`; null
+    /// when every node is bound or the queue has none. Protected by `lock`.
+    pub observer_free: *mut crate::sched::thread::DeathObserver,
+    /// Number of death-observer nodes the queue was created with, inline after
+    /// the ring. Fixed at construction; the reclaim path sizes the slot by it.
+    pub observer_count: u32,
     /// Serialises post/recv across CPUs (see notification.rs for rationale).
     pub lock: crate::sync::Spinlock,
 }
@@ -108,7 +115,8 @@ impl EventQueueState
     /// `ring` must point to `capacity + 1` zeroed [`EventEntry`] slots and remain
     /// valid for the lifetime of the `EventQueueState`. The retype path
     /// places the ring inline in the same slot as the state; reclaim
-    /// frees both regions together via `retype_free`.
+    /// frees both regions together via `retype_free`. The queue starts with
+    /// no observer nodes; [`Self::init_observer_pool`] adds them.
     ///
     /// # Safety
     /// `ring` must be 8-byte aligned, point to writable memory of at
@@ -117,6 +125,8 @@ impl EventQueueState
     pub unsafe fn new(capacity: u32, ring: *mut EventEntry) -> Self
     {
         Self {
+            observer_free: core::ptr::null_mut(),
+            observer_count: 0,
             ring,
             capacity,
             count: core::sync::atomic::AtomicU32::new(0),
@@ -128,6 +138,103 @@ impl EventQueueState
             lock: crate::sync::Spinlock::new(),
         }
     }
+
+    /// Construct the queue's `count` death-observer nodes at `nodes`, each
+    /// naming `eq` (this queue's object), and put them all on the free list.
+    ///
+    /// # Safety
+    /// Called once, before the queue is reachable by any other path. `nodes`
+    /// must be 8-byte aligned, point to writable memory of `count`
+    /// `DeathObserver`s inside this queue's retype slot, and `eq` must be the
+    /// object wrapping this state.
+    pub unsafe fn init_observer_pool(
+        &mut self,
+        nodes: *mut crate::sched::thread::DeathObserver,
+        count: u32,
+        eq: *mut crate::cap::object::EventQueueObject,
+    )
+    {
+        self.observer_count = count;
+        self.observer_free = core::ptr::null_mut();
+        for i in (0..count as usize).rev()
+        {
+            // SAFETY: i < count; the node lies in the pool (contract), unaliased.
+            unsafe {
+                core::ptr::write(
+                    nodes.add(i),
+                    crate::sched::thread::DeathObserver {
+                        next: self.observer_free,
+                        eq,
+                        correlator: 0,
+                    },
+                );
+            }
+            // SAFETY: as above; the node now heads the free list.
+            self.observer_free = unsafe { nodes.add(i) };
+        }
+    }
+}
+
+// ── Death-observer node pool ──────────────────────────────────────────────────
+
+/// Take a free death-observer node from `eq`'s pool, or null when the pool
+/// is empty (every node bound, or the queue was created with none).
+///
+/// The node stays the queue's: the binder links it into an owner chain and
+/// the owner's teardown hands it back through [`event_queue_return_observer`].
+///
+/// # Safety
+/// `eq` must be a live queue the caller pins for the call; acquires
+/// `eq.lock` internally — the caller must not hold it, nor any lock ordered
+/// after it.
+#[cfg(not(test))]
+pub unsafe fn event_queue_take_observer(
+    eq: *mut EventQueueState,
+) -> *mut crate::sched::thread::DeathObserver
+{
+    // SAFETY: caller guarantees eq is live.
+    let eq = unsafe { &mut *eq };
+    // SAFETY: lock serialises the free list; paired with unlock_raw below.
+    let saved = unsafe { eq.lock.lock_raw() };
+    let node = eq.observer_free;
+    if !node.is_null()
+    {
+        // SAFETY: a free-list node is valid and owned by the list under eq.lock.
+        unsafe {
+            eq.observer_free = (*node).next;
+            (*node).next = core::ptr::null_mut();
+        }
+    }
+    // SAFETY: paired with lock_raw above.
+    unsafe { eq.lock.unlock_raw(saved) };
+    node
+}
+
+/// Return a death-observer node to the free list of the queue it belongs to.
+///
+/// # Safety
+/// `node` must have come from [`event_queue_take_observer`] on `eq`, be on
+/// no owner chain, and `eq` must still be live (the caller holds the
+/// reference the binding took, or its capability pin). Acquires `eq.lock`
+/// internally — the caller must not hold it.
+#[cfg(not(test))]
+pub unsafe fn event_queue_return_observer(
+    eq: *mut EventQueueState,
+    node: *mut crate::sched::thread::DeathObserver,
+)
+{
+    // SAFETY: caller guarantees eq is live.
+    let eq = unsafe { &mut *eq };
+    // SAFETY: lock serialises the free list; paired with unlock_raw below.
+    let saved = unsafe { eq.lock.lock_raw() };
+    // SAFETY: node is this queue's and unlinked (contract).
+    unsafe {
+        (*node).next = eq.observer_free;
+        (*node).correlator = 0;
+    }
+    eq.observer_free = node;
+    // SAFETY: paired with lock_raw above.
+    unsafe { eq.lock.unlock_raw(saved) };
 }
 
 // ── Operations ────────────────────────────────────────────────────────────────

@@ -25,7 +25,8 @@
 
 use syscall::{
     aspace_bind_notification, cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete,
-    cap_info, event_queue_create, thread_bind_notification, thread_configure, thread_start,
+    cap_info, event_queue_create_observed, thread_bind_notification, thread_configure,
+    thread_start,
 };
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, EXIT_FAULT_BASE};
 
@@ -110,7 +111,7 @@ fn run_with(ctx: &TestContext, parts: &mut Parts) -> TestResult
             .ok_or("death_observer_outlives_queue_caps: frame pool exhausted")?;
         parts.frames[i] = Some(frames[i]);
         empty[i] = available(frames[i])?;
-        queues[i] = event_queue_create(frames[i], CAPACITY)
+        queues[i] = event_queue_create_observed(frames[i], CAPACITY, 1)
             .map_err(|_| "death_observer_outlives_queue_caps: event_queue_create failed")?;
         parts.queues[i] = Some(queues[i]);
         occupied[i] = available(frames[i])?;

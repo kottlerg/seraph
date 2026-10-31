@@ -290,16 +290,15 @@ against that cap and never holds a namespace cap of its own. Loading, the
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap |
 
-procmgr `FS_CLOSE`s and deletes the file cap after the load, whether it
-succeeds or fails, and deletes its copy of the creator endpoint and any cap the
-layout does not name. When present, the death-relay cap is the last cap in the
-message, so the creator-endpoint slot stays at cap[1]; it is a cap of its own,
-so a request that sets `CREATE_DEATH_RELAY` carries at least two caps, and one
-whose only cap is the file cap is refused with `INVALID_ARGUMENT`. Once the
-child is recorded, procmgr binds the relay as an `AddressSpace` death observer
-(correlator 0) on the child, so a terminal fault in any of the child's threads
-posts the fault class to the spawner's own death queue, then deletes its copy;
-a failed creation deletes it unbound. `CREATE_PROCESS` ignores bit 17.
+procmgr `FS_CLOSE`s and deletes the file cap after the load, whether it succeeds or fails, and
+deletes its copy of the creator endpoint and any cap the layout does not name. When present, the
+death-relay cap is the last cap in the message, so the creator-endpoint slot stays at cap[1]; it is
+a cap of its own, so a request that sets `CREATE_DEATH_RELAY` carries at least two caps, and one
+whose only cap is the file cap is refused with `INVALID_ARGUMENT`. Once the child is recorded,
+procmgr binds the relay as an `AddressSpace` death observer (correlator 0) on the child, using one
+of the relay queue's observer nodes, so a terminal fault in any of the child's threads posts the
+fault class to the spawner's own death queue, then deletes its copy; a failed creation deletes it
+unbound. `CREATE_PROCESS` ignores bit 17.
 
 **Reply (success):** as for `CREATE_PROCESS` (cap[0] process handle, cap[1]
 child `Thread` cap), including the destruction of a child whose reply caps
@@ -355,7 +354,7 @@ Wire format:
 |---|---|
 | label | `procmgr_labels::REGISTER_DEATH_EQ` (14) |
 | caller's cap badge | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY` (`1 << 62`); svcmgr mints this badged `SEND\|GRANT` cap for real-logd on each launch, from the badge-0 `SEND\|GRANT` procmgr source init hands it at the handover (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)) |
-| `caps[0]` | `EventQueue` cap with `POST` right; procmgr binds it as a second death observer on the main thread of every supervised process |
+| `caps[0]` | `EventQueue` cap with `POST` right and an observer node per supervised process; procmgr binds it as a second death observer on the main thread of every supervised process |
 
 Procmgr stores the cap in
 [`process::LOGD_DEATH_EQ`](../src/process.rs) and immediately

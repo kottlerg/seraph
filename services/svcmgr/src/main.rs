@@ -148,10 +148,18 @@ fn main() -> !
     // One shared death-notification queue, capacity sized so a burst of
     // simultaneous service crashes (worst case `MAX_SERVICES`) cannot
     // overflow before svcmgr drains. The slab request is the kernel's raw
-    // EventQueue debit for that capacity.
-    let deaths_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(MAX_SERVICES as u64 * 2);
+    // EventQueue debit for that capacity, with as many observer nodes: one
+    // per supervised main thread, and a restarted service binds its new
+    // thread before the old one's node returns.
+    let deaths_eq_slab_bytes =
+        std::os::seraph::event_queue_retype_bytes(MAX_SERVICES as u64 * 2, MAX_SERVICES as u64 * 2);
     let Some(deaths_eq) = std::os::seraph::object_slab_retype(deaths_eq_slab_bytes, |slab| {
-        syscall::event_queue_create(slab, (MAX_SERVICES as u32) * 2).ok()
+        syscall::event_queue_create_observed(
+            slab,
+            (MAX_SERVICES as u32) * 2,
+            (MAX_SERVICES as u32) * 2,
+        )
+        .ok()
     })
     else
     {

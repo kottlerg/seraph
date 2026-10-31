@@ -660,9 +660,12 @@ mod reaper {
         if cur != 0 {
             return cur;
         }
-        let want = syscall_abi::event_queue_retype_bytes(u64::from(EQ_CAPACITY));
+        // As many observer nodes as entries: at most REAPER_SLOTS threads are
+        // bound at once, and a node returns when its thread is destroyed.
+        let want =
+            syscall_abi::event_queue_retype_bytes(u64::from(EQ_CAPACITY), u64::from(EQ_CAPACITY));
         let made = crate::sys::alloc::seraph::object_slab_retype(want, |slab| {
-            syscall::event_queue_create(slab, EQ_CAPACITY).ok()
+            syscall::event_queue_create_observed(slab, EQ_CAPACITY, EQ_CAPACITY).ok()
         });
         let Some(eq) = made else {
             return 0;

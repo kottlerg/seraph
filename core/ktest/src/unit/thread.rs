@@ -24,8 +24,8 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_derive, event_queue_create,
-    notification_send, notification_wait, notification_wait_timeout, sched_split, system_info,
+    RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_derive, notification_send,
+    notification_wait, notification_wait_timeout, sched_split, system_info,
     thread_bind_notification, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
     thread_set_priority, thread_sleep, thread_start, thread_stop, thread_write_regs,
 };
@@ -1769,7 +1769,7 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
     // lost on the blocked-receiver handoff, fails the compare.
     const CORRELATOR: u64 = 0xCAFE_0000_0000_CAFE;
 
-    let eq = event_queue_create(ctx.memory_base, 4)
+    let eq = syscall::event_queue_create_observed(ctx.memory_base, 4, 1)
         .map_err(|_| "thread::bind_notification_fires_on_exit: event_queue_create failed")?;
 
     let mut child = crate::spawn::new_child(ctx)
@@ -1801,6 +1801,71 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
     child.delete_cspace().ok();
     cap_delete(eq).ok();
     Ok(())
+}
+
+/// Death-observer bindings are funded by the observing queue's node pool:
+/// one thread takes more bindings than the former fixed per-thread ceiling of
+/// four, every one fires, a bind beyond a queue's nodes returns
+/// `OutOfMemory`, and destroying the bound thread returns its nodes for a new
+/// binding. Fails if the kernel still caps observers per thread, drops a post
+/// from a chained node, over-commits a pool, or leaks a node at teardown.
+pub fn bind_notification_nodes_come_from_the_queue(ctx: &TestContext) -> TestResult
+{
+    const NODES: u32 = 6;
+    let eq = syscall::event_queue_create_observed(ctx.memory_base, 8, NODES)
+        .map_err(|_| "thread::bind_nodes: event_queue_create failed")?;
+    let result = bind_nodes_on(ctx, eq, NODES);
+    cap_delete(eq).ok();
+    result
+}
+
+/// Body of [`bind_notification_nodes_come_from_the_queue`] on `eq`, a queue
+/// of capacity 8 with `nodes` observer nodes.
+fn bind_nodes_on(ctx: &TestContext, eq: u32, nodes: u32) -> TestResult
+{
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "thread::bind_nodes: spawn::new_child failed")?;
+    for i in 0..u64::from(nodes)
+    {
+        thread_bind_notification(child.th, eq, 0x0B5E_0000_0000_0000 | i)
+            .map_err(|_| "thread::bind_nodes: a bind within the pool failed")?;
+    }
+    if thread_bind_notification(child.th, eq, 0) != Err(SyscallError::OutOfMemory as i64)
+    {
+        return Err("thread::bind_nodes: a bind past the pool did not return OutOfMemory");
+    }
+
+    let stack_top = crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK));
+    // SAFETY: the stack is `BIND_NOTIF_STACK`, which this test and
+    // `bind_notification_fires_on_exit` use one at a time, each waiting for
+    // its child to exit before returning; no other live thread runs on it.
+    unsafe { crate::spawn::configure_and_start(&child, bind_notif_exit_entry, stack_top, 0) }
+        .map_err(|_| "thread::bind_nodes: configure_and_start failed")?;
+    crate::spawn::wait_until_exited(child.th, crate::scaled_polls(2000))?;
+
+    // Every chained node posted once, its own correlator, a clean exit.
+    let mut seen = 0u64;
+    for _ in 0..nodes
+    {
+        let death = syscall::event_try_recv_death(eq)
+            .map_err(|_| "thread::bind_nodes: a chained observer posted nothing")?;
+        let i = death.correlator ^ 0x0B5E_0000_0000_0000;
+        if i >= u64::from(nodes) || death.exit_reason != 0 || seen & (1 << i) != 0
+        {
+            return Err("thread::bind_nodes: wrong or duplicate death entry");
+        }
+        seen |= 1 << i;
+    }
+
+    // Destroying the thread returns its nodes: a fresh thread binds again.
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    let mut next = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::bind_nodes: spawn::new_child (second) failed")?;
+    let rebound = thread_bind_notification(next.th, eq, 1);
+    next.delete_thread().ok();
+    next.delete_cspace().ok();
+    rebound.map_err(|_| "thread::bind_nodes: teardown did not return the nodes to the pool")
 }
 
 /// `thread_bind_notification` with a null thread cap must return

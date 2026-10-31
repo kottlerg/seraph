@@ -26,8 +26,8 @@
 //!      proving the process-exit syscall records the encoded code on the thread.
 
 use syscall::{
-    DeathEvent, cap_delete, event_queue_create, event_try_recv, event_try_recv_death, process_exit,
-    thread_bind_notification, thread_exit, thread_sleep,
+    DeathEvent, cap_delete, event_queue_create, event_queue_create_observed, event_try_recv,
+    event_try_recv_death, process_exit, thread_bind_notification, thread_exit, thread_sleep,
 };
 use syscall_abi::{EXIT_FAULT_BASE, SyscallError, encode_exit_code};
 
@@ -144,7 +144,9 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 {
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "death_notification_late_bind: spawn::new_child (control) failed")?;
-    let eq = event_queue_create(ctx.memory_base, 4)
+    // One observer node: this bind links one; the late binds above, onto
+    // exited threads, take none from their node-less queues.
+    let eq = event_queue_create_observed(ctx.memory_base, 4, 1)
         .map_err(|_| "death_notification_late_bind: event_queue_create (control) failed")?;
     // Thread is Created (not started): the append path.
     thread_bind_notification(child.th, eq, CORR_LIVE)

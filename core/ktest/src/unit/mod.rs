@@ -570,6 +570,10 @@ pub fn run_all(ctx: &TestContext)
         thread::bind_notification_fires_on_exit(ctx)
     );
     run_test!(
+        "thread::bind_notification_nodes_come_from_the_queue",
+        thread::bind_notification_nodes_come_from_the_queue(ctx)
+    );
+    run_test!(
         "thread::bind_notification_invalid_cap_err",
         thread::bind_notification_invalid_cap_err(ctx)
     );

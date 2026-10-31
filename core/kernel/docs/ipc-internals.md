@@ -490,7 +490,14 @@ asks for, all on `observer_free` at creation. A thread or address-space bind tak
 owner's chain, and takes a checked reference on the queue (`try_inc_ref`); the owner's teardown
 returns the node under `eq.lock` (`event_queue_return_observer`) and only then drops that
 reference. `eq.lock` is therefore never held with a thread's `sched_lock` or an address space's
-`death_lock`, and a queue whose count reaches zero has every node back on its free list.
+`death_lock`, and a queue whose count reaches zero has every node back on its free list. A node's
+`next` and `correlator` are bare fields owned by the lock of the list that holds the node: the
+queue's `lock` while it is free, the owner thread's `sched_lock` or the owner address space's
+`death_lock` while it is bound (the bare-field exception of
+[coding-standards.md § Concurrency](../../../docs/coding-standards.md#concurrency)); a death walk
+reads a bound node's links without the lock, after reading the chain head under it, because a
+linked node's links never change until the owner's teardown takes the chain. `eq` is fixed at
+creation.
 
 ### Post Path
 

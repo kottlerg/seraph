@@ -223,10 +223,17 @@ let value = unsafe { ptr.read() };
   - a thread-control-block field whose owner
     [scheduling-internals.md § Cross-CPU TCB Ownership](../core/kernel/docs/scheduling-internals.md#cross-cpu-tcb-ownership)
     names (the TCB's own `sched_lock`, a CPU's `scheduler.lock`, the all-locks hold of a lifecycle
-    commit, `THREAD_REGISTRY_LOCK`, the lock of the source or wait set the thread is parked on, or,
-    for a field that table assigns to it, the claim on the thread's park episode);
+    commit, `THREAD_REGISTRY_LOCK`, the lock of the source or wait set the thread is parked on,
+    `SLEEP_LIST_LOCK` for the thread's sleep-list node, the timer pop's batch for the expiry
+    snapshot that batch takes, or, for a field that table assigns to it, the claim on the thread's
+    park episode);
   - a field of an IPC object, a source or a wait set, that the object's own `lock` serialises, as
     the object's § Object Structure in [ipc-internals.md](../core/kernel/docs/ipc-internals.md)
+    records;
+  - a death-observer node's link and correlator, which the lock of the list holding the node
+    serialises (its queue's `lock` on the free list, the owner thread's `sched_lock` or the owner
+    address space's `death_lock` on an owner chain), as
+    [ipc-internals.md § Event Queue](../core/kernel/docs/ipc-internals.md#event-queue-corekernelsrcipcevent_queuers)
     records;
   - a field of a per-CPU scheduler that its `lock` serialises, as
     [scheduling-internals.md § Lock Hierarchy](../core/kernel/docs/scheduling-internals.md#lock-hierarchy)

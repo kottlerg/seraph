@@ -435,9 +435,12 @@ pub const MEMMGR_LABELS_VERSION: u32 = 6;
 /// shape.
 pub mod memmgr_labels
 {
-    /// Allocate one or more Memory caps covering at least `want_pages` pages,
-    /// from any badged cap; [`super::memmgr_grant_layout`] checks the reply
-    /// shape. Specified in `services/memmgr/docs/ipc-interface.md` § Label 1:
+    /// Allocate one or more Memory caps covering `want_pages` pages, or fewer
+    /// for a best-effort partial grant, whose caller requests the remainder
+    /// again; with `REQUIRE_CONTIGUOUS`, exactly one cap covering all
+    /// `want_pages`, or a failure. Callable from any badged cap;
+    /// [`super::memmgr_grant_layout`] checks the reply shape. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 1:
     /// `REQUEST_MEMORY_CAPS`.
     pub const REQUEST_MEMORY_CAPS: u64 = 1;
     /// Return previously granted regions to the pool mid-life, named by the

@@ -149,10 +149,10 @@ pub unsafe fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
 
 /// Format `args` followed by a newline and emit it through [`write_bytes`],
 /// staging the text in a [`CHUNK_SIZE`]-byte stack buffer that is sent each
-/// time it fills, so a message of any length arrives whole, newline included.
-/// Non-allocating — safe to call from heap-independent paths (panic
-/// handlers, pre-bootstrap diagnostics). An IPC failure drops the rest of the
-/// message.
+/// time it fills, so a message of any length is sent in full, newline
+/// included; a failed send drops the chunks after it, and the receiver may
+/// emit a long message as several lines. Non-allocating — safe to call from
+/// heap-independent paths (panic handlers, pre-bootstrap diagnostics).
 ///
 /// # Safety
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC

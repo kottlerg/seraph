@@ -578,7 +578,11 @@ device block-size query and fs-fat's sector size).
 
 ### init and logd
 
-Tracked by [#645](https://github.com/kottlerg/seraph/issues/645).
+The entries left open are tracked by the Issue each recommendation names: memmgr's page-table
+seed by [#642](https://github.com/kottlerg/seraph/issues/642), the ACPI region caps by
+[#637](https://github.com/kottlerg/seraph/issues/637), the service-name packing and logd's death
+queue by [#643](https://github.com/kottlerg/seraph/issues/643), and logd's eviction by the low 32
+correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|

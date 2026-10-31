@@ -1631,7 +1631,10 @@ pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
     // field is one of the CAP_INFO_* selectors. The kernel performs all validation
     // (slot bounds and generation, tag match for tag-specific fields, selector
     // recognition) and returns the requested field value.
-    let ret = unsafe { syscall2(SYS_CAP_INFO, u64::from(slot), field) };
+    // The window registers are zeroed: `CAP_INFO_MEMORY_MAPPINGS` reads its
+    // window from them and refuses an empty one, so a call through this
+    // wrapper is refused rather than counting an undefined window.
+    let ret = unsafe { syscall4(SYS_CAP_INFO, u64::from(slot), field, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 

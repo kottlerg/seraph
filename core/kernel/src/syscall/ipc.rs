@@ -1484,8 +1484,9 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 ///          available").
 ///
 /// On success returns `0` in rax/a0, the entry's payload word in the secondary
-/// return register (rdx/a1), and its tag word in the tertiary one (rsi/a2). The disambiguation between "data wake" and "timer
-/// wake" uses `tcb.timed_out` rather than an in-band sentinel on
+/// return register (rdx/a1), and its tag word in the tertiary one (rsi/a2).
+/// The disambiguation between "data wake" and "timer wake" uses
+/// `tcb.timed_out` rather than an in-band sentinel on
 /// `wakeup_value`, because event payloads may be any `u64` including 0
 /// (contrast `sys_notification_wait`, where `wakeup_value == 0` works because
 /// `notification_send` rejects zero-bit sends). A stop of the caller, or the

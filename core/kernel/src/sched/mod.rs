@@ -342,8 +342,9 @@ static WAKE_PENDING_CLEAR_TRIPPED: core::sync::atomic::AtomicBool =
 /// Owed-wake suspects `(tcb, rule)` recorded by the previous scan, for the
 /// two-scan persistence requirement of the `wake_in_flight` / `wake_pending`
 /// rules. Keyed by TCB pointer, which no two live threads share (the random
-/// `thread_id` can collide); the pointer is only compared, never dereferenced. BSP-only access from `owed_wake_scan` (CPU0 timer
-/// context behind an interrupt gate, non-reentrant) — the same single-writer
+/// `thread_id` can collide); the pointer is only compared, never dereferenced.
+/// BSP-only access from `owed_wake_scan` (CPU0 timer context behind an
+/// interrupt gate, non-reentrant) — the same single-writer
 /// CPU0-static idiom of core/kernel/docs/scheduling-internals.md § Off-Stack
 /// Scratch for Ceiling-Sized Arrays.
 #[cfg(not(test))]
@@ -2032,8 +2033,8 @@ pub fn sleep_check_wakeups()
             // Snapshot the binding under SLEEP_LIST_LOCK, where the TCB is
             // provably alive: dealloc_object(Thread) removes its entry from
             // this list under the same lock before freeing. The claim loop
-            // below dispatches off this snapshot and never dereferences the
-            // TCB to choose its arm.
+            // below dispatches off this snapshot and never re-reads the live
+            // binding to choose its arm.
             let ipc_state = (*tcb).ipc_state;
             let blocked_on = (*tcb).blocked_on_object;
             let park_seq = (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed);

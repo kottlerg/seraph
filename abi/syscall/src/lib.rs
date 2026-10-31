@@ -834,8 +834,9 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
 // The exit reason is the value a death notification delivers (the payload word
-// of its two-word entry) when a thread or process dies. It is a single flat space partitioned into disjoint
-// ranges, kernel-owned so userspace can never forge a fault or kill reason:
+// of its two-word entry) when a thread or process dies. It is a single flat
+// space partitioned into disjoint ranges, kernel-owned so userspace can never
+// forge a fault or kill reason:
 //
 //   | Reason            | Class               | Meaning                            |
 //   |-------------------|---------------------|------------------------------------|

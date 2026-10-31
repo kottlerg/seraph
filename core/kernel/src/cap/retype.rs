@@ -1315,8 +1315,8 @@ const _: () = {
             == syscall::ENDPOINT_RETYPE_BYTES
     );
     assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
-    // The WaitSet formula, at one member, two (the ring padding changes),
-    // and the largest.
+    // The WaitSet formula, at one member, four (where the ring's 8-byte
+    // padding steps), and the largest.
     assert!(wait_set_raw_bytes(1) == syscall::wait_set_retype_bytes(1));
     assert!(wait_set_raw_bytes(4) == syscall::wait_set_retype_bytes(4));
     assert!(

@@ -154,8 +154,9 @@ pub struct SleepExpiry
 {
     /// Next TCB of the batch, or null at its end.
     pub next: *mut ThreadControlBlock,
-    /// The popped park's binding.
+    /// The popped park's binding: its IPC state.
     pub ipc_state: IpcThreadState,
+    /// The popped park's binding: the source it is parked on, or null.
     pub blocked_on: *mut u8,
     /// `park_seq` of the popped park: a timed-wait claim requires it unchanged.
     pub park_seq: u32,

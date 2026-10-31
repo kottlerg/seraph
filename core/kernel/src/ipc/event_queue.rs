@@ -489,3 +489,80 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use crate::sched::thread::DeathObserver;
+
+    fn pool(count: usize) -> (EventQueueState, Vec<DeathObserver>, [EventEntry; 2])
+    {
+        let ring = [EventEntry { payload: 0, tag: 0 }; 2];
+        let nodes = (0..count)
+            .map(|_| DeathObserver {
+                next: core::ptr::null_mut(),
+                eq: core::ptr::null_mut(),
+                correlator: 7,
+            })
+            .collect();
+        // SAFETY: the ring pointer is not dereferenced by the pool test.
+        let eq = unsafe { EventQueueState::new(1, core::ptr::null_mut()) };
+        (eq, nodes, ring)
+    }
+
+    /// The nodes reachable from the free list, in order.
+    fn free_list(eq: &EventQueueState) -> Vec<*mut DeathObserver>
+    {
+        let mut out = Vec::new();
+        let mut n = eq.observer_free;
+        while !n.is_null()
+        {
+            out.push(n);
+            // SAFETY: n is a node of the test's live pool.
+            n = unsafe { (*n).next };
+            assert!(out.len() <= 64, "free list loops");
+        }
+        out
+    }
+
+    // Defect guarded: a pool that links fewer than its count of nodes, links
+    // one twice (a loop), or leaves a node without its queue would refuse
+    // binds the creator funded or post a death to the wrong queue.
+    #[test]
+    fn observer_pool_links_every_node_once_each_naming_its_queue()
+    {
+        let (mut eq, mut nodes, _ring) = pool(5);
+        let obj = core::ptr::NonNull::<crate::cap::object::EventQueueObject>::dangling().as_ptr();
+        // SAFETY: nodes holds 5 writable nodes that outlive eq's use here.
+        unsafe { eq.init_observer_pool(nodes.as_mut_ptr(), 5, obj) };
+        let list = free_list(&eq);
+        assert_eq!(eq.observer_count, 5);
+        assert_eq!(list.len(), 5);
+        let mut sorted = list.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5);
+        for n in list
+        {
+            // SAFETY: n is a node of the live pool.
+            unsafe {
+                assert_eq!((*n).eq, obj);
+                assert_eq!((*n).correlator, 0);
+            }
+        }
+    }
+
+    // Defect guarded: a queue created with no observer nodes must refuse
+    // every bind (an empty free list), not hand out memory past its slot.
+    #[test]
+    fn an_empty_observer_pool_has_no_free_node()
+    {
+        let (mut eq, mut nodes, _ring) = pool(0);
+        let obj = core::ptr::NonNull::<crate::cap::object::EventQueueObject>::dangling().as_ptr();
+        // SAFETY: a zero-count pool writes no node.
+        unsafe { eq.init_observer_pool(nodes.as_mut_ptr(), 0, obj) };
+        assert!(eq.observer_free.is_null());
+        assert_eq!(eq.observer_count, 0);
+    }
+}

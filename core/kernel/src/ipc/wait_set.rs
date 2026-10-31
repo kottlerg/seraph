@@ -819,3 +819,110 @@ unsafe fn clear_source_backpointer(source_ptr: *mut u8, tag: WaitSetSourceTag)
         }
     }
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A set of `CAP` members over local arrays, every member occupied with
+    /// badge `100 + index`. The source pointers are never dereferenced by the
+    /// ring operations under test.
+    struct Fixture<const CAP: usize, const RING: usize>
+    {
+        members: [WaitSetMember; CAP],
+        ring: [u16; RING],
+    }
+
+    impl<const CAP: usize, const RING: usize> Fixture<CAP, RING>
+    {
+        fn new() -> Self
+        {
+            Self {
+                members: [const { WaitSetMember::vacant() }; CAP],
+                ring: [0; RING],
+            }
+        }
+
+        fn set(&mut self) -> WaitSetState
+        {
+            // SAFETY: the arrays hold CAP members and CAP + 1 ring slots and
+            // outlive the state within each test.
+            let mut ws = unsafe {
+                WaitSetState::new(
+                    CAP as u16,
+                    self.members.as_mut_ptr(),
+                    self.ring.as_mut_ptr(),
+                )
+            };
+            for (i, m) in ws.members_mut().iter_mut().enumerate()
+            {
+                *m = WaitSetMember {
+                    source_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                    source_tag: WaitSetSourceTag::Notification,
+                    badge: 100 + i as u64,
+                };
+            }
+            ws
+        }
+    }
+
+    // Defect guarded: a ring that holds one entry fewer than its capacity, or
+    // overwrites at full, or loses order across the wrap, drops or reorders
+    // ready members of a caller-sized set.
+    #[test]
+    fn ring_holds_capacity_entries_drops_the_next_and_pops_in_order_across_the_wrap()
+    {
+        let mut fx = Fixture::<3, 4>::new();
+        let mut ws = fx.set();
+        for idx in [0, 1, 2]
+        {
+            ws.push_ready(idx);
+        }
+        ws.push_ready(0);
+        assert_eq!(ws.pop_ready(), Some(100));
+        assert_eq!(ws.pop_ready(), Some(101));
+        assert_eq!(ws.pop_ready(), Some(102));
+        assert_eq!(ws.pop_ready(), None);
+        // The indices now wrap past the ring's end.
+        ws.push_ready(2);
+        ws.push_ready(0);
+        ws.push_ready(1);
+        assert_eq!(ws.pop_ready(), Some(102));
+        assert_eq!(ws.pop_ready(), Some(100));
+        assert_eq!(ws.pop_ready(), Some(101));
+        assert_eq!(ws.pop_ready(), None);
+    }
+
+    // Defect guarded: a pop that returned a removed member's badge would wake
+    // the waiter for a source no longer in the set.
+    #[test]
+    fn pop_skips_entries_of_removed_members()
+    {
+        let mut fx = Fixture::<2, 3>::new();
+        let mut ws = fx.set();
+        ws.push_ready(0);
+        ws.push_ready(1);
+        ws.members_mut()[0] = WaitSetMember::vacant();
+        assert_eq!(ws.pop_ready(), Some(101));
+        assert_eq!(ws.pop_ready(), None);
+    }
+
+    // Defect guarded: a set constructed with leftover member contents would
+    // report phantom members before any add.
+    #[test]
+    fn a_new_set_has_every_member_vacant_and_nothing_ready()
+    {
+        let mut stale = [const { WaitSetMember::vacant() }; 4];
+        for m in &mut stale
+        {
+            m.source_ptr = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        }
+        let mut ring = [9u16; 5];
+        // SAFETY: the arrays hold 4 members and 5 ring slots and outlive ws.
+        let mut ws = unsafe { WaitSetState::new(4, stale.as_mut_ptr(), ring.as_mut_ptr()) };
+        assert!(ws.members().iter().all(|m| !m.is_occupied()));
+        assert_eq!(ws.pop_ready(), None);
+        assert_eq!(ws.capacity(), 4);
+    }
+}

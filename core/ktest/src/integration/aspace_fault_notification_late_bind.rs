@@ -32,7 +32,7 @@ const UNMAPPED_ENTRY: u64 = 0x3E_2000_0000;
 const UNMAPPED_STACK: u64 = 0x3E_2000_8000;
 
 /// Distinct, non-zero correlator so a dropped/misrouted event surfaces as a
-/// wrong high word rather than a coincidental zero.
+/// wrong tag word rather than a coincidental zero.
 const CORR: u64 = 0xA5FA_0000_0000_4444;
 
 /// Poll bound: ~2 s at 1 ms/poll before declaring the thread never faulted.

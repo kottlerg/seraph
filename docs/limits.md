@@ -76,10 +76,11 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **CPU ceiling.** The binding CPU ceiling is `MAX_ORDER`: every per-CPU slab must fit one buddy
   block, and `AP_IST_STACKS` is exactly 8 MiB at `MAX_CPUS = 512`. `MAX_CPUS` itself is inline
   in the one-page `BootInfo`, and shipping two-socket servers already exceed 512 logical CPUs.
-- **Process ceiling.** Live processes stop at 32 (procmgr `MAX_PROCESSES`), then 64 (memmgr);
-  the kernel's `CSpace` registry is sized from RAM and does not bind first. Behind those sit
+- **Process ceiling.** Live processes stop at 64 (memmgr); procmgr's table grows on its heap,
+  and the kernel's `CSpace` registry is sized from RAM and does not bind first. Behind those sit
   the per-process `u32` death correlator, `badge as u32` in procmgr, logd and svcmgr, which
-  collides once tables grow, and the cap handle's 8-bit wrapping generation.
+  procmgr keeps unique among live processes by redrawing a colliding badge (#638 widens it),
+  and the cap handle's 8-bit wrapping generation.
 - **Per-process address space.** One static VA map sized to Sv39's 2^38 is used on every
   architecture. It caps each process's heap at 1 GiB, its reservation arena at 256 MiB, and its
   main stack at 1 MiB.
@@ -89,7 +90,7 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
   (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
-  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, the ktest mirrors of
+  `GEN_BITS`, the ktest mirrors of
   `MAX_SLEEPING` and `L2_SIZE`, and the svctest mirrors of the fs-fat cache constants.
 - **Spin-count timeouts.** Several deadlock detectors and device polls are counted in loop
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
@@ -428,10 +429,12 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, r
 | `ARGS_BLOB_MAX` | `shared/ipc/src/lib.rs` | 256 B | current peak plus headroom; inline in one message | none | needs a design | argv and env through a Memory cap |
 | CREATE_FROM_FILE `args_bytes`, `env_bytes` | `shared/ipc/src/lib.rs` | `u16` | encoding artefact (label bit packing) | none | needs a design | Widen with the blob design |
 | CREATE_FROM_FILE `args_count`, `env_count` | `shared/ipc/src/lib.rs` | `u8` | encoding artefact (label bit packing) | none | needs a design | Unreachable at 256 B blobs; binds once blobs grow |
-| `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 48 | unknown (the "6 IPC words" rationale is stale) | 96 B per svcmgr service | raise | One path limit |
+| `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 4096 | encoding artefact (the POSIX `PATH_MAX` convention; no message carries a whole path, and svcmgr stores each at its length) | none | correct as is | None: svcmgr's one recipe path limit |
+| `svcmgr_labels::NAME_MAX`, `NAME_WORDS` | `shared/ipc/src/lib.rs` | 64 B / 8 words | encoding artefact (a name beside the label and round header fits one message; longest name in use 15 B) | none | correct as is | None: the one svcmgr name limit, which the registry, its client, svcmgr, its parser and init's endowment share with the `pack_name` codec |
+| `QUERY_LIVE_PROCESSES` page | `shared/ipc/src/lib.rs` (`LIVE_PROCESSES_PAGE`) | `MSG_DATA_WORDS_MAX - 1` = 63 badges | per-message bound (the caller pages on) | none | correct as is | None |
 | `CREATE_SCHED_FIELD_MASK` | `shared/ipc/src/lib.rs` | 5 bits | ABI width (32 priority levels) | none | correct as is | None |
 | `BASELINE_PRIORITY_MAX`, `DEVMGR_BAND_MAX` | `shared/ipc/src/lib.rs` | 28 / 26 | encoding artefact (policy placement in 32 levels) | none | correct as is | None |
-| `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u32` | ABI width (kernel death correlator) | none | needs a design | Collides once tables grow (#638) |
+| `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u32` | ABI width (kernel death correlator) | none | needs a design | procmgr keeps the low word unique among live processes; widening is #638 |
 | `memmgr_grant_layout` caps per reply | `shared/ipc/src/lib.rs` | `MSG_CAP_SLOTS_MAX` | ABI width (4 caps per reply); a request spread over more runs fails | none | needs a design | memmgr returns a partial best-effort grant and callers loop (#642) |
 | `memmgr_bootstrap::MAX_MEMORY_CAPS` | `shared/ipc/src/lib.rs` | `(MSG_DATA_WORDS_MAX - 3) * 2` = 122 | encoding artefact (one bootstrap round) | none | needs a design | Overflow spills through init's reap donation; confirm it loses nothing (#642) |
 | phys-table index constants (`FACTS_*`, `IN_USE_*`) | `shared/ipc/src/lib.rs` | 128 to 131 | encoding artefact (one-page layout) | none | correct as is | Pin `MAX_MEMORY_CAPS <= FACTS_SYSTEM_RAM_IDX` with a const assert |
@@ -457,10 +460,10 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, r
 | `SlotAccumulator<N>.slots` | `shared/ipc/src/bootstrap.rs` | caller's `N` | per-instance | `4 * N` B | correct as is | None |
 | `request_slots` round loop | `shared/ipc/src/bootstrap.rs` | unbounded until DONE | provably unreachable (the creator is trusted) | none | correct as is | None |
 | `RECV_FAILURE_FATAL_STREAK`, `RECV_FAILURE_BACKOFF_CAP_MS`, `RecvGuard.streak` | `shared/ipc/src/recv_guard.rs` | 32 / 128 ms / `u32` | tuning (bounds no capacity) | 4 B | correct as is | None |
-| `registry::NAME_MAX` | `shared/registry/src/lib.rs` | 16 | current peak plus headroom (longest name 15 B) | per entry | raise | One name limit |
-| `Registry<N>.entries` | `shared/registry/src/lib.rs` | caller's `N` (svcmgr 16) | current peak plus headroom (set by svcmgr) | about 24 B per entry | make pay-as-you-go | Growable registry |
+| `registry::NAME_MAX` | `shared/registry/src/lib.rs` | `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | per entry | correct as is | None |
+| `Registry.entries` | `shared/registry/src/lib.rs` | heap `Vec`, one entry per published name | per-instance (a publish fails only when the heap cannot grow it) | none | correct as is | None |
 | `Entry.name_len`, `Entry.cap` | `shared/registry/src/lib.rs` | `u8`, `u32` | ABI width (cap handle); length unreachable | 5 B per entry | correct as is | None |
-| `registry-client` `NAME_MAX`, `NAME_WORDS` | `shared/registry-client/src/lib.rs` | 16 / 2 | copy of `registry::NAME_MAX` | 16 B stack | raise | Share one constant or pin with a test |
+| `registry-client` `NAME_MAX`, `NAME_WORDS` | `shared/registry-client/src/lib.rs` | re-export of `svcmgr_labels::NAME_MAX` / `NAME_WORDS` | the shared svcmgr name limit | 64 B stack | correct as is | None |
 | `REGISTRY_CAP`, `BADGEED_CAP` | `shared/registry-client`, `shared/log` | `AtomicU32` | ABI width (cap handle) | 4 B | correct as is | None (#74) |
 | log `CHUNK_SIZE` | `shared/log/src/lib.rs` | 512 | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | None |
 | log `STACK_BUF_LEN` | `shared/log/src/lib.rs` | 512 | ABI width (one `STREAM_BYTES` payload; a longer message is sent in chunks as the buffer fills) | 512 B stack per call | correct as is | None |
@@ -478,7 +481,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, r
 | ns-client `hop_count` | `shared/ns-client/src/lib.rs` | unbounded `usize` | provably unreachable (bounded by the path length) | none | correct as is | None |
 | `cap_revoke_all` `MAX_RETRIES` | `shared/syscall/src/lib.rs` | 4096 | provably unreachable (only an adversarial deriver exhausts it) | none | correct as is | None |
 | syscall wrapper argument widths | `shared/syscall/src/lib.rs` | `u32`, `u16`, `u8` | ABI width (syscall ABI) | none | correct as is | None |
-| `MAX_RELA_TABLE_SIZE` | `shared/elf/src/lib.rs` | 4 MiB | current peak plus headroom and a hostile-input bound | none | raise | Streamed; bound by file size |
+| `MAX_RELA_TABLE_SIZE` | `shared/elf/src/lib.rs` | 4 MiB, applied only by the kernel to init's table | current peak plus headroom (init is an in-tree binary; its table size arrives from the bootloader) | none | correct as is | None: the table locators bound a table by its `PT_LOAD` file data and the file instead |
 | `MAX_STREAMING_DYNAMIC`, `MAX_STREAMING_STRTAB`, `MAX_STREAMING_NOTE` | `shared/elf/src/lib.rs` | 4096 / 4096 / 64 | provably unreachable (lld output is far smaller; only fixed sections) | stack | correct as is | None |
 | `Elf64Ehdr.e_phnum`, `e_shnum` | `shared/elf/src/lib.rs` | `u16` | hardware spec (ELF64 header) | none | correct as is | None |
 | ed25519 `MSG_SCRATCH` | `shared/crypto/src/ed25519.rs` | 1024 | provably unreachable (largest RFC 8032 vector 1023 B) | 2 KiB stack | correct as is | None |
@@ -521,10 +524,10 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_PROCESSES` (`ProcessTable.entries`) | `services/procmgr/process-table/src/lib.rs` | 32 | current peak plus headroom | about 2.8 KiB stack | make pay-as-you-go | Caps live user processes at 32; growable table after the correlator widening |
-| death EQ capacity | `services/procmgr/src/main.rs` | `MAX_PROCESSES * 2` | provably unreachable while the table is fixed | about 0.6 KiB | needs a design | Growable or resync-on-full with a dynamic table |
-| `RECENT_EXITS_SLOTS` | `services/procmgr/process-table/src/lib.rs` | 16 | unknown | 384 B | raise | Rotation turns a query into UNKNOWN; size from the death rate |
-| death correlator `badge as u32` | `services/procmgr/src/process.rs`, `process-table/src/lib.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Accepted at 32 live; collides as the table grows (#638) |
+| `ProcessTable.entries` | `services/procmgr/process-table/src/lib.rs` | heap `Vec` sorted by badge | per-instance (a spawn fails only when the heap cannot grow it) | none | correct as is | None |
+| `DEATH_EQ_CAPACITY` | `services/procmgr/src/main.rs` | 256 | tuning (a drain of a full queue's worth rescans every live entry's thread state, recovering any dropped post) | about 2 KiB | correct as is | None |
+| `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
+| death correlator `correlator_of` | `services/procmgr/process-table/src/lib.rs` | low 32 bits, unique among live processes | ABI width (kernel correlator) | none | needs a design | Minting redraws a live low word; widening is #638 |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | `CreateBlobs.args_buf`, `env_buf` | `services/procmgr/process-table/src/create_blobs.rs` | 256 B each | encoding artefact (one message) | about 530 B stack | needs a design | argv and env through a Memory cap |
 | blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design |
@@ -536,7 +539,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_SLOTS` | `services/procmgr/src/main.rs` | 256 / 1024 slots | tuning (headroom over a burst of spawns) | none | correct as is | None |
 | `INIT_THREADS`, `FIRST_ROUND_CAPS` | `services/procmgr/process-table/src/init_reap.rs` | 2 / 4 | provably unreachable (fixed init protocol) | none | correct as is | None |
 | DONATE round size | `services/procmgr/src/init_reap.rs` | `MSG_CAP_SLOTS_MAX` | ABI width | none | correct as is | Loops over every cap |
-| `PROBE_SETTLE_READS` | `services/procmgr/src/init_reap.rs` | 64 reads with a yield between | unknown (yield count) | none | needs a design | When it runs out, the probe page stays out of memmgr's pool; its wall time depends on scheduling. Use a time-based bound |
+| `PROBE_SETTLE_BUDGET_NS` | `services/procmgr/src/init_reap.rs` | 500 ms of wall-clock time, a yield between reads | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
 | memory cookie, process badge | `services/procmgr/src/process.rs` | random `u64` | ABI width | none | correct as is | None |
 
 ### svcmgr and registry
@@ -545,16 +548,16 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_SERVICES` | `services/svcmgr/src/service.rs` | 16 | current peak plus headroom | about 3.5 KiB stack | make pay-as-you-go | `.svc` definitions past 16 are refused |
-| `REGISTRY_CAPACITY` | `services/svcmgr/src/main.rs` | 16 | current peak plus headroom | per entry | make pay-as-you-go | Growable registry (#75) |
-| `MAX_PENDING_REGISTRATIONS` | `services/svcmgr/src/main.rs` | `MAX_SERVICES` | encoding artefact (mirror) | about 640 B | make pay-as-you-go | Follows `MAX_SERVICES` |
-| death EQ capacity | `services/svcmgr/src/main.rs` | `MAX_SERVICES * 2` | provably unreachable while the table is fixed | small | needs a design | Re-tie to the growable table |
-| `MAX_RESTARTS` | `services/svcmgr/src/service.rs` | 1 per boot, never reset | unknown | none | needs a design | Windowed budget (#262) |
-| `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | 48 B (`MAX_PATH_LEN`) | unknown | 96 B per service | raise | One path limit |
-| `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | 32 B | unknown | 32 B each | raise | Disagrees with `registry::NAME_MAX` (16); one name limit |
+| `ServiceTable.services`, `recipes` | `services/svcmgr/src/definitions/reconcile.rs` | heap `Vec`s, one slot per supervised service, never reused | per-instance (a definition is dropped only when the heap cannot grow them) | none | correct as is | None |
+| `SvcmgrState.registry` | `services/svcmgr/src/main.rs` | growable `Registry` | per-instance | none | correct as is | None (#75) |
+| `SvcmgrState.pending` | `services/svcmgr/src/main.rs` | heap `Vec`, one per substrate round | per-instance | none | correct as is | None |
+| `DEATHS_EQ_CAPACITY` | `services/svcmgr/src/main.rs` | 64 | tuning (a drain of a full queue's worth rescans every active service's thread state) | about 0.5 KiB | correct as is | None |
+| `RESTART_BURST`, `RESTART_WINDOW_NS` (`RestartBudget`) | `services/svcmgr/svc-defs/src/restart_budget.rs` | 3 restarts per 60 s window | tuning (stops a crash loop; a rarer crash always restarts) | 16 B per service | correct as is | None (#262 for clean cap-holder restart) |
+| `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
+| `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
 | svc-defs argv and env limits | `services/svcmgr/svc-defs/src/parse.rs` | 255 / 256 B / 64 words | encoding artefact (procmgr wire) | none | needs a design | Follows the blob design |
 | restart create word check | `services/svcmgr/src/restart.rs` | `MSG_DATA_WORDS_MAX` | ABI width | none | correct as is | None |
-| reconcile correlator `idx as u32` | `services/svcmgr/src/definitions/reconcile.rs` | table index | encoding artefact | none | correct as is | A dynamic table needs a generation |
+| reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | table index, `u32` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its live thread state) | none | correct as is | None |
 | endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 6 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
 | bootstrap badge | `services/svcmgr/src/restart.rs` | random `u64` | ABI width | none | correct as is | None |
 
@@ -602,12 +605,12 @@ correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `MODULE_SCRATCH_MAX_PAGES` | `services/init/src/bootstrap.rs` | 65536 (256 MiB) | encoding artefact (init VA layout) | none | correct as is | Caps one boot module at 256 MiB |
 | `MAX_APERTURE_CAPS` (`HwCaps.apertures`) | `services/init/src/service.rs` | 32 | hardware spec mirror (boot `MAX_APERTURES` = 16) | 768 B | correct as is | Pin against the boot constant with a const assert |
 | `MAX_ACPI_REGION_CAPS` (`HwCaps.acpi_regions`) | `services/init/src/service.rs` | 8 | mirror of the kernel's 8 | 192 B | raise | Raise with the kernel bound (#637) |
-| `pack_svc_name` | `services/init/src/service.rs` | 16 B | encoding artefact (two words) | none | raise | One name limit (#643) |
+| substrate name packing | `services/init/src/service.rs` | `svcmgr_labels::NAME_MAX` (64), `pack_name` | the shared svcmgr name limit | 64 B stack | correct as is | None |
 | `mm_boot_data` | `services/init/src/main.rs` | literal 64 | ABI width (`MSG_DATA_WORDS_MAX`) | 512 B stack | correct as is | Use the constant |
 | `log_hex` buffer | `services/init/src/bootstrap.rs` | 96 B | diagnostic output cap | 96 B stack | correct as is | None |
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
-| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | procmgr `MAX_PROCESSES * 2` = 64 | follows procmgr's own death queue (a burst procmgr's queue absorbs fits, if logd drains before more deaths arrive) | about 0.6 KiB | needs a design | A full queue still drops, with a post-hoc diagnostic, and the slot leaks; a resync path replaces the coupling once procmgr's table grows (#643) |
+| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 1 KiB | correct as is | None |
 | eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Evicts every slot sharing the low bits (#638) |
 | death exit reason | `services/logd/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |

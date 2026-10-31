@@ -9,7 +9,9 @@ encoders, its captured-history byte ring (`HistoryRing`, which packs lines by le
 them back by absolute push sequence), and record of names to send again (`NameResend`), which
 init-logd (`services/init/src/logging.rs`) drives; and the receiver's chunk decoder and
 time-bounded release retry (`retry_within`), which real-logd (`services/logd/src/handover.rs`)
-drives. It also holds the line and name widths both log receivers keep per sender
+drives. It holds real-logd's death-queue resync decisions (`is_resync_candidate`,
+`decode_live_page`, `evictable`; see [`docs/ipc-interface.md`](../docs/ipc-interface.md)
+§ Death-queue resync). It also holds the line and name widths both log receivers keep per sender
 (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), and `BoundedStr`, the fixed-capacity, UTF-8-safe formatter
 logd uses for its own diagnostics. It issues no syscall and no IPC, so both ends keep the IPC
 calls and the logic stays host-reachable, per
@@ -30,6 +32,8 @@ services/logd/codec/
     ├── handover.rs             # Handover wire contract: codes, encoders,
     │                           # decoder, NameResend, release retry
     ├── history.rs              # HistoryRing: init-logd's captured history
+    ├── resync.rs               # Death-queue resync: candidates, live-page
+    │                           # decoder, eviction set
     └── bounded_str.rs          # BoundedStr: UTF-8-safe bounded formatter
 ```
 

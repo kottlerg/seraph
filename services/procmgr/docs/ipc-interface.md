@@ -26,9 +26,9 @@ Label numbers, error codes, and query states are defined in
 `START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, and
 `CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
 create call returns); procmgr identifies the target process by the badge
-`ipc_recv` delivers. Labels 14–17 are specified in § `REGISTER_DEATH_EQ`,
-§ `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, and § `QUERY_INIT_REAP`
-below. Labels 3–7 and 10
+`ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
+§ `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
+§ `QUERY_LIVE_PROCESSES` below. Labels 3–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see
 § Capability Transfer).
@@ -212,9 +212,9 @@ handle with no data words or caps.
 | data[1] | Kernel-encoded exit reason when `data[0]` is `EXITED`; 0 otherwise |
 
 A live entry whose thread the kernel reports as exited answers `EXITED` before
-procmgr reaps it. After the reap, the badge answers `EXITED` while it remains
-in procmgr's recent-exits ring; retention is best-effort, and once the ring
-rotates the badge answers `UNKNOWN`.
+procmgr reaps it. After the reap, the badge answers `EXITED` for
+`RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time, however many other
+processes die meanwhile, and `UNKNOWN` after that.
 
 ### Label 11: `CONFIGURE_PIPE`
 
@@ -361,11 +361,12 @@ Procmgr stores the cap in
 [`process::LOGD_DEATH_EQ`](../src/process.rs) and immediately
 walks its process table, calling
 `sys_thread_bind_notification(entry.thread_cap, logd_eq,
-entry.badge as u32)` on every live entry, where `entry.thread_cap` is
-the process's main thread. From that moment onward,
+correlator_of(entry.badge))` on every live entry, where `entry.thread_cap`
+is the process's main thread and the correlator is the badge's low 32 bits,
+which procmgr keeps unique among live processes. From that moment onward,
 [`finalize_creation`](../src/process.rs) also binds the same EQ on
-the main thread of every newly spawned child (correlator = process
-badge). Threads a process creates itself carry no logd binding.
+the main thread of every newly spawned child (the same correlator). Threads
+a process creates itself carry no logd binding.
 
 Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
 caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,
@@ -380,6 +381,32 @@ procmgr's CSpace (per
 [docs/capability-model.md](../../../docs/capability-model.md#transfer) § Transfer),
 so logd must retain `RECV` on its own copy to
 keep `wait_set_add` and `event_try_recv` working.
+
+---
+
+## QUERY_LIVE_PROCESSES — list live process badges
+
+Wire format:
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::QUERY_LIVE_PROCESSES` (18) |
+| caller's cap badge | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`, as for `REGISTER_DEATH_EQ`; a badge names a process handle, so the list is not public |
+| `data[0]` | `0` to start the walk, `1` to resume after the badge in `data[1]` |
+| `data[1]` | The cursor badge when `data[0]` is `1` |
+| caps | none; procmgr deletes any cap the message carried |
+
+Reply `SUCCESS` with `data[0]` = the page's count and `data[1..=count]` = the
+badges of live processes above the cursor, ascending, at most
+`LIVE_PROCESSES_PAGE` (`MSG_DATA_WORDS_MAX - 1` = 63). A page shorter than that
+ends the walk; a full page is followed by a call resuming after its last badge.
+A process that stays live across the whole walk is listed exactly once,
+whatever spawns and deaths happen between pages. `UNAUTHORIZED` for any other
+badge; `INVALID_ARGUMENT` for a `data[0]` other than 0 or 1.
+
+Real-logd walks it to resync its slots after its death queue may have dropped a
+post (see [logd IPC interface](../../logd/docs/ipc-interface.md) § Death-queue
+resync), from a helper thread rather than its main thread.
 
 ---
 
@@ -478,8 +505,10 @@ into init's CSpace through its CSpace capability after the donation step and
 before the revoke and delete. Freeing init's CSpace releases the endpoint, whose
 bytes return to the grant, and nothing else retypes from or returns bytes to the
 grant. procmgr reads the grant's `available_bytes` before the move and again after
-the revoke and delete, re-reading up to 64 times with a yield between reads (a
-concurrent syscall pin on init's CSpace defers its free to the pin's release). It
+the revoke and delete, re-reading with a yield between reads for up to 500 ms of
+wall-clock time (a concurrent syscall pin on init's CSpace defers its free to the
+pin's release, and a time bound outlasts a loaded scheduler that stretches each
+yield). It
 reports `RELEASED` once the value rose, and returns the page to memmgr
 (`RELEASE_MEMORY_CAPS`); otherwise it reports `HELD` and keeps the page, which the
 endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.

@@ -5,10 +5,10 @@
 
 //! Pure GUID Partition Table parsing.
 //!
-//! Decodes a GPT header and partition entries from raw sector bytes, and
+//! Decodes a GPT header and partition entries from raw block bytes, and
 //! resolves a partition by type GUID with Discoverable-Partitions-Specification
-//! priority tie-breaking. This crate performs no I/O: a caller reads sectors
-//! off a block device (over IPC, in `vfsd`) and hands the bytes here. Keeping
+//! priority tie-breaking. This crate performs no I/O: a caller reads logical
+//! blocks off a block device (over IPC, in `vfsd`) and hands the bytes here. Keeping
 //! the parse of untrusted on-disk structures pure and host-testable is the
 //! point — see [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
@@ -18,8 +18,17 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// Sector size for block I/O. The GPT header lives in one sector.
-pub const SECTOR_SIZE: usize = 512;
+/// Largest logical block size the parser takes. A GPT's LBAs are in the
+/// device's logical block size (UEFI 2.10 §5.3: the header sits at LBA 1 and
+/// every LBA it names is in that unit), which the caller reads from the
+/// device; 4096 is the largest the block driver serves
+/// (`virtio_blk::MAX_BLOCK_SIZE`), and one buffer of it lives on the stack
+/// during [`collect_partitions`].
+pub const MAX_BLOCK_SIZE: usize = 4096;
+
+/// Smallest logical block size: the GPT header and an entry of the spec's
+/// minimum size both fit it.
+pub const MIN_BLOCK_SIZE: usize = 512;
 
 /// A discovered GPT partition.
 ///
@@ -43,12 +52,14 @@ pub struct GptEntry
 /// `num_parts * entry_size`-byte array lies between LBA 2 and the header's
 /// own first usable LBA. That holds the array to the layout the header
 /// declares; it is only as trustworthy as `first_usable_lba`, which comes
-/// from the same sector.
+/// from the same block. `block_size` is the length of the block the header
+/// was parsed from, the unit of every LBA here.
 pub struct GptHeader
 {
     pub part_entry_lba: u64,
     pub num_parts: u32,
     pub entry_size: u32,
+    pub block_size: u32,
 }
 
 /// GPT parsing error.
@@ -60,8 +71,11 @@ pub enum GptError
     /// GPT header signature is not "EFI PART".
     InvalidSignature,
     /// Partition entry size is not one the GPT spec permits within one
-    /// sector: `128 * 2^n` bytes, so `128`, `256`, or `512`.
+    /// block: `128 * 2^n` bytes, no larger than the block.
     InvalidEntrySize,
+    /// The block handed to [`parse_header`] is not a power of two from
+    /// [`MIN_BLOCK_SIZE`] to [`MAX_BLOCK_SIZE`] bytes.
+    InvalidBlockSize,
     /// The partition-entry array does not lie where the GPT spec places it:
     /// it starts before LBA 2 (over the protective MBR or the header), or its
     /// `num_parts * entry_size` bytes run past `first_usable_lba`, the first
@@ -69,31 +83,43 @@ pub enum GptError
     InvalidEntryArray,
 }
 
-/// Parse and validate the GPT header from sector 1.
+/// Parse and validate the GPT header from `block`, the logical block at LBA 1;
+/// its length is the device's logical block size.
 ///
 /// Checks the `EFI PART` signature and that `entry_size` is one the GPT spec
-/// permits (`128 * 2^n`) and fits one sector. The entry-size check matters: the
-/// partition-array walk tiles each sector from offset 0 with
-/// `SECTOR_SIZE / entry_size` entries, which reads every entry at its true
-/// offset only when `entry_size` divides the sector, and `parse_entry` reads 56
+/// permits (`128 * 2^n`) and fits one block. The entry-size check matters: the
+/// partition-array walk tiles each block from offset 0 with
+/// `block_size / entry_size` entries, which reads every entry at its true
+/// offset only when `entry_size` divides the block, and `parse_entry` reads 56
 /// bytes per entry.
 ///
 /// Also checks that the entry array lies between LBA 2 and the header's
 /// `first_usable_lba`, as the GPT spec places it, so a `num_parts` that
 /// disagrees with the header's own layout is refused rather than walked.
-/// The check trusts `first_usable_lba`, which the same sector supplies: a
+/// The check trusts `first_usable_lba`, which the same block supplies: a
 /// header that also inflates it still passes, and its walk is then bounded
 /// only by the device (a read past its capacity fails) and by memory
 /// ([`collect_partitions`] stops with [`ScanStop`] either way). The header
 /// and entry-array CRC32s are not checked.
 ///
 /// # Errors
-/// Returns [`GptError::InvalidSignature`] when the `EFI PART` signature is
-/// absent, [`GptError::InvalidEntrySize`] when `entry_size` is not `128`,
-/// `256`, or `512`, or [`GptError::InvalidEntryArray`] when the entry array
-/// starts before LBA 2 or ends past `first_usable_lba`.
-pub fn parse_header(sector: &[u8; SECTOR_SIZE]) -> Result<GptHeader, GptError>
+/// Returns [`GptError::InvalidBlockSize`] when `block` is not a supported
+/// block size, [`GptError::InvalidSignature`] when the `EFI PART` signature
+/// is absent, [`GptError::InvalidEntrySize`] when `entry_size` is not
+/// `128 * 2^n` or exceeds the block, or [`GptError::InvalidEntryArray`] when
+/// the entry array starts before LBA 2 or ends past `first_usable_lba`.
+pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
 {
+    let Ok(block_size) = u32::try_from(block.len())
+    else
+    {
+        return Err(GptError::InvalidBlockSize);
+    };
+    if !block.len().is_power_of_two() || !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block.len())
+    {
+        return Err(GptError::InvalidBlockSize);
+    }
+    let sector = block;
     if &sector[0..8] != b"EFI PART"
     {
         return Err(GptError::InvalidSignature);
@@ -102,14 +128,12 @@ pub fn parse_header(sector: &[u8; SECTOR_SIZE]) -> Result<GptHeader, GptError>
     let part_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap_or([0; 8]));
     let num_parts = u32::from_le_bytes(sector[80..84].try_into().unwrap_or([0; 4]));
     let entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap_or([0; 4]));
-    if !(128..=512).contains(&entry_size) || !entry_size.is_power_of_two()
+    if !(128..=block_size).contains(&entry_size) || !entry_size.is_power_of_two()
     {
         return Err(GptError::InvalidEntrySize);
     }
-    // Cast is range-safe: SECTOR_SIZE is 512.
-    #[allow(clippy::cast_possible_truncation)]
-    let entries_per_sector = SECTOR_SIZE as u32 / entry_size;
-    let array_sectors = u64::from(num_parts.div_ceil(entries_per_sector));
+    let entries_per_block = block_size / entry_size;
+    let array_sectors = u64::from(num_parts.div_ceil(entries_per_block));
     let array_fits = part_entry_lba >= 2
         && part_entry_lba
             .checked_add(array_sectors)
@@ -122,6 +146,7 @@ pub fn parse_header(sector: &[u8; SECTOR_SIZE]) -> Result<GptHeader, GptError>
         part_entry_lba,
         num_parts,
         entry_size,
+        block_size,
     })
 }
 
@@ -167,7 +192,7 @@ pub fn parse_entry(entry: &[u8]) -> Option<GptEntry>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanStop
 {
-    /// Reading the entry-array sector at this LBA failed, or its LBA
+    /// Reading the entry-array block at this LBA failed, or its LBA
     /// overflowed `u64`.
     ReadFailed
     {
@@ -190,27 +215,40 @@ pub struct PartitionScan
 /// Walk the partition-entry array `header` describes and collect every used
 /// entry, however many the header declares.
 ///
-/// `read_sector(lba, buf)` fills `buf` with the sector at `lba` and returns
-/// whether the read succeeded; the walk reads the array's sectors in order
-/// starting at `header.part_entry_lba`, tiling each with
-/// `SECTOR_SIZE / entry_size` entries, and checks exactly `num_parts`
-/// entries. The list grows on the heap, one element per used entry, so its
-/// size follows the disk, not a fixed table.
+/// `read_block(lba, buf)` fills `buf`, `header.block_size` bytes long, with
+/// the logical block at `lba` and returns whether the read succeeded; the
+/// walk reads the array's blocks in order starting at
+/// `header.part_entry_lba`, tiling each with `block_size / entry_size`
+/// entries, and checks exactly `num_parts` entries. The list grows on the
+/// heap, one element per used entry, so its size follows the disk, not a
+/// fixed table. A header whose block size or entry size [`parse_header`]
+/// would refuse yields an empty scan stopped at its first LBA.
 pub fn collect_partitions(
     header: &GptHeader,
-    mut read_sector: impl FnMut(u64, &mut [u8; SECTOR_SIZE]) -> bool,
+    mut read_sector: impl FnMut(u64, &mut [u8]) -> bool,
 ) -> PartitionScan
 {
     let mut entries = Vec::new();
-    let mut sector = [0u8; SECTOR_SIZE];
-    // Cast is range-safe: SECTOR_SIZE is 512.
-    #[allow(clippy::cast_possible_truncation)]
-    let entries_per_sector = SECTOR_SIZE as u32 / header.entry_size;
+    let mut block = [0u8; MAX_BLOCK_SIZE];
+    let block_size = header.block_size as usize;
+    if block_size > MAX_BLOCK_SIZE
+        || header.entry_size < 128
+        || header.entry_size > header.block_size
+    {
+        return PartitionScan {
+            entries,
+            stop: Some(ScanStop::ReadFailed {
+                lba: header.part_entry_lba,
+            }),
+        };
+    }
+    let sector = &mut block[..block_size];
+    let entries_per_sector = header.block_size / header.entry_size;
     let mut remaining = header.num_parts;
     let mut lba = header.part_entry_lba;
     while remaining > 0
     {
-        if !read_sector(lba, &mut sector)
+        if !read_sector(lba, sector)
         {
             return PartitionScan {
                 entries,
@@ -319,11 +357,17 @@ mod tests
 {
     use super::*;
 
-    /// A header sector whose first usable LBA is 34, where a default
+    /// A 512-byte header block whose first usable LBA is 34, where a default
     /// 128-entry, 128-byte array from LBA 2 ends.
-    fn header_sector(sig: &[u8; 8], part_lba: u64, num: u32, esize: u32) -> [u8; SECTOR_SIZE]
+    fn header_sector(sig: &[u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
     {
-        let mut s = [0u8; SECTOR_SIZE];
+        header_block(512, sig, part_lba, num, esize)
+    }
+
+    /// A `size`-byte header block whose first usable LBA is 34.
+    fn header_block(size: usize, sig: &[u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
+    {
+        let mut s = vec![0u8; size];
         s[0..8].copy_from_slice(sig);
         s[40..48].copy_from_slice(&34u64.to_le_bytes());
         s[72..80].copy_from_slice(&part_lba.to_le_bytes());
@@ -351,6 +395,46 @@ mod tests
         assert_eq!(h.part_entry_lba, 2);
         assert_eq!(h.num_parts, 128);
         assert_eq!(h.entry_size, 128);
+        assert_eq!(h.block_size, 512);
+    }
+
+    #[test]
+    fn parse_header_of_a_4kn_block_sizes_the_array_in_4096_byte_blocks()
+    {
+        // 128 entries of 128 bytes fill four 4 KiB blocks (LBAs 2..6), so an
+        // array ending at LBA 6 fits; read as 512-byte blocks it would need
+        // 32 and be refused against the same first usable LBA.
+        let mut s = header_block(4096, b"EFI PART", 2, 128, 128);
+        s[40..48].copy_from_slice(&6u64.to_le_bytes());
+        let h = parse_header(&s).ok().expect("4Kn header");
+        assert_eq!(h.block_size, 4096);
+        s.truncate(512);
+        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+    }
+
+    #[test]
+    fn parse_header_accepts_an_entry_as_large_as_a_4kn_block()
+    {
+        assert!(parse_header(&header_block(4096, b"EFI PART", 2, 1, 4096)).is_ok());
+        assert!(matches!(
+            parse_header(&header_block(4096, b"EFI PART", 2, 1, 8192)),
+            Err(GptError::InvalidEntrySize)
+        ));
+    }
+
+    #[test]
+    fn parse_header_rejects_unsupported_block_sizes()
+    {
+        for size in [256, 1000, 8192]
+        {
+            assert!(
+                matches!(
+                    parse_header(&header_block(size, b"EFI PART", 2, 1, 128)),
+                    Err(GptError::InvalidBlockSize)
+                ),
+                "block size {size}"
+            );
+        }
     }
 
     #[test]
@@ -471,22 +555,22 @@ mod tests
         disk
     }
 
-    /// A `read_sector` over `disk` placed at LBA 2 that fails at `fail_lba`
+    /// A `read_block` over `disk` placed at LBA 2 that fails at `fail_lba`
     /// and past the array, recording each LBA it is asked for in `reads`.
     fn reader<'a>(
         disk: &'a [u8],
         fail_lba: Option<u64>,
         reads: &'a mut Vec<u64>,
-    ) -> impl FnMut(u64, &mut [u8; SECTOR_SIZE]) -> bool + 'a
+    ) -> impl FnMut(u64, &mut [u8]) -> bool + 'a
     {
         move |lba, buf| {
             reads.push(lba);
-            let off = (lba - 2) as usize * SECTOR_SIZE;
-            if Some(lba) == fail_lba || off + SECTOR_SIZE > disk.len()
+            let off = (lba - 2) as usize * buf.len();
+            if Some(lba) == fail_lba || off + buf.len() > disk.len()
             {
                 return false;
             }
-            buf.copy_from_slice(&disk[off..off + SECTOR_SIZE]);
+            buf.copy_from_slice(&disk[off..off + buf.len()]);
             true
         }
     }
@@ -497,7 +581,24 @@ mod tests
             part_entry_lba: 2,
             num_parts,
             entry_size,
+            block_size: 512,
         }
+    }
+
+    #[test]
+    fn collect_tiles_4kn_blocks_with_32_entries_each()
+    {
+        let disk = entry_array(128, 128, |i| i == 0 || i == 33 || i == 127);
+        let mut reads = Vec::new();
+        let h = GptHeader {
+            block_size: 4096,
+            ..header(128, 128)
+        };
+        let scan = collect_partitions(&h, reader(&disk, None, &mut reads));
+        assert_eq!(scan.stop, None);
+        let firsts: Vec<u64> = scan.entries.iter().map(|e| e.first_lba).collect();
+        assert_eq!(firsts, vec![1000, 34_000, 128_000]);
+        assert_eq!(reads, vec![2, 3, 4, 5]);
     }
 
     #[test]
@@ -553,6 +654,7 @@ mod tests
             part_entry_lba: u64::MAX,
             num_parts: 8,
             entry_size: 128,
+            block_size: 512,
         };
         let mut reads = Vec::new();
         let scan = collect_partitions(&header, |lba, _| {

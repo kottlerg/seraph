@@ -4390,9 +4390,10 @@ mod tests
     }
 
     /// Add to the model a tree of CSpaces under `root`: `width` CSpaces per
-    /// CSpace to `depth` levels, each also holding an endpoint and a thread,
-    /// and below the first level the level's first CSpace also held by the
-    /// previous level's last, in another subtree.
+    /// CSpace to `depth` levels, each non-leaf CSpace (the root included)
+    /// also holding an endpoint and a thread, and below the first level the
+    /// level's first CSpace also held by the previous level's last, in
+    /// another subtree.
     fn add_nested_cspaces(
         types: &mut Vec<ObjectType>,
         holds: &mut Vec<Vec<usize>>,

@@ -1075,7 +1075,7 @@ specific slot numbers.
 | 2 | 7 | Mmio capabilities, Map and Write rights (one over the kernel console UART on RISC-V, then one per validated `BootInfo.mmio_apertures` entry) |
 | 3 | 7 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
 | 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture) |
-| 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, up to eight, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
+| 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, as many as the map reports, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
 | 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
 | 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
 | 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |

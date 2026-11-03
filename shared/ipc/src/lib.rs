@@ -1445,7 +1445,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 11;
+pub const DEVMGR_LABELS_VERSION: u32 = 12;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1460,14 +1460,24 @@ pub mod devmgr_labels
     /// driver for every block device it enumerates and can give a private
     /// IRQ line (one whose line another device already holds is not served,
     /// #664); `data[1]`, when sent, selects which: an ordinal over the
-    /// running block drivers in PCI segment, bus, device, function order,
-    /// not stable across boots (a device added, removed, or failing its
-    /// spawn shifts the ones after it). An absent `data[1]` is 0, the first.
-    /// Caller's badge must have [`BLOCK_DEVICE_AUTHORITY`] set; the handler
-    /// replies `UNAUTHORIZED` otherwise, and `INVALID_REQUEST` when no block
-    /// driver runs at that ordinal or the derivation fails.
+    /// served block drivers in PCI segment, bus, device, function order,
+    /// not stable across boots. A driver is served once it has reported its
+    /// device ready ([`DRIVER_READY`]); one whose spawn failed, or that died
+    /// before reporting (its device setup failed), is not, and counts in no
+    /// ordinal, so a device added, removed, or failing either way shifts the
+    /// ones after it. devmgr settles every block driver before it serves this
+    /// label, so the ordinals do not change while a client probes them. An
+    /// absent `data[1]` is 0, the first. Caller's badge must have
+    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
+    /// otherwise, and `INVALID_REQUEST` when no block driver is served at
+    /// that ordinal or the derivation fails.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
+    ///
+    /// Served on devmgr's registry endpoint (the framebuffer driver's query
+    /// cap) and, while a `VirtIO` PCI driver's spawn batch settles, on that
+    /// batch's private driver endpoint (the virtio-blk and virtio-input
+    /// drivers' query caps; see [`DRIVER_READY`]).
     ///
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
@@ -1624,14 +1634,17 @@ pub mod devmgr_labels
     /// Mints an `input_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on
     /// the service endpoint of one input driver to the caller. devmgr spawns
     /// a driver for every input device it enumerates; `data[1]`, when sent,
-    /// selects which: an ordinal over the running input drivers in PCI
-    /// segment, bus, device, function order, not stable across boots. An
-    /// absent `data[1]` is 0, the first. Caller's badge must have
-    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
-    /// otherwise. Like [`QUERY_RTC_DEVICE`], it replies `NO_DEVICE` until
-    /// the on-disk drivers are spawned, and for the rest of the boot when
-    /// no input driver runs at that ordinal (none enumerated there, or its
-    /// spawn failed); `INVALID_REQUEST` when the derivation fails. The verb
+    /// selects which: an ordinal over the served input drivers in PCI
+    /// segment, bus, device, function order, not stable across boots. A
+    /// driver is served once it has reported its device ready
+    /// ([`DRIVER_READY`]); one whose spawn failed, or that died before
+    /// reporting, counts in no ordinal. An absent `data[1]` is 0, the first.
+    /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise. Like [`QUERY_RTC_DEVICE`], it
+    /// replies `NO_DEVICE` until the on-disk drivers are spawned and settled,
+    /// and for the rest of the boot when no input driver is served at that
+    /// ordinal (none enumerated there, its spawn failed, or it died before
+    /// reporting ready); `INVALID_REQUEST` when the derivation fails. The verb
     /// is transport-agnostic: any keyboard backend (virtio-input today,
     /// USB HID / PS-2 later) registers this one slot, so consumers never
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
@@ -1675,6 +1688,21 @@ pub mod devmgr_labels
     /// may badge an un-badged SEND itself
     /// (docs/capability-model.md § Verb-bit authority pattern).
     pub const TEST_DENY_BADGE: u64 = 1;
+
+    /// Driver-only: report that the driver has set its device up and is
+    /// entering its service loop, so devmgr may serve its endpoint.
+    ///
+    /// Sent by a `VirtIO` PCI driver (virtio-blk, virtio-input) on its
+    /// round-2 devmgr query cap, a SEND badged with its device badge on the
+    /// private driver endpoint of its spawn batch; the registry endpoint
+    /// replies `UNKNOWN_OPCODE` to it. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Reply: `SUCCESS` when the badge names
+    /// a driver of the batch that has not died (a repeated report included);
+    /// `INVALID_REQUEST` otherwise, and the driver then exits, since devmgr
+    /// will not serve it. devmgr serves the label only until the batch
+    /// settles, every driver of it having reported ready or died, and then
+    /// revokes the private endpoint.
+    pub const DRIVER_READY: u64 = 13;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
     /// u64 bit, gating the device-endpoint queries ([`QUERY_SERIAL_DEVICE`],

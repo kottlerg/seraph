@@ -1160,8 +1160,9 @@ pub fn finalize_memmgr(
     // contiguous prefix — the loop breaks on the first memory cap it cannot
     // forward). `memory_base + alloc.next_idx` is now the reap floor:
     // every memory cap at or above it is still solely init's, never
-    // handed out by `MemoryAlloc` nor forwarded here, and is donated to
-    // memmgr's pool via the reap route, which has no per-round cap.
+    // handed out by `MemoryAlloc` nor forwarded here, and every
+    // descriptor-bearing one is donated to memmgr's pool via the reap route,
+    // which has no per-round cap.
     alloc.next_idx += mm_memory_count;
 
     // Forward the partial tail left in `alloc.current`: the unallocated

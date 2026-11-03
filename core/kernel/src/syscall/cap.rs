@@ -1125,8 +1125,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: pointers are inside the freshly-allocated retype slot.
     // Both the wrapper and the TCB land on page 4 of the slot, so they
     // are 8-byte aligned (page-aligned, in fact). The kstack pages are
-    // intentionally left uninitialised — they are written from the top
-    // down by the first context switch, and `kstack_top` excludes the
+    // painted above (`stack_depth::paint`), and `kstack_top` excludes the
     // wrapper page.
     unsafe {
         core::ptr::write(

@@ -503,8 +503,8 @@ cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeo
     --save-logs $T
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
-# run, at 1x, takes ~58 s; the 128-vCPU run, at 8x vCPU oversubscription,
-# ~75 s, since idle vCPUs halt; each budget is for HANG classification, see
+# run, at 1x, takes ~60 s; the 128-vCPU run, at 8x vCPU oversubscription,
+# ~78 s, since idle vCPUs halt; each budget is for HANG classification, see
 # below):
 cargo xtask clean
 cargo xtask build

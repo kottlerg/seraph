@@ -198,8 +198,9 @@ already holds is not served until shared lines are,
 [#664](https://github.com/kottlerg/seraph/issues/664)), each with its own service endpoint.
 `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one of those drivers by an optional instance
 ordinal in `data[1]` (absent means the first): the ordinal counts the running drivers of that class
-in PCI segment, bus, device, function order, and is not stable across boots. vfsd and the terminal
-send none, so they bind the first instance.
+in PCI segment, bus, device, function order, and is not stable across boots. vfsd queries every
+block ordinal from 0 until the reply is not `SUCCESS` and holds every disk; the terminal sends
+none, so it binds the first input instance.
 
 ### Driver binary sources
 

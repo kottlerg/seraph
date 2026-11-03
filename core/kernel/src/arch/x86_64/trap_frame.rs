@@ -229,9 +229,10 @@ impl TrapFrame
     /// this to `SyscallError::InvalidArgument`.
     pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>
     {
-        // Canonical user address: bits [63:47] must all be zero.
-        const USER_ADDR_MASK: u64 = 0xFFFF_8000_0000_0000;
-        if self.rip & USER_ADDR_MASK != 0 || self.rsp & USER_ADDR_MASK != 0
+        // Canonical user address: below the boot paging depth's lower-half
+        // limit (`1 << 47`, or `1 << 56` under `CR4.LA57`).
+        let limit = super::paging::user_canonical_limit();
+        if self.rip >= limit || self.rsp >= limit
         {
             return Err(());
         }

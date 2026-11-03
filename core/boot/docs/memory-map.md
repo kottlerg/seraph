@@ -122,6 +122,8 @@ The `Loaded` allocations are:
 - Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB).
 - Page-table frames allocated for the initial mapping (see
   [page-tables.md](page-tables.md)).
+- The x86-64 LA57 toggle page (`EfiLoaderCode`), when the handoff changes the paging
+  depth; it is reclaimed with the page-table frames.
 
 ---
 

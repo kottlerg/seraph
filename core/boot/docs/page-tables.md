@@ -29,7 +29,8 @@ bootloader *builds*, described in later sections — is:
   the framebuffer when present, and the UART MMIO page on RISC-V, so the kernel can read
   them using physical addresses before its own direct-physical map is established.
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
-  continues across the root-table switch.
+  continues across the root-table switch (on x86-64, the LA57 toggle trampoline's page when
+  the handoff changes the paging depth, § x86-64: Negotiated Paging Depth).
 - Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the
   device tree, which `BootInfo` references, are not mapped.
 
@@ -58,9 +59,9 @@ This allows the kernel to read them using physical addresses before its direct p
 map is established in
 [Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
 
-**Handoff trampoline** — the page or pages holding the handoff trampoline are
-identity-mapped read-execute, so the instruction fetch after the root-table switch
-resolves.
+**Handoff trampoline** — the page or pages holding the handoff trampoline (on x86-64, the
+LA57 toggle page when the handoff changes the paging depth) are identity-mapped
+read-execute, so the instruction fetch after the root-table switch resolves.
 
 **Handoff stack** — the bootloader allocates the kernel's entry stack
 (`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages`, identity-maps it with read-write,
@@ -111,15 +112,30 @@ architecture's module as `arch::current`, whose `mod.rs` re-exports its
 
 ---
 
-## x86-64: 4-Level Paging
+## x86-64: Negotiated Paging Depth
+
+### Depth negotiation
+
+The paging depth is selected at boot, before the tables are built: 5-level paging
+(`CR4.LA57`) when `CPUID.(EAX=07H,ECX=0):ECX[16]` reports LA57, 4-level otherwise. The
+bootloader has no override knob of its own; a test host selects the depth by the CPU it
+presents (`cargo xtask --x86-paging`, [xtask/README.md](../../../xtask/README.md)). The
+firmware runs one of the two depths itself, which the bootloader reads from its `CR4.LA57`.
+When the negotiated depth differs from the firmware's, the handoff must change `CR4.LA57`,
+which the CPU accepts only outside IA-32e mode; the bootloader then reserves one
+`EfiLoaderCode` page below 4 GiB and copies the LA57 toggle trampoline into it (§ Activation).
+When no such page can be allocated, or the assembled trampoline does not fit one (the page is
+then freed), the bootloader keeps the firmware's depth, which needs no toggle. The negotiated
+depth, the firmware's, and the handoff path are printed at step 5.
 
 ### Hierarchy
 
-x86-64 with 4-level paging uses a four-level hierarchy indexed by bits of the virtual
-address:
+The negotiated depth fixes the hierarchy: four levels at 4-level paging, five at 5-level.
+Every level indexes 512 eight-byte entries with 9 VA bits above the 12-bit page offset:
 
 ```
 Virtual address bits:
+  [56:48] → PML5 index (512 entries, 4 KiB table; 5-level only)
   [47:39] → PML4 index (512 entries, 4 KiB table)
   [38:30] → PML3 (PDPT) index (512 entries, 4 KiB table)
   [29:21] → PML2 (PD) index (512 entries, 4 KiB table)
@@ -127,9 +143,10 @@ Virtual address bits:
   [11:0]  → Byte offset within the 4 KiB page
 ```
 
-The root table (PML4) occupies one 4 KiB frame. Each entry is a 64-bit value. Present
-entries in PML4, PML3, and PML2 point to the next-level table's physical frame. PML1
-entries (PTEs) point to the final 4 KiB data frame.
+The root table (PML5 or PML4) occupies one 4 KiB frame, allocated below 4 GiB because the
+LA57 toggle trampoline loads it into `CR3` with paging off, in legacy protected mode, with a
+32-bit move. Each entry is a 64-bit value. Present entries above PML1 point to the next-level
+table's physical frame. PML1 entries (PTEs) point to the final 4 KiB data frame.
 
 ### PTE Format
 
@@ -159,22 +176,43 @@ writable with NX=0, leaving the permission to the leaf); `map` returns
 
 ### Intermediate Table Allocation
 
-Each new PML3, PML2, or PML1 table requires one 4 KiB frame. Frames are allocated
+Each new intermediate table requires one 4 KiB frame. Frames are allocated
 via `AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &addr)` and zeroed before use.
 Zeroing ensures absent entries have `P=0` (not present); the hardware never walks
 an absent entry regardless of other bits.
 
 ### Activation
 
-Activation writes the root PML4's physical address to `CR3`. The write
-flushes all non-global TLB entries; the bootloader sets no Global bit
-(`G=0` in every PTE), so none of its translations is global, and the
-trampoline does not toggle `CR4.PGE`, so a global entry left by the
-firmware's tables is not flushed by this write. Interrupts
-are disabled at activation time; the required mappings are all present
-before `CR3` is written. See
+When the negotiated depth equals the firmware's, activation writes the root table's physical
+address to `CR3`. The write flushes all non-global TLB entries; the bootloader sets no
+Global bit (`G=0` in every PTE), so none of its translations is global, and the
+trampoline does not toggle `CR4.PGE`, so a global entry left by the firmware's tables is not
+flushed by this write.
+
+When the depths differ, the handoff jumps, under the firmware's tables, to the LA57 toggle
+trampoline in its page below 4 GiB, which is identity-mapped read-execute in the new tables
+(§ Contract at Kernel Entry). The trampoline:
+
+1. stores the root address, the `CR4.LA57` value, the kernel entry, the `BootInfo` address,
+   and the stack top into its page's parameter block, since the upper halves of the
+   general-purpose registers are undefined after a pass through legacy protected mode;
+2. clears `CR4.PCIDE` (paging cannot be disabled while it is set), loads a GDT held in its
+   page (64-bit code, 32-bit code, and flat data descriptors, written with the accessed bit
+   set so no segment load writes the page once it is read-only), and far-jumps to the 32-bit
+   code segment, entering compatibility mode;
+3. clears `CR0.PG`, which leaves IA-32e mode (`IA32_EFER.LMA = 0`) and turns paging off;
+4. sets or clears `CR4.LA57` and loads `CR3` with the new root;
+5. sets `CR0.PG`, which re-enters IA-32e mode (`IA32_EFER.LME` stayed set) on the new tables
+   at the negotiated depth, and far-jumps to the 64-bit code segment;
+6. loads the stack pointer and the `BootInfo` argument and jumps to the kernel entry.
+
+Turning paging off flushes every TLB entry, global ones included. The kernel is then entered
+with `GDTR` naming the trampoline page's GDT, which it replaces in Phase 5
+([kernel-handoff.md](kernel-handoff.md)). Interrupts are disabled at activation on either
+path, and the required mappings are all present before `CR3` is written. See
 [`core/boot/src/arch/x86_64/handoff.rs`](../src/arch/x86_64/handoff.rs)
-(`_handoff_trampoline`, `perform_handoff`) for the asm and its SAFETY justification.
+(`_handoff_trampoline`, `_la57_toggle`, `perform_handoff`) for the asm and its SAFETY
+justification.
 
 ---
 
@@ -290,7 +328,9 @@ policy violation.
 
 Each arch-specific `BootPageTable` records the physical address of every
 frame it allocates from `AllocatePages` — the root table and every
-intermediate table allocated during `map` — in an inline `frame_log`.
+intermediate table allocated during `map` — in an inline `frame_log`; the
+x86-64 builder also records the LA57 toggle page when one is installed,
+which is dead once the kernel has replaced the boot GDT and tables.
 After [step 8](boot-flow.md#step-8-exitbootservices),
 [step 9](boot-flow.md#step-9-populate-bootinfo) reads this log via the trait method
 `PageTableBuilder::allocated_frames` and appends one

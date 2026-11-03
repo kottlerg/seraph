@@ -19,11 +19,13 @@
 //! 0x018  Padding
 //! 0x020  RM far-jmp target (6 B): [u32: AP_PAGE+0x90, u16: 0x08]  — BSP-patched
 //! 0x026  Padding
+//! 0x028  CR4 paging bits (u32): PAE, plus LA57 at 5-level — BSP-patched
+//! 0x02C  Padding
 //! 0x040  GDTR descriptor (6 B): [u16: limit=0x1F, u32: base=AP_PAGE+0x48] — BSP-patched
 //! 0x046  Padding
 //! 0x048  GDT (32 bytes, 4 entries): null, code32, code64, data
-//! 0x068  AP params (40 bytes): pml4_phys, cpu_id, stack_top, entry_fn, ist1_top, ist2_top
-//! 0x090  PM32 code (95 bytes): set segs, load CR3, enable PAE/LME/NXE/PG/WP,
+//! 0x068  AP params (40 bytes): root_phys, cpu_id, stack_top, entry_fn, ist1_top, ist2_top
+//! 0x090  PM32 code (95 bytes): set segs, load CR3, enable PAE (+LA57)/LME/NXE/PG/WP,
 //!        far-jmp to LM64 (0xA3–0xB4 are NOP padding)
 //! 0x0EF  Padding
 //! 0x0F8  LM64 far-jmp target (6 B): [u32: AP_PAGE+0x100, u16: 0x10] — BSP-patched
@@ -50,6 +52,13 @@
 /// Layout: [u32 little-endian: `AP_PAGE+0x90`, u16 little-endian: 0x0008].
 pub const TRAMP_PATCH_RM_FAR_JMP: usize = 0x20;
 
+/// Offset of the `u32` CR4 paging bits the PM32 code ORs into CR4 before it
+/// enables paging: `CR4.PAE`, plus `CR4.LA57` when the BSP runs 5-level
+/// paging, so the AP walks the kernel root at the BSP's depth. `CR4.LA57`
+/// can change only outside IA-32e mode, so the AP sets it here, with paging
+/// off.
+pub const TRAMP_PATCH_CR4: usize = 0x28;
+
 /// Offset of the GDTR descriptor within the trampoline page.
 /// Layout: [u16: GDT limit = 0x001F, u32: GDT linear base = `AP_PAGE+0x48`].
 pub const TRAMP_PATCH_GDTR: usize = 0x40;
@@ -58,7 +67,7 @@ pub const TRAMP_PATCH_GDTR: usize = 0x40;
 ///
 /// Layout (40 bytes):
 /// ```text
-/// +0  pml4_phys: u32   — physical address of kernel root page table
+/// +0  root_phys: u32   — physical address of kernel root page table
 /// +4  cpu_id:    u32   — logical CPU index for this AP
 /// +8  stack_top: u64   — kernel stack top (loaded into RSP before jumping)
 /// +16 entry_fn:  u64   — virtual address of kernel_entry_ap
@@ -77,7 +86,7 @@ pub const TRAMP_PATCH_LM64_FAR_JMP: usize = 0xF8;
 
 // ── Param sub-offsets (relative to TRAMP_PARAMS) ─────────────────────────────
 
-const PARAM_PML4: usize = 0; // u32
+const PARAM_ROOT: usize = 0; // u32
 const PARAM_CPU_ID: usize = 4; // u32
 const PARAM_STACK: usize = 8; // u64
 const PARAM_ENTRY_FN: usize = 16; // u64
@@ -100,6 +109,14 @@ const GDT_CODE64: u64 = 0x0020_9A00_0000_0000;
 /// Flat data segment (ring 0, DPL=0, selector 0x18 in trampoline GDT).
 /// Base=0, limit=4GiB, G=1, D=1, data/writable, present.
 const GDT_DATA: u64 = 0x00CF_9200_0000_FFFF;
+
+/// `CR4.PAE` (bit 5), required to enter IA-32e mode.
+const CR4_PAE: u32 = 1 << 5;
+
+/// `CR4.LA57` (bit 12), 5-level paging.
+// cast_possible_truncation: the bit is 1 << 12, well inside u32.
+#[allow(clippy::cast_possible_truncation)]
+const CR4_LA57: u32 = boot_protocol::x86_paging::CR4_LA57 as u32;
 
 /// IST stack pair size: 8 KiB IST1 + 8 KiB IST2 = 16 KiB per AP.
 const AP_IST_PAIR_SIZE: usize = 16384;
@@ -133,7 +150,8 @@ pub fn init_ap_ist_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAll
 
 /// Fixed-content trampoline bytes copied to the AP trampoline page.
 ///
-/// Variable addresses (`AP_PAGE`, `pml4_phys`, etc.) are zeroed here and written
+/// Variable addresses (`AP_PAGE`, `root_phys`, etc.) and the CR4 paging bits
+/// are zeroed here and written
 /// by [`setup_trampoline`] / [`setup_ap_params`] at runtime.
 ///
 /// See module-level layout table for byte-offset annotations.
@@ -166,7 +184,8 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         i += 1;
     }
     // 0x18..0x1F: zero padding. 0x20..0x25: real-mode far-jmp target, written by
-    // setup_trampoline. 0x26..0x3F: zero padding.
+    // setup_trampoline. 0x26..0x27: zero padding. 0x28..0x2B: CR4 paging bits,
+    // written by setup_trampoline. 0x2C..0x3F: zero padding.
 
     // ── GDTR limit (0x40–0x41): constant 0x001F ───────────────────────────────
     // GDT has 4 entries × 8 bytes = 32 bytes; limit = 32 − 1 = 31 = 0x1F.
@@ -224,10 +243,10 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
     // E8 00 00 00 00        call +0                   ; push EIP of next instr
     // 5B                   pop ebx                   ; EBX = AP_PAGE + offset
     // 81 E3 00 F0 FF FF     and ebx, 0xFFFFF000       ; EBX = AP_PAGE
-    // 8B 43 68              mov eax, [ebx+0x68]       ; pml4_phys
+    // 8B 43 68              mov eax, [ebx+0x68]       ; root_phys
     // 0F 22 D8              mov cr3, eax
     // 0F 20 E0              mov eax, cr4
-    // 83 C8 20              or eax, 0x20              ; PAE
+    // 0B 43 28              or eax, [ebx+0x28]        ; PAE (+ LA57), BSP-patched
     // 0F 22 E0              mov cr4, eax
     // B9 80 00 00 C0        mov ecx, 0xC0000080       ; IA32_EFER MSR
     // 0F 32                 rdmsr
@@ -258,7 +277,7 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         0x8B, 0x43, 0x68, // mov eax, [ebx+0x68]
         0x0F, 0x22, 0xD8, // mov cr3, eax
         0x0F, 0x20, 0xE0, // mov eax, cr4
-        0x83, 0xC8, 0x20, // or eax, 0x20
+        0x0B, 0x43, 0x28, // or eax, [ebx+0x28]
         0x0F, 0x22, 0xE0, // mov cr4, eax
         0xB9, 0x80, 0x00, 0x00, 0xC0, // mov ecx, 0xC0000080
         0x0F, 0x32, // rdmsr
@@ -420,6 +439,23 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
         write_u16(virt, TRAMP_PATCH_RM_FAR_JMP + 4, 0x0008);
     }
 
+    // Patch: CR4 paging bits at 0x28 → PAE, plus LA57 when this CPU (the BSP)
+    // runs 5-level paging; the AP loads the same kernel root, so it must walk
+    // it at the same depth.
+    let cr4_bits = CR4_PAE
+        | if super::paging::paging_depth().la57()
+        {
+            CR4_LA57
+        }
+        else
+        {
+            0
+        };
+    // SAFETY: virt is direct-map address; write within page bounds.
+    unsafe {
+        write_u32(virt, TRAMP_PATCH_CR4, cr4_bits);
+    }
+
     // Patch: GDTR base at 0x42 → AP_PAGE+0x48
     // cast_possible_truncation: ap_page is always < 1 MiB; fits u32
     #[allow(clippy::cast_possible_truncation)]
@@ -456,7 +492,7 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
 /// # Parameters
 /// - `ap_trampoline_phys`: physical address of the trampoline page.
 /// - `cpu_id`: logical CPU index (0-based) for this AP.
-/// - `pml4_phys`: physical address of the kernel root page table.
+/// - `root_phys`: physical address of the kernel root page table.
 /// - `stack_top`: kernel stack top for this AP's idle thread.
 /// - `entry_fn`: virtual address of `kernel_entry_ap` to jump to.
 /// - `ist1_top`: IST1 stack top (double fault and machine check).
@@ -468,7 +504,7 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
 pub unsafe fn setup_ap_params(
     ap_trampoline_phys: u64,
     cpu_id: u32,
-    pml4_phys: u32,
+    root_phys: u32,
     stack_top: u64,
     entry_fn: u64,
     ist1_top: u64,
@@ -480,7 +516,7 @@ pub unsafe fn setup_ap_params(
 
     // SAFETY: base is direct-map address; writes within parameter block bounds.
     unsafe {
-        write_u32(base, PARAM_PML4, pml4_phys);
+        write_u32(base, PARAM_ROOT, root_phys);
         write_u32(base, PARAM_CPU_ID, cpu_id);
         write_u64(base, PARAM_STACK, stack_top);
         write_u64(base, PARAM_ENTRY_FN, entry_fn);
@@ -539,7 +575,7 @@ pub unsafe fn start_ap(
     // place the x86_64 kernel image below 4 GiB (`BootInfo.kernel_physical_base`);
     // this check is the backstop for a bootloader that does not. Halt with a
     // reason rather than start the AP on a truncated root.
-    let Ok(pml4_pa) = u32::try_from(crate::mm::paging::kernel_root_table_pa())
+    let Ok(root_pa) = u32::try_from(crate::mm::paging::kernel_root_table_pa())
     else
     {
         crate::fatal("smp: kernel root page table above 4 GiB; the AP CR3 load is 32-bit");
@@ -550,7 +586,7 @@ pub unsafe fn start_ap(
         setup_ap_params(
             trampoline_pa,
             cpu_idx,
-            pml4_pa,
+            root_pa,
             stack_top,
             entry_fn,
             ist1_top,
@@ -625,14 +661,22 @@ mod tests
         );
 
         // PM32: the data selector names GDT_DATA; `mov esp, imm32` puts its
-        // immediate at the stack patch site; CR3 comes from the PML4 param; the
-        // far jmp reads the LM64 target patch site.
+        // immediate at the stack patch site; CR3 comes from the root param; the
+        // CR4 OR reads the CR4 patch site; the far jmp reads the LM64 target
+        // patch site.
         assert_eq!(u16_at(0x92), selector_of(GDT_DATA));
         assert_eq!(TRAMPOLINE_TEMPLATE[TRAMP_PATCH_PM32_STACK - 1], 0xBC);
         assert_eq!(
             usize::from(TRAMPOLINE_TEMPLATE[0xC3]),
-            TRAMP_PARAMS + PARAM_PML4
+            TRAMP_PARAMS + PARAM_ROOT
         );
+        // `or eax, [ebx+disp8]` (0B /r, ModRM 0x43), EBX = AP_PAGE.
+        assert_eq!(TRAMPOLINE_TEMPLATE[0xCA..0xCC], [0x0B, 0x43]);
+        assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0xCC]), TRAMP_PATCH_CR4);
+        // The CR4 patch site lies in padding: clear of the RM far-jmp target
+        // before it and the GDTR after it.
+        assert!(TRAMP_PATCH_RM_FAR_JMP + 6 <= TRAMP_PATCH_CR4);
+        assert!(TRAMP_PATCH_CR4 + 4 <= TRAMP_PATCH_GDTR);
         assert_eq!(
             usize::try_from(u32_at(0xEB)).unwrap(),
             TRAMP_PATCH_LM64_FAR_JMP

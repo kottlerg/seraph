@@ -34,7 +34,7 @@ core/kernel/
 │   │   ├── mod.rs              # Re-exports the active arch module
 │   │   ├── x86_64/             # x86-64 implementation
 │   │   │   ├── mod.rs
-│   │   │   ├── paging.rs       # Page table management (PML4/PDPT/PD/PT)
+│   │   │   ├── paging.rs       # Page table management (PML5/PML4/PDPT/PD/PT, depth from CR4.LA57)
 │   │   │   ├── context.rs      # Thread context save/restore, context switch
 │   │   │   ├── trap_frame.rs   # Trap/syscall frame: user register snapshot
 │   │   │   ├── interrupts.rs   # Phase 5 interrupt init, local APIC (xAPIC/x2APIC), IPIs

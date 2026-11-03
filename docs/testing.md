@@ -333,7 +333,9 @@ Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial, plus `vmgenid,guid=auto`
 on x86_64; CI boots headless, so no framebuffer), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
-are manual, same posture as CPU-count variations). The `virtio-rng` device is
+are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
+5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
+host whose CPU lacks LA57, are manual, same posture). The `virtio-rng` device is
 a boot-entropy source for the pool seed and KASLR: the firmware's RNG driver
 binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF
 also backs the protocol with RDRAND on x86_64; on riscv64 the device is the

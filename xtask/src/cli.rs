@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::arch::Arch;
 use crate::bundle::Harness;
-use crate::qemu::RiscvMmu;
+use crate::qemu::{RiscvMmu, X86Paging};
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -222,6 +222,12 @@ pub struct RunArgs
     /// selects the mode a run exercises.
     #[arg(long, default_value = "sv48")]
     pub riscv_mmu: RiscvMmu,
+
+    /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
+    /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
+    /// when CPUID reports LA57, so this selects the depth a run exercises.
+    #[arg(long, default_value = "4")]
+    pub x86_paging: X86Paging,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -300,6 +306,12 @@ pub struct TestKaslrArgs
     /// riscv64 paging mode to negotiate (ignored on x86-64).
     #[arg(long, default_value = "sv48")]
     pub riscv_mmu: RiscvMmu,
+
+    /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
+    /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
+    /// when CPUID reports LA57, so this selects the depth a run exercises.
+    #[arg(long, default_value = "4")]
+    pub x86_paging: X86Paging,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────
@@ -391,6 +403,12 @@ pub struct RunParallelArgs
     /// selects the mode every run in the batch exercises.
     #[arg(long, default_value = "sv48")]
     pub riscv_mmu: RiscvMmu,
+
+    /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
+    /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
+    /// when CPUID reports LA57, so this selects the depth a run exercises.
+    #[arg(long, default_value = "4")]
+    pub x86_paging: X86Paging,
 
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the cross-harness

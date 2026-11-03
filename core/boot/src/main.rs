@@ -321,7 +321,9 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.
     let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm) };
     // Negotiate the paging mode before step 6 fixes the table hierarchy depth
-    // and step 10 installs it. No-op on x86-64.
+    // and step 10 installs it: Sv39/Sv48/Sv57 on riscv64, 4- or 5-level on
+    // x86-64, where a depth other than the firmware's also reserves the LA57
+    // toggle page.
     // SAFETY: ctx.bs valid pre-exit; firm.device_tree is zero or an
     // identity-mapped FDT; the probe masks SIE and restores the live satp.
     unsafe { arch::current::negotiate_paging(ctx.bs, firm.device_tree, cpus.boot_hart_id)? };
@@ -1181,8 +1183,10 @@ fn collect_identity_regions(
 ///
 /// On x86-64, after `mov cr3` the CPU fetches the next instruction at the same
 /// virtual address; under UEFI x86-64 VA == PA, so the symbol address doubles
-/// as the physical address. On RISC-V the trampoline page(s) are likewise
-/// identity-mapped RX so execution continues across the satp write.
+/// as the physical address. When the handoff changes the paging depth, the
+/// page mapped is the LA57 toggle page instead, whose copy of the trampoline
+/// re-enables paging on the new tables. On RISC-V the trampoline page(s) are
+/// likewise identity-mapped RX so execution continues across the satp write.
 fn install_handoff_trampoline_mapping(
     page_table: &mut arch::current::BootPageTable,
 ) -> Result<(), BootError>

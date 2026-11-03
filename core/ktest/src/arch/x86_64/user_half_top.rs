@@ -5,42 +5,50 @@
 
 //! Tier 1 (x86-64): the top page of the user half is never mappable.
 //!
-//! The kernel keeps `[0x7FFF_FFFF_F000, 1 << 47)` out of every user mapping
-//! (`paging::user_va_top` is `(1 << 47) - 4096`; docs/memory-model.md § x86-64):
-//! with that page unmappable no user instruction ends at the canonical
-//! boundary, so the address after a ring-3 `syscall` (the RIP `sysretq`
-//! returns to) is always canonical. A mappable top page would let a `syscall`
-//! in its last two bytes hand the kernel the non-canonical return RIP
-//! `1 << 47`, which only `syscall_entry`'s defensive divert keeps from faulting
-//! in ring 0 (core/kernel/docs/syscalls.md § Syscall Entry and Exit).
+//! The kernel keeps the last page of the lower canonical half out of every
+//! user mapping: `paging::user_va_top` is that half's limit less 4 KiB, the
+//! limit being `1 << 47` at 4-level paging and `1 << 56` at 5-level
+//! (docs/memory-model.md § x86-64). With that page unmappable no user
+//! instruction ends at the canonical boundary, so the address after a ring-3
+//! `syscall` (the RIP `sysretq` returns to) is always canonical. A mappable top
+//! page would let a `syscall` in its last two bytes hand the kernel the
+//! non-canonical return RIP at the limit, which only `syscall_entry`'s
+//! defensive divert keeps from faulting in ring 0
+//! (core/kernel/docs/syscalls.md § Syscall Entry and Exit).
 
-use syscall::{mem_map, mem_unmap};
-use syscall_abi::{MAP_WRITABLE, SyscallError};
+use syscall::{mem_map, mem_unmap, system_info};
+use syscall_abi::{MAP_WRITABLE, PAGE_SIZE, SyscallError, SystemInfoType};
 
 use crate::{TestContext, TestResult};
 
-/// The last page of the user half: `(1 << 47) - 4096`.
-const TOP_USER_PAGE: u64 = 0x7FFF_FFFF_F000;
-
-/// The page just below it, the highest one a process may map.
-const HIGHEST_MAPPABLE_PAGE: u64 = TOP_USER_PAGE - 0x1000;
-
-/// `mem_map` refuses the top user page with `InvalidAddress` and maps the page
-/// below it, so the boundary sits exactly one page under `1 << 47`.
+/// `mem_map` refuses the top page of the lower canonical half with
+/// `InvalidAddress` and maps the page below it, so the boundary sits exactly
+/// one page under the half's limit (`1 << 47` or `1 << 56`, by paging depth).
 pub fn top_page_unmappable(ctx: &TestContext) -> TestResult
 {
+    // The top user page is the first unmappable one: `UserVaTop` itself.
+    let top_user_page = system_info(SystemInfoType::UserVaTop as u64)
+        .map_err(|_| "user_half_top: system_info(UserVaTop) failed")?;
+    let limit = top_user_page + PAGE_SIZE;
+    if limit != 1 << 47 && limit != 1 << 56
+    {
+        return Err("user_half_top: UserVaTop is not one page under a canonical-half limit");
+    }
+    // The page just below it, the highest one a process may map.
+    let highest_mappable_page = top_user_page - PAGE_SIZE;
+
     let frame = crate::frame_pool::alloc().ok_or("user_half_top: frame pool exhausted")?;
 
-    // SAFETY: `TOP_USER_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+    // SAFETY: `top_user_page` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
-    let top = unsafe { mem_map(frame, ctx.aspace_cap, TOP_USER_PAGE, 0, 1, MAP_WRITABLE) };
+    let top = unsafe { mem_map(frame, ctx.aspace_cap, top_user_page, 0, 1, MAP_WRITABLE) };
     if top.is_ok()
     {
         // The frame is now mapped at the top page: unmap before returning it
         // to the pool, and keep it if the unmap fails.
-        // SAFETY: `TOP_USER_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+        // SAFETY: `top_user_page` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
-        if unsafe { mem_unmap(ctx.aspace_cap, TOP_USER_PAGE, 1) }.is_ok()
+        if unsafe { mem_unmap(ctx.aspace_cap, top_user_page, 1) }.is_ok()
         {
             // SAFETY: `frame` came from the pool and its only mapping was just
             // removed.
@@ -49,22 +57,22 @@ pub fn top_page_unmappable(ctx: &TestContext) -> TestResult
         return Err("user_half_top: mem_map of the top user page succeeded");
     }
 
-    // SAFETY: `HIGHEST_MAPPABLE_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+    // SAFETY: `highest_mappable_page` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
     let below = unsafe {
         mem_map(
             frame,
             ctx.aspace_cap,
-            HIGHEST_MAPPABLE_PAGE,
+            highest_mappable_page,
             0,
             1,
             MAP_WRITABLE,
         )
     };
-    // SAFETY: `HIGHEST_MAPPABLE_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+    // SAFETY: `highest_mappable_page` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
     let unmapped =
-        below.is_err() || unsafe { mem_unmap(ctx.aspace_cap, HIGHEST_MAPPABLE_PAGE, 1) }.is_ok();
+        below.is_err() || unsafe { mem_unmap(ctx.aspace_cap, highest_mappable_page, 1) }.is_ok();
     if unmapped
     {
         // SAFETY: `frame` came from the pool and is mapped nowhere: the top-page

@@ -36,8 +36,10 @@
 //! the framebuffer and kernel MMIO above it, and the AP trampoline page.
 //! Phase 2's free-range stream keeps the frames stage 2 used out of the buddy
 //! (`mm::init::record_boot_table_carve`). The seed's size is fixed by the
-//! stage-1 mappings, and the carve's by the machine, so no amount of RAM
-//! exhausts either.
+//! stage-1 mappings, and the carve's by the machine, so no RAM a 4-level or
+//! Sv48 kernel half can hold exhausts either; only a direct map of petabytes,
+//! which x86-64 5-level paging or Sv57 can address, outgrows the seed
+//! ([`BOOT_TABLE_POOL_SIZE`]).
 
 // cast_possible_truncation: u64→usize memory-map entry count; 64-bit targets
 // only, so the cast is exact.
@@ -60,8 +62,8 @@ use crate::arch::current::paging as arch_paging;
 
 // ── Kernel root page table physical address ───────────────────────────────────
 
-/// Physical address of the kernel's root page table (PML4 on x86-64, the
-/// negotiated-mode root on RISC-V).
+/// Physical address of the kernel's root page table (the boot depth's PML4 or
+/// PML5 on x86-64, the negotiated-mode root on RISC-V).
 ///
 /// Set once during Phase 3 by `init_kernel_page_tables`. APs load this into CR3
 /// (x86-64) or `satp` (RISC-V) during the SMP startup sequence.
@@ -242,7 +244,10 @@ impl MapOutcome
 /// upper levels), about eight for the stack window, and one directory per GiB
 /// of carve, which is about 1 MiB of carve per 256 GiB of RAM. 64 frames leave
 /// room for a 64 MiB image beside the carve of any direct map up to the
-/// 128 TiB kernel half. A seed too small fails the boot in Phase 3 by name.
+/// 128 TiB 4-level kernel half, whose carve stays under 1 GiB (one directory),
+/// at any paging depth (a fifth level adds one table to each chain). Only a
+/// 5-level or Sv57 direct map of petabytes, one more directory per 256 TiB of
+/// RAM, outgrows the seed. A seed too small fails the boot in Phase 3 by name.
 pub const BOOT_TABLE_POOL_SIZE: usize = 64;
 
 /// Contiguous 4 KiB-aligned block of zeroed BSS frames for boot page tables.
@@ -704,7 +709,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     // ── AP trampoline identity mapping (arch-neutral) ────────────────────────
     // Map the AP trampoline page at its physical address as a 4 KiB identity
     // page (VA = PA). Both arches need this: on x86-64 the AP enables paging
-    // (writes CR3 = kernel PML4) during the PM32 → LM64 transition and must
+    // (writes CR3 = kernel root) during the PM32 → LM64 transition and must
     // keep fetching trampoline instructions at their PA through the LM64 relay
     // stub until its `jmp rax` reaches the kernel-VA entry; on RISC-V the
     // trampoline executes

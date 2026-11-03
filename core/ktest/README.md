@@ -118,7 +118,8 @@ Architecture-only Tier 1 tests live under `src/arch/<arch>/` and run through
 `crate::arch::run_unit`. On x86-64, `src/arch/x86_64/configure_wrapped_stack.rs` checks that
 `thread_configure` refuses a stack top the entry alignment wraps below zero, and
 `src/arch/x86_64/user_half_top.rs` that `mem_map` refuses the top user page
-(`0x7FFF_FFFF_F000`) with `InvalidAddress` and maps the page below it. Each architecture's
+(`0x7FFF_FFFF_F000` at 4-level paging, `0xFF_FFFF_FFFF_F000` at 5-level) with
+`InvalidAddress` and maps the page below it. Each architecture's
 `ioport_syscalls.rs` holds its `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` tests (a bind and a split
 of the initial `IoPort` caps on x86-64, `NotSupported` on RISC-V), and its `sbi_call.rs` its
 `SYS_SBI_CALL` test: the call reaches the SBI firmware on RISC-V and returns `NotSupported` on

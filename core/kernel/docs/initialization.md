@@ -35,9 +35,10 @@ layout) that Phase 0 depends on, see
     at or below kernel_virtual_base
 11. Validate that a slid image (kernel_virtual_base above KERNEL_LINK_BASE) carries
     KASLR_IMAGE_RANDOMIZED in kaslr_flags
-12. arch::current::paging::init_paging_mode: halt if direct_map_base is below the active
-    paging mode's kernel-half base (RISC-V: also if satp names no supported mode), then
-    publish direct_map_base
+12. arch::current::paging::init_paging_mode: read the paging mode (RISC-V: satp.MODE;
+    x86-64: CR4.LA57, 4- or 5-level), halt if direct_map_base is below that mode's
+    kernel-half base (RISC-V: also if satp names no supported mode), then publish the mode
+    and direct_map_base
 ```
 
 Phase 0 produces no output; the console is not available until Phase 1.
@@ -160,7 +161,8 @@ again from the recorded BootInfo address.
    - Permissions: readable, writable, not executable; write-back except those MMIO pages
    direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
    1 GiB-aligned base at or above the paging mode's kernel-half floor
-   (0xFFFF800000000000 on x86-64 / Sv48), published by init_paging_mode
+   (0xFFFF800000000000 at x86-64 4-level and Sv48, 0xFF00000000000000 at x86-64
+   5-level and Sv57), published by init_paging_mode
    at kernel entry after validation. Before step 1's mappings, a guard re-checks that
    the whole direct map (RAM plus any framebuffer / kernel MMIO above the RAM
    ceiling — the shared boot_protocol::direct_map_ceiling) ends at or below
@@ -583,7 +585,8 @@ and inserts the cap into the root CSpace; a SEED or CSpace failure there halts t
 reported is assumed online from Phase 8 on (IPI targets, scheduler placement, affinity), so a
 CPU that cannot be started halts the boot with a descriptive message.
 On x86-64, a kernel root page table above 4 GiB is fatal before the first SIPI: the AP trampoline
-loads CR3 with a 32-bit move.
+loads CR3 with a 32-bit move. The trampoline also sets `CR4.LA57` with paging off when the BSP
+runs 5-level paging, so every AP walks the kernel root at the BSP's depth.
 A started CPU that does not announce itself within `AP_ONLINE_BUDGET_US` (10 s) halts the
 boot with "FATAL: smp: a listed CPU did not come online", after a line naming the CPU's
 index and hardware id; on x86-64 that wait is the only signal, since SIPI delivery is

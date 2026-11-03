@@ -383,7 +383,7 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    § Coverage tiers) on that commit: the whole boundary set (riscv64 16 and
    128 harts, x86_64 16 and 128 vCPUs) three times each in the debug profile
    and once each in the release profile, and the memory
-   variation and the disk variations (a 4Kn disk and two second-disk boots,
+   variation and the disk variations (a 4Kn disk and three second-disk boots,
    on both architectures) once each. When they pass, tag it and push the
    tag:
    `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.

@@ -105,14 +105,18 @@ impl X86Paging
     }
 }
 
-/// A second disk for a QEMU launch: its image and the logical block size its
-/// device presents.
+/// A second disk for a QEMU launch: its image, the logical block size its
+/// device presents, and whether it shares the first disk's `INTx` line.
 pub struct SecondDisk<'a>
 {
     pub path: &'a Path,
     /// Logical and physical block size of the `virtio-blk-pci` device, in
     /// bytes.
     pub block_size: u32,
+    /// Place the device at `SHARED_LINE_SECOND_DISK_SLOT`, on the first
+    /// disk's `INTx` line on both machines, rather than at
+    /// `SECOND_DISK_SLOT`, on a line of its own.
+    pub shared_line: bool,
 }
 
 /// Specification for one QEMU launch.
@@ -205,7 +209,20 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "-drive".into(),
             format!("if=none,id=hd1,format=raw,file={}", second.path.display()),
             "-device".into(),
-            blk_device("hd1", second.block_size, Some(SECOND_DISK_SLOT)),
+            blk_device(
+                "hd1",
+                second.block_size,
+                Some(
+                    if second.shared_line
+                    {
+                        SHARED_LINE_SECOND_DISK_SLOT
+                    }
+                    else
+                    {
+                        SECOND_DISK_SLOT
+                    },
+                ),
+            ),
         ]);
     }
 
@@ -265,16 +282,20 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 }
 
 /// PCI slots of the two disks of a two-disk launch (a single disk takes
-/// QEMU's next free slot). devmgr does not serve a virtio-blk device on an
-/// `INTx` line another device already holds (#664), so the two disks must
-/// land on distinct lines, and two slots apart they do on both machines: on
-/// `x86_64` OVMF programs the line from `{10, 10, 11, 11}` indexed by
-/// `(slot + 1) % 4`, which pairs adjacent slots, and on riscv64 the `virt`
-/// host swizzles `INTA` onto PLIC source `32 + slot % 4`. Both slots sit
-/// below 25, past which q35 routes every slot to one line, above the slots
-/// auto-placed devices take, and clear of q35's built-in slot 0x1f.
+/// QEMU's next free slot). On `x86_64` OVMF programs a slot's `INTA` line
+/// from `{10, 10, 11, 11}` indexed by `(slot + 1) % 4`, which pairs adjacent
+/// slots, and on riscv64 the `virt` host swizzles `INTA` onto PLIC source
+/// `32 + slot % 4`. `SECOND_DISK_SLOT`, two slots past the first, avoids
+/// the share on both machines, so the ordinary two-disk boots give each disk
+/// a line of its own. `SHARED_LINE_SECOND_DISK_SLOT`, four slots past the
+/// first, lands on the first disk's line on both machines (the same index
+/// into OVMF's table, the same PLIC source), which the shared-line boot
+/// stages on purpose. Every slot sits below 25, past which q35 routes every
+/// slot to one line, above the slots auto-placed devices take, and clear of
+/// q35's built-in slot 0x1f.
 const FIRST_DISK_SLOT: u8 = 0x10;
 const SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 2;
+const SHARED_LINE_SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 4;
 
 /// The `virtio-blk-pci` device for `drive`, presenting `block_size`-byte
 /// logical and physical blocks (QEMU requires the physical size to be at
@@ -854,6 +875,7 @@ mod tests
         spec.second_disk = Some(SecondDisk {
             path: Path::new("disk-data.img"),
             block_size: 8192,
+            shared_line: false,
         });
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(
@@ -872,25 +894,54 @@ mod tests
         u8::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap()
     }
 
-    #[test]
-    fn two_disks_land_on_distinct_intx_lines_on_both_machines()
+    /// The two disks' slots of a two-disk launch, the second placed on the
+    /// shared line or not.
+    fn disk_slots(shared_line: bool) -> (u8, u8)
     {
-        // devmgr does not serve a virtio-blk device on a line another holds
-        // (#664), so two disks on one line would leave the second unserved.
         let mut spec = riscv_spec(1, 512);
         spec.second_disk = Some(SecondDisk {
             path: Path::new("disk-data.img"),
             block_size: 512,
+            shared_line,
         });
         let argv = build_qemu_argv(&spec).unwrap();
-        let first = slot_of(blk_device_arg(&argv, "hd0").unwrap());
-        let second = slot_of(blk_device_arg(&argv, "hd1").unwrap());
-        // OVMF's x86_64 line, from {10, 10, 11, 11} at (slot + 1) % 4.
-        let ovmf_line = |slot: u8| [10, 10, 11, 11][usize::from((slot + 1) % 4)];
+        (
+            slot_of(blk_device_arg(&argv, "hd0").unwrap()),
+            slot_of(blk_device_arg(&argv, "hd1").unwrap()),
+        )
+    }
+
+    /// OVMF's x86_64 line, from {10, 10, 11, 11} at (slot + 1) % 4.
+    fn ovmf_line(slot: u8) -> u8
+    {
+        [10, 10, 11, 11][usize::from((slot + 1) % 4)]
+    }
+
+    /// riscv64 `virt`: INTA of a slot reaches PLIC source 32 + slot % 4.
+    fn plic_source(slot: u8) -> u8
+    {
+        32 + slot % 4
+    }
+
+    #[test]
+    fn two_disks_land_on_distinct_intx_lines_on_both_machines()
+    {
+        let (first, second) = disk_slots(false);
         assert_ne!(ovmf_line(first), ovmf_line(second));
-        // riscv64 `virt`: INTA of a slot reaches PLIC source 32 + slot % 4.
-        assert_ne!(first % 4, second % 4);
+        assert_ne!(plic_source(first), plic_source(second));
         // q35 routes every slot past 24 to one line.
+        assert!(first <= 24 && second <= 24);
+    }
+
+    #[test]
+    fn shared_line_disks_land_on_one_intx_line_on_both_machines()
+    {
+        let (first, second) = disk_slots(true);
+        assert_ne!(first, second);
+        assert_eq!(ovmf_line(first), ovmf_line(second));
+        assert_eq!(plic_source(first), plic_source(second));
+        // Below q35's every-slot-one-line range, so the share is the
+        // swizzle's, not q35's fallback.
         assert!(first <= 24 && second <= 24);
     }
 
@@ -914,6 +965,7 @@ mod tests
             spec.second_disk = Some(SecondDisk {
                 path: Path::new("second.img"),
                 block_size: size,
+                shared_line: false,
             });
             assert!(build_qemu_argv(&spec).is_err(), "second disk {size}");
         }

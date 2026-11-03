@@ -13,7 +13,8 @@ devmgr/
 ├── README.md
 ├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI scan,
 │                                   #   aperture / IRQ range-cap table, driver-settle roster,
-│                                   #   served-driver ordinal table (tombstones)
+│                                   #   served-driver ordinal table (tombstones),
+│                                   #   held interrupt-line table
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown

@@ -1255,19 +1255,21 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///
 /// Returns the new capability's handle in the destination `CSpace` (slot
 /// index and generation, per docs/capability-model.md § Capability Handle
-/// Format). The copy of an `Mmio` or `IoPort` capability references a fresh
-/// object over the same range, so mappings and port bindings made through it
-/// are withdrawn when it goes (docs/capability-model.md § Mmio).
+/// Format). The copy of an `Mmio`, `IoPort`, or `Interrupt` capability
+/// references a fresh object over the same range, so mappings, port bindings,
+/// and the interrupt binding made through it are withdrawn when it goes
+/// (docs/capability-model.md § Interrupt, § Mmio, § `IoPort`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
-/// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio` or
-/// `IoPort` source, `QuotaExceeded` also means its range already has 2^31 - 1
-/// live copies, and `OutOfMemory` that the destination `CSpace`'s pool cannot
-/// back the fresh object; for any other source, `QuotaExceeded` also means the object's
-/// reference count is at its 2^31 ceiling. `InvalidCapability`
+/// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio`,
+/// `IoPort`, or `Interrupt` source, `QuotaExceeded` also means its range
+/// already has 2^31 - 1 live copies, and `OutOfMemory` that the destination
+/// `CSpace`'s pool cannot back the fresh object; for any other source,
+/// `QuotaExceeded` also means the object's reference count is at its 2^31
+/// ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
 /// capability transfer is in flight on the source.
@@ -1296,20 +1298,22 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// Attenuate a capability within the caller's own `CSpace` (`SYS_CAP_DERIVE`).
 ///
 /// Creates a new slot in the caller's `CSpace` with `rights_mask & src_rights`.
-/// The new slot is a derivation child of the source; for an `Mmio` or `IoPort`
-/// source it references a fresh object over the same range, as for
-/// [`cap_copy`].
+/// The new slot is a derivation child of the source; for an `Mmio`, `IoPort`,
+/// or `Interrupt` source it references a fresh object over the same range, as
+/// for [`cap_copy`].
 ///
 /// Returns the new capability handle (slot index plus generation).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
-/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling), or, as for [`cap_copy`], `QuotaExceeded` past 2^31 - 1
-/// live copies of an `Mmio` or `IoPort` source's range or at any other source
-/// object's 2^31 reference-count ceiling, and `OutOfMemory` when the caller's
-/// `CSpace` pool cannot back an `Mmio` or `IoPort` object. `InvalidCapability` also covers a source a concurrent
-/// delete, move, or revoke freed before the new slot was linked;
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`;
+/// `QuotaExceeded` at the structural ceiling), or, as for [`cap_copy`],
+/// `QuotaExceeded` past 2^31 - 1 live copies of an `Mmio`, `IoPort`, or
+/// `Interrupt` source's range or at any other source object's 2^31
+/// reference-count ceiling, and `OutOfMemory` when the caller's `CSpace` pool
+/// cannot back an `Mmio`, `IoPort`, or `Interrupt` object. `InvalidCapability`
+/// also covers a source a concurrent delete, move, or revoke freed before the
+/// new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
@@ -1337,7 +1341,7 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling),
-/// or as for [`cap_copy`] (the `Mmio` and `IoPort` copy limits, and any other
+/// or as for [`cap_copy`] (the `Mmio`, `IoPort`, and `Interrupt` copy limits, and any other
 /// source object's 2^31 reference-count ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
@@ -2027,17 +2031,20 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 
 /// Bind `notification_cap` to receive notifications when `irq_cap`'s interrupt fires.
 ///
-/// After registration the IRQ is masked until the first `irq_ack`. The driver
-/// must call `irq_ack` after servicing each interrupt to re-enable delivery.
+/// The binding is `irq_cap`'s own: each copy of an Interrupt cap binds on its own,
+/// so several drivers sharing a line each register and are each signalled, and
+/// registering again through the same cap rebinds it to the new notification.
+/// After registration the IRQ is masked until this binding's first `irq_ack`. The
+/// driver must call `irq_ack` after servicing each interrupt to re-enable delivery.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
 /// names an id no discovered interrupt controller implements (a GSI no I/O APIC
 /// reports on x86-64, a source past the PLIC's `riscv,ndev` on RISC-V), or
-/// `QuotaExceeded` when the controller has no delivery resource left (x86-64:
-/// every device vector is assigned). A second registration of a line replaces
-/// the first.
+/// `QuotaExceeded` when the line already holds 64 bindings or, for its first
+/// binding, the controller has no delivery resource left (x86-64: every device
+/// vector is assigned).
 #[inline]
 pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 {
@@ -2053,11 +2060,12 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Re-enable interrupt delivery for `irq_cap` after handling the interrupt.
+/// Acknowledge the interrupt `irq_cap`'s binding was signalled for, after handling it.
 ///
 /// Must be called once the interrupt source in the device has been cleared,
-/// otherwise the interrupt will fire again immediately on unmask. A line with no
-/// registered notification stays masked.
+/// otherwise the interrupt will fire again immediately on unmask. Clears the
+/// acknowledgement `irq_cap`'s binding owes; the line is unmasked once no binding
+/// on it owes one. Through a cap that is not registered it changes nothing.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,
@@ -2067,7 +2075,7 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; irq_cap is cap index as u64;
-    // kernel validates cap and unmasks IRQ to re-enable delivery.
+    // kernel validates cap and acknowledges its binding, unmasking once none owes.
     let ret = unsafe { syscall2(SYS_IRQ_ACK, u64::from(irq_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }

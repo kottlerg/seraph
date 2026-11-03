@@ -420,8 +420,10 @@ pub unsafe fn init_ap();
 /// EOI and ignores `irq`. On RISC-V, `irq` is a PLIC source, and `acknowledge`
 /// completes it on the executing hart's context, enabling it there for the
 /// completion when the dispatch's `mask` disabled it (the PLIC ignores a
-/// completion of a disabled source). `unmask` is reached from `SYS_IRQ_ACK`
-/// through `irq::ack`, under the routing lock, only for a routed line.
+/// completion of a disabled source). `unmask` is reached, under the routing
+/// lock and only for a routed line, from `SYS_IRQ_ACK` through `irq::ack` and
+/// from a binding's removal, each once no binding on the line owes an
+/// acknowledgement.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
@@ -432,11 +434,11 @@ pub fn unmask(irq: u32);
 /// the source's target hart. Fails with `irq::RouteError::NoSuchLine` for a line
 /// no discovered controller implements, `Exhausted` when the controller has no
 /// delivery resource left (x86-64: every device vector assigned). Called by
-/// `irq::register`, under its routing lock.
+/// `irq::register` for a line's first binding, under its routing lock.
 pub unsafe fn route_device_irq(irq: u32) -> Result<(), irq::RouteError>;
 /// Release a routed line: mask it and free what `route_device_irq` assigned (the
-/// x86-64 device vector; the RISC-V target hart). Called by `irq` when a route is
-/// cleared, under its routing lock.
+/// x86-64 device vector; the RISC-V target hart). Called by `irq` when a line's
+/// last binding is removed, under its routing lock.
 pub unsafe fn unroute_device_irq(irq: u32);
 /// Number of interrupt lines the discovered controllers implement, which sizes
 /// the `irq` routing table at Phase 5: one past the highest I/O APIC GSI on
@@ -468,7 +470,8 @@ skips CPUs whose APIC id is `0xFF` or above: an I/O APIC redirection entry canno
 id in physical destination mode (the kernel programs no interrupt remapping), and `0xFF` is the
 broadcast id, which delivers to every CPU. On RISC-V the line's
 PLIC source is enabled on the chosen hart's S-mode context only, so exactly one hart takes
-and claims it. A line routed again (a `SYS_IRQ_REGISTER` replace) takes the next CPU in turn.
+and claims it. The line's first binding chooses the CPU, and the line keeps it while any binding
+remains; a line bound again after its last binding went takes the next CPU in turn.
 
 Per-CPU table allocation that exists only on x86-64 (GDT/TSS, AP IST stacks, NMI-backtrace
 storage) is reached through the `init_ap_percpu_storage` module-level surface function (a

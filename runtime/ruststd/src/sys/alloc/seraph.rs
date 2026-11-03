@@ -1218,7 +1218,8 @@ pub fn cspace_general_headroom(self_cspace: u32) -> u64 {
 /// object slab) and donates it to the pool with augment-mode
 /// `cap_create_cspace`. After a success, `slots` general allocations succeed,
 /// and the body arena can still take one more page: up to 31 further bodies
-/// (split children, `Mmio` or `IoPort` copies, spilled mapping records). A
+/// (split children, `Mmio`, `IoPort`, or `Interrupt` copies, spilled mapping
+/// records). A
 /// burst of `n` splits therefore needs `slots` of at least `n` plus 56 for
 /// each 31 bodies past the first page. Call before a known burst of cap
 /// acquisitions, or periodically to keep headroom above a low-water mark, so

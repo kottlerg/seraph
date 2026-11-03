@@ -12,8 +12,9 @@ The capability subsystem comprises six components:
 3. **Page pools** — the donated pages behind a CSpace's slots and an address
    space's page tables, and the record of every donation
 4. **Capability slot** — in-memory representation of one capability
-5. **Range capability objects** — the Mmio and IoPort objects, which record the
-   mappings and port bindings made through them so revocation can withdraw them
+5. **Range capability objects** — the Mmio, IoPort, and Interrupt objects, which record the
+   mappings, port bindings, and interrupt binding made through them so revocation can withdraw
+   them
 6. **Derivation tree** — cross-process tree for revocation
 
 ---
@@ -315,16 +316,16 @@ syscall is [#434](https://github.com/kottlerg/seraph/issues/434).
 
 Some kernel objects a syscall creates have no Memory capability in the call to be retyped from:
 the bodies of a range split (`SYS_MEMORY_SPLIT`'s tail, the two children of `SYS_MMIO_SPLIT`,
-`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`, and `SYS_SCHED_SPLIT`), the fresh object of an `Mmio` or
-`IoPort` copy ([§ Copies and Lineages](#copies-and-lineages)), the mapping records past an `Mmio`
-object's inline ones ([§ Mmio Mappings](#mmio-mappings)), and a thread's port-binding table
-([§ IoPort Bindings](#ioport-bindings)). A `CSpace` the call names funds them from its pool, as it
-funds the slot:
+`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`, and `SYS_SCHED_SPLIT`), the fresh object of an `Mmio`,
+`IoPort`, or `Interrupt` copy ([§ Copies and Lineages](#copies-and-lineages)), the mapping records
+past an `Mmio` object's inline ones ([§ Mmio Mappings](#mmio-mappings)), and a thread's
+port-binding table ([§ IoPort Bindings](#ioport-bindings)). A `CSpace` the call names funds them
+from its pool, as it funds the slot:
 
 | Body | Funded by |
 |---|---|
 | A split's children | the caller's `CSpace`, which receives them |
-| An `Mmio` or `IoPort` copy | the destination `CSpace` |
+| An `Mmio`, `IoPort`, or `Interrupt` copy | the destination `CSpace` |
 | An `Mmio` mapping-record spill chunk | the `CSpace` the map resolves through |
 | A port-binding table | the bound thread's own `CSpace` |
 
@@ -583,10 +584,10 @@ The principal kernel-internal owners:
   page pool is referenced by the donation record until that AddressSpace or CSpace is
   freed. The Memory object an AddressSpace or CSpace is created from is referenced
   once, by donation record 0, which serves as its retype ancestry too.
-- **Arena pages.** A body a `CSpace`'s arena funded (a split's children, an `Mmio` or
-  `IoPort` copy, a mapping-record spill chunk) holds a reference on the arena page it sits
-  on, and the page a hold of its owner's; a page kept past its owner's death holds a lease
-  on the Memory object its donation came from until its last chunk goes
+- **Arena pages.** A body a `CSpace`'s arena funded (a split's children, an `Mmio`,
+  `IoPort`, or `Interrupt` copy, a mapping-record spill chunk) holds a reference on the arena
+  page it sits on, and the page a hold of its owner's; a page kept past its owner's death holds
+  a lease on the Memory object its donation came from until its last chunk goes
   ([§ Body Arena](#body-arena)).
 - **Mmio mapping records.** Each `SYS_MMIO_MAP` mapping an Mmio object records holds a
   reference on the target `AddressSpace`, released when the object is freed and the
@@ -650,19 +651,20 @@ so no `pin_slot` can be reading it.
 
 ## Range Capability Objects
 
-Mmio and IoPort capabilities grant hardware access that outlives the syscall that
-establishes it: a page mapping, or a thread's I/O permission bitmap. Revocation must
-withdraw that access ([docs/capability-model.md](../../../docs/capability-model.md) § Mmio,
-§ IoPort), so the kernel ties each grant to the object of the capability it was made
-through, and withdraws it when that object is freed.
+Mmio, IoPort, and Interrupt capabilities grant hardware access that outlives the syscall that
+establishes it: a page mapping, a thread's I/O permission bitmap, or a Notification's binding
+to an interrupt line. Revocation must withdraw that access
+([docs/capability-model.md](../../../docs/capability-model.md) § Interrupt, § Mmio, § IoPort),
+so the kernel ties each grant to the object of the capability it was made through, and
+withdraws it when that object is freed.
 
 ### Copies and Lineages
 
-`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio or IoPort capability do not
-share the source's object: `object_for_new_slot` places a fresh object over the same range in the
-arena of the `CSpace` that receives the new slot ([§ Body Arena](#body-arena)), so every slot owns
-its object, and deleting the slot, consuming it with a split, or revoking
-an ancestor of it frees it (a syscall pin defers the free to the pinning syscall's end, as for any
+`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio, IoPort, or Interrupt
+capability do not share the source's object: `object_for_new_slot` places a fresh object over the
+same range in the arena of the `CSpace` that receives the new slot ([§ Body Arena](#body-arena)),
+so every slot owns its object, and deleting the slot, consuming it with a split, or revoking an
+ancestor of it frees it (a syscall pin defers the free to the pinning syscall's end, as for any
 object). A boot mint or a range split produces a lineage *root*; a copy records its root
 (`RangeLineage`), and the root's lineage count holds a root share while the root has references plus
 one per live copy. A copy past `RANGE_COPY_LIMIT` live copies of one root returns `QuotaExceeded`,
@@ -734,6 +736,20 @@ CPU's TSS is written only by that CPU, except for the offset, which `TssWithIopb
 alignment lets another CPU store atomically; any interleaving of a remote invalidation with a
 local reload leaves the CPU either invalidated or running a bitmap loaded under its thread's lock
 after the rebuild.
+
+### Interrupt Bindings
+
+An `InterruptObject` carries one binding (`irq::IrqBinding`): unbound until `SYS_IRQ_REGISTER`
+through it, and then linked in its line's binding list in the IRQ routing table with one bit of
+the line's bound and owing masks (`core/kernel/src/irq.rs`, module doc § Sharing). Since a copy is a
+fresh object, each capability to a line is a binding of its own, and a line holds at most
+`irq::MAX_IRQ_BINDINGS` (64). The object's `dealloc_object` arm removes its binding
+(`irq::unregister`) before the body goes: under the IRQ routing lock it unlinks the binding,
+clears its bits, waits out the deliveries in flight on the line, and unmasks or releases the line,
+so no delivery reaches the freed body and the other bindings on the line stay. A Notification's
+teardown removes every binding naming it the same way (`irq::unregister_notification`), leaving
+those Interrupt objects unbound. A range capability (more than one line) never binds, and its arm
+finds nothing to remove.
 
 ---
 

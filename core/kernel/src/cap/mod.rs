@@ -1687,11 +1687,7 @@ fn populate_cspace(
     // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
     // the routing table ignores one past its discovered size (see
     // `ROOT_IRQ_COUNT` above).
-    let irq_ptr = mint_phase7_body(InterruptObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
-        start: 0,
-        count: ROOT_IRQ_COUNT,
-    });
+    let irq_ptr = mint_phase7_body(InterruptObject::new_root(0, ROOT_IRQ_COUNT));
     let irq_range_slot = insert_or_fatal(
         cspace,
         IrqRights::NOTIFY,

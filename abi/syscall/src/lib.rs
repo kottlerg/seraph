@@ -344,8 +344,9 @@ pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
 pub const CAP_INFO_CSPACE_USED: u64 = 6;
 
 /// `CSpace` only — bytes available to back new slot pages, the pages of the
-/// `CSpace`'s body arena (the objects a split, an `Mmio` or `IoPort` copy, or a
-/// spilled `Mmio` mapping record funded by this `CSpace` needs; see
+/// `CSpace`'s body arena (the objects a split, an `Mmio`, `IoPort`, or
+/// `Interrupt` copy, or a spilled `Mmio` mapping record funded by this `CSpace`
+/// needs; see
 /// [`cspace_topup_pages`]), and the three pages of the port-binding table of a
 /// thread bound to it, taken at the thread's first `ioport_bind`.
 ///
@@ -607,7 +608,8 @@ pub const CSPACE_SLOTS_PER_PAGE: u64 = 56;
 /// (`CAP_INFO_CSPACE_CAPACITY - CAP_INFO_CSPACE_USED - CSPACE_IPC_RECV_RESERVE`)
 /// and `budget_bytes` its [`CAP_INFO_CSPACE_BUDGET`]. The body arena takes
 /// whole pages from the same budget as slot pages, for the objects a split, an
-/// `Mmio` or `IoPort` copy, or a spilled `Mmio` mapping record needs: headroom
+/// `Mmio`, `IoPort`, or `Interrupt` copy, or a spilled `Mmio` mapping record
+/// needs: headroom
 /// of one page beyond `slots` keeps a page for it after `slots` allocations
 /// drawn from the budget, and a budget of a page keeps one when the slots come
 /// from pages already in use. A thread's first `ioport_bind` takes three more

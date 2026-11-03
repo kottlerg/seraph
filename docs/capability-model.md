@@ -48,9 +48,7 @@ every operation the kernel checks the handle's generation against the slot's
 current generation and returns `InvalidCapability` on mismatch. This closes the
 stale-slot alias class (#349): a handle held across a free/reallocate of its slot
 fails closed instead of silently operating on whatever unrelated capability now
-occupies the index. The generation never wraps: a free at its last value (255)
-retires the slot, which no allocation or explicit placement reuses, so no handle
-is issued twice in a `CSpace`'s life.
+occupies the index.
 
 A never-recycled slot has generation 0, so its handle is numerically identical to
 the bare slot index. Long-lived capabilities minted once at boot or process spawn

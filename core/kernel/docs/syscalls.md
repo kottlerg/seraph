@@ -563,12 +563,10 @@ time the slot is freed and recycled. Every cap-bearing syscall checks the
 handle's generation against the slot's current generation and returns
 `InvalidCapability` on mismatch — a handle held across a free/reallocate of its
 slot fails closed rather than aliasing the unrelated capability now at that index
-(#349). A free at the generation's last value retires the slot instead of
-recycling it, so no handle is issued twice. A never-recycled slot has generation
-0, so its handle equals the bare index; long-lived boot/spawn caps keep their
-historical values, and a `0` handle still means "no capability". Range-split
-syscalls return their two child handles in the primary and secondary return
-registers (never packed into one word). See
+(#349). A never-recycled slot has generation 0, so its handle equals the bare
+index; long-lived boot/spawn caps keep their historical values, and a `0` handle
+still means "no capability". Range-split syscalls return their two child handles
+in the primary and secondary return registers (never packed into one word). See
 [capability-model.md](../../../docs/capability-model.md) § Capability Handle
 Format.
 
@@ -2122,10 +2120,10 @@ to it is stopped and the call never returns (see
 
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
-`InvalidArgument` (dst_slot occupied, retired, or out of range), `OutOfMemory` (slot-page pool
-exhausted, or SEED cannot back an `Mmio` or `IoPort` copy's object), `QuotaExceeded` (dst CSpace
-directory structurally full, an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT`
-(64) live copies, or any other source's object has its reference count at its 2^31 ceiling).
+`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
+or SEED cannot back an `Mmio` or `IoPort` copy's object), `QuotaExceeded` (dst CSpace directory
+structurally full, an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
+copies, or any other source's object has its reference count at its 2^31 ceiling).
 
 ---
 
@@ -2173,7 +2171,7 @@ and the call never returns (see
 
 **Errors:** `InvalidCapability` (also: an ancestor's revoke freed the
 capability while the move was in flight), `InsufficientRights` (dst CSpace
-lacks Insert), `InvalidArgument` (dst_slot occupied, retired, or out of range),
+lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
 structurally full, or the object's reference count is at its 2^31 ceiling: the destination takes
 its reference before the source releases its own), `InvalidState` (a `SYS_CAP_REVOKE`, another

@@ -82,8 +82,7 @@ An entry an existing open Issue already names cites it in the recommendation.
   RAM-bound, and the kernel's `CSpace` registry is sized from RAM and does not bind first.
   Behind those sit the per-process `u32` death correlator, `badge as u32` in procmgr, logd and
   svcmgr, which procmgr keeps unique among live processes by redrawing a colliding badge (#638
-  widens it), and the cap handle's 8-bit generation, whose retirement at wrap caps each
-  `CSpace`'s lifetime frees.
+  widens it), and the cap handle's 8-bit wrapping generation.
 - **Per-process address space.** The surfaces a creator places stay in one static map below
   Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
@@ -164,7 +163,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `REGISTRY_CHUNK_ORDER` | `core/kernel/src/cap/registry.rs` | 8 (1 MiB chunks) | encoding artefact (chunk granularity of the two-level arena) | none | correct as is | None |
 | `CSpaceRegistry` chunk table (`chunks_for_ram`, `MAX_ID_CHUNKS`) | `core/kernel/src/cap/registry.rs` | one slot per 256 MiB of DRAM, at most `MAX_ID_CHUNKS` (the `u32` id space, 16 TiB of DRAM) | encoding artefact (`CSpaceId` width) | 8 B per 256 MiB of DRAM | correct as is | None |
 | `RegistryEntry.epoch`, `SlotId.epoch` | `core/kernel/src/cap/registry.rs`, `slot.rs` | `u32`, redrawn on recycle | encoding artefact (12 B `SlotId`, 72 B slot) | 4 B per `SlotId` | correct as is | Freshness-only; the residual per recycle is documented |
-| `CapabilitySlot.pad[1]` (handle generation) | `core/kernel/src/cap/slot.rs` | `u8`, retired at wrap (`CSpace::free_slot` retires an index after its 256th occupant) | ABI width (`u32` handle: 8 generation + 24 index bits) | 1 B per slot | raise | Retired at wrap, so no handle is reissued; the lifetime bound goes with the handle width: a retired slot (72 B) is never reused, so a `CSpace` makes at most about `MAX_SLOTS_STRUCTURAL` x 256 (about 9.4e8) frees in its life, which a server receiving and deleting 10 000 caps a second reaches in about 26 h; decide with `CAP_INDEX_BITS` |
+| `CapabilitySlot.pad[1]` (handle generation) | `core/kernel/src/cap/slot.rs` | `u8`, wrapping | ABI width (`u32` handle: 8 generation + 24 index bits) | 1 B per slot | raise | Wraps after 256 recycles of one index. Retiring the index at wrap instead leaks one 72 B slot per 256 frees, which cap-churning workloads exhaust their `CSpace` pools with in seconds, so widen handles; decide with `CAP_INDEX_BITS` |
 | `CAP_INDEX_BITS` | `abi/syscall/src/lib.rs` | 24 | ABI width (`u32` handle) | none | needs a design | About 16.7 M slots per CSpace; decide with the generation (#41) |
 | `L2_SIZE` | `core/kernel/src/cap/cspace.rs` | 56 | encoding artefact (56 x 72 B in one page, asserted; published as `CSPACE_SLOTS_PER_PAGE`) | none | correct as is | None |
 | `L1_DIRECT`, `L1_INDIRECT` | `core/kernel/src/cap/cspace.rs` | 128 / 128 | encoding artefact (two-level directory inline in the CSpace) | 2 KiB per CSpace | correct as is | Add a level, not inline pointers, if `MAX_SLOTS_STRUCTURAL` ever binds (#41) |

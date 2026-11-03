@@ -298,9 +298,12 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// FNV-1a over the key's bytes: the key index's hash. Keys are on-disk slot
-/// positions the driver reads, not client-chosen bytes, so the hash needs
-/// no keying against collision floods.
+/// FNV-1a over the key's bytes: the key index's hash. The fat driver's keys
+/// are on-disk slots, `(sector_lba, offset_in_sector)`. A client holding
+/// `MUTATE_DIR` chooses which slots stay live, by creating entries and
+/// removing the ones it does not want, but never sees the `sector_lba` an
+/// entry lands at, so it cannot aim its entries at one probe run, and the
+/// hash needs no keying against collision floods.
 struct Fnv1a(u64);
 
 impl Hasher for Fnv1a

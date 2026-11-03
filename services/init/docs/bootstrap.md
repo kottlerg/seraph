@@ -58,8 +58,12 @@ process creation to procmgr IPC.
   the memmgr SEND cap so its std heap reaches memmgr on the first
   allocation (`bootstrap::bootstrap_procmgr` in
   `../src/bootstrap.rs`, called from `run()` in `../src/main.rs`).
-- Delegate all remaining RAM Memory caps to memmgr's CSpace via
-  `finalize_memmgr` and serve a single bootstrap-IPC round carrying
+- Delegate the remaining RAM Memory caps to memmgr's CSpace via
+  `finalize_memmgr`, up to the forwarding stop: the first cap with no
+  `InitInfo` descriptor, or the one that would leave memmgr's or init's
+  `CSpace` short of its headroom, ends the forwarded prefix, and that cap
+  and every later one reach memmgr's pool through the reap donation
+  (§ Handover) instead. Serve a single bootstrap-IPC round carrying
   the pool's memory-cap range + a read-only phys-table cap (so memmgr can
   ingest its pool) (`finalize_memmgr`, served via `ipc::bootstrap::serve_round`; `../src/main.rs`).
   Init retains every boot-module Memory cap (its self-loaded

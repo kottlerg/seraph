@@ -87,9 +87,11 @@ Allocation Contract").
 - **Serve MMIO or IOMMU memory caps.** memmgr's pool is RAM only. MMIO Memory
   caps come from devmgr (see [device-management.md](../../docs/device-management.md));
   memmgr never sees them.
-- **Implement swap, paging, or page-fault handling.** Memory caps are allocated
-  out of physical RAM; there is no backing store. A failed allocation
-  returns an out-of-memory error to the caller (see
+- **Implement swap or a backing store.** Memory caps are allocated out of
+  physical RAM, and as the default pager memmgr fills a demand-paged fault
+  from that RAM too (see [docs/fault-handling.md](../../docs/fault-handling.md)
+  § Demand Paging and the Default System Pager); nothing is paged out. A failed
+  allocation returns an out-of-memory error to the caller (see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Failure Modes").
 - **Operate a page cache.** Caching of file pages (when fs drivers
   implement it) lives in the fs driver, not in memmgr.

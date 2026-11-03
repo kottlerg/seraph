@@ -1059,15 +1059,18 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
     }
 }
 
-/// Delegate every remaining RAM Memory cap from init's pool into memmgr's
-/// `CSpace`, forward the in-use bootstrap arenas (memmgr's, procmgr's, and
-/// init's own backing), then `thread_configure` + `thread_start` memmgr.
+/// Delegate the remaining RAM Memory caps from init's pool into memmgr's
+/// `CSpace` up to the forwarding stop (the first cap with no `InitInfo`
+/// descriptor, or one past memmgr's or init's `CSpace` headroom), forward the
+/// in-use bootstrap arenas (memmgr's, procmgr's, and init's own backing), then
+/// `thread_configure` + `thread_start` memmgr. The caps past the stop reach
+/// memmgr's pool through the reap donation (`finish_init_reap_handoff`).
 ///
 /// Call after every `alloc.alloc_page()` consumer (memmgr's own setup,
 /// procmgr's setup) has run — at that point everything left in init's
-/// memory-cap pool is RAM that memmgr should own. After this call, init has
-/// no more memory caps; subsequent allocations route through memmgr like any
-/// other process.
+/// memory-cap pool is RAM that memmgr should own. After this call, init
+/// allocates nothing more from its pool; subsequent allocations route through
+/// memmgr like any other process.
 ///
 /// `pm_arena_cap` is procmgr's backing arena and `init_arena_cap` is init's own
 /// (from [`ProcmgrBootstrap`] and [`crate::run`]); both are forwarded alongside

@@ -63,8 +63,9 @@ surfacing as an intermittent consumer fault.
 
 Each free run (a Memory cap, its page count, and its physical base) is a node
 in the metadata arena (below), linked on one list sorted by physical base. The
-run count is therefore bounded by RAM, not by a constant: no run is ever
-turned away for want of a slot. The pool keeps running totals of its free
+run count is therefore bounded by RAM, not by a constant: no run is turned
+away for want of a slot, short of the arena being unable to grow with its
+reserve spent. The pool keeps running totals of its free
 pages and runs. Selection walks the list:
 
 - **Smallest fit.** The smallest run covering at least `N` pages serves a

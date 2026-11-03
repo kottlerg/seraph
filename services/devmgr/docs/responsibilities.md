@@ -41,7 +41,11 @@ devmgr's responsibilities are:
   `goldfish-rtc` on RISC-V) spawn through a simpler path whose first
   bootstrap round delivers a service endpoint and one arch authority cap
   (`IoPort` for COM1 and CMOS, `Mmio` for an NS16550, the framebuffer, or
-  the goldfish RTC at `0x101000`), with the UART's interrupt cap after it,
+  the goldfish RTC at `0x101000`), with the UART's interrupt cap after it
+  (devmgr carves the UART line exclusive and holds nothing of it: the
+  serial driver acknowledges a delivery only when its client reads, so no
+  other device may share its line; every PCI device's line is instead held
+  and shared, [docs/pci-enumeration.md](pci-enumeration.md) step 3),
   and whose second, terminal round delivers the driver's devmgr query cap
   (below). The `cmos-rtc` first round also carries one data word: the CMOS
   RAM index of the century register the FADT's `CENTURY` field names, or 0

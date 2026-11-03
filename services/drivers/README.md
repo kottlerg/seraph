@@ -148,7 +148,8 @@ holds only the capabilities
 requests on the service endpoint devmgr creates and delivers at spawn (devmgr mints
 client SEND caps from its registry; see
 [services/devmgr/docs/responsibilities.md](../devmgr/docs/responsibilities.md#responsibilities)
-§ Responsibilities), and reuses shared crates such as
+§ Responsibilities), acknowledges each interrupt delivery promptly when it holds a binding on a
+line devmgr may share, and reuses shared crates such as
 [`virtio/core/`](virtio/core/README.md) for transport logic.
 
 ---

@@ -26,16 +26,19 @@ TODO: specify driver teardown.
    withdraws and destroys a driver that has not reported within its settle bound; see
    [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities.
-5. A driver holding an IRQ binding MUST acknowledge each delivery promptly (`SYS_IRQ_ACK`),
-   whether or not it has a request in flight: a line another device may share stays masked until
-   every binding on it has acknowledged, so a driver that acknowledges only inside its request
-   path holds the line masked for every other device on it while it is idle (see
-   [docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
-   § Interrupt Delivery). The VirtIO drivers wait on their service endpoint and IRQ notification
-   together and acknowledge on every wake. The serial driver acknowledges only when its client
-   reads, so devmgr keeps the UART line exclusive; the UART line is never a PCI `INTx` line on
-   either machine (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is PLIC source 10 against
-   `INTx` sources 32 to 35), so the exclusivity costs no device a cap in practice.
+5. A driver holding an IRQ binding on a line devmgr may share (a PCI `INTx` line) MUST
+   acknowledge each delivery promptly (`SYS_IRQ_ACK`), whether or not it has a request in flight:
+   the line stays masked until every binding on it has acknowledged, so a driver that acknowledges
+   only inside its request path holds the line masked for every other device on it while it is
+   idle (see [docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
+   § Interrupt Delivery). The VirtIO drivers run an interrupt-service thread, the only waiter on
+   the line's notification, which reads the device's interrupt status and acknowledges on every
+   wake. A driver that does not acknowledge promptly needs its line kept exclusive: the serial
+   driver acknowledges only when its client reads
+   ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr
+   keeps the UART line exclusive. The UART line is never a PCI `INTx` line on either machine
+   (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is PLIC source 10 against `INTx` sources
+   32 to 35), so the exclusivity costs no device a cap in practice.
 6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
 
@@ -43,4 +46,4 @@ TODO: specify driver teardown.
 
 ## Summarized By
 
-[services/drivers/README.md](../README.md)
+[Device Management](../../../docs/device-management.md), [services/drivers/README.md](../README.md)

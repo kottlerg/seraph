@@ -160,11 +160,13 @@ A driver receives a wired interrupt line as a single-line `Interrupt` cap and bi
 Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
 `MAX_IRQ_BINDINGS` (64) bindings, one per bound Interrupt object; a copy or derivation of an
 Interrupt cap references a fresh object over the same line, so every capability to a line is a
-binding of its own. devmgr splits each line once from its range, the first time a device on it
-needs it, holds that cap for the boot, and hands every driver on the line, the first included, a
-derivation of it, so PCI functions that share an `INTx` line are all served
+binding of its own. devmgr splits each PCI device's line once from its range, the first time a
+device on it needs it, holds that cap for the boot, and hands every driver on the line, the first
+included, a derivation of it, so PCI functions that share an `INTx` line are all served
 ([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md)
-§ Per-Device Capability Creation).
+§ Per-Device Capability Creation). The UART line is the exception: devmgr carves it exclusive,
+holds nothing, and moves the cap itself to the serial driver (devmgr's
+[responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 - **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
   routes it at its controller, and every new binding masks the line and owes an acknowledgement,
@@ -173,17 +175,20 @@ derivation of it, so PCI functions that share an `INTx` line are all served
   `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
   signals every bound notification, and completes at the controller. A receiver whose device did
-  not assert reads its device's interrupt status and finds nothing. Every receiver MUST
-  acknowledge each delivery promptly, whether or not it has a request in flight: the line stays
-  masked until every binding has acknowledged, so a receiver that acknowledges only while it
-  serves a request of its own holds the line masked for the others on it while it is idle, and
-  their devices' interrupts are lost until it next does. The VirtIO drivers therefore wait on
-  their service endpoint and interrupt notification together and acknowledge on every wake
-  ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md) rule 5).
-  The serial driver acknowledges only when its client reads, so devmgr keeps the UART line
-  exclusive and shares no other device onto it. The UART line is never a PCI `INTx` line on
-  either machine (x86-64 COM1 is ISA IRQ 4; the riscv64 `virt` NS16550 is PLIC source 10, against
-  `INTx` sources 32 to 35), so the exclusivity costs no device a cap in practice.
+  not assert reads its device's interrupt status and finds nothing. Every receiver on a line
+  devmgr may share MUST acknowledge each delivery promptly, whether or not it has a request in
+  flight: the line stays masked until every binding has acknowledged, so a receiver that
+  acknowledges only while it serves a request of its own holds the line masked for the others on
+  it while it is idle, and their devices' interrupts are lost (x86-64) or delayed (riscv64) until
+  it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges on
+  every wake ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
+  rule 5). A driver that does not acknowledge promptly needs its line kept exclusive: the serial
+  driver acknowledges only when its client reads
+  ([services/drivers/serial/README.md](../services/drivers/serial/README.md#interrupts)
+  § Interrupts), so devmgr keeps the UART line exclusive and shares no other device onto it. The
+  UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA IRQ 4; the riscv64
+  `virt` NS16550 is PLIC source 10, against `INTx` sources 32 to 35), so the exclusivity costs no
+  device a cap in practice.
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
@@ -311,6 +316,7 @@ specified in [`docs/storage.md`](storage.md).
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),
+[Driver Model](../services/drivers/docs/driver-model.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
 [services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),
 [services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),

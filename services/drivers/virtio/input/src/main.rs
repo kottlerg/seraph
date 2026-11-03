@@ -444,13 +444,11 @@ struct InputRuntime
     vq: SplitVirtqueue,
     transport: PciTransport,
     queue_notify_off: u16,
-    irq_notification: u32,
-    irq_cap: u32,
-    /// The service loop's wait set over the service endpoint and
-    /// `irq_notification` when an IRQ is bound, so an interrupt on the line
-    /// is acknowledged while no read is in flight
-    /// ([`acknowledge_idle_interrupt`]); 0 when no IRQ is bound.
-    wait_set: u32,
+    /// Notification the read loop waits on: signalled by the
+    /// interrupt-service thread after each delivery it acknowledged
+    /// ([`start_isr_thread`]), never signalled when no IRQ is bound, in which
+    /// case the bounded wait is a timed poll.
+    wake: u32,
     ring: EventRing,
     mods: ModifierState,
 }
@@ -489,15 +487,12 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
         {
             break;
         }
-        // Wait for input. When an IRQ is bound the notification wakes on the
-        // device interrupt; otherwise this is a timed poll. The bounded wait
-        // re-drains every tick, so a lost or absent IRQ cannot wedge the read.
-        let _ = syscall::notification_wait_timeout(rt.irq_notification, POLL_INTERVAL_MS);
-        let _ = rt.transport.read_isr();
-        if rt.irq_cap != 0
-        {
-            let _ = syscall::irq_ack(rt.irq_cap);
-        }
+        // Wait for input. When an IRQ is bound the interrupt-service thread
+        // signals `wake` on each delivery, having read the ISR and
+        // acknowledged the line itself; otherwise this is a timed poll. The
+        // bounded wait re-drains every tick, so a lost or absent IRQ cannot
+        // wedge the read.
+        let _ = syscall::notification_wait_timeout(rt.wake, POLL_INTERVAL_MS);
     }
 
     let mut builder = IpcMessage::builder(input_errors::SUCCESS).word(0, count as u64);
@@ -510,44 +505,38 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Wait-set badge of the service endpoint.
-const WS_REQUEST: u64 = 1;
-/// Wait-set badge of the IRQ notification.
-const WS_IRQ: u64 = 2;
-
-/// Create the service loop's wait set over `service_ep` and
-/// `irq_notification`. Returns `None`, with what it created released, when
-/// the set cannot be created or a member cannot be added.
-fn service_wait_set(service_ep: u32, irq_notification: u32) -> Option<u32>
-{
-    let ws =
-        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
-            syscall::wait_set_create(slab, 2).ok()
-        })?;
-    if syscall::wait_set_add(ws, service_ep, WS_REQUEST).is_err()
-        || syscall::wait_set_add(ws, irq_notification, WS_IRQ).is_err()
-    {
-        let _ = syscall::cap_delete(ws);
-        return None;
-    }
-    Some(ws)
-}
-
-/// Acknowledge an interrupt that arrived while no read was in flight.
+/// Start the interrupt-service thread: the only waiter on
+/// `irq_notification`, the notification bound to the device's line. On every
+/// delivery it reads the ISR, which clears this device's assertion (the
+/// delivery is this device's or another's on the line), acknowledges the
+/// binding at once, and signals `wake` for the read loop.
 ///
 /// Every binding on a line owes an acknowledgement for each delivery, and
 /// the kernel keeps the line masked until all of them have acknowledged
-/// (docs/device-management.md § Interrupt Delivery), so an idle driver that
-/// left its binding owing would mask the line for every other device on it.
-/// The delivery is this device's or another's; reading the ISR clears this
-/// device's assertion either way, and the next read drains any events the
-/// eventq holds. The notification's bits are taken first, so the wait set
-/// does not report it ready again.
-fn acknowledge_idle_interrupt(rt: &InputRuntime)
+/// (docs/device-management.md § Interrupt Delivery). A thread of its own,
+/// rather than the service loop, acknowledges, because the service loop
+/// blocks in `ipc_recv`, which has no timeout: a wait set over the service
+/// endpoint and the notification can report a sender that has since left,
+/// and the receive then blocks with the binding owing. Returns whether the
+/// thread started.
+fn start_isr_thread(transport: PciTransport, irq_notification: u32, irq_cap: u32, wake: u32)
+-> bool
 {
-    let _ = syscall::notification_wait_timeout(rt.irq_notification, 1);
-    let _ = rt.transport.read_isr();
-    let _ = syscall::irq_ack(rt.irq_cap);
+    std::thread::Builder::new()
+        .spawn(move || {
+            loop
+            {
+                if syscall::notification_wait(irq_notification).is_err()
+                {
+                    let _ = syscall::thread_yield();
+                    continue;
+                }
+                let _ = transport.read_isr();
+                let _ = syscall::irq_ack(irq_cap);
+                let _ = syscall::notification_send(wake, 1);
+            }
+        })
+        .is_ok()
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -573,28 +562,6 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        // With an IRQ bound, wait for a request or an interrupt; an
-        // interrupt while idle is acknowledged at once, so this driver never
-        // holds a shared line masked between reads.
-        if rt.wait_set != 0
-        {
-            match syscall::wait_set_wait(rt.wait_set)
-            {
-                Ok(WS_IRQ) =>
-                {
-                    guard.on_success();
-                    acknowledge_idle_interrupt(rt);
-                    continue;
-                }
-                Ok(_) =>
-                {}
-                Err(e) =>
-                {
-                    guard.on_failure(e);
-                    continue;
-                }
-            }
-        }
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
         {
@@ -679,47 +646,57 @@ fn main() -> !
     transport
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-    // Create the notification the read path waits on. The IRQ is optional:
-    // virtio-input may share an INTx line (devmgr then delivers no IRQ cap), and
-    // the read path polls the eventq regardless. When an IRQ cap is present, bind
-    // the notification to it for low-latency wakeups; otherwise the bounded wait
-    // degrades to timed polling.
-    let Some(irq_notification) =
+    // Create the notification the read path waits on (`wake`). The IRQ is
+    // optional: devmgr delivers no IRQ cap when it can give the device none,
+    // and the read path polls the eventq regardless. When an IRQ cap is
+    // present, bind a second notification to it and start the
+    // interrupt-service thread, which acknowledges every delivery and signals
+    // `wake`; otherwise the bounded wait degrades to timed polling.
+    let create_notification = || {
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
             syscall::cap_create_notification(slab).ok()
         })
+    };
+    let Some(wake) = create_notification()
     else
     {
         std::os::seraph::log!("failed to create notification");
         syscall::thread_exit();
     };
     let irq_cap = caps.irq_slot;
-    // With an IRQ bound, the service loop waits on the service endpoint and
-    // the IRQ notification together, so it acknowledges every delivery, a
-    // read in flight or not. Without the wait set the IRQ is not bound and
-    // the read path polls.
-    let wait_set = if irq_cap == 0
+    if irq_cap == 0
     {
         std::os::seraph::log!("no IRQ cap; polling the eventq");
-        0
     }
-    else if let Some(ws) = service_wait_set(caps.service_ep, irq_notification)
+    else
     {
+        let Some(irq_notification) = create_notification()
+        else
+        {
+            std::os::seraph::log!("failed to create IRQ notification");
+            syscall::thread_exit();
+        };
         if syscall::irq_register(irq_cap, irq_notification).is_err()
         {
             std::os::seraph::log!("irq_register failed");
             syscall::thread_exit();
         }
+        // The interrupt-service thread acknowledges every delivery from here
+        // on, a read in flight or not, so this driver never holds a shared
+        // line masked. Its transport is a copy over the same register window.
+        if !start_isr_thread(
+            PciTransport::new(window_va, &layout),
+            irq_notification,
+            irq_cap,
+            wake,
+        )
+        {
+            std::os::seraph::log!("failed to start the interrupt-service thread");
+            syscall::thread_exit();
+        }
         // irq_register leaves the entry masked; the first ack unmasks it.
         let _ = syscall::irq_ack(irq_cap);
-        ws
     }
-    else
-    {
-        std::os::seraph::log!("no service wait set; IRQ not bound, polling the eventq");
-        0
-    };
-    let irq_cap = if wait_set == 0 { 0 } else { irq_cap };
 
     // Tell the device its event buffers are available.
     transport.notify(0, queue_notify_off);
@@ -738,9 +715,7 @@ fn main() -> !
         vq,
         transport,
         queue_notify_off,
-        irq_notification,
-        irq_cap,
-        wait_set,
+        wake,
         ring,
         mods: ModifierState::new(),
     };

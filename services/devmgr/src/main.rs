@@ -87,8 +87,9 @@ fn main() -> !
     );
 
     // IRQ allocator state: single-line caps carved out of devmgr's
-    // Interrupt range cap, every remainder kept, and each carved line held,
-    // every device on it given a derivation.
+    // Interrupt range cap, every remainder kept; each PCI device's line held
+    // once carved, every device on it given a derivation, and the UART line
+    // carved exclusive.
     let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
 
     // The UART line (`arch::current::UART_IRQ`), kept exclusive: the serial
@@ -932,11 +933,13 @@ const IRQ_SPLIT_OUT_OF_RANGE: i64 = syscall_abi::SyscallError::InvalidArgument a
 /// devmgr's interrupt lines: single-line `Interrupt` caps carved out of its
 /// Interrupt range cap, in any order (every line not yet carved stays in the
 /// range table, so a device whose GSI lies below one already carved still
-/// gets its line), each held for the boot once carved
-/// ([`firmware::lines::HeldLines`]). Every device on a line, the first
-/// included, gets a derivation of the held cap, so devices that share an
-/// `INTx` line each bind their own receiver on it
-/// (docs/device-management.md § Interrupt Delivery).
+/// gets its line). A PCI device's line is held for the boot once carved
+/// ([`firmware::lines::HeldLines`], [`line_cap`](Self::line_cap)), and every
+/// device on it, the first included, gets a derivation of the held cap, so
+/// devices that share an `INTx` line each bind their own receiver on it
+/// (docs/device-management.md § Interrupt Delivery). The UART line is carved
+/// exclusive instead ([`exclusive_line`](Self::exclusive_line)): nothing is
+/// held, and its cap itself goes to the serial driver.
 struct IrqRangeAllocator
 {
     ranges: SpanTable<u32>,

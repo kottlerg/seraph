@@ -207,6 +207,15 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 
 W^X is verified during construction: no leaf PTE has both writable and executable permissions.
 
+The handoff stack is `HANDOFF_STACK_BYTES` (`boot_protocol::layout`) of whole pages, so its
+top is page-aligned, and the kernel is entered with the stack pointer at that top
+(step 10). The bootloader fills the stack with `STACK_PAINT` and writes
+`HANDOFF_STACK_BASE_MARK` at its lowest word. The kernel relies on both for its stack depth
+report: it rounds its entry stack pointer up to a page to find the stack's top, confirms the
+bottom by the mark, and measures the deepest use as the lowest word no longer painted
+([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth) § Kernel
+Stack Depth).
+
 Detail: [page-tables.md](page-tables.md)
 
 ### Step 7: Query Final Memory Map
@@ -303,9 +312,11 @@ the kernel has consumed them.
 
 [core/boot/README.md](../README.md), [ACPI Parsing](acpi.md), [Early Console](console.md),
 [Device Tree Parsing](dtb.md), [ELF Loading](elf-loading.md),
-[Firmware Parsing](firmware-parsing.md), [Memory Map Translation](memory-map.md),
+[Firmware Parsing](firmware-parsing.md), [Kernel Handoff Contract](kernel-handoff.md),
+[Memory Map Translation](memory-map.md),
 [Page Tables](page-tables.md), [UEFI Environment](uefi-environment.md),
 [Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../../kernel/docs/initialization.md),
+[Memory Subsystem Internals](../../kernel/docs/memory-internals.md),
 [Architecture Overview](../../../docs/architecture.md),
 [System Bootstrap](../../../docs/bootstrap.md), [xtask/README.md](../../../xtask/README.md)

@@ -107,7 +107,7 @@ mirroring the kernel's own source layout.
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT` (`SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` and `SYS_SBI_CALL` are under `src/arch/<arch>/`) |
-| `sysinfo.rs` | `SYS_SYSTEM_INFO` |
+| `sysinfo.rs` | `SYS_SYSTEM_INFO`, including each `StackHighWater` class |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
 | `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
@@ -332,6 +332,7 @@ wait), where a lost wake is the defect the watchdog reports.
 | `split_delete_race.rs` | A same-CSpace sibling deletes the original while this thread splits it across three reparent batches; the split's result classifies each cycle and the slot count returns to baseline | `CYCLES=40`, `CHILDREN=600` |
 | `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn (≥ 2 CPUs) | `CYCLES=100` |
 | `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence | `NUM_PRODUCERS=4`, `MESSAGES_PER_PRODUCER=64` |
+| `stack_depth.rs` | Runs last in Tier S: reads `SYS_SYSTEM_INFO(StackHighWater)` for the idle stacks, the thread kernel stacks, and the handoff stack and logs each depth beside its stack size; a report, failing only on an overflow: a class reading full, or the handoff stack's base mark gone | none |
 
 ### Tier 3 — `src/bench/`
 

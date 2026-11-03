@@ -199,3 +199,41 @@ pub fn user_va_top(ctx: &TestContext) -> TestResult
     }
     Ok(())
 }
+
+/// `system_info(StackHighWater)` answers each stack class with a depth inside
+/// that class's stack, and refuses an unknown class with `InvalidArgument`.
+///
+/// Tier 1 runs on a fresh boot, so every depth is a partial one; the Tier S
+/// `stress::stack_depth` cell reports them after the stress tier.
+pub fn stack_high_water_classes(_ctx: &TestContext) -> TestResult
+{
+    use syscall::stack_high_water;
+    use syscall_abi::{STACK_CLASS_HANDOFF, STACK_CLASS_IDLE, STACK_CLASS_THREAD};
+
+    let kernel_stack = crate::KERNEL_STACK_BYTES;
+    // The calling thread's own stack is in use, so the thread class reads
+    // above zero; an idle stack has at least run its idle loop.
+    let thread = stack_high_water(STACK_CLASS_THREAD)
+        .map_err(|_| "sysinfo::stack_high_water: thread class failed")?;
+    if thread == 0 || thread >= kernel_stack
+    {
+        return Err("sysinfo::stack_high_water: thread depth outside (0, stack size)");
+    }
+    let idle = stack_high_water(STACK_CLASS_IDLE)
+        .map_err(|_| "sysinfo::stack_high_water: idle class failed")?;
+    if idle == 0 || idle >= kernel_stack
+    {
+        return Err("sysinfo::stack_high_water: idle depth outside (0, stack size)");
+    }
+    let handoff = stack_high_water(STACK_CLASS_HANDOFF)
+        .map_err(|_| "sysinfo::stack_high_water: handoff class failed")?;
+    if handoff == 0 || handoff >= boot_protocol::layout::HANDOFF_STACK_BYTES as u64
+    {
+        return Err("sysinfo::stack_high_water: handoff depth outside (0, stack size)");
+    }
+    if stack_high_water(3) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("sysinfo::stack_high_water: unknown class not refused");
+    }
+    Ok(())
+}

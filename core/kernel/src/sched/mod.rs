@@ -44,7 +44,14 @@ pub const IDLE_PRIORITY: u8 = 0;
 /// reaches zero. A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
-/// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).
+/// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total).
+///
+/// Measured bound (the paint report, `crate::stack_depth`; ktest
+/// `stress::stack_depth` after Tier S): the deepest thread stack uses 4304 B
+/// and the deepest idle stack 1752 B, a margin of about 74% and 89%, over
+/// debug and release builds at 4, 16 and 128 CPUs on both architectures
+/// (release: thread 4304 B, idle 1616 B; debug: thread 4200 B, idle 1752 B).
+/// The report gives the depth, not the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
@@ -2600,6 +2607,12 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
         // Stack grows downward; top = base + size (direct map).
         let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+        // Paint it for the depth report (crate::stack_depth).
+        // SAFETY: the fresh order-`stack_order` block is this CPU's idle stack
+        // alone, mapped through the direct map; no thread runs on it yet.
+        unsafe {
+            crate::stack_depth::paint(phys_to_virt(stack_phys), KERNEL_STACK_PAGES * PAGE_SIZE);
+        }
         // SAFETY: tops_ptr covers n slots; cpu < n.
         unsafe { core::ptr::write(tops_ptr.add(cpu), stack_top) };
     }
@@ -6411,6 +6424,10 @@ pub unsafe fn enter() -> !
     BOOT_TRANSIENT_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
 
     crate::kprintln!("sched: enter - handing control to init");
+
+    // The BSP's deepest remaining call on the handoff stack is above; it
+    // leaves the stack for init's kernel stack below. Record its depth.
+    crate::stack_depth::record_handoff_stack();
 
     // Activate init's address space (tagged when tagging is enabled) and enter
     // user mode. `first_entry_to_user` handles the arch-specific sequence:

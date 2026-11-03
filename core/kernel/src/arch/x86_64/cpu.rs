@@ -9,8 +9,8 @@
 //! control and halt, the fence ahead of an x2APIC MSR write, and the debug-build
 //! kernel-entry RFLAGS check.
 //!
-//! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`,
-//! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
+//! `current_stack_pointer`, `load_word_racy`, the CR4/MSR accessors, `x2apic_wrmsr_fence`,
+//! `copy_user`, `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
 //! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
 //! host stubs). `cpuid`, `current_cpu` (which returns 0 under test),
@@ -36,7 +36,9 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32)
 
 /// Read the current stack pointer (`rsp`).
 ///
-/// Used by the panic-path backtrace scanner to bound the kernel-stack walk.
+/// Used by the panic-path backtrace scanner to bound the kernel-stack walk,
+/// and at `kernel_entry`'s first statement to locate the handoff stack
+/// (`crate::stack_depth::note_boot_entry`).
 #[cfg(not(test))]
 pub fn current_stack_pointer() -> u64
 {
@@ -46,6 +48,33 @@ pub fn current_stack_pointer() -> u64
         core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
     }
     sp
+}
+
+/// Load one word that another CPU may be writing concurrently, as an opaque
+/// machine load the compiler neither elides nor reasons about.
+///
+/// For diagnostics that sample memory a running CPU owns (the idle-stack depth
+/// scan, `crate::stack_depth`): a Rust read racing a plain store is undefined
+/// behaviour, a `mov` instruction is not, and a stale value only changes the
+/// sample.
+///
+/// # Safety
+/// `p` is a mapped, 8-byte aligned kernel address.
+#[cfg(not(test))]
+pub unsafe fn load_word_racy(p: *const u64) -> u64
+{
+    let v: u64;
+    // SAFETY: p is mapped and aligned per the contract; a load has no side
+    // effect.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, [{}]",
+            out(reg) v,
+            in(reg) p,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    v
 }
 
 // ── CR4 ───────────────────────────────────────────────────────────────────────

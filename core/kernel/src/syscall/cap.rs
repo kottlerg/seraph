@@ -1082,6 +1082,12 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
 
     let kstack_virt = block_virt;
     let kstack_top = block_virt + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+    // Paint the kernel stack for the depth report (crate::stack_depth): a full
+    // overwrite of the stack pages, so their previous content never reaches
+    // the thread.
+    // SAFETY: the retype slot's first KERNEL_STACK_PAGES pages are this new
+    // thread's stack, exclusively owned here; no thread runs on them yet.
+    unsafe { crate::stack_depth::paint(kstack_virt, KERNEL_STACK_PAGES * PAGE_SIZE) };
     let thread_obj_ptr = kstack_top as *mut ThreadObject;
     let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
     let tcb_ptr = (kstack_top + tcb_offset) as *mut ThreadControlBlock;
@@ -1119,8 +1125,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: pointers are inside the freshly-allocated retype slot.
     // Both the wrapper and the TCB land on page 4 of the slot, so they
     // are 8-byte aligned (page-aligned, in fact). The kstack pages are
-    // intentionally left uninitialised — they are written from the top
-    // down by the first context switch, and `kstack_top` excludes the
+    // painted above (`stack_depth::paint`), and `kstack_top` excludes the
     // wrapper page.
     unsafe {
         core::ptr::write(

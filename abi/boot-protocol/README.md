@@ -107,7 +107,7 @@ boot-protocol/
     ├── lib.rs           # BootInfo and its types, BOOT_PROTOCOL_VERSION, MAX_CPUS, the
     │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags
     ├── bundle.rs        # bootstrap.bundle wire format (header, entries, INIT_ENTRY_NAME)
-    ├── layout.rs        # direct-map layout arithmetic both bootloader and kernel use
+    ├── layout.rs        # direct-map layout and stack-paint words both bootloader and kernel use
     ├── riscv_paging.rs  # RISC-V paging-mode constants and satp encoding
     ├── role_guids.rs    # GPT partition type GUIDs for role-based discovery
     └── x86_paging.rs    # x86-64 paging-depth geometry (4- or 5-level, CR4.LA57)

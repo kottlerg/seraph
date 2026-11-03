@@ -314,8 +314,8 @@ fn assemble_provided_boot_caps(
 /// pwrmgr phases use; consumers that don't tolerate a missing cap fail on
 /// first use, which is the right surface for a real misconfiguration.
 ///
-/// `bind_target` carries the `(deaths_eq, correlator)` for supervised
-/// launches: when present, death-notification is bound BEFORE
+/// `bind_target` carries the death correlator for supervised launches,
+/// bound on `ctx.deaths`: when present, death-notification is bound BEFORE
 /// `START_PROCESS` so the observer is in place the instant the thread
 /// runs. (A death before the bind is delivered regardless — the kernel
 /// retains the exit reason and replays it to a later bind — but binding
@@ -326,7 +326,7 @@ pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-    bind_target: Option<(u32, u32)>,
+    bind_target: Option<u64>,
 ) -> Option<Launched>
 {
     let (argv_blob, argv_count) = build_blob(&def.argv);
@@ -356,8 +356,10 @@ pub fn launch(
     // Bind death-notification BEFORE start_process so any immediate
     // post-start death is captured. Thread is suspended at this
     // point — no userspace code has run yet.
-    if let Some((deaths_eq, correlator)) = bind_target
-        && syscall::thread_bind_notification(created.thread_cap, deaths_eq, u64::from(correlator))
+    if let Some(correlator) = bind_target
+        && ctx
+            .deaths
+            .bind_thread(created.thread_cap, correlator)
             .is_err()
     {
         std::os::seraph::log!("launch {}: thread_bind_notification failed", def.name);

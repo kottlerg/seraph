@@ -31,7 +31,7 @@ services/svctest/
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
-        ├── procmgr.rs         # `Command` spawn, cwd, error paths; refused requests; init reap
+        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; death queues; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
@@ -179,18 +179,17 @@ token falls through to the normal run.
 
 ## Fixtures
 
-Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` and
-`pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust`
-(recv guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardown
-phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver, and the
-driver-withdrawal phase three [`test-fault`](../drivers/test-fault/README.md) drivers, one of
-which never reports ready, so the phase waits the fault batch's settle bound
-(`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The
+Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` (pipes,
+procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust` (recv
+guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardown phase has devmgr
+spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver, and the driver-withdrawal phase
+three [`test-fault`](../drivers/test-fault/README.md) drivers, one of which never reports ready, so
+the phase waits the fault batch's settle bound (`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The
 `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
-delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it
-down with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS
-phases also read the build-synthesised `/data/svctest/large.bin` and write their scratch files
-under `/data/svctest/`; and `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
+delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
+with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
+also read the build-synthesised `/data/svctest/large.bin` and write their scratch files under
+`/data/svctest/`; and `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
 build-synthesised `/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 

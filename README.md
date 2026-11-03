@@ -62,7 +62,7 @@ cargo xtask run                              # launch existing sysroot under QEM
 cargo xtask run --gdb                        # pause at start; GDB on :1234
 cargo xtask test                             # run host-side workspace tests
 cargo xtask lint-docs                        # check docs and source-header rules
-cargo xtask clean [--all]                    # remove sysroot/ and disk.img (target/ with --all)
+cargo xtask clean [--all]                    # remove sysroot/ and disk images (target/ with --all)
 ```
 
 Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses

@@ -9,11 +9,12 @@
 //! from in-memory ELF images or by streaming from VFS, as well as starting
 //! suspended processes.
 
+use crate::death_queues::DeathSet;
 use crate::loader::{self, ScratchMapping};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
-use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
+use syscall_abi::{EXIT_KILLED, FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 /// The reply's `MSG_DATA_WORDS_MAX` words less the count word fix it, and
@@ -23,26 +24,24 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// Mint a fresh process badge: a random `u64` drawn from the kernel entropy
 /// pool ([`syscall::random_u64`]). The same value is procmgr's process-table
 /// key, the badged SEND-cap badge on the log endpoint (logd keys slots by the
-/// full `u64`), and procmgr's death-EQ correlator (low 32 bits,
-/// [`process_table::correlator_of`]). Drawing it at random — rather than the
-/// former monotonic counter — keeps the per-process identifier and the spawn
-/// rate it would otherwise leak unguessable; the capability is still the sole
-/// authority, so this is defense-in-depth. The `u64` width is the kernel
-/// badge word, so the space never runs out.
+/// full `u64`), and procmgr's death-EQ correlator. Drawing it at random —
+/// rather than the former monotonic counter — keeps the per-process
+/// identifier and the spawn rate it would otherwise leak unguessable; the
+/// capability is still the sole authority, so this is defense-in-depth. The
+/// `u64` width is the kernel badge word, so the space never runs out.
 ///
 /// Single allocation point so the value threads to `populate_child_info`
 /// (writes the badged SEND derivation into `pi.log_send_cap`) AND
 /// `finalize_creation` (table key, death-EQ correlator, process-handle badge).
 ///
-/// Redraws until the low 32 bits clear `LOG_BADGE_FIRST_CHILD` — keeping the
-/// badge out of the reserved log-badge / no-correlator range that the old
-/// monotonic counter held structurally by starting at 16 — and avoid the
-/// reserved init-reap correlator, and until no verb bit
-/// (`ipc::VERB_BIT_MASK`) is set; see [`badge_is_acceptable`]. It also
-/// redraws a candidate whose low 32 bits a live process already holds, so the
-/// `u32` death correlator names one live process however large the table
-/// grows. Returns `None` if the entropy draw fails (a kernel-contract
-/// violation), failing the spawn rather than minting a weak badge.
+/// Redraws until the badge clears `LOG_BADGE_FIRST_CHILD` — keeping it out
+/// of the reserved log-badge / no-correlator range that the old monotonic
+/// counter held structurally by starting at 16 — and avoids the reserved
+/// init-reap correlator, and until no verb bit (`ipc::VERB_BIT_MASK`) is set;
+/// see [`badge_is_acceptable`]. It also redraws a badge a live process
+/// already holds, so the death correlator names one live process. Returns
+/// `None` if the entropy draw fails (a kernel-contract violation), failing
+/// the spawn rather than minting a weak badge.
 fn next_process_badge(table: &ProcessTable) -> Option<u64>
 {
     loop
@@ -53,7 +52,7 @@ fn next_process_badge(table: &ProcessTable) -> Option<u64>
             ipc::log_badges::LOG_BADGE_FIRST_CHILD,
             ipc::procmgr_labels::INIT_REAP_CORRELATOR,
             ipc::VERB_BIT_MASK,
-        ) && !table.correlator_in_use(process_table::correlator_of(t))
+        ) && !table.badge_in_use(t)
         {
             return Some(t);
         }
@@ -107,22 +106,18 @@ fn choose_image_bias_or_default() -> u64
 
 /// Logd's death-notification `EventQueue` cap, registered via
 /// `procmgr_labels::REGISTER_DEATH_EQ` once real-logd is up. Zero
-/// until then. Read in `finalize_creation` to bind logd as a second
-/// death observer on the main thread of every newly spawned child; on
-/// registration, retroactively bound to the main thread of every
-/// existing process table entry by `install_logd_death_eq` so logd does
-/// not miss prior children. Threads a process creates itself carry no
-/// logd binding.
+/// until then. Every teardown after the registration posts the dead
+/// process's death entry to it ([`forward_death_to_logd`]), so the queue
+/// carries no death-observer nodes and no pool of its own bounds the
+/// processes logd hears of.
 ///
 /// Single-writer (the `REGISTER_DEATH_EQ` handler runs under
 /// procmgr's single-threaded dispatch); readers race only with the
-/// writer, and the Acquire load pairs with the Release store on
+/// writer, and the Acquire load pairs with the Release half of the store on
 /// registration.
 pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Install logd's death-notification EQ cap and retroactively bind it
-/// as a second observer on the main thread (`entry.thread_cap`) of
-/// every process currently in the process table. Called by
+/// Install logd's death-notification EQ cap. Called by
 /// `REGISTER_DEATH_EQ`'s handler.
 ///
 /// First-wins semantics: returns `false` (and changes nothing) if a
@@ -134,7 +129,7 @@ pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// later attacker's registration is always second and is rejected
 /// here. The caller (`handle_register_death_eq`) is responsible for
 /// `cap_delete`ing the just-transferred slot when this returns false.
-pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
+pub fn install_logd_death_eq(logd_eq: u32) -> bool
 {
     if logd_eq == 0
     {
@@ -142,34 +137,43 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     }
     // First-wins: refuse to overwrite. Real logd registers exactly
     // once at startup, so the slot transitions 0 → logd_eq and stays.
-    if LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire) != 0
+    LOGD_DEATH_EQ
+        .compare_exchange(
+            0,
+            logd_eq,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// `SYS_EVENT_POST`'s refusal of a post to a full queue.
+const QUEUE_FULL: i64 = SyscallError::QueueFull as i64;
+
+/// Post the death entry `(exit_reason, badge)` of a process procmgr tears
+/// down to logd's registered death queue, so logd evicts the process's slot.
+/// A no-op before logd registers. A post the full queue refuses is dropped,
+/// as the kernel drops a post to a full observer queue: logd's drain of the
+/// full queue starts its resync, which evicts the slot.
+fn forward_death_to_logd(badge: u64, exit_reason: u64)
+{
+    let logd_eq = LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire);
+    if logd_eq == 0
     {
-        return false;
+        return;
     }
-    // Commit semantics: this function returns `true` whenever the cap
-    // becomes the registered logd death-EQ (atomic stored). The caller
-    // contract is "false ⇒ cap_delete on the just-transferred slot;
-    // true ⇒ slot is now owned by procmgr". A partial bind failure
-    // CANNOT roll back successful binds — the kernel has no
-    // thread-unbind syscall — so we commit unconditionally once
-    // first-wins passes. Any failed-bind entry is logged; logd will
-    // not receive a death event for it (procmgr's own observer still
-    // does, so memmgr accounting is unaffected). In practice
-    // `finalize_creation` registers logd-EQ at every spawn going
-    // forward; only the pre-existing table is subject to this.
-    LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
-    table.for_each(|entry| {
-        let correlator = process_table::correlator_of(entry.badge);
-        if syscall::thread_bind_notification(entry.thread_cap, logd_eq, u64::from(correlator))
-            .is_err()
+    let entry = syscall::EventEntry {
+        payload: exit_reason,
+        tag: badge,
+    };
+    match syscall::event_post_entry(logd_eq, entry)
+    {
+        Ok(()) | Err(QUEUE_FULL) => (),
+        Err(e) =>
         {
-            std::os::seraph::log!(
-                "install_logd_death_eq: bind failed for entry badge={} (logd will miss its death event; procmgr observer unaffected)",
-                entry.badge,
-            );
+            std::os::seraph::log!("procmgr: death forward to logd failed (badge={badge}, err={e})");
         }
-    });
-    true
+    }
 }
 
 // Pure process-table, badge, recent-exit, and create-request blob logic
@@ -669,7 +673,7 @@ unsafe fn populate_child_info(
     // `::log::install_badged_cap`; `seraph::log!` writes ride it
     // directly with no discovery roundtrip. Logd attributes the
     // writes by the kernel-delivered badge, which equals procmgr's
-    // process badge, whose low 32 bits are the death-EQ correlator —
+    // process badge, which is also the death-EQ correlator —
     // self-reconciliation across the three views.
     let log_send_in_child = if universals.log_send_source != 0
     {
@@ -1309,7 +1313,7 @@ fn finalize_creation(
     main_tls: MainTls,
     table: &mut ProcessTable,
     self_endpoint: u32,
-    death_eq: u32,
+    deaths: &DeathSet,
     memmgr_send_cap: u32,
     memmgr_badge: u64,
     process_badge: u64,
@@ -1324,29 +1328,29 @@ fn finalize_creation(
 {
     let badge = process_badge;
 
-    // Bind procmgr's shared death queue as an observer on the child's
-    // main thread. Correlator = low 32 bits of the table badge; on death,
-    // dispatch_death recovers the entry via `take_by_correlator`.
-    let correlator = u64::from(process_table::correlator_of(badge));
-    syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
-
-    // Also bind procmgr's death queue as an address-space observer with the
-    // SAME correlator, so a terminal fault in a *spawned* (non-main) thread —
-    // which the main-thread binding above does not cover — still routes into
-    // `dispatch_death` → `take_by_correlator` → teardown. On a main-thread
-    // fault both observers fire with the same correlator and `take_by_correlator`
-    // reaps exactly once (the second event is a stale-correlator no-op).
-    let _ = syscall::aspace_bind_notification(child_aspace, death_eq, correlator);
-
-    // If logd has registered its own death EQ via REGISTER_DEATH_EQ,
-    // bind it as a second observer with the same correlator (logd's
-    // slot map is keyed by process_badge, which equals this badge).
-    // Children spawned before logd registers are bound retroactively
-    // by `install_logd_death_eq`.
-    let logd_eq = LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire);
-    if logd_eq != 0
+    // Bind a death observer from procmgr's death queues on the child's main
+    // thread. Correlator = the table badge; on death, dispatch_death recovers
+    // the entry via `take_by_badge`. A pool that runs out is followed by a
+    // further queue, so a failure here is procmgr's memory running out.
+    if let Err(e) = deaths.bind_thread(child_thread, badge)
     {
-        let _ = syscall::thread_bind_notification(child_thread, logd_eq, correlator);
+        std::os::seraph::log!("procmgr: main-thread death bind failed (err={e}); spawn refused");
+        return None;
+    }
+
+    // Also bind an address-space observer with the SAME correlator, so a
+    // terminal fault in a *spawned* (non-main) thread — which the main-thread
+    // binding above does not cover — still routes into `dispatch_death` →
+    // `take_by_badge` → teardown. On a main-thread fault both observers fire
+    // with the same correlator and `take_by_badge` reaps exactly once (the
+    // second event is a stale-correlator no-op). Without it a worker
+    // thread's fault would never reap the process, so its failure refuses
+    // the spawn; the caller's guards destroy the child, which returns the
+    // main-thread observer's node.
+    if let Err(e) = deaths.bind_aspace(child_aspace, badge)
+    {
+        std::os::seraph::log!("procmgr: address-space death bind failed (err={e}); spawn refused");
+        return None;
     }
 
     // Derive a badged endpoint cap for the caller. The badge identifies this
@@ -1381,8 +1385,8 @@ fn finalize_creation(
         })
         .is_err()
     {
-        // Heap exhausted (the badge's correlator was checked free when it was
-        // minted, and nothing ran since): drop the caps we minted for the caller; the caller's
+        // Heap exhausted (the badge was checked free when it was minted, and
+        // nothing ran since): drop the caps we minted for the caller; the caller's
         // guards still own the child kernel objects and per-child memory caps
         // and will release them when finalize returns None.
         let _ = syscall::cap_delete(thread_for_caller);
@@ -1395,12 +1399,19 @@ fn finalize_creation(
     // thread posts the fault class straight to the spawner's death queue and
     // `Child::wait()` returns. The kernel captures the EventQueue state at
     // bind time, so procmgr drops its copy afterwards (mirrors how the
-    // main-thread death_eq binding leaves no procmgr-side ownership concern).
+    // main-thread death binding leaves no procmgr-side ownership concern).
     // Consumed only here, after the last failure return, so on every `None`
     // the caller still owns the cap and releases it.
     if parent_relay_cap != 0
     {
-        let _ = syscall::aspace_bind_notification(child_aspace, parent_relay_cap, 0);
+        if let Err(e) = syscall::aspace_bind_notification(child_aspace, parent_relay_cap, 0)
+        {
+            // The creation is complete; the spawner's own main-thread
+            // observer still reports the child's exit.
+            std::os::seraph::log!(
+                "procmgr: death-relay bind failed (err={e}); a worker-thread fault will not reach the spawner"
+            );
+        }
         let _ = syscall::cap_delete(parent_relay_cap);
     }
 
@@ -1521,7 +1532,7 @@ fn create_process_from_bytes(
     universals: &UniversalCaps,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    death_eq: u32,
+    deaths: &DeathSet,
     sched: ChildSched,
     ipc_buf: *mut u64,
 ) -> Option<CreateResult>
@@ -1753,7 +1764,7 @@ fn create_process_from_bytes(
         main_tls,
         table,
         self_endpoint,
-        death_eq,
+        deaths,
         child_memmgr_send,
         universals.memmgr_badge,
         process_badge,
@@ -1788,7 +1799,7 @@ pub fn create_process(
     universals: &UniversalCaps,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    death_eq: u32,
+    deaths: &DeathSet,
     sched: ChildSched,
 ) -> Option<CreateResult>
 {
@@ -1811,7 +1822,7 @@ pub fn create_process(
         universals,
         args,
         env,
-        death_eq,
+        deaths,
         sched,
         ipc_buf,
     );
@@ -2340,7 +2351,7 @@ pub fn create_process_from_file(
     creator_endpoint: u32,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    death_eq: u32,
+    deaths: &DeathSet,
     demand_paged: bool,
     parent_relay_cap: u32,
     sched: ChildSched,
@@ -2693,7 +2704,7 @@ pub fn create_process_from_file(
         main_tls_for_finalize,
         table,
         self_endpoint,
-        death_eq,
+        deaths,
         mms.cap(),
         mms.badge(),
         process_badge,
@@ -2718,28 +2729,6 @@ pub fn create_process_from_file(
 
 // ── Process destruction ─────────────────────────────────────────────────────
 
-/// Auto-reap path — called when the shared death queue fires with a
-/// correlator matching some entry.
-///
-/// Idempotent: stale correlators (already reaped via explicit
-/// `DESTROY_PROCESS`) drop silently. Takes the same cleanup path as the
-/// IPC-driven `destroy_process` — the only difference is the lookup key.
-#[allow(dead_code)]
-pub fn reap_by_correlator(
-    correlator: u32,
-    memmgr_ep: u32,
-    ipc_buf: *mut u64,
-    table: &mut ProcessTable,
-)
-{
-    let Some(entry) = table.take_by_correlator(correlator)
-    else
-    {
-        return;
-    };
-    teardown_entry(entry, memmgr_ep, ipc_buf);
-}
-
 /// Destroy a process identified by `badge`.
 ///
 /// For each kernel object procmgr held on behalf of the child
@@ -2761,6 +2750,8 @@ pub fn reap_by_correlator(
 /// pool via the process-death notification.
 ///
 /// Idempotent: returns silently if the badge is unknown (already destroyed).
+/// The death forwarded to logd carries `EXIT_KILLED`, the reason the kernel
+/// records for a thread its teardown stops.
 pub fn destroy_process(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mut ProcessTable)
 {
     let Some(entry) = table.take_by_badge(badge)
@@ -2768,7 +2759,7 @@ pub fn destroy_process(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mu
     {
         return;
     };
-    teardown_entry(entry, memmgr_ep, ipc_buf);
+    teardown_entry(entry, EXIT_KILLED, memmgr_ep, ipc_buf);
 }
 
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed
@@ -2787,16 +2778,18 @@ fn notify_memmgr_died(memmgr_ep: u32, memmgr_badge: u64, ipc_buf: *mut u64)
 }
 
 /// Shared cleanup for both the explicit-IPC reap path (`destroy_process`)
-/// and the auto-reap path (`reap_by_correlator`). Revokes and deletes
-/// every kernel object procmgr held on behalf of the child.
+/// and the auto-reap paths (`dispatch_death` and `resync_deaths` in
+/// `main.rs`). Revokes and deletes every kernel object procmgr held on
+/// behalf of the child, then forwards the death, with `exit_reason`, to
+/// logd ([`forward_death_to_logd`]).
 ///
-/// Note: the bound death-notification observer in the child thread's TCB
-/// is released automatically when the thread is torn down by the
-/// cap-revoke below — no explicit unbind syscall is required.
+/// Note: the bound death-notification observers in the child thread's TCB
+/// and address space are released automatically when the objects are torn
+/// down by the cap-revokes below — no explicit unbind syscall is required.
 // needless_pass_by_value: consumes the entry's cap slots; passing by
 // reference would invite accidental double-free on subsequent reuse.
 #[allow(clippy::needless_pass_by_value)]
-pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
+pub fn teardown_entry(entry: ProcessEntry, exit_reason: u64, memmgr_ep: u32, ipc_buf: *mut u64)
 {
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
@@ -2837,6 +2830,8 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
     {
         let _ = syscall::cap_delete(entry.memmgr_send_cap);
     }
+
+    forward_death_to_logd(entry.badge, exit_reason);
 }
 
 // ── Process start ───────────────────────────────────────────────────────────
@@ -2847,7 +2842,7 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 /// per-process namespace cap installed via `CONFIGURE_NAMESPACE`. If
 /// no cap was installed, the slot stays zero — the child runs without
 /// namespace authority. `finalize_creation` already bound the child's
-/// main thread to procmgr's shared death queue, so this just configures
+/// main thread to one of procmgr's death queues, so this just configures
 /// the thread and kicks it.
 ///
 /// # Errors

@@ -825,6 +825,7 @@ name = "procmgr-process-table"
 version = "0.1.1"
 dependencies = [
  "ipc",
+ "syscall-abi",
 ]
 
 [[package]]
@@ -1085,6 +1086,7 @@ dependencies = [
  "namespace-protocol",
  "process-abi",
  "process-layout",
+ "procmgr-process-table",
  "shmem",
  "syscall",
  "syscall-abi",

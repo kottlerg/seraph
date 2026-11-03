@@ -4,7 +4,8 @@
 // xtask/src/commands/mkdisk.rs
 
 //! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise
-//! test fixtures, and regenerate `disk.img` without invoking cargo.
+//! test fixtures, and regenerate `disk.img` (and `disk-data.img` under
+//! `--split-data`) at the requested block size without invoking cargo.
 //! Used to refresh the boot image after `rootfs/` or sysroot files were
 //! edited outside the cargo flow. Hand-staging a test recipe (copying it
 //! from `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/`)
@@ -28,7 +29,8 @@ use crate::util::step;
 
 /// Entry point for `cargo xtask mkdisk`. Re-mirrors `rootfs/` into the
 /// sysroot (including the test-fixture synthesis), then regenerates
-/// `disk.img`. Cargo is not invoked; the existing per-arch sysroot
+/// `disk.img` (and `disk-data.img` under `--split-data`) at the requested
+/// block size. Cargo is not invoked; the existing per-arch sysroot
 /// from a prior `cargo xtask build` is reused.
 pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 {
@@ -38,7 +40,18 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
         sysroot::install_rootfs(ctx)?;
     }
     stage_nokaslr_knob(ctx, args.no_kaslr)?;
-    disk::create_disk_image(ctx, args.arch)?;
+    let layout = disk::DiskLayout {
+        block_size: args.block_size,
+        data: if args.split_data
+        {
+            disk::DataPlacement::SecondImage
+        }
+        else
+        {
+            disk::DataPlacement::MainImage
+        },
+    };
+    disk::create_disk_image(ctx, args.arch, layout)?;
     step(&format!("mkdisk complete ({})", args.arch));
     Ok(())
 }

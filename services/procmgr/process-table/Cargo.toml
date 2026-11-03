@@ -11,6 +11,7 @@ publish.workspace = true
 # `IpcMessage` and `ARGS_BLOB_MAX`: the create-request blob decoder reads the
 # message snapshot directly, so its bounds checks are host-tested.
 ipc = { path = "../../../shared/ipc" }
+syscall-abi = { path = "../../../abi/syscall" }
 
 [lints]
 workspace = true

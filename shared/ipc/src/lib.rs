@@ -79,7 +79,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 4;
+pub const PROCMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -271,19 +271,18 @@ pub mod procmgr_labels
     pub const CONFIGURE_NAMESPACE: u64 = 12;
 
     /// Register a death-notification `EventQueue` cap (`caps[0]`, POST
-    /// right) with procmgr, which binds it as a second death observer on
-    /// the main thread of every supervised process (threads a process
-    /// creates itself carry no binding), so the kernel posts each
-    /// process's main-thread death to it.
-    /// Real-logd uses it to evict the slot of a dead sender. Specified,
-    /// with its replies, in `services/procmgr/docs/ipc-interface.md`
-    /// § `REGISTER_DEATH_EQ` — install logd's death observer.
+    /// right) with procmgr, which posts to it the death entry
+    /// `(exit_reason, process badge)` of every process it tears down, so the
+    /// queue needs no death-observer nodes. Real-logd uses it to evict the
+    /// slot of a dead sender. Specified, with its replies, in
+    /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_DEATH_EQ` —
+    /// install logd's death queue.
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
     /// Badge bit on procmgr service caps that authorises
     /// `REGISTER_DEATH_EQ`; un-badged or differently-badged callers are
     /// rejected. Who holds it is in `services/procmgr/docs/ipc-interface.md`
-    /// § `REGISTER_DEATH_EQ` — install logd's death observer.
+    /// § `REGISTER_DEATH_EQ` — install logd's death queue.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
     /// List the badges of the live processes procmgr tracks, one page per
@@ -335,11 +334,11 @@ pub mod procmgr_labels
     pub const INIT_REAP_PROBE_HELD: u64 = 2;
 
     /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
-    /// Per-child correlators are `process_badge as u32`; procmgr redraws a
-    /// random badge whose low 32 bits are below
-    /// `log_badges::LOG_BADGE_FIRST_CHILD` or equal this value, so the two
-    /// never collide.
-    pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
+    /// Per-child correlators are the full process badge; procmgr redraws a
+    /// random badge below `log_badges::LOG_BADGE_FIRST_CHILD`, equal to this
+    /// value, or carrying a `VERB_BIT_MASK` bit (this value carries all of
+    /// them), so the two never collide.
+    pub const INIT_REAP_CORRELATOR: u64 = u64::MAX;
 }
 
 /// System-wide scheduling-policy constants: the per-service priority level
@@ -2358,8 +2357,8 @@ const _: () = core::assert!(
 /// assigned process badge; the kernel-side identity, the receiver's
 /// per-sender slot key, and procmgr's death-notification correlator
 /// thus all share one u64. To leave room for system-special senders
-/// whose identity is not a procmgr process badge, procmgr's per-child
-/// badge counter starts at [`LOG_BADGE_FIRST_CHILD`].
+/// whose identity is not a procmgr process badge, every per-child badge
+/// is at least [`LOG_BADGE_FIRST_CHILD`].
 pub mod log_badges
 {
     /// init's self-identity. Init derives `cap_derive_badge(log_ep,
@@ -2371,10 +2370,9 @@ pub mod log_badges
     /// `ProcessInfo.log_send_cap` so procmgr's std `_start` can
     /// install it. Procmgr's `seraph::log!` writes ride this cap.
     pub const LOG_BADGE_PROCMGR: u64 = 2;
-    /// Floor of the low 32 bits of every per-child badge: procmgr draws
-    /// child badges at random and redraws any whose low 32 bits fall below
-    /// it. Lower values are reserved for the system specials above;
-    /// raising this leaves room to reserve more.
+    /// Floor of every per-child badge: procmgr draws child badges at
+    /// random and redraws any below it. Lower values are reserved for the
+    /// system specials above; raising this leaves room to reserve more.
     pub const LOG_BADGE_FIRST_CHILD: u64 = 16;
 }
 

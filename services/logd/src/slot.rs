@@ -8,9 +8,9 @@
 //! sinks.
 //!
 //! Slots are keyed by the kernel-delivered badge on every IPC message —
-//! the same `u64` procmgr uses as the child's process badge, whose low 32
-//! bits are the correlator on its death-EQ binding. Slot eviction is
-//! driven by the death-EQ event drained inside logd's main loop.
+//! the same `u64` procmgr uses as the child's process badge and posts as
+//! the correlator of the child's death to logd's death queue. Slot
+//! eviction is driven by the death event drained inside logd's main loop.
 
 use std::collections::HashMap;
 
@@ -93,9 +93,8 @@ impl SlotTable
         self.slots.get(&badge)
     }
 
-    /// Evict the slot for `badge`. Called for each slot whose badge's low
-    /// 32 bits match a death-EQ correlator, and by the resync. Idempotent on
-    /// unknown badges.
+    /// Evict the slot for `badge`. Called with each death event's
+    /// correlator, and by the resync. Idempotent on unknown badges.
     pub fn evict(&mut self, badge: u64) -> bool
     {
         self.slots.remove(&badge).is_some()

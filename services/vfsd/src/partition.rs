@@ -296,8 +296,7 @@ fn query_block_size(blk_ep: u32, ipc_buf: *mut u64) -> Option<usize>
         return None;
     }
     let size = usize::try_from(reply.word(0)).ok()?;
-    (size.is_power_of_two() && (gpt::MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&size))
-        .then_some(size)
+    gpt::is_block_size(size).then_some(size)
 }
 
 /// Read one logical block, `buf.len()` bytes, from the block device via

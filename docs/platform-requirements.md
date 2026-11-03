@@ -139,11 +139,16 @@ Each feature is classified per architecture as one of:
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.
+- **LA57 (5-level paging)** — a larger-VA expansion above 4-level paging, the x86-64 analogue of
+  riscv64's Sv57: the bootloader enables it when CPUID reports it, and the kernel takes the
+  paging depth from `CR4.LA57` at entry, as riscv64 takes its mode from `satp` (design intent;
+  not yet implemented: the kernel uses 4-level paging, whose 128 TiB halves cap direct-mapped
+  RAM and each process's virtual address space below the 526 TB target of
+  [#177](https://github.com/kottlerg/seraph/issues/177)).
 
 ### Unsupported
 
 - **AVX-512 / x86-64-v4** — server-class; never required, never depended upon.
-- **LA57 (5-level paging)** — the kernel uses 4-level paging.
 - **1 GiB huge pages, global pages (`PGE`), MTRR reprogramming, HPET, the legacy 8259 PIC** —
   not used. (The kernel relies on firmware's default PAT and leaves the 8259 masked.)
 - **`FSGSBASE`** — kept disabled: the kernel clears `CR4.FSGSBASE` on every CPU, because its
@@ -265,8 +270,11 @@ budget in TSC ticks expires.
 Independent of the feature classification, the kernel imposes fixed platform limits:
 
 - **Page size** is 4 KiB ([memory-model.md](memory-model.md)).
-- **Maximum RAM** is approximately 248 GiB. The kernel's boot-time direct-map pool is a fixed-size
-  table sized for that ceiling; a platform with more RAM is refused at boot
+- **Maximum RAM** is what the paging mode's kernel half can direct-map below the top-2 GiB kernel
+  image window: the half less 2 GiB, so 128 TiB less 2 GiB under x86-64 4-level paging and riscv64
+  Sv48, 64 PiB less 2 GiB under Sv57, and 254 GiB under Sv39 ([memory-model.md](memory-model.md)); a
+  platform whose RAM reaches past it is refused at boot. No kernel table bounds RAM below that: the
+  Phase 3 page tables come from a carve of RAM sized to the machine
   (`core/kernel/src/mm/paging.rs`).
 - **CPU count** is at most `boot_protocol::MAX_CPUS` (512); CPUs beyond it are not brought up.
 - **riscv64 vector length** is at most VLEN 512 (`MAX_VLENB`); a wider boot hart is refused at boot.

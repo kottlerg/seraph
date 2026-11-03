@@ -144,7 +144,9 @@ pub struct KernelObjectHeader
 /// in all. Per other object: wait-set membership (one per source), Mmio mapping
 /// records (each 16 bytes of a caller-funded body or spill chunk, so 2^31 of
 /// them hold 32 GiB), SEED leases (the boot mints, bounded by the SEED reserve),
-/// and the destinations IPC transfers' abandoned moves leave
+/// an arena page's chunk references (at most 31, its chunks), the leases of the
+/// arena pages a dead `CSpace` keeps (at most one per page of the donation each
+/// lies in), and the destinations IPC transfers' abandoned moves leave
 /// live: a message check refuses once the count is at the ceiling, and
 /// transfers run one at a time under `DERIVATION_LOCK`, so these keep an
 /// object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the ceiling.
@@ -165,10 +167,12 @@ impl KernelObjectHeader
 {
     /// Construct a new header with `ref_count = 1` and no ancestor yet.
     ///
-    /// Used by host tests, and for a body a `CSpace`'s arena funds, whose
-    /// ancestor [`CSpaceKernelObject::alloc_body`] stamps; every other
-    /// production object is retyped and uses [`Self::with_ancestor`] to record
-    /// the source `MemoryObject` for auto-reclaim.
+    /// Used by host tests; for a body a `CSpace`'s arena funds, whose
+    /// ancestor [`CSpaceKernelObject::alloc_body`] stamps; and for an
+    /// [`ArenaPage`] header, whose ancestor its `CSpace`'s teardown sets if it
+    /// keeps the page. Every other production object is retyped and uses
+    /// [`Self::with_ancestor`] to record the source `MemoryObject` for
+    /// auto-reclaim.
     pub fn new(obj_type: ObjectType) -> Self
     {
         Self {
@@ -196,7 +200,9 @@ impl KernelObjectHeader
 
     /// Increment the reference count for an owner whose number is bounded
     /// below the headroom above [`REF_COUNT_LIMIT`]: a syscall pin, a binding,
-    /// a mapping record, a boot mint's SEED lease, or the lease of a retype that
+    /// a mapping record, a boot mint's SEED lease, a chunk's reference on its
+    /// [`ArenaPage`] (at most 31 per page), a kept arena page's lease on its
+    /// donation's Memory object (one per page of that donation), or the lease of a retype that
     /// [`crate::cap::retype::retype_allocate`] admitted (see
     /// core/kernel/docs/capability-internals.md § Kernel Object Reference
     /// Counting), or an IPC transfer's move destination, whose message
@@ -1016,6 +1022,10 @@ struct InlineRecord
     base_offset: AtomicU64,
     /// Total pages carved (initial + grown).
     page_count: AtomicU64,
+    /// A dying `CSpace`'s arena pages in this donation that its teardown keeps
+    /// past it, linked through [`ArenaPage::next`]; null otherwise. Written
+    /// only by that teardown's pass (`CSpaceKernelObject::orphan_arena_pages`).
+    holes: AtomicPtr<ArenaPage>,
 }
 
 impl InlineRecord
@@ -1027,6 +1037,7 @@ impl InlineRecord
             ancestor: AtomicPtr::new(core::ptr::null_mut()),
             base_offset: AtomicU64::new(0),
             page_count: AtomicU64::new(0),
+            holes: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -1040,6 +1051,7 @@ impl InlineRecord
             ancestor,
             base_offset: self.base_offset.load(Ordering::Relaxed),
             page_count: self.page_count.load(Ordering::Relaxed),
+            holes: self.holes.load(Ordering::Relaxed),
         })
     }
 }
@@ -1055,6 +1067,8 @@ struct DonationRecord
     ancestor: *mut KernelObjectHeader,
     base_offset: u64,
     page_count: u64,
+    /// As [`InlineRecord`]'s `holes`.
+    holes: *mut ArenaPage,
 }
 
 #[cfg(not(test))]
@@ -1064,8 +1078,16 @@ impl DonationRecord
         ancestor: core::ptr::null_mut(),
         base_offset: 0,
         page_count: 0,
+        holes: core::ptr::null_mut(),
     };
 }
+
+/// Where a donation's record keeps its list of kept arena pages (the `holes`
+/// field of an [`InlineRecord`] or of a `RecordPage` entry). Every free page
+/// of a pool carries its donation's cell in its second word, so an arena page
+/// carved from it knows its record without a search.
+#[cfg(not(test))]
+type HolesCell = *mut *mut ArenaPage;
 
 /// Pages `PagePool::seed_pages` pushes per pool-lock hold. The pool lock is a
 /// bare spin lock (scheduling-internals.md § Lock Hierarchy, "Bare spin
@@ -1115,7 +1137,8 @@ const _: () = assert!(
 );
 
 /// A wrapper object's page pool: an intrusive free list of donated pages
-/// plus a record of every donation, for wholesale reclaim at teardown.
+/// plus a record of every donation, for reclaim at teardown: whole, or, for a
+/// `CSpace`, around the arena pages its teardown keeps.
 ///
 /// Shared by [`AddressSpaceObject`] (intermediate page tables) and
 /// [`CSpaceKernelObject`] (slot and directory pages). The owner keeps the
@@ -1244,6 +1267,7 @@ impl PagePool
             ancestor: ancestor.as_ptr(),
             base_offset,
             page_count: total_pages,
+            holes: core::ptr::null_mut(),
         };
 
         pool_lock(&self.lock);
@@ -1255,17 +1279,22 @@ impl PagePool
         {
             cell.base_offset.store(base_offset, Ordering::Relaxed);
             cell.page_count.store(total_pages, Ordering::Relaxed);
+            cell.holes.store(core::ptr::null_mut(), Ordering::Relaxed);
             // A non-null ancestor marks the record populated, so it is
             // written last.
             cell.ancestor.store(ancestor.as_ptr(), Ordering::Release);
-            true
+            Some(cell.holes.as_ptr())
         }
         else
         {
             // SAFETY: lock held.
             unsafe { self.record_spilled(record) }
         };
-        if !recorded
+        let cell = if let Some(cell) = recorded
+        {
+            cell
+        }
+        else
         {
             if first_pool == total_pages
             {
@@ -1274,14 +1303,16 @@ impl PagePool
             }
             // SAFETY: lock held; the page is the donation's first pool page,
             // freshly retyped from `ancestor` and not yet published.
-            unsafe { self.open_record_page(donation_phys + first_pool * p, record) };
+            let cell = unsafe { self.open_record_page(donation_phys + first_pool * p, record) };
             first_pool += 1;
-        }
+            cell
+        };
         pool_unlock(&self.lock);
 
-        // SAFETY: the record covering these pages is written above; the
-        // pages were just retyped from `ancestor` and are unaliased.
-        unsafe { self.seed_pages(donation_phys, first_pool, total_pages, budget) };
+        // SAFETY: the record covering these pages is written above, at
+        // `cell`; the pages were just retyped from `ancestor` and are
+        // unaliased.
+        unsafe { self.seed_pages(donation_phys, first_pool, total_pages, budget, cell) };
         Ok(())
     }
 
@@ -1296,7 +1327,14 @@ impl PagePool
     /// be freshly retyped, and be unaliased. The pool lock must not be held.
     #[cfg(not(test))]
     #[track_caller]
-    unsafe fn seed_pages(&self, donation_phys: u64, first: u64, total: u64, budget: &AtomicU64)
+    unsafe fn seed_pages(
+        &self,
+        donation_phys: u64,
+        first: u64,
+        total: u64,
+        budget: &AtomicU64,
+        cell: HolesCell,
+    )
     {
         let p = crate::mm::PAGE_SIZE as u64;
         let mut end = total;
@@ -1307,8 +1345,8 @@ impl PagePool
             for i in (start..end).rev()
             {
                 // SAFETY: lock held; the caller's contract makes the page
-                // exclusively owned and recorded.
-                unsafe { pool_push(&self.head_phys, donation_phys + i * p) };
+                // exclusively owned and recorded at `cell`.
+                unsafe { pool_push_tagged(&self.head_phys, donation_phys + i * p, cell) };
             }
             budget.fetch_add((end - start) * p, Ordering::AcqRel);
             pool_unlock(&self.lock);
@@ -1322,31 +1360,32 @@ impl PagePool
     /// # Safety
     /// The pool lock must be held.
     #[cfg(not(test))]
-    unsafe fn record_spilled(&self, record: DonationRecord) -> bool
+    unsafe fn record_spilled(&self, record: DonationRecord) -> Option<HolesCell>
     {
         let page_phys = self.record_head_phys.load(Ordering::Acquire);
         if page_phys == 0
         {
-            return false;
+            return None;
         }
         let page = crate::mm::paging::phys_to_virt(page_phys) as *mut RecordPage;
         // SAFETY: lock held; a published record page stays mapped in the
         // direct map and exclusively owned by this pool until teardown.
-        unsafe {
+        let cell = unsafe {
             let used = (*page).used;
             if used >= RECORDS_PER_PAGE
             {
-                return false;
+                return None;
             }
             (*page).records[used] = record;
             (*page).used = used + 1;
-        }
+            core::ptr::addr_of_mut!((*page).records[used].holes)
+        };
         // Re-publish the head with Release so the appended record and the
         // new `used` are visible to a reader that Acquire-loads the head
         // (`reclaim_donations`), as they are for an inline record's ancestor
         // store; teardown otherwise leans on the refcount edge alone.
         self.record_head_phys.store(page_phys, Ordering::Release);
-        true
+        Some(cell)
     }
 
     /// Make `page_phys` the newest record page, holding `record` (the donation
@@ -1357,19 +1396,21 @@ impl PagePool
     /// of `record`'s donation that is neither on the free list nor otherwise
     /// in use.
     #[cfg(not(test))]
-    unsafe fn open_record_page(&self, page_phys: u64, record: DonationRecord)
+    unsafe fn open_record_page(&self, page_phys: u64, record: DonationRecord) -> HolesCell
     {
         let page = crate::mm::paging::phys_to_virt(page_phys) as *mut RecordPage;
         // SAFETY: the page is exclusively owned and page-aligned (caller's
         // contract) and holds one RecordPage (fit asserted at compile
         // time).
-        unsafe {
+        let cell = unsafe {
             core::ptr::write_bytes(page.cast::<u8>(), 0, crate::mm::PAGE_SIZE);
             (*page).next_phys = self.record_head_phys.load(Ordering::Acquire);
             (*page).used = 1;
             (*page).records[0] = record;
-        }
+            core::ptr::addr_of_mut!((*page).records[0].holes)
+        };
         self.record_head_phys.store(page_phys, Ordering::Release);
+        cell
     }
 
     /// Hand every recorded donation to `free` as `(ancestor, base_offset,
@@ -1390,7 +1431,7 @@ impl PagePool
     #[cfg(not(test))]
     unsafe fn reclaim_donations<F>(&self, mut free: F)
     where
-        F: FnMut(*mut KernelObjectHeader, u64, u64),
+        F: FnMut(*mut KernelObjectHeader, u64, u64, *mut ArenaPage),
     {
         let mut inline_snapshot = [DonationRecord::VACANT; INLINE_RECORDS];
         let mut count = 0;
@@ -1417,14 +1458,24 @@ impl PagePool
                 // holds the page — is read last, after which the page is
                 // not read again.
                 let record = unsafe { (*page).records[i] };
-                free(record.ancestor, record.base_offset, record.page_count);
+                free(
+                    record.ancestor,
+                    record.base_offset,
+                    record.page_count,
+                    record.holes,
+                );
             }
             page_phys = next;
         }
 
         for record in inline_snapshot[..count].iter().rev()
         {
-            free(record.ancestor, record.base_offset, record.page_count);
+            free(
+                record.ancestor,
+                record.base_offset,
+                record.page_count,
+                record.holes,
+            );
         }
     }
 }
@@ -1494,8 +1545,8 @@ pub struct CSpaceKernelObject
     /// budget is exhausted.
     pub cspace_growth_budget_bytes: AtomicU64,
     /// Slot and directory pages donated to this `CSpace`, and the record of
-    /// every donation; `dealloc` reclaims the donations wholesale, but for
-    /// the arena pages that still hold a live body.
+    /// every donation; `dealloc` returns every donation, but for the arena
+    /// pages that still hold a live body, cut out of their donations' spans.
     pub cs_pool: PagePool,
     /// Head of the body arena's free-chunk list (a chunk's kernel virtual
     /// address, `0` for none): the 128-byte chunks of pool pages this `CSpace`
@@ -1592,6 +1643,36 @@ unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
     let next = unsafe { core::ptr::read_volatile(virt as *const u64) };
     head_phys.store(next, Ordering::Release);
     head
+}
+
+/// Push a page onto a `CSpace` pool's free list as [`pool_push`] does, and
+/// write `cell`, its donation record's [`HolesCell`], in its second word.
+///
+/// # Safety
+/// As [`pool_push`]; `cell` is the cell of the record of the donation `phys`
+/// lies in.
+#[cfg(not(test))]
+unsafe fn pool_push_tagged(head_phys: &AtomicU64, phys: u64, cell: HolesCell)
+{
+    let virt = crate::mm::paging::phys_to_virt(phys);
+    // SAFETY: caller guarantees `phys` is exclusively owned and unaliased.
+    unsafe { core::ptr::write_volatile((virt as *mut u64).add(1), cell as u64) };
+    // SAFETY: forwarded from the caller's contract.
+    unsafe { pool_push(head_phys, phys) };
+}
+
+/// The [`HolesCell`] a free pool page carries in its second word
+/// ([`pool_push_tagged`]).
+///
+/// # Safety
+/// `phys` is a page just popped from a `CSpace` pool's free list, before
+/// anything else writes it.
+#[cfg(not(test))]
+unsafe fn pool_page_cell(phys: u64) -> HolesCell
+{
+    let virt = crate::mm::paging::phys_to_virt(phys);
+    // SAFETY: caller contract.
+    unsafe { core::ptr::read_volatile((virt as *const u64).add(1)) as HolesCell }
 }
 
 /// Push a page onto the pool free-list. Caller must hold the pool lock and
@@ -1736,12 +1817,17 @@ pub struct ArenaPage
     /// The funding wrapper while it lives; null once its teardown has passed
     /// this page. Serialised by `lock`.
     owner: AtomicPtr<CSpaceKernelObject>,
-    /// The next page of the owner's list, then of its teardown's list of kept
-    /// pages.
+    /// The next page of the owner's list, then, once the teardown keeps the
+    /// page, of its donation record's list of kept pages.
     next: AtomicPtr<ArenaPage>,
+    /// The next page of the teardown's list of every page it keeps.
+    kept_next: AtomicPtr<ArenaPage>,
     /// Serialises `owner` against a chunk free that pushes the chunk to the
     /// owner's list, so the teardown's pass over the page is a barrier.
     lock: AtomicU64,
+    /// The cell of the donation record whose span holds this page, taken from
+    /// the pool page when it was carved ([`HolesCell`]).
+    record: AtomicU64,
 }
 
 const _: () = assert!(core::mem::size_of::<ArenaPage>() <= crate::cap::arena::CHUNK_BYTES);
@@ -1814,13 +1900,25 @@ impl CSpaceKernelObject
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
     {
+        self.alloc_pool_page().map(|(phys, _)| phys)
+    }
+
+    /// [`alloc_slot_page`](Self::alloc_slot_page), also returning the page's
+    /// donation record cell, for a page that goes back to the pool later
+    /// ([`free_pool_page`](Self::free_pool_page)).
+    #[cfg(not(test))]
+    #[track_caller]
+    fn alloc_pool_page(&self) -> Option<(u64, HolesCell)>
+    {
         let phys = self.cs_pool.pop()?;
+        // SAFETY: the page just left the free list; nothing wrote it.
+        let cell = unsafe { pool_page_cell(phys) };
         self.cspace_growth_budget_bytes
             .fetch_sub(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
         let virt = crate::mm::paging::phys_to_virt(phys);
         // SAFETY: page is now exclusively owned by the caller.
         unsafe { core::ptr::write_bytes(virt as *mut u8, 0, crate::mm::PAGE_SIZE) };
-        Some(phys)
+        Some((phys, cell))
     }
 
     /// Construct `body` in a chunk of this `CSpace`'s body arena, with its
@@ -1904,6 +2002,8 @@ impl CSpaceKernelObject
                 self.cspace_growth_budget_bytes
                     .fetch_sub(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
                 let page = crate::mm::paging::phys_to_virt(phys) as *mut ArenaPage;
+                // SAFETY: the page just left the free list; nothing wrote it.
+                let record = unsafe { pool_page_cell(phys) } as u64;
                 // SAFETY: pool lock held; the page just left the free list,
                 // so it is exclusively the arena's; its chunk 0 takes the
                 // header, the rest go on the free list.
@@ -1914,7 +2014,9 @@ impl CSpaceKernelObject
                             header: KernelObjectHeader::new(ObjectType::ArenaPage),
                             owner: AtomicPtr::new(core::ptr::from_ref(self).cast_mut()),
                             next: AtomicPtr::new(self.arena_pages.load(Ordering::Relaxed)),
+                            kept_next: AtomicPtr::new(core::ptr::null_mut()),
                             lock: AtomicU64::new(0),
+                            record: AtomicU64::new(record),
                         },
                     );
                     self.arena_pages.store(page, Ordering::Release);
@@ -1935,28 +2037,32 @@ impl CSpaceKernelObject
     }
 
     /// Return a page taken from this pool (a port-binding table's) to it,
-    /// crediting the budget under the pool lock.
+    /// with its donation record cell, crediting the budget under the pool
+    /// lock.
     ///
     /// # Safety
-    /// `phys` came from this wrapper's [`alloc_slot_page`](Self::alloc_slot_page)
-    /// and nothing references the page any more.
+    /// `phys` and `cell` came from this wrapper's
+    /// [`alloc_pool_page`](Self::alloc_pool_page) and nothing references the
+    /// page any more.
     #[cfg(not(test))]
     #[track_caller]
-    pub unsafe fn free_pool_page(&self, phys: u64)
+    unsafe fn free_pool_page(&self, phys: u64, cell: HolesCell)
     {
         pool_lock(&self.cs_pool.lock);
         // SAFETY: pool lock held; caller contract.
-        unsafe { pool_push(&self.cs_pool.head_phys, phys) };
+        unsafe { pool_push_tagged(&self.cs_pool.head_phys, phys, cell) };
         self.cspace_growth_budget_bytes
             .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
         pool_unlock(&self.cs_pool.lock);
     }
 
     /// Pass over every arena page at teardown: clear its owner under its lock,
-    /// so no later chunk free touches this wrapper, and return the pages that
-    /// still hold a live chunk, linked through [`ArenaPage::next`], each with
-    /// the teardown's hold (the owner's, carried over). A page with no live
-    /// chunk is left to go back with its donation.
+    /// so no later chunk free touches this wrapper, and keep the pages that
+    /// still hold a live chunk, each with the teardown's hold (the owner's,
+    /// carried over): each is linked onto its donation record's list of kept
+    /// pages (through [`ArenaPage::next`]), and all of them onto the returned
+    /// list (through [`ArenaPage::kept_next`]). A page with no live chunk is
+    /// left to go back with its donation.
     ///
     /// # Safety
     /// The wrapper's reference count is zero and its `CSpace` is drained, so no
@@ -1981,7 +2087,19 @@ impl CSpaceKernelObject
             // stays 1; a higher count can only fall, never below the hold.
             if page.header.ref_count.load(Ordering::Acquire) > 1
             {
-                page.next.store(kept, Ordering::Relaxed);
+                let cell = page.record.load(Ordering::Relaxed) as HolesCell;
+                if cell.is_null()
+                {
+                    crate::fatal("CSpace teardown: an arena page carries no donation record");
+                }
+                // SAFETY: the cell is a field of a record of this pool, which
+                // stays intact until the donations are reclaimed after this
+                // pass; only this pass writes it.
+                unsafe {
+                    page.next.store(*cell, Ordering::Relaxed);
+                    *cell = cur;
+                }
+                page.kept_next.store(kept, Ordering::Relaxed);
                 kept = cur;
             }
             cur = next;
@@ -2037,19 +2155,21 @@ pub fn alloc_port_binding_table(
     use crate::mm::paging::phys_to_virt;
 
     let mut pages = [0u64; TABLE_PAGES];
+    let mut cells = [0usize; TABLE_PAGES];
     for i in 0..TABLE_PAGES
     {
-        let Some(phys) = funder.alloc_slot_page()
+        let Some((phys, cell)) = funder.alloc_pool_page()
         else
         {
-            for &phys in &pages[..i]
+            for (&phys, &cell) in pages[..i].iter().zip(&cells[..i])
             {
-                // SAFETY: a page taken above and never used.
-                unsafe { funder.free_pool_page(phys) };
+                // SAFETY: a page taken above and never used, with its cell.
+                unsafe { funder.free_pool_page(phys, cell as HolesCell) };
             }
             return Err(syscall::SyscallError::OutOfMemory);
         };
         pages[i] = phys;
+        cells[i] = cell as usize;
     }
     let mut parts = [core::ptr::null_mut::<[u8; IOPB_PART_BYTES]>(); IOPB_PARTS];
     for (part, &phys) in parts.iter_mut().zip(&pages[1..])
@@ -2059,7 +2179,9 @@ pub fn alloc_port_binding_table(
     let table = phys_to_virt(pages[0]) as *mut IoPortBindings;
     // SAFETY: every page was taken above, page-aligned and exclusively ours;
     // each stays live until `free_port_binding_table` returns it.
-    unsafe { IoPortBindings::init_in_place(table, parts, core::ptr::from_ref(funder) as usize) };
+    unsafe {
+        IoPortBindings::init_in_place(table, parts, core::ptr::from_ref(funder) as usize, cells);
+    }
     Ok(table)
 }
 
@@ -2077,20 +2199,22 @@ pub unsafe fn free_port_binding_table(table: *mut crate::cap::ioport_bindings::I
 {
     use crate::mm::paging::virt_to_phys;
     // SAFETY: caller contract; the table names the funder its pages came from.
-    let (funder, parts) = unsafe {
+    let (funder, parts, cells) = unsafe {
         (
             &*((*table).funder() as *const CSpaceKernelObject),
             (*table).bitmap.parts,
+            (*table).page_cells(),
         )
     };
-    for part in parts
+    for (part, &cell) in parts.iter().zip(&cells[1..])
     {
-        // SAFETY: a part page this table took; unreferenced (contract).
-        unsafe { funder.free_pool_page(virt_to_phys(part as u64)) };
+        // SAFETY: a part page this table took, with its cell; unreferenced
+        // (contract).
+        unsafe { funder.free_pool_page(virt_to_phys(*part as u64), cell as HolesCell) };
     }
-    // SAFETY: the table's own page, taken with the parts; nothing reads it
-    // after this.
-    unsafe { funder.free_pool_page(virt_to_phys(table as u64)) };
+    // SAFETY: the table's own page, taken with the parts, with its cell;
+    // nothing reads it after this.
+    unsafe { funder.free_pool_page(virt_to_phys(table as u64), cells[0] as HolesCell) };
 }
 
 /// The wrapper of the `CSpace` at `cspace`: the arena that funds the bodies a
@@ -2102,9 +2226,14 @@ pub unsafe fn free_port_binding_table(table: *mut crate::cap::ioport_bindings::I
 /// from (only the host-test stubs).
 ///
 /// # Safety
-/// `cspace` is a live `CSpace` the caller pins (its own, bound to the running
-/// thread, or one named by a capability it holds a pin on); the returned
-/// reference is used only while that pin lasts.
+/// `cspace` is a live `CSpace` the caller keeps live while it uses the
+/// returned reference: its own, bound to the running thread; one named by a
+/// capability it holds a pin on; or the bound `CSpace` of a thread whose
+/// `sched_lock` the caller holds while that thread is not `Exited`, which
+/// `sys_ioport_bind` uses. A `CSpace`'s teardown marks every thread bound to
+/// it `Exited` under that lock before it frees anything, and frees their
+/// port-binding tables under it before it reclaims the pool
+/// (`ioport_bindings::free_tables_bound_to`).
 #[cfg(not(test))]
 pub unsafe fn arena_of<'a>(
     cspace: *mut crate::cap::cspace::CSpace,
@@ -3016,66 +3145,64 @@ unsafe fn free_donation(
 }
 
 /// Return the donation `(anc_ptr, off, pages)` of a dead `CSpace`'s pool to
-/// its Memory object but for the arena pages on the `kept` list that lie in
-/// it: each such page takes a lease of its own on the Memory object and
-/// records it as its ancestor, and returns there with its last chunk. Then
-/// drop the donation's reference, pushing the Memory object onto `stack` if
-/// that was its last.
+/// its Memory object but for the arena pages on its record's `holes` list,
+/// which the teardown keeps: each such page takes a lease of its own on the
+/// Memory object and records it as its ancestor, and returns there with its
+/// last chunk. Then drop the donation's reference, pushing the Memory object
+/// onto `stack` if that was its last.
 ///
-/// The cost is one pass over `kept` per run of the span, so a span holding
-/// `k` of the `h` kept pages costs `O(k * h)` and a teardown `O(records * h)`.
+/// The record's kept pages are sorted once and the span walked with them in
+/// order, so a donation with `k` kept pages costs `O(k log k)` and a teardown
+/// with `r` records and `h` kept pages `O(r + h log h)`.
 ///
 /// # Safety
-/// The record is one `PagePool::reclaim_donations` hands out, and `kept` the
-/// list `CSpaceKernelObject::orphan_arena_pages` returned, every page on it
-/// held; no lock is held.
+/// The record is one `PagePool::reclaim_donations` hands out, `holes` its
+/// list of kept pages (linked through [`ArenaPage::next`] by
+/// `CSpaceKernelObject::orphan_arena_pages`), every page on it held; no lock
+/// is held.
 #[cfg(not(test))]
 unsafe fn free_donation_around(
     anc_ptr: *mut KernelObjectHeader,
     off: u64,
     pages: u64,
-    kept: *mut ArenaPage,
+    holes: *mut ArenaPage,
     stack: &mut CascadeStack,
 )
 {
     use crate::mm::paging::virt_to_phys;
-    let p = crate::mm::PAGE_SIZE as u64;
     // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
     #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: the record's reference keeps its Memory object live until the
     // release at the end.
     let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-    let kept_pages = || {
-        let mut cur = kept;
+    let offset_of = |page: *mut ArenaPage| virt_to_phys(page as u64) - anc_memory.base;
+    // SAFETY: every page on the list is held (contract) and lies in this
+    // donation's span (its record cell named this record).
+    let sorted = unsafe {
+        crate::cap::arena::sort_list(
+            holes,
+            &|page: *mut ArenaPage| (*page).next.load(Ordering::Relaxed),
+            &|page: *mut ArenaPage, to| (*page).next.store(to, Ordering::Relaxed),
+            &offset_of,
+        )
+    };
+    let kept = || {
+        let mut cur = sorted;
         core::iter::from_fn(move || {
             // SAFETY: every page on the list is held (contract).
             let page = unsafe { cur.as_ref() }?;
             cur = page.next.load(Ordering::Relaxed);
-            // A page of another donor wraps far past the span, which skips it.
-            Some(virt_to_phys(core::ptr::from_ref(page) as u64).wrapping_sub(anc_memory.base))
+            // The page's lease on the Memory object is taken while the
+            // record's reference still holds it.
+            anc_memory.header.inc_ref();
+            page.header.ancestor.store(anc_ptr, Ordering::Release);
+            Some(offset_of(core::ptr::from_ref(page).cast_mut()))
         })
     };
-    let end = off + pages * p;
-    let mut cur = off;
-    while cur < end
-    {
-        let (run_end, hole) = crate::cap::arena::next_run(cur, end, kept_pages());
-        if run_end > cur
-        {
-            crate::cap::retype::retype_free(anc_memory, cur, run_end - cur);
-        }
-        if let Some(h) = hole
-        {
-            let page = crate::mm::paging::phys_to_virt(anc_memory.base + h) as *mut ArenaPage;
-            // SAFETY: a kept page, held; its lease on the Memory object is
-            // taken while the record's reference still holds the object.
-            unsafe {
-                anc_memory.header.inc_ref();
-                (*page).header.ancestor.store(anc_ptr, Ordering::Release);
-            }
-        }
-        cur = hole.map_or(run_end, |h| h + p);
-    }
+    let p = crate::mm::PAGE_SIZE as u64;
+    crate::cap::arena::for_each_run(off, off + pages * p, kept(), |from, to| {
+        crate::cap::retype::retype_free(anc_memory, from, to - from);
+    });
     // SAFETY: the record's reference, released once, after every run.
     if unsafe { &*anc_ptr }.dec_ref() == 0
     {
@@ -3086,13 +3213,14 @@ unsafe fn free_donation_around(
 }
 
 /// Return every donation of a dead `CSpace`'s pool, the create-time slab
-/// (holding the wrapper and the pool) last, but for the arena pages on `kept`;
-/// `obj` is dangling afterwards. Then release the teardown's hold on each kept
-/// page, pushing one whose last chunk has gone meanwhile onto `stack`. Unlike
-/// a `CSpace`'s derivation drain, this walk is not batched: no lock is held
-/// across it (each return takes only its ancestor's cap lock), so nothing else
-/// waits on it, and its length is the number of donations the owner paid for,
-/// times the kept pages ([`free_donation_around`]).
+/// (holding the wrapper and the pool) last, but for the arena pages the
+/// teardown keeps, on its records' lists; `obj` is dangling afterwards. Then
+/// release the teardown's hold on each kept page, through `kept`, pushing one
+/// whose last chunk has gone meanwhile onto `stack`. Unlike a `CSpace`'s
+/// derivation drain, this walk is not batched: no lock is held across it
+/// (each return takes only its ancestor's cap lock), so nothing else waits on
+/// it; its length is the number of donations the owner paid for plus the
+/// sort of the kept pages ([`free_donation_around`]).
 ///
 /// # Safety
 /// `obj`'s reference count is zero, its derivation drain has run and its
@@ -3105,10 +3233,10 @@ unsafe fn reclaim_cspace_donations(
     stack: &mut CascadeStack,
 )
 {
-    let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
+    let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64, holes: *mut ArenaPage| {
         // SAFETY: a record handed out by reclaim_donations under its
-        // contract; `kept` as the caller's; no lock held.
-        unsafe { free_donation_around(anc, off, pages, kept, stack) }
+        // contract, with its kept pages; no lock held.
+        unsafe { free_donation_around(anc, off, pages, holes, stack) }
     };
     // SAFETY: caller contract.
     unsafe { obj.cs_pool.reclaim_donations(free) };
@@ -3118,7 +3246,7 @@ unsafe fn reclaim_cspace_donations(
         // SAFETY: a kept page, held by the teardown until the release below;
         // its ancestor and lease were set when its donation went back.
         let page = unsafe { &*cur };
-        cur = page.next.load(Ordering::Relaxed);
+        cur = page.kept_next.load(Ordering::Relaxed);
         debug_assert!(
             !page.header.ancestor.load(Ordering::Relaxed).is_null(),
             "a kept arena page lies in no donation of its CSpace"
@@ -3971,7 +4099,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
             // Return every donation, the create-time slab (holding the
             // wrapper and this pool) last; `obj` is dangling afterwards.
-            let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
+            // An address space's pool carves no arena page, so no record has
+            // a kept page.
+            let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64, _: *mut ArenaPage| {
                 // SAFETY: a record handed out by reclaim_donations under
                 // its contract; no lock held.
                 unsafe { free_donation(anc, off, pages, stack) }
@@ -4127,8 +4257,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // is unregistered and dropped. Randomizing the epoch now
             // invalidates any surviving SlotId stamped with the pre-recycle
             // value — subsequent `lookup_cspace` returns None. The slot pages
-            // go back with the donations below or at the second pop; no live
-            // structure names them.
+            // go back with the donations below; no live structure names them.
             if needs_free_id
             {
                 crate::cap::free_cspace_id(dying_id);

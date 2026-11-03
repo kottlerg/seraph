@@ -197,6 +197,10 @@ pub fn cycles_now() -> u64
 pub fn run_unit(ctx: &TestContext)
 {
     crate::run_test!("hw::ioport_bind", ioport_syscalls::bind(ctx));
+    crate::run_test!(
+        "hw::ioport_bind_teardown",
+        ioport_syscalls::bind_table_outlives_no_pool(ctx)
+    );
     crate::run_test!("hw::ioport_split", ioport_syscalls::split(ctx));
     crate::run_test!(
         "thread::configure_wrapped_stack_err",

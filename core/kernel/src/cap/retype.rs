@@ -842,9 +842,14 @@ pub fn current_bump(memory: &MemoryObject) -> u64
 /// # Safety
 ///
 /// `memory` must be a valid `MemoryObject` reference; `offset` and `bytes`
-/// must match a previous successful [`retype_allocate`] return. The slot
-/// at `offset` must not contain a live kernel object — caller has dropped
-/// any state, drained wait queues, etc., before calling.
+/// must match a previous successful [`retype_allocate`] return, or, for a
+/// page-class allocation, name a page-aligned run of whole pages within one,
+/// each page of it freed exactly once (a dead `CSpace` returns a donation's
+/// span in runs around the arena pages it keeps, and each kept page alone;
+/// the page free list is address-ordered and coalescing, so the runs merge as
+/// one free of the whole would). The slot at `offset` must not contain a live
+/// kernel object — caller has dropped any state, drained wait queues, etc.,
+/// before calling.
 #[track_caller]
 pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {

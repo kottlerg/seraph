@@ -39,13 +39,14 @@ struct IoPortBinding
 }
 
 /// Most bindings one thread records: as many as the table's page holds after
-/// its header (254 on x86-64). A bind past it returns `QuotaExceeded`; binding
+/// its header (252 on x86-64). A bind past it returns `QuotaExceeded`; binding
 /// the same `IoPort` object again reuses its record. Each binding is made
 /// through a distinct `IoPort` object, and the page is funded by the bound
 /// thread's `CSpace`.
-pub const MAX_IOPORT_BINDINGS: usize =
-    (crate::mm::PAGE_SIZE - core::mem::size_of::<ThreadIopb>() - 2 * core::mem::size_of::<usize>())
-        / core::mem::size_of::<IoPortBinding>();
+pub const MAX_IOPORT_BINDINGS: usize = (crate::mm::PAGE_SIZE
+    - core::mem::size_of::<ThreadIopb>()
+    - (2 + TABLE_PAGES) * core::mem::size_of::<usize>())
+    / core::mem::size_of::<IoPortBinding>();
 
 /// The port-binding table of one thread: one page.
 #[repr(C)]
@@ -57,6 +58,10 @@ pub struct IoPortBindings
     /// The `CSpaceKernelObject` whose pool funded this page and the bitmap's
     /// parts (the bound thread's), as an address.
     funder: usize,
+    /// For this page and then each part's, the donation record cell its pool
+    /// page carried (`cap::object`'s `HolesCell`), restored when the page
+    /// goes back to the pool.
+    page_cells: [usize; TABLE_PAGES],
     count: usize,
     records: [IoPortBinding; MAX_IOPORT_BINDINGS],
 }
@@ -74,7 +79,8 @@ pub struct TableFull;
 impl IoPortBindings
 {
     /// Initialise a table in place: every port denied, no bindings, the
-    /// bitmap held in `parts`, all funded by `funder`.
+    /// bitmap held in `parts`, all funded by `funder`, with the donation record
+    /// cells of the table's page and the parts' in `page_cells`.
     ///
     /// # Safety
     /// `table` points at a writable page and each of `parts` at a writable
@@ -84,6 +90,7 @@ impl IoPortBindings
         table: *mut Self,
         parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS],
         funder: usize,
+        page_cells: [usize; TABLE_PAGES],
     )
     {
         for &part in &parts
@@ -95,6 +102,7 @@ impl IoPortBindings
         unsafe {
             core::ptr::addr_of_mut!((*table).bitmap).write(ThreadIopb { parts });
             core::ptr::addr_of_mut!((*table).funder).write(funder);
+            core::ptr::addr_of_mut!((*table).page_cells).write(page_cells);
             core::ptr::addr_of_mut!((*table).count).write(0);
         }
     }
@@ -103,6 +111,12 @@ impl IoPortBindings
     pub fn funder(&self) -> usize
     {
         self.funder
+    }
+
+    /// The donation record cells of the table's page and the parts' pages.
+    pub fn page_cells(&self) -> [usize; TABLE_PAGES]
+    {
+        self.page_cells
     }
 
     /// Permit `count` ports from `base` in every part of the bitmap.
@@ -294,7 +308,7 @@ mod tests
         let table = unsafe {
             let p = std::alloc::alloc(layout).cast::<IoPortBindings>();
             assert!(!p.is_null());
-            IoPortBindings::init_in_place(p, parts, 0x5000);
+            IoPortBindings::init_in_place(p, parts, 0x5000, [0; TABLE_PAGES]);
             Box::from_raw(p)
         };
         Table {

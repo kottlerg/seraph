@@ -334,8 +334,9 @@ const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 /// funds: init's bootstrap allocator splits a Memory cap once per page it hands
 /// out, and each split's tail body takes a 128-byte chunk of init's own
 /// `CSpace` (core/kernel/docs/capability-internals.md § Body Arena), which init
-/// never augments. 16 pages hold 512 bodies, about twice the splits init
-/// makes before it hands memory to memmgr.
+/// never augments. 16 pages hold 496 bodies (31 per page after its header),
+/// about twice the splits init makes before it hands memory to memmgr; a
+/// shortfall is the refillable `OutOfMemory` of the split that meets it.
 #[cfg(not(test))]
 const ROOT_CSPACE_BODY_PAGES: u64 = 16;
 

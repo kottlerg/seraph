@@ -26,22 +26,100 @@ pub fn bind(ctx: &TestContext) -> TestResult
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
+    let result = match bind_first_ioport(ctx, th)
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) =>
+        {
+            crate::log("ktest: hw::ioport_bind SKIP (no IoPort caps in initial cap set)");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
+    syscall::cap_delete(th).ok();
+    syscall::cap_delete(cs).ok();
+    result
+}
+
+/// Bind the first `IoPort` cap of ktest's `CSpace` to `th`; returns its slot,
+/// or `None` when there is none. A slot of another type refuses the bind and
+/// is skipped; `OutOfMemory`, the table's three pages missing from `th`'s
+/// `CSpace` pool, fails the test instead of passing for a missing cap.
+fn bind_first_ioport(ctx: &TestContext, th: u32) -> Result<Option<u32>, &'static str>
+{
     let bound = crate::unit::hw::scan_bound(ctx);
     for slot in 1u32..=bound
     {
-        // Any error (a slot of another type, most often) leaves the cap
-        // intact; keep scanning.
-        if syscall::ioport_bind(th, slot).is_ok()
+        match syscall::ioport_bind(th, slot)
         {
-            syscall::cap_delete(th).ok();
-            syscall::cap_delete(cs).ok();
-            return Ok(());
+            Ok(()) => return Ok(Some(slot)),
+            Err(e) if e == SyscallError::OutOfMemory as i64 =>
+            {
+                return Err("hw::ioport_bind: the binding table could not be funded");
+            }
+            // Any other error (a slot of another type, most often) leaves
+            // the cap intact; keep scanning.
+            Err(_) =>
+            {}
         }
     }
+    Ok(None)
+}
 
-    crate::log("ktest: hw::ioport_bind SKIP (no IoPort caps in initial cap set)");
+/// A thread's port-binding table comes from its own `CSpace`'s pool, and that
+/// `CSpace`'s teardown returns it when the `CSpace` dies before the thread
+/// ([core/kernel/docs/capability-internals.md § `IoPort`
+/// Bindings](../../../../kernel/docs/capability-internals.md#ioport-bindings)):
+/// after the `CSpace`, then the thread, are deleted, `memory_base` has every
+/// byte back. A bind of the thread its `CSpace`'s death left `Exited` is
+/// refused with `InvalidCapability`.
+pub fn bind_table_outlives_no_pool(ctx: &TestContext) -> TestResult
+{
+    let available =
+        || syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
+    let before = available();
+    // Three pool pages, exactly the table's.
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "hw::ioport_bind_teardown: cap_create_cspace failed")?;
+    let Ok(th) = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
+    else
+    {
+        syscall::cap_delete(cs).ok();
+        return Err("hw::ioport_bind_teardown: cap_create_thread failed");
+    };
+    let bound = bind_first_ioport(ctx, th);
+    // The CSpace goes first: its teardown stops the thread and frees its table.
+    let deleted = syscall::cap_delete(cs);
+    let rebind = match bound
+    {
+        Ok(Some(slot)) => Some(syscall::ioport_bind(th, slot)),
+        _ => None,
+    };
     syscall::cap_delete(th).ok();
-    syscall::cap_delete(cs).ok();
+    let after = available();
+    match bound
+    {
+        Err(e) => return Err(e),
+        Ok(None) =>
+        {
+            crate::log("ktest: hw::ioport_bind_teardown SKIP (no IoPort caps in initial cap set)");
+            return Ok(());
+        }
+        Ok(Some(_)) =>
+        {}
+    }
+    if deleted.is_err()
+    {
+        return Err("hw::ioport_bind_teardown: cap_delete(cs) failed");
+    }
+    if rebind != Some(Err(SyscallError::InvalidCapability as i64))
+    {
+        return Err("hw::ioport_bind_teardown: a bind of an Exited thread was not refused");
+    }
+    if after != before
+    {
+        return Err("hw::ioport_bind_teardown: the CSpace's pages did not all come back");
+    }
     Ok(())
 }
 

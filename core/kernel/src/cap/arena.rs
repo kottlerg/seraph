@@ -20,9 +20,9 @@
 //! body.
 //!
 //! This module holds the parts that are pure logic: the carving and linking of
-//! chunks within a page ([`carve_page`], [`push_chunk`], [`pop_chunk`]) and the
-//! cut of a donation's span around the arena pages that outlive their
-//! `CSpace` ([`next_run`]). The caller serialises the chunk list (the
+//! chunks within a page ([`carve_page`], [`push_chunk`], [`pop_chunk`]), and
+//! the sort of a donation's kept arena pages ([`sort_list`]) and the cut of its
+//! span around them ([`for_each_run`]). The caller serialises the chunk list (the
 //! wrapper's pool lock).
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -99,21 +99,103 @@ pub fn page_of(chunk: usize) -> usize
     chunk & !(crate::mm::PAGE_SIZE - 1)
 }
 
-/// The next run of a donation's span to return, from page address `cur` up to
-/// `end`, and the hole that ends it: the lowest of `holes` (page addresses of
-/// arena pages kept past their `CSpace`) in `[cur, end)`. Returns
-/// `(run_end, Some(hole))` when the run stops at a hole, which the caller skips
-/// past (`hole + PAGE_SIZE`), or `(end, None)` when no hole lies ahead. The
-/// cost is one pass over `holes`, so a span with `k` holes among `h` costs
-/// `O(k * h)`.
-#[must_use]
-pub fn next_run(cur: u64, end: u64, holes: impl Iterator<Item = u64>) -> (u64, Option<u64>)
+/// Call `run(from, to)` for each run of the page-aligned span `[start, end)`
+/// left between `holes`, the page addresses of the arena pages a dying
+/// `CSpace` keeps past it, given in ascending order. A hole outside the span
+/// is skipped. The cost is one pass over `holes`.
+pub fn for_each_run(
+    start: u64,
+    end: u64,
+    holes: impl Iterator<Item = u64>,
+    mut run: impl FnMut(u64, u64),
+)
 {
-    match holes.filter(|&h| h >= cur && h < end).min()
+    let page = crate::mm::PAGE_SIZE as u64;
+    let mut cur = start;
+    for h in holes
     {
-        Some(h) => (h, Some(h)),
-        None => (end, None),
+        if h < cur || h >= end
+        {
+            continue;
+        }
+        if h > cur
+        {
+            run(cur, h);
+        }
+        cur = h + page;
     }
+    if cur < end
+    {
+        run(cur, end);
+    }
+}
+
+/// Sort the intrusive singly linked list headed by `head` ascending by `key`
+/// and return its new head: a merge sort, `O(n log n)` with recursion depth
+/// `O(log n)`, which allocates nothing. `next` reads a node's link and
+/// `set_next` writes it.
+///
+/// # Safety
+/// Every node on the list is valid for `next`, `set_next`, and `key`, and
+/// the list ends in null and has no cycle.
+pub unsafe fn sort_list<N>(
+    head: *mut N,
+    next: &impl Fn(*mut N) -> *mut N,
+    set_next: &impl Fn(*mut N, *mut N),
+    key: &impl Fn(*mut N) -> u64,
+) -> *mut N
+{
+    if head.is_null() || next(head).is_null()
+    {
+        return head;
+    }
+    // Split at the middle: `slow` ends on the last node of the first half.
+    let mut slow = head;
+    let mut fast = next(head);
+    while !fast.is_null()
+    {
+        fast = next(fast);
+        if !fast.is_null()
+        {
+            slow = next(slow);
+            fast = next(fast);
+        }
+    }
+    let second = next(slow);
+    set_next(slow, core::ptr::null_mut());
+    // SAFETY: both halves are null-terminated sublists of the caller's list.
+    let (mut a, mut b) = unsafe {
+        (
+            sort_list(head, next, set_next, key),
+            sort_list(second, next, set_next, key),
+        )
+    };
+    let mut merged: *mut N = core::ptr::null_mut();
+    let mut tail: *mut N = core::ptr::null_mut();
+    while !a.is_null() || !b.is_null()
+    {
+        let take_a = b.is_null() || (!a.is_null() && key(a) <= key(b));
+        let node = if take_a { a } else { b };
+        if take_a
+        {
+            a = next(a);
+        }
+        else
+        {
+            b = next(b);
+        }
+        set_next(node, core::ptr::null_mut());
+        if tail.is_null()
+        {
+            merged = node;
+        }
+        else
+        {
+            set_next(tail, node);
+        }
+        tail = node;
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -195,20 +277,13 @@ mod tests
         assert_eq!(unsafe { pop_chunk(&head) }, Some(a));
     }
 
-    /// The runs `next_run` cuts `[start, end)` into around `holes`.
+    /// The runs `for_each_run` cuts `[start, end)` into around `holes`.
     fn runs(start: u64, end: u64, holes: &[u64]) -> Vec<(u64, u64)>
     {
+        let mut sorted = holes.to_vec();
+        sorted.sort_unstable();
         let mut out = Vec::new();
-        let mut cur = start;
-        while cur < end
-        {
-            let (run_end, hole) = next_run(cur, end, holes.iter().copied());
-            if run_end > cur
-            {
-                out.push((cur, run_end));
-            }
-            cur = hole.map_or(run_end, |h| h + P);
-        }
+        for_each_run(start, end, sorted.into_iter(), |a, b| out.push((a, b)));
         out
     }
 
@@ -231,5 +306,57 @@ mod tests
             "holes at both ends"
         );
         assert_eq!(runs(s, s + P, &[s]), [], "a one-page span that is a hole");
+    }
+
+    struct Node
+    {
+        key: u64,
+        next: *mut Node,
+    }
+
+    // The defect caught: a sort that drops or duplicates a node, leaves the
+    // list out of order, or loops, which would leave a kept page out of the
+    // cut or cut a span twice.
+    #[test]
+    fn an_intrusive_list_sorts_ascending_keeping_every_node()
+    {
+        for n in [0usize, 1, 2, 3, 7, 64, 257]
+        {
+            let mut nodes: Vec<Box<Node>> = (0..n)
+                .map(|i| {
+                    Box::new(Node {
+                        key: ((i * 7919) % 1009) as u64,
+                        next: core::ptr::null_mut(),
+                    })
+                })
+                .collect();
+            let mut head: *mut Node = core::ptr::null_mut();
+            for node in nodes.iter_mut().rev()
+            {
+                node.next = head;
+                head = core::ptr::from_mut(&mut **node);
+            }
+            // SAFETY: every node is a live Box above; the list ends in null.
+            let mut cur = unsafe {
+                sort_list(
+                    head,
+                    &|p: *mut Node| (*p).next,
+                    &|p: *mut Node, q| (*p).next = q,
+                    &|p: *mut Node| (*p).key,
+                )
+            };
+            let mut got = Vec::new();
+            while !cur.is_null()
+            {
+                // SAFETY: as above.
+                unsafe {
+                    got.push((*cur).key);
+                    cur = (*cur).next;
+                }
+            }
+            let mut want: Vec<u64> = nodes.iter().map(|b| b.key).collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "{n} nodes");
+        }
     }
 }

@@ -443,7 +443,7 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
     {
         cap_delete(a).ok();
         memory_merge(ctx.memory_base, piece).ok();
-        crate::log("ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (no IoPort)");
+        crate::log("ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (none bound)");
         return Ok(());
     }
     finish_kept(ctx, a, piece, T_PAGES, base_before, placed)

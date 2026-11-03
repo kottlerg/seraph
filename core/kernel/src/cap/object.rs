@@ -2482,15 +2482,19 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
     {
         return;
     }
-    // SAFETY: refcount reached 0; nothing else references the object.
+    // SAFETY: refcount reached 0; nothing else references the object, apart
+    // from a `CSpace` wrapper's arena pages' `owner` back-pointer, used only
+    // for `cs_pool.lock` and `arena_free` (`free_arena_chunk`).
     match unsafe { obj.as_ref().obj_type }
     {
         ObjectType::Thread | ObjectType::CSpaceObj | ObjectType::AddressSpace =>
         {
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
-            // SAFETY: refcount 0, exclusively owned, a linkable type; the
-            // CPU index is stable (syscall context with interrupts disabled,
-            // or the pinned idle thread's drain, per the contract).
+            // SAFETY: refcount 0, exclusively owned (but for a `CSpace`
+            // wrapper's arena-page `owner` back-pointer, which
+            // `push_deferred_reclaim` allows), a linkable type; the CPU index
+            // is stable (syscall context with interrupts disabled, or the
+            // pinned idle thread's drain, per the contract).
             unsafe { push_deferred_reclaim(cpu, obj) };
         }
         _ =>
@@ -2526,7 +2530,9 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
 ///
 /// # Safety
 /// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
-/// object (refcount 0). A `Thread` pushed by a self-teardown is already
+/// object (refcount 0), apart from a `CSpace` wrapper's arena pages' `owner`
+/// back-pointer, used only for the wrapper's `cs_pool.lock` and `arena_free`
+/// (`free_arena_chunk`), never its `deferred_next`. A `Thread` pushed by a self-teardown is already
 /// `Exited` and unlinked from every run queue; one pushed by
 /// `release_ref` may be in any state, and the drain's Thread arm
 /// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
@@ -2547,7 +2553,9 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
     loop
     {
         let head = slot.load(Ordering::Acquire);
-        // SAFETY: node is exclusively owned (refcount 0); the link field is ours.
+        // SAFETY: node is exclusively owned (refcount 0) but for the `owner`
+        // back-pointer the contract allows, which never reaches the link
+        // field; the link field is ours.
         unsafe { *link = head.cast::<KernelObjectHeader>() };
         if slot
             .compare_exchange(head, node.cast::<u8>(), Ordering::AcqRel, Ordering::Acquire)
@@ -3167,15 +3175,14 @@ pub unsafe fn object_for_new_slot(
 /// nodes' queue references. Each object one of those releases leaves
 /// unreferenced is pushed onto a [`CascadeStack`] local to this call (and a
 /// `CSpace` wrapper's first run re-pushes the wrapper beneath its slots'
-/// objects, for the second run that returns its pool),
-/// linked through the objects' own headers, and this function tears the
-/// stack down, most recent first, until it is empty. No arm recurses into
-/// `dealloc_object`, so the call's stack use is a constant whatever the
-/// fan-out (a caller-sized wait set, a chain of observer nodes, a
-/// `CSpace`'s slots) or the depth of the chain (a `CSpace` holding the last
-/// reference to another, a Memory object whose last child frees it), and no
-/// arm runs inside another's lock scope. The stack is unbounded and
-/// allocates nothing
+/// objects, for the second run that returns its pool), linked through the
+/// objects' own headers, and this function tears the stack down, most recent
+/// first, until it is empty. No arm recurses into `dealloc_object`, so the
+/// call's stack use is a constant whatever the fan-out (a caller-sized wait
+/// set, a chain of observer nodes, a `CSpace`'s slots) or the depth of the
+/// chain (a `CSpace` holding the last reference to another, a Memory object
+/// whose last child frees it), and no arm runs inside another's lock scope.
+/// The stack is unbounded and allocates nothing
 /// (core/kernel/docs/capability-internals.md § Teardown).
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)

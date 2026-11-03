@@ -277,33 +277,6 @@ fn subpage_link_ok(link: u64, memory_size: u64) -> bool
     link == FREE_LIST_END || (link < memory_size && link.is_multiple_of(BIN_128))
 }
 
-/// Validate a SEED-scratch free request and return the in-region offset.
-///
-/// Returns `Some(offset)` iff `[phys, phys + round_to_class(bytes))` lies wholly
-/// within `[base, base + size)` — i.e. `phys` is a real lease into the region and
-/// the rounded span does not run off the top. Returns `None` for any corrupt
-/// pointer: `phys < base` (which would underflow the offset), a zero-byte span,
-/// or a span whose top exceeds `base + size`.
-///
-/// Pure and `cfg`-independent (mirrors [`subpage_link_ok`]) so the host
-/// `#[cfg(test)]` suite can exercise it directly. Its sole runtime caller is
-/// `free_seed_scratch` (IOPB teardown, meaningful only on x86-64).
-fn seed_scratch_offset(phys: u64, base: u64, size: u64, bytes: u64) -> Option<u64>
-{
-    let need = round_to_class(bytes);
-    if need == 0
-    {
-        return None;
-    }
-    let offset = phys.checked_sub(base)?;
-    let top = offset.checked_add(need)?;
-    if top > size
-    {
-        return None;
-    }
-    Some(offset)
-}
-
 /// Try to pop a slot from the bin's free list. Returns the offset if a slot
 /// was reused, or `None` if the list is empty.
 ///
@@ -679,9 +652,7 @@ unsafe fn carve_page_into_bin(
 /// (`crate::mm::frame_map`), in which case nothing changes. A carve is
 /// permanent while the cap holds a live object (the drain reset alone undoes
 /// it, and SEED never drains), so carving trades page blocks for sub-page
-/// capacity: on SEED, sustained sub-page demand can leave too few contiguous
-/// pages for an x86-64 port-binding table, whose `sys_ioport_bind` then
-/// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
+/// capacity. A carve happens only once the bump frontier cannot
 /// serve the class, so the bump frontier is by then spent and the class's
 /// free list empty: without the carve, the sub-page request fails instead.
 /// Returns `Err(SyscallError::QuotaExceeded)`, changing nothing, when
@@ -881,8 +852,7 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 
     // Defense-in-depth: every caller is a trusted internal dealloc path passing a
     // kernel-computed offset, so an out-of-region (offset, bytes) is a kernel
-    // logic regression — caught here in debug/test at no release cost. Untrusted
-    // input is filtered upstream (e.g. `seed_scratch_offset` for SEED scratch).
+    // logic regression — caught here in debug/test at no release cost.
     debug_assert!(
         offset.saturating_add(need) <= memory.size,
         "retype_free out of range: offset=0x{:x} need=0x{:x} size=0x{:x}",
@@ -990,93 +960,6 @@ pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObject
     // SAFETY: T is repr(C) with KernelObjectHeader at offset 0; the cast
     // preserves the pointer validity established by the write above.
     unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) }
-}
-
-/// Reserve `bytes` of opaque scratch from SEED for non-cap kernel state
-/// (currently x86_64-only: per-thread IOPB pages). Returns a kernel-
-/// direct-map pointer to the freshly-carved region; bumps SEED's
-/// refcount once so the bytes outlive any holder.
-///
-/// Caller frees via [`free_seed_scratch`] giving back the matching
-/// `(ptr, bytes)` pair.
-///
-/// No `KernelObjectHeader` is written and the region does not enter any
-/// `CSpace`; the returned pointer is opaque.
-///
-/// Compiled on every architecture but only exercised on x86-64 (per-thread
-/// IOPB pages); RISC-V has no I/O permission bitmap, so the only caller
-/// (`sys_ioport_bind`) is `HAS_IO_PORTS`-gated and never reaches this on that
-/// arch. The per-thread FPU/SIMD/V save area is not allocated through this
-/// path — it is carved as part of the Thread retype slot (an extra page beyond
-/// kstack + wrapper) so its memory comes from the user's Memory cap rather than
-/// the SEED bootstrap reserve.
-#[cfg(not(test))]
-#[track_caller]
-pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
-{
-    let seed = crate::cap::seed_memory_ref();
-    let offset = retype_allocate(seed, bytes)?;
-    seed.header.inc_ref();
-    Ok(crate::mm::paging::phys_to_virt(seed.base + offset) as *mut u8)
-}
-
-/// Return a [`alloc_seed_scratch`] reservation to SEED. `ptr` and `bytes`
-/// must match the values returned/passed at allocation time. Decrements
-/// SEED's refcount once.
-///
-/// SEED is statically pinned (initial refcount 1 + Phase-7 `inc_ref` pin),
-/// so its refcount can never drop to zero in normal operation; the
-/// `dec_ref` here is bookkeeping for the scratch lease.
-#[cfg(not(test))]
-#[track_caller]
-pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
-{
-    let seed = crate::cap::seed_memory_ref();
-    let virt = ptr as u64;
-
-    // A valid lease is `phys_to_virt(seed.base + offset)`, always
-    // >= the direct-map base. A virt below it is a corrupt/garbage iopb pointer
-    // (e.g. a clobbered userspace address); `virt_to_phys` would underflow.
-    let Some(phys) = virt.checked_sub(crate::mm::paging::direct_map_base())
-    else
-    {
-        // The pointer is a kernel VA: serial only
-        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
-        // diagnostics).
-        crate::kprintln!(
-            "SEED SCRATCH FREE CORRUPT: bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
-            bytes,
-            seed.base,
-            seed.size
-        );
-        crate::kprintln_serial!("  ptr=0x{:x}", virt);
-        return;
-    };
-
-    // Skip both `retype_free` and `dec_ref` on a corrupt pointer: feeding a bogus
-    // offset to the allocator would corrupt SEED, and a lone `dec_ref` would
-    // unbalance the lease refcount. The lease is leaked and the anomaly logged;
-    // SEED is statically pinned (initial refcount 1 + Phase-7 pin), so the
-    // imbalance is inert.
-    if let Some(offset) = seed_scratch_offset(phys, seed.base, seed.size, bytes)
-    {
-        retype_free(seed, offset, bytes);
-        seed.header.dec_ref();
-    }
-    else
-    {
-        // The pointer is a kernel VA and, with `phys`, gives the direct-map
-        // base: both serial only
-        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
-        // diagnostics).
-        crate::kprintln!(
-            "SEED SCRATCH FREE CORRUPT: bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
-            bytes,
-            seed.base,
-            seed.size
-        );
-        crate::kprintln_serial!("  ptr=0x{:x} phys=0x{:x}", virt, phys);
-    }
 }
 
 /// Per-`ObjectType` retype dispatch entry.
@@ -1368,52 +1251,6 @@ mod tests
         // In range but misaligned (not a multiple of BIN_128).
         assert!(!subpage_link_ok(BIN_128 - 8, size));
         assert!(!subpage_link_ok(0x40, size));
-    }
-
-    #[test]
-    fn seed_scratch_offset_accepts_in_range()
-    {
-        let base: u64 = 0x1_0000;
-        let size: u64 = 512 * 1024; // SEED_RESERVE_BYTES
-        let need = round_to_class(8192); // IOPB_SIZE rounds to 0x2000
-
-        // Lease at the very start of the region.
-        assert_eq!(seed_scratch_offset(base, base, size, 8192), Some(0));
-        // Lease mid-region.
-        assert_eq!(
-            seed_scratch_offset(base + 0x4000, base, size, 8192),
-            Some(0x4000)
-        );
-        // Lease whose rounded span ends exactly at the region top.
-        assert_eq!(
-            seed_scratch_offset(base + size - need, base, size, 8192),
-            Some(size - need)
-        );
-    }
-
-    #[test]
-    fn seed_scratch_offset_rejects_corrupt_pointers()
-    {
-        let base: u64 = 0x1_0000;
-        let size: u64 = 512 * 1024;
-
-        // phys below base: would underflow phys - base; must be rejected.
-        assert_eq!(seed_scratch_offset(base - 0x1000, base, size, 8192), None);
-        assert_eq!(seed_scratch_offset(0, base, size, 8192), None);
-        // Rounded span runs off the top of the region.
-        assert_eq!(
-            seed_scratch_offset(base + size - 0x1000, base, size, 8192),
-            None
-        );
-        assert_eq!(seed_scratch_offset(base + size, base, size, 8192), None);
-        // A userspace-stack-looking pointer: as a raw phys it is
-        // astronomically larger than base + size.
-        assert_eq!(
-            seed_scratch_offset(0x0000_7FFF_FFFF_D048, base, size, 8192),
-            None
-        );
-        // Zero-byte free is rejected (need == 0).
-        assert_eq!(seed_scratch_offset(base, base, size, 0), None);
     }
 
     #[test]

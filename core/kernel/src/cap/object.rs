@@ -1601,10 +1601,11 @@ impl CSpaceKernelObject
     /// Pop a free page from this `CSpace`'s pool, charging the growth budget,
     /// and zero it. Returns the page's physical address, or `None` if empty.
     /// Called from `CSpace::grow` for a slot or directory page, and by the
-    /// body arena ([`alloc_body`](Self::alloc_body)). Every credit lands under
-    /// the pool lock together with the push of its page (`seed_pages`), so a
-    /// debit after a pop is always of a page already credited and the budget
-    /// cannot wrap.
+    /// body arena ([`alloc_body`](Self::alloc_body),
+    /// [`alloc_page_lease`](Self::alloc_page_lease)). Every credit lands under
+    /// the pool lock together with the push of its page (`seed_pages`,
+    /// [`free_page_lease`](Self::free_page_lease)), so a debit after a pop is
+    /// always of a page already credited and the budget cannot wrap.
     #[cfg(not(test))]
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
@@ -1715,6 +1716,45 @@ impl CSpaceKernelObject
         unsafe { self.release_lease(stack) };
     }
 
+    /// Take a whole page from this `CSpace`'s pool as an arena lease, zeroed,
+    /// for kernel state a chunk cannot hold (a thread's I/O-port binding
+    /// table). Returns the page's physical address.
+    ///
+    /// # Errors
+    /// `OutOfMemory` when the pool is empty.
+    #[cfg(not(test))]
+    #[track_caller]
+    pub fn alloc_page_lease(&self) -> Result<u64, syscall::SyscallError>
+    {
+        let phys = self
+            .alloc_slot_page()
+            .ok_or(syscall::SyscallError::OutOfMemory)?;
+        self.arena_live.retain();
+        Ok(phys)
+    }
+
+    /// Return a page taken by [`alloc_page_lease`](Self::alloc_page_lease) to
+    /// the pool, crediting the budget under the pool lock, and release its
+    /// lease. The release that completes a begun teardown pushes this wrapper
+    /// onto `stack`.
+    ///
+    /// # Safety
+    /// `phys` came from this wrapper's `alloc_page_lease` and nothing
+    /// references the page any more.
+    #[cfg(not(test))]
+    #[track_caller]
+    unsafe fn free_page_lease(&self, phys: u64, stack: &mut CascadeStack)
+    {
+        pool_lock(&self.cs_pool.lock);
+        // SAFETY: pool lock held; caller contract.
+        unsafe { pool_push(&self.cs_pool.head_phys, phys) };
+        self.cspace_growth_budget_bytes
+            .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
+        pool_unlock(&self.cs_pool.lock);
+        // SAFETY: the lease is released after the page's last use above.
+        unsafe { self.release_lease(stack) };
+    }
+
     /// Release one arena lease; the release that completes a begun teardown
     /// pushes this wrapper onto `stack`.
     ///
@@ -1760,6 +1800,113 @@ impl CSpaceKernelObject
                 &self.cspace_growth_budget_bytes,
             )
         }
+    }
+}
+
+/// Allocate a thread's port-binding table from `funder`'s pool: the table's
+/// page and the pages of its bitmap's parts, each an arena lease, initialised
+/// with every port denied
+/// (core/kernel/docs/capability-internals.md § `IoPort` Bindings).
+///
+/// # Errors
+/// `OutOfMemory` when the pool cannot supply every page; the pages already
+/// taken are returned.
+#[cfg(not(test))]
+pub fn alloc_port_binding_table(
+    funder: &CSpaceKernelObject,
+) -> Result<*mut crate::cap::ioport_bindings::IoPortBindings, syscall::SyscallError>
+{
+    use crate::arch::current::{IOPB_PART_BYTES, IOPB_PARTS};
+    use crate::cap::ioport_bindings::{IoPortBindings, TABLE_PAGES};
+    use crate::mm::paging::phys_to_virt;
+
+    let mut pages = [0u64; TABLE_PAGES];
+    for i in 0..TABLE_PAGES
+    {
+        match funder.alloc_page_lease()
+        {
+            Ok(phys) => pages[i] = phys,
+            Err(e) =>
+            {
+                with_cascade(|stack| {
+                    for &phys in &pages[..i]
+                    {
+                        // SAFETY: a page leased above and never used.
+                        unsafe { funder.free_page_lease(phys, stack) };
+                    }
+                });
+                return Err(e);
+            }
+        }
+    }
+    let mut parts = [core::ptr::null_mut::<[u8; IOPB_PART_BYTES]>(); IOPB_PARTS];
+    for (part, &phys) in parts.iter_mut().zip(&pages[1..])
+    {
+        *part = phys_to_virt(phys) as *mut [u8; IOPB_PART_BYTES];
+    }
+    let table = phys_to_virt(pages[0]) as *mut IoPortBindings;
+    // SAFETY: every page was leased above, page-aligned and exclusively ours;
+    // each stays live until `release_port_binding_table` returns it.
+    unsafe { IoPortBindings::init_in_place(table, parts, core::ptr::from_ref(funder) as usize) };
+    Ok(table)
+}
+
+/// Return a port-binding table's pages to the arena that funded them. The
+/// release that completes the funder's begun teardown pushes it onto `stack`.
+///
+/// # Safety
+/// `table` came from [`alloc_port_binding_table`] and nothing references it
+/// or its parts any more.
+#[cfg(not(test))]
+unsafe fn release_port_binding_table(
+    table: *mut crate::cap::ioport_bindings::IoPortBindings,
+    stack: &mut CascadeStack,
+)
+{
+    use crate::mm::paging::virt_to_phys;
+    // SAFETY: caller contract; the table names the funder its pages came from,
+    // which its leases keep live until the last is released below.
+    let (funder, parts) = unsafe {
+        (
+            &*((*table).funder() as *const CSpaceKernelObject),
+            (*table).bitmap.parts,
+        )
+    };
+    for part in parts
+    {
+        // SAFETY: a part page this table leased; unreferenced (contract).
+        unsafe { funder.free_page_lease(virt_to_phys(part as u64), stack) };
+    }
+    // SAFETY: the table's own page, leased with the parts; nothing reads it
+    // after this.
+    unsafe { funder.free_page_lease(virt_to_phys(table as u64), stack) };
+}
+
+/// Return the pages of a port-binding table no thread ever installed (a bind
+/// that lost the install race).
+///
+/// # Safety
+/// As [`release_port_binding_table`]; no lock is held.
+#[cfg(not(test))]
+pub unsafe fn free_uninstalled_port_binding_table(
+    table: *mut crate::cap::ioport_bindings::IoPortBindings,
+)
+{
+    // SAFETY: forwarded from the caller's contract.
+    with_cascade(|stack| unsafe { release_port_binding_table(table, stack) });
+}
+
+/// Run `f` with a fresh cascade stack, then tear down whatever it queued.
+#[cfg(not(test))]
+fn with_cascade(f: impl FnOnce(&mut CascadeStack))
+{
+    let mut stack = CascadeStack::new();
+    f(&mut stack);
+    while let Some(next) = stack.pop()
+    {
+        // SAFETY: `next` was queued by an arena release, which leaves it
+        // unreferenced and exclusively this stack's; no lock is held.
+        unsafe { dealloc_object_one(next, &mut stack) };
     }
 }
 
@@ -3346,10 +3493,15 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 };
                 if !iopb_ptr.is_null()
                 {
-                    crate::cap::retype::free_seed_scratch(
-                        iopb_ptr.cast::<u8>(),
-                        crate::cap::ioport_bindings::TABLE_BYTES,
-                    );
+                    // SAFETY: the detached table was installed by
+                    // sys_ioport_bind, and the thread is off every CPU, so no
+                    // TSS load reads it.
+                    unsafe {
+                        release_port_binding_table(
+                            iopb_ptr.cast::<crate::cap::ioport_bindings::IoPortBindings>(),
+                            stack,
+                        );
+                    }
                 }
 
                 // The per-thread XSAVE / FP-save area is page N+1 of the

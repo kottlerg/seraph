@@ -355,8 +355,9 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg1 = `IoPort` cap index (must have USE right).
 ///
 /// On first bind, a per-thread port-binding table (`cap::ioport_bindings`: the
-/// 8 KiB IOPB bitmap, all ports denied, and the record of each binding) is
-/// carved from the SEED Memory cap. The bind records the `IoPort` object it is
+/// 8 KiB IOPB bitmap in page-sized parts, all ports denied, and the record of
+/// each binding) is taken from the pool of the caller's `CSpace`, three pages
+/// in all. The bind records the `IoPort` object it is
 /// made through and clears the range's bits (0 = allowed); freeing that object
 /// withdraws the binding (docs/capability-model.md § `IoPort`). On context
 /// switch the bitmap is copied into the TSS IOPB region. The install and the
@@ -379,7 +380,7 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
 
     {
         use crate::arch::current::gdt;
-        use crate::cap::ioport_bindings::{IoPortBindings, TABLE_BYTES};
+        use crate::cap::ioport_bindings::IoPortBindings;
         use crate::cap::object::{IoPortObject, ThreadObject};
         use crate::cap::slot::{IoPortRights, ThreadRights};
         use crate::syscall::current_tcb;
@@ -424,24 +425,25 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
         let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
         let (port_object, port_base, port_count) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed IoPort; the object is an IoPortObject retyped in
-            // place from the SEED reserve (at boot, by a split, or by a copy).
+            // SAFETY: tag confirmed IoPort; the object is an IoPortObject built in
+            // place (from SEED at boot, or from an arena by a split or a copy).
             #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
             (obj.as_ptr() as usize, u32::from(po.base), po.port_count())
         };
 
         // The per-thread binding table is allocated on first bind from the
-        // kernel SEED Memory cap and freed back to SEED on thread dealloc via
-        // the Thread arm of `dealloc_object`. The pointer and the table's bytes
+        // pool of the caller's CSpace (core/kernel/docs/capability-internals.md
+        // § IoPort Bindings) and returned there on thread dealloc via the
+        // Thread arm of `dealloc_object`. The pointer and the table's bytes
         // are owned by the target's `sched_lock`
         // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership,
         // Address-space / capability row), which `schedule()` also holds when
-        // it loads the bitmap into a CPU's TSS. The SEED allocation is not made
+        // it loads the bitmap into a CPU's TSS. The allocation is not made
         // under that lock: a first bind peeks under it, allocates outside it,
         // and installs under it only if the slot is still empty; a concurrent
-        // bind that installed first wins, and the loser's block goes back to
-        // SEED.
+        // bind that installed first wins, and the loser's pages go back to
+        // the pool.
         // SAFETY: target_tcb validated non-null; lock_raw/unlock_raw paired.
         let needs_iopb = unsafe {
             let saved = (*target_tcb).sched_lock.lock_raw();
@@ -452,16 +454,10 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
         let mut fresh: *mut IoPortBindings = core::ptr::null_mut();
         if needs_iopb
         {
-            let raw = crate::cap::retype::alloc_seed_scratch(TABLE_BYTES)?;
-            // cast_ptr_alignment: a page-class SEED scratch block is page-aligned,
-            // which satisfies the table's alignment.
-            #[allow(clippy::cast_ptr_alignment)]
-            {
-                fresh = raw.cast::<IoPortBindings>();
-            }
-            // SAFETY: fresh points at a freshly-carved TABLE_BYTES block in
-            // SEED's region, page-aligned and not aliased.
-            unsafe { IoPortBindings::init_in_place(fresh) };
+            // SAFETY: cspace is the running thread's own CSpace, live while
+            // the thread runs.
+            let funder = unsafe { crate::cap::object::arena_of(cspace) }?;
+            fresh = crate::cap::object::alloc_port_binding_table(funder)?;
         }
 
         // SAFETY: target_tcb validated non-null; under its sched_lock, iopb is
@@ -472,11 +468,11 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             let saved = (*target_tcb).sched_lock.lock_raw();
             if (*target_tcb).iopb.is_null() && !fresh.is_null()
             {
-                (*target_tcb).iopb = fresh.cast::<[u8; gdt::IOPB_SIZE]>();
+                (*target_tcb).iopb = fresh.cast::<crate::arch::current::ThreadIopb>();
                 fresh = core::ptr::null_mut();
             }
             // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-            // IoPortBindings block (the allocation above or an earlier bind's).
+            // IoPortBindings page (the allocation above or an earlier bind's).
             #[allow(clippy::cast_ptr_alignment)]
             let table = (*target_tcb).iopb.cast::<IoPortBindings>();
             let bound = if table.is_null()
@@ -498,10 +494,13 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             bound
         };
 
-        // A concurrent bind installed its table first: return ours to SEED.
+        // A concurrent bind installed its table first: return ours to the
+        // pool.
         if !fresh.is_null()
         {
-            crate::cap::retype::free_seed_scratch(fresh.cast::<u8>(), TABLE_BYTES);
+            // SAFETY: `fresh` was never installed, so nothing references it;
+            // no lock is held.
+            unsafe { crate::cap::object::free_uninstalled_port_binding_table(fresh) };
         }
 
         bound.map_err(|_| SyscallError::QuotaExceeded)?;

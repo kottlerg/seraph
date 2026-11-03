@@ -107,20 +107,11 @@ fn main() -> !
     let mut table = process::ProcessTable::new();
     let mut recent = process::RecentExits::new();
 
-    let Some(ws_cap) = std::os::seraph::object_slab_retype(
-        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
-        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
-    )
-    else
-    {
-        syscall::thread_exit();
-    };
-    if syscall::wait_set_add(ws_cap, boot.service_ep, WS_BADGE_SERVICE).is_err()
-    {
-        syscall::thread_exit();
-    }
-    // The first death queue; further ones join the wait set as pools run out.
-    let Some(deaths) = death_queues::DeathSet::new(ws_cap, WS_BADGE_DEATH)
+    // The main wait set, holding the service endpoint and the first death
+    // queue; further queues join it as pools run out, and it is replaced by a
+    // wider one as they fill it.
+    let Some(deaths) =
+        death_queues::DeathSet::new(boot.service_ep, WS_BADGE_SERVICE, WS_BADGE_DEATH)
     else
     {
         syscall::thread_exit();
@@ -133,7 +124,6 @@ fn main() -> !
         registry_ep: boot.registry_ep,
         memmgr_ep: startup.memmgr_endpoint,
         deaths,
-        ws_cap,
         sched_baseline: startup.sched_control_cap,
     };
     let service_ep = boot.service_ep;
@@ -146,7 +136,9 @@ fn main() -> !
     loop
     {
         hold_cspace_headroom(startup.self_cspace, &mut headroom_warned);
-        let badge = match syscall::wait_set_wait(ws_cap)
+        // Read every time: a bind that grows the death queues may have
+        // replaced the wait set.
+        let badge = match syscall::wait_set_wait(ctx.deaths.ws_cap())
         {
             Ok(badge) => badge,
             Err(e) =>
@@ -187,10 +179,6 @@ fn main() -> !
         }
     }
 }
-
-/// The main wait set's member capacity: the service endpoint and every death
-/// queue procmgr may create.
-const WS_MEMBERS: u32 = 1 + death_queues::DEATH_QUEUES_MAX as u32;
 
 /// Monotonic time since the first call, in nanoseconds, for the
 /// recent-exits retention window and the init-reap probe budget. Saturates
@@ -1185,14 +1173,11 @@ pub struct ProcmgrCtx
     /// memory-cap allocations (memmgr auto-registers procmgr's badge at
     /// bootstrap so `REQUEST_MEMORY_CAPS` on this cap is allowed).
     pub memmgr_ep: u32,
-    /// The death-notification event queues. Every spawned child binds its
-    /// main thread and its address space on them with `correlator =
-    /// entry.badge`. Multiplexed alongside the service endpoint via the
-    /// wait-set in `ws_cap`.
+    /// The death-notification event queues and the main wait set they share
+    /// with the service endpoint (`WS_BADGE_SERVICE`, every queue under
+    /// `WS_BADGE_DEATH`). Every spawned child binds its main thread and its
+    /// address space on the queues with `correlator = entry.badge`.
     pub deaths: death_queues::DeathSet,
-    /// Wait-set cap. Multiplexes procmgr's service endpoint
-    /// (`WS_BADGE_SERVICE`) and every death event queue (`WS_BADGE_DEATH`).
-    pub ws_cap: u32,
     /// Procmgr's baseline `SchedControl` cap, delivered via its own
     /// `ProcessInfo.sched_control_cap` (band
     /// `[1, sched_policy::BASELINE_PRIORITY_MAX]`). The fan-out source for

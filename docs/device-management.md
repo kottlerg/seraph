@@ -132,7 +132,7 @@ holds no per-IOMMU state.
 
 When devmgr binds a DMA-capable (PCI BAR + IRQ) driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,
-and delivers its BAR `Mmio`, optional IRQ, and endpoint caps. No
+and delivers its BAR `Mmio` caps, optional IRQ, and endpoint caps. No
 DMA-authorising capability type exists, and with no IOMMU programmed the
 physical isolation is absent; whether to refuse, warn, or restrict is a
 userspace policy decision, not a kernel-enforced mode. The kernel is
@@ -196,10 +196,16 @@ devmgr spawns one driver for every virtio-input device it enumerates and for eve
 device it can give a private IRQ line (virtio-blk requires one; a disk whose line another device
 already holds is not served until shared lines are,
 [#664](https://github.com/kottlerg/seraph/issues/664)), each with its own service endpoint.
-`QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one of those drivers by an optional instance
-ordinal in `data[1]` (absent means the first): the ordinal counts the running drivers of that class
-in PCI segment, bus, device, function order, and is not stable across boots. vfsd and the terminal
-send none, so they bind the first instance.
+devmgr serves one of those drivers only once it has reported its device set up
+(`devmgr_labels::DRIVER_READY`); a driver that dies first, its device setup failed, is withdrawn
+and never served. devmgr waits for every driver of a class to report or die before it serves that
+class's queries (devmgr's
+[responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)
+gives the settle and the serving order). `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one
+of those drivers by an optional instance ordinal in `data[1]` (absent means the first): the ordinal
+counts the served drivers of that class in PCI segment, bus, device, function order, and is not
+stable across boots. vfsd queries every block ordinal from 0 until the reply is not `SUCCESS` and
+holds every disk; the terminal sends none, so it binds the first input instance.
 
 ### Driver binary sources
 
@@ -216,7 +222,7 @@ devmgr loads driver binaries from one of two places:
   virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
   then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
   critical path. A PCI device that shares an `INTx` line may get no private IRQ cap; such a driver
-  is delivered a 2-cap bootstrap round (BAR + service, no IRQ) and polls its queue. Post-handover,
+  is delivered a bootstrap that names its IRQ slot absent, and polls its queue. Post-handover,
   svcmgr walks its universal root to `/services/drivers/` and hands devmgr that subtree cap via
   `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
   devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr

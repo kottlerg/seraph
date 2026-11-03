@@ -5,8 +5,9 @@
 
 //! Seraph `VirtIO` block device driver.
 //!
-//! Receives BAR MMIO cap, IRQ cap, and `VirtioPciStartupInfo` startup message
-//! from devmgr. Initialises the `VirtIO` device via the modern PCI transport,
+//! Receives a BAR MMIO cap per BAR the device's register regions name, an
+//! IRQ cap, and the `VirtioPciStartupInfo` startup message from devmgr.
+//! Initialises the `VirtIO` device via the modern PCI transport,
 //! sets up a split virtqueue, and serves block reads
 //! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`),
 //! partition registration (`REGISTER_PARTITION`), and the device geometry
@@ -23,10 +24,12 @@ use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
 use virtio_blk::{Geometry, IoOutcome, PartitionTable};
+use virtio_core::bootstrap::{DeliveredBars, DriverEndpoints};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
-    STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, VirtioPciStartupInfo,
+    RegisterLayout, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK,
+    VirtioPciStartupInfo,
 };
 
 use crate::io::IoLayout;
@@ -47,20 +50,14 @@ const QUEUE_SIZE: u16 = 4;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
-// devmgr → virtio-blk bootstrap plan:
-// Round 1 (3 caps):
-//   caps[0]: BAR MMIO region
-//   caps[1]: IRQ line
-//   caps[2]: service endpoint (virtio-blk receives on this)
-// Round 2 (1 cap):
-//   caps[0]: devmgr query endpoint (badged per-device — for QUERY_DEVICE_INFO)
-//
-// log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
-// this protocol.
+// devmgr serves the two rounds `virtio_core::bootstrap` specifies: the BAR
+// caps with their BAR indices, then the service endpoint, the IRQ, and the
+// per-device devmgr query endpoint. log_ep and procmgr_ep arrive via
+// `ProcessInfo`/`StartupInfo`, not through this protocol.
 
 struct DriverCaps
 {
-    bar_mmio_slot: u32,
+    bars: DeliveredBars,
     irq_slot: u32,
     memmgr_ep: u32,
     service_ep: u32,
@@ -78,26 +75,69 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 
     // SAFETY: `ipc_buf` is the registered IPC buffer for this thread.
     let round1 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
-    if round1.cap_count < 3 || round1.done
-    {
-        return None;
-    }
+    let bars = DeliveredBars::from_round(&round1)?;
 
     // SAFETY: same invariant.
     let round2 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
-    if round2.cap_count < 1 || !round2.done
-    {
-        return None;
-    }
+    let endpoints = DriverEndpoints::from_round(&round2)?;
 
     Some(DriverCaps {
-        bar_mmio_slot: round1.caps[0],
-        irq_slot: round1.caps[1],
-        service_ep: round1.caps[2],
+        bars,
+        irq_slot: endpoints.irq,
+        service_ep: endpoints.service,
         memmgr_ep: info.memmgr_endpoint,
-        devmgr_ep: round2.caps[0],
+        devmgr_ep: endpoints.devmgr_query,
         self_aspace: info.self_aspace,
     })
+}
+
+/// Map every delivered BAR into one register window laid out as `layout`
+/// says, after checking the delivered BARs are the layout's own. Returns the
+/// window's virtual address; exits on any failure (the device cannot be
+/// driven without its registers).
+fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
+{
+    if !layout.matches_delivered(caps.bars.bar_indices())
+    {
+        std::os::seraph::log!("delivered BARs do not match the device's register regions");
+        syscall::thread_exit();
+    }
+    let window_pages = layout.window_pages();
+    // The BAR mappings live for the driver process's lifetime; the
+    // reservation is intentionally never returned to the arena (the
+    // ReservedRange has no Drop impl, so falling out of scope is a no-op).
+    let Ok(window) = reserve_pages(window_pages)
+    else
+    {
+        std::os::seraph::log!("BAR reserve_pages failed");
+        syscall::thread_exit();
+    };
+    let window_va = window.va_start();
+    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, window_pages)
+    {
+        std::os::seraph::log!("BAR PT-budget funding failed");
+        syscall::thread_exit();
+    }
+    let mut bar_va = window_va;
+    for (&bar_cap, aperture) in caps.bars.caps().iter().zip(layout.bars())
+    {
+        // SAFETY: `window` is a fresh reservation of `window_pages` pages
+        // from the per-process arena, and `bar_va` starts this BAR's
+        // `aperture.pages`-page share of it. devmgr carves each BAR cap to at
+        // most the same `pages` (`carve_virtio_bars`), so the whole-region
+        // mapping stays inside that share: VA no Rust object or IPC page
+        // occupies. `PciTransport` reaches the BARs only through its raw
+        // volatile accessors, never a reference, and the reservation is
+        // never returned, so the VA stays reserved for the driver's lifetime
+        // (`mmio_map` § Safety).
+        if unsafe { syscall::mmio_map(caps.self_aspace, bar_cap, bar_va, 0) }.is_err()
+        {
+            std::os::seraph::log!("BAR mmio_map failed");
+            syscall::thread_exit();
+        }
+        bar_va += aperture.pages * PAGE_SIZE;
+    }
+    window_va
 }
 
 // ── Device info query via devmgr IPC ──────────────────────────────────────
@@ -165,6 +205,27 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
         syscall::thread_exit();
     };
     info
+}
+
+/// Report the device set up to devmgr (`DRIVER_READY` on the devmgr query
+/// cap), immediately before the service loop: devmgr serves this driver's
+/// service endpoint only after the report. Exits when devmgr refuses it or
+/// the call fails, since devmgr then serves no client this driver.
+fn report_ready(devmgr_ep: u32, ipc_buf: *mut u64)
+{
+    let request = IpcMessage::builder(devmgr_labels::DRIVER_READY)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let accepted = matches!(
+        unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) },
+        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS
+    );
+    if !accepted
+    {
+        std::os::seraph::log!("DRIVER_READY refused; exiting");
+        syscall::thread_exit();
+    }
 }
 
 // ── Memory-cap allocation via memmgr IPC ────────────────────────────────────────
@@ -353,6 +414,11 @@ fn setup_virtqueue(
 
     // Save notification offset for this queue before changing selection.
     let queue_notify_off = transport.queue_notify_off();
+    if !transport.doorbell_in_region(queue_notify_off)
+    {
+        std::os::seraph::log!("queue doorbell outside the notification region");
+        syscall::thread_exit();
+    }
 
     let desc_size = virtqueue::desc_table_size(queue_size);
     let used_off = virtqueue::used_ring_offset(queue_size);
@@ -895,11 +961,6 @@ fn main() -> !
     };
 
     std::os::seraph::log!("starting");
-    if caps.bar_mmio_slot == 0
-    {
-        std::os::seraph::log!("no BAR MMIO cap");
-        syscall::thread_exit();
-    }
     if caps.memmgr_ep == 0
     {
         std::os::seraph::log!("no memmgr endpoint");
@@ -914,38 +975,17 @@ fn main() -> !
     }
     let pci_info = query_device_info(caps.devmgr_ep, ipc_buf);
 
-    // Map BAR MMIO. Reservation covers the highest reach across the four
-    // VirtIO PCI capability regions (rounded up to whole pages); the BAR
-    // mapping lives for the driver process's lifetime.
-    let bar_pages = pci_info.bar_aperture_pages();
-    let Ok(bar_range) = reserve_pages(bar_pages)
+    // Map every BAR the register regions name into one register window.
+    let Some(layout) = pci_info.register_layout()
     else
     {
-        std::os::seraph::log!("BAR reserve_pages failed");
+        std::os::seraph::log!("device presents no complete set of register regions");
         syscall::thread_exit();
     };
-    let bar_va = bar_range.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, bar_pages)
-    {
-        std::os::seraph::log!("BAR PT-budget funding failed");
-        syscall::thread_exit();
-    }
-    // SAFETY: `bar_range` is a fresh reservation of `bar_pages` pages from
-    // the per-process arena, owned for the driver's lifetime, and devmgr
-    // carves the BAR cap to at most the same `bar_aperture_pages`
-    // (`find_virtio_bar_cap`), so the whole-region mapping stays inside it:
-    // VA no Rust object or IPC page occupies.
-    // `PciTransport` reaches the BAR only through its raw volatile accessors,
-    // never a reference, and `bar_range` stays held for the driver's
-    // lifetime (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, bar_va, 0) }.is_err()
-    {
-        std::os::seraph::log!("BAR mmio_map failed");
-        syscall::thread_exit();
-    }
+    let window_va = map_register_window(&caps, &layout);
 
     // Create PCI transport and initialise device.
-    let transport = PciTransport::new(bar_va, &pci_info);
+    let transport = PciTransport::new(window_va, &layout);
     let geometry = init_device(&transport);
     std::os::seraph::log!(
         "capacity (blocks)={:#018x} block size={}",
@@ -1015,5 +1055,6 @@ fn main() -> !
         geometry,
         device_faulted: false,
     };
+    report_ready(caps.devmgr_ep, ipc_buf);
     service_loop(caps.service_ep, ipc_buf, &mut rt);
 }

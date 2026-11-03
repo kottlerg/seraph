@@ -98,12 +98,17 @@ within the top 2 GiB, canonical in every mode. Under Sv39 the kernel half is
 window, and the kernel refuses to boot rather than overlap; a near-full Sv39 half narrows
 the direct-map randomization window (falling back to the kernel-half floor when
 fewer than two 1 GiB slots remain).
-All fixed userspace-layout zones sit below 2^38, the smallest user half, so
-one static userspace layout is canonical in every mode
-([userspace-memory-model.md](userspace-memory-model.md)). The one private
-zone above it is memmgr's metadata-arena high zone, which exists only in a
-mode with a wider user half and which the arena grows into after its low zone
-(see [services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+Every draw window a process creator places a surface in, and every `DEFAULT_*`
+fallback, sits below 2^38, the smallest user half, so that static part of the userspace
+layout is canonical in every mode
+([userspace-memory-model.md](userspace-memory-model.md)). The zones that follow the
+mode's user half are the byte heap and page-reservation arena a process places itself
+(below the creator's windows under Sv39, above 2^38 in a wider half) and the image zone
+procmgr validates its children's images against, which in a wider half ends above 2^38
+([userspace-memory-model.md](userspace-memory-model.md) § Growth Zones). memmgr, which
+has neither, keeps a private metadata-arena high zone above 2^38 in a wider half, which
+its arena grows into after its low zone (see
+[services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
 § Metadata Arena).
 
 ### Userspace Layout
@@ -113,12 +118,16 @@ init for memmgr and procmgr, procmgr for everything else) maps segments as direc
 the binary format. The general convention is:
 
 ```
-  2^38 (layout ceiling) ┐
-                        │  Program image (PIE load-bias window)
+  user-half top         ┐
+                        │  Page-reservation arena   ┐ wider half only
+                        │  Byte heap (grows upward) ┘ (above 2^38)
+  2^38 (layout ceiling) ┤
+                        │  Program image (PIE load-bias window; a procmgr
+                        │    child's image may run past 2^38 in a wider half)
                         │  Main-thread stack (guard page below), handover page,
                         │    IPC buffer, main-thread TLS
-                        │  Page-reservation arena (foreign mappings)
-                        │  Byte heap (grows upward)
+                        │  Page-reservation arena   ┐ Sv39, or size unknown
+                        │  Byte heap (grows upward) ┘
   (low VA)              ┘
 ```
 
@@ -126,8 +135,10 @@ The diagram shows the ordering convention only: each region's base is randomised
 process within a fixed window (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)).
 When an entropy draw fails, the byte heap, the page-reservation arena, and the program image
 fall back to their window bases, while the bootstrap VAs fall back to fixed `DEFAULT_*`
-addresses above the image window, so the ordering above does not hold for them (see
-[userspace-memory-model.md](userspace-memory-model.md) § Bootstrap Cross-Boundary VAs).
+addresses between init's stack-guard window and the image window, outside every draw window,
+and init's own `InitInfo` page and stack to the kernel's fallbacks above the fixed image
+zone (see [userspace-memory-model.md](userspace-memory-model.md) § Bootstrap Cross-Boundary
+VAs).
 Concrete VA management surfaces, the per-region randomisation windows, the frame-allocation
 contract, and ownership boundaries between the kernel, memmgr, procmgr, and
 `std::sys::seraph` are documented in [userspace-memory-model.md](userspace-memory-model.md).

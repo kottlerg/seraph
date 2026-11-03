@@ -6,8 +6,9 @@
 //! Pure GUID Partition Table parsing.
 //!
 //! Decodes a GPT header and partition entries from raw block bytes, and
-//! resolves a partition by type GUID with Discoverable-Partitions-Specification
-//! priority tie-breaking. This crate performs no I/O: a caller reads logical
+//! resolves a partition by type GUID across the partitions of every disk the
+//! caller holds, with Discoverable-Partitions-Specification priority
+//! tie-breaking. This crate performs no I/O: a caller reads logical
 //! blocks off a block device (over IPC, in `vfsd`) and hands the bytes here. Keeping
 //! the parse of untrusted on-disk structures pure and host-testable is the
 //! point — see [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
@@ -306,60 +307,83 @@ pub fn collect_partitions(
 /// Failure modes for [`lookup_partition_by_type_guid`].
 pub enum GptLookupError
 {
-    /// No partition carries the requested type GUID.
+    /// No partition on any disk carries the requested type GUID.
     NotFound,
     /// Two or more partitions claim the same type GUID with equal DPS
-    /// priority (attribute bits 48-63); the caller must not pick arbitrarily.
+    /// priority (attribute bits 48-63), on one disk or across disks; the
+    /// caller must not pick arbitrarily.
     DuplicateTie,
 }
 
-/// Look up a partition by GPT type GUID using DPS-style priority tie-breaking.
+/// Where [`lookup_partition_by_type_guid`] found a partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionLocation
+{
+    /// Position of the disk holding the partition in the sequence the
+    /// caller passed.
+    pub disk: usize,
+    /// The partition's first LBA, in that disk's logical blocks.
+    pub first_lba: u64,
+    /// The partition's length in that disk's logical blocks.
+    pub length_lba: u64,
+}
+
+/// Look up a partition by GPT type GUID across every disk in `disks`, using
+/// DPS-style priority tie-breaking.
 ///
-/// "Priority" is bits 48-63 of the partition attribute u64. The
-/// highest-priority match wins; an exact tie between two or more
-/// partitions is a fatal configuration error rather than an arbitrary choice.
+/// `disks` yields each disk's used partition entries. "Priority" is bits
+/// 48-63 of the partition attribute u64. The highest-priority match wins,
+/// whichever disk holds it; an exact tie at the highest priority between two
+/// or more partitions, on one disk or on different ones, is a configuration
+/// error rather than an arbitrary choice. A disk's position in `disks` never
+/// breaks a tie, since the order disks are found in is not stable across
+/// boots.
 ///
 /// # Errors
 /// Returns [`GptLookupError::NotFound`] when no partition carries
 /// `type_guid`, or [`GptLookupError::DuplicateTie`] when two or more matches
 /// share the highest priority.
-pub fn lookup_partition_by_type_guid(
+pub fn lookup_partition_by_type_guid<'a>(
     type_guid: &[u8; 16],
-    parts: &[GptEntry],
-) -> Result<(u64, u64), GptLookupError>
+    disks: impl IntoIterator<Item = &'a [GptEntry]>,
+) -> Result<PartitionLocation, GptLookupError>
 {
-    let mut best: Option<(usize, u16)> = None;
+    let mut best: Option<(PartitionLocation, u16)> = None;
     let mut tied = false;
-    for (i, p) in parts.iter().enumerate()
+    for (disk, parts) in disks.into_iter().enumerate()
     {
-        if &p.type_guid != type_guid
+        for p in parts.iter().filter(|p| &p.type_guid == type_guid)
         {
-            continue;
-        }
-        // clippy::cast_possible_truncation: explicit shift+mask narrows to 16 bits.
-        #[allow(clippy::cast_possible_truncation)]
-        let priority = ((p.attributes >> 48) & 0xFFFF) as u16;
-        match best
-        {
-            None => best = Some((i, priority)),
-            Some((_, b)) if priority > b =>
+            // clippy::cast_possible_truncation: explicit shift+mask narrows to 16 bits.
+            #[allow(clippy::cast_possible_truncation)]
+            let priority = ((p.attributes >> 48) & 0xFFFF) as u16;
+            let location = PartitionLocation {
+                disk,
+                first_lba: p.first_lba,
+                length_lba: p.length_lba,
+            };
+            match best
             {
-                best = Some((i, priority));
-                tied = false;
+                None => best = Some((location, priority)),
+                Some((_, b)) if priority > b =>
+                {
+                    best = Some((location, priority));
+                    tied = false;
+                }
+                Some((_, b)) if priority == b =>
+                {
+                    tied = true;
+                }
+                _ =>
+                {}
             }
-            Some((_, b)) if priority == b =>
-            {
-                tied = true;
-            }
-            _ =>
-            {}
         }
     }
     if tied
     {
         return Err(GptLookupError::DuplicateTie);
     }
-    best.map(|(i, _)| (parts[i].first_lba, parts[i].length_lba))
+    best.map(|(location, _)| location)
         .ok_or(GptLookupError::NotFound)
 }
 
@@ -720,16 +744,30 @@ mod tests
         }
     }
 
+    fn at(disk: usize, first_lba: u64, length_lba: u64) -> PartitionLocation
+    {
+        PartitionLocation {
+            disk,
+            first_lba,
+            length_lba,
+        }
+    }
+
     #[test]
     fn lookup_returns_not_found_when_no_entry_matches()
     {
         let parts = [part(0x22, 100, 50, 0)];
+        let empty: [&[GptEntry]; 2] = [&[], &[]];
         assert!(matches!(
-            lookup_partition_by_type_guid(&[0x11; 16], &parts),
+            lookup_partition_by_type_guid(&[0x11; 16], [&parts[..], &parts[..]]),
             Err(GptLookupError::NotFound)
         ));
         assert!(matches!(
-            lookup_partition_by_type_guid(&[0x11; 16], &[]),
+            lookup_partition_by_type_guid(&[0x11; 16], empty),
+            Err(GptLookupError::NotFound)
+        ));
+        assert!(matches!(
+            lookup_partition_by_type_guid(&[0x11; 16], []),
             Err(GptLookupError::NotFound)
         ));
     }
@@ -738,20 +776,46 @@ mod tests
     fn lookup_returns_single_match()
     {
         let parts = [part(0x22, 300, 10, 0), part(0x11, 100, 50, 0)];
-        assert!(matches!(
-            lookup_partition_by_type_guid(&[0x11; 16], &parts),
-            Ok((100, 50))
-        ));
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&parts[..]]).ok(),
+            Some(at(0, 100, 50))
+        );
+    }
+
+    #[test]
+    fn lookup_finds_a_match_on_a_later_disk()
+    {
+        let first = [part(0x22, 300, 10, 0)];
+        let second = [part(0x33, 40, 4, 0), part(0x11, 100, 50, 0)];
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&first[..], &[], &second[..]]).ok(),
+            Some(at(2, 100, 50))
+        );
     }
 
     #[test]
     fn lookup_picks_higher_priority_among_matches()
     {
         let parts = [part(0x11, 100, 50, 1), part(0x11, 200, 60, 5)];
-        assert!(matches!(
-            lookup_partition_by_type_guid(&[0x11; 16], &parts),
-            Ok((200, 60))
-        ));
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&parts[..]]).ok(),
+            Some(at(0, 200, 60))
+        );
+    }
+
+    #[test]
+    fn lookup_picks_the_higher_priority_disk_whatever_its_position()
+    {
+        let low = [part(0x11, 100, 50, 1)];
+        let high = [part(0x11, 200, 60, 5)];
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&low[..], &high[..]]).ok(),
+            Some(at(1, 200, 60))
+        );
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&high[..], &low[..]]).ok(),
+            Some(at(0, 200, 60))
+        );
     }
 
     #[test]
@@ -759,8 +823,84 @@ mod tests
     {
         let parts = [part(0x11, 100, 50, 3), part(0x11, 200, 60, 3)];
         assert!(matches!(
-            lookup_partition_by_type_guid(&[0x11; 16], &parts),
+            lookup_partition_by_type_guid(&[0x11; 16], [&parts[..]]),
             Err(GptLookupError::DuplicateTie)
         ));
+    }
+
+    #[test]
+    fn lookup_reports_duplicate_tie_across_disks()
+    {
+        // One partition type at one priority on two disks, as two copies of
+        // one disk image carry, is ambiguous: disk order does not pick one.
+        let a = [part(0x11, 100, 50, 0)];
+        let b = [part(0x11, 100, 50, 0)];
+        assert!(matches!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&a[..], &b[..]]),
+            Err(GptLookupError::DuplicateTie)
+        ));
+    }
+
+    #[test]
+    fn lookup_ignores_a_tie_below_another_disks_winner()
+    {
+        let tied = [part(0x11, 100, 50, 1), part(0x11, 200, 50, 1)];
+        let winner = [part(0x11, 300, 60, 2)];
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&tied[..], &winner[..]]).ok(),
+            Some(at(1, 300, 60))
+        );
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x11; 16], [&winner[..], &tied[..]]).ok(),
+            Some(at(0, 300, 60))
+        );
+    }
+
+    /// A 512-byte-block disk image holding a GPT header at LBA 1 and a
+    /// 128-entry array from LBA 2 with `parts` in its first slots, each
+    /// `(type GUID byte, first LBA, last LBA, DPS priority)`.
+    fn disk_image(parts: &[(u8, u64, u64, u64)]) -> Vec<u8>
+    {
+        let mut disk = vec![0u8; 512 * 34];
+        disk[512..1024].copy_from_slice(&header_sector(b"EFI PART", 2, 128, 128));
+        for (i, &(tg, first, last, priority)) in parts.iter().enumerate()
+        {
+            let off = 1024 + i * 128;
+            disk[off..off + 128].copy_from_slice(&entry_bytes(tg, first, last, priority << 48));
+        }
+        disk
+    }
+
+    /// The used partitions of `disk`, read through the header parse and
+    /// array walk vfsd runs on each block device.
+    fn discover(disk: &[u8]) -> Vec<GptEntry>
+    {
+        let header = parse_header(&disk[512..1024]).ok().expect("header");
+        let scan = collect_partitions(&header, |lba, buf| {
+            let off = lba as usize * buf.len();
+            buf.copy_from_slice(&disk[off..off + buf.len()]);
+            true
+        });
+        assert_eq!(scan.stop, None);
+        scan.entries
+    }
+
+    #[test]
+    fn role_discovery_resolves_each_role_on_the_disk_that_holds_it()
+    {
+        // The first disk carries an ESP-like and a data-like partition, the
+        // second the root-like one, so a discovery that read only the first
+        // disk would find no root.
+        let first = discover(&disk_image(&[(0xE5, 34, 99, 0), (0xDA, 100, 199, 0)]));
+        let second = discover(&disk_image(&[(0x77, 2048, 4095, 0)]));
+        let disks = [first.as_slice(), second.as_slice()];
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0x77; 16], disks).ok(),
+            Some(at(1, 2048, 2048))
+        );
+        assert_eq!(
+            lookup_partition_by_type_guid(&[0xDA; 16], disks).ok(),
+            Some(at(0, 100, 100))
+        );
     }
 }

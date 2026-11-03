@@ -25,15 +25,16 @@ virtio/input/
 
 ## Endpoint
 
-Devmgr enumerates the virtio-input PCI device, carves its per-device
-capabilities (BAR MMIO, and an IRQ unless the device shares an `INTx` line), and
-spawns this driver from the rootfs (`/services/drivers/virtio-input`) — it is not
-bootstrap-essential, so it loads lazily through devmgr's `SET_DRIVERS_DIR` subtree cap,
-like the RTC drivers (see
-[docs/device-management.md](../../../../docs/device-management.md)).
-Devmgr owns the service endpoint and mints clients an
-`input_labels::READ_AUTHORITY`-badged SEND cap via
-`devmgr_labels::QUERY_INPUT_DEVICE` (see
+Devmgr enumerates the virtio-input PCI device, carves its per-device capabilities (an
+`Mmio` cap for every BAR its VirtIO register regions name, and an IRQ unless the device
+shares an `INTx` line), and spawns this driver from the rootfs
+(`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads lazily
+through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
+[docs/device-management.md](../../../../docs/device-management.md)). The driver
+reports `DRIVER_READY` on its devmgr query endpoint once its device is set up,
+immediately before its service loop, and devmgr serves its endpoint only after that
+report. Devmgr owns the service endpoint and mints clients an
+`input_labels::READ_AUTHORITY`-badged SEND cap via `devmgr_labels::QUERY_INPUT_DEVICE` (see
 [devmgr Responsibilities](../../../devmgr/docs/responsibilities.md#responsibilities)).
 
 One device, one client for v0.1.0; multi-device fan-out is out of scope.

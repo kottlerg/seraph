@@ -121,6 +121,27 @@ fn is_same_arch(arch: Arch) -> bool
     }
 }
 
+impl Accel
+{
+    /// Every backend, for the round trip `name` and `parse_explicit` keep.
+    #[cfg(test)]
+    const ALL: [Accel; 5] = [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg];
+
+    /// The backend's lower-case name: the value `parse_explicit` accepts for
+    /// it, and the one `run-parallel --save-logs` records in its trailer.
+    pub fn name(self) -> &'static str
+    {
+        match self
+        {
+            Accel::Kvm => "kvm",
+            Accel::Hvf => "hvf",
+            Accel::Whpx => "whpx",
+            Accel::Nvmm => "nvmm",
+            Accel::Tcg => "tcg",
+        }
+    }
+}
+
 /// Parse a user-provided env-var value into an `Accel`. Returns
 /// `None` for the documented `auto` sentinel, the empty string, and
 /// for unknown values; the caller distinguishes "auto/empty"
@@ -222,6 +243,15 @@ mod tests
         else
         {
             Arch::X86_64
+        }
+    }
+
+    #[test]
+    fn every_backend_name_parses_back_to_its_backend()
+    {
+        for accel in Accel::ALL
+        {
+            assert_eq!(parse_explicit(accel.name()), Some(accel));
         }
     }
 

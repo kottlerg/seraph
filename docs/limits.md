@@ -83,12 +83,13 @@ An entry an existing open Issue already names cites it in the recommendation.
   Behind those sit the per-process `u32` death correlator, `badge as u32` in procmgr, logd and
   svcmgr, which procmgr keeps unique among live processes by redrawing a colliding badge (#638
   widens it), and the cap handle's 8-bit wrapping generation.
-- **Per-process address space.** One static VA map sized to Sv39's 2^38 is used on every
-  architecture. It caps each process's heap at 1 GiB, its reservation arena at 256 MiB, and its
-  main stack at 1 MiB.
+- **Per-process address space.** The surfaces a creator places stay in one static map below
+  Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
+  sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
+  TLS block each reach 1 GiB of VA.
 - **Silent truncation.** Many tables drop entries past their bound with no diagnostic: boot
-  memory-map entries, ACPI regions, DTB nodes and ranges, named modules, and reserve free runs.
-  Each needs a diagnostic as well as a better bound.
+  memory-map entries, ACPI regions, DTB nodes and ranges, named modules. Each needs a diagnostic
+  as well as a better bound.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_MODULES` and `INIT_MAX_NAMED_MODULES` (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS`
   and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `MAX_SLEEPING` and
@@ -372,38 +373,36 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `LAYOUT_VA_CEILING` | `shared/process-layout/src/lib.rs` | `1 << 38` | hardware spec (Sv39 user half), applied on every architecture | none | needs a design | Per-architecture, per-paging-mode ceiling |
-| `IMAGE_MAX_SPAN` | `shared/process-layout/src/lib.rs` | 1 GiB | unknown | none | raise | Derive from the per-architecture ceiling |
+| `LAYOUT_VA_CEILING` | `shared/process-layout/src/lib.rs` | `1 << 38` | hardware spec (Sv39 user half), for the fixed tier only: the surfaces a creator places without knowing the paging mode; the heap and arena zones follow the user half | none | correct as is | None |
+| `IMAGE_MAX_SPAN` | `shared/process-layout/src/lib.rs` | 28 GiB, derived (`FIXED_IMAGE_ZONE_END` less the image window's end); procmgr's children get `image_max_span` of their user half's image zone (`H/8` less the window's end) | encoding artefact (fixed-tier zone map) | none | correct as is | None |
 | Window `slots_log2` values | `shared/process-layout/src/lib.rs` | 21, 23 | encoding artefact (ASLR budget under the ceiling) | none | correct as is | None |
-| `MAX_WINDOW_REGION_PAGES` | `shared/process-layout/src/lib.rs` | 512 | current peak plus headroom (stack 1 + 256) | none | needs a design | Pin against `MAX_PROCESS_STACK_PAGES` with a const assert |
-| `HEAP_ZONE_END`, ruststd `HEAP_SPAN` | `shared/process-layout/src/lib.rs`, `runtime/ruststd/src/sys/alloc/seraph.rs` | zone end 4 GiB (`0x1_0000_0000`); span 1 GiB | encoding artefact (zone map under 2^38) | none (VA only) | needs a design | No process can hold more than 1 GiB of heap |
-| `RESERVE_ARENA_ZONE_END`, `RESERVE_ARENA_PAGES` | `shared/process-layout/src/lib.rs`, `runtime/ruststd/src/sys/reserve/seraph.rs` | zone end `0x20_1000_0000`; arena 256 MiB | current peak plus headroom | none (VA only) | raise | About 120 demand stacks exhaust it, then stacks fall back unguarded |
-| Zone-map asserts | `shared/process-layout/src/lib.rs` | 10 asserts | encoding artefact | none | correct as is | Keep |
+| `MAX_WINDOW_REGION_PAGES` | `shared/process-layout/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the 9 GiB stride less the 8 GiB draw span) | none | correct as is | None; const asserts pin the stack reservation and the main TLS block to it |
+| Heap zone (`growth_zones`) | `shared/process-layout/src/lib.rs` | Sv39: base window `[1 GiB, 3 GiB)`, 60 GiB span; user half `H` above 2^38: `H/4` span (32 TiB at 2^47) | hardware spec (user half) | none (VA only) | correct as is | None |
+| Arena zone (`growth_zones`) | `shared/process-layout/src/lib.rs` | Sv39: base window `[64 GiB, 96 GiB)`, 32 GiB span; user half `H` above 2^38: `H/4` span | hardware spec (user half) | none (VA only) | correct as is | None |
+| Zone-map asserts | `shared/process-layout/src/lib.rs` | stride chain, defaults, fixed image zone, and the growth zones under every supported paging mode | encoding artefact | none | correct as is | Keep |
 | `LAYOUT_ENTROPY_BYTES` | `shared/process-layout/src/lib.rs` | 32 | provably unreachable (exactly four surfaces) | none | correct as is | None |
 | `DEFAULT_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 8 | default (per-binary override exists) | 32 KiB per process | correct as is | None |
-| `MAX_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 256 (1 MiB) | unknown | none | raise | Raise (VA-only cost) and reject instead of clamping (#46) |
-| `PROCESS_MAIN_TLS_MAX_PAGES` | `abi/process-abi/src/lib.rs` | 4 | unknown | none | raise | Size from `PT_TLS` |
+| `MAX_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | `(1 << 18) - 1` (just under 1 GiB) | encoding artefact (the window region tail less the guard page) | none (VA only; loaders map the declared stack) | correct as is | None; loaders refuse a larger note |
+| `PROCESS_MAIN_TLS_MAX_PAGES` | `abi/process-abi/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the TLS window's region tail) | none (loaders map the `PT_TLS` size) | correct as is | None |
 | `ProcessInfo` page (argv and env blobs share it) | `abi/process-abi/src/lib.rs` | 4096 B less the struct | BSS budget (one page) | 4 KiB per process | needs a design | See the argv entries in the procmgr section (#672) |
 | `ProcessInfo.initial_priority` | `abi/process-abi/src/lib.rs` | `u8` | ABI width (`PRIORITY_MAX` 30) | none | correct as is | None |
 | `ProcessInfo` cap fields | `abi/process-abi/src/lib.rs` | `u32` | ABI width (cap handle) | embedded | correct as is | Follows the handle-width decision (#637) |
-| `HEAP_BASE_SLOTS_LOG2` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 19 | encoding artefact (ASLR window) | none | correct as is | Revisit with `HEAP_SPAN` |
-| `HEAP_INITIAL_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 512 (2 MiB) | current peak plus headroom | 2 MiB eager RAM per std process | make pay-as-you-go | Demand-back the heap floor |
-| `GROW_MAX_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 256 (1 MiB) | unknown | none | raise | One allocation above the tail plus 1 MiB fails; grow to fit |
+| Growth-zone window `slots_log2` | `shared/process-layout/src/lib.rs` | Sv39: 19 (heap), 23 (arena); user half `H` above 2^38: `log2(H) - 18` | encoding artefact (ASLR window) | none | correct as is | None |
+| `HEAP_INITIAL_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 512 (2 MiB) | default (a floor that avoids early grows) | demand-paged process: VA, and frames as the allocator hands them out; pinned process: 2 MiB eager | correct as is | None |
 | `GROW_MIN_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | tuning | none | correct as is | None |
 | `MAX_ROUNDS` (`grow_exact`) | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | tuning (anti-wedge bound; a partial grant takes another round, so one grow spans up to 64 runs and keeps what it mapped past that) | none | correct as is | None |
 | `PT_FUND_ROUNDS` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 2 | provably unreachable (record-page argument) | none | correct as is | None |
 | `CSPACE_FUND_ROUNDS` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 2 | provably unreachable (record-page argument) | none | correct as is | None |
 | `SLAB_SHELF_SIZE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 4 | tuning (overflow strands a run until exit, bounded) | 192 B static | correct as is | None |
 | `ALLOCATOR_METADATA_RESERVE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 64 | tuning (slack) | none | correct as is | None |
-| `RESERVE_ARENA_SLOTS_LOG2` | `runtime/ruststd/src/sys/reserve/seraph.rs` | 24 | encoding artefact (ASLR window) | none | correct as is | Revisit with the arena zone |
-| reserve `MAX_FREE_RUNS` (`Arena.runs`) | `runtime/ruststd/src/sys/reserve/seraph.rs` | 64 | unknown | about 1.5 KiB static | make pay-as-you-go | A full table leaks freed VA silently |
+| reserve `INLINE_RUNS` (`Arena.inline`) | `runtime/ruststd/src/sys/reserve/seraph.rs` | 64 | tuning (the static run table before it grows into the byte heap) | 1 KiB static | correct as is | None; a process without a heap fails its 64th live reservation instead of losing freed VA |
 | `REAPER_SLOTS` (`Registry.slots`) | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 | unknown | about 6 KiB static | make pay-as-you-go | Detached threads past 64 leak until exit |
 | thread `EQ_CAPACITY` | `runtime/ruststd/src/sys/thread/seraph.rs` | 128 | unknown | about 1 KiB retype | raise | Overflow drops death posts |
 | `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (`u32` payload half) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
 | `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
-| `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | unknown | VA only | raise | A frame over 4 KiB can step over it |
+| `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | default (inline stack probes, #503, touch every page of a larger frame) | VA only | correct as is | None |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |
-| `THREAD_RETYPE_BYTES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 5 pages | encoding artefact, short of the kernel's 6-page `dispatch_for(Thread)`; it works only because `ALLOCATOR_METADATA_RESERVE` rounds the request up to 6 pages | 24 KiB per thread | needs a design | Export the size from abi/syscall so it cannot drift |
+| `THREAD_RETYPE_BYTES` | `abi/syscall/src/lib.rs` | 6 pages | encoding artefact (the kernel's `dispatch_for(Thread)`: kernel stack, TCB page, extended-state page) | 24 KiB per thread | correct as is | Pin the kernel's debit to it with a const assert in `cap/retype.rs` |
 | `DEATH_EQ_CAPACITY` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 4 | provably unreachable (four post sources, each posting at most once per child) | about 112 B per child | correct as is | None |
 | `Process::id` | `runtime/ruststd/src/sys/process/seraph.rs` | `u32` | ABI width (upstream `Child::id` is `u32`) | none | correct as is | None |
 | pipe `RING_CAPACITY` | `runtime/ruststd/src/sys/pipe/seraph.rs` | 2048 | encoding artefact (largest power of two in one page after the header) | 4 KiB per direction | correct as is | None |
@@ -412,14 +411,13 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | Rename name-sum limit | `runtime/ruststd/src/sys/fs/seraph.rs` | 496 B | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | None (#89) |
 | Path component limit | `runtime/ruststd/src/sys/fs/seraph.rs` | 255 (`MAX_NAME_LEN`) | ABI width (namespace protocol) | none | correct as is | None |
 | `READ_WAIT` | `runtime/ruststd/src/sys/fs/release_handler.rs` | 100 ms | ABI width (the driver's cooperative-release window) | none | correct as is | None |
-| `SPIN_BUDGET` | `runtime/ruststd/src/sys/time/seraph.rs` | `1 << 20` | unknown (spin count) | none | needs a design | Time-based bound |
+| `RESOLVE_WAIT_US` | `runtime/ruststd/src/sys/time/seraph.rs` | 100 ms | tuning (many registry round trips, on the kernel's clock) | none | correct as is | None |
 | `Mutex::spin` count | `runtime/ruststd/src/sys/sync/mutex/seraph.rs` | 100 | tuning (a backoff before parking) | none | correct as is | None |
 | `MAX_READERS` | `runtime/ruststd/src/sys/sync/rwlock/seraph.rs` | `2^30 - 2` | provably unreachable short of leaked guards (more than any thread count; past it readers wait) | 4 B per lock | correct as is | None |
 
 ### Shared IPC and protocol crates
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
-[#641](https://github.com/kottlerg/seraph/issues/641) (shmem), and
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
@@ -440,7 +438,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 | FS_WRITE, FS_READ inline payloads | `shared/ipc/src/lib.rs` | 504 B per call | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | Large transfers use the memory verbs (#87) |
 | FS_READ_MEMORY, FS_WRITE_MEMORY | `shared/ipc/src/lib.rs` | one page per call | encoding artefact (one slot cap per reply) | none | correct as is | Callers iterate; batching is a throughput question (#229) |
 | FS_READ_MEMORY release cookie | `shared/ipc/src/lib.rs` | `u64`, client-chosen | ABI width | none | correct as is | None (#530) |
-| QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled once delivered) | none | correct as is | None |
+| QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled) | none | correct as is | None |
 | `blk_labels` partition badges | `shared/ipc/src/lib.rs` | `u64`, one per distinct registered range | ABI width | none | correct as is | None |
 | `INVALID_MEMORY_CAP` byte limit | `shared/ipc/src/lib.rs` | `count * block_size <= u32::MAX` | hardware spec (VirtIO descriptor `u32` length) | none | correct as is | 4 GiB per request |
 | serial, framebuffer and stream byte counts | `shared/ipc/src/lib.rs` | 512 B per call | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | Callers iterate |
@@ -464,8 +462,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 | `REGISTRY_CAP`, `BADGEED_CAP` | `shared/registry-client`, `shared/log` | `AtomicU32` | ABI width (cap handle) | 4 B | correct as is | None (#74) |
 | log `CHUNK_SIZE` | `shared/log/src/lib.rs` | 512 | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | None |
 | log `STACK_BUF_LEN` | `shared/log/src/lib.rs` | 512 | ABI width (one `STREAM_BYTES` payload; a longer message is sent in chunks as the buffer fills) | 512 B stack per call | correct as is | None |
-| shmem `MAX_PAGES` | `shared/shmem/src/lib.rs` | 4 (16 KiB) | ABI width (one single-page cap per slot) | none | needs a design | Multi-page caps or several rounds |
-| `SharedBuffer.page_count` | `shared/shmem/src/lib.rs` | `u32` | provably unreachable (at most `MAX_PAGES`) | 4 B | correct as is | None |
+| `SharedBuffer.page_count` | `shared/shmem/src/lib.rs` | `u64` | ABI width (`mem_map` page count) | 8 B | correct as is | None |
 | `SpscHeader.head`, `tail` | `shared/shmem/src/lib.rs` | `u32`, free-running | provably unreachable (modular index, correct across wrap for capacity up to 2^31) | 16 B per ring | correct as is | None |
 | `SpscHeader.capacity` | `shared/shmem/src/lib.rs` | `u32` power of two | ABI width (shared header layout) | none | correct as is | None |
 | `MAX_NAME_LEN` (`EntryName`) | `shared/namespace-protocol/src/name.rs` | 255 | ABI width (`u8` length; the POSIX `NAME_MAX` convention) | 255 B per name | correct as is | None |
@@ -535,8 +532,8 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 | blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design (#672) |
 | `VFS_CHUNK_SIZE` | `services/procmgr/src/process.rs` | 504 | ABI width (`MSG_DATA_WORDS_MAX - 1` words) | none | correct as is | Derive from the ABI constant |
 | `RELA_CHUNK_RECORDS` | `services/procmgr/src/process.rs` | 128 | batch size (streaming chunk) | 3 KiB stack | correct as is | None |
-| `MAX_PROCESS_STACK_PAGES` clamp | `services/procmgr/src/process.rs` | 256 | see the process-layout section | none | raise | Reject, do not clamp (#641) |
-| `THREAD_RETYPE_PAGES` | `services/procmgr/src/main.rs` | 6 | encoding artefact (kernel stack, TCB and FPU pages) | none | correct as is | Share with init |
+| `MAX_PROCESS_STACK_PAGES` check | `services/procmgr/src/process.rs` | notes outside `1..=MAX_PROCESS_STACK_PAGES` refused | see the process-layout section | none | correct as is | None |
+| `THREAD_RETYPE_PAGES` | `services/procmgr/src/main.rs` | 6, derived (`syscall_abi::THREAD_RETYPE_BYTES` in pages) | encoding artefact (kernel stack, TCB and FPU pages) | none | correct as is | None |
 | `ASPACE_RETYPE_PAGES`, `CSPACE_RETYPE_PAGES` (per child) | `services/procmgr/src/main.rs` | 48 / 7 | refillable seed (augment) | per child | correct as is | None |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_SLOTS` | `services/procmgr/src/main.rs` | 256 / 1024 slots | tuning (headroom over a burst of spawns) | none | correct as is | None |
 | `INIT_THREADS`, `FIRST_ROUND_CAPS` | `services/procmgr/process-table/src/init_reap.rs` | 2 / 4 | provably unreachable (fixed init protocol) | none | correct as is | None |
@@ -573,6 +570,7 @@ Every entry here is `correct as is`; none is tracked.
 | tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (`install` refuses a pool of `u32::MAX` nodes, each a heap allocation) | 4 B per link | correct as is | None |
 | tree component limit (`validate_name`) | `services/vfsd/root-backend/src/lib.rs` | `MAX_NAME_LEN` (255) | ABI width (the namespace protocol's name rule) | none (names are heap-allocated to their length) | correct as is | None |
 | `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
+| `discover_disks` disk list | `services/vfsd/src/partition.rs` | heap `Vec`, one `Disk` per block driver devmgr serves, found once at startup | per-instance (devmgr's block-driver count, one per virtio-blk device; an allocation failure stops discovery with a log, keeping the disks found before it) | none | correct as is | None |
 | `collect_partitions` entry list | `services/vfsd/gpt/src/lib.rs` | heap `Vec`, every used entry of the header's `num_parts` array | hardware spec (UEFI GPT: `parse_header` requires the array to lie between LBA 2 and the header's own `first_usable_lba`); a header that also inflates `first_usable_lba` is bounded by the device capacity, and a read or allocation failure stops the walk with a log | none | correct as is | None |
 | gpt `MAX_BLOCK_SIZE` | `services/vfsd/gpt/src/lib.rs` | 4096; the block size itself comes from `BLK_GET_GEOMETRY` | hardware spec (the block driver's `MAX_BLOCK_SIZE`, one page) | 4 KiB stack during a walk | correct as is | None (4Kn boot: #669) |
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
@@ -597,7 +595,7 @@ correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
 | `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | `INIT_INFO_MAX_PAGES * PAGE_SIZE / size_of::<CapDescriptor>()` = 682 | provably unreachable (at most one orphan per usable-RAM cap, each of which has an `InitInfo` descriptor; `memory_count` is clamped to it) | about 2.7 KiB BSS, reclaimed at init's reap | correct as is | None |
 | `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | refillable seed (augment) | 149 pages each for memmgr and procmgr | correct as is | None: both self-augment (#642, #643, #41) |
-| `THREAD_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 6 | encoding artefact (kernel stack, TCB and FPU pages) | per tier-1 service | correct as is | Share with procmgr |
+| `THREAD_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 6, derived (`syscall_abi::THREAD_RETYPE_BYTES` in pages) | encoding artefact (kernel stack, TCB and FPU pages) | per tier-1 service | correct as is | None |
 | `ASPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 48 | refillable seed (augment) | 48 pages per tier-1 service | correct as is | None: memmgr and procmgr both self-augment (#642) |
 | `INIT_RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 8 | provably unreachable (asserted against the fixed endpoint count) | 8 pages | correct as is | None |
 | `RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 203 | encoding artefact (sum) | per tier-1 service | correct as is | None |
@@ -633,8 +631,7 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 
 ### devmgr
 
-Tracked by [#661](https://github.com/kottlerg/seraph/issues/661) and
-[#664](https://github.com/kottlerg/seraph/issues/664).
+Tracked by [#664](https://github.com/kottlerg/seraph/issues/664).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -648,12 +645,14 @@ Tracked by [#661](https://github.com/kottlerg/seraph/issues/661) and
 | absorb rounds `.min(4)` | `services/devmgr/src/caps.rs` | literal 4 | ABI width (`MSG_CAP_SLOTS_MAX`) | none | correct as is | Use the constant |
 | ACPI table window (`table_window`) | `services/devmgr/firmware/src/acpi.rs` | the table's own pages, clamped to its region | firmware spec (the table's reported length) | VA for one table per read | correct as is | None; the per-process reservation arena bounds it, and a failed reservation is logged |
 | `MAX_DEVICE_INFO_PAYLOAD` | `services/devmgr/src/main.rs` | 64 | encoding artefact (largest payload type 56 B) | 76 B per entry | correct as is | None |
-| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per spawned device) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
+| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per enumerated device given one, spawned or not; never removed) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
 | `device_badge` | `services/devmgr/src/main.rs` | `u64` | provably unreachable | none | correct as is | None |
 | `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
 | virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
+| Settle batch death queue (`SettleBatch::new`) | `services/devmgr/src/settle.rs` | the batch's device count, at most `EVENT_QUEUE_MAX_CAPACITY` = 4096 | ABI width (the kernel's event-queue capacity) | 8 B per driver | correct as is | None; a batch past it spawns no driver of its class, with a log |
+| Settle roster (`Roster`) | `services/devmgr/firmware/src/roster.rs` | growable `Vec` | provably unreachable (one entry per spawned driver of a batch) | about 24 B plus the caller's record per driver | correct as is | None; a driver the roster cannot record is not spawned, with a log |
+| Death-observer correlator | `services/devmgr/src/spawn.rs` | `u32` device badge | ABI width (`SYS_THREAD_BIND_NOTIFICATION`'s `u32` correlator) | none | correct as is | None; a device whose badge exceeds it is not spawned, with a log |
 | One IRQ-bearing driver per INTx line (`IrqRangeAllocator::isolate_one`) | `services/devmgr/src/main.rs` | 1 per GSI (riscv64: 4 swizzled lines) | encoding artefact (a single-line cap is carved once) | none | needs a design | A virtio-blk on a line another device holds is not spawned, with a log (#664) |
-| One BAR per `VirtIO` driver (`virtio_second_bar`) | `services/devmgr/firmware/src/scan.rs` | 1 | encoding artefact (the driver bootstrap round carries one BAR) | none | needs a design | A device whose registers span two BARs is refused with a log; multi-BAR delivery is #661 |
 | `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
 | `find_pci_ecams` | `services/devmgr/firmware/src/dtb.rs` | every node | firmware spec (structure block) | 24 B per window | correct as is | None |
 | firmware dtb `MAX_DEPTH` | `services/devmgr/firmware/src/dtb.rs` | 16 | provably unreachable on real trees (under 8 deep) | 256 B stack | correct as is | None |
@@ -666,6 +665,7 @@ Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
+| `MAX_VIRTIO_BARS` | `services/drivers/virtio/core/src/lib.rs` | 4 BARs per device, at most `MSG_CAP_SLOTS_MAX` (const-asserted) so one bootstrap round carries them | hardware spec (one BAR per `VirtIO` 1.2 § 4.1.4 register region: common, notification, ISR, device configuration) | about 170 B per driver and 40 B per device in devmgr | correct as is | None |
 | `MAX_QUEUE_SIZE` | `services/drivers/virtio/core/src/virtqueue.rs` | 32768; the bookkeeping is sized to the negotiated queue | hardware spec (VirtIO split ring) | 4 B per negotiated descriptor | correct as is | None |
 | `last_used_idx`, `avail.idx` | `services/drivers/virtio/core/src/virtqueue.rs` | `u16` | hardware spec (VirtIO split ring; `new` refuses a queue size that is not a power of two) | none | correct as is | None |
 | `RESET_TIMEOUT` | `services/drivers/virtio/core/src/pci.rs` | 5 s on the monotonic clock | tuning | none | correct as is | None |

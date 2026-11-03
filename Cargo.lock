@@ -803,6 +803,7 @@ name = "process-layout"
 version = "0.1.1"
 dependencies = [
  "process-abi",
+ "rustc-std-workspace-core",
 ]
 
 [[package]]
@@ -1244,6 +1245,7 @@ version = "0.1.1"
 dependencies = [
  "ipc",
  "mmio",
+ "syscall-abi",
 ]
 
 [[package]]

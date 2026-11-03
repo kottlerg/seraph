@@ -38,7 +38,7 @@
 //! original. Each phase runs a long-lived caller, pinned to CPU 1, and the
 //! controller, pinned to CPU 0; both live in ktest's own `CSpace`, so the
 //! controller's delete is the target's last reference. The controller runs
-//! [`CYCLES`] rounds (fewer past 16 CPUs, see [`super::scaled_attempts`]).
+//! [`CYCLES`] rounds.
 //! Each round creates a fresh target, pinned to CPU 2, that spins in user mode
 //! counting, publishes the handle the caller is to use (the target's own cap,
 //! or a copy derived from it in the revoke phase), and opens the round. The
@@ -100,12 +100,6 @@ const CELL: &str = "stress::thread_cap_delete_under_use";
 
 /// Rounds per phase; each frees one target under the caller.
 const CYCLES: u32 = 200;
-
-/// Fewest rounds per phase at any width: four per call the controller aims
-/// at, so each of the seven calls is the aim of some rounds, and the stop,
-/// whose drain spans a slice expiry, the aim of four, enough for some free to
-/// land inside a call.
-const MIN_CYCLES: u32 = 28;
 
 /// CPUs needed: one each for the controller, the caller, and the target.
 const MIN_CPUS: u64 = 3;
@@ -222,9 +216,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::thread_cap_delete_under_use: pin controller failed")?;
-    // Each round's cross-CPU stop drain, free, and respawn grow with the
-    // width; the count shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = phases(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::thread_cap_delete_under_use: restore controller affinity failed");
     result?;

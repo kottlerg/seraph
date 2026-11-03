@@ -77,11 +77,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// across the CPU rotation while staying well under a second.
 const CYCLES: u32 = 256;
 
-/// Fewest races at any width ([`super::scaled_attempts`]): the cell's gate
-/// holds on every cycle and a wedged drain hangs the run, so the floor only
-/// keeps the overlap tried across the rotation.
-const MIN_CYCLES: u32 = 32;
-
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
@@ -130,18 +125,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
-    // Each race's starts, stop drain and teardown cross CPUs, whose cost
-    // grows with the width; the count shrinks with it and the placements stay
-    // spread.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
 
     // Anti-vacuous accumulator: every cycle must arm the setup exactly once.
     let mut armed_cycles = 0u32;
 
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         // Distinct for cpus >= 3: offsets 0,1,2 never collide mod n.
-        let victim_cpu = super::rotation_slot(cycle, cycles, cpu_mod);
+        let victim_cpu = super::rotation_slot(cycle, CYCLES, cpu_mod);
         let stop_cpu = (victim_cpu + 1) % cpu_mod;
         let start_cpu = (victim_cpu + 2) % cpu_mod;
 
@@ -281,7 +272,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Non-vacuous: the setup armed on every cycle, so a clean boot reflects the
     // stop-vs-resume drain path actually executing, not a setup that no-op'd.
-    if armed_cycles != cycles
+    if armed_cycles != CYCLES
     {
         return Err("stress::stop_resume_race: race never armed on some cycle");
     }

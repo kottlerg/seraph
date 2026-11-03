@@ -19,10 +19,12 @@
 mod arch;
 mod caps;
 mod pci;
+mod settle;
 mod spawn;
 mod tables;
 
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
+use firmware::roster::Roster;
 use ipc::IpcMessage;
 use std::os::seraph::{reserve_pages, startup_info, unreserve_pages};
 use syscall_abi::PAGE_SIZE;
@@ -95,8 +97,9 @@ fn main() -> !
     // VIRTIO_PCI; framebuffer (spawned later) uses kind FRAMEBUFFER.
     let mut catalog = DeviceCatalog::default();
 
-    // One service endpoint per running virtio-blk driver, in BDF order:
-    // `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it.
+    // One service endpoint per served virtio-blk driver (one that reported
+    // its device ready), in BDF order: `QUERY_BLOCK_DEVICE`'s instance
+    // ordinal indexes it.
     let blk_eps = spawn_virtio_blk_all(&devices, &mut caps, &mut irq_range, ipc_buf, &mut catalog);
 
     // Spawn the serial (UART) driver via the non-PCI simple-device path.
@@ -153,7 +156,8 @@ fn main() -> !
     // Service endpoints of the on-disk virtio-input drivers, in BDF order.
     // devmgr owns them and mints client SEND caps on `QUERY_INPUT_DEVICE`,
     // whose instance ordinal indexes this list. Empty until the
-    // `SET_DRIVERS_DIR` handler spawns the drivers; a failed spawn adds none.
+    // `SET_DRIVERS_DIR` handler spawns and settles the drivers; a driver that
+    // fails to spawn or dies before reporting ready adds none.
     let mut input_eps: Vec<u32> = Vec::new();
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
@@ -424,29 +428,22 @@ fn main() -> !
                     }
                     // virtio-input is on-disk too (not bootstrap-essential).
                     // Spawn every enumerated device's driver here, after the
-                    // reply, like the RTC. `take()` makes the attempts
-                    // at-most-once and sticky on failure: a failed spawn adds
-                    // no endpoint, so `QUERY_INPUT_DEVICE` replies `NO_DEVICE`
-                    // past the running drivers thereafter.
-                    for pending in core::mem::take(&mut pending_inputs)
+                    // reply, like the RTC, and settle them before the next
+                    // receive. `take()` makes the attempts at-most-once and
+                    // sticky on failure: a driver not spawned, or not ready,
+                    // adds no endpoint, so `QUERY_INPUT_DEVICE` replies
+                    // `NO_DEVICE` past the served drivers thereafter.
+                    let inputs = core::mem::take(&mut pending_inputs);
+                    if !inputs.is_empty()
                     {
-                        if input_eps.try_reserve(1).is_err()
-                        {
-                            std::os::seraph::log!(
-                                "virtio-input: no memory to record a driver; not spawned"
-                            );
-                            pending.release();
-                            continue;
-                        }
-                        if let Some(new_ep) = spawn_virtio_input_from_disk(
+                        spawn_virtio_input_all(
+                            inputs,
                             &mut caps,
-                            &pending,
                             drivers_dir_cap,
+                            &catalog,
+                            &mut input_eps,
                             ipc_buf,
-                        )
-                        {
-                            input_eps.push(new_ep);
-                        }
+                        );
                     }
                 }
             }
@@ -508,8 +505,9 @@ fn main() -> !
             {
                 // Like QUERY_RTC_DEVICE: the drivers are spawned on-disk by the
                 // SET_DRIVERS_DIR handler, so `input_eps` is empty until then
-                // and holds no entry for a failed spawn — reply NO_DEVICE for an
-                // ordinal no running driver has.
+                // and holds no entry for a driver that failed to spawn or died
+                // before reporting ready — reply NO_DEVICE for an ordinal no
+                // served driver has.
                 // Do not `seraph::log!` here (deadlock risk if logd ever fans
                 // input queries through devmgr).
                 if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
@@ -565,43 +563,7 @@ fn main() -> !
             }
             ipc::devmgr_labels::QUERY_DEVICE_INFO =>
             {
-                let dev_idx = usize::try_from(badge.wrapping_sub(1)).unwrap_or(usize::MAX);
-                if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
-                    // SAFETY: ipc_buf is the registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                }
-                else if let Some(entry) = catalog.entries.get(dev_idx)
-                {
-                    // Reply schema: word[0] = kind, word[1] = version,
-                    // word[2] = byte_len, word[3..] = payload bytes
-                    // packed contiguously as u64. Devmgr does not
-                    // interpret the payload — driver-side deserialise.
-                    let byte_len = entry.byte_len as usize;
-                    let word_count = byte_len.div_ceil(8);
-                    let mut words = [0u64; 3 + MAX_DEVICE_INFO_PAYLOAD / 8];
-                    words[0] = u64::from(entry.kind);
-                    words[1] = u64::from(entry.version);
-                    words[2] = u64::from(entry.byte_len);
-                    for (i, chunk) in entry.payload[..byte_len].chunks(8).enumerate()
-                    {
-                        let mut buf = [0u8; 8];
-                        buf[..chunk.len()].copy_from_slice(chunk);
-                        words[3 + i] = u64::from_le_bytes(buf);
-                    }
-                    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                        .words(0, &words[..3 + word_count])
-                        .build();
-                    // SAFETY: ipc_buf is the registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                }
-                else
-                {
-                    let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
-                    // SAFETY: ipc_buf is the registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                }
+                reply_device_info(&catalog, &msg, ipc_buf);
             }
             // TODO(#165): remove with the devmgr enumeration redesign.
             // Test-only fault injection for #176, gated on
@@ -699,6 +661,45 @@ fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
 fn instance_ordinal(msg: &IpcMessage) -> Option<usize>
 {
     usize::try_from(msg.words().get(1).copied().unwrap_or(0)).ok()
+}
+
+/// `QUERY_DEVICE_INFO` handler, on the registry endpoint and on a settle
+/// batch's driver endpoint: reply the catalog entry the caller's badge names
+/// (badge == entry index + 1).
+fn reply_device_info(catalog: &DeviceCatalog, msg: &IpcMessage, ipc_buf: *mut u64)
+{
+    let dev_idx = usize::try_from(msg.badge.wrapping_sub(1)).unwrap_or(usize::MAX);
+    if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+    {
+        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+    }
+    else if let Some(entry) = catalog.entries.get(dev_idx)
+    {
+        // Reply schema: word[0] = kind, word[1] = version, word[2] =
+        // byte_len, word[3..] = payload bytes packed contiguously as u64.
+        // Devmgr does not interpret the payload — driver-side deserialise.
+        let byte_len = entry.byte_len as usize;
+        let word_count = byte_len.div_ceil(8);
+        let mut words = [0u64; 3 + MAX_DEVICE_INFO_PAYLOAD / 8];
+        words[0] = u64::from(entry.kind);
+        words[1] = u64::from(entry.version);
+        words[2] = u64::from(entry.byte_len);
+        for (i, chunk) in entry.payload[..byte_len].chunks(8).enumerate()
+        {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            words[3 + i] = u64::from_le_bytes(buf);
+        }
+        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+            .words(0, &words[..3 + word_count])
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    }
+    else
+    {
+        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+    }
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -1060,7 +1061,8 @@ impl DeviceInfoEntry
 /// drivers are spawned. Devmgr does not interpret payload bytes; the
 /// per-class shape lives in the driver crate (e.g.
 /// `virtio_core::VirtioPciStartupInfo::from_bytes`). An entry's badge is
-/// its index + 1.
+/// its index + 1. Entries are never removed, a failed or withdrawn driver's
+/// included, so a badge is never recycled.
 #[derive(Default)]
 pub struct DeviceCatalog
 {
@@ -1083,22 +1085,37 @@ impl DeviceCatalog
         self.entries.push(entry);
         u64::try_from(self.entries.len()).ok()
     }
+}
 
-    /// Drop the newest entry, whose driver failed to spawn before its badge
-    /// was delivered, so no live badge ever names a recycled slot.
-    pub fn drop_newest(&mut self)
+/// The `Mmio` caps carved for every BAR a `VirtIO` device's register
+/// regions name, in ascending BAR index.
+struct VirtioBars
+{
+    bars: [spawn::BarSpec; virtio_core::MAX_VIRTIO_BARS],
+    count: usize,
+}
+
+impl VirtioBars
+{
+    fn as_slice(&self) -> &[spawn::BarSpec]
     {
-        self.entries.pop();
+        &self.bars[..self.count]
+    }
+
+    fn release(&self)
+    {
+        for bar in self.as_slice()
+        {
+            let _ = syscall::cap_delete(bar.cap);
+        }
     }
 }
 
-/// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio`, its
-/// optional single-IRQ cap, and the badge of its catalog entry.
+/// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio` caps,
+/// its optional single-IRQ cap, and the badge of its catalog entry.
 struct VirtioDeviceCaps
 {
-    bar_cap: u32,
-    bar_base: u64,
-    bar_size: u64,
+    bars: VirtioBars,
     irq_cap: Option<u32>,
     device_badge: u64,
 }
@@ -1108,7 +1125,7 @@ impl VirtioDeviceCaps
     /// Release the BAR and IRQ caps of a device whose driver is not spawned.
     fn release(&self)
     {
-        let _ = syscall::cap_delete(self.bar_cap);
+        self.bars.release();
         if let Some(irq) = self.irq_cap
         {
             let _ = syscall::cap_delete(irq);
@@ -1118,9 +1135,9 @@ impl VirtioDeviceCaps
 
 /// Carve a `VirtIO` device's BAR and IRQ caps and add its catalog entry.
 /// Returns `None`, logging why and releasing what it carved, when the
-/// device's register regions span more than one BAR (a `VirtIO` driver is
-/// delivered one), no aperture covers the BAR, or the catalog entry cannot
-/// be added. The IRQ is optional here; a driver that requires one checks.
+/// device presents no complete set of register regions, a BAR they name is
+/// not an MMIO BAR or no aperture covers it, or the catalog entry cannot be
+/// added. The IRQ is optional here; a driver that requires one checks.
 fn carve_virtio_device(
     name: &str,
     pci_dev: &pci::PciDevice,
@@ -1139,17 +1156,7 @@ fn carve_virtio_device(
         pci_dev.irq_line,
         pci_dev.irq_pin
     );
-    if let Some(second) = firmware::scan::virtio_second_bar(&pci_dev.virtio_info)
-    {
-        std::os::seraph::log!(
-            "{}: registers span BAR {} and BAR {}; a VirtIO driver is delivered one BAR, not spawned",
-            name,
-            pci_dev.virtio_info.common_cfg.bar,
-            second
-        );
-        return None;
-    }
-    let (bar_cap, bar_base, bar_size) = find_virtio_bar_cap(pci_dev, caps)?;
+    let bars = carve_virtio_bars(name, pci_dev, caps)?;
     // Serialise the virtio startup info into the generic catalog entry.
     // Devmgr stores the bytes opaquely; the driver's `from_bytes` (verified
     // via kind/version) deserialises on the QUERY_DEVICE_INFO reply.
@@ -1168,26 +1175,83 @@ fn carve_virtio_device(
             "{}: catalog entry not added (payload or memory); not spawned",
             name
         );
-        let _ = syscall::cap_delete(bar_cap);
+        bars.release();
         return None;
     };
     Some(VirtioDeviceCaps {
-        bar_cap,
-        bar_base,
-        bar_size,
+        bars,
         irq_cap: acquire_single_irq_cap(pci_dev, irq_range),
         device_badge,
     })
 }
 
+/// A spawned `VirtIO` PCI driver its settle batch records: its service
+/// endpoint and the device caps devmgr carved for it.
+struct SpawnedVirtio
+{
+    ep: u32,
+    dev_caps: VirtioDeviceCaps,
+}
+
+impl SpawnedVirtio
+{
+    /// Withdraw a driver the registry does not serve: revoke its service
+    /// endpoint (every copy derived from it, the driver's receive copy
+    /// included) and delete it, and release the device's BAR and IRQ caps.
+    /// The device's catalog entry stays, so its badge is never recycled.
+    fn withdraw(&self)
+    {
+        let _ = syscall::cap_revoke(self.ep);
+        let _ = syscall::cap_delete(self.ep);
+        self.dev_caps.release();
+    }
+}
+
+/// Record a spawned driver in its batch's roster, withdrawing it when the
+/// roster cannot hold it (its room is reserved before each spawn, so only a
+/// repeated device badge, which the catalog never issues, reaches that).
+fn record_spawned(roster: &mut Roster<SpawnedVirtio>, driver: SpawnedVirtio, name: &str)
+{
+    let badge = driver.dev_caps.device_badge;
+    if let Err(driver) = roster.add(badge, driver)
+    {
+        std::os::seraph::log!("{}: driver not recorded; device not served", name);
+        driver.withdraw();
+    }
+}
+
+/// Serve a settled batch: push the service endpoint of every driver that
+/// reported its device ready onto `endpoints`, in spawn order, the order the
+/// registry's instance ordinals count; withdraw every other driver.
+/// `endpoints` has room reserved for every driver of `roster`.
+fn collect_served(roster: Roster<SpawnedVirtio>, endpoints: &mut Vec<u32>, name: &str)
+{
+    for (served, driver) in roster.into_outcomes()
+    {
+        if served
+        {
+            endpoints.push(driver.ep);
+        }
+        else
+        {
+            std::os::seraph::log!(
+                "{}: driver did not report its device ready; not served",
+                name
+            );
+            driver.withdraw();
+        }
+    }
+}
+
 /// Spawn a `VirtIO` block driver for every virtio-blk device that gets a
-/// private IRQ line, in BDF order,
-/// each from a copy of the boot module and with its own service endpoint.
-/// Returns the endpoints of the drivers that completed their bootstrap, in
-/// that order: `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it. A device
-/// is skipped, logged, when no module was delivered, its caps cannot be
-/// carved, it gets no IRQ cap (virtio-blk requires one; a line another device
-/// already holds gives none, #664), or its spawn fails.
+/// private IRQ line, in BDF order, each from a copy of the boot module and
+/// with its own service endpoint, then settle them. Returns the endpoints of
+/// the drivers that reported their device ready, in that order:
+/// `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it. A device is skipped,
+/// logged, when no module was delivered, its caps cannot be carved, it gets no
+/// IRQ cap (virtio-blk requires one; a line another device already holds
+/// gives none, #664), its spawn fails, or its driver dies before reporting
+/// ready (its device setup failed).
 fn spawn_virtio_blk_all(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
@@ -1204,14 +1268,27 @@ fn spawn_virtio_blk_all(
     let _module_guard = spawn::ModuleCapGuard::new(module_cap);
     let mut endpoints = Vec::new();
 
+    let count = devices.iter().filter(|d| pci::is_virtio_blk(d)).count();
+    if count == 0
+    {
+        return endpoints;
+    }
+    if module_cap == 0
+    {
+        std::os::seraph::log!("no virtio-blk driver module available");
+        return endpoints;
+    }
+    let Some(batch) = settle::SettleBatch::new(count)
+    else
+    {
+        std::os::seraph::log!("virtio-blk: no settle batch; no driver spawned");
+        return endpoints;
+    };
+    let mut roster = Roster::new();
+
     for pci_dev in devices.iter().filter(|d| pci::is_virtio_blk(d))
     {
-        if module_cap == 0
-        {
-            std::os::seraph::log!("no virtio-blk driver module available");
-            break;
-        }
-        if endpoints.try_reserve(1).is_err()
+        if roster.try_reserve_one().is_err() || endpoints.try_reserve(roster.len() + 1).is_err()
         {
             std::os::seraph::log!("virtio-blk: no memory to record a driver; not spawned");
             break;
@@ -1221,34 +1298,36 @@ fn spawn_virtio_blk_all(
         {
             continue;
         };
-        if let Some(ep) = spawn_one_virtio_blk(caps, module_cap, &dev_caps, ipc_buf)
+        if let Some(ep) = spawn_one_virtio_blk(caps, module_cap, &dev_caps, &batch, ipc_buf)
         {
-            endpoints.push(ep);
+            record_spawned(&mut roster, SpawnedVirtio { ep, dev_caps }, "virtio-blk");
         }
         else
         {
             dev_caps.release();
-            catalog.drop_newest();
         }
     }
+    batch.settle(&mut roster, catalog, ipc_buf);
+    collect_served(roster, &mut endpoints, "virtio-blk");
     endpoints
 }
 
 /// Spawn one virtio-blk driver for the carved `dev_caps` from a copy of
-/// `module_cap`, with a fresh service endpoint. Returns that endpoint when
-/// the driver completed its bootstrap; on `None` the caller releases
-/// `dev_caps`.
+/// `module_cap`, with a fresh service endpoint, into the settle `batch`.
+/// Returns that endpoint when the driver completed its bootstrap; on `None`
+/// the caller releases `dev_caps`.
 fn spawn_one_virtio_blk(
     caps: &caps::DevmgrCaps,
     module_cap: u32,
     dev_caps: &VirtioDeviceCaps,
+    batch: &settle::SettleBatch,
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    // virtio-blk requires an IRQ: it rejects the 2-cap no-IRQ round 1 and
-    // exits, which would leave `spawn_driver` blocked serving round 2.
-    // Refuse the spawn instead; a disk on a line another device holds is
-    // not served until shared lines are (#664).
+    // virtio-blk requires an IRQ: delivered an absent IRQ slot, it exits
+    // after its bootstrap, which would leave the device registered with no
+    // driver serving it. Refuse the spawn instead; a disk on a line another
+    // device holds is not served until shared lines are (#664).
     let Some(irq_cap) = dev_caps.irq_cap
     else
     {
@@ -1272,21 +1351,15 @@ fn spawn_one_virtio_blk(
         let _ = syscall::cap_delete(module_copy);
         return None;
     }
-    let bar_caps = [dev_caps.bar_cap];
-    let bar_bases = [dev_caps.bar_base];
-    let bar_sizes = [dev_caps.bar_size];
     let config = spawn::DriverSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
         source: spawn::CreateSource::Module(module_copy),
-        bars: spawn::BarSpec {
-            caps: &bar_caps,
-            bases: &bar_bases,
-            sizes: &bar_sizes,
-        },
+        bars: dev_caps.bars.as_slice(),
         irq_cap: Some(irq_cap),
         service_ep: blk_ep,
-        registry_ep: caps.registry_ep,
+        query_ep: batch.driver_ep(),
+        death_eq: batch.death_eq(),
         // Deliberately index-derived (not randomized like the
         // cross-boundary service badges, #249): this badge names a specific
         // device-catalog slot — the driver enforces its own badge per
@@ -1353,42 +1426,73 @@ fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
     arch::current::intx_fallback_gsi(pci_dev.irq_pin, pci_dev.dev)
 }
 
-/// Carve the cap for the `VirtIO` device's register BAR, the one its
-/// common-configuration region names. Returns `(cap, base, size)`, or
-/// `None`, logged, when the device has no such MMIO BAR or no aperture
-/// covers it.
-fn find_virtio_bar_cap(
+/// Carve an `Mmio` cap for every BAR a `VirtIO` device's register regions
+/// name, in the order of its [`virtio_core::RegisterLayout::bars`].
+/// Returns `None`, logged and with every cap carved so far released, when
+/// the device presents no complete set of register regions, a BAR they name
+/// is not an MMIO BAR, or no aperture covers one.
+fn carve_virtio_bars(
+    name: &str,
     pci_dev: &pci::PciDevice,
     caps: &mut caps::DevmgrCaps,
-) -> Option<(u32, u64, u64)>
+) -> Option<VirtioBars>
 {
-    let virtio_bar_idx = pci_dev.virtio_info.common_cfg.bar;
-    let Some(b) = (0..pci_dev.bar_count)
-        .find(|&b| pci_dev.bar_pci_idx[b] == virtio_bar_idx && pci_dev.bar_is_mmio[b])
-    else
-    {
-        std::os::seraph::log!("devmgr: VirtIO BAR {} is not an MMIO BAR", virtio_bar_idx);
-        return None;
-    };
-    std::os::seraph::log!(
-        "devmgr: VirtIO BAR phys={:#018x} size={:#018x}",
-        pci_dev.bar_phys[b],
-        pci_dev.bar_size[b]
-    );
-    // The driver reserves `bar_aperture_pages` of VA for the BAR and
-    // `mmio_map` maps the whole cap region, so the cap covers no more of the
-    // BAR than the VirtIO capability structures reach.
-    let size = pci_dev.bar_size[b].min(pci_dev.virtio_info.bar_aperture_pages() * PAGE_SIZE);
-    let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
+    let Some(layout) = pci_dev.virtio_info.register_layout()
     else
     {
         std::os::seraph::log!(
-            "devmgr: VirtIO BAR not covered by any aperture virtio_bar_idx={:#x}",
-            u64::from(virtio_bar_idx)
+            "{}: device presents no complete set of VirtIO register regions; not spawned",
+            name
         );
         return None;
     };
-    Some((cap, pci_dev.bar_phys[b], size))
+    let mut bars = VirtioBars {
+        bars: [spawn::BarSpec::default(); virtio_core::MAX_VIRTIO_BARS],
+        count: 0,
+    };
+    for aperture in layout.bars()
+    {
+        let Some(b) = (0..pci_dev.bar_count)
+            .find(|&b| pci_dev.bar_pci_idx[b] == aperture.bar && pci_dev.bar_is_mmio[b])
+        else
+        {
+            std::os::seraph::log!(
+                "{}: VirtIO BAR {} is not an MMIO BAR; not spawned",
+                name,
+                aperture.bar
+            );
+            bars.release();
+            return None;
+        };
+        std::os::seraph::log!(
+            "{}: VirtIO BAR {} phys={:#018x} size={:#018x}",
+            name,
+            aperture.bar,
+            pci_dev.bar_phys[b],
+            pci_dev.bar_size[b]
+        );
+        // The driver maps the BAR into `aperture.pages` pages of its register
+        // window and `mmio_map` maps the whole cap region, so the cap covers
+        // no more of the BAR than the regions in it reach.
+        let size = pci_dev.bar_size[b].min(aperture.pages * PAGE_SIZE);
+        let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
+        else
+        {
+            std::os::seraph::log!(
+                "{}: VirtIO BAR {} not covered by any aperture; not spawned",
+                name,
+                aperture.bar
+            );
+            bars.release();
+            return None;
+        };
+        bars.bars[bars.count] = spawn::BarSpec {
+            bar: aperture.bar,
+            cap,
+        };
+        bars.count += 1;
+    }
+    Some(bars)
 }
 
 // ── VirtIO input (keyboard) driver: deferred on-disk spawn ──────────────────
@@ -1423,17 +1527,62 @@ fn enumerate_virtio_input(
     pending
 }
 
-/// Spawn the on-disk virtio-input driver for one stashed device. Walks
-/// `/services/drivers/virtio-input` through the `SET_DRIVERS_DIR` subtree cap,
-/// then hands the carved BAR/IRQ caps (stashed at enumeration) to the
-/// file-source PCI spawn path. Returns the freshly created service endpoint on
-/// success; the caller stores it for `QUERY_INPUT_DEVICE`. Mirrors
-/// [`spawn_rtc_from_disk`], but uses [`spawn::spawn_driver`] (BAR + IRQ +
-/// device-info) rather than the simple-device path. On failure it returns
-/// `None` and releases the stashed BAR and IRQ caps.
+/// Spawn the on-disk virtio-input driver of every stashed device, in BDF
+/// order, then settle them, pushing onto `input_eps` the endpoints of the
+/// drivers that reported their device ready, in that order:
+/// `QUERY_INPUT_DEVICE`'s instance ordinal indexes it. A device whose driver
+/// is not spawned or dies before reporting ready adds none, and its BAR and
+/// IRQ caps are released.
+fn spawn_virtio_input_all(
+    pending: Vec<VirtioDeviceCaps>,
+    caps: &mut caps::DevmgrCaps,
+    drivers_dir_cap: u32,
+    catalog: &DeviceCatalog,
+    input_eps: &mut Vec<u32>,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(batch) = settle::SettleBatch::new(pending.len())
+    else
+    {
+        std::os::seraph::log!("virtio-input: no settle batch; no driver spawned");
+        for dev_caps in &pending
+        {
+            dev_caps.release();
+        }
+        return;
+    };
+    let mut roster = Roster::new();
+    for dev_caps in pending
+    {
+        if roster.try_reserve_one().is_err() || input_eps.try_reserve(roster.len() + 1).is_err()
+        {
+            std::os::seraph::log!("virtio-input: no memory to record a driver; not spawned");
+            dev_caps.release();
+            continue;
+        }
+        if let Some(ep) =
+            spawn_virtio_input_from_disk(caps, &dev_caps, &batch, drivers_dir_cap, ipc_buf)
+        {
+            record_spawned(&mut roster, SpawnedVirtio { ep, dev_caps }, "virtio-input");
+        }
+    }
+    batch.settle(&mut roster, catalog, ipc_buf);
+    collect_served(roster, input_eps, "virtio-input");
+}
+
+/// Spawn the on-disk virtio-input driver for one stashed device into the
+/// settle `batch`. Walks `/services/drivers/virtio-input` through the
+/// `SET_DRIVERS_DIR` subtree cap, then hands the carved BAR/IRQ caps (stashed
+/// at enumeration) to the file-source PCI spawn path. Returns the freshly
+/// created service endpoint on success. Mirrors [`spawn_rtc_from_disk`], but
+/// uses [`spawn::spawn_driver`] (BAR + IRQ + device-info) rather than the
+/// simple-device path. On failure it returns `None` and releases the stashed
+/// BAR and IRQ caps.
 fn spawn_virtio_input_from_disk(
     caps: &mut caps::DevmgrCaps,
     pending: &VirtioDeviceCaps,
+    batch: &settle::SettleBatch,
     drivers_dir_cap: u32,
     ipc_buf: *mut u64,
 ) -> Option<u32>
@@ -1465,9 +1614,6 @@ fn spawn_virtio_input_from_disk(
         return None;
     }
 
-    let bar_caps = [pending.bar_cap];
-    let bar_bases = [pending.bar_base];
-    let bar_sizes = [pending.bar_size];
     let config = spawn::DriverSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
@@ -1475,14 +1621,11 @@ fn spawn_virtio_input_from_disk(
             file_cap: walked.file_cap,
             size: walked.size,
         },
-        bars: spawn::BarSpec {
-            caps: &bar_caps,
-            bases: &bar_bases,
-            sizes: &bar_sizes,
-        },
+        bars: pending.bars.as_slice(),
         irq_cap: pending.irq_cap,
         service_ep: input_ep,
-        registry_ep: caps.registry_ep,
+        query_ep: batch.driver_ep(),
+        death_eq: batch.death_eq(),
         device_badge: pending.device_badge,
         priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
     };

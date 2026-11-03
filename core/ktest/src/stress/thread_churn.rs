@@ -5,34 +5,22 @@
 
 //! Stress test: rapid thread create/destroy cycles.
 //!
-//! Creates and destroys [`ITERATIONS`] threads sequentially (fewer past 16
-//! CPUs, see [`super::scaled_attempts`]), verifying that kernel resource
-//! cleanup (TCBs, `CSpace` refcounts) works correctly under churn.
+//! Creates and destroys [`ITERATIONS`] threads sequentially, verifying that
+//! kernel resource cleanup (TCBs, `CSpace` refcounts) works correctly under
+//! churn.
 
-use syscall::{
-    cap_copy, cap_create_notification, cap_delete, notification_send, system_info, thread_exit,
-};
-use syscall_abi::SystemInfoType;
+use syscall::{cap_copy, cap_create_notification, cap_delete, notification_send, thread_exit};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const ITERATIONS: u32 = 1000;
 
-/// Fewest iterations at any width: the cell checks cleanup, not a race, so
-/// a few dozen create/destroy cycles still exercise every teardown path.
-const MIN_ITERATIONS: u32 = 64;
-
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let cpus = system_info(SystemInfoType::CpuCount as u64)
-        .map_err(|_| "thread_churn: system_info(CpuCount) failed")?;
-    // Each iteration's start and exit wake cross CPUs, whose cost grows with
-    // the width; the count shrinks with it.
-    let iterations = super::scaled_attempts(ITERATIONS, MIN_ITERATIONS, cpus);
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "thread_churn: create_notification failed")?;
 
-    for _i in 0..iterations
+    for _i in 0..ITERATIONS
     {
         let mut child =
             spawn::new_child(ctx).map_err(|_| "thread_churn: spawn::new_child failed")?;

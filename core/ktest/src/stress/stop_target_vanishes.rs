@@ -44,8 +44,7 @@
 //! bad. B never parks, so each stop of it drains until B's slice expires,
 //! and A spends nearly all of its loop inside the drain.
 //!
-//! The controller, pinned to CPU 0, runs [`CYCLES`] rounds per phase (fewer
-//! past 16 CPUs, see [`super::scaled_attempts`]): wait
+//! The controller, pinned to CPU 0, runs [`CYCLES`] rounds per phase: wait
 //! until A counts a loop, spin a varying delay, and stop A, so most stops
 //! land while A drains B. It then classifies where the stop landed: it reads
 //! A's flag (A is off its CPU, and clears the flag only once its stop has
@@ -104,11 +103,6 @@ const CELL: &str = "stress::stop_target_vanishes";
 
 /// Rounds per phase; each stops the stopper mid-loop and vanishes its handle.
 const CYCLES: u32 = 200;
-
-/// Fewest rounds per phase at any width: nearly every stop lands in the
-/// stopper's drain, so a few dozen rounds still reach the vanish-and-restart
-/// interleaving.
-const MIN_CYCLES: u32 = 32;
 
 /// CPUs needed: one each for the controller, the stopper, and the target.
 const MIN_CPUS: u64 = 3;
@@ -232,9 +226,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_target_vanishes: pin controller failed")?;
-    // Each round's cross-CPU stop drains, teardown and respawn grow with the
-    // width; the count shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = phases(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_target_vanishes: restore controller affinity failed");
     result?;

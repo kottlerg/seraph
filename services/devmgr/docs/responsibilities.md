@@ -55,8 +55,53 @@ devmgr's responsibilities are:
   devmgr spawns one driver for every virtio-input device and for every
   virtio-blk device it can give a private IRQ line (a disk whose line another
   device already holds is not served, #664), each with its own service
-  endpoint, and refuses, logged, a VirtIO device whose register regions span
-  more than one BAR.
+  endpoint and an `Mmio` cap for every BAR the device's VirtIO register
+  regions name.
+
+  devmgr serves a VirtIO driver's endpoint only once the driver has set its
+  device up. It spawns the drivers of one class as a settle batch: each
+  driver's devmgr query cap is a SEND, badged with its device badge, on the
+  batch's private endpoint, and devmgr binds a death observer on the driver's
+  thread to the batch's event queue once the driver's bootstrap is served. The
+  driver calls `QUERY_DEVICE_INFO` on that cap before its device setup and
+  `DRIVER_READY` after it, immediately before its service loop. devmgr waits on
+  the batch's wait set, serving those two labels on the private endpoint and
+  taking deaths from the queue, until every driver of the batch has reported
+  ready or died, and then takes every death still queued. It then revokes the
+  private endpoint and withdraws each driver that died (its service endpoint
+  revoked and deleted, its BAR and IRQ caps released). The catalog entry of a
+  withdrawn driver, or of one that failed to spawn, stays, so a badge is never
+  reused. No `QUERY_*` reply hands out the endpoint of a VirtIO driver that
+  failed its device setup. The instance ordinals count only the served
+  drivers.
+
+  The serving order follows from where each batch settles. The virtio-blk
+  batch settles during initial enumeration, before the registry loop opens.
+  vfsd's `QUERY_BLOCK_DEVICE` probes wait in the registry endpoint's queue
+  until then, so the ordinals do not change while vfsd probes them. The
+  virtio-input batch settles in the `SET_DRIVERS_DIR` handler, after its reply
+  and before the next receive, so `QUERY_INPUT_DEVICE` sees the settled
+  drivers. While a batch settles, devmgr receives on no registry endpoint, and
+  every registry caller waits for the settle. devmgr cannot serve the settled
+  classes meanwhile: it must reply to a received call before its next receive,
+  and it holds no saved reply capability, so an input query cannot wait while
+  other labels are served.
+
+  The settle does not deadlock against the log path as long as the drivers'
+  synchronous log calls reach a receiver that does not wait on devmgr. During
+  the virtio-blk settle, before handover, that receiver is init-logd, which
+  never calls devmgr. During the virtio-input settle it may be logd. logd
+  calls devmgr only to resolve the serial and framebuffer drivers on its first
+  emit. That emit comes before its `HANDOVER_PULL`, while init-logd still
+  drains the log endpoint, and logd caches both outcomes. The precondition
+  fails only when the serial driver cannot be resolved: logd then queries
+  `QUERY_SERIAL_DEVICE` again on later emits, and devmgr's own logging in that
+  handler already has the same deadlock window. A driver that hangs in its
+  setup without dying stalls the settle, since the wait has no timeout. A
+  driver that dies after reporting ready stays served, because devmgr keeps
+  no death observation past the settle. Neither case is handled (#695); the serial,
+  framebuffer, and RTC drivers, which spawn through the simple-device path,
+  report no readiness.
 
   Driver binaries are sourced from one of two places:
 
@@ -73,22 +118,25 @@ devmgr's responsibilities are:
     after handover (gated by `DRIVERS_DIR_AUTHORITY`); devmgr replies
     SUCCESS immediately (so svcmgr never blocks on driver work), then walks
     to each driver's binary and spawns it between `ipc_reply` and the next
-    `ipc_recv`. Each spawn is at-most-once per boot; failure is sticky and
-    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE`
-    and `QUERY_INPUT_DEVICE` queries, the same reply as before the spawn has
-    run, so a client retries it only a bounded number of times. See
+    `ipc_recv`, settling the virtio-input drivers there (above). Each spawn
+    is at-most-once per boot; failure, including a virtio-input driver's death
+    before it reports ready, is sticky and surfaced as
+    `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE` and
+    `QUERY_INPUT_DEVICE` queries, the same reply as before the spawn has run,
+    so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
-  the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
+  every block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
   (`QUERY_SERIAL_DEVICE`), `programs/terminal` resolves the framebuffer and
   input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
   resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd (design intent; not
   yet implemented, #30). devmgr owns each driver's service endpoint and mints a
   badged SEND on query. `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select
   one driver of their class by an optional instance ordinal in `data[1]`
-  (absent means the first), counted over the running drivers in PCI
-  segment, bus, device, function order and not stable across boots.
+  (absent means the first), counted over the served drivers (those that
+  reported their device ready) in PCI segment, bus, device, function order and
+  not stable across boots.
   `QUERY_BLOCK_DEVICE`, whose reply is the `MOUNT_AUTHORITY`-badged whole-disk
   cap, is gated on `BLOCK_DEVICE_AUTHORITY`, which only the registry cap init
   mints for vfsd carries. The serial,
@@ -144,7 +192,7 @@ how devmgr uses them.
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves every `QUERY_*` request (`QUERY_*_DEVICE`, `QUERY_DEVICE_INFO`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` labels the enumeration redesign removes (#165) on it, and mints from it the badged SENDs drivers use for `QUERY_DEVICE_INFO`. The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` mints a SEND on the serial, input, or framebuffer driver's endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves every `QUERY_*` request (`QUERY_*_DEVICE`, `QUERY_DEVICE_INFO`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` labels the enumeration redesign removes (#165) on it, and mints from it the badged SEND the framebuffer driver uses for `QUERY_DEVICE_INFO` (the VirtIO drivers' query caps are on their settle batch's private endpoint instead, above). The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` mints a SEND on the serial, input, or framebuffer driver's endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
@@ -184,6 +232,7 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md),
 [services/drivers/goldfish-rtc/README.md](../../drivers/goldfish-rtc/README.md),
 [services/drivers/serial/README.md](../../drivers/serial/README.md),
+[services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md),
 [services/drivers/virtio/input/README.md](../../drivers/virtio/input/README.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),

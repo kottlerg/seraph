@@ -59,10 +59,8 @@ use syscall_abi::SystemInfoType;
 use crate::arch::serial::{UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt};
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Rounds at up to [`crate::UNSCALED_CPUS`] CPUs.
+/// Rounds to run.
 const CYCLES: u32 = 400;
-/// Fewest rounds at any width ([`super::scaled_attempts`]).
-const MIN_CYCLES: u32 = 40;
 const MIN_CPUS: u64 = 2;
 const CONTROLLER_CPU: u32 = 0;
 const DELETER_CPU: u32 = 1;
@@ -111,7 +109,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::irq_route_delete_race: pin controller failed")?;
     let line = carve_line(ctx);
     let result = line.and_then(|line| {
-        let raced = race(ctx, line, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+        let raced = race(ctx, line, CYCLES);
         quiet_tx_interrupt();
         cap_delete(line).ok();
         raced

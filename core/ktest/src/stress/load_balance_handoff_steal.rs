@@ -40,8 +40,7 @@
 //! not the exact stolen interleaving:
 //!   * **Churn volume** — clients fold completed round-trips into [`ROUNDTRIPS`];
 //!     the controller asserts `== NUM_PAIRS` times the round-trips each client
-//!     issued ([`ITERS`], fewer past 16 CPUs: see
-//!     [`super::scaled_attempts`]), so every client completed every
+//!     issued ([`ITERS`]), so every client completed every
 //!     round-trip ⇒ the mid-handoff transients were generated densely.
 //!   * **Cross-CPU migration of unpinned threads** — each client samples
 //!     `system_info(CurrentCpu)` and a client whose samples span ≥ 2 CPUs
@@ -95,12 +94,6 @@ const NUM_PAIRS: usize = 16;
 /// burn-in matrix repetition amplifies to near-certain detection, while the
 /// cell stays ~2–3 s on riscv64 TCG, well inside ktest's 180 s suite budget.
 const ITERS: u32 = 16000;
-
-/// Fewest round-trips per client at any width ([`super::scaled_attempts`]):
-/// the widths the migration guard checks (up to [`MIGRATION_GUARD_MAX_CPUS`])
-/// keep at least half of [`ITERS`], and past them the floor keeps every
-/// client issuing round-trips long enough to be stolen mid-handoff.
-const MIN_ITERS: u32 = 1000;
 
 /// Sample `CurrentCpu` every this many round-trips (bounds the witness syscall
 /// overhead while still catching migrations across the run).
@@ -195,10 +188,6 @@ pub fn run(ctx: &TestContext) -> TestResult
     ROUNDTRIPS.store(0, Ordering::Relaxed);
     OBSERVED_CPUS.store(0, Ordering::Relaxed);
     MIGRATIONS.store(0, Ordering::Relaxed);
-
-    // Every round-trip's cross-CPU reply grows costlier with the width; the
-    // count shrinks with it.
-    let iters = super::scaled_attempts(ITERS, MIN_ITERS, cpus);
 
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::load_balance_handoff_steal: cap_create_notification failed")?;
@@ -297,7 +286,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                     ep: client_ep,
                     done: client_done,
                     idx: i,
-                    iters,
+                    iters: ITERS,
                 },
             )
         };
@@ -372,7 +361,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         u64::from(migrations),
     );
 
-    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::from(iters);
+    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::from(ITERS);
     if roundtrips != expected
     {
         return Err("stress::load_balance_handoff_steal: not all round-trips completed");

@@ -29,7 +29,7 @@ use crate::cell::{Cell, UnsafeCell};
 use crate::mem::MaybeUninit;
 use crate::path::PathBuf;
 use crate::sync::Mutex;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sys::alloc::seraph as pal_alloc;
 use crate::sys::reserve as pal_reserve;
 use crate::sys::stdio::seraph as pal_stdio;
@@ -278,6 +278,30 @@ pub fn set_panic_sink(sink: fn(&[u8])) {
     pal_stdio::set_panic_sink(sink);
 }
 
+// ── Address-space size ──────────────────────────────────────────────────────
+
+/// Exclusive top of this process's user half, read once by `_start` through
+/// `SystemInfoType::UserVaTop` before any heap or reservation zone is placed.
+/// Zero before `_start` reads it, or when the kernel did not answer.
+static USER_VA_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusive top of this process's user half: the first virtual address the
+/// kernel refuses to map (`SystemInfoType::UserVaTop`), fixed per architecture
+/// and boot paging mode. `_start` reads it once; zero before that, or when the
+/// kernel did not answer.
+#[must_use]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn user_va_top() -> u64 {
+    USER_VA_TOP.load(Ordering::Acquire)
+}
+
+/// The heap, reservation-arena, and image zones sized to this process's
+/// address space ([`user_va_top`]); the zones valid under every paging mode
+/// while the size is unknown.
+pub(crate) fn growth_zones() -> process_layout::AddressSpaceZones {
+    process_layout::growth_zones(user_va_top())
+}
+
 // ── Startup storage ─────────────────────────────────────────────────────────
 
 struct StartupCell(UnsafeCell<MaybeUninit<StartupInfo>>);
@@ -358,6 +382,12 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     if info.version != PROCESS_ABI_VERSION {
         syscall::process_exit(STARTUP_FAIL_BAD_ABI);
     }
+
+    // Learn the address space's size before stdio, the heap, or anything else
+    // places a heap or reservation zone (`growth_zones`). A kernel that
+    // does not answer leaves zero, which selects the zones valid in every
+    // paging mode.
+    USER_VA_TOP.store(syscall::user_va_top().unwrap_or(0), Ordering::Release);
 
     // Register the IPC buffer before any IPC-using code runs. Idempotent in
     // the kernel, so services that call `ipc_buffer_set` again are fine.
@@ -919,22 +949,37 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
         unreserve_pages(range);
         return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
     }
-    let len_bytes = pages.saturating_mul(syscall_abi::PAGE_SIZE);
-    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
-        .word(0, range.va_start())
-        .word(1, len_bytes)
-        .word(2, syscall_abi::MAP_WRITABLE)
-        .build();
     // SAFETY: current_ipc_buf returns the registered IPC buffer page.
-    let accepted = matches!(
-        unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
-        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
-    );
-    if !accepted {
+    if !unsafe { register_rw_region(memmgr_ep, ipc_buf, range.va_start(), pages) } {
         unreserve_pages(range);
         return Err(crate::io::Error::other("seraph: REGISTER_REGION rejected"));
     }
     Ok(range)
+}
+
+/// Register `[va, va + pages * PAGE_SIZE)` with memmgr (`REGISTER_REGION`) as
+/// a read-write demand-paged region of this process. Returns whether memmgr
+/// accepted it. Issues one IPC and allocates nothing, so the heap bootstrap
+/// can register its floor before the heap exists.
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+pub(crate) unsafe fn register_rw_region(
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    va: u64,
+    pages: u64,
+) -> bool {
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
+        .word(0, va)
+        .word(1, pages.saturating_mul(syscall_abi::PAGE_SIZE))
+        .word(2, syscall_abi::MAP_WRITABLE)
+        .build();
+    // SAFETY: the caller passes the registered IPC buffer page.
+    matches!(
+        unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
+    )
 }
 
 /// A guarded demand-paged thread stack: a reserved VA window whose upper
@@ -995,18 +1040,8 @@ pub(crate) fn reserve_guarded_stack(
         unreserve_pages(range);
         return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
     }
-    let usable_len = usable_pages.saturating_mul(syscall_abi::PAGE_SIZE);
-    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
-        .word(0, usable_base)
-        .word(1, usable_len)
-        .word(2, syscall_abi::MAP_WRITABLE)
-        .build();
     // SAFETY: current_ipc_buf returns the registered IPC buffer page.
-    let accepted = matches!(
-        unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
-        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
-    );
-    if !accepted {
+    if !unsafe { register_rw_region(memmgr_ep, ipc_buf, usable_base, usable_pages) } {
         unreserve_pages(range);
         return Err(crate::io::Error::other("seraph: REGISTER_REGION rejected"));
     }

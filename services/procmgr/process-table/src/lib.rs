@@ -130,8 +130,9 @@ impl ProcessEntry
 
 /// Ring of recently reaped or destroyed processes, queried on `QUERY_PROCESS`
 /// table miss to distinguish "exited recently" from "never existed".
-/// Each record is kept for [`RECENT_EXIT_RETENTION_NS`] after its death; a
-/// query on an older one returns `None`.
+/// Each record is kept for up to [`RECENT_EXIT_RETENTION_NS`] after its death
+/// (best-effort: see [`RecentExits::record`]); a query on an older one, or on
+/// one the ring no longer holds, returns `None`.
 #[derive(Default)]
 pub struct RecentExits
 {

@@ -624,8 +624,9 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
 /// The `procmgr_process_state` value and exit reason procmgr reports for the
 /// process behind `handle`, asked through the calling thread's IPC buffer.
 /// After a destroy or reap procmgr still answers on the handle, with
-/// `EXITED` for the recent-exit window and `UNKNOWN` after it, so a failed
-/// call or a refusal is a test failure, not a sign the process is gone.
+/// `EXITED` while it holds the exit record (the recent-exit window, best
+/// effort) and `UNKNOWN` after, so a failed call or a refusal is a test
+/// failure, not a sign the process is gone.
 fn process_state_and_reason(handle: u32) -> (u64, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

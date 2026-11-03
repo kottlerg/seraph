@@ -217,12 +217,12 @@ handle with no data words or caps.
 A live entry whose thread the kernel reports as exited answers `EXITED` before
 procmgr reaps it. After the reap, or after a `DESTROY_PROCESS` teardown, the
 badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time,
-however many other processes die meanwhile, and `UNKNOWN` after that. Retention
-is best-effort: when procmgr's heap cannot hold a new record, the oldest record
-makes room (or, with none held, the new one is dropped), so such a badge can
-answer `UNKNOWN` early. A
-destroyed process's reason is the one the kernel retained if its main thread
-had already exited, else `EXIT_KILLED`.
+however many other processes die meanwhile while procmgr's heap can hold their
+records, and `UNKNOWN` after that. Retention is best-effort: when the heap
+cannot hold a new record, the oldest record makes room (or, with none held, the
+new one is dropped), so such a badge can answer `UNKNOWN` early. A destroyed
+process's reason is the one the kernel retained if its main thread had already
+exited, else `EXIT_KILLED`.
 
 ### Label 11: `CONFIGURE_PIPE`
 

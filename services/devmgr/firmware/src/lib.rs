@@ -25,6 +25,7 @@
 
 pub mod acpi;
 pub mod dtb;
+pub mod lines;
 pub mod pci;
 pub mod resource;
 pub mod roster;

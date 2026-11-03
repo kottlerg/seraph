@@ -244,6 +244,13 @@ pub struct RunArgs
     /// second device the driver refuses).
     #[arg(long, value_name = "BYTES", requires = "second_disk")]
     pub second_disk_block_size: Option<u32>,
+
+    /// Place the second disk's device on the first disk's `INTx` line (four
+    /// PCI slots past it, where both machines' interrupt routing puts it on
+    /// the same line), staging the boot in which two virtio-blk devices
+    /// share one line.
+    #[arg(long, requires = "second_disk")]
+    pub second_disk_shared_line: bool,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -509,6 +516,11 @@ pub struct RunParallelArgs
     /// second device the driver refuses).
     #[arg(long, value_name = "BYTES", requires = "second_disk")]
     pub second_disk_block_size: Option<u32>,
+
+    /// Place the second disk's device on the first disk's `INTx` line; same
+    /// semantics as `cargo xtask run --second-disk-shared-line`.
+    #[arg(long, requires = "second_disk")]
+    pub second_disk_shared_line: bool,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

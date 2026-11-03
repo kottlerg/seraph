@@ -180,6 +180,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         )),
         None => None,
     };
+    let second_shared_line = args.second_disk_shared_line;
     let next_run = Arc::new(AtomicU32::new(1));
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(args.runs as usize);
 
@@ -265,6 +266,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     second_disk: second_src.as_ref().map(|&(_, block_size)| SecondDisk {
                         path: &second_dst,
                         block_size,
+                        shared_line: second_shared_line,
                     }),
                     firmware_code_path: &firmware_code,
                     firmware_vars_path: vars_path_for_qemu.as_deref(),

@@ -13,10 +13,10 @@
 //! device badge, takes those two events, says when the batch is settled, and
 //! yields each driver's outcome in spawn order, so the served drivers keep
 //! that order for the registry's instance ordinals. [`settle`] is devmgr's
-//! settle loop over those events; the kernel objects behind them (the wait
-//! set, the death event queue, the private driver endpoint) reach it through
-//! [`SettleEvents`], which keeps this module free of syscalls and
-//! host-testable.
+//! settle loop over those events, bounded by a timer wake; the kernel objects
+//! behind them (the wait set, the death event queue, the private driver
+//! endpoint, the timer notification) reach it through [`SettleEvents`], which
+//! keeps this module free of syscalls and host-testable.
 
 extern crate alloc;
 
@@ -132,8 +132,20 @@ pub enum SettleWake
     Death,
     /// A driver call is queued on the batch's private endpoint.
     Driver,
+    /// The settle's bound elapsed: the drivers still pending are not served.
+    Timeout,
     /// Any other wake; the loop waits again.
     Other,
+}
+
+/// How [`settle`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleEnd
+{
+    /// Every driver of the batch reported ready or died.
+    Settled,
+    /// The bound elapsed first; the drivers still pending stay pending.
+    TimedOut,
 }
 
 /// The kernel objects one batch settles over, as [`settle`] drives them.
@@ -159,6 +171,11 @@ pub trait SettleEvents<T>
     /// A death post named the driver under `badge` (`reason` is the post's
     /// exit reason), and `roster` now holds it dead.
     fn on_death(&mut self, badge: u64, reason: u64);
+
+    /// A death post named no driver of the batch: the death of a driver an
+    /// earlier batch settled, which the caller withdraws, or of one it no
+    /// longer tracks.
+    fn on_other_death(&mut self, post: DeathPost);
 }
 
 /// One death post of the batch's event queue, decoded from its two words.
@@ -173,23 +190,32 @@ pub struct DeathPost
 }
 
 /// Settle `roster`: serve the drivers' calls and take their deaths until
-/// every driver has reported ready or died, then take every death still
-/// queued, so a driver that died after reporting ready, with its death
-/// queued when the last report settled the batch, is not served.
+/// every driver has reported ready or died, or the timer wake reports the
+/// bound elapsed, then take every death still queued, so a driver that died
+/// after reporting ready, with its death queued when the last report settled
+/// the batch, is not served. A death post for a badge the batch does not
+/// hold goes to [`SettleEvents::on_other_death`], so no post is lost.
 ///
 /// # Errors
 /// Returns the wait's failure, after taking the queued deaths; the drivers
 /// still pending are then not served.
-pub fn settle<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)
--> Result<(), E::Error>
+pub fn settle<T, E: SettleEvents<T>>(
+    events: &mut E,
+    roster: &mut Roster<T>,
+) -> Result<SettleEnd, E::Error>
 {
-    let mut result = Ok(());
+    let mut result = Ok(SettleEnd::Settled);
     while !roster.is_settled()
     {
         match events.wait()
         {
             Ok(SettleWake::Death) => drain_deaths(events, roster),
             Ok(SettleWake::Driver) => events.serve_driver(roster),
+            Ok(SettleWake::Timeout) =>
+            {
+                result = Ok(SettleEnd::TimedOut);
+                break;
+            }
             Ok(SettleWake::Other) =>
             {}
             Err(e) =>
@@ -203,14 +229,19 @@ pub fn settle<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)
     result
 }
 
-/// Mark dead every driver whose death the event queue holds.
+/// Mark dead every driver whose death the event queue holds, handing each
+/// post for a badge the batch does not hold to the caller.
 fn drain_deaths<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)
 {
-    while let Some(DeathPost { badge, reason }) = events.try_death()
+    while let Some(post) = events.try_death()
     {
-        if roster.mark_dead(badge)
+        if roster.mark_dead(post.badge)
         {
-            events.on_death(badge, reason);
+            events.on_death(post.badge, post.reason);
+        }
+        else
+        {
+            events.on_other_death(post);
         }
     }
 }
@@ -347,15 +378,15 @@ impl<T> Roster<T>
         self.entries.iter().all(|e| e.state != DriverState::Pending)
     }
 
-    /// Consume the roster, yielding each driver with whether the registry
-    /// serves it, in spawn order. A driver is served when it reported ready
-    /// and was not seen to die; one still pending is not served, so a caller
-    /// that stops settling early serves only the drivers known ready.
-    pub fn into_outcomes(self) -> impl Iterator<Item = (bool, T)>
+    /// Consume the roster, yielding each driver with its final state, in
+    /// spawn order. The registry serves a driver whose state is
+    /// [`DriverState::Ready`]: it reported ready and was not seen to die. One
+    /// still [`DriverState::Pending`] is alive but not set up (the settle's
+    /// bound elapsed, or its wait failed), so a caller that stops settling
+    /// early serves only the drivers known ready and destroys the rest.
+    pub fn into_outcomes(self) -> impl Iterator<Item = (DriverState, T)>
     {
-        self.entries
-            .into_iter()
-            .map(|e| (e.state == DriverState::Ready, e.driver))
+        self.entries.into_iter().map(|e| (e.state, e.driver))
     }
 }
 
@@ -380,7 +411,7 @@ mod tests
     fn served(r: Roster<u64>) -> Vec<u64>
     {
         r.into_outcomes()
-            .filter_map(|(served, d)| served.then_some(d))
+            .filter_map(|(state, d)| (state == DriverState::Ready).then_some(d))
             .collect()
     }
 
@@ -473,6 +504,7 @@ mod tests
         queue: Vec<DeathPost>,
         replies: Vec<bool>,
         deaths: Vec<(u64, u64)>,
+        other_deaths: Vec<DeathPost>,
     }
 
     impl SettleEvents<u64> for Script
@@ -501,6 +533,11 @@ mod tests
         {
             self.deaths.push((badge, reason));
         }
+
+        fn on_other_death(&mut self, post: DeathPost)
+        {
+            self.other_deaths.push(post);
+        }
     }
 
     fn post(badge: u64, reason: u64) -> DeathPost
@@ -522,7 +559,7 @@ mod tests
             calls: vec![1, 2],
             ..Script::default()
         };
-        assert_eq!(settle(&mut s, &mut r), Ok(()));
+        assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::Settled));
         assert_eq!(s.deaths, [(1, 7)]);
         assert_eq!(served(r), [2]);
     }
@@ -542,11 +579,13 @@ mod tests
             calls: vec![3, 2, 1],
             ..Script::default()
         };
-        assert_eq!(settle(&mut s, &mut r), Ok(()));
+        assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::Settled));
         // Driver 2's report after its death is refused; the post for a badge
-        // the batch does not hold changes nothing; the loop stops once settled.
+        // the batch does not hold goes to the caller; the loop stops once
+        // settled.
         assert_eq!(s.replies, [true, false, true]);
         assert_eq!(s.deaths, [(2, 1)]);
+        assert_eq!(s.other_deaths, [post(9, 1)]);
         assert!(s.wakes.is_empty());
         assert_eq!(served(r), [1, 3]);
     }
@@ -583,9 +622,56 @@ mod tests
             calls: vec![5],
             ..Script::default()
         };
-        assert_eq!(settle(&mut s, &mut r), Ok(()));
+        assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::Settled));
         assert_eq!(s.deaths, [(wide, 0x1_8000_0001)]);
         assert_eq!(served(r), [5]);
+    }
+
+    #[test]
+    fn timeout_ends_the_settle_with_pending_drivers_left_pending()
+    {
+        // Driver 1 reports ready; driver 2 hangs in its setup; the bound
+        // elapses. Driver 3's death, queued at the timeout, is still taken.
+        let mut r = roster_of(&[1, 2, 3]);
+        let mut s = Script {
+            wakes: vec![
+                (Ok(SettleWake::Driver), vec![]),
+                (Ok(SettleWake::Timeout), vec![post(3, 4)]),
+                (Ok(SettleWake::Driver), vec![]),
+            ],
+            calls: vec![1],
+            ..Script::default()
+        };
+        assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::TimedOut));
+        assert_eq!(s.deaths, [(3, 4)]);
+        // The wake after the timeout is never taken.
+        assert_eq!(s.wakes.len(), 1);
+        let outcomes: Vec<_> = r.into_outcomes().collect();
+        assert_eq!(
+            outcomes,
+            [
+                (DriverState::Ready, 1),
+                (DriverState::Pending, 2),
+                (DriverState::Dead, 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn death_outside_the_batch_reaches_the_caller_in_the_final_drain()
+    {
+        // The last ready report settles the batch while the death of a
+        // driver an earlier batch settled is still queued.
+        let mut r = roster_of(&[1]);
+        let mut s = Script {
+            wakes: vec![(Ok(SettleWake::Driver), vec![post(40, 2)])],
+            calls: vec![1],
+            ..Script::default()
+        };
+        assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::Settled));
+        assert!(s.deaths.is_empty());
+        assert_eq!(s.other_deaths, [post(40, 2)]);
+        assert_eq!(served(r), [1]);
     }
 
     const LABELS: DriverLabels = DriverLabels {

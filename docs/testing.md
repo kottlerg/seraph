@@ -98,7 +98,8 @@ sysroot/
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # and the test-only test-orphan)
+│   │                         # and the test-only test-orphan and
+│   │                         # test-fault)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn
@@ -121,11 +122,12 @@ sysroot/
 testers; those live under `/tests/`. Dropping `/tests/` does not by itself
 give a non-test distro, because test-only artifacts also install under
 `/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, and `/data/`.
-Under `/services/drivers/` is
-[`test-orphan`](../services/drivers/test-orphan/README.md), a test-only
-fault-injection driver installed there until the devmgr enumeration
+Under `/services/drivers/` are
+[`test-orphan`](../services/drivers/test-orphan/README.md) and
+[`test-fault`](../services/drivers/test-fault/README.md), test-only
+fault-injection drivers installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
-it. Under `/programs/` are the test fixtures the harnesses and per-program
+them. Under `/programs/` are the test fixtures the harnesses and per-program
 testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
 `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which
 consumer spawns or drives each one is owned by

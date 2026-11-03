@@ -54,13 +54,16 @@ pub struct Disk
 /// Query devmgr for every block driver it runs and parse each disk's GPT.
 ///
 /// Sends `QUERY_BLOCK_DEVICE` at instance ordinals 0, 1, ... and stops at
-/// the first reply that is not `SUCCESS` (devmgr's reply past the last
-/// driver) or the first failed call. The ordinal counts drivers in PCI
-/// order and is not stable across boots, so the returned order carries no
-/// meaning beyond this boot's log lines; role discovery never breaks a tie
-/// on it (`gpt::lookup_partition_by_type_guid`). A disk whose GPT cannot be
-/// parsed is held with no partitions. An allocation failure for the list
-/// stops discovery with a log, keeping the disks found before it.
+/// the first reply that is neither `SUCCESS` nor `WITHDRAWN` (devmgr's reply
+/// past the last driver) or the first failed call. A `WITHDRAWN` ordinal, a
+/// driver devmgr served and withdrew when it died, is skipped: devmgr keeps
+/// the ordinals after it, so no live disk is missed. The ordinal counts
+/// drivers in PCI order and is not stable across boots, so the returned
+/// order carries no meaning beyond this boot's log lines; role discovery
+/// never breaks a tie on it (`gpt::lookup_partition_by_type_guid`). A disk
+/// whose GPT cannot be parsed is held with no partitions. An allocation
+/// failure for the list stops discovery with a log, keeping the disks found
+/// before it.
 ///
 /// `*scratch_cap` and `*scratch_va` are the scratch page from
 /// [`alloc_scratch`]. A read whose call fails or whose reply carries no cap
@@ -95,6 +98,10 @@ pub fn discover_disks(
                 break;
             }
             BlockDeviceReply::CallFailed => break,
+            BlockDeviceReply::Withdrawn =>
+            {
+                std::os::seraph::log!("disk {ordinal}: driver withdrawn; skipped");
+            }
             BlockDeviceReply::NoCap =>
             {
                 std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE reply carried no cap");
@@ -170,10 +177,14 @@ fn replace_scratch(
 /// The outcome of one `QUERY_BLOCK_DEVICE`.
 enum BlockDeviceReply
 {
-    /// A reply other than `SUCCESS`, with its label: past the last driver,
-    /// or devmgr's refusal at a live ordinal (a failed badge derivation, an
-    /// unauthorized caller, a label-version mismatch). Discovery ends.
+    /// A reply other than `SUCCESS` or `WITHDRAWN`, with its label: past the
+    /// last driver, or devmgr's refusal at a live ordinal (a failed badge
+    /// derivation, an unauthorized caller, a label-version mismatch).
+    /// Discovery ends.
     End(u64),
+    /// `WITHDRAWN`: the driver at this ordinal died after devmgr served it;
+    /// discovery continues at the next ordinal.
+    Withdrawn,
     /// A failed call (logged where it fails): discovery ends.
     CallFailed,
     /// A `SUCCESS` reply that carried no cap.
@@ -196,6 +207,10 @@ fn query_block_device(registry_ep: u32, ordinal: u64, ipc_buf: *mut u64) -> Bloc
         std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE ipc_call failed");
         return BlockDeviceReply::CallFailed;
     };
+    if reply.label == devmgr_errors::WITHDRAWN
+    {
+        return BlockDeviceReply::Withdrawn;
+    }
     if reply.label != devmgr_errors::SUCCESS
     {
         return BlockDeviceReply::End(reply.label);

@@ -492,14 +492,14 @@ report below (`--save-logs`).
 
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 16-hart
-# run, at 1x, takes ~95 s; the 128-hart run ~580 s at 8x hart
+# run, at 1x, takes ~80 s; the 128-hart run ~530 s at 8x hart
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
 cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 300 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1620 \
     --save-logs $T
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU

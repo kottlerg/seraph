@@ -53,9 +53,11 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// derived from it; the bootloader allocates exactly this many bytes.
 ///
 /// Measured bound (the kernel's paint report, ktest `stress::stack_depth`): the
-/// kernel's boot phases use at most 7248 B of it at 4 CPUs, debug and release
-/// builds on both architectures, a margin of about 89%. The report gives the
-/// depth, not the path that reached it.
+/// kernel's boot phases use at most 9008 B of it, a margin of about 86%, over
+/// debug builds at 4, 16 and 128 CPUs and release builds at 4 CPUs on both
+/// architectures (release builds at 16 and 128 CPUs are measured at each tag's
+/// release host runs). The report gives the depth, not the path that reached
+/// it.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
 /// Word every idle, thread, and handoff stack is filled with when it is allocated, so the

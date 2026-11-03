@@ -135,15 +135,15 @@ impl DeathSet
     fn replace_wait_set(&self, queues: &[u32], members: u32) -> Result<(), i64>
     {
         let old = self.ws_cap.get();
+        // Reserve before creating the new set, so a heap that cannot hold
+        // the move list leaves no new set behind.
+        let mut moved: Vec<(u32, u64)> = Vec::new();
+        moved
+            .try_reserve_exact(queues.len() + 1)
+            .map_err(|_| OUT_OF_MEMORY)?;
         let new = create_wait_set(members)?;
         let sources = core::iter::once((self.service_ep, self.service_badge))
             .chain(queues.iter().map(|&q| (q, self.death_badge)));
-        let mut moved: Vec<(u32, u64)> = Vec::new();
-        if moved.try_reserve_exact(queues.len() + 1).is_err()
-        {
-            let _ = syscall::cap_delete(new);
-            return Err(OUT_OF_MEMORY);
-        }
         for (source, badge) in sources
         {
             // A source is a member of one wait set at a time. The kernel
@@ -170,7 +170,10 @@ impl DeathSet
         // A wait set of 32 members or more is a page-sized retype whose grant
         // `object_slab_retype` keeps no handle to return, so the old set's
         // pages stay charged to this service: at most 14 over its life
-        // (docs/limits.md, `FIRST_WAIT_SET_MEMBERS`).
+        // (docs/limits.md, `FIRST_WAIT_SET_MEMBERS`). A move the kernel
+        // refused would strand the new set the same way, but no path here
+        // makes it refuse: the new set has room for every member, and each
+        // source was just removed from the old one.
         let _ = syscall::cap_delete(old);
         std::os::seraph::log!("procmgr: main wait set widened to {members} members");
         Ok(())

@@ -54,7 +54,8 @@ svcmgr/
 │                                  # `cwd_rights` / `handover_permitted`
 │                                  # decisions, the windowed
 │                                  # `RestartBudget`, and the death-queue
-│                                  # bind order and growth (`DeathQueues`)
+│                                  # bind order and growth, main wait set
+│                                  # included (`DeathQueues`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see

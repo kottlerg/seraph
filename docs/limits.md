@@ -632,8 +632,7 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 
 ### devmgr
 
-Tracked by [#661](https://github.com/kottlerg/seraph/issues/661) and
-[#664](https://github.com/kottlerg/seraph/issues/664).
+Tracked by [#664](https://github.com/kottlerg/seraph/issues/664).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -652,7 +651,6 @@ Tracked by [#661](https://github.com/kottlerg/seraph/issues/661) and
 | `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
 | virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
 | One IRQ-bearing driver per INTx line (`IrqRangeAllocator::isolate_one`) | `services/devmgr/src/main.rs` | 1 per GSI (riscv64: 4 swizzled lines) | encoding artefact (a single-line cap is carved once) | none | needs a design | A virtio-blk on a line another device holds is not spawned, with a log (#664) |
-| One BAR per `VirtIO` driver (`virtio_second_bar`) | `services/devmgr/firmware/src/scan.rs` | 1 | encoding artefact (the driver bootstrap round carries one BAR) | none | needs a design | A device whose registers span two BARs is refused with a log; multi-BAR delivery is #661 |
 | `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
 | `find_pci_ecams` | `services/devmgr/firmware/src/dtb.rs` | every node | firmware spec (structure block) | 24 B per window | correct as is | None |
 | firmware dtb `MAX_DEPTH` | `services/devmgr/firmware/src/dtb.rs` | 16 | provably unreachable on real trees (under 8 deep) | 256 B stack | correct as is | None |
@@ -665,6 +663,7 @@ Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
+| `MAX_VIRTIO_BARS` | `services/drivers/virtio/core/src/lib.rs` | 4 BARs per device, at most `MSG_CAP_SLOTS_MAX` (const-asserted) so one bootstrap round carries them | hardware spec (one BAR per `VirtIO` 1.2 § 4.1.4 register region: common, notification, ISR, device configuration) | about 170 B per driver and 40 B per device in devmgr | correct as is | None |
 | `MAX_QUEUE_SIZE` | `services/drivers/virtio/core/src/virtqueue.rs` | 32768; the bookkeeping is sized to the negotiated queue | hardware spec (VirtIO split ring) | 4 B per negotiated descriptor | correct as is | None |
 | `last_used_idx`, `avail.idx` | `services/drivers/virtio/core/src/virtqueue.rs` | `u16` | hardware spec (VirtIO split ring; `new` refuses a queue size that is not a power of two) | none | correct as is | None |
 | `RESET_TIMEOUT` | `services/drivers/virtio/core/src/pci.rs` | 5 s on the monotonic clock | tuning | none | correct as is | None |

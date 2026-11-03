@@ -83,8 +83,9 @@ pub fn init_cspace_released_phase(_: &Caps)
     panic!("init_cspace_released: init's reap did not run within the poll budget");
 }
 
-/// `command_*`, `stdio_file_unsupported`, and `procmgr_refusals` run after
-/// the namespace cluster has established attenuation invariants.
+/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, and
+/// `death_queue_growth` run after the namespace cluster has established
+/// attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
 {
     &[
@@ -124,6 +125,10 @@ pub fn command_phases() -> &'static [Phase]
             name: "procmgr_refusals",
             run: procmgr_refusals_phase,
         },
+        Phase {
+            name: "death_queue_growth",
+            run: death_queue_growth_phase,
+        },
     ]
 }
 
@@ -149,6 +154,91 @@ pub fn reentry_main(role: &str)
     {
         undeliverable_reply_child_main();
     }
+}
+
+/// Children [`death_queue_growth_phase`] holds alive at once. procmgr binds
+/// two death observers per live process on its death queues, the first of
+/// which holds 64 nodes (`FIRST_POOL_OBSERVERS` in
+/// `services/procmgr/src/death_queues.rs`), and init's reap takes two more:
+/// 32 children alone take the rest of that pool and two more, so their binds
+/// cross into a further queue whatever else is live.
+const GROWTH_CHILDREN: usize = 32;
+
+/// Hold [`GROWTH_CHILDREN`] children alive at once, so procmgr's death
+/// binds outgrow its first death queue's pool, then let each exit and check
+/// its clean exit and procmgr's `QUERY_PROCESS` answer (`EXITED`, reason 0).
+/// Each child is `/programs/stdiotest`, blocked on its piped stdin until the
+/// phase writes a line to it. A procmgr whose pool did not grow refuses the
+/// spawns past it.
+pub fn death_queue_growth_phase(_: &Caps)
+{
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let mut children = Vec::with_capacity(GROWTH_CHILDREN);
+    for i in 0..GROWTH_CHILDREN
+    {
+        let child = Command::new("/programs/stdiotest")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!("death_queue_growth: spawn {i} of {GROWTH_CHILDREN} failed: {e}")
+            });
+        children.push(child);
+    }
+    for child in &mut children
+    {
+        assert!(
+            child
+                .try_wait()
+                .expect("death_queue_growth: try_wait failed")
+                .is_none(),
+            "death_queue_growth: a child exited before its stdin was written"
+        );
+    }
+    std::os::seraph::log!("death_queue_growth: {GROWTH_CHILDREN} children alive at once");
+
+    for mut child in children
+    {
+        child
+            .stdin
+            .take()
+            .expect("piped child must have stdin handle")
+            .write_all(b"x\n")
+            .expect("death_queue_growth: write to stdin failed");
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .expect("piped child must have stdout handle")
+            .read_to_string(&mut out)
+            .expect("death_queue_growth: read stdout failed");
+        assert!(
+            out.contains("PASS"),
+            "death_queue_growth: child stdout missing PASS: {out:?}"
+        );
+        let status = child.wait().expect("death_queue_growth: wait failed");
+        assert!(
+            status.success(),
+            "death_queue_growth: child did not exit cleanly: {status}"
+        );
+        let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+        let reply =
+            unsafe { ipc::ipc_call(child.id(), &query, std::os::seraph::current_ipc_buf()) }
+                .expect("death_queue_growth: QUERY_PROCESS call failed");
+        assert_eq!(
+            (reply.label, reply.word(0), reply.word(1)),
+            (
+                ipc::procmgr_errors::SUCCESS,
+                ipc::procmgr_process_state::EXITED,
+                0
+            ),
+            "death_queue_growth: QUERY_PROCESS after wait"
+        );
+    }
+    std::os::seraph::log!("death_queue_growth: every child exited cleanly");
 }
 
 /// argv[1] of a child that parks until it is torn down; the

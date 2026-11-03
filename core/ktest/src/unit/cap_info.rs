@@ -23,12 +23,12 @@
 
 use syscall::{
     MAP_WRITABLE, cap_create_aspace, cap_create_cspace, cap_create_notification, cap_delete,
-    cap_info, mem_map, mem_unmap,
+    cap_info, cap_info_memory_mappings, mem_map, mem_unmap,
 };
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
-    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS,
-    CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, SyscallError,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
+    CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, SyscallError,
 };
 
 use crate::{TestContext, TestResult};
@@ -133,8 +133,10 @@ const MAPPINGS_VA: u64 = 0x1_5D00_0000;
 
 /// `CAP_INFO_MEMORY_MAPPINGS` counts the live user leaves naming a frame:
 /// none before a map, one per address space that maps it, one fewer after an
-/// unmap, and none once the last mapping's address space is destroyed. A
-/// region past `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` is refused.
+/// unmap, and none once the last mapping's address space is destroyed. On a
+/// region larger than `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, a full-length
+/// window past the first `MAX_PAGES` answers, and a window that is too long,
+/// empty, or runs past the region is refused.
 pub fn memory_mappings(ctx: &TestContext) -> TestResult
 {
     let memory_cap =
@@ -142,7 +144,7 @@ pub fn memory_mappings(ctx: &TestContext) -> TestResult
     let result = mappings_probe(ctx, memory_cap);
     // A failed cleanup can leave the frame mapped; it then stays out of the
     // pool rather than break `free`'s precondition.
-    if cap_info(memory_cap, CAP_INFO_MEMORY_MAPPINGS) == Ok(0)
+    if cap_info_memory_mappings(memory_cap, 0, 1) == Ok(0)
     {
         // SAFETY: the kernel reports no address space maps the frame, so every
         // mapping the probe made of it is gone.
@@ -150,17 +152,39 @@ pub fn memory_mappings(ctx: &TestContext) -> TestResult
     }
     result?;
 
+    mappings_windows(ctx)
+}
+
+/// The windowed query on `memory_base`, a region larger than one window:
+/// windows inside it answer wherever they start, and the refused shapes are
+/// refused.
+fn mappings_windows(ctx: &TestContext) -> TestResult
+{
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "cap_info::memory_mappings: cap_info(memory_base, SIZE) failed")?;
-    if size <= CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES * syscall_abi::PAGE_SIZE
+    let pages = size / syscall_abi::PAGE_SIZE;
+    let max = CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES;
+    if pages < 2 * max + 1
     {
-        return Err("cap_info::memory_mappings: memory_base is too small to test the bound");
+        return Err("cap_info::memory_mappings: memory_base is too small to test the window");
     }
-    match cap_info(ctx.memory_base, CAP_INFO_MEMORY_MAPPINGS)
+    if cap_info_memory_mappings(ctx.memory_base, max, max).is_err()
+        || cap_info_memory_mappings(ctx.memory_base, pages - 1, 1).is_err()
     {
-        Err(e) if e == SyscallError::InvalidArgument as i64 => Ok(()),
-        _ => Err("cap_info::memory_mappings: an over-bound region was not refused"),
+        return Err("cap_info::memory_mappings: a window inside a large region was refused");
     }
+    let refused = |first, len| {
+        cap_info_memory_mappings(ctx.memory_base, first, len)
+            == Err(SyscallError::InvalidArgument as i64)
+    };
+    if !refused(0, max + 1)
+        || !refused(0, 0)
+        || !refused(pages - max + 1, max)
+        || !refused(pages, 1)
+    {
+        return Err("cap_info::memory_mappings: a malformed window was not refused");
+    }
+    Ok(())
 }
 
 /// Map `memory_cap` into ktest's address space and a fresh one, checking the
@@ -168,7 +192,7 @@ pub fn memory_mappings(ctx: &TestContext) -> TestResult
 fn mappings_probe(ctx: &TestContext, memory_cap: u32) -> TestResult
 {
     let count = || {
-        cap_info(memory_cap, CAP_INFO_MEMORY_MAPPINGS)
+        cap_info_memory_mappings(memory_cap, 0, 1)
             .map_err(|_| "cap_info::memory_mappings: cap_info(MAPPINGS) failed")
     };
     if count()? != 0
@@ -340,7 +364,7 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
     cap_delete(eq).map_err(|_| "creation_masks: cap_delete(event queue) failed")?;
     r?;
 
-    let ws = syscall::wait_set_create(ctx.memory_base)
+    let ws = syscall::wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
         .map_err(|_| "creation_masks: wait_set_create failed")?;
     let r = check_mask(
         ws,

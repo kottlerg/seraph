@@ -747,6 +747,11 @@ pub fn bind_fault_handler(thread: u32, endpoint: u32, badge: u64) -> Result<(), 
     bound.and(deleted)
 }
 
+/// Member capacity of the wait sets the cells create (`SYS_CAP_CREATE_WAIT_SET`
+/// arg1); every cell adds fewer members than this, except the ones that size
+/// their own set to test the capacity.
+pub const WS_CAPACITY: u32 = 16;
+
 /// The widest CPU count at which ktest's wall-clock bounds and budgets apply
 /// as written. Past it a boot is an oversubscribed boundary run, where every
 /// cross-CPU handoff waits for a host core, so a step's latency grows with

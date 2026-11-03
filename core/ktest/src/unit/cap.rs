@@ -114,7 +114,7 @@ pub fn create_wait_set(ctx: &TestContext) -> TestResult
 // the underlying syscall number is `SYS_CAP_CREATE_WAIT_SET`.
 fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create(memory_cap)
+    syscall::wait_set_create(memory_cap, crate::WS_CAPACITY)
 }
 
 // ── SYS_CAP_COPY ─────────────────────────────────────────────────────────────
@@ -784,14 +784,26 @@ pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `event_queue_create(EVENT_QUEUE_MAX_CAPACITY + 1)` must return
-/// `InvalidArgument` (see core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_Q`).
+/// `event_queue_create(EVENT_QUEUE_MAX_CAPACITY + 1)`, and an observer count
+/// past the same ceiling, must return `InvalidArgument` (see
+/// core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_Q`).
 pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 {
-    let err = event_queue_create(ctx.memory_base, 4097);
+    let err = event_queue_create(ctx.memory_base, syscall_abi::EVENT_QUEUE_MAX_CAPACITY + 1);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("event_queue_create(4097) did not return InvalidArgument");
+        return Err("event_queue_create(MAX + 1) did not return InvalidArgument");
+    }
+    let err = syscall::event_queue_create_observed(
+        ctx.memory_base,
+        1,
+        syscall_abi::EVENT_QUEUE_MAX_CAPACITY + 1,
+    );
+    if err != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err(
+            "event_queue_create_observed(observers MAX + 1) did not return InvalidArgument",
+        );
     }
     Ok(())
 }
@@ -998,8 +1010,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 }
 
 /// Correlators for the death observers in `cspace_delete_stops_bound_thread`.
-const STOP_CORR_EARLY: u32 = 0x5701;
-const STOP_CORR_LATE: u32 = 0x5702;
+const STOP_CORR_EARLY: u64 = 0x5701;
+const STOP_CORR_LATE: u64 = 0x5702;
 
 /// Death-event side of a teardown stop: the observer bound before the stop
 /// (`early`) received nothing, and a fresh observer bound now receives the
@@ -1010,8 +1022,11 @@ fn check_stop_observers(ctx: &TestContext, thread: u32, early: u32) -> TestResul
         .map_err(|_| "stop_bound: event_queue_create (late) failed")?;
     thread_bind_notification(thread, late, STOP_CORR_LATE)
         .map_err(|_| "stop_bound: thread_bind_notification (late) failed")?;
-    let expected = (u64::from(STOP_CORR_LATE) << 32) | syscall_abi::EXIT_KILLED;
-    let result = if event_try_recv(late) != Ok(expected)
+    let expected = syscall::DeathEvent {
+        exit_reason: syscall_abi::EXIT_KILLED,
+        correlator: STOP_CORR_LATE,
+    };
+    let result = if syscall::event_try_recv_death(late) != Ok(expected)
     {
         Err("stop_bound: late-bound observer did not receive EXIT_KILLED")
     }
@@ -1065,7 +1080,7 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     notification_wait(ready).map_err(|_| "stop_bound: wait ready failed")?;
 
     // Observer bound before the stop: the teardown walk posts nothing to it.
-    let early = event_queue_create(ctx.memory_base, 4)
+    let early = syscall::event_queue_create_observed(ctx.memory_base, 4, 1)
         .map_err(|_| "stop_bound: event_queue_create (early) failed")?;
     thread_bind_notification(child.th, early, STOP_CORR_EARLY)
         .map_err(|_| "stop_bound: thread_bind_notification (early) failed")?;

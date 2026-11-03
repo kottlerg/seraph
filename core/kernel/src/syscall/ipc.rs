@@ -1298,16 +1298,12 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = notification cap index (WAIT right).
 /// arg1 = `timeout_ms`. `0` blocks indefinitely. `> 0` blocks until bits
-///        are delivered *or* `timeout_ms` milliseconds have elapsed (at once
-///        if the sleep list is full;
-///        core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
-///        Invariants, invariant 4).
+///        are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). A notification wake always carries non-zero bits because
 /// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
-/// means the wait timed out: its timeout elapsed, or it found the sleep list
-/// full and returned at once. A stop of the caller, or the destruction of the
+/// means the wait's timeout elapsed. A stop of the caller, or the destruction of the
 /// notification while the caller is parked, returns `Interrupted`. The split
 /// is required because the bitmask is an unrestricted `u64`: an in-band
 /// encoding via `cast_signed` would alias bit-63-set payloads with the
@@ -1365,8 +1361,7 @@ pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
 
     if let Ok(bits) = result
     {
-        // Bits were already set, or (0 bits) a timed wait met a full sleep
-        // list and timed out at once; deliver the bitmask in the secondary
+        // Bits were already set; deliver the bitmask in the secondary
         // register.
         tf.set_ipc_return(0, bits);
         return Ok(0);
@@ -1412,20 +1407,24 @@ pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
 
 // ── Event Queue handlers ──────────────────────────────────────────────────────
 
-/// `SYS_EVENT_POST` (5): append a payload word to an event queue (non-blocking).
+/// `SYS_EVENT_POST` (5): append a two-word entry to an event queue (non-blocking).
 ///
 /// arg0 = event queue cap index (must have POST right).
-/// arg1 = payload word to enqueue.
+/// arg1 = payload word of the entry.
+/// arg2 = tag word of the entry.
 ///
 /// Returns `SyscallError::QueueFull` if the queue is at capacity.
-/// Any `u64` payload, 0 included, is valid; there is no zero-payload check.
+/// Any `u64` in either word, 0 included, is valid; there is no zero check.
 #[cfg(not(test))]
 pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let eq_idx = tf.arg(0) as u32;
-    let payload = tf.arg(1);
+    let entry = crate::ipc::event_queue::EventEntry {
+        payload: tf.arg(1),
+        tag: tf.arg(2),
+    };
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1448,7 +1447,7 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
     };
 
     // SAFETY: eq_state extracted from validated EventQueue object.
-    let result = unsafe { crate::ipc::event_queue::event_queue_post(eq_state, payload) };
+    let result = unsafe { crate::ipc::event_queue::event_queue_post(eq_state, entry) };
 
     match result
     {
@@ -1480,15 +1479,14 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 ///          the caller is never registered as a waiter and never enters
 ///          the scheduler.
 ///        - `1 .. u64::MAX-1` blocks until a post arrives or the timeout
-///          elapses, whichever comes first (at once if the sleep list is
-///          full; core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
-///          List Invariants, invariant 4). On timeout returns `WouldBlock`
+///          elapses, whichever comes first. On timeout returns `WouldBlock`
 ///          (same code as the try-once-empty case — both mean "no payload
 ///          available").
 ///
-/// On success returns `0` in rax/a0 and the payload in the secondary return
-/// register (rdx/a1). The disambiguation between "data wake" and "timer
-/// wake" uses `tcb.timed_out` rather than an in-band sentinel on
+/// On success returns `0` in rax/a0, the entry's payload word in the secondary
+/// return register (rdx/a1), and its tag word in the tertiary one (rsi/a2).
+/// The disambiguation between "data wake" and "timer wake" uses
+/// `tcb.timed_out` rather than an in-band sentinel on
 /// `wakeup_value`, because event payloads may be any `u64` including 0
 /// (contrast `sys_notification_wait`, where `wakeup_value == 0` works because
 /// `notification_send` rejects zero-bit sends). A stop of the caller, or the
@@ -1531,9 +1529,9 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: eq_state extracted from a validated EventQueue object.
         return match unsafe { crate::ipc::event_queue::event_queue_try_recv(eq_state) }
         {
-            Some(payload) =>
+            Some(entry) =>
             {
-                tf.set_ipc_return(0, payload);
+                set_event_return(tf, entry);
                 Ok(0)
             }
             None => Err(SyscallError::WouldBlock),
@@ -1558,18 +1556,11 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: eq_state extracted from validated EventQueue object.
     let result = unsafe { crate::ipc::event_queue::event_queue_recv(eq_state, tcb, deadline) };
 
-    match result
+    if let Ok(entry) = result
     {
-        Ok(Some(payload)) =>
-        {
-            // Entry available immediately; deliver payload in secondary register.
-            tf.set_ipc_return(0, payload);
-            return Ok(0);
-        }
-        // A timed wait that met a full sleep list: an immediate timeout.
-        Ok(None) => return Err(SyscallError::WouldBlock),
-        Err(()) =>
-        {}
+        // Entry available immediately; deliver it in the return registers.
+        set_event_return(tf, entry);
+        return Ok(0);
     }
 
     // Queue was empty; `event_queue_recv` queued `tcb` on `eq.waiters` (or a
@@ -1596,30 +1587,43 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb validated above.
         unsafe {
             (*tcb).wakeup_value = 0;
+            (*tcb).wakeup_tag = 0;
             (*tcb).timed_out = false;
         }
         return Err(SyscallError::Interrupted);
     }
 
-    // On resume, exactly one of two outcomes: `event_queue_post` stored a
-    // payload in `wakeup_value`, or the sleep-list timer arm set
+    // On resume, exactly one of two outcomes: `event_queue_post` stored an
+    // entry in `wakeup_value` and `wakeup_tag`, or the sleep-list timer arm set
     // `timed_out = true`. Both paths remove any sleep-list entry (and its
     // deadline) as part of claiming the wake.
     // SAFETY: tcb still valid after resume.
-    let (payload, timed_out) = unsafe {
-        let p = (*tcb).wakeup_value;
+    let (entry, timed_out) = unsafe {
+        let e = crate::ipc::event_queue::EventEntry {
+            payload: (*tcb).wakeup_value,
+            tag: (*tcb).wakeup_tag,
+        };
         let t = (*tcb).timed_out;
         (*tcb).wakeup_value = 0;
+        (*tcb).wakeup_tag = 0;
         (*tcb).timed_out = false;
-        (p, t)
+        (e, t)
     };
 
     if timed_out
     {
         return Err(SyscallError::WouldBlock);
     }
-    tf.set_ipc_return(0, payload);
+    set_event_return(tf, entry);
     Ok(0)
+}
+
+/// Write a received event entry into `SYS_EVENT_RECV`'s return registers:
+/// the payload word secondary (rdx/a1), the tag word tertiary (rsi/a2).
+#[cfg(not(test))]
+fn set_event_return(tf: UserFrame, entry: crate::ipc::event_queue::EventEntry)
+{
+    tf.set_ipc_return_with_badge(0, entry.payload, entry.tag);
 }
 
 // ── Wait Set handlers ─────────────────────────────────────────────────────────

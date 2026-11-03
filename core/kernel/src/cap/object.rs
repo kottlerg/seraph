@@ -109,13 +109,16 @@ pub struct KernelObjectHeader
 
 /// Ceiling on [`KernelObjectHeader::ref_count`] for the references userspace
 /// can multiply without a bound of its own: a new capability slot (copy,
-/// derive, badged derive, a move's destination) refuses at it, and so does a
-/// retype from a Memory object whose count is at it.
+/// derive, badged derive, a move's destination) refuses at it, and so do a
+/// retype from a Memory object whose count is at it and a death-observer bind
+/// onto an `EventQueue` whose count is at it (its creator funds any number of
+/// observer nodes).
 ///
 /// The value is correct as is, not a limit a workload meets: every
-/// userspace-amplifiable reference costs a 72-byte capability slot or a retype
-/// child of at least 128 bytes, so 2^31 references to one object hold at least
-/// 144 GiB against that single object, which no workload does, and reaching the
+/// userspace-amplifiable reference costs a 72-byte capability slot, a retype
+/// child of at least 128 bytes, or a 24-byte death-observer node, so 2^31
+/// references to one object hold at least 48 GiB against that single object,
+/// which no workload does, and reaching the
 /// ceiling refuses the request with `QuotaExceeded` instead of wrapping the
 /// count and freeing a live object.
 ///
@@ -127,15 +130,13 @@ pub struct KernelObjectHeader
 /// The ceiling leaves 2^31 of headroom below `u32::MAX` for every other
 /// reference, which the kernel takes unchecked. Each of those is bounded by an
 /// object count, not by a caller's request. Per thread: its syscall pins (a
-/// few), its fault-handler binding (one), the death observers bound on it (at
-/// most `MAX_DEATH_OBSERVERS`, four), the lease of a retype it has in flight
+/// few), its fault-handler binding (one), the lease of a retype it has in flight
 /// that passed `retype_allocate`'s check before another took the count to the
 /// ceiling (one), and the destinations of an IPC transfer it has in flight that
 /// passed the message check (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16
 /// in all. Per other object: wait-set membership (one per source), Mmio mapping
-/// records (four per Mmio object, whose bodies are SEED-backed), address-space
-/// death observers (a fixed number per address space), SEED leases (bounded by
-/// the SEED reserve), and the destinations IPC transfers' abandoned moves leave
+/// records (four per Mmio object, whose bodies are SEED-backed), SEED leases
+/// (bounded by the SEED reserve), and the destinations IPC transfers' abandoned moves leave
 /// live: a message check refuses once the count is at the ceiling, and
 /// transfers run one at a time under `DERIVATION_LOCK`, so these keep an
 /// object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the ceiling.
@@ -1670,10 +1671,9 @@ unsafe impl Sync for EventQueueObject {}
 
 /// Kernel object for a wait set (`WaitSet` capability).
 ///
-/// `WaitSetState` is the body (at most 440 bytes, asserted in
-/// `ipc/wait_set.rs`) holding member slots and the ready
-/// ring; it lives inline immediately after the 24-byte wrapper within a single
-/// `BIN_512` retype slot.
+/// `WaitSetState` is the body, inline immediately after the 24-byte wrapper,
+/// followed by the caller-sized member slots and ready ring, all in one retype
+/// slot (`cap::retype::wait_set_dispatch`).
 #[repr(C)]
 pub struct WaitSetObject
 {
@@ -2223,32 +2223,34 @@ where
     }
 }
 
-/// Release the `EventQueueObject` reference each populated death observer in
-/// `observers` holds, queueing a queue whose last reference this was on the
-/// cascade stack (its dealloc then runs from the caller's loop, not by
-/// recursion). Called by an owner's teardown (the Thread and `AddressSpace`
-/// arms) once no death walk can read the observers.
+/// Return each death-observer node of the chain starting at `first` to its
+/// queue's pool and release the `EventQueueObject` reference the node held,
+/// queueing a queue whose last reference this was on the cascade stack (its
+/// dealloc then runs from the caller's loop, not by recursion). Called by an
+/// owner's teardown (the Thread and `AddressSpace` arms) with the chain it
+/// took, once no death walk can read it.
+///
+/// # Safety
+/// The caller owns every node of the chain and holds no lock.
 #[cfg(not(test))]
-fn release_death_observers(
-    observers: &[crate::sched::thread::DeathObserver],
+unsafe fn release_death_observers(
+    first: *mut crate::sched::thread::DeathObserver,
     stack: &mut CascadeStack,
 )
 {
-    for observer in observers
-    {
-        let Some(eq) = NonNull::new(observer.eq)
-        else
-        {
-            continue;
-        };
-        // SAFETY: a populated observer owns one reference on its live
-        // EventQueueObject (DeathObserver), consumed here; the header is at
-        // offset 0.
-        if unsafe { eq.as_ref().header.dec_ref() } == 0
-        {
-            // SAFETY: the observer's reference was the queue's last.
-            unsafe { stack.push(eq.cast::<KernelObjectHeader>()) };
-        }
+    // SAFETY: the caller took the chain, so it owns every node; each lives in
+    // its queue, which the node's reference keeps live until the dec_ref
+    // below, issued after the node is back in the pool. A queue at zero has no
+    // capability or binding left, so it is unreferenced for the push.
+    unsafe {
+        crate::sched::thread::for_each_observer(first, |node| {
+            let eq = (*node).eq;
+            crate::ipc::event_queue::event_queue_return_observer((*eq).state, node);
+            if (*eq).header.dec_ref() == 0
+            {
+                stack.push(NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()));
+            }
+        });
     }
 }
 
@@ -2438,15 +2440,17 @@ pub unsafe fn object_for_new_slot(
 /// Tearing an object down releases references it held: its ancestor
 /// `MemoryObject`'s retype lease, a pool donation's lease on its Memory
 /// object, the references a dying `CSpace`'s slots hold, a wait set's
-/// member references, a thread's fault-handler binding, death observers.
-/// Each object one of those releases leaves unreferenced is pushed onto a
-/// [`CascadeStack`] local to this call, linked through the objects' own
-/// headers, and this function tears the stack down, most recent first,
-/// until it is empty. No arm recurses into `dealloc_object`, so the call's
-/// stack use is a constant whatever the fan-out or the depth of the chain
-/// (a `CSpace` holding the last reference to another, a Memory object whose
-/// last child frees it), and no arm runs inside another's lock scope. The
-/// stack is unbounded and allocates nothing
+/// member references, a thread's fault-handler binding, death-observer
+/// nodes' queue references. Each object one of those releases leaves
+/// unreferenced is pushed onto a [`CascadeStack`] local to this call,
+/// linked through the objects' own headers, and this function tears the
+/// stack down, most recent first, until it is empty. No arm recurses into
+/// `dealloc_object`, so the call's stack use is a constant whatever the
+/// fan-out (a caller-sized wait set, a chain of observer nodes, a
+/// `CSpace`'s slots) or the depth of the chain (a `CSpace` holding the last
+/// reference to another, a Memory object whose last child frees it), and no
+/// arm runs inside another's lock scope. The stack is unbounded and
+/// allocates nothing
 /// (core/kernel/docs/capability-internals.md § Teardown).
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
@@ -3151,14 +3155,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // thread runs on no CPU (the gate above), so its death walk is
                 // over or never runs, and no binder can pin it (refcount 0).
                 // SAFETY: tcb valid (not yet freed) and unreachable by any
-                // other path; the array is Copy and read by value.
-                let (observers, count) = unsafe {
-                    let observers = (*tcb).death_observers;
-                    let count = (*tcb).death_observer_count as usize;
-                    (*tcb).death_observer_count = 0;
-                    (observers, count)
-                };
-                release_death_observers(&observers[..count], stack);
+                // other path.
+                let first = unsafe { (*tcb).death_observers.take() };
+                // SAFETY: the chain was just taken; no lock is held here.
+                unsafe { release_death_observers(first, stack) };
 
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
@@ -3380,9 +3380,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // Every bound thread is stopped and off-CPU (above), so no
                 // terminal-fault post can still read them.
                 // SAFETY: as_ptr valid and uniquely owned; death_lock not held.
-                let (observers, count) =
+                let first =
                     unsafe { crate::mm::address_space::AddressSpace::take_death_observers(as_ptr) };
-                release_death_observers(&observers[..count], stack);
+                // SAFETY: the chain was just taken; no lock is held here.
+                unsafe { release_death_observers(first, stack) };
 
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic
@@ -3848,16 +3849,18 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             let obj = unsafe { &*(ptr.as_ptr().cast::<EventQueueObject>()) };
             let state = obj.state;
 
-            // Read the capacity before any drop; it determines how many
-            // bytes belong to the slot (wrapper + state + inline ring).
-            let capacity = if state.is_null()
+            // Read the sizes before any drop; they determine how many bytes
+            // belong to the slot (wrapper + state + inline ring + node pool).
+            // Every node is free by now: a bound node holds a reference on
+            // this queue, which has none left.
+            let (capacity, observers) = if state.is_null()
             {
-                0u32
+                (0u32, 0u32)
             }
             else
             {
                 // SAFETY: state non-null; EventQueueState live.
-                unsafe { (*state).capacity }
+                unsafe { ((*state).capacity, (*state).observer_count) }
             };
 
             if !state.is_null()
@@ -3894,7 +3897,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             );
             use crate::cap::retype::retype_free;
             // The same ABI formula `dispatch_for` debited at creation.
-            let raw_bytes = syscall::event_queue_retype_bytes(u64::from(capacity));
+            let raw_bytes =
+                syscall::event_queue_retype_bytes(u64::from(capacity), u64::from(observers));
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
@@ -3930,22 +3934,31 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ptr points to a WaitSetObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<WaitSetObject>()) };
             let state = obj.state;
+            // Read the capacity before any drop; it sizes the slot.
+            let capacity = if state.is_null()
+            {
+                0
+            }
+            else
+            {
+                // SAFETY: state is the live in-place WaitSetState.
+                unsafe { (*state).capacity() }
+            };
 
             if !state.is_null()
             {
                 // wait_set_drop wakes any blocked waiter, clears every source
                 // back-pointer, and drops the +1 cap-level ref each member
-                // held on its source. Any source whose ref drops to zero is
-                // returned for cascade-reclaim on this stack — performed
-                // here rather than inside `wait_set_drop` so the source
-                // dealloc runs after every source/ws IPC lock has been
-                // released (see scheduling-internals.md § Lock Hierarchy).
-                // SAFETY: state non-null and live.
-                let zeroed = unsafe { crate::ipc::wait_set::wait_set_drop(state) };
-                for entry in zeroed.iter().copied().flatten()
-                {
-                    // SAFETY: the reference just released was its last.
-                    unsafe { stack.push(entry) };
+                // held on its source. A source whose ref drops to zero is
+                // queued on the cascade stack, and so torn down only after
+                // `wait_set_drop` has returned and released every source/ws
+                // IPC lock (see scheduling-internals.md § Lock Hierarchy),
+                // however many members the caller-sized set held.
+                // SAFETY: state non-null and live; each zeroed header has no
+                // capability or membership left, so it is unreferenced for
+                // the push.
+                unsafe {
+                    crate::ipc::wait_set::wait_set_drop(state, |source| stack.push(source));
                 }
             }
 
@@ -3953,9 +3966,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 !ancestor_ptr.is_null(),
                 "WaitSet: every production cap is retype-backed via cap_create_wait_set"
             );
-            use crate::cap::retype::{dispatch_for, retype_free};
-            let raw_bytes = dispatch_for(ObjectType::WaitSet, 0)
-                .map_or(syscall::WAIT_SET_RETYPE_BYTES, |e| e.raw_bytes);
+            use crate::cap::retype::retype_free;
+            // The same ABI formula `wait_set_dispatch` debited at creation.
+            let raw_bytes = syscall::wait_set_retype_bytes(u64::from(capacity));
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
@@ -4405,10 +4418,10 @@ mod tests
         assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
     }
 
-    // Defect guarded: nested CSpaces, which the cascade now queues like any
-    // other object instead of on a separate pending list, are lost or torn
-    // down twice when a CSpace's teardown releases CSpaces whose own teardown
-    // releases further CSpaces and the objects they hold.
+    // Defect guarded: nested CSpaces, which the cascade queues like any other
+    // object, are lost or torn down twice when a CSpace's teardown releases
+    // CSpaces whose own teardown releases further CSpaces and the objects
+    // they hold.
     #[test]
     fn nested_cspaces_released_by_a_dying_cspace_are_torn_down_once()
     {

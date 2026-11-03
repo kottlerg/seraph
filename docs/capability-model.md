@@ -719,7 +719,7 @@ kernel growth path.
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
 retype-rights flag, physical base, and the number of user mappings of its pages (for a
-region of at most 512 pages) for Memory caps; lifecycle state and
+window of at most 512 pages per query) for Memory caps; lifecycle state and
 exit reason for Thread caps; PT growth budget for AddressSpace caps; backed
 slot capacity, slots used, and growth budget for CSpace caps; plus two
 system-wide tagged-TLB diagnostic counters.

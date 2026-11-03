@@ -630,15 +630,18 @@ boundary failure no open Issue for that boundary names), and any HANG or failure
 owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
 
 **Disk variations.** Three svctest boots, on each architecture, vary the disk: a 4Kn disk
-(`mkdisk --block-size 4096`), whose boot runs the firmware from a 4096-byte-block ESP and vfsd's
-GPT discovery, the root self-mount, and the data mount at 4096-byte blocks; the data partition
-alone on a second disk (`mkdisk --split-data`, booted with `--second-disk disk-data.img`), whose
-`/data` mounts only when vfsd's `QUERY_BLOCK_DEVICE` ordinal walk reaches the second disk; and a
-second device at 8192-byte blocks, above virtio-blk's `MAX_BLOCK_SIZE`, whose driver exits in
-its device setup before it reports `DRIVER_READY`, so devmgr serves the first disk alone and
-vfsd's walk ends at ordinal 1 ([xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the
-options). svctest is staged as the canonical cells stage it, and its pass marker passes each
-boot.
+(`mkdisk --block-size 4096`), booted from a 4096-byte-block ESP with its root and data
+partitions at 4096-byte blocks; the data partition alone on a second disk (`mkdisk
+--split-data`, booted with `--second-disk disk-data.img`), so `/data` lives only there; and a
+second disk at 8192-byte blocks (`--second-disk-block-size 8192`), above virtio-blk's
+`MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and device documents own
+what each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
+[device-management.md](device-management.md) § Relationship to Other Services), and
+[xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is staged as the
+canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is the
+larger of three times the slowest local run of this boot (riscv64 svctest, about 129 s) and that
+run plus 100 s, rounded up to a minute, the rule the boundary budgets above follow; a change to
+that run re-derives it.
 
 ```sh
 # Disk variations, per architecture (clean between architectures):

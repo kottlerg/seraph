@@ -440,7 +440,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | FS_WRITE, FS_READ inline payloads | `shared/ipc/src/lib.rs` | 504 B per call | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | Large transfers use the memory verbs (#87) |
 | FS_READ_MEMORY, FS_WRITE_MEMORY | `shared/ipc/src/lib.rs` | one page per call | encoding artefact (one slot cap per reply) | none | correct as is | Callers iterate; batching is a throughput question (#229) |
 | FS_READ_MEMORY release cookie | `shared/ipc/src/lib.rs` | `u64`, client-chosen | ABI width | none | correct as is | None (#530) |
-| QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled once delivered) | none | correct as is | None |
+| QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled) | none | correct as is | None |
 | `blk_labels` partition badges | `shared/ipc/src/lib.rs` | `u64`, one per distinct registered range | ABI width | none | correct as is | None |
 | `INVALID_MEMORY_CAP` byte limit | `shared/ipc/src/lib.rs` | `count * block_size <= u32::MAX` | hardware spec (VirtIO descriptor `u32` length) | none | correct as is | 4 GiB per request |
 | serial, framebuffer and stream byte counts | `shared/ipc/src/lib.rs` | 512 B per call | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | Callers iterate |
@@ -647,10 +647,13 @@ Tracked by [#664](https://github.com/kottlerg/seraph/issues/664).
 | absorb rounds `.min(4)` | `services/devmgr/src/caps.rs` | literal 4 | ABI width (`MSG_CAP_SLOTS_MAX`) | none | correct as is | Use the constant |
 | ACPI table window (`table_window`) | `services/devmgr/firmware/src/acpi.rs` | the table's own pages, clamped to its region | firmware spec (the table's reported length) | VA for one table per read | correct as is | None; the per-process reservation arena bounds it, and a failed reservation is logged |
 | `MAX_DEVICE_INFO_PAYLOAD` | `services/devmgr/src/main.rs` | 64 | encoding artefact (largest payload type 56 B) | 76 B per entry | correct as is | None |
-| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per spawned device) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
+| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per enumerated device given one, spawned or not; never removed) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
 | `device_badge` | `services/devmgr/src/main.rs` | `u64` | provably unreachable | none | correct as is | None |
 | `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
 | virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
+| Settle batch death queue (`SettleBatch::new`) | `services/devmgr/src/settle.rs` | the batch's device count, at most `EVENT_QUEUE_MAX_CAPACITY` = 4096 | ABI width (the kernel's event-queue capacity) | 8 B per driver | correct as is | None; a batch past it spawns no driver of its class, with a log |
+| Settle roster (`Roster`) | `services/devmgr/firmware/src/roster.rs` | growable `Vec` | provably unreachable (one entry per spawned driver of a batch) | about 24 B plus the caller's record per driver | correct as is | None; a driver the roster cannot record is not spawned, with a log |
+| Death-observer correlator | `services/devmgr/src/spawn.rs` | `u32` device badge | ABI width (`SYS_THREAD_BIND_NOTIFICATION`'s `u32` correlator) | none | correct as is | None; a device whose badge exceeds it is not spawned, with a log |
 | One IRQ-bearing driver per INTx line (`IrqRangeAllocator::isolate_one`) | `services/devmgr/src/main.rs` | 1 per GSI (riscv64: 4 swizzled lines) | encoding artefact (a single-line cap is carved once) | none | needs a design | A virtio-blk on a line another device holds is not spawned, with a log (#664) |
 | `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
 | `find_pci_ecams` | `services/devmgr/firmware/src/dtb.rs` | every node | firmware spec (structure block) | 24 B per window | correct as is | None |

@@ -754,11 +754,11 @@ list as the tracking Issues move):
   into the fewest contiguous Memory caps before minting (see
   [process-lifecycle.md § Kernel → init](process-lifecycle.md#kernel--init)), so the descriptor
   count tracks memory-map fragmentation (a small fixed number of usable extents
-  plus reservation holes), not total RAM. The Phase-9 size check now logs the
-  descriptor count, page need, and `INIT_INFO_MAX_PAGES` before fatal-ing, so
-  any residual overflow on a pathologically fragmented map is diagnosable rather
-  than bare. Verified booting clean to the ktest pass marker on both arches at
-  `--mem 4096`.
+  plus reservation holes), not total RAM. The capacity check now runs at Phase 7,
+  where the drain and `push_descriptor` log the count against
+  `INIT_INFO_DESCRIPTOR_CAPACITY` before fatal-ing, so any residual overflow on a
+  pathologically fragmented map is diagnosable rather than bare. Verified booting
+  clean to the ktest pass marker on both arches at `--mem 4096`.
 
 ---
 

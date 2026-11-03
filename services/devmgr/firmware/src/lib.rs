@@ -11,7 +11,9 @@
 //! broker's check) and flattened device trees for the PCI ECAM windows,
 //! computes ECAM register offsets and BAR sizes, walks PCI configuration
 //! space through a caller-supplied accessor, keeps the table of MMIO and
-//! interrupt range caps devmgr carves per-device caps from, tracks which
+//! interrupt range caps devmgr carves per-device caps from, holds the
+//! interrupt lines it has carved so every device on a line gets its own
+//! derivation, tracks which
 //! spawned drivers reported their device ready, and keeps each class's served
 //! drivers by instance ordinal, a withdrawn one's ordinal held by a tombstone.
 //! The functions read caller-mapped byte slices or values, or reach the

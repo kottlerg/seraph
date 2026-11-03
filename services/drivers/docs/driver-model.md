@@ -26,7 +26,15 @@ TODO: specify driver teardown.
    withdraws and destroys a driver that has not reported within its settle bound; see
    [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities.
-5. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
+5. A driver holding an IRQ binding MUST acknowledge each delivery promptly (`SYS_IRQ_ACK`),
+   whether or not it has a request in flight: a line another device may share stays masked until
+   every binding on it has acknowledged, so a driver that acknowledges only inside its request
+   path holds the line masked for every other device on it while it is idle (see
+   [docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
+   § Interrupt Delivery). The VirtIO drivers wait on their service endpoint and IRQ notification
+   together and acknowledge on every wake. The serial driver acknowledges only when its client
+   reads, so devmgr keeps the UART line exclusive.
+6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
 
 ---

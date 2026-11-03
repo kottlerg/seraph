@@ -505,6 +505,10 @@ pub struct BlkRuntime<'a>
     pub queue_notify_off: u16,
     pub irq_notification: u32,
     pub irq_cap: u32,
+    /// The service loop's wait set over the service endpoint and
+    /// `irq_notification`, so an interrupt on the line is acknowledged
+    /// while no request is in flight ([`acknowledge_idle_interrupt`]).
+    pub wait_set: u32,
     /// Un-badged `SEND_GRANT` cap on this driver's service endpoint;
     /// kept so `handle_register_partition` can `cap_derive_badge` per-
     /// partition badged caps from it. The kernel rejects re-badging
@@ -519,6 +523,46 @@ pub struct BlkRuntime<'a>
     /// Set once [`quiesce_device`] has reset the device after a lost
     /// request; every later transfer is answered `DEVICE_FAULT`.
     device_faulted: bool,
+}
+
+/// Wait-set badge of the service endpoint.
+const WS_REQUEST: u64 = 1;
+/// Wait-set badge of the IRQ notification.
+const WS_IRQ: u64 = 2;
+
+/// Create the service loop's wait set over `service_ep` and
+/// `irq_notification`. Returns `None`, logged and with what it created
+/// released, when the set cannot be created or a member cannot be added.
+fn service_wait_set(service_ep: u32, irq_notification: u32) -> Option<u32>
+{
+    let ws =
+        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |slab| {
+            syscall::wait_set_create(slab, 2).ok()
+        })?;
+    if syscall::wait_set_add(ws, service_ep, WS_REQUEST).is_err()
+        || syscall::wait_set_add(ws, irq_notification, WS_IRQ).is_err()
+    {
+        let _ = syscall::cap_delete(ws);
+        return None;
+    }
+    Some(ws)
+}
+
+/// Acknowledge an interrupt that arrived while no request was in flight.
+///
+/// Every binding on a line owes an acknowledgement for each delivery, and
+/// the kernel keeps the line masked until all of them have acknowledged
+/// (docs/device-management.md § Interrupt Delivery), so an idle driver that
+/// left its binding owing would mask the line for every other device on it.
+/// The delivery is this device's or another's; reading the ISR clears this
+/// device's assertion either way, and the next request finds any completion
+/// in the used ring. The notification's bits are taken first, so the wait
+/// set does not report it ready again.
+fn acknowledge_idle_interrupt(rt: &BlkRuntime)
+{
+    let _ = syscall::notification_wait_timeout(rt.irq_notification, 1);
+    let _ = rt.transport.read_isr();
+    let _ = syscall::irq_ack(rt.irq_cap);
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -545,6 +589,25 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
+        // Wait for a request or an interrupt; an interrupt while idle is
+        // acknowledged at once, so this driver never holds a shared line
+        // masked between requests.
+        match syscall::wait_set_wait(rt.wait_set)
+        {
+            Ok(WS_IRQ) =>
+            {
+                guard.on_success();
+                acknowledge_idle_interrupt(rt);
+                continue;
+            }
+            Ok(_) =>
+            {}
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
+        }
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
         {
@@ -1037,12 +1100,24 @@ fn main() -> !
     if caps.service_ep == 0
     {
         std::os::seraph::log!("no service endpoint, entering idle loop");
+        // Drop the IRQ binding: an idle loop never acknowledges, and an
+        // owed acknowledgement would hold a shared line masked.
+        let _ = syscall::cap_delete(irq_cap);
         loop
         {
             let _ = syscall::thread_yield();
         }
     }
 
+    // The service loop waits on the service endpoint and the IRQ
+    // notification together, so it acknowledges every delivery, a request
+    // in flight or not.
+    let Some(wait_set) = service_wait_set(caps.service_ep, irq_notification)
+    else
+    {
+        std::os::seraph::log!("failed to create the service wait set");
+        syscall::thread_exit();
+    };
     let mut rt = BlkRuntime {
         layout: &layout,
         vq: &mut vq,
@@ -1050,6 +1125,7 @@ fn main() -> !
         queue_notify_off,
         irq_notification,
         irq_cap,
+        wait_set,
         service_ep: caps.service_ep,
         partitions: PartitionTable::new(),
         geometry,

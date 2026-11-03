@@ -91,10 +91,13 @@ fn main() -> !
     // every device on it given a derivation.
     let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
 
-    // The UART's own cap on its line (`arch::current::UART_IRQ`); zero on
-    // failure, and the serial driver then degrades to client-side timeout
-    // polling for RX.
-    let uart_irq = irq_range.line_cap(arch::current::UART_IRQ).unwrap_or(0);
+    // The UART line (`arch::current::UART_IRQ`), kept exclusive: the serial
+    // driver acknowledges a delivery only when its client reads, so no other
+    // device may share its line. Zero on failure, and the serial driver then
+    // degrades to client-side timeout polling for RX.
+    let uart_irq = irq_range
+        .exclusive_line(arch::current::UART_IRQ)
+        .unwrap_or(0);
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes, and its index + 1 is the device badge
@@ -982,6 +985,19 @@ impl IrqRangeAllocator
         )
     }
 
+    /// Carve the single-line cap for line `id` off the range for one device
+    /// alone, holding nothing: no later device gets a cap on the line, which
+    /// [`line_cap`](Self::line_cap) then finds not covered. For a line whose
+    /// driver does not acknowledge each delivery promptly (the UART's).
+    ///
+    /// # Errors
+    /// [`CarveError::NotCovered`] when no held range contains the line, any
+    /// other carve error when the split fails.
+    fn exclusive_line(&mut self, id: u32) -> Result<u32, CarveError>
+    {
+        Self::isolate_one(&mut self.ranges, id)
+    }
+
     /// Carve the single-line cap for line `id` off the range table;
     /// [`CarveError::NotCovered`] when no held range contains it.
     fn isolate_one(ranges: &mut SpanTable<u32>, id: u32) -> Result<u32, CarveError>
@@ -1513,8 +1529,8 @@ fn spawn_boot_drivers(
 /// IRQ cap, in BDF order, each from a copy of the boot module and with its
 /// own service endpoint, into the settle `batch`, recording each in
 /// `roster`. A device is skipped, logged, when no module was delivered, its
-/// caps cannot be carved, it gets no IRQ cap (virtio-blk requires one; a
-/// line no held range covers gives none), or its spawn fails.
+/// caps cannot be carved, it gets no IRQ cap (virtio-blk requires one; for
+/// instance, a line no held range covers gives none), or its spawn fails.
 // too_many_arguments: the carve state, the batch's objects, and the roster
 // are each consumed per device.
 #[allow(clippy::too_many_arguments)]

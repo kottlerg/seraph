@@ -173,7 +173,15 @@ derivation of it, so PCI functions that share an `INTx` line are all served
   `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
   signals every bound notification, and completes at the controller. A receiver whose device did
-  not assert reads its device's interrupt status and finds nothing.
+  not assert reads its device's interrupt status and finds nothing. Every receiver MUST
+  acknowledge each delivery promptly, whether or not it has a request in flight: the line stays
+  masked until every binding has acknowledged, so a receiver that acknowledges only while it
+  serves a request of its own holds the line masked for the others on it while it is idle, and
+  their devices' interrupts are lost until it next does. The VirtIO drivers therefore wait on
+  their service endpoint and interrupt notification together and acknowledge on every wake
+  ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md) rule 5).
+  The serial driver acknowledges only when its client reads, so devmgr keeps the UART line
+  exclusive and shares no other device onto it.
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
@@ -257,18 +265,17 @@ devmgr loads driver binaries from one of two places:
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
   driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries
-  also live there; devmgr spawns them only on `devmgr_labels::TEST_SPAWN_ORPHAN` and
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries also
+  live there; devmgr spawns them only on `devmgr_labels::TEST_SPAWN_ORPHAN` and
   `TEST_SPAWN_FAULT_DRIVERS` (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only
-  `devmgr.test` cap carries), so a boot without svctest spawns neither.
-  virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
-  then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
-  critical path. A PCI device devmgr can give no IRQ cap (its line lies outside the Interrupt range
-  devmgr holds) is delivered a bootstrap that names its IRQ slot absent, and its driver polls its
-  queue. Post-handover,
-  svcmgr walks its universal root to `/services/drivers/` and hands devmgr that subtree cap via
-  `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
-  devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
+  `devmgr.test` cap carries), so a boot without svctest spawns neither. virtio-input is
+  PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed then — but its
+  spawn is deferred to this path, since a keyboard is not on the read-the-disk critical path. A PCI
+  device devmgr can give no IRQ cap (for instance, its line lies outside the Interrupt range devmgr
+  holds) is delivered a bootstrap that names its IRQ slot absent, and its driver polls its queue.
+  Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
+  subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
+  the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
   cannot reach outside the drivers subtree). The handshake is specified in
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
@@ -282,10 +289,10 @@ devmgr loads driver binaries from one of two places:
   `QUERY_INPUT_DEVICE` consumer, logs and exits). Before the spawn has run the reply is the same
   `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
   times (the terminal does), while a client with a no-device path treats the first `NO_DEVICE` as
-  terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns
-  the rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the
-  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on
-  the read-the-disk-in-the-first-place critical path.
+  terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the
+  rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the system
+  needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
+  read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

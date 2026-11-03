@@ -103,8 +103,9 @@ VirtIO PCI devices use vendor ID `0x1AF4`. Device IDs:
 devmgr matches discovered devices against its driver binaries by vendor and
 device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
 Every matching device gets its own driver process, in segment, bus, device,
-function order, except a virtio-blk device that gets no IRQ cap (its line
-lies outside the Interrupt range devmgr holds): virtio-blk requires one. A
+function order, except a virtio-blk device that gets no IRQ cap (for
+instance, its line lies outside the Interrupt range devmgr holds):
+virtio-blk requires one. A
 device on a line another device already holds gets an IRQ cap too (step 3).
 Class-based matching is design intent (#165).
 

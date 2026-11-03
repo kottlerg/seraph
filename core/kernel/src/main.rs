@@ -140,9 +140,9 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 // obscure the sequential phase structure without reducing actual complexity.
 // not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
-// similar_names: boot_cpu_count/boot_cpu_ids and kaslr_image_base/kaslr_dm_base
-// copy the BootInfo cpu_count/cpu_ids and kernel_virtual_base/direct_map_base
-// pairs; the shared prefix keeps that provenance visible.
+// similar_names: kaslr_image_base/kaslr_dm_base copy the BootInfo
+// kernel_virtual_base/direct_map_base pair; the shared prefix keeps that
+// provenance visible.
 #[allow(
     clippy::too_many_lines,
     clippy::not_unsafe_ptr_arg_deref,
@@ -174,8 +174,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // Copy all fields needed beyond Phase 3 out of BootInfo now, while the
     // identity mapping is still live. After Phase 3 activates the kernel page
     // tables, the physical address in `info` is no longer mapped.
+    // The CPU ids stay in the BootInfo page, read through the direct map
+    // after Phase 3 (`boot_cpu_ids`); only their count is copied.
     let boot_cpu_count = info.cpu_count.max(1);
-    let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
     // KASLR: copy the status flags and the slid/randomized bases out of the
@@ -295,7 +296,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         kernel_entry_post_rebase(
             boot_info as u64,
             boot_cpu_count,
-            boot_cpu_ids,
             trampoline_pa,
             init_image,
             vmgenid_paddr,
@@ -308,6 +308,23 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // the function must type-check as returning `!`.
     #[cfg(test)]
     arch::current::cpu::halt_loop()
+}
+
+/// The CPU ids `BootInfo` lists, `cpu_ids[..count]`, read in place through the
+/// direct map: the BSP's first, then the APs'.
+///
+/// # Safety
+/// Phase 3 has completed (the direct map is active), `boot_info_phys` is the
+/// `BootInfo` Phase 0 validated (`count <= MAX_CPUS`), its page is not yet
+/// scrubbed, and nothing writes its `cpu_ids` while the slice lives.
+#[cfg(not(test))]
+unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
+{
+    let bi = mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo;
+    // SAFETY: caller contract; the borrow covers `cpu_ids` alone, so a write
+    // elsewhere in the page (the Phase-5 seed scrub) does not alias it.
+    let ids: &[u32; boot_protocol::MAX_CPUS] = unsafe { &*core::ptr::addr_of!((*bi).cpu_ids) };
+    &ids[..(count as usize).min(boot_protocol::MAX_CPUS)]
 }
 
 /// Continuation of [`kernel_entry`] after the boot-stack rebase.
@@ -338,12 +355,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
 // desc_count and info_pages are bounded by the INIT_INFO_MAX_PAGES check
 // (fatal past it); size_of::<InitInfo>() and STACK_PAGES are small constants.
-// large_types_passed_by_value: boot_cpu_ids ([u32; 512] = 2 KiB) and init_image
-// (304 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
-// boundary is what defeats the cross-rebase hoist; the by-value signature is
-// incidental — the ABI passes both via hidden-pointer and emits an explicit
-// memcpy into the callee's stack frame either way. Single boot-path copy;
-// nothing on the hot path.
+// large_types_passed_by_value: init_image (304 B) crosses the
+// by-value/by-reference threshold. The `#[inline(never)]` boundary is what
+// defeats the cross-rebase hoist; the by-value signature is incidental — the
+// ABI passes it via hidden-pointer and emits an explicit memcpy into the
+// callee's stack frame either way. Single boot-path copy; nothing on the hot
+// path.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -357,7 +374,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 unsafe fn kernel_entry_post_rebase(
     boot_info_phys: u64,
     boot_cpu_count: u32,
-    boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
     vmgenid_paddr: u64,
@@ -459,11 +475,11 @@ unsafe fn kernel_entry_post_rebase(
     // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
     // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.
     #[cfg(not(test))]
-    // SAFETY: single-threaded boot; boot_cpu_ids copied from BootInfo above;
-    // init_storage allocated the id slab; init_apic_ids writes it once before
-    // SMP is active.
+    // SAFETY: single-threaded boot; the ids are read from the validated
+    // BootInfo page through the direct map; init_storage allocated the id slab;
+    // init_apic_ids writes it once before SMP is active.
     unsafe {
-        percpu::init_apic_ids(&boot_cpu_ids);
+        percpu::init_apic_ids(boot_cpu_ids(boot_info_phys, boot_cpu_count));
     }
 
     // ── Phase 5: architecture hardware initialization ─────────────────────────
@@ -634,10 +650,13 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 let entry_fn = kernel_entry_ap as *const () as u64;
+                // SAFETY: the BootInfo page is intact until the reclaim scrub at
+                // the end of boot, and nothing writes its CPU ids.
+                let cpu_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
 
                 for cpu_idx in 1..=ap_count
                 {
-                    let hw_id = boot_cpu_ids[cpu_idx];
+                    let hw_id = cpu_ids[cpu_idx];
                     // SAFETY: the idle stacks and their tops slab come from
                     // Phase 4 storage (sched::init_storage), and the idle TCBs
                     // were initialised in Phase 8 (sched::init);

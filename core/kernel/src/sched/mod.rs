@@ -3559,7 +3559,7 @@ unsafe fn mark_bound_threads(
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let mut self_bound = false;
-    let mut prod = [false; MAX_CPUS];
+    let mut prod = crate::cpu_mask::CpuMask::empty();
     // SAFETY: caller contract (no conflicting locks held); the walk body
     // takes only locks ordered after the registry lock and never waits
     // on another CPU.
@@ -3595,17 +3595,18 @@ unsafe fn mark_bound_threads(
             else if let StateCommit::Committed(Some(cpu)) = committed
                 && cpu != this_cpu
             {
-                prod[cpu] = true;
+                prod.set(cpu);
             }
         });
     }
-    for (cpu, hit) in prod.iter().enumerate().take(cpu_count)
+    for cpu in prod.iter()
     {
-        if *hit
-        {
-            // SAFETY: cpu < cpu_count.
-            unsafe { prod_remote_cpu(cpu) };
-        }
+        debug_assert!(
+            cpu < cpu_count,
+            "mark_bound_threads: a thread runs past cpu_count"
+        );
+        // SAFETY: cpu < cpu_count: a thread is current only on a started CPU.
+        unsafe { prod_remote_cpu(cpu) };
     }
     self_bound
 }

@@ -425,9 +425,10 @@ changed line that names one of these items as a whole identifier or lies within 
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
   `discover_boot_hart_id` and `bsp_hardware_id` (the source of the BSP id that becomes
   `cpu_ids[0]`), and the handoff of the count and the CPU ids into `BootInfo` (`cpus.count` and
-  `cpus.cpu_ids`); in the kernel, the boot CPU count and ids (`info.cpu_count`, `info.cpu_ids`,
-  `boot_cpu_count`, and `boot_cpu_ids`), `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every
-  `init_ap`, and the `init_ap_*` per-CPU storage initialisers;
+  `cpus.cpu_ids`); in the kernel, the boot CPU count and ids (`info.cpu_count`,
+  `boot_cpu_count`, and `boot_cpu_ids`, which reads the ids in place), `start_ap`,
+  `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the `init_ap_*` per-CPU storage
+  initialisers;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
@@ -469,7 +470,7 @@ S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|ini
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
-S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
+S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"

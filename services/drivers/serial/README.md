@@ -175,4 +175,7 @@ implemented.
 ## Summarized By
 
 [Console Model](../../../docs/console-model.md),
-[programs/terminal/README.md](../../../programs/terminal/README.md)
+[Device Management](../../../docs/device-management.md),
+[programs/terminal/README.md](../../../programs/terminal/README.md),
+[devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
+[Driver Model](../docs/driver-model.md)

@@ -683,17 +683,20 @@ Any other HANG or failure of a run the PR does not owe (a memory-variation HANG 
 boundary failure no open Issue for that boundary names), and any HANG or failure of a run the PR
 owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
 
-**Disk variations.** Three svctest boots, on each architecture, vary the disk: a 4Kn disk
-(`mkdisk --block-size 4096`), booted from a 4096-byte-block ESP with its root and data
-partitions at 4096-byte blocks; the data partition alone on a second disk (`mkdisk
---split-data`, booted with `--second-disk disk-data.img`), so `/data` lives only there; and a
-second disk at 8192-byte blocks (`--second-disk-block-size 8192`), above virtio-blk's
-`MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and device documents own
-what each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
-[device-management.md](device-management.md) § Relationship to Other Services), and
-[xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is staged as the
-canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is the
-larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
+**Disk variations.** Four svctest boots, on each architecture, vary the disk: a 4Kn disk (`mkdisk
+--block-size 4096`), booted from a 4096-byte-block ESP with its root and data partitions at
+4096-byte blocks; the data partition alone on a second disk (`mkdisk --split-data`, booted with
+`--second-disk disk-data.img`), so `/data` lives only there; the same second disk on the first
+disk's `INTx` line (`--second-disk-shared-line`), so the svctest phases that read `/data` pass only
+when devmgr serves both virtio-blk devices on one line (a lost interrupt costs a disk request its
+driver's timed poll, not the boot, so the boot's time, not its outcome, shows whether both drivers
+acknowledge every delivery); and a second disk at 8192-byte blocks (`--second-disk-block-size
+8192`), above virtio-blk's `MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and
+device documents own what each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
+[device-management.md](device-management.md) § Relationship to Other Services and § Interrupt
+Delivery), and [xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is
+staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is
+the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
 boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
 follow; a change to that boot re-derives it.
 
@@ -708,6 +711,8 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
     --second-disk disk-data.img
+cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+    --second-disk disk-data.img --second-disk-shared-line
 cargo xtask mkdisk --arch <arch> --repack-only
 cp disk.img target/xtask/second-disk.img
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \

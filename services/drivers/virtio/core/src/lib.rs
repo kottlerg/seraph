@@ -8,8 +8,9 @@
 //! Provides the modern PCI transport, virtqueue management, device negotiation,
 //! the startup message format used by devmgr to pass PCI capability info
 //! to `VirtIO` drivers, the register layout by which a driver maps every BAR
-//! the register regions name ([`RegisterLayout`]), and the devmgr-to-driver
-//! bootstrap rounds ([`bootstrap`]).
+//! the register regions name ([`RegisterLayout`]), the devmgr-to-driver
+//! bootstrap rounds ([`bootstrap`]), and the interrupt-service loop each driver
+//! runs on a thread of its own ([`isr`]).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -18,6 +19,7 @@ extern crate alloc;
 use syscall_abi::PAGE_SIZE;
 
 pub mod bootstrap;
+pub mod isr;
 pub mod pci;
 pub mod virtqueue;
 

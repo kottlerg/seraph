@@ -72,7 +72,7 @@ or stamped for a different architecture.
 ```
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
     [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
-    [--second-disk PATH [--second-disk-block-size BYTES]]
+    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]]
 ```
 
 | Option | Description |
@@ -87,6 +87,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--x86-paging` | Guest x86-64 paging depth (default: `4`; x86_64 only, ignored on riscv64). Appends `la57=off` (`4`) or `la57=on` (`5`) to the QEMU `-cpu` model on every accelerator, which sets the CPUID LA57 bit the bootloader negotiates the depth from ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57`, per [docs/memory-model.md](../docs/memory-model.md) § x86-64. The default pins `4` because TCG's `-cpu max` otherwise advertises LA57. `5` on a native accelerator (KVM, HVF, WHPX, NVMM) whose host CPU lacks LA57 fails before launch, naming the TCG route (`SERAPH_ACCEL=tcg`), since QEMU would drop the property with a warning and boot 4-level |
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
+| `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -126,10 +127,12 @@ launcher (`run`, `run-parallel`, and the `test-*` runners) does the same. `run` 
 `run-parallel` attach `--second-disk` as a second `virtio-blk-pci` device on drive `hd1`, at its
 own image's block size unless `--second-disk-block-size` sets it. A two-disk launch pins the
 disks to PCI slots `0x10` and `0x12`, which OVMF (x86-64) and the `virt` host bridge (riscv64)
-route to distinct `INTx` lines, since devmgr does not serve a disk on a line another device
-already holds ([docs/device-management.md](../docs/device-management.md) § Relationship to Other
-Services). OVMF routes every x86-64 PCI slot to one of two lines, so in a two-disk x86-64 boot
-the keyboard, which devmgr serves after the disks, gets no line of its own.
+route to distinct `INTx` lines, so each disk has a line of its own. With
+`--second-disk-shared-line` the second disk sits at slot `0x14` instead, which both machines route
+to the first disk's line, so the two disks share one line
+([docs/device-management.md](../docs/device-management.md) § Interrupt Delivery). OVMF routes
+every x86-64 PCI slot to one of two lines, so in a two-disk x86-64 boot the keyboard shares a
+line with a disk.
 
 #### Environment variables
 
@@ -334,7 +337,7 @@ cargo xtask run-parallel \
     [--mem MIB] \
     [--riscv-mmu sv39|sv48|sv57] \
     [--x86-paging 4|5] \
-    [--second-disk PATH [--second-disk-block-size BYTES]] \
+    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-grace-secs SECONDS] \
@@ -355,6 +358,7 @@ cargo xtask run-parallel \
 | `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
 | `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
 | `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
+| `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |

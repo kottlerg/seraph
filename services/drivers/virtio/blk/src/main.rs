@@ -503,8 +503,10 @@ pub struct BlkRuntime<'a>
     pub vq: &'a mut SplitVirtqueue,
     pub transport: &'a PciTransport,
     pub queue_notify_off: u16,
-    pub irq_notification: u32,
-    pub irq_cap: u32,
+    /// Notification the interrupt-service thread signals after each
+    /// delivery it acknowledged and each interrupt its timed ISR read finds
+    /// ([`start_isr_thread`]); the request path waits on it.
+    pub completion: u32,
     /// Un-badged `SEND_GRANT` cap on this driver's service endpoint;
     /// kept so `handle_register_partition` can `cap_derive_badge` per-
     /// partition badged caps from it. The kernel rejects re-badging
@@ -519,6 +521,48 @@ pub struct BlkRuntime<'a>
     /// Set once [`quiesce_device`] has reset the device after a lost
     /// request; every later transfer is answered `DEVICE_FAULT`.
     device_faulted: bool,
+}
+
+/// Start the interrupt-service thread, which runs
+/// [`virtio_core::isr::serve_interrupts`] over `irq_notification`, the
+/// notification bound to the device's line: it acknowledges every delivery
+/// at once, a request in flight or not, and signals `completion` for the
+/// request path. Returns whether the thread started.
+fn start_isr_thread(
+    transport: PciTransport,
+    irq_notification: u32,
+    irq_cap: u32,
+    completion: u32,
+) -> bool
+{
+    std::thread::Builder::new()
+        .spawn(move || {
+            virtio_core::isr::serve_interrupts(
+                &transport,
+                irq_notification,
+                irq_cap,
+                completion,
+                isr_diag,
+            )
+        })
+        .is_ok()
+}
+
+/// Diagnostic hook of the interrupt-service loop's `RecvGuard`: one line at
+/// the start of a failure streak, one more before the fatal exit.
+fn isr_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("interrupt wait failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("interrupt wait wedged (err={err}); exiting");
+        }
+    }
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -693,8 +737,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
-        rt.irq_notification,
-        rt.irq_cap,
+        rt.completion,
     );
     if outcome == IoOutcome::Lost
     {
@@ -1016,15 +1059,36 @@ fn main() -> !
         std::os::seraph::log!("failed to create IRQ notification");
         syscall::thread_exit();
     };
+    let Some(completion) =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+    else
+    {
+        std::os::seraph::log!("failed to create the completion notification");
+        syscall::thread_exit();
+    };
     if syscall::irq_register(caps.irq_slot, irq_notification).is_err()
     {
         std::os::seraph::log!("irq_register failed");
         syscall::thread_exit();
     }
+    // The interrupt-service thread acknowledges every delivery from here on,
+    // a request in flight or not, so this driver never holds a shared line
+    // masked. Its transport is a copy over the same register window.
+    if !start_isr_thread(
+        PciTransport::new(window_va, &layout),
+        irq_notification,
+        caps.irq_slot,
+        completion,
+    )
+    {
+        std::os::seraph::log!("failed to start the interrupt-service thread");
+        syscall::thread_exit();
+    }
     // Unmask the interrupt at the controller (IOAPIC/PLIC).
     // irq_register leaves the entry masked; the first irq_ack unmasks it.
     let _ = syscall::irq_ack(caps.irq_slot);
-    let irq_cap = caps.irq_slot;
 
     // Set up I/O buffer (driver-owned page hosting request header at offset
     // 0 and status byte at offset 1024). Data segments live in caller-supplied
@@ -1048,8 +1112,7 @@ fn main() -> !
         vq: &mut vq,
         transport: &transport,
         queue_notify_off,
-        irq_notification,
-        irq_cap,
+        completion,
         service_ep: caps.service_ep,
         partitions: PartitionTable::new(),
         geometry,

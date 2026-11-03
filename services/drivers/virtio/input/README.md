@@ -26,10 +26,10 @@ virtio/input/
 ## Endpoint
 
 Devmgr enumerates the virtio-input PCI device, carves its per-device capabilities (an
-`Mmio` cap for every BAR its VirtIO register regions name, and an IRQ unless the device
-shares an `INTx` line), and spawns this driver from the rootfs
-(`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads lazily
-through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
+`Mmio` cap for every BAR its VirtIO register regions name, and its own derivation of its
+line's `Interrupt` cap, a line another device shares included), and spawns this driver from
+the rootfs (`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads
+lazily through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
 [docs/device-management.md](../../../../docs/device-management.md)). The driver
 reports `DRIVER_READY` on its devmgr query endpoint once its device is set up,
 immediately before its service loop, and devmgr serves its endpoint only after that
@@ -85,9 +85,15 @@ The driver owns one DMA page of 8-byte event buffers posted to the eventq
 (virtqueue 0) as device-writable descriptors. The device fills one event per
 buffer as keys arrive and raises an interrupt; the driver drains the used ring,
 decodes, and re-posts each buffer. A descriptor-head → buffer-slot map locates
-the filled buffer on completion. The IRQ wait carries a bounded timeout and
-re-drains each tick, so the read still completes with no IRQ cap and tolerates
-the occasional lost PLIC interrupt on QEMU virt RISC-V.
+the filled buffer on completion. With an IRQ cap, an interrupt-service thread
+is the only waiter on the notification bound to the device's line: it runs
+virtio-core's `isr::serve_interrupts`, which reads the ISR and acknowledges
+every delivery at once, a read in flight or not, as a driver on a shared line
+must ([driver-model.md](../../docs/driver-model.md) rule 5), reads the ISR on a
+bounded timeout too, and signals the read loop's `wake` notification. The read
+loop's wait on `wake` carries a bounded timeout and re-drains each tick, so the
+read still completes with no IRQ cap and tolerates a lost interrupt (a lost
+PLIC interrupt on QEMU virt RISC-V, or an edge the x86-64 I/O APIC drops).
 
 ---
 

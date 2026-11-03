@@ -460,8 +460,8 @@ pub const SPIN_SITE_REGS_SETTLE: u32 = 8;
 /// target that left its CPU before the commit publishes its save.
 pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 /// IRQ route drain: spinning, under the IRQ routing lock, until every
-/// device-IRQ delivery in flight through a route a change just replaced or
-/// cleared has finished (`irq::register`, `irq::unregister`, and the
+/// device-IRQ delivery in flight on a line a change just unbound or rebound
+/// has finished (`irq::register`, `irq::unregister`, and the
 /// Notification dealloc arm's `irq::unregister_notification`).
 pub const SPIN_SITE_IRQ_ROUTE_DRAIN: u32 = 10;
 

@@ -174,6 +174,19 @@ The holder binds a Notification to the line with `SYS_IRQ_REGISTER`; each interr
 ORs bit 0 into that Notification, and the holder re-enables the line with
 `SYS_IRQ_ACK`.
 
+Every Interrupt capability references an object of its own, as for [Mmio](#mmio): a copy or
+derivation references a fresh object over the same range, bounded the same way, and that object
+carries the capability's binding of its line. Register and acknowledge act on the binding of the
+capability's own object, so several capabilities to one line are each a binding: every
+interrupt signals each bound Notification, and the line is re-enabled only once every binding has
+acknowledged. A line holds at most 64 bindings, and a further registration returns
+`QuotaExceeded`. When an Interrupt capability goes (deleted, consumed by a split, or revoked
+through an ancestor), its object is freed and its binding removed, while the other capabilities'
+bindings to the line stay; a line whose remaining bindings owe no acknowledgement is re-enabled
+then, so a receiver that goes cannot hold a shared line masked. The binding semantics are
+specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IRQ_REGISTER`
+and § `SYS_IRQ_ACK`.
+
 The kernel mints one root Interrupt range capability at boot that covers every IRQ id on the
 architecture and places it in init's CSpace. Init keeps the root and hands devmgr a full-rights
 derivation, from which devmgr splits single-line children with `SYS_IRQ_SPLIT` for the drivers.
@@ -382,8 +395,9 @@ source are dropped, never granted.
 
 Capabilities may be derived: a new capability slot is created referencing the same
 underlying object, with equal or fewer rights. The original is retained. Both slots
-now reference the object independently. An Mmio or IoPort capability is the exception: its
-derivation or copy references a fresh object over the same range (see [Mmio](#mmio)).
+now reference the object independently. An Mmio, IoPort, or Interrupt capability is the
+exception: its derivation or copy references a fresh object over the same range (see
+[Mmio](#mmio)).
 
 The kernel maintains a **derivation tree** tracking parent/child relationships between
 capability slots across all processes, enabling correct revocation.
@@ -600,7 +614,7 @@ capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
 against Memory caps it holds with `Retype` rights. The exceptions are
 the objects the kernel carves from its own SEED reserve on a process's
-behalf: range-split children, Mmio and IoPort copies (bounded per range
+behalf: range-split children, Mmio, IoPort, and Interrupt copies (bounded per range
 lineage, see [Mmio](#mmio)), and per-thread port-binding tables.
 
 Kernel objects and user mappings never share a page, in either order. A Memory capability
@@ -801,11 +815,11 @@ effect, and is posted, only if the thread is started again (see
 
 procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
 just the main thread — drives procmgr's teardown of the whole process. A worker's fault fails to
-drive that teardown at once only when procmgr's full death queue drops its post: procmgr recovers
+drive that teardown at once only when a full procmgr death queue drops its post: procmgr recovers
 the main-thread deaths it missed from the kernel's thread states, but no kernel state reports an
 address space's terminal fault, so that process is torn down when its main thread exits
 ([#666](https://github.com/kottlerg/seraph/issues/666); see
-[services/procmgr/README.md](../services/procmgr/README.md) § Process table and death queue).
+[services/procmgr/README.md](../services/procmgr/README.md) § Process table and death queues).
 Normal thread exit does not fire these observers.
 
 ---

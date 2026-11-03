@@ -41,6 +41,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::death_queues::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_PHYS_BASE, MSG_CAP_SLOTS_MAX};
@@ -238,7 +239,7 @@ fn refuse(refusal: Refusal, caps: &[u32], ipc_buf: *mut u64)
 /// accepted, and only before the reap.
 /// On the first round, binds death-EQ observers on both init threads (main +
 /// init-logd) with `INIT_REAP_CORRELATOR`.
-pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
+pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &DeathSet)
 {
     let caps = req.caps();
     let is_first = req.word(0) != 0;
@@ -271,18 +272,12 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
     // correlator. Both are alive at this point (init's main is mid-handoff;
     // init-logd is still serving the log endpoint), so neither bind lands
     // on an already-exited thread. The reap waits for both.
-    if syscall::thread_bind_notification(
-        main_thread,
-        death_eq,
-        u64::from(procmgr_labels::INIT_REAP_CORRELATOR),
-    )
-    .is_err()
-        || syscall::thread_bind_notification(
-            logd_thread,
-            death_eq,
-            u64::from(procmgr_labels::INIT_REAP_CORRELATOR),
-        )
+    if deaths
+        .bind_thread(main_thread, procmgr_labels::INIT_REAP_CORRELATOR)
         .is_err()
+        || deaths
+            .bind_thread(logd_thread, procmgr_labels::INIT_REAP_CORRELATOR)
+            .is_err()
     {
         std::os::seraph::log!("init-reap: thread_bind_notification failed; refusing handoff");
         refuse(Refusal::Invalid(CapDisposition::Keep), caps, ipc_buf);

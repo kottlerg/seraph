@@ -152,18 +152,50 @@ that cap's address.
 
 ## Interrupt Delivery
 
-A driver receives a wired interrupt line as a single-line `Interrupt` cap that devmgr splits
-from the root range, and binds it to a Notification with `SYS_IRQ_REGISTER`. A line routes to one
-notification at a time: devmgr delegates a private cap only for a line no other device holds. A
-driver that accepts a round without one (virtio-input) polls, and a virtio-blk disk on a line
-another device holds is not served (§ Relationship to Other Services); serving shared lines is an
-open design ([#664](https://github.com/kottlerg/seraph/issues/664)), and devices that need
-several interrupts are to get message-signaled ones (design intent, not yet implemented;
-[#325](https://github.com/kottlerg/seraph/issues/325)). The kernel delivers each registered line
-to one CPU, chosen when the line is registered by taking the CPUs in turn, so the interrupts of
-several devices spread over the CPUs. On x86-64 only CPUs whose APIC id an I/O APIC can name
-(below `0xFF`, the broadcast id) take part. The mechanism is specified in
-[core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
+Implementation status: the kernel's binding mechanism below is implemented; devmgr's sharing of a
+line among the devices on it, and the x86-64 trigger and polarity word, are design intent, not yet
+implemented ([#664](https://github.com/kottlerg/seraph/issues/664)). Today devmgr delegates a line
+to one device only.
+
+A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
+Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
+`MAX_IRQ_BINDINGS` (64) bindings, one per bound Interrupt object; a copy or derivation of an
+Interrupt cap references a fresh object over the same line, so every capability to a line is a
+binding of its own. devmgr is to split each line once from its range and hand every driver on the
+line, the first included, a derivation of that cap, so PCI functions that share an `INTx` line are
+all served (design intent, not yet implemented).
+
+- **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
+  routes it at its controller, and every new binding masks the line and owes an acknowledgement,
+  so the line stays masked until the new receiver's first `SYS_IRQ_ACK`. Through a bound object
+  it rebinds that binding to the new notification. A binding past the bound is refused with
+  `QuotaExceeded`.
+- **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
+  signals every bound notification, and completes at the controller. A receiver whose device did
+  not assert reads its device's interrupt status and finds nothing.
+- **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
+  binding owes one; a repeated acknowledgement changes nothing.
+- **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
+  or torn down with its holder's CSpace) or its Notification is; the line is unmasked when the
+  remaining bindings owe nothing, and released at its controller when none remains.
+
+The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
+§ `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the PLIC gateway is level-sensitive, so an
+assertion that persists while the line is masked is delivered at the unmask. On x86-64 the I/O
+APIC entries are programmed edge-triggered, active-high (core/kernel/src/arch/x86_64/ioapic.rs),
+and on a shared level-triggered line an assertion while the line is masked or another device holds
+it high raises no new edge, so its receiver is not signalled until the line interrupts again; a
+driver's timed poll then finds its completion (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
+`POLL_INTERVAL_MS`), so the loss is latency, not a hang. That is the x86-64 limit until
+`SYS_IRQ_REGISTER` takes a trigger and polarity word, which devmgr sets to level, active-low for
+PCI `INTx` (design intent, not yet implemented). Devices that need several interrupts are to get
+message-signaled ones (design intent, not yet implemented;
+[#325](https://github.com/kottlerg/seraph/issues/325)), as further sources beside the wired ones.
+The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
+CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose
+APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. The mechanism is
+specified in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md)
+§ `interrupts`.
 
 ---
 
@@ -265,4 +297,4 @@ specified in [`docs/storage.md`](storage.md).
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
-[services/vfsd/README.md](../services/vfsd/README.md)
+[services/vfsd/README.md](../services/vfsd/README.md), [xtask/README.md](../xtask/README.md)

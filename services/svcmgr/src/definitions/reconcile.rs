@@ -87,12 +87,11 @@ impl ServiceTable
 
     /// Reserve the next slot, inactive, and return its index and the death
     /// correlator that names it. `None`, changing nothing, when the heap
-    /// cannot grow either vector or the index does not fit the 32-bit
-    /// correlator svcmgr binds.
-    fn reserve(&mut self) -> Option<(usize, u32)>
+    /// cannot grow either vector.
+    fn reserve(&mut self) -> Option<(usize, u64)>
     {
         let idx = self.services.len();
-        let correlator = u32::try_from(idx).ok()?;
+        let correlator = u64::try_from(idx).ok()?;
         self.services.try_reserve(1).ok()?;
         self.recipes.try_reserve(1).ok()?;
         self.services.push(ServiceEntry::empty());
@@ -113,7 +112,6 @@ impl ServiceTable
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
-    deaths_eq: u32,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
 )
@@ -228,7 +226,7 @@ pub fn reconcile_and_launch(
 
     for def in &defs
     {
-        handle_definition(def, pending, table, deaths_eq, ctx, registry);
+        handle_definition(def, pending, table, ctx, registry);
     }
 
     report_orphans(pending);
@@ -239,7 +237,6 @@ fn handle_definition(
     def: &Definition,
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
-    deaths_eq: u32,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
 )
@@ -257,7 +254,7 @@ fn handle_definition(
         // `restart::restart_process`. Bind happens after the fact (the
         // thread has been running since its bootstrap spawn); `bind_only`
         // states why a death in that window is still delivered.
-        bind_only(def, slot.thread_cap, table, deaths_eq);
+        bind_only(def, slot.thread_cap, table, &ctx.deaths);
         return;
     }
 
@@ -320,7 +317,7 @@ fn handle_definition(
         return;
     };
 
-    let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))
+    let Some(launched) = launch::launch(def, ctx, registry, Some(correlator))
     else
     {
         log!("svcmgr: launch failed: {}", def.name);
@@ -342,9 +339,14 @@ fn handle_definition(
 /// Race-free despite binding after the thread was started: the kernel
 /// retains a thread's `exit_reason` past death and `thread_bind_notification`
 /// serialises on the thread's `sched_lock`. A death in the window between
-/// init's spawn and this bind is therefore delivered to `deaths_eq` when the
+/// init's spawn and this bind is therefore delivered to the death queues when the
 /// bind lands on the already-exited thread, not dropped (#106 Window 2).
-fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths_eq: u32)
+fn bind_only(
+    def: &Definition,
+    thread_cap: u32,
+    table: &mut ServiceTable,
+    deaths: &crate::death_queues::DeathSet,
+)
 {
     let Some((idx, correlator)) = table.reserve()
     else
@@ -366,7 +368,7 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     };
-    if syscall::thread_bind_notification(thread_cap, deaths_eq, u64::from(correlator)).is_err()
+    if deaths.bind_thread(thread_cap, correlator).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);

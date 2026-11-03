@@ -4,7 +4,8 @@ Test fixture that proves a line written to a child's piped stdin comes back on i
 uses only `std::io` and has no Seraph capability awareness. Its per-program tester, which `usertest`
 discovers at `/tests/programs/stdiotest`, drives it; the
 [`svctest`](../../services/svctest/README.md) `pipes` phase
-([pipes.rs](../../services/svctest/src/phases/pipes.rs)) spawns it directly; and the
+([pipes.rs](../../services/svctest/src/phases/pipes.rs)) and `death_queue_growth` phase
+([procmgr.rs](../../services/svctest/src/phases/procmgr.rs)) spawn it directly; and the
 [shell](../shell/README.md) per-program tester runs it through `/programs/shell` to prove stdin
 forwarding. Nothing starts it automatically on a normal boot.
 

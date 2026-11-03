@@ -70,7 +70,8 @@ or stamped for a different architecture.
 
 ```
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
-    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
+    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
+    [--second-disk PATH [--second-disk-block-size BYTES]]
 ```
 
 | Option | Description |
@@ -83,6 +84,8 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--mem` | Guest memory size in MiB (default: `512`) |
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 | `--x86-paging` | Guest x86-64 paging depth (default: `4`; x86_64 only, ignored on riscv64). Appends `la57=off` (`4`) or `la57=on` (`5`) to the QEMU `-cpu` model on every accelerator, which sets the CPUID LA57 bit the bootloader negotiates the depth from ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57`, per [docs/memory-model.md](../docs/memory-model.md) § x86-64. The default pins `4` because TCG's `-cpu max` otherwise advertises LA57. `5` on a native accelerator (KVM, HVF, WHPX, NVMM) whose host CPU lacks LA57 fails before launch, naming the TCG route (`SERAPH_ACCEL=tcg`), since QEMU would drop the property with a warning and boot 4-level |
+| `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
+| `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -105,7 +108,7 @@ is a superset that `xtask` does not expose (see
 
 #### Attached devices
 
-Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci`, a
+Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci` (drive `hd0`), a
 `virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over
 QMP), a `virtio-rng-pci` boot-entropy source, and the guest UART on `-serial stdio`. On
 x86-64 it also attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
@@ -114,6 +117,18 @@ x86-64 it also attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID d
 q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair,
 added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
 adapter, so no framebuffer is advertised.
+
+The disk device presents the logical block size of the image it boots, 512 or 4096 bytes
+(`logical_block_size` and `physical_block_size`), read from the LBA its GPT header sits at, so a
+4Kn image from `mkdisk --block-size 4096` boots as a 4Kn disk with no launch option; every
+launcher (`run`, `run-parallel`, and the `test-*` runners) does the same. `run` and
+`run-parallel` attach `--second-disk` as a second `virtio-blk-pci` device on drive `hd1`, at its
+own image's block size unless `--second-disk-block-size` sets it. A two-disk launch pins the
+disks to PCI slots `0x10` and `0x12`, which OVMF (x86-64) and the `virt` host bridge (riscv64)
+route to distinct `INTx` lines, since devmgr does not serve a disk on a line another device
+already holds ([docs/device-management.md](../docs/device-management.md) § Relationship to Other
+Services). OVMF routes every x86-64 PCI slot to one of two lines, so in a two-disk x86-64 boot
+the keyboard, which devmgr serves after the disks, gets no line of its own.
 
 #### Environment variables
 
@@ -170,16 +185,25 @@ harness).
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
 excluding `esp/` and `data/`), and an arch-neutral `SERAPH_DATA`
 partition (from `sysroot/data/`). The data partition is authored
-unconditionally — there is no flag to toggle it. vfsd auto-mounts it at
-`/data`; the data tree lives only on this partition, not on root.
+unconditionally; `mkdisk --split-data` authors it alone on a second image,
+`disk-data.img` beside `disk.img`, which then carries the other two, for a
+boot that attaches the pair (`run --second-disk disk-data.img`), and every
+other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
+the data partition at `/data`, on whichever disk holds it; the data tree
+lives only on this partition, not on root.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
 so a dedicated partition is a disk-authoring choice — the in-tree image
 uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID Discovery.)
-This applies to `build`, `mkdisk`, and
-`compose-bundle` alike.
+The images' logical block size, the unit of their GPT LBAs and the sector
+size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
+`mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
+author the partitions above; `build`, `compose-bundle`, and `test-kaslr`
+author them at 512 bytes on a single image, so a 4Kn or split boot runs
+`mkdisk` after them.
 
 ```
-cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr]
+cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
+    [--block-size 512|4096] [--split-data]
 ```
 
 | Option | Default | Description |
@@ -187,6 +211,8 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr]
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
+| `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
+| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`; omit to author all three on `disk.img` and remove a stale `disk-data.img` |
 
 Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
 recipe; a plain repack would prune it):
@@ -195,6 +221,16 @@ recipe; a plain repack would prune it):
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only --arch x86_64
 cargo xtask run --arch x86_64
+```
+
+Example — boot the staged svctest set from a 4Kn disk, then with the data
+partition on a second disk:
+
+```sh
+cargo xtask mkdisk --repack-only --block-size 4096
+cargo xtask run --arch x86_64
+cargo xtask mkdisk --repack-only --split-data
+cargo xtask run --arch x86_64 --second-disk disk-data.img
 ```
 
 See [docs/testing.md](../docs/testing.md) for the test-harness gating
@@ -253,7 +289,8 @@ single-component build does not re-compose the bundle); see
 
 ### `cargo xtask clean`
 
-Remove the sysroot and the disk image `disk.img` (and optionally `target/`).
+Remove the sysroot and the disk images `disk.img` and `disk-data.img` (and optionally
+`target/`).
 
 ```
 cargo xtask clean [--all]
@@ -296,6 +333,7 @@ cargo xtask run-parallel \
     [--mem MIB] \
     [--riscv-mmu sv39|sv48|sv57] \
     [--x86-paging 4|5] \
+    [--second-disk PATH [--second-disk-block-size BYTES]] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-grace-secs SECONDS] \
@@ -314,6 +352,8 @@ cargo xtask run-parallel \
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
+| `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
+| `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
@@ -400,16 +440,15 @@ the kernel's timer started, the stamp the kernel console prints too. A cell runs
 `ktest: RUN <name>` (Tier 1) or `ktest: <name> starting` (Tier 2, Tier S) line to its
 `ktest: PASS <name>` or `ktest: FAIL <name>` line; a cell whose log ends before its end line is
 `unfinished` and runs to the log's last stamp of any kind (a watchdog dump included), which locates
-a HANG. Kernel
-output can share a serial line with a ktest line, since ktest writes its stamp, its message, and
-the newline separately, and its UART writes take no lock the kernel console shares, so kernel
-output can also land inside a message: a ktest message ends where the next stamp begins, a
-`ktest: ` line whose stamp a kernel line took takes the latest stamp before it, and a cell whose
-end line the output broke up is `end-lost` when ktest goes on (a later cell, tier marker, or
-summary follows; ktest runs its cells one at a time), its time running to that line, an upper
-bound. A tier runs from its `ktest: --- Tier <id>: ... ---` marker to the next marker or the
-`ktest: passed=` summary. A name logged twice is matched by occurrence (`<name> #2`). The width
-is read from the kernel's `scheduler initialised, N CPUs` line and the architecture from its
+a HANG. Kernel output can share a serial line with a ktest line, since ktest writes its stamp, its
+message, and the newline separately, and its UART writes take no lock the kernel console shares, so
+kernel output can also land inside a message: a ktest message ends where the next stamp begins, a
+`ktest: ` line whose stamp a kernel line took takes the latest stamp before it, and a cell whose end
+line the output broke up is `end-lost` when ktest goes on (a later cell, tier marker, or summary
+follows; ktest runs its cells one at a time), its time running to that line, an upper bound. A tier
+runs from its `ktest: --- Tier <id>: ... ---` marker to the next marker or the `ktest: passed=`
+summary. A name logged twice is matched by occurrence (`<name> #2`). The width is read from the
+kernel's `scheduler initialised, N CPUs` line and the architecture from its
 `Seraph kernel v<version> (<arch>)` banner, each else from the trailer, which also gives the host
 wall time.
 

@@ -2027,17 +2027,20 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 
 /// Bind `notification_cap` to receive notifications when `irq_cap`'s interrupt fires.
 ///
-/// After registration the IRQ is masked until the first `irq_ack`. The driver
-/// must call `irq_ack` after servicing each interrupt to re-enable delivery.
+/// The binding is `irq_cap`'s own: each copy of an Interrupt cap binds on its own,
+/// so several drivers sharing a line each register and are each signalled, and
+/// registering again through the same cap rebinds it to the new notification.
+/// After registration the IRQ is masked until this binding's first `irq_ack`. The
+/// driver must call `irq_ack` after servicing each interrupt to re-enable delivery.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
 /// names an id no discovered interrupt controller implements (a GSI no I/O APIC
 /// reports on x86-64, a source past the PLIC's `riscv,ndev` on RISC-V), or
-/// `QuotaExceeded` when the controller has no delivery resource left (x86-64:
-/// every device vector is assigned). A second registration of a line replaces
-/// the first.
+/// `QuotaExceeded` when the line already holds 64 bindings or, for its first
+/// binding, the controller has no delivery resource left (x86-64: every device
+/// vector is assigned).
 #[inline]
 pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 {
@@ -2053,11 +2056,12 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Re-enable interrupt delivery for `irq_cap` after handling the interrupt.
+/// Acknowledge the interrupt `irq_cap`'s binding was signalled for, after handling it.
 ///
 /// Must be called once the interrupt source in the device has been cleared,
-/// otherwise the interrupt will fire again immediately on unmask. A line with no
-/// registered notification stays masked.
+/// otherwise the interrupt will fire again immediately on unmask. Clears the
+/// acknowledgement `irq_cap`'s binding owes; the line is unmasked once no binding
+/// on it owes one. Through a cap that is not registered it changes nothing.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,
@@ -2067,7 +2071,7 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; irq_cap is cap index as u64;
-    // kernel validates cap and unmasks IRQ to re-enable delivery.
+    // kernel validates cap and acknowledges its binding, unmasking once none owes.
     let ret = unsafe { syscall2(SYS_IRQ_ACK, u64::from(irq_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }

@@ -1264,9 +1264,9 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
 /// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio` or
-/// `IoPort` source, `QuotaExceeded` also means its range already has 64 live
-/// copies, and `OutOfMemory` that the kernel's SEED reserve cannot back the
-/// fresh object; for any other source, `QuotaExceeded` also means the object's
+/// `IoPort` source, `QuotaExceeded` also means its range already has 2^31 - 1
+/// live copies, and `OutOfMemory` that the destination `CSpace`'s pool cannot
+/// back the fresh object; for any other source, `QuotaExceeded` also means the object's
 /// reference count is at its 2^31 ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
@@ -1305,10 +1305,10 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling), or, as for [`cap_copy`], `QuotaExceeded` past 64 live
-/// copies of an `Mmio` or `IoPort` source's range or at any other source
-/// object's 2^31 reference-count ceiling, and `OutOfMemory` when SEED cannot
-/// back an `Mmio` or `IoPort` object. `InvalidCapability` also covers a source a concurrent
+/// structural ceiling), or, as for [`cap_copy`], `QuotaExceeded` past 2^31 - 1
+/// live copies of an `Mmio` or `IoPort` source's range or at any other source
+/// object's 2^31 reference-count ceiling, and `OutOfMemory` when the caller's
+/// `CSpace` pool cannot back an `Mmio` or `IoPort` object. `InvalidCapability` also covers a source a concurrent
 /// delete, move, or revoke freed before the new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
@@ -2099,9 +2099,10 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
 /// non-canonical, or the range leaves the user half), `InvalidCapability`,
 /// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
-/// size zero, unaligned, or overflowing), `QuotaExceeded` (the cap's object
-/// already records 4 other mappings), or `OutOfMemory` (page-table growth
-/// pool exhausted; refill with [`cap_create_aspace`] in augment mode). An
+/// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table growth
+/// pool exhausted; refill with [`cap_create_aspace`] in augment mode; or, for a
+/// mapping past the object's four inline records, the caller's `CSpace` pool
+/// cannot fund a spill chunk; refill with [`cap_create_cspace`]). An
 /// `OutOfMemory` failure keeps the mapping's record and the pages already
 /// mapped; a retry at the same `virt` reuses the record.
 #[inline]
@@ -2134,8 +2135,9 @@ pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) ->
 /// # Errors
 /// Returns a negative `i64` error code: `NotSupported` (RISC-V),
 /// `InvalidCapability`, `InsufficientRights` (a cap lacks Control/Use),
-/// `QuotaExceeded` (the thread already records 16 bindings through other
-/// caps), or `OutOfMemory` (binding-table allocation).
+/// `QuotaExceeded` (the thread already records 254 bindings through other
+/// caps), or `OutOfMemory` (the first bind's binding table cannot be taken
+/// from the caller's `CSpace` pool).
 #[inline]
 pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 {

@@ -192,7 +192,15 @@ Nor can a retype carve a page any address space maps: the kernel counts the
 user mappings of every frame of RAM and refuses a retype over a mapped page
 ([memory-internals.md](memory-internals.md) § Frame Map Table), so no kernel
 object state in donated memory sits behind a live user mapping, whichever order
-the map and the retype came in.
+the map and the retype came in. A `CSpace`'s pool pages also hold its body
+arena ([capability-internals.md](capability-internals.md) § Body Arena): the
+bodies of split children and range-capability copies (Memory, Mmio, Interrupt,
+IoPort and SchedControl objects, with lineage and ancestor pointers), Mmio
+mapping-record spill chunks (address-space pointers), the free-chunk links
+(kernel virtual addresses), and x86-64 port-binding tables (object addresses
+and bitmap-part pointers). They are pool pages retyped from the donating
+capability like the slot pages, so the same two rules keep them from every user
+mapping.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained

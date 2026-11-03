@@ -1275,8 +1275,9 @@ pub fn init_capability_system(
 
 /// Mint a read-only Memory cap over each `AcpiReclaimable` region of `mmap`
 /// (userspace parses XSDT / MADT / MCFG through them), in consecutive slots,
-/// with a descriptor each. Returns the run's first slot and its length, the
-/// `CSpaceLayout`'s `acpi_region_memory_base` and `acpi_region_memory_count`.
+/// with a descriptor each, handed to `record`. Returns the run's first slot
+/// and its length, the `CSpaceLayout`'s `acpi_region_memory_base` and
+/// `acpi_region_memory_count`.
 ///
 /// There is one cap per region, however many the map reports: the map's
 /// length bounds them ([`ACPI_REGION_DESCRIPTOR_TERM`]), and a root `CSpace`
@@ -1285,7 +1286,7 @@ pub fn init_capability_system(
 fn mint_acpi_region_caps(
     cspace: &mut CSpace,
     mmap: &[MemoryMapEntry],
-    desc_count: &mut usize,
+    mut record: impl FnMut(CapDescriptor),
 ) -> (u32, u32)
 {
     let mut base: u32 = 0;
@@ -1304,17 +1305,7 @@ fn mint_acpi_region_caps(
         {
             continue;
         }
-        let ptr = mint_phase7_body(MemoryObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
-            base: aligned_base,
-            size,
-            // Firmware table: not retypable; cap minted without RETYPE.
-            available_bytes: core::sync::atomic::AtomicU64::new(0),
-            // Firmware-reserved memory; not buddy-backed.
-            owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
-            lock: AtomicU32::new(0),
-        });
+        let ptr = mint_phase7_body(firmware_table_memory(aligned_base, size));
         let slot = insert_or_fatal(
             cspace,
             MemRights::MAP,
@@ -1327,19 +1318,33 @@ fn mint_acpi_region_caps(
             slot,
             "Phase 7: ACPI region Memory caps are not in consecutive slots",
         );
-        push_descriptor(
-            desc_count,
-            CapDescriptor {
-                slot,
-                cap_type: init_protocol::CapType::Memory,
-                pad: [0; 3],
-                aux0: aligned_base,
-                aux1: size,
-            },
-        );
+        record(CapDescriptor {
+            slot,
+            cap_type: init_protocol::CapType::Memory,
+            pad: [0; 3],
+            aux0: aligned_base,
+            aux1: size,
+        });
         count += 1;
     }
     (base, count)
+}
+
+/// The body of a read-only Memory cap over the firmware table at
+/// `[base, base + size)`: not retypable, and not buddy-backed.
+fn firmware_table_memory(base: u64, size: u64) -> MemoryObject
+{
+    MemoryObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
+        base,
+        size,
+        // Firmware table: not retypable; cap minted without RETYPE.
+        available_bytes: core::sync::atomic::AtomicU64::new(0),
+        // Firmware-reserved memory; not buddy-backed.
+        owns_memory: core::sync::atomic::AtomicBool::new(false),
+        allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+        lock: AtomicU32::new(0),
+    }
 }
 
 /// Core `CSpace` population logic, separated for testability.
@@ -1629,7 +1634,7 @@ fn populate_cspace(
     );
 
     let (acpi_region_memory_base, acpi_region_memory_count) =
-        mint_acpi_region_caps(cspace, mmap, &mut desc_count);
+        mint_acpi_region_caps(cspace, mmap, |d| push_descriptor(&mut desc_count, d));
 
     // RO Memory cap over the single 4 KiB page containing the ACPI RSDP.
     // RSDP commonly sits in firmware-reserved memory outside
@@ -2542,14 +2547,10 @@ mod tests
             memory_type: MemoryType::AcpiReclaimable,
         });
         let mut cspace = CSpace::new(0);
-        let mut desc_count = 0;
-        let (base, count) = mint_acpi_region_caps(&mut cspace, &mmap, &mut desc_count);
+        let mut descs = Vec::new();
+        let (base, count) = mint_acpi_region_caps(&mut cspace, &mmap, |d| descs.push(d));
         assert_eq!(count, 20);
-        assert_eq!(desc_count, 20);
-        // SAFETY: the descriptor buffer's only writer is the call above.
-        let all: &[CapDescriptor; CSPACE_LAYOUT_MAX_DESCRIPTORS] =
-            unsafe { &*core::ptr::addr_of!(CSPACE_LAYOUT_DESCRIPTORS) };
-        let descs = &all[..desc_count];
+        assert_eq!(descs.len(), 20);
         for (i, d) in descs.iter().enumerate()
         {
             assert_eq!(d.slot, base + i as u32);

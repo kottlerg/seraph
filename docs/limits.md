@@ -589,9 +589,8 @@ Every entry here is `correct as is`; none is tracked.
 
 ### init and logd
 
-The entries left open are tracked by the Issue each recommendation names: the ACPI region caps by
-[#637](https://github.com/kottlerg/seraph/issues/637), and logd's eviction by the low 32
-correlator bits and its death queue's observer pool by
+The entries left open are tracked by the Issue each recommendation names: logd's eviction by the
+low 32 correlator bits and its death queue's observer pool by
 [#643](https://github.com/kottlerg/seraph/issues/643).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |

@@ -2087,7 +2087,7 @@ const CASCADE_LINK_BITS: u32 = 56;
 /// bits survives); `obj_type` and `ancestor`, which the teardown reads, are
 /// never written. [`Self::pop`] zeroes both link fields again, so the object
 /// it returns reads `ref_count == 0`, as when it was pushed.
-pub(crate) struct CascadeStack
+struct CascadeStack
 {
     top: Option<NonNull<KernelObjectHeader>>,
 }
@@ -2181,7 +2181,7 @@ impl CascadeStack
     /// capability slot, pin, or other kernel owner references, that is on no
     /// cascade stack, and that the caller owns exclusively; no reference to
     /// its header is used after this call.
-    pub(crate) unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
+    unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract (a live header).
         let refs = unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed);
@@ -2192,7 +2192,7 @@ impl CascadeStack
     }
 
     /// Take the most recently pushed object, its link fields zeroed.
-    pub(crate) fn pop(&mut self) -> Option<NonNull<KernelObjectHeader>>
+    fn pop(&mut self) -> Option<NonNull<KernelObjectHeader>>
     {
         let top = self.top?;
         // SAFETY: `top` was queued by `push`, whose contract keeps it live,
@@ -4304,6 +4304,44 @@ mod tests
         ((i + 1) * 64) as *mut KernelObjectHeader
     }
 
+    /// Heap model objects of `types`, object `i` with `refs[i]` references,
+    /// as raw pointers: the cascade writes their headers, so every pointer it
+    /// is handed must come from a raw (not a shared-reference) source, as the
+    /// kernel's do. [`free_models`] reclaims them.
+    fn alloc_models(types: &[ObjectType], refs: &[u32]) -> Vec<*mut ModelObject>
+    {
+        types
+            .iter()
+            .enumerate()
+            .map(|(index, &obj_type)| {
+                let header = KernelObjectHeader::new(obj_type);
+                header.ref_count.store(refs[index], Ordering::Relaxed);
+                header
+                    .ancestor
+                    .store(model_ancestor(index), Ordering::Relaxed);
+                Box::into_raw(Box::new(ModelObject { header, index }))
+            })
+            .collect()
+    }
+
+    /// The header of model object `raw`, as the cascade's pointer to it.
+    fn model_header(raw: *mut ModelObject) -> NonNull<KernelObjectHeader>
+    {
+        // SAFETY: `raw` is a live `alloc_models` object; the header is
+        // addressed without creating a reference.
+        unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).header)) }
+    }
+
+    /// Reclaim the objects [`alloc_models`] returned.
+    fn free_models(objects: Vec<*mut ModelObject>)
+    {
+        for raw in objects
+        {
+            // SAFETY: each pointer came from `Box::into_raw` and is freed once.
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
+
     /// Run `run_cascade` from object 0 over a model in which object `i` holds
     /// one reference on each object in `holds[i]` and its teardown releases
     /// them; every object starts with as many references as it has holders,
@@ -4319,23 +4357,13 @@ mod tests
             }
         }
         assert_eq!(refs[0], 0, "the model's first object must be unreferenced");
-        let objects: Vec<Box<ModelObject>> = types
-            .iter()
-            .enumerate()
-            .map(|(index, &obj_type)| {
-                let header = KernelObjectHeader::new(obj_type);
-                header.ref_count.store(refs[index], Ordering::Relaxed);
-                header
-                    .ancestor
-                    .store(model_ancestor(index), Ordering::Relaxed);
-                Box::new(ModelObject { header, index })
-            })
-            .collect();
+        let objects = alloc_models(types, &refs);
         let ptrs: Vec<NonNull<KernelObjectHeader>> =
-            objects.iter().map(|o| NonNull::from(&o.header)).collect();
+            objects.iter().map(|&raw| model_header(raw)).collect();
         let mut torn = vec![0u32; types.len()];
         run_cascade(ptrs[0], |obj, stack| {
-            // SAFETY: every pointer the model queues is one of `objects`.
+            // SAFETY: every pointer the model queues is one of `objects`,
+            // popped and so no longer written by the stack.
             let model = unsafe { &*obj.as_ptr().cast::<ModelObject>() };
             let i = model.index;
             assert_eq!(model.header.ref_count.load(Ordering::Relaxed), 0);
@@ -4351,12 +4379,58 @@ mod tests
                 // SAFETY: `ptrs[h]` is a live model header.
                 if unsafe { ptrs[h].as_ref() }.dec_ref() == 0
                 {
-                    // SAFETY: that was the model object's last reference.
+                    // SAFETY: that was the model object's last reference,
+                    // and its pointer has a raw source.
                     unsafe { stack.push(ptrs[h]) };
                 }
             }
         });
+        free_models(objects);
         torn
+    }
+
+    /// Add to the model a tree of CSpaces under `root`: `width` CSpaces per
+    /// CSpace to `depth` levels, each also holding an endpoint and a thread,
+    /// and below the first level the level's first CSpace also held by the
+    /// previous level's last, in another subtree.
+    fn add_nested_cspaces(
+        types: &mut Vec<ObjectType>,
+        holds: &mut Vec<Vec<usize>>,
+        root: usize,
+        width: usize,
+        depth: usize,
+    )
+    {
+        let mut level = vec![root];
+        let mut extra_holder: Option<usize> = None;
+        for _ in 0..depth
+        {
+            let mut next = Vec::new();
+            for &parent in &level
+            {
+                for _ in 0..width
+                {
+                    let c = types.len();
+                    types.push(ObjectType::CSpaceObj);
+                    holds.push(Vec::new());
+                    holds[parent].push(c);
+                    next.push(c);
+                }
+                for t in [ObjectType::Endpoint, ObjectType::Thread]
+                {
+                    let o = types.len();
+                    types.push(t);
+                    holds.push(Vec::new());
+                    holds[parent].push(o);
+                }
+            }
+            if let Some(holder) = extra_holder
+            {
+                holds[holder].push(next[0]);
+            }
+            extra_holder = next.last().copied();
+            level = next;
+        }
     }
 
     // Defect guarded: a cascade that loses an entry (as any fixed-size
@@ -4365,10 +4439,13 @@ mod tests
     #[test]
     fn a_cascade_with_wide_fan_out_and_deep_chains_tears_every_object_down_once()
     {
-        // Object 0 holds 40 objects (more than a 32-entry array holds): 20
-        // endpoints and 20 wait sets, each wait set holding 16 notifications.
-        // Every object holds a lease on one of the Memory objects, which form
-        // a 64-deep ancestor chain, each holding the next.
+        // Object 0, a CSpace, holds 40 objects (more than a 32-entry array
+        // holds): 20 endpoints and 20 wait sets, each wait set holding 16
+        // notifications. Every one of those holds a lease on one of the Memory
+        // objects, which form a 64-deep ancestor chain, each holding the next.
+        // Object 0 also holds a tree of CSpaces, 3 wide and 4 deep, whose
+        // teardowns release further CSpaces and the objects they hold, with
+        // one CSpace per level held from two subtrees.
         const CHAIN: usize = 64;
         let mut types = vec![ObjectType::CSpaceObj];
         let mut holds: Vec<Vec<usize>> = vec![Vec::new()];
@@ -4414,58 +4491,7 @@ mod tests
                 }
             }
         }
-        let torn = run_model_cascade(&types, &holds);
-        assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
-    }
-
-    // Defect guarded: nested CSpaces, which the cascade queues like any other
-    // object, are lost or torn down twice when a CSpace's teardown releases
-    // CSpaces whose own teardown releases further CSpaces and the objects
-    // they hold.
-    #[test]
-    fn nested_cspaces_released_by_a_dying_cspace_are_torn_down_once()
-    {
-        // Object 0, a CSpace, holds 3 CSpaces; each holds 3 more, to depth 4
-        // (120 CSpaces below the root), and every CSpace also holds 2
-        // endpoints and a thread. Below the first level, the level's first
-        // CSpace is also held by the last CSpace of the level above, in
-        // another subtree, so it reaches zero only once both release it.
-        let mut types = vec![ObjectType::CSpaceObj];
-        let mut holds: Vec<Vec<usize>> = vec![Vec::new()];
-        let mut level = vec![0usize];
-        let mut extra_holder: Option<usize> = None;
-        for _ in 0..4
-        {
-            let mut next = Vec::new();
-            for &parent in &level
-            {
-                for _ in 0..3
-                {
-                    let c = types.len();
-                    types.push(ObjectType::CSpaceObj);
-                    holds.push(Vec::new());
-                    holds[parent].push(c);
-                    next.push(c);
-                }
-                for t in [
-                    ObjectType::Endpoint,
-                    ObjectType::Endpoint,
-                    ObjectType::Thread,
-                ]
-                {
-                    let o = types.len();
-                    types.push(t);
-                    holds.push(Vec::new());
-                    holds[parent].push(o);
-                }
-            }
-            if let Some(holder) = extra_holder
-            {
-                holds[holder].push(next[0]);
-            }
-            extra_holder = next.last().copied();
-            level = next;
-        }
+        add_nested_cspaces(&mut types, &mut holds, 0, 3, 4);
         let torn = run_model_cascade(&types, &holds);
         assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
     }
@@ -4476,25 +4502,20 @@ mod tests
     #[test]
     fn a_cascade_stack_pops_lifo_and_restores_each_header()
     {
-        let objects: Vec<Box<ModelObject>> = (0..100)
-            .map(|index| {
-                let header = KernelObjectHeader::new(ObjectType::Endpoint);
-                header.ref_count.store(0, Ordering::Relaxed);
-                header
-                    .ancestor
-                    .store(model_ancestor(index), Ordering::Relaxed);
-                Box::new(ModelObject { header, index })
-            })
-            .collect();
+        let types = [ObjectType::Endpoint; 100];
+        let objects = alloc_models(&types, &[0; 100]);
         let mut stack = CascadeStack::new();
-        for o in &objects
+        for &raw in &objects
         {
-            // SAFETY: an unreferenced model header queued once.
-            unsafe { stack.push(NonNull::from(&o.header)) };
+            // SAFETY: an unreferenced model header with a raw source, queued
+            // once.
+            unsafe { stack.push(model_header(raw)) };
         }
-        for o in objects.iter().rev()
+        for &raw in objects.iter().rev()
         {
-            assert_eq!(stack.pop(), Some(NonNull::from(&o.header)));
+            assert_eq!(stack.pop(), Some(model_header(raw)));
+            // SAFETY: popped, so the stack no longer writes it.
+            let o = unsafe { &*raw };
             assert_eq!(o.header.ref_count.load(Ordering::Relaxed), 0);
             assert_eq!(o.header.cascade_link_hi, [0; 3]);
             assert_eq!(o.header.obj_type, ObjectType::Endpoint);
@@ -4504,6 +4525,7 @@ mod tests
             );
         }
         assert_eq!(stack.pop(), None);
+        free_models(objects);
     }
 
     // Defect guarded: a decode that fails to sign-extend, so a kernel

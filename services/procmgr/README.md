@@ -219,9 +219,11 @@ events behind it for that drain or the next, so the rescan runs after the
 drop. The rescan recovers main-thread deaths only: a dropped address-space
 terminal-fault post, for a worker thread's fault while the main thread runs, is
 not recovered, since the kernel exposes no address-space fault state to read
-back; that process is reaped when its main thread exits. A reaped child stays in
-a recent-exits record for 30 s, so `QUERY_PROCESS` answers `EXITED` for it (see
-[docs/ipc-interface.md](docs/ipc-interface.md) § Label 9: `QUERY_PROCESS`).
+back; that process is reaped when its main thread exits. A reaped or destroyed
+(`DESTROY_PROCESS`) child stays in a recent-exits record for 30 s, so
+`QUERY_PROCESS` answers `EXITED` for it, unless heap exhaustion drops or evicts
+its record first (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9:
+`QUERY_PROCESS`).
 
 ---
 

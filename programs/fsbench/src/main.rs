@@ -39,6 +39,8 @@ const PAGE_SIZE_USIZE: usize = 4096;
 const INLINE_CHUNK: u64 = 504;
 const SIZES: &[u64] = &[16, 1024, 4096, 16384, 65536];
 const WARMUP_ITERS: u32 = 8;
+/// Timed iterations per size and path when no count is given on the command
+/// line: the full benchmark.
 const MEASURE_ITERS: u32 = 256;
 const FIXTURE_PATH: &str = "/data/svctest/bench.bin";
 
@@ -146,7 +148,7 @@ fn read_frame(f: &mut File, size: u64, buf: &mut [u8]) -> u64
     consumed
 }
 
-fn measure(f: &mut File, size: u64, path: &str, buf: &mut [u8])
+fn measure(f: &mut File, size: u64, path: &str, buf: &mut [u8], iters: u32)
 {
     let runner: fn(&mut File, u64, &mut [u8]) -> u64 = match path
     {
@@ -163,7 +165,7 @@ fn measure(f: &mut File, size: u64, path: &str, buf: &mut [u8])
     let mut min_c = u64::MAX;
     let mut max_c = 0u64;
     let mut sum_c: u64 = 0;
-    for _ in 0..MEASURE_ITERS
+    for _ in 0..iters
     {
         let start = cycles_now();
         let got = runner(f, size, buf);
@@ -182,10 +184,9 @@ fn measure(f: &mut File, size: u64, path: &str, buf: &mut [u8])
         }
         sum_c = sum_c.wrapping_add(elapsed);
     }
-    let mean_c = sum_c / u64::from(MEASURE_ITERS);
+    let mean_c = sum_c / u64::from(iters);
 
     let arch = ARCH_TAG;
-    let iters = MEASURE_ITERS;
     std::os::seraph::log!(
         "arch={arch} size={size} path={path} iters={iters} \
          cycles_min={min_c} cycles_mean={mean_c} cycles_max={max_c}"
@@ -226,10 +227,27 @@ fn verify_fixture(f: &mut File)
     );
 }
 
+/// The timed iteration count: `argv[1]` when given (a positive integer, so a
+/// harness can exercise both read paths in a few iterations), else
+/// [`MEASURE_ITERS`].
+fn measure_iters() -> u32
+{
+    match std::env::args().nth(1)
+    {
+        None => MEASURE_ITERS,
+        Some(arg) => match arg.parse::<u32>()
+        {
+            Ok(n) if n > 0 => n,
+            _ => panic!("fsbench: iteration count {arg:?} is not a positive integer"),
+        },
+    }
+}
+
 fn main()
 {
     std::os::seraph::log::register_name(b"fsbench");
-    std::os::seraph::log!("starting, fixture={FIXTURE_PATH}");
+    let iters = measure_iters();
+    std::os::seraph::log!("starting, fixture={FIXTURE_PATH} iters={iters}");
 
     let mut f =
         File::open(FIXTURE_PATH).unwrap_or_else(|e| panic!("fsbench: open {FIXTURE_PATH}: {e}"));
@@ -238,8 +256,8 @@ fn main()
     let mut buf = vec![0u8; PAGE_SIZE_USIZE];
     for &size in SIZES
     {
-        measure(&mut f, size, "inline", &mut buf);
-        measure(&mut f, size, "frame", &mut buf);
+        measure(&mut f, size, "inline", &mut buf, iters);
+        measure(&mut f, size, "frame", &mut buf, iters);
     }
 
     std::os::seraph::log!("done");

@@ -16,7 +16,7 @@
 use namespace_protocol::rights as ns_rights;
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
-use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, build_blob};
+use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, blob_len};
 
 /// Badge stamped on an `:auth` provider SEND — the first verb bit
 /// (`1 << 63`), the one a server's primary `*_AUTHORITY` gate tests; a
@@ -59,6 +59,46 @@ pub enum ParseError
     /// bytes on the key's line, or (line `0`) both blobs together over
     /// `MSG_DATA_WORDS_MAX` words.
     TooLarge(usize, &'static str),
+    /// The heap could not hold a copy of a recipe field (or of the text an
+    /// error reports); the scan drops the recipe.
+    OutOfMemory,
+}
+
+/// Reserve room for `additional` more bytes in `s`, or
+/// [`ParseError::OutOfMemory`] when the heap cannot provide it.
+fn reserve_str(s: &mut String, additional: usize) -> Result<(), ParseError>
+{
+    s.try_reserve_exact(additional)
+        .map_err(|_| ParseError::OutOfMemory)
+}
+
+/// Copy `s` into a new `String`, or [`ParseError::OutOfMemory`].
+fn owned(s: &str) -> Result<String, ParseError>
+{
+    let mut out = String::new();
+    reserve_str(&mut out, s.len())?;
+    out.push_str(s);
+    Ok(out)
+}
+
+/// Append `item` to `v`, or [`ParseError::OutOfMemory`] when `v` cannot grow.
+fn push<T>(v: &mut Vec<T>, item: T) -> Result<(), ParseError>
+{
+    v.try_reserve(1).map_err(|_| ParseError::OutOfMemory)?;
+    v.push(item);
+    Ok(())
+}
+
+/// Copy every whitespace-separated token of `value`, or
+/// [`ParseError::OutOfMemory`].
+fn owned_tokens(value: &str) -> Result<Vec<String>, ParseError>
+{
+    let mut out = Vec::new();
+    for tok in value.split_whitespace()
+    {
+        push(&mut out, owned(tok)?)?;
+    }
+    Ok(out)
 }
 
 /// Bound one `argv` / `env` token list against the `CREATE_FROM_FILE` wire
@@ -80,12 +120,12 @@ fn check_blob(
     {
         return Err(ParseError::TooLarge(lineno, too_many));
     }
-    let (blob, _) = build_blob(tokens);
-    if blob.len() > ipc::ARGS_BLOB_MAX
+    let len = blob_len(tokens);
+    if len > ipc::ARGS_BLOB_MAX
     {
         return Err(ParseError::TooLarge(lineno, too_long));
     }
-    Ok(blob.len().div_ceil(8))
+    Ok(len.div_ceil(8))
 }
 
 /// Bound a `binary` or `subtree:<path>` value against `ipc::MAX_PATH_LEN`,
@@ -150,7 +190,8 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// subtree path over `ipc::MAX_PATH_LEN` or with no path components
 /// ([`ParseError::InvalidValue`]), or
 /// `argv` / `env` that would not fit procmgr's `CREATE_FROM_FILE` message
-/// ([`ParseError::TooLarge`]).
+/// ([`ParseError::TooLarge`]). Every copy it makes is fallible: a heap that
+/// cannot hold one returns [`ParseError::OutOfMemory`].
 // too_many_lines: one pass over the `key = value` grammar whose per-key
 // `match` is a flat table of short arms sharing the duplicate-key and
 // mandatory-key bookkeeping locals; moving arms into helpers would thread
@@ -214,7 +255,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     return Err(ParseError::InvalidValue(lineno, "binary must be absolute"));
                 }
                 check_path_len(lineno, value, "binary path exceeds MAX_PATH_LEN bytes")?;
-                binary = Some(value.to_owned());
+                binary = Some(owned(value)?);
             }
             "argv" =>
             {
@@ -223,7 +264,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     return Err(ParseError::DuplicateKey(lineno, "argv"));
                 }
                 seen_argv = true;
-                argv = value.split_whitespace().map(str::to_owned).collect();
+                argv = owned_tokens(value)?;
                 // The blob is NUL-delimited, so an embedded NUL would split
                 // one token into two on the child's side while the label
                 // still carries the parser's count.
@@ -264,7 +305,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                             "env tokens must not contain NUL",
                         ));
                     }
-                    env.push(tok.to_owned());
+                    push(&mut env, owned(tok)?)?;
                 }
                 env_words = check_blob(
                     lineno,
@@ -284,7 +325,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     "never" => RestartPolicy::Never,
                     "on_failure" => RestartPolicy::OnFailure,
                     "always" => RestartPolicy::Always,
-                    other => return Err(ParseError::BadRestart(lineno, other.to_owned())),
+                    other => return Err(ParseError::BadRestart(lineno, owned(other)?)),
                 });
             }
             "critical" =>
@@ -297,7 +338,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 {
                     "yes" => true,
                     "no" => false,
-                    other => return Err(ParseError::BadCriticality(lineno, other.to_owned())),
+                    other => return Err(ParseError::BadCriticality(lineno, owned(other)?)),
                 });
             }
             "namespace" =>
@@ -319,7 +360,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 {
                     return Err(ParseError::InvalidValue(lineno, "cwd must be non-empty"));
                 }
-                cwd = Some(value.to_owned());
+                cwd = Some(owned(value)?);
             }
             "seed" =>
             {
@@ -328,7 +369,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     return Err(ParseError::DuplicateKey(lineno, "seed"));
                 }
                 seen_seed = true;
-                seed = value.split_whitespace().map(str::to_owned).collect();
+                seed = owned_tokens(value)?;
             }
             "provides" =>
             {
@@ -359,10 +400,13 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                             "provides name must be non-empty and <= NAME_MAX bytes",
                         ));
                     }
-                    provides.push(ProvidedName {
-                        name: name.to_owned(),
-                        badge,
-                    });
+                    push(
+                        &mut provides,
+                        ProvidedName {
+                            name: owned(name)?,
+                            badge,
+                        },
+                    )?;
                 }
                 if provides.is_empty()
                 {
@@ -415,7 +459,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     "sched_max must be a level in [1, 30]",
                 )?);
             }
-            other => return Err(ParseError::UnknownKey(lineno, other.to_owned())),
+            other => return Err(ParseError::UnknownKey(lineno, owned(other)?)),
         }
     }
 
@@ -497,7 +541,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     }
 
     Ok(Definition {
-        name: name.to_owned(),
+        name: owned(name)?,
         binary,
         argv,
         env,
@@ -527,12 +571,14 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
     }
     if let Some(rest) = value.strip_prefix("subtree:")
     {
-        let (path, rights_str) = rest
-            .rsplit_once(':')
-            .ok_or_else(|| ParseError::BadNamespace(lineno, value.to_owned()))?;
+        let Some((path, rights_str)) = rest.rsplit_once(':')
+        else
+        {
+            return Err(ParseError::BadNamespace(lineno, owned(value)?));
+        };
         if path.is_empty() || !path.starts_with('/')
         {
-            return Err(ParseError::BadNamespace(lineno, value.to_owned()));
+            return Err(ParseError::BadNamespace(lineno, owned(value)?));
         }
         // A path with no components walks no NS_LOOKUP hop, so no namespace
         // server attenuates the cap to `<rights>` (see `names_root`): the
@@ -552,11 +598,11 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
         )?;
         let rights = parse_rights(lineno, rights_str)?;
         return Ok(NamespaceShape::Subtree {
-            path: path.to_owned(),
+            path: owned(path)?,
             rights,
         });
     }
-    Err(ParseError::BadNamespace(lineno, value.to_owned()))
+    Err(ParseError::BadNamespace(lineno, owned(value)?))
 }
 
 /// A path with no components names the walk's anchor, the root, which
@@ -573,7 +619,7 @@ fn parse_rights(lineno: usize, value: &str) -> Result<u32, ParseError>
 {
     if value.is_empty()
     {
-        return Err(ParseError::BadRights(lineno, value.to_owned()));
+        return Err(ParseError::BadRights(lineno, owned(value)?));
     }
     let mut mask: u32 = 0;
     for tok in value.split('+')
@@ -589,7 +635,7 @@ fn parse_rights(lineno: usize, value: &str) -> Result<u32, ParseError>
             "EXEC" => ns_rights::EXEC,
             "MUTATE_DIR" => ns_rights::MUTATE_DIR,
             "ADMIN" => ns_rights::ADMIN,
-            other => return Err(ParseError::BadRights(lineno, other.to_owned())),
+            other => return Err(ParseError::BadRights(lineno, owned(other)?)),
         };
         mask |= bit;
     }
@@ -627,6 +673,7 @@ impl core::fmt::Display for ParseError
             }
             Self::BadRights(l, v) => write!(f, "line {l}: bad rights `{v}`"),
             Self::TooLarge(l, why) => write!(f, "line {l}: {why} (CREATE_FROM_FILE wire limit)"),
+            Self::OutOfMemory => write!(f, "no memory to copy the recipe"),
         }
     }
 }
@@ -635,6 +682,19 @@ impl core::fmt::Display for ParseError
 mod tests
 {
     use super::*;
+    use crate::build_blob;
+
+    #[test]
+    fn a_reservation_the_heap_cannot_meet_is_out_of_memory()
+    {
+        // The one way a host test can make a reservation fail: a request no
+        // allocator can meet. The parser's string copies reserve through here.
+        let mut s = String::new();
+        assert!(matches!(
+            reserve_str(&mut s, usize::MAX),
+            Err(ParseError::OutOfMemory)
+        ));
+    }
 
     /// Minimal valid recipe body; tests append the lines under test.
     const BASE: &str = "binary = /services/x\nrestart = never\ncritical = no\nnamespace = none\n";

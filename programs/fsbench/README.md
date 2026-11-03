@@ -7,10 +7,12 @@ through its two read paths, inline `FS_READ` and memory-cap `FS_READ_MEMORY`.
 
 ## Invocation
 
-The [`svctest`](../../services/svctest/README.md) phase `fs_crossover_bench`
-([fs_ipc.rs](../../services/svctest/src/phases/fs_ipc.rs)) spawns `fsbench` from
-`/programs/fsbench` and passes when it exits cleanly; `fsbench` is one of the test-only
-fixtures installed under `/programs/`, per
+`fsbench [ITERS]` runs `ITERS` timed iterations per size and path (a positive integer; 256
+when omitted, the full benchmark). The [`svctest`](../../services/svctest/README.md) phase
+`fs_crossover_bench` ([fs_ipc.rs](../../services/svctest/src/phases/fs_ipc.rs)) spawns
+`fsbench 8` from `/programs/fsbench`, enough to exercise both read paths at every size, and
+passes when it exits cleanly; the full count is for a manual benchmark run. `fsbench` is one of
+the test-only fixtures installed under `/programs/`, per
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---
@@ -49,13 +51,13 @@ without crossing a page tail, memory cap otherwise, per
 | `inline` | At most 504 bytes, trimmed so the read ends at or before a page tail |
 | `frame` (memory cap) | A full 4096-byte page                           |
 
-For each size in 16 B, 1 KiB, 4 KiB, 16 KiB, and 64 KiB, and for each path, it runs 8
-untimed warm-up iterations, then 256 timed ones. Each iteration seeks to offset 0 and reads the
-full size through as many `read` calls as the path's buffer needs: 144 inline or 16 memory-cap
-calls for 64 KiB. A memory-cap `read` that returns `Interrupted` (std discarded a copy whose page
-the driver may have released during it) is read again inside the same timed iteration, so such an
-iteration makes one more `read` call than the size needs for each retry, and its cycles include
-them. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed iteration that
+For each size in 16 B, 1 KiB, 4 KiB, 16 KiB, and 64 KiB, and for each path, it runs 8 untimed
+warm-up iterations, then the timed ones (256, or `ITERS`). Each iteration seeks to offset 0 and
+reads the full size through as many `read` calls as the path's buffer needs: 144 inline or 16
+memory-cap calls for 64 KiB. A memory-cap `read` that returns `Interrupted` (std discarded a copy
+whose page the driver may have released during it) is read again inside the same timed iteration, so
+such an iteration makes one more `read` call than the size needs for each retry, and its cycles
+include them. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed iteration that
 reads fewer bytes than the size panics.
 
 ---
@@ -63,20 +65,20 @@ reads fewer bytes than the size panics.
 ## Output
 
 Lines are logged under the name `fsbench`. The run opens with
-`starting, fixture=/data/svctest/bench.bin`, emits one result line per size and path, and
+`starting, fixture=/data/svctest/bench.bin iters=<n>`, emits one result line per size and path, and
 closes with `done`. Each result line has the form below, where `<arch>` is `x86_64` or
 `riscv64` and `<path>` is `inline` or `frame`:
 
 ```text
-arch=<arch> size=<bytes> path=<path> iters=256 cycles_min=<n> cycles_mean=<n> cycles_max=<n>
+arch=<arch> size=<bytes> path=<path> iters=<n> cycles_min=<n> cycles_mean=<n> cycles_max=<n>
 ```
 
 Each `cycles_*` value is taken over the timed iterations, and one iteration covers all the
 `read` calls that one size needs, not a single call.
 
-A failed open, fixture check, seek, or read panics, so the process exits unsuccessfully and the
-`fs_crossover_bench` phase fails; a memory-cap `read` that returns `Interrupted` is retried, not
-a failure.
+A failed open, fixture check, seek, or read, or an `ITERS` that is not a positive integer, panics,
+so the process exits unsuccessfully and the `fs_crossover_bench` phase fails; a memory-cap `read`
+that returns `Interrupted` is retried, not a failure.
 
 ---
 

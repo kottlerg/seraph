@@ -215,9 +215,14 @@ handle with no data words or caps.
 | data[1] | Kernel-encoded exit reason when `data[0]` is `EXITED`; 0 otherwise |
 
 A live entry whose thread the kernel reports as exited answers `EXITED` before
-procmgr reaps it. After the reap, the badge answers `EXITED` for
-`RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time, however many other
-processes die meanwhile, and `UNKNOWN` after that.
+procmgr reaps it. After the reap, or after a `DESTROY_PROCESS` teardown, the
+badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time,
+however many other processes die meanwhile while procmgr's heap can hold their
+records, and `UNKNOWN` after that. Retention is best-effort: when the heap
+cannot hold a new record, the oldest record makes room (or, with none held, the
+new one is dropped), so such a badge can answer `UNKNOWN` early. A destroyed
+process's reason is the one the kernel retained if its main thread had already
+exited, else `EXIT_KILLED`.
 
 ### Label 11: `CONFIGURE_PIPE`
 
@@ -367,7 +372,8 @@ death resync, and `DESTROY_PROCESS`) posts the two-word death entry
 badge in the correlator word (`syscall::DeathEvent`), after the process's
 objects are torn down. procmgr, not the kernel, is the source of logd's death
 events: a worker thread's terminal fault that tears down its process reaches
-logd too, and `DESTROY_PROCESS` posts `EXIT_KILLED`. A process torn down
+logd too, and `DESTROY_PROCESS` posts the reason the kernel retained if the
+process's main thread had already exited, else `EXIT_KILLED`. A process torn down
 before the registration posts nothing. A post the full queue refuses
 (`QueueFull`) is dropped, as the kernel drops a post to a full queue; logd's
 full-drain resync recovers it.

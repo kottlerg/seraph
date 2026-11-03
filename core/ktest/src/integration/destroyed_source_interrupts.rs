@@ -211,7 +211,7 @@ fn create_source(ctx: &TestContext, source: Source) -> Result<(u32, Option<u32>)
             cap_create_notification(ctx.memory_base)
         }
         Source::EventQueue => event_queue_create(ctx.memory_base, 4),
-        Source::WaitSet => wait_set_create(ctx.memory_base),
+        Source::WaitSet => wait_set_create(ctx.memory_base, crate::WS_CAPACITY),
     }
     .map_err(|_| "integration::destroyed_source_interrupts: create source failed")?;
     if !matches!(source, Source::WaitSet)

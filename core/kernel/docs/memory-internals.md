@@ -203,7 +203,8 @@ Memory handle a second time, and it refuses the map with `InvalidCapability` if 
 longer names the same object. A revoke clears the slot under its CSpace's lock before the
 issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the counts. Either the
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
-the map installs. The query reads one count per page of the region, at most 512 pages.
+the map installs. The query reads one count per page of the window it names, at most 512 pages
+of the region; a larger region is read window by window.
 
 **Storage.** The table is two-level: a chunk table with one pointer per GiB below the top of DRAM,
 allocated from the buddy, each pointer naming a 1 MiB buddy block of 262144 counters. Phase 4 sizes
@@ -249,10 +250,12 @@ pub struct AddressSpace
 }
 ```
 
-The terminal-fault observer state (`death_observers`, `death_observer_count`, `terminal_faulted`,
-`terminal_fault_reason`) changes and is read only under `death_lock`: the bind
-(`sys_aspace_bind_notification`) appends under it, and the terminal-fault post snapshots the
-observers and records the first fault under it before posting outside it.
+The terminal-fault observer state (the `death_observers` chain of observer nodes,
+`terminal_faulted`, `terminal_fault_reason`) changes and is read only under `death_lock`: the bind
+(`sys_aspace_bind_notification`) pushes a node, drawn from the observing queue's pool, under it, and
+the terminal-fault post reads the chain head and records the first fault under it before walking the
+chain and posting outside it (a linked node's links never change until the teardown takes the
+chain).
 
 ### Lifecycle
 

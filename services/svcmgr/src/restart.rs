@@ -775,7 +775,7 @@ fn rebind_death_notification(
     correlator: u32,
 ) -> bool
 {
-    if syscall::thread_bind_notification(new_thread_cap, deaths_eq, correlator).is_err()
+    if syscall::thread_bind_notification(new_thread_cap, deaths_eq, u64::from(correlator)).is_err()
     {
         std::os::seraph::log!("failed to rebind death notification");
         return false;

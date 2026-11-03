@@ -1150,17 +1150,57 @@ pub const NOTIFICATION_RAW_BYTES: u64 =
 /// `EventQueueState` body bytes, kept in sync with the struct in
 /// `core/kernel/src/ipc/event_queue.rs` (anchored by the const assertion
 /// in that module). Update both sides together.
-pub const EVENT_QUEUE_STATE_BYTES: u64 = 56;
+pub const EVENT_QUEUE_STATE_BYTES: u64 = 64;
+
+/// `WaitSetState` body bytes, kept in sync with the struct in
+/// `core/kernel/src/ipc/wait_set.rs` (anchored by the const assertion in that
+/// module).
+pub const WAIT_SET_STATE_BYTES: u64 = 40;
+
+/// Offset of a `WaitSet`'s inline member array from the start of its retype
+/// slot: directly after the wrapper and the state, both 8-byte multiples.
+pub const WAIT_SET_MEMBERS_OFFSET: u64 = 24 + WAIT_SET_STATE_BYTES;
+
+/// Offset of a `WaitSet`'s inline ready ring from the start of its retype
+/// slot: directly after the `capacity` member slots.
+pub const fn wait_set_ring_offset(capacity: u64) -> u64
+{
+    WAIT_SET_MEMBERS_OFFSET
+        + capacity * core::mem::size_of::<crate::ipc::wait_set::WaitSetMember>() as u64
+}
+
+/// Inline byte cost of a `WaitSet` retype slot of `capacity` members: wrapper
+/// + state + members + the `capacity + 1` `u16` ready ring, padded to 8 bytes.
+pub const fn wait_set_raw_bytes(capacity: u64) -> u64
+{
+    wait_set_ring_offset(capacity) + ((capacity + 1) * 2).div_ceil(8) * 8
+}
+
+/// Byte cost and allocation mode of a `WaitSet` of `capacity` members:
+/// sub-page in place while it fits the 512 B bin, page-aligned split beyond.
+/// The construction in `sys_cap_create_wait_set` and the reclaim in
+/// `dealloc_object_one`'s `WaitSet` arm use the same formula, the ABI's
+/// `wait_set_retype_bytes` (pinned below).
+pub const fn wait_set_dispatch(capacity: u64) -> DispatchEntry
+{
+    let raw_bytes = syscall::wait_set_retype_bytes(capacity);
+    DispatchEntry {
+        raw_bytes,
+        split: raw_bytes > BIN_512,
+    }
+}
+
+/// Bytes of one death-observer node in an `EventQueue`'s inline pool.
+const EVENT_QUEUE_OBSERVER_BYTES: u64 =
+    core::mem::size_of::<crate::sched::thread::DeathObserver>() as u64;
 
 /// Compute the inline byte cost of an `EventQueue` retype slot for a
-/// user-visible `capacity`: wrapper + state + (capacity + 1) ring slots,
-/// padded so the ring starts at a `u64` boundary.
-pub const fn event_queue_raw_bytes(capacity: u64) -> u64
+/// user-visible `capacity` and `observers` death-observer nodes: wrapper +
+/// state + (capacity + 1) two-word ring slots + the node pool. Every part is
+/// an 8-byte multiple, so the ring and the pool start at `u64` boundaries.
+pub const fn event_queue_raw_bytes(capacity: u64, observers: u64) -> u64
 {
-    let header = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE_STATE_BYTES;
-    // Both 24 and 56 are 8-byte multiples, so no extra alignment padding.
-    let ring_bytes = (capacity + 1) * 8;
-    header + ring_bytes
+    event_queue_observer_offset(capacity) + observers * EVENT_QUEUE_OBSERVER_BYTES
 }
 
 /// Offset of the inline ring buffer from the start of an `EventQueue`
@@ -1168,11 +1208,36 @@ pub const fn event_queue_raw_bytes(capacity: u64) -> u64
 /// path; must match the layout assumed by `event_queue_raw_bytes`.
 pub const EVENT_QUEUE_RING_OFFSET: u64 = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE_STATE_BYTES;
 
+/// Offset of the death-observer node pool from the start of an `EventQueue`
+/// retype slot of `capacity`: directly after the ring.
+pub const fn event_queue_observer_offset(capacity: u64) -> u64
+{
+    EVENT_QUEUE_RING_OFFSET
+        + (capacity + 1) * core::mem::size_of::<crate::ipc::event_queue::EventEntry>() as u64
+}
+
+/// Byte cost and allocation mode of an `EventQueue` of `capacity` entries and
+/// `observers` death-observer nodes: sub-page in place while it fits the
+/// 512 B bin, page-aligned split beyond. The construction layout in
+/// `sys_cap_create_event_queue` and the reclaim arithmetic in
+/// `dealloc_object_one`'s `EventQueue` arm use the same formula, the ABI's
+/// `event_queue_retype_bytes` (pinned below).
+pub const fn event_queue_dispatch(capacity: u64, observers: u64) -> DispatchEntry
+{
+    let raw_bytes = syscall::event_queue_retype_bytes(capacity, observers);
+    DispatchEntry {
+        raw_bytes,
+        split: raw_bytes > BIN_512,
+    }
+}
+
 /// Look up the byte cost and allocation mode for a given `ObjectType`.
 ///
-/// `size_arg` is the variable-size argument (capacity for `EventQueue`,
-/// page count for `Memory`, total pages carved — the syscall's `init_pages` —
-/// for `AddressSpace` / `CSpace`). Pass `0` for fixed-size types.
+/// `size_arg` is the variable-size argument (page count for `Memory`, total
+/// pages carved — the syscall's `init_pages` — for `AddressSpace` / `CSpace`).
+/// Pass `0` for fixed-size types. An `EventQueue` takes two sizes and is
+/// looked up through [`event_queue_dispatch`] instead; this returns `None`
+/// for it.
 ///
 /// Returns `None` for object types that cannot be retyped (`Memory` is
 /// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
@@ -1197,28 +1262,6 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: syscall::NOTIFICATION_RETYPE_BYTES,
             split: false,
         }),
-        // WaitSet: 24 wrapper + 440 (the asserted upper bound on WaitSetState)
-        // → BIN_512; sizing per core/kernel/docs/ipc-internals.md § Wait Set,
-        // pinned by the const assertion in core/kernel/src/ipc/wait_set.rs.
-        ObjectType::WaitSet => Some(DispatchEntry {
-            raw_bytes: syscall::WAIT_SET_RETYPE_BYTES,
-            split: false,
-        }),
-        // EventQueue: 24 wrapper + EventQueueState (56 B, EVENT_QUEUE_STATE_BYTES)
-        // + (size_arg + 1) u64 ring slots, all inline in the retype slot, the
-        // ABI's `event_queue_retype_bytes` (pinned below). Sub-page
-        // in-place for small rings; page-aligned split when the total exceeds the
-        // 512 B sub-page bin. The exact byte count here must match the
-        // construction layout in `sys_cap_create_event_queue` and the reclaim
-        // arithmetic in `dealloc_object_one`'s EventQueue arm.
-        ObjectType::EventQueue =>
-        {
-            let raw_bytes = syscall::event_queue_retype_bytes(size_arg);
-            Some(DispatchEntry {
-                raw_bytes,
-                split: raw_bytes > BIN_512,
-            })
-        }
         // Thread: KERNEL_STACK_PAGES kstack pages + 1 page holding the
         // ThreadObject wrapper and the TCB + 1 page for the per-thread
         // extended-state save area. Layout: pages 0..N are kstack
@@ -1248,8 +1291,11 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: size_arg.saturating_mul(PAGE_SIZE as u64),
             split: true,
         }),
-        // Boot-minted only.
-        ObjectType::Mmio
+        // Boot-minted only; and the caller-sized EventQueue and WaitSet,
+        // looked up through `event_queue_dispatch` and `wait_set_dispatch`.
+        ObjectType::EventQueue
+        | ObjectType::WaitSet
+        | ObjectType::Mmio
         | ObjectType::Interrupt
         | ObjectType::IoPort
         | ObjectType::SchedControl
@@ -1260,24 +1306,35 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
 // Pins the ABI retype-cost constants `dispatch_for` debits (and the reclaim
 // path in cap/object.rs credits back) to the kernel's real object sizes. The
 // ABI EventQueue formula is checked against the kernel's layout formula at
-// capacities 0, 1 and `EVENT_QUEUE_MAX_CAPACITY` (both bodies are affine in
-// the capacity, so two points and the largest pin them).
+// capacities 0, 1 and `EVENT_QUEUE_MAX_CAPACITY`, with and without observer
+// nodes (both bodies are affine in each size, so two points per axis and the
+// largest pin them).
 const _: () = {
     assert!(
         24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64
             == syscall::ENDPOINT_RETYPE_BYTES
     );
     assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
-    // The WaitSet debit is a declared budget: the real state must fit it.
+    // The WaitSet formula, at one member, four (where the ring's 8-byte
+    // padding steps), and the largest.
+    assert!(wait_set_raw_bytes(1) == syscall::wait_set_retype_bytes(1));
+    assert!(wait_set_raw_bytes(4) == syscall::wait_set_retype_bytes(4));
     assert!(
-        24 + core::mem::size_of::<crate::ipc::wait_set::WaitSetState>() as u64
-            <= syscall::WAIT_SET_RETYPE_BYTES
+        wait_set_raw_bytes(syscall::WAIT_SET_MAX_MEMBERS as u64)
+            == syscall::wait_set_retype_bytes(syscall::WAIT_SET_MAX_MEMBERS as u64)
     );
-    assert!(event_queue_raw_bytes(0) == syscall::event_queue_retype_bytes(0));
-    assert!(event_queue_raw_bytes(1) == syscall::event_queue_retype_bytes(1));
+    assert!(event_queue_raw_bytes(0, 0) == syscall::event_queue_retype_bytes(0, 0));
+    assert!(event_queue_raw_bytes(1, 0) == syscall::event_queue_retype_bytes(1, 0));
+    assert!(event_queue_raw_bytes(0, 1) == syscall::event_queue_retype_bytes(0, 1));
+    assert!(event_queue_raw_bytes(1, 1) == syscall::event_queue_retype_bytes(1, 1));
     assert!(
-        event_queue_raw_bytes(syscall::EVENT_QUEUE_MAX_CAPACITY as u64)
-            == syscall::event_queue_retype_bytes(syscall::EVENT_QUEUE_MAX_CAPACITY as u64)
+        event_queue_raw_bytes(
+            syscall::EVENT_QUEUE_MAX_CAPACITY as u64,
+            syscall::EVENT_QUEUE_MAX_CAPACITY as u64
+        ) == syscall::event_queue_retype_bytes(
+            syscall::EVENT_QUEUE_MAX_CAPACITY as u64,
+            syscall::EVENT_QUEUE_MAX_CAPACITY as u64
+        )
     );
 };
 
@@ -1416,29 +1473,38 @@ mod tests
 
         // WaitSetState is niche-packed to fit, with the wrapper, inside
         // the 512 B sub-page bin.
-        let w = dispatch_for(ObjectType::WaitSet, 0).unwrap();
+        // WaitSet: 64 header + 24 per member + the u16 ring padded to 8.
+        // 16 members → 64 + 384 + 40 = 488 → BIN_512, in place.
+        let w = wait_set_dispatch(16);
         assert!(!w.split);
+        assert_eq!(w.raw_bytes, 488);
         assert_eq!(round_to_class(w.raw_bytes), BIN_512);
+        // 17 members → 64 + 408 + 40 = 512, still in place; 18 → split.
+        assert!(!wait_set_dispatch(17).split);
+        assert!(wait_set_dispatch(18).split);
+        assert!(dispatch_for(ObjectType::WaitSet, 0).is_none());
     }
 
     #[test]
     fn dispatch_event_queue()
     {
-        // Inline ring: 24 wrapper + 56 state + (capacity+1)*8.
-        // capacity=4 → 80 + 40 = 120 → BIN_128, in-place.
-        let small = dispatch_for(ObjectType::EventQueue, 4).unwrap();
+        // Inline: 24 wrapper + 64 state + (capacity+1)*16 ring + observers*24.
+        // capacity=1, no observers → 88 + 32 = 120 → BIN_128, in-place.
+        let small = event_queue_dispatch(1, 0);
         assert!(!small.split);
         assert_eq!(small.raw_bytes, 120);
         assert_eq!(round_to_class(small.raw_bytes), BIN_128);
-        // capacity=32 → 80 + 33*8 = 344 → BIN_512, in-place.
-        let medium = dispatch_for(ObjectType::EventQueue, 32).unwrap();
+        // capacity=16, 2 observers → 88 + 17*16 + 48 = 408 → BIN_512, in-place.
+        let medium = event_queue_dispatch(16, 2);
         assert!(!medium.split);
-        assert_eq!(medium.raw_bytes, 344);
+        assert_eq!(medium.raw_bytes, 408);
         assert_eq!(round_to_class(medium.raw_bytes), BIN_512);
-        // capacity=64 → 80 + 65*8 = 600 → exceeds BIN_512 → split.
-        let large = dispatch_for(ObjectType::EventQueue, 64).unwrap();
+        // capacity=1, 18 observers → 88 + 32 + 432 = 552 → exceeds BIN_512 → split.
+        let large = event_queue_dispatch(1, 18);
         assert!(large.split);
-        assert_eq!(large.raw_bytes, 600);
+        assert_eq!(large.raw_bytes, 552);
+        // The two-size type has no single-size entry.
+        assert!(dispatch_for(ObjectType::EventQueue, 4).is_none());
     }
 
     #[test]

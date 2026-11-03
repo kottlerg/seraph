@@ -218,6 +218,41 @@ pub unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
     (ret, secondary)
 }
 
+/// Issue a syscall with 2 arguments. Returns (primary, secondary, tertiary).
+///
+/// Used by the event-queue receive wrappers to retrieve `(ret, payload, tag)`
+/// from a0, a1 and a2.
+///
+/// # Safety
+///
+/// The raw-wrapper contract in [`crate::arch`] § Safety.
+// inline_always: syscall wrapper contains inline asm; must inline to call site.
+// cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
+#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[inline(always)]
+pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
+{
+    let ret: i64;
+    let secondary: u64;
+    let tertiary: u64;
+    let a0 = a0 as i64;
+    // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
+    // args in a0-a1; reads secondary return from a1 (inout) and tertiary from a2; a3 is
+    // discarded defensively (an IPC return register).
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inout("a0") a0 => ret,
+            inout("a1") a1 => secondary,
+            lateout("a2") tertiary,
+            lateout("a3") _,
+            in("a7") nr,
+            options(nostack),
+        );
+    }
+    (ret, secondary, tertiary)
+}
+
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
 /// Used by `raw_ipc_recv` to retrieve `(ret, label, badge, word_count)`.

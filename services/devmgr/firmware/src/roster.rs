@@ -150,23 +150,26 @@ pub trait SettleEvents<T>
 
     /// Take the next death post the event queue holds, if any, without
     /// blocking.
-    fn try_death(&mut self) -> Option<u64>;
+    fn try_death(&mut self) -> Option<DeathPost>;
 
     /// Receive one driver call on the private endpoint and answer it,
     /// taking a ready report into `roster`.
     fn serve_driver(&mut self, roster: &mut Roster<T>);
 
     /// A death post named the driver under `badge` (`reason` is the post's
-    /// low half), and `roster` now holds it dead.
+    /// exit reason), and `roster` now holds it dead.
     fn on_death(&mut self, badge: u64, reason: u64);
 }
 
-/// Split a death post into the driver's device badge (the correlator, the
-/// high 32 bits) and the exit reason (the low 32 bits).
-#[must_use]
-pub fn death_post_parts(post: u64) -> (u64, u64)
+/// One death post of the batch's event queue, decoded from its two words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeathPost
 {
-    (post >> 32, post & 0xFFFF_FFFF)
+    /// The driver's device badge: the full `u64` correlator its death
+    /// observer was bound with.
+    pub badge: u64,
+    /// The driver thread's exit reason.
+    pub reason: u64,
 }
 
 /// Settle `roster`: serve the drivers' calls and take their deaths until
@@ -203,9 +206,8 @@ pub fn settle<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)
 /// Mark dead every driver whose death the event queue holds.
 fn drain_deaths<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)
 {
-    while let Some(post) = events.try_death()
+    while let Some(DeathPost { badge, reason }) = events.try_death()
     {
-        let (badge, reason) = death_post_parts(post);
         if roster.mark_dead(badge)
         {
             events.on_death(badge, reason);
@@ -465,10 +467,10 @@ mod tests
     struct Script
     {
         /// Each wake, with the death posts queued just before it reports.
-        wakes: Vec<(Result<SettleWake, ()>, Vec<u64>)>,
+        wakes: Vec<(Result<SettleWake, ()>, Vec<DeathPost>)>,
         /// The ready-report badge of each driver call, in order.
         calls: Vec<u64>,
-        queue: Vec<u64>,
+        queue: Vec<DeathPost>,
         replies: Vec<bool>,
         deaths: Vec<(u64, u64)>,
     }
@@ -484,7 +486,7 @@ mod tests
             wake
         }
 
-        fn try_death(&mut self) -> Option<u64>
+        fn try_death(&mut self) -> Option<DeathPost>
         {
             (!self.queue.is_empty()).then(|| self.queue.remove(0))
         }
@@ -501,9 +503,9 @@ mod tests
         }
     }
 
-    fn post(badge: u64, reason: u64) -> u64
+    fn post(badge: u64, reason: u64) -> DeathPost
     {
-        (badge << 32) | reason
+        DeathPost { badge, reason }
     }
 
     #[test]
@@ -567,13 +569,23 @@ mod tests
     }
 
     #[test]
-    fn death_post_splits_into_badge_and_reason()
+    fn death_names_its_driver_by_the_full_badge()
     {
-        assert_eq!(
-            death_post_parts(post(0xFFFF_FFFF, 0x8000_0001)),
-            (0xFFFF_FFFF, 0x8000_0001)
-        );
-        assert_eq!(death_post_parts(0), (0, 0));
+        // Two badges that share their low 32 bits: the death of the wide one
+        // marks only it, and its full exit reason reaches `on_death`.
+        let wide = (1 << 40) | 5;
+        let mut r = roster_of(&[5, wide]);
+        let mut s = Script {
+            wakes: vec![
+                (Ok(SettleWake::Death), vec![post(wide, 0x1_8000_0001)]),
+                (Ok(SettleWake::Driver), vec![]),
+            ],
+            calls: vec![5],
+            ..Script::default()
+        };
+        assert_eq!(settle(&mut s, &mut r), Ok(()));
+        assert_eq!(s.deaths, [(wide, 0x1_8000_0001)]);
+        assert_eq!(served(r), [5]);
     }
 
     const LABELS: DriverLabels = DriverLabels {

@@ -316,8 +316,7 @@ unsafe fn commit_stopped(
 /// target commits while the stop is in progress: on restart the stopped
 /// thread's blocked syscall returns `Interrupted` and a fault-blocked thread
 /// is killed (see `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`), unless
-/// a genuine waker, the sleep timer, or the target's own full-list withdrawal
-/// (a timed wait or sleep that found the sleep list full) claimed it first.
+/// a genuine waker or the sleep timer claimed it first.
 /// A target parked on an endpoint, notification, event queue, or wait set
 /// whose last capability is deleted concurrently is claimed by the stop or by
 /// the source's teardown, which stamps the same `Interrupted`. A thread may
@@ -1062,8 +1061,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // race means the waker's deposit stands and the resume
                     // delivers it (fail-open), or a concurrent cancel already
                     // claimed and stamped it, or the thread's own
-                    // dealloc_object(Thread) unlinked it as it dies, or its
-                    // own full-list withdrawal dequeued it and returns 0 bits.
+                    // dealloc_object(Thread) unlinked it as it dies.
                     if (*sig).waiters.remove(tcb)
                     {
                         // Re-derive the observer flag like every other
@@ -1109,8 +1107,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // lost race means a genuine wake's deposit stands
                     // (fail-open), or a concurrent cancel already claimed and
                     // stamped it, or the thread's own dealloc_object(Thread)
-                    // unlinked it as it dies, or its own full-list withdrawal
-                    // dequeued it and returns WouldBlock.
+                    // unlinked it as it dies.
                     if (*eq).waiters.remove(tcb)
                     {
                         // A timed wait's entry goes with the waiter, under

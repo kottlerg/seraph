@@ -151,6 +151,15 @@ impl UserFrame
         unsafe { (*self.0.as_ptr()).set_ipc_return(primary, label) };
     }
 
+    /// Write the three-register return (primary, secondary, tertiary): rax,
+    /// rdx, rsi on x86-64; a0, a1, a2 on RISC-V. `SYS_EVENT_RECV` returns an
+    /// entry's payload and tag words through it.
+    pub fn set_ipc_return_with_badge(self, primary: u64, label: u64, badge: u64)
+    {
+        // SAFETY: as for `set_return`.
+        unsafe { (*self.0.as_ptr()).set_ipc_return_with_badge(primary, label, badge) };
+    }
+
     /// Write the `SYS_IPC_CALL` return registers.
     pub fn set_ipc_call_return(self, primary: u64, reply_label: u64, reply_word_count: u64)
     {
@@ -495,53 +504,12 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
         }
     }
 
+    // A refusal means a stop or teardown cancelled the park between the
+    // commit and the add, stamped it INTERRUPTED, and commits Stopped or
+    // Exited; schedule() below deschedules the thread and the resume takes
+    // that stamp. The list has no capacity, so no other refusal exists.
     // SAFETY: tcb is this CPU's running thread.
-    match unsafe { crate::sched::sleep_list_add(tcb) }
-    {
-        Ok(()) | Err(crate::sched::SleepAddError::Cancelled) =>
-        {
-            // Cancelled: a stop or teardown cancelled the park between the
-            // commit and the add, stamped it INTERRUPTED, and commits Stopped
-            // or Exited; schedule() below deschedules the thread and the
-            // resume takes that stamp.
-        }
-        Err(crate::sched::SleepAddError::Full) =>
-        {
-            // Sleep list at capacity: withdraw the park. sys_thread_sleep has
-            // no IPC source to fall back on, so the honest answer is to
-            // surface the failure (core/kernel/docs/thread-lifecycle-and-sleep.md
-            // § Sleep List Invariants). The withdrawal is the claim a cancel makes,
-            // sleep_list_remove under sched_lock, true while the deadline is
-            // still pending: winning it means no stop or teardown claimed the
-            // park, so restore Running and report OutOfMemory (a later stop
-            // commits over the restored Running). Losing it means one did and
-            // stamped the park INTERRUPTED; fall through to schedule() as the
-            // Ok path does, and the resume consumes the stamp.
-            // A won withdrawal leaves the thread Running with cs = 0 (the
-            // commit_blocked above cleared context_saved), which is
-            // intentional and benign: cs = 0 truthfully means "live registers
-            // authoritative" for a still-`current`, never-switched-out thread,
-            // no path dispatches a not-linked `current` thread cross-CPU, and
-            // the next switch-out republishes cs = 1. Do NOT "restore" cs = 1
-            // here.
-            // SAFETY: tcb valid; SLEEP_LIST_LOCK is a leaf under sched_lock;
-            // restoring before any schedule().
-            let withdrawn = unsafe {
-                let saved = (*tcb).sched_lock.lock_raw();
-                let won = crate::sched::sleep_list_remove(tcb);
-                if won && (*tcb).state == crate::sched::thread::ThreadState::Blocked
-                {
-                    (*tcb).state = crate::sched::thread::ThreadState::Running;
-                }
-                (*tcb).sched_lock.unlock_raw(saved);
-                won
-            };
-            if withdrawn
-            {
-                return Err(SyscallError::OutOfMemory);
-            }
-        }
-    }
+    let _ = unsafe { crate::sched::sleep_list_add(tcb) };
 
     // SAFETY: called from syscall handler on valid kernel stack.
     unsafe {
@@ -566,12 +534,11 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = Thread cap slot (CONTROL right required).
 /// arg1 = `EventQueue` cap slot (POST right required).
-/// arg2 = caller-chosen `correlator: u32` (opaque routing tag).
+/// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
-/// When the target thread exits or faults, the kernel posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to the bound
-/// `EventQueue`. Passing `correlator = 0` makes the payload equal to the
-/// exit reason.
+/// When the target thread exits or faults, the kernel posts the two-word
+/// entry `(exit_reason, correlator)` to the bound `EventQueue`: the exit
+/// reason as the payload word, the correlator as the tag word.
 ///
 /// Binding onto a thread that has *already* exited posts the retained
 /// `exit_reason` to the `EventQueue` immediately. The bind serialises on the
@@ -585,22 +552,23 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 /// queue live for the death post (core/kernel/docs/syscalls.md
 /// § `SYS_THREAD_BIND_NOTIFICATION`). A bind onto an exited thread takes none.
 ///
-/// Multiple independent observers may be registered (up to
-/// `MAX_DEATH_OBSERVERS`); all fire on death. Returns `OutOfMemory` if the
-/// per-thread observer array is full (only reachable while the thread is
-/// still live — a bind onto an already-exited thread consumes no slot).
+/// Multiple independent observers may be registered; all fire on death. Each
+/// live binding holds one death-observer node of the queue's pool
+/// (`SYS_CAP_CREATE_EVENT_Q` arg2) until the thread's teardown. Returns
+/// `OutOfMemory` if the queue has no free node (only reachable while the
+/// thread is still live — a bind onto an already-exited thread takes none).
 #[cfg(not(test))]
-// cast_possible_truncation: cap handles and the correlator are u32 by ABI
-// contract; the truncation discards any upper bits a caller sets.
+// cast_possible_truncation: cap handles are u32 by ABI contract; the
+// truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{EqRights, ThreadRights};
-    use crate::sched::thread::{DeathObserver, MAX_DEATH_OBSERVERS, ThreadState};
+    use crate::sched::thread::ThreadState;
 
     let thread_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
-    let correlator = tf.arg(2) as u32;
+    let correlator = tf.arg(2);
 
     // SAFETY: current_tcb valid in syscall context.
     let caller = unsafe { current_tcb() };
@@ -634,18 +602,26 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
         .as_ptr()
         .cast::<crate::cap::object::EventQueueObject>();
 
+    // Take the observer node from the queue's pool first, under eq.lock
+    // alone: eq.lock is never taken under a thread's sched_lock. A pool with
+    // no free node still lets a bind onto an exited thread succeed below,
+    // since that bind links nothing.
+    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call; no lock
+    // is held.
+    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer((*eq).state) };
+
     // Serialise on the target thread's `sched_lock` against the death
     // transition (`set_state_under_all_locks`) and the post-death observer
-    // snapshot (`post_death_notification`):
+    // walk (`post_death_notification`):
     //
     //   * Already `Exited`: the death walk ran without this observer. The
     //     thread's `exit_reason` was written in the same all-locks hold as
     //     the `Exited` commit (`exit_under_all_locks`), which includes this
     //     lock, so it is visible here; re-deliver it to the newly
-    //     bound queue and do not append (the thread cannot die again). Closes
+    //     bound queue and link nothing (the thread cannot die again). Closes
     //     the bind-after-death window for services bound after start (#106).
-    //   * Not yet `Exited`: append the observer; the eventual death walk posts
-    //     to it.
+    //   * Not yet `Exited`: link the node; the eventual death walk posts
+    //     through it.
     //
     // Deliver outside the lock — `post_one_death_event` posts to the event
     // queue and may wake a receiver.
@@ -659,35 +635,49 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
             (*target_tcb).exit_reason,
         )
     };
-    if already_exited
+    if already_exited || node.is_null()
     {
         // SAFETY: paired with the lock_raw above.
         unsafe { (*target_tcb).sched_lock.unlock_raw(saved) };
+        if !node.is_null()
+        {
+            // SAFETY: node came from this queue's pool and was never linked;
+            // eq is pinned by `eq_slot`.
+            unsafe { crate::ipc::event_queue::event_queue_return_observer((*eq).state, node) };
+        }
+        if !already_exited
+        {
+            return Err(SyscallError::OutOfMemory);
+        }
         // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call, so
         // it is live for the post; sched_lock is released.
         unsafe { crate::sched::post_one_death_event(eq, correlator, retained_reason) };
         return Ok(0);
     }
-    // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS. The
-    // binding's reference is taken while `eq_slot` pins the queue; the
-    // thread's teardown releases it (dealloc_object, Thread arm).
-    let result = unsafe {
-        let count = (*target_tcb).death_observer_count as usize;
-        if count >= MAX_DEATH_OBSERVERS
-        {
-            Err(SyscallError::OutOfMemory)
+    // The binding's reference is checked against REF_COUNT_LIMIT: the number
+    // of bindings on one queue grows with the nodes its creator funds. It is
+    // taken while `eq_slot` pins the queue.
+    // SAFETY: eq is pinned by `eq_slot`; header at offset 0.
+    if let Err(e) = unsafe { (*eq).header.try_inc_ref() }
+    {
+        // SAFETY: paired with the lock_raw above; the node was never linked
+        // and eq is pinned by `eq_slot`.
+        unsafe {
+            (*target_tcb).sched_lock.unlock_raw(saved);
+            crate::ipc::event_queue::event_queue_return_observer((*eq).state, node);
         }
-        else
-        {
-            (*eq).header.inc_ref();
-            (*target_tcb).death_observers[count] = DeathObserver { eq, correlator };
-            (*target_tcb).death_observer_count = (count + 1) as u8;
-            Ok(0)
-        }
-    };
-    // SAFETY: paired with the lock_raw above.
-    unsafe { (*target_tcb).sched_lock.unlock_raw(saved) };
-    result
+        return Err(e);
+    }
+    // SAFETY: lock held; node is this queue's, unlinked, and lives in the
+    // queue's retype slot, which the reference just taken keeps live until
+    // the thread's teardown returns the node and releases it (dealloc_object,
+    // Thread arm).
+    unsafe {
+        (*node).correlator = correlator;
+        (*target_tcb).death_observers.push(node);
+        (*target_tcb).sched_lock.unlock_raw(saved);
+    }
+    Ok(0)
 }
 
 /// `SYS_ASPACE_BIND_NOTIFICATION` (53): bind a terminal-fault death observer
@@ -695,7 +685,7 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = `AddressSpace` cap slot index (`CONTROL` right required).
 /// arg1 = `EventQueue` cap slot index (`POST` right required).
-/// arg2 = caller-chosen `correlator` (opaque routing tag).
+/// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
 /// On a terminal fault by any thread in the address space (no handler bound,
 /// the handler replied `KILL`, or the fault episode was cancelled by
@@ -706,8 +696,8 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// fault, cancelling the episode before any reply claims it or keeping a
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
-/// the kernel posts the terminal-fault reason (with the observer's correlator
-/// in the high 32 bits) to each bound observer. The kernel only notifies; it
+/// the kernel posts the entry `(terminal-fault reason, correlator)` to each
+/// bound observer. The kernel only notifies; it
 /// never enumerates or terminates threads, and normal `thread_exit` does NOT
 /// fire these observers.
 ///
@@ -718,11 +708,12 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// Binding onto an address space that has *already* terminal-faulted posts the
 /// retained fault reason to the `EventQueue` immediately (serialised on the
 /// space's `death_lock`), so an observer bound after the space was running does
-/// not miss the fault. Returns `OutOfMemory` if the per-address-space observer
-/// array is full (only reachable before the first fault).
+/// not miss the fault. Each live binding holds one death-observer node of the
+/// queue's pool until the address space's teardown; returns `OutOfMemory` if
+/// the queue has no free node (only reachable before the first fault).
 #[cfg(not(test))]
-// cast_possible_truncation: cap handles and the correlator are u32 by ABI
-// contract; the truncation discards any upper bits a caller sets.
+// cast_possible_truncation: cap handles are u32 by ABI contract; the
+// truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -730,7 +721,7 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let aspace_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
-    let correlator = tf.arg(2) as u32;
+    let correlator = tf.arg(2);
 
     // SAFETY: current_tcb valid in syscall context.
     let caller = unsafe { current_tcb() };
@@ -781,11 +772,23 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     // terminal-fault post, so a fault before this bind is not lost (the
     // address-space analogue of the thread bind-after-death path above).
     //
+    // The node comes from the queue's pool under eq.lock alone, before
+    // death_lock (the two are never nested).
+    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call; no lock
+    // is held.
+    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer((*eq).state) };
     // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap;
-    // eq is the EventQueueObject `eq_slot` pins for the call.
-    match unsafe {
-        crate::mm::address_space::AddressSpace::bind_or_retained(as_ptr, eq, correlator)
+    // eq is the EventQueueObject `eq_slot` pins for the call; node is null or
+    // this queue's, unlinked.
+    let bound = unsafe {
+        crate::mm::address_space::AddressSpace::bind_or_retained(as_ptr, eq, node, correlator)
+    };
+    if !matches!(bound, Ok(None)) && !node.is_null()
+    {
+        // SAFETY: the node was not linked; eq is pinned by `eq_slot`.
+        unsafe { crate::ipc::event_queue::event_queue_return_observer((*eq).state, node) };
     }
+    match bound
     {
         Ok(None) => Ok(0),
         Ok(Some(reason)) =>
@@ -795,7 +798,7 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
             unsafe { crate::sched::post_one_death_event(eq, correlator, reason) };
             Ok(0)
         }
-        Err(()) => Err(SyscallError::OutOfMemory),
+        Err(e) => Err(e),
     }
 }
 

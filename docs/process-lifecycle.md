@@ -316,9 +316,10 @@ at creation time. Examples:
   endpoint, minted by procmgr per child via
   `cap_derive_badge(log_send_source, RIGHTS_EP_SEND, process_badge)`.
   The cap's kernel-attached badge equals procmgr's process badge,
-  which also equals the death-EQ correlator procmgr posts to
-  logd. Identity is reconciled across the three views without
-  any auxiliary mapping.
+  whose low 32 bits are the death-EQ correlator procmgr binds
+  into logd's queue (logd compares the low words). Identity is
+  reconciled across the three views without any auxiliary
+  mapping.
 - `ProcessInfo.sched_control_cap` — baseline `SchedControl` cap covering the
   band the spawner assigned (`[1, band_max]`, from the create label's
   `CREATE_BAND_MAX` field; default is a copy of the creator's own band).
@@ -443,8 +444,9 @@ delivery, fault delivery, a death post) keeps that source live until its wake co
 
 ### Exit reason
 
-The kernel records a single 32-bit **exit reason** at death and delivers it
-(low 32 bits) through the thread death-observer surface. It is a flat,
+The kernel records a single **exit reason** at death, every value of which fits
+32 bits, and delivers it whole, as the payload word of the death entry, through the
+thread death-observer surface. It is a flat,
 kernel-owned space partitioned into disjoint ranges so userspace can never forge
 a fault or kill reason — defined once in `syscall_abi`:
 

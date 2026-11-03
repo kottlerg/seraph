@@ -38,8 +38,7 @@
 //! waiter has entered a later wait, so no wait is served twice (a stop may
 //! have ended the wait meanwhile; the delivery then stays on the source and
 //! the waiter's next wait on it consumes it). The controller, pinned to
-//! CPU 0, runs [`CYCLES`] rounds per phase (fewer past 16 CPUs, see
-//! [`super::scaled_attempts`]): stop the waiter, spin a varying
+//! CPU 0, runs [`CYCLES`] rounds per phase: stop the waiter, spin a varying
 //! delay, restart it, wait until it enters its next wait (bounded by
 //! [`ENTRY_WAIT_US`]; a round that times out is tallied), and spin a varying
 //! delay, so stops land on a park with the sender's delivery before, during,
@@ -78,11 +77,6 @@ const CELL: &str = "stress::stop_repark";
 
 /// Stop/start rounds per phase.
 const CYCLES: u32 = 1000;
-
-/// Fewest rounds per phase at any width: a stop interrupts the waiter on a
-/// good share of the rounds and the sender delivers on both sources between
-/// stops, so a few dozen rounds still see both.
-const MIN_CYCLES: u32 = 64;
 
 /// The two sources of a phase, and its two children (the waiter and the
 /// sender).
@@ -207,9 +201,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_repark: pin controller failed")?;
-    // Each round's cross-CPU stop drain and restart grow with the width; the
-    // count shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = phases(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_repark: restore controller affinity failed");
     result?;

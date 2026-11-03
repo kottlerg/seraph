@@ -7,16 +7,15 @@
 //!
 //! `NUM_CALLERS` callers simultaneously block on one endpoint. The server
 //! drains all of them, verifying no caller is lost. Repeats for `CYCLES`
-//! cycles (fewer past 16 CPUs, see [`super::scaled_attempts`]), logging the
-//! cycles done at most every [`PROGRESS_INTERVAL_US`]. Exercises the endpoint
-//! send-queue spinlock under contention.
+//! cycles, logging the cycles done at most every [`PROGRESS_INTERVAL_US`].
+//! Exercises the endpoint send-queue spinlock under contention.
 
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
-    notification_wait, system_info, thread_exit,
+    notification_wait, thread_exit,
 };
-use syscall_abi::{RIGHTS_EP_SEND_GRANT, SystemInfoType};
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -25,11 +24,6 @@ const CELL: &str = "stress::concurrent_ipc";
 
 const NUM_CALLERS: usize = 64;
 const CYCLES: u32 = 200;
-
-/// Fewest cycles at any width: every cycle queues all `NUM_CALLERS` callers
-/// on the endpoint at once, so a handful of cycles still contends its
-/// send-queue lock from every caller.
-const MIN_CYCLES: u32 = 8;
 
 /// Least time between two progress lines, in microseconds: at wide CPU
 /// counts a cycle takes long enough that the cell would otherwise run
@@ -56,13 +50,8 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, NUM_CALLERS> = spawn::ArgBlock::
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let cpus = system_info(SystemInfoType::CpuCount as u64)
-        .map_err(|_| "concurrent_ipc: system_info(CpuCount) failed")?;
-    // Each cycle's starts, replies and exits wake callers across CPUs, whose
-    // cost grows with the width; the count shrinks with it.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
     let mut logged_at = crate::elapsed_us();
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         let now = crate::elapsed_us();
         if now.saturating_sub(logged_at) >= PROGRESS_INTERVAL_US

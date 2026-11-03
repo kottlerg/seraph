@@ -29,10 +29,9 @@
 //! copy the caller uses) immediately followed by the delete of the original.
 //! A long-lived caller, pinned to CPU 1, and the controller, pinned to CPU 0,
 //! both live in ktest's own `CSpace`. The controller runs [`CYCLES`] rounds
-//! per phase (fewer past 16 CPUs, see [`super::scaled_attempts`]). Each round
-//! creates a fresh endpoint, publishes the handle the caller is to use (the
-//! endpoint's original capability, or a copy derived from it in the revoke
-//! phase), and opens the round. The caller loops over one group of calls
+//! per phase. Each round creates a fresh endpoint, publishes the handle the
+//! caller is to use (the endpoint's original capability, or a copy derived
+//! from it in the revoke phase), and opens the round. The caller loops over one group of calls
 //! through that handle until a call finds it gone: copy it into ktest's own
 //! `CSpace`, derive from it, derive a badged capability from it, deleting each
 //! new capability at once. In the delete phase the controller's free is the
@@ -82,11 +81,6 @@ const CELL: &str = "stress::copy_source_delete";
 
 /// Rounds per phase; each frees one source under the caller.
 const CYCLES: u32 = 300;
-
-/// Fewest rounds per phase at any width: ten per call the controller aims
-/// at, enough for every call to return `Ok` in some round and some free to
-/// land inside a call.
-const MIN_CYCLES: u32 = 30;
 
 /// CPUs needed: one each for the controller and the caller.
 const MIN_CPUS: u64 = 2;
@@ -179,9 +173,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::copy_source_delete: pin controller failed")?;
-    // Each round's cross-CPU free and handoff grow with the width; the count
-    // shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = phases(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::copy_source_delete: restore controller affinity failed");
     result?;

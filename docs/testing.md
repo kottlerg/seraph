@@ -482,28 +482,28 @@ saves its log for the timing report below (`--save-logs`).
 
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 64- and
-# 65-hart runs take ~115 s and ~120 s, the 128-hart run ~220 s at 8x hart
+# 65-hart runs take ~220 s each, the 128-hart run ~590 s at 8x hart
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 540 \
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 660 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 540 \
+cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 720 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1080 \
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
     --save-logs $T
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
-# run, at 1x, takes ~55 s; the 128-vCPU run, at 8x vCPU oversubscription,
-# ~27 s, since its scaled cells make an eighth of their attempts and idle
-# vCPUs halt; each budget is for HANG classification, see below):
+# run, at 1x, takes ~58 s; the 128-vCPU run, at 8x vCPU oversubscription,
+# ~75 s, since idle vCPUs halt; each budget is for HANG classification, see
+# below):
 cargo xtask clean
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
 cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
     --save-logs $T
-cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 840 \
+cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 900 \
     --save-logs $T
 
 # Timing report (report only; see below):
@@ -526,13 +526,14 @@ count at which hart-scaled firmware allocations once collided with the kernel im
 ([#377](https://github.com/kottlerg/seraph/issues/377)); the two 128-CPU runs are the widest, two
 full mask words at 8x oversubscription.
 
-Past 16 CPUs ktest scales its round-based stress cells' attempt counts, and stretches the
-wall-clock bounds [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists,
-by the oversubscription factor the width implies, so the boundary runs stay inside their budgets
-while the CI widths keep the full counts and tight budgets.
+Past 16 CPUs ktest stretches the wall-clock bounds
+[core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists by the
+oversubscription factor the width implies, so a slow step at a boundary run is not taken for a
+stuck one while the CI widths keep the tight budgets; its stress cells make their full attempt
+counts at every width.
 
-**Timing report.** The scaling assumes that a cell's cost grows at most linearly with the width;
-the boundary runs measure it. `cargo xtask ktest-timing`
+**Timing report.** The stretched bounds assume that a cell's cost grows at most linearly with the
+width; the boundary runs measure it. `cargo xtask ktest-timing`
 ([xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) reads the saved logs and reports,
 per tier and per cell, the wall time between the stamps ktest prints (a cell's start line and its
 `PASS` or `FAIL` line), with the boot to ktest's start, ktest's span, and the host's wall time for
@@ -543,17 +544,14 @@ the commit and the reference host's CPU, kernel, QEMU, and accelerator settings 
 parameters on x86_64), and warns when the host running the comparison differs. A row is flagged
 when `R/F`, or its ratio to the baseline, exceeds 1.5 and its time exceeds the expected one (`F`
 times the base, or the baseline's) by at least 1 s; the cells are listed by that ratio, highest
-first. A cell whose attempt count is scaled (a † knob of
-[core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress)) makes `1/F` of its
-attempts at the wide width, down to its floor, so its `R/F` understates the growth of one attempt by
-up to `F`: on the reference host the whole of Tier S at 128 vCPUs takes 0.27 times its 16-vCPU
-time, which, were every Tier S cell scaled to one eighth of its attempts, would be about 2.2 times
-the cost of one attempt (an approximation: some cells are unscaled and some stop at their
-floor). The baseline comparison is the check for such a cell. The report is a report, not a
-gate: a PR that owes the boundary set carries it in its body, and no flag blocks a PR or a tag
-until the threshold is calibrated against the baselines and made a gate. A baseline is rewritten,
-on the reference host and from runs at a `master` commit, by the PR that changes a cell's cost on
-purpose and when the reference host's QEMU, kernel, or accelerator settings change.
+first. Every cell makes the same attempts at both widths, so `R` is the growth of the cell's whole
+cost. The report is a report, not a gate: a PR that owes the boundary set carries it in its body,
+and no flag blocks a PR or a tag until the threshold is calibrated against the baselines and made
+a gate. A baseline is rewritten on the reference host: from runs at a `master` commit when the
+host's QEMU, kernel, or accelerator settings change, and by the PR that changes a cell's cost on
+purpose, from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
+[xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) is the code its merge brings to
+`master`, taken again when `master` changes that code before the merge.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
 a non-inert change to the memory surface: the code that sizes or maps physical memory by the

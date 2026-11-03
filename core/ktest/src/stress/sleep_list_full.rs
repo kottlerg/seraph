@@ -42,9 +42,7 @@
 //! until every filler has started and a probe `thread_sleep(1)` of its own
 //! returns `OutOfMemory`, which proves every slot is held. A victim
 //! pinned to CPU 1 then loops `thread_sleep(1)` while the controller issues
-//! [`CYCLES`] stop/start pairs against it (fewer past 16 CPUs, as for the
-//! timed-wait storm below; see [`super::scaled_attempts`]), each after a
-//! cycle-varying spin,
+//! [`CYCLES`] stop/start pairs against it, each after a cycle-varying spin,
 //! so stops land before, inside and after the victim's commit-to-withdrawal
 //! window. With the list full no victim sleep can be listed, so every
 //! result must be `OutOfMemory` or `Interrupted`. The controller then stops
@@ -107,12 +105,6 @@ const WAIT_CYCLES: u32 = 1000;
 
 /// Stop/start pairs to issue against the victim.
 const CYCLES: u32 = 2000;
-
-/// Fewest pairs of each storm at any width: between two stops each victim
-/// loops many full-list waits or sleeps, so a few dozen pairs already meet
-/// the full list and land stops around its withdrawals.
-const MIN_WAIT_CYCLES: u32 = 32;
-const MIN_CYCLES: u32 = 64;
 
 /// The stop/start pairs of the timed-wait storm and of the sleep storm.
 #[derive(Clone, Copy)]
@@ -204,11 +196,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::sleep_list_full: pin controller failed")?;
-    // Each pair's cross-CPU stop drain grows with the width; the counts
-    // shrink with it.
     let storms = Storms {
-        waits: super::scaled_attempts(WAIT_CYCLES, MIN_WAIT_CYCLES, cpus),
-        sleeps: super::scaled_attempts(CYCLES, MIN_CYCLES, cpus),
+        waits: WAIT_CYCLES,
+        sleeps: CYCLES,
     };
     let result = with_fillers(ctx, storms);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)

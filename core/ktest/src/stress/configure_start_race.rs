@@ -28,8 +28,7 @@
 //! ## How this exercises it
 //!
 //! A helper, pinned to CPU 1 in ktest's own `CSpace`, serves [`CYCLES`]
-//! rounds (fewer past 16 CPUs, see [`super::scaled_attempts`]). Each round
-//! the controller, pinned to CPU 0, creates a thread in
+//! rounds. Each round the controller, pinned to CPU 0, creates a thread in
 //! ktest's `CSpace`, configures it to enter [`entry_a`] on its own stress
 //! stack with argument [`tag`]`(round, A)`, pins it to CPU 2 (with 3+ CPUs,
 //! an idle CPU that dispatches it at once) or else to CPU 0 (dispatched at
@@ -77,10 +76,6 @@ const CELL: &str = "stress::configure_start_race";
 
 /// Rounds; each races one configure against one start of a fresh thread.
 const CYCLES: u32 = 200;
-
-/// Fewest rounds at any width: the delay sweep puts the start first on
-/// about half the rounds, so a few dozen rounds still see both outcomes.
-const MIN_CYCLES: u32 = 32;
 
 /// CPUs needed: one each for the controller and the helper.
 const MIN_CPUS: u64 = 2;
@@ -180,10 +175,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::configure_start_race: pin controller failed")?;
-    // Each round's thread creation, cross-CPU start and exit grow with the
-    // width; the count shrinks with it.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
-    let result = with_helper(ctx, target_cpu, cycles);
+    let result = with_helper(ctx, target_cpu, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::configure_start_race: restore controller affinity failed");
     let tally = result?;

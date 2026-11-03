@@ -97,15 +97,9 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const CELL: &str = "stress::reply_caller_delete";
 
 /// Rounds to run, rotating over the three kinds and the four order slots
-/// ([`ORDERS`]); half are race rounds, so an unscaled run (up to
-/// [`crate::UNSCALED_CPUS`] CPUs) races the reply against the delete 600
-/// times.
+/// ([`ORDERS`]); half are race rounds, so every run races the reply against
+/// the delete 600 times.
 const CYCLES: u32 = 1200;
-
-/// Fewest rounds at any width ([`super::scaled_attempts`]): 96 rounds give
-/// each kind 8 reply-first, 8 delete-first and 16 race rounds, so every
-/// (kind, steered order) check runs several times.
-const MIN_CYCLES: u32 = 96;
 
 /// The controller's, the server's, and the caller's CPUs.
 const CONTROLLER_CPU: u32 = 0;
@@ -245,12 +239,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     BAD_CALLER.reset();
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::reply_caller_delete: pin controller failed")?;
-    // Each round's spawns, deletes and cross-CPU wakes grow with the width;
-    // the count shrinks with it.
-    let count = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
     let mut outcomes = Outcomes::default();
     let mut result = Ok(());
-    for cycle in 0..count
+    for cycle in 0..CYCLES
     {
         if let Err(e) = one_round(ctx, cycle, &mut outcomes)
         {

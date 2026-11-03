@@ -223,7 +223,9 @@ pub enum SyscallError
     ObjectGone = -7,
     /// No memory available to satisfy the request.
     OutOfMemory = -8,
-    /// The operation is not supported on this object type.
+    /// The operation is not supported: on this object type, on this
+    /// architecture, or (for a diagnostic query) in this boot; or the firmware
+    /// returned an error (`SYS_SBI_CALL`).
     NotSupported = -9,
     /// The capability rights bitmask violates the W^X constraint.
     WxViolation = -10,
@@ -2357,13 +2359,15 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | _(unused)_ | Ignored by the kernel; the `shared/syscall` wrapper passes 0 |
+| 1 | `class` | `StackHighWater` only: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2); ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
 **Capability requirement:** None.
 
-**Errors:** `InvalidArgument` (unknown `info_type`).
+**Errors:** `InvalidArgument` (unknown `info_type`, or unknown `class` for `StackHighWater`);
+`NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
+stack).
 
 ### `SystemInfoType`
 
@@ -2412,6 +2416,17 @@ pub enum SystemInfoType
     /// or `1 << 56` under riscv64 Sv39, Sv48, or Sv57.
     /// ruststd sizes a process's heap and reservation-arena zones from it.
     UserVaTop           = 8,
+
+    /// Deepest use, in bytes, of the kernel stack class in arg1, measured from
+    /// the paint the stack was filled with at allocation
+    /// ([memory-internals.md](memory-internals.md) § Kernel Stack Depth):
+    /// `STACK_CLASS_IDLE` — the deepest idle stack, scanned at the call;
+    /// `STACK_CLASS_THREAD` — the deepest of every freed thread's kernel stack
+    /// and the caller's own, scanned at the call; `STACK_CLASS_HANDOFF` — the
+    /// bootloader's handoff stack, recorded when the BSP left it, or the error
+    /// `NotSupported` when its base mark was not found. A diagnostic, read by
+    /// ktest.
+    StackHighWater      = 9,
 }
 ```
 
@@ -2577,11 +2592,12 @@ source of truth.
 
 ## Summarized By
 
-[core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Kernel Handoff Contract](../../boot/docs/kernel-handoff.md), [core/kernel/README.md](../README.md),
+[Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
-[Scheduler Internals](scheduler.md),
+[Memory Subsystem Internals](memory-internals.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
 [core/ktest/README.md](../../ktest/README.md),

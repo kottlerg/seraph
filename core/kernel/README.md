@@ -27,6 +27,7 @@ core/kernel/
 │   ├── irq.rs                  # IRQ routing table (sized at boot): lines to notifications
 │   ├── percpu.rs               # Per-CPU private state
 │   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
+│   ├── stack_depth.rs          # Kernel stack paint and deepest-use report (StackHighWater)
 │   ├── sync.rs                 # Kernel synchronisation primitives
 │   ├── uaccess.rs              # Fault-recoverable user-memory copies
 │   ├── validate.rs             # Phase 0 boot-info validation

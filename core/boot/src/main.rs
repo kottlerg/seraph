@@ -1079,6 +1079,20 @@ unsafe fn step6_allocate_and_build_page_tables(
     // SAFETY: bs is valid.
     let stack_phys = unsafe { allocate_pages(ctx.bs, KERNEL_STACK_PAGES)? };
     let stack_top = stack_phys + (KERNEL_STACK_PAGES as u64) * 4096;
+    // Paint the stack and mark its lowest word for the kernel's depth report
+    // (core/boot/docs/boot-flow.md § Step 6; the kernel derives the span from
+    // this page-aligned top).
+    // SAFETY: allocate_pages returned KERNEL_STACK_PAGES identity-mapped,
+    // page-aligned pages owned by this allocation; nothing uses them yet.
+    unsafe {
+        let words = (KERNEL_STACK_PAGES * 4096) / core::mem::size_of::<u64>();
+        let p = stack_phys as *mut u64;
+        for i in 1..words
+        {
+            p.add(i).write(boot_protocol::layout::STACK_PAINT);
+        }
+        p.write(boot_protocol::layout::HANDOFF_STACK_BASE_MARK);
+    }
     // Reclaim-array page: dedicated 4 KiB backing for BootInfo.reclaim_ranges.
     // SAFETY: bs is valid.
     let reclaim_array_phys = unsafe { allocate_pages(ctx.bs, 1)? };

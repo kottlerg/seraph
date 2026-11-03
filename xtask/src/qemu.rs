@@ -191,12 +191,13 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             spec.disk_path.display()
         ),
         "-device".into(),
-        blk_device("hd0", spec.disk_block_size),
+        blk_device(
+            "hd0",
+            spec.disk_block_size,
+            spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
+        ),
     ];
 
-    // The second disk's device follows the first's, so the two take
-    // adjacent PCI slots and, by the slot swizzle, distinct INTx lines:
-    // devmgr serves a virtio-blk device only on a line no other device holds.
     if let Some(second) = &spec.second_disk
     {
         check_block_size(second.block_size)?;
@@ -204,7 +205,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "-drive".into(),
             format!("if=none,id=hd1,format=raw,file={}", second.path.display()),
             "-device".into(),
-            blk_device("hd1", second.block_size),
+            blk_device("hd1", second.block_size, Some(SECOND_DISK_SLOT)),
         ]);
     }
 
@@ -263,19 +264,33 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     Ok(args)
 }
 
+/// PCI slots of the two disks of a two-disk launch (a single disk takes
+/// QEMU's next free slot). devmgr serves a virtio-blk device only on an
+/// `INTx` line no other device holds (#664), so the two disks must land on
+/// distinct lines, and two slots apart they do on both machines: on `x86_64`
+/// OVMF programs the line from `{10, 10, 11, 11}` indexed by
+/// `(slot + 1) % 4`, which pairs adjacent slots, and on riscv64 the `virt`
+/// host swizzles `INTA` onto PLIC source `32 + slot % 4`. Both slots sit
+/// below 25, past which q35 routes every slot to one line, and above the
+/// slots QEMU's default and auto-placed devices take.
+const FIRST_DISK_SLOT: u8 = 0x10;
+const SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 2;
+
 /// The `virtio-blk-pci` device for `drive`, presenting `block_size`-byte
 /// logical and physical blocks (QEMU requires the physical size to be at
-/// least the logical).
-fn blk_device(drive: &str, block_size: u32) -> String
+/// least the logical), at PCI slot `slot` when one is given.
+fn blk_device(drive: &str, block_size: u32, slot: Option<u8>) -> String
 {
+    let addr = slot.map_or_else(String::new, |slot| format!(",addr={slot:#04x}"));
     format!(
         "virtio-blk-pci,drive={drive},disable-legacy=on,logical_block_size={block_size},\
-         physical_block_size={block_size}"
+         physical_block_size={block_size}{addr}"
     )
 }
 
-/// Refuse a device block size QEMU cannot present: a power of two of at
-/// least 512 bytes. A size the guest's driver refuses (above its
+/// Refuse a device block size below 512 bytes or not a power of two, which
+/// QEMU refuses at launch. Its upper bound, which varies by QEMU version, is
+/// left to QEMU; a size the guest's driver refuses (above its
 /// `MAX_BLOCK_SIZE`) is a valid launch.
 fn check_block_size(block_size: u32) -> Result<()>
 {
@@ -848,6 +863,42 @@ mod tests
         let dev = blk_device_arg(&argv, "hd1").unwrap();
         assert!(dev.contains(",logical_block_size=8192,"), "{dev}");
         assert!(blk_device_arg(&argv, "hd0").unwrap().contains("=512,"));
+    }
+
+    /// The PCI slot an `addr=` property in `device` pins.
+    fn slot_of(device: &str) -> u8
+    {
+        let addr = device.split(",addr=").nth(1).unwrap();
+        u8::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap()
+    }
+
+    #[test]
+    fn two_disks_land_on_distinct_intx_lines_on_both_machines()
+    {
+        // devmgr does not serve a virtio-blk device on a line another holds
+        // (#664), so two disks on one line would leave the second unserved.
+        let mut spec = riscv_spec(1, 512);
+        spec.second_disk = Some(SecondDisk {
+            path: Path::new("disk-data.img"),
+            block_size: 512,
+        });
+        let argv = build_qemu_argv(&spec).unwrap();
+        let first = slot_of(blk_device_arg(&argv, "hd0").unwrap());
+        let second = slot_of(blk_device_arg(&argv, "hd1").unwrap());
+        // OVMF's x86_64 line, from {10, 10, 11, 11} at (slot + 1) % 4.
+        let ovmf_line = |slot: u8| [10, 10, 11, 11][usize::from((slot + 1) % 4)];
+        assert_ne!(ovmf_line(first), ovmf_line(second));
+        // riscv64 `virt`: INTA of a slot reaches PLIC source 32 + slot % 4.
+        assert_ne!(first % 4, second % 4);
+        // q35 routes every slot past 24 to one line.
+        assert!(first <= 24 && second <= 24);
+    }
+
+    #[test]
+    fn a_single_disk_takes_the_next_free_slot()
+    {
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(!blk_device_arg(&argv, "hd0").unwrap().contains(",addr="));
     }
 
     #[test]

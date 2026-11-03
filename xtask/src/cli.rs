@@ -232,8 +232,9 @@ pub struct RunArgs
 
     /// Attach this image as a second disk: its own `virtio-blk-pci` device
     /// (drive `hd1`) beside `disk.img`, presenting the logical block size of
-    /// the image's GPT unless `--second-disk-block-size` sets it.
-    /// `cargo xtask mkdisk --split-data` authors `disk-data.img` for it.
+    /// the image's GPT unless `--second-disk-block-size` sets it (an image
+    /// with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask
+    /// mkdisk --split-data` authors `disk-data.img` for it.
     #[arg(long, value_name = "PATH")]
     pub second_disk: Option<PathBuf>,
 
@@ -496,8 +497,9 @@ pub struct RunParallelArgs
 
     /// Attach this image as a second disk: its own `virtio-blk-pci` device
     /// (drive `hd1`) beside `disk.img`, presenting the logical block size of
-    /// the image's GPT unless `--second-disk-block-size` sets it.
-    /// `cargo xtask mkdisk --split-data` authors `disk-data.img` for it.
+    /// the image's GPT unless `--second-disk-block-size` sets it (an image
+    /// with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask
+    /// mkdisk --split-data` authors `disk-data.img` for it.
     #[arg(long, value_name = "PATH")]
     pub second_disk: Option<PathBuf>,
 

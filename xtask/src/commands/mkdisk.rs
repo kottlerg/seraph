@@ -4,7 +4,8 @@
 // xtask/src/commands/mkdisk.rs
 
 //! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise
-//! test fixtures, and regenerate `disk.img` without invoking cargo.
+//! test fixtures, and regenerate `disk.img` (and `disk-data.img` under
+//! `--split-data`) at the requested block size without invoking cargo.
 //! Used to refresh the boot image after `rootfs/` or sysroot files were
 //! edited outside the cargo flow. Hand-staging a test recipe (copying it
 //! from `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/`)

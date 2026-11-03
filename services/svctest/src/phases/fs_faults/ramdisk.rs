@@ -5,8 +5,9 @@
 
 //! RAM block device behind the `fs_faults` phase's own fatfs: a FAT16 volume
 //! just past FAT12's cluster count, formatted at run time and held sparsely,
-//! served over the `BLK_READ_INTO_MEMORY` / `BLK_WRITE_FROM_MEMORY` requests
-//! fatfs issues, with block faults armed by sector and attempt.
+//! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
+//! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
+//! sector and attempt.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -239,6 +240,27 @@ pub fn serve(ep: u32, disk: &SharedDisk)
         }
         let label = match msg.label & 0xFFFF
         {
+            blk_labels::BLK_GET_GEOMETRY =>
+            {
+                let reply = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
+                {
+                    IpcMessage::builder(blk_errors::SUCCESS)
+                        .word(0, SECTOR as u64)
+                        .word(1, TOTAL_SECTORS as u64)
+                        .build()
+                }
+                else
+                {
+                    IpcMessage::new(blk_errors::LABEL_VERSION_MISMATCH)
+                };
+                if cap != 0
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+                // SAFETY: as above.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                continue;
+            }
             blk_labels::BLK_READ_INTO_MEMORY => transfer(
                 disk,
                 aspace,

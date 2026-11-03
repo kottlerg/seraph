@@ -1551,6 +1551,7 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, uart_irq: u32, ipc_buf: *mut u64) -
         hw_cap,
         uart_irq, // UART interrupt; 0 falls back to client-side RX polling
         0,        // no devmgr_query_ep: serial driver needs no runtime platform metadata
+        &[],
         ipc::sched_policy::BOOT_DRIVER_PRIORITY, // boot-critical: the console path
         ipc_buf,
     );
@@ -1679,6 +1680,7 @@ fn spawn_framebuffer(
         hw_cap,
         0, // no UART IRQ: framebuffer has no interrupt-driven path
         devmgr_query_ep,
+        &[],
         ipc::sched_policy::AUX_DRIVER_PRIORITY,
         ipc_buf,
     );
@@ -1751,6 +1753,7 @@ fn spawn_rtc_from_disk(
         return None;
     };
 
+    let word = arch::current::rtc_bootstrap_word(caps);
     let spawned = spawn::spawn_simple_device(
         caps.procmgr_ep,
         caps.self_bootstrap_ep,
@@ -1761,7 +1764,8 @@ fn spawn_rtc_from_disk(
         rtc_ep,
         hw_cap,
         0, // no UART IRQ: RTC is polled
-        0, // no devmgr_query_ep: RTC driver needs no runtime platform metadata
+        0, // no devmgr_query_ep: the RTC's one platform datum rides the bootstrap round
+        word.as_slice(),
         ipc::sched_policy::AUX_DRIVER_PRIORITY,
         ipc_buf,
     );
@@ -1852,6 +1856,7 @@ fn test_spawn_orphan(
         hw_cap,
         0, // no UART IRQ: this device has no interrupt-driven path
         query_ep,
+        &[],
         0, // scheduling unspecified: procmgr defaults; the child is torn down anyway
         ipc_buf,
     );

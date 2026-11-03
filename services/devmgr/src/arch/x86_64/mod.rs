@@ -89,6 +89,21 @@ pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
     ioport_carve(caps.arch.ioport_cap, 0x70, 2)
 }
 
+/// The data word the RTC driver's bootstrap round carries: the CMOS RAM
+/// index of the century register the FADT's `CENTURY` field names, or 0
+/// when the FADT names none or cannot be read. The cmos driver reads the
+/// century from that register, and with 0 falls back to its fixed
+/// century.
+// unnecessary_wraps: the arch-dispatch signature is shared with riscv64,
+// whose RTC takes no bootstrap word and returns `None`.
+#[allow(clippy::unnecessary_wraps)]
+pub fn rtc_bootstrap_word(caps: &DevmgrCaps) -> Option<u64>
+{
+    let index = locate_table_by_sig(caps, *b"FACP")
+        .and_then(|fadt| with_acpi_table(caps, fadt, firmware::acpi::fadt_century_index));
+    Some(index.map_or(0, u64::from))
+}
+
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with
 /// pwrmgr's shutdown actuator caps: a narrow `IoPort` over the
 /// caller-supplied `PM1a` control port (`msg` word 1) plus the 8042 reset

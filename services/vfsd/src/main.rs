@@ -209,6 +209,10 @@ fn main() -> !
                 {
                     std::os::seraph::log!("GPT parse failed: invalid signature");
                 }
+                gpt::GptError::InvalidBlockSize =>
+                {
+                    std::os::seraph::log!("GPT parse failed: unsupported logical block size");
+                }
                 gpt::GptError::InvalidEntrySize =>
                 {
                     std::os::seraph::log!("GPT parse failed: invalid entry size");

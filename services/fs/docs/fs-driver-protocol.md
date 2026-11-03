@@ -76,9 +76,11 @@ its block device endpoint and reply success or a typed error.
 **Reply (error)**: `label = ipc::fs_errors::*`:
 `LABEL_VERSION_MISMATCH` when `data[0]` differs from the driver's
 `FS_LABELS_VERSION` (checked before the BPB is read), else e.g.
-`IO_ERROR`, or `NOT_FOUND` for a malformed BPB, one whose sector size
-is not 512 bytes (the only size the FAT driver reads), or one with fewer
-than 4085 clusters (FAT12, which the driver does not read).
+`IO_ERROR` (the block device's `BLK_GET_GEOMETRY` or the BPB read failed),
+or `NOT_FOUND` for a malformed BPB, one whose sector size is not the
+device's logical block size (the driver reads one block per sector, 512 to
+4096 bytes), or one with fewer than 4085 clusters (FAT12, which the driver
+does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
@@ -390,9 +392,12 @@ the recorded release endpoint). The slot is per node and shared by
 every client of the file, so one client's `FS_CLOSE` revokes every
 client's outstanding pages on it (a defect, tracked in
 [#530](https://github.com/kottlerg/seraph/issues/530); see
-[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The kernel-side cap is
-**not** freed here — the holder still `cap_delete`s its node cap to
-drop the kernel reference.
+[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The node itself is not
+freed: every holder of the entry shares it, so it lives until
+[`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
+unlinks the entry, and a cap used after its `FS_CLOSE` still reaches its
+own file. The kernel-side cap is **not** freed here — the holder still
+`cap_delete`s its node cap to drop the kernel reference.
 
 **Request**
 
@@ -488,8 +493,8 @@ entry of that name), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED` (the
 badge lacks `MUTATE_DIR`, or it carries none of `STAT`, `READ`, `WRITE`,
 and `EXEC`, so the new file's cap would carry no rights; the driver
 refuses before writing anything, and no entry is created),
-`TOO_MANY_OPEN` (the driver's node table is full; the entry was
-created).
+`TOO_MANY_OPEN` (the driver's node table is full or the heap cannot grow
+it; the entry was created).
 
 ---
 
@@ -535,7 +540,10 @@ slot back from the device, past its cache:
   on the device without its LFN run.
 
 A node the driver drops no longer names anything, so a later `FS_CREATE`
-that reuses the slot cannot reach a stale node through a held cap.
+that reuses the slot cannot reach a stale node through a held cap. The
+driver reuses a dropped node's id for a later node under a new generation,
+so a held cap on the dropped node is answered `INVALID_BADGE`, never with
+the content of the node that reused the id.
 
 ---
 

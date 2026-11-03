@@ -207,7 +207,8 @@ elements:
   to the caller badge's partition base. The block driver enforces
   the bound on every request.
 - **Caller-supplied Memory-cap DMA.** Each read or write transfers one
-  Memory cap of at least `count * 512` bytes as the DMA target; the
+  Memory cap of at least `count * block_size` bytes as the DMA target
+  (LBAs and counts are in the device's logical blocks); the
   Memory cap is moved back to the caller in every reply (success or
   error). The block driver never retains the data Memory cap. After a
   request the device loses, the driver resets the device before it
@@ -216,7 +217,8 @@ elements:
   replying and the cap is destroyed with it.
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
-`BLK_READ_INTO_MEMORY`, and `BLK_WRITE_FROM_MEMORY` live in
+`BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, and `BLK_GET_GEOMETRY`
+live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 The fs-driver side — `FS_MOUNT`, `FS_READ`, `FS_READ_MEMORY`,
 `FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,

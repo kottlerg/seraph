@@ -19,7 +19,7 @@
 //! `BOOT    CON`.
 
 use crate::alloc::{FatError, allocate_cluster, free_cluster_chain};
-use crate::bpb::{FatState, FatType, SECTOR_SIZE};
+use crate::bpb::{FatState, FatType, sector_buffer};
 use crate::cache::PageCache;
 use crate::fat::chain_next;
 
@@ -30,12 +30,7 @@ pub use fat_parse::{
     DirEntry, LfnAccum, MAX_LFN_CHARS, MAX_LFN_UTF8, lfn_checksum, name_matches, parse_dir_entry,
     to_upper,
 };
-use fat_parse::{FreeRunScan, RemoveRunScan, RemoveStep};
-
-/// [`SECTOR_SIZE`] as a `u32`, for sector arithmetic on FAT's 32-bit fields.
-// cast_possible_truncation: SECTOR_SIZE is 512.
-#[allow(clippy::cast_possible_truncation)]
-const SECTOR_SIZE_U32: u32 = SECTOR_SIZE as u32;
+use fat_parse::{FreeRunScan, RemoveRunScan, RemoveStep, TailSet, compose_tailed_name, encode_lfn};
 
 // ── Chain walking ─────────────────────────────────────────────────────────
 
@@ -129,7 +124,7 @@ pub fn find_in_directory(
     ipc_buf: *mut u64,
 ) -> Result<Option<DirEntry>, FatError>
 {
-    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut sector_buf = sector_buffer()?;
     let mut lfn = LfnAccum::new();
 
     if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
@@ -153,7 +148,7 @@ pub fn find_in_directory(
             {
                 return Err(FatError::Io);
             }
-            match scan_sector_for_name(&sector_buf, name, &mut lfn)
+            match scan_sector_for_name(&sector_buf[..state.sector_bytes()], name, &mut lfn)
             {
                 SectorScan::Found(entry) => return Ok(Some(entry)),
                 SectorScan::EndOfDir => return Ok(None),
@@ -181,8 +176,8 @@ fn find_in_fat16_root(
 ) -> Result<Option<DirEntry>, FatError>
 {
     let root_start = u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-    let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
-    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
+    let root_sectors = state.root_dir_sectors();
+    let mut sector_buf = sector_buffer()?;
     let mut lfn = LfnAccum::new();
 
     for s in 0..root_sectors
@@ -196,7 +191,7 @@ fn find_in_fat16_root(
         {
             return Err(FatError::Io);
         }
-        match scan_sector_for_name(&sector_buf, name, &mut lfn)
+        match scan_sector_for_name(&sector_buf[..state.sector_bytes()], name, &mut lfn)
         {
             SectorScan::Found(entry) => return Ok(Some(entry)),
             SectorScan::EndOfDir => return Ok(None),
@@ -211,9 +206,9 @@ fn find_in_fat16_root(
 /// Like [`find_in_directory`], but also returns the on-disk location of
 /// the matching 8.3 entry, used by callers that intend to patch the
 /// entry's metadata fields (`size`, `first_cluster`) later. `None`
-/// covers a failed directory or FAT read and a corrupt or cyclic chain
-/// as well as an absent name, so its callers reply `NOT_FOUND` in each
-/// case.
+/// covers a failed directory or FAT read, a corrupt or cyclic chain, and
+/// no memory for a sector buffer as well as an absent name, so its callers
+/// reply `NOT_FOUND` in each case.
 pub fn find_in_directory_with_location(
     dir_cluster: u32,
     name: &[u8],
@@ -223,15 +218,15 @@ pub fn find_in_directory_with_location(
     ipc_buf: *mut u64,
 ) -> Option<(DirEntry, DirEntryLocation)>
 {
-    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut sector_buf = sector_buffer().ok()?;
     let mut lfn = LfnAccum::new();
-    let entries_per_sector = SECTOR_SIZE / 32;
+    let entries_per_sector = state.sector_bytes() / 32;
 
     if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
+        let root_sectors = state.root_dir_sectors();
         for s in 0..root_sectors
         {
             let sector_lba = root_start + s;
@@ -295,7 +290,7 @@ pub fn find_in_directory_with_location(
 }
 
 fn scan_sector_for_name_with_offset(
-    sector: &[u8; SECTOR_SIZE],
+    sector: &[u8],
     name: &[u8],
     lfn: &mut LfnAccum,
     entries_per_sector: usize,
@@ -340,13 +335,10 @@ fn scan_sector_for_name_with_offset(
 ///
 /// Supports both 8.3 and LFN matching. The `lfn` accumulator carries
 /// LFN state across sector boundaries.
-fn scan_sector_for_name(
-    sector: &[u8; SECTOR_SIZE],
-    name: &[u8],
-    lfn: &mut LfnAccum,
-) -> SectorScan<DirEntry>
+/// `sector` is one sector's bytes, `bytes_per_sector` long.
+fn scan_sector_for_name(sector: &[u8], name: &[u8], lfn: &mut LfnAccum) -> SectorScan<DirEntry>
 {
-    let entries_per_sector = SECTOR_SIZE / 32;
+    let entries_per_sector = sector.len() / 32;
     for i in 0..entries_per_sector
     {
         let offset = i * 32;
@@ -408,16 +400,16 @@ pub fn read_dir_entry_at_index(
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
 {
-    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut sector_buf = sector_buffer().ok()?;
     let mut lfn = LfnAccum::new();
-    let entries_per_sector = SECTOR_SIZE / 32;
+    let entries_per_sector = state.sector_bytes() / 32;
     let mut current_idx: u64 = 0;
 
     if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
+        let root_sectors = state.root_dir_sectors();
 
         for s in 0..root_sectors
         {
@@ -568,10 +560,6 @@ const ATTR_LFN: u8 = 0x0F;
 /// LFN sequence flag: `0x40` `OR`ed into the highest-seq slot marks
 /// "last entry in the LFN run" (per the FAT spec).
 const LFN_LAST_FLAG: u8 = 0x40;
-/// Maximum `NUMERIC_TAIL` we will probe (`~1` through `~6`). Beyond
-/// this callers see [`FatError::NoSpace`] for the name; in practice
-/// tests never collide hard enough to exhaust the tail.
-const MAX_NUMERIC_TAIL: u8 = 6;
 
 /// Physical location of a 32-byte directory entry on disk.
 ///
@@ -612,11 +600,12 @@ pub struct RemovedEntry
 ///
 /// # Errors
 /// [`FatError::Exists`] when the directory already holds an entry of that
-/// name; [`FatError::Corrupt`] for an empty name or one longer than
-/// [`MAX_LFN_CHARS`], or when the directory's first cluster or a link
-/// lies outside the data region, a link is a bad-cluster marker, or the
-/// chain has a cycle; [`FatError::NoSpace`] when no short-name alias or no free
-/// slot run is left (see `find_free_slot_run`); [`FatError::Io`] when a
+/// name; [`FatError::Corrupt`] for an empty name, one that is not UTF-8,
+/// or one needing more than [`MAX_LFN_CHARS`] UTF-16 code units, or when
+/// the directory's first cluster or a link lies outside the data region, a
+/// link is a bad-cluster marker, or the chain has a cycle;
+/// [`FatError::NoSpace`] when no free slot run is left (see
+/// `find_free_slot_run`); [`FatError::Io`] when a
 /// directory or FAT sector read or write fails, possibly after some LFN
 /// slots were written.
 // too_many_arguments: the parent directory, the new entry's name, kind, first
@@ -636,10 +625,15 @@ pub fn insert_entry(
     ipc_buf: *mut u64,
 ) -> Result<DirEntryLocation, FatError>
 {
-    if name.is_empty() || name.len() > MAX_LFN_CHARS
+    // The long name is stored as UTF-16 code units, so its length bound is
+    // in units, not bytes: a character outside the Basic Multilingual Plane
+    // takes two.
+    let mut chars = [0u16; MAX_LFN_CHARS];
+    let Some(unit_count) = encode_lfn(name, &mut chars).filter(|&n| n > 0)
+    else
     {
         return Err(FatError::Corrupt);
-    }
+    };
     // A read failure is an error, never "absent": inserting past an entry
     // that could not be read would create a duplicate name.
     if find_in_directory(parent_dir_cluster, name, state, cache, block_dev, ipc_buf)?.is_some()
@@ -653,7 +647,7 @@ pub fn insert_entry(
     let needs_lfn = !is_strict_83_match(&sfn, name);
     let lfn_slot_count = if needs_lfn
     {
-        name.len().div_ceil(13)
+        unit_count.div_ceil(13)
     }
     else
     {
@@ -677,14 +671,13 @@ pub fn insert_entry(
     // sequence number.
     if needs_lfn
     {
-        let chars = name_as_ucs2(name);
         // cast_possible_truncation: lfn_slot_count ≤ ceil(255 / 13) = 20
         #[allow(clippy::cast_possible_truncation)]
         for (i, slot) in slots.iter().take(lfn_slot_count).enumerate()
         {
             let seq = (lfn_slot_count - i) as u8;
             let is_last = i == 0;
-            let slot_chars = lfn_chars_for_seq(&chars, name.len(), seq);
+            let slot_chars = lfn_chars_for_seq(&chars, unit_count, seq);
             let raw = pack_lfn_slot(seq, is_last, chksum, &slot_chars);
             write_dir_slot(*slot, &raw, cache, block_dev, ipc_buf)?;
         }
@@ -762,7 +755,14 @@ pub fn remove_entry(
     let mut touched = Vec::with_capacity(scan.run().len());
     for slot in scan.run()
     {
-        let mut buf = Box::new([0u8; SECTOR_SIZE]);
+        let Ok(mut buf) = sector_buffer()
+        else
+        {
+            return Err(RemoveFailure {
+                error: FatError::Io,
+                touched,
+            });
+        };
         if !cache.read_sector(u64::from(slot.sector_lba), block_dev, &mut buf, ipc_buf)
         {
             return Err(RemoveFailure {
@@ -802,7 +802,12 @@ pub fn restore_slot_first_bytes(
     let mut result = Ok(());
     for slot in slots
     {
-        let mut buf = Box::new([0u8; SECTOR_SIZE]);
+        let Ok(mut buf) = sector_buffer()
+        else
+        {
+            result = Err(FatError::Io);
+            continue;
+        };
         if !cache.read_sector(u64::from(slot.loc.sector_lba), block_dev, &mut buf, ipc_buf)
         {
             result = Err(FatError::Io);
@@ -842,7 +847,11 @@ pub fn device_slot_state(
     ipc_buf: *mut u64,
 ) -> DeviceSlotState
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let Ok(mut buf) = sector_buffer()
+    else
+    {
+        return DeviceSlotState::Unreadable;
+    };
     if !cache.reload_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
         return DeviceSlotState::Unreadable;
@@ -868,7 +877,7 @@ pub fn update_entry_metadata(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer()?;
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
         return Err(FatError::Io);
@@ -907,8 +916,8 @@ pub fn directory_is_empty(
     ipc_buf: *mut u64,
 ) -> Result<bool, FatError>
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
-    let entries_per_sector = SECTOR_SIZE / 32;
+    let mut buf = sector_buffer()?;
+    let entries_per_sector = state.sector_bytes() / 32;
 
     let mut cluster = dir_start_cluster(state, dir_cluster)?;
     let mut steps = 0;
@@ -959,7 +968,7 @@ pub fn write_dot_entries(
 ) -> Result<(), FatError>
 {
     let base_sector = state.cluster_to_sector(new_dir_cluster);
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer()?;
     // First sector: "." and ".." entries packed at offsets 0 and 32;
     // remaining slots zeroed (== "end of directory" sentinel for every
     // following slot). Subsequent sectors of the cluster stay zero;
@@ -984,7 +993,7 @@ pub fn write_dot_entries(
     // Zero out the rest of the cluster so a stale neighbour sector
     // (allocate_cluster reuses freed clusters) does not surface as
     // ghost entries.
-    let zeros = Box::new([0u8; SECTOR_SIZE]);
+    let zeros = sector_buffer()?;
     for s in 1..u32::from(state.sectors_per_cluster)
     {
         if !cache.write_sector(u64::from(base_sector + s), block_dev, &zeros, ipc_buf)
@@ -1024,14 +1033,14 @@ fn find_free_slot_run(
 ) -> Result<FreeRunScan<DirEntryLocation>, FatError>
 {
     let mut scan = FreeRunScan::new(count);
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer()?;
 
     // FAT16 fixed root.
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
+        let root_sectors = state.root_dir_sectors();
         for s in 0..root_sectors
         {
             if scan_sector_free_run(
@@ -1039,7 +1048,7 @@ fn find_free_slot_run(
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf,
+                &mut buf[..state.sector_bytes()],
                 &mut scan,
             )?
             {
@@ -1062,7 +1071,7 @@ fn find_free_slot_run(
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf,
+                &mut buf[..state.sector_bytes()],
                 &mut scan,
             )?
             {
@@ -1087,13 +1096,14 @@ fn find_free_slot_run(
 
 /// Feed every slot of the directory sector at `sector_lba` to `scan`,
 /// returning `true` once its run is complete. A sector past the
-/// end-of-directory marker is free throughout and is not read.
+/// end-of-directory marker is free throughout and is not read. `buf` is
+/// one sector long.
 fn scan_sector_free_run(
     sector_lba: u32,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-    buf: &mut [u8; SECTOR_SIZE],
+    buf: &mut [u8],
     scan: &mut FreeRunScan<DirEntryLocation>,
 ) -> Result<bool, FatError>
 {
@@ -1102,7 +1112,7 @@ fn scan_sector_free_run(
     {
         return Err(FatError::Io);
     }
-    for off in (0..SECTOR_SIZE).step_by(32)
+    for off in (0..buf.len()).step_by(32)
     {
         let first = if read { buf[off] } else { 0x00 };
         let loc = DirEntryLocation {
@@ -1125,7 +1135,7 @@ fn zero_cluster(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let zeros = Box::new([0u8; SECTOR_SIZE]);
+    let zeros = sector_buffer()?;
     let base = state.cluster_to_sector(cluster);
     for s in 0..u32::from(state.sectors_per_cluster)
     {
@@ -1145,7 +1155,7 @@ fn write_dir_slot(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer()?;
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
         return Err(FatError::Io);
@@ -1193,23 +1203,6 @@ fn pack_lfn_slot(seq: u8, is_last: bool, chksum: u8, chars: &[u16; 13]) -> [u8; 
     e
 }
 
-fn name_as_ucs2(name: &[u8]) -> [u16; MAX_LFN_CHARS]
-{
-    let mut chars = [0u16; MAX_LFN_CHARS];
-    // ASCII-only encoding (FAT LFN is UCS-2). For the v0.1.0 write
-    // surface we accept the namespace-protocol's name validator,
-    // which is ASCII-only; anything beyond ASCII is rejected upstream.
-    for (i, &b) in name.iter().enumerate()
-    {
-        if i >= MAX_LFN_CHARS
-        {
-            break;
-        }
-        chars[i] = u16::from(b);
-    }
-    chars
-}
-
 fn lfn_chars_for_seq(chars: &[u16; MAX_LFN_CHARS], name_len: usize, seq: u8) -> [u16; 13]
 {
     let base = (usize::from(seq) - 1) * 13;
@@ -1230,13 +1223,22 @@ fn lfn_chars_for_seq(chars: &[u16; MAX_LFN_CHARS], name_len: usize, seq: u8) -> 
     slot
 }
 
-/// Generate a short (8.3) filename for `name`, ensuring uniqueness in
-/// the parent directory via `NUMERIC_TAIL` collision probing.
+/// Generate a short (8.3) filename for `name`, unique in the parent
+/// directory.
 ///
-/// Strict-8.3 names round-trip exactly (uppercased). Names outside the
-/// strict-8.3 charset get a basis derived from the first six valid
-/// uppercased characters, with `~N` (1..=6) appended for uniqueness;
-/// extension is the first three valid characters after the last `.`.
+/// Strict-8.3 names round-trip exactly (uppercased). Any other name gets a
+/// basis of up to eight valid uppercased base characters and the first three
+/// valid characters after the last `.`, then the Microsoft FAT
+/// specification's numeric tail: `~N` with the basis shortened to fit, for
+/// the lowest `N` no short name in the directory already carries for that
+/// basis. One pass over the directory records the tails in use. A directory
+/// holds at most [`fat_parse::DIR_ENTRIES_MAX`] entries, so a free tail
+/// always exists below the scheme's `~999999`.
+///
+/// # Errors
+/// As [`find_in_directory`]; [`FatError::Io`] also when the heap cannot hold
+/// the tail set; [`FatError::NoSpace`] should every tail the scan covers be
+/// taken, which a well-formed directory cannot reach.
 fn generate_sfn(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -1250,23 +1252,22 @@ fn generate_sfn(
     {
         return Ok(strict);
     }
-    let (basis_base, basis_ext) = basis_name(name);
-    for tail in 1..=MAX_NUMERIC_TAIL
-    {
-        let candidate = compose_sfn(basis_base, tail, basis_ext);
-        if !sfn_in_directory(
-            parent_dir_cluster,
-            &candidate,
-            state,
-            cache,
-            block_dev,
-            ipc_buf,
-        )?
-        {
-            return Ok(candidate);
-        }
-    }
-    Err(FatError::NoSpace)
+    let basis = basis_name(name);
+    let mut tails = TailSet::try_new().ok_or(FatError::Io)?;
+    for_each_short_name(
+        state,
+        parent_dir_cluster,
+        cache,
+        block_dev,
+        ipc_buf,
+        |sfn| {
+            tails.note(sfn, &basis);
+        },
+    )?;
+    tails
+        .lowest_free()
+        .and_then(|tail| compose_tailed_name(&basis, tail))
+        .ok_or(FatError::NoSpace)
 }
 
 fn try_strict_83(name: &[u8]) -> Option<[u8; 11]>
@@ -1330,115 +1331,80 @@ fn is_strict_83_match(sfn: &[u8; 11], name: &[u8]) -> bool
     strict == *sfn
 }
 
-fn basis_name(name: &[u8]) -> ([u8; 6], [u8; 3])
+/// The numeric-tail basis of a non-strict name: up to eight valid
+/// uppercased characters before the last `.`, then up to three after it,
+/// space padded in the 8.3 layout [`compose_tailed_name`] takes.
+fn basis_name(name: &[u8]) -> [u8; 11]
 {
-    let mut base = [b' '; 6];
-    let mut ext = [b' '; 3];
+    let mut basis = [b' '; 11];
     let dot_pos = name.iter().rposition(|&b| b == b'.');
     let (base_src, ext_src) = match dot_pos
     {
         Some(p) => (&name[..p], &name[p + 1..]),
         None => (name, &[] as &[u8]),
     };
-    let mut bi = 0;
-    for &b in base_src
-    {
-        if bi >= 6
+    let valid = |src: &[u8], out: &mut [u8]| {
+        let mut n = 0;
+        for &b in src.iter().filter(|&&b| is_strict_83_char(b))
         {
-            break;
+            if n == out.len()
+            {
+                break;
+            }
+            out[n] = to_upper(b);
+            n += 1;
         }
-        if is_strict_83_char(b)
-        {
-            base[bi] = to_upper(b);
-            bi += 1;
-        }
-    }
-    let mut ei = 0;
-    for &b in ext_src
-    {
-        if ei >= 3
-        {
-            break;
-        }
-        if is_strict_83_char(b)
-        {
-            ext[ei] = to_upper(b);
-            ei += 1;
-        }
-    }
+        n
+    };
     // FAT spec: every SFN basis must have at least one valid base
     // character; fall back to a single underscore if upstream gave us
     // a name with no usable chars in the base portion.
-    if bi == 0
+    if valid(base_src, &mut basis[..8]) == 0
     {
-        base[0] = b'_';
+        basis[0] = b'_';
     }
-    (base, ext)
+    valid(ext_src, &mut basis[8..]);
+    basis
 }
 
-fn compose_sfn(basis_base: [u8; 6], tail: u8, basis_ext: [u8; 3]) -> [u8; 11]
-{
-    let mut out = [b' '; 11];
-    // Find how much of the basis-base we keep; the tail "~N" replaces
-    // the trailing slot(s).
-    let mut base_end = 6;
-    while base_end > 0 && basis_base[base_end - 1] == b' '
-    {
-        base_end -= 1;
-    }
-    // Tail length: "~" + decimal digits. tail ≤ 6 → one digit.
-    let tail_chars: [u8; 2] = [b'~', b'0' + tail];
-    let keep = (8 - tail_chars.len()).min(base_end);
-    out[..keep].copy_from_slice(&basis_base[..keep]);
-    out[keep] = tail_chars[0];
-    out[keep + 1] = tail_chars[1];
-    // Extension at bytes 8..11.
-    out[8..11].copy_from_slice(&basis_ext);
-    out
-}
-
-/// Whether the directory holds an entry with 8.3 name `sfn` (no LFN
-/// matching). Used by [`generate_sfn`] for `NUMERIC_TAIL` collision
-/// probing; `Ok(false)` only when the whole directory was read.
+/// Call `visit` with the 8.3 name of every live short entry of the
+/// directory at `parent_dir_cluster` (deleted and LFN slots skipped), up to
+/// its end-of-directory marker or the end of its chain.
 ///
 /// # Errors
 /// As [`find_in_directory`].
-fn sfn_in_directory(
-    parent_dir_cluster: u32,
-    sfn: &[u8; 11],
+fn for_each_short_name(
     state: &mut FatState,
+    parent_dir_cluster: u32,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-) -> Result<bool, FatError>
+    mut visit: impl FnMut(&[u8; 11]),
+) -> Result<(), FatError>
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
-    let entries_per_sector = SECTOR_SIZE / 32;
+    let mut buf = sector_buffer()?;
+    let sector_bytes = state.sector_bytes();
 
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
-        for s in 0..root_sectors
+        for s in 0..state.root_dir_sectors()
         {
-            match scan_sector_for_sfn(
+            let sector = &mut buf[..sector_bytes];
+            if !visit_sector_short_names(
                 root_start + s,
-                sfn,
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf,
-                entries_per_sector,
+                sector,
+                &mut visit,
             )?
             {
-                SectorScan::Found(()) => return Ok(true),
-                SectorScan::EndOfDir => return Ok(false),
-                SectorScan::Continue =>
-                {}
+                return Ok(());
             }
         }
-        return Ok(false);
+        return Ok(());
     }
 
     let mut cluster = dir_start_cluster(state, parent_dir_cluster)?;
@@ -1448,65 +1414,61 @@ fn sfn_in_directory(
         let base_sector = state.cluster_to_sector(cluster);
         for s in 0..u32::from(state.sectors_per_cluster)
         {
-            match scan_sector_for_sfn(
+            let sector = &mut buf[..sector_bytes];
+            if !visit_sector_short_names(
                 base_sector + s,
-                sfn,
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf,
-                entries_per_sector,
+                sector,
+                &mut visit,
             )?
             {
-                SectorScan::Found(()) => return Ok(true),
-                SectorScan::EndOfDir => return Ok(false),
-                SectorScan::Continue =>
-                {}
+                return Ok(());
             }
         }
         match next_dir_cluster(state, cluster, &mut steps, cache, block_dev, ipc_buf)?
         {
             Some(n) => cluster = n,
-            None => return Ok(false),
+            None => return Ok(()),
         }
     }
 }
 
-/// Per-sector SFN match used by `sfn_in_directory`.
+/// Read the directory sector at `sector_lba` into `buf` (one sector long)
+/// and call `visit` with each live short entry's 8.3 name. Returns `false`
+/// at the end-of-directory marker.
 ///
 /// # Errors
 /// [`FatError::Io`] when the sector cannot be read.
-fn scan_sector_for_sfn(
+fn visit_sector_short_names(
     sector_lba: u32,
-    sfn: &[u8; 11],
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-    buf: &mut [u8; SECTOR_SIZE],
-    entries_per_sector: usize,
-) -> Result<SectorScan<()>, FatError>
+    buf: &mut [u8],
+    visit: &mut impl FnMut(&[u8; 11]),
+) -> Result<bool, FatError>
 {
     if !cache.read_sector(u64::from(sector_lba), block_dev, buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
-    for e in 0..entries_per_sector
+    let (slots, _) = buf.as_chunks::<32>();
+    for raw in slots
     {
-        let off = e * 32;
-        if buf[off] == 0x00
+        if raw[0] == 0x00
         {
-            return Ok(SectorScan::EndOfDir);
+            return Ok(false);
         }
-        if buf[off] == 0xE5 || buf[off + 11] == ATTR_LFN
+        if raw[0] == 0xE5 || raw[11] == ATTR_LFN
         {
             continue;
         }
-        if buf[off..off + 11] == *sfn
-        {
-            return Ok(SectorScan::Found(()));
-        }
+        let (sfn, _) = raw.split_first_chunk::<11>().unwrap_or((&[0; 11], &[]));
+        visit(sfn);
     }
-    Ok(SectorScan::Continue)
+    Ok(true)
 }
 
 /// Locate an entry by name *and* the disk positions of its LFN run.
@@ -1522,14 +1484,14 @@ fn locate_entry_with_lfn_run(
     ipc_buf: *mut u64,
 ) -> Result<(RemovedEntry, RemoveRunScan<DirEntryLocation>), FatError>
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    let mut buf = sector_buffer()?;
     let mut scan = RemoveRunScan::new();
 
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
+        let root_sectors = state.root_dir_sectors();
         for s in 0..root_sectors
         {
             if let Some(entry) = scan_sector_for_remove(
@@ -1538,7 +1500,7 @@ fn locate_entry_with_lfn_run(
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf,
+                &mut buf[..state.sector_bytes()],
                 &mut scan,
             )?
             {
@@ -1565,7 +1527,7 @@ fn locate_entry_with_lfn_run(
                 cache,
                 block_dev,
                 ipc_buf,
-                &mut buf,
+                &mut buf[..state.sector_bytes()],
                 &mut scan,
             )?
             {
@@ -1589,14 +1551,14 @@ fn locate_entry_with_lfn_run(
 /// `None` to continue. On end-of-directory, returns the sentinel
 /// [`RemovedEntry`] `start_cluster == u32::MAX`, which the caller maps to
 /// [`FatError::Corrupt`]: lookup found the entry, and it is gone before
-/// the end of the directory.
+/// the end of the directory. `buf` is one sector long.
 fn scan_sector_for_remove(
     sector_lba: u32,
     name: &[u8],
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-    buf: &mut [u8; SECTOR_SIZE],
+    buf: &mut [u8],
     scan: &mut RemoveRunScan<DirEntryLocation>,
 ) -> Result<Option<RemovedEntry>, FatError>
 {

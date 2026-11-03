@@ -190,7 +190,13 @@ pub struct DriverSpawnConfig<'a>
     pub bars: &'a [BarSpec],
     pub irq_cap: Option<u32>,
     pub service_ep: u32,
-    pub registry_ep: u32,
+    /// Endpoint the driver's devmgr query cap is a `device_badge`-badged
+    /// SEND on: the private driver endpoint of the driver's settle batch
+    /// ([`crate::settle::SettleBatch::driver_ep`]).
+    pub query_ep: u32,
+    /// Event queue the driver's death observer posts to, with `device_badge`
+    /// as the correlator ([`crate::settle::SettleBatch::death_eq`]).
+    pub death_eq: u32,
     pub device_badge: u64,
     /// Priority level the driver is created at; its band ceiling equals
     /// its level (a driver never spawns further processes). Rides the
@@ -204,8 +210,11 @@ pub struct DriverSpawnConfig<'a>
 ///
 /// Creates the process via procmgr, starts it, and serves its bootstrap over
 /// IPC to deliver the BAR MMIO, IRQ, and endpoint caps. The `device_badge` is
-/// used to derive a per-device badged send cap from `registry_ep` so the
-/// driver can query devmgr for its device configuration.
+/// used to derive a per-device badged send cap from `query_ep` so the
+/// driver can query devmgr for its device configuration and report its
+/// device ready. Once the final round is served it binds a death observer
+/// on the driver's thread to `death_eq`, correlator `device_badge`, so the
+/// settle sees a driver that dies before reporting ready.
 ///
 /// The rounds are the ones [`virtio_core::bootstrap`] specifies and the
 /// virtio-blk and virtio-input drivers decode:
@@ -215,7 +224,9 @@ pub struct DriverSpawnConfig<'a>
 ///     devmgr query endpoint, packed with [`ipc::bootstrap::pack_slots`];
 ///     the IRQ slot is absent when `irq_cap` is `None`.
 ///
-/// log + procmgr endpoints arrive via `ProcessInfo`.
+/// log + procmgr endpoints arrive via `ProcessInfo`. Returns `false`, the
+/// child torn down, on any failure, including a service endpoint that cannot
+/// be copied (a driver delivered none would never report ready).
 // clippy::too_many_lines: driver spawn is a single transaction — derive the
 // per-child caps, install them into the suspended child, and serve two
 // bootstrap rounds against one shared `ipc` buffer. Each derive owns a slot
@@ -243,7 +254,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     let procmgr_ep = config.procmgr_ep;
     let bootstrap_ep = config.bootstrap_ep;
     let service_ep = config.service_ep;
-    let registry_ep = config.registry_ep;
+    let query_ep = config.query_ep;
     let device_badge = config.device_badge;
 
     // Allocate a bootstrap badge for the child.
@@ -361,25 +372,22 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
         }
         None => 0,
     };
-    let service_copy = if service_ep != 0
-    {
-        syscall::cap_derive(service_ep, syscall::RIGHTS_ALL).unwrap_or(0)
-    }
+    let Ok(service_copy) = syscall::cap_derive(service_ep, syscall::RIGHTS_ALL)
     else
     {
-        0
+        std::os::seraph::log!("driver service endpoint derivation failed");
+        drop_bars(bar_copies);
+        let _ = syscall::cap_delete(irq_copy);
+        return false;
     };
     let Ok(devmgr_copy) =
-        syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, device_badge)
+        syscall::cap_derive_badge(query_ep, syscall::RIGHTS_EP_SEND, device_badge)
     else
     {
         std::os::seraph::log!("driver devmgr query cap derivation failed");
         drop_bars(bar_copies);
         let _ = syscall::cap_delete(irq_copy);
-        if service_copy != 0
-        {
-            let _ = syscall::cap_delete(service_copy);
-        }
+        let _ = syscall::cap_delete(service_copy);
         return false;
     };
 
@@ -389,10 +397,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     let drop_derived = || {
         drop_bars(bar_copies);
         let _ = syscall::cap_delete(irq_copy);
-        if service_copy != 0
-        {
-            let _ = syscall::cap_delete(service_copy);
-        }
+        let _ = syscall::cap_delete(service_copy);
         let _ = syscall::cap_delete(devmgr_copy);
     };
 
@@ -431,8 +436,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 
     // Round 2: [service, irq, devmgr_query] as positional slots, done. A
     // null slot cannot be transferred, so an absent IRQ (a device sharing
-    // an INTx line) or service endpoint is named absent in the presence
-    // word instead.
+    // an INTx line) is named absent in the presence word instead.
     let mut slots = [0u32; ROUND2_SLOTS];
     slots[SLOT_SERVICE] = service_copy;
     slots[SLOT_IRQ] = irq_copy;
@@ -453,6 +457,15 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     {
         std::os::seraph::log!("driver bootstrap round 2 failed");
         drop_derived();
+        return false;
+    }
+
+    // Observe the driver's death from here on. Bound only once every round
+    // has succeeded, so the batch's death queue takes posts only from the
+    // drivers its roster records; a child that already died posts at once.
+    if syscall::thread_bind_notification(thread_cap, config.death_eq, device_badge).is_err()
+    {
+        std::os::seraph::log!("driver death observer bind failed");
         return false;
     }
 

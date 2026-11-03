@@ -261,6 +261,14 @@ controller polls of `sleep_list_wide`, the first-fault and death polls of `fault
 delivery probe, delete and exit polls of `irq_route_delete_race`. Every other bound applies as
 written.
 
+The boundary runs measure the scaling rather than assume it: they save their logs, and
+`cargo xtask ktest-timing` reports each cell's wall time between its start line and its `PASS` or
+`FAIL` line, the ratio of its x86_64 128-vCPU time to its 16-vCPU time against the width factor
+(8), and each width's times against a checked-in baseline of that width
+([docs/testing.md § Coverage tiers](../../docs/testing.md#coverage-tiers), Timing report). A
+cell whose time grows faster than the width shows there before it outlives a budget; the report
+flags it and blocks nothing until its threshold is made a gate.
+
 A controller waits for a child to reach a state by a notification bit the child sends on reaching
 it. For a state inside a blocking call (`ipc_call`, `ipc_recv`, a notification wait) or at an exit,
 the child sends just before the call or the exit, and a cell that needs the call entered closes the

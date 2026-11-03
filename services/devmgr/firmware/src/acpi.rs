@@ -31,6 +31,9 @@ const MCFG_ENTRY_SIZE: usize = 16;
 
 /// FADT `PM1a_CNT_BLK` (ACPI 6.x section 5.2.9): a 32-bit I/O port number.
 const FADT_OFF_PM1A_CNT_BLK: usize = 64;
+/// FADT `CENTURY` (ACPI 6.x section 5.2.9): the CMOS RAM index of the RTC's
+/// century-of-year register, a byte; 0 means the RTC has none.
+const FADT_OFF_CENTURY: usize = 108;
 
 // ── Byte-read helpers ─────────────────────────────────────────────────
 
@@ -153,6 +156,31 @@ pub fn fadt_pm1a_cnt_blk(fadt_bytes: &[u8]) -> Option<u16>
     }
     let port = u16::try_from(read_u32(fadt_bytes, FADT_OFF_PM1A_CNT_BLK)).ok()?;
     if port == 0 { None } else { Some(port) }
+}
+
+// ── FADT → CENTURY ─────────────────────────────────────────────────────
+
+/// Read the FADT's `CENTURY` field: the CMOS RAM index of the RTC's
+/// century register.
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) does not reach the field, or the field is
+/// zero, which the specification reserves for an RTC with no century
+/// register.
+#[must_use]
+pub fn fadt_century_index(fadt_bytes: &[u8]) -> Option<u8>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    if total_len <= FADT_OFF_CENTURY
+    {
+        return None;
+    }
+    let index = fadt_bytes[FADT_OFF_CENTURY];
+    if index == 0 { None } else { Some(index) }
 }
 
 // ── MCFG → ECAM ────────────────────────────────────────────────────────
@@ -484,6 +512,38 @@ mod tests
                 .copy_from_slice(&pm1a.to_le_bytes());
         }
         b
+    }
+
+    /// A FADT whose `CENTURY` byte is `century`, `len` bytes long.
+    fn fadt_with_century(len: u32, century: u8) -> Vec<u8>
+    {
+        let mut b = fadt(len, 0x604);
+        if b.len() > FADT_OFF_CENTURY
+        {
+            b[FADT_OFF_CENTURY] = century;
+        }
+        b
+    }
+
+    #[test]
+    fn fadt_yields_its_century_register_index()
+    {
+        assert_eq!(
+            fadt_century_index(&fadt_with_century(244, 0x32)),
+            Some(0x32)
+        );
+    }
+
+    #[test]
+    fn fadt_with_no_century_register_or_too_short_yields_none()
+    {
+        // Zero is the specification's "no century register".
+        assert_eq!(fadt_century_index(&fadt_with_century(244, 0)), None);
+        // An ACPI 1.0-sized table ending before offset 108.
+        assert_eq!(fadt_century_index(&fadt_with_century(108, 0x32)), None);
+        let mut other = fadt_with_century(244, 0x32);
+        other[0..4].copy_from_slice(b"APIC");
+        assert_eq!(fadt_century_index(&other), None);
     }
 
     #[test]

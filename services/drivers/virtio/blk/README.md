@@ -2,7 +2,10 @@
 
 VirtIO block device driver. Exposes a per-request DMA IPC interface for
 filesystem drivers; the data segment of every read targets a Memory
-capability the caller transfers in.
+capability the caller transfers in. Every LBA and count on the interface is
+in the device's logical blocks: 512 bytes, or the size the device reports
+when it offers `VIRTIO_BLK_F_BLK_SIZE` (up to 4096, so 4Kn media serve in
+4096-byte blocks). The driver converts to VirtIO's 512-byte request sectors.
 
 ---
 
@@ -13,8 +16,9 @@ virtio/blk/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs                 # Transfer-length bound, outcome-to-reply mapping (host-tested)
-    ├── main.rs                # Driver entry, IPC service loop, partition table, fail-stop
+    ├── lib.rs                 # Geometry, transfer-length bound, partition table,
+    │                          #   outcome-to-reply mapping (host-tested)
+    ├── main.rs                # Driver entry, IPC service loop, fail-stop
     └── io.rs                  # IoLayout (header + status DMA), descriptor chain submission
 ```
 
@@ -53,6 +57,10 @@ defined in `shared/ipc::blk_labels`; error codes in `shared/ipc::blk_errors`.
 Register a partition LBA range and receive a partition-badged `SEND_GRANT`
 cap scoped to it. Callable only with a `MOUNT_AUTHORITY`-badged cap (the
 whole-disk cap); callers whose badge lacks it receive `REGISTER_REJECTED`.
+The badge identifies the range: registering a range already registered
+returns a cap carrying that range's badge, so a remount reuses its entry, and
+the driver's table holds one entry per distinct range. The table grows with
+those ranges and has no fixed size.
 
 **Request:**
 
@@ -61,7 +69,7 @@ whole-disk cap); callers whose badge lacks it receive `REGISTER_REJECTED`.
 | label | 2 |
 | data[0] | Caller's `BLK_LABELS_VERSION` |
 | data[1] | Base LBA |
-| data[2] | Length in sectors (`>= 1`; base + length within device capacity) |
+| data[2] | Length in blocks (`>= 1`; base + length within device capacity) |
 
 **Reply:**
 
@@ -72,9 +80,9 @@ whole-disk cap); callers whose badge lacks it receive `REGISTER_REJECTED`.
 
 ### Label 3: `BLK_READ_INTO_MEMORY`
 
-Read one or more contiguous sectors into a caller-supplied Memory cap. The
-driver writes `count * 512` bytes starting at offset 0 of the supplied
-page, packed contiguously; the rest of the page is unspecified.
+Read one or more contiguous blocks into a caller-supplied Memory cap. The
+driver writes `count * block_size` bytes starting at offset 0 of the
+supplied page, packed contiguously; the rest of the page is unspecified.
 
 **Request:**
 
@@ -82,8 +90,8 @@ page, packed contiguously; the rest of the page is unspecified.
 |---|---|
 | label | 3 |
 | data[0] | Starting LBA (relative to the caller badge's partition base) |
-| data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
-| caps[0] | Target Memory cap, `MAP | WRITE`, at least `count * 512` bytes |
+| data[1] | Block count (`>= 1`; defaults to `1` if absent) |
+| caps[0] | Target Memory cap, `MAP | WRITE`, at least `count * block_size` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
 | caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
 
@@ -101,7 +109,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | 1 | `DEVICE_STATUS_IOERR` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OUT_OF_BOUNDS` | LBA outside the caller badge's partition range |
-| 5 | `INVALID_MEMORY_CAP` | Target Memory cap missing `MAP|WRITE`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 5 | `INVALID_MEMORY_CAP` | Target Memory cap missing `MAP|WRITE`, smaller than `count * block_size`, or absent; or `count` is 0 or `count * block_size` exceeds the u32 descriptor length |
 | 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
 #### Reserved cap slots and the IOMMU forward-compat shape
@@ -125,8 +133,8 @@ the slot is unused.
 ### Label 4: `BLK_WRITE_FROM_MEMORY`
 
 Mirror of `BLK_READ_INTO_MEMORY` for the write direction. The driver
-reads `count * 512` bytes starting at offset 0 of the supplied page and
-writes them to disk. The memory cap contents past the requested run are not
+reads `count * block_size` bytes starting at offset 0 of the supplied page
+and writes them to disk. The memory cap contents past the requested run are not
 read.
 
 **Request:**
@@ -135,8 +143,8 @@ read.
 |---|---|
 | label | 4 |
 | data[0] | Starting LBA (relative to the caller badge's partition base) |
-| data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
-| caps[0] | Source Memory cap, `MAP` rights, at least `count * 512` bytes |
+| data[1] | Block count (`>= 1`; defaults to `1` if absent) |
+| caps[0] | Source Memory cap, `MAP` rights, at least `count * block_size` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
 | caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
 
@@ -154,8 +162,31 @@ read.
 | 1 | `DEVICE_STATUS_IOERR` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OUT_OF_BOUNDS` | LBA outside the caller badge's partition range |
-| 5 | `INVALID_MEMORY_CAP` | Source Memory cap missing `MAP`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 5 | `INVALID_MEMORY_CAP` | Source Memory cap missing `MAP`, smaller than `count * block_size`, or absent; or `count` is 0 or `count * block_size` exceeds the u32 descriptor length |
 | 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
+
+### Label 5: `BLK_GET_GEOMETRY`
+
+Report the device's logical block size and the caller's addressable length.
+Callable with either tier's cap: a `MOUNT_AUTHORITY` badge addresses the
+whole device, a partition badge its registered range. vfsd reads the block
+size before it reads the GPT, and fatfs before it reads the BPB; the geometry
+is fixed for the device's life.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 5 |
+| data[0] | Caller's `BLK_LABELS_VERSION` |
+
+**Reply:**
+
+| Field | Value |
+|---|---|
+| label | 0 (success), `OUT_OF_BOUNDS` (3) for a badge naming no range, or `LABEL_VERSION_MISMATCH` (6) |
+| data[0] | On success, the logical block size in bytes (a power of two, 512 to 4096) |
+| data[1] | On success, the length in blocks: the device capacity, or the partition's length |
 
 ---
 
@@ -172,18 +203,24 @@ accumulates in the driver's `CSpace`.
 
 The driver keeps one request in flight and waits for the completion of
 that chain, polling and parking on the IRQ notification, for at most
-50 seconds. A request the device loses, by timing out or by publishing a
-used-ring element the virtqueue refuses (an id heading no outstanding
-chain) or one naming another chain, may still be
-in flight, so its Memory cap cannot go back while the device can still
-DMA into or out of it. The driver resets the device first: once the
+50 seconds. The depth of 1 is the design: the service loop receives one
+request, waits for its completion, and replies before it receives the next,
+so the virtqueue is sized to one three-descriptor chain (four descriptors,
+one ring page). A device whose queue cannot hold three descriptors is
+refused at setup: the driver logs and exits.
+
+A request the device loses, by timing out or by publishing a used-ring
+element the virtqueue refuses (an id heading no outstanding chain) or one
+naming another chain, may still be in flight, so its Memory cap cannot go
+back while the device can still DMA into or out of it. The driver resets the device first: once the
 reset is acknowledged, the device no longer accesses the virtqueue or
 the buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies
 `DEVICE_FAULT` with the cap moved back, and fails stop: every later read
 or write is answered `DEVICE_FAULT` with its cap moved back, so clients
 see an error rather than block on an endpoint nobody serves. A device
 that does not acknowledge the reset within a bounded poll may still be
-transferring, so the driver logs and exits without replying; the cap is
+transferring (the driver waits up to five seconds on the monotonic clock),
+so the driver logs and exits without replying; the cap is
 destroyed with the driver's `CSpace` instead of returning to a caller
 who could reuse the memory.
 

@@ -2765,13 +2765,13 @@ const CASCADE_LINK_BITS: u32 = 56;
 /// twice is that `CSpace` wrapper, whose first teardown run, having been
 /// popped, re-queues it beneath the objects its slots held for its second
 /// (core/kernel/docs/capability-internals.md § Teardown). While it is queued,
-/// the header's `ref_count` and `cascade_link_hi` hold the link
-/// to the object below it (its virtual address shifted right by 3, every
-/// header being 8-byte aligned, kept to [`CASCADE_LINK_BITS`] and
-/// sign-extended back, which every canonical address of up to 59 significant
-/// bits survives); `obj_type` and `ancestor`, which the teardown reads, are
-/// never written. [`Self::pop`] zeroes both link fields again, so the object
-/// it returns reads `ref_count == 0`, as when it was pushed.
+/// the header's `ref_count` and `cascade_link_hi` hold the link to the object
+/// below it (its virtual address shifted right by 3, every header being
+/// 8-byte aligned, kept to [`CASCADE_LINK_BITS`] and sign-extended back,
+/// which every canonical address of up to 59 significant bits survives);
+/// `obj_type` and `ancestor`, which the teardown reads, are never written.
+/// [`Self::pop`] zeroes both link fields again, so the object it returns
+/// reads `ref_count == 0`, as when it was pushed.
 struct CascadeStack
 {
     top: Option<NonNull<KernelObjectHeader>>,
@@ -2874,7 +2874,9 @@ impl CascadeStack
         // SAFETY: caller contract (a live header).
         let refs = unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed);
         debug_assert_eq!(refs, 0, "cascade: pushed object is still referenced");
-        // SAFETY: caller contract (exclusively owned).
+        // SAFETY: caller contract: the link fields are ours alone; the one
+        // other reference it allows, a `CSpace` wrapper's arena-page `owner`
+        // back-pointer, never reaches the header.
         unsafe { Self::write_link(obj, Self::encode(self.top)) };
         self.top = Some(obj);
     }

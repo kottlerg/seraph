@@ -67,12 +67,15 @@ Mount the partition identified by a Seraph-minted GPT type GUID at the
 given path. vfsd resolves the role byte to a type GUID (arch-conditional
 for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
-looks the partition up in its parsed GPT table via
+looks the partition up across the parsed GPT tables of every disk it
+holds via
 [`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs) (DPS-style
-priority tie-break on attribute bits 48-63; a tie at the highest
-priority is rejected with `NO_MOUNT` (fatal only for the root
-self-mount); see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
-registers the partition bound with virtio-blk, spawns a fatfs
+priority tie-break on attribute bits 48-63, run across disks; a tie at
+the highest priority, on one disk or across disks, is rejected with
+`NO_MOUNT` (fatal only for the root self-mount); see
+[docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
+registers the partition bound with the virtio-blk instance of the disk
+that holds it, spawns a fatfs
 driver, sends `FS_MOUNT` (see
 [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md))
 to validate the BPB, captures the driver's
@@ -119,7 +122,8 @@ the arch-neutral `SERAPH_DATA` GUID.
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a
 badge without `MOUNT_AUTHORITY`, `NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
-matches the role GUID or if duplicate-priority partitions are detected,
+on any held disk matches the role GUID or if duplicate-priority
+partitions are detected,
 `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if the synthetic-root install
 fails: root already mounted, the path already a mount point, a path
 component the namespace protocol's name rule rejects, or no memory to

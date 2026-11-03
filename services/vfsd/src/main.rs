@@ -112,8 +112,8 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
 // ── Entry point ────────────────────────────────────────────────────────────
 
 // clippy::too_many_lines: vfsd's main is the in-order startup
-// transcript — bootstrap caps, worker pool, devmgr query, GPT scratch
-// alloc, GPT parse, namespace endpoint create, runtime leak,
+// transcript — bootstrap caps, worker pool, GPT scratch alloc, disk
+// discovery, namespace endpoint create, runtime leak,
 // namespace-thread spawn, service-thread fanout, then the calling
 // thread's own service loop. Each step depends on the prior step's
 // locals; splitting introduces threading those locals through helper
@@ -153,37 +153,11 @@ fn main() -> !
     };
     caps.bootstrap_ep = pool.bootstrap_ep();
 
-    // Query devmgr for the block device endpoint.
-    std::os::seraph::log!("querying devmgr for block device");
-    let query_msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_BLOCK_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(query_reply) = (unsafe { ipc::ipc_call(caps.registry_ep, &query_msg, ipc_buf) })
-    else
-    {
-        std::os::seraph::log!("QUERY_BLOCK_DEVICE ipc_call failed");
-        idle_loop();
-    };
-    if query_reply.label != 0
-    {
-        std::os::seraph::log!("no block device available");
-        idle_loop();
-    }
-
-    let reply_caps = query_reply.caps();
-    if reply_caps.is_empty()
-    {
-        std::os::seraph::log!("QUERY_BLOCK_DEVICE returned no caps");
-        idle_loop();
-    }
-    let blk_ep = reply_caps[0];
-    std::os::seraph::log!("block device endpoint acquired");
-
     // Allocate a single scratch memory cap for GPT block reads. The
     // BLK_READ_INTO_MEMORY contract requires the caller to supply the DMA
-    // target memory cap; vfsd reuses one scratch page across all GPT reads.
-    // The memory cap and its VA reservation are process-lifetime-leaked.
+    // target memory cap; vfsd reuses one scratch page across every disk's
+    // GPT reads. The memory cap and its VA reservation are
+    // process-lifetime-leaked.
     let Some((mut scratch_cap, scratch_va)) =
         partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
@@ -192,41 +166,15 @@ fn main() -> !
         idle_loop();
     };
 
-    // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
-    let gpt_parts = match partition::parse_gpt(blk_ep, ipc_buf, &mut scratch_cap, scratch_va)
+    // Hold every block device devmgr serves and parse each one's GPT; role
+    // lookups on MOUNT consider the partitions of all of them.
+    std::os::seraph::log!("querying devmgr for block devices");
+    let disks = partition::discover_disks(caps.registry_ep, ipc_buf, &mut scratch_cap, scratch_va);
+    if disks.is_empty()
     {
-        Ok(parts) =>
-        {
-            std::os::seraph::log!("GPT parsed, {} partitions", parts.len());
-            parts
-        }
-        Err(e) =>
-        {
-            match e
-            {
-                gpt::GptError::IoError => std::os::seraph::log!("GPT parse failed: I/O error"),
-                gpt::GptError::InvalidSignature =>
-                {
-                    std::os::seraph::log!("GPT parse failed: invalid signature");
-                }
-                gpt::GptError::InvalidBlockSize =>
-                {
-                    std::os::seraph::log!("GPT parse failed: unsupported logical block size");
-                }
-                gpt::GptError::InvalidEntrySize =>
-                {
-                    std::os::seraph::log!("GPT parse failed: invalid entry size");
-                }
-                gpt::GptError::InvalidEntryArray =>
-                {
-                    std::os::seraph::log!(
-                        "GPT parse failed: entry array outside LBA 2..first_usable_lba"
-                    );
-                }
-            }
-            Vec::new()
-        }
-    };
+        std::os::seraph::log!("no block device available");
+        idle_loop();
+    }
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
@@ -263,8 +211,7 @@ fn main() -> !
     let boot_module_cap = caps.fatfs_module_cap;
     let runtime: &'static VfsdRuntime = Box::leak(Box::new(VfsdRuntime {
         caps,
-        blk_ep,
-        gpt_parts,
+        disks,
         pool,
         boot_module_cap: Mutex::new(boot_module_cap),
         namespace_ep,
@@ -319,9 +266,9 @@ fn main() -> !
 pub struct VfsdRuntime
 {
     pub caps: VfsdCaps,
-    pub blk_ep: u32,
-    /// Every used GPT partition entry, parsed once at startup.
-    pub gpt_parts: Vec<gpt::GptEntry>,
+    /// Every block device devmgr serves, each with its whole-disk cap and
+    /// its used GPT partition entries, found once at startup.
+    pub disks: Vec<partition::Disk>,
     pub pool: WorkerPool,
     /// Boot-module fatfs cap consumed (and zeroed) by the very first MOUNT.
     /// Mutex-guarded because that MOUNT may land on any handler thread.
@@ -981,8 +928,8 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 }
 
 /// One-shot best-effort mount of the partition tagged `type_guid` at
-/// `mount_path`. Scans the parsed GPT for a matching partition; if
-/// none is present (or its role lookup is ambiguous), logs a diagnostic
+/// `mount_path`. Scans every held disk's parsed GPT for a matching
+/// partition; if none is present (or its role lookup is ambiguous), logs a diagnostic
 /// and returns without mounting, leaving `mount_path` to resolve through
 /// the root-fs fall-through. On a match, runs the mount transaction and
 /// logs the outcome. Never fatal — distinct from the root self-mount,
@@ -992,7 +939,11 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 /// driver spawned.
 fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)
 {
-    let present = rt.gpt_parts.iter().any(|p| &p.type_guid == type_guid);
+    let present = rt
+        .disks
+        .iter()
+        .flat_map(|d| &d.partitions)
+        .any(|p| &p.type_guid == type_guid);
     if !present
     {
         std::os::seraph::log!("MOUNT: no partition for {mount_path}; skipping auto-mount");
@@ -1039,10 +990,11 @@ fn mount_path_is_root(path: &[u8]) -> bool
     path.split(|&b| b == b'/').all(<[u8]>::is_empty)
 }
 
-/// Mount a partition identified by `uuid` at `path`.
+/// Mount the partition `role` names at `path`.
 ///
-/// Looks up the UUID in the GPT table, registers the partition bound
-/// with virtio-blk, spawns a fatfs driver, registers a mount entry,
+/// Looks the role's type GUID up across every held disk's GPT, registers
+/// the partition bound with the block driver of the disk that holds it,
+/// spawns a fatfs driver, registers a mount entry,
 /// and captures the driver's namespace endpoint (terminal mounts) or a
 /// badged SEND on the root fs (the root mount) into [`VfsdRootBackend`]
 /// so the system-root cap can resolve through the new mount.
@@ -1079,28 +1031,43 @@ fn do_mount_internal(
     path: &[u8],
 ) -> Result<u32, u64>
 {
-    let (partition_lba, partition_len) =
-        match gpt::lookup_partition_by_type_guid(type_guid, &rt.gpt_parts)
+    // The role resolves across every held disk (docs/storage.md § GPT
+    // Role-GUID Discovery): a tie at the top priority is ambiguous whether
+    // the tied partitions share a disk or not.
+    let disk_parts = rt.disks.iter().map(|d| d.partitions.as_slice());
+    let location = match gpt::lookup_partition_by_type_guid(type_guid, disk_parts)
+    {
+        Ok(location) => location,
+        Err(gpt::GptLookupError::NotFound) =>
         {
-            Ok(pair) => pair,
-            Err(gpt::GptLookupError::NotFound) =>
-            {
-                std::os::seraph::log!("MOUNT: partition role GUID not found");
-                return Err(ipc::vfsd_errors::NO_MOUNT);
-            }
-            Err(gpt::GptLookupError::DuplicateTie) =>
-            {
-                // Non-fatal here; the caller decides (root self-mount treats
-                // the returned error as fatal, the /esp and /data auto-mounts
-                // skip and fall through).
-                std::os::seraph::log!(
-                    "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
-                );
-                return Err(ipc::vfsd_errors::NO_MOUNT);
-            }
-        };
+            std::os::seraph::log!("MOUNT: partition role GUID not found on any disk");
+            return Err(ipc::vfsd_errors::NO_MOUNT);
+        }
+        Err(gpt::GptLookupError::DuplicateTie) =>
+        {
+            // Non-fatal here; the caller decides (root self-mount treats
+            // the returned error as fatal, the /esp and /data auto-mounts
+            // skip and fall through).
+            std::os::seraph::log!(
+                "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
+            );
+            return Err(ipc::vfsd_errors::NO_MOUNT);
+        }
+    };
+    let Some(disk) = rt.disks.get(location.disk)
+    else
+    {
+        // The lookup ran over `rt.disks`, so its index is in range.
+        std::os::seraph::log!(
+            "MOUNT: role lookup named disk {} vfsd does not hold",
+            location.disk
+        );
+        return Err(ipc::vfsd_errors::NO_MOUNT);
+    };
+    let (partition_lba, partition_len) = (location.first_lba, location.length_lba);
     std::os::seraph::log!(
-        "MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}"
+        "MOUNT: partition on disk {} LBA={partition_lba:#018x} length={partition_len:#018x}",
+        location.disk
     );
 
     // Reject a mount the synthetic root would refuse (root already mounted,
@@ -1119,7 +1086,7 @@ fn do_mount_internal(
     }
 
     let Some(partition_ep) =
-        derive_and_register_partition(rt, partition_lba, partition_len, ipc_buf)
+        derive_and_register_partition(disk.blk_ep, partition_lba, partition_len, ipc_buf)
     else
     {
         std::os::seraph::log!("MOUNT: partition cap registration failed");
@@ -1384,16 +1351,17 @@ fn idle_loop() -> !
     }
 }
 
-/// Register a partition bound with virtio-blk and receive back a
+/// Register a partition bound with the block driver of the disk that holds
+/// it, through that disk's whole-disk cap `blk_ep`, and receive back a
 /// badged `SEND_GRANT` cap scoped to that partition.
 ///
-/// vfsd's `rt.blk_ep` is itself a badged cap (the `blk_labels::MOUNT_AUTHORITY` cap
+/// `blk_ep` is itself a badged cap (the `blk_labels::MOUNT_AUTHORITY` cap
 /// minted by devmgr), so vfsd cannot mint partition caps locally — the
 /// kernel rejects re-badging of a badged source. Partition cap
 /// derivation lives server-side in virtio-blk; this call just sends the
 /// bounds and consumes the cap from the reply.
 fn derive_and_register_partition(
-    rt: &VfsdRuntime,
+    blk_ep: u32,
     base_lba: u64,
     length_lba: u64,
     ipc_buf: *mut u64,
@@ -1405,7 +1373,7 @@ fn derive_and_register_partition(
         .word(2, length_lba)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(rt.blk_ep, &msg, ipc_buf) })
+    let Ok(reply) = (unsafe { ipc::ipc_call(blk_ep, &msg, ipc_buf) })
     else
     {
         std::os::seraph::log!("REGISTER_PARTITION ipc_call failed");

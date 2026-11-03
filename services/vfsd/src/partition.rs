@@ -3,13 +3,15 @@
 
 // services/vfsd/src/partition.rs
 
-//! Boot-disk partition discovery: block-device I/O wrapped around the pure
-//! [`gpt`] format parser.
+//! Disk and partition discovery: devmgr's block-device registry queried at
+//! every instance ordinal, and block-device I/O wrapped around the pure
+//! [`gpt`] format parser on each disk found.
 //!
-//! This module owns the IPC — allocating a scratch page, moving a Memory cap
-//! to the block driver and back, and copying the returned sector — and
-//! delegates every decode of the (untrusted) on-disk GPT structures to the
-//! host-tested [`gpt`] crate.
+//! This module owns the IPC — querying devmgr for each block driver,
+//! allocating a scratch page, moving a Memory cap to the block driver and
+//! back, and copying the returned sector — and delegates every decode of the
+//! (untrusted) on-disk GPT structures, and the role lookup across disks, to
+//! the host-tested [`gpt`] crate.
 //!
 //! Block reads use [`BLK_READ_INTO_MEMORY`](ipc::blk_labels::BLK_READ_INTO_MEMORY):
 //! a single scratch Memory cap (allocated via [`alloc_scratch`] at startup) is
@@ -25,12 +27,139 @@ use std::os::seraph::reserve_pages;
 use gpt::{
     GptEntry, GptError, GptHeader, MAX_BLOCK_SIZE, ScanStop, collect_partitions, parse_header,
 };
-use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
+use ipc::{
+    IpcMessage, blk_errors, blk_labels, devmgr_errors, devmgr_labels, memmgr_errors, memmgr_labels,
+};
 use syscall_abi::MAP_WRITABLE;
 
 /// Offset within the scratch page where `BLK_READ_INTO_MEMORY` deposits the
 /// block (per the wire contract).
 const SECTOR_OFFSET_IN_MEMORY: u64 = 0;
+
+/// One block device vfsd holds: devmgr's whole-disk cap on its driver and
+/// the used partitions of its GPT.
+pub struct Disk
+{
+    /// `blk_labels::MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` on the
+    /// disk's block driver, from `QUERY_BLOCK_DEVICE`. Every
+    /// `REGISTER_PARTITION` for a partition of this disk goes here.
+    pub blk_ep: u32,
+    /// Every used GPT entry of this disk, parsed once at startup; empty when
+    /// its GPT could not be read or validated.
+    pub partitions: Vec<GptEntry>,
+}
+
+/// Query devmgr for every block driver it runs and parse each disk's GPT.
+///
+/// Sends `QUERY_BLOCK_DEVICE` at instance ordinals 0, 1, ... and stops at
+/// the first reply that is not `SUCCESS` (devmgr's reply past the last
+/// driver) or the first failed call. The ordinal counts drivers in PCI
+/// order and is not stable across boots, so the returned order carries no
+/// meaning beyond this boot's log lines; role discovery never breaks a tie
+/// on it (`gpt::lookup_partition_by_type_guid`). A disk whose GPT cannot be
+/// parsed is held with no partitions. An allocation failure for the list
+/// stops discovery with a log, keeping the disks found before it.
+pub fn discover_disks(
+    registry_ep: u32,
+    ipc_buf: *mut u64,
+    scratch_cap: &mut u32,
+    scratch_va: u64,
+) -> Vec<Disk>
+{
+    let mut disks = Vec::new();
+    let mut ordinal: u64 = 0;
+    loop
+    {
+        match query_block_device(registry_ep, ordinal, ipc_buf)
+        {
+            BlockDeviceReply::End => break,
+            BlockDeviceReply::NoCap =>
+            {
+                std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE reply carried no cap");
+            }
+            BlockDeviceReply::Disk(blk_ep) =>
+            {
+                std::os::seraph::log!("disk {ordinal}: block device endpoint acquired");
+                let partitions = match parse_gpt(ordinal, blk_ep, ipc_buf, scratch_cap, scratch_va)
+                {
+                    Ok(parts) => parts,
+                    Err(e) =>
+                    {
+                        log_gpt_error(ordinal, &e);
+                        Vec::new()
+                    }
+                };
+                if disks.try_reserve(1).is_err()
+                {
+                    std::os::seraph::log!(
+                        "disk {ordinal}: no memory for the disk list; later disks are not visible"
+                    );
+                    break;
+                }
+                disks.push(Disk { blk_ep, partitions });
+            }
+        }
+        let Some(next) = ordinal.checked_add(1)
+        else
+        {
+            break;
+        };
+        ordinal = next;
+    }
+    std::os::seraph::log!("disks found: {}", disks.len());
+    disks
+}
+
+/// The outcome of one `QUERY_BLOCK_DEVICE`.
+enum BlockDeviceReply
+{
+    /// A failed call, or a reply other than `SUCCESS`: no driver runs at
+    /// this ordinal, and discovery ends.
+    End,
+    /// A `SUCCESS` reply that carried no cap.
+    NoCap,
+    /// The whole-disk cap on the driver at this ordinal.
+    Disk(u32),
+}
+
+/// `QUERY_BLOCK_DEVICE` at instance ordinal `ordinal` (`data[1]`).
+fn query_block_device(registry_ep: u32, ordinal: u64, ipc_buf: *mut u64) -> BlockDeviceReply
+{
+    let msg = IpcMessage::builder(devmgr_labels::QUERY_BLOCK_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .word(1, ordinal)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(registry_ep, &msg, ipc_buf) })
+    else
+    {
+        std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE ipc_call failed");
+        return BlockDeviceReply::End;
+    };
+    if reply.label != devmgr_errors::SUCCESS
+    {
+        return BlockDeviceReply::End;
+    }
+    match reply.caps().first().copied()
+    {
+        Some(cap) if cap != 0 => BlockDeviceReply::Disk(cap),
+        _ => BlockDeviceReply::NoCap,
+    }
+}
+
+/// Log why the GPT of disk `ordinal` could not be parsed.
+fn log_gpt_error(ordinal: u64, e: &GptError)
+{
+    let why = match e
+    {
+        GptError::IoError => "I/O error",
+        GptError::InvalidSignature => "invalid signature",
+        GptError::InvalidBlockSize => "unsupported logical block size",
+        GptError::InvalidEntrySize => "invalid entry size",
+        GptError::InvalidEntryArray => "entry array outside LBA 2..first_usable_lba",
+    };
+    std::os::seraph::log!("disk {ordinal}: GPT parse failed: {why}; no partitions");
+}
 
 /// Allocate one scratch Memory cap from memmgr, reserve a 1-page VA window,
 /// and map the memory cap into vfsd's AS at that VA.
@@ -166,7 +295,8 @@ fn read_and_validate_header(
     parse_header(block)
 }
 
-/// Parse the GPT and return every used partition entry, in on-disk order.
+/// Parse the GPT of disk `ordinal` (the ordinal only labels the log lines)
+/// and return every used partition entry, in on-disk order.
 /// The list holds as many entries as the header's `num_parts` array has
 /// used ones; a walk that stops early (a failed sector read, or no memory
 /// for the list) is logged and returns the partitions found before it.
@@ -176,7 +306,8 @@ fn read_and_validate_header(
 /// via [`alloc_scratch`]. The cap is moved through IPC on every block read;
 /// the slot index in `*scratch_cap` is updated to track where the kernel
 /// deposited the returned cap.
-pub fn parse_gpt(
+fn parse_gpt(
+    ordinal: u64,
     blk_ep: u32,
     ipc_buf: *mut u64,
     scratch_cap: &mut u32,
@@ -190,7 +321,7 @@ pub fn parse_gpt(
     for entry in &scan.entries
     {
         std::os::seraph::log!(
-            "GPT: partition at LBA {:#018x} length {:#018x}",
+            "disk {ordinal}: GPT: partition at LBA {:#018x} length {:#018x}",
             entry.first_lba,
             entry.length_lba
         );
@@ -200,14 +331,16 @@ pub fn parse_gpt(
         None =>
         {}
         Some(ScanStop::ReadFailed { lba }) => std::os::seraph::log!(
-            "GPT: entry-array read at LBA {lba:#018x} failed; later partitions are not visible"
+            "disk {ordinal}: GPT: entry-array read at LBA {lba:#018x} failed; \
+             later partitions are not visible"
         ),
         Some(ScanStop::OutOfMemory) => std::os::seraph::log!(
-            "GPT: no memory for the partition list; later partitions are not visible"
+            "disk {ordinal}: GPT: no memory for the partition list; \
+             later partitions are not visible"
         ),
     }
     std::os::seraph::log!(
-        "GPT: partitions found: {} of {} entries",
+        "disk {ordinal}: GPT: partitions found: {} of {} entries",
         scan.entries.len(),
         header.num_parts
     );

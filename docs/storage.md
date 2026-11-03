@@ -14,7 +14,7 @@ exclusively by capability delegation:
 
 | Layer | Process | Owns |
 |---|---|---|
-| Block | `virtio-blk` (one per virtio-blk device with a private IRQ line, [#664](https://github.com/kottlerg/seraph/issues/664); vfsd binds instance ordinal 0) | Hardware MMIO, IRQ, descriptor rings |
+| Block | `virtio-blk` (one per virtio-blk device with a private IRQ line, [#664](https://github.com/kottlerg/seraph/issues/664); vfsd binds every instance) | Hardware MMIO, IRQ, descriptor rings |
 | Filesystem | one fs driver per mount (e.g. `fatfs`) | On-disk format, BPB, FAT chains |
 | Namespace | `vfsd` (single instance) | Synthetic root, GPT discovery, mount tree |
 
@@ -32,10 +32,11 @@ Four system-scope invariants govern the stack:
   corrupt another. `vfsd` spawns every fs driver.
 - **Block access is partition-scoped at the capability layer.** The
   block driver serves only badged callers: vfsd holds a
-  `blk_labels::MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr, and fs
+  `blk_labels::MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr for
+  each block driver, and fs
   drivers hold partition-identity-badged caps the block driver mints
   on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd is the
-  sole holder of the whole-disk cap: devmgr mints it on
+  sole holder of the whole-disk caps: devmgr mints one on
   `QUERY_BLOCK_DEVICE` only for a caller whose registry cap carries
   `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's registry cap
   alone. Out-of-bounds LBAs are rejected by the block driver on every
@@ -65,8 +66,8 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
   → init delegates Mmio + IRQ caps to devmgr
     → devmgr binds virtio-blk; delegates per-device MMIO + IRQ
       → devmgr creates the block service endpoint and hands it to virtio-blk at spawn
-        → vfsd queries devmgr's registry → blk_labels::MOUNT_AUTHORITY-badged whole-disk SEND_GRANT
-          → vfsd issues REGISTER_PARTITION (whole-disk endpoint only)
+        → vfsd queries devmgr's registry → each disk's blk_labels::MOUNT_AUTHORITY-badged SEND_GRANT
+          → vfsd issues REGISTER_PARTITION (whole-disk endpoint of the partition's disk only)
             → virtio-blk mints a partition-badged SEND_GRANT and returns it in the reply
               → vfsd spawns fs driver; injects partition-scoped block cap
                 → vfsd sends FS_MOUNT; fs driver reads BPB, replies OK
@@ -85,7 +86,7 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
 `blk_labels::MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
 can mint a partition binding. vfsd is the only such holder: devmgr
-mints the whole-disk cap on `QUERY_BLOCK_DEVICE` only for a caller
+mints a whole-disk cap on `QUERY_BLOCK_DEVICE` only for a caller
 whose registry cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on
 vfsd's registry cap alone. The block driver
 enforces the LBA bound on every read and write against the caller's
@@ -125,11 +126,23 @@ or on-disk UUID. The model is:
   therefore a disk-authoring choice, not a vfsd concern; the in-tree
   image (see [build-system.md](build-system.md)) carries the tree on the
   partition only.
+- **Every disk is searched.** At startup vfsd sends `QUERY_BLOCK_DEVICE`
+  at instance ordinals 0, 1, … until the reply is not `SUCCESS`, holds
+  the whole-disk cap of every block driver devmgr serves, and parses each
+  disk's GPT. A role lookup, at the root self-mount, the auto-mounts, and
+  a runtime `MOUNT`, considers the partitions of every held disk; a disk
+  whose GPT cannot be read or validated contributes none. The partition's
+  `REGISTER_PARTITION` goes to the block driver of the disk that holds it.
 - **DPS-style priority tie-break.** Where multiple partitions match
-  a role GUID, GPT attribute bits 48–63 are compared as an unsigned
-  priority; the highest wins. A tie at the highest priority is
-  ambiguous: for the root role it is a fatal boot error that must be
-  repaired; the `/esp` and `/data` auto-mounts skip the mount.
+  a role GUID, on one disk or across disks, GPT attribute bits 48–63 are
+  compared as an unsigned priority; the highest wins, whichever disk holds
+  it. A tie at the highest priority is ambiguous whether the tied
+  partitions share a disk or not: the instance ordinal follows PCI order
+  and is not stable across boots
+  ([device-management.md](device-management.md#relationship-to-other-services)),
+  so disk order never breaks a tie. For the root role an ambiguity is a
+  fatal boot error that must be repaired; the `/esp` and `/data`
+  auto-mounts skip the mount.
 - **Nothing else binds.** There is no `mounts.conf`, no `/etc/fstab`,
   no kernel command line carrying mount config, no on-disk
   filesystem label or UUID consulted by vfsd. The GUID is the
@@ -159,9 +172,10 @@ filesystem access of its own. The `GET_SYSTEM_ROOT_CAP` contract is
 owned by
 [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md).
 
-**vfsd** parses the GPT once at startup, then self-mounts the root
-partition: it resolves the arch root GUID, looks the partition up in
-its parsed table, registers the partition bound with virtio-blk,
+**vfsd** parses every held disk's GPT once at startup, then self-mounts
+the root partition: it resolves the arch root GUID, looks the partition
+up across the parsed tables, registers the partition bound with the
+virtio-blk instance of the disk that holds it,
 spawns the fs driver, sends `FS_MOUNT` to validate the BPB, and
 captures the driver's root cap into the synthetic root (see
 [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)).

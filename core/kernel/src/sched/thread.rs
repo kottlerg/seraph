@@ -890,11 +890,11 @@ pub struct ThreadControlBlock
     pub timed_out: bool,
 
     // === I/O port permissions (x86_64 only) ===
-    /// Per-thread I/O Permission Bitmap: the bitmap at the head of this
-    /// thread's port-binding table (`cap::ioport_bindings::IoPortBindings`,
-    /// carved from the SEED Memory cap on first `SYS_IOPORT_BIND`), which also
-    /// records the `IoPort` object behind each binding. Null if this thread
-    /// has no port bindings.
+    /// Per-thread I/O Permission Bitmap: the page-sized parts at the head of
+    /// this thread's port-binding table (`cap::ioport_bindings::IoPortBindings`,
+    /// pages of this thread's own `CSpace` pool taken on the first
+    /// `SYS_IOPORT_BIND`), which also records the `IoPort` object behind each
+    /// binding. Null if this thread has no port bindings.
     ///
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.
@@ -902,11 +902,13 @@ pub struct ThreadControlBlock
     /// Owned, pointer and bytes, by this TCB's `sched_lock`: `sys_ioport_bind`
     /// installs and edits it, an `IoPort` teardown's withdrawal rebuilds it,
     /// and `schedule()`'s dispatch flip and the `#GP` lazy reload load it into
-    /// a TSS, under that lock; `dealloc_object(Thread)` detaches it under that
-    /// lock and frees it once the thread is off every CPU
+    /// a TSS, under that lock; `dealloc_object(Thread)` detaches and frees it
+    /// under that lock once the thread is off every CPU, unless the thread's
+    /// `CSpace` died first, whose teardown frees it under the same lock
+    /// (`ioport_bindings::free_tables_bound_to`)
     /// (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership, the
     /// Address-space / capability row).
-    pub iopb: *mut [u8; crate::arch::current::IOPB_SIZE],
+    pub iopb: *mut crate::arch::current::ThreadIopb,
 
     // === IPC block cancellation ===
     /// Pointer to the kernel IPC object this thread is currently blocked on

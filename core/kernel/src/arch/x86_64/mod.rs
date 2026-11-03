@@ -57,9 +57,10 @@ pub const HAS_SBI: bool = false;
 #[allow(clippy::cast_possible_truncation)]
 pub const ROOT_IRQ_COUNT: u32 = boot_protocol::MAX_IOAPICS as u32 * ioapic::IOAPIC_MAX_PINS;
 
-/// Size of the I/O Permission Bitmap in bytes (re-exported from gdt for use
-/// in architecture-independent code such as `ThreadControlBlock`).
-pub use gdt::IOPB_SIZE;
+/// A thread's I/O permission bitmap and its page-sized parts (re-exported from
+/// gdt for architecture-independent code: `ThreadControlBlock` and the
+/// port-binding table).
+pub use gdt::{IOPB_PART_BYTES, IOPB_PARTS, ThreadIopb};
 
 /// Forward a sanctioned SBI call — unsupported on x86-64.
 ///

@@ -117,13 +117,14 @@ allocator returns, its header records the source, and the bytes go back to that 
 the object's reference count reaches zero, whether a capability (deleted, or removed by a
 revoke) or a kernel-internal owner releases the last reference (see
 [capability-internals.md](capability-internals.md) § Kernel Object Reference Counting). The
-kernel's own objects are retyped from the SEED reserve, pinned at the Phase 7 handoff from
+objects the boot mints are retyped from the SEED reserve, pinned at the Phase 7 handoff from
 the front of the largest extent drained from the buddy allocator
-([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies of
+([initialization.md](initialization.md) § Phase 7: Capability System). The bodies of
 split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
-split children), the bodies of Mmio, IoPort, and Interrupt copies and derivations
-([capability-internals.md](capability-internals.md) § Copies and Lineages), and per-thread
-port-binding tables (the IOPB and its binding records) are also carved from SEED at runtime;
+split children), of Mmio, IoPort, and Interrupt copies and derivations, and the spilled mapping
+records of Mmio objects are placed in the body arena of the `CSpace` the call inserts into or
+resolves through, and per-thread port-binding tables in pages of the bound thread's `CSpace`, each
+funded from that `CSpace`'s pool ([capability-internals.md](capability-internals.md) § Body Arena);
 every other userspace object comes from the capability a `cap_create_*` syscall names.
 Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
@@ -131,23 +132,20 @@ Address spaces and CSpaces additionally own a page pool for their page tables an
 The retype allocator (`core/kernel/src/cap/retype.rs`) rounds each request to a size class: two
 sub-page classes of 128 and 512 bytes, or a page multiple. A sub-page request is placed from its
 class's free list, else at the bump cursor, else, once the bump cursor cannot fit the request, in
-one page taken from the page free list and cut into that class's slots. A page-multiple request
-is placed from the page free list, else at the bump cursor. The page free list is kept in
-ascending address order, a freed block merging with the free blocks on either side, so it holds
-one node per run of free pages and a first-fit walk visits at most `size / PAGE_SIZE` nodes; a
-node that starts below its predecessor's end, or lies outside the object, is corruption, which the
-walk reports once per boot and stops at. The carve keeps freed page blocks
-usable by sub-page requests, which SEED depends on: init's bootstrap objects return to it as page
-blocks at init's reap, and its runtime bodies are sub-page apart from x86_64's per-thread
-port-binding tables. Free bytes held in the other sub-page class, or in sub-page slots for a
-page-multiple request, are not placeable, so a request can still fail while the object's
-`available_bytes` counts enough bytes. A carve is permanent while the object holds a live
-retype (only the drain reset, when every retyped byte is freed, undoes it, and SEED never drains,
-as it is pinned), so on SEED the carve trades page blocks for sub-page capacity: sustained
-sub-page demand can leave too few contiguous pages for a port-binding table, and
-`sys_ioport_bind` then returns `OutOfMemory`. A carve happens only once the bump cursor cannot
-serve the class, so the bump frontier is by then spent and the class's free list empty: without
-the carve, the sub-page request fails instead.
+one page taken from the page free list and cut into that class's slots. A page-multiple request is
+placed from the page free list, else at the bump cursor. The page free list is kept in ascending
+address order, a freed block merging with the free blocks on either side, so it holds one node per
+run of free pages and a first-fit walk visits at most `size / PAGE_SIZE` nodes; a node that starts
+below its predecessor's end, or lies outside the object, is corruption, which the walk reports once
+per boot and stops at. The carve keeps freed page blocks usable by sub-page requests (SEED's, for
+one, become page blocks when init's bootstrap objects return to it at init's reap). Free bytes held
+in the other sub-page class, or in sub-page slots for a page-multiple request, are not placeable, so
+a request can still fail while the object's `available_bytes` counts enough bytes. A carve is
+permanent while the object holds a live retype (only the drain reset, when every retyped byte is
+freed, undoes it, and SEED never drains, as it is pinned), so the carve trades page blocks for
+sub-page capacity. A carve happens only once the bump cursor cannot serve the class, so the bump
+frontier is by then spent and the class's free list empty: without the carve, the sub-page request
+fails instead.
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail

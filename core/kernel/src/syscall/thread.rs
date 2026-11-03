@@ -1453,8 +1453,6 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
 pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{KernelObjectHeader, ObjectType, SchedControlObject, dealloc_object};
-    use crate::cap::retype::alloc_in_seed;
-    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, SchedRights};
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
@@ -1505,14 +1503,20 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Create two child SchedControlObjects ───────────────────────────────────
 
-    let child1_ptr = alloc_in_seed(SchedControlObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::SchedControl, seed_header_nn()),
+    // The caller's CSpace, which receives both children, funds their
+    // bodies from its arena (core/kernel/docs/capability-internals.md
+    // § Body Arena); dealloc returns each chunk there.
+    // SAFETY: caller_cspace is the running thread's own CSpace, live
+    // while the thread runs.
+    let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }?;
+    let child1_ptr = funder.alloc_body(SchedControlObject {
+        header: KernelObjectHeader::new(ObjectType::SchedControl),
         min,
         max: split_at - 1,
     })?;
 
-    let child2_ptr = match alloc_in_seed(SchedControlObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::SchedControl, seed_header_nn()),
+    let child2_ptr = match funder.alloc_body(SchedControlObject {
+        header: KernelObjectHeader::new(ObjectType::SchedControl),
         min: split_at,
         max,
     })
@@ -1520,7 +1524,7 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
         Ok(p) => p,
         Err(e) =>
         {
-            // SAFETY: child1_ptr is a freshly-allocated SEED-backed body with
+            // SAFETY: child1_ptr is a freshly-allocated arena-backed body with
             // refcount 1 and not yet inserted into any CSpace.
             unsafe { dealloc_object(child1_ptr) };
             return Err(e);
@@ -1530,7 +1534,7 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
     // Install both children, rewire the derivation tree, and consume the
     // original — shared with the hardware range splits.
     // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
-    // children are freshly-allocated SEED-backed SchedControlObjects (refcount 1);
+    // children are freshly-allocated arena-backed SchedControlObjects (refcount 1);
     // orig_obj_ptr is the live original from lookup_cap.
     let (handle1, handle2) = unsafe {
         install_split_children(

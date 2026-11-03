@@ -1183,18 +1183,28 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     std::os::seraph::log!("fs_carried_caps_dropped phase passed");
 }
 
-/// fatfs's cache slots, the one definition fatfs itself uses.
-const FATFS_SLOT_COUNT: usize = fat_parse::SLOT_COUNT;
-
 /// fatfs's quarantine bound, the one definition fatfs itself uses.
 const FATFS_QUARANTINE_MAX: usize = fat_parse::QUARANTINE_MAX;
 
-/// Pages of the slot-reuse file: more than fatfs's slots plus its quarantine
-/// bound, so holding pages until fatfs refuses one ends before the file does.
-const SLOT_REUSE_PAGES: usize = 200;
+/// Pages of the slot-reuse file past fatfs's slots and its quarantine bound,
+/// so holding pages until fatfs refuses one ends before the file does.
+const SLOT_REUSE_MARGIN: usize = 40;
 
-// The slot-reuse phase's bound check needs a file that outlasts the cache.
-const _: () = assert!(SLOT_REUSE_PAGES > FATFS_SLOT_COUNT + FATFS_QUARANTINE_MAX);
+/// fatfs's cache slot ceiling on this machine: [`fat_parse::slot_ceiling`] of
+/// the RAM memmgr reports, the one rule fatfs itself sizes its cache by.
+fn fatfs_slot_ceiling(ipc_buf: *mut u64) -> usize
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &req, ipc_buf) }
+        .expect("slot reuse: memmgr QUERY_POOL_STATUS ipc_call failed");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "slot reuse: QUERY_POOL_STATUS status"
+    );
+    fat_parse::slot_ceiling(reply.word(0) / syscall_abi::PAGE_SIZE)
+}
 
 /// Pages the first case holds mapped: more than the quarantine bound, so
 /// some still-mapped slots must stay out of service instead of being given a
@@ -1327,7 +1337,7 @@ impl HeldPage
 
 /// Read every page of the slot-reuse file from page `skip` on, checking
 /// each page's tag, so the LRU reuses every unreferenced slot.
-fn read_slot_reuse_file(path: &str, skip: usize)
+fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
 {
     use std::io::{Seek, SeekFrom};
 
@@ -1335,7 +1345,7 @@ fn read_slot_reuse_file(path: &str, skip: usize)
     f.seek(SeekFrom::Start((skip * SLOT_REUSE_PAGE) as u64))
         .expect("slot reuse: seek");
     let mut page = vec![0u8; SLOT_REUSE_PAGE];
-    for i in skip..SLOT_REUSE_PAGES
+    for i in skip..pages
     {
         let mut got = 0;
         while got < SLOT_REUSE_PAGE
@@ -1372,10 +1382,13 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
 
     let path = "/data/svctest/slotreuse.bin";
     let name: &[u8] = b"slotreuse.bin";
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let slots = fatfs_slot_ceiling(ipc_buf);
+    let file_pages = slots + FATFS_QUARANTINE_MAX + SLOT_REUSE_MARGIN;
     {
         let mut f = std::fs::File::create(path).expect("slot reuse: create");
         let mut page = vec![0u8; SLOT_REUSE_PAGE];
-        for i in 0..SLOT_REUSE_PAGES
+        for i in 0..file_pages
         {
             for chunk in page.chunks_exact_mut(8)
             {
@@ -1385,7 +1398,6 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
         }
     }
 
-    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
     let (node, _kind, _size) =
         ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("slot reuse: lookup");
@@ -1393,8 +1405,8 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     let held: Vec<HeldPage> = (0..SLOT_REUSE_HELD)
         .map(|i| HeldPage::take(node, i, ipc_buf).expect("slot reuse: a read past the bound"))
         .collect();
-    read_slot_reuse_file(path, SLOT_REUSE_HELD);
-    read_slot_reuse_file(path, 0);
+    read_slot_reuse_file(path, SLOT_REUSE_HELD, file_pages);
+    read_slot_reuse_file(path, 0, file_pages);
     for page in &held
     {
         page.check("after every slot was reused");
@@ -1405,7 +1417,7 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     }
 
     let mut held = Vec::new();
-    while held.len() < SLOT_REUSE_PAGES
+    while held.len() < file_pages
     {
         match HeldPage::take(node, held.len(), ipc_buf)
         {
@@ -1415,11 +1427,11 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     }
     let count = held.len();
     assert!(
-        count > FATFS_SLOT_COUNT,
+        count > slots,
         "slot reuse: fatfs refused after {count} held pages; spares never replaced a slot"
     );
     assert!(
-        count <= FATFS_SLOT_COUNT + FATFS_QUARANTINE_MAX,
+        count <= slots + FATFS_QUARANTINE_MAX,
         "slot reuse: fatfs held {count} pages without refusing; the quarantine is unbounded"
     );
     for page in &held
@@ -1430,7 +1442,7 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     {
         page.release();
     }
-    read_slot_reuse_file(path, 0);
+    read_slot_reuse_file(path, 0, file_pages);
 
     let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.

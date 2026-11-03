@@ -11,6 +11,7 @@
 //! and the scenarios here reach their per-arch helpers and constants (for
 //! example `crate::arch::fpu`, `crate::arch::IP_OFFSET`) through it.
 
+pub mod arena_reclaim;
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
@@ -35,6 +36,7 @@ pub mod irq_shared_line;
 pub mod mem_map_retyped_refused;
 pub mod memory_lifecycle;
 pub mod mmio_revoke_unmaps;
+pub mod mmio_spill_withdrawn;
 pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
@@ -134,9 +136,14 @@ pub fn run_all(ctx: &TestContext)
         mmio_revoke_unmaps::run(ctx)
     );
     run_integration_test!(
+        "integration::mmio_spill_withdrawn",
+        mmio_spill_withdrawn::run(ctx)
+    );
+    run_integration_test!(
         "integration::range_copy_lineage",
         range_copy_lineage::run(ctx)
     );
+    run_integration_test!("integration::arena_reclaim", arena_reclaim::run(ctx));
     run_integration_test!("integration::irq_shared_line", irq_shared_line::run(ctx));
     run_integration_test!(
         "integration::priority_preemption",

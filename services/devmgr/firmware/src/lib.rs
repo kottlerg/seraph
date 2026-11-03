@@ -3,15 +3,16 @@
 
 // services/devmgr/firmware/src/lib.rs
 
-//! Firmware-table parsers, PCI configuration-space logic, and range-cap
-//! bookkeeping for devmgr.
+//! Firmware-table parsers, PCI configuration-space logic, range-cap
+//! bookkeeping, and driver-settle bookkeeping for devmgr.
 //!
 //! Narrow subset lifted from `core/boot/src/{acpi,dtb}.rs`. Walks ACPI tables
 //! (RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK` for the shutdown
 //! broker's check) and flattened device trees for the PCI ECAM windows,
 //! computes ECAM register offsets and BAR sizes, walks PCI configuration
-//! space through a caller-supplied accessor, and keeps the table of MMIO and
-//! interrupt range caps devmgr carves per-device caps from. The functions read
+//! space through a caller-supplied accessor, keeps the table of MMIO and
+//! interrupt range caps devmgr carves per-device caps from, and tracks which
+//! spawned drivers reported their device ready. The functions read
 //! caller-mapped byte slices or values, or reach the platform only through a
 //! caller-supplied accessor or split operation, and touch no syscall, IPC, or
 //! `std::os::seraph` surface, so the crate is host-reachable and
@@ -26,6 +27,7 @@ pub mod acpi;
 pub mod dtb;
 pub mod pci;
 pub mod resource;
+pub mod roster;
 pub mod scan;
 
 /// Location of one PCI ECAM configuration-space window discovered from an

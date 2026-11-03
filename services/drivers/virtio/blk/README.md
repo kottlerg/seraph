@@ -31,7 +31,12 @@ cap for every BAR the device's VirtIO register regions name in the first
 bootstrap round, each with its PCI BAR index, then the service endpoint, the
 IRQ, and a per-device badged devmgr query endpoint in the second (the rounds
 `virtio_core::bootstrap` specifies). The driver maps the BARs into one
-register window and reaches each region through its own BAR's mapping. vfsd
+register window and reaches each region through its own BAR's mapping. Once
+its device is set up, immediately before its service loop, the driver reports
+`DRIVER_READY` on the devmgr query endpoint; devmgr serves the driver's
+endpoint only after that report, so a driver that exits in its device setup
+is never handed to a client (see [devmgr
+Responsibilities](../../../devmgr/docs/responsibilities.md#responsibilities)). vfsd
 obtains a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap through
 devmgr's `QUERY_BLOCK_DEVICE`. The delegation chain is owned by
 [docs/storage.md](../../../../docs/storage.md) § Capability Delegation Chain.

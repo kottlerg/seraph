@@ -32,8 +32,11 @@ const _: () = assert!(MAX_VIRTIO_BARS <= MSG_CAP_SLOTS_MAX);
 pub const SLOT_SERVICE: usize = 0;
 /// Round-2 slot of the device's single-IRQ `Interrupt` cap.
 pub const SLOT_IRQ: usize = 1;
-/// Round-2 slot of the per-device badged SEND on devmgr's registry
-/// endpoint, for `QUERY_DEVICE_INFO`.
+/// Round-2 slot of the per-device badged SEND on the private driver endpoint
+/// of the driver's devmgr spawn batch, for `QUERY_DEVICE_INFO` and, once the
+/// device is set up, `DRIVER_READY` (`ipc::devmgr_labels`). devmgr serves the
+/// driver's service endpoint only after that report, and revokes this cap
+/// once its batch has settled.
 pub const SLOT_DEVMGR_QUERY: usize = 2;
 /// Slots round 2 carries.
 pub const ROUND2_SLOTS: usize = 3;
@@ -96,7 +99,8 @@ pub struct DriverEndpoints
     pub service: u32,
     /// The device's IRQ cap ([`SLOT_IRQ`]), `0` when devmgr delivered none.
     pub irq: u32,
-    /// devmgr's per-device query endpoint ([`SLOT_DEVMGR_QUERY`]).
+    /// devmgr's per-device query and ready-report endpoint
+    /// ([`SLOT_DEVMGR_QUERY`]).
     pub devmgr_query: u32,
 }
 

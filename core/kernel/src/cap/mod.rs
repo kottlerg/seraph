@@ -310,7 +310,10 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// pre-memmgr-handover peak. The headroom absorbs realistic
 /// per-RAM-extent-count growth (more drained extents ⇒ more init-time
 /// Memory-cap derivations) and per-service growth (more boot modules ⇒
-/// more module-memory caps) without revisiting this knob.
+/// more module-memory caps) without revisiting this knob. The boot mint is
+/// itself bounded by [`BOOT_BODY_BOUND`] (about 670 caps, the `InitInfo`
+/// descriptor capacity), so a boot at that bound, an ACPI-region-heavy memory
+/// map among them, still leaves init about 866 slots.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -327,40 +330,115 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
+/// Pool pages of the root `CSpace` beyond its slots, for the bodies its arena
+/// funds: init's bootstrap allocator splits a Memory cap once per page it hands
+/// out, and each split's tail body takes a 128-byte chunk of init's own
+/// `CSpace` (core/kernel/docs/capability-internals.md § Body Arena), which init
+/// never augments. 16 pages hold 512 bodies, about twice the splits init
+/// makes before it hands memory to memmgr.
+#[cfg(not(test))]
+const ROOT_CSPACE_BODY_PAGES: u64 = 16;
+
 /// Pages carved from `SEED_MEMORY` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
 /// pages seed the slot-page pool. Sized so the pool holds at least
 /// [`ROOT_CSPACE_INIT_SLOT_CAPACITY`] slots regardless of `L2_SIZE`
-/// (slots-per-page). The slot-0 reservation on page 0 costs one slot
-/// and is absorbed by rounding up.
+/// (slots-per-page), plus [`ROOT_CSPACE_BODY_PAGES`] for the bodies of init's
+/// splits. The slot-0 reservation on page 0 costs one slot and is absorbed by
+/// rounding up.
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_PAGES: u64 =
-    1 + ROOT_CSPACE_INIT_SLOT_CAPACITY.div_ceil(cspace::L2_SIZE as u64);
+    1 + ROOT_CSPACE_INIT_SLOT_CAPACITY.div_ceil(cspace::L2_SIZE as u64) + ROOT_CSPACE_BODY_PAGES;
+
+/// Pages of init's bootstrap `AddressSpace` slab, retyped from SEED at Phase 9:
+/// 1 wrapper + 1 root PT + 16 PT pool pages. Phase 9 mappings (ELF segments,
+/// `InitInfo`, stack) go through `map_page`, a kernel-direct call whose
+/// intermediate PT pages come from `kernel_pt_pool`, not this wrapper's pool.
+/// The wrapper's pool serves init's userspace pooled paths: `sys_mem_map`
+/// (`TEMP_MAP_BASE` + `ELF_PAGE_TEMP_VA` scratch) and `sys_mmio_map` for init's
+/// own MMIO (the riscv64 serial UART, one page). 16 pool pages cover that
+/// footprint with margin. The footprint is fixed by init's own code, so no
+/// hardware count grows it; the pool also takes augment-mode
+/// `SYS_CAP_CREATE_ASPACE` donations, which ktest uses.
+#[cfg(not(test))]
+pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
+
+/// Pages of init's Thread slab, retyped from SEED at Phase 9, in the layout
+/// `sys_cap_create_thread` establishes: the kernel stack
+/// (`KERNEL_STACK_PAGES`), then the `ThreadObject` followed by the
+/// `ThreadControlBlock`, then the per-thread FPU/SIMD/V save area.
+#[cfg(not(test))]
+pub(crate) const INIT_THREAD_PAGES: u64 = (crate::sched::KERNEL_STACK_PAGES + 2) as u64;
+
+/// Most boot-minted capability bodies: one per descriptor the `InitInfo`
+/// block can carry. Every capability Phase 7 and Phase 9 mint into the root
+/// `CSpace` is described to init there, so a boot whose capabilities
+/// outnumber the block halts at Phase 9 ("`InitInfo` region too large")
+/// before it could need more bodies. At `INIT_INFO_MAX_PAGES` = 4 that is
+/// about 670 capabilities, which also bounds the ACPI region caps: a memory
+/// map of more than about 640 `AcpiReclaimable` regions halts the boot by
+/// name, and real firmware reports 1 or 2.
+#[cfg(not(test))]
+const BOOT_BODY_BOUND: usize = (init_protocol::INIT_INFO_MAX_PAGES * crate::mm::PAGE_SIZE
+    - core::mem::size_of::<init_protocol::InitInfo>())
+    / core::mem::size_of::<CapDescriptor>();
+
+/// Bytes of one boot-minted body: the 128-byte retype size class, which
+/// every body type fits (asserted below).
+#[cfg(not(test))]
+const BOOT_BODY_BYTES: usize = 128;
+
+#[cfg(not(test))]
+const _: () = assert!(
+    core::mem::size_of::<MemoryObject>() <= BOOT_BODY_BYTES
+        && core::mem::size_of::<object::MmioObject>() <= BOOT_BODY_BYTES
+        && core::mem::size_of::<object::InterruptObject>() <= BOOT_BODY_BYTES
+        && core::mem::size_of::<object::IoPortObject>() <= BOOT_BODY_BYTES
+        && core::mem::size_of::<object::SchedControlObject>() <= BOOT_BODY_BYTES
+        && core::mem::size_of::<object::SbiControlObject>() <= BOOT_BODY_BYTES,
+    "a boot-minted body exceeds the size class SEED_RESERVE_BYTES budgets"
+);
+
+/// Pages the seed's bump cursor can lose to page alignment: one at each switch
+/// from sub-page bodies to a page-aligned slab, and the boot makes three
+/// (Phase 7's bodies, then Phase 9's address-space slab, bodies, and thread
+/// slab), with one to spare.
+#[cfg(not(test))]
+const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 
 // ── Phase-7 seed Memory cap ───────────────────────────────────────────────────
 
-/// Bytes carved off the front of the largest drained RAM extent to host
-/// every initial cap-identity body.
+/// Bytes carved off the front of the largest drained RAM extent for the boot
+/// footprint, every kernel object the boot mints before init runs:
 ///
-/// Today's footprint on `x86_64` is ~150 KB:
-/// ~15 KB for sub-page cap-identity bodies (bin-128 slots: one RAM
-/// `MemoryObject` per coalesced drained extent, the seed tail included (see
-/// [`drain_and_install_seed`]) + 10 `Mmio` wrappers + 1 `Interrupt` + 1 `IoPort` +
-/// 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps + 3
-/// init-segment Memory caps, plus the seed's own `RetypeAllocator` metadata),
-/// plus ~130 KB for init's bootstrap state (one [`AddressSpaceObject`] slab —
-/// wrapper page + root PT + PT growth pool, one [`CSpaceKernelObject`] slab —
-/// wrapper page + slot-page pool, one [`ThreadObject`] slab — kernel stack +
-/// wrapper/TCB).
-/// `SEED_RESERVE_BYTES` is sized at 512 KB — generous headroom so future
-/// cap types and longer module lists land without revisiting the constant.
+/// - the root `CSpace` slab ([`ROOT_CSPACE_INIT_PAGES`]: 1 + 28 + 16 = 45
+///   pages);
+/// - init's bootstrap `AddressSpace` and Thread slabs ([`INIT_ASPACE_PAGES`]
+///   18, [`INIT_THREAD_PAGES`] 6);
+/// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (about
+///   670) of [`BOOT_BODY_BYTES`] each (about 21 pages): one RAM `MemoryObject`
+///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
+///   `SchedControl` and `SbiControl` roots, the firmware-table, boot-module,
+///   init-segment, `InitInfo`/stack and reclaim Memory caps;
+/// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
+///
+/// That is about 94 pages (376 KiB). Nothing draws on SEED at runtime: the
+/// bodies a syscall creates are funded by the caller's `CSpace`
+/// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
+/// capabilities pass the body bound exhausts SEED with a named fatal in
+/// Phase 7, as it would overflow `InitInfo` in Phase 9.
 ///
 /// The remainder of the largest extent is exposed to userspace as a
 /// regular retype-backed RAM Memory cap (the "seed-tail"), so init and
 /// memmgr operate on virgin caps with zero behavioural change in their
 /// front-split allocators.
 #[cfg(not(test))]
-const SEED_RESERVE_BYTES: u64 = 512 * 1024;
+const SEED_RESERVE_BYTES: u64 = (ROOT_CSPACE_INIT_PAGES
+    + INIT_ASPACE_PAGES
+    + INIT_THREAD_PAGES
+    + (BOOT_BODY_BOUND * BOOT_BODY_BYTES).div_ceil(crate::mm::PAGE_SIZE) as u64
+    + SEED_ALIGNMENT_SLACK_PAGES)
+    * crate::mm::PAGE_SIZE as u64;
 
 /// BSS-static `MemoryObject` covering the seed RAM region.
 ///

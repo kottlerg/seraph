@@ -19,7 +19,10 @@
 //! reclaim the bytes back to the source cap. Init's bootstrap state
 //! (the root `CSpace`, which is init's `CSpace`, and init's `AddressSpace`
 //! and `Thread`) and the Phase-7 boot-time identity wrappers are retyped from the SEED reserve
-//! (`boot_retype_*`, `mint_phase7_body`) and carry the SEED ancestor.
+//! (`boot_retype_*`, `mint_phase7_body`) and carry the SEED ancestor. The
+//! bodies a split or an `Mmio`/`IoPort` copy creates at runtime are chunks of
+//! the receiving `CSpace`'s body arena ([`CSpaceKernelObject::alloc_body`]) and
+//! carry that `CSpace`'s wrapper as their ancestor.
 //!
 //! Deallocation: read `header.obj_type` from the raw pointer, drop the
 //! object in place, and call `retype_free` against the ancestor
@@ -135,8 +138,9 @@ pub struct KernelObjectHeader
 /// ceiling (one), and the destinations of an IPC transfer it has in flight that
 /// passed the message check (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16
 /// in all. Per other object: wait-set membership (one per source), Mmio mapping
-/// records (four per Mmio object, whose bodies are SEED-backed), SEED leases
-/// (bounded by the SEED reserve), and the destinations IPC transfers' abandoned moves leave
+/// records (each 16 bytes of a caller-funded body or spill chunk, so 2^31 of
+/// them hold 32 GiB), SEED leases (the boot mints, bounded by the SEED reserve),
+/// and the destinations IPC transfers' abandoned moves leave
 /// live: a message check refuses once the count is at the ceiling, and
 /// transfers run one at a time under `DERIVATION_LOCK`, so these keep an
 /// object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the ceiling.
@@ -188,7 +192,7 @@ impl KernelObjectHeader
 
     /// Increment the reference count for an owner whose number is bounded
     /// below the headroom above [`REF_COUNT_LIMIT`]: a syscall pin, a binding,
-    /// a mapping record, a SEED lease, or the lease of a retype that
+    /// a mapping record, a boot mint's SEED lease, or the lease of a retype that
     /// [`crate::cap::retype::retype_allocate`] admitted (see
     /// core/kernel/docs/capability-internals.md § Kernel Object Reference
     /// Counting), or an IPC transfer's move destination, whose message
@@ -705,12 +709,14 @@ pub struct MmioObject
 }
 
 // MmioObject fits the 128-byte size class of the SEED mints
-// (`retype::round_to_class`) and of an arena chunk.
+// (`retype::round_to_class`) and of an arena chunk (`alloc_body` asserts it).
 const _: () = assert!(core::mem::size_of::<MmioObject>() <= 128);
 
 impl MmioObject
 {
-    /// A lineage-root `Mmio` object over `[base, base + size)`, retyped from SEED.
+    /// A lineage-root `Mmio` object over `[base, base + size)`, with SEED as its
+    /// ancestor; a split or copy restamps it with its funding `CSpace`
+    /// ([`CSpaceKernelObject::alloc_body`]).
     pub fn new_root(base: u64, size: u64, flags: u32) -> Self
     {
         Self {
@@ -904,7 +910,8 @@ pub struct IoPortObject
 impl IoPortObject
 {
     /// A lineage-root `IoPort` object over `size` ports from `base` (`size == 0`
-    /// for all 65536), retyped from SEED.
+    /// for all 65536), with SEED as its ancestor; a split or copy restamps it
+    /// with its funding `CSpace` ([`CSpaceKernelObject::alloc_body`]).
     pub fn new_root(base: u16, size: u16) -> Self
     {
         Self {
@@ -3627,7 +3634,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // Invariants, invariant 9.
                 crate::sched::sleep_wakeups_quiesce();
 
-                // Release the per-thread port-binding table to SEED if one was
+                // Release the per-thread port-binding table to its funding
+                // CSpace's pool if one was
                 // bound via `sys_ioport_bind` (x86-64 only). RISC-V threads never
                 // set this field — there is no I/O port space — so `iopb` is
                 // always null and this is a no-op there. The pointer is taken

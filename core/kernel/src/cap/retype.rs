@@ -742,10 +742,10 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
         // The bump frontier cannot fit the request. A sub-page request can
         // still be served from a freed page block, whose bytes
         // `available_bytes` counts: carve one page into the request's bin
-        // rather than fail while those bytes are free. SEED reaches this state
-        // at runtime: init's bootstrap slabs return to it as page blocks at
-        // init's reap, and its runtime bodies are sub-page apart from x86_64's
-        // per-thread port-binding tables.
+        // rather than fail while those bytes are free. A cap reaches this state
+        // once page-sized children it held are freed and sub-page ones follow
+        // (SEED does at init's reap, when init's bootstrap slabs return to it
+        // as page blocks).
         // SAFETY: alloc lock held.
         let carved = subpage_bin_for(need)
             .and_then(|bin| unsafe { carve_page_into_bin(alloc, memory, bin, need) });

@@ -445,8 +445,9 @@ changes. The second prints every file header of the diff and every line, changed
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it: the
-set is owed when a non-inert changed line lies within that function, read in the widened hunk. The
+hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it
+(except `frame_map::init` and `init_cspace_registry`, which the memory surface covers): the set is
+owed when a non-inert changed line lies within that function, read in the widened hunk. The
 screen finds named items and changes inside their definitions; it does not follow a size
 change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
 constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
@@ -678,15 +679,16 @@ list as the tracking Issues move):
 - Both arches, widths past 128 CPUs (residual): the boundary set stops at 128,
   so no local run exercises x2APIC destinations above APIC id 255, threshold
   effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
-  with the width), or the runtime sizing of the per-CPU slabs past 128 (the
-  run of buddy blocks `alloc_zeroed_slab` takes for a slab wider than one
-  block). What covers `MAX_CPUS` instead: the host tests of `CpuMask` at
-  `MAX_CPUS` (`core/kernel/src/cpu_mask.rs`), the host tests of
+  with the width), or the runtime sizing of the per-CPU slabs past 128 (each
+  slab's byte count at the wider widths,
+  [#698](https://github.com/kottlerg/seraph/issues/698)). What covers
+  `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
+  (`core/kernel/src/cpu_mask.rs`), the host tests of
   `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
   past one block, a run that cannot be found, and requests of one block or
   less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
-  (`sched::slab_pages`), the 65-hart boot for the first mask-word crossing, and the 128-CPU
-  boots for two full words.
+  (`sched::slab_pages`), the 65-hart boot for the first mask-word crossing,
+  and the 128-CPU boots for two full words.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

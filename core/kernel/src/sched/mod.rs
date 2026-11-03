@@ -6468,6 +6468,10 @@ mod slab_tests
 {
     use super::slab_pages;
     use crate::mm::PAGE_SIZE;
+    use crate::mm::buddy::MAX_ORDER;
+
+    /// Pages in one largest buddy block.
+    const BLOCK_PAGES: usize = 1 << MAX_ORDER;
 
     #[test]
     fn a_zero_byte_slab_takes_one_page()
@@ -6483,11 +6487,11 @@ mod slab_tests
     }
 
     #[test]
-    fn an_exact_power_of_two_page_count_takes_exactly_those_pages()
+    fn a_whole_page_byte_count_takes_exactly_that_many_pages()
     {
         assert_eq!(slab_pages(PAGE_SIZE), 1);
         assert_eq!(slab_pages(4 * PAGE_SIZE), 4);
-        assert_eq!(slab_pages(2048 * PAGE_SIZE), 2048);
+        assert_eq!(slab_pages(BLOCK_PAGES * PAGE_SIZE), BLOCK_PAGES);
     }
 
     #[test]
@@ -6495,6 +6499,6 @@ mod slab_tests
     {
         assert_eq!(slab_pages(PAGE_SIZE + 1), 2);
         assert_eq!(slab_pages(4 * PAGE_SIZE + 1), 5);
-        assert_eq!(slab_pages(2048 * PAGE_SIZE + 1), 2049);
+        assert_eq!(slab_pages(BLOCK_PAGES * PAGE_SIZE + 1), BLOCK_PAGES + 1);
     }
 }

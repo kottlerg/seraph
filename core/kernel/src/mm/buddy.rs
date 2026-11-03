@@ -962,7 +962,7 @@ mod tests
     }
 
     #[test]
-    fn a_contiguous_request_of_exactly_one_largest_block_takes_no_run()
+    fn a_contiguous_request_of_exactly_one_largest_block_leaves_the_other_whole()
     {
         let mut alloc = with_region(2 * M);
         let first = alloc.alloc_contiguous(M as usize).expect("one block");

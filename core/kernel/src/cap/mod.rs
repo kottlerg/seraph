@@ -390,7 +390,7 @@ static mut SEED_MEMORY: object::MemoryObject = object::MemoryObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
         obj_type: object::ObjectType::Memory,
-        _pad: [0; 3],
+        cascade_link_hi: [0; 3],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
     },
     base: 0,

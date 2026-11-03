@@ -9,6 +9,14 @@ doctest = false
 
 [dependencies]
 process-abi = { workspace = true }
+# When std pulls this crate in via build-std (ruststd sizes its heap and
+# reservation-arena zones with `growth_zones`), `rustc-dep-of-std`
+# activates and the crate uses the core facade. Same pattern as
+# abi/process-abi.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = ["rustc-std-workspace-core", "process-abi/rustc-dep-of-std"]
 
 [lints]
 workspace = true

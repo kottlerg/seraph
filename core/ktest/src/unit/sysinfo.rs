@@ -8,8 +8,8 @@
 //! Covers: `SYS_SYSTEM_INFO` (all `SystemInfoType` variants and unknown
 //! discriminant).
 
-use syscall::system_info;
-use syscall_abi::{KERNEL_VERSION, SyscallError, SystemInfoType};
+use syscall::{MAP_WRITABLE, mem_map, mem_unmap, system_info};
+use syscall_abi::{KERNEL_VERSION, PAGE_SIZE, SyscallError, SystemInfoType};
 
 use crate::{TestContext, TestResult};
 
@@ -139,5 +139,55 @@ pub fn cpu_count_smp(_ctx: &TestContext) -> TestResult
         return Ok(());
     }
     crate::log_u64("ktest: SMP CpuCount=", cpus);
+    Ok(())
+}
+
+/// `system_info(UserVaTop)` returns one of the supported modes' user tops,
+/// and it is the address `mem_map` refuses from: a map at it fails with
+/// `InvalidAddress`, a map of the page below it does not.
+///
+/// ruststd sizes a process's heap and reservation-arena zones from this
+/// value (`process_layout::growth_zones`), so a value above the real
+/// gate would put those zones where every map fails.
+pub fn user_va_top(ctx: &TestContext) -> TestResult
+{
+    let top = system_info(SystemInfoType::UserVaTop as u64)
+        .map_err(|_| "system_info(UserVaTop) failed")?;
+    // Sv39, x86-64 4-level (top page unmappable), Sv48, Sv57.
+    if ![1 << 38, (1 << 47) - PAGE_SIZE, 1 << 47, 1 << 56].contains(&top)
+    {
+        return Err("system_info(UserVaTop) is no supported mode's user top");
+    }
+    crate::log_u64("ktest: UserVaTop=", top);
+
+    let memory_cap =
+        crate::frame_pool::alloc().ok_or("sysinfo::user_va_top: frame pool exhausted")?;
+    // SAFETY: `top` is at the user-half gate, which the kernel refuses (the
+    // test's premise), so the call maps nothing.
+    let at_top = unsafe { mem_map(memory_cap, ctx.aspace_cap, top, 0, 1, MAP_WRITABLE) };
+    let below = top - PAGE_SIZE;
+    // SAFETY: `below` is a ktest scratch page (the top page of the user half,
+    // or on x86-64 one of its top two; see the crate's § Scratch VAs): tests
+    // run one at a time and none leaves a scratch page mapped, so nothing
+    // lives there, and no reference into it is formed.
+    let under_top = unsafe { mem_map(memory_cap, ctx.aspace_cap, below, 0, 1, MAP_WRITABLE) };
+    if under_top.is_ok()
+    {
+        // SAFETY: the page was mapped just above and nothing references it.
+        let _ = unsafe { mem_unmap(ctx.aspace_cap, below, 1) };
+    }
+    // SAFETY: memory_cap came from the pool and no mapping of it remains.
+    unsafe { crate::frame_pool::free(memory_cap) };
+
+    if at_top != Err(SyscallError::InvalidAddress as i64)
+    {
+        return Err("mem_map at UserVaTop did not fail with InvalidAddress");
+    }
+    // The page below the gate may still fail for want of page-table budget,
+    // but never on the address.
+    if under_top == Err(SyscallError::InvalidAddress as i64)
+    {
+        return Err("mem_map of the page below UserVaTop failed with InvalidAddress");
+    }
     Ok(())
 }

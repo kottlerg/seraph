@@ -162,8 +162,9 @@ const META_ARENA_SLOTS_LOG2: u32 = 21;
 /// `process-layout` draws in memmgr's address space.
 const META_ARENA_LOW_END: u64 = process_layout::MAIN_TLS_WINDOW.base;
 
-/// Base of the arena's high zone: the shared layout ceiling, above which no
-/// `process-layout` zone lies.
+/// Base of the arena's high zone: the shared layout ceiling, above which
+/// memmgr's address space holds no `process-layout` surface (memmgr is
+/// `no_std`, with no heap or reservation arena in the growth zones above it).
 const META_ARENA_HIGH_BASE: u64 = process_layout::LAYOUT_VA_CEILING;
 
 /// Exclusive end of the arena's high zone: the largest user half among the

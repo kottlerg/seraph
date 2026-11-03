@@ -40,26 +40,39 @@ static TIMED_CAP: AtomicU32 = AtomicU32::new(0);
 /// load `TIMED_CAP` and accept it as final).
 static TIMED_RESOLVED: AtomicU32 = AtomicU32::new(0);
 
+/// How long a thread waits on another thread's in-flight `timed` lookup
+/// before doing its own, in microseconds: 100 ms, many registry round trips,
+/// on the kernel's clock rather than a spin count, so the bound does not
+/// scale with CPU speed.
+const RESOLVE_WAIT_US: u64 = 100_000;
+
+/// The kernel's elapsed-microsecond clock (`SystemInfoType::ElapsedUs`), or
+/// `u64::MAX` when the query fails, which ends a [`RESOLVE_WAIT_US`] wait at
+/// once instead of leaving it unbounded.
+fn elapsed_us() -> u64
+{
+    syscall::system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(u64::MAX)
+}
+
 /// Resolve `timed` exactly once per process, even under concurrent
 /// `SystemTime::now()` calls. Returns zero on failure.
 ///
 /// Liveness: the gate is designed to survive a resolver that panics
 /// or is killed mid-lookup — a single hung `SystemTime::now()` must
 /// not propagate to the whole process. Waiting threads bound their
-/// spin to `SPIN_BUDGET` `pause` iterations, then perform the lookup
-/// themselves. The straggler tries to install its result via a second
+/// spin to [`RESOLVE_WAIT_US`] of the kernel's elapsed clock, then perform
+/// the lookup themselves. The straggler tries to install its result via a second
 /// compare-exchange; on collision (resolver finished first) it deletes
 /// its now-redundant cap and returns the resolver's. This bounds
 /// CSpace consumption to one slot per stuck-resolver event.
 fn timed_cap_once(ipc_buf: *mut u64) -> u32
 {
-    const SPIN_BUDGET: u32 = 1 << 20;
     let c = TIMED_CAP.load(Ordering::Acquire);
     if c != 0
     {
         return c;
     }
-    let mut spins: u32 = 0;
+    let mut deadline: Option<u64> = None;
     loop
     {
         match TIMED_RESOLVED.compare_exchange(
@@ -87,8 +100,8 @@ fn timed_cap_once(ipc_buf: *mut u64) -> u32
             // or cancelled resolver cannot wedge us forever.
             Err(_) =>
             {
-                spins += 1;
-                if spins > SPIN_BUDGET
+                let now = elapsed_us();
+                if now >= *deadline.get_or_insert(now.saturating_add(RESOLVE_WAIT_US))
                 {
                     // SAFETY: ipc_buf is the registered IPC buffer page.
                     let fallback = unsafe { registry_client::lookup(b"timed", ipc_buf) }

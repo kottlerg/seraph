@@ -54,13 +54,15 @@ ruststd/
 
 A std-built binary's ELF entry is `std::os::seraph::_start` (`src/os/seraph.rs`). It takes the
 address of the read-only `ProcessInfo` page from the entry register and exits with a voluntary
-startup-failure code (`STARTUP_FAIL_BAD_ABI`) when the page's version is not
-`PROCESS_ABI_VERSION`. It then registers the IPC buffer, builds `std::os::seraph::StartupInfo` from
-the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the page
-carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP` if
-that fails). Last it runs the rustc-synthesised `main`, which drives `std::rt::lang_start` and the
-binary's idiomatic `fn main()`; when `main` returns, `_start` closes the stdio pipes and exits the
-process with its return code.
+startup-failure code (`STARTUP_FAIL_BAD_ABI`) when the page's version is not `PROCESS_ABI_VERSION`.
+It then reads the top of its user half once (`SystemInfoType::UserVaTop`, exposed as
+`std::os::seraph::user_va_top()`), which sizes the heap and reservation-arena zones
+(`process_layout::growth_zones`), registers the IPC buffer, builds `std::os::seraph::StartupInfo`
+from the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the
+page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
+if that fails). Last it runs the rustc-synthesised `main`, which drives `std::rt::lang_start` and
+the binary's idiomatic `fn main()`; when `main` returns, `_start` closes the stdio pipes and exits
+the process with its return code.
 
 `std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
 (which only memmgr's bespoke runtime constructs); a binary reads it through
@@ -86,9 +88,12 @@ allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
 `String`, and `alloc`/`std` collection allocates here. The grow path
 requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
-heap's high-water mark with a single multi-page `mem_map` per returned cap.
-The bootstrap heap is allocated by `std::os::seraph::_start` before
-`fn main()` runs. On OOM, `GlobalAlloc::alloc` returns null and the `alloc`
+heap's high-water mark with a single multi-page `mem_map` per returned cap;
+a grow covers the whole request, and an allocation grows again while each
+grow maps pages. The heap floor is installed by `std::os::seraph::_start`
+before `fn main()` runs: a demand region registered with memmgr in a
+demand-paged process, whose pages the allocator touches before handing them
+out, and an eager mapping otherwise. On OOM, `GlobalAlloc::alloc` returns null and the `alloc`
 crate aborts through `handle_alloc_error`; nothing unwinds. See
 [§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
@@ -121,11 +126,12 @@ acquires a memmgr-backed RETYPE Memory cap and augments the AS's PT pool via
 `cap_create_aspace`. It MUST be called after reserving VA and before
 `mem_map`/`mmio_map`, or the map fails with `OutOfMemory`.
 
-The arena is carved out of the process's address space on first use, at a
-base drawn per process from a fixed 64 GiB window via `SYS_GETRANDOM`
-(ASLR, [#39](https://github.com/kottlerg/seraph/issues/39); deterministic
-default only if the draw fails). The caller owns `mem_map`/`mem_unmap`;
-the allocator only manages VA space. See
+The arena is carved out of the process's address space on first use, in the
+arena zone sized to the user half, at a base drawn per process from the
+zone's window via `SYS_GETRANDOM` (ASLR,
+[#39](https://github.com/kottlerg/seraph/issues/39); deterministic default
+only if the draw fails). The caller owns `mem_map`/`mem_unmap`; the
+allocator only manages VA space, and a release never loses freed VA. See
 [§ Page Reservations](../../docs/userspace-memory-model.md#page-reservations).
 
 #### Spawned-thread stacks

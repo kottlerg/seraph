@@ -7,7 +7,11 @@
 //!
 //! Spawned by devmgr with a narrow `IoPort` cap covering CMOS
 //! index/data ports `0x70`–`0x71` plus a RECV cap on the driver's
-//! service endpoint. Implements the one-label RTC driver contract
+//! service endpoint in a first bootstrap round, and its devmgr query cap in
+//! a second, terminal one. Once its ports are bound it reports ready
+//! (`devmgr_labels::DRIVER_READY`) on the query cap, immediately before its
+//! service loop: devmgr serves the driver's endpoint only after that report.
+//! Implements the one-label RTC driver contract
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
 //! every request.
 
@@ -37,8 +41,14 @@ struct BootCaps
     /// none (0), names one the driver cannot read
     /// ([`cmos_rtc::century_register`]), or sent no word.
     century_reg: Option<u8>,
+    /// devmgr query cap: a SEND badged with this device's badge on its spawn
+    /// batch's private endpoint, for `DRIVER_READY`.
+    devmgr_query_ep: u32,
 }
 
+/// Request the two bootstrap rounds: round 1 (not terminal)
+/// `[service_ep, ioport_cap]` with the century index as its data word,
+/// round 2 (terminal) `[devmgr_query_ep]`.
 fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
@@ -46,18 +56,25 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
         return None;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let round = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if round.cap_count < 2 || !round.done
+    let r1 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
+    if r1.cap_count < 2 || r1.done
     {
         return None;
     }
-    let century_reg = (round.data_words >= 1)
-        .then(|| cmos_rtc::century_register(round.data[0]))
+    let century_reg = (r1.data_words >= 1)
+        .then(|| cmos_rtc::century_register(r1.data[0]))
         .flatten();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let r2 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
+    if r2.cap_count < 1 || !r2.done
+    {
+        return None;
+    }
     Some(BootCaps {
-        service_ep: round.caps[0],
-        ioport_cap: round.caps[1],
+        service_ep: r1.caps[0],
+        ioport_cap: r1.caps[1],
         century_reg,
+        devmgr_query_ep: r2.caps[0],
     })
 }
 
@@ -330,5 +347,11 @@ fn main() -> !
         syscall::thread_exit();
     }
 
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    {
+        std::os::seraph::log!("DRIVER_READY failed ({:?}); exiting", e);
+        syscall::thread_exit();
+    }
     service_loop(caps.service_ep, caps.century_reg, ipc_buf);
 }

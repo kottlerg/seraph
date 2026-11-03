@@ -74,7 +74,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::ffi::OsString;
+use crate::ffi::{OsStr, OsString};
 use crate::fmt;
 use crate::fs::TryLockError;
 use crate::hash::{Hash, Hasher};
@@ -398,6 +398,9 @@ impl DirEntry
 {
     pub fn path(&self) -> PathBuf { self.parent_path.join(&self.name) }
     pub fn file_name(&self) -> OsString { self.name.clone() }
+    /// The entry's name, borrowed: no allocation (backs
+    /// `std::os::seraph::fs::DirEntryExt::file_name_ref`).
+    pub fn file_name_ref(&self) -> &OsStr { &self.name }
     pub fn metadata(&self) -> io::Result<FileAttr>
     {
         // Refetch live attrs via stat — directory contents may have

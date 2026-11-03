@@ -547,8 +547,15 @@ CS-keyed stubs do not depend on it. `FSGSBASE` is classified unsupported in
 pub fn current_cpu() -> u32;
 
 /// Read the current stack pointer (`rsp` / `sp`). Used by the panic-path
-/// backtrace scanner to bound the kernel-stack walk.
+/// backtrace scanner to bound the kernel-stack walk, and at `kernel_entry`'s
+/// first statement to locate the handoff stack (`stack_depth`).
 pub fn current_stack_pointer() -> u64;
+
+/// Load one aligned word another CPU may be writing, as an opaque machine
+/// load (`mov` / `ld`). Used by the idle-stack depth sample
+/// (`stack_depth`), where a Rust read racing a plain store would be undefined
+/// behaviour.
+pub unsafe fn load_word_racy(p: *const u64) -> u64;
 
 /// Verify the platform hardware baseline and refuse unsupported hardware with a
 /// clear diagnostic. Run once in early boot after the console is live. x86-64

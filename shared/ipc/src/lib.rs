@@ -696,14 +696,20 @@ pub mod procmgr_process_state
     /// Entry exists but the process has not yet been started (still in the
     /// suspended post-CREATE state). Rare for external queriers to see.
     pub const CREATED: u64 = 1;
-    /// No entry for this badge — already reaped, or the badge was never
-    /// valid. Equivalent to `ESRCH`.
+    /// No entry for this badge — reaped or destroyed more than the
+    /// recent-exit window ago (30 s), or within it but no longer recorded
+    /// (retention is best-effort: when procmgr's heap cannot hold a new
+    /// record, the oldest record makes room, or the new one is dropped), or
+    /// the badge was never valid. Equivalent to `ESRCH`.
     pub const UNKNOWN: u64 = 2;
     /// The process has exited: its main thread is already `Exited` (before
-    /// procmgr's death-event drain reaps it), or procmgr reaped it and the
-    /// badge is still in the recent-exits ring. Reply word 1 carries the
-    /// kernel-encoded `exit_reason`. Recent-exit retention is best-effort;
-    /// once the ring rotates, queries on the same badge return `UNKNOWN`.
+    /// procmgr's death-event drain reaps it), or procmgr reaped or destroyed
+    /// (`DESTROY_PROCESS`) it within the recent-exit window (30 s) and still
+    /// holds its record (best-effort; see [`UNKNOWN`]). Reply word 1 carries
+    /// the kernel-encoded `exit_reason`; for a destroyed process, `EXIT_KILLED`
+    /// unless its main thread had already exited, when the reason the kernel
+    /// retained. After the window, queries on the same badge return
+    /// `UNKNOWN`.
     pub const EXITED: u64 = 3;
 }
 
@@ -1444,7 +1450,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 12;
+pub const DEVMGR_LABELS_VERSION: u32 = 13;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1461,32 +1467,39 @@ pub mod devmgr_labels
     /// #664); `data[1]`, when sent, selects which: an ordinal over the
     /// served block drivers in PCI segment, bus, device, function order,
     /// not stable across boots. A driver is served once it has reported its
-    /// device ready ([`DRIVER_READY`]); one whose spawn failed, or that died
-    /// before reporting (its device setup failed), is not, and counts in no
-    /// ordinal, so a device added, removed, or failing either way shifts the
-    /// ones after it. devmgr settles every block driver before it serves this
-    /// label, so the ordinals do not change while a client probes them. An
-    /// absent `data[1]` is 0, the first. Caller's badge must have
-    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
-    /// otherwise, and `INVALID_REQUEST` when no block driver is served at
-    /// that ordinal or the derivation fails.
+    /// device ready ([`DRIVER_READY`]); one whose spawn failed, that died
+    /// before reporting (its device setup failed), or that did not report
+    /// within devmgr's settle bound is not, and counts in no ordinal, so a
+    /// device added, removed, or failing either way shifts the ones after
+    /// it. devmgr settles every block driver before it serves this label,
+    /// and the ordinals are fixed from then on: a served driver that dies
+    /// later is withdrawn, its ordinal replies
+    /// [`super::devmgr_errors::WITHDRAWN`] for the rest of the boot, and the
+    /// ordinals after it keep their drivers, so a client probing ordinals 0,
+    /// 1, ... passes a `WITHDRAWN` reply and stops at the first other reply
+    /// that is not `SUCCESS`. An absent `data[1]` is 0, the first. Caller's
+    /// badge must have [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
+    /// `UNAUTHORIZED` otherwise, `WITHDRAWN` at a withdrawn driver's
+    /// ordinal, and `INVALID_REQUEST` past the last served driver or when
+    /// the derivation fails.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
-    /// Served on devmgr's registry endpoint (the framebuffer driver's query
-    /// cap) and, while a `VirtIO` PCI driver's spawn batch settles, on that
-    /// batch's private driver endpoint (the virtio-blk and virtio-input
-    /// drivers' query caps; see [`DRIVER_READY`]).
+    /// Served only while a driver's spawn batch settles, on that batch's
+    /// private driver endpoint, which every devmgr-spawned driver's query
+    /// cap names (see [`DRIVER_READY`]); the registry endpoint replies
+    /// `UNKNOWN_OPCODE` to it.
     ///
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
-    /// entry gets `INVALID_REQUEST`. The catalog only grows (the entry of a
-    /// driver that failed to spawn or was withdrawn stays), so a badge is
-    /// never recycled and its `u64` width bounds no catalog size. No
-    /// authority bit is checked. Devmgr
-    /// stores the
-    /// payload bytes opaquely; the per-class shape lives in the driver
-    /// crate. Reply schema (generic for every kind):
+    /// entry, or an entry that carries no startup info (the serial and RTC
+    /// drivers', and the test-only `test-fault` fixtures'), gets
+    /// `INVALID_REQUEST`. The catalog only grows (the entry of a driver that
+    /// failed to spawn or was withdrawn stays),
+    /// so a badge is never recycled and its `u64` width bounds no catalog
+    /// size. No authority bit is checked. Devmgr stores the payload bytes
+    /// opaquely; the per-class shape lives in the driver crate. Reply schema
+    /// (generic for every kind):
     /// - `word[0]` = `kind` discriminant ([`super::device_info_kind`])
     /// - `word[1]` = `version` (per-kind payload schema version)
     /// - `word[2]` = `byte_len` (valid bytes in the payload)
@@ -1500,11 +1513,15 @@ pub mod devmgr_labels
     ///
     /// Mints a `serial_labels::WRITE_AUTHORITY |
     /// serial_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on the
-    /// serial driver's service endpoint to the caller.
-    /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
-    /// handler replies `UNAUTHORIZED` otherwise, and `INVALID_REQUEST`
-    /// when the driver is not running or the derivation fails. Mirrors
-    /// [`QUERY_BLOCK_DEVICE`]'s reply shape.
+    /// serial driver's service endpoint to the caller, once the driver has
+    /// reported its device ready ([`DRIVER_READY`]); devmgr settles it
+    /// before the registry opens. Caller's badge must have
+    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
+    /// otherwise, [`super::devmgr_errors::WITHDRAWN`] once the served driver
+    /// has died, and `INVALID_REQUEST` when the driver is not served (not
+    /// spawned, or it died or did not report ready within devmgr's settle
+    /// bound) or the derivation fails. Mirrors [`QUERY_BLOCK_DEVICE`]'s reply
+    /// shape.
     pub const QUERY_SERIAL_DEVICE: u64 = 3;
     /// Query for the framebuffer device endpoint.
     ///
@@ -1512,7 +1529,8 @@ pub mod devmgr_labels
     /// on the framebuffer driver's service endpoint to the caller.
     /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
-    /// [`QUERY_SERIAL_DEVICE`], including its `INVALID_REQUEST` cases.
+    /// [`QUERY_SERIAL_DEVICE`], including its readiness rule and its
+    /// `WITHDRAWN` and `INVALID_REQUEST` cases.
     pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
     /// Query for the platform real-time-clock device endpoint.
     ///
@@ -1520,8 +1538,11 @@ pub mod devmgr_labels
     /// on the RTC driver's service endpoint to the caller. Caller's
     /// badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
     /// replies `UNAUTHORIZED` otherwise. Replies `NO_DEVICE` until the
-    /// driver is spawned (see [`SET_DRIVERS_DIR`]), and for the rest of the
-    /// boot if that spawn failed; `INVALID_REQUEST` when the derivation
+    /// driver is spawned and has reported its device ready
+    /// ([`DRIVER_READY`]; see [`SET_DRIVERS_DIR`]), and for the rest of the
+    /// boot if that spawn failed or the driver died or did not report ready
+    /// within devmgr's settle bound; [`super::devmgr_errors::WITHDRAWN`] once
+    /// the served driver has died; `INVALID_REQUEST` when the derivation
     /// fails. Today's sole consumer is `timed`, which seeds its wall-clock
     /// offset from one `RTC_GET_EPOCH_TIME` round-trip and serves
     /// `GET_WALL_TIME` thereafter.
@@ -1546,19 +1567,21 @@ pub mod devmgr_labels
     /// work, so svcmgr never blocks on driver bring-up. The actual walk,
     /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
     /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC
-    /// and virtio-input; #165 will generalize) run after the reply but
-    /// before devmgr returns to its next `ipc_recv`. The nested IPC
-    /// chain the spawn requires (procmgr → vfsd → block driver) cannot
+    /// and virtio-input; #165 will generalize), and the settle that waits
+    /// for each of them to report ready ([`DRIVER_READY`]), run after the
+    /// reply but before devmgr returns to its next `ipc_recv`. The nested
+    /// IPC chain the spawn requires (procmgr → vfsd → block driver) cannot
     /// run inside a request-handler frame without clobbering the
     /// implicit reply context, so it must happen between `ipc_reply`
     /// and the next `ipc_recv`. Clients querying `QUERY_RTC_DEVICE`
-    /// before the spawn completes block in the kernel's send queue
+    /// before the settle completes block in the kernel's send queue
     /// until devmgr returns to `ipc_recv`; once devmgr returns, those
-    /// queries see `rtc_ep != 0` (or the sticky-failure state) and
+    /// queries see the served driver (or the sticky-failure state) and
     /// reply normally.
     ///
     /// Each spawn is attempted at most once per boot. On failure
-    /// (missing binary, ELF corrupt, carve failure, OOM, etc.),
+    /// (missing binary, ELF corrupt, carve failure, OOM, a driver that
+    /// died or did not report ready within the settle bound, etc.),
     /// devmgr marks the driver permanently unavailable for this boot
     /// and replies [`super::devmgr_errors::NO_DEVICE`] to subsequent
     /// [`QUERY_RTC_DEVICE`] / [`QUERY_INPUT_DEVICE`] queries; the retry
@@ -1636,14 +1659,19 @@ pub mod devmgr_labels
     /// selects which: an ordinal over the served input drivers in PCI
     /// segment, bus, device, function order, not stable across boots. A
     /// driver is served once it has reported its device ready
-    /// ([`DRIVER_READY`]); one whose spawn failed, or that died before
-    /// reporting, counts in no ordinal. An absent `data[1]` is 0, the first.
-    /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
-    /// replies `UNAUTHORIZED` otherwise. Like [`QUERY_RTC_DEVICE`], it
-    /// replies `NO_DEVICE` until the on-disk drivers are spawned and settled,
-    /// and for the rest of the boot when no input driver is served at that
-    /// ordinal (none enumerated there, its spawn failed, or it died before
-    /// reporting ready); `INVALID_REQUEST` when the derivation fails. The verb
+    /// ([`DRIVER_READY`]); one whose spawn failed, or that died or did not
+    /// report within devmgr's settle bound, counts in no ordinal. The
+    /// ordinals are fixed once the input drivers settle; a served driver that
+    /// dies later is withdrawn and its ordinal replies
+    /// [`super::devmgr_errors::WITHDRAWN`], as for [`QUERY_BLOCK_DEVICE`].
+    /// An absent `data[1]` is 0, the first. Caller's badge must have
+    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
+    /// otherwise. Like [`QUERY_RTC_DEVICE`], it replies `NO_DEVICE` until the
+    /// on-disk drivers are spawned and settled, and for the rest of the boot
+    /// past the last served input driver (none enumerated there, its spawn
+    /// failed, or it died or did not report ready before the settle ended);
+    /// `WITHDRAWN` at a withdrawn driver's ordinal; `INVALID_REQUEST` when
+    /// the derivation fails. The verb
     /// is transport-agnostic: any keyboard backend (virtio-input today,
     /// USB HID / PS-2 later) registers this one slot, so consumers never
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
@@ -1676,10 +1704,10 @@ pub mod devmgr_labels
     /// cannot strip a bit from a badged cap. Request: `data[0]` = caller's
     /// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]` = the query label
     /// naming the driver ([`QUERY_SERIAL_DEVICE`], [`QUERY_INPUT_DEVICE`], or
-    /// [`QUERY_FRAMEBUFFER_DEVICE`]). Gate as [`TEST_SPAWN_ORPHAN`]. Reply:
-    /// `SUCCESS` with the SEND in `caps[0]`; `NO_DEVICE` when that driver is
-    /// not running; `INVALID_REQUEST` for any other `data[1]` or a failed
-    /// derive.
+    /// [`QUERY_FRAMEBUFFER_DEVICE`]; for input, the first input driver still
+    /// served). Gate as [`TEST_SPAWN_ORPHAN`]. Reply: `SUCCESS` with the SEND
+    /// in `caps[0]`; `NO_DEVICE` when no such driver is served;
+    /// `INVALID_REQUEST` for any other `data[1]` or a failed derive.
     pub const TEST_QUERY_DENY_DEVICE: u64 = 12;
     /// TODO(#165): remove with [`TEST_QUERY_DENY_DEVICE`]. The badge devmgr
     /// stamps on a [`TEST_QUERY_DENY_DEVICE`] SEND: no verb bit of the
@@ -1687,20 +1715,60 @@ pub mod devmgr_labels
     /// may badge an un-badged SEND itself
     /// (docs/capability-model.md § Verb-bit authority pattern).
     pub const TEST_DENY_BADGE: u64 = 1;
+    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    /// label: spawn and settle the fault batch, three `test-fault` fixture
+    /// drivers from `/services/drivers/` in one settle batch, the first two
+    /// in [`super::test_fault_labels::MODE_READY`] and the third in
+    /// [`super::test_fault_labels::MODE_NEVER_READY`], so a harness observes
+    /// a settle that ends at its bound and the withdrawal of a served driver
+    /// that dies. The batch's bound is [`TEST_FAULT_SETTLE_TIMEOUT_MS`], not
+    /// the production settle bound, so the fault batch costs a test boot
+    /// little time. The handler replies `SUCCESS` before it spawns (the
+    /// spawns do nested `ipc_call`s), then spawns and settles; the served
+    /// fixtures are queried with [`TEST_QUERY_FAULT_DEVICE`], which waits in
+    /// the registry queue until the settle has ended. At most once per boot:
+    /// a repeated request, or one before [`SET_DRIVERS_DIR`], replies
+    /// `INVALID_REQUEST` and spawns nothing. Request: `data[0]` = caller's
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
+    /// [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_SPAWN_FAULT_DRIVERS: u64 = 14;
+    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. Test-only label:
+    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service
+    /// endpoint of the served fault fixture at instance ordinal `data[1]`
+    /// (absent means 0), counted as [`QUERY_BLOCK_DEVICE`]'s ordinals are.
+    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` at a withdrawn fixture's
+    /// ordinal; `NO_DEVICE` past the served fixtures; `INVALID_REQUEST` for a
+    /// failed derive. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_QUERY_FAULT_DEVICE: u64 = 15;
+    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. The settle bound
+    /// of the fault batch, in milliseconds. The fixtures make no bounded wait
+    /// in their setup, so a short bound suffices; the production bound is
+    /// devmgr's `SETTLE_TIMEOUT`, which the batch shares every other part of
+    /// its settle with.
+    pub const TEST_FAULT_SETTLE_TIMEOUT_MS: u64 = 1000;
+    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. The fixtures
+    /// one fault batch spawns, which devmgr's driver death queue reserves
+    /// room for.
+    pub const TEST_FAULT_DRIVERS: usize = 3;
 
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
     ///
-    /// Sent by a `VirtIO` PCI driver (virtio-blk, virtio-input) on its
-    /// round-2 devmgr query cap, a SEND badged with its device badge on the
-    /// private driver endpoint of its spawn batch; the registry endpoint
-    /// replies `UNKNOWN_OPCODE` to it. Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]. Reply: `SUCCESS` when the badge names
-    /// a driver of the batch that has not died (a repeated report included);
-    /// `INVALID_REQUEST` otherwise, and the driver then exits, since devmgr
-    /// will not serve it. devmgr serves the label only until the batch
-    /// settles, every driver of it having reported ready or died, and then
-    /// revokes the private endpoint.
+    /// Sent by every driver devmgr spawns (the `VirtIO` PCI drivers
+    /// virtio-blk and virtio-input, and the serial, framebuffer, and RTC
+    /// drivers) on its round-2 devmgr query cap, a SEND badged with its
+    /// device badge on the private driver endpoint of its spawn batch; the
+    /// registry endpoint replies `UNKNOWN_OPCODE` to it. Request: `data[0]` =
+    /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Reply: `SUCCESS`
+    /// when the badge names a driver of the batch that has not died (a
+    /// repeated report included); `INVALID_REQUEST` otherwise, and the driver
+    /// then exits, since devmgr will not serve it. devmgr serves the label
+    /// only until the batch settles, every driver of it having reported
+    /// ready or died, or until devmgr's settle bound elapses, and then
+    /// revokes the private endpoint; a driver that has not reported by then
+    /// is destroyed and never served. [`report_driver_ready`](super::report_driver_ready)
+    /// sends it.
     pub const DRIVER_READY: u64 = 13;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
@@ -1728,8 +1796,9 @@ pub mod devmgr_labels
     /// holds the bit. Disjoint position from the other authority bits.
     pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
     /// TODO(#165): remove with the test labels. Authority bit gating
-    /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`], and
-    /// [`TEST_QUERY_DENY_DEVICE`]. svcmgr mints it,
+    /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
+    /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`], and
+    /// [`TEST_QUERY_FAULT_DEVICE`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
@@ -1742,6 +1811,79 @@ pub mod devmgr_labels
     /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
     /// Disjoint position from the other authority bits.
     pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
+}
+
+/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`. The
+/// `test-fault` fixture driver's bootstrap mode word and service labels.
+///
+/// The fixture's first bootstrap round carries its mode in `data[0]`. On its
+/// service endpoint it answers [`FAULT_PING`] with `SUCCESS`, and
+/// [`FAULT_EXIT`] with `SUCCESS` before it receives nothing more and exits
+/// once [`FAULT_EXIT_DELAY_MS`] has passed, so a call sent on the endpoint
+/// after the reply stays queued until devmgr withdraws the dead fixture.
+/// Every request carries no data; no badge bit is checked.
+pub mod test_fault_labels
+{
+    /// Mode word: set up, report `DRIVER_READY`, and serve.
+    pub const MODE_READY: u64 = 0;
+    /// Mode word: reserve and touch [`NEVER_READY_RESERVE_BYTES`], then
+    /// neither report ready nor exit; sleep until destroyed.
+    pub const MODE_NEVER_READY: u64 = 1;
+    /// Bytes a `MODE_NEVER_READY` fixture holds while it hangs, so a harness
+    /// sees its destruction as their return to memmgr's free pool (4 MiB,
+    /// well above the pool's incidental movement in a test boot).
+    pub const NEVER_READY_RESERVE_BYTES: usize = 4 << 20;
+    /// Reply `SUCCESS`.
+    pub const FAULT_PING: u64 = 1;
+    /// Reply `SUCCESS`, then exit after [`FAULT_EXIT_DELAY_MS`] without
+    /// receiving again.
+    pub const FAULT_EXIT: u64 = 2;
+    /// How long the fixture waits between its `FAULT_EXIT` reply and its
+    /// exit, so the caller's next call is queued before the fixture dies.
+    pub const FAULT_EXIT_DELAY_MS: u64 = 200;
+}
+
+/// Why [`report_driver_ready`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyError
+{
+    /// The `ipc_call` itself failed, with this syscall error.
+    Call(i64),
+    /// devmgr replied this non-`SUCCESS` label
+    /// ([`devmgr_errors::INVALID_REQUEST`] for a refused report,
+    /// [`devmgr_errors::LABEL_VERSION_MISMATCH`] for another label-set
+    /// version).
+    Refused(u64),
+}
+
+/// Report a driver's device set up to devmgr: [`devmgr_labels::DRIVER_READY`]
+/// on `devmgr_ep`, the driver's round-2 devmgr query cap. A driver calls it
+/// immediately before its service loop, since devmgr serves the driver's
+/// endpoint only after the report. It logs nothing, so the serial and
+/// framebuffer drivers, which must not log, call it too.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`ReadyError::Call`] when the call fails, and [`ReadyError::Refused`]
+/// with devmgr's reply label when devmgr does not accept the report. Either
+/// way devmgr serves no client the driver, which then exits.
+pub unsafe fn report_driver_ready(devmgr_ep: u32, ipc_buf: *mut u64) -> Result<(), ReadyError>
+{
+    let request = IpcMessage::builder(devmgr_labels::DRIVER_READY)
+        .word(0, u64::from(DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(devmgr_ep, &request, ipc_buf) }.map_err(ReadyError::Call)?;
+    if reply.label == devmgr_errors::SUCCESS
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(ReadyError::Refused(reply.label))
+    }
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -2473,11 +2615,13 @@ pub mod devmgr_errors
     /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// The request cannot be served: a reply-cap derivation failed, the
-    /// requested driver is not running (`QUERY_BLOCK_DEVICE`,
-    /// `QUERY_SERIAL_DEVICE`, `QUERY_FRAMEBUFFER_DEVICE`), the badge indexes
-    /// no catalog entry (`QUERY_DEVICE_INFO`), `SET_DRIVERS_DIR` carried no
-    /// cap, or a label-specific argument was rejected (see
-    /// `QUERY_ACPI_TABLE` and `QUERY_SHUTDOWN_DEVICE`).
+    /// requested driver is not served (`QUERY_BLOCK_DEVICE` past the last
+    /// served driver, `QUERY_SERIAL_DEVICE`, `QUERY_FRAMEBUFFER_DEVICE`), the
+    /// badge indexes no catalog entry with startup info
+    /// (`QUERY_DEVICE_INFO`), a `DRIVER_READY` badge names no live driver of
+    /// the batch, `SET_DRIVERS_DIR` carried no cap, or a label-specific
+    /// argument was rejected (see `QUERY_ACPI_TABLE` and
+    /// `QUERY_SHUTDOWN_DEVICE`).
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's badge lacks the verb bit required by the handler
     /// (e.g. `BLOCK_DEVICE_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
@@ -2491,10 +2635,10 @@ pub mod devmgr_errors
     /// has not yet spawned the on-disk driver (no
     /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet), or (b) attempted the
     /// lazy disk-walked spawn and failed (missing binary, ELF corrupt,
-    /// hardware carve failed, OOM, etc.), or, for `QUERY_INPUT_DEVICE`, no
-    /// input driver is served at the requested instance ordinal (none
-    /// enumerated there, its spawn failed, or it died before reporting
-    /// ready). Case (a) is transient: it ends once the `SET_DRIVERS_DIR`
+    /// hardware carve failed, OOM, the driver died or did not report ready
+    /// within the settle bound, etc.), or, for `QUERY_INPUT_DEVICE`, the
+    /// requested instance ordinal is past the last input driver the settle
+    /// served. Case (a) is transient: it ends once the `SET_DRIVERS_DIR`
     /// spawns and the input settle complete, so a
     /// client that cannot proceed without the device MAY retry with a
     /// bounded number of attempts. Case (b) is sticky for the boot, since a
@@ -2504,6 +2648,16 @@ pub mod devmgr_errors
     /// bound. Also returned by `QUERY_ACPI_TABLE` (table not found) and
     /// `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
     pub const NO_DEVICE: u64 = 4;
+    /// The driver the query names was served and has since died, so devmgr
+    /// withdrew it: its service endpoint is revoked, and callers queued on
+    /// it returned. Returned by `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE`
+    /// at the withdrawn driver's instance ordinal, which stays held for the
+    /// rest of the boot so the ordinals after it keep their drivers (a client
+    /// probing ordinals continues at the next one), and by
+    /// `QUERY_SERIAL_DEVICE`, `QUERY_FRAMEBUFFER_DEVICE`, and
+    /// `QUERY_RTC_DEVICE` once their driver is withdrawn. Sticky for the
+    /// boot: devmgr restarts no driver.
+    pub const WITHDRAWN: u64 = 5;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

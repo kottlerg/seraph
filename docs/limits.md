@@ -97,8 +97,9 @@ An entry an existing open Issue already names cites it in the recommendation.
   as well as a better bound.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_MODULES` and `INIT_MAX_NAMED_MODULES` (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS`
-  and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` and
-  `MAX_IRQ_BINDINGS`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
+  and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE`,
+  `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and
+  virtio-blk's.
 - **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
   depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
   (`bounded_wait::DEADLOCK_BUDGET_US`) are the time-based model.
@@ -229,7 +230,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `SLEEP_LIST` (deadline heap) | `core/kernel/src/sched/mod.rs` | unbounded, one node per TCB | none (intrusive through the TCB) | about 72 B per TCB (heap node and expiry snapshot) | correct as is | One global heap under `SLEEP_LIST_LOCK`, popped on the BSP |
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |
 | `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning | none | correct as is | None |
-| `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget (call depth unaudited) | 4 pages per thread, caller-funded | needs a design | Measure the kernel call depth and state the bound at the constant (#676) |
+| `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget, measured (the bound at the constant): deepest thread stack 4304 B, idle stack 1752 B (ktest after Tier S; debug and release at 4, 16 and 128 CPUs, both arches) | 4 pages per thread, caller-funded | needs a design | Add a guard page below each kernel stack (a measured depth bounds no path the tests do not run, and an overflow now corrupts the page beneath) |
 | `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 512 (`boot_protocol::MAX_CPUS`) | ABI width (boot protocol) | see the per-CPU rows | needs a design | See the boot section |
 | Watchdog breadcrumbs (`CpuDiag`, `CPU_DIAG_PTR`) | `core/kernel/src/sched/mod.rs` | `cpu_count`-sized slab | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x 32 B | correct as is | Already pay-as-you-go |
 | `stop_threads_bound_to` `prod` (`mark_bound_threads`) | `core/kernel/src/sched/mod.rs` | a `CpuMask` | ABI width (`CPU_MASK_WORDS`) | 64 B kernel stack | correct as is | None |
@@ -359,7 +360,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 | `InitInfo` size assert | `abi/init-protocol/src/lib.rs` | at most `INIT_INFO_MAX_PAGES` pages | ABI width | none | correct as is | Also assert the header fits page 1 |
 | `MAX_MODULES` (`ModulesLoad.modules`) | `core/boot/src/main.rs` | 16 | current peak plus headroom (8 in use) | 768 B stack | raise | The output page holds 85; unify with `INIT_MAX_NAMED_MODULES` (#183) |
 | `MEM_MAP_ENTRY_PAGES` | `core/boot/src/main.rs` | 4 (about 682 entries) | unknown | 16 KiB, reclaimed | raise | `translate_memory_map` truncates silently; size from the firmware count |
-| `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget (the kernel runs its boot phases on this stack; depth unaudited) | 64 KiB | needs a design | Measure with the kernel stack (#676); its size is the shared `HANDOFF_STACK_BYTES` |
+| `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget, measured (the bound at `HANDOFF_STACK_BYTES`): the kernel's boot phases use at most 9008 B (ktest; debug and release at 4, 16 and 128 CPUs, both arches) | 64 KiB | needs a design | Its size is the shared `HANDOFF_STACK_BYTES`; no guard page below it (#656) |
 | `MAX_IDENTITY_REGIONS` | `core/boot/src/main.rs` | 64 | provably unreachable (`MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 at most) | 1 KiB stack | correct as is | Pin the sum with a const assert |
 | `MAX_APERTURE_SEEDS` | `core/boot/src/main.rs` | 64 | unknown | 1 KiB stack | raise | Silent drop past `out.len()` |
 | `MAX_HEURISTIC_SEEDS` | `core/boot/src/main.rs` | 16 | current peak plus headroom | 256 B stack | raise | More than about 7 MCFG segments drop windows |
@@ -655,12 +656,14 @@ Tracked by [#664](https://github.com/kottlerg/seraph/issues/664).
 | absorb rounds `.min(4)` | `services/devmgr/src/caps.rs` | literal 4 | ABI width (`MSG_CAP_SLOTS_MAX`) | none | correct as is | Use the constant |
 | ACPI table window (`table_window`) | `services/devmgr/firmware/src/acpi.rs` | the table's own pages, clamped to its region | firmware spec (the table's reported length) | VA for one table per read | correct as is | None; the per-process reservation arena bounds it, and a failed reservation is logged |
 | `MAX_DEVICE_INFO_PAYLOAD` | `services/devmgr/src/main.rs` | 64 | encoding artefact (largest payload type 56 B) | 76 B per entry | correct as is | None |
-| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per enumerated device given one, spawned or not; never removed) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
+| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per enumerated device given a catalog entry, spawned or not, and one with no startup info for each of the serial and RTC drivers whose spawn devmgr attempts and for each `test-fault` fixture of the test-only fault batch, TODO(#165); never removed) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
 | `device_badge` | `services/devmgr/src/main.rs` | `u64` | provably unreachable | none | correct as is | None |
 | `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
-| virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
-| Settle batch death queue (`SettleBatch::new`) | `services/devmgr/src/settle.rs` | the batch's device count in entries and observer nodes, at most `EVENT_QUEUE_MAX_CAPACITY` = 2^20 | per-call bound (the kernel's event-queue capacity) | 40 B per driver (a 16 B entry and a 24 B observer node) | correct as is | None; a batch past it spawns no driver of its class, with a log |
+| virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]`, fixed when the class settles, a withdrawn driver's ordinal held by a tombstone | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
+| Driver death queue (`DriverWatch::new`) | `services/devmgr/src/settle.rs` | sized at enumeration to every driver the boot can spawn (one per virtio-blk and virtio-input device, plus the serial, framebuffer, and RTC drivers, plus the `TEST_FAULT_DRIVERS` = 3 fixtures of the test-only fault batch, which runs at most once per boot, TODO(#165)), in entries and observer nodes, at most `EVENT_QUEUE_MAX_CAPACITY` = 2^20 | provably unreachable (devmgr spawns each driver at most once and binds one observer on it; paid as the boot's devices are, with no ceiling below the kernel's) | 40 B per driver (a 16 B entry and a 24 B observer node) | correct as is | None while the driver set is fixed at enumeration; hotplug takes the growable `DeathQueues` policy whose hoist #677 records |
+| `SETTLE_TIMEOUT` | `services/devmgr/src/settle.rs` | 10 s from the start of a batch's settle, `2 * RESET_TIMEOUT`: the longest bounded wait of a driver's setup, plus one more as margin; the test-only fault batch settles under `TEST_FAULT_SETTLE_TIMEOUT_MS` = 1 s instead, its fixtures making no bounded wait (TODO(#165)) | tuning (bounds no capacity; derived so a settle never ends before a driver's own reset timeout) | one timer thread (64 KiB stack) per settle | correct as is | None; a driver still pending at it is withdrawn and destroyed, with a log |
 | Settle roster (`Roster`) | `services/devmgr/firmware/src/roster.rs` | growable `Vec` | provably unreachable (one entry per spawned driver of a batch) | about 24 B plus the caller's record per driver | correct as is | None; a driver the roster cannot record is not spawned, with a log |
+| Served-driver ordinal table (`Served`) | `services/devmgr/firmware/src/served.rs` | growable `Vec`, one slot per served driver of a class, a withdrawn one's kept as a tombstone | provably unreachable (one slot per driver a settle served; devmgr restarts none) | about 16 B plus the caller's record per slot | correct as is | None; a driver the table cannot hold is destroyed, with a log |
 | Death-observer correlator | `services/devmgr/src/spawn.rs` | the full `u64` device badge | ABI width (`SYS_THREAD_BIND_NOTIFICATION`'s `u64` correlator) | none | correct as is | None |
 | One IRQ-bearing driver per INTx line (`IrqRangeAllocator::isolate_one`) | `services/devmgr/src/main.rs` | 1 per GSI (riscv64: 4 swizzled lines) | encoding artefact (a single-line cap is carved once) | none | needs a design | A virtio-blk on a line another device holds is not spawned, with a log (#664) |
 | `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
@@ -695,6 +698,7 @@ Every entry here is `correct as is`; none is tracked.
 | cmos `UIP_POLL_LIMIT` | `services/drivers/cmos/src/lib.rs` | 10 000 | hardware spec (UIP held at most about 2 ms) | none | correct as is | None |
 | cmos `FALLBACK_CENTURY` | `services/drivers/cmos/src/lib.rs` | 2000 to 2099, only without a century register (FADT `CENTURY` 0) | hardware spec (two-digit year) | none | correct as is | None |
 | test-orphan `RESERVE_BYTES` | `services/drivers/test-orphan/src/main.rs` | 1 MiB | test fixture | 1 MiB heap | correct as is | None |
+| test-fault `NEVER_READY_RESERVE_BYTES` | `shared/ipc/src/lib.rs` (`test_fault_labels`) | 4 MiB | test fixture (held by the never-ready fixture until devmgr destroys it; svctest watches it return) | 4 MiB heap while the fixture hangs | correct as is | None |
 
 ### fs-fat
 

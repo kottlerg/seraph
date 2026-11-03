@@ -30,6 +30,7 @@ members = [
     "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",
     "services/drivers/serial",
+    "services/drivers/test-fault",
     "services/drivers/test-orphan",
     "services/drivers/virtio/core",
     "services/drivers/virtio/blk",

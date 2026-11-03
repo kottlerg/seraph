@@ -1595,10 +1595,36 @@ pub fn cap_insert(
 #[inline]
 pub fn system_info(kind: u64) -> Result<u64, i64>
 {
-    // Unused second arg is required because no syscall1 raw variant exists.
+    // The second arg is 0: only `StackHighWater` reads it (its class; see
+    // `stack_high_water`), and no syscall1 raw variant exists.
     // SAFETY: syscall2 issues raw syscall instruction; kind is SystemInfoType discriminant as u64;
     // kernel validates kind and returns queried value.
     let ret = unsafe { syscall2(SYS_SYSTEM_INFO, kind, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Deepest use, in bytes, of the kernel stack class `class`
+/// (`SystemInfoType::StackHighWater`; `syscall_abi::STACK_CLASS_*`).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` for an unknown class
+/// or from a kernel that predates the selector, and `NotSupported` for the
+/// handoff class when the kernel could not locate the handoff stack.
+// cast_sign_loss: a non-negative return is the queried value.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn stack_high_water(class: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the
+    // StackHighWater discriminant and arg1 the class, which the kernel
+    // validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::StackHighWater as u64,
+            class,
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 

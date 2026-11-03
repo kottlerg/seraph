@@ -32,8 +32,8 @@ cmos/
 
 ## Endpoint
 
-Bootstrap caps from devmgr (one round, two caps and one data word,
-`done=true`):
+Bootstrap caps from devmgr, in two rounds. Round 1 (`done=false`) carries
+two caps and one data word:
 
 | Slot      | Cap                                                  |
 |-----------|------------------------------------------------------|
@@ -45,9 +45,16 @@ Bootstrap caps from devmgr (one round, two caps and one data word,
 index from `0x0E` to `0x7F`: lower ones are the clock and status registers,
 and higher ones lie past the bank its ports reach.
 
+Round 2 (`done=true`) carries one cap, the driver's devmgr query cap: a
+SEND badged with its device badge on the private endpoint of its devmgr
+spawn batch.
+
 The driver binds the `IoPort` cap to its main thread via
 `syscall::ioport_bind` and uses `in`/`out` to drive the CMOS access
-protocol.
+protocol. Once the ports are bound it reports `devmgr_labels::DRIVER_READY`
+on the query cap, immediately before its service loop, and exits when
+devmgr refuses it: devmgr serves the driver's endpoint only after the
+report, and withdraws it when the driver dies.
 
 ---
 

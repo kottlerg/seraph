@@ -37,16 +37,24 @@ goldfish-rtc/
 
 ## Endpoint
 
-Bootstrap caps from devmgr (one round, two caps, `done=true`):
+Bootstrap caps from devmgr, in two rounds. Round 1 (`done=false`) carries two
+caps:
 
 | Slot      | Cap                                                  |
 |-----------|------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (driver receives on this)      |
 | `caps[1]` | `Mmio` covering one page at `0x101000`         |
 
+Round 2 (`done=true`) carries one cap, the driver's devmgr query cap: a SEND
+badged with its device badge on the private endpoint of its devmgr spawn
+batch.
+
 The driver reserves one page of VA via `reserve_pages`, funds the AS's
 page-table growth budget for that page via `fund_aspace_pt_budget`, and maps
-the `Mmio` cap into it via `syscall::mmio_map`.
+the `Mmio` cap into it via `syscall::mmio_map`. It then reports
+`devmgr_labels::DRIVER_READY` on the query cap, immediately before its
+service loop, and exits when devmgr refuses it: devmgr serves the driver's
+endpoint only after the report, and withdraws it when the driver dies.
 
 ---
 

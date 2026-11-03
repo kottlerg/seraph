@@ -400,18 +400,20 @@ changed line that names one of these items as a whole identifier or lies within 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
 - per-CPU storage: `alloc_zeroed_slab`, and the definition of every function that calls it (the
   per-CPU storage initialisers; a call to one is on the surface only when it names another listed
-  item, as a call to an `init_ap_*` initialiser does); every `init_storage` and
-  `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
-  one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
-  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
-  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
-  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the single-slot
-  entropy pool slab, which is not per-CPU). A change that alters an element type's size is on the
-  surface whether it edits the type's own fields or a type or constant the element holds by value
-  (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
-  `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
-  for the idle stacks);
+  item, as a call to an `init_ap_*` initialiser does), except `frame_map::init` and
+  `init_cspace_registry`, which size RAM tables through it and are on the memory surface instead;
+  every `init_storage` and `init_per_cpu_storage`, which take the boot CPU count and size per-CPU
+  storage from it (a call to one names it, so a change to the count it passes is on the surface);
+  `kernel_reserve_pages` (the CPU-scaled kernel reserve); and the element types of the per-CPU
+  arrays and slabs, today `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through
+  `MaybeUninit`), `TssWithIopb`, `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and
+  `TlbShootdownRequest` (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the
+  arrays and slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag
+  pool, and the RAM-sized chunk tables of `frame_map::init` and `init_cspace_registry`). A change
+  that alters an element type's size is on the surface whether it edits the type's own fields or a
+  type or constant the element holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS`
+  inside `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes
+  a per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
   and the MADT walk behind it (`madt_topology` and its per-CPU `record_cpu_id`),
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
@@ -676,14 +678,13 @@ list as the tracking Issues move):
   so no local run exercises x2APIC destinations above APIC id 255, threshold
   effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
   with the width), or the runtime sizing of the per-CPU slabs past 128 (the
-  block order `alloc_zeroed_slab` computes, which no host test reaches,
-  [#698](https://github.com/kottlerg/seraph/issues/698)). What covers
-  `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
-  (`core/kernel/src/cpu_mask.rs`), the compile-time asserts that the
-  `AP_IST_STACKS` slab (`core/kernel/src/arch/x86_64/ap_trampoline.rs`) and the
-  `AP_TSS` slab (`core/kernel/src/arch/x86_64/gdt.rs`) each fit one buddy block
-  at `MAX_CPUS`, the 65-hart boot for the first mask-word crossing, and the
-  128-CPU boots for two full words.
+  run of buddy blocks `alloc_zeroed_slab` takes for a slab wider than one
+  block). What covers `MAX_CPUS` instead: the host tests of `CpuMask` at
+  `MAX_CPUS` (`core/kernel/src/cpu_mask.rs`), the host tests of
+  `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
+  past one block, a run that cannot be found, and a request within one
+  block), the 65-hart boot for the first mask-word crossing, and the 128-CPU
+  boots for two full words.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

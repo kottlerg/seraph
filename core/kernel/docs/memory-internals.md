@@ -58,13 +58,15 @@ out with their headers in place, and its caller zeroes every drained extent befo
 ([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated
 memory).
 
-`MAX_ORDER` is 11 (largest single block: 2048 pages = 8 MiB). It bounds no allocation's
-size: `alloc_contiguous` serves a boot-time request larger than one block from a run of
+`MAX_ORDER` is 11 (largest single block: 2048 pages = 8 MiB). It bounds no allocation that
+`alloc_contiguous` serves: that call serves a boot-time request larger than one block from a run of
 address-adjacent `MAX_ORDER` blocks, found by sorting that order's free list, and returns the
 run's unused tail to the free lists. The per-CPU boot slabs (`sched::alloc_zeroed_slab`) and
 the RAM-sized tables (the frame map's and the `CSpace` registry's chunk tables, the tag pool)
 are allocated through it, so neither a CPU count nor a RAM size is capped by the largest
-block; a boot that finds no long enough run halts naming the slab.
+block; a boot that finds no long enough run halts naming the slab. The IRQ routing table
+(`irq::init_table`) stays a single `alloc` block, which its few bytes per interrupt line keep far
+below `MAX_ORDER`.
 
 ### Zone Management
 

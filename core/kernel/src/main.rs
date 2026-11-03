@@ -35,8 +35,8 @@ static APS_READY: AtomicU32 = AtomicU32::new(0);
 /// Time one AP may take, from its start request to its `APS_READY` increment,
 /// before the BSP halts the boot naming it. A healthy AP answers in
 /// milliseconds; the budget covers a host that runs the guest's vCPUs at 32x
-/// oversubscription (the 512-vCPU boundary boot), where every step of the
-/// AP's bringup waits for a host core. It bounds no capacity.
+/// oversubscription (a 512-vCPU guest on a 16-core host), where every step of
+/// the AP's bringup waits for a host core. It bounds no capacity.
 #[cfg(not(test))]
 const AP_ONLINE_BUDGET_US: u64 = 10_000_000;
 

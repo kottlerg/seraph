@@ -261,11 +261,12 @@ impl Thread {
             done_notification,
         }));
 
-        // 5-page slab for the Thread retype slot (kstack + wrapper/TCB).
-        // Matches `cap::retype::dispatch_for(Thread)` in the kernel.
-        const THREAD_RETYPE_BYTES: u64 = 5 * 4096;
+        // Dedicated slab for the Thread retype slot, sized to the kernel's
+        // debit (kstack, wrapper and TCB, extended-state save area).
         let (thread_slab, thread_slab_phys) =
-            match crate::sys::alloc::seraph::object_slab_acquire_fresh(THREAD_RETYPE_BYTES) {
+            match crate::sys::alloc::seraph::object_slab_acquire_fresh(
+                syscall_abi::THREAD_RETYPE_BYTES,
+            ) {
                 Some(g) => (g.cap, g.phys),
                 None => {
                     // SAFETY: `args` was just leaked via `Box::into_raw`.

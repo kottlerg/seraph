@@ -11,10 +11,7 @@
 
 use crate::loader::{self, ScratchMapping};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
-use process_abi::{
-    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION,
-    PROCESS_MAIN_TLS_MAX_PAGES,
-};
+use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
 use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
@@ -84,6 +81,15 @@ fn choose_child_layout() -> ProcessLayout
         std::os::seraph::log!("procmgr: layout entropy draw failed; using default layout");
     }
     choose_process_layout(entropy.as_ref())
+}
+
+/// Whether a child's `ET_DYN` image with load span `[span_min, span_end)` may
+/// load at `bias`: against the image zone sized to the address space, which
+/// every process of this boot shares with procmgr (`std::os::seraph::user_va_top`).
+fn child_image_fits(bias: u64, span_min: u64, span_end: u64) -> bool
+{
+    let zones = process_layout::growth_zones(std::os::seraph::user_va_top());
+    process_layout::validate_image_placement_below(bias, span_min, span_end, zones.image_zone_end)
 }
 
 /// Draw an `ET_DYN` image load bias (ASLR, #39), degrading to the window base
@@ -514,9 +520,9 @@ pub struct UniversalCaps
     /// Whether the child is demand-paged. Demand paging is the default; this
     /// is false only when the caller set `procmgr_labels::CREATE_PINNED` (a
     /// DMA driver that must be eager-mapped). When true, `finalize_creation`
-    /// binds the child's main-thread fault handler to memmgr and delegates the
-    /// child `AddressSpace`, and `populate_child_info` advertises the pager in
-    /// `ProcessInfo`.
+    /// delegates the child `AddressSpace` to memmgr, binds the child's
+    /// main-thread fault handler to it, and, once both took effect,
+    /// advertises the pager in `ProcessInfo` (`advertise_pager`).
     pub demand_paged: bool,
     /// Procmgr's own (procmgr-badged) SEND cap on memmgr's endpoint, used to
     /// issue the procmgr-only `DELEGATE_ASPACE`. Distinct from
@@ -809,18 +815,8 @@ unsafe fn populate_child_info(
     // TLS block base, or zero when the binary has no PT_TLS (mirrors
     // `tls_template_memsz == 0`); the block is mapped only in the TLS case.
     pi.main_tls_vaddr = if tls.memsz != 0 { layout.tls_base } else { 0 };
-    // Advertise the demand-paging pager so the runtime can inherit it onto
-    // spawned threads. The child's badged memmgr endpoint is the pager
-    // endpoint; the kernel stamps each fault with that cap's derivation
-    // badge, the child's memmgr badge, so the fault is attributed to the
-    // right memmgr record. `pager_badge` records the same value for the
-    // runtime's information; no binder passes it to the kernel.
-    // procmgr binds the main thread separately in `finalize_creation`.
-    if universals.demand_paged
-    {
-        pi.pager_endpoint_cap = pi.memmgr_endpoint_cap;
-        pi.pager_badge = universals.memmgr_badge;
-    }
+    // The pager fields stay zero here: `finalize_creation` writes them only
+    // once the pager binding has taken effect (`advertise_pager`).
 
     // Write the argv blob, then the env blob, into the page region
     // following the struct. Each blob begins at a u64-aligned offset so
@@ -922,6 +918,8 @@ struct MainTlsAlloc
     /// Mapped base VA of the TLS block (the chosen `layout.tls_base`); the block
     /// is mapped here and `tls_base_va = tls_block_base + tls_base_offset`.
     tls_block_base: u64,
+    /// Pages the block spans, mapped at the scratch VA and then in the child.
+    pages: u64,
 }
 
 impl MainTlsAlloc
@@ -930,16 +928,25 @@ impl MainTlsAlloc
     {
         self.scratch.va()
     }
+
+    /// Bytes mapped at the scratch VA: the whole block, page-rounded.
+    fn scratch_bytes(&self) -> u64
+    {
+        self.pages * PAGE_SIZE
+    }
 }
 
 /// Allocate a memory cap for the main thread's TLS block, map it writable in
 /// procmgr's own aspace at a transient scratch VA, and zero it.
 ///
-/// Returns `None` when the binary has no TLS, when the block exceeds the
-/// single-page budget, or when alignment demands would outrun the page
-/// mapping. Callers write the `.tdata` template starting at the scratch
-/// VA and then call [`finalize_main_tls`] to install the TCB self-pointer
-/// and remap the memory cap into the child.
+/// The block spans the pages its `PT_TLS` memsz needs
+/// ([`process_abi::tls_block_layout`]), from one contiguous Memory cap.
+/// Returns `None` when the binary has no TLS, when the block exceeds
+/// `PROCESS_MAIN_TLS_MAX_PAGES` (the region the layout leaves after the TLS
+/// draw), when alignment demands would outrun the page mapping, or when
+/// memmgr cannot supply the pages. Callers write the `.tdata` template
+/// starting at the scratch VA and then call [`finalize_main_tls`] to install
+/// the TCB self-pointer and remap the memory cap into the child.
 fn alloc_main_tls_memory(
     self_aspace: u32,
     tls: &ChildTlsTemplate,
@@ -951,20 +958,27 @@ fn alloc_main_tls_memory(
     let (block_size, block_align, tls_base_offset) =
         process_abi::tls_block_layout(tls.memsz, tls.align);
 
-    if block_size == 0
-        || block_size > PAGE_SIZE * PROCESS_MAIN_TLS_MAX_PAGES
-        || block_size > PAGE_SIZE
-        || block_align > PAGE_SIZE
+    let pages = block_size.div_ceil(PAGE_SIZE);
+    if block_size == 0 || pages > PROCESS_MAIN_TLS_MAX_PAGES || block_align > PAGE_SIZE
     {
         return None;
     }
 
-    let tls_memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
-    let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), 1, syscall::MAP_WRITABLE)?;
+    let tls_memory = CapGuard::new(
+        if pages == 1
+        {
+            crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?
+        }
+        else
+        {
+            crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)?
+        },
+    );
+    let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), pages, syscall::MAP_WRITABLE)?;
     let scratch_va = scratch.va();
 
-    // SAFETY: scratch_va is mapped writable for one page.
-    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
+    // SAFETY: scratch_va is mapped writable for `pages` pages.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, (pages * PAGE_SIZE) as usize) };
 
     Some(MainTlsAlloc {
         scratch,
@@ -972,6 +986,7 @@ fn alloc_main_tls_memory(
         tls_base_offset,
         tls_base_va: layout.tls_base + tls_base_offset,
         tls_block_base: layout.tls_base,
+        pages,
     })
 }
 
@@ -989,7 +1004,8 @@ unsafe fn finalize_main_tls(
     child_aspace: u32,
 ) -> Option<MainTls>
 {
-    // SAFETY: scratch_va is mapped writable for one page; the block fits.
+    // SAFETY: scratch_va is mapped writable for the whole block, which holds
+    // the TCB at `tls_base_offset`.
     unsafe {
         process_abi::tls_install_tcb(
             alloc.scratch_va() as *mut u8,
@@ -1010,7 +1026,7 @@ unsafe fn finalize_main_tls(
             child_aspace,
             alloc.tls_block_base,
             0,
-            1,
+            alloc.pages,
             syscall::MAP_FROM_CAP,
         )
     }
@@ -1054,11 +1070,11 @@ unsafe fn prepare_main_tls_from_bytes(
     {
         return Some(MainTls::default());
     }
-    if template_bytes.len() > PAGE_SIZE as usize
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
+    if template_bytes.len() as u64 > alloc.scratch_bytes()
     {
         return None;
     }
-    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
     // SAFETY: scratch_va is mapped writable; length was bounded above.
     unsafe {
@@ -1106,15 +1122,15 @@ unsafe fn prepare_main_tls_from_vfs(
     {
         return Some(MainTls::default());
     }
-    if tls.filesz > PAGE_SIZE
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
+    if tls.filesz > alloc.scratch_bytes()
     {
         return None;
     }
-    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
 
-    // SAFETY: scratch_va is mapped writable for one page and
-    // `tls.filesz <= PAGE_SIZE` was checked above; the mapping stays until
+    // SAFETY: scratch_va is mapped writable for the whole block and
+    // `tls.filesz` fits it (checked above); the mapping stays until
     // finalize drops it, after the last use of `template`.
     let template =
         unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, tls.filesz as usize) };
@@ -1303,6 +1319,7 @@ fn finalize_creation(
     band_max: u8,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
+    self_aspace: u32,
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
@@ -1388,49 +1405,26 @@ fn finalize_creation(
     }
 
     // Demand-paged wiring (best-effort): delegate the child address space to
-    // memmgr and bind the main thread's fault handler to it. A failure here
-    // degrades to "no pager" (faults kill the thread) rather than failing an
-    // otherwise-complete creation. Which processes are exempt from the default
-    // pager is in docs/fault-handling.md § Default System Pager.
-    if demand_paged && memmgr_send_cap != 0 && self_memmgr_ep != 0
-    {
-        // Hand memmgr its own copy of the child AS, keyed by the child's
-        // memmgr badge, over procmgr's (procmgr-badged) endpoint so it lands
-        // on the privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`.
-        // Mask out CONTROL: memmgr only maps pages into the AS; the authority
-        // to register terminal-fault death observers stays with procmgr (the
-        // creator), which holds the CONTROL-bearing `child_aspace`.
-        if let Ok(as_copy) = syscall::cap_derive(
+    // memmgr and bind the main thread's fault handler to it, then advertise
+    // the pager in `ProcessInfo`. A failure at any step degrades to "no
+    // pager" (the child keeps its memory eager) rather than failing an
+    // otherwise-complete creation; the advertisement is written last, so the
+    // page never names a pager the child does not have. Which processes are
+    // exempt from the default pager is in docs/fault-handling.md § Default
+    // System Pager.
+    if demand_paged
+        && memmgr_send_cap != 0
+        && self_memmgr_ep != 0
+        && bind_pager(
             child_aspace,
-            syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_CONTROL,
+            child_thread,
+            memmgr_send_cap,
+            memmgr_badge,
+            self_memmgr_ep,
+            ipc_buf,
         )
-        {
-            let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
-                .word(0, memmgr_badge)
-                .cap(as_copy)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let delegated = unsafe { ipc::ipc_call(self_memmgr_ep, &msg, ipc_buf) }
-                .is_ok_and(|r| r.label == memmgr_errors::SUCCESS);
-            if delegated
-            {
-                // Bind only after the AS is delegated, so memmgr can service
-                // the first fault. The kernel stamps each fault with the
-                // derivation badge of memmgr_send_cap, which memmgr minted as
-                // the child's memmgr badge.
-                let _ = syscall::thread_set_fault_handler(
-                    child_thread,
-                    memmgr_send_cap,
-                    FAULT_CLASS_ALL,
-                );
-            }
-            else
-            {
-                // Call failed or memmgr declined: drop the copy if the IPC did
-                // not transfer it (deleting an already-moved slot is harmless).
-                let _ = syscall::cap_delete(as_copy);
-            }
-        }
+    {
+        advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
     }
 
     Some(CreateResult {
@@ -1438,6 +1432,75 @@ fn finalize_creation(
         thread_for_caller,
         badge,
     })
+}
+
+/// Delegate a child's address space to memmgr and bind its main thread's
+/// fault handler to `memmgr_send_cap`. Returns `true` only when both took
+/// effect, so the child's demand faults reach a pager that can map them.
+fn bind_pager(
+    child_aspace: u32,
+    child_thread: u32,
+    memmgr_send_cap: u32,
+    memmgr_badge: u64,
+    self_memmgr_ep: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    // Hand memmgr its own copy of the child AS, keyed by the child's memmgr
+    // badge, over procmgr's (procmgr-badged) endpoint so it lands on the
+    // privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`. Mask out
+    // CONTROL: memmgr only maps pages into the AS; the authority to register
+    // terminal-fault death observers stays with procmgr (the creator), which
+    // holds the CONTROL-bearing `child_aspace`.
+    let Ok(as_copy) = syscall::cap_derive(
+        child_aspace,
+        syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_CONTROL,
+    )
+    else
+    {
+        return false;
+    };
+    let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
+        .word(0, memmgr_badge)
+        .cap(as_copy)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let delegated = unsafe { ipc::ipc_call(self_memmgr_ep, &msg, ipc_buf) }
+        .is_ok_and(|r| r.label == memmgr_errors::SUCCESS);
+    if !delegated
+    {
+        // Call failed or memmgr declined: drop the copy if the IPC did not
+        // transfer it (deleting an already-moved slot is harmless).
+        let _ = syscall::cap_delete(as_copy);
+        return false;
+    }
+    // Bind only after the AS is delegated, so memmgr can service the first
+    // fault. The kernel stamps each fault with the derivation badge of
+    // memmgr_send_cap, which memmgr minted as the child's memmgr badge.
+    syscall::thread_set_fault_handler(child_thread, memmgr_send_cap, FAULT_CLASS_ALL).is_ok()
+}
+
+/// Advertise the pager in a child's `ProcessInfo` (still writable through
+/// `pi_memory_cap` until the child starts), so the runtime inherits it onto
+/// spawned threads and backs its heap floor on demand. The child's badged
+/// memmgr endpoint is the pager endpoint: the kernel stamps each fault with
+/// that cap's derivation badge, `memmgr_badge`, so the fault is attributed to
+/// the right memmgr record, and `pager_badge` records the same value for the
+/// runtime's information. When the page cannot be mapped the fields stay
+/// zero and the child runs as if it had no pager, which is safe: its memory
+/// stays eager.
+fn advertise_pager(self_aspace: u32, pi_memory_cap: u32, memmgr_badge: u64)
+{
+    let Some(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
+    else
+    {
+        return;
+    };
+    // SAFETY: the scratch mapping is the child's ProcessInfo page, mapped
+    // writable for one page; the struct lives at offset 0 per the ABI.
+    let pi = unsafe { process_abi::process_info_mut(scratch.va()) };
+    pi.pager_endpoint_cap = pi.memmgr_endpoint_cap;
+    pi.pager_badge = memmgr_badge;
 }
 
 // ── Process creation (from memory) ──────────────────────────────────────────
@@ -1475,7 +1538,7 @@ fn create_process_from_bytes(
     let (span_min, span_end) = elf::load_span(ehdr, module_bytes).ok()?;
     if kind == elf::ElfKind::Dyn
     {
-        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        if !child_image_fits(bias, span_min, span_end)
         {
             return None;
         }
@@ -1513,9 +1576,8 @@ fn create_process_from_bytes(
         .ok()?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
-    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
-        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-        .clamp(1, MAX_PROCESS_STACK_PAGES);
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    let stack_pages = resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))?;
     let layout = choose_child_layout();
 
     // The child's kernel objects and per-child memory caps are guarded from
@@ -1703,6 +1765,7 @@ fn create_process_from_bytes(
         sched.band_max,
         ipc_buf,
         &layout,
+        self_aspace,
     )?;
     let _ = child_objs.disarm();
     let _ = pi_memory.disarm();
@@ -2349,7 +2412,7 @@ pub fn create_process_from_file(
         elf::load_span(ehdr, header_data).map_err(|_| procmgr_errors::INVALID_ELF)?;
     if kind == elf::ElfKind::Dyn
     {
-        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        if !child_image_fits(bias, span_min, span_end)
         {
             return Err(procmgr_errors::INVALID_ELF);
         }
@@ -2406,11 +2469,13 @@ pub fn create_process_from_file(
     // section are fetched on demand via `vfs_read`; the helper hands a
     // closure that drives the same primitive used to stream `PT_LOAD`
     // pages, so no extra IPC machinery is involved.
-    let stack_pages = elf::parse_stack_note_streaming(ehdr, file_size, |off, dst| {
-        vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)
-    })
-    .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-    .clamp(1, MAX_PROCESS_STACK_PAGES);
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    let stack_pages = resolve_stack_pages(elf::parse_stack_note_streaming(
+        ehdr,
+        file_size,
+        |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+    ))
+    .ok_or(procmgr_errors::INVALID_ELF)?;
     let layout = choose_child_layout();
 
     // The three child kernel-object caps, guarded from creation so
@@ -2638,6 +2703,7 @@ pub fn create_process_from_file(
         sched.band_max,
         ipc_buf,
         &layout,
+        self_aspace,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);
     if result.is_ok()

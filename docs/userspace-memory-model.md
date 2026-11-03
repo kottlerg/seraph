@@ -105,14 +105,22 @@ communicates them via `ProcessInfo` / `InitInfo`.
   caps (one cap covering many pages) are returned whenever one free run
   covers a best-effort request (`flags` = 0); the multi-page-cap
   reply path collapses what would otherwise be
-  many single-page IPCs into a single round.
-- **Bootstrap.** `std::os::seraph::_start` calls `REQUEST_MEMORY_CAPS`
-  before `fn main()` runs and maps the returned caps at the process's
-  initial heap base, drawn per process from a fixed window above
-  `0x4000_0000` (19 bits of entropy; ASLR,
-  [#39](https://github.com/kottlerg/seraph/issues/39)) via one raw
-  non-allocating `SYS_GETRANDOM` call. The size of the initial
-  bootstrap heap is a `std::sys::seraph` implementation detail.
+  many single-page IPCs into a single round. A grow covers the whole
+  request beyond the free block at the heap's top, and an allocation
+  grows again while each grow maps pages, so a single allocation is
+  bounded only by the heap zone ([Growth Zones](#growth-zones)) and the
+  pool.
+- **Bootstrap.** Before `fn main()` runs, `std::os::seraph::_start`
+  installs the heap floor at the process's heap base, drawn per process
+  from the heap zone's window via one raw non-allocating `SYS_GETRANDOM`
+  call (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)). In a
+  demand-paged process the floor is a demand region registered with the
+  pager (`REGISTER_REGION`), so it costs VA and the frames the allocator
+  hands out; the allocator touches each floor page before handing it out,
+  since a kernel copy into an unbacked user page fails instead of faulting
+  to the pager. A process with no pager maps the floor eagerly through
+  `REQUEST_MEMORY_CAPS`. The floor's size is a `std::sys::seraph`
+  implementation detail.
 - **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`
   crate aborts through `handle_alloc_error` (std's abort path, which
   traps on seraph): a terminal fault that tears down the whole process
@@ -141,13 +149,19 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   `unreserve_pages(range)` releases it. The caller maps owned Memory
   caps into the reservation with `mem_map`. The caller is responsible
   for `mem_unmap` before `unreserve_pages`.
-- **Arena.** Each process carves a fixed-size arena out of its own
-  address space on first use. The arena base is drawn per process from a
-  fixed 64 GiB window above `0x10_0000_0000` (24 bits of entropy; ASLR,
+- **Arena.** Each process carves its arena out of its own address space
+  on first use, in the arena zone sized to its user half
+  ([Growth Zones](#growth-zones)). The arena base is drawn per process
+  from the zone's window (ASLR,
   [#39](https://github.com/kottlerg/seraph/issues/39)), degrading to the
   window base when the entropy draw fails. Everything placed through the
   arena — demand-paged thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
   inherits the randomised base.
+- **Free runs.** Released ranges coalesce into a sorted run table, which
+  each reservation first grows to hold one run more than the live
+  reservations (into the byte heap once its static table is full), so a
+  release always finds a slot and freed VA is never lost. A reservation
+  that cannot grow the table fails with `OutOfSpace`.
 - **Concurrency.** Reservations are independent across threads; the
   allocator serialises on a spinlock as needed.
 
@@ -180,22 +194,26 @@ window constants (`crate::entropy::fill_bytes`).
 Every bootstrap surface is randomised independently (ASLR,
 [#39](https://github.com/kottlerg/seraph/issues/39)): each is a
 page-aligned draw from a fixed per-region window of 2²¹ slots (21 bits
-of entropy per surface) on 9 GiB strides between the reservation-arena
+of entropy per surface) on 9 GiB strides between the Sv39 reservation-arena
 zone and the image window — TLS at `0x21_0000_0000`, IPC buffer at
 `0x23_4000_0000`, `ProcessInfo` at `0x25_8000_0000`, stack guard at
 `0x27_C000_0000`, and, kernel-drawn for init, `InitInfo` at
 `0x2A_0000_0000` and the init stack guard at `0x2C_4000_0000`. The
 stride spacing makes region ordering, pairwise disjointness, and the
 unmapped guard page below every stack hold for all possible draws, so
-no collision checking or redraw is ever needed. The whole zone map ends
-below 2³⁸ — the smallest user half among the supported paging modes
-(riscv64 Sv39) — so one static layout is canonical under every mode on
-both architectures; that ceiling is what caps these windows at 21 bits.
-A creator whose entropy draw fails (a kernel-contract violation once the
-pool is seeded) logs and degrades to the deterministic `DEFAULT_*`
-addresses, which lie outside the windows, above the image window and
-just below `LAYOUT_VA_CEILING` — the test harnesses' window assertions
-then fail loudly by design. The default boot on both architectures is
+no collision checking or redraw is ever needed. Each window's 8 GiB draw
+span leaves a 1 GiB region tail in its stride (`MAX_WINDOW_REGION_PAGES`),
+which bounds the largest stack reservation and TLS block a loader accepts.
+Every creator-placed surface ends below `LAYOUT_VA_CEILING` (2³⁸, the
+smallest user half among the supported paging modes, riscv64 Sv39), since
+the creator places them without knowing the paging mode, so one static
+layout is canonical under every mode on both architectures; that ceiling
+is what caps these windows at 21 bits. A creator whose entropy draw fails
+(a kernel-contract violation once the pool is seeded) logs and degrades to
+the deterministic `DEFAULT_*` addresses, which lie outside the windows,
+between init's stack-guard zone and the image window, each with its
+window's full region tail — the test harnesses' window assertions then
+fail loudly by design. The default boot on both architectures is
 firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
 firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
 without that device, under the EDK2 firmware the default boot uses, seeds
@@ -221,15 +239,18 @@ quality caveat.
   `std::os::seraph::stack_pages!` macro; see
   [Stack-size note](../abi/process-abi/README.md#stack-size-note-noteseraphstack));
   binaries that omit the note inherit
-  `DEFAULT_PROCESS_STACK_PAGES`. Loaders clamp to
-  `MAX_PROCESS_STACK_PAGES`; the pool's available RAM is the remaining
-  gate on the resulting `REQUEST_MEMORY_CAPS` calls (memmgr tracks
-  per-process frames in a RAM-bound arena, not a fixed quota).
+  `DEFAULT_PROCESS_STACK_PAGES`. Loaders refuse a binary whose note
+  declares zero pages or more than `MAX_PROCESS_STACK_PAGES`; the pool's
+  available RAM is the remaining gate on the resulting
+  `REQUEST_MEMORY_CAPS` calls (memmgr tracks per-process frames in a
+  RAM-bound arena, not a fixed quota).
 - **Main-thread IPC buffer.** The creator picks a per-process VA and
   writes it into `ProcessInfo.ipc_buffer_vaddr`.
-- **Main-thread TLS block.** The creator maps the block at the chosen
-  base and records it in `ProcessInfo.main_tls_vaddr` (zero when the
-  binary has no `PT_TLS`); the kernel installs the thread pointer, so
+- **Main-thread TLS block.** The creator maps the pages the binary's
+  `PT_TLS` memsz needs, up to `PROCESS_MAIN_TLS_MAX_PAGES` (the TLS
+  window's region tail), at the chosen base and records it in
+  `ProcessInfo.main_tls_vaddr` (zero when the binary has no `PT_TLS`); the
+  kernel installs the thread pointer, so
   `_start` reads the field only for introspection. Spawned threads
   allocate their TLS blocks from the heap.
 
@@ -261,9 +282,15 @@ slots above `0x30_0000_0000` (23 bits of entropy; ASLR,
 children, init for memmgr and procmgr, the kernel for init itself — and
 applies the image's `RELATIVE` relocations while the segments are
 staged, before the process exists. Placement is validated before
-loading: the biased span must fit the window's 1 GiB image budget and
-stay below `LAYOUT_VA_CEILING` (2³⁸, the Sv39 user half). A failed
-entropy draw degrades to the window
+loading: the biased image must end inside its image zone, and its span
+must fit the room between the window's last slot and the zone's end
+(`process_layout::image_max_span`). The kernel (for init) and init (for
+memmgr and procmgr) validate against the fixed-tier image zone, which ends
+at `0x3F_0000_0000` (`IMAGE_MAX_SPAN`, 28 GiB), below the kernel's
+fallback addresses for init; procmgr validates its children against the
+image zone of its own user half ([Growth Zones](#growth-zones)), which
+every process of the boot shares. A failed entropy draw degrades to the
+window
 base (never bias 0), keeping the single relocation path; loaders reject
 any relocation format other than the architecture's `RELATIVE` type,
 and every table record must land in exactly one loaded *writable*
@@ -282,6 +309,27 @@ address; debugging correlates through the creator's spawn log line
 (procmgr: `spawn image bias=0x…`; init: `init: <svc> image bias=0x…`;
 kernel Phase 9: `init: PIE bias=0x…`) and loads symbols with
 `add-symbol-file <binary> -o <bias>` in GDB.
+
+### Growth Zones
+
+The byte heap and the reservation arena are placed by the process itself,
+which knows its address space's size: `std::os::seraph::_start` reads the
+exclusive top of the user half once (`SYS_SYSTEM_INFO` with
+`SystemInfoType::UserVaTop`), and `process_layout::growth_zones` sizes
+both zones, and the image zone procmgr validates against, to it. The
+creator-placed surfaces above stay in the fixed tier below 2³⁸ at the same
+addresses in every mode.
+
+| User half | Heap zone | Arena zone | Image zone end |
+|---|---|---|---|
+| Sv39 (2³⁸), or unknown | base window `[1 GiB, 3 GiB)`, 60 GiB above the base | base window `[64 GiB, 96 GiB)`, 32 GiB above the base | `0x3F_0000_0000` |
+| `H` = 2⁴⁷ (x86-64, Sv48) or 2⁵⁶ (Sv57) | base window at `H/8`, `H/64` wide, `H/4` above the base | base window at `H/2`, `H/64` wide, `H/4` above the base | `H/8` |
+
+Under Sv39 both zones lie below the bootstrap windows; in a wider half they
+lie above the whole fixed tier, so they grow with the address space (32 TiB
+each under 2⁴⁷). A runtime that cannot read the size uses the Sv39 zones,
+which are valid in every mode. `shared/process-layout` const-asserts the
+zones disjoint and inside the address space for every supported mode.
 
 ---
 

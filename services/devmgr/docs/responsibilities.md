@@ -55,8 +55,8 @@ devmgr's responsibilities are:
   devmgr spawns one driver for every virtio-input device and for every
   virtio-blk device it can give a private IRQ line (a disk whose line another
   device already holds is not served, #664), each with its own service
-  endpoint, and refuses, logged, a VirtIO device whose register regions span
-  more than one BAR.
+  endpoint and an `Mmio` cap for every BAR the device's VirtIO register
+  regions name.
 
   Driver binaries are sourced from one of two places:
 
@@ -80,7 +80,7 @@ devmgr's responsibilities are:
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
-  the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
+  every block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
   (`QUERY_SERIAL_DEVICE`), `programs/terminal` resolves the framebuffer and
   input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
   resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd (design intent; not

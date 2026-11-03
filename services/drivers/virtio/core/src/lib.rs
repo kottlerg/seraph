@@ -6,13 +6,18 @@
 //! `VirtIO` transport and virtqueue primitives shared by all `VirtIO` drivers.
 //!
 //! Provides the modern PCI transport, virtqueue management, device negotiation,
-//! and the startup message format used by devmgr to pass PCI capability info
-//! to `VirtIO` drivers.
+//! the startup message format used by devmgr to pass PCI capability info
+//! to `VirtIO` drivers, the register layout by which a driver maps every BAR
+//! the register regions name ([`RegisterLayout`]), and the devmgr-to-driver
+//! bootstrap rounds ([`bootstrap`]).
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
+use syscall_abi::PAGE_SIZE;
+
+pub mod bootstrap;
 pub mod pci;
 pub mod virtqueue;
 
@@ -114,28 +119,165 @@ impl VirtioPciStartupInfo
         Some(())
     }
 
-    /// Number of 4 KiB pages spanned by the highest reach across all four
-    /// capability regions in BAR 0. Drivers use this to size the VA
-    /// reservation backing `mmio_map` for the BAR.
+    /// Locate the device's register regions for the driver's register
+    /// window: the distinct BARs they name and each region's place in the
+    /// window (see [`RegisterLayout`]).
+    ///
+    /// Returns `None` when a region is absent (zero length) or names a BAR
+    /// index outside 0-5. `VirtIO` 1.2 § 4.1.4 requires a modern PCI device
+    /// to present the common, notification, and ISR regions, and a device
+    /// type with device-specific configuration (block and input both have
+    /// one) to present that region too, each in a BAR of the device's
+    /// choosing; devmgr's scan keeps the first structure of each type that
+    /// lies wholly inside one of the device's MMIO BARs, so an absent region
+    /// means the device presents none the driver can map.
     #[must_use]
-    pub fn bar_aperture_pages(&self) -> u64
+    pub fn register_layout(&self) -> Option<RegisterLayout>
     {
-        const PAGE_SIZE: u64 = 0x1000;
-        let mut max_reach: u64 = 0;
-        for cap in [
+        let regions = [
             &self.common_cfg,
             &self.notify_cfg,
             &self.isr_cfg,
             &self.device_cfg,
-        ]
+        ];
+        if regions
+            .iter()
+            .any(|r| r.length == 0 || r.bar >= PCI_BAR_COUNT)
         {
-            let reach = u64::from(cap.offset).saturating_add(u64::from(cap.length));
-            if reach > max_reach
+            return None;
+        }
+        let mut bars = [BarAperture::default(); MAX_VIRTIO_BARS];
+        let mut bar_count = 0;
+        // Ascending BAR index; each BAR spans the furthest reach of the
+        // regions in it. Four regions name at most four BARs.
+        for bar in 0..PCI_BAR_COUNT
+        {
+            let reach = regions
+                .iter()
+                .filter(|r| r.bar == bar)
+                .map(|r| u64::from(r.offset) + u64::from(r.length))
+                .max();
+            if let Some(reach) = reach
             {
-                max_reach = reach;
+                bars[bar_count] = BarAperture {
+                    bar,
+                    pages: reach.div_ceil(PAGE_SIZE),
+                };
+                bar_count += 1;
             }
         }
-        max_reach.div_ceil(PAGE_SIZE).max(1)
+        let mut layout = RegisterLayout {
+            bars,
+            bar_count,
+            common: 0,
+            notify: 0,
+            isr: 0,
+            device: 0,
+            notify_len: u64::from(self.notify_cfg.length),
+            notify_off_multiplier: self.notify_off_multiplier,
+        };
+        layout.common = layout.region_offset(&self.common_cfg);
+        layout.notify = layout.region_offset(&self.notify_cfg);
+        layout.isr = layout.region_offset(&self.isr_cfg);
+        layout.device = layout.region_offset(&self.device_cfg);
+        Some(layout)
+    }
+}
+
+/// BAR registers in a PCI type-0 configuration header; a `VirtIO`
+/// capability naming an index at or above it names no BAR.
+const PCI_BAR_COUNT: u8 = 6;
+
+/// Most distinct BARs a `VirtIO` device's register regions name: one per
+/// region (common, notification, ISR, and device configuration, the four
+/// region types `VirtIO` 1.2 § 4.1.4 defines). A hardware-spec bound; the
+/// one bootstrap round that delivers the BARs holds that many caps
+/// ([`bootstrap`]).
+pub const MAX_VIRTIO_BARS: usize = 4;
+
+/// One BAR a device's register regions name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BarAperture
+{
+    /// PCI BAR index (0-5).
+    pub bar: u8,
+    /// 4 KiB pages from the BAR's start that the regions in it reach; at
+    /// least 1. devmgr carves the BAR's `Mmio` cap to at most this many
+    /// pages, and the driver maps it into that many pages of its window.
+    pub pages: u64,
+}
+
+/// Where a `VirtIO` device's four register regions sit, for a driver that
+/// maps every BAR they name into one register window.
+///
+/// The window holds one mapping per BAR in [`bars`](Self::bars) order
+/// (ascending BAR index), each [`BarAperture::pages`] long and following the
+/// previous one. A region's window offset is its BAR's offset in the window
+/// plus the region's offset in the BAR. Built by
+/// [`VirtioPciStartupInfo::register_layout`].
+#[derive(Clone, Copy, Debug)]
+pub struct RegisterLayout
+{
+    bars: [BarAperture; MAX_VIRTIO_BARS],
+    bar_count: usize,
+    /// Window offset of the common configuration region.
+    pub common: u64,
+    /// Window offset of the notification region.
+    pub notify: u64,
+    /// Window offset of the ISR status region.
+    pub isr: u64,
+    /// Window offset of the device-specific configuration region.
+    pub device: u64,
+    /// Length in bytes of the notification region; every queue's doorbell
+    /// must lie inside it ([`pci::doorbell_fits`]).
+    pub notify_len: u64,
+    /// Multiplier for queue-specific notification offsets.
+    pub notify_off_multiplier: u32,
+}
+
+impl RegisterLayout
+{
+    /// The distinct BARs the regions name, in ascending BAR index: the
+    /// order devmgr delivers their caps in and the window lays them out in.
+    #[must_use]
+    pub fn bars(&self) -> &[BarAperture]
+    {
+        &self.bars[..self.bar_count]
+    }
+
+    /// Pages the whole register window spans: the sum of the BARs' pages.
+    #[must_use]
+    pub fn window_pages(&self) -> u64
+    {
+        self.bars().iter().map(|b| b.pages).sum()
+    }
+
+    /// Window offset of `region`: the offset of its BAR's mapping (the pages
+    /// of every BAR before it) plus its offset in the BAR. Every region of
+    /// the layout names one of its BARs.
+    fn region_offset(&self, region: &VirtioCapLocation) -> u64
+    {
+        let bar_offset: u64 = self
+            .bars()
+            .iter()
+            .take_while(|b| b.bar != region.bar)
+            .map(|b| b.pages * PAGE_SIZE)
+            .sum();
+        bar_offset + u64::from(region.offset)
+    }
+
+    /// Whether `bar_indices`, the PCI BAR index of each delivered BAR cap in
+    /// delivery order, names exactly this layout's BARs in its order, so the
+    /// caps map into the window by position.
+    #[must_use]
+    pub fn matches_delivered(&self, bar_indices: &[u64]) -> bool
+    {
+        bar_indices.len() == self.bar_count
+            && self
+                .bars()
+                .iter()
+                .zip(bar_indices)
+                .all(|(b, &i)| u64::from(b.bar) == i)
     }
 }
 
@@ -203,19 +345,109 @@ mod tests
         assert!(VirtioPciStartupInfo::from_bytes(&small).is_none());
     }
 
-    #[test]
-    fn bar_aperture_pages_spans_max_reach_across_all_caps()
+    fn layout_of(regions: [VirtioCapLocation; 4]) -> Option<RegisterLayout>
     {
-        let mut info = populated();
-        // The 4th cap reaches furthest, one byte into the second page; the
-        // result must take the max over all caps and round the partial page up.
-        info.device_cfg = cap(0, 0x1000, 0x10);
-        assert_eq!(info.bar_aperture_pages(), 2);
+        VirtioPciStartupInfo {
+            common_cfg: regions[0],
+            notify_cfg: regions[1],
+            isr_cfg: regions[2],
+            device_cfg: regions[3],
+            notify_off_multiplier: 4,
+            pad: 0,
+        }
+        .register_layout()
     }
 
     #[test]
-    fn bar_aperture_pages_floors_to_one_page_when_all_zero()
+    fn one_bar_spans_the_furthest_region_rounded_up_to_a_page()
     {
-        assert_eq!(VirtioPciStartupInfo::default().bar_aperture_pages(), 1);
+        // The device region reaches furthest, one byte past the first page;
+        // the BAR takes the furthest reach, not the last region's, and
+        // rounds the partial page up.
+        let layout = layout_of([
+            cap(0, 0, 0x38),
+            cap(0, 0x800, 0x100),
+            cap(0, 0x900, 4),
+            cap(0, 0xFF0, 0x11),
+        ])
+        .expect("every region present");
+        assert_eq!(layout.bars(), &[BarAperture { bar: 0, pages: 2 }]);
+        assert_eq!(
+            (layout.common, layout.notify, layout.isr, layout.device),
+            (0, 0x800, 0x900, 0xFF0)
+        );
+    }
+
+    #[test]
+    fn regions_in_two_bars_are_placed_through_their_own_bars_mappings()
+    {
+        // Notification in BAR 2; the other three in BAR 4, reaching into its
+        // third page. The window lays BAR 2 (one page) before BAR 4 (three),
+        // and each region sits at its own BAR's window offset.
+        let layout = layout_of([
+            cap(4, 0, 0x38),
+            cap(2, 0, 0x1000),
+            cap(4, 0x1000, 4),
+            cap(4, 0x2000, 8),
+        ])
+        .expect("every region present");
+        assert_eq!(
+            layout.bars(),
+            &[
+                BarAperture { bar: 2, pages: 1 },
+                BarAperture { bar: 4, pages: 3 }
+            ]
+        );
+        assert_eq!(layout.window_pages(), 4);
+        assert_eq!(
+            (layout.common, layout.notify, layout.isr, layout.device),
+            (0x1000, 0, 0x2000, 0x3000)
+        );
+        // The doorbell bound is the notification region's own length.
+        assert_eq!(layout.notify_len, 0x1000);
+    }
+
+    #[test]
+    fn a_device_missing_a_register_region_has_no_layout()
+    {
+        let mut regions = [
+            cap(0, 0, 0x38),
+            cap(0, 0x1000, 0x1000),
+            cap(0, 0x2000, 4),
+            cap(0, 0x3000, 8),
+        ];
+        assert!(layout_of(regions).is_some());
+        regions[3].length = 0;
+        assert!(layout_of(regions).is_none());
+    }
+
+    #[test]
+    fn a_region_naming_a_reserved_bar_index_has_no_layout()
+    {
+        assert!(
+            layout_of([
+                cap(0, 0, 0x38),
+                cap(6, 0, 0x1000),
+                cap(0, 0x2000, 4),
+                cap(0, 0x3000, 8),
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn delivered_bars_match_only_the_layouts_bars_in_its_order()
+    {
+        let layout = layout_of([
+            cap(4, 0, 0x38),
+            cap(2, 0, 0x1000),
+            cap(4, 0x1000, 4),
+            cap(4, 0x2000, 8),
+        ])
+        .expect("every region present");
+        assert!(layout.matches_delivered(&[2, 4]));
+        assert!(!layout.matches_delivered(&[4, 2]));
+        assert!(!layout.matches_delivered(&[2]));
+        assert!(!layout.matches_delivered(&[2, 4, 5]));
     }
 }

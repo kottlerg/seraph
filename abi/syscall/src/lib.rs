@@ -148,6 +148,14 @@ pub fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS
 // each object kind, so a change to an object's size changes them, and that is
 // an ABI-visible change by design.
 
+/// Raw retype debit of one `Thread`, in bytes: the kernel stack
+/// (`KERNEL_STACK_PAGES`, four pages), one page holding the object wrapper and
+/// the thread control block, and one page for the extended-state (FPU, SIMD,
+/// vector) save area, all page-granular (`dispatch_for(Thread)` in
+/// core/kernel/src/cap/retype.rs). A process sizes the Memory cap it retypes
+/// a thread from with it.
+pub const THREAD_RETYPE_BYTES: u64 = 6 * 4096;
+
 /// Raw retype debit of one `Endpoint`, in bytes.
 pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
 
@@ -1097,6 +1105,13 @@ pub enum SystemInfoType
     /// Useful for diagnostics and for verifying affinity / migration
     /// behaviour from userspace.
     CurrentCpu = 7,
+    /// Exclusive top of the user half of the caller's address space: the
+    /// first virtual address a mapping syscall refuses. A fixed value per
+    /// architecture and boot paging mode (`(1 << 47) - 4096` on x86-64, whose
+    /// top user page is unmappable; `1 << 38`, `1 << 47`, or `1 << 56` under
+    /// riscv64 Sv39, Sv48, or Sv57), so a process sizes the zones it places
+    /// itself to its address space.
+    UserVaTop = 8,
 }
 
 #[cfg(test)]

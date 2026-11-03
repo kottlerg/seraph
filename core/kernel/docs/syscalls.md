@@ -2367,6 +2367,13 @@ pub enum SystemInfoType
     /// Useful for diagnostics and for verifying affinity / migration
     /// behaviour from userspace.
     CurrentCpu          = 7,
+
+    /// Exclusive top of the user half: the first virtual address a mapping
+    /// syscall refuses (`user_va_top`). Fixed per architecture and boot paging
+    /// mode: `(1 << 47) - 4096` on x86-64, whose top user page is unmappable;
+    /// `1 << 38`, `1 << 47`, or `1 << 56` under riscv64 Sv39, Sv48, or Sv57.
+    /// ruststd sizes a process's heap and reservation-arena zones from it.
+    UserVaTop           = 8,
 }
 ```
 

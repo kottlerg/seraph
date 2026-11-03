@@ -111,7 +111,7 @@ holds a handle to it.
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via
 `SYS_THREAD_SET_FAULT_HANDLER`, delegates the child `AddressSpace` to memmgr via
-`memmgr_labels::DELEGATE_ASPACE`, and sets `ProcessInfo.pager_endpoint_cap` (the
+`memmgr_labels::DELEGATE_ASPACE`, and then sets `ProcessInfo.pager_endpoint_cap` (the
 child's badged memmgr cap, whose derivation badge the kernel stamps on each fault)
 and `pager_badge` (that badge) so the runtime inherits the handler onto spawned
 threads. The
@@ -123,7 +123,10 @@ depend on the fault path — a DMA driver. init, memmgr, and procmgr are pre-pag
 and never routed through this path, so they are pinned by construction. See
 [docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
 best-effort: a failure degrades to "no pager" (faults kill), never blocking
-creation.
+creation. procmgr writes `pager_endpoint_cap` and `pager_badge` only after the
+delegation and the main thread's binding have both taken effect, so the page never
+names a pager the child does not have; a child whose binding failed, or whose page
+procmgr could not map to advertise it, reads zero and keeps its memory eager.
 
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and

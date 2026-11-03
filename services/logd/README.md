@@ -146,7 +146,7 @@ the devmgr-registry cap for its lifetime (see
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client and a framebuffer-driver consumer |
 | [services/init/README.md](../init/README.md) | init-logd's role + termination, and the reserved log-sink sources init endows svcmgr |
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
-| [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
+| [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with and the `BoundedStr` diagnostic formatter |

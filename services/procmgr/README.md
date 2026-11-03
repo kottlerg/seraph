@@ -25,10 +25,12 @@ procmgr/
 ├── process-table/              # `procmgr-process-table` crate: pure host-tested
 │                                 table + badge logic, the create-request
 │                                 argv/env blob decoder and cap split, the
-│                                 fs-reply bounds, and the init-reap state
-│                                 machine
+│                                 fs-reply bounds, the init-reap state
+│                                 machine, and the death-queue bind order
+│                                 and growth (`DeathQueues`)
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
+│   ├── death_queues.rs         # The growable death-queue set (`DeathSet`)
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
 │   ├── init_reap.rs            # Init-reap: reaps init after handover
@@ -195,18 +197,18 @@ no `main()` of either shape `abi/process-abi` describes.
 
 ## Process table and death queues
 
-The process table lives on procmgr's heap, sorted by badge, and grows with the
-live process count; a spawn fails when the heap cannot grow it. Each child's main
-thread and address space bind a death observer, with the child's full `u64` badge
-as the correlator, on one of procmgr's death `EventQueue`s. A bind takes one node
-from its queue's pool, fixed at the queue's creation, so procmgr keeps a growable
-set of queues: a bind tries the newest queue first, then the older ones, whose
-nodes return as their processes are destroyed, and only when every queue is out of
-nodes creates a further queue, funded from procmgr's own memory, with twice the
-last pool (64 nodes first, up to `EVENT_QUEUE_MAX_CAPACITY`). Up to
-`DEATH_QUEUES_MAX` (24) queues hold more nodes than twice the children procmgr's
-`CSpace` can hold, so the pools never bind first. A bind that still fails (procmgr
-out of memory) fails the spawn, the address-space bind included.
+The process table lives on procmgr's heap, sorted by badge, and grows with the live process count; a
+spawn fails when the heap cannot grow it. Each child's main thread and address space bind a death
+observer, with the child's full `u64` badge as the correlator, on one of procmgr's death
+`EventQueue`s. A bind takes one node from its queue's pool, fixed at the queue's creation, so
+procmgr keeps a growable set of queues: a bind tries the newest queue first, then the older ones,
+whose nodes return as their processes are destroyed, and only when every queue is out of nodes
+creates a further queue, funded from procmgr's own memory, with twice the last pool (64 nodes first,
+up to `EVENT_QUEUE_MAX_CAPACITY`). Up to `DEATH_QUEUES_MAX` (24) queues hold more nodes than twice
+the children procmgr's `CSpace` can hold, so their count never binds first; each further queue is
+one contiguous grant from memmgr (about 24 MiB once a pool reaches the kernel maximum), which
+fragmented RAM can refuse first. A bind that still fails (procmgr out of memory) fails the spawn,
+the address-space bind included.
 
 Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
 procmgr drains every queue on each death wakeup. The kernel drops a post to a

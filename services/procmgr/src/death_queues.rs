@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 
 use process_table::DeathQueues;
+use process_table::death_queues::FIRST_POOL_OBSERVERS;
 use syscall::DeathEvent;
 use syscall_abi::SyscallError;
 
@@ -26,17 +27,12 @@ use syscall_abi::SyscallError;
 /// full queue's worth of events from one queue.
 pub const DEATH_EQ_CAPACITY: u32 = 256;
 
-/// Observer nodes in procmgr's first death queue; each further queue has
-/// twice the last one's, up to `EVENT_QUEUE_MAX_CAPACITY`. Each live process
-/// takes two (its main thread and its address space) and the init reap takes
-/// init's two threads; a node returns when its thread or address space is
-/// destroyed. Sized small so the pool is paid for as processes arrive.
-const FIRST_POOL_OBSERVERS: u32 = 64;
-
 /// Most death queues procmgr creates. From [`FIRST_POOL_OBSERVERS`] doubling,
 /// 24 queues hold more than 11 M nodes, past twice the about 1 M children
 /// procmgr's `CSpace` can hold (docs/limits.md, `MAX_SLOTS_STRUCTURAL`), so
-/// the pools never bind before that bound does.
+/// their count never binds before that bound does. Each further queue is one
+/// contiguous grant from memmgr (about 24 MiB once a pool reaches the kernel
+/// maximum), which fragmented RAM can refuse first.
 pub const DEATH_QUEUES_MAX: usize = 24;
 
 /// The death queues and the wait set they are members of. procmgr's

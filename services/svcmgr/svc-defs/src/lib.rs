@@ -8,8 +8,8 @@
 //! Holds the plain-data recipe record ([`Definition`] and its component
 //! enums), the `key = value` parser ([`parse`]), the argv/env wire-blob
 //! encoder ([`build_blob`]) the parser validates against procmgr's
-//! `CREATE_FROM_FILE` limits, and two decisions svcmgr applies at runtime:
-//! the rights of a recipe's `cwd` cap ([`cwd_rights`]) and the
+//! `CREATE_FROM_FILE` limits, and the policies svcmgr applies at runtime:
+//! the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the windowed restart
 //! budget ([`RestartBudget`]), and the bind order and growth of the death
 //! queues ([`DeathQueues`]). Nothing here touches a syscall, IPC, or

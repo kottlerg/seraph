@@ -1086,6 +1086,7 @@ dependencies = [
  "namespace-protocol",
  "process-abi",
  "process-layout",
+ "procmgr-process-table",
  "shmem",
  "syscall",
  "syscall-abi",

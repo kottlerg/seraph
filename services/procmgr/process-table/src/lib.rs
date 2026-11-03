@@ -304,10 +304,8 @@ impl ProcessTable
         Some(self.entries.remove(idx))
     }
 
-    /// Visit every live entry in badge order. Used by
-    /// `install_logd_death_eq` to retroactively bind logd's EQ as a
-    /// second death observer on each child's main thread, and by the death
-    /// resync to read each child's thread state.
+    /// Visit every live entry in badge order. Used by the death resync to
+    /// read each child's thread state.
     pub fn for_each<F: FnMut(&ProcessEntry)>(&self, f: F)
     {
         self.entries.iter().for_each(f);

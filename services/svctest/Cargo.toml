@@ -17,6 +17,7 @@ ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 process-abi = { workspace = true }
 process-layout = { path = "../../shared/process-layout" }
+process_table = { path = "../procmgr/process-table", package = "procmgr-process-table" }
 syscall = { path = "../../shared/syscall" }
 # `MSG_DATA_WORDS_MAX`: the blob-size cells size argv/env against the
 # `CREATE_FROM_FILE` data area, the `fs_std` rename cell sizes its long

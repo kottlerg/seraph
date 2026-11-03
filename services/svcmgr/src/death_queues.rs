@@ -28,15 +28,17 @@ pub const DEATHS_EQ_CAPACITY: u32 = 64;
 /// Observer nodes in svcmgr's first death queue; each further queue has
 /// twice the last one's, up to `EVENT_QUEUE_MAX_CAPACITY`. Each supervised
 /// service's main thread takes one, and a restarted service binds its new
-/// thread before the old one's node returns. Sized small so the pool is paid
-/// for as services arrive; a boot's supervised services cross it once.
-const FIRST_POOL_OBSERVERS: u32 = 8;
+/// thread before the old one's node returns. Sized below a boot's seven
+/// supervised and adopted services, so every boot grows the set and runs the
+/// growth path; the pool is paid for as services arrive.
+const FIRST_POOL_OBSERVERS: u32 = 4;
 
 /// Most death queues svcmgr creates. From [`FIRST_POOL_OBSERVERS`] doubling,
-/// 24 queues hold more than 8 M nodes, past the 3.6 M slots svcmgr's `CSpace`
+/// 24 queues hold more than 7 M nodes, past the 3.6 M slots svcmgr's `CSpace`
 /// can hold (docs/limits.md, `MAX_SLOTS_STRUCTURAL`), each supervised service
-/// taking at least its thread's, so the pools never bind before that bound
-/// does.
+/// taking at least its thread's, so their count never binds before that bound
+/// does. Each further queue is one contiguous grant from memmgr, which
+/// fragmented RAM can refuse first.
 pub const DEATH_QUEUES_MAX: usize = 24;
 
 /// The death queues and the wait set they are members of. svcmgr's

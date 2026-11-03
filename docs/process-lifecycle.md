@@ -479,10 +479,11 @@ The death-notification flow:
 1. **Procmgr observes.** Procmgr's existing supervision path detects
    the death (a death notification on the child's main thread, an
    address-space death notification for a terminal fault in any thread,
-   or an explicit `DESTROY_PROCESS` teardown). When its death queue was
-   full and a post was dropped, procmgr recovers the main-thread deaths
-   from the kernel's thread states; a dropped address-space post is not
-   recovered, and that process is reaped when its main thread exits (see
+   or an explicit `DESTROY_PROCESS` teardown). When one of its death
+   queues was full and a post was dropped, procmgr recovers the
+   main-thread deaths from the kernel's thread states; a dropped
+   address-space post is not recovered, and that process is reaped when
+   its main thread exits (see
    [services/procmgr/README.md](../services/procmgr/README.md) § Process
    table and death queues).
 2. **Procmgr → memmgr.** Procmgr sends `PROCESS_DIED` to memmgr carrying
@@ -502,8 +503,8 @@ The death-notification flow:
 6. **Procmgr → logd.** Once real-logd has registered its death queue,
    procmgr posts the death entry `(exit_reason, process badge)` to it
    after the teardown; logd evicts the dead sender's slot. procmgr, not
-   the kernel, is the source of logd's death events: logd binds no death
-   observer (see
+   the kernel, is the source of logd's death events: nothing binds logd's
+   queue as a death observer (see
    [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md)
    § `REGISTER_DEATH_EQ`).
 

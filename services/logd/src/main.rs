@@ -195,8 +195,9 @@ fn main() -> !
 }
 
 /// Capacity of logd's death-notification `EventQueue`: a tuning value, not
-/// a process ceiling. The kernel drops a post to a full queue, so a drain
-/// that takes this many events or more starts a resync ([`Resync`]), which
+/// a process ceiling. procmgr's post of a death is refused, and dropped,
+/// when the queue is full, so a drain that takes this many events or more
+/// starts a resync ([`Resync`]), which
 /// evicts the slots of senders procmgr no longer lists as live; no process
 /// count sizes the queue.
 const DEATH_EQ_CAPACITY: u32 = 128;
@@ -271,9 +272,8 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32, resync_note: u32) -> Option<
 /// receiver's `CSpace` and clears the sender's slot. logd needs to
 /// retain `RECV` on the original event queue so `wait_set_add` and
 /// `event_try_recv` keep working, so it first derives a POST-only
-/// copy and transfers that. Procmgr's `REGISTER_DEATH_EQ` handler
-/// gates on the POST right (`sys_thread_bind_notification`'s lookup
-/// already requires it).
+/// copy and transfers that. The POST right is what procmgr's
+/// `SYS_EVENT_POST` of each death to the queue needs.
 fn register_with_procmgr(procmgr_send: u32, death_eq: u32, ipc_buf: *mut u64)
 {
     if procmgr_send == 0
@@ -301,7 +301,7 @@ fn register_with_procmgr(procmgr_send: u32, death_eq: u32, ipc_buf: *mut u64)
     };
     if reply.label == procmgr_errors::SUCCESS
     {
-        self_log("REGISTER_DEATH_EQ: bound on procmgr");
+        self_log("REGISTER_DEATH_EQ: registered with procmgr");
     }
     else
     {

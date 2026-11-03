@@ -35,6 +35,7 @@ svcmgr/
 ├── src/
 │   ├── main.rs                    # main() (std runtime), IPC dispatch,
 │   │                              # dispatch_deaths, initiate_graceful_shutdown
+│   ├── death_queues.rs            # The growable death-queue set (`DeathSet`)
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
@@ -51,8 +52,9 @@ svcmgr/
 │                                  # Definition types, parser, argv/env
 │                                  # wire-blob encoder (`build_blob`), the
 │                                  # `cwd_rights` / `handover_permitted`
-│                                  # decisions, and the windowed
-│                                  # `RestartBudget`
+│                                  # decisions, the windowed
+│                                  # `RestartBudget`, and the death-queue
+│                                  # bind order and growth (`DeathQueues`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see

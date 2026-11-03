@@ -158,18 +158,18 @@ pub fn reentry_main(role: &str)
 
 /// Children [`death_queue_growth_phase`] holds alive at once. procmgr binds
 /// two death observers per live process on its death queues, the first of
-/// which holds 64 nodes (`FIRST_POOL_OBSERVERS` in
-/// `services/procmgr/src/death_queues.rs`), and init's reap takes two more:
-/// 32 children alone take the rest of that pool and two more, so their binds
-/// cross into a further queue whatever else is live.
-const GROWTH_CHILDREN: usize = 32;
+/// which holds `FIRST_POOL_OBSERVERS` nodes: half that many children take the
+/// whole pool, and svctest's own two nodes, live while the phase runs, push
+/// the binds into a further queue whatever else is live.
+const GROWTH_CHILDREN: usize = process_table::death_queues::FIRST_POOL_OBSERVERS as usize / 2;
 
 /// Hold [`GROWTH_CHILDREN`] children alive at once, so procmgr's death
 /// binds outgrow its first death queue's pool, then let each exit and check
 /// its clean exit and procmgr's `QUERY_PROCESS` answer (`EXITED`, reason 0).
 /// Each child is `/programs/stdiotest`, blocked on its piped stdin until the
 /// phase writes a line to it. A procmgr whose pool did not grow refuses the
-/// spawns past it.
+/// spawns past it. The phase cannot observe which queue a bind landed on, so
+/// it tests growth only while [`GROWTH_CHILDREN`] follows procmgr's pool.
 pub fn death_queue_growth_phase(_: &Caps)
 {
     use std::io::{Read, Write};

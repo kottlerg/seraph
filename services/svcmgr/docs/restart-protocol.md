@@ -18,11 +18,12 @@ A bind takes one death-observer node from its queue's pool, fixed when the
 queue is created, so svcmgr keeps a growable set of queues: a bind tries the
 newest queue first, then the older ones, and only when every queue is out of
 nodes creates a further queue, funded from svcmgr's own memory, with twice
-the last pool (8 nodes first, up to `EVENT_QUEUE_MAX_CAPACITY`; a boot's
-supervised services cross the first pool once). Up to `DEATH_QUEUES_MAX` (24)
-queues hold more nodes than svcmgr's `CSpace` has slots, so the pools never
-bind first; a bind that still fails (svcmgr out of memory) fails the launch,
-restart, or adoption.
+the last pool (4 nodes first, below a boot's seven supervised and adopted
+services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). Up
+to `DEATH_QUEUES_MAX` (24) queues hold more nodes than svcmgr's `CSpace` has
+slots, so their count never binds first; each further queue is one contiguous
+grant from memmgr, which fragmented RAM can refuse first. A bind that still
+fails fails the launch, restart, or adoption.
 
 The WaitSet holds the service endpoint (badge 0) and every death queue
 (badge 1). On wakeup svcmgr drains every queue and routes

@@ -20,6 +20,14 @@ use alloc::vec::Vec;
 
 use syscall_abi::{EVENT_QUEUE_MAX_CAPACITY, SyscallError};
 
+/// Observer nodes in procmgr's first death queue; each further queue has
+/// twice the last one's, up to `EVENT_QUEUE_MAX_CAPACITY`. Each live process
+/// takes two (its main thread and its address space) and the init reap takes
+/// init's two threads; a node returns when its thread or address space is
+/// destroyed. Sized small so the pool is paid for as processes arrive. Public
+/// so svctest's growth phase sizes its children from it.
+pub const FIRST_POOL_OBSERVERS: u32 = 64;
+
 /// The error a bind or a create returns when no node or no memory is left.
 const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
 

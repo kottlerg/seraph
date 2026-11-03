@@ -1014,10 +1014,10 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 {
     const PAGE: u64 = 4096;
     const DONATIONS: u64 = 200;
-    // Donations 16 and 186 open the two record pages: the inline records
+    // Donations 16 and 143 open the two record pages: the inline records
     // hold the create-time slab plus fifteen donations, and a record page
-    // holds 170 records — the kernel's RECORDS_PER_PAGE: a page's 4096
-    // bytes less a 16-byte header, over 24-byte records — the first being its
+    // holds 127 records — the kernel's RECORDS_PER_PAGE: a page's 4096
+    // bytes less a 16-byte header, over 32-byte records — the first being its
     // own donation.
     const RECORD_PAGES: u64 = 2;
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
@@ -1132,7 +1132,9 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 {
     const PAGE: u64 = 4096;
-    const DONATIONS: u64 = 200;
+    // Donations 16 and 143 open the two record pages (127 records each, as
+    // above), so the newest describes the last fourteen donations.
+    const DONATIONS: u64 = 157;
     const RECORD_PAGES: u64 = 2;
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
     // Each region at a 1 GiB stride costs at least two fresh intermediate

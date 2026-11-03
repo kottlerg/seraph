@@ -514,8 +514,10 @@ fn ensure_index(l: &mut MemLedger)
 /// also how the first ingested run seeds the arena, before the pool holds
 /// anything. When that carve fails (both arena zones spent, the split of the
 /// run's first page refused, or the self-map failing), the run goes into the
-/// arena's reserve ([`push_last_resort`]); only with the reserve spent too
-/// does it stay owned and counted in `pool_total` but out of circulation.
+/// arena's reserve ([`push_last_resort`]); when the split cannot be merged
+/// back, the remainder takes the reserve before the head page. Only with the
+/// reserve spent does a run stay owned and counted in `pool_total` but out of
+/// circulation.
 fn insert_run(l: &mut MemLedger, run: FreeRun)
 {
     if ensure_slots(l, 1)
@@ -555,6 +557,10 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
             Some(rest) if merge(run.cap_slot, rest.cap_slot) => push_last_resort(l, run),
             Some(rest) =>
             {
+                // The remainder first: it is never smaller than the one-page
+                // head, so with one reserve slot left it is the one kept in
+                // circulation.
+                push_last_resort(l, rest);
                 push_last_resort(
                     l,
                     FreeRun {
@@ -562,7 +568,6 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
                         ..run
                     },
                 );
-                push_last_resort(l, rest);
             }
             None => push_last_resort(l, run),
         }
@@ -1489,7 +1494,8 @@ fn cspace_headroom(self_cspace: u32) -> u64
         .saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
 }
 
-/// Keep memmgr's `CSpace` above [`CSPACE_LOW_WATER`] general slots by
+/// Keep memmgr's `CSpace` above [`CSPACE_LOW_WATER`] general slots, with a
+/// page of growth budget beyond them for its body arena, by
 /// donating pool frames to its slot-page pool (augment-mode
 /// `cap_create_cspace`), so its own splits and derivations never meet an
 /// exhausted `CSpace` and its receives keep the IPC receive reserve
@@ -1501,7 +1507,11 @@ fn cspace_headroom(self_cspace: u32) -> u64
 /// before the next receive; a refused augment returns the frame to the pool.
 fn hold_cspace_headroom(self_cspace: u32)
 {
-    if cspace_headroom(self_cspace) >= CSPACE_LOW_WATER
+    // Every grant's split takes a body from the arena as well as a slot, and
+    // the arena draws whole pages from the same growth budget, so a page of it
+    // is held beyond the slots (`syscall_abi::cspace_topup_pages`).
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    if syscall_abi::cspace_topup_pages(cspace_headroom(self_cspace), budget, CSPACE_LOW_WATER) == 0
     {
         return;
     }

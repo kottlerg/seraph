@@ -25,14 +25,17 @@ in [crash-safety.md](crash-safety.md).
   the UTF-8 name encoded as UTF-16 code units (`fat_parse::encode_lfn`, at
   most 255). The trailing `0x40` LFN sequence flag and `LDIR_Chksum`
   computation match the Microsoft FAT specification.
-* **Page cache** (`src/cache.rs`): up to `SLOT_COUNT` (128) single-page slots backed by
+* **Page cache** (`src/cache.rs`): up to its slot ceiling of single-page slots, fixed at init from
+  the RAM memmgr reports (`QUERY_POOL_STATUS`): one slot per `SLOT_RAM_DIVISOR` (512) pages of RAM,
+  never fewer than `SLOT_COUNT` (256; `fat_parse::slot_ceiling`). The slots are backed by
   `BLK_READ_INTO_MEMORY` for fills and a process-static scratch memory cap for single-sector
   `BLK_WRITE_FROM_MEMORY` writebacks and single-sector device reads. A sector is one logical block
   of the device, whose size `FS_MOUNT` reads with `BLK_GET_GEOMETRY` before the BPB; a page holds
   `PAGE_SIZE` over it. A slot takes its page from memmgr the first time a miss finds no free slot,
-  and the cache evicts only once all `SLOT_COUNT` slots hold a page or memmgr refuses one, so an
-  idle mount pays only for the pages it fills. Cache init funds the fs's own `CSpace` with general
-  headroom for every slot page, the quarantine's replacements, the scratch page, and 64 more
+  and the cache evicts only once every slot holds a page or memmgr refuses one, so an idle mount
+  pays only for the pages it fills. A file holds at most the slot ceiling of outstanding
+  `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with general headroom for every
+  slot page, the quarantine's replacements, the scratch page, and 64 more
   (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache never meets an exhausted
   `CSpace`; a failed funding fails cache init. Write-through: the cached page is updated in place
   before the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the page observes new

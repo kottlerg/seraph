@@ -87,9 +87,11 @@ Allocation Contract").
 - **Serve MMIO or IOMMU memory caps.** memmgr's pool is RAM only. MMIO Memory
   caps come from devmgr (see [device-management.md](../../docs/device-management.md));
   memmgr never sees them.
-- **Implement swap, paging, or page-fault handling.** Memory caps are allocated
-  out of physical RAM; there is no backing store. A failed allocation
-  returns an out-of-memory error to the caller (see
+- **Implement swap or a backing store.** Memory caps are allocated out of
+  physical RAM, and as the default pager memmgr fills a demand-paged fault
+  from that RAM too (see [docs/fault-handling.md](../../docs/fault-handling.md)
+  § Demand Paging and the Default System Pager); nothing is paged out. A failed
+  allocation returns an out-of-memory error to the caller (see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Failure Modes").
 - **Operate a page cache.** Caching of file pages (when fs drivers
   implement it) lives in the fs driver, not in memmgr.
@@ -201,6 +203,7 @@ mint or retire process badges (see [`docs/ipc-interface.md`](docs/ipc-interface.
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | System-wide memory ownership, memory-cap contract, page-reservation contract |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Boot order, ProcessInfo/InitInfo handover, process-death flow |
 | [docs/capability-model.md](../../docs/capability-model.md) | Memory cap rights, derivation, revocation |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Demand paging, with memmgr as the default system pager |
 | [docs/architecture.md](../../docs/architecture.md) | System design, tier-1 service roles |
 | [services/procmgr/README.md](../procmgr/README.md) | Sister tier-1 service for process lifecycle |
 | [services/init/README.md](../init/README.md) | Boot-time origin of memmgr's memory-cap pool |

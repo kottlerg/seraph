@@ -818,10 +818,11 @@ Derive a new capability from an existing one, with equal or fewer rights.
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
 
-The derived capability references the same kernel object, except that a derived `Mmio` or
-`IoPort` capability references a fresh object over the same range, so the mappings and port
-bindings made through it are withdrawn when it goes (see
-[capability-model.md](../../../docs/capability-model.md) § Mmio and § IoPort (x86-64 only)). The
+The derived capability references the same kernel object, except that a derived `Mmio`,
+`IoPort`, or `Interrupt` capability references a fresh object over the same range, so the
+mappings, port bindings, and interrupt binding made through it are withdrawn when it goes (see
+[capability-model.md](../../../docs/capability-model.md) § Interrupt, § Mmio, and § IoPort
+(x86-64 only)); a fresh `Interrupt` object starts unbound. The
 effective rights are `rights_mask & source_rights` — bits requested beyond what the source holds
 are silently masked off rather than rejected, so derivation can only attenuate. The derivation is
 recorded in the global derivation tree for revocation tracking.
@@ -835,11 +836,11 @@ leaving the new capability an unlinked derivation root.
 
 **Errors:** `InvalidCapability` (source invalid, null, or freed meanwhile),
 `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight
-on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio` or `IoPort` source,
-the kernel's SEED reserve cannot back the fresh object), `QuotaExceeded` (caller's CSpace
-directory structurally full; for an `Mmio` or `IoPort` source, its range already has
-`RANGE_COPY_LIMIT` (64) live copies; for any other source, the object's reference count is at its
-2^31 ceiling).
+on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio`, `IoPort`, or
+`Interrupt` source, the kernel's SEED reserve cannot back the fresh object), `QuotaExceeded`
+(caller's CSpace directory structurally full; for an `Mmio`, `IoPort`, or `Interrupt` source, its
+range already has `RANGE_COPY_LIMIT` (64) live copies; for any other source, the object's
+reference count is at its 2^31 ceiling).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -872,8 +873,8 @@ The source capability must have `badge == 0`. Re-badging (setting a new badge
 on an already-badged cap) returns `InvalidArgument`. Derivation via
 `SYS_CAP_DERIVE` inherits the source's badge (see
 [capability-model.md](../../../docs/capability-model.md) § Badges). Source revalidation
-under the derivation lock, and the fresh object of an `Mmio` or `IoPort` derivation: as for
-`SYS_CAP_DERIVE`.
+under the derivation lock, and the fresh object of an `Mmio`, `IoPort`, or `Interrupt`
+derivation: as for `SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
@@ -1879,8 +1880,8 @@ caller waited).
 
 ### `SYS_IRQ_ACK` (29)
 
-Acknowledge a hardware interrupt line after handling. Re-enables the line at the
-interrupt controller when a notification is registered on it.
+Acknowledge a hardware interrupt line after handling, through the capability's own binding.
+Re-enables the line at the interrupt controller once no binding on it owes an acknowledgement.
 
 **Arguments:**
 
@@ -1890,13 +1891,19 @@ interrupt controller when a notification is registered on it.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The kernel masks the interrupt line before delivering the notification to the driver
-(see [docs/architecture.md](../../../docs/architecture.md) — Driver Model). The driver
-must call `SYS_IRQ_ACK` to re-enable the line. `SYS_IRQ_REGISTER` leaves the line
-masked, so the driver's first `SYS_IRQ_ACK` after registering is what enables delivery;
-`SYS_IRQ_ACK` unmasks a registered line whether or not an interrupt has been delivered
-since the last acknowledgement; a line with no registered notification (never registered,
-or its registration cleared) stays masked, and the call still returns 0.
+The kernel masks the interrupt line before delivering to the bindings on it, and marks every
+binding as owing an acknowledgement (see [docs/architecture.md](../../../docs/architecture.md)
+— Driver Model, and § `SYS_IRQ_REGISTER`). The driver must call `SYS_IRQ_ACK` to re-enable the
+line. `SYS_IRQ_ACK` clears the acknowledgement owed by the binding of `irq_cap`'s own object (each
+copy of an Interrupt capability is an object of its own), and unmasks the line only when no
+binding on it owes one, so a shared line is re-enabled once every receiver signalled since the
+last unmask has acknowledged. A new binding owes from the start, so the driver's first
+`SYS_IRQ_ACK` after registering is what lets the line deliver. An acknowledgement is
+idempotent: a repeated one, or one with no delivery since the last (a driver's timeout-wake
+acknowledgement), clears nothing and unmasks only when no binding owes; with a single binding
+on the line it unmasks whether or not an interrupt has been delivered since. Through an object
+with no binding (never registered, or its binding removed with its Notification) the call
+changes nothing and returns 0.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
 specific line.
@@ -1908,9 +1915,9 @@ specific line.
 
 ### `SYS_IRQ_REGISTER` (30)
 
-Register a notification to receive interrupt notifications for a hardware interrupt line.
-When the interrupt fires, the kernel delivers it by ORing a notification bit into
-the registered notification.
+Bind a notification to a hardware interrupt line through an Interrupt capability. When the
+interrupt fires, the kernel delivers it by ORing a notification bit into every notification
+bound to the line.
 
 **Arguments:**
 
@@ -1921,13 +1928,37 @@ the registered notification.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Only one notification may be registered per interrupt line at a time. A second call
-replaces the previous registration, and returns once no delivery to the replaced
-notification is still in flight. The kernel routes the line to one CPU, the next in turn
-([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked, and it masks
-the line again before each delivery of the notification; the driver MUST call
-`SYS_IRQ_ACK` to re-enable it (see [architecture.md](../../../docs/architecture.md)
-§ Driver Model).
+The binding lives in `irq_cap`'s own object: a copy or derivation of an Interrupt capability
+references a fresh object over the same line (see
+[capability-model.md](../../../docs/capability-model.md) § Interrupt), so a line holds one binding
+per bound object, up to `MAX_IRQ_BINDINGS` (64), and receivers sharing a wired line each bind
+through their own capability.
+
+- **Bind.** Through an object with no binding the call adds one. The line's first binding routes
+  the line at its controller, to one CPU, the next in turn
+  ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing is
+  kept while any binding remains, so every receiver on the line is signalled from that CPU. A
+  later binding masks the line. Every new binding owes an acknowledgement, so the line stays
+  masked until its receiver's first `SYS_IRQ_ACK`.
+- **Rebind.** Through an object already bound, the call rebinds that binding to
+  `notification_cap`'s notification, keeping whether it owes an acknowledgement and leaving the
+  line's mask as it is, and returns once no delivery to the replaced notification is still in
+  flight.
+- **Deliver.** Each interrupt masks the line, marks every binding on it as owing an
+  acknowledgement, ORs bit 0 into each bound notification, and completes at the controller. A
+  receiver whose device did not raise the interrupt finds nothing in its device's status and
+  acknowledges. The driver MUST call `SYS_IRQ_ACK` (see
+  [architecture.md](../../../docs/architecture.md) § Driver Model); the line is unmasked once no
+  binding owes.
+- **Unbind.** A binding is removed when its Interrupt object is freed (its last capability
+  deleted, consumed by a split, revoked through an ancestor, or torn down with its holder's
+  CSpace) or when its Notification is freed; the removal waits out the deliveries in flight on
+  the line. The line is then unmasked if bindings remain and none owes, so a receiver that goes
+  cannot hold a shared line masked, and released at its controller when no binding remains.
+
+On x86-64 the line is programmed edge-triggered, active-high (see
+[docs/device-management.md](../../../docs/device-management.md) § Interrupt Delivery for what that
+means on a shared level-triggered line); on RISC-V the PLIC gateway is level-sensitive.
 
 **Capability requirements:** `irq_cap` (Notify rights; single-line), `notification_cap`
 (Notify rights).
@@ -1938,8 +1969,10 @@ interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the 
 Interrupt cap spans 2048 GSIs; on RISC-V a source outside the PLIC's reported
 `1..=riscv,ndev`, where the root Interrupt cap spans the PLIC's 1024-id space; see
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions),
-`QuotaExceeded` (x86-64: every device IDT vector, 217 of them, is assigned to another
-routed GSI; a vector is freed when its line's route is cleared).
+`QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or,
+for the line's first binding on x86-64, every device IDT vector, 217 of them, is assigned to
+another routed GSI; a vector is freed when its line's last binding is removed). Nothing changes on
+an error.
 
 ---
 
@@ -2110,8 +2143,8 @@ derivation tree node (child of the source slot).
 success; `SyscallError` on failure.
 
 The copy is a derivation (child of `src_cap` in the tree). Both the original and
-the copy remain valid. The copy of an `Mmio` or `IoPort` capability references a fresh object, as
-for `SYS_CAP_DERIVE`. With `dst_slot == 0` the kernel auto-allocates a free
+the copy remain valid. The copy of an `Mmio`, `IoPort`, or `Interrupt` capability references a
+fresh object, as for `SYS_CAP_DERIVE`. With `dst_slot == 0` the kernel auto-allocates a free
 slot (and returns it); with a non-zero `dst_slot` the cap is placed at that
 caller-chosen index — the path init uses to populate well-known slots in new
 service CSpaces before starting their threads. This caller-chosen-slot mode
@@ -2145,9 +2178,10 @@ to it is stopped and the call never returns (see
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
-or SEED cannot back an `Mmio` or `IoPort` copy's object), `QuotaExceeded` (dst CSpace directory
-structurally full, an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
-copies, or any other source's object has its reference count at its 2^31 ceiling).
+or SEED cannot back an `Mmio`, `IoPort`, or `Interrupt` copy's object), `QuotaExceeded` (dst
+CSpace directory structurally full, an `Mmio`, `IoPort`, or `Interrupt` source's range already has
+`RANGE_COPY_LIMIT` (64) live copies, or any other source's object has its reference count at its
+2^31 ceiling).
 
 ---
 
@@ -2565,7 +2599,8 @@ source of truth.
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
 [Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
 [core/ktest/README.md](../../ktest/README.md),
-[Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
+[Capability Model](../../../docs/capability-model.md),
+[Device Management](../../../docs/device-management.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Testing](../../../docs/testing.md),
 [services/drivers/serial/README.md](../../../services/drivers/serial/README.md),

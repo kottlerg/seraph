@@ -98,13 +98,14 @@ An entry an existing open Issue already names cites it in the recommendation.
   as well as a better bound.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_MODULES` and `INIT_MAX_NAMED_MODULES` (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS`
-  and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` and
-  `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
+  and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE`,
+  `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and
+  virtio-blk's.
 - **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
   depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
   (`bounded_wait::DEADLOCK_BUDGET_US`) are the time-based model.
-- **Hidden global pools.** The kernel's 512 KiB SEED also funds split bodies, Mmio and IoPort
-  copies, and IOPB tables at runtime.
+- **Hidden global pools.** The kernel's 512 KiB SEED also funds split bodies, Mmio, IoPort, and
+  Interrupt copies, and IOPB tables at runtime.
 
 ## Catalogue
 
@@ -177,7 +178,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | CSpace geometry asserts | `core/kernel/src/cap/cspace.rs` | `MAX_SLOTS_STRUCTURAL <= 1 << CAP_INDEX_BITS`, page fits | encoding artefact | none | correct as is | Keep |
 | `CSpace.next_leaf`, `pool_exhaustions` | `core/kernel/src/cap/cspace.rs` | `u32` | encoding artefact (`next_leaf` asserted against `MAX_LEAVES`); `pool_exhaustions` is a wrapping diagnostic counter | embedded | correct as is | None |
 | `ROOT_CSPACE_INIT_SLOT_CAPACITY` | `core/kernel/src/cap/mod.rs` | 1536 slots | refillable seed (init augments) | about 29 pages | correct as is | None |
-| `SEED_RESERVE_BYTES` (`SEED_MEMORY`) | `core/kernel/src/cap/mod.rs` | 512 KiB | current peak plus headroom (boot footprint) | 512 KiB pinned | needs a design | Also funds split bodies, Mmio and IoPort copies and IOPB tables at runtime; fund them from the caller (#260) |
+| `SEED_RESERVE_BYTES` (`SEED_MEMORY`) | `core/kernel/src/cap/mod.rs` | 512 KiB | current peak plus headroom (boot footprint) | 512 KiB pinned | needs a design | Also funds split bodies, Mmio, IoPort, and Interrupt copies and IOPB tables at runtime; fund them from the caller (#260) |
 | `MAX_DRAIN_BLOCKS` | `core/kernel/src/cap/mod.rs` | 4096 coalesced extents | current peak plus headroom (the fragmentation of free RAM, not its size) | 64 KiB BSS, used once | needs a design | Overflow is fatal with the count; size the buffer from the drained extent count, or write straight into the InitInfo block (#636) |
 | `CSPACE_LAYOUT_MAX_DESCRIPTORS` | `core/kernel/src/cap/mod.rs` | 5504 (`ACPI_REGION_DESCRIPTOR_TERM`, 1024, covers the ACPI region caps, one per memory-map entry of that type) | encoding artefact (sum of other ceilings) | about 129 KiB BSS | needs a design | About 8x what InitInfo holds; write straight into the InitInfo block |
 | `CSpaceLayout.module_names` | `core/kernel/src/cap/mod.rs` | 12 (`INIT_MAX_NAMED_MODULES`) | ABI width (init protocol) | embedded | needs a design | Names past 12 are dropped without a message; see the boot section |
@@ -254,14 +255,13 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 The entries left open are tracked by the Issue each recommendation names: the vector space by
 [#325](https://github.com/kottlerg/seraph/issues/325), the per-CPU slabs by
 [#636](https://github.com/kottlerg/seraph/issues/636), the vector-register save area by
-[#658](https://github.com/kottlerg/seraph/issues/658), shared lines by
-[#664](https://github.com/kottlerg/seraph/issues/664), and `IOAPICS` by the boot section's Issue.
+[#658](https://github.com/kottlerg/seraph/issues/658), and `IOAPICS` by the boot section's Issue.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| IRQ routing table (`irq::init_table`) | `core/kernel/src/irq.rs` | one entry per line the discovered controllers implement (`interrupts::irq_line_count`) | hardware (the discovered I/O APICs' GSIs; the PLIC's `riscv,ndev`) | 24 B per line from the buddy at Phase 5 | correct as is | None |
-| `unregister_notification` walk | `core/kernel/src/irq.rs` | the routed lines (`LineSet`) | provable unreachability (scales with the registrations) | none | correct as is | None |
-| `IrqRoute.notification` | `core/kernel/src/irq.rs` | one per line | single owner per wired line: devmgr carves each line once (its "One IRQ-bearing driver per INTx line" row) | none | needs a design | Shared `INTx` lines, with the kernel's notification binding and acknowledgement semantics for them (#664) |
+| IRQ routing table (`irq::init_table`) | `core/kernel/src/irq.rs` | one entry per line the discovered controllers implement (`interrupts::irq_line_count`) | hardware (the discovered I/O APICs' GSIs; the PLIC's `riscv,ndev`) | 40 B per line from the buddy at Phase 5 (`table_bytes`: `size_of::<IrqRoute>()` = 32 B, const-asserted beside the struct: an 8 B binding-list head, a 4 B in-flight count padded to 8, and the 8 B bound and 8 B owing masks; plus the routed-line set's 2 x 4 B) | correct as is | None |
+| `unregister_notification` walk | `core/kernel/src/irq.rs` | the routed lines (`LineSet`), and each one's bindings | provable unreachability (scales with the bindings) | none | correct as is | None |
+| `MAX_IRQ_BINDINGS` (`LineMasks`) | `core/kernel/src/irq.rs` | 64 bindings per line | provable unreachability (plausible hardware; one bit per binding in an atomic word) | none (one bit per binding in the routing-table entry; each binding lives in its Interrupt object) | correct as is | None: PCI Express requires every interrupting function to support MSI or MSI-X, SR-IOV virtual functions have no `INTx`, and once message-signalled delivery is served (#325, design intent) only legacy-only functions stay on wired lines, so more than 64 on one line is not plausible hardware (Linux's `IRQF_ONESHOT` `threads_oneshot` bitmask refuses a sharer past `BITS_PER_LONG`); a registration past it returns `QuotaExceeded` |
 | x86_64 `DEVICE_VECTOR_COUNT` (`VECTOR_GSI`) | `core/kernel/src/arch/x86_64/ioapic.rs` | 217 device vectors (33-249), one generated stub each | hardware spec (x86 vector space less the exception, timer, IPI and spurious vectors), on one destination's vector space | 868 B BSS, 217 stubs of 16 B | needs a design | GSIs routed at once stop at 217; per-CPU vector spaces belong with the MSI work (#325) |
 | x86_64 `ROOT_IRQ_COUNT`, `MAX_IRQ_ID` | `core/kernel/src/arch/x86_64/mod.rs` | `MAX_IOAPICS` x `IOAPIC_MAX_PINS` = 2048 / 2047 | ABI width (boot protocol) times hardware spec (8-bit redirection-entry count) | none | correct as is | Follows `MAX_IOAPICS`; a GSI above it is logged at boot |
 | `IOAPIC_MAX_PINS` | `core/kernel/src/arch/x86_64/ioapic.rs` | 256 | hardware spec (I/O APIC version register) | none | correct as is | None |
@@ -748,6 +748,7 @@ production value is raised.
 | `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
 | `SLOTS_PER_PAGE`, `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 56 / 4097 | mirror of kernel `L2_SIZE`; one past the former 4096-entry registry | about 16 KiB BSS | correct as is | Reference or assert against `L2_SIZE` |
 | `HOLDERS`, `WAKERS` | `core/ktest/src/stress/sleep_list_wide.rs` | 192 / 64 | test fixture (past the former 128-entry sleep list) | 1 MiB BSS | correct as is | None |
+| `MAX_IRQ_BINDINGS` (`Held`) | `core/ktest/src/integration/irq_shared_line.rs` | 64 | mirror of kernel `MAX_IRQ_BINDINGS` | about 540 B stack (`Held` and the bound-cap array) | correct as is | Reference the kernel constant if it moves to an ABI crate |
 | `MAX_PINNED` | `core/ktest/src/bench/tlb.rs` | 7 | test fixture | 224 KiB BSS | correct as is | None |
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |

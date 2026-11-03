@@ -121,7 +121,7 @@ kernel's own objects are retyped from the SEED reserve, pinned at the Phase 7 ha
 the front of the largest extent drained from the buddy allocator
 ([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies of
 split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
-split children), the bodies of Mmio and IoPort copies and derivations
+split children), the bodies of Mmio, IoPort, and Interrupt copies and derivations
 ([capability-internals.md](capability-internals.md) § Copies and Lineages), and per-thread
 port-binding tables (the IOPB and its binding records) are also carved from SEED at runtime;
 every other userspace object comes from the capability a `cap_create_*` syscall names.

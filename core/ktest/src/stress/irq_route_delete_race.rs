@@ -30,11 +30,13 @@
 //! repeatedly unmasks the line (`SYS_IRQ_ACK`; each delivery masks it again)
 //! and raises the interrupt, so deliveries follow one another, while a
 //! deleter pinned to CPU 1 waits a varying delay and deletes the
-//! notification's only capability. Each registration routes the line to the
-//! next CPU in turn (core/kernel/docs/arch-interface.md § `interrupts`), so most
-//! rounds deliver on a CPU other than the deleter's, where the delivery and the
-//! delete race; a round that delivers on CPU 1 serialises them instead, and only
-//! the CPU count bounds how many do. On every other round the deleter first
+//! notification's only capability. A registration that finds the line with no
+//! binding routes it to the next CPU in turn (core/kernel/docs/arch-interface.md
+//! § `interrupts`): every round's does but the one after a rerouted round, which
+//! rebinds the cap the spare holds and keeps its CPU. Most rounds therefore
+//! deliver on a CPU other than the deleter's, where the delivery and the delete
+//! race; a round that delivers on CPU 1 serialises them instead, and only the
+//! CPU count bounds how many do. On every other round the deleter first
 //! reroutes the line to a spare notification (`SYS_IRQ_REGISTER`), so the
 //! delete meets a route a replace already removed, the path whose teardown
 //! must still wait out a delivery that read the old route. A raise after the

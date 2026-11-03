@@ -463,17 +463,18 @@ impl Drop for MemoryReadGuard<'_>
 
 /// Most copies of one range-capability lineage that may be live at once: the
 /// `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` copies of an
-/// `Mmio` or `IoPort` capability, each a fresh SEED-backed object
+/// `Mmio`, `IoPort`, or `Interrupt` capability, each a fresh SEED-backed object
 /// ([`object_for_new_slot`]). A copy past it returns `QuotaExceeded`.
 pub const RANGE_COPY_LIMIT: u32 = 64;
 
-/// The lineage an `Mmio` or `IoPort` object belongs to.
+/// The lineage an `Mmio`, `IoPort`, or `Interrupt` object belongs to.
 ///
 /// A boot mint or a range split produces a lineage *root*; copying a
-/// capability of either type produces a fresh object whose lineage names
-/// that root, so each capability slot owns its own object and the mappings
-/// or port bindings made through it are withdrawn when that object is freed
-/// (docs/capability-model.md § Mmio, § `IoPort`). The root's `live` holds
+/// capability of any of these types produces a fresh object whose lineage
+/// names that root, so each capability slot owns its own object and the
+/// mappings, port bindings, or interrupt binding made through it are withdrawn
+/// when that object is freed (docs/capability-model.md § Interrupt, § Mmio,
+/// § `IoPort`). The root's `live` holds
 /// [`ROOT_SHARE`] while the root has references (dropped when its reference
 /// count reaches zero) plus one per live copy; the root's body is freed when
 /// `live` reaches zero, so a copy's lineage pointer never dangles, and the copy
@@ -512,8 +513,8 @@ impl RangeLineage
     /// `QuotaExceeded` when `root` already has [`RANGE_COPY_LIMIT`] live copies.
     ///
     /// # Safety
-    /// `root` is a live `Mmio` or `IoPort` lineage root whose `live` count is
-    /// held above zero by a pinned member of the lineage.
+    /// `root` is a live `Mmio`, `IoPort`, or `Interrupt` lineage root whose
+    /// `live` count is held above zero by a pinned member of the lineage.
     unsafe fn reserve_copy(root: NonNull<KernelObjectHeader>)
     -> Result<Self, syscall::SyscallError>
     {
@@ -546,10 +547,10 @@ impl RangeLineage
     }
 }
 
-/// The lineage of an `Mmio` or `IoPort` object.
+/// The lineage of an `Mmio`, `IoPort`, or `Interrupt` object.
 ///
 /// # Safety
-/// `hdr` is a live `Mmio` or `IoPort` object.
+/// `hdr` is a live `Mmio`, `IoPort`, or `Interrupt` object.
 // cast_ptr_alignment: each object is constructed in place at a
 // size-class-aligned retype offset; the header sits at offset 0.
 #[allow(clippy::cast_ptr_alignment)]
@@ -561,6 +562,7 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
         {
             ObjectType::Mmio => &(*hdr.as_ptr().cast::<MmioObject>()).lineage,
             ObjectType::IoPort => &(*hdr.as_ptr().cast::<IoPortObject>()).lineage,
+            ObjectType::Interrupt => &(*hdr.as_ptr().cast::<InterruptObject>()).lineage,
             _ => crate::fatal("lineage_of: not a range-capability object"),
         }
     }
@@ -737,6 +739,10 @@ impl MmioObject
 /// A cap with `count == 1` is a single-IRQ cap usable with
 /// `sys_irq_register` / `sys_irq_ack`. Wider caps are delegatable
 /// range authorities: narrow them with `sys_irq_split` before use.
+///
+/// Each capability references an object of its own (a copy is a fresh object
+/// in its lineage, [`object_for_new_slot`]), so each carries its own binding of
+/// its line; freeing the object removes that binding (`irq::unregister`).
 #[repr(C)]
 pub struct InterruptObject
 {
@@ -745,6 +751,33 @@ pub struct InterruptObject
     pub start: u32,
     /// Number of consecutive IRQ lines covered by the cap.
     pub count: u32,
+    /// The lineage this object belongs to (see [`RangeLineage`]).
+    lineage: RangeLineage,
+    /// This capability's binding of its line; unbound on a range cap.
+    pub binding: crate::irq::IrqBinding,
+}
+
+// InterruptObject fits the 128-byte retype size class every SEED mint, split,
+// and copy carves it from (`retype::round_to_class`).
+const _: () = assert!(core::mem::size_of::<InterruptObject>() <= 128);
+
+impl InterruptObject
+{
+    /// A lineage-root, unbound `Interrupt` object over `count` lines from
+    /// `start`, retyped from SEED.
+    pub fn new_root(start: u32, count: u32) -> Self
+    {
+        Self {
+            header: KernelObjectHeader::with_ancestor(
+                ObjectType::Interrupt,
+                crate::cap::seed_header_nn(),
+            ),
+            start,
+            count,
+            lineage: RangeLineage::new_root(),
+            binding: crate::irq::IrqBinding::unbound(),
+        }
+    }
 }
 
 /// Kernel object for an x86-64 I/O port range (`IoPort` capability).
@@ -1747,8 +1780,8 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
-/// Notification first clears its IRQ routes and waits out the device-IRQ
-/// deliveries in flight through them (`irq::unregister_notification`), for a
+/// Notification first removes its IRQ bindings and waits out the device-IRQ
+/// deliveries in flight on their lines (`irq::unregister_notification`), for a
 /// Notification or
 /// `EventQueue` waits for the timer's in-flight wakeup batch
 /// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
@@ -2115,7 +2148,7 @@ unsafe fn free_body<T>(
     }
 }
 
-/// Release the lineage share of a refcount-0 `Mmio` or `IoPort` object of
+/// Release the lineage share of a refcount-0 `Mmio`, `IoPort`, or `Interrupt` object of
 /// concrete type `T`, freeing whatever bodies that leaves unreferenced: a
 /// copy's own body at once, and its root's when the copy was the root's last
 /// live member; a root's body only once it has no live copy
@@ -2131,7 +2164,7 @@ unsafe fn release_range_object<T>(
     head: &mut usize,
 )
 {
-    // SAFETY: a live Mmio or IoPort object (caller contract).
+    // SAFETY: a live Mmio, IoPort, or Interrupt object (caller contract).
     let root = unsafe { lineage_of(ptr) }.root_of(ptr);
     if root != ptr
     {
@@ -2157,19 +2190,20 @@ unsafe fn release_range_object<T>(
 /// or `SYS_CAP_DERIVE_BADGE` from a slot naming `src` references, with the
 /// reference the new slot holds already taken.
 ///
-/// For an `Mmio` or `IoPort` capability this is a fresh SEED-backed object
-/// over the same range, in `src`'s lineage, so mappings and port bindings made
-/// through the new capability are withdrawn when it is deleted, consumed by a
-/// split, or revoked through an ancestor, whatever other capabilities to the
-/// range survive
-/// (docs/capability-model.md § Mmio, § `IoPort`). Every other type shares
-/// `src`, whose reference count is incremented.
+/// For an `Mmio`, `IoPort`, or `Interrupt` capability this is a fresh
+/// SEED-backed object over the same range, in `src`'s lineage, so mappings,
+/// port bindings, and the interrupt binding made through the new capability
+/// are withdrawn when it is deleted, consumed by a split, or revoked through an
+/// ancestor, whatever other capabilities to the range survive
+/// (docs/capability-model.md § Interrupt, § Mmio, § `IoPort`); an `Interrupt`
+/// copy starts unbound. Every other type shares `src`, whose reference count is
+/// incremented.
 ///
 /// The caller releases the returned reference with [`release_ref`] if the
 /// slot is never published.
 ///
 /// # Errors
-/// For `Mmio` and `IoPort`: `QuotaExceeded` when the lineage already has
+/// For `Mmio`, `IoPort`, and `Interrupt`: `QuotaExceeded` when the lineage already has
 /// [`RANGE_COPY_LIMIT`] live copies, and `OutOfMemory` when SEED cannot back
 /// the copy. For every other type: `QuotaExceeded` when `src`'s reference
 /// count is at [`REF_COUNT_LIMIT`].
@@ -2216,6 +2250,22 @@ pub unsafe fn object_for_new_slot(
             // SAFETY: as the Mmio arm.
             let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
             let mut body = IoPortObject::new_root(po.base, po.size);
+            body.lineage = lineage;
+            alloc_in_seed(body).inspect_err(|_| {
+                // SAFETY: as the Mmio arm.
+                unsafe { lineage_of(root) }
+                    .live
+                    .fetch_sub(1, Ordering::AcqRel);
+            })
+        }
+        CapTag::Interrupt =>
+        {
+            // SAFETY: tag Interrupt; src pinned (contract).
+            let io = unsafe { &*src.as_ptr().cast::<InterruptObject>() };
+            let root = io.lineage.root_of(src);
+            // SAFETY: as the Mmio arm.
+            let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
+            let mut body = InterruptObject::new_root(io.start, io.count);
             body.lineage = lineage;
             alloc_in_seed(body).inspect_err(|_| {
                 // SAFETY: as the Mmio arm.
@@ -2484,53 +2534,20 @@ unsafe fn dealloc_object_one(
         }
         ObjectType::Interrupt =>
         {
+            // Remove this capability's binding of its line before its bytes go
+            // (docs/capability-model.md § Interrupt): `irq::unregister` leaves an
+            // unbound object (every range cap, and a line cap never registered)
+            // untouched.
             // SAFETY: ptr points to a live InterruptObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<InterruptObject>()) };
-            let start = obj.start;
-            let count = obj.count;
-
-            // Only single-IRQ caps ever register a notification with the routing
-            // table and program the controller (sys_irq_register asserts
-            // `count == 1`). Range caps are delegation authorities; they
-            // have no routing-table footprint to clean up. Nor does a
-            // single-id cap outside the routable range, which
-            // sys_irq_register refuses; `irq::unregister` ignores an id
-            // inside it that lies past the discovered routing table.
-            if count == 1
-                && (crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID)
-                    .contains(&start)
-            {
-                // SAFETY: not interrupt context, and no IPC source, scheduler,
-                // or sleep-list lock is held (this function's contract), as
-                // `irq::unregister` requires; it masks and releases the line.
-                unsafe { crate::irq::unregister(start) };
-            }
-
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "Interrupt: every production cap is retype-backed (Phase-7 SEED, sys_irq_split SEED)"
-            );
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<InterruptObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<InterruptObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_cascade(worklist, head, ancestor_nn);
-            }
+            // SAFETY: not interrupt context, and no IPC source, scheduler, or
+            // sleep-list lock is held (this function's contract), as
+            // `irq::unregister` requires; the object stays live until the
+            // release below.
+            unsafe { crate::irq::unregister(obj.start, &obj.binding) };
+            // SAFETY: a refcount-0 Interrupt object whose binding is removed; no
+            // lock held.
+            unsafe { release_range_object::<InterruptObject>(ptr, worklist, head) };
         }
         ObjectType::IoPort =>
         {
@@ -3648,11 +3665,11 @@ unsafe fn dealloc_object_one(
 
             if !state.is_null()
             {
-                // Clear the IRQ routes that point to this NotificationState and
-                // wait out the device-IRQ deliveries in flight through them on
-                // any CPU; a route an earlier replace or clear removed was
-                // drained by that change, so none reaches the state after the
-                // free below (irq::unregister_notification).
+                // Remove the IRQ bindings that name this NotificationState and
+                // wait out the device-IRQ deliveries in flight on their lines on
+                // any CPU; a binding an earlier rebind or unbind took it from
+                // was drained by that change, so none reaches the state after
+                // the free below (irq::unregister_notification).
                 // SAFETY: state is live; no IPC source, scheduler, or
                 // sleep-list lock is held, and this is not interrupt context.
                 unsafe { crate::irq::unregister_notification(state) };

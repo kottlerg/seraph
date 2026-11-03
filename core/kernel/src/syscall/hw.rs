@@ -6,7 +6,7 @@
 //! Hardware access syscall handlers.
 //!
 //! Implements:
-//! - `SYS_IRQ_ACK` (29): re-enable a masked interrupt line.
+//! - `SYS_IRQ_ACK` (29): acknowledge an interrupt line through its binding.
 //! - `SYS_IRQ_REGISTER` (30): bind a Notification to an interrupt line.
 //! - `SYS_MMIO_MAP` (34): map an MMIO region into an address space.
 //! - `SYS_IOPORT_BIND` (35): bind an I/O port range to a thread (`x86_64` only).
@@ -37,15 +37,17 @@ use syscall::SyscallError;
 
 // ── SYS_IRQ_ACK ───────────────────────────────────────────────────────────────
 
-/// `SYS_IRQ_ACK` (29): re-enable an interrupt line after the driver has handled
-/// the interrupt.
+/// `SYS_IRQ_ACK` (29): acknowledge an interrupt line after the driver has
+/// handled the interrupt.
 ///
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 ///
-/// Unmasks the IRQ line at the interrupt controller, allowing the next
-/// interrupt delivery, when a notification is registered on it; a line with
-/// no registration stays masked. The driver must call this after clearing the
-/// interrupt source in the device to avoid an interrupt storm.
+/// Clears the acknowledgement the cap's own binding owes and unmasks the line
+/// at the interrupt controller, allowing the next delivery, once no binding on
+/// the line owes one (`irq::ack`). Repeating it, or acknowledging with no
+/// delivery since the last acknowledgement, clears nothing; through a cap whose
+/// object is not bound it changes nothing. The driver must call this after
+/// clearing the interrupt source in the device to avoid an interrupt storm.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -70,24 +72,23 @@ pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
     // rejects a null cspace and checks tag and rights.
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
-    let irq_id = {
-        let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
-        // constructed in place at a size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
-        let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
-        if io.count != 1
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
-        io.start
-    };
+    let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+    // constructed in place at a size-class-aligned retype offset, and
+    // `irq_slot`'s pin keeps it live for this call.
+    #[allow(clippy::cast_ptr_alignment)]
+    let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
+    if io.count != 1
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
 
-    // Unmask at the interrupt controller to re-enable delivery, if the line is
-    // routed (`irq::ack` checks and unmasks under the routing lock).
+    // Clear this binding's debt, and unmask the line once none owes
+    // (`irq::ack` does both under the routing lock).
     // SAFETY: syscall context, not interrupt context, with no IPC source,
-    // scheduler, or sleep-list lock held.
-    unsafe { crate::irq::ack(irq_id) };
+    // scheduler, or sleep-list lock held; `io` is live and its line is
+    // `io.start`.
+    unsafe { crate::irq::ack(io.start, &io.binding) };
 
     Ok(0)
 }
@@ -105,19 +106,28 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 /// arg1 = Notification cap index (must have NOTIFY right).
 ///
+/// Binds the cap's own object (each copy of an Interrupt cap is an object of
+/// its own) to the Notification; a line holds one binding per bound object, up
+/// to `irq::MAX_IRQ_BINDINGS`. Through an object already bound, rebinds it to
+/// the new Notification (`irq::register`).
+///
 /// When the interrupt fires:
 /// 1. The IRQ is masked at the controller.
-/// 2. Bit 0 is `ORed` into the Notification.
-/// 3. Any thread blocked on `SYS_NOTIFICATION_WAIT` for this notification is woken.
-/// 4. The driver must call `SYS_IRQ_ACK` to re-enable delivery.
+/// 2. Every binding on the line owes an acknowledgement.
+/// 3. Bit 0 is `ORed` into each bound Notification, and any thread blocked on
+///    `SYS_NOTIFICATION_WAIT` for it is woken.
+/// 4. Each driver calls `SYS_IRQ_ACK`; the line is unmasked once none owes.
 ///
-/// On `x86_64`: assigns the GSI a device IDT vector and programs its IOAPIC
-/// redirection entry (masked until first ACK). On RISC-V: assigns the PLIC
-/// source a target hart (masked at the controller until first ACK).
+/// The line's first binding routes it: on `x86_64` it assigns the GSI a device
+/// IDT vector and programs its IOAPIC redirection entry, on RISC-V it assigns
+/// the PLIC source a target hart, masked until the first ACK in both cases. A
+/// later binding masks the line, which stays masked until that binding's
+/// first ACK.
 ///
 /// Returns 0 on success; `InvalidArgument` for an id no discovered controller
 /// implements, `QuotaExceeded` when the controller has no delivery resource left
-/// (x86-64: every device vector assigned).
+/// (x86-64: every device vector assigned) or the line already holds
+/// `MAX_IRQ_BINDINGS` bindings.
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -142,19 +152,18 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
     // rejects a null cspace and checks tag and rights.
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
-    let irq_id = {
-        let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
-        // constructed in place at a size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
-        let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
-        if io.count != 1
-        {
-            // Range caps must be narrowed via SYS_IRQ_SPLIT before register.
-            return Err(SyscallError::InvalidArgument);
-        }
-        io.start
-    };
+    let irq_obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+    // constructed in place at a size-class-aligned retype offset, and
+    // `irq_slot`'s pin keeps it live for this call.
+    #[allow(clippy::cast_ptr_alignment)]
+    let io = unsafe { &*irq_obj.as_ptr().cast::<InterruptObject>() };
+    if io.count != 1
+    {
+        // Range caps must be narrowed via SYS_IRQ_SPLIT before register.
+        return Err(SyscallError::InvalidArgument);
+    }
+    let irq_id = io.start;
     // The root Interrupt cap spans the controller's whole id space
     // (`ROOT_IRQ_COUNT`); refuse an id outside the routable range here, and
     // `irq::register` refuses a line no discovered controller implements.
@@ -177,16 +186,21 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Route the line at its controller (left masked: the x86_64 IOAPIC
+    // Bind the cap's object to the notification, routing the line at its
+    // controller for its first binding (left masked: the x86_64 IOAPIC
     // redirection entry, the RISC-V PLIC source; the driver unmasks via
-    // SYS_IRQ_ACK after registering) and record the notification in the IRQ
-    // routing table, both under the table's routing lock.
+    // SYS_IRQ_ACK after registering), under the table's routing lock.
     // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock held;
-    // sig_state is the live state of the Notification cap resolved above.
-    unsafe { crate::irq::register(irq_id, sig_state) }.map_err(|e| match e
+    // sig_state is the live state of the Notification cap resolved above; `io`
+    // is live, its line is `irq_id`, and its dealloc arm unbinds it
+    // (`irq::unregister`) before it is freed.
+    unsafe { crate::irq::register(irq_id, &io.binding, sig_state) }.map_err(|e| match e
     {
         crate::irq::RouteError::NoSuchLine => SyscallError::InvalidArgument,
-        crate::irq::RouteError::Exhausted => SyscallError::QuotaExceeded,
+        crate::irq::RouteError::Exhausted | crate::irq::RouteError::TooManyBindings =>
+        {
+            SyscallError::QuotaExceeded
+        }
     })?;
 
     Ok(0)
@@ -707,9 +721,8 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
+    use crate::cap::object::{InterruptObject, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
-    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, IrqRights};
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
@@ -767,17 +780,9 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     // `header.ancestor` points at SEED so dealloc returns the bytes via
     // `retype_free`.
 
-    let child1_ptr = alloc_in_seed(InterruptObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
-        start,
-        count: lower_count,
-    })?;
+    let child1_ptr = alloc_in_seed(InterruptObject::new_root(start, lower_count))?;
 
-    let child2_ptr = match alloc_in_seed(InterruptObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
-        start: split_at,
-        count: upper_count,
-    })
+    let child2_ptr = match alloc_in_seed(InterruptObject::new_root(split_at, upper_count))
     {
         Ok(p) => p,
         Err(e) =>

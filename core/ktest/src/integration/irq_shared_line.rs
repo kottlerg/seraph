@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// core/ktest/src/integration/irq_shared_line.rs
+
+//! Integration: several capabilities to one interrupt line, each its own
+//! binding.
+//!
+//! A copy or derivation of an Interrupt capability is a fresh object with a
+//! binding of its own, so receivers sharing a wired line each bind, are each
+//! signalled, and each acknowledge; the line is unmasked only once none owes an
+//! acknowledgement (core/kernel/docs/syscalls.md § `SYS_IRQ_REGISTER` and
+//! § `SYS_IRQ_ACK`).
+//!
+//! The stand-in device is the UART ktest already owns: setting its
+//! transmit-empty interrupt enable while the holding register is empty raises
+//! its line (`crate::arch::serial::raise_tx_interrupt`), and clearing it lowers
+//! the line again before every acknowledgement. Two derivations A and B of the
+//! carved line bind notifications N1 and N2, and then:
+//!
+//! 1. one raise signals both;
+//! 2. after A alone acknowledges, the line stays masked: a raise signals
+//!    neither, and an acknowledgement through a third derivation that never
+//!    registered changes nothing;
+//! 3. after B acknowledges, a raise signals both again;
+//! 4. with A owing and B acknowledged, deleting A unmasks the line, and a raise
+//!    signals N2 alone;
+//! 5. rebinding B to N3 keeps one binding: one acknowledgement unmasks the
+//!    line, a raise signals N3 alone, and it does so again after the next.
+//!
+//! Then the line and 63 of its copies, bound to one notification, fill the
+//! line's `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration
+//! returns `QuotaExceeded`, and succeeds once a binding goes.
+
+use syscall::{
+    RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive, irq_ack, irq_register,
+    notification_wait_timeout,
+};
+use syscall_abi::SyscallError;
+
+use crate::arch::serial::{UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt};
+use crate::{TestContext, TestResult};
+
+/// The kernel's `MAX_IRQ_BINDINGS`: bindings one line holds.
+const MAX_IRQ_BINDINGS: usize = 64;
+/// Wait for a delivery that must come, in ms, through [`crate::scaled_bound`].
+const DELIVERY_TIMEOUT_MS: u64 = 1000;
+/// Wait for a delivery that must not come, in ms.
+const QUIET_WAIT_MS: u64 = 20;
+
+/// Capability handles a scenario made, deleted when it ends.
+struct Held
+{
+    handles: [u32; MAX_IRQ_BINDINGS + 4],
+    len: usize,
+}
+
+impl Held
+{
+    const fn new() -> Self
+    {
+        Self {
+            handles: [0; MAX_IRQ_BINDINGS + 4],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, handle: u32) -> u32
+    {
+        self.handles[self.len] = handle;
+        self.len += 1;
+        handle
+    }
+
+    /// Delete every held handle. A handle a scenario already deleted fails
+    /// its generation check here and is skipped.
+    fn release(&mut self)
+    {
+        for &handle in self.handles[..self.len].iter().rev()
+        {
+            cap_delete(handle).ok();
+        }
+        self.len = 0;
+    }
+}
+
+pub fn run(ctx: &TestContext) -> TestResult
+{
+    if !crate::serial::is_ready()
+    {
+        return Err("integration::irq_shared_line: UART not initialised");
+    }
+    let line = crate::unit::hw::isolate_irq_id(ctx, UART_IRQ)
+        .ok_or("integration::irq_shared_line: cannot carve the UART line")?;
+    let mut held = Held::new();
+    let shared = shared_line(ctx, line, &mut held);
+    quiet_tx_interrupt();
+    held.release();
+    let bounded = shared.and_then(|()| binding_bound(ctx, line, &mut held));
+    held.release();
+    cap_delete(line).ok();
+    bounded
+}
+
+/// The five steps of the module doc.
+fn shared_line(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
+{
+    let a = held.push(derive(line)?);
+    let b = held.push(derive(line)?);
+    let unbound = held.push(derive(line)?);
+    let n1 = held.push(notification(ctx)?);
+    let n2 = held.push(notification(ctx)?);
+    let n3 = held.push(notification(ctx)?);
+    irq_register(a, n1)
+        .and_then(|()| irq_register(b, n2))
+        .map_err(|_| "integration::irq_shared_line: binding A or B refused")?;
+    acknowledge(&[a, b])?;
+
+    raise_expect(&[n1, n2], &[], "one raise did not signal both bindings")?;
+
+    acknowledge(&[a, unbound])?;
+    raise_expect(
+        &[],
+        &[n1, n2],
+        "the line was unmasked before B's acknowledgement",
+    )?;
+
+    acknowledge(&[b])?;
+    raise_expect(
+        &[n1, n2],
+        &[],
+        "B's acknowledgement did not unmask the line",
+    )?;
+
+    acknowledge(&[b])?;
+    cap_delete(a).map_err(|_| "integration::irq_shared_line: cap_delete(A) failed")?;
+    raise_expect(&[n2], &[n1], "deleting the owing A did not leave B served")?;
+
+    irq_register(b, n3).map_err(|_| "integration::irq_shared_line: rebinding B refused")?;
+    acknowledge(&[b])?;
+    raise_expect(&[n3], &[n1, n2], "a rebind left more than one binding")?;
+    acknowledge(&[b])?;
+    raise_expect(&[n3], &[n2], "the rebound B was not served again")
+}
+
+/// The line's binding bound: [`MAX_IRQ_BINDINGS`] bindings fit, one more is
+/// refused, and a freed binding makes room.
+fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
+{
+    let ntf = held.push(notification(ctx)?);
+    irq_register(line, ntf)
+        .map_err(|_| "integration::irq_shared_line: binding the line refused")?;
+    let mut first_copy = 0;
+    for i in 1..MAX_IRQ_BINDINGS
+    {
+        let copy = held.push(derive(line)?);
+        if i == 1
+        {
+            first_copy = copy;
+        }
+        irq_register(copy, ntf)
+            .map_err(|_| "integration::irq_shared_line: a binding under the bound was refused")?;
+    }
+    let extra = held.push(derive(line)?);
+    if irq_register(extra, ntf) != Err(SyscallError::QuotaExceeded as i64)
+    {
+        return Err("integration::irq_shared_line: a binding past the bound was not refused");
+    }
+    cap_delete(first_copy).map_err(|_| "integration::irq_shared_line: cap_delete(copy) failed")?;
+    irq_register(extra, ntf)
+        .map_err(|_| "integration::irq_shared_line: a freed binding did not make room")
+}
+
+fn derive(line: u32) -> Result<u32, &'static str>
+{
+    cap_derive(line, RIGHTS_ALL).map_err(|_| "integration::irq_shared_line: cap_derive failed")
+}
+
+fn notification(ctx: &TestContext) -> Result<u32, &'static str>
+{
+    cap_create_notification(ctx.memory_base)
+        .map_err(|_| "integration::irq_shared_line: cap_create_notification failed")
+}
+
+fn acknowledge(caps: &[u32]) -> TestResult
+{
+    caps.iter()
+        .try_for_each(|&cap| irq_ack(cap))
+        .map_err(|_| "integration::irq_shared_line: irq_ack failed")
+}
+
+/// Raise the line once and require every notification in `signalled` to see
+/// bit 0 and none in `quiet` to see anything, then lower the line.
+fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
+{
+    raise_tx_interrupt();
+    let mut result = Ok(());
+    for &ntf in signalled
+    {
+        match notification_wait_timeout(ntf, crate::scaled_bound(DELIVERY_TIMEOUT_MS))
+        {
+            Ok(bits) if bits & 1 != 0 =>
+            {}
+            _ => result = Err(failure),
+        }
+    }
+    for &ntf in quiet
+    {
+        if notification_wait_timeout(ntf, QUIET_WAIT_MS) != Ok(0)
+        {
+            result = Err(failure);
+        }
+    }
+    quiet_tx_interrupt();
+    result
+}

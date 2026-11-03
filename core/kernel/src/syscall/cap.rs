@@ -107,7 +107,7 @@ pub(super) unsafe fn revalidate_src_under_lock(
 /// Give up the reference a copy or derive took for its new slot when the slot
 /// did not materialise. For a shared object the caller's source pin still
 /// holds it, so this is never the last reference; for the fresh object an
-/// `Mmio` or `IoPort` copy mints (`object_for_new_slot`) it is, and the
+/// `Mmio`, `IoPort`, or `Interrupt` copy mints (`object_for_new_slot`) it is, and the
 /// release frees it through `release_ref`.
 ///
 /// # Safety
@@ -1328,7 +1328,7 @@ fn pre_grow_for_explicit_slot(
 ///
 /// Copies the source capability's kernel object into the destination `CSpace`
 /// with the requested (attenuated) rights, increments the object's reference
-/// count (an `Mmio` or `IoPort` copy instead references a fresh object over the
+/// count (an `Mmio`, `IoPort`, or `Interrupt` copy instead references a fresh object over the
 /// same range, `QuotaExceeded` past `RANGE_COPY_LIMIT` live copies of its
 /// lineage), propagates the source badge, and wires the new slot as a child of the
 /// source in the derivation tree. When `arg2 == 0` a free slot is allocated;
@@ -1428,9 +1428,10 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     let effective_rights = rights_mask & src_rights;
 
     // Take the reference the new slot holds: on the source's object, or, for
-    // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
-    // mappings and port bindings made through the new capability are withdrawn
-    // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
+    // an `Mmio`, `IoPort`, or `Interrupt` capability, on a fresh object of its
+    // own, so the mappings, port bindings, and interrupt binding made through
+    // the new capability are withdrawn when it goes (docs/capability-model.md
+    // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
     let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
 
@@ -1562,9 +1563,10 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
     // Take the reference the new slot holds: on the source's object, or, for
-    // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
-    // mappings and port bindings made through the new capability are withdrawn
-    // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
+    // an `Mmio`, `IoPort`, or `Interrupt` capability, on a fresh object of its
+    // own, so the mappings, port bindings, and interrupt binding made through
+    // the new capability are withdrawn when it goes (docs/capability-model.md
+    // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
     let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
 
@@ -1688,9 +1690,10 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
     // Take the reference the new slot holds: on the source's object, or, for
-    // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
-    // mappings and port bindings made through the new capability are withdrawn
-    // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
+    // an `Mmio`, `IoPort`, or `Interrupt` capability, on a fresh object of its
+    // own, so the mappings, port bindings, and interrupt binding made through
+    // the new capability are withdrawn when it goes (docs/capability-model.md
+    // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
     let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
 

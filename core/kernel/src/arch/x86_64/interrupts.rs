@@ -741,9 +741,9 @@ pub fn mask(irq: u32)
 pub fn mask(_irq: u32) {}
 
 /// Unmask (enable delivery of) GSI `irq` at the I/O APIC. Called by `irq::ack`
-/// (`SYS_IRQ_ACK`) to re-enable delivery after the driver has serviced the interrupt,
-/// only for a routed GSI (one with a device vector) and under `irq`'s routing lock, so
-/// no route clear runs between its check and this unmask.
+/// (`SYS_IRQ_ACK`) and by a binding's removal to re-enable delivery once no binding on
+/// the line owes an acknowledgement, only for a routed GSI (one with a device vector) and
+/// under `irq`'s routing lock, so no route release runs between its check and this unmask.
 #[cfg(not(test))]
 pub fn unmask(irq: u32)
 {
@@ -758,7 +758,8 @@ pub fn unmask(_irq: u32) {}
 /// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: assign it a
 /// device vector ([`super::ioapic::assign_vector`]) and a destination CPU, and program its
 /// redirection entry. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
-/// handler. A GSI routed again keeps its vector and is given the next destination.
+/// handler. Called by `irq::register` for the GSI's first binding; the route is kept
+/// while any binding remains.
 ///
 /// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id the
 /// redirection entry's 8-bit physical destination field can name: below `0xFF`, which is

@@ -78,9 +78,8 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const CYCLES: u32 = 400;
 /// Fewest rounds at any width ([`super::scaled_attempts`]).
 const MIN_CYCLES: u32 = 40;
-/// Binding rounds at up to [`crate::UNSCALED_CPUS`] CPUs, and their fewest.
+/// Binding rounds, at every width.
 const BINDING_CYCLES: u32 = 200;
-const MIN_BINDING_CYCLES: u32 = 20;
 const MIN_CPUS: u64 = 2;
 const CONTROLLER_CPU: u32 = 0;
 const DELETER_CPU: u32 = 1;
@@ -135,7 +134,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let result = line.and_then(|line| {
         let cycles = [
             super::scaled_attempts(CYCLES, MIN_CYCLES, cpus),
-            super::scaled_attempts(BINDING_CYCLES, MIN_BINDING_CYCLES, cpus),
+            BINDING_CYCLES,
         ];
         let raced = race(ctx, line, cycles);
         quiet_tx_interrupt();

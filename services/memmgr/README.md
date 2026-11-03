@@ -203,6 +203,7 @@ mint or retire process badges (see [`docs/ipc-interface.md`](docs/ipc-interface.
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | System-wide memory ownership, memory-cap contract, page-reservation contract |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Boot order, ProcessInfo/InitInfo handover, process-death flow |
 | [docs/capability-model.md](../../docs/capability-model.md) | Memory cap rights, derivation, revocation |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Demand paging, with memmgr as the default system pager |
 | [docs/architecture.md](../../docs/architecture.md) | System design, tier-1 service roles |
 | [services/procmgr/README.md](../procmgr/README.md) | Sister tier-1 service for process lifecycle |
 | [services/init/README.md](../init/README.md) | Boot-time origin of memmgr's memory-cap pool |

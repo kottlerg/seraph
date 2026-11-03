@@ -514,8 +514,10 @@ fn ensure_index(l: &mut MemLedger)
 /// also how the first ingested run seeds the arena, before the pool holds
 /// anything. When that carve fails (both arena zones spent, the split of the
 /// run's first page refused, or the self-map failing), the run goes into the
-/// arena's reserve ([`push_last_resort`]); only with the reserve spent too
-/// does it stay owned and counted in `pool_total` but out of circulation.
+/// arena's reserve ([`push_last_resort`]); when the split cannot be merged
+/// back, the remainder takes the reserve before the head page. Only with the
+/// reserve spent does a run stay owned and counted in `pool_total` but out of
+/// circulation.
 fn insert_run(l: &mut MemLedger, run: FreeRun)
 {
     if ensure_slots(l, 1)
@@ -555,8 +557,9 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
             Some(rest) if merge(run.cap_slot, rest.cap_slot) => push_last_resort(l, run),
             Some(rest) =>
             {
-                // The multi-page remainder first: with one reserve slot left,
-                // the larger run is the one kept in circulation.
+                // The remainder first: it is never smaller than the one-page
+                // head, so with one reserve slot left it is the one kept in
+                // circulation.
                 push_last_resort(l, rest);
                 push_last_resort(
                     l,

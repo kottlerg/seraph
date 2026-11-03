@@ -131,8 +131,11 @@ pub fn reconcile_and_launch(
         }
     };
 
-    // Every copy below is fallible: a recipe the heap cannot hold is dropped
-    // with a log line, and the others still launch.
+    // The copies and collections this scan makes are fallible, and both sorts
+    // sort in place: a recipe whose name or path the heap cannot hold is
+    // dropped with a log line and the others still launch, and with no room
+    // for the parsed list none launches. The directory walk (`DirEntry::path`)
+    // and `parse` allocate inside std and svc-defs.
     let mut entries: Vec<String> = Vec::new();
     for ent in read
     {
@@ -155,7 +158,12 @@ pub fn reconcile_and_launch(
         {
             continue;
         }
-        let Some(name) = try_string(name).filter(|_| entries.try_reserve(1).is_ok())
+        if entries.try_reserve(1).is_err()
+        {
+            log!("svcmgr: no memory to list {name}; dropped");
+            continue;
+        }
+        let Some(name) = try_string(name)
         else
         {
             log!("svcmgr: no memory to list {name}; dropped");
@@ -167,19 +175,22 @@ pub fn reconcile_and_launch(
     // Deterministic launch order — purely for grep-ability of the
     // boot log; svcmgr makes no policy claim about start sequencing
     // across /config/svcmgr/services/ (services that depend on each other use
-    // discovery-registry lookups, not file-system ordering).
-    entries.sort();
+    // discovery-registry lookups, not file-system ordering). File names in
+    // one directory are unique, so the unstable sort, which needs no scratch
+    // allocation, gives the same order a stable one would.
+    entries.sort_unstable();
 
     // Parse every recipe first, then order providers (services that
     // publish their own endpoint via `provides = ...`) ahead of pure
     // consumers, so a provided name is in the discovery registry before
-    // any consumer launched here resolves it. `sort_by_key` is stable, so
-    // alphabetical order is preserved within each group.
+    // any consumer launched here resolves it. Names are unique, so ordering
+    // by (consumer, name) with the allocation-free unstable sort keeps
+    // alphabetical order within each group.
     let mut defs: Vec<Definition> = Vec::new();
     if defs.try_reserve_exact(entries.len()).is_err()
     {
         log!("svcmgr: no memory to parse {} recipes", entries.len());
-        report_orphans(pending);
+        release_unsupervised(pending);
         return;
     }
     for filename in &entries
@@ -208,7 +219,9 @@ pub fn reconcile_and_launch(
             Err(e) => log!("svcmgr: parse {path}: {e}"),
         }
     }
-    defs.sort_by_key(|d| d.provides.is_empty());
+    defs.sort_unstable_by(|a, b| {
+        (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
+    });
 
     for def in &defs
     {
@@ -459,6 +472,25 @@ fn build_entry(def: &Definition) -> Option<ServiceEntry>
 /// running for the services that did resolve cleanly. Releasing the
 /// thread cap here avoids leaking a slot per orphaned registration
 /// over svcmgr's lifetime.
+/// Release the thread cap of every pending registration when the scan has
+/// no memory to parse the recipes: the init-spawned services run on,
+/// unsupervised, and none is reported as a configuration error.
+fn release_unsupervised(pending: &mut [PendingRegistration])
+{
+    for slot in pending.iter_mut().filter(|p| !p.consumed)
+    {
+        log!(
+            "svcmgr: no memory for the recipes; {} runs unsupervised",
+            slot.name_str()
+        );
+        if slot.thread_cap != 0
+        {
+            let _ = syscall::cap_delete(slot.thread_cap);
+        }
+        slot.consumed = true;
+    }
+}
+
 fn report_orphans(pending: &[PendingRegistration])
 {
     for slot in pending

@@ -59,13 +59,17 @@ process creation to procmgr IPC.
   allocation (`bootstrap::bootstrap_procmgr` in
   `../src/bootstrap.rs`, called from `run()` in `../src/main.rs`).
 - Delegate the remaining RAM Memory caps to memmgr's CSpace via
-  `finalize_memmgr`, up to the forwarding stop: the first cap with no
-  `InitInfo` descriptor, or the one that would leave memmgr's or init's
-  `CSpace` short of its headroom, ends the forwarded prefix, and that cap
-  and every later one reach memmgr's pool through the reap donation
-  (§ Handover) instead. Serve a single bootstrap-IPC round carrying
-  the pool's memory-cap range + a read-only phys-table cap (so memmgr can
-  ingest its pool) (`finalize_memmgr`, served via `ipc::bootstrap::serve_round`; `../src/main.rs`).
+  `finalize_memmgr`, up to the forwarding stop, which ends the forwarded
+  prefix at the first cap that has no `InitInfo` descriptor, that comes
+  once memmgr's or init's `CSpace` headroom is already below its limit, or
+  whose derive or copy is refused. The descriptor-bearing caps from the
+  stop on reach memmgr's pool through the reap donation
+  ([Handover](#handover)) instead; a cap with no descriptor is not
+  donated (the kernel halts the boot rather than truncate the
+  descriptors, so that stop does not arise). Serve a single bootstrap-IPC
+  round carrying the pool's memory-cap range + a read-only phys-table cap
+  (so memmgr can ingest its pool) (`finalize_memmgr`, served via
+  `ipc::bootstrap::serve_round`; `../src/main.rs`).
   Init retains every boot-module Memory cap (its self-loaded
   memmgr/procmgr ELFs plus the devmgr/vfsd/driver modules) as sole
   owner; those donate to memmgr's pool on the reap-handoff route, not

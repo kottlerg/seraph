@@ -229,7 +229,7 @@ Each process virtual address space is represented by an `AddressSpace` object:
 ```rust
 pub struct AddressSpace
 {
-    /// Physical address of the root page table frame (PML4 / RISC-V root).
+    /// Physical address of the root page table frame (PML4 or PML5 / RISC-V root).
     root_phys: u64,
 
     /// Virtual address of the root frame (via the direct physical map).

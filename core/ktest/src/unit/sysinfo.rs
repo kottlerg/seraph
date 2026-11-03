@@ -153,8 +153,16 @@ pub fn user_va_top(ctx: &TestContext) -> TestResult
 {
     let top = system_info(SystemInfoType::UserVaTop as u64)
         .map_err(|_| "system_info(UserVaTop) failed")?;
-    // Sv39, x86-64 4-level (top page unmappable), Sv48, Sv57.
-    if ![1 << 38, (1 << 47) - PAGE_SIZE, 1 << 47, 1 << 56].contains(&top)
+    // Sv39, x86-64 4-level (top page unmappable), Sv48, x86-64 5-level
+    // (top page unmappable), Sv57.
+    if ![
+        1 << 38,
+        (1 << 47) - PAGE_SIZE,
+        1 << 47,
+        (1 << 56) - PAGE_SIZE,
+        1 << 56,
+    ]
+    .contains(&top)
     {
         return Err("system_info(UserVaTop) is no supported mode's user top");
     }

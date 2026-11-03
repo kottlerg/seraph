@@ -191,7 +191,7 @@ a per-boot drawn base (ASLR) up to the lowest bootstrap window
 `shared/process-layout` draws, past the std heap and reservation-arena zones,
 which memmgr, having no std runtime, does not use. The high zone continues
 above the shared 2^38 layout ceiling and exists only where the boot's paging
-mode has a wider user half (x86-64 4-level paging, Sv48, Sv57); under Sv39 the
+mode has a wider user half (x86-64 4- or 5-level paging, Sv48, Sv57); under Sv39 the
 kernel refuses the map and the arena ends with the low zone, which outlasts any
 RAM such a machine holds. Growth stops when neither zone has a page left or RAM
 is exhausted, surfaced as `QUOTA`.

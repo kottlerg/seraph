@@ -3,14 +3,117 @@
 
 // core/boot/src/arch/x86_64/paging.rs
 
-//! x86-64 4-level (PML4) page table construction for the bootloader.
+//! x86-64 page table construction for the bootloader, parameterized over
+//! the negotiated paging depth.
 //!
-//! Builds the minimal initial page tables needed for kernel handoff. Frame
-//! allocation and W^X enforcement follow `core/boot/docs/page-tables.md`
+//! [`negotiate_paging`] picks the depth at boot: 5-level (`CR4.LA57`) when
+//! CPUID reports LA57, 4-level otherwise. The depth fixes the hierarchy
+//! (four or five levels of 512-entry, 4 KiB tables) that [`BootPageTable`]
+//! builds, and the handoff installs it, through the LA57 toggle trampoline
+//! when the firmware runs the other depth
+//! (`core/boot/docs/page-tables.md` § x86-64: Negotiated Paging Depth).
+//! Frame allocation and W^X enforcement follow `core/boot/docs/page-tables.md`
 //! (preamble and § W^X Enforcement); `map` reports a W^X request as
 //! [`MapError::WxViolation`].
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use boot_protocol::x86_paging::{PagingDepth, table_index};
+
 use crate::paging::{MapError, PageFlags, PageTableBuilder};
+
+// ── Depth negotiation ─────────────────────────────────────────────────────────
+
+/// The paging depth negotiated by [`negotiate_paging`], as a level count. The
+/// bootloader is single-threaded; the 4-level default only stands in until
+/// negotiation runs (step 5), before any consumer (steps 6 and 10).
+static NEGOTIATED_LEVELS: AtomicU8 = AtomicU8::new(PagingDepth::Four as u8);
+
+/// The paging depth the bootloader builds tables for and installs at handoff.
+pub(crate) fn negotiated_depth() -> PagingDepth
+{
+    // The store site only writes PagingDepth discriminants, so the decode
+    // cannot fail.
+    match PagingDepth::from_levels(NEGOTIATED_LEVELS.load(Ordering::Relaxed))
+    {
+        Some(depth) => depth,
+        None => unreachable!(),
+    }
+}
+
+/// Negotiate the paging depth: 5-level when CPUID reports LA57, else 4-level.
+///
+/// When the chosen depth differs from the one the firmware runs (its
+/// `CR4.LA57`), the handoff must leave long mode to change it; this reserves
+/// an `EfiLoaderCode` page below 4 GiB for the LA57 toggle trampoline and
+/// copies the trampoline into it. When no such page can be allocated, the
+/// firmware's depth is kept, which needs no toggle.
+///
+/// # Safety
+/// `bs` must be valid boot services (before `ExitBootServices`), and the call
+/// must precede step 6, which builds the tables at the negotiated depth.
+#[cfg(not(test))]
+pub unsafe fn negotiate_paging(bs: *mut crate::uefi::EfiBootServices)
+{
+    let (max_leaf, ..) = super::cpuid(0, 0);
+    let leaf7_ecx = if max_leaf >= 7
+    {
+        super::cpuid(7, 0).2
+    }
+    else
+    {
+        0
+    };
+    let advertised = PagingDepth::from_cpuid_7_ecx(leaf7_ecx);
+    let firmware = PagingDepth::from_cr4(super::read_cr4());
+
+    let mut depth = advertised;
+    if depth != firmware
+    {
+        // SAFETY: bs is valid pre-ExitBootServices (caller contract).
+        let page = unsafe { crate::uefi::allocate_code_pages_max_addr(bs, 0xFFFF_FFFF, 1) };
+        if let Ok(page) = page
+        {
+            // SAFETY: page is a fresh, exclusively-owned EfiLoaderCode frame
+            // below 4 GiB, identity-mapped by the firmware; step 6 has not run.
+            unsafe { super::handoff::install_la57_toggle(page) };
+        }
+        else
+        {
+            crate::bprintln!(
+                "[--------] boot: WARNING: no page below 4 GiB for the LA57 toggle; \
+                 keeping the firmware's paging depth"
+            );
+            depth = firmware;
+        }
+    }
+
+    NEGOTIATED_LEVELS.store(depth as u8, Ordering::Relaxed);
+    crate::bprintln!(
+        "[--------] boot: paging depth {} (cpuid la57 {}; firmware {}-level; handoff {})",
+        depth.levels(),
+        if advertised.la57() { "yes" } else { "no" },
+        firmware.levels(),
+        if depth == firmware
+        {
+            "keeps the firmware depth"
+        }
+        else
+        {
+            "toggles CR4.LA57"
+        }
+    );
+}
+
+/// Host-test stand-in: the CPUID and CR4 reads need ring 0, so host tests
+/// keep the 4-level default.
+///
+/// # Safety
+/// Safe to call at any point; the argument is unused.
+#[cfg(test)]
+pub unsafe fn negotiate_paging(_bs: *mut crate::uefi::EfiBootServices) {}
+
+// ── Page tables ───────────────────────────────────────────────────────────────
 
 /// PTE bit: Present.
 const PTE_PRESENT: u64 = 1 << 0;
@@ -19,37 +122,51 @@ const PTE_WRITABLE: u64 = 1 << 1;
 // Bit 2 (U/S) = 0 for supervisor-only; never set in bootloader mappings.
 /// PTE bit: No-Execute (NX, bit 63). Set for all non-executable mappings.
 const PTE_NO_EXECUTE: u64 = 1 << 63;
+/// Mask of the physical-address bits \[51:12\] of a table-pointer entry.
+const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Page size in bytes (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 /// Number of entries in a single page table (all levels).
 const TABLE_ENTRIES: usize = 512;
 
+/// Highest physical address the root table may occupy: the LA57 toggle
+/// trampoline loads it into CR3 from compatibility mode with a 32-bit move.
+const ROOT_MAX_PHYS: u64 = 0xFFFF_FFFF;
+
 /// Capacity of the page-table frame log used for post-handoff reclamation.
 ///
-/// Covers the root PML4 plus every intermediate frame `map` allocates for the
-/// mappings `core/boot/docs/page-tables.md` § Contract at Kernel Entry lists.
-/// The reclaim array's backing page in `BootInfo` holds up to
+/// Covers the root plus every intermediate frame `map` allocates for the
+/// mappings `core/boot/docs/page-tables.md` § Contract at Kernel Entry lists,
+/// and the LA57 toggle page when one is installed. Five-level paging adds
+/// one intermediate level (one extra frame per distinct top-level chain), so
+/// the cap matches the riscv64 builder's, which covers Sv57. The reclaim
+/// array's backing page in `BootInfo` holds up to
 /// `boot_protocol::MAX_RECLAIM_RANGES` (256) entries, so this cap is the
 /// binding limit; `alloc_table` returns `None` once exhausted, propagating as
 /// `BootError::OutOfMemory` — diagnose by bumping this constant rather than
 /// silently truncating.
-const FRAME_LOG_CAP: usize = 128;
+const FRAME_LOG_CAP: usize = 160;
 
-/// x86-64 4-level page table builder.
+/// x86-64 page table builder for the negotiated paging depth.
 ///
-/// Holds the physical address of the PML4 root and the UEFI boot services
-/// pointer used to allocate intermediate table frames on demand.
+/// Holds the physical address of the root table (PML4 or PML5) and the UEFI
+/// boot services pointer used to allocate intermediate table frames on
+/// demand.
 pub struct BootPageTable
 {
-    /// Physical address of the PML4 root table.
+    /// Physical address of the root table, below 4 GiB.
     root_phys: u64,
+    /// Translation levels of the negotiated depth (4 / 5), captured from
+    /// [`negotiated_depth`] at construction.
+    levels: usize,
     /// UEFI boot services pointer for frame allocation.
     bs: *mut crate::uefi::EfiBootServices,
     /// Physical addresses of every frame allocated for this builder's tables
-    /// (root + every intermediate frame), appended to `BootInfo.reclaim_ranges`
-    /// for kernel reclamation per `core/boot/docs/page-tables.md` § Page Table
-    /// Frame Tracking.
+    /// (root + every intermediate frame), and of the LA57 toggle page when
+    /// one is installed, which is dead once the kernel runs. Appended to
+    /// `BootInfo.reclaim_ranges` for kernel reclamation per
+    /// `core/boot/docs/page-tables.md` § Page Table Frame Tracking.
     frame_log: [u64; FRAME_LOG_CAP],
     /// Number of valid entries in [`Self::frame_log`].
     frame_log_len: usize,
@@ -59,9 +176,9 @@ impl PageTableBuilder for BootPageTable
 {
     fn new(bs: *mut crate::uefi::EfiBootServices) -> Option<Self>
     {
-        // SAFETY: bs is valid pre-ExitBootServices; allocate_pages returns a
-        // physical address of a freshly allocated EfiLoaderData region.
-        let root_phys = unsafe { crate::uefi::allocate_pages(bs, 1).ok()? };
+        // SAFETY: bs is valid pre-ExitBootServices; the allocation returns the
+        // physical address of a fresh EfiLoaderData page below 4 GiB.
+        let root_phys = unsafe { crate::uefi::allocate_pages_max_addr(bs, ROOT_MAX_PHYS, 1).ok()? };
         // SAFETY: root_phys points to one PAGE_SIZE region of allocated memory.
         // Zeroing ensures all entries have P=0 (not present); absent entries
         // are never walked by the hardware regardless of other bits.
@@ -72,11 +189,19 @@ impl PageTableBuilder for BootPageTable
         }
         let mut frame_log = [0u64; FRAME_LOG_CAP];
         frame_log[0] = root_phys;
+        let mut frame_log_len = 1;
+        let toggle = super::handoff::la57_toggle_page();
+        if toggle != 0
+        {
+            frame_log[1] = toggle;
+            frame_log_len = 2;
+        }
         Some(Self {
             root_phys,
+            levels: negotiated_depth().levels(),
             bs,
             frame_log,
-            frame_log_len: 1,
+            frame_log_len,
         })
     }
 
@@ -117,40 +242,25 @@ impl BootPageTable
 {
     /// Map a single 4 KiB page at virtual address `virt` to physical address `phys`.
     ///
-    /// Walks the four-level PML4 hierarchy, allocating intermediate table frames
-    /// on demand. Writes the leaf PTE with the permissions encoded in `flags`.
+    /// Walks the negotiated depth's hierarchy from the root (PML5 or PML4)
+    /// down, allocating intermediate table frames on demand. Writes the leaf
+    /// PTE with the permissions encoded in `flags`.
     fn map_4k_page(&mut self, virt: u64, phys: u64, flags: &PageFlags) -> Result<(), MapError>
     {
-        // Extract 9-bit table indices from the virtual address.
-        // Each index selects one of 512 entries in the corresponding table.
-        let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
-        let pml3_idx = ((virt >> 30) & 0x1FF) as usize;
-        let pml2_idx = ((virt >> 21) & 0x1FF) as usize;
-        let pml1_idx = ((virt >> 12) & 0x1FF) as usize;
+        let mut table_phys = self.root_phys;
+        for level in (1..self.levels).rev()
+        {
+            // SAFETY: table_phys is the root frame allocated in new() or a
+            // child frame from ensure_table: a valid, identity-mapped 4 KiB
+            // table. The index is within [0, 511].
+            let table =
+                unsafe { core::slice::from_raw_parts_mut(table_phys as *mut u64, TABLE_ENTRIES) };
+            table_phys = self.ensure_table(&mut table[table_index(level, virt)])?;
+        }
 
-        // ── Level 4 (PML4) ────────────────────────────────────────────────────
-        // SAFETY: root_phys is the physical address of a valid, zeroed 4 KiB
-        // frame allocated in new(). The index is within [0, 511].
-        let pml4 =
-            unsafe { core::slice::from_raw_parts_mut(self.root_phys as *mut u64, TABLE_ENTRIES) };
-
-        let pml3_phys = self.ensure_table(&mut pml4[pml4_idx])?;
-
-        // ── Level 3 (PDPT) ────────────────────────────────────────────────────
-        // SAFETY: Same as pml4 above; frame from ensure_table, index in [0, 511].
-        let pml3 = unsafe { core::slice::from_raw_parts_mut(pml3_phys as *mut u64, TABLE_ENTRIES) };
-
-        let pml2_phys = self.ensure_table(&mut pml3[pml3_idx])?;
-
-        // ── Level 2 (PD) ─────────────────────────────────────────────────────
-        // SAFETY: Same as pml4 above; frame from ensure_table, index in [0, 511].
-        let pml2 = unsafe { core::slice::from_raw_parts_mut(pml2_phys as *mut u64, TABLE_ENTRIES) };
-
-        let pml1_phys = self.ensure_table(&mut pml2[pml2_idx])?;
-
-        // ── Level 1 (PT) — leaf PTE ───────────────────────────────────────────
-        // SAFETY: Same as pml4 above; frame from ensure_table, index in [0, 511].
-        let pml1 = unsafe { core::slice::from_raw_parts_mut(pml1_phys as *mut u64, TABLE_ENTRIES) };
+        // ── Level 0 (PT) — leaf PTE ───────────────────────────────────────────
+        // SAFETY: Same as the walk above; frame from ensure_table, index in [0, 511].
+        let pt = unsafe { core::slice::from_raw_parts_mut(table_phys as *mut u64, TABLE_ENTRIES) };
 
         // Build the leaf PTE. Physical frame number occupies bits [51:12].
         let mut pte = PTE_PRESENT | (phys & !0xFFF);
@@ -164,7 +274,7 @@ impl BootPageTable
             pte |= PTE_NO_EXECUTE;
         }
 
-        pml1[pml1_idx] = pte;
+        pt[table_index(0, virt)] = pte;
 
         Ok(())
     }
@@ -182,8 +292,7 @@ impl BootPageTable
     {
         if *entry & PTE_PRESENT != 0
         {
-            // Extract the physical address: bits [51:12] of the PTE.
-            return Ok(*entry & 0x000F_FFFF_FFFF_F000);
+            return Ok(*entry & PTE_ADDR_MASK);
         }
 
         let frame = self.alloc_table().ok_or(MapError::OutOfMemory)?;

@@ -40,8 +40,8 @@ core/boot/
         ├── mod.rs              # Re-exports the active arch module
         ├── x86_64/
         │   ├── mod.rs              # x86-64 arch-dispatch surface (hooks + re-exports)
-        │   ├── paging.rs           # x86-64 4-level page table implementation
-        │   ├── handoff.rs          # CR3 write + kernel jump
+        │   ├── paging.rs           # x86-64 depth negotiation (LA57) + 4/5-level page tables
+        │   ├── handoff.rs          # CR3 write (or LA57 toggle trampoline) + kernel jump
         │   ├── serial.rs           # 16550 serial output for early debug
         │   └── acpi_kernel_mmio.rs # ACPI MADT kernel_mmio extraction
         └── riscv64/

@@ -140,11 +140,12 @@ Each feature is classified per architecture as one of:
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.
 - **LA57 (5-level paging)** — a larger-VA expansion above 4-level paging, the x86-64 analogue of
-  riscv64's Sv57: the bootloader enables it when CPUID reports it, and the kernel takes the
-  paging depth from `CR4.LA57` at entry, as riscv64 takes its mode from `satp` (design intent;
-  not yet implemented: the kernel uses 4-level paging, whose 128 TiB halves cap direct-mapped
-  RAM and each process's virtual address space below the 526 TB target of
-  [#177](https://github.com/kottlerg/seraph/issues/177)).
+  riscv64's Sv57: the bootloader enables it when CPUID reports it
+  ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging
+  Depth), and the kernel takes the paging depth from `CR4.LA57` at entry, as riscv64 takes its
+  mode from `satp`. Its 64 PiB halves meet the 526 TB target of
+  [#177](https://github.com/kottlerg/seraph/issues/177); without it the 4-level 128 TiB halves
+  cap direct-mapped RAM and each process's virtual address space below that target.
 
 ### Unsupported
 
@@ -272,10 +273,12 @@ Independent of the feature classification, the kernel imposes fixed platform lim
 - **Page size** is 4 KiB ([memory-model.md](memory-model.md)).
 - **Maximum RAM** is what the paging mode's kernel half can direct-map below the top-2 GiB kernel
   image window: the half less 2 GiB, so 128 TiB less 2 GiB under x86-64 4-level paging and riscv64
-  Sv48, 64 PiB less 2 GiB under Sv57, and 254 GiB under Sv39 ([memory-model.md](memory-model.md)); a
-  platform whose RAM reaches past it is refused at boot. No kernel table bounds RAM below that: the
-  Phase 3 page tables come from a carve of RAM sized to the machine
-  (`core/kernel/src/mm/paging.rs`).
+  Sv48, 64 PiB less 2 GiB under x86-64 5-level paging and Sv57, and 254 GiB under Sv39
+  ([memory-model.md](memory-model.md)); a platform whose RAM reaches past it is refused at boot.
+  Below a 4-level or Sv48 half no kernel table bounds RAM: the Phase 3 page tables come from a
+  carve of RAM sized to the machine (`core/kernel/src/mm/paging.rs`). Under 5-level paging or
+  Sv57 a direct map of petabytes would outgrow the stage-1 seed that maps the carve
+  (`BOOT_TABLE_POOL_SIZE`, [limits.md](limits.md)) and is refused in Phase 3.
 - **CPU count** is at most `boot_protocol::MAX_CPUS` (512); CPUs beyond it are not brought up.
 - **riscv64 vector length** is at most VLEN 512 (`MAX_VLENB`); a wider boot hart is refused at boot.
 

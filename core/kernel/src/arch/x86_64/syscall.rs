@@ -31,10 +31,12 @@
 //! base is active, and the exit path swaps back (with interrupts disabled)
 //! immediately before `sysretq`.
 //!
-//! A return RIP with any of bits 63:47 set is never returned to with `sysretq`,
-//! which would fault in ring 0 after the swap. None can arise: the top user page
-//! is unmappable (`paging::user_va_top`), so the address after a `syscall` is
-//! canonical, and configure and `WRITE_REGS` reject a non-canonical RIP. The exit
+//! A non-canonical return RIP (at or above the boot paging depth's lower-half
+//! limit, `1 << 47`, or `1 << 56` under `CR4.LA57`) is never returned to with
+//! `sysretq`, which would fault in ring 0 after the swap. None can arise: the
+//! top user page is unmappable (`paging::user_va_top`), so the address after a
+//! `syscall` is canonical, and configure and `WRITE_REGS` reject a
+//! non-canonical RIP. The exit
 //! path checks anyway and terminates such a thread as for an unhandled user #GP,
 //! without delivery to a bound fault handler (core/kernel/docs/syscalls.md
 //! § Syscall Entry and Exit).
@@ -180,11 +182,12 @@ unsafe extern "C" fn syscall_entry()
         // ── Phase 4: restore registers for sysretq ────────────────────────
         // sysretq raises #GP in ring 0, on the user RSP and after the GS swap,
         // when RCX is not canonical. With the top user page unmappable no
-        // syscall returns to such an address; a return RIP with any of bits
-        // 63:47 set (a kernel defect) is terminated as a user #GP instead.
+        // syscall returns to such an address; a return RIP at or above the
+        // depth's lower-half limit (`paging::USER_CANONICAL_LIMIT`, published
+        // at entry; a kernel defect) is terminated as a user #GP instead.
         "mov rax, [rsp + 120]",
-        "shr rax, 47",
-        "jnz 3f",
+        "cmp rax, qword ptr [rip + {canonical_limit}]",
+        "jae 3f",
         // sysretq: RIP←RCX, RFLAGS←R11, RSP stays as set.
         "mov rax, [rsp +   0]",     // return value (dispatch set tf.rax)
         "mov rbx, [rsp +   8]",
@@ -221,6 +224,7 @@ unsafe extern "C" fn syscall_entry()
 
         dispatch = sym crate::syscall::dispatch,
         terminate = sym super::idt::common_exception_handler,
+        canonical_limit = sym super::paging::USER_CANONICAL_LIMIT,
     );
 }
 

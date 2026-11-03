@@ -329,9 +329,10 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 `xtask/src/qemu.rs` passes
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
 plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
-`-cpu max,migratable=no` on x86-64 TCG. The explicit feature string is the source of
-truth on every supported QEMU, including the 10.2 the pinned CI image ships (§ Continuous
-Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
+`-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
+`,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
+string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
+ships (§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
 required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
 the first userspace mapping (see [platform-requirements.md](platform-requirements.md)). The
 named `-cpu rva23s64` model (QEMU ≥ 10.0, 2025-04) is a superset of this string that adds the

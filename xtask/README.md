@@ -70,7 +70,7 @@ or stamped for a different architecture.
 
 ```
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
-    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
+    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
 ```
 
 | Option | Description |
@@ -82,6 +82,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, `boot_protocol::MAX_CPUS`, which the kernel sizes its per-CPU structures from) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
+| `--x86-paging` | Guest x86-64 paging depth (default: `4`; x86_64 only, ignored on riscv64). Appends `la57=off` (`4`) or `la57=on` (`5`) to the QEMU `-cpu` model on every accelerator, which sets the CPUID LA57 bit the bootloader negotiates the depth from ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57`, per [docs/memory-model.md](../docs/memory-model.md) § x86-64. The default pins `4` because TCG's `-cpu max` otherwise advertises LA57. `5` on a native accelerator (KVM, HVF, WHPX, NVMM) whose host CPU lacks LA57 fails before launch, naming the TCG route (`SERAPH_ACCEL=tcg`), since QEMU would drop the property with a warning and boot 4-level |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -294,6 +295,7 @@ cargo xtask run-parallel \
     [--cpus N] \
     [--mem MIB] \
     [--riscv-mmu sv39|sv48|sv57] \
+    [--x86-paging 4|5] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-grace-secs SECONDS] \
@@ -311,6 +313,7 @@ cargo xtask run-parallel \
 | `--cpus` | `4` | vCPUs per guest (bounded by `1..=512`, `boot_protocol::MAX_CPUS`) |
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
+| `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
@@ -512,8 +515,12 @@ A pure runner; requires the ktest bundle composed:
 ```sh
 cargo xtask build [--arch x86_64|riscv64]
 cargo xtask compose-bundle --harness ktest [--arch x86_64|riscv64]
-cargo xtask test-kaslr [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
+cargo xtask test-kaslr [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] \
+    [--x86-paging 4|5]
 ```
+
+`--riscv-mmu` and `--x86-paging` have the semantics of `cargo xtask run`'s and select the mode
+whose floor the `nokaslr` boot expects.
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
 [docs/memory-model.md](../docs/memory-model.md) for the randomized layout.
@@ -568,7 +575,7 @@ pattern also matches legitimate prose.
 | Document | Content |
 |---|---|
 | [docs/build-system.md](../docs/build-system.md) | Toolchain, workspace layout, custom targets, sysroot, CI workflows |
-| [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout `test-kaslr` checks; RISC-V paging-mode ceiling behind `--riscv-mmu` |
+| [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout `test-kaslr` checks; RISC-V paging-mode ceiling behind `--riscv-mmu`; x86-64 paging depth behind `--x86-paging` |
 | [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` |
 | [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks |

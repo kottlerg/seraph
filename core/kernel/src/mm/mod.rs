@@ -27,10 +27,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Exclusive upper bound of user-half virtual addresses.
 ///
-/// The single kernel-wide gate for "is this VA in the user half": constant
-/// `(1 << 47) - 4096` on x86-64 (the top page of the lower half is kept
-/// unmappable; `arch::current::paging::user_va_top`); on riscv64 the active
-/// paging mode's half boundary (`1 << 38` / `1 << 47` / `1 << 56`), published at
+/// The single kernel-wide gate for "is this VA in the user half": on x86-64
+/// the boot paging depth's lower half less its top page (`(1 << 47) - 4096`,
+/// or `(1 << 56) - 4096` under `CR4.LA57`; the top page is kept unmappable,
+/// `arch::current::paging::user_va_top`); on riscv64 the active paging mode's
+/// half boundary (`1 << 38` / `1 << 47` / `1 << 56`); either is published at
 /// kernel entry.
 #[cfg(not(test))]
 #[inline]

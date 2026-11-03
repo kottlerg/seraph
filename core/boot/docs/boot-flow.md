@@ -140,9 +140,11 @@ RAM-class and firmware-exclusive ranges, heuristic PCI windows every non-MMIO ra
 there with the UEFI memory map's `MemoryMappedIO` regions (firmware-parsing.md
 § [`mmio_apertures` construction](firmware-parsing.md#mmio_apertures-construction)).
 
-On RISC-V the paging mode is negotiated here, from the DTB `mmu-type` claim and
-a `satp` probe, before step 6 fixes the table hierarchy depth (see
-[page-tables.md](page-tables.md) § Mode negotiation).
+The paging depth is negotiated here, before step 6 fixes the table hierarchy depth: on
+RISC-V from the DTB `mmu-type` claim and a `satp` probe (see
+[page-tables.md](page-tables.md) § Mode negotiation), on x86-64 from the CPUID LA57 bit,
+reserving the LA57 toggle page when the depth differs from the firmware's (see
+[page-tables.md](page-tables.md) § x86-64: Negotiated Paging Depth).
 
 ### Step 5b: Allocate the AP Trampoline Page
 
@@ -236,7 +238,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `15`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `16`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|

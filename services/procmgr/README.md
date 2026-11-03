@@ -27,10 +27,11 @@ procmgr/
 │                                 argv/env blob decoder and cap split, the
 │                                 fs-reply bounds, the init-reap state
 │                                 machine, and the death-queue bind order
-│                                 and growth (`DeathQueues`)
+│                                 and growth, main wait set included
+│                                 (`DeathQueues`)
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
-│   ├── death_queues.rs         # The growable death-queue set (`DeathSet`)
+│   ├── death_queues.rs         # The death-queue set and main wait set (`DeathSet`)
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
 │   ├── init_reap.rs            # Init-reap: reaps init after handover
@@ -206,7 +207,7 @@ whose nodes return as their processes are destroyed, and only when every queue i
 creates a further queue, funded from procmgr's own memory, with twice the last pool (64 nodes first,
 up to `EVENT_QUEUE_MAX_CAPACITY`). A further queue is one contiguous grant from memmgr (about 24 MiB
 once a pool reaches the kernel maximum); when memmgr refuses it, procmgr retries at half the pool,
-down to the first pool's size, a grant of about two pages.
+down to the first pool's size, whose request is three pages.
 
 The queues share procmgr's main wait set with its service endpoint, and procmgr's death-queue set
 (`DeathSet`, `src/death_queues.rs`) owns that wait set: it starts with room for two members (the
@@ -214,9 +215,11 @@ endpoint and the first queue), and when the queues fill it, procmgr creates one 
 members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one;
 the main loop waits on whichever is current. The kernel queues a member that is already ready when
 it is added, so the move loses no pending request or death post. Up to 1023 queues then hold far
-more nodes than twice the children procmgr's `CSpace` can hold; only RAM so fragmented that every
-grant above the first pool's is refused keeps the queues at that size, which caps procmgr near
-32 K live processes. A bind that still fails (procmgr out of memory) fails the spawn, the
+more nodes than twice the children procmgr's `CSpace` can hold. Only RAM so fragmented that memmgr
+refuses every request above three pages keeps the queues small: they settle at 128 nodes, the
+largest pool a three-page request covers, and 1023 of them hold about 65 K live processes. A
+replaced wait set of 32 members or more stays charged to procmgr, at most 14 pages over its life
+(docs/limits.md). A bind that still fails (procmgr out of memory) fails the spawn, the
 address-space bind included.
 
 Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and

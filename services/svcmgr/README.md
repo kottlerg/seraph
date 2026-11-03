@@ -35,7 +35,7 @@ svcmgr/
 ├── src/
 │   ├── main.rs                    # main() (std runtime), IPC dispatch,
 │   │                              # dispatch_deaths, initiate_graceful_shutdown
-│   ├── death_queues.rs            # The growable death-queue set (`DeathSet`)
+│   ├── death_queues.rs            # The death-queue set and main wait set (`DeathSet`)
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives

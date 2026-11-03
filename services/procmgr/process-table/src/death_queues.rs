@@ -398,6 +398,19 @@ mod tests
     }
 
     #[test]
+    fn a_wait_set_grown_before_a_refused_queue_stays_grown()
+    {
+        // The caller's wider set is already live when the create fails, so
+        // the policy must keep counting it.
+        let mut set = DeathQueues::new(4, 2);
+        assert_eq!(set.grow(|_| Ok(1), no_ws), Ok(1));
+        let result = set.grow(|_| Err(OUT_OF_MEMORY), |_, _| Ok(()));
+        assert_eq!(result, Err(OUT_OF_MEMORY));
+        assert_eq!(set.ws_members(), 4);
+        assert_eq!(set.queues(), [1]);
+    }
+
+    #[test]
     fn the_wait_set_grows_no_wider_than_the_kernel_maximum()
     {
         let mut set = DeathQueues::new(4, WAIT_SET_MAX_MEMBERS / 2);

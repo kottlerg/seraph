@@ -92,8 +92,12 @@ impl DeathSet
     /// death, growing the set when every queue is out of nodes.
     ///
     /// # Errors
-    /// The `SYS_THREAD_BIND_NOTIFICATION` error, or `OutOfMemory` when no
-    /// further queue can be created.
+    /// The `SYS_THREAD_BIND_NOTIFICATION` error; `OutOfMemory` when no
+    /// further queue can be created, or when the main wait set must widen
+    /// and cannot (it is already `WAIT_SET_MAX_MEMBERS` wide, or the wider
+    /// set cannot be funded); or the `SYS_WAIT_SET_REMOVE` /
+    /// `SYS_WAIT_SET_ADD` error that stopped the move into a wider set (every
+    /// member is back in the old one).
     pub fn bind_thread(&self, thread_cap: u32, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::thread_bind_notification(thread_cap, q, correlator))
@@ -103,8 +107,8 @@ impl DeathSet
     /// growing the set as [`Self::bind_thread`] does.
     ///
     /// # Errors
-    /// The `SYS_ASPACE_BIND_NOTIFICATION` error, or `OutOfMemory` when no
-    /// further queue can be created.
+    /// The `SYS_ASPACE_BIND_NOTIFICATION` error, or a growth error as for
+    /// [`Self::bind_thread`].
     pub fn bind_aspace(&self, aspace_cap: u32, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::aspace_bind_notification(aspace_cap, q, correlator))
@@ -163,6 +167,10 @@ impl DeathSet
             moved.push((source, badge));
         }
         self.ws_cap.set(new);
+        // A wait set of 32 members or more is a page-sized retype whose grant
+        // `object_slab_retype` keeps no handle to return, so the old set's
+        // pages stay charged to this service: at most 14 over its life
+        // (docs/limits.md, `FIRST_WAIT_SET_MEMBERS`).
         let _ = syscall::cap_delete(old);
         std::os::seraph::log!("procmgr: main wait set widened to {members} members");
         Ok(())

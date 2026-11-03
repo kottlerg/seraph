@@ -445,9 +445,10 @@ struct InputRuntime
     transport: PciTransport,
     queue_notify_off: u16,
     /// Notification the read loop waits on: signalled by the
-    /// interrupt-service thread after each delivery it acknowledged
-    /// ([`start_isr_thread`]), never signalled when no IRQ is bound, in which
-    /// case the bounded wait is a timed poll.
+    /// interrupt-service thread after each delivery it acknowledged and each
+    /// interrupt its timed ISR read finds ([`start_isr_thread`]), never
+    /// signalled when no IRQ is bound, in which case the bounded wait is a
+    /// timed poll.
     wake: u32,
     ring: EventRing,
     mods: ModifierState,
@@ -488,7 +489,7 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
             break;
         }
         // Wait for input. When an IRQ is bound the interrupt-service thread
-        // signals `wake` on each delivery, having read the ISR and
+        // signals `wake` on each interrupt, having read the ISR and
         // acknowledged the line itself; otherwise this is a timed poll. The
         // bounded wait re-drains every tick, so a lost or absent IRQ cannot
         // wedge the read.
@@ -505,38 +506,42 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Start the interrupt-service thread: the only waiter on
-/// `irq_notification`, the notification bound to the device's line. On every
-/// delivery it reads the ISR, which clears this device's assertion (the
-/// delivery is this device's or another's on the line), acknowledges the
-/// binding at once, and signals `wake` for the read loop.
-///
-/// Every binding on a line owes an acknowledgement for each delivery, and
-/// the kernel keeps the line masked until all of them have acknowledged
-/// (docs/device-management.md § Interrupt Delivery). A thread of its own,
-/// rather than the service loop, acknowledges, because the service loop
-/// blocks in `ipc_recv`, which has no timeout: a wait set over the service
-/// endpoint and the notification can report a sender that has since left,
-/// and the receive then blocks with the binding owing. Returns whether the
-/// thread started.
+/// Start the interrupt-service thread, which runs
+/// [`virtio_core::isr::serve_interrupts`] over `irq_notification`, the
+/// notification bound to the device's line: it acknowledges every delivery
+/// at once, a read in flight or not, and signals `wake` for the read loop.
+/// Returns whether the thread started.
 fn start_isr_thread(transport: PciTransport, irq_notification: u32, irq_cap: u32, wake: u32)
 -> bool
 {
     std::thread::Builder::new()
         .spawn(move || {
-            loop
-            {
-                if syscall::notification_wait(irq_notification).is_err()
-                {
-                    let _ = syscall::thread_yield();
-                    continue;
-                }
-                let _ = transport.read_isr();
-                let _ = syscall::irq_ack(irq_cap);
-                let _ = syscall::notification_send(wake, 1);
-            }
+            virtio_core::isr::serve_interrupts(
+                &transport,
+                irq_notification,
+                irq_cap,
+                wake,
+                isr_diag,
+            )
         })
         .is_ok()
+}
+
+/// Diagnostic hook of the interrupt-service loop's `RecvGuard`: one line at
+/// the start of a failure streak, one more before the fatal exit.
+fn isr_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("interrupt wait failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("interrupt wait wedged (err={err}); exiting");
+        }
+    }
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,

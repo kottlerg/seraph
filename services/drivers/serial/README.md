@@ -177,4 +177,5 @@ implemented.
 [Console Model](../../../docs/console-model.md),
 [Device Management](../../../docs/device-management.md),
 [programs/terminal/README.md](../../../programs/terminal/README.md),
+[devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [Driver Model](../docs/driver-model.md)

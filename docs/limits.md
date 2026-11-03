@@ -683,6 +683,7 @@ Every entry here is `correct as is`; none is tracked.
 | `MAX_QUEUE_SIZE` | `services/drivers/virtio/core/src/virtqueue.rs` | 32768; the bookkeeping is sized to the negotiated queue | hardware spec (VirtIO split ring) | 4 B per negotiated descriptor | correct as is | None |
 | `last_used_idx`, `avail.idx` | `services/drivers/virtio/core/src/virtqueue.rs` | `u16` | hardware spec (VirtIO split ring; `new` refuses a queue size that is not a power of two) | none | correct as is | None |
 | `RESET_TIMEOUT` | `services/drivers/virtio/core/src/pci.rs` | 5 s on the monotonic clock | tuning | none | correct as is | None |
+| `ISR_POLL_MS` | `services/drivers/virtio/core/src/isr.rs` | 50 ms | tuning (how late an interrupt whose edge the x86-64 I/O APIC dropped while its line was masked is seen, against idle wakeups) | one wakeup and one ISR read per 50 ms per IRQ-bound `VirtIO` driver while idle | correct as is | None |
 | virtio-blk `QUEUE_SIZE` | `services/drivers/virtio/blk/src/main.rs` | 4 | provably unreachable (one request in flight by design; one three-descriptor chain) | one ring page | correct as is | None |
 | `PartitionTable.entries` | `services/drivers/virtio/blk/src/lib.rs` | heap `Vec`, one entry per distinct registered range (a remount reuses its entry) | per-instance | none | correct as is | None |
 | `PartitionTable.next_badge` | `services/drivers/virtio/blk/src/lib.rs` | `u64`, one per distinct range | provably unreachable (2^63 ranges) | none | correct as is | None |

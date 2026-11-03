@@ -163,15 +163,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 /// over the expected wake and three orders under [`REQUEST_TIMEOUT`].
 const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
-/// How long each iteration polls the used ring before parking on the IRQ
-/// notification, on the monotonic clock. A wall-clock window, so the time it
-/// spans does not depend on the cost of a poll; QEMU completes a request in
-/// well under it, so the fast path never parks. A tuning value that bounds
-/// no capacity: a completion it misses is seen after the next wait.
+/// How long each iteration polls the used ring before parking on the
+/// completion notification, on the monotonic clock. A wall-clock window, so
+/// the time it spans does not depend on the cost of a poll; QEMU completes a
+/// request in well under it, so the fast path never parks. A tuning value
+/// that bounds no capacity: a completion it misses is seen after the next
+/// wait.
 const POLL_BURST: Duration = Duration::from_micros(500);
 
-/// Submit a read or write request and wait for its completion via IRQ
-/// notification, returning how the request ended.
+/// Submit a read or write request and wait for its completion via the
+/// completion notification, returning how the request ended.
 ///
 /// [`IoOutcome::Completed`] carries the status byte of the completion of the
 /// submitted chain. [`IoOutcome::NotQueued`] means the chain never reached
@@ -188,8 +189,8 @@ const POLL_BURST: Duration = Duration::from_micros(500);
 /// `sector`; the device transfers the entire run in one descriptor chain.
 ///
 /// Blocks on a bounded `notification_wait_timeout` on `completion` per
-/// iteration until the interrupt-service thread signals a delivery (it has
-/// already read the ISR and acknowledged the binding) or the per-iteration
+/// iteration until the interrupt-service thread signals an interrupt (it has
+/// already read the ISR, and acknowledged any delivery) or the per-iteration
 /// timeout elapses, then re-polls the used ring. The bounded wait ensures
 /// that a lost PLIC external interrupt on QEMU virt RISC-V cannot park this
 /// thread indefinitely — see the wait loop body for details.
@@ -266,7 +267,8 @@ pub fn submit_and_wait(
 
         // No completion yet — block on the completion notification with a
         // bounded timeout. The interrupt-service thread signals it after each
-        // delivery, having read the ISR and acknowledged the line itself.
+        // delivery, and after a timed ISR read that finds an interrupt no
+        // delivery reported, having read the ISR and acknowledged itself.
         // Ok(0) means timeout (notification_send rejects zero-bit sends, so 0
         // is unambiguous); Ok(_) means a real wake; Err means the cap path
         // failed and there's nothing useful to do but fall through and poll.

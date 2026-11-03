@@ -182,8 +182,9 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
   it while it is idle, and their devices' interrupts are lost (x86-64) or delayed (riscv64) until
   it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges on
   every wake ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
-  rule 5). A driver that does not acknowledge promptly needs its line kept exclusive: the serial
-  driver acknowledges only when its client reads
+  rule 5) and also reads its device's interrupt status on a bounded timeout, which the x86-64
+  limit below needs. A driver that does not acknowledge promptly needs its line kept exclusive:
+  the serial driver acknowledges only when its client reads
   ([services/drivers/serial/README.md](../services/drivers/serial/README.md#interrupts)
   § Interrupts), so devmgr keeps the UART line exclusive and shares no other device onto it. The
   UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA IRQ 4; the riscv64
@@ -200,8 +201,10 @@ The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/
 assertion that persists while the line is masked is delivered at the unmask. On x86-64 the I/O
 APIC entries are programmed edge-triggered, active-high (core/kernel/src/arch/x86_64/ioapic.rs),
 and on a shared level-triggered line an assertion while the line is masked or another device holds
-it high raises no new edge, so its receiver is not signalled until the line interrupts again; a
-driver's timed poll then finds its completion (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
+it high raises no new edge, and the device stays asserted until its interrupt status is read, so
+no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed read
+(`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
+finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
 `POLL_INTERVAL_MS`), so the loss is latency, not a hang. That is the x86-64 limit until
 `SYS_IRQ_REGISTER` takes a trigger and polarity word, which devmgr sets to level, active-low for
 PCI `INTx` (design intent, not yet implemented). Devices that need several interrupts are to get

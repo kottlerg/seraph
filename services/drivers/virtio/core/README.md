@@ -7,7 +7,10 @@ capability locations, which devmgr serialises into its `QUERY_DEVICE_INFO` reply
 driver, and the register layout derived from it (the distinct BARs the four register regions name,
 up to `MAX_VIRTIO_BARS`, and each region's place in the driver's register window). It also
 specifies the two bootstrap rounds devmgr serves a VirtIO PCI driver and decodes them on the driver
-side. The design is specified in [docs/virtio-architecture.md](../../docs/virtio-architecture.md).
+side, and provides the interrupt-service loop (`isr::serve_interrupts`) each VirtIO driver runs on
+a thread of its own, so it acknowledges every delivery on its line, a request in flight or not
+([driver-model.md](../../docs/driver-model.md) rule 5). The design is specified in
+[docs/virtio-architecture.md](../../docs/virtio-architecture.md).
 
 ---
 
@@ -21,6 +24,7 @@ virtio/core/
     ├── lib.rs            # Device status bits, VirtioPciStartupInfo QUERY_DEVICE_INFO payload,
     │                     #   RegisterLayout (per-BAR register window)
     ├── bootstrap.rs      # devmgr-to-driver bootstrap rounds (BAR caps, endpoint slots)
+    ├── isr.rs            # Interrupt-service loop (bounded wait, ISR read, acknowledge, signal)
     ├── pci.rs            # Modern PCI transport register access
     └── virtqueue.rs      # Split virtqueue rings and descriptors
 ```

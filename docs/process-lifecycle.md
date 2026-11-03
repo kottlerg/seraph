@@ -316,8 +316,9 @@ at creation time. Examples:
   endpoint, minted by procmgr per child via
   `cap_derive_badge(log_send_source, RIGHTS_EP_SEND, process_badge)`.
   The cap's kernel-attached badge equals procmgr's process badge,
-  whose low 32 bits are the death-EQ correlator procmgr binds
-  into logd's queue (logd compares the low words). Identity is
+  which is also the death-EQ correlator procmgr binds and the
+  correlator of the death entry procmgr posts to logd's death queue
+  (logd evicts the slot of that exact badge). Identity is
   reconciled across the three views without any auxiliary
   mapping.
 - `ProcessInfo.sched_control_cap` — baseline `SchedControl` cap covering the
@@ -483,7 +484,7 @@ The death-notification flow:
    from the kernel's thread states; a dropped address-space post is not
    recovered, and that process is reaped when its main thread exits (see
    [services/procmgr/README.md](../services/procmgr/README.md) § Process
-   table and death queue).
+   table and death queues).
 2. **Procmgr → memmgr.** Procmgr sends `PROCESS_DIED` to memmgr carrying
    the dead process's memmgr badge in `data[0]` (the badged cap is not
    transferred; procmgr deletes its copy afterwards). The badge identifies
@@ -498,6 +499,13 @@ The death-notification flow:
    §"Coalescing".
 5. **Procmgr clears its registry entry.** Independent of memmgr's
    reclamation; the procmgr-side process table releases its slot.
+6. **Procmgr → logd.** Once real-logd has registered its death queue,
+   procmgr posts the death entry `(exit_reason, process badge)` to it
+   after the teardown; logd evicts the dead sender's slot. procmgr, not
+   the kernel, is the source of logd's death events: logd binds no death
+   observer (see
+   [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md)
+   § `REGISTER_DEATH_EQ`).
 
 Memory caps the dead process held in its CSpace become unreachable when
 procmgr's teardown revokes and deletes the child's `CSpace`. Memmgr's

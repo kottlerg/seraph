@@ -98,8 +98,9 @@ svcmgr/
   resolves the namespace through `apply_namespace_policy`
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
 - **Health monitoring** — bind every supervised service's main
-  thread to one shared `deaths_eq` with `correlator =
-  service_index`. Detect crashes via async notifications, resyncing from
+  thread to svcmgr's death queues with `correlator = service_index`,
+  adding a queue when every pool is out of nodes. Detect crashes via
+  async notifications, resyncing from
   the kernel's thread states after a drain that may have followed a full
   queue ([docs/restart-protocol.md](docs/restart-protocol.md) § Death
   detection). The service table, its restart recipes, the pending

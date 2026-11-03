@@ -71,12 +71,11 @@ procmgr/
   fields (parent-chosen, per-process).
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
-  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
-  it retroactively on the main thread of every existing process, and
-  bind it on the main thread of every new spawn alongside procmgr's own
-  death observer (correlator = the process badge's low 32 bits, the
-  low word of logd's per-sender slot key). Threads a process creates
-  itself carry no logd binding. See
+  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, and post
+  to it the death entry `(exit_reason, process badge)` of every process
+  procmgr tears down after that (the badge is logd's per-sender slot
+  key). The kernel posts nothing to logd's queue: procmgr is the source
+  of logd's death events, so the queue needs no death-observer nodes. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
   init's Handover stage
@@ -194,25 +193,28 @@ no `main()` of either shape `abi/process-abi` describes.
 
 ---
 
-## Process table and death queue
+## Process table and death queues
 
 The process table lives on procmgr's heap, sorted by badge, and grows with the
-live process count. A spawn fails when the heap cannot grow it, or when procmgr's
-death queue has no free observer node for the child's main thread: the queue's
-pool of `DEATH_EQ_OBSERVERS` (1024) nodes, two per live process, is fixed at
-creation (#643 grows it). The kernel's death correlator is a `u64`, but procmgr
-still binds each child's death observers with the low 32 bits of its `u64` badge
-(adopting the full width is #643), and procmgr redraws a minted badge whose low 32
-bits a live process already holds: the correlator names one live process however
-large the table grows.
+live process count; a spawn fails when the heap cannot grow it. Each child's main
+thread and address space bind a death observer, with the child's full `u64` badge
+as the correlator, on one of procmgr's death `EventQueue`s. A bind takes one node
+from its queue's pool, fixed at the queue's creation, so procmgr keeps a growable
+set of queues: a bind tries the newest queue first, then the older ones, whose
+nodes return as their processes are destroyed, and only when every queue is out of
+nodes creates a further queue, funded from procmgr's own memory, with twice the
+last pool (64 nodes first, up to `EVENT_QUEUE_MAX_CAPACITY`). Up to
+`DEATH_QUEUES_MAX` (24) queues hold more nodes than twice the children procmgr's
+`CSpace` can hold, so the pools never bind first. A bind that still fails (procmgr
+out of memory) fails the spawn, the address-space bind included.
 
-Every child's main thread and address space post to one shared death
-`EventQueue` of a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256). The kernel
-drops a post to a full queue, so a drain that takes a full queue's worth of
-events or more rescans the table and reaps every entry whose main thread the
-kernel reports exited (`CAP_INFO_THREAD_STATE`). Any dropped post leaves a full
-queue of events behind it for that drain or the next, so the rescan runs after
-the drop. The rescan recovers main-thread deaths only: a dropped address-space
+Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
+procmgr drains every queue on each death wakeup. The kernel drops a post to a
+full queue, so a drain that takes a full queue's worth of events or more from
+one queue rescans the table and reaps every entry whose main thread the kernel
+reports exited (`CAP_INFO_THREAD_STATE`). Any dropped post leaves a full queue of
+events behind it for that drain or the next, so the rescan runs after the
+drop. The rescan recovers main-thread deaths only: a dropped address-space
 terminal-fault post, for a worker thread's fault while the main thread runs, is
 not recovered, since the kernel exposes no address-space fault state to read
 back; that process is reaped when its main thread exits. A reaped child stays in

@@ -102,6 +102,7 @@ impl Guest
             },
             incoming: None,
             riscv_mmu: args.riscv_mmu,
+            x86_paging: args.x86_paging,
         };
         let qemu_args = build_qemu_argv(&spec)?;
 
@@ -272,10 +273,14 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
 /// the bootloader's `default_direct_map_base`.
 fn mode_floor(args: &TestKaslrArgs) -> u64
 {
-    use crate::qemu::RiscvMmu;
+    use crate::qemu::{RiscvMmu, X86Paging};
     match args.arch
     {
-        Arch::X86_64 => 0xFFFF_8000_0000_0000,
+        Arch::X86_64 => match args.x86_paging
+        {
+            X86Paging::Four => 0xFFFF_8000_0000_0000,
+            X86Paging::Five => 0xFF00_0000_0000_0000,
+        },
         Arch::Riscv64 => match args.riscv_mmu
         {
             RiscvMmu::Sv39 => 0xFFFF_FFC0_0000_0000,

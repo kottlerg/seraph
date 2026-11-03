@@ -127,7 +127,7 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 //                                                            layout ceiling
 //
 // The high zone exists only where the paging mode's user half is wider than
-// the shared 2^38 layout ceiling (x86-64 4-level, Sv48, Sv57); under Sv39 the
+// the shared 2^38 layout ceiling (x86-64 4- or 5-level, Sv48, Sv57); under Sv39 the
 // kernel refuses the map and the arena ends at the low zone, which outlasts
 // the RAM such a machine can hold.
 

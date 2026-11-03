@@ -79,7 +79,10 @@ pub struct Cell
     /// The cell's name; a later run of a name already seen in the log carries
     /// ` #<n>`, so cells match across logs by name and occurrence.
     pub name: String,
+    /// Seconds from the cell's start stamp to its end stamp, or to the log's
+    /// last stamp for an unfinished cell.
     pub secs: f64,
+    /// How the cell ended.
     pub outcome: CellOutcome,
 }
 
@@ -87,7 +90,9 @@ pub struct Cell
 #[derive(Clone, Debug, PartialEq)]
 pub struct TierSpan
 {
+    /// `Tier 1`, `Tier 2`, `Tier S`, or `Tier 3`.
     pub name: String,
+    /// Seconds from the tier's marker to its end.
     pub secs: f64,
 }
 
@@ -105,12 +110,49 @@ pub struct Timing
     pub accel: Option<String>,
     /// Kernel timer start to `ktest: starting`.
     pub boot_secs: Option<f64>,
-    /// `ktest: starting` to the log's last ktest stamp.
+    /// `ktest: starting` to the log's last stamp.
     pub ktest_secs: Option<f64>,
     /// The host's wall time for the whole QEMU run, from the trailer.
     pub wall_secs: Option<f64>,
+    /// The tiers in log order.
     pub tiers: Vec<TierSpan>,
+    /// The cells in the order they ended (unfinished cells last).
     pub cells: Vec<Cell>,
+}
+
+/// Which ktest line a stamp heads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineKind
+{
+    /// `ktest: <message>`.
+    Ktest,
+    /// `[ktest] <terminal marker>`.
+    Marker,
+}
+
+/// The ktest prefix `text` opens with, and the offset of the message after it.
+fn ktest_prefix(text: &str) -> Option<(LineKind, usize)>
+{
+    if text.starts_with("ktest: ")
+    {
+        Some((LineKind::Ktest, "ktest: ".len()))
+    }
+    else if text.starts_with("[ktest] ")
+    {
+        Some((LineKind::Marker, "[ktest] ".len()))
+    }
+    else
+    {
+        None
+    }
+}
+
+/// One `[S.uuuuuu] ` stamp on a line: its byte span and its seconds.
+struct Stamp
+{
+    start: usize,
+    end: usize,
+    at: f64,
 }
 
 /// The patterns the parser matches, compiled once per parse.
@@ -131,10 +173,8 @@ impl Patterns
     {
         let name = r"([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)+)";
         Ok(Self {
-            // The last stamp of a line wins and its message runs to the end of
-            // the line: kernel output can land on the same serial line as a
-            // ktest line when the two interleave.
-            stamp: Regex::new(r"\[(\d+\.\d{6})\] (ktest: |\[ktest\] )")?,
+            // The stamp the kernel console and ktest both print.
+            stamp: Regex::new(r"\[(\d+\.\d{6})\] ")?,
             width: Regex::new(r"scheduler initialised, (\d+) CPU")?,
             banner: Regex::new(r"Seraph kernel v\S+ \(([A-Za-z0-9_]+)\)")?,
             tier: Regex::new(r"^--- (Tier \S+): .* ---$")?,
@@ -225,7 +265,6 @@ impl Scan
 
     fn ktest_line(&mut self, p: &Patterns, at: f64, msg: &str)
     {
-        self.last = Some(at);
         if msg == "starting"
         {
             self.ktest_start = Some(at);
@@ -278,28 +317,37 @@ impl Scan
         {
             self.timing.arch = Some(c[1].to_string());
         }
-        let Some(c) = p.stamp.captures_iter(line).last()
-        else
+        let stamps: Vec<Stamp> = p
+            .stamp
+            .captures_iter(line)
+            .filter_map(|c| {
+                let m = c.get(0)?;
+                Some(Stamp {
+                    start: m.start(),
+                    end: m.end(),
+                    at: c[1].parse().ok()?,
+                })
+            })
+            .collect();
+        let before = self.last;
+        if let Some(s) = stamps.last()
         {
-            return;
-        };
-        let Ok(at) = c[1].parse::<f64>()
-        else
-        {
-            return;
-        };
-        let msg = line[c.get(0).map_or(0, |m| m.end())..].trim_end_matches('\r');
-        if &c[2] == "ktest: "
-        {
-            self.ktest_line(p, at, msg);
+            self.last = Some(s.at);
         }
+        let Some((kind, at, msg)) = locate_ktest_message(line, &stamps, before)
         else
         {
-            self.last = Some(at);
-            let msg = msg.trim();
-            if msg == "ALL TESTS PASSED" || msg == "SOME TESTS FAILED"
+            return;
+        };
+        match kind
+        {
+            LineKind::Ktest => self.ktest_line(p, at, msg),
+            LineKind::Marker =>
             {
-                self.timing.marker = Some(msg.to_string());
+                if msg == "ALL TESTS PASSED" || msg == "SOME TESTS FAILED"
+                {
+                    self.timing.marker = Some(msg.to_string());
+                }
             }
         }
     }
@@ -332,6 +380,35 @@ impl Scan
     }
 }
 
+/// The ktest message on `line`, its kind, and its time. ktest writes a line's
+/// stamp, its message, and its newline separately, so kernel output can land
+/// between them on the same serial line: the message is the one after the
+/// line's last ktest-prefixed stamp, ending where the next stamp begins, and a
+/// line that opens with a ktest prefix but no stamp (its stamp went to the
+/// line before, ahead of a kernel line) takes `before`, the latest stamp seen
+/// before it.
+fn locate_ktest_message<'a>(
+    line: &'a str,
+    stamps: &[Stamp],
+    before: Option<f64>,
+) -> Option<(LineKind, f64, &'a str)>
+{
+    let stamped = stamps.iter().enumerate().rev().find_map(|(i, s)| {
+        ktest_prefix(&line[s.end..]).map(|(kind, len)| (i, kind, s.at, s.end + len))
+    });
+    let (kind, at, start, end) = if let Some((i, kind, at, start)) = stamped
+    {
+        (kind, at, start, stamps.get(i + 1).map(|s| s.start))
+    }
+    else
+    {
+        let (kind, len) = ktest_prefix(line)?;
+        (kind, before?, len, stamps.first().map(|s| s.start))
+    };
+    let msg = line[start..end.unwrap_or(line.len())].trim_end();
+    Some((kind, at, msg))
+}
+
 /// A cell name without its ` #<n>` occurrence suffix.
 fn base_name(name: &str) -> &str
 {
@@ -358,7 +435,9 @@ pub fn parse_log(text: &str) -> Result<Timing>
 #[derive(Clone, Copy, Debug)]
 pub struct FlagRule
 {
+    /// The normalised ratio a row must exceed.
     pub threshold: f64,
+    /// The seconds by which a row's time must exceed the expected time.
     pub min_secs: f64,
 }
 
@@ -429,78 +508,78 @@ fn cell_note(reference: Option<&Cell>, measured: Option<&Cell>) -> String
     }
 }
 
-/// The tier rows, the cell rows (sorted by their normalised ratio, highest
-/// first, rows without one last), and the summary rows, in report order.
-fn compare_rows(reference: &Timing, measured: &Timing, factor: f64) -> Vec<Row>
+/// One row per tier either timing has, reference tiers first.
+fn tier_rows(reference: &Timing, measured: &Timing) -> Vec<Row>
 {
-    let mut rows = Vec::new();
-    let mut tier_names: Vec<&str> = reference.tiers.iter().map(|t| t.name.as_str()).collect();
+    let mut names: Vec<&str> = reference.tiers.iter().map(|t| t.name.as_str()).collect();
     for t in &measured.tiers
     {
-        if !tier_names.contains(&t.name.as_str())
+        if !names.contains(&t.name.as_str())
         {
-            tier_names.push(&t.name);
+            names.push(&t.name);
         }
     }
-    for name in tier_names
-    {
-        let secs = |t: &Timing| t.tiers.iter().find(|s| s.name == name).map(|s| s.secs);
-        rows.push(Row {
-            tier: name.to_string(),
-            name: "(tier)".to_string(),
-            reference: secs(reference),
-            measured: secs(measured),
-            note: String::new(),
-        });
-    }
+    names
+        .into_iter()
+        .map(|name| {
+            let secs = |t: &Timing| t.tiers.iter().find(|s| s.name == name).map(|s| s.secs);
+            Row {
+                tier: name.to_string(),
+                name: "(tier)".to_string(),
+                reference: secs(reference),
+                measured: secs(measured),
+                note: String::new(),
+            }
+        })
+        .collect()
+}
 
-    let mut cells = Vec::new();
-    for r in &reference.cells
+/// One row per cell either timing has, sorted by the normalised ratio,
+/// highest first, with the rows that have none (a cell missing from one side)
+/// last.
+fn cell_rows(reference: &Timing, measured: &Timing, factor: f64) -> Vec<Row>
+{
+    let row = |r: Option<&Cell>, m: Option<&Cell>, c: &Cell| Row {
+        tier: c.tier.clone(),
+        name: c.name.clone(),
+        reference: r.map(|c| c.secs),
+        measured: m.map(|c| c.secs),
+        note: cell_note(r, m),
+    };
+    let mut rows: Vec<Row> = reference
+        .cells
+        .iter()
+        .map(|r| row(Some(r), measured.cells.iter().find(|c| c.name == r.name), r))
+        .collect();
+    rows.extend(
+        measured
+            .cells
+            .iter()
+            .filter(|m| !reference.cells.iter().any(|c| c.name == m.name))
+            .map(|m| row(None, Some(m), m)),
+    );
+    rows.sort_by(|a, b| match (a.normalised(factor), b.normalised(factor))
     {
-        let m = measured.cells.iter().find(|c| c.name == r.name);
-        cells.push(Row {
-            tier: r.tier.clone(),
-            name: r.name.clone(),
-            reference: Some(r.secs),
-            measured: m.map(|c| c.secs),
-            note: cell_note(Some(r), m),
-        });
-    }
-    for m in &measured.cells
-    {
-        if !reference.cells.iter().any(|c| c.name == m.name)
-        {
-            cells.push(Row {
-                tier: m.tier.clone(),
-                name: m.name.clone(),
-                reference: None,
-                measured: Some(m.secs),
-                note: cell_note(None, Some(m)),
-            });
-        }
-    }
-    cells.sort_by(|a, b| {
-        let (x, y) = (a.normalised(factor), b.normalised(factor));
-        match (x, y)
-        {
-            (Some(x), Some(y)) => y.total_cmp(&x),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     });
-    rows.extend(cells);
+    rows
+}
 
-    for (name, get) in RUN_TIMES
-    {
-        rows.push(Row {
-            tier: "-".to_string(),
-            name: name.to_string(),
-            reference: get(reference),
-            measured: get(measured),
-            note: String::new(),
-        });
-    }
+/// The tier rows, the cell rows, and the whole-run rows, in report order.
+fn compare_rows(reference: &Timing, measured: &Timing, factor: f64) -> Vec<Row>
+{
+    let mut rows = tier_rows(reference, measured);
+    rows.extend(cell_rows(reference, measured, factor));
+    rows.extend(RUN_TIMES.iter().map(|(name, get)| Row {
+        tier: "-".to_string(),
+        name: (*name).to_string(),
+        reference: get(reference),
+        measured: get(measured),
+        note: String::new(),
+    }));
     rows
 }
 
@@ -544,25 +623,28 @@ enum Comparison
     SameWidth,
 }
 
-/// Render rows as a fixed-width table, FLAG column first.
-fn render_rows(out: &mut String, rows: &[Row], factor: f64, rule: FlagRule, kind: Comparison)
+/// The table's column heads.
+fn render_head(out: &mut String, kind: Comparison)
 {
-    if matches!(kind, Comparison::CrossWidth)
+    let _ = match kind
     {
-        let _ = writeln!(
+        Comparison::CrossWidth => writeln!(
             out,
             "{:<4}  {:<6}  {:>10}  {:>10}  {:>7}  {:>6}  NAME",
             "FLAG", "TIER", "BASE_S", "WIDE_S", "R", "R/F"
-        );
-    }
-    else
-    {
-        let _ = writeln!(
+        ),
+        Comparison::SameWidth => writeln!(
             out,
             "{:<4}  {:<6}  {:>10}  {:>10}  {:>7}  NAME",
             "FLAG", "TIER", "BASELINE_S", "LOG_S", "RATIO"
-        );
-    }
+        ),
+    };
+}
+
+/// Render rows as a fixed-width table, FLAG column first.
+fn render_rows(out: &mut String, rows: &[Row], factor: f64, rule: FlagRule, kind: Comparison)
+{
+    render_head(out, kind);
     for row in rows
     {
         let flag = if row.flagged(factor, rule)
@@ -573,7 +655,6 @@ fn render_rows(out: &mut String, rows: &[Row], factor: f64, rule: FlagRule, kind
         {
             ""
         };
-        let n = row.normalised(factor);
         let note = if row.note.is_empty()
         {
             String::new()
@@ -582,14 +663,11 @@ fn render_rows(out: &mut String, rows: &[Row], factor: f64, rule: FlagRule, kind
         {
             format!("  ({})", row.note)
         };
-        let ratios = if matches!(kind, Comparison::CrossWidth)
+        let n = fmt_ratio(row.normalised(factor));
+        let ratios = match kind
         {
-            let raw = row.normalised(1.0);
-            format!("{:>7}  {:>6}", fmt_ratio(raw), fmt_ratio(n))
-        }
-        else
-        {
-            format!("{:>7}", fmt_ratio(n))
+            Comparison::CrossWidth => format!("{:>7}  {n:>6}", fmt_ratio(row.normalised(1.0))),
+            Comparison::SameWidth => format!("{n:>7}"),
         };
         let _ = writeln!(
             out,
@@ -747,12 +825,15 @@ pub fn single_report(t: &Timing) -> String
 #[derive(Clone, Debug, PartialEq)]
 pub struct Baseline
 {
+    /// The `key<TAB>value` lines other than the timing's own, in file order.
     pub headers: Vec<(String, String)>,
+    /// The timing the file records.
     pub timing: Timing,
 }
 
 impl Baseline
 {
+    /// The value of header `key`, if the file has one.
     pub fn header(&self, key: &str) -> Option<&str>
     {
         self.headers
@@ -1026,14 +1107,17 @@ mod tests
                     [1.500000] ktest: FAIL ipc::call_reply\n\
                     [1.500000] ktest: reason text\n\
                     [2.000000] ktest: stress::mutual_stop starting\n\
-                    [9.000000] ktest: stress::mutual_stop: round 3\n";
+                    [9.000000] ktest: stress::mutual_stop: round 3\n\
+                    [12.000000] kernel: === WATCHDOG owed wake\n";
         let t = parse_log(text).unwrap();
         assert_eq!(cell(&t, "ipc::call_reply").outcome, CellOutcome::Fail);
+        // The hung cell and its tier run to the log's last stamp, the
+        // kernel's watchdog dump, not to the last ktest line.
         let hung = cell(&t, "stress::mutual_stop");
         assert_eq!(hung.outcome, CellOutcome::Unfinished);
-        assert!(close(hung.secs, 7.0));
+        assert!(close(hung.secs, 10.0));
         assert!(t.marker.is_none());
-        assert!(close(t.tiers[0].secs, 8.0));
+        assert!(close(t.tiers[0].secs, 11.0));
     }
 
     #[test]
@@ -1044,6 +1128,31 @@ mod tests
                     [1.100000] kernel: noise[1.250000] ktest: PASS cap::a\r\n";
         let t = parse_log(text).unwrap();
         assert!(close(cell(&t, "cap::a").secs, 0.25));
+    }
+
+    #[test]
+    fn kernel_output_after_a_ktest_message_on_one_line_does_not_hide_it()
+    {
+        let text = "[1.000000] ktest: RUN cap::a[1.010000] kernel: noise\n\
+                    [1.250000] ktest: PASS cap::a[1.300000] kernel: more noise\n";
+        let t = parse_log(text).unwrap();
+        let c = cell(&t, "cap::a");
+        assert_eq!(c.outcome, CellOutcome::Pass);
+        assert!(close(c.secs, 0.25));
+    }
+
+    #[test]
+    fn a_ktest_line_whose_stamp_a_kernel_line_took_uses_the_latest_stamp()
+    {
+        // ktest wrote `[1.200000] `, the kernel then wrote its own line, and
+        // ktest's message and newline followed on a line of their own.
+        let text = "[1.000000] ktest: RUN cap::a\n\
+                    [1.200000] [1.210000] kernel: noise\n\
+                    ktest: PASS cap::a\n";
+        let t = parse_log(text).unwrap();
+        let c = cell(&t, "cap::a");
+        assert_eq!(c.outcome, CellOutcome::Pass);
+        assert!(close(c.secs, 0.21));
     }
 
     #[test]

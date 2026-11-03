@@ -476,7 +476,7 @@ pub struct KtestTimingArgs
     pub write_baseline: Option<PathBuf>,
 
     /// The commit the LOG ran at, recorded by `--write-baseline`.
-    #[arg(long, default_value = "HEAD")]
+    #[arg(long, default_value = "HEAD", requires = "write_baseline")]
     pub commit: String,
 
     /// Flag a row whose normalised ratio exceeds this (R/F across widths,

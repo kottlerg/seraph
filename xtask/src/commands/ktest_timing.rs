@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::accel::{Accel, detect_for_arch};
+use crate::accel::detect_for_arch;
 use crate::arch::Arch;
 use crate::cli::KtestTimingArgs;
 use crate::context::Context as BuildContext;
@@ -128,8 +128,8 @@ fn write_baseline_file(
 }
 
 /// `commit`, the full hash of `rev`, and `ktest-commit`, the newest commit at
-/// or before it that changed `core/` (the bootloader, the kernel, or ktest),
-/// when that is another commit.
+/// or before it that changed anything the boot image or its QEMU launch is
+/// built from (all but `TIMING_INERT_PATHS`), when that is another commit.
 fn commit_headers(ctx: &BuildContext, rev: &str) -> Result<Vec<(String, String)>>
 {
     let git = |args: &[&str]| -> Result<String> {
@@ -145,14 +145,25 @@ fn commit_headers(ctx: &BuildContext, rev: &str) -> Result<Vec<(String, String)>
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     let commit = git(&["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
-    let core = git(&["log", "-1", "--format=%H", &commit, "--", "core/"])?;
+    let mut log = vec!["log", "-1", "--format=%H", commit.as_str(), "--", "."];
+    log.extend(TIMING_INERT_PATHS);
+    let code = git(&log)?;
     let mut headers = vec![("commit".to_string(), commit.clone())];
-    if !core.is_empty() && core != commit
+    if !code.is_empty() && code != commit
     {
-        headers.push(("ktest-commit".to_string(), core));
+        headers.push(("ktest-commit".to_string(), code));
     }
     Ok(headers)
 }
+
+/// The pathspecs `ktest-commit` ignores: changes there alter neither the boot
+/// image nor its QEMU launch.
+const TIMING_INERT_PATHS: [&str; 4] = [
+    ":(exclude,glob)**/*.md",
+    ":(exclude).claude",
+    ":(exclude).github",
+    ":(exclude)xtask/baselines",
+];
 
 /// The host keys of `crate::timing::HOST_KEYS` for the host this runs on and
 /// the architecture and accelerator of `timing`.
@@ -167,7 +178,7 @@ fn host_headers(timing: &Timing) -> Result<Vec<(String, String)>>
     let accel = match timing.accel.as_deref()
     {
         Some(name) => name.to_string(),
-        None => accel_name(detect_for_arch(arch)).to_string(),
+        None => detect_for_arch(arch).name().to_string(),
     };
     Ok(vec![
         ("host-cpu".to_string(), host_cpu()),
@@ -178,19 +189,6 @@ fn host_headers(timing: &Timing) -> Result<Vec<(String, String)>>
         ),
         ("accel".to_string(), accel_settings(&accel)),
     ])
-}
-
-/// The lower-case accelerator name `run-parallel --save-logs` writes.
-pub fn accel_name(accel: Accel) -> &'static str
-{
-    match accel
-    {
-        Accel::Kvm => "kvm",
-        Accel::Hvf => "hvf",
-        Accel::Whpx => "whpx",
-        Accel::Nvmm => "nvmm",
-        Accel::Tcg => "tcg",
-    }
 }
 
 fn first_line(program: &str, args: &[&str]) -> String

@@ -393,18 +393,23 @@ cargo xtask ktest-timing --write-baseline FILE [--commit REV] LOG
 
 The times come from the stamps ktest prints ([core/ktest/README.md](../core/ktest/README.md)
 § Test infrastructure): every line ktest logs opens with `[S.uuuuuu] `, the microseconds since
-the kernel's timer started. A cell runs from its `ktest: RUN <name>` (Tier 1) or
-`ktest: <name> starting` (Tier 2, Tier S) line to its `ktest: PASS <name>` or `ktest: FAIL <name>`
-line; a cell with no end line is `unfinished` and runs to the log's last stamp, which locates a
-HANG. A tier runs from its `ktest: --- Tier <id>: ... ---` marker to the next marker or the
-`ktest: passed=` summary. A name logged twice is matched by occurrence (`<name> #2`). The width is
-read from the kernel's `scheduler initialised, N CPUs` line and the architecture from its
+the kernel's timer started, the stamp the kernel console prints too. A cell runs from its
+`ktest: RUN <name>` (Tier 1) or `ktest: <name> starting` (Tier 2, Tier S) line to its
+`ktest: PASS <name>` or `ktest: FAIL <name>` line; a cell with no end line is `unfinished` and
+runs to the log's last stamp of any kind (a watchdog dump included), which locates a HANG. Kernel
+output can share a serial line with a ktest line, since ktest writes its stamp, its message, and
+the newline separately: a ktest message ends where the next stamp begins, and a `ktest: ` line
+whose stamp a kernel line took takes the latest stamp before it. A tier runs from its
+`ktest: --- Tier <id>: ... ---` marker to the next marker or the `ktest: passed=` summary. A
+name logged twice is matched by occurrence (`<name> #2`). The width is read from the kernel's
+`scheduler initialised, N CPUs` line and the architecture from its
 `Seraph kernel v<version> (<arch>)` banner, each else from the trailer, which also gives the host
 wall time.
 
 A comparison table lists the tier rows first, then the cells sorted by their normalised ratio,
 highest first (cells missing from one side last, with a note), then three whole-run rows: the boot
-(kernel timer start to `ktest: starting`), ktest's span (`ktest: starting` to its last stamp), and
+(kernel timer start to `ktest: starting`), ktest's span (`ktest: starting` to the log's last
+stamp), and
 the host wall time (from the trailer; it also covers the firmware and the bootloader). The `FLAG`
 column comes first; the table ends with the count of flagged rows.
 
@@ -419,7 +424,7 @@ column comes first; the table ends with the count of flagged rows.
 | `arch`, `cpus` | The log's architecture and width |
 | `marker` | ktest's terminal marker (`ALL TESTS PASSED`), or `-` |
 | `commit` | The full hash of `--commit` |
-| `ktest-commit` | Present only when it is another commit: the newest commit at or before `commit` that changed `core/` (the bootloader, the kernel, or ktest), so a baseline refreshed after an unrelated change names the code it times |
+| `ktest-commit` | Present only when it is another commit: the newest commit at or before `commit` that changed anything outside Markdown, `.claude/`, `.github/`, and `xtask/baselines/` (the code the boot image is built from and the QEMU launch), so a baseline refreshed after a documentation-only change names the code it times |
 | `date` | The UTC date the file was written |
 | `host-cpu` | The host's CPU model and its count of host CPUs |
 | `host-kernel` | `uname -sr` |

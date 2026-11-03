@@ -28,7 +28,6 @@ use regex::Regex;
 use crate::accel::detect_for_arch;
 use crate::arch::Arch;
 use crate::cli::RunParallelArgs;
-use crate::commands::ktest_timing::accel_name;
 use crate::context::Context as BuildContext;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
@@ -156,7 +155,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating --save-logs dir {}", dir.display()))?;
     }
-    let accel = accel_name(detect_for_arch(args.arch));
+    let accel = detect_for_arch(args.arch).name();
 
     step(&format!(
         "Starting run-parallel: arch={:?} parallel={} runs={} timeout={}s workdir={}",
@@ -1110,7 +1109,6 @@ mod tests
         }
     }
 
-    // SIGKILL (our own timeout kill, or OOM) is NOT a tolerated QEMU crash.
     #[test]
     fn a_saved_log_trailer_carries_what_the_timing_parser_reads()
     {
@@ -1139,6 +1137,7 @@ mod tests
         assert!((t.wall_secs.unwrap() - 71.25).abs() < 1e-9);
     }
 
+    // SIGKILL (our own timeout kill, or OOM) is NOT a tolerated QEMU crash.
     #[test]
     fn sigkill_is_not_qemu_crash()
     {

@@ -26,8 +26,8 @@
 //!      proving the process-exit syscall records the encoded code on the thread.
 
 use syscall::{
-    cap_delete, event_queue_create, event_try_recv, process_exit, thread_bind_notification,
-    thread_exit, thread_sleep,
+    DeathEvent, cap_delete, event_queue_create, event_queue_create_observed, event_try_recv,
+    event_try_recv_death, process_exit, thread_bind_notification, thread_exit, thread_sleep,
 };
 use syscall_abi::{EXIT_FAULT_BASE, SyscallError, encode_exit_code};
 
@@ -39,11 +39,13 @@ use crate::{ChildStack, TestContext, TestResult};
 const WILD_VA: u64 = 0x3E_6000_0000;
 
 /// Distinct, non-zero correlators so a dropped or misrouted event surfaces as
-/// a wrong high word rather than a coincidental zero.
-const CORR_CLEAN: u32 = 0x1111;
-const CORR_FAULT: u32 = 0x2222;
-const CORR_LIVE: u32 = 0x3333;
-const CORR_PROC_EXIT: u32 = 0x4444;
+/// a wrong correlator rather than a coincidental zero. Each sets bits in both
+/// halves, so a kernel that truncated the correlator to 32 bits fails the
+/// compare.
+const CORR_CLEAN: u64 = 0xC1EA_0000_0000_1111;
+const CORR_FAULT: u64 = 0xFA17_0000_0000_2222;
+const CORR_LIVE: u64 = 0x11FE_0000_0000_3333;
+const CORR_PROC_EXIT: u64 = 0xE417_0000_0000_4444;
 
 /// Voluntary exit code scenario 4's child passes to `process_exit`. Distinct
 /// from the correlators and inside the voluntary range so `encode_exit_code`
@@ -92,7 +94,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 fn late_bind_after_death(
     ctx: &TestContext,
     entry: extern "C" fn(u64) -> !,
-    correlator: u32,
+    correlator: u64,
     expected_reason: u64,
 ) -> TestResult
 {
@@ -113,11 +115,14 @@ fn late_bind_after_death(
     thread_bind_notification(child.th, eq, correlator)
         .map_err(|_| "death_notification_late_bind: bind onto exited thread failed")?;
 
-    let payload = event_try_recv(eq).map_err(
+    let death = event_try_recv_death(eq).map_err(
         |_| "death_notification_late_bind: no event delivered to late-bound observer (dropped)",
     )?;
-    let expected = (u64::from(correlator) << 32) | (expected_reason & 0xFFFF_FFFF);
-    if payload != expected
+    let expected = DeathEvent {
+        exit_reason: expected_reason,
+        correlator,
+    };
+    if death != expected
     {
         return Err("death_notification_late_bind: late-bound observer got wrong payload");
     }
@@ -139,7 +144,9 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 {
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "death_notification_late_bind: spawn::new_child (control) failed")?;
-    let eq = event_queue_create(ctx.memory_base, 4)
+    // One observer node: this bind links one; the late binds above, onto
+    // exited threads, take none from their node-less queues.
+    let eq = event_queue_create_observed(ctx.memory_base, 4, 1)
         .map_err(|_| "death_notification_late_bind: event_queue_create (control) failed")?;
     // Thread is Created (not started): the append path.
     thread_bind_notification(child.th, eq, CORR_LIVE)
@@ -154,9 +161,13 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
 
     // The death walk posts asynchronously on the child's CPU; poll for it.
-    let payload = poll_event(eq)?;
-    let expected = u64::from(CORR_LIVE) << 32; // clean exit, reason 0
-    if payload != expected
+    let death = poll_event(eq)?;
+    // Clean exit: reason 0.
+    let expected = DeathEvent {
+        exit_reason: 0,
+        correlator: CORR_LIVE,
+    };
+    if death != expected
     {
         return Err("death_notification_late_bind: bind-before-start got wrong payload");
     }
@@ -172,15 +183,15 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 }
 
 /// Bounded poll for a death event the child posts asynchronously on its own CPU.
-fn poll_event(eq: u32) -> Result<u64, &'static str>
+fn poll_event(eq: u32) -> Result<DeathEvent, &'static str>
 {
     let bound = crate::scaled_polls(MAX_POLLS);
     let mut polls = 0;
     loop
     {
-        if let Ok(payload) = event_try_recv(eq)
+        if let Ok(death) = event_try_recv_death(eq)
         {
-            return Ok(payload);
+            return Ok(death);
         }
         polls += 1;
         if polls >= bound

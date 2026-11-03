@@ -226,8 +226,7 @@ pub struct DriverSpawnConfig<'a>
 ///
 /// log + procmgr endpoints arrive via `ProcessInfo`. Returns `false`, the
 /// child torn down, on any failure, including a service endpoint that cannot
-/// be copied (a driver delivered none would never report ready) and a
-/// `device_badge` no `u32` correlator holds.
+/// be copied (a driver delivered none would never report ready).
 // clippy::too_many_lines: driver spawn is a single transaction — derive the
 // per-child caps, install them into the suspended child, and serve two
 // bootstrap rounds against one shared `ipc` buffer. Each derive owns a slot
@@ -257,12 +256,6 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     let service_ep = config.service_ep;
     let query_ep = config.query_ep;
     let device_badge = config.device_badge;
-    let Ok(correlator) = u32::try_from(device_badge)
-    else
-    {
-        std::os::seraph::log!("driver spawn: device badge exceeds the death correlator");
-        return false;
-    };
 
     // Allocate a bootstrap badge for the child.
     let Some(child_badge) = mint_bootstrap_badge()
@@ -470,7 +463,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     // Observe the driver's death from here on. Bound only once every round
     // has succeeded, so the batch's death queue takes posts only from the
     // drivers its roster records; a child that already died posts at once.
-    if syscall::thread_bind_notification(thread_cap, config.death_eq, correlator).is_err()
+    if syscall::thread_bind_notification(thread_cap, config.death_eq, device_badge).is_err()
     {
         std::os::seraph::log!("driver death observer bind failed");
         return false;

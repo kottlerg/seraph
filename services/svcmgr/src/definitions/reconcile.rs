@@ -86,8 +86,8 @@ impl ServiceTable
 
     /// Reserve the next slot, inactive, and return its index and the death
     /// correlator that names it. `None`, changing nothing, when the heap
-    /// cannot grow either vector or the index does not fit the kernel's
-    /// 32-bit correlator.
+    /// cannot grow either vector or the index does not fit the 32-bit
+    /// correlator svcmgr binds.
     fn reserve(&mut self) -> Option<(usize, u32)>
     {
         let idx = self.services.len();
@@ -331,7 +331,7 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     };
-    if syscall::thread_bind_notification(thread_cap, deaths_eq, correlator).is_err()
+    if syscall::thread_bind_notification(thread_cap, deaths_eq, u64::from(correlator)).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);

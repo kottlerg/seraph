@@ -13,9 +13,9 @@
 //! receives or posts while the queue is empty.
 
 use syscall::{
-    cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_recv,
-    event_recv_timeout, event_try_recv, notification_send, notification_wait, system_info,
-    thread_exit, thread_sleep,
+    EventEntry, cap_copy, cap_create_notification, cap_delete, event_post, event_post_entry,
+    event_queue_create, event_recv, event_recv_entry, event_recv_timeout, event_try_recv,
+    notification_send, notification_wait, system_info, thread_exit, thread_sleep,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -73,6 +73,36 @@ pub fn post_recv_fifo(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(eq).map_err(|_| "cap_delete after FIFO test failed")?;
+    Ok(())
+}
+
+/// Both words of a posted entry come back from the ring unchanged, with each
+/// entry's tag kept beside its own payload. Fails if the kernel drops the tag
+/// argument, returns it in the wrong register, or pairs a payload with
+/// another entry's tag.
+pub fn post_recv_entry_round_trips_both_words(ctx: &TestContext) -> TestResult
+{
+    let eq = event_queue_create(ctx.memory_base, 4)
+        .map_err(|_| "event_queue_create for entry test failed")?;
+    let first = EventEntry {
+        payload: 0x0123_4567_89AB_CDEF,
+        tag: 0xFEDC_BA98_7654_3210,
+    };
+    let second = EventEntry {
+        payload: 0,
+        tag: u64::MAX,
+    };
+    event_post_entry(eq, first).map_err(|_| "event_post_entry(first) failed")?;
+    event_post_entry(eq, second).map_err(|_| "event_post_entry(second) failed")?;
+
+    let got_first = event_recv_entry(eq, 0).map_err(|_| "event_recv_entry[0] failed")?;
+    let got_second = event_recv_entry(eq, u64::MAX).map_err(|_| "event_recv_entry[1] failed")?;
+    cap_delete(eq).map_err(|_| "cap_delete after entry test failed")?;
+
+    if got_first != first || got_second != second
+    {
+        return Err("event_recv_entry returned a different entry than was posted");
+    }
     Ok(())
 }
 

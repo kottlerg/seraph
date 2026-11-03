@@ -488,12 +488,12 @@ saves its log for the timing report below (`--save-logs`).
 
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 64- and
-# 65-hart runs take ~220 s each, the 128-hart run ~590 s at 8x hart
+# 65-hart runs take ~230 s each, the 128-hart run ~580 s at 8x hart
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 660 \
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 720 \
     --save-logs $T
 cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 720 \
     --save-logs $T

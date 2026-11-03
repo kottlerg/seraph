@@ -22,7 +22,9 @@
 //! serve other labels while a query on the settling class waits. See
 //! `services/devmgr/docs/responsibilities.md` § Responsibilities.
 
-use firmware::roster::{self, DriverLabels, DriverReply, Roster, SettleEvents, SettleWake};
+use firmware::roster::{
+    self, DeathPost, DriverLabels, DriverReply, Roster, SettleEvents, SettleWake,
+};
 use ipc::IpcMessage;
 use ipc::recv_guard::RecvGuard;
 
@@ -32,6 +34,9 @@ use crate::DeviceCatalog;
 const WS_BADGE_DRIVER: u64 = 1;
 /// Wait-set badge of the death event queue.
 const WS_BADGE_DEATH: u64 = 2;
+/// Wait-set member capacity: the private driver endpoint and the death event
+/// queue.
+const WS_MEMBERS: u32 = 2;
 
 /// The kernel objects one spawn batch settles over. Dropping it revokes and
 /// deletes the private driver endpoint, so a driver's devmgr query cap stops
@@ -48,9 +53,10 @@ pub struct SettleBatch
 impl SettleBatch
 {
     /// Create the objects for a batch of at most `capacity` drivers, the
-    /// death event queue holding one post per driver so no death is
-    /// dropped. Returns `None`, logging why and releasing what it created,
-    /// when `capacity` is 0, exceeds the kernel's event-queue capacity, or an
+    /// death event queue holding one post and one death-observer node per
+    /// driver, so no death is dropped and every driver's bind is funded.
+    /// Returns `None`, logging why and releasing what it created, when
+    /// `capacity` is 0, exceeds the kernel's event-queue capacity, or an
     /// object cannot be created.
     pub fn new(capacity: usize) -> Option<Self>
     {
@@ -71,9 +77,14 @@ impl SettleBatch
             std::os::seraph::log!("settle: driver endpoint not created");
             return None;
         };
-        let eq_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(eq_capacity));
+        // One observer node per driver: each spawn binds one death observer
+        // on its driver's thread into this queue.
+        let eq_bytes = std::os::seraph::event_queue_retype_bytes(
+            u64::from(eq_capacity),
+            u64::from(eq_capacity),
+        );
         let Some(death_eq) = std::os::seraph::object_slab_retype(eq_bytes, |slab| {
-            syscall::event_queue_create(slab, eq_capacity).ok()
+            syscall::event_queue_create_observed(slab, eq_capacity, eq_capacity).ok()
         })
         else
         {
@@ -81,10 +92,10 @@ impl SettleBatch
             let _ = syscall::cap_delete(driver_ep);
             return None;
         };
-        let Some(wait_set) =
-            std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
-                syscall::wait_set_create(slab).ok()
-            })
+        let Some(wait_set) = std::os::seraph::object_slab_retype(
+            std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+            |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+        )
         else
         {
             std::os::seraph::log!("settle: wait set not created");
@@ -163,9 +174,14 @@ impl<T> SettleEvents<T> for BatchEvents<'_>
         })
     }
 
-    fn try_death(&mut self) -> Option<u64>
+    fn try_death(&mut self) -> Option<DeathPost>
     {
-        syscall::event_try_recv(self.batch.death_eq).ok()
+        syscall::event_try_recv_death(self.batch.death_eq)
+            .ok()
+            .map(|d| DeathPost {
+                badge: d.correlator,
+                reason: d.exit_reason,
+            })
     }
 
     fn serve_driver(&mut self, roster: &mut Roster<T>)

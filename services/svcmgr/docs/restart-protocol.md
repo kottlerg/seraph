@@ -11,7 +11,7 @@ svcmgr binds every supervised service's main thread to one shared
 EventQueue (`deaths_eq`) via `SYS_THREAD_BIND_NOTIFICATION`, using the
 service's table index as the correlator. When a thread exits — either
 cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
-kernel posts `(correlator << 32) | exit_reason` to `deaths_eq` (per
+kernel posts the death entry `(exit_reason, correlator)` to `deaths_eq` (per
 [syscalls.md](../../../core/kernel/docs/syscalls.md)).
 
 The WaitSet has two members: the service endpoint (badge 0) and the

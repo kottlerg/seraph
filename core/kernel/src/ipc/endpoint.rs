@@ -65,7 +65,7 @@ pub struct EndpointState
     /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
     pub wait_set: *mut u8,
     /// Index of this endpoint's entry in `WaitSetState::members`.
-    pub wait_set_member_idx: u8,
+    pub wait_set_member_idx: u16,
     /// Serialises the send/recv queues and the call/recv rendezvous; reply is
     /// serialised by the `reply_tcb` claim, not this lock.
     pub lock: crate::sync::Spinlock,

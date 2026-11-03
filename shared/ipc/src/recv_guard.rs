@@ -104,8 +104,8 @@ impl RecvGuard
     /// process exits with [`EXIT_RECV_WEDGE`] — this call does not return.
     /// Below the fatal streak the call parks the thread for the backoff
     /// interval (`min(2^(streak-1), RECV_FAILURE_BACKOFF_CAP_MS)` ms); if
-    /// the kernel sleep list is full it degrades to a single yield, keeping
-    /// the loop bounded-but-busier rather than wedged.
+    /// the sleep fails it degrades to a single yield, keeping the loop
+    /// bounded-but-busier rather than wedged.
     pub fn on_failure(&mut self, err: i64)
     {
         if err == SyscallError::Interrupted as i64

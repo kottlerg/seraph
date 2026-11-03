@@ -2035,7 +2035,9 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
     let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
     if remaining == 0
     {
-        // SAFETY: refcount reached 0; no other references exist.
+        // SAFETY: refcount reached 0, so no capability slot or pin references
+        // the object (a `CSpace` wrapper's arena pages' `owner` aside, which
+        // `dealloc_object` allows).
         unsafe {
             crate::cap::object::dealloc_object(obj_ptr);
         }
@@ -2267,7 +2269,9 @@ fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::Ker
         let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
         if remaining == 0
         {
-            // SAFETY: refcount reached 0; no other references exist.
+            // SAFETY: refcount reached 0, so no capability slot or pin
+            // references the object (a `CSpace` wrapper's arena pages'
+            // `owner` aside, which `dealloc_object` allows).
             unsafe {
                 crate::cap::object::dealloc_object(obj_ptr);
             }

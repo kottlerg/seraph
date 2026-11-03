@@ -4351,7 +4351,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // iteratively, not one recursion per level.
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration;
                 // each slot's reference is released once, and one that was
-                // its object's last leaves the object unreferenced and ours.
+                // its object's last leaves the object referenced by no slot,
+                // pin, or kernel owner and on no stack; a nested `CSpace`
+                // wrapper among them stays reachable only through its arena
+                // pages' `owner`, which `CascadeStack::push` allows.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
                         if obj_ptr.as_ref().dec_ref() == 0

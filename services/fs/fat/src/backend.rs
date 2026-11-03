@@ -17,7 +17,10 @@
 //! `NodeId(0)` is the FAT root directory regardless of FAT type
 //! (`FatType::Fat16` uses the fixed-area sentinel cluster 0; `Fat32`
 //! uses `state.root_cluster`). Non-root nodes are allocated lazily
-//! at lookup time and indexed into [`NodeTable`].
+//! at lookup time and indexed into [`NodeTable`], which recycles them
+//! under a generation once their on-disk entry is removed or renamed.
+
+use fat_parse::node_slab::{self, NodeSlab};
 
 use crate::bpb::{FatState, FatType};
 use crate::cache::PageCache;
@@ -30,10 +33,10 @@ use namespace_protocol::{
     NodeKind, NodeStat, NsError, rights,
 };
 
-/// Maximum entries surfaced through `NS_LOOKUP` over a single fatfs
-/// session. Sized to the current test surface; an unbounded `NodeId`
-/// allocator is a follow-up (issue #27).
-pub const MAX_NODES: usize = 128;
+// A node identifier is the slab's index and generation, packed to fill the
+// namespace protocol's NodeId.
+const _: () =
+    assert!(node_slab::INDEX_BITS + node_slab::GENERATION_BITS == namespace_protocol::NODE_ID_BITS);
 
 /// Per-NodeId metadata captured at lookup time.
 ///
@@ -66,29 +69,42 @@ pub struct FatNode
 
 /// Sentinel for [`FatNode::open_slot`] meaning "no `OpenFile` slot
 /// associated yet". The slot is allocated lazily on first
-/// `FS_READ_MEMORY` against the node cap. Slot indices stay below
-/// `MAX_OPEN_FILES`, so `u32::MAX` never names a real slot.
+/// `FS_READ_MEMORY` against the node cap. The open-file table holds at most
+/// one slot per live node, fewer than `node_slab::MAX_ENTRIES`, so
+/// `u32::MAX` never names a real slot.
 pub const NO_OPEN_SLOT: u32 = u32::MAX;
 
-/// Index into [`NodeTable`]'s entries of the non-root `id` (`raw - 1`), or
-/// `None` for the reserved root id 0. An index past the table is left to the
-/// caller's bounds-checked access.
-// cast_possible_truncation: fatfs builds only for 64-bit targets (x86_64,
-// riscv64), where `usize` holds every `u64`.
-#[allow(clippy::cast_possible_truncation)]
-fn entry_index(id: NodeId) -> Option<usize>
+/// The on-disk slot that identifies a node: `(sector_lba, offset_in_sector)`
+/// of its 8.3 entry. Two distinct entries never share one, and repeated walks
+/// of one file always rediscover it, so it keys the node table's dedupe.
+type NodeKey = (u32, usize);
+
+fn node_key(loc: DirEntryLocation) -> NodeKey
 {
-    id.raw().checked_sub(1).map(|i| i as usize)
+    (loc.sector_lba, loc.offset_in_sector)
 }
 
-/// Append-only table of non-root nodes minted by [`FatfsBackend::lookup`].
+/// The non-root nodes minted by [`FatfsBackend::lookup`] and by
+/// `FS_CREATE` / `FS_MKDIR`, over a [`NodeSlab`].
 ///
-/// `NodeId(0)` is reserved as the fatfs root and never appears here.
-/// `NodeId(N)` for `N > 0` indexes into `entries[N - 1]`.
+/// `NodeId(0)` is reserved as the fatfs root and never appears here. Every
+/// other `NodeId` packs a slab index and its generation. Every lookup of one
+/// on-disk entry returns its one node, which lives until `FS_REMOVE` or
+/// `FS_RENAME` unlinks the entry; `FS_CLOSE` frees no node, since the driver
+/// cannot tell which of a node's holders a close comes from. A freed index is
+/// reused under a new generation, so a cap kept past the removal of its file
+/// names no node rather than the one that reused the index. The heap-grown
+/// slab holds one node per distinct live entry looked up, up to
+/// [`node_slab::MAX_ENTRIES`].
 pub struct NodeTable
 {
-    entries: [Option<FatNode>; MAX_NODES],
-    len: usize,
+    slab: NodeSlab<NodeKey, FatNode>,
+    /// Open-file slot of the node [`Self::invalidate_for_loc`] last freed,
+    /// which the dispatch loop releases under the open-file table's lock
+    /// after the request. One request frees at most one node (its
+    /// `FS_REMOVE` or `FS_RENAME` unlinks one entry), so one slot suffices
+    /// and holding it allocates nothing.
+    orphaned_open_slot: Option<u32>,
 }
 
 impl NodeTable
@@ -96,20 +112,19 @@ impl NodeTable
     pub const fn new() -> Self
     {
         Self {
-            entries: [None; MAX_NODES],
-            len: 0,
+            slab: NodeSlab::new(),
+            orphaned_open_slot: None,
         }
     }
 
     /// Look up the [`FatNode`] for a non-root [`NodeId`]. Returns `None`
-    /// for the reserved root id (0), for ids past the table tail, and for
-    /// entries `invalidate_for_loc` cleared (removed or renamed). Used by
-    /// the `service_loop` node-cap dispatch arms in `main.rs`.
+    /// for the reserved root id (0) and for every id whose node was freed
+    /// (its entry removed or renamed). Used by the
+    /// `service_loop` node-cap dispatch arms in `main.rs`.
     #[must_use]
     pub fn get(&self, id: NodeId) -> Option<FatNode>
     {
-        let idx = entry_index(id)?;
-        self.entries.get(idx).copied().flatten()
+        self.slab.get(id.raw()).copied()
     }
 
     /// Public-to-the-crate wrapper around `alloc` so dispatch handlers
@@ -121,32 +136,12 @@ impl NodeTable
         self.alloc(node)
     }
 
+    /// The id of the node for `node`'s on-disk slot, recording `node` when
+    /// the slot has none. `None` when the table cannot grow.
     fn alloc(&mut self, node: FatNode) -> Option<NodeId>
     {
-        // Dedupe by on-disk slot location. `(sector_lba,
-        // offset_in_sector)` uniquely identifies a 32-byte directory
-        // entry — two distinct files can never share one, and repeated
-        // walks of the same file always rediscover the same slot.
-        // Previous keys based on `(cluster, kind, size)` collapsed
-        // every empty file (cluster=0, size=0) to a single NodeId,
-        // silently aliasing FS_CREATEs of distinct empty files.
-        for (i, slot) in self.entries[..self.len].iter().enumerate()
-        {
-            if let Some(existing) = slot
-                && existing.loc.sector_lba == node.loc.sector_lba
-                && existing.loc.offset_in_sector == node.loc.offset_in_sector
-            {
-                return NodeId::new((i + 1) as u64);
-            }
-        }
-        if self.len >= MAX_NODES
-        {
-            return None;
-        }
-        self.entries[self.len] = Some(node);
-        self.len += 1;
-        // self.len fits in NodeId's u40 range trivially (MAX_NODES is small).
-        NodeId::new(self.len as u64)
+        let raw = self.slab.acquire(node_key(node.loc), || node)?;
+        NodeId::new(raw)
     }
 
     /// Set or clear the lazy `OpenFile` slot index for `id`. Used by
@@ -154,52 +149,47 @@ impl NodeTable
     /// against a node cap allocates an `OpenFile` slot, and on
     /// `FS_CLOSE` to clear it back to [`NO_OPEN_SLOT`].
     ///
-    /// No-op for the reserved root id (0), for ids past the table tail,
-    /// and for entries `invalidate_for_loc` cleared.
+    /// No-op for the reserved root id (0) and for freed ids.
     pub fn set_open_slot(&mut self, id: NodeId, slot: u32)
     {
-        let Some(idx) = entry_index(id)
-        else
-        {
-            return;
-        };
-        if let Some(Some(node)) = self.entries.get_mut(idx)
+        if let Some(node) = self.slab.get_mut(id.raw())
         {
             node.open_slot = slot;
         }
     }
 
-    /// Invalidate any entry whose on-disk slot matches `loc`. Called
-    /// from `FS_REMOVE` / `FS_RENAME` so a follow-on `FS_CREATE` that
-    /// lands at the same disk slot does not dedupe to a stale
-    /// `NodeId`.
-    ///
-    /// The append-only table cannot recycle slots (filed as Issue
-    /// #27), so the slot is left present but cleared to `None`; the
-    /// dedupe scan in `alloc()` only matches `Some` entries.
+    /// Free the node whose on-disk slot is `loc`.
+    /// Called from `FS_REMOVE` / `FS_RENAME`: every cap on the unlinked entry
+    /// stops resolving, and a follow-on `FS_CREATE` that lands at the same
+    /// disk slot gets a fresh node rather than the stale one. The freed
+    /// node's open-file slot, if it had one, is kept for
+    /// [`Self::take_orphaned_open_slot`].
     pub fn invalidate_for_loc(&mut self, loc: DirEntryLocation)
     {
-        for slot in &mut self.entries[..self.len]
+        if let Some(node) = self.slab.remove_key(&node_key(loc))
+            && node.open_slot != NO_OPEN_SLOT
         {
-            if let Some(existing) = slot
-                && existing.loc.sector_lba == loc.sector_lba
-                && existing.loc.offset_in_sector == loc.offset_in_sector
-            {
-                *slot = None;
-            }
+            debug_assert!(
+                self.orphaned_open_slot.is_none(),
+                "two nodes freed by one request"
+            );
+            self.orphaned_open_slot = Some(node.open_slot);
         }
+    }
+
+    /// The open-file slot of the node a removal or rename freed since the
+    /// last call, for the dispatch loop to release: no cap resolves to the
+    /// node any more, so no `FS_CLOSE` would reach it.
+    pub fn take_orphaned_open_slot(&mut self) -> Option<u32>
+    {
+        self.orphaned_open_slot.take()
     }
 
     /// Update the cluster and size fields of a non-root node entry.
     /// Used by `FS_WRITE` after extending the file's cluster chain.
     pub fn update_size_and_cluster(&mut self, id: NodeId, new_cluster: u32, new_size: u32)
     {
-        let Some(idx) = entry_index(id)
-        else
-        {
-            return;
-        };
-        if let Some(Some(node)) = self.entries.get_mut(idx)
+        if let Some(node) = self.slab.get_mut(id.raw())
         {
             node.cluster = new_cluster;
             node.size = new_size;

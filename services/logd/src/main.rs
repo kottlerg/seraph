@@ -206,8 +206,8 @@ const DEATH_EQ_CAPACITY: u32 = 128;
 /// destroyed. A bind past the pool fails: silently at spawn, logged by
 /// procmgr's retroactive bind. logd then gets no death post for that process,
 /// so its slot stays until a later full-queue resync from procmgr's live list
-/// evicts it, if one runs (#643 grows the pool). Sized well above the live
-/// processes memmgr allows.
+/// evicts it, if one runs (#643 grows the pool). Sized above the live
+/// processes procmgr's own death-queue pool allows, so that pool binds first.
 const DEATH_EQ_OBSERVERS: u32 = 1024;
 
 /// Allocate the slab and create the death-notification `EventQueue` of

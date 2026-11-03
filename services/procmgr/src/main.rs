@@ -215,8 +215,7 @@ const DEATH_EQ_CAPACITY: u32 = 256;
 /// (its main thread and its address space) and the init reap binds init's
 /// two threads; a node returns when its thread or address space is destroyed.
 /// A spawn whose main-thread bind finds the pool empty fails, so this caps
-/// live processes at about half of it, well above the live processes memmgr
-/// allows.
+/// live processes at about half of it; no process table binds before it.
 const DEATH_EQ_OBSERVERS: u32 = 1024;
 
 /// The main wait set's member capacity: the service endpoint and the death queue.

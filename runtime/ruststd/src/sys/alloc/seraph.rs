@@ -340,11 +340,12 @@ impl Heap {
             return false;
         }
         let mut mapped: u64 = 0;
-        // Loop until the request is mapped, in case a reply covers fewer
-        // pages than asked. Bound the retry count so a misbehaving memmgr
-        // cannot wedge the caller. A correct memmgr never reaches it:
-        // `REQUEST_MEMORY_CAPS` grants the whole request or fails, so one
-        // round suffices.
+        // Loop until the request is mapped: a best-effort reply MAY cover
+        // fewer pages than asked (a partial grant, when no `MSG_CAP_SLOTS_MAX`
+        // runs cover the request although the free pages do), and the next
+        // round asks for the rest. Bound the round count so a misbehaving
+        // memmgr cannot wedge the caller; a grow that runs out of rounds keeps
+        // the pages already mapped.
         const MAX_ROUNDS: u32 = 16;
         let mut rounds: u32 = 0;
         let complete = loop {

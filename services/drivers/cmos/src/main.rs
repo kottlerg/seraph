@@ -32,6 +32,11 @@ struct BootCaps
 {
     service_ep: u32,
     ioport_cap: u32,
+    /// CMOS RAM index of the century register, from the FADT `CENTURY`
+    /// field devmgr sends as the round's data word; `None` when it names
+    /// none (0), names one the driver cannot read
+    /// ([`cmos_rtc::century_register`]), or sent no word.
+    century_reg: Option<u8>,
 }
 
 fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -46,9 +51,13 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
     {
         return None;
     }
+    let century_reg = (round.data_words >= 1)
+        .then(|| cmos_rtc::century_register(round.data[0]))
+        .flatten();
     Some(BootCaps {
         service_ep: round.caps[0],
         ioport_cap: round.caps[1],
+        century_reg,
     })
 }
 
@@ -150,17 +159,7 @@ fn decode(raw: CmosFields, status_b: u8) -> Calendar
 
     let day = conv(raw.day);
     let month = conv(raw.month);
-    let year_lo = conv(raw.year);
-    let century_raw = conv(raw.century);
-
-    // QEMU CMOS leaves register 0x32 at zero; treat a missing/implausible
-    // century as 20 (year 2000–2099). Real hardware writes 19, 20, or 21.
-    let century: u32 = match century_raw
-    {
-        19..=21 => u32::from(century_raw),
-        _ => 20,
-    };
-    let year: u32 = century * 100 + u32::from(year_lo);
+    let year = cmos_rtc::full_year(conv(raw.year), raw.century.map(conv));
 
     Calendar {
         year,
@@ -172,12 +171,13 @@ fn decode(raw: CmosFields, status_b: u8) -> Calendar
     }
 }
 
-/// Read and decode the CMOS clock. `None` when [`cmos_rtc::snapshot`]
-/// finds no consistent reading within its bounded attempts (a stuck
+/// Read and decode the CMOS clock, with the century from `century_reg` when
+/// the platform names one. `None` when [`cmos_rtc::snapshot`] finds no
+/// consistent reading within its bounded attempts (a stuck
 /// update-in-progress bit included); the caller replies `READ_FAILED`.
-fn snapshot_cmos() -> Option<Calendar>
+fn snapshot_cmos(century_reg: Option<u8>) -> Option<Calendar>
 {
-    let (fields, status_b) = cmos_rtc::snapshot(&mut PortRegs)?;
+    let (fields, status_b) = cmos_rtc::snapshot(&mut PortRegs, century_reg)?;
     Some(decode(fields, status_b))
 }
 
@@ -237,7 +237,7 @@ fn epoch_us(c: Calendar) -> Option<u64>
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64)
+fn handle_request(msg: &IpcMessage, century_reg: Option<u8>, ipc_buf: *mut u64)
 {
     let reply = match msg.label
     {
@@ -249,7 +249,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64)
             }
             else
             {
-                match snapshot_cmos().and_then(epoch_us)
+                match snapshot_cmos(century_reg).and_then(epoch_us)
                 {
                     Some(us) => IpcMessage::builder(rtc_errors::SUCCESS).word(0, us).build(),
                     None => IpcMessage::new(rtc_errors::READ_FAILED),
@@ -279,7 +279,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
-fn service_loop(service_ep: u32, ipc_buf: *mut u64) -> !
+fn service_loop(service_ep: u32, century_reg: Option<u8>, ipc_buf: *mut u64) -> !
 {
     std::os::seraph::log!("ready");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
@@ -296,7 +296,7 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64) -> !
             }
         };
         guard.on_success();
-        handle_request(&msg, ipc_buf);
+        handle_request(&msg, century_reg, ipc_buf);
     }
 }
 
@@ -330,5 +330,5 @@ fn main() -> !
         syscall::thread_exit();
     }
 
-    service_loop(caps.service_ep, ipc_buf);
+    service_loop(caps.service_ep, caps.century_reg, ipc_buf);
 }

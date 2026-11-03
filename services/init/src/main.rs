@@ -648,8 +648,8 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // Populate the phys-table page: free-run physical bases, the kernel's
-    // immutable RAM-accounting facts, and the in-use bootstrap arenas. The
+    // Populate the phys-table page: the kernel's immutable RAM-accounting
+    // facts and the in-use bootstrap arenas. The
     // page is mapped writable at TEMP_MAP_BASE; memmgr reads it back via the
     // RO cap derived below. See `bootstrap::write_memmgr_aux_memory`.
     // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
@@ -671,41 +671,20 @@ fn run(info_ptr: u64) -> !
     //
     // Caps: [0] memmgr's own service endpoint (RECV).
     //       [1] read-only Memory cap covering the phys-table page; memmgr
-    //           reads `mm_memory_count` u64 phys_base entries from it
-    //           parallel to the page-count array, then drops the cap.
-    // Data: [memory_base, memory_count, procmgr_badge, page_counts...].
+    //           reads the RAM facts and in-use arenas from it, then drops
+    //           the cap.
+    // Data: [memory_base, memory_count, procmgr_badge] (`ipc::memmgr_bootstrap`).
     let Ok(mm_service_cap_for_mm) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
         logging::log("FATAL: cannot derive memmgr service cap for bootstrap");
         syscall::thread_exit();
     };
-    // Pack 2 page_counts per data word: low 32 bits = even index, high
-    // 32 bits = odd index. Mirror this on memmgr's parser. The 64 words are
-    // `MSG_DATA_WORDS_MAX`, one round's data; `MAX_MEMORY_CAPS` is sized so
-    // the 3-word prefix plus every packed count fits it.
-    let mut mm_boot_data = [0u64; 64];
-    mm_boot_data[0] = u64::from(mm_final.mm_memory_base);
-    mm_boot_data[1] = u64::from(mm_final.mm_memory_count);
-    mm_boot_data[2] = mm.procmgr_badge;
-    let count = mm_final.mm_memory_count as usize;
-    let packed_words = count.div_ceil(2);
-    for w in 0..packed_words
-    {
-        let i0 = w * 2;
-        let i1 = i0 + 1;
-        let lo = u64::from(mm_final.page_counts[i0]);
-        let hi = if i1 < count
-        {
-            u64::from(mm_final.page_counts[i1])
-        }
-        else
-        {
-            0
-        };
-        mm_boot_data[3 + w] = lo | (hi << 32);
-    }
-    let mm_data_words = 3 + packed_words;
+    let mm_boot_data = [
+        u64::from(mm_final.mm_memory_base),
+        u64::from(mm_final.mm_memory_count),
+        mm.procmgr_badge,
+    ];
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe {
         ipc::bootstrap::serve_round(
@@ -714,7 +693,7 @@ fn run(info_ptr: u64) -> !
             ipc_buf,
             true,
             &[mm_service_cap_for_mm, phys_table_ro_cap],
-            &mm_boot_data[..mm_data_words],
+            &mm_boot_data,
         )
     }
     .is_err()

@@ -381,8 +381,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    point at a commit that contains them.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
    § Coverage tiers) on that commit: the riscv64 64- and 65-hart and the
-   x86_64 256-vCPU boundaries three times each, the riscv64 128-hart and the
-   x86_64 512-vCPU boundaries once each, and the memory variation once. When
+   x86_64 128-vCPU boundaries three times each, the riscv64 128-hart and the
+   x86_64 16-vCPU boundaries once each, and the memory variation once. When
    they pass, tag it and push the tag:
    `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
 5. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in

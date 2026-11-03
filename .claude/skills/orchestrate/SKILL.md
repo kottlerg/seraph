@@ -84,7 +84,7 @@ harness allows, so a worker presumed dead that resumes does not push over its re
 
 ## Host token
 
-The host is one machine; a 512-vCPU boot saturates it and a second QEMU or build beside it
+The host is one machine; a 128-vCPU boot saturates it and a second QEMU or build beside it
 produces hangs that then need classifying. One slot at a time:
 
 - A worker sends its exact command list and estimate and ends its turn. You answer `host free`
@@ -215,7 +215,7 @@ this session. Cancel the watchdog. Close the record with the open-Issue count by
   with the results so it writes the body and runs the review with its own context.
 - Reviewers can detach HEAD in a worker's worktree; a push then moves nothing. The worker
   checks `git status -sb` after every review.
-- A boundary run that finishes late is not a hang; a 512-vCPU boot grows with every stress cell
+- A boundary run that finishes late is not a hang; a 128-vCPU boot grows with every stress cell
   a PR adds and with unrelated host load. Judge PASS or HANG against the budget.
 - The review loop files roughly one new Issue per merged PR; that ratio, not host time, sets
   the end of a drain. Plan the batch by Issues closed net, not PRs merged.

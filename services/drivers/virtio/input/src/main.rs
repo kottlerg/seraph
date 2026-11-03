@@ -203,6 +203,27 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     info
 }
 
+/// Report the device set up to devmgr (`DRIVER_READY` on the devmgr query
+/// cap), immediately before the service loop: devmgr serves this driver's
+/// service endpoint only after the report. Exits when devmgr refuses it or
+/// the call fails, since devmgr then serves no client this driver.
+fn report_ready(devmgr_ep: u32, ipc_buf: *mut u64)
+{
+    let request = IpcMessage::builder(devmgr_labels::DRIVER_READY)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let accepted = matches!(
+        unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) },
+        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS
+    );
+    if !accepted
+    {
+        std::os::seraph::log!("DRIVER_READY refused; exiting");
+        syscall::thread_exit();
+    }
+}
+
 // ── Memory-cap allocation via memmgr IPC ────────────────────────────────────
 
 /// Request a single contiguous Memory cap covering `page_count` pages from
@@ -643,5 +664,6 @@ fn main() -> !
         ring,
         mods: ModifierState::new(),
     };
+    report_ready(caps.devmgr_ep, ipc_buf);
     service_loop(caps.service_ep, ipc_buf, &mut rt);
 }

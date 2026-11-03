@@ -287,17 +287,16 @@ so only the call that took it there queues it, at most once at a time, and the s
 number of objects without allocating. The one object queued twice is a `CSpace` wrapper: its arm's
 first run, having popped it, pushes it back beneath the objects its slots held, so its second run,
 which returns its pool, comes after their teardowns and every cascade they start ([§ Body
-Arena](#body-arena)). Every
-release a teardown makes pushes the object it orphans: an ancestor Memory object's retype lease, a
-donation's lease, the references a dying `CSpace`'s slots hold (a nested `CSpace` among them), a
-caller-sized wait set's member references, a thread's fault-handler binding, and the queue
-references of an owner's chain of death-observer nodes. The call pops and tears down the most recent
-object until the stack is empty, and no teardown calls `dealloc_object` itself, so a chain of
-`CSpace`s each holding the last reference to the next, or a `CSpace` releasing thousands of
-objects, is torn down iteratively with constant stack use, and no arm runs inside another's lock
-scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer arm has
-released it; a wait set's sources are torn down after `wait_set_drop` has released every source
-lock).
+Arena](#body-arena)). Every release a teardown makes pushes the object it orphans: an ancestor
+Memory object's retype lease, a donation's lease, the references a dying `CSpace`'s slots hold (a
+nested `CSpace` among them), a caller-sized wait set's member references, a thread's fault-handler
+binding, and the queue references of an owner's chain of death-observer nodes. The call pops and
+tears down the most recent object until the stack is empty, and no teardown calls `dealloc_object`
+itself, so a chain of `CSpace`s each holding the last reference to the next, or a `CSpace` releasing
+thousands of objects, is torn down iteratively with constant stack use, and no arm runs inside
+another's lock scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer
+arm has released it; a wait set's sources are torn down after `wait_set_drop` has released every
+source lock).
 
 The walk costs one `retype_free` per donation (for a `CSpace` with kept arena pages, one
 `retype_free_runs` returning the runs between them through a single walk of the Memory object's page
@@ -390,8 +389,7 @@ fixed stack (the sort is a bottom-up merge through 64 sorted runs), plus one wal
 Memory object's page free list, as the return of a donation without kept pages costs ([§
 Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`: at most one
 per such body, and at most the `CSpace`'s arena pages, one per 31 bodies it funded. Each of those
-pages returns later, in the call that frees its last chunk, as a
-one-page `retype_free`.
+pages returns later, in the call that frees its last chunk, as a one-page `retype_free`.
 
 ---
 

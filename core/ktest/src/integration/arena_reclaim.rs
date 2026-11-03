@@ -9,7 +9,7 @@
 //! A Memory tail split by a thread bound to `CSpace` A has its body in A's
 //! arena ([core/kernel/docs/capability-internals.md § Body
 //! Arena](../../../kernel/docs/capability-internals.md#body-arena)). Donated to
-//! a `CSpace`'s pool, the tail is held by that donation. Two cases:
+//! a `CSpace`'s pool, the tail is held by that donation. Five cases:
 //!
 //! 1. Self-funding: the tail T is donated to A itself. When A dies, its
 //!    donations, T's included, go back at once, though T's body still lives in
@@ -32,8 +32,9 @@
 //! 5. Kept pages on freed table pages (x86-64): a `CSpace` made from one
 //!    8-page piece binds an `IoPort` to a thread of its own and deletes the
 //!    thread, whose port-binding table's pages go back to the top of its pool
-//!    with their record cell; the arena pages of case 4's bodies are carved
-//!    from them, and the piece comes back cut around them as in case 4.
+//!    with their record cell; two of the three arena pages of case 4's bodies
+//!    are carved from them (a slot page takes the third), and the piece comes
+//!    back cut around the kept pages as in case 4.
 //!
 //! A RAM tail cannot be deleted in ktest (its destruction would free into the
 //! sealed buddy), so each tail is moved out to ktest's own `CSpace` before its
@@ -398,8 +399,9 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
     finish_kept(ctx, a, piece, P_PAGES, base_before, placed)
 }
 
-/// Case 5 (x86-64): kept pages carved from pool pages a port-binding table
-/// gave back, which carry their donation record's cell from the table.
+/// Case 5 (x86-64): kept pages, two of them carved from pool pages a
+/// port-binding table gave back, which carry their donation record's cell
+/// from the table.
 #[cfg(target_arch = "x86_64")]
 fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
 {
@@ -413,18 +415,19 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
     };
     let base_before = available(ctx.memory_base);
     let piece = split_piece(ctx, T_PAGES)?;
-    // Every page of A is P's: its create-time slab is P, its only donation.
+    // Every page of A is the piece's: its create-time slab, its only donation.
     let Ok(a) = cap_create_cspace(piece, 0, T_PAGES)
     else
     {
         memory_merge(ctx.memory_base, piece).ok();
-        return Err("integration::arena_reclaim: cap_create_cspace(A from P) failed");
+        return Err("integration::arena_reclaim: cap_create_cspace(A from the piece) failed");
     };
     let mut bound = false;
     let placed = (|| {
         // A bound thread's first bind takes its table's three pages from A's
         // pool; deleting the thread returns them to the top of the pool, each
-        // with its record's cell, where the arena then carves its pages.
+        // with its record's cell, where the arena carves two of its pages
+        // and a slot page takes the third.
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, a, 0, 0)
             .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
         bound = (1..=crate::unit::hw::scan_bound(ctx))
@@ -440,9 +443,7 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
     {
         cap_delete(a).ok();
         memory_merge(ctx.memory_base, piece).ok();
-        crate::log(
-            "ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (no IoPort cap bound)",
-        );
+        crate::log("ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (no IoPort)");
         return Ok(());
     }
     finish_kept(ctx, a, piece, T_PAGES, base_before, placed)
@@ -513,7 +514,7 @@ fn finish_kept(
     }
     let whole = available(piece);
     memory_merge(ctx.memory_base, piece)
-        .map_err(|_| "integration::arena_reclaim: memory_merge(memory_base, P) failed")?;
+        .map_err(|_| "integration::arena_reclaim: memory_merge(memory_base, piece) failed")?;
     let base_after = available(ctx.memory_base);
     placed?;
     if moved != MANY || !deleted
@@ -522,11 +523,13 @@ fn finish_kept(
     }
     if held > (pages - 2) * PAGE
     {
-        return Err("integration::arena_reclaim: fewer than two of P's arena pages were kept");
+        return Err(
+            "integration::arena_reclaim: fewer than two of the piece's arena pages were kept",
+        );
     }
     if whole != pages * PAGE
     {
-        return Err("integration::arena_reclaim: P's kept pages never came back");
+        return Err("integration::arena_reclaim: the piece's kept pages never came back");
     }
     if base_after != base_before
     {

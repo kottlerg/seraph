@@ -877,7 +877,7 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
 /// that starts below it, and by `sys_memory_merge` to require a virgin tail; see
 /// `core/kernel/docs/syscalls.md` § `SYS_MEMORY_SPLIT` (33) and § `SYS_MEM_MAP` (16).
 ///
-/// # Safety
+/// # Locking
 ///
 /// Caller must hold either `memory.read_lock()` or `memory.write_lock()` so
 /// the cap's `size` cannot change under the reader.

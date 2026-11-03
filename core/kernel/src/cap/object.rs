@@ -1891,12 +1891,14 @@ unsafe fn free_arena_chunk(chunk: *mut u8, stack: &mut CascadeStack)
     {
         // SAFETY: a non-null owner under the page lock has not passed this
         // page in its teardown, which reclaims the wrapper only after every
-        // page, so the wrapper is live.
-        let owner = unsafe { &*owner };
-        pool_lock(&owner.cs_pool.lock);
+        // page, so the wrapper is live. Only the two atomics a chunk free
+        // uses are borrowed, never the whole wrapper: its teardown may be
+        // writing `cspace` or its header's cascade link meanwhile.
+        let (lock, free) = unsafe { (&(*owner).cs_pool.lock, &(*owner).arena_free) };
+        pool_lock(lock);
         // SAFETY: pool lock held; the chunk is this arena's (contract).
-        unsafe { crate::cap::arena::push_chunk(&owner.arena_free, chunk) };
-        pool_unlock(&owner.cs_pool.lock);
+        unsafe { crate::cap::arena::push_chunk(free, chunk) };
+        pool_unlock(lock);
     }
     pool_unlock(&page.lock);
     if page.header.dec_ref() == 0
@@ -2743,12 +2745,15 @@ const CASCADE_LINK_BITS: u32 = 56;
 /// them without allocating.
 ///
 /// Only a refcount-0 object that nothing else references, and that is on no
-/// stack, is pushed. An object reaches 0 once, so only the stack of the call
-/// that took it there holds it, and at most once at a time: the one object
-/// pushed twice is a `CSpace` wrapper, whose first teardown run, having been
+/// stack, is pushed; the one reference allowed is a `CSpace` wrapper's arena
+/// pages' `owner` back-pointer, through which a chunk free reaches only the
+/// wrapper's `cs_pool.lock` and `arena_free` until the wrapper's second run
+/// clears it. An object reaches 0 once, so only the stack of the call that
+/// took it there holds it, and at most once at a time: the one object pushed
+/// twice is that `CSpace` wrapper, whose first teardown run, having been
 /// popped, re-queues it beneath the objects its slots held for its second
-/// (core/kernel/docs/capability-internals.md § Teardown). While
-/// it is queued, the header's `ref_count` and `cascade_link_hi` hold the link
+/// (core/kernel/docs/capability-internals.md § Teardown). While it is queued,
+/// the header's `ref_count` and `cascade_link_hi` hold the link
 /// to the object below it (its virtual address shifted right by 3, every
 /// header being 8-byte aligned, kept to [`CASCADE_LINK_BITS`] and
 /// sign-extended back, which every canonical address of up to 59 significant
@@ -2848,7 +2853,10 @@ impl CascadeStack
     /// `obj` is a live object's header whose reference count is 0, that no
     /// capability slot, pin, or other kernel owner references, that is on no
     /// cascade stack, and that the caller owns exclusively; no reference to
-    /// its header is used after this call.
+    /// its header is used after this call. The one exception to "no other
+    /// owner" is a `CSpace` wrapper's arena pages' `owner` back-pointer, used
+    /// only for the wrapper's `cs_pool.lock` and `arena_free`
+    /// (`free_arena_chunk`), never its header.
     unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract (a live header).
@@ -4312,9 +4320,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // SAFETY: refcount 0, so no capability or pin reaches the
                 // wrapper, and it was popped, so it is on no stack. Between the
                 // runs another CPU reaches it only through an arena page's
-                // `owner`, which a chunk free uses for `cs_pool`'s lock and
-                // `arena_free` alone, never `cspace` or the header; this arm
-                // uses neither after the push.
+                // `owner`, which a chunk free borrows for `cs_pool`'s lock and
+                // `arena_free` alone, never the whole wrapper, `cspace`, or the
+                // header (`free_arena_chunk`), as `CascadeStack::push` allows;
+                // this arm uses neither after the push.
                 unsafe {
                     (*ptr.as_ptr().cast::<CSpaceKernelObject>()).cspace = core::ptr::null_mut();
                     stack.push(ptr);
@@ -5430,9 +5439,9 @@ mod tests
         assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
     }
 
-    // Defect guarded: a CSpace whose pool is returned before the objects its
-    // slots held are torn down keeps every arena page their bodies sit on,
-    // each returned later by a walk of its Memory object's free list.
+    // Defect guarded: a cascade stack that pops a re-pushed CSpace before
+    // everything pushed above it, the order the kernel's CSpace arm relies on
+    // to tear its slots' objects down before it returns its pool.
     #[test]
     fn a_cspace_is_torn_down_after_everything_its_slots_alone_held()
     {

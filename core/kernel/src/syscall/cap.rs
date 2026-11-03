@@ -788,8 +788,7 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     {
         // Every id the registry arena backs is live (one per DRAM page,
         // so unreachable while the caller's pages still pay for this one).
-        // Surface to userspace; the retype carve is undone below by
-        // `retype_free` after the error return.
+        // Surface to userspace, undoing the retype carve.
         // SAFETY: this call's own `retype_allocate` return, holding no live
         // object (none placed yet, or dropped above) and published nowhere.
         unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -861,7 +860,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
         crate::cap::unregister_cspace(id);
         crate::cap::free_cspace_id(id);
         // SAFETY: this call's own `retype_allocate` return, holding no live
-        // object (none placed yet, or dropped above) and published nowhere.
+        // object (dropped above) and no longer reachable: its registry
+        // entry is removed above.
         unsafe { retype_free(memory, offset, entry.raw_bytes) };
         // SAFETY: matches inc_ref above.
         unsafe { memory_obj_nn.as_ref().dec_ref() };
@@ -904,7 +904,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(cs_ptr);
             }
             // SAFETY: this call's own `retype_allocate` return, holding no live
-            // object (none placed yet, or dropped above) and published nowhere.
+            // object (dropped above) and no longer reachable: its registry
+            // entry is removed above.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the `memory_obj_nn.as_ref().inc_ref()` above.
             unsafe { memory_obj_nn.as_ref().dec_ref() };
@@ -1264,7 +1265,8 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(thread_obj_ptr);
             }
             // SAFETY: this call's own `retype_allocate` return, holding no live
-            // object (none placed yet, or dropped above) and published nowhere.
+            // object (dropped above) and no longer reachable: its registry
+            // entry is removed above.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };

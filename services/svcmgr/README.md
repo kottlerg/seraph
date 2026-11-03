@@ -91,8 +91,10 @@ svcmgr/
   with the pending-registration table (substrate pairs parked from the
   endowment). Three outcomes: `bind only` (parked AND defined),
   `launching` (defined only), `registered without definition`
-  (parked AND no recipe → hard error). Out of memory releases an
-  endowed service to run unsupervised rather than reporting it. See
+  (parked AND no recipe → hard error). With no memory for the parsed
+  list, or for a bind-only entry's record, an endowed service runs on
+  unsupervised without a report; a recipe dropped for memory is
+  reported like a malformed one. See
   [docs/service-definitions.md](docs/service-definitions.md) § Reconciliation.
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)

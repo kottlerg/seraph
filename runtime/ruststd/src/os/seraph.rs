@@ -1208,13 +1208,7 @@ macro_rules! __seraph_stack_pages {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use crate::__seraph_stack_pages as stack_pages;
 
-// ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────
-//
-// Sandboxed spawns: caller walks-and-attenuates a namespace cap into a
-// reduced-rights sub-cap, then attaches it to the `Command` so the child's
-// `ProcessInfo.system_root_cap` / `ProcessInfo.current_dir_cap` carries
-// the attenuated cap rather than the parent-inherit default. Wire shape
-// lives in `procmgr_labels::CONFIGURE_NAMESPACE`.
+// ── Directory entries (DirEntryExt) ─────────────────────────────────────────
 
 /// Seraph-specific extensions to `std::fs`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -1241,6 +1235,14 @@ pub mod fs {
         }
     }
 }
+
+// ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────
+//
+// Sandboxed spawns: caller walks-and-attenuates a namespace cap into a
+// reduced-rights sub-cap, then attaches it to the `Command` so the child's
+// `ProcessInfo.system_root_cap` / `ProcessInfo.current_dir_cap` carries
+// the attenuated cap rather than the parent-inherit default. Wire shape
+// lives in `procmgr_labels::CONFIGURE_NAMESPACE`.
 
 /// Seraph-specific extensions to `std::process::Command`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]

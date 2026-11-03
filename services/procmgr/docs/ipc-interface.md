@@ -369,7 +369,8 @@ death resync, and `DESTROY_PROCESS`) posts the two-word death entry
 badge in the correlator word (`syscall::DeathEvent`), after the process's
 objects are torn down. procmgr, not the kernel, is the source of logd's death
 events: a worker thread's terminal fault that tears down its process reaches
-logd too, and `DESTROY_PROCESS` posts `EXIT_KILLED`. A process torn down
+logd too, and `DESTROY_PROCESS` posts the reason the kernel retained if the
+process's main thread had already exited, else `EXIT_KILLED`. A process torn down
 before the registration posts nothing. A post the full queue refuses
 (`QueueFull`) is dropped, as the kernel drops a post to a full queue; logd's
 full-drain resync recovers it.

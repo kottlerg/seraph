@@ -688,7 +688,7 @@ mod tests
     fn a_reservation_the_heap_cannot_meet_is_out_of_memory()
     {
         // The one way a host test can make a reservation fail: a request no
-        // allocator can meet. The parser's copies all reserve through here.
+        // allocator can meet. The parser's string copies reserve through here.
         let mut s = String::new();
         assert!(matches!(
             reserve_str(&mut s, usize::MAX),

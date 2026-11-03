@@ -364,25 +364,26 @@ operations on the hot path when no waiter or wait set is registered.
 Setting an already-set bit is idempotent — this is the defined coalescing
 behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md#notifications)).
 
-**Device IRQ delivery.** A line `SYS_IRQ_REGISTER` routed to a notification reaches the send
-path from interrupt context (`irq::dispatch_device_irq`), with no capability and no reference
-on the notification. Each route instead counts the deliveries in flight through it: a delivery
-raises the line's count before it reads the route and drops it after its last access to the
-state and to the waiter it woke (step f above). Every route change runs under the
-routing table's lock, and a change that removes a notification from a line (`SYS_IRQ_REGISTER`
-replacing it, the Interrupt cap's teardown clearing it) waits, before it releases the lock, until
-that line's count is zero (spin site `irq:route-drain`). Once the lock is free, then, no delivery
-holds a notification that no line routes to. The Notification teardown (`dealloc_object`,
-Notification arm) takes the lock, and for each line in the routed-line set that names the state
-clears the route, waits for the line's count to reach zero, masks the line, and releases it at
-its controller (`irq::unregister_notification`); only then does it drain the waiters and free
-the state. The walk visits the routed lines only, so it scales with the registrations, not with
-the table. A delivery's raise and route read, and a change's store and count reads, are `SeqCst`:
-a delivery that read the state before a change removed it raised its count before the change
-reads it, so it is counted and waited for, and no delivery on any CPU reaches the state after its
-free. The wait is bounded: each delivery runs interrupts-off without waiting on the change, and
-masks its line until the driver's `SYS_IRQ_ACK`, so the line's count falls to zero between
-deliveries.
+**Device IRQ delivery.** A line `SYS_IRQ_REGISTER` bound to notifications reaches the send path
+from interrupt context (`irq::dispatch_device_irq`), with no capability and no reference on the
+notifications: it walks the line's bindings and signals each bound notification. Each line
+instead counts the deliveries in flight on it: a delivery raises the line's count before it reads
+the line's bindings and drops it after its last access to a binding, a state, and the waiter it
+woke (step f above). Every binding change runs under the routing table's lock, and a change that
+removes a notification from a line (a `SYS_IRQ_REGISTER` rebind replacing it, or a binding's
+removal when its Interrupt object is freed) waits, before it releases the lock, until that line's
+count is zero (spin site `irq:route-drain`). Once the lock is free, then, no delivery holds a
+notification that no binding names. The Notification teardown (`dealloc_object`, Notification
+arm) takes the lock, and for each line in the routed-line set removes every binding that names the
+state, waiting for the line's count to reach zero, and unmasks or releases the line as the
+remaining bindings require (`irq::unregister_notification`); only then does it drain the waiters
+and free the state. The walk visits the routed lines only, so it scales with the bindings, not with
+the table. A delivery's raise and its reads of the line's bindings, and a change's stores and count
+reads, are `SeqCst`: a delivery that read the state before a change removed it raised its count
+before the change reads it, so it is counted and waited for, and no delivery on any CPU reaches the
+state after its free. The wait is bounded: each delivery runs interrupts-off without waiting on the
+change, and masks its line until its receivers' `SYS_IRQ_ACK`, so the line's count falls to zero
+between deliveries.
 
 ### Wait Path
 

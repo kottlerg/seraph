@@ -12,8 +12,9 @@ The capability subsystem comprises six components:
 3. **Page pools** — the donated pages behind a CSpace's slots and an address
    space's page tables, and the record of every donation
 4. **Capability slot** — in-memory representation of one capability
-5. **Range capability objects** — the Mmio and IoPort objects, which record the
-   mappings and port bindings made through them so revocation can withdraw them
+5. **Range capability objects** — the Mmio, IoPort, and Interrupt objects, which record the
+   mappings, port bindings, and interrupt binding made through them so revocation can withdraw
+   them
 6. **Derivation tree** — cross-process tree for revocation
 
 ---
@@ -504,8 +505,8 @@ The principal kernel-internal owners:
 - **SEED scratch leases.** A per-thread x86-64 port-binding table (the IOPB and its
   binding records, [§ IoPort Bindings](#ioport-bindings)) reserved by `sys_ioport_bind`
   holds a reference on the SEED reserve until the thread is destroyed
-  (`alloc_seed_scratch` / `free_seed_scratch`). The body of every Mmio and IoPort object
-  is retyped from SEED as well, a copy's included, so each live copy holds one more SEED
+  (`alloc_seed_scratch` / `free_seed_scratch`). The body of every Mmio, IoPort, and Interrupt
+  object is retyped from SEED as well, a copy's included, so each live copy holds one more SEED
   lease; [§ Copies and Lineages](#copies-and-lineages) bounds how many a range can have.
 - **Mmio mapping records.** Each `SYS_MMIO_MAP` mapping an Mmio object records holds a
   reference on the target `AddressSpace`, released when the object is freed and the
@@ -568,25 +569,26 @@ so no `pin_slot` can be reading it.
 
 ## Range Capability Objects
 
-Mmio and IoPort capabilities grant hardware access that outlives the syscall that
-establishes it: a page mapping, or a thread's I/O permission bitmap. Revocation must
-withdraw that access ([docs/capability-model.md](../../../docs/capability-model.md) § Mmio,
-§ IoPort), so the kernel ties each grant to the object of the capability it was made
-through, and withdraws it when that object is freed.
+Mmio, IoPort, and Interrupt capabilities grant hardware access that outlives the syscall that
+establishes it: a page mapping, a thread's I/O permission bitmap, or a Notification's binding
+to an interrupt line. Revocation must withdraw that access
+([docs/capability-model.md](../../../docs/capability-model.md) § Interrupt, § Mmio, § IoPort),
+so the kernel ties each grant to the object of the capability it was made through, and
+withdraws it when that object is freed.
 
 ### Copies and Lineages
 
-`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio or IoPort capability do not
-share the source's object: `object_for_new_slot` retypes a fresh object over the same range from
-SEED, so every slot owns its object, and deleting the slot, consuming it with a split, or revoking
-an ancestor of it frees it (a syscall pin defers the free to the pinning syscall's end, as for any
-object). A boot mint or a range split produces a lineage *root*; a copy records its root
-(`RangeLineage`), and the root's lineage count holds a root share while the root has references plus
-one per live copy. A copy past `RANGE_COPY_LIMIT` (64) live copies of one root returns
-`QuotaExceeded`, counting the copies alone whether or not the root is still referenced; that bounds
-the SEED copying can consume per lineage, while a split of a copy produces two fresh roots, each
-with a lineage of its own. A copy's body is freed with its last reference; the root's body is freed
-when its last share goes, so a copy's root pointer never dangles.
+`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio, IoPort, or Interrupt
+capability do not share the source's object: `object_for_new_slot` retypes a fresh object over the
+same range from SEED, so every slot owns its object, and deleting the slot, consuming it with a
+split, or revoking an ancestor of it frees it (a syscall pin defers the free to the pinning
+syscall's end, as for any object). A boot mint or a range split produces a lineage *root*; a copy
+records its root (`RangeLineage`), and the root's lineage count holds a root share while the root
+has references plus one per live copy. A copy past `RANGE_COPY_LIMIT` (64) live copies of one root
+returns `QuotaExceeded`, counting the copies alone whether or not the root is still referenced; that
+bounds the SEED copying can consume per lineage, while a split of a copy produces two fresh roots,
+each with a lineage of its own. A copy's body is freed with its last reference; the root's body is
+freed when its last share goes, so a copy's root pointer never dangles.
 
 ### Mmio Mappings
 
@@ -639,6 +641,20 @@ CPU's TSS is written only by that CPU, except for the offset, which `TssWithIopb
 alignment lets another CPU store atomically; any interleaving of a remote invalidation with a
 local reload leaves the CPU either invalidated or running a bitmap loaded under its thread's lock
 after the rebuild.
+
+### Interrupt Bindings
+
+An `InterruptObject` carries one binding (`irq::IrqBinding`): unbound until `SYS_IRQ_REGISTER`
+through it, and then linked in its line's binding list in the IRQ routing table with one bit of
+the line's bound and owing masks (`core/kernel/src/irq.rs`, module doc § Sharing). Since a copy is a
+fresh object, each capability to a line is a binding of its own, and a line holds at most
+`irq::MAX_IRQ_BINDINGS` (64). The object's `dealloc_object` arm removes its binding
+(`irq::unregister`) before the body goes: under the IRQ routing lock it unlinks the binding,
+clears its bits, waits out the deliveries in flight on the line, and unmasks or releases the line,
+so no delivery reaches the freed body and the other bindings on the line stay. A Notification's
+teardown removes every binding naming it the same way (`irq::unregister_notification`), leaving
+those Interrupt objects unbound. A range capability (more than one line) never binds, and its arm
+finds nothing to remove.
 
 ---
 

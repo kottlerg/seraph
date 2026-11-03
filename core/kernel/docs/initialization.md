@@ -148,13 +148,18 @@ again from the recorded BootInfo address.
    rebased onto the direct map right after Phase 3 (wide enough to hold the HANDOFF_STACK_BYTES
    of stack the entry contract guarantees below the entry stack pointer, whatever its
    alignment), and the direct map of the
-   2 MiB chunks covering the carve.
+   first two 2 MiB chunks covering the carve (mm::paging::carve_bootstrap_end; all of them
+   when there are fewer), which hold at least 513 of its frames whenever it spans more, so
+   the seed's need is fixed by the image, not by RAM.
 4. Activate the tables: arch::current::paging::activate(root_phys). From here nothing
    reads BootInfo until step 9: everything later steps map was read from it before.
-5. Stage 2, from the carve, reached through the direct map: map the direct physical map —
+5. Stage 2, from the carve, reached through the direct map. First map the carve's other
+   chunks, each from frames of the part already mapped (mm::paging::map_carve_rest: a chunk
+   takes at most one table per level and makes 512 more frames reachable, and the pool hands
+   out only frames the direct map reaches). Then map the direct physical map —
    - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
      AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
-     — at direct_map_base() + phys, less the carve's chunks mapped in step 3
+     — at direct_map_base() + phys, less the carve's chunks
    - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used, except that a
      2 MiB chunk holding an arch kernel MMIO page (xAPIC or I/O APIC on x86-64) is mapped as
      4 KiB pages, the MMIO pages uncacheable

@@ -29,17 +29,17 @@
 //! `.bss` seed of [`BOOT_TABLE_POOL_SIZE`] frames, which lies inside the kernel
 //! image the bootloader already mapped (at its KASLR-slid link address); their
 //! physical addresses are derived from the kernel VA/PA offset in
-//! [`BootInfo`]. It maps the kernel image, the boot stack, and the direct-map
-//! chunks covering a carve of free RAM sized to [`stage2_table_bound`], then
-//! activates the tables. Stage 2 draws its frames from the carve, now reachable
-//! through the live direct map, and maps the rest: the direct map of all RAM,
-//! the framebuffer and kernel MMIO above it, and the AP trampoline page.
-//! Phase 2's free-range stream keeps the frames stage 2 used out of the buddy
+//! [`BootInfo`]. It maps the kernel image, the boot stack, and the first two
+//! direct-map chunks of a carve of free RAM sized to [`stage2_table_bound`]
+//! ([`carve_bootstrap_end`]), then activates the tables. Stage 2 draws its
+//! frames from the carve, reachable through the live direct map: first it maps
+//! the carve's other chunks, each from frames of the part already mapped
+//! ([`map_carve_rest`]), then the rest: the direct map of all RAM, the
+//! framebuffer and kernel MMIO above it, and the AP trampoline page. Phase 2's
+//! free-range stream keeps the frames stage 2 used out of the buddy
 //! (`mm::init::record_boot_table_carve`). The seed's size is fixed by the
-//! stage-1 mappings, and the carve's by the machine, so no RAM a 4-level or
-//! Sv48 kernel half can hold exhausts either; only a direct map of petabytes,
-//! which x86-64 5-level paging or Sv57 can address, outgrows the seed
-//! ([`BOOT_TABLE_POOL_SIZE`]).
+//! kernel image, and the carve's by the machine, so no amount of RAM exhausts
+//! either ([`BOOT_TABLE_POOL_SIZE`]).
 
 // cast_possible_truncation: u64→usize memory-map entry count; 64-bit targets
 // only, so the cast is exact.
@@ -239,15 +239,13 @@ impl MapOutcome
 /// Number of 4 KiB frames in the stage-1 BSS seed (256 KiB).
 ///
 /// Stage 1 maps only the root, the kernel image, the boot stack window and the
-/// direct-map chunks of the stage-2 carve, so the seed's need is fixed by the
-/// image size, not by RAM: the image's tables (one per 2 MiB of image plus its
-/// upper levels), about eight for the stack window, and one directory per GiB
-/// of carve, which is about 1 MiB of carve per 256 GiB of RAM. 64 frames leave
-/// room for a 64 MiB image beside the carve of any direct map up to the
-/// 128 TiB 4-level kernel half, whose carve stays under 1 GiB (one directory),
-/// at any paging depth (a fifth level adds one table to each chain). Only a
-/// 5-level or Sv57 direct map of petabytes, one more directory per 256 TiB of
-/// RAM, outgrows the seed. A seed too small fails the boot in Phase 3 by name.
+/// first two direct-map chunks of the stage-2 carve, whose frames map the rest
+/// of it ([`map_carve_rest`]), so the seed's need is fixed by the image size,
+/// not by RAM: the image's tables (one per 2 MiB of image plus its upper
+/// levels), about eight for the stack window, and one table chain for the two
+/// carve chunks. 64 frames leave room for a 64 MiB image at any paging depth (a
+/// fifth level adds one table to each chain). A seed too small fails the boot
+/// in Phase 3 by name.
 pub const BOOT_TABLE_POOL_SIZE: usize = 64;
 
 /// Contiguous 4 KiB-aligned block of zeroed BSS frames for boot page tables.
@@ -289,6 +287,9 @@ pub struct PoolState
     carve_pa_base: u64,
     carve_capacity: usize,
     carve_next: usize,
+    /// Carve frames the direct map reaches so far: frames are handed out only
+    /// below it ([`PoolState::extend_carve_mapped`]).
+    carve_mapped: usize,
     /// Direct-map base through which carve frames are reached.
     dm_base: u64,
 }
@@ -321,6 +322,7 @@ impl PoolState
             carve_pa_base: 0,
             carve_capacity: 0,
             carve_next: 0,
+            carve_mapped: 0,
             dm_base: 0,
         }
     }
@@ -342,6 +344,7 @@ impl PoolState
             carve_pa_base: 0,
             carve_capacity: 0,
             carve_next: 0,
+            carve_mapped: 0,
             dm_base: 0,
         }
     }
@@ -357,7 +360,7 @@ impl PoolState
     {
         if self.carve_capacity != 0
         {
-            if self.carve_next >= self.carve_capacity
+            if self.carve_next >= self.carve_capacity.min(self.carve_mapped)
             {
                 return Err(PagingError::OutOfFrames);
             }
@@ -378,13 +381,22 @@ impl PoolState
 
     /// Draw every later frame from the `frames` frames of RAM at `base`,
     /// reached through the direct map at `dm_base`, which must already map
-    /// them.
-    pub fn switch_to_carve(&mut self, base: u64, frames: usize, dm_base: u64)
+    /// the first `mapped` of them; later ones are handed out once
+    /// [`Self::extend_carve_mapped`] says the direct map reaches them.
+    pub fn switch_to_carve(&mut self, base: u64, frames: usize, dm_base: u64, mapped: usize)
     {
         self.carve_pa_base = base;
         self.carve_capacity = frames;
         self.carve_next = 0;
+        self.carve_mapped = mapped;
         self.dm_base = dm_base;
+    }
+
+    /// Record that the direct map now reaches the carve's first `mapped`
+    /// frames.
+    pub fn extend_carve_mapped(&mut self, mapped: usize)
+    {
+        self.carve_mapped = self.carve_mapped.max(mapped);
     }
 
     /// Frames drawn from the carve so far.
@@ -411,6 +423,61 @@ impl PoolState
             self.dm_base.wrapping_add(phys)
         }
     }
+}
+
+// ── Carve bootstrap ───────────────────────────────────────────────────────────
+
+/// End of the carve chunks stage 1 maps from the seed: the first two of the
+/// carve's 2 MiB chunks `chunks` (all of them, when there are fewer). Two
+/// hold at least 513 of the carve's frames whenever the carve spans more,
+/// since only its first chunk can be partial, so the seed's share is a
+/// constant whatever the carve's size.
+#[must_use]
+pub fn carve_bootstrap_end(chunks: (u64, u64)) -> u64
+{
+    chunks.1.min(chunks.0.saturating_add(2 * LARGE_PAGE_SIZE))
+}
+
+/// Frames of the carve of `frames` frames at `base` that lie below `end`.
+#[must_use]
+pub fn carve_frames_below(base: u64, frames: usize, end: u64) -> usize
+{
+    ((end.saturating_sub(base) / PAGE_SIZE as u64) as usize).min(frames)
+}
+
+/// Switch `pool` to the carve `(base, frames, dm_base)` (see
+/// [`PoolState::switch_to_carve`]), whose chunks below `rest.0` the direct map
+/// reaches, and map its other chunks `[rest.0, rest.1)` with frames from the
+/// carve: after each chunk `map_chunk` maps, the pool may hand out the carve
+/// frames it holds. A chunk's mapping takes at most one table per level below the
+/// root, and each chunk mapped makes 512 more frames reachable, so the
+/// frames handed out stay inside the mapped prefix, which starts with the
+/// chunks stage 1 mapped ([`carve_bootstrap_end`]).
+///
+/// # Errors
+/// [`PagingError::OutOfFrames`] if a chunk's tables outrun the mapped prefix
+/// (a prefix too small, a defect in the bound above), or `map_chunk`'s error.
+pub fn map_carve_rest(
+    pool: &mut PoolState,
+    (base, frames, dm_base): (u64, usize, u64),
+    rest: (u64, u64),
+    mut map_chunk: impl FnMut(&mut PoolState, u64) -> Result<(), PagingError>,
+) -> Result<(), PagingError>
+{
+    pool.switch_to_carve(
+        base,
+        frames,
+        dm_base,
+        carve_frames_below(base, frames, rest.0),
+    );
+    let mut phys = rest.0;
+    while phys < rest.1
+    {
+        map_chunk(pool, phys)?;
+        phys += LARGE_PAGE_SIZE;
+        pool.extend_carve_mapped(carve_frames_below(base, frames, phys));
+    }
+    Ok(())
 }
 
 // ── Stage-2 frame bound ───────────────────────────────────────────────────────
@@ -657,28 +724,38 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     );
 
     // ── Stage 1, from the BSS seed ────────────────────────────────────────────
+    // Only the carve's first chunks: they hold the frames that map the rest
+    // of it, so the seed's need does not grow with the carve.
     map_kernel_image(root_va, info, &mut pool)?;
     map_boot_stack(root_va, info, &mut pool)?;
-    let mut phys = carve_chunks.0;
-    while phys < carve_chunks.1
-    {
-        map_direct_chunk(root_va, dm_base, phys, mmio_regions, &mut pool)?;
-        phys += LARGE_PAGE_SIZE;
-    }
+    let bootstrap_end = carve_bootstrap_end(carve_chunks);
+    map_direct_chunks(
+        root_va,
+        dm_base,
+        (carve_chunks.0, bootstrap_end),
+        mmio_regions,
+        &mut pool,
+    )?;
     // SAFETY: the tables map the kernel image (code, data, this stack's frame
-    // via the boot stack window) and the carve's direct map; nothing below
-    // touches `info` or other identity-mapped memory.
+    // via the boot stack window) and the carve's first chunks in the direct
+    // map; nothing below touches `info` or other identity-mapped memory.
     unsafe {
         arch_paging::activate(root_pa);
     }
 
     // ── Stage 2, from the carve ───────────────────────────────────────────────
-    // The carve frames' bound fits `usize` on the 64-bit kernel.
-    pool.switch_to_carve(carve, carve_frames as usize, dm_base);
+    // The carve frames' bound fits `usize` on the 64-bit kernel. The rest of
+    // the carve is mapped first, from the frames its mapped prefix holds.
+    map_carve_rest(
+        &mut pool,
+        (carve, carve_frames as usize, dm_base),
+        (bootstrap_end, carve_chunks.1),
+        |pool, phys| map_direct_chunk(root_va, dm_base, phys, mmio_regions, pool),
+    )?;
 
     // Direct physical map of [0, max_phys_rounded) in 2 MiB pages, except a
     // chunk holding a kernel MMIO page (`map_direct_chunk`). The carve's own
-    // chunks were mapped in stage 1.
+    // chunks are mapped already.
     let mut phys: u64 = 0;
     while phys < max_phys_rounded
     {
@@ -764,6 +841,25 @@ fn map_direct_chunk(
     }
     let rw = direct_map_page_flags(phys, &[]);
     arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, pool)
+}
+
+/// Map the 2 MiB direct-map chunks `[chunks.0, chunks.1)` ([`map_direct_chunk`]).
+#[cfg(not(test))]
+fn map_direct_chunks(
+    root_va: u64,
+    dm_base: u64,
+    chunks: (u64, u64),
+    mmio_regions: &[(u64, u64)],
+    pool: &mut PoolState,
+) -> Result<(), PagingError>
+{
+    let mut phys = chunks.0;
+    while phys < chunks.1
+    {
+        map_direct_chunk(root_va, dm_base, phys, mmio_regions, pool)?;
+        phys += LARGE_PAGE_SIZE;
+    }
+    Ok(())
 }
 
 /// Map every 4 KiB page `[phys, phys + len)` touches at `dm_base + phys`,
@@ -1308,7 +1404,7 @@ mod tests
         let mut pool = PoolState::new_for_test(seed, 2);
         let (_, seed_pa) = pool.alloc_frame().unwrap();
         let dm = 0xFFFF_9000_0000_0000;
-        pool.switch_to_carve(0x10_0000, 2, dm);
+        pool.switch_to_carve(0x10_0000, 2, dm, 2);
         let (va, pa) = pool.alloc_frame().unwrap();
         assert_eq!((va, pa), (dm + 0x10_0000, 0x10_0000));
         assert_eq!(pool.phys_to_virt(pa), dm + pa);
@@ -1326,5 +1422,73 @@ mod tests
         let pool = PoolState::new_for_test(base, 1);
         // new_for_test uses kv_minus_kp = 0, so phys_to_virt is identity.
         assert_eq!(pool.phys_to_virt(base), base);
+    }
+
+    // Defect caught: a carve whose rest is mapped from frames the direct map
+    // does not reach yet, or a stage-1 share that grows with the carve, which
+    // brings back a seed sized by RAM.
+    #[test]
+    fn the_carve_maps_its_rest_from_its_own_mapped_prefix_at_any_size()
+    {
+        // Each chunk's mapping takes up to one table per level below a
+        // five-level root; only frame accounting is modelled, so a carve of
+        // any size costs no memory.
+        const TABLES_PER_CHUNK: usize = 4;
+        let large = LARGE_PAGE_SIZE;
+        for (offset_pages, frames) in [
+            (0u64, 1usize),
+            (0, 600),
+            (511, 600),
+            (511, 1_000_000),
+            (7, 50_000_000),
+        ]
+        {
+            let base = (1u64 << 40) + offset_pages * PAGE_SIZE as u64;
+            let end = base + frames as u64 * PAGE_SIZE as u64;
+            let chunks = (base & !(large - 1), (end + large - 1) & !(large - 1));
+            let prefix_end = carve_bootstrap_end(chunks);
+            assert!(
+                (prefix_end - chunks.0) / large <= 2,
+                "stage 1 maps at most two chunks"
+            );
+            let mut pool = PoolState::new_for_test(0x1000, 0);
+            let mut chunks_mapped = 0usize;
+            map_carve_rest(
+                &mut pool,
+                (base, frames, 0),
+                (prefix_end, chunks.1),
+                |pool, _| {
+                    chunks_mapped += 1;
+                    for _ in 0..TABLES_PER_CHUNK.min(frames)
+                    {
+                        pool.alloc_frame()?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_or_else(|e| panic!("carve of {frames} frames at +{offset_pages}: {e:?}"));
+            assert_eq!(
+                pool.carve_mapped, frames,
+                "the whole carve is reachable afterwards"
+            );
+            assert_eq!(
+                pool.carve_used(),
+                chunks_mapped * TABLES_PER_CHUNK.min(frames)
+            );
+        }
+    }
+
+    // Defect caught: a pool that hands out a carve frame past the mapped
+    // prefix, which stage 2 would then write through an unmapped address.
+    #[test]
+    fn a_carve_frame_past_the_mapped_prefix_is_refused()
+    {
+        let mut pool = PoolState::new_for_test(0x1000, 0);
+        pool.switch_to_carve(0x10_0000, 4, 0, 2);
+        pool.alloc_frame().unwrap();
+        pool.alloc_frame().unwrap();
+        assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
+        pool.extend_carve_mapped(3);
+        assert_eq!(pool.alloc_frame(), Ok((0x10_2000, 0x10_2000)));
     }
 }

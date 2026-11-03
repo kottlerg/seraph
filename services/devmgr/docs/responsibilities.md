@@ -61,32 +61,31 @@ devmgr's responsibilities are:
   regions name.
 
   devmgr serves a driver's endpoint only once the driver has set its device
-  up. It spawns its drivers in two production settle batches: the boot batch (every
-  virtio-blk driver, then the serial and framebuffer drivers) and the
+  up. It spawns its drivers in two production settle batches: the boot batch
+  (every virtio-blk driver, then the serial and framebuffer drivers) and the
   on-disk batch (the RTC driver, then every virtio-input driver). Each
   driver's devmgr query cap is a SEND, badged with its device badge, on its
   batch's private endpoint; the serial and RTC drivers' badges name catalog
   entries that carry no startup info. Once a driver's bootstrap is served,
   devmgr binds a death observer on the driver's thread to its driver death
-  queue: one queue for the boot, sized at enumeration to every driver the
-  boot can spawn (one per virtio-blk and virtio-input device, the serial,
+  queue: one queue for the boot, sized at enumeration to every driver the boot
+  can spawn (one per virtio-blk and virtio-input device, the serial,
   framebuffer, and RTC drivers, and the three fixtures of the test-only fault
-  batch below), so every bind is funded and no death is dropped. A driver
-  that needs startup info (the VirtIO drivers, the framebuffer) calls
+  batch below), so every bind is funded and no death is dropped. A driver that
+  needs startup info (the VirtIO drivers, the framebuffer) calls
   `QUERY_DEVICE_INFO` on its query cap before its device setup, and every
   driver calls `DRIVER_READY` on it after, immediately before its service
-  loop. devmgr waits on a wait set over the batch's
-  private endpoint, the death queue, and a timer, serving those two labels on
-  the private endpoint and taking deaths from the queue, until every driver
-  of the batch has reported ready or died or the settle bound elapses, and
-  then takes every death still queued. It then revokes the private endpoint,
-  serves each driver that reported ready, and withdraws the rest: its service
-  endpoint revoked and deleted, its BAR and IRQ caps released, and a driver
-  still pending destroyed (`DESTROY_PROCESS` on the process handle devmgr
-  keeps until the batch settles). The catalog entry of a withdrawn driver, or
-  of one that failed to spawn, stays, so a badge is never reused. No
-  `QUERY_*` reply hands out the endpoint of a driver that has not reported
-  its device ready.
+  loop. devmgr waits on a wait set over the batch's private endpoint, the
+  death queue, and a timer, serving those two labels on the private endpoint
+  and taking deaths from the queue, until every driver of the batch has
+  reported ready or died or the settle bound elapses, and then takes every
+  death still queued. It then revokes the private endpoint, serves each driver
+  that reported ready, and withdraws the rest: its service endpoint revoked
+  and deleted, its BAR and IRQ caps released, and a driver still pending
+  destroyed (`DESTROY_PROCESS` on the process handle devmgr keeps until the
+  batch settles). The catalog entry of a withdrawn driver, or of one that
+  failed to spawn, stays, so a badge is never reused. No `QUERY_*` reply hands
+  out the endpoint of a driver that has not reported its device ready.
 
   The settle bound, `SETTLE_TIMEOUT` (`services/devmgr/src/settle.rs`), is
   twice `virtio_core::pci::RESET_TIMEOUT` (5 s), so 10 s, counted from the

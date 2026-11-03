@@ -66,6 +66,13 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
             let cpu = crate::arch::current::cpu::current_cpu();
             Ok(u64::from(cpu))
         }
+        8 =>
+        // UserVaTop — exclusive top of the user half; fixed per architecture
+        // and boot paging mode, a value the ABI already fixes (see
+        // `SystemInfoType::UserVaTop`), not a kernel address.
+        {
+            Ok(crate::mm::user_va_top())
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }

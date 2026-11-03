@@ -1595,6 +1595,19 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// Exclusive top of the user half of the caller's address space
+/// (`SystemInfoType::UserVaTop`): the first virtual address a mapping syscall
+/// refuses, fixed per architecture and boot paging mode.
+///
+/// # Errors
+/// Returns a negative `i64` error code from a kernel that predates the
+/// selector (`InvalidArgument`).
+#[inline]
+pub fn user_va_top() -> Result<u64, i64>
+{
+    system_info(syscall_abi::SystemInfoType::UserVaTop as u64)
+}
+
 /// Inspect a capability slot's runtime state.
 ///
 /// `slot` — capability handle (slot index plus generation) in the caller's

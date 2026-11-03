@@ -1067,6 +1067,13 @@ pub enum SystemInfoType
     /// Useful for diagnostics and for verifying affinity / migration
     /// behaviour from userspace.
     CurrentCpu = 7,
+    /// Exclusive top of the user half of the caller's address space: the
+    /// first virtual address a mapping syscall refuses. A fixed value per
+    /// architecture and boot paging mode (`(1 << 47) - 4096` on x86-64, whose
+    /// top user page is unmappable; `1 << 38`, `1 << 47`, or `1 << 56` under
+    /// riscv64 Sv39, Sv48, or Sv57), so a process sizes the zones it places
+    /// itself to its address space.
+    UserVaTop = 8,
 }
 
 #[cfg(test)]

@@ -29,8 +29,9 @@
 //!
 //! Tests map, unmap, and reprotect pages of ktest's own address space only at
 //! scratch VAs: the low band `[0x1_4000_0000, 0x2_0000_0000)`, the high band
-//! `[0x3E_0000_0000, 0x3F_0000_0000)`, and, on x86-64, the top two pages of
-//! the user half. ktest's own memory lies in none of them: the kernel places its
+//! `[0x3E_0000_0000, 0x3F_0000_0000)`, the top page of the user half
+//! (`sysinfo::user_va_top`), and, on x86-64, the top two pages of the user
+//! half. ktest's own memory lies in none of them: the kernel places its
 //! image (every static: child stacks, IPC pages, argument blocks), its boot
 //! stack, and its `InitInfo` page in the `shared/process-layout` windows
 //! (`0x21_0000_0000` up to the image window's end below `0x38_4000_0000`) or

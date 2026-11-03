@@ -201,26 +201,16 @@ fn main() -> !
 /// count sizes the queue.
 const DEATH_EQ_CAPACITY: u32 = 128;
 
-/// Death-observer nodes in logd's death queue: procmgr binds one per live
-/// process's main thread, and a node returns only when that thread is
-/// destroyed. A bind past the pool fails: silently at spawn, logged by
-/// procmgr's retroactive bind. logd then gets no death post for that process,
-/// so its slot stays until a later full-queue resync from procmgr's live list
-/// evicts it, if one runs (#643 grows the pool). Sized above the live
-/// processes procmgr's own death-queue pool allows, so that pool binds first.
-const DEATH_EQ_OBSERVERS: u32 = 1024;
-
 /// Allocate the slab and create the death-notification `EventQueue` of
-/// [`DEATH_EQ_CAPACITY`] entries and [`DEATH_EQ_OBSERVERS`] observer nodes.
+/// [`DEATH_EQ_CAPACITY`] entries. It has no death-observer nodes: nothing
+/// binds it, since procmgr posts each death to it itself
+/// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_DEATH_EQ`).
 fn create_death_eq() -> Option<u32>
 {
-    // The kernel's raw EventQueue debit for that capacity and node count.
-    let slab_bytes = std::os::seraph::event_queue_retype_bytes(
-        u64::from(DEATH_EQ_CAPACITY),
-        u64::from(DEATH_EQ_OBSERVERS),
-    );
+    // The kernel's raw EventQueue debit for that capacity and no nodes.
+    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY), 0);
     std::os::seraph::object_slab_retype(slab_bytes, |slab| {
-        syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS).ok()
+        syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
     })
 }
 
@@ -554,41 +544,28 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     self_log(buf.as_str());
 }
 
-/// Non-blocking drain of the death event queue. Each death event carries
-/// the exit reason and the correlator procmgr bound, `process_badge as u32`
-/// widened to `u64` (`syscall::DeathEvent`). We evict the
-/// matching slot from the badge table. Returns whether the drain took a full
-/// queue's worth of events: the queue may then have filled, and a post to a
-/// full queue is dropped, so the caller starts a [`Resync`].
+/// Non-blocking drain of the death event queue. Each death event procmgr
+/// posts carries the exit reason and the dead process's full badge as the
+/// correlator (`syscall::DeathEvent`). We evict the slot of exactly that
+/// badge. Returns whether the drain took a full queue's worth of events: the
+/// queue may then have filled, and a post to a full queue is dropped, so the
+/// caller starts a [`Resync`].
 fn drain_deaths(death_eq: u32, table: &mut SlotTable) -> bool
 {
     let mut drained: u32 = 0;
     while let Ok(death) = syscall::event_try_recv_death(death_eq)
     {
         drained = drained.saturating_add(1);
-        // procmgr binds the badge's low 32 bits widened to u64, so the low
-        // word is the whole correlator.
-        // cast_possible_truncation: see above; the high word is always zero.
-        #[allow(clippy::cast_possible_truncation)]
-        let correlator = death.correlator as u32;
-        let exit_reason = death.exit_reason;
-        // Badge in logd's slot map is the full u64; the correlator
-        // procmgr binds is `process_badge as u32`, unique among live
-        // processes. Match against the low 32 bits.
-        let dead: Vec<u64> = table
-            .slots
-            .keys()
-            .copied()
-            .filter(|&t| (t as u32) == correlator)
-            .collect();
-        for badge in dead
+        let badge = death.correlator;
+        if table.evict(badge)
         {
-            if table.evict(badge)
-            {
-                let mut buf = SerialFmt::new();
-                let _ = write!(buf, "reclaim: badge={badge} exit_reason=0x{exit_reason:x}");
-                self_log(buf.as_str());
-            }
+            let mut buf = SerialFmt::new();
+            let _ = write!(
+                buf,
+                "reclaim: badge={badge} exit_reason=0x{:x}",
+                death.exit_reason
+            );
+            self_log(buf.as_str());
         }
     }
     if drained < DEATH_EQ_CAPACITY

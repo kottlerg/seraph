@@ -259,11 +259,11 @@ pub struct RestartCtx
     pub procmgr_ep: u32,
     pub bootstrap_ep: u32,
     pub ipc_buf: *mut u64,
-    /// Shared death-notification queue. Restarted services are
-    /// rebound here with the same correlator they used pre-crash, so
-    /// the routing in `dispatch_deaths` continues to land on the
-    /// correct `ServiceEntry`.
-    pub deaths_eq: u32,
+    /// The death-notification queues. Restarted services are rebound
+    /// here with the same correlator they used pre-crash, so the routing
+    /// in `dispatch_deaths` continues to land on the correct
+    /// `ServiceEntry`.
+    pub deaths: crate::death_queues::DeathSet,
     /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
     pub master_log_source: u32,
@@ -298,7 +298,7 @@ pub fn handle_death(
     svc: &mut ServiceEntry,
     exit_reason: u64,
     ctx: &RestartCtx,
-    correlator: u32,
+    correlator: u64,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
 ) -> DeathOutcome
@@ -391,7 +391,7 @@ fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
 fn restart_process(
     svc: &mut ServiceEntry,
     ctx: &RestartCtx,
-    correlator: u32,
+    correlator: u64,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
 ) -> bool
@@ -459,7 +459,7 @@ fn restart_process(
 
     svc.bootstrap_badge = child_badge;
 
-    if !rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
+    if !rebind_death_notification(svc, &ctx.deaths, new_thread_cap, correlator)
     {
         destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
         svc.process_handle = 0;
@@ -764,18 +764,18 @@ pub(crate) fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_bu
     let _ = syscall::cap_delete(thread_cap);
 }
 
-/// Rebind death notification onto the shared queue using the same
-/// correlator the dead instance used. No new event queue is created —
-/// every supervised service routes through `ctx.deaths_eq`, and the
-/// payload tag is what links a death back to its `ServiceEntry`.
+/// Rebind death notification onto the death queues using the same
+/// correlator the dead instance used. Every supervised service routes
+/// through `ctx.deaths`, and the payload tag is what links a death back to
+/// its `ServiceEntry`.
 fn rebind_death_notification(
     svc: &mut ServiceEntry,
-    deaths_eq: u32,
+    deaths: &crate::death_queues::DeathSet,
     new_thread_cap: u32,
-    correlator: u32,
+    correlator: u64,
 ) -> bool
 {
-    if syscall::thread_bind_notification(new_thread_cap, deaths_eq, u64::from(correlator)).is_err()
+    if deaths.bind_thread(new_thread_cap, correlator).is_err()
     {
         std::os::seraph::log!("failed to rebind death notification");
         return false;

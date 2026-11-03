@@ -46,8 +46,8 @@ devmgr's responsibilities are:
   serial driver acknowledges a delivery only when its client reads
   ([services/drivers/serial/README.md](../../drivers/serial/README.md#interrupts)
   § Interrupts), so no other device may share its line; every PCI device's
-  line is instead held
-  and shared, [docs/pci-enumeration.md](pci-enumeration.md) step 3),
+  line is instead held and shared,
+  [docs/pci-enumeration.md](pci-enumeration.md) step 3),
   and whose second, terminal round delivers the driver's devmgr query cap
   (below). The `cmos-rtc` first round also carries one data word: the CMOS
   RAM index of the century register the FADT's `CENTURY` field names, or 0

@@ -32,11 +32,11 @@ TODO: specify driver teardown.
    only inside its request path holds the line masked for every other device on it while it is
    idle (see [docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
    § Interrupt Delivery). The VirtIO drivers run an interrupt-service thread, the only waiter on
-   the line's notification, which reads the device's interrupt status and acknowledges on every
-   wake, and reads the status on a bounded timeout too, so an interrupt whose edge was lost on
+   the line's notification, which reads the device's interrupt status and acknowledges every
+   delivery, and reads the status on a bounded timeout too, so an interrupt whose edge was lost on
    x86-64 is still seen (`virtio_core::isr::serve_interrupts`, at most `ISR_POLL_MS` late). A
-   driver that does not acknowledge promptly needs its line kept exclusive: the serial
-   driver acknowledges only when its client reads
+   driver that does not acknowledge promptly needs its line kept exclusive: the serial driver
+   acknowledges only when its client reads
    ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr
    keeps the UART line exclusive. The UART line is never a PCI `INTx` line on either machine
    (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is PLIC source 10 against `INTx` sources
@@ -50,4 +50,5 @@ TODO: specify driver teardown.
 
 [Device Management](../../../docs/device-management.md), [services/drivers/README.md](../README.md),
 [services/drivers/virtio/blk/README.md](../virtio/blk/README.md),
-[services/drivers/virtio/core/README.md](../virtio/core/README.md)
+[services/drivers/virtio/core/README.md](../virtio/core/README.md),
+[services/drivers/virtio/input/README.md](../virtio/input/README.md)

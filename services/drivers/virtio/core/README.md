@@ -37,6 +37,7 @@ virtio/core/
 |---|---|
 | [docs/virtio-architecture.md](../../docs/virtio-architecture.md) | VirtIO transport abstraction and queue internals |
 | [docs/device-management.md](../../../../docs/device-management.md) | Driver lifecycle, DMA safety |
+| [docs/driver-model.md](../../docs/driver-model.md) | Driver rules, including rule 5's prompt acknowledgement on a shared line |
 
 ---
 

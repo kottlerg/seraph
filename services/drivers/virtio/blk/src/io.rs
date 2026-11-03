@@ -268,7 +268,8 @@ pub fn submit_and_wait(
         // No completion yet — block on the completion notification with a
         // bounded timeout. The interrupt-service thread signals it after each
         // delivery, and after a timed ISR read that finds an interrupt no
-        // delivery reported, having read the ISR and acknowledged itself.
+        // delivery reported, having read the ISR and acknowledged any
+        // delivery.
         // Ok(0) means timeout (notification_send rejects zero-bit sends, so 0
         // is unambiguous); Ok(_) means a real wake; Err means the cap path
         // failed and there's nothing useful to do but fall through and poll.

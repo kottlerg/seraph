@@ -85,9 +85,15 @@ The driver owns one DMA page of 8-byte event buffers posted to the eventq
 (virtqueue 0) as device-writable descriptors. The device fills one event per
 buffer as keys arrive and raises an interrupt; the driver drains the used ring,
 decodes, and re-posts each buffer. A descriptor-head → buffer-slot map locates
-the filled buffer on completion. The IRQ wait carries a bounded timeout and
-re-drains each tick, so the read still completes with no IRQ cap and tolerates
-the occasional lost PLIC interrupt on QEMU virt RISC-V.
+the filled buffer on completion. With an IRQ cap, an interrupt-service thread
+is the only waiter on the notification bound to the device's line: it runs
+virtio-core's `isr::serve_interrupts`, which reads the ISR and acknowledges
+every delivery at once, a read in flight or not, as a driver on a shared line
+must ([driver-model.md](../../docs/driver-model.md) rule 5), reads the ISR on a
+bounded timeout too, and signals the read loop's `wake` notification. The read
+loop's wait on `wake` carries a bounded timeout and re-drains each tick, so the
+read still completes with no IRQ cap and tolerates a lost interrupt (a lost
+PLIC interrupt on QEMU virt RISC-V, or an edge the x86-64 I/O APIC drops).
 
 ---
 

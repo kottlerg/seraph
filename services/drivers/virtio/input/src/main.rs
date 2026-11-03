@@ -490,7 +490,7 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
         }
         // Wait for input. When an IRQ is bound the interrupt-service thread
         // signals `wake` on each interrupt, having read the ISR and
-        // acknowledged the line itself; otherwise this is a timed poll. The
+        // acknowledged any delivery; otherwise this is a timed poll. The
         // bounded wait re-drains every tick, so a lost or absent IRQ cannot
         // wedge the read.
         let _ = syscall::notification_wait_timeout(rt.wake, POLL_INTERVAL_MS);

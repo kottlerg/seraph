@@ -180,8 +180,8 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
   flight: the line stays masked until every binding has acknowledged, so a receiver that
   acknowledges only while it serves a request of its own holds the line masked for the others on
   it while it is idle, and their devices' interrupts are lost (x86-64) or delayed (riscv64) until
-  it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges on
-  every wake ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
+  it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges
+  every delivery ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
   rule 5) and also reads its device's interrupt status on a bounded timeout, which the x86-64
   limit below needs. A driver that does not acknowledge promptly needs its line kept exclusive:
   the serial driver acknowledges only when its client reads

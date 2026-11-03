@@ -1386,12 +1386,17 @@ fn carve_virtio_bars(
             .find(|&b| pci_dev.bar_pci_idx[b] == aperture.bar && pci_dev.bar_is_mmio[b])
         else
         {
-            std::os::seraph::log!("devmgr: VirtIO BAR {} is not an MMIO BAR", aperture.bar);
+            std::os::seraph::log!(
+                "{}: VirtIO BAR {} is not an MMIO BAR; not spawned",
+                name,
+                aperture.bar
+            );
             bars.release();
             return None;
         };
         std::os::seraph::log!(
-            "devmgr: VirtIO BAR {} phys={:#018x} size={:#018x}",
+            "{}: VirtIO BAR {} phys={:#018x} size={:#018x}",
+            name,
             aperture.bar,
             pci_dev.bar_phys[b],
             pci_dev.bar_size[b]
@@ -1404,7 +1409,8 @@ fn carve_virtio_bars(
         else
         {
             std::os::seraph::log!(
-                "devmgr: VirtIO BAR {} not covered by any aperture",
+                "{}: VirtIO BAR {} not covered by any aperture; not spawned",
+                name,
                 aperture.bar
             );
             bars.release();

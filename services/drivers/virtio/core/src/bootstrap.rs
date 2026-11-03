@@ -38,6 +38,9 @@ pub const SLOT_DEVMGR_QUERY: usize = 2;
 /// Slots round 2 carries.
 pub const ROUND2_SLOTS: usize = 3;
 
+// Round 2 is one positional-slot round.
+const _: () = assert!(ROUND2_SLOTS <= MSG_CAP_SLOTS_MAX);
+
 /// The BAR caps a driver received in round 1, each with its PCI BAR index.
 pub struct DeliveredBars
 {

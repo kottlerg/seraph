@@ -6,8 +6,10 @@
 //! `VirtIO` transport and virtqueue primitives shared by all `VirtIO` drivers.
 //!
 //! Provides the modern PCI transport, virtqueue management, device negotiation,
-//! and the startup message format used by devmgr to pass PCI capability info
-//! to `VirtIO` drivers.
+//! the startup message format used by devmgr to pass PCI capability info
+//! to `VirtIO` drivers, the register layout a driver maps every BAR it names
+//! by ([`RegisterLayout`]), and the devmgr-to-driver bootstrap rounds
+//! ([`bootstrap`]).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -126,7 +128,9 @@ impl VirtioPciStartupInfo
     /// to present the common, notification, and ISR regions, and a device
     /// type with device-specific configuration (block and input both have
     /// one) to present that region too, each in a BAR of the device's
-    /// choosing.
+    /// choosing; devmgr's scan keeps the first structure of each type that
+    /// lies in an MMIO BAR, so an absent region means the device presents
+    /// none the driver can map.
     #[must_use]
     pub fn register_layout(&self) -> Option<RegisterLayout>
     {

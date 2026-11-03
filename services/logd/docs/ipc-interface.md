@@ -129,10 +129,10 @@ evicted before logd processes any of its still-queued
 Every process spawned by procmgr is bound to two death observers
 at creation:
 
-1. Procmgr's own death `EventQueue` (correlator = process badge,
-   for procmgr's auto-reap path).
-2. logd's death `EventQueue` (correlator = process badge, for
-   logd's slot eviction).
+1. Procmgr's own death `EventQueue` (correlator = the process
+   badge's low 32 bits, for procmgr's auto-reap path).
+2. logd's death `EventQueue` (correlator = the process badge's low
+   32 bits, for logd's slot eviction).
 
 Procmgr installs the second binding inside
 [`finalize_creation`](../../procmgr/src/process.rs) when its
@@ -142,8 +142,8 @@ existing process table entry when logd's
 registers see only the first binding until the retroactive bind
 catches them up.
 
-logd's drain consumes each event as
-`(process_badge as u32) << 32 | exit_reason` and evicts the
+logd's drain consumes each event as the death entry
+`(exit_reason, process_badge as u32)` (`syscall::DeathEvent`) and evicts the
 matching slot from the hash-keyed badge table. Idempotent on
 already-evicted badges. procmgr keeps the low 32 bits unique among live
 processes, so a death evicts only the dead sender's slot.

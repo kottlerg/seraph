@@ -22,19 +22,22 @@
 //! is identity-mapped until [`unmap_identity_page`] retires it after SMP
 //! bringup.
 //!
-//! ## Bootstrap pool
+//! ## Table frames: a BSS seed, then carved RAM
 //!
-//! The buddy allocator returns physical addresses; writing to a freshly
-//! allocated frame requires a virtual address — but the bootloader only
-//! identity-maps specific regions, not all RAM. To avoid this chicken-and-egg
-//! problem, a fixed array of [`BOOT_TABLE_POOL_SIZE`] × 4 KiB frames is placed
-//! in `.bss` (zeroed, no binary bloat). It lies inside the kernel image the
-//! bootloader already mapped (at its KASLR-slid link address), so its virtual
-//! addresses are usable immediately; their physical addresses are derived from
-//! the kernel VA/PA offset in [`BootInfo`].
-//!
-//! 256 frames (1 MiB) supports direct-mapping ≈ 248 GiB of RAM. Systems that
-//! exceed this limit halt with a clear fatal message.
+//! The bootloader identity-maps only specific regions, not free RAM, so the
+//! tables are built in two stages. Stage 1 draws its frames from a small
+//! `.bss` seed of [`BOOT_TABLE_POOL_SIZE`] frames, which lies inside the kernel
+//! image the bootloader already mapped (at its KASLR-slid link address); their
+//! physical addresses are derived from the kernel VA/PA offset in
+//! [`BootInfo`]. It maps the kernel image, the boot stack, and the direct-map
+//! chunks covering a carve of free RAM sized to [`stage2_table_bound`], then
+//! activates the tables. Stage 2 draws its frames from the carve, now reachable
+//! through the live direct map, and maps the rest: the direct map of all RAM,
+//! the framebuffer and kernel MMIO above it, and the AP trampoline page.
+//! Phase 2's free-range stream keeps the frames stage 2 used out of the buddy
+//! (`mm::init::record_boot_table_carve`). The seed's size is fixed by the
+//! stage-1 mappings, and the carve's by the machine, so no amount of RAM
+//! exhausts either.
 
 // cast_possible_truncation: u64→usize memory-map entry count; 64-bit targets
 // only, so the cast is exact.
@@ -130,14 +133,32 @@ pub fn virt_to_phys(virt: u64) -> u64
 #[derive(Debug, PartialEq, Eq)]
 pub enum PagingError
 {
-    /// The static boot table pool is exhausted.
-    ///
-    /// Increase [`BOOT_TABLE_POOL_SIZE`] and rebuild, or reduce the amount of
-    /// RAM being direct-mapped.
+    /// The table-frame source is exhausted: the BSS seed in stage 1, or the
+    /// carve in stage 2 (its size is an upper bound, so this is a defect).
     OutOfFrames,
     /// The target virtual address is not mapped (returned by the protect walk,
     /// `AddressSpace::protect_page`).
     NotMapped,
+}
+
+/// Why [`init_kernel_page_tables`] could not build the kernel's tables.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BootTableError
+{
+    /// A mapping found no table frame ([`PagingError::OutOfFrames`]).
+    OutOfFrames,
+    /// No free RAM range holds the stage-2 carve.
+    NoTableCarve,
+}
+
+impl From<PagingError> for BootTableError
+{
+    fn from(_: PagingError) -> Self
+    {
+        // The boot builders map fresh, present-less ranges, so a walk never
+        // reports `NotMapped`; only frame exhaustion reaches here.
+        Self::OutOfFrames
+    }
 }
 
 /// Page permission flags for a mapping.
@@ -213,13 +234,16 @@ impl MapOutcome
 
 // ── Static boot table pool ────────────────────────────────────────────────────
 
-/// Number of 4 KiB frames in the static boot table pool.
+/// Number of 4 KiB frames in the stage-1 BSS seed (256 KiB).
 ///
-/// 256 frames = 1 MiB of BSS. Supports direct-mapping up to ≈ 248 GiB of RAM
-/// (1 PML4 + 1 PDPT + 248 PDs) plus 6 frames for the kernel image and stack,
-/// less one page table per 2 MiB direct-map chunk split for kernel MMIO.
-/// Increase this constant to support larger systems; rebuild is required.
-pub const BOOT_TABLE_POOL_SIZE: usize = 256;
+/// Stage 1 maps only the root, the kernel image, the boot stack window and the
+/// direct-map chunks of the stage-2 carve, so the seed's need is fixed by the
+/// image size, not by RAM: the image's tables (one per 2 MiB of image plus its
+/// upper levels), about eight for the stack window, and one directory per GiB
+/// of carve, which is about 1 MiB of carve per 256 GiB of RAM. 64 frames leave
+/// room for a 64 MiB image beside the carve of any direct map up to the
+/// 128 TiB kernel half. A seed too small fails the boot in Phase 3 by name.
+pub const BOOT_TABLE_POOL_SIZE: usize = 64;
 
 /// Contiguous 4 KiB-aligned block of zeroed BSS frames for boot page tables.
 ///
@@ -238,7 +262,9 @@ static mut BOOT_TABLE_POOL: BootTablePool = BootTablePool {
 
 // ── PoolState ─────────────────────────────────────────────────────────────────
 
-/// Allocation state for the static boot table pool.
+/// Allocation state for the boot page-table frames: the BSS seed, then (after
+/// [`PoolState::switch_to_carve`]) a carve of RAM reached through the direct
+/// map.
 ///
 /// Handed to arch-specific mapping functions so they can allocate intermediate
 /// page table frames and convert frame physical addresses back to virtual ones.
@@ -246,13 +272,20 @@ pub struct PoolState
 {
     /// `kernel_virtual_base - kernel_physical_base` (wrapping arithmetic).
     ///
-    /// Adding this offset to any pool frame's physical address yields its
+    /// Adding this offset to any seed frame's physical address yields its
     /// virtual address: `frame_va = frame_pa.wrapping_add(kv_minus_kp)`.
     kv_minus_kp: u64,
     pool_va_base: u64,
     pool_pa_base: u64,
     pool_capacity: usize,
     next: usize,
+    /// Physical base of the stage-2 carve; frames come from it once
+    /// `carve_capacity` is non-zero.
+    carve_pa_base: u64,
+    carve_capacity: usize,
+    carve_next: usize,
+    /// Direct-map base through which carve frames are reached.
+    dm_base: u64,
 }
 
 impl PoolState
@@ -280,6 +313,10 @@ impl PoolState
             pool_pa_base,
             pool_capacity: BOOT_TABLE_POOL_SIZE,
             next: 0,
+            carve_pa_base: 0,
+            carve_capacity: 0,
+            carve_next: 0,
+            dm_base: 0,
         }
     }
 
@@ -297,6 +334,10 @@ impl PoolState
             pool_pa_base: pool_va,
             pool_capacity: capacity,
             next: 0,
+            carve_pa_base: 0,
+            carve_capacity: 0,
+            carve_next: 0,
+            dm_base: 0,
         }
     }
 
@@ -309,6 +350,16 @@ impl PoolState
     /// `fatal()` in the caller if this is unacceptable.
     pub fn alloc_frame(&mut self) -> Result<(u64, u64), PagingError>
     {
+        if self.carve_capacity != 0
+        {
+            if self.carve_next >= self.carve_capacity
+            {
+                return Err(PagingError::OutOfFrames);
+            }
+            let pa = self.carve_pa_base + (self.carve_next * 4096) as u64;
+            self.carve_next += 1;
+            return Ok((self.dm_base.wrapping_add(pa), pa));
+        }
         if self.next >= self.pool_capacity
         {
             return Err(PagingError::OutOfFrames);
@@ -320,14 +371,111 @@ impl PoolState
         Ok((va, pa))
     }
 
-    /// Convert a pool frame physical address to its virtual address.
+    /// Draw every later frame from the `frames` frames of RAM at `base`,
+    /// reached through the direct map at `dm_base`, which must already map
+    /// them.
+    pub fn switch_to_carve(&mut self, base: u64, frames: usize, dm_base: u64)
+    {
+        self.carve_pa_base = base;
+        self.carve_capacity = frames;
+        self.carve_next = 0;
+        self.dm_base = dm_base;
+    }
+
+    /// Frames drawn from the carve so far.
+    #[must_use]
+    pub fn carve_used(&self) -> usize
+    {
+        self.carve_next
+    }
+
+    /// Convert a table frame's physical address to its virtual address: the
+    /// seed's through the kernel image, a carve frame's through the direct map.
     ///
-    /// Only valid for addresses that belong to the pool; the result is
+    /// Only valid for addresses of frames this pool handed out; the result is
     /// meaningless for arbitrary physical addresses.
     pub fn phys_to_virt(&self, phys: u64) -> u64
     {
-        phys.wrapping_add(self.kv_minus_kp)
+        let seed_end = self.pool_pa_base + (self.pool_capacity * 4096) as u64;
+        if self.carve_capacity == 0 || (self.pool_pa_base..seed_end).contains(&phys)
+        {
+            phys.wrapping_add(self.kv_minus_kp)
+        }
+        else
+        {
+            self.dm_base.wrapping_add(phys)
+        }
     }
+}
+
+// ── Stage-2 frame bound ───────────────────────────────────────────────────────
+
+/// Upper bound on the page-table frames, the root excluded, that mapping
+/// `[start, end)` with leaves of `2^leaf_shift` bytes (12 for 4 KiB, 21 for
+/// 2 MiB) can allocate, under paging of up to five levels: at each level from
+/// the leaf tables up to the one below a five-level root, one table per
+/// aligned block of that table's reach that the span touches. A four- or
+/// three-level root makes the top terms over-count, never under-count.
+#[must_use]
+pub fn span_table_bound(start: u64, end: u64, leaf_shift: u32) -> u64
+{
+    if end <= start
+    {
+        return 0;
+    }
+    let mut total = 0;
+    // A table one level above a leaf reaches 512 leaves.
+    let mut shift = leaf_shift + 9;
+    while shift <= 48
+    {
+        total += ((end - 1) >> shift) - (start >> shift) + 1;
+        shift += 9;
+    }
+    total
+}
+
+/// Upper bound on the frames stage 2 of [`init_kernel_page_tables`] draws from
+/// its carve: the direct map of `[0, direct_top)` in 2 MiB leaves, one leaf
+/// table per kernel-MMIO region below `direct_top` (its 2 MiB chunk is split),
+/// and 4 KiB mappings of every region above it, of the framebuffer span
+/// `fb` when it lies above, and of the AP trampoline page (identity-mapped).
+///
+/// The tables are indexed by virtual address, `dm_base + phys` in the direct
+/// map, and `dm_base` is only 1 GiB-aligned, so every span is counted at its
+/// virtual address: a span can touch one more 512 GiB block virtually than
+/// physically.
+#[must_use]
+pub fn stage2_table_bound(
+    dm_base: u64,
+    direct_top: u64,
+    mmio_regions: &[(u64, u64)],
+    fb: Option<(u64, u64)>,
+    trampoline: u64,
+) -> u64
+{
+    let mut frames = span_table_bound(dm_base, dm_base.saturating_add(direct_top), 21);
+    for &(base, size) in mmio_regions
+    {
+        frames += if base < direct_top
+        {
+            1
+        }
+        else
+        {
+            let va = dm_base.saturating_add(base);
+            span_table_bound(va, va.saturating_add(size), 12)
+        };
+    }
+    if let Some((base, size)) = fb
+    {
+        let va = dm_base.saturating_add(base);
+        frames += span_table_bound(va, va.saturating_add(size), 12);
+    }
+    if trampoline != 0
+    {
+        frames += span_table_bound(trampoline, trampoline + PAGE_SIZE as u64, 12);
+    }
+    frames
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -408,16 +556,23 @@ unsafe extern "C" {
 /// - Kernel sections are mapped with W^X permissions.
 /// - The boot stack remains accessible at its current virtual address.
 ///
-/// Every frame this function needs comes from the static boot pool
-/// ([`BOOT_TABLE_POOL_SIZE`]), not the buddy allocator.
+/// Every frame this function needs comes from the BSS seed
+/// ([`BOOT_TABLE_POOL_SIZE`]) or the carve of free RAM it sizes with
+/// [`stage2_table_bound`] (see the module documentation), not the buddy
+/// allocator, which is populated after it returns.
 ///
 /// # Errors
-/// `PagingError::OutOfFrames` if the 256-frame BSS pool is exhausted.
-/// The caller should `fatal()` on this error; it indicates > 248 GiB of RAM.
+/// - [`BootTableError::NoTableCarve`] when no free RAM range holds the carve;
+///   returned before the switch.
+/// - [`BootTableError::OutOfFrames`] when the seed runs out in stage 1 (a seed
+///   too small for the kernel image), or the carve in stage 2 (a defect in the
+///   bound).
+///
+/// The caller should `fatal()` on either.
 ///
 /// In test builds this is a no-op stub so `main.rs` compiles unchanged.
 #[cfg(test)]
-pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), PagingError>
+pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), BootTableError>
 {
     Ok(())
 }
@@ -425,7 +580,7 @@ pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), PagingError>
 // similar_names: root_va/root_pa and other va/pa pairs are VA/PA of the same frame.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]
-pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
+pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
 {
     // Enable NX on x86-64 before we install tables with NX entries; a no-op
     // on RISC-V (X bit is always independently controllable).
@@ -476,65 +631,73 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
     // RISC-V, whose PLIC and UART take their device memory type from the
     // platform PMAs). Bases come from `BootInfo.kernel_mmio` directly because
     // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
-    let mut mmio_regions = [(0u64, 0u64); 16];
+    let mut mmio_regions = [(0u64, 0u64); crate::arch::current::platform::MMIO_DIRECT_MAP_REGIONS];
     let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
         &info.kernel_mmio,
         &mut mmio_regions,
     );
     let mmio_regions = &mmio_regions[..mmio_count];
 
-    // ── Direct physical map ───────────────────────────────────────────────────
-    // Map [0, max_phys_rounded) at the direct-map base using 2 MiB large
-    // pages, except a 2 MiB chunk holding a kernel MMIO page: that chunk is
-    // mapped as 4 KiB pages so the MMIO pages can be uncacheable while the
-    // rest stay write-back (`direct_map_page_flags`). The framebuffer MMIO
-    // (if above max_phys) is handled separately below.
+    // Everything stage 2 maps is read from `info` now: after the stage-1
+    // switch the bootloader's identity map of `info` is gone.
+    let fb = framebuffer_above(info, max_phys_rounded);
+    let trampoline = info.ap_trampoline_page;
+    let carve_frames = stage2_table_bound(dm_base, max_phys_rounded, mmio_regions, fb, trampoline);
+    let carve = crate::mm::init::find_boot_table_carve(info, carve_frames)
+        .ok_or(BootTableError::NoTableCarve)?;
+    let carve_end = carve + carve_frames * PAGE_SIZE as u64;
+    let carve_chunks = (
+        carve & !(LARGE_PAGE_SIZE - 1),
+        (carve_end + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1),
+    );
+
+    // ── Stage 1, from the BSS seed ────────────────────────────────────────────
+    map_kernel_image(root_va, info, &mut pool)?;
+    map_boot_stack(root_va, info, &mut pool)?;
+    let mut phys = carve_chunks.0;
+    while phys < carve_chunks.1
+    {
+        map_direct_chunk(root_va, dm_base, phys, mmio_regions, &mut pool)?;
+        phys += LARGE_PAGE_SIZE;
+    }
+    // SAFETY: the tables map the kernel image (code, data, this stack's frame
+    // via the boot stack window) and the carve's direct map; nothing below
+    // touches `info` or other identity-mapped memory.
+    unsafe {
+        arch_paging::activate(root_pa);
+    }
+
+    // ── Stage 2, from the carve ───────────────────────────────────────────────
+    // The carve frames' bound fits `usize` on the 64-bit kernel.
+    pool.switch_to_carve(carve, carve_frames as usize, dm_base);
+
+    // Direct physical map of [0, max_phys_rounded) in 2 MiB pages, except a
+    // chunk holding a kernel MMIO page (`map_direct_chunk`). The carve's own
+    // chunks were mapped in stage 1.
     let mut phys: u64 = 0;
     while phys < max_phys_rounded
     {
-        if span_overlaps_regions(phys, LARGE_PAGE_SIZE, mmio_regions)
+        if phys < carve_chunks.0 || phys >= carve_chunks.1
         {
-            let chunk_end = phys + LARGE_PAGE_SIZE;
-            while phys < chunk_end
-            {
-                let flags = direct_map_page_flags(phys, mmio_regions);
-                arch_paging::map_page(root_va, dm_base + phys, phys, flags, &mut pool)?;
-                phys += PAGE_SIZE as u64;
-            }
-            continue;
+            map_direct_chunk(root_va, dm_base, phys, mmio_regions, &mut pool)?;
         }
-        let rw = direct_map_page_flags(phys, &[]);
-        arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, &mut pool)?;
         phys += LARGE_PAGE_SIZE;
     }
 
-    // ── Kernel image (W^X per section) ────────────────────────────────────────
-    map_kernel_image(root_va, info, &mut pool)?;
+    // Framebuffer, when it lies above the RAM ceiling.
+    if let Some((fb_phys, fb_bytes)) = fb
+    {
+        map_direct_pages(root_va, dm_base, fb_phys, fb_bytes, &[], &mut pool)?;
+    }
 
-    // ── Boot stack identity mapping ───────────────────────────────────────────
-    map_boot_stack(root_va, info, &mut pool)?;
-
-    // ── Framebuffer (only if above direct map range) ──────────────────────────
-    map_framebuffer_if_needed(root_va, info, max_phys_rounded, &mut pool)?;
-
-    // ── Kernel MMIO above the RAM ceiling ─────────────────────────────────────
-    // A region below the ceiling was mapped uncacheable by the direct-map loop
-    // above; one above it gets its own uncacheable 4 KiB pages here.
+    // Kernel MMIO above the RAM ceiling: a region below it was mapped
+    // uncacheable by the direct-map loop; one above gets its own uncacheable
+    // 4 KiB pages here.
     for &(phys_base, size) in mmio_regions
     {
-        if phys_base < max_phys_rounded
+        if phys_base >= max_phys_rounded
         {
-            continue; // mapped by the direct-map loop
-        }
-        let page_mask = !(PAGE_SIZE as u64 - 1);
-        let start = phys_base & page_mask;
-        let end = (phys_base + size + PAGE_SIZE as u64 - 1) & page_mask;
-        let mut phys = start;
-        while phys < end
-        {
-            let flags = direct_map_page_flags(phys, mmio_regions);
-            arch_paging::map_page(root_va, dm_base + phys, phys, flags, &mut pool)?;
-            phys += PAGE_SIZE as u64;
+            map_direct_pages(root_va, dm_base, phys_base, size, mmio_regions, &mut pool)?;
         }
     }
 
@@ -554,9 +717,8 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
     // not conflict. Once SMP bringup completes,
     // `mm::paging::unmap_identity_page` (called in Phase 8) retires the
     // mapping so the page can be reclaimed as a Memory cap.
-    if info.ap_trampoline_page != 0
+    if trampoline != 0
     {
-        let tramp = info.ap_trampoline_page;
         // R/W/X: the trampoline page contains startup code AND writable patch areas.
         let rwx = PageFlags {
             readable: true,
@@ -564,16 +726,78 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
             executable: true,
             uncacheable: false,
         };
-        arch_paging::map_page(root_va, tramp, tramp, rwx, &mut pool)?;
+        arch_paging::map_page(root_va, trampoline, trampoline, rwx, &mut pool)?;
     }
 
-    // Activate the new page tables. After this point the direct map is live.
-    // SAFETY: we have mapped kernel code, stack, and all data accessed next.
+    // Reload the root: drops any translation cached while stage 2 filled
+    // entries that stage 1 left not-present (RISC-V may cache invalid
+    // entries). After this point the direct map covers all RAM.
+    // SAFETY: the same tables as above, now complete.
     unsafe {
         arch_paging::activate(root_pa);
     }
+    crate::mm::init::record_boot_table_carve(carve, pool.carve_used() as u64);
 
     Ok(())
+}
+
+/// Map the 2 MiB direct-map chunk at `phys`: one large page, or, when the
+/// chunk holds a kernel MMIO page, 4 KiB pages so the MMIO pages can be
+/// uncacheable while the rest stay write-back (`direct_map_page_flags`).
+#[cfg(not(test))]
+fn map_direct_chunk(
+    root_va: u64,
+    dm_base: u64,
+    phys: u64,
+    mmio_regions: &[(u64, u64)],
+    pool: &mut PoolState,
+) -> Result<(), PagingError>
+{
+    if span_overlaps_regions(phys, LARGE_PAGE_SIZE, mmio_regions)
+    {
+        return map_direct_pages(root_va, dm_base, phys, LARGE_PAGE_SIZE, mmio_regions, pool);
+    }
+    let rw = direct_map_page_flags(phys, &[]);
+    arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, pool)
+}
+
+/// Map every 4 KiB page `[phys, phys + len)` touches at `dm_base + phys`,
+/// uncacheable where a page overlaps one of `mmio_regions`.
+#[cfg(not(test))]
+fn map_direct_pages(
+    root_va: u64,
+    dm_base: u64,
+    phys: u64,
+    len: u64,
+    mmio_regions: &[(u64, u64)],
+    pool: &mut PoolState,
+) -> Result<(), PagingError>
+{
+    let page_mask = !(PAGE_SIZE as u64 - 1);
+    let mut page = phys & page_mask;
+    let end = (phys + len + PAGE_SIZE as u64 - 1) & page_mask;
+    while page < end
+    {
+        let flags = direct_map_page_flags(page, mmio_regions);
+        arch_paging::map_page(root_va, dm_base + page, page, flags, pool)?;
+        page += PAGE_SIZE as u64;
+    }
+    Ok(())
+}
+
+/// The framebuffer's `(physical base, bytes)` when it lies at or above
+/// `max_phys_rounded`, outside the RAM direct map; `None` when there is none
+/// or the RAM direct map covers it.
+#[cfg(not(test))]
+fn framebuffer_above(info: &BootInfo, max_phys_rounded: u64) -> Option<(u64, u64)>
+{
+    let fb_phys = info.framebuffer.physical_base;
+    (fb_phys != 0 && fb_phys >= max_phys_rounded).then(|| {
+        (
+            fb_phys,
+            u64::from(info.framebuffer.stride) * u64::from(info.framebuffer.height),
+        )
+    })
 }
 
 /// Tear down a 4 KiB identity mapping (VA == PA) in the kernel root page
@@ -671,11 +895,20 @@ fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
     Ok(())
 }
 
-/// Identity-map 64 KiB around the current stack pointer so it remains
-/// accessible after the page table switch.
+/// Identity-map the window that holds the bootloader's handoff stack, so the
+/// stack stays usable after the page-table switch until `kernel_entry`
+/// rebases it into the direct map.
+///
+/// The entry contract guarantees [`HANDOFF_STACK_BYTES`] of stack below the
+/// entry stack pointer (core/boot/docs/kernel-handoff.md);
+/// [`handoff_stack_window`] covers that region from the current `sp` alone. It
+/// also maps up to `HANDOFF_STACK_BYTES` + 4 KiB of pages beside the stack,
+/// which are never accessed through this low-half alias.
 ///
 /// If the stack pointer is already within the kernel image mapping (unlikely
 /// but possible), this is a no-op.
+///
+/// [`HANDOFF_STACK_BYTES`]: boot_protocol::layout::HANDOFF_STACK_BYTES
 #[cfg(not(test))]
 fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result<(), PagingError>
 {
@@ -689,16 +922,15 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
         return Ok(());
     }
 
-    // Identity-map 64 KiB aligned to 64 KiB around SP (VA == PA).
-    let stack_base = sp & !0xFFFF;
+    let (lo, hi) = handoff_stack_window(sp);
     let rw = PageFlags {
         readable: true,
         writable: true,
         executable: false,
         uncacheable: false,
     };
-    let mut virt = stack_base;
-    while virt < stack_base + 0x10000
+    let mut virt = lo;
+    while virt < hi
     {
         arch_paging::map_page(root_va, virt, virt, rw, pool)?;
         virt += PAGE_SIZE as u64;
@@ -707,43 +939,24 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
     Ok(())
 }
 
-/// If the framebuffer's physical base is above `max_phys_rounded`, add
-/// explicit 4 KiB mappings in the direct map region so it is accessible
-/// after the switch. Frames within [0, `max_phys_rounded`) are already
-/// covered by the large-page direct map loop.
-#[cfg(not(test))]
-fn map_framebuffer_if_needed(
-    root_va: u64,
-    info: &BootInfo,
-    max_phys_rounded: u64,
-    pool: &mut PoolState,
-) -> Result<(), PagingError>
+/// The page-aligned `[lo, hi)` that holds the guaranteed handoff stack, given
+/// the current stack pointer `sp` deeper in the same stack.
+///
+/// With `S` = [`HANDOFF_STACK_BYTES`] and `e` the entry stack pointer, the
+/// stack the boot phases may use is `[e - S, e)`. The frames between `sp` and
+/// `e` lie in it, so `sp < e <= sp + S`; then `e - S > sp - S >= page(sp) - S`
+/// and `e <= sp + S < page(sp) + 4 KiB + S`.
+///
+/// [`HANDOFF_STACK_BYTES`]: boot_protocol::layout::HANDOFF_STACK_BYTES
+fn handoff_stack_window(sp: u64) -> (u64, u64)
 {
-    let fb_phys = info.framebuffer.physical_base;
-    if fb_phys == 0 || fb_phys < max_phys_rounded
-    {
-        return Ok(());
-    }
-
-    let fb_bytes = (info.framebuffer.stride * info.framebuffer.height) as u64;
-    let page_mask = !(PAGE_SIZE as u64 - 1);
-    let start = fb_phys & page_mask;
-    let end = (fb_phys + fb_bytes + PAGE_SIZE as u64 - 1) & page_mask;
-
-    let rw = PageFlags {
-        readable: true,
-        writable: true,
-        executable: false,
-        uncacheable: false,
-    };
-    let mut phys = start;
-    while phys < end
-    {
-        arch_paging::map_page(root_va, direct_map_base() + phys, phys, rw, pool)?;
-        phys += PAGE_SIZE as u64;
-    }
-
-    Ok(())
+    let stack = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
+    let page = PAGE_SIZE as u64;
+    let sp_page = sp & !(page - 1);
+    (
+        sp_page.saturating_sub(stack),
+        sp_page.saturating_add(stack + page),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -873,8 +1086,7 @@ mod tests
 
     /// `Reserved` entries (e.g. 64-bit PCIe MMIO windows reported by UEFI
     /// firmware) must not inflate `max_phys`, otherwise Phase 3 would direct-map
-    /// the aperture with 2 MiB pages and exhaust the boot page-table pool
-    /// ([`BOOT_TABLE_POOL_SIZE`]).
+    /// the aperture with 2 MiB pages, sizing its page-table carve for it.
     #[test]
     fn max_phys_reserved_entries_are_excluded()
     {
@@ -928,6 +1140,115 @@ mod tests
         assert_eq!(compute_max_physical_address(&info), 0x3000_1000);
     }
 
+    // ── Boot stack window ────────────────────────────────────────────────────
+
+    // Defect caught: the former 64 KiB-aligned window around SP, which leaves
+    // the low part of a stack that is only 4 KiB-aligned unmapped.
+    #[test]
+    fn the_stack_window_covers_the_guaranteed_stack_from_any_deeper_sp()
+    {
+        let size = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
+        // Entry SPs on and off a page boundary, straddling a 64 KiB boundary.
+        for entry in [0x5_3000u64, 0x5_3008, 0x5_2ff8]
+        {
+            // The guaranteed stack is [entry - size, entry); sp is anywhere in it.
+            for sp in [entry - 8, entry - 0x1000, entry - size / 2, entry - size]
+            {
+                let (lo, hi) = handoff_stack_window(sp);
+                assert!(
+                    lo <= entry - size && entry <= hi,
+                    "entry {entry:#x}, sp {sp:#x}: {lo:#x}..{hi:#x}"
+                );
+            }
+        }
+    }
+
+    // ── Stage-2 frame bound ──────────────────────────────────────────────────
+
+    #[test]
+    fn span_bound_counts_one_table_per_level_for_a_small_span()
+    {
+        // One 2 MiB leaf: a PD, a PDPT, and a level-4 table (five-level).
+        assert_eq!(span_table_bound(0, LARGE_PAGE_SIZE, 21), 3);
+        // One 4 KiB leaf adds its PT.
+        assert_eq!(span_table_bound(0x1000, 0x2000, 12), 4);
+        assert_eq!(span_table_bound(0x1000, 0x1000, 12), 0);
+    }
+
+    // Defect caught: a bound counted over physical spans, which misses the
+    // extra 512 GiB block a direct map at a 1 GiB-aligned KASLR base touches.
+    #[test]
+    fn the_stage2_bound_counts_the_blocks_the_virtual_span_touches()
+    {
+        let top: u64 = 600 << 30;
+        let aligned = 0xFFFF_8000_0000_0000;
+        let misaligned = aligned + (511 << 30);
+        // [511 GiB, 1111 GiB) touches three 512 GiB blocks; [0, 600 GiB) two.
+        assert_eq!(
+            stage2_table_bound(misaligned, top, &[], None, 0)
+                - stage2_table_bound(aligned, top, &[], None, 0),
+            1
+        );
+    }
+
+    // Defect caught: a carve sized below what stage 2 allocates, which would
+    // exhaust it after the stage-1 switch, where the boot cannot report it.
+    #[test]
+    fn the_stage2_bound_covers_every_table_a_large_direct_map_allocates()
+    {
+        let top: u64 = 600 << 30;
+        let lapic = (0xFEE0_0000, 0x1000);
+        let high_mmio = (top + (5 << 30), 0x1000);
+        let fb = (top + (7 << 30), 8 << 20);
+        let trampoline = 0x8000;
+        let regions = [lapic, high_mmio];
+        // A KASLR base that is 1 GiB- but not 512 GiB-aligned, so the virtual
+        // spans touch more 512 GiB blocks than the physical ones.
+        let dm = 0xFFFF_8000_0000_0000 + (511 << 30);
+        let bound = stage2_table_bound(dm, top, &regions, Some(fb), trampoline);
+        let frames = bound as usize + 1; // plus the root
+        let buf = make_test_pool_buf(frames);
+        let mut pool = PoolState::new_for_test(aligned_start(&buf), frames);
+        let (root_va, _) = pool.alloc_frame().unwrap();
+        let map = crate::arch::current::paging::map_page;
+        let mut phys = 0;
+        while phys < top
+        {
+            if span_overlaps_regions(phys, LARGE_PAGE_SIZE, &regions)
+            {
+                for page in (phys..phys + LARGE_PAGE_SIZE).step_by(0x1000)
+                {
+                    let flags = direct_map_page_flags(page, &regions);
+                    map(root_va, dm + page, page, flags, &mut pool).unwrap();
+                }
+            }
+            else
+            {
+                let flags = direct_map_page_flags(phys, &[]);
+                crate::arch::current::paging::map_large_page(
+                    root_va,
+                    dm + phys,
+                    phys,
+                    flags,
+                    &mut pool,
+                )
+                .unwrap();
+            }
+            phys += LARGE_PAGE_SIZE;
+        }
+        for (base, len) in [high_mmio, fb, (trampoline, 0x1000)]
+        {
+            for page in (base..base + len).step_by(0x1000)
+            {
+                let va = if base == trampoline { page } else { dm + page };
+                let flags = direct_map_page_flags(page, &regions);
+                map(root_va, va, page, flags, &mut pool).unwrap();
+            }
+        }
+        // Every map succeeded inside a pool of `bound` frames past the root.
+        assert!(pool.next <= frames);
+    }
+
     // ── PoolState ─────────────────────────────────────────────────────────────
 
     // Allocate a test pool buffer of `n` × 4 KiB frames aligned to 4 KiB.
@@ -970,6 +1291,26 @@ mod tests
         assert!(pool.alloc_frame().is_ok());
         assert!(pool.alloc_frame().is_ok());
         assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
+    }
+
+    // Defect caught: a stage-2 walk resolving a seed table through the direct
+    // map (which does not cover it then) or a carve table through the image.
+    #[test]
+    fn after_the_switch_frames_come_from_the_carve_and_each_resolves_by_source()
+    {
+        let buf = make_test_pool_buf(2);
+        let seed = aligned_start(&buf);
+        let mut pool = PoolState::new_for_test(seed, 2);
+        let (_, seed_pa) = pool.alloc_frame().unwrap();
+        let dm = 0xFFFF_9000_0000_0000;
+        pool.switch_to_carve(0x10_0000, 2, dm);
+        let (va, pa) = pool.alloc_frame().unwrap();
+        assert_eq!((va, pa), (dm + 0x10_0000, 0x10_0000));
+        assert_eq!(pool.phys_to_virt(pa), dm + pa);
+        assert_eq!(pool.phys_to_virt(seed_pa), seed_pa);
+        pool.alloc_frame().unwrap();
+        assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
+        assert_eq!(pool.carve_used(), 2);
     }
 
     #[test]

@@ -192,7 +192,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(ep).map_err(|_| "integration::park_interrupted_stop_start: del ep failed")?;
 
     // ── Phase 5: wait_set_wait (member registered, never ready). ────────────
-    let ws = wait_set_create(ctx.memory_base)
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
         .map_err(|_| "integration::park_interrupted_stop_start: create ws failed")?;
     let member = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::park_interrupted_stop_start: create member failed")?;

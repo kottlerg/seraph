@@ -10,6 +10,8 @@ Build task runner for Seraph, invoked as `cargo xtask <command>`.
 xtask/
 ├── Cargo.toml
 ├── README.md
+├── baselines/
+│   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)
 ├── src/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # Clap derive structs for every subcommand
@@ -24,10 +26,11 @@ xtask/
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
+│   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # One module per subcommand (build, run, run_parallel,
-│   │                           #   mkdisk, compose_bundle, clean, test, test_kaslr,
-│   │                           #   test_terminal, test_vmgenid, lint_docs)
+│   │                           #   ktest_timing, mkdisk, compose_bundle, clean, test,
+│   │                           #   test_kaslr, test_terminal, test_vmgenid, lint_docs)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -295,7 +298,8 @@ cargo xtask run-parallel \
     [--fail REGEX] \
     [--fail-grace-secs SECONDS] \
     [--debug-listen] \
-    [--hold-on-hang]
+    [--hold-on-hang] \
+    [--save-logs DIR]
 ```
 
 | Option | Default | Description |
@@ -312,6 +316,7 @@ cargo xtask run-parallel \
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--debug-listen` | off | Expose each guest's gdbstub without pausing it (QEMU `-s`, tcp::1234) so a wedged guest can be attached post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port) |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
+| `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run-parallel] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing` reads |
 
 The default `--fail` regex matches the cross-harness terminal marker
 `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the
@@ -340,7 +345,8 @@ cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
 **Output**: one line per completed run, plus a summary block. Logs for
 non-passing runs are preserved under `target/xtask/run-parallel/` as
 `OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or
-`QEMU-CRASH-<run>.log`. PASS logs are discarded. Each invocation first removes
+`QEMU-CRASH-<run>.log`. PASS logs are discarded there (`--save-logs` keeps a copy of every
+log elsewhere). Each invocation first removes
 the run logs an earlier one left there, so the preserved logs are its own.
 
 **Outcome precedence**:
@@ -359,6 +365,78 @@ the run logs an earlier one left there, so the preserved logs are its own.
    SIGKILL is excluded (the `--timeout` kill, or an OOM).
 6. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
    e.g. `139` for SIGSEGV)
+
+---
+
+### `cargo xtask ktest-timing`
+
+Read ktest boot logs saved by `run-parallel --save-logs` and report their wall times: the
+measurement of the boundary runs of [docs/testing.md](../docs/testing.md) § Coverage tiers
+(Timing report). Report-only: a flagged row never fails the command.
+
+```
+cargo xtask ktest-timing LOG...
+cargo xtask ktest-timing --base LOG --wide LOG [--threshold R] [--min-secs S]
+cargo xtask ktest-timing --baseline FILE LOG [--threshold R] [--min-secs S]
+cargo xtask ktest-timing --write-baseline FILE [--commit REV] LOG
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `LOG...` | | Print each log's table: its tiers, its cells in log order with their outcome, then the whole-run rows |
+| `--base`, `--wide` | | Cross-width comparison of two logs of one architecture: per row the base and wide times, their ratio `R`, and `R/F` with `F` = wide CPUs / base CPUs |
+| `--baseline` | | Same-width comparison of the one `LOG` with a baseline file of its architecture and width (refused otherwise): per row the baseline and log times and their ratio. A `WARNING:` line heads the report for each of the baseline's `host-cpu`, `host-kernel`, `qemu`, and `accel` values that differs from this host's |
+| `--write-baseline` | | Write the one `LOG`'s timing to `FILE` in the format below |
+| `--commit` | `HEAD` | The commit the `LOG` ran at, recorded by `--write-baseline` |
+| `--threshold` | `1.5` | Flag a row whose normalised ratio (`R/F`, or the ratio to the baseline) exceeds this |
+| `--min-secs` | `1.0` | Flag a row only when its time exceeds the expected time (`F` times the base, or the baseline's) by at least this many seconds |
+
+The times come from the stamps ktest prints ([core/ktest/README.md](../core/ktest/README.md)
+§ Test infrastructure): every line ktest logs opens with `[S.uuuuuu] `, the microseconds since
+the kernel's timer started, the stamp the kernel console prints too. A cell runs from its
+`ktest: RUN <name>` (Tier 1) or `ktest: <name> starting` (Tier 2, Tier S) line to its
+`ktest: PASS <name>` or `ktest: FAIL <name>` line; a cell whose log ends before its end line is
+`unfinished` and runs to the log's last stamp of any kind (a watchdog dump included), which locates
+a HANG. Kernel
+output can share a serial line with a ktest line, since ktest writes its stamp, its message, and
+the newline separately, and its UART writes take no lock the kernel console shares, so kernel
+output can also land inside a message: a ktest message ends where the next stamp begins, a
+`ktest: ` line whose stamp a kernel line took takes the latest stamp before it, and a cell whose
+end line the output broke up is `end-lost` when ktest goes on (a later cell, tier marker, or
+summary follows; ktest runs its cells one at a time), its time running to that line, an upper
+bound. A tier runs from its `ktest: --- Tier <id>: ... ---` marker to the next marker or the
+`ktest: passed=` summary. A name logged twice is matched by occurrence (`<name> #2`). The width
+is read from the kernel's `scheduler initialised, N CPUs` line and the architecture from its
+`Seraph kernel v<version> (<arch>)` banner, each else from the trailer, which also gives the host
+wall time.
+
+A comparison table lists the tier rows first, then the cells sorted by their normalised ratio,
+highest first (cells missing from one side last, with a note), then three whole-run rows: the boot
+(kernel timer start to `ktest: starting`), ktest's span (`ktest: starting` to the log's last
+stamp), and the host wall time (from the trailer; it also covers the firmware and the
+bootloader). The `FLAG` column comes first; the table ends with the count of flagged rows.
+
+**Baseline format.** Baselines live under `xtask/baselines/ktest-timing/` as
+`<arch>-<cpus>cpu.txt`, one per boundary width. A baseline is text: `#` comment lines, then
+`key<TAB>value` lines, then one `tier<TAB><tier><TAB><secs>` line per tier and one
+`cell<TAB><tier><TAB><name><TAB><secs><TAB><outcome>` line per cell, in log order. The keys:
+
+| Key | Value |
+|---|---|
+| `format` | `1`, the format version; a file of another version is refused |
+| `arch`, `cpus` | The log's architecture and width |
+| `marker` | ktest's terminal marker (`ALL TESTS PASSED`), or `-` |
+| `commit` | The full hash of `--commit` |
+| `ktest-commit` | Present only when it is another commit: the newest commit at or before `commit` that changed anything outside Markdown, `.claude/`, `.github/`, and `xtask/baselines/` (conservatively: every change that could alter the boot image or its QEMU launch moves it, and so do some that cannot), so a baseline refreshed after a documentation-only change names the code it times |
+| `date` | The UTC date the file was written |
+| `host-cpu` | The host's CPU model and its count of host CPUs |
+| `host-kernel` | `uname -sr` |
+| `qemu` | The first line of `qemu-system-<arch> --version` |
+| `accel` | The trailer's accelerator; for `kvm`, also the `kvm`, `kvm_intel`, and `kvm_amd` module parameters that move cross-CPU timing (`halt_poll_ns`, `enable_apicv`, `enable_ipiv`, `ept`, `ple_gap`, `ple_window`, `avic`, `npt`, `pause_filter_count`, `pause_filter_thresh`, those the host has) |
+| `boot`, `ktest`, `wall` | The three whole-run times in seconds, or `-` |
+
+The host values are read when the file is written, so a baseline is written on the host that ran
+its log.
 
 ---
 

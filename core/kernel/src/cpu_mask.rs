@@ -24,6 +24,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::sched::MAX_CPUS;
 
 /// Number of 64-bit words needed to cover every CPU index in `[0, MAX_CPUS)`.
+///
+/// Every mask is this wide whatever the boot CPU count, and is held by value in
+/// each `AddressSpace` and TLB-shootdown request: 64 B at today's 512. That is
+/// paid while `MAX_CPUS` is the inline `BootInfo.cpu_ids` bound. When that bound
+/// goes (the boot ABI moving `cpu_ids` out of `BootInfo`), the masks take a
+/// per-boot width, `cpu_count.div_ceil(64)` words, held in storage sized with
+/// their object, so a mask costs only the CPUs booted. A hierarchical mask is
+/// not the design: it still fixes a maximum, and adds a level to every bit test
+/// on the shootdown and context-switch paths.
 pub const CPU_MASK_WORDS: usize = MAX_CPUS.div_ceil(64);
 
 /// Map a CPU index to its `(word, bit)` position.
@@ -273,6 +282,40 @@ mod tests
         assert_eq!(n, 70);
         assert_eq!(buf[0], 0);
         assert_eq!(buf[n - 1], 69);
+    }
+
+    #[test]
+    fn range_at_max_cpus_covers_every_index_and_one_less_drops_the_top()
+    {
+        // The full width the kernel sizes its masks for, which no local boot
+        // reaches (docs/testing.md § Coverage tiers, Known boundaries).
+        let m = CpuMask::range(MAX_CPUS);
+        assert_eq!(m.iter().count(), MAX_CPUS);
+        assert_eq!(m.first(), Some(0));
+        assert_eq!(m.iter().last(), Some(MAX_CPUS - 1));
+        let below = CpuMask::range(MAX_CPUS - 1);
+        assert_eq!(below.iter().count(), MAX_CPUS - 1);
+        assert_eq!(below.iter().last(), Some(MAX_CPUS - 2));
+    }
+
+    #[test]
+    fn the_top_cpu_index_sets_clears_and_takes_in_both_mask_forms()
+    {
+        let top = MAX_CPUS - 1;
+        let mut m = CpuMask::empty();
+        m.set(top);
+        assert_eq!(m.first(), Some(top));
+        assert_eq!(m.iter().collect::<Vec<_>>(), [top]);
+        m.clear(top);
+        assert!(m.is_empty());
+
+        let a = AtomicCpuMask::new();
+        a.set_cpu(top, Ordering::Relaxed);
+        assert!(a.test_cpu(top, Ordering::Relaxed));
+        assert_eq!(a.snapshot(Ordering::Relaxed).first(), Some(top));
+        assert!(a.take_cpu(top, Ordering::Relaxed));
+        assert!(!a.take_cpu(top, Ordering::Relaxed));
+        assert!(a.is_empty(Ordering::Relaxed));
     }
 
     #[test]

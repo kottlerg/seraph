@@ -348,14 +348,13 @@ cells automatically; variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 64, 65, and 128 harts; x86_64 256 and 512 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 64, 65, and 128 harts; x86_64 16 and 128 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
-65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
-infeasible there. High `-smp` coverage is local by design, not an
-oversight. The local host runs below are procedurally REQUIRED for the PRs
-that owe them, and the release host runs for each tag —
-binding the same way the
+65-vCPU guest is a ~16× thread oversubscription and a 128-vCPU guest a
+~32×. High `-smp` coverage is local by design, not an oversight. The local
+host runs below are procedurally REQUIRED for the PRs that owe them, and the
+release host runs for each tag — binding the same way the
 [pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
 surface.
 
@@ -399,18 +398,21 @@ changed line that names one of these items as a whole identifier or lies within 
 (its attributes, signature, fields, or body):
 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
-- per-CPU storage: `alloc_zeroed_slab`, and the definition of every function that calls it (the
-  per-CPU storage initialisers; a call to one is on the surface only when it names another listed
-  item, as a call to an `init_ap_*` initialiser does); every `init_storage` and
-  `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
-  one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
-  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
-  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, and `TlbShootdownRequest` (`git grep -n -E
-  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the single-slot
-  entropy pool slab, which is not per-CPU). A change that alters an element type's size is on the
-  surface whether it edits the type's own fields or a type or constant the element holds by value
-  (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
+- per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`), and the
+  definition of every function that calls `alloc_zeroed_slab` (the per-CPU storage initialisers; a
+  call to one is on the surface only when it names another listed item, as a call to an `init_ap_*`
+  initialiser does), except `frame_map::init` and `init_cspace_registry`, which size RAM tables
+  through it and are on the memory surface instead; every `init_storage` and `init_per_cpu_storage`,
+  which take the boot CPU count and size per-CPU storage from it (a call to one names it, so a
+  change to the count it passes is on the surface); `kernel_reserve_pages` (the CPU-scaled kernel
+  reserve); and the element types of the per-CPU arrays and slabs, today `PerCpuData`,
+  `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`,
+  `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
+  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the slabs that
+  are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk tables of
+  `frame_map::init` and `init_cspace_registry`). A change that alters an element type's size is on
+  the surface whether it edits the type's own fields or a type or constant the element holds by
+  value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
   `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
   for the idle stacks);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
@@ -443,8 +445,9 @@ changes. The second prints every file header of the diff and every line, changed
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it: the
-set is owed when a non-inert changed line lies within that function, read in the widened hunk. The
+hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it
+(except `frame_map::init` and `init_cspace_registry`, which the memory surface covers): the set is
+owed when a non-inert changed line lies within that function, read in the widened hunk. The
 screen finds named items and changes inside their definitions; it does not follow a size
 change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
 constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
@@ -457,9 +460,9 @@ B=$(git merge-base <head> origin/master)
 git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
     core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
     'core/kernel/src/arch/*/ap_trampoline.rs'
-S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
+S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
-S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|TlbShootdownRequest|CpuTopology"
+S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
 S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
@@ -474,37 +477,85 @@ git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```
 
 The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
-count says): riscv64 64, 65, and 128 harts, and x86_64 256 and 512 vCPUs.
+count says): riscv64 64, 65, and 128 harts, and x86_64 16 and 128 vCPUs. No run is wider than 128
+CPUs, on either architecture: the 256- and 512-vCPU runs are removed from every set by the
+maintainer's decision on [#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU
+run (`MAX_CPUS`) took most of an hour and saturated the host, and a raised `MAX_CPUS` is past any
+local host's reach; Known boundaries below states what covers the widths past 128. Every run
+saves its log for the timing report below (`--save-logs`).
 
 ```sh
-# Boundary CPU counts, riscv64 (the 64- and 65-hart runs take ~70 s each
-# on a 16-core host, the 128-hart run ~2-3 min at 8x hart oversubscription;
-# the 600 s and 1800 s budgets are for HANG classification):
+# Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 64- and
+# 65-hart runs take ~230 s each, the 128-hart run ~580 s at 8x hart
+# oversubscription; each budget is for HANG classification, see below):
+T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 600
-cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 600
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 720 \
+    --save-logs $T
+cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 720 \
+    --save-logs $T
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
+    --save-logs $T
 
-# Boundary CPU counts, x86_64 (the 256-vCPU run takes ~2 min on a 16-core
-# KVM host at 16x vCPU oversubscription. The 512-vCPU run, the MAX_CPUS
-# boundary, takes ~28 min at 32x, where every cross-CPU step waits for a
-# host core and the stress tier takes about three quarters of the run. The
-# 900 s and 3600 s budgets are for HANG classification):
+# Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
+# run, at 1x, takes ~58 s; the 128-vCPU run, at 8x vCPU oversubscription,
+# ~75 s, since idle vCPUs halt; each budget is for HANG classification, see
+# below):
+cargo xtask clean
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 1 --timeout 900
-cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 3600
+cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
+    --save-logs $T
+cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 900 \
+    --save-logs $T
+
+# Timing report (report only; see below):
+B=xtask/baselines/ktest-timing
+cargo xtask ktest-timing --base $T/x86_64-16cpu-1.log --wide $T/x86_64-128cpu-1.log
+for w in riscv64-64 riscv64-65 riscv64-128 x86_64-16 x86_64-128; do
+    cargo xtask ktest-timing --baseline $B/${w}cpu.txt $T/${w}cpu-1.log
+done
 ```
 
-The 65-hart run is the first count past a 64-bit word; the 128-hart run is the count at which
-hart-scaled firmware allocations once collided with the kernel image's load address
-([#377](https://github.com/kottlerg/seraph/issues/377)); the 512-vCPU run is `MAX_CPUS`.
+Each budget is the larger of three times the measured run and the measured run plus the longest
+failing bound ktest stretches at that width (`split_delete_race`'s 100 s exit poll, through
+`scaled_polls`: 100 s at 16 CPUs, 400 s at 64 and 65, 800 s at 128), rounded up to a minute, so a
+stuck cell reaches its own FAIL line before `run-parallel` classifies the run as a HANG. A change
+to the measured runs or to the longest stretched bound re-derives the budgets.
 
-Past 16 CPUs ktest scales its round-based stress cells' attempt counts, and stretches the
-wall-clock bounds [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists,
-by the oversubscription factor the width implies, so the boundary runs stay inside their budgets
-while the CI widths keep the full counts and tight budgets.
+The 16-vCPU run is the 1x width the scaling below starts past (`UNSCALED_CPUS`, the reference
+host's core count); the 65-hart run is the first count past a 64-bit word; the 128-hart run is the
+count at which hart-scaled firmware allocations once collided with the kernel image's load address
+([#377](https://github.com/kottlerg/seraph/issues/377)); the two 128-CPU runs are the widest, two
+full mask words at 8x oversubscription.
+
+Past 16 CPUs ktest stretches the wall-clock bounds
+[core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists by the
+oversubscription factor the width implies, so a slow step at a boundary run is not taken for a
+stuck one while the CI widths keep the tight budgets; its stress cells make their full attempt
+counts at every width.
+
+**Timing report.** The stretched bounds assume that a cell's cost grows at most linearly with the
+width; the boundary runs measure it. `cargo xtask ktest-timing`
+([xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) reads the saved logs and reports,
+per tier and per cell, the wall time between the stamps ktest prints (a cell's start line and its
+`PASS` or `FAIL` line), with the boot to ktest's start, ktest's span, and the host's wall time for
+the run below them. Across widths it reports the x86_64 16- and 128-vCPU times, their ratio `R`,
+and `R/F`, the ratio over the width factor `F` (8). Within a width it compares each log with the
+baseline of its architecture and width under `xtask/baselines/ktest-timing/`, whose header records
+the commit and the reference host's CPU, kernel, QEMU, and accelerator settings (KVM's module
+parameters on x86_64), and warns when the host running the comparison differs. A row is flagged
+when `R/F`, or its ratio to the baseline, exceeds 1.5 and its time exceeds the expected one (`F`
+times the base, or the baseline's) by at least 1 s; the cells are listed by that ratio, highest
+first. Every cell makes the same attempts at both widths, so `R` is the growth of the cell's whole
+cost. The report is a report, not a gate: a PR that owes the boundary set carries it in its body,
+and no flag blocks a PR or a tag until the threshold is calibrated against the baselines and made
+a gate. A baseline is rewritten on the reference host: from runs at a `master` commit when the
+host's QEMU, kernel, or accelerator settings change, and by the PR that changes a cell's cost on
+purpose, from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
+[xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) is the code its merge brings to
+`master`, taken again when `master` changes that code before the merge.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
 a non-inert change to the memory surface: the code that sizes or maps physical memory by the
@@ -512,19 +563,21 @@ guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
 `core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
 within the definition of, one of these items: the boot memory map and the direct map
 (`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
-`init_kernel_page_tables`, and `BOOT_TABLE_POOL_SIZE`), and the drain of RAM into Memory caps
+`init_kernel_page_tables`, `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve,
+`stage2_table_bound` and `find_boot_table_carve`), and the drain of RAM into Memory caps
 (`drain_and_install_seed`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
-`frame_map::init`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
+`frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
 boundary one does:
 
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
-M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed"
+M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
+M="$M|drain_and_install_seed"
 M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
-M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|CHUNK_ORDER"
+M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
@@ -535,7 +588,7 @@ cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1
 **Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
 its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
 cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
-the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`),
+the riscv64 64- and 65-hart and the x86_64 128-vCPU boundaries three times each (`--runs 3`),
 whether or not its diff changes the CPU-count surface: a race in those mechanisms can fail rarely
 enough that one run misses it. That PR's other owed runs stay at `--runs 1`. A concurrency fix
 elsewhere is not a concurrency-fix purpose, and a change to those mechanisms' files without that
@@ -562,20 +615,19 @@ defines it.
 **Hangs at oversubscription.** A boundary run the PR does not owe, that is, one whose surface the
 PR's own diff does not change, that HANGs (outlives its `--timeout` budget) or fails with a defect
 an open Issue for that boundary already names is not the PR's defect: the preserved log is recorded
-on the open Issue for that boundary (today [#421](https://github.com/kottlerg/seraph/issues/421)
-for the x86_64 high-smp budget overruns and [#455](https://github.com/kottlerg/seraph/issues/455)
-for the 512-vCPU IPI watchdog), or on a new Issue when that boundary has none, and the run does not
-block the PR. The PR body reports such a run as HANG or FAIL with a link to that record. Any other
-HANG or failure of a run the PR does not owe (a memory-variation HANG or failure, or a boundary
-failure no open Issue for that boundary names), and any HANG or failure of a run the PR owes,
-blocks the PR.
+on the open Issue for that boundary, or on a new Issue when that boundary has none, and the run
+does not block the PR. The PR body reports such a run as HANG or FAIL with a link to that record.
+Any other HANG or failure of a run the PR does not owe (a memory-variation HANG or failure, or a
+boundary failure no open Issue for that boundary names), and any HANG or failure of a run the PR
+owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), the maintainer MUST run, on the commit to be tagged, the riscv64 64- and
-65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`), the
-riscv64 128-hart and the x86_64 512-vCPU boundaries once each, and the memory
-variation once, so every tag boots at each boundary CPU count. A run whose
+65-hart and the x86_64 128-vCPU boundaries three times each (`--runs 3`), the
+riscv64 128-hart and the x86_64 16-vCPU boundaries once each, and the memory
+variation once, so every tag boots at each boundary CPU count, and runs the timing
+report on the boundary logs, which is reported and blocks nothing. A run whose
 outcome is not a pass, as When the runs are owed classifies outcomes, blocks the
 tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
@@ -601,11 +653,11 @@ list as the tracking Issues move):
 - x86_64 > 256 CPUs ([#376](https://github.com/kottlerg/seraph/issues/376),
   fixed): the per-CPU boot slabs (`AP_IST_STACKS`, `AP_TSS`) exceeded the
   buddy allocator's old `MAX_ORDER = 10` single-allocation cap (4 MiB) at
-  257+ CPUs, failing Phase 4 regardless of guest memory size. `MAX_ORDER`
-  is now 11 (8 MiB — exactly `AP_IST_STACKS` at `MAX_CPUS = 512`), with
-  compile-time asserts at the slab consumer sites so the envelope breaks
-  the build, not the boot. The full 512-vCPU width is exercised by the
-  MAX_CPUS boundary run above.
+  257+ CPUs, failing Phase 4 regardless of guest memory size. A per-CPU slab
+  may now span several buddy blocks (`alloc_zeroed_slab` through
+  `BuddyAllocator::alloc_contiguous`), so no block size caps the CPU count.
+  No local run boots past 128 vCPUs; the residual entry below states what
+  covers the widths past it.
 - riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377),
   fixed): boot died in UEFI (`ConvertPages: Incompatible memory types`) while
   loading the kernel ELF, because the bootloader requested the image at a fixed
@@ -624,6 +676,19 @@ list as the tracking Issues move):
   addressed in-tree. High-hart cross-architecture parity is therefore
   theoretical, with real testing on hold pending faster firmware, KVM-capable
   RISC-V emulation, or real hardware.
+- Both arches, widths past 128 CPUs (residual): the boundary set stops at 128,
+  so no local run exercises x2APIC destinations above APIC id 255, threshold
+  effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
+  with the width), or the runtime sizing of the per-CPU slabs past 128 (each
+  slab's byte count at the wider widths,
+  [#698](https://github.com/kottlerg/seraph/issues/698)). What covers
+  `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
+  (`core/kernel/src/cpu_mask.rs`), the host tests of
+  `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
+  past one block, a run that cannot be found, and requests of one block or
+  less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
+  (`sched::slab_pages`), the 65-hart boot for the first mask-word crossing,
+  and the 128-CPU boots for two full words.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

@@ -228,11 +228,16 @@ devmgr spawns one driver for every virtio-input device it enumerates and for eve
 device it can give a private IRQ line (virtio-blk requires one; a disk whose line another device
 already holds is not served until shared lines are,
 [#664](https://github.com/kottlerg/seraph/issues/664)), each with its own service endpoint.
-`QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one of those drivers by an optional instance
-ordinal in `data[1]` (absent means the first): the ordinal counts the running drivers of that class
-in PCI segment, bus, device, function order, and is not stable across boots. vfsd queries every
-block ordinal from 0 until the reply is not `SUCCESS` and holds every disk; the terminal sends
-none, so it binds the first input instance.
+devmgr serves one of those drivers only once it has reported its device set up
+(`devmgr_labels::DRIVER_READY`); a driver that dies first, its device setup failed, is withdrawn
+and never served. devmgr waits for every driver of a class to report or die before it serves that
+class's queries (devmgr's
+[responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)
+gives the settle and the serving order). `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one
+of those drivers by an optional instance ordinal in `data[1]` (absent means the first): the ordinal
+counts the served drivers of that class in PCI segment, bus, device, function order, and is not
+stable across boots. vfsd queries every block ordinal from 0 until the reply is not `SUCCESS` and
+holds every disk; the terminal sends none, so it binds the first input instance.
 
 ### Driver binary sources
 

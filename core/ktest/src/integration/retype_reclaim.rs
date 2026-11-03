@@ -94,24 +94,30 @@ pub fn run(ctx: &TestContext) -> TestResult
         baseline,
     )?;
 
-    // ── WaitSet ──────────────────────────────────────────────────────────────
-    let ws = wait_set_create(memory)
-        .map_err(|_| "integration::retype_reclaim: wait_set_create failed")?;
-    let mid = read_available(memory)?;
-    if mid >= baseline
+    // ── WaitSet (small — sub-page, and large — page-aligned split) ───────────
+    //
+    // 16 members → 64 + 16*24 + 40 = 488 B → BIN_512 in place; 64 members →
+    // 64 + 64*24 + 136 = 1736 B → split mode.
+    for capacity in [crate::WS_CAPACITY, 64]
     {
-        return Err("integration::retype_reclaim: WaitSet mint did not debit available_bytes");
+        let ws = wait_set_create(memory, capacity)
+            .map_err(|_| "integration::retype_reclaim: wait_set_create failed")?;
+        let mid = read_available(memory)?;
+        if mid >= baseline
+        {
+            return Err("integration::retype_reclaim: WaitSet mint did not debit available_bytes");
+        }
+        cap_delete(ws).map_err(|_| "integration::retype_reclaim: cap_delete(wait_set) failed")?;
+        assert_baseline(
+            "integration::retype_reclaim: WaitSet reclaim mismatch",
+            memory,
+            baseline,
+        )?;
     }
-    cap_delete(ws).map_err(|_| "integration::retype_reclaim: cap_delete(wait_set) failed")?;
-    assert_baseline(
-        "integration::retype_reclaim: WaitSet reclaim mismatch",
-        memory,
-        baseline,
-    )?;
 
     // ── EventQueue (small — sub-page) ────────────────────────────────────────
     //
-    // capacity 4 → 24 + 56 + 5*8 = 120 B → BIN_128 in-place.
+    // capacity 4 → 24 + 64 + 5*16 = 168 B → BIN_512 in-place.
     let eq_small = event_queue_create(memory, 4)
         .map_err(|_| "integration::retype_reclaim: event_queue_create(4) failed")?;
     let mid = read_available(memory)?;
@@ -130,7 +136,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── EventQueue (large — page-aligned split) ──────────────────────────────
     //
-    // capacity 64 → 24 + 56 + 65*8 = 600 B → exceeds BIN_512 → split mode.
+    // capacity 64 → 24 + 64 + 65*16 = 1128 B → exceeds BIN_512 → split mode.
     let eq_large = event_queue_create(memory, 64)
         .map_err(|_| "integration::retype_reclaim: event_queue_create(64) failed")?;
     let mid = read_available(memory)?;
@@ -221,8 +227,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         cap_create_endpoint(memory).map_err(|_| "integration::retype_reclaim: batch ep2 failed")?;
     let s1 = cap_create_notification(memory)
         .map_err(|_| "integration::retype_reclaim: batch sig1 failed")?;
-    let w1 =
-        wait_set_create(memory).map_err(|_| "integration::retype_reclaim: batch ws1 failed")?;
+    let w1 = wait_set_create(memory, crate::WS_CAPACITY)
+        .map_err(|_| "integration::retype_reclaim: batch ws1 failed")?;
     let a1 = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: batch aspace1 failed")?;
 

@@ -101,10 +101,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// window many chances to land on either side of the free.
 const CYCLES: u32 = 300;
 
-/// Fewest races at any width ([`super::scaled_attempts`]): enough stop-first
-/// cycles for some second stop to reach a reply-blocked client.
-const MIN_CYCLES: u32 = 64;
-
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
@@ -203,9 +199,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_count = u32::try_from(cpus).unwrap_or(2);
-    // Each race's starts, stops and dealloc cross CPUs, whose cost grows with
-    // the width; the count shrinks with it and the placements stay spread.
-    let count = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
     let second_stopper = cpus >= 4;
     if !second_stopper
     {
@@ -217,7 +210,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                 span: cpu_count,
             },
             Stops::Single,
-            count,
+            CYCLES,
         );
     }
     // The controller takes CPU 0 so a floor-priority child never shares its
@@ -231,7 +224,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             span: cpu_count - 1,
         },
         Stops::Double,
-        count,
+        CYCLES,
     );
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_reply_race: restore controller affinity failed");

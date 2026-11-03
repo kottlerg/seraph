@@ -12,7 +12,7 @@ devmgr/
 ├── Cargo.toml
 ├── README.md
 ├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI scan,
-│                                   #   aperture / IRQ range-cap table
+│                                   #   aperture / IRQ range-cap table, driver-settle roster
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown
@@ -21,6 +21,7 @@ devmgr/
 │   │   └── riscv64/mod.rs          # QEMU virt windows (ECAM, NS16550, goldfish-RTC); SbiControl
 │   ├── caps.rs                     # Bootstrap-round capability absorbers and DevmgrCaps
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
+│   ├── settle.rs                   # Settle a VirtIO driver batch: ready reports and deaths
 │   ├── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
 │   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup
 └── docs/

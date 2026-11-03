@@ -405,7 +405,7 @@ These race fixes are independent of the lock and landed in the same migration
   plain sleeper left a dangling pointer the next timer tick dereferenced), placed
   OUTSIDE the all-locks region (no `sched.lock`→`SLEEP_LIST_LOCK` order edge). And
   `sleep_check_wakeups` SNAPSHOTS `(ipc_state, blocked_on)` under
-  `SLEEP_LIST_LOCK` at pop (the `ExpiredWaiter` struct), claiming a plain sleeper
+  `SLEEP_LIST_LOCK` at pop (each popped TCB's `sleep_expiry`), claiming a plain sleeper
   with `wake_in_flight = 1` there so dealloc's existing gate covers an
   already-popped timer wake; the IPC arms claim under their own source lock at the
   win, and the per-entry claim never dereferences a possibly-freed TCB to choose

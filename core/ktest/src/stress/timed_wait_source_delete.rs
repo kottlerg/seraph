@@ -51,10 +51,6 @@ const CELL: &str = "stress::timed_wait_source_delete";
 /// Source-destroy cycles (half notification, half event queue).
 const CYCLES: u32 = 200;
 
-/// Fewest cycles at any width ([`super::scaled_attempts`]): most destroys
-/// land on a parked waiter, so a few dozen cycles still interrupt some.
-const MIN_CYCLES: u32 = 32;
-
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
@@ -108,12 +104,9 @@ fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::timed_wait_source_delete: create done failed")?;
-    // Each cycle's waiter start and cross-CPU destroy grow with the width;
-    // the count shrinks with it.
-    let count = super::scaled_attempts(CYCLES, MIN_CYCLES, u64::from(cpus));
     let mut interrupted = 0u64;
     let mut result = Ok(());
-    for cycle in 0..count
+    for cycle in 0..CYCLES
     {
         match one_cycle(ctx, done, cycle, cpus)
         {
@@ -224,8 +217,7 @@ fn race(
         "stress::timed_wait_source_delete: the waiter never reported ready",
     )?;
     // Any outcome serves: the sleep only staggers the destroy around the
-    // waiter's deadlines, and the spin below varies it further (a sleep
-    // refused with `OutOfMemory` on a full sleep list destroys earlier).
+    // waiter's deadlines, and the spin below varies it further.
     let _ = thread_sleep(WAIT_MS);
     for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 18)
     {

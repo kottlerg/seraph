@@ -73,31 +73,42 @@ pub unsafe fn capture_kernel_mmio(boot_info_phys: u64)
 
 // ── MMIO aperture validation ─────────────────────────────────────────────────
 
-/// Maximum number of MMIO apertures the kernel accepts at boot.
-///
-/// Bounded so the validated-aperture buffer can live in BSS with no runtime
-/// allocation. Real platforms (UEFI `x86_64` or RISC-V virt) report at most
-/// a handful of apertures (`PCIe` ECAM + a few platform MMIO ranges); 64 is
-/// generous headroom. Apertures beyond this cap are ignored with a
-/// `kprintln` warning.
-pub const MAX_MMIO_APERTURES: usize = 64;
+/// The MMIO apertures `BootInfo` reports, with the boot memory map that judges
+/// them. Phase 6 builds it ([`validate_mmio_apertures`]) and Phase 7 mints one
+/// `Mmio` capability per aperture [`ValidatedApertures::iter`] yields: exactly
+/// the ones Phase 6 accepted, in order. Nothing is copied, so no count of
+/// apertures is bounded here.
+#[derive(Clone, Copy)]
+pub struct ValidatedApertures
+{
+    raw: &'static [MmioAperture],
+    mmap: &'static [MemoryMapEntry],
+}
 
-/// Validated apertures: BSS-resident, populated once in Phase 6 by
-/// [`validate_mmio_apertures`] and consumed by Phase 7. The first
-/// `count` entries (returned by `validate_mmio_apertures`) are valid.
-///
-/// `static mut` is written exactly once, single-threaded, during Phase 6.
-#[cfg(not(test))]
-static mut VALIDATED_APERTURES: [MmioAperture; MAX_MMIO_APERTURES] = {
-    const VACANT: MmioAperture = MmioAperture {
-        phys_base: 0,
-        size: 0,
-    };
-    [VACANT; MAX_MMIO_APERTURES]
-};
+impl ValidatedApertures
+{
+    /// No apertures.
+    #[must_use]
+    pub const fn empty() -> Self
+    {
+        Self {
+            raw: &[],
+            mmap: &[],
+        }
+    }
 
-/// Validate MMIO apertures from `BootInfo` and return them as a static
-/// slice into [`VALIDATED_APERTURES`].
+    /// The accepted apertures, in `BootInfo` order.
+    pub fn iter(&self) -> impl Iterator<Item = &'static MmioAperture> + use<>
+    {
+        let mmap = self.mmap;
+        self.raw
+            .iter()
+            .filter(move |ap| aperture_fault(ap).is_none() && ram_overlap(ap, mmap).is_none())
+    }
+}
+
+/// Validate the MMIO apertures `BootInfo` reports and return the view of the
+/// accepted ones.
 ///
 /// Re-derives the `BootInfo` reference via `phys_to_virt`, then delegates to
 /// [`validate_apertures_inner`].
@@ -107,46 +118,39 @@ static mut VALIDATED_APERTURES: [MmioAperture; MAX_MMIO_APERTURES] = {
 /// - The entries slice falls outside Usable/Loaded memory map regions.
 ///
 /// # Safety
-/// Must be called exactly once during Phase 6, single-threaded.
+/// Must be called during Phase 6, single-threaded, with the direct map active.
 #[cfg(not(test))]
-pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> &'static [MmioAperture]
+pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> ValidatedApertures
 {
     // SAFETY: boot_info_phys was validated in Phase 0; the direct physical map
     // is active since Phase 3.
     let info: &BootInfo = unsafe { &*(phys_to_virt(boot_info_phys) as *const BootInfo) };
-    // SAFETY: single-threaded Phase 6; VALIDATED_APERTURES not yet aliased.
-    let buf = unsafe { &mut *core::ptr::addr_of_mut!(VALIDATED_APERTURES) };
-    let count = validate_apertures_inner(info, buf);
-    // SAFETY: validate_apertures_inner wrote `count` entries; the rest are vacant.
-    let p = core::ptr::addr_of!(VALIDATED_APERTURES);
-    // SAFETY: `p` points at the valid 'static VALIDATED_APERTURES array;
-    // the just-completed write has finished, no other reader is active.
-    let arr_ref: &[MmioAperture; MAX_MMIO_APERTURES] = unsafe { &*p };
-    &arr_ref[..count]
+    validate_apertures_inner(info)
 }
 
 /// Host-test stub. The only call site, `kernel_entry_post_rebase`, is
-/// `#[cfg(not(test))]`, so nothing calls this in test builds; it returns an
-/// empty slice without exercising the production validation/storage path.
+/// `#[cfg(not(test))]`, so nothing calls this in test builds; it returns no
+/// apertures without exercising the production validation path.
 #[cfg(test)]
 // missing_safety_doc: host-test stub; the production `validate_mmio_apertures` carries the
 // `# Safety` contract.
 #[allow(clippy::missing_safety_doc)]
-pub unsafe fn validate_mmio_apertures(_boot_info_phys: u64) -> &'static [MmioAperture]
+pub unsafe fn validate_mmio_apertures(_boot_info_phys: u64) -> ValidatedApertures
 {
-    &[]
+    ValidatedApertures::empty()
 }
 
-/// Core validation, separated from the entry point for unit-test access.
-/// Returns the number of accepted apertures written to the head of `out`.
-fn validate_apertures_inner(info: &BootInfo, out: &mut [MmioAperture]) -> usize
+/// Core validation, separated from the entry point for unit-test access:
+/// checks the aperture slice, reports each rejected aperture and the counts,
+/// and returns the view of the accepted ones.
+fn validate_apertures_inner(info: &'static BootInfo) -> ValidatedApertures
 {
     let ap = &info.mmio_apertures;
 
     if ap.count == 0
     {
         kprintln!("mmio apertures: 0 validated (0 skipped)");
-        return 0;
+        return ValidatedApertures::empty();
     }
 
     if ap.entries.is_null()
@@ -154,7 +158,8 @@ fn validate_apertures_inner(info: &BootInfo, out: &mut [MmioAperture]) -> usize
         crate::fatal("Phase 6: mmio_apertures.entries is null with non-zero count");
     }
 
-    let mmap: &[MemoryMapEntry] = if info.memory_map.count == 0 || info.memory_map.entries.is_null()
+    let mmap: &'static [MemoryMapEntry] = if info.memory_map.count == 0
+        || info.memory_map.entries.is_null()
     {
         &[]
     }
@@ -181,69 +186,46 @@ fn validate_apertures_inner(info: &BootInfo, out: &mut [MmioAperture]) -> usize
 
     // SAFETY: slice verified to lie within Usable/Loaded physical memory;
     // direct map is active; count is bounded above.
-    let raw: &[MmioAperture] = unsafe {
+    let raw: &'static [MmioAperture] = unsafe {
         core::slice::from_raw_parts(
             phys_to_virt(entries_phys) as *const MmioAperture,
             ap.count as usize,
         )
     };
 
-    let ApertureCounts {
-        accepted,
-        skipped: skip_count,
-        dropped: overflow_count,
-    } = filter_apertures(raw, mmap, out);
-
-    if overflow_count > 0
-    {
-        kprintln!(
-            "mmio apertures: {} validated ({} skipped, {} dropped — exceeded MAX_MMIO_APERTURES)",
-            accepted,
-            skip_count,
-            overflow_count
-        );
-    }
-    else
-    {
-        kprintln!(
-            "mmio apertures: {} validated ({} skipped)",
-            accepted,
-            skip_count
-        );
-    }
-
-    accepted
+    let counts = report_apertures(raw, mmap);
+    kprintln!(
+        "mmio apertures: {} validated ({} skipped)",
+        counts.accepted,
+        counts.skipped
+    );
+    ValidatedApertures { raw, mmap }
 }
 
-/// Outcome of [`filter_apertures`]: entries accepted into `out`, entries
-/// skipped as invalid or RAM-overlapping, and valid entries dropped past the
-/// capacity of `out`.
+/// Outcome of [`report_apertures`]: entries accepted and entries skipped as
+/// invalid or RAM-overlapping.
 struct ApertureCounts
 {
     accepted: usize,
     skipped: usize,
-    dropped: usize,
 }
 
-/// Copy every aperture of `raw` that [`aperture_valid`] accepts and that
-/// intersects no RAM-class region of `mmap` ([`ram_overlap`]) into the head
-/// of `out`, in order, until `out` is full.
-fn filter_apertures(
-    raw: &[MmioAperture],
-    mmap: &[MemoryMapEntry],
-    out: &mut [MmioAperture],
-) -> ApertureCounts
+/// Report every aperture of `raw` that [`aperture_fault`] rejects or that
+/// intersects a RAM-class region of `mmap` ([`ram_overlap`]), and count the
+/// accepted and skipped ones. The accepted set is the one
+/// [`ValidatedApertures::iter`] yields.
+fn report_apertures(raw: &[MmioAperture], mmap: &[MemoryMapEntry]) -> ApertureCounts
 {
     let mut counts = ApertureCounts {
         accepted: 0,
         skipped: 0,
-        dropped: 0,
     };
 
     for (i, entry) in raw.iter().enumerate()
     {
-        if !aperture_valid(entry, i)
+        if let Some(fault) = aperture_fault(entry)
         {
+            report_fault(i, entry, fault);
             counts.skipped += 1;
             continue;
         }
@@ -261,12 +243,6 @@ fn filter_apertures(
             counts.skipped += 1;
             continue;
         }
-        if counts.accepted >= out.len()
-        {
-            counts.dropped += 1;
-            continue;
-        }
-        out[counts.accepted] = *entry;
         counts.accepted += 1;
     }
 
@@ -277,8 +253,8 @@ fn filter_apertures(
 /// entry of `map` that `ap` intersects, or `None`. An `Mmio` capability over
 /// RAM would let its holder map and write frames outside Memory-capability
 /// accounting, so Phase 6 rejects such an aperture
-/// (`core/kernel/docs/initialization.md` § Phase 6). `ap` has passed
-/// [`aperture_valid`], so its end does not wrap.
+/// (`core/kernel/docs/initialization.md` § Phase 6). Called only for an `ap`
+/// [`aperture_fault`] accepts, so its end does not wrap.
 fn ram_overlap<'a>(ap: &MmioAperture, map: &'a [MemoryMapEntry]) -> Option<&'a MemoryMapEntry>
 {
     let ap_end = ap.phys_base + ap.size;
@@ -294,50 +270,80 @@ fn ram_overlap<'a>(ap: &MmioAperture, map: &'a [MemoryMapEntry]) -> Option<&'a M
     })
 }
 
-/// Accept an aperture iff its base is page-aligned, its size is non-zero
-/// and page-aligned, and `base + size` does not wrap.
-fn aperture_valid(ap: &MmioAperture, index: usize) -> bool
+/// Why an aperture is malformed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApertureFault
+{
+    /// The base is not page-aligned.
+    UnalignedBase,
+    /// The size is zero.
+    EmptySize,
+    /// The size is not page-aligned.
+    UnalignedSize,
+    /// `base + size` wraps `u64`.
+    Wraps,
+}
+
+/// The fault of a malformed aperture, or `None` when its base is
+/// page-aligned, its size is non-zero and page-aligned, and `base + size`
+/// does not wrap.
+fn aperture_fault(ap: &MmioAperture) -> Option<ApertureFault>
 {
     let page = PAGE_SIZE as u64;
-
     if !ap.phys_base.is_multiple_of(page)
     {
-        kprintln!(
-            "  aperture[{}]: base {:#x} is not page-aligned, skipping",
-            index,
-            ap.phys_base
-        );
-        return false;
+        Some(ApertureFault::UnalignedBase)
     }
-
-    if ap.size == 0
+    else if ap.size == 0
     {
-        kprintln!("  aperture[{}]: size is zero, skipping", index);
-        return false;
+        Some(ApertureFault::EmptySize)
     }
-
-    if !ap.size.is_multiple_of(page)
+    else if !ap.size.is_multiple_of(page)
     {
-        kprintln!(
-            "  aperture[{}]: size {:#x} is not page-aligned, skipping",
-            index,
-            ap.size
-        );
-        return false;
+        Some(ApertureFault::UnalignedSize)
     }
-
-    if ap.phys_base.checked_add(ap.size).is_none()
+    else if ap.phys_base.checked_add(ap.size).is_none()
     {
-        kprintln!(
-            "  aperture[{}]: range {:#x}+{:#x} wraps u64, skipping",
-            index,
-            ap.phys_base,
-            ap.size
-        );
-        return false;
+        Some(ApertureFault::Wraps)
     }
+    else
+    {
+        None
+    }
+}
 
-    true
+/// Report aperture `index`'s `fault` on the kernel console.
+fn report_fault(index: usize, ap: &MmioAperture, fault: ApertureFault)
+{
+    match fault
+    {
+        ApertureFault::UnalignedBase =>
+        {
+            kprintln!(
+                "  aperture[{}]: base {:#x} is not page-aligned, skipping",
+                index,
+                ap.phys_base
+            );
+        }
+        ApertureFault::EmptySize => kprintln!("  aperture[{}]: size is zero, skipping", index),
+        ApertureFault::UnalignedSize =>
+        {
+            kprintln!(
+                "  aperture[{}]: size {:#x} is not page-aligned, skipping",
+                index,
+                ap.size
+            );
+        }
+        ApertureFault::Wraps =>
+        {
+            kprintln!(
+                "  aperture[{}]: range {:#x}+{:#x} wraps u64, skipping",
+                index,
+                ap.phys_base,
+                ap.size
+            );
+        }
+    }
 }
 
 /// Return `true` if `[slice_start, slice_end)` is fully covered by Usable or
@@ -432,48 +438,35 @@ mod tests
     #[test]
     fn empty_apertures_returns_empty_vec()
     {
-        let info = make_boot_info(&[], &[]);
-        let mut out = [MmioAperture {
-            phys_base: 0,
-            size: 0,
-        }; MAX_MMIO_APERTURES];
-        let count = validate_apertures_inner(&info, &mut out);
-        assert_eq!(count, 0);
+        let info: &'static BootInfo = Box::leak(Box::new(make_boot_info(&[], &[])));
+        assert_eq!(validate_apertures_inner(info).iter().count(), 0);
     }
 
     #[test]
     fn valid_aperture_accepted()
     {
-        let ap = aperture(0x1000_0000, 0x1000);
-        assert!(aperture_valid(&ap, 0));
+        assert_eq!(aperture_fault(&aperture(0x1000_0000, 0x1000)), None);
     }
 
     #[test]
-    fn unaligned_base_rejected()
+    fn malformed_apertures_are_rejected_by_cause()
     {
-        let ap = aperture(0x1001, 0x1000);
-        assert!(!aperture_valid(&ap, 0));
-    }
-
-    #[test]
-    fn zero_size_rejected()
-    {
-        let ap = aperture(0x1000_0000, 0);
-        assert!(!aperture_valid(&ap, 0));
-    }
-
-    #[test]
-    fn unaligned_size_rejected()
-    {
-        let ap = aperture(0x1000_0000, 0x1001);
-        assert!(!aperture_valid(&ap, 0));
-    }
-
-    #[test]
-    fn wrap_rejected()
-    {
-        let ap = aperture(u64::MAX - 0x0FFF, 0x1000);
-        assert!(!aperture_valid(&ap, 0));
+        assert_eq!(
+            aperture_fault(&aperture(0x1001, 0x1000)),
+            Some(ApertureFault::UnalignedBase)
+        );
+        assert_eq!(
+            aperture_fault(&aperture(0x1000_0000, 0)),
+            Some(ApertureFault::EmptySize)
+        );
+        assert_eq!(
+            aperture_fault(&aperture(0x1000_0000, 0x1001)),
+            Some(ApertureFault::UnalignedSize)
+        );
+        assert_eq!(
+            aperture_fault(&aperture(u64::MAX - 0x0FFF, 0x1000)),
+            Some(ApertureFault::Wraps)
+        );
     }
 
     fn entry(base: u64, size: u64, memory_type: MemoryType) -> MemoryMapEntry
@@ -485,12 +478,33 @@ mod tests
         }
     }
 
-    /// Run `filter_apertures`; return the accepted apertures and the skip count.
+    /// The accepted apertures of `raw` against `map`, and the skip count.
     fn run_filter(raw: &[MmioAperture], map: &[MemoryMapEntry]) -> (Vec<MmioAperture>, usize)
     {
-        let mut out = [aperture(0, 0); MAX_MMIO_APERTURES];
-        let counts = filter_apertures(raw, map, &mut out);
-        (out[..counts.accepted].to_vec(), counts.skipped)
+        let raw: &'static [MmioAperture] = Box::leak(raw.to_vec().into_boxed_slice());
+        let mmap: &'static [MemoryMapEntry] = Box::leak(map.to_vec().into_boxed_slice());
+        let view = ValidatedApertures { raw, mmap };
+        let counts = report_apertures(raw, mmap);
+        let accepted: Vec<MmioAperture> = view.iter().copied().collect();
+        assert_eq!(
+            accepted.len(),
+            counts.accepted,
+            "the view and the report agree"
+        );
+        (accepted, counts.skipped)
+    }
+
+    // Defect caught: the former 64-entry buffer dropping valid apertures, so
+    // the devices behind them were unreachable.
+    #[test]
+    fn every_valid_aperture_is_kept_however_many_there_are()
+    {
+        let raw: Vec<MmioAperture> = (0..200u64)
+            .map(|i| aperture(0x1_0000_0000 + i * 0x10_0000, 0x1000))
+            .collect();
+        let (accepted, skipped) = run_filter(&raw, &[]);
+        assert_eq!((accepted.len(), skipped), (200, 0));
+        assert_eq!(accepted[199].phys_base, raw[199].phys_base);
     }
 
     #[test]

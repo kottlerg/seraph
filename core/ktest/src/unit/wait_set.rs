@@ -58,6 +58,68 @@ const fn waiter_bits(k: u32, bits: u64) -> u64
     bits << (k * WAITER_SHIFT)
 }
 
+// ── SYS_CAP_CREATE_WAIT_SET capacity ─────────────────────────────────────────
+
+/// Members past the former fixed ceiling of 16, in the set sized for them.
+const WIDE_MEMBERS: usize = 40;
+
+/// A wait set holds exactly the member capacity its creator chose: a set of
+/// [`WIDE_MEMBERS`] takes that many members and wakes for the last one, an add
+/// past the capacity is refused, and a capacity of 0 or past
+/// `WAIT_SET_MAX_MEMBERS` is refused at create. Fails if the kernel still caps
+/// members at a fixed width, over-fills a set, or misindexes a member past 16.
+pub fn capacity_is_caller_sized(ctx: &TestContext) -> TestResult
+{
+    let max = syscall_abi::WAIT_SET_MAX_MEMBERS;
+    if wait_set_create(ctx.memory_base, 0) != Err(SyscallError::InvalidArgument as i64)
+        || wait_set_create(ctx.memory_base, max + 1) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("wait_set::capacity: an out-of-range capacity was not refused");
+    }
+    // cast_possible_truncation: WIDE_MEMBERS is a small literal.
+    #[allow(clippy::cast_possible_truncation)]
+    let ws = wait_set_create(ctx.memory_base, WIDE_MEMBERS as u32)
+        .map_err(|_| "wait_set::capacity: wait_set_create(wide) failed")?;
+    let mut sigs = [0u32; WIDE_MEMBERS + 1];
+    let result = fill_and_wake(ctx, ws, &mut sigs);
+    for &sig in sigs.iter().filter(|&&s| s != 0)
+    {
+        cap_delete(sig).ok();
+    }
+    cap_delete(ws).ok();
+    result
+}
+
+/// Body of [`capacity_is_caller_sized`]: fill `ws` with `sigs.len() - 1`
+/// notifications, refuse one more, and wake on the last member.
+fn fill_and_wake(ctx: &TestContext, ws: u32, sigs: &mut [u32]) -> TestResult
+{
+    let last = sigs.len() - 1;
+    for (i, sig) in sigs.iter_mut().enumerate()
+    {
+        *sig = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "wait_set::capacity: cap_create_notification failed")?;
+        let added = wait_set_add(ws, *sig, 0x1000 + i as u64);
+        if i < last && added.is_err()
+        {
+            return Err("wait_set::capacity: an add within the capacity was refused");
+        }
+        if i == last && added.is_ok()
+        {
+            return Err("wait_set::capacity: an add past the capacity was accepted");
+        }
+    }
+    notification_send(sigs[last - 1], 0x1)
+        .map_err(|_| "wait_set::capacity: notification_send failed")?;
+    let badge = wait_set_wait(ws).map_err(|_| "wait_set::capacity: wait_set_wait failed")?;
+    notification_wait(sigs[last - 1]).ok();
+    if badge != 0x1000 + (last - 1) as u64
+    {
+        return Err("wait_set::capacity: the wait returned the wrong member's badge");
+    }
+    Ok(())
+}
+
 // ── wait_set_add (notification, immediate wake) ────────────────────────────────────
 
 /// Signalling a notification already registered in a wait set causes
@@ -65,7 +127,8 @@ const fn waiter_bits(k: u32, bits: u64) -> u64
 /// queues the member on the wait set's ready ring).
 pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create failed")?;
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for ws-notification test failed")?;
 
@@ -95,8 +158,8 @@ pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 /// queues the member on the wait set's ready ring).
 pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 {
-    let ws =
-        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for ws-queue test failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for ws-queue test failed")?;
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for ws-queue test failed")?;
 
@@ -130,8 +193,8 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 /// first on another CPU, returns the badge already queued on the ready ring.
 pub fn blocking_wait(ctx: &TestContext) -> TestResult
 {
-    let ws =
-        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for blocking test failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for blocking test failed")?;
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for blocking test failed")?;
 
@@ -226,7 +289,8 @@ pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
 fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
 {
     let ws = *o.ws.insert(
-        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for occupied failed")?,
+        wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+            .map_err(|_| "wait_set_create for occupied failed")?,
     );
     let sig = *o.sig.insert(
         cap_create_notification(ctx.memory_base)
@@ -326,8 +390,8 @@ fn collect(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 /// notification. Posts to the event queue and verifies only badge 2 fires.
 pub fn remove(ctx: &TestContext) -> TestResult
 {
-    let ws =
-        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for remove test failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create for remove test failed")?;
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for remove test failed")?;
     let eq = event_queue_create(ctx.memory_base, 4)
@@ -364,7 +428,8 @@ pub fn remove(ctx: &TestContext) -> TestResult
 /// reference rule is in core/kernel/docs/ipc-internals.md § Wait Set Add/Remove.
 pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create failed")?;
     let sig =
         cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
 
@@ -394,7 +459,8 @@ pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
 /// ring, so the post-drop `wait_set_wait` returns its badge.
 pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create failed")?;
     let eq = event_queue_create(ctx.memory_base, 4).map_err(|_| "event_queue_create failed")?;
 
     wait_set_add(ws, eq, 73).map_err(|_| "wait_set_add(eq) failed")?;
@@ -418,7 +484,8 @@ pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
 /// without UAF — the source is reclaimed via `wait_set_drop`'s cascade.
 pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let ws = wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+        .map_err(|_| "wait_set_create failed")?;
     let ep = cap_create_endpoint(ctx.memory_base).map_err(|_| "cap_create_endpoint failed")?;
 
     wait_set_add(ws, ep, 19).map_err(|_| "wait_set_add(ep) failed")?;

@@ -69,33 +69,38 @@ An entry an existing open Issue already names cites it in the recommendation.
 
 ## Cross-Cutting Findings
 
-- **RAM ceiling.** The binding RAM ceiling today is about 248 GiB of top RAM address, set by the
-  boot direct map's table pool (`BOOT_TABLE_POOL_SIZE`), just before the frame map's 256 GiB
-  (`MAX_CHUNKS`). The buddy allocator keeps its free-list links in the free blocks and has no
-  RAM ceiling of its own.
-- **CPU ceiling.** The binding CPU ceiling is `MAX_ORDER`: every per-CPU slab must fit one buddy
-  block, and `AP_IST_STACKS` is exactly 8 MiB at `MAX_CPUS = 512`. `MAX_CPUS` itself is inline
-  in the one-page `BootInfo`, and shipping two-socket servers already exceed 512 logical CPUs.
+- **RAM ceiling.** No kernel memory-management structure bounds RAM: the Phase 3 tables come
+  from a carve of RAM sized to the machine, the frame map's and the `CSpace` registry's chunk
+  tables are sized from the memory map, and the buddy allocator keeps its free-list links in the
+  free blocks. What binds is the address space: x86_64's 4-level paging gives the direct map a
+  128 TiB kernel half (LA57 is the decided expansion), and the `u32` `CSpaceId` stops the
+  registry at 16 TiB of DRAM.
+- **CPU ceiling.** The binding CPU ceiling is `MAX_CPUS` itself, inline in the one-page
+  `BootInfo`; shipping two-socket servers already exceed 512 logical CPUs. A per-CPU slab may
+  span several buddy blocks, so `MAX_ORDER` no longer caps the CPU count.
 - **Process ceiling.** No table caps live processes: procmgr's grows on its heap, memmgr's is
-  RAM-bound, and the kernel's `CSpace` registry is sized from RAM and does not bind first.
-  Behind those sit the per-process `u32` death correlator, `badge as u32` in procmgr, logd and
-  svcmgr, which procmgr keeps unique among live processes by redrawing a colliding badge (#638
-  widens it), and the cap handle's 8-bit wrapping generation.
+  RAM-bound, and the kernel's `CSpace` registry is sized from RAM and does not bind first. The
+  death queues' fixed observer pools bind first (procmgr's at about 512 live processes, logd's at
+  1024, svcmgr's at 256 supervised services; #643 grows them). Behind those sit the 32-bit death
+  correlators the services still bind where the kernel carries a `u64` one: procmgr binds
+  `badge as u32` into its own queue and logd's, which logd compares `as u32`, and svcmgr binds its
+  table index. procmgr keeps the low word unique among live processes by redrawing a colliding
+  badge (adopting the full width is #643). Behind those sits the cap handle's 8-bit wrapping
+  generation.
 - **Per-process address space.** The surfaces a creator places stay in one static map below
   Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
   TLS block each reach 1 GiB of VA.
 - **Silent truncation.** Many tables drop entries past their bound with no diagnostic: boot
-  memory-map entries, usable RAM ranges, apertures, ACPI regions, DTB nodes and ranges, named
-  modules. Each needs a diagnostic as well as a better bound.
+  memory-map entries, ACPI regions, DTB nodes and ranges, named modules. Each needs a diagnostic
+  as well as a better bound.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
-  copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
-  (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
-  `GEN_BITS`, the ktest mirrors of `MAX_SLEEPING`, `L2_SIZE`, and `MAX_IRQ_BINDINGS`, and vfsd
-  gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
-- **Spin-count timeouts.** Several deadlock detectors and device polls are counted in loop
-  iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
-  model.
+  copies: `MAX_MODULES` and `INIT_MAX_NAMED_MODULES` (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS`
+  and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` and
+  `MAX_IRQ_BINDINGS`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
+- **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
+  depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
+  (`bounded_wait::DEADLOCK_BUDGET_US`) are the time-based model.
 - **Hidden global pools.** The kernel's 512 KiB SEED also funds split bodies, Mmio, IoPort, and
   Interrupt copies, and IOPB tables at runtime.
 
@@ -108,34 +113,33 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `BuddyAllocator.free_lists` (`FreeHeader` in each free block) | `core/kernel/src/mm/buddy.rs` | none: one 16 B header inside each free block, linked by physical address | provable unreachability (no metadata outside the free pages) | 96 B BSS (the 12 list heads) | correct as is | None |
-| `MAX_ORDER` | `core/kernel/src/mm/buddy.rs` | 11 (8 MiB largest block) | BSS budget (the 512-CPU `AP_IST_STACKS` slab fits one block) | none | needs a design | With the one-block rule of `alloc_zeroed_slab` it is the effective `MAX_CPUS` ceiling; allocate per-CPU slabs in several blocks |
-| `BOOT_TABLE_POOL_SIZE` (`BootTablePool.frames`) | `core/kernel/src/mm/paging.rs` | 256 frames | BSS budget | 1 MiB BSS | make pay-as-you-go | Halts above about 248 GiB of top RAM address; 1 GiB leaves or tables carved from usable RAM |
+| `MAX_ORDER` | `core/kernel/src/mm/buddy.rs` | 11 (8 MiB largest block) | tuning (block granularity; a boot allocation past one block takes a run of blocks, `alloc_contiguous`) | none | correct as is | None |
+| `BOOT_TABLE_POOL_SIZE` (`BootTablePool.frames`) | `core/kernel/src/mm/paging.rs` | 64 frames | provable unreachability (stage 1 maps only the image, the handoff stack window and the stage-2 carve, whose tables fit the seed for any direct map within the 128 TiB kernel half) | 256 KiB BSS | correct as is | None |
+| Phase 3 stage-2 carve (`stage2_table_bound`, `find_boot_table_carve`) | `core/kernel/src/mm/paging.rs`, `init.rs` | an upper bound on the stage-2 tables, about one frame per GiB of direct map | provable unreachability (sized from the machine; a host test checks the bound against a real allocation) | about 4 KiB per GiB of RAM | correct as is | None |
 | `LARGE_PAGE_SIZE` | `core/kernel/src/mm/paging.rs` | 2 MiB | hardware spec (x86-64 and Sv39 large leaf) | none | correct as is | None |
-| `init_kernel_page_tables` `mmio_regions` | `core/kernel/src/mm/paging.rs` | `[(u64, u64); 16]` | current peak plus headroom (LAPIC plus `MAX_IOAPICS` = 9) | 256 B stack | raise | Pin `1 + MAX_IOAPICS <= 16` with a const assert or derive the length |
-| `map_boot_stack` identity window | `core/kernel/src/mm/paging.rs` | 64 KiB aligned down around SP | unknown | 16 PTEs | raise | The bootloader stack is only 4 KiB-aligned; map the reported stack range |
-| `MAX_CHUNKS` (`FrameMap.chunks`) | `core/kernel/src/mm/frame_map.rs` | 256 (1 GiB per chunk) | BSS budget (matched to the boot pool) | 2 KiB BSS | make pay-as-you-go | Fatal past 256 GiB of DRAM span; size from `dram_bounds()` and skip holes |
+| `init_kernel_page_tables` `mmio_regions` | `core/kernel/src/mm/paging.rs` | `[(u64, u64); MMIO_DIRECT_MAP_REGIONS]`: `1 + MAX_IOAPICS` on x86_64, 0 on riscv64 | ABI width (derived from the producer's own bound) | 144 B stack | correct as is | None |
+| `map_boot_stack` identity window (`handoff_stack_window`) | `core/kernel/src/mm/paging.rs` | `2 x HANDOFF_STACK_BYTES + 4 KiB` around SP | ABI width (the entry contract's guaranteed stack, `HANDOFF_STACK_BYTES`) | 33 PTEs | correct as is | None |
+| `FrameMap` chunk table (`chunk_slots`) | `core/kernel/src/mm/frame_map.rs` | one slot per GiB of DRAM span; a chunk per GiB that holds RAM | provable unreachability (sized from the memory map at boot) | 8 B per GiB of span plus 1 MiB per GiB of RAM | correct as is | None |
 | `FrameMap` per-frame counter | `core/kernel/src/mm/frame_map.rs` | `AtomicU32`, saturating | provably unreachable (2^32 leaf PTEs to one frame need 32 GiB of page tables, and saturation refuses the map) | 4 B per frame | correct as is | None |
 | `RELEASE_RUNS` (`ReleaseBatch.runs`) | `core/kernel/src/mm/frame_map.rs` | 16 | batch size (a full batch flushes, never fails) | 256 B stack | correct as is | None |
 | `FRAMES_PER_CHUNK` geometry assert | `core/kernel/src/mm/frame_map.rs` | 1 GiB per chunk, 1 MiB counter block | encoding artefact | none | correct as is | Keep |
-| `MAX_RANGES` (`RangeList` usable and work lists) | `core/kernel/src/mm/init.rs` | 64 | current peak plus headroom | about 1 KiB stack per list | raise | `push` drops RAM ranges past 64 silently; size from `memory_map.count` or fail loudly |
-| `MAX_EXCL` | `core/kernel/src/mm/init.rs` | 32 | provably unreachable today (27 at most) only through core/boot's private `MAX_MODULES` | 512 B stack | needs a design | Derive from an ABI constant with a const assert; make overflow fatal |
-| `FREE_RANGE_CAP` (`FREE_RANGES`) | `core/kernel/src/mm/init.rs` | `MAX_RANGES + MAX_EXCL + 1` = 97 | provable unreachability (the usable ranges are disjoint, so each subtracted extent adds at most one piece; `push_counted` asserts it) | about 1.5 KiB BSS plus transient boot-stack copies of the same size | correct as is | None |
+| Free-range stream (`for_each_payload_free_piece`) | `core/kernel/src/mm/init.rs` | none: each usable entry is cut against the boot payload's extents as it is read | provable unreachability (nothing is stored; the cost is pieces times exclusions) | none | correct as is | None |
 | `fdt_extent` DTB size check | `core/kernel/src/mm/init.rs` | FDT `u32` `totalsize`, at least the 40-byte header, inside the direct-mapped span | hardware or format spec (FDT header) | none | correct as is | None; a blob outside the bounds halts the boot at Phase 3 |
-| `TAG_CAP` (`TagPool`) | `core/kernel/src/mm/tag_allocator.rs` | 4096 | hardware spec (x86 12-bit PCID); clips riscv64's 16-bit ASID | about 64.5 KiB BSS | make pay-as-you-go | Allocate from the buddy, sized to the probed tag count |
-| `enable` `max_fit` tag trim | `core/kernel/src/mm/tag_allocator.rs` | `2^MAX_ORDER` pages / (`cpu_count` x 16) | BSS budget (one-block slab) | `cpu_count` x tags x 16 B | needs a design | Follows the per-CPU slab design |
+| `TagPool` storage (`MAX_HW_TAGS`) | `core/kernel/src/mm/tag_allocator.rs` | buddy-allocated, sized to the probed tag count, at most 2^16 | hardware spec (the 16-bit `satp.ASID`; x86 PCID is 12 bits) | 16 B per tag plus the bitmap | correct as is | None |
+| `TAG_STATE_BUDGET_BYTES` tag trim | `core/kernel/src/mm/tag_allocator.rs` | 8 MiB of per-CPU tag state, never below `cpu_count + 2` tags | tuning (a claim always succeeds; fewer tags only means more evictions) | `cpu_count` x tags x 16 B | correct as is | None |
 | `AddressSpace.tag`, `TlbShootdownRequest.tag` | `core/kernel/src/mm/address_space.rs`, `tlb_shootdown.rs` | `AtomicU16` | hardware spec (PCID and ASID widths) | 2 B each | correct as is | None |
 | `alloc_gen`, `tag_gen`, `tlb_gen` | `core/kernel/src/mm/tag_allocator.rs`, `address_space.rs` | `u64` | provably unreachable (no wrap at any claim rate) | 8 B each | correct as is | None |
-| `acquire_tag_pool_lock` spin bound | `core/kernel/src/mm/tag_allocator.rs` | 500 000 spins, then hang | unknown (spin count) | none | needs a design | Time-based bound or the softlockup watchdog |
-| `claim` eviction retry bound | `core/kernel/src/mm/tag_allocator.rs` | 10 000 000 passes, then fatal | unknown (spin count) | none | needs a design | Time-based bound |
-| `acquire_frame_alloc_lock` spin bound | `core/kernel/src/mm/mod.rs` | 500 000 spins, then hang | unknown (spin count) | none | needs a design | Time-based bound or the softlockup watchdog |
-| `TLB_REQUESTS` | `core/kernel/src/mm/tlb_shootdown.rs` | `[TlbShootdownRequest; MAX_CPUS]` | ABI width (`MAX_CPUS`) | about 48 KiB BSS | make pay-as-you-go | Allocate with the `cpu_count`-sized per-CPU slabs |
+| `acquire_tag_pool_lock` wait bound | `core/kernel/src/mm/tag_allocator.rs` | `DEADLOCK_BUDGET_US` (5 s elapsed), then fatal | tuning (bounds no capacity) | none | correct as is | None |
+| `claim` eviction retry bound | `core/kernel/src/mm/tag_allocator.rs` | `DEADLOCK_BUDGET_US` (5 s elapsed), then fatal | tuning (bounds no capacity) | none | correct as is | None |
+| `acquire_frame_alloc_lock` wait bound | `core/kernel/src/mm/mod.rs` | `DEADLOCK_BUDGET_US` (5 s elapsed), then fatal | tuning (bounds no capacity) | none | correct as is | None |
+| TLB-shootdown request slab (`TLB_REQUESTS_PTR`) | `core/kernel/src/mm/tlb_shootdown.rs` | `cpu_count`-sized | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x about 96 B | correct as is | Already pay-as-you-go |
 | `RANGE_FLUSH_CEILING_PAGES` | `core/kernel/src/mm/tlb_shootdown.rs` | 32 | tuning threshold (bounds no capacity) | none | correct as is | None |
-| `CPU_MASK_WORDS` (`CpuMask`) | `core/kernel/src/cpu_mask.rs` | `MAX_CPUS.div_ceil(64)` = 8 | ABI width (`MAX_CPUS`) | 64 B in every `AddressSpace` and TLB request | needs a design | Per-boot width or a hierarchical mask before `MAX_CPUS` rises |
-| `AddressSpace.death_observers` | `core/kernel/src/mm/address_space.rs` | 4 (`MAX_DEATH_OBSERVERS`) | current peak plus headroom | 64 B per `AddressSpace` | make pay-as-you-go | See the thread-side entry |
+| `CPU_MASK_WORDS` (`CpuMask`) | `core/kernel/src/cpu_mask.rs` | `MAX_CPUS.div_ceil(64)` = 8 | ABI width (`MAX_CPUS`) | 64 B in every `AddressSpace` and TLB request | make pay-as-you-go | Decided: a per-boot width (`cpu_count.div_ceil(64)` words held with their object) once `MAX_CPUS` leaves `BootInfo` (#640); a hierarchical mask is rejected (reasons at the constant) |
+| `AddressSpace.death_observers` | `core/kernel/src/mm/address_space.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per `AddressSpace` | correct as is | None |
 | `DEFAULT_INIT_INFO_VA`, `DEFAULT_INIT_STACK_TOP` | `core/kernel/src/mm/address_space.rs` | fixed VAs under the Sv39 user top | encoding artefact (fallback layout) | none | correct as is | Not a count |
 | `INIT_MAX_SEGMENTS` RELRO split | `core/kernel/src/mm/init_reloc.rs` | 8 | ABI width (boot protocol) | none | correct as is | A split past 8 is a clean error |
 | `kernel_pt_pool` seed | `core/kernel/src/mm/kernel_pt_pool.rs` | 64 pages (`POOL_SEED_PAGES`), never returned | current peak plus headroom | 256 KiB | needs a design | Also the fallback for address spaces with no donation; confirm it is unreachable after boot |
-| x86_64 4-level paging (`user_va_top`) | `core/kernel/src/arch/x86_64/paging.rs` | user 128 TiB, kernel half 128 TiB | hardware spec (4-level paging chosen; no LA57) | none | needs a design | Below the #177 target of 526 TB; decide on LA57 |
+| x86_64 4-level paging (`user_va_top`) | `core/kernel/src/arch/x86_64/paging.rs` | user 128 TiB, kernel half 128 TiB | hardware spec (4-level paging; LA57 not yet implemented) | none | raise | Below the #177 target of 526 TB; decided: opportunistic LA57, as riscv64 Sv57 (docs/platform-requirements.md); tracked by #675 |
 | `PerCpuData`, `CPU_APIC_IDS` slabs | `core/kernel/src/percpu.rs` | `cpu_count`-sized | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x about 76 B | correct as is | Already pay-as-you-go |
 | `CPU_APIC_IDS` element | `core/kernel/src/percpu.rs` | `u32` | ABI width (`BootInfo.cpu_ids`; x2APIC IDs are 32-bit) | 4 B per CPU | correct as is | riscv64 `mhartid` is XLEN-wide; a hart id above 2^32 is refused |
 | `PerCpuData.cpu_id`, `preempt_count` | `core/kernel/src/percpu.rs` | `u32` | provably unreachable (CPUs and nesting are far below 2^32) | embedded | correct as is | None |
@@ -144,13 +148,13 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `INIT_ASPACE_PAGES` | `core/kernel/src/main.rs` | 18 | provably unreachable (init's fixed footprint: temp-map scratch and one UART page; augment can refill it, as ktest does) | 72 KiB from SEED | correct as is | None |
 | `INIT_THREAD_PAGES` | `core/kernel/src/main.rs` | `KERNEL_STACK_PAGES + 2` = 6 | encoding artefact (stack, TCB, FPU page) | 24 KiB from SEED | correct as is | None |
 | `page_ptrs`, `page_phys` | `core/kernel/src/main.rs` | `[_; INIT_INFO_MAX_PAGES]` | ABI width (init protocol) | 64 B stack | correct as is | Overflow is fatal above it |
-| `backtrace_scan` `MAX_BYTES` | `core/kernel/src/main.rs` | 8 KiB | unknown | none | raise | Half the 16 KiB kernel stack; bound by `stack_top` |
+| `backtrace_scan` extent | `core/kernel/src/main.rs` | the thread's stack, SP to `stack_top` | provable unreachability (the stack's own extent) | none | correct as is | None |
 | `backtrace_scan` `MAX_HITS` | `core/kernel/src/main.rs` | 24 | diagnostic output cap | none | correct as is | None |
-| `APS_READY` wait | `core/kernel/src/main.rs` | unbounded | unknown | none | needs a design | Time bound and a fatal naming the CPU |
+| `APS_READY` wait (`AP_ONLINE_BUDGET_US`) | `core/kernel/src/main.rs` | 10 s per AP, then fatal naming the CPU | tuning (bounds no capacity) | none | correct as is | None |
 | `timer::init(1_000)` tick period | `core/kernel/src/main.rs` | 1000 us | tuning (bounds no capacity) | none | correct as is | None |
 | `print_timestamp` `sec_buf` | `core/kernel/src/console.rs` | 20 B | ABI width (`u64::MAX` has 20 digits) | 20 B stack | correct as is | None |
 | `FramebufferWriter` geometry fields | `core/kernel/src/framebuffer.rs` | `u32` | ABI width (boot-protocol `FramebufferInfo`) | embedded | correct as is | None |
-| `platform::MAX_MMIO_APERTURES` (`VALIDATED_APERTURES`) | `core/kernel/src/platform.rs` | 64 | current peak plus headroom | 1 KiB BSS | raise | Apertures past 64 are dropped with a warning; size from the boot count |
+| `platform::ValidatedApertures` | `core/kernel/src/platform.rs` | none: a filtered view of `BootInfo`'s aperture list | provable unreachability (nothing is copied) | none | correct as is | None |
 
 ### Kernel: capabilities
 
@@ -161,7 +165,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 |---|---|---|---|---|---|---|
 | `CSPACE_REGISTRY` arena (`chunks_for_ram`, `init_cspace_registry`) | `core/kernel/src/cap/registry.rs` | one 16 B entry per page of DRAM | provably unreachable (every `CSpace` costs its creator at least one page, so the id space never binds before RAM does) | about 0.4 % of DRAM, carved at boot | correct as is | None |
 | `REGISTRY_CHUNK_ORDER` | `core/kernel/src/cap/registry.rs` | 8 (1 MiB chunks) | encoding artefact (chunk granularity of the two-level arena) | none | correct as is | None |
-| `MAX_REGISTRY_CHUNKS` | `core/kernel/src/cap/registry.rs` | 1024 (one entry per page of 256 GiB) | encoding artefact (matched to `frame_map::MAX_CHUNKS`, asserted) | 8 KiB BSS | needs a design | Fatal past 256 GiB of DRAM; follows `MAX_CHUNKS` (#636) |
+| `CSpaceRegistry` chunk table (`chunks_for_ram`, `MAX_ID_CHUNKS`) | `core/kernel/src/cap/registry.rs` | one slot per 256 MiB of DRAM, at most `MAX_ID_CHUNKS` (the `u32` id space, 16 TiB of DRAM) | encoding artefact (`CSpaceId` width) | 8 B per 256 MiB of DRAM | correct as is | None |
 | `RegistryEntry.epoch`, `SlotId.epoch` | `core/kernel/src/cap/registry.rs`, `slot.rs` | `u32`, redrawn on recycle | encoding artefact (12 B `SlotId`, 72 B slot) | 4 B per `SlotId` | correct as is | Freshness-only; the residual per recycle is documented |
 | `CapabilitySlot.pad[1]` (handle generation) | `core/kernel/src/cap/slot.rs` | `u8`, wrapping | ABI width (`u32` handle: 8 generation + 24 index bits) | 1 B per slot | raise | Wraps after 256 recycles of one index; retire at wrap or widen handles |
 | `CAP_INDEX_BITS` | `abi/syscall/src/lib.rs` | 24 | ABI width (`u32` handle) | none | needs a design | About 16.7 M slots per CSpace; decide with the generation (#41) |
@@ -196,7 +200,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `INLINE_RECORDS` (`PagePool.inline`) | `core/kernel/src/cap/object.rs` | 16 | encoding artefact (spills to record pages beyond) | 384 B per pool | correct as is | Unbounded through record pages |
 | `SEED_BATCH_PAGES` | `core/kernel/src/cap/object.rs` | 64 | batch size (lock-hold bound) | none | correct as is | The total window is #434 |
 | `RECORDS_PER_PAGE` | `core/kernel/src/cap/object.rs` | 170 | encoding artefact | none | correct as is | None |
-| `MAX_CASCADE` (`dealloc_object` worklist) | `core/kernel/src/cap/object.rs` | 32 | current peak plus headroom (fan-out 16 plus ancestors) | 256 B stack | needs a design | Overflow drops entries silently; make the worklist intrusive or const-assert the fan-out sum |
+| `MAX_CASCADE` (`dealloc_object` worklist) | `core/kernel/src/cap/object.rs` | 32 | current peak plus headroom (ancestor chains; the unbounded fan-outs reclaim through nested cascades) | 256 B stack | needs a design | Overflow drops entries silently; make the worklist intrusive or const-assert the fan-out sum |
 | `MAX_DRAIN_EDITS` | `core/kernel/src/cap/object.rs` | 256 | batch size | none | correct as is | None |
 | `FRAME_WRITE_LOCKED` reader count | `core/kernel/src/cap/object.rs` | `u32` | provably unreachable (readers at most CPUs) | embedded | correct as is | None |
 
@@ -211,33 +215,33 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `EventQueueState` counters | `core/kernel/src/ipc/event_queue.rs` | `u32` | encoding artefact (capacity at most `EVENT_QUEUE_MAX_CAPACITY`) | embedded | correct as is | None |
 | `NotificationState.bits` | `core/kernel/src/ipc/notification.rs` | `u64` | ABI width (64 signal bits) | embedded | correct as is | None |
 | Endpoint, Notification, EventQueue state size asserts | `core/kernel/src/ipc/*.rs` | 128 B bin | encoding artefact | none | correct as is | Keep |
-| `WAIT_SET_MAX_MEMBERS` | `core/kernel/src/ipc/wait_set.rs` | 16 | BSS budget (512 B retype bin) | about 400 B per wait set | make pay-as-you-go | Caller-sized at create, as EventQueue capacity is |
-| Wait-set member indices | `core/kernel/src/ipc/wait_set.rs` | `u8` | encoding artefact (at most 255 members) | embedded | correct as is | Widen with caller-sized sets |
+| `WAIT_SET_MAX_MEMBERS` | `abi/syscall/src/lib.rs` | 1024, caller-sized below it | per-call bound (the interrupts-off level-readiness walk over every member) | 24 B per member, caller-funded | correct as is | A server with more sources splits them across sets |
+| Wait-set member indices | `core/kernel/src/ipc/wait_set.rs` | `u16` | encoding artefact (above `WAIT_SET_MAX_MEMBERS`, asserted) | embedded | correct as is | None |
 | `WaitSetState.waiters` | `core/kernel/src/ipc/wait_set.rs` | 1 | unknown | none | needs a design | A second waiter is refused (#464) |
 | One wait set per source | `core/kernel/src/ipc/wait_set.rs` | 1 | design choice (bounds no capacity) | 8 B per source | correct as is | None |
-| Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state at most 440 B | encoding artefact | none | correct as is | Keep |
+| Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state 40 B | encoding artefact | none | correct as is | Keep |
 | Bound-source backoff | `core/kernel/src/ipc/mod.rs` | 64 spins | tuning (a backoff, not a bound) | none | correct as is | None |
-| `MAX_SLEEPING` (`SLEEP_LIST`, `EXPIRED_SCRATCH`) | `core/kernel/src/sched/mod.rs` | 128 | current peak plus headroom | about 5 KiB BSS | needs a design | Caps sleepers and timed IPC waits system-wide; intrusive per-CPU deadline structure |
+| `SLEEP_LIST` (deadline heap) | `core/kernel/src/sched/mod.rs` | unbounded, one node per TCB | none (intrusive through the TCB) | about 72 B per TCB (heap node and expiry snapshot) | correct as is | One global heap under `SLEEP_LIST_LOCK`, popped on the BSP |
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |
 | `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning | none | correct as is | None |
-| `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget (call depth unaudited) | 4 pages per thread, caller-funded | needs a design | Audit kernel call depth and the stack locals that scale with `MAX_CPUS` (#636) |
+| `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget (call depth unaudited) | 4 pages per thread, caller-funded | needs a design | Measure the kernel call depth and state the bound at the constant (#676) |
 | `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 512 (`boot_protocol::MAX_CPUS`) | ABI width (boot protocol) | see the per-CPU rows | needs a design | See the boot section |
-| `TICK_HEARTBEAT`, `SPIN_SITE`, `LOCK_WAIT_KIND`, `LOCK_WAIT_WORD`, `CPU_SYSCALL_NR` | `core/kernel/src/sched/mod.rs` | `[_; MAX_CPUS]` | ABI width (`MAX_CPUS`) | about 16 KiB BSS | make pay-as-you-go | Move into the per-CPU slab (#636) |
+| Watchdog breadcrumbs (`CpuDiag`, `CPU_DIAG_PTR`) | `core/kernel/src/sched/mod.rs` | `cpu_count`-sized slab | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x 32 B | correct as is | Already pay-as-you-go |
 | `stop_threads_bound_to` `prod` | `core/kernel/src/sched/mod.rs` | `[bool; MAX_CPUS]` | ABI width (`MAX_CPUS`) | 512 B kernel stack | make pay-as-you-go | Use a `CpuMask` (#636) |
-| `WATCHDOG_THRESHOLD_TICKS`, `DETECTOR_SCAN_INTERVAL_TICKS` | `core/kernel/src/sched/mod.rs` | 3000 / 512 ticks | unknown (assumes a 1 ms tick) | none | needs a design | Express in seconds times `ticks_per_second()` |
+| `WATCHDOG_THRESHOLD_SECONDS`, `DETECTOR_SCAN_INTERVAL_MS` | `core/kernel/src/sched/mod.rs` | 3 s / 500 ms, converted at `ticks_per_second()` | tuning (a diagnostic threshold at any tick rate) | none | correct as is | None |
 | `WEDGE_GRACE_SECONDS` | `core/kernel/src/sched/mod.rs` | 8, scaled per 128 CPUs | tuning (scales with CPU count) | none | correct as is | None |
-| `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | 64 B BSS | needs a design | Keyed by a random `u32` thread id; key by TCB pointer |
+| `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8, keyed by TCB pointer | diagnostic output cap | 128 B BSS | correct as is | None |
 | `WATCHDOG_SLEEP_ENTRIES` | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | about 128 B stack | correct as is | None |
 | `CS_SPIN_WARN_US` | `core/kernel/src/sched/mod.rs` | 100 000 us | diagnostic threshold | none | correct as is | None |
 | `LOAD_BALANCE_IMBALANCE_THRESHOLD` | `core/kernel/src/sched/mod.rs` | 2 | tuning | none | correct as is | None |
 | `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits) | per CPU | correct as is | None |
-| `MAX_DEATH_OBSERVERS` (`ThreadControlBlock.death_observers`) | `core/kernel/src/sched/thread.rs` | 4 | current peak plus headroom (three binders) | 64 B per TCB | make pay-as-you-go | Chain caller-funded observer nodes |
-| `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u32` correlator, low 32 bits of the reason | encoding artefact (one-word EQ entry) | embedded | needs a design | Userspace passes `badge as u32` as an identity; widen before process tables grow |
+| `ThreadControlBlock.death_observers` | `core/kernel/src/sched/thread.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per TCB | correct as is | None |
+| `EventQueueState.observer_count` | `core/kernel/src/ipc/event_queue.rs` | caller-chosen, at most `EVENT_QUEUE_MAX_CAPACITY` | caller-funded per queue (24 B per node) | none up front | correct as is | Bindings past the pool return `OutOfMemory` until a bound owner is destroyed |
+| `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u64` correlator, full `u64` reason (one two-word EQ entry) | ABI width | embedded | correct as is | procmgr and logd still pass `badge as u32` as an identity (devmgr passes the full device badge); they adopt the full width under #643 |
 | `ThreadControlBlock.thread_id` | `core/kernel/src/sched/thread.rs` | random `u32` | provably unreachable as an identity (diagnostic only; no lookup, not exposed) | 4 B per TCB | correct as is | Widen if ever exposed |
 | `park_seq`, `start_seq`, `park_episode`, `deposit_episode` | `core/kernel/src/sched/thread.rs` | `u32` | provably unreachable (freshness inside one short window) | embedded | correct as is | None |
 | `ThreadControlBlock.cspace_epoch` | `core/kernel/src/sched/thread.rs` | `u32` | encoding artefact (mirrors the registry epoch) | 4 B per TCB | correct as is | None |
 | `ThreadControlBlock.cpu_affinity` | `core/kernel/src/sched/thread.rs` | one CPU index or none | design choice | embedded | correct as is | A set affinity would need a `CpuMask` |
-| `death_observer_count` | `core/kernel/src/sched/thread.rs` | `u8` | encoding artefact (at most `MAX_DEATH_OBSERVERS`) | 1 B per TCB | correct as is | None |
 | `MAX_GROW_LEAVES_PER_HOLD` | `core/kernel/src/syscall/cap.rs` | 64 | batch size (lock-hold bound) | none | correct as is | None |
 | `MAX_REVOKE_BATCHES` | `core/kernel/src/syscall/cap.rs` | `1 << 20` | batch size (a retry after `Interrupted` resumes; revoked nodes stay revoked) | none | correct as is | None |
 | `TRAMPOLINE_FRAME_SIZE` | `core/kernel/src/syscall/cap.rs` | 512 B | encoding artefact (fixed trampoline frame) | none | correct as is | None |
@@ -263,10 +267,8 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | `IDT` | `core/kernel/src/arch/x86_64/idt.rs` | 256 entries | hardware spec (x86 vector space) | 4 KiB BSS | correct as is | None |
 | `GDT`, AP GDTs | `core/kernel/src/arch/x86_64/gdt.rs` | 7 descriptors | hardware spec (fixed descriptor layout) | 56 B per CPU | correct as is | None |
 | `IOPB_SIZE` (`TssWithIopb.iopb`) | `core/kernel/src/arch/x86_64/gdt.rs` | 8192 B | hardware spec (65536 ports / 8) | about 8.3 KiB per CPU | correct as is | None |
-| TSS slab assert | `core/kernel/src/arch/x86_64/gdt.rs` | `MAX_CPUS` x TSS within `2^MAX_ORDER` pages | BSS budget (one-block slab) | none | needs a design | Follows the per-CPU slab design (#636) |
 | `IST_STACK_SIZE` (`BSP_IST_STACKS`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 8 KiB x 2 | stack budget for the fixed NMI, #DF and #MC paths, audited: worst case under 3.7 KiB, debug and release builds | 16 KiB BSS | correct as is | None |
 | `AP_IST_PAIR_SIZE` | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 16384 | encoding artefact (two IST stacks) | `cpu_count` x 16 KiB | correct as is | Derive as `2 * IST_STACK_SIZE` |
-| AP IST slab assert | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 512 x 16 KiB = 8 MiB, at the limit | BSS budget (one-block slab) | none | needs a design | The binding `MAX_CPUS` constraint (#636) |
 | Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; PML4 below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
 | `wait_icr_idle` (`ICR_IDLE_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based) | none | correct as is | None |
 | `wait_for_ack` ladder | `core/kernel/src/arch/*/interrupts.rs` | 250 / 750 / 5000 ms, on the spin-count estimate before the timer is calibrated | tuning (time-based) | none | correct as is | None |
@@ -285,7 +287,7 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | riscv64 `DEFAULT_PLIC_SIZE` | `core/kernel/src/arch/riscv64/platform.rs` | 64 MiB | hardware spec (PLIC register map, 15 872 contexts) | none | correct as is | None |
 | device IRQ destination (`irq::next_target_cpu`) | `core/kernel/src/irq.rs` | one CPU per line, the CPUs in turn at route time; x86_64 only APIC ids below 255 | hardware spec (one PLIC context per source; the 8-bit physical destination of an I/O APIC entry without interrupt remapping, 255 being broadcast) | none | correct as is | None |
 | riscv64 `MAX_VLENB` | `core/kernel/src/arch/riscv64/fpu.rs` | 64 (VLEN 512) | BSS budget (one 4 KiB save page per thread) | one page per thread | make pay-as-you-go | Boot halts at VLEN above 512; size the save area from `vlenb` (#658) |
-| riscv64 ASID mask | `core/kernel/src/arch/riscv64/cpu.rs` | 16 bits | hardware spec (`satp`) | none | correct as is | Clipped by `TAG_CAP` |
+| riscv64 ASID mask | `core/kernel/src/arch/riscv64/cpu.rs` | 16 bits | hardware spec (`satp`) | none | correct as is | None; the tag pool takes every probed ASID |
 | riscv64 `sbi_hart_mask` window | `core/kernel/src/arch/riscv64/interrupts.rs` | 64 harts per call | hardware spec (SBI `hart_mask`) | none | correct as is | None |
 | riscv64 `NAPOT_64K_PAGES` | `core/kernel/src/arch/riscv64/paging.rs` | 16 | hardware spec (Svnapot) | none | correct as is | None |
 | riscv64 `timebase_freq` check | `core/kernel/src/arch/riscv64/timer.rs` | at most `u32::MAX` Hz | encoding artefact (overflow-free tick math) | none | correct as is | None |
@@ -320,10 +322,10 @@ generation by [#637](https://github.com/kottlerg/seraph/issues/637).
 | `MSG_DATA_WORDS_MAX` | `abi/syscall/src/lib.rs` | 64 | ABI width (IPC buffer layout) | about 550 B per TCB | correct as is | Bulk data moves through Memory caps (#36, #40) |
 | IPC buffer layout | `abi/syscall/src/lib.rs` | data words 0..64, count at 64, handles 65..69, in one page | ABI width | 4 KiB per thread | correct as is | None |
 | `CAP_INDEX_BITS + 8 <= 32` assert | `abi/syscall/src/lib.rs` | compile time | ABI width | none | correct as is | Keep |
-| `EVENT_QUEUE_MAX_CAPACITY` | `abi/syscall/src/lib.rs` | 4096 | unknown (the ring is caller-funded) | none | raise | A supervisor watching more deaths drops posts; raise to the retype limit |
+| `EVENT_QUEUE_MAX_CAPACITY` | `abi/syscall/src/lib.rs` | 2^20 entries and observer nodes | per-call bound (one create zeroes the ring and links the nodes in the kernel; the queue is caller-funded) | none | correct as is | More is had with more queues |
 | `PRIORITY_MIN`, `PRIORITY_MAX` | `abi/syscall/src/lib.rs` | 1 / 30 | ABI width (32-level mask: 0 idle, 31 reserved) | none | correct as is | None (#215) |
 | `MAX_GETRANDOM_LEN` | `abi/syscall/src/lib.rs` | 256 B | per-call bound (callers loop; it bounds the interrupts-off window) | 256 B stack | correct as is | None |
-| `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` | `abi/syscall/src/lib.rs` | 512 pages | per-call bound on the `frame_map` scan | none | raise | A Memory cap over 2 MiB is refused; take an offset window |
+| `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` | `abi/syscall/src/lib.rs` | 512 pages per window | batch size (a larger region is read window by window) | none | correct as is | None |
 | `encode_exit_code` range | `abi/syscall/src/lib.rs` | 12-bit code below `EXIT_FAULT_BASE` | encoding artefact (flat exit-reason space) | none | correct as is | Saturates; never aliases success |
 | `KERNEL_VERSION` packing | `abi/syscall/src/lib.rs` | 32 / 16 / 16 bits | encoding artefact | none | correct as is | None |
 
@@ -352,7 +354,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 | `InitInfo` size assert | `abi/init-protocol/src/lib.rs` | at most `INIT_INFO_MAX_PAGES` pages | ABI width | none | correct as is | Also assert the header fits page 1 |
 | `MAX_MODULES` (`ModulesLoad.modules`) | `core/boot/src/main.rs` | 16 | current peak plus headroom (8 in use) | 768 B stack | raise | The output page holds 85; unify with `INIT_MAX_NAMED_MODULES` (#183) |
 | `MEM_MAP_ENTRY_PAGES` | `core/boot/src/main.rs` | 4 (about 682 entries) | unknown | 16 KiB, reclaimed | raise | `translate_memory_map` truncates silently; size from the firmware count |
-| `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget (the kernel runs its boot phases on this stack; depth unaudited) | 64 KiB | needs a design | Audit with the kernel stack (#636) |
+| `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget (the kernel runs its boot phases on this stack; depth unaudited) | 64 KiB | needs a design | Measure with the kernel stack (#676); its size is the shared `HANDOFF_STACK_BYTES` |
 | `MAX_IDENTITY_REGIONS` | `core/boot/src/main.rs` | 64 | provably unreachable (`MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 at most) | 1 KiB stack | correct as is | Pin the sum with a const assert |
 | `MAX_APERTURE_SEEDS` | `core/boot/src/main.rs` | 64 | unknown | 1 KiB stack | raise | Silent drop past `out.len()` |
 | `MAX_HEURISTIC_SEEDS` | `core/boot/src/main.rs` | 16 | current peak plus headroom | 256 B stack | raise | More than about 7 MCFG segments drop windows |
@@ -398,13 +400,14 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `ALLOCATOR_METADATA_RESERVE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 64 | tuning (slack) | none | correct as is | None |
 | reserve `INLINE_RUNS` (`Arena.inline`) | `runtime/ruststd/src/sys/reserve/seraph.rs` | 64 | tuning (the static run table before it grows into the byte heap) | 1 KiB static | correct as is | None; a process without a heap fails its 64th live reservation instead of losing freed VA |
 | `REAPER_SLOTS` (`Registry.slots`) | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 | unknown | about 6 KiB static | make pay-as-you-go | Detached threads past 64 leak until exit |
-| thread `EQ_CAPACITY` | `runtime/ruststd/src/sys/thread/seraph.rs` | 128 | unknown | about 1 KiB retype | raise | Overflow drops death posts |
-| `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (`u32` payload half) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
+| thread `EQ_CAPACITY` | `runtime/ruststd/src/sys/thread/seraph.rs` | 128 | unknown | about 2.1 KiB retype | raise | Overflow drops death posts |
+| `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (packed in 32 bits of the `u64` correlator) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
 | `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
 | `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | default (inline stack probes, #503, touch every page of a larger frame) | VA only | correct as is | None |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |
 | `THREAD_RETYPE_BYTES` | `abi/syscall/src/lib.rs` | 6 pages | encoding artefact (the kernel's `dispatch_for(Thread)`: kernel stack, TCB page, extended-state page) | 24 KiB per thread | correct as is | Pin the kernel's debit to it with a const assert in `cap/retype.rs` |
-| `DEATH_EQ_CAPACITY` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 4 | provably unreachable (four post sources, each posting at most once per child) | about 112 B per child | correct as is | None |
+| `DEATH_EQ_CAPACITY` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 4 | provably unreachable (four post sources, each posting at most once per child) | about 168 B per child | correct as is | None |
+| `DEATH_EQ_OBSERVERS` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 2 nodes | provably unreachable (the main-thread bind and procmgr's relay bind) | 48 B per child | correct as is | None |
 | `Process::id` | `runtime/ruststd/src/sys/process/seraph.rs` | `u32` | ABI width (upstream `Child::id` is `u32`) | none | correct as is | None |
 | pipe `RING_CAPACITY` | `runtime/ruststd/src/sys/pipe/seraph.rs` | 2048 | encoding artefact (largest power of two in one page after the header) | 4 KiB per direction | correct as is | None |
 | `STDIN_BUF_SIZE` | `runtime/ruststd/src/sys/stdio/seraph.rs` | 512 | streaming chunk (a longer read refills from the stdin pipe) | 512 B | correct as is | None |
@@ -431,7 +434,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | `QUERY_LIVE_PROCESSES` page | `shared/ipc/src/lib.rs` (`LIVE_PROCESSES_PAGE`) | `MSG_DATA_WORDS_MAX - 1` = 63 badges | per-message bound (the caller pages on) | none | correct as is | None |
 | `CREATE_SCHED_FIELD_MASK` | `shared/ipc/src/lib.rs` | 5 bits | ABI width (32 priority levels) | none | correct as is | None |
 | `BASELINE_PRIORITY_MAX`, `DEVMGR_BAND_MAX` | `shared/ipc/src/lib.rs` | 28 / 26 | encoding artefact (policy placement in 32 levels) | none | correct as is | None |
-| `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u32` | ABI width (kernel death correlator) | none | needs a design | procmgr keeps the low word unique among live processes; widening is #638 |
+| `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u32` | userspace choice (the kernel correlator is `u64`) | none | needs a design | procmgr keeps the low word unique among live processes; adopt the `u64` correlator (#643) |
 | `memmgr_grant_layout` caps per reply | `shared/ipc/src/lib.rs` | `MSG_CAP_SLOTS_MAX` | ABI width (4 caps per reply); a request spread over more runs gets a partial grant the caller requests again | none | correct as is | None |
 | phys-table index constants (`FACTS_*`, `IN_USE_*`) | `shared/ipc/src/lib.rs` | 0 to 3 | encoding artefact (one-page layout) | none | correct as is | None |
 | `MAX_IN_USE`, `IN_USE_WORDS` | `shared/ipc/src/lib.rs` | 4 / 3 | provably unreachable (three tier-1 producers; the page fit is const-asserted) | none | correct as is | None |
@@ -439,7 +442,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | FS_WRITE, FS_READ inline payloads | `shared/ipc/src/lib.rs` | 504 B per call | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | Large transfers use the memory verbs (#87) |
 | FS_READ_MEMORY, FS_WRITE_MEMORY | `shared/ipc/src/lib.rs` | one page per call | encoding artefact (one slot cap per reply) | none | correct as is | Callers iterate; batching is a throughput question (#229) |
 | FS_READ_MEMORY release cookie | `shared/ipc/src/lib.rs` | `u64`, client-chosen | ABI width | none | correct as is | None (#530) |
-| QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled once delivered) | none | correct as is | None |
+| QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled) | none | correct as is | None |
 | `blk_labels` partition badges | `shared/ipc/src/lib.rs` | `u64`, one per distinct registered range | ABI width | none | correct as is | None |
 | `INVALID_MEMORY_CAP` byte limit | `shared/ipc/src/lib.rs` | `count * block_size <= u32::MAX` | hardware spec (VirtIO descriptor `u32` length) | none | correct as is | 4 GiB per request |
 | serial, framebuffer and stream byte counts | `shared/ipc/src/lib.rs` | 512 B per call | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | Callers iterate |
@@ -519,15 +522,17 @@ Every entry here is `correct as is`; none is tracked.
 ### procmgr
 
 Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
-[#638](https://github.com/kottlerg/seraph/issues/638) (the correlator width), and
+[#643](https://github.com/kottlerg/seraph/issues/643) (adopting the full-width correlator, and
+growing the death queue's observer pool), and
 [#666](https://github.com/kottlerg/seraph/issues/666) (address-space fault read-back).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `ProcessTable.entries` | `services/procmgr/process-table/src/lib.rs` | heap `Vec` sorted by badge | per-instance (a spawn fails only when the heap cannot grow it) | none | correct as is | None |
-| `DEATH_EQ_CAPACITY` | `services/procmgr/src/main.rs` | 256 | tuning (a drain of a full queue's worth rescans every live entry's main-thread state, recovering any dropped main-thread post) | about 2 KiB | needs a design | A dropped address-space terminal-fault post (a worker thread's fault) is not recovered: no kernel state reports an address space's terminal fault (#666) |
+| `ProcessTable.entries` | `services/procmgr/process-table/src/lib.rs` | heap `Vec` sorted by badge | per-instance (the table itself fails only when the heap cannot grow it; the death queue's observer pool binds first, see `DEATH_EQ_OBSERVERS`) | none | correct as is | None |
+| `DEATH_EQ_CAPACITY` | `services/procmgr/src/main.rs` | 256 | tuning (a drain of a full queue's worth rescans every live entry's main-thread state, recovering any dropped main-thread post) | about 4.1 KiB | needs a design | A dropped address-space terminal-fault post (a worker thread's fault) is not recovered: no kernel state reports an address space's terminal fault (#666) |
+| `DEATH_EQ_OBSERVERS` | `services/procmgr/src/main.rs` | 1024 nodes | current peak plus headroom (two per live process; the first fixed ceiling on live processes) | 24 KiB | make pay-as-you-go | A spawn past half of it fails its main-thread bind; add a death queue when the pool runs low (#643) |
 | `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
-| death correlator `correlator_of` | `services/procmgr/process-table/src/lib.rs` | low 32 bits, unique among live processes | ABI width (kernel correlator) | none | needs a design | Minting redraws a live low word; widening is #638 |
+| death correlator `correlator_of` | `services/procmgr/process-table/src/lib.rs` | low 32 bits, unique among live processes | userspace choice (the kernel correlator is `u64`) | none | needs a design | Minting redraws a live low word; pass the full badge (#643) |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | `CreateBlobs.args_buf`, `env_buf` | `services/procmgr/process-table/src/create_blobs.rs` | 256 B each | encoding artefact (one message) | about 530 B stack | needs a design | argv and env through a Memory cap (#672) |
 | blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design (#672) |
@@ -544,14 +549,16 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
 
 ### svcmgr and registry
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
+[#643](https://github.com/kottlerg/seraph/issues/643) (the deaths queue's observer pool).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `ServiceTable.services`, `recipes` | `services/svcmgr/src/definitions/reconcile.rs` | heap `Vec`s, one slot per supervised service, never reused | per-instance (a definition is dropped only when the heap cannot grow them) | none | correct as is | None |
+| `ServiceTable.services`, `recipes` | `services/svcmgr/src/definitions/reconcile.rs` | heap `Vec`s, one slot per supervised service, never reused | per-instance (the tables fail only when the heap cannot grow them; the deaths queue's observer pool binds first, see `DEATHS_EQ_OBSERVERS`) | none | correct as is | None |
 | `SvcmgrState.registry` | `services/svcmgr/src/main.rs` | growable `Registry` | per-instance | none | correct as is | None (#75) |
 | `SvcmgrState.pending` | `services/svcmgr/src/main.rs` | heap `Vec`, one per substrate round | per-instance | none | correct as is | None |
-| `DEATHS_EQ_CAPACITY` | `services/svcmgr/src/main.rs` | 64 | tuning (a drain of a full queue's worth rescans every active service's thread state) | about 0.5 KiB | correct as is | None |
+| `DEATHS_EQ_CAPACITY` | `services/svcmgr/src/main.rs` | 64 | tuning (a drain of a full queue's worth rescans every active service's thread state) | about 1.1 KiB | correct as is | None |
+| `DEATHS_EQ_OBSERVERS` | `services/svcmgr/src/main.rs` | 256 nodes | current peak plus headroom (one per supervised service, plus restarts in flight) | 6 KiB | make pay-as-you-go | A launch, restart, or adoption past it fails its bind; add a death queue when the pool runs low (#643) |
 | `RESTART_BURST`, `RESTART_WINDOW_NS` (`RestartBudget`) | `services/svcmgr/svc-defs/src/restart_budget.rs` | 3 restarts per 60 s window | tuning (stops a crash loop; a rarer crash always restarts) | 16 B per service | correct as is | None (#262 for clean cap-holder restart) |
 | `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
@@ -583,7 +590,8 @@ Every entry here is `correct as is`; none is tracked.
 
 The entries left open are tracked by the Issue each recommendation names: the ACPI region caps by
 [#637](https://github.com/kottlerg/seraph/issues/637), and logd's eviction by the low 32
-correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
+correlator bits and its death queue's observer pool by
+[#643](https://github.com/kottlerg/seraph/issues/643).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -608,8 +616,9 @@ correlator bits by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `log_hex` buffer | `services/init/src/bootstrap.rs` | 96 B | diagnostic output cap | 96 B stack | correct as is | None |
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
-| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 1 KiB | correct as is | None |
-| eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Evicts every slot sharing the low bits (#638) |
+| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | 128 | tuning (a drain of a full queue's worth starts a resync from procmgr's `QUERY_LIVE_PROCESSES`, which evicts the slots a dropped post left) | about 2.1 KiB | correct as is | None |
+| `DEATH_EQ_OBSERVERS` | `services/logd/src/main.rs` | 1024 nodes | current peak plus headroom (one per live process) | 24 KiB | make pay-as-you-go | A bind past it leaves that slot unevicted until a later full-queue resync (#643) |
+| eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | userspace choice (the kernel correlator is `u64`) | none | needs a design | Evicts every slot sharing the low bits; compare the full badge (#643) |
 | death exit reason | `services/logd/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |
 | `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
@@ -646,10 +655,13 @@ Tracked by [#664](https://github.com/kottlerg/seraph/issues/664).
 | absorb rounds `.min(4)` | `services/devmgr/src/caps.rs` | literal 4 | ABI width (`MSG_CAP_SLOTS_MAX`) | none | correct as is | Use the constant |
 | ACPI table window (`table_window`) | `services/devmgr/firmware/src/acpi.rs` | the table's own pages, clamped to its region | firmware spec (the table's reported length) | VA for one table per read | correct as is | None; the per-process reservation arena bounds it, and a failed reservation is logged |
 | `MAX_DEVICE_INFO_PAYLOAD` | `services/devmgr/src/main.rs` | 64 | encoding artefact (largest payload type 56 B) | 76 B per entry | correct as is | None |
-| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per spawned device) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
+| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per enumerated device given one, spawned or not; never removed) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
 | `device_badge` | `services/devmgr/src/main.rs` | `u64` | provably unreachable | none | correct as is | None |
 | `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
 | virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
+| Settle batch death queue (`SettleBatch::new`) | `services/devmgr/src/settle.rs` | the batch's device count in entries and observer nodes, at most `EVENT_QUEUE_MAX_CAPACITY` = 2^20 | per-call bound (the kernel's event-queue capacity) | 40 B per driver (a 16 B entry and a 24 B observer node) | correct as is | None; a batch past it spawns no driver of its class, with a log |
+| Settle roster (`Roster`) | `services/devmgr/firmware/src/roster.rs` | growable `Vec` | provably unreachable (one entry per spawned driver of a batch) | about 24 B plus the caller's record per driver | correct as is | None; a driver the roster cannot record is not spawned, with a log |
+| Death-observer correlator | `services/devmgr/src/spawn.rs` | the full `u64` device badge | ABI width (`SYS_THREAD_BIND_NOTIFICATION`'s `u64` correlator) | none | correct as is | None |
 | One IRQ-bearing driver per INTx line (`IrqRangeAllocator::isolate_one`) | `services/devmgr/src/main.rs` | 1 per GSI (riscv64: 4 swizzled lines) | encoding artefact (a single-line cap is carved once) | none | needs a design | A virtio-blk on a line another device holds is not spawned, with a log (#664) |
 | `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
 | `find_pci_ecams` | `services/devmgr/firmware/src/dtb.rs` | every node | firmware spec (structure block) | 24 B per window | correct as is | None |
@@ -733,7 +745,7 @@ production value is raised.
 | `await_all` mask | `core/ktest/src/tally.rs` | 64 children | ABI width (notification word) | none | correct as is | None |
 | `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
 | `SLOTS_PER_PAGE`, `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 56 / 4097 | mirror of kernel `L2_SIZE`; one past the former 4096-entry registry | about 16 KiB BSS | correct as is | Reference or assert against `L2_SIZE` |
-| `FILLERS` | `core/ktest/src/stress/sleep_list_full.rs` | 128 | mirror of kernel `MAX_SLEEPING` | 1 MiB BSS | correct as is | Reference or assert against `MAX_SLEEPING` (#638) |
+| `HOLDERS`, `WAKERS` | `core/ktest/src/stress/sleep_list_wide.rs` | 192 / 64 | test fixture (past the former 128-entry sleep list) | 1 MiB BSS | correct as is | None |
 | `MAX_IRQ_BINDINGS` (`Held`) | `core/ktest/src/integration/irq_shared_line.rs` | 64 | mirror of kernel `MAX_IRQ_BINDINGS` | about 540 B stack (`Held` and the bound-cap array) | correct as is | Reference the kernel constant if it moves to an ABI crate |
 | `MAX_PINNED` | `core/ktest/src/bench/tlb.rs` | 7 | test fixture | 224 KiB BSS | correct as is | None |
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |

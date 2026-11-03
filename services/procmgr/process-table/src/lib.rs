@@ -125,7 +125,7 @@ impl ProcessEntry
     }
 }
 
-/// Ring of recently auto-reaped processes, queried on `QUERY_PROCESS`
+/// Ring of recently reaped or destroyed processes, queried on `QUERY_PROCESS`
 /// table miss to distinguish "exited recently" from "never existed".
 /// Each record is kept for [`RECENT_EXIT_RETENTION_NS`] after its death; a
 /// query on an older one returns `None`.

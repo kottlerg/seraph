@@ -215,9 +215,11 @@ handle with no data words or caps.
 | data[1] | Kernel-encoded exit reason when `data[0]` is `EXITED`; 0 otherwise |
 
 A live entry whose thread the kernel reports as exited answers `EXITED` before
-procmgr reaps it. After the reap, the badge answers `EXITED` for
-`RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time, however many other
-processes die meanwhile, and `UNKNOWN` after that.
+procmgr reaps it. After the reap, or after a `DESTROY_PROCESS` teardown, the
+badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time,
+however many other processes die meanwhile, and `UNKNOWN` after that. A
+destroyed process's reason is the one the kernel retained if its main thread
+had already exited, else `EXIT_KILLED`.
 
 ### Label 11: `CONFIGURE_PIPE`
 

@@ -496,8 +496,14 @@ fn dispatch_ipc(
         procmgr_labels::DESTROY_PROCESS =>
         {
             release_caps(req.caps());
-            // Badge from ipc_recv identifies which process to destroy.
-            process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, table);
+            // Badge from ipc_recv identifies which process to destroy. Its
+            // exit is recorded like a reaped death's, so a `QUERY_PROCESS`
+            // racing a death drain the destroy overtook still answers
+            // `EXITED`.
+            if let Some(reason) = process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, table)
+            {
+                recent.record(badge, reason, now_ns());
+            }
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
         }
 
@@ -979,7 +985,8 @@ fn reply_create_result(
         std::os::seraph::log!("procmgr: create reply undeliverable; destroying the child");
         let _ = syscall::cap_delete(result.thread_for_caller);
         let _ = syscall::cap_delete(result.process_handle);
-        process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
+        // No handle to this child survives, so nothing can query its exit.
+        let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
     }
 }
 

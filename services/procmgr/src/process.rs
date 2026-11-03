@@ -2749,17 +2749,32 @@ pub fn create_process_from_file(
 /// frees nothing to the sealed buddy; memmgr reclaims those pages into its
 /// pool via the process-death notification.
 ///
-/// Idempotent: returns silently if the badge is unknown (already destroyed).
-/// The death forwarded to logd carries `EXIT_KILLED`, the reason the kernel
-/// records for a thread its teardown stops.
-pub fn destroy_process(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mut ProcessTable)
+/// Returns the exit reason the process is torn down with, for the caller to
+/// record in the recent-exits ring so `QUERY_PROCESS` answers `EXITED` for
+/// it: the reason the kernel retained when the main thread had already
+/// exited (a death procmgr's drain had not reaped yet), else `EXIT_KILLED`,
+/// the reason the kernel records for a thread its teardown stops. The death
+/// forwarded to logd carries the same reason.
+///
+/// Idempotent: returns `None` if the badge is unknown (already destroyed).
+pub fn destroy_process(
+    badge: u64,
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    table: &mut ProcessTable,
+) -> Option<u64>
 {
-    let Some(entry) = table.take_by_badge(badge)
-    else
+    let entry = table.take_by_badge(badge)?;
+    let exit_reason = match syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
     {
-        return;
+        Ok(packed) if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED =>
+        {
+            packed & 0xFFFF_FFFF
+        }
+        _ => EXIT_KILLED,
     };
-    teardown_entry(entry, EXIT_KILLED, memmgr_ep, ipc_buf);
+    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf);
+    Some(exit_reason)
 }
 
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed

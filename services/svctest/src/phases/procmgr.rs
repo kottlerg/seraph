@@ -588,10 +588,13 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
                 "killed",
                 "a killed child must report killed, got {status}"
             );
-            let state = process_state(child.id());
-            assert!(
-                matches!(state, UNKNOWN | EXITED),
-                "Child::kill from a spawned thread left the child in state {state}"
+            // `Child::kill` sends `DESTROY_PROCESS`, which records the exit:
+            // the parked child answers `EXITED` with `EXIT_KILLED`.
+            let (state, reason) = process_state_and_reason(child.id());
+            assert_eq!(
+                (state, reason),
+                (EXITED, syscall_abi::EXIT_KILLED),
+                "Child::kill from a spawned thread left the child in state {state} (reason {reason:#x})"
             );
 
             let unwaited = Command::new("/tests/svctest")
@@ -622,6 +625,12 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
 /// or a refusal is a test failure, not a sign the process is gone.
 fn process_state(handle: u32) -> u64
 {
+    process_state_and_reason(handle).0
+}
+
+/// [`process_state`] with the exit reason `QUERY_PROCESS` reports beside it.
+fn process_state_and_reason(handle: u32) -> (u64, u64)
+{
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
@@ -632,7 +641,7 @@ fn process_state(handle: u32) -> u64
         ipc::procmgr_errors::SUCCESS,
         "QUERY_PROCESS refused the child's process handle"
     );
-    reply.word(0)
+    (reply.word(0), reply.word(1))
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

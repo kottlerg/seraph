@@ -36,6 +36,13 @@ mod phases;
 mod reentry;
 mod runner;
 
+/// svctest's main-thread stack, declared in its `.note.seraph.stack` note
+/// rather than left to the loader's default, so the stack-note phase
+/// (`phases::layout`) finds a note to patch in a copy of this image.
+pub(crate) const SVCTEST_STACK_PAGES: u32 = process_abi::DEFAULT_PROCESS_STACK_PAGES;
+
+process_abi::stack_pages!(SVCTEST_STACK_PAGES);
+
 fn main()
 {
     std::os::seraph::log::register_name(b"svctest");

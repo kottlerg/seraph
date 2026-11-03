@@ -60,6 +60,7 @@
 //! assembly time); our overlays apply to files by unlink-then-write so
 //! the shared inode with the real toolchain is never mutated.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -662,77 +663,55 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     Ok(())
 }
 
-/// Add target-conditional path dependencies on the workspace's `syscall-abi`
-/// and `syscall` crates to `library/std/Cargo.toml` when building for
+/// The workspace crates std depends on when built for seraph: the dependency
+/// name, its path under the project root, and any extra key placed between
+/// `path` and `features` in its `library/std/Cargo.toml` line.
+const STD_WORKSPACE_DEPS: [(&str, &str, &str); 10] = [
+    ("syscall-abi", "abi/syscall", ""),
+    ("syscall", "shared/syscall", ""),
+    ("ipc", "shared/ipc", ""),
+    ("log", "shared/log", ""),
+    ("process-abi", "abi/process-abi", ""),
+    ("process-layout", "shared/process-layout", ""),
+    ("shmem", "shared/shmem", ""),
+    ("namespace-protocol", "shared/namespace-protocol", ""),
+    ("registry-client", "shared/registry-client", ""),
+    (
+        "argv-env",
+        "runtime/ruststd/argv-env",
+        ", package = \"ruststd-argv-env\"",
+    ),
+];
+
+/// Add target-conditional path dependencies on the workspace crates
+/// [`STD_WORKSPACE_DEPS`] names to `library/std/Cargo.toml` when building for
 /// seraph. Mirrors the hermit-abi / fortanix-sgx-abi pattern — std calls
 /// into the ABI crate directly, eliminating duplicated `asm!` syscall
 /// wrappers inside the overlay.
 fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<()>
 {
     let cargo_toml = rust_src.join("library/std/Cargo.toml");
-    let syscall_abi_path = project_root
-        .join("abi/syscall")
-        .canonicalize()
-        .context("canonicalising abi/syscall")?;
-    let syscall_path = project_root
-        .join("shared/syscall")
-        .canonicalize()
-        .context("canonicalising shared/syscall")?;
-    let ipc_path = project_root
-        .join("shared/ipc")
-        .canonicalize()
-        .context("canonicalising shared/ipc")?;
-    let log_path = project_root
-        .join("shared/log")
-        .canonicalize()
-        .context("canonicalising shared/log")?;
-    let process_abi_path = project_root
-        .join("abi/process-abi")
-        .canonicalize()
-        .context("canonicalising abi/process-abi")?;
-    let shmem_path = project_root
-        .join("shared/shmem")
-        .canonicalize()
-        .context("canonicalising shared/shmem")?;
-    let namespace_protocol_path = project_root
-        .join("shared/namespace-protocol")
-        .canonicalize()
-        .context("canonicalising shared/namespace-protocol")?;
-    let registry_client_path = project_root
-        .join("shared/registry-client")
-        .canonicalize()
-        .context("canonicalising shared/registry-client")?;
-    let argv_env_path = project_root
-        .join("runtime/ruststd/argv-env")
-        .canonicalize()
-        .context("canonicalising runtime/ruststd/argv-env")?;
-    let block = format!(
+    let mut block = String::from(
         "\n\
          # seraph-overlay: workspace ABI crates as std deps.\n\
          # Mirrors hermit-abi / fortanix-sgx-abi pattern. Absolute paths are\n\
          # baked here because the mirror lives under target/ and this file\n\
          # is hard-linked on assembly — relative paths would point the wrong\n\
          # way. Regenerated whenever the mirror's content stamp changes.\n\
-         [target.'cfg(target_os = \"seraph\")'.dependencies]\n\
-         syscall-abi = {{ path = \"{abi}\", features = [\"rustc-dep-of-std\"] }}\n\
-         syscall = {{ path = \"{sys}\", features = [\"rustc-dep-of-std\"] }}\n\
-         ipc = {{ path = \"{ipc}\", features = [\"rustc-dep-of-std\"] }}\n\
-         log = {{ path = \"{log}\", features = [\"rustc-dep-of-std\"] }}\n\
-         process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n\
-         shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n\
-         namespace-protocol = {{ path = \"{ns}\", features = [\"rustc-dep-of-std\"] }}\n\
-         registry-client = {{ path = \"{regcli}\", features = [\"rustc-dep-of-std\"] }}\n\
-         argv-env = {{ path = \"{argv_env}\", package = \"ruststd-argv-env\", features = [\"rustc-dep-of-std\"] }}\n",
-        abi = syscall_abi_path.display(),
-        sys = syscall_path.display(),
-        ipc = ipc_path.display(),
-        log = log_path.display(),
-        proc = process_abi_path.display(),
-        shmem = shmem_path.display(),
-        ns = namespace_protocol_path.display(),
-        regcli = registry_client_path.display(),
-        argv_env = argv_env_path.display(),
+         [target.'cfg(target_os = \"seraph\")'.dependencies]\n",
     );
+    for (name, rel, extra) in STD_WORKSPACE_DEPS
+    {
+        let path = project_root
+            .join(rel)
+            .canonicalize()
+            .with_context(|| format!("canonicalising {rel}"))?;
+        writeln!(
+            block,
+            "{name} = {{ path = \"{}\"{extra}, features = [\"rustc-dep-of-std\"] }}",
+            path.display()
+        )?;
+    }
 
     let text = fs::read_to_string(&cargo_toml)
         .with_context(|| format!("reading {}", cargo_toml.display()))?;
@@ -741,17 +720,10 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     // marker is present but a known dep line is missing (added in a
     // later overlay revision), strip the old block and re-apply.
     let marker = "seraph-overlay: workspace ABI crates";
-    let has_log_dep = text.contains("log = { path");
-    let has_shmem_dep = text.contains("shmem = { path");
-    let has_namespace_protocol_dep = text.contains("namespace-protocol = { path");
-    let has_registry_client_dep = text.contains("registry-client = { path");
-    let has_argv_env_dep = text.contains("argv-env = { path");
-    if text.contains(marker)
-        && has_log_dep
-        && has_shmem_dep
-        && has_namespace_protocol_dep
-        && has_registry_client_dep
-        && has_argv_env_dep
+    let has_every_dep = STD_WORKSPACE_DEPS
+        .iter()
+        .all(|(name, _, _)| text.contains(&format!("{name} = {{ path")));
+    if text.contains(marker) && has_every_dep
     {
         return Ok(());
     }

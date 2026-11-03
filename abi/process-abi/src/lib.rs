@@ -94,13 +94,31 @@ pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
 /// Hard cap on the declared main-thread stack size, in 4 KiB pages.
 ///
-/// Loaders clamp the note value to this bound before allocation;
-/// the pool's available RAM is the remaining gate on the resulting
-/// `REQUEST_MEMORY_CAPS` calls; memmgr enforces no per-process quota (see
-/// `services/memmgr/docs/memory-pool.md` § Non-Goals).
-/// 256 pages = 1 MiB — far above any realistic in-tree need, sized to
-/// catch a corrupt or hostile note rather than to ration memory.
-pub const MAX_PROCESS_STACK_PAGES: u32 = 256;
+/// Loaders reject a binary whose note declares more than this; the pool's
+/// available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS`
+/// calls, and memmgr enforces no per-process quota (see
+/// `services/memmgr/docs/memory-pool.md` § Non-Goals). The value is the
+/// largest stack whose reservation (`1 +` this, the guard page included)
+/// fills the region tail `process-layout` leaves after each draw window
+/// (`MAX_WINDOW_REGION_PAGES`, 1 GiB), which it pins with a const assert.
+/// The ceiling costs VA only: a loader maps the pages a binary declares.
+pub const MAX_PROCESS_STACK_PAGES: u32 = (1 << 18) - 1;
+
+/// Resolve a binary's main-thread stack size from its optional
+/// `.note.seraph.stack` value: [`DEFAULT_PROCESS_STACK_PAGES`] without a note,
+/// the declared value when it is in `1..=MAX_PROCESS_STACK_PAGES`, and `None`
+/// (the loader rejects the binary) for a note outside that range, which a
+/// loader would otherwise have to clamp silently.
+#[must_use]
+pub const fn resolve_stack_pages(note: Option<u32>) -> Option<u32>
+{
+    match note
+    {
+        None => Some(DEFAULT_PROCESS_STACK_PAGES),
+        Some(pages @ 1..=MAX_PROCESS_STACK_PAGES) => Some(pages),
+        Some(_) => None,
+    }
+}
 
 // ── Stack-size ELF note (`.note.seraph.stack`) ──────────────────────────────
 //
@@ -198,12 +216,15 @@ macro_rules! stack_pages {
     };
 }
 
-/// Maximum number of 4 KiB pages reserved for the main thread's TLS block.
+/// Maximum number of 4 KiB pages in the main thread's TLS block.
 ///
-/// Loaders (init, procmgr) reject binaries whose TLS block exceeds this size. Spawned
-/// threads allocate their own blocks from the heap and are unconstrained by
-/// this limit.
-pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 4;
+/// Loaders (init, procmgr) map the block the binary's `PT_TLS` memsz needs
+/// ([`tls_block_layout`]) and reject a block larger than this. The value is
+/// the region tail `process-layout` leaves after the TLS draw window
+/// (`MAX_WINDOW_REGION_PAGES`, 1 GiB), which it pins with a const assert, so
+/// it costs VA only. Spawned threads allocate their own blocks from the heap
+/// and are unconstrained by this limit.
+pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 1 << 18;
 
 // ── ProcessInfo ──────────────────────────────────────────────────────────────
 
@@ -511,9 +532,11 @@ pub struct ProcessInfo
 
     /// `CSpace` slot of an `Endpoint` cap on the process's demand-paging
     /// pager (memmgr's service endpoint). Nonzero for ordinary processes —
-    /// demand paging is the system-wide default — and zero only for pinned
-    /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers) and the
-    /// pre-pager bootstrap (memmgr/procmgr).
+    /// demand paging is the system-wide default — and zero for pinned
+    /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers), the
+    /// pre-pager bootstrap (memmgr/procmgr), and a process whose pager
+    /// binding failed at creation, so a nonzero value always names a pager
+    /// that backs this process's demand faults.
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
     /// creation; the runtime reads this slot to bind the same handler onto
@@ -525,8 +548,8 @@ pub struct ProcessInfo
     /// The derivation badge of [`Self::pager_endpoint_cap`], identifying this
     /// process to the pager: the badge the kernel stamps on this process's
     /// fault messages. Informational: `SYS_THREAD_SET_FAULT_HANDLER` takes no
-    /// badge, so no binder passes it to the kernel. Zero when the process is
-    /// pinned (no pager).
+    /// badge, so no binder passes it to the kernel. Zero whenever
+    /// [`Self::pager_endpoint_cap`] is.
     pub pager_badge: u64,
 
     /// Mapped base virtual address of the main thread's TLS block — the value
@@ -806,5 +829,27 @@ pub unsafe fn tls_install_tcb(block_ptr: *mut u8, tls_base_offset: u64, tls_base
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (block_ptr, tls_base_offset, tls_base_va);
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defect guarded: a loader that clamps a hostile or corrupt stack note to
+    // the cap (or to one page) instead of refusing the binary, or that refuses
+    // a note at the cap itself.
+    #[test]
+    fn stack_note_outside_its_range_is_refused_not_clamped()
+    {
+        assert_eq!(resolve_stack_pages(None), Some(DEFAULT_PROCESS_STACK_PAGES));
+        assert_eq!(resolve_stack_pages(Some(1)), Some(1));
+        assert_eq!(
+            resolve_stack_pages(Some(MAX_PROCESS_STACK_PAGES)),
+            Some(MAX_PROCESS_STACK_PAGES)
+        );
+        assert_eq!(resolve_stack_pages(Some(MAX_PROCESS_STACK_PAGES + 1)), None);
+        assert_eq!(resolve_stack_pages(Some(0)), None);
     }
 }

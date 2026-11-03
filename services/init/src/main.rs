@@ -40,10 +40,10 @@ pub(crate) use syscall_abi::PAGE_SIZE;
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
 /// Page span a single Thread retype consumes from its source Memory cap's
-/// front bump: `KERNEL_STACK_PAGES` (4) kernel-stack pages + one TCB/wrapper
-/// page + one extended FPU/SIMD save page = 6, page-aligned. Used to size the
+/// front bump (`syscall_abi::THREAD_RETYPE_BYTES`, page-aligned: kernel
+/// stack, TCB and wrapper page, extended-state save page). Used to size the
 /// retype reserve of init's and the tier-1 services' bootstrap arenas.
-pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
+pub(crate) const THREAD_RETYPE_PAGES: u64 = syscall_abi::THREAD_RETYPE_BYTES / PAGE_SIZE;
 
 /// Pages init carves for memmgr/procmgr's `AddressSpace`, all reaching
 /// the kernel: page 0 holds the wrapper, page 1 the root PT, and the

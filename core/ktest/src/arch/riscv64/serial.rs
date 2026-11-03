@@ -14,7 +14,7 @@ pub const UART_PHYS: u64 = 0x1000_0000;
 
 /// Virtual address where the UART MMIO page is mapped.
 ///
-/// Below the randomized heap zone (which starts at `0x4000_0000`) and
+/// Below ktest's scratch bands and every `process_layout` window, and
 /// distinct from every other ktest fixed VA.
 pub(crate) const SERIAL_VA: u64 = 0x3000_0000;
 

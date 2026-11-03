@@ -7,8 +7,9 @@ Shared-memory byte transport for Seraph userspace, in two layers.
 ## Overview
 
 `SharedBuffer` maps Memory
-caps received from a peer contiguously at a chosen VA (`SharedBuffer::attach`, at most
-`MAX_PAGES` = 4 pages); the granting side owns allocation and release of the backing pages.
+caps received from a peer contiguously at a chosen VA (`SharedBuffer::attach`, one
+`SharedRegion` per cap, each mapped whole, so a buffer spans as many pages as its caps cover);
+the granting side owns allocation and release of the backing pages.
 `SpscHeader`, `SpscWriter`, and `SpscReader` form a single-producer, single-consumer byte ring
 over any mapped shared region, given by its base VA (for example one attached with
 `SharedBuffer`). The region starts with an `SpscHeader`: the `head` and `tail` `AtomicU32`
@@ -32,7 +33,7 @@ shared/shmem/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs                  # ShmemError, SharedBuffer, SPSC ring
+    └── lib.rs                  # ShmemError, SharedRegion, SharedBuffer, SPSC ring
 ```
 
 ---

@@ -56,7 +56,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory / address-space page-table budget counts, memory has-retype flag | `cap::sys_cap_info` | c/d |
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of a Memory region's frames | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
-| `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
+| `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |

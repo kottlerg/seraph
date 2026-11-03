@@ -21,9 +21,9 @@ use syscall_abi::SyscallError;
 
 use crate::{TestContext, TestResult};
 
-/// Test virtual address for MMIO mapping: 5.25 GiB, in the gap between the
-/// byte-heap zone and the reservation arena, below every `process_layout`
-/// window (ktest's PIE image loads in `IMAGE_WINDOW`).
+/// Test virtual address for MMIO mapping: 5.25 GiB, in ktest's low scratch
+/// band (ktest is `no_std` and has no byte heap or reservation arena), below
+/// every `process_layout` window (ktest's PIE image loads in `IMAGE_WINDOW`).
 const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
 /// Upper bound for a slot scan over the test's own `CSpace`: its backed

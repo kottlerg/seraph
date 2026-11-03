@@ -40,7 +40,7 @@ use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::sys::reserve::{ReservedRange, reserve_pages, unreserve_pages};
-use shmem::{SharedBuffer, SpscHeader, SpscReader, SpscWriter};
+use shmem::{SharedBuffer, SharedRegion, SpscHeader, SpscReader, SpscWriter};
 use syscall_abi::SyscallError;
 
 /// Ring data byte capacity. One 4 KiB page = 16-byte header + 4080 bytes
@@ -439,11 +439,11 @@ impl Pipe {
         reserved: ReservedRange,
     ) -> io::Result<Pipe> {
         let child_va = reserved.va_start();
-        let memory_caps = [memory_cap, 0, 0, 0];
+        let regions = [SharedRegion { cap: memory_cap, pages: 1 }];
         // SAFETY: child_va is the caller's reservation from the per-process
         // arena (`sys::reserve`): VA no Rust object or IPC page occupies, owned
         // exclusively by this pipe until its Drop unmaps it and returns it.
-        match unsafe { SharedBuffer::attach(&memory_caps, 1, aspace, child_va) } {
+        match unsafe { SharedBuffer::attach(&regions, aspace, child_va) } {
             // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
             Ok(sb) => core::mem::forget(sb),
             Err(_) => {

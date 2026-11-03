@@ -37,19 +37,23 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// Page size on both supported architectures.
 const PAGE_SIZE: u64 = 4096;
 
-/// Maximum number of pages per `SharedBuffer`.
-///
-/// Bounded by `MSG_CAP_SLOTS_MAX` on IPC transfer (each Memory cap travels in
-/// its own cap slot when the peer attaches). Keep in lockstep with the
-/// IPC abi.
-pub const MAX_PAGES: u32 = 4;
+/// One Memory cap a peer shares and the number of pages it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedRegion
+{
+    /// Memory cap slot; the buffer maps it through a derived read-write cap,
+    /// so the slot stays with the caller.
+    pub cap: u32,
+    /// Pages the cap covers, all of which are mapped.
+    pub pages: u64,
+}
 
 /// Errors that can surface from [`SharedBuffer`] operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShmemError
 {
-    /// `pages` is zero, exceeds [`MAX_PAGES`], or exceeds the number of
-    /// Memory caps supplied.
+    /// No region was supplied, a region covers zero pages, or the total
+    /// span overflows the address space.
     InvalidPageCount,
     /// Deriving a mapping cap or `sys_mem_map` failed partway through —
     /// pages already mapped are unmapped before the error surfaces.
@@ -62,77 +66,97 @@ pub enum ShmemError
 pub struct SharedBuffer
 {
     vaddr: u64,
-    /// At most [`MAX_PAGES`], which [`SharedBuffer::attach`] enforces, so the
-    /// `u32` never truncates.
-    page_count: u32,
+    page_count: u64,
     aspace: u32,
+}
+
+/// Total pages `regions` cover, or `None` when there is no region, a region
+/// is empty, or the span from `vaddr` would overflow.
+fn total_pages(regions: &[SharedRegion], vaddr: u64) -> Option<u64>
+{
+    if regions.is_empty()
+    {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for region in regions
+    {
+        if region.pages == 0
+        {
+            return None;
+        }
+        total = total.checked_add(region.pages)?;
+    }
+    vaddr.checked_add(total.checked_mul(PAGE_SIZE)?)?;
+    Some(total)
 }
 
 impl SharedBuffer
 {
     /// Attach to a shared buffer using memory caps received from the peer.
-    /// Maps `memory_caps[..pages]` sequentially read-write at `vaddr` in
-    /// `aspace`; dropping the buffer unmaps the span.
+    /// Maps `regions` back to back read-write at `vaddr` in `aspace`, each
+    /// cap with one map of all its pages, so a buffer is as large as the
+    /// caps it is given and a peer may share it as one multi-page cap or as
+    /// several; dropping the buffer unmaps the span.
     ///
     /// # Safety
     /// When `aspace` names the calling program's own address space, no page of
-    /// `[vaddr, vaddr + pages * 4096)` may hold a live Rust object or a
-    /// registered IPC buffer page, from this call until the buffer is dropped:
-    /// the map replaces what the span held and the drop unmaps it (the
-    /// contracts of `syscall::mem_map` and `syscall::mem_unmap`).
+    /// the span (`vaddr` up by the regions' total pages) may hold a live Rust
+    /// object or registered IPC buffer page, from this call until the buffer
+    /// is dropped: the map replaces what the span held and the drop unmaps it
+    /// (the contracts of `syscall::mem_map` and `syscall::mem_unmap`).
     ///
     /// # Errors
-    /// [`ShmemError::InvalidPageCount`] if `pages` is zero, exceeds
-    /// [`MAX_PAGES`], or exceeds `memory_caps.len()`;
+    /// [`ShmemError::InvalidPageCount`] if `regions` is empty, a region
+    /// covers zero pages, or the span overflows;
     /// [`ShmemError::MapFailed`] if deriving a mapping cap or any map call
-    /// fails.
+    /// fails (a cap covering fewer pages than its region claims among them).
     pub unsafe fn attach(
-        memory_caps: &[u32],
-        pages: u32,
+        regions: &[SharedRegion],
         aspace: u32,
         vaddr: u64,
     ) -> Result<Self, ShmemError>
     {
-        if pages == 0 || pages > MAX_PAGES || memory_caps.len() < pages as usize
+        let total = total_pages(regions, vaddr).ok_or(ShmemError::InvalidPageCount)?;
+        let mut mapped: u64 = 0;
+        for region in regions
         {
-            return Err(ShmemError::InvalidPageCount);
-        }
-        for i in 0..pages
-        {
-            let Ok(rw) = syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MEM_MAP_RW)
+            let Ok(rw) = syscall::cap_derive(region.cap, syscall::RIGHTS_MEM_MAP_RW)
             else
             {
-                // SAFETY: pages `0..i` were mapped by this call, inside the
-                // span the caller's contract dedicates.
-                unsafe { unmap_range(aspace, vaddr, i) };
+                // SAFETY: the first `mapped` pages were mapped by this call,
+                // inside the span the caller's contract dedicates.
+                unsafe { unmap_range(aspace, vaddr, mapped) };
                 return Err(ShmemError::MapFailed);
             };
-            // SAFETY: page `i` lies in the span the caller's contract keeps
-            // off live Rust objects and registered IPC pages.
-            let mapped = unsafe {
+            // SAFETY: the region's pages lie in the span the caller's
+            // contract keeps off live Rust objects and registered IPC pages.
+            let ok = unsafe {
                 syscall::mem_map(
                     rw,
                     aspace,
-                    vaddr + u64::from(i) * PAGE_SIZE,
+                    vaddr + mapped * PAGE_SIZE,
                     0,
-                    1,
+                    region.pages,
                     syscall::MAP_WRITABLE,
                 )
-            };
-            if mapped.is_err()
+            }
+            .is_ok();
+            let _ = syscall::cap_delete(rw);
+            if !ok
             {
-                let _ = syscall::cap_delete(rw);
-                // SAFETY: pages `0..i` were mapped by this call, inside the
-                // dedicated span.
-                unsafe { unmap_range(aspace, vaddr, i) };
+                // SAFETY: the first `mapped` pages were mapped by this call,
+                // and a failed map of this region leaves its pages for the
+                // same unmap, inside the dedicated span.
+                unsafe { unmap_range(aspace, vaddr, mapped + region.pages) };
                 return Err(ShmemError::MapFailed);
             }
-            let _ = syscall::cap_delete(rw);
+            mapped += region.pages;
         }
 
         Ok(SharedBuffer {
             vaddr,
-            page_count: pages,
+            page_count: total,
             aspace,
         })
     }
@@ -147,16 +171,17 @@ impl SharedBuffer
     /// Total size in bytes.
     #[must_use]
     // cast_possible_truncation: userspace targets 64-bit only, so `usize`
-    // holds every `u64` byte count; the product is at most `MAX_PAGES` pages.
+    // holds every `u64` byte count, and `attach` checked the span fits the
+    // address space.
     #[allow(clippy::cast_possible_truncation)]
     pub fn size(&self) -> usize
     {
-        (u64::from(self.page_count) * PAGE_SIZE) as usize
+        (self.page_count * PAGE_SIZE) as usize
     }
 
     /// Number of pages.
     #[must_use]
-    pub fn pages(&self) -> u32
+    pub fn pages(&self) -> u64
     {
         self.page_count
     }
@@ -184,21 +209,22 @@ impl Drop for SharedBuffer
     {
         // SAFETY: `attach`'s contract dedicates the span to this buffer until
         // it is dropped, so no live Rust object or IPC page lies in it.
-        let _ = unsafe { syscall::mem_unmap(self.aspace, self.vaddr, u64::from(self.page_count)) };
+        let _ = unsafe { syscall::mem_unmap(self.aspace, self.vaddr, self.page_count) };
     }
 }
 
-/// Best-effort unmap of `count` pages starting at `vaddr`. Used during
-/// failure cleanup; errors are swallowed.
+/// Best-effort unmap of `count` pages starting at `vaddr`, one call for the
+/// whole span (unmapping a page that holds no mapping is harmless). Used
+/// during failure cleanup; errors are swallowed.
 ///
 /// # Safety
 /// The contract of `syscall::mem_unmap` for the `count` pages at `vaddr`.
-unsafe fn unmap_range(aspace: u32, vaddr: u64, count: u32)
+unsafe fn unmap_range(aspace: u32, vaddr: u64, count: u64)
 {
-    for i in 0..count
+    if count != 0
     {
-        // SAFETY: page `i` is in the span the caller's contract covers.
-        let _ = unsafe { syscall::mem_unmap(aspace, vaddr + u64::from(i) * PAGE_SIZE, 1u64) };
+        // SAFETY: the span is the one the caller's contract covers.
+        let _ = unsafe { syscall::mem_unmap(aspace, vaddr, count) };
     }
 }
 
@@ -511,6 +537,20 @@ mod tests
     use super::*;
 
     const CAP: u32 = 64;
+
+    // Defect guarded: a buffer size capped by one page per cap (the old
+    // `MAX_PAGES` of four single-page caps), or a span check that lets an
+    // empty region or an overflowing total through to the map loop.
+    #[test]
+    fn shared_span_sums_multi_page_regions_and_refuses_bad_ones()
+    {
+        let region = |pages| SharedRegion { cap: 1, pages };
+        assert_eq!(total_pages(&[region(1024), region(3)], 0x1000), Some(1027));
+        assert_eq!(total_pages(&[], 0x1000), None);
+        assert_eq!(total_pages(&[region(2), region(0)], 0x1000), None);
+        assert_eq!(total_pages(&[region(u64::MAX), region(1)], 0x1000), None);
+        assert_eq!(total_pages(&[region(u64::MAX / PAGE_SIZE)], 0x1000), None);
+    }
 
     /// A ring region in ordinary memory: header plus a `CAP`-byte body.
     #[repr(C, align(8))]

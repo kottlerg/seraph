@@ -547,10 +547,11 @@ times the base, or the baseline's) by at least 1 s; the cells are listed by that
 first. Every cell makes the same attempts at both widths, so `R` is the growth of the cell's whole
 cost. The report is a report, not a gate: a PR that owes the boundary set carries it in its body,
 and no flag blocks a PR or a tag until the threshold is calibrated against the baselines and made
-a gate. A baseline is rewritten
-on the reference host when its QEMU, kernel, or accelerator settings change, from runs at a
-`master` commit, and by the PR that changes a cell's cost on purpose, from runs at that PR's head,
-whose ktest tree is the one its merge brings to `master`.
+a gate. A baseline is rewritten on the reference host: from runs at a `master` commit when the
+host's QEMU, kernel, or accelerator settings change, and by the PR that changes a cell's cost on
+purpose, from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
+[xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) is the code its merge brings to
+`master`, taken again when `master` changes that code before the merge.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
 a non-inert change to the memory surface: the code that sizes or maps physical memory by the

@@ -29,9 +29,9 @@
 //! copy the caller uses) immediately followed by the delete of the original.
 //! A long-lived caller, pinned to CPU 1, and the controller, pinned to CPU 0,
 //! both live in ktest's own `CSpace`. The controller runs [`CYCLES`] rounds
-//! per phase. Each round creates a fresh endpoint, publishes the handle the caller is to use (the
-//! endpoint's original capability, or a copy derived from it in the revoke
-//! phase), and opens the round. The caller loops over one group of calls
+//! per phase. Each round creates a fresh endpoint, publishes the handle the
+//! caller is to use (the endpoint's original capability, or a copy derived
+//! from it in the revoke phase), and opens the round. The caller loops over one group of calls
 //! through that handle until a call finds it gone: copy it into ktest's own
 //! `CSpace`, derive from it, derive a badged capability from it, deleting each
 //! new capability at once. In the delete phase the controller's free is the

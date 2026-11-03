@@ -992,41 +992,6 @@ pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObject
     unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) }
 }
 
-/// Runtime mint: allocate `size_of::<T>()` bytes from the kernel SEED Memory
-/// cap, write `body` in place, bump SEED's refcount, and return a pointer
-/// suitable for `CSpace::insert_cap`.
-///
-/// SEED is the only kernel-internal Memory cap; through this function it backs
-/// the wrapper bodies of split-derived caps (`sys_mmio_split`, `sys_irq_split`,
-/// `sys_ioport_split`, `sys_sched_split`, and the tail of `sys_memory_split`).
-/// Opaque non-cap SEED state (the per-thread IOPB bound by `sys_ioport_bind`)
-/// goes through [`alloc_seed_scratch`] instead.
-/// All callers debit `SEED.available_bytes`; runtime exhaustion returns
-/// `OutOfMemory` to the syscall surface (unlike [`boot_retype_body`] which
-/// fatals).
-///
-/// `body.header.ancestor` MUST be stamped by the caller via
-/// [`KernelObjectHeader::with_ancestor`] using
-/// [`crate::cap::seed_header_nn`] so the dealloc cascade returns the body
-/// to SEED.
-///
-/// `T` must be `#[repr(C)]` with [`KernelObjectHeader`] at offset 0.
-#[cfg(not(test))]
-#[track_caller]
-pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallError>
-{
-    let seed = crate::cap::seed_memory_ref();
-    let bytes = core::mem::size_of::<T>() as u64;
-    let offset = retype_allocate(seed, bytes)?;
-    let virt = crate::mm::paging::phys_to_virt(seed.base + offset) as *mut T;
-    // SAFETY: `virt` is in the kernel direct map, freshly carved by
-    // `retype_allocate`, and not aliased.
-    unsafe { core::ptr::write(virt, body) };
-    seed.header.inc_ref();
-    // SAFETY: T is repr(C) with KernelObjectHeader at offset 0.
-    Ok(unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) })
-}
-
 /// Reserve `bytes` of opaque scratch from SEED for non-cap kernel state
 /// (currently x86_64-only: per-thread IOPB pages). Returns a kernel-
 /// direct-map pointer to the freshly-carved region; bumps SEED's
@@ -1035,8 +1000,8 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// Caller frees via [`free_seed_scratch`] giving back the matching
 /// `(ptr, bytes)` pair.
 ///
-/// Unlike [`alloc_in_seed`], no `KernelObjectHeader` is written and the
-/// region does not enter any `CSpace`; the returned pointer is opaque.
+/// No `KernelObjectHeader` is written and the region does not enter any
+/// `CSpace`; the returned pointer is opaque.
 ///
 /// Compiled on every architecture but only exercised on x86-64 (per-thread
 /// IOPB pages); RISC-V has no I/O permission bitmap, so the only caller

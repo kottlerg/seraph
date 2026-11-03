@@ -36,6 +36,7 @@ extern crate alloc;
 #[cfg(test)]
 use alloc::boxed::Box;
 
+pub mod arena;
 pub mod cspace;
 pub mod derivation;
 pub mod ioport_bindings;
@@ -907,10 +908,9 @@ pub(crate) unsafe fn boot_retype_cspace(
 ) -> (NonNull<object::KernelObjectHeader>, *mut cspace::CSpace)
 {
     use crate::cap::cspace::CSpace;
-    use crate::cap::object::{CSpaceKernelObject, KernelObjectHeader, ObjectType, PagePool};
+    use crate::cap::object::{CSpaceKernelObject, KernelObjectHeader, ObjectType};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
-    use core::sync::atomic::AtomicU64;
 
     debug_assert!(init_pages >= 1);
 
@@ -944,13 +944,10 @@ pub(crate) unsafe fn boot_retype_cspace(
     unsafe {
         core::ptr::write(
             cs_kobj_ptr,
-            CSpaceKernelObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, seed_header_nn()),
-                cspace: cs_ptr,
-                cspace_growth_budget_bytes: AtomicU64::new(0),
-                cs_pool: PagePool::new(),
-                deferred_next: core::ptr::null_mut(),
-            },
+            CSpaceKernelObject::new(
+                KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, seed_header_nn()),
+                cs_ptr,
+            ),
         );
     }
     // SAFETY: cs_ptr just constructed.

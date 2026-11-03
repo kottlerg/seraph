@@ -155,11 +155,12 @@ unsafe impl Sync for KernelObjectHeader {}
 
 impl KernelObjectHeader
 {
-    /// Construct a new header with `ref_count = 1` and no ancestor cap.
+    /// Construct a new header with `ref_count = 1` and no ancestor yet.
     ///
-    /// Used by host tests only; production objects are retyped and use
-    /// [`Self::with_ancestor`] to record the source `MemoryObject` for
-    /// auto-reclaim.
+    /// Used by host tests, and for a body a `CSpace`'s arena funds, whose
+    /// ancestor [`CSpaceKernelObject::alloc_body`] stamps; every other
+    /// production object is retyped and uses [`Self::with_ancestor`] to record
+    /// the source `MemoryObject` for auto-reclaim.
     pub fn new(obj_type: ObjectType) -> Self
     {
         Self {
@@ -1355,8 +1356,17 @@ pub struct CSpaceKernelObject
     /// budget is exhausted.
     pub cspace_growth_budget_bytes: AtomicU64,
     /// Slot and directory pages donated to this `CSpace`, and the record of
-    /// every donation; `dealloc` reclaims the donations wholesale.
+    /// every donation; `dealloc` reclaims the donations wholesale once the
+    /// body arena below has no lease outstanding.
     pub cs_pool: PagePool,
+    /// Head of the body arena's free-chunk list (a chunk's kernel virtual
+    /// address, `0` for none): the 128-byte chunks of pool pages this `CSpace`
+    /// funds runtime kernel object bodies from (`cap::arena`). Serialised by
+    /// `cs_pool`'s lock.
+    arena_free: AtomicU64,
+    /// The body arena's outstanding leases (chunks and pages it has handed
+    /// out) and whether this `CSpace`'s teardown has begun.
+    arena_live: crate::cap::arena::ArenaLive,
     /// Intrusive link for the per-CPU deferred reclaim stack
     /// ([`drain_deferred_reclaim`]); see `AddressSpaceObject::deferred_next`.
     pub deferred_next: *mut KernelObjectHeader,
@@ -1572,10 +1582,29 @@ impl AddressSpaceObject
 
 impl CSpaceKernelObject
 {
-    /// Pop a free slot page from this `CSpace`'s pool, charging the growth
-    /// budget. Returns the page's physical address, or `None` if empty.
-    /// Called from `CSpace::grow` under the `CSpace` lock, the only debit;
-    /// credits land under the pool lock in `seed_pages`.
+    /// A wrapper for the `CSpace` at `cspace`, with an empty pool and an empty
+    /// body arena; `header` names the Memory object the slab was retyped from.
+    #[must_use]
+    pub const fn new(header: KernelObjectHeader, cspace: *mut crate::cap::cspace::CSpace) -> Self
+    {
+        Self {
+            header,
+            cspace,
+            cspace_growth_budget_bytes: AtomicU64::new(0),
+            cs_pool: PagePool::new(),
+            arena_free: AtomicU64::new(0),
+            arena_live: crate::cap::arena::ArenaLive::new(),
+            deferred_next: core::ptr::null_mut(),
+        }
+    }
+
+    /// Pop a free page from this `CSpace`'s pool, charging the growth budget,
+    /// and zero it. Returns the page's physical address, or `None` if empty.
+    /// Called from `CSpace::grow` for a slot or directory page, and by the
+    /// body arena ([`alloc_body`](Self::alloc_body)). Every credit lands under
+    /// the pool lock together with the push of its page (`seed_pages`), so a
+    /// debit after a pop is always of a page already credited and the budget
+    /// cannot wrap.
     #[cfg(not(test))]
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
@@ -1587,6 +1616,121 @@ impl CSpaceKernelObject
         // SAFETY: page is now exclusively owned by the caller.
         unsafe { core::ptr::write_bytes(virt as *mut u8, 0, crate::mm::PAGE_SIZE) };
         Some(phys)
+    }
+
+    /// Construct `body` in a chunk of this `CSpace`'s body arena, with its
+    /// `header.ancestor` naming this wrapper, so the dealloc cascade returns
+    /// the chunk here ([`free_body`]). Returns the body's header, with the
+    /// reference count `body` carries.
+    ///
+    /// The `CSpace` the calling syscall inserts the new capability into funds
+    /// the body, as it funds the slot (core/kernel/docs/capability-internals.md
+    /// § Body Arena).
+    ///
+    /// `T` must be `#[repr(C)]` with [`KernelObjectHeader`] at offset 0, as
+    /// every kernel object type is; its size and alignment are checked at
+    /// compile time against the chunk.
+    ///
+    /// # Errors
+    /// `OutOfMemory` when no chunk is free and the pool has no page to carve.
+    #[cfg(not(test))]
+    #[track_caller]
+    pub fn alloc_body<T>(
+        &self,
+        body: T,
+    ) -> Result<NonNull<KernelObjectHeader>, syscall::SyscallError>
+    {
+        const {
+            assert!(core::mem::size_of::<T>() <= crate::cap::arena::CHUNK_BYTES);
+            assert!(crate::cap::arena::CHUNK_BYTES.is_multiple_of(core::mem::align_of::<T>()));
+        };
+        let chunk = self.alloc_chunk()?.cast::<T>();
+        // SAFETY: the chunk is CHUNK_BYTES, aligned for T (asserted above),
+        // and exclusively the caller's.
+        unsafe { core::ptr::write(chunk, body) };
+        let header = chunk.cast::<KernelObjectHeader>();
+        // SAFETY: every kernel object type holds its header at offset 0 (the
+        // type requirement above), and the body was just written.
+        unsafe {
+            (*header).ancestor.store(
+                core::ptr::from_ref(&self.header).cast_mut(),
+                Ordering::Release,
+            );
+        }
+        // SAFETY: chunk is non-null.
+        Ok(unsafe { NonNull::new_unchecked(header) })
+    }
+
+    /// Take one chunk from the arena, carving a fresh pool page when none is
+    /// free, and count its lease.
+    #[cfg(not(test))]
+    #[track_caller]
+    fn alloc_chunk(&self) -> Result<*mut u8, syscall::SyscallError>
+    {
+        pool_lock(&self.cs_pool.lock);
+        // SAFETY: pool lock held; every chunk on the list is the arena's.
+        let mut chunk = unsafe { crate::cap::arena::pop_chunk(&self.arena_free) };
+        if chunk.is_none()
+        {
+            // SAFETY: pool lock held.
+            let phys = unsafe { pool_pop(&self.cs_pool.head_phys) };
+            if phys != 0
+            {
+                // The credit of this page landed with its push, under the
+                // lock held here.
+                self.cspace_growth_budget_bytes
+                    .fetch_sub(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
+                let page = crate::mm::paging::phys_to_virt(phys) as *mut u8;
+                // SAFETY: pool lock held; the page just left the free list,
+                // so it is exclusively the arena's.
+                unsafe {
+                    crate::cap::arena::carve_page(&self.arena_free, page);
+                    chunk = crate::cap::arena::pop_chunk(&self.arena_free);
+                }
+            }
+        }
+        if chunk.is_some()
+        {
+            self.arena_live.retain();
+        }
+        pool_unlock(&self.cs_pool.lock);
+        chunk.ok_or(syscall::SyscallError::OutOfMemory)
+    }
+
+    /// Return a chunk taken by [`alloc_body`](Self::alloc_body) and release
+    /// its lease. The release that completes a begun teardown pushes this
+    /// wrapper onto `stack`, whose pop reclaims the donations.
+    ///
+    /// # Safety
+    /// `chunk` came from this arena and nothing references it any more.
+    #[cfg(not(test))]
+    #[track_caller]
+    unsafe fn free_chunk(&self, chunk: *mut u8, stack: &mut CascadeStack)
+    {
+        pool_lock(&self.cs_pool.lock);
+        // SAFETY: pool lock held; caller contract.
+        unsafe { crate::cap::arena::push_chunk(&self.arena_free, chunk) };
+        pool_unlock(&self.cs_pool.lock);
+        // SAFETY: the lease is released after the chunk's last use above.
+        unsafe { self.release_lease(stack) };
+    }
+
+    /// Release one arena lease; the release that completes a begun teardown
+    /// pushes this wrapper onto `stack`.
+    ///
+    /// # Safety
+    /// The lease is held by the caller and its chunk or page is no longer
+    /// used.
+    #[cfg(not(test))]
+    unsafe fn release_lease(&self, stack: &mut CascadeStack)
+    {
+        if self.arena_live.release()
+        {
+            // SAFETY: the wrapper's reference count reached zero when its
+            // teardown began, and only this release completes it, so it is
+            // queued once for that completion.
+            unsafe { stack.push(NonNull::from(&self.header)) };
+        }
     }
 
     /// Record a freshly-retyped donation, seed its pool pages, and credit the
@@ -1617,6 +1761,29 @@ impl CSpaceKernelObject
             )
         }
     }
+}
+
+/// The wrapper of the `CSpace` at `cspace`: the arena that funds the bodies a
+/// syscall inserting into that `CSpace` creates
+/// ([`CSpaceKernelObject::alloc_body`]).
+///
+/// # Errors
+/// `OutOfMemory` for a `CSpace` without a wrapper, which has no arena to fund
+/// from (only the host-test stubs).
+///
+/// # Safety
+/// `cspace` is a live `CSpace` the caller pins (its own, bound to the running
+/// thread, or one named by a capability it holds a pin on); the returned
+/// reference is used only while that pin lasts.
+#[cfg(not(test))]
+pub unsafe fn arena_of<'a>(
+    cspace: *mut crate::cap::cspace::CSpace,
+) -> Result<&'a CSpaceKernelObject, syscall::SyscallError>
+{
+    // SAFETY: caller contract.
+    let kobj = unsafe { (*cspace).kobj_ptr() }.ok_or(syscall::SyscallError::OutOfMemory)?;
+    // SAFETY: a wired wrapper outlives its CSpace's pins (caller contract).
+    Ok(unsafe { &*kobj })
 }
 
 /// Kernel object for an IPC endpoint (Endpoint capability).
@@ -2254,14 +2421,16 @@ unsafe fn release_death_observers(
     }
 }
 
-/// Free the SEED-backed body of an object of concrete type `T`: drop it in
-/// place, return its bytes to its ancestor Memory object, and release the
-/// ancestor reference, pushing the ancestor onto `stack` if that was the
-/// last.
+/// Free the body of an object of concrete type `T`: drop it in place and
+/// return its bytes to its ancestor. A body a `CSpace`'s arena funded goes back
+/// to that arena, releasing its lease
+/// ([`CSpaceKernelObject::alloc_body`]); any other goes back to its ancestor
+/// Memory object (SEED for a boot mint), releasing the retype lease. Either
+/// release that leaves the ancestor done pushes it onto `stack`.
 ///
 /// # Safety
-/// `ptr` is an exclusively owned, retype-backed `T` (header at offset 0) that
-/// nothing references; no lock is held.
+/// `ptr` is an exclusively owned, retype- or arena-backed `T` (header at
+/// offset 0) that nothing references; no lock is held.
 #[cfg(not(test))]
 unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
@@ -2272,9 +2441,26 @@ unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStac
     {
         crate::fatal("free_body: object carries no ancestor");
     };
-    // cast_ptr_alignment: the ancestor is a MemoryObject (header at offset 0).
+    // SAFETY: the object's lease keeps its ancestor live until it is released
+    // below.
+    if unsafe { ancestor.as_ref().obj_type } == ObjectType::CSpaceObj
+    {
+        // A body a CSpace's arena funded (CSpaceKernelObject::alloc_body).
+        // cast_ptr_alignment: the ancestor is a CSpaceKernelObject (header at
+        // offset 0).
+        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: as above.
+        let funder = unsafe { &*ancestor.as_ptr().cast::<CSpaceKernelObject>() };
+        // SAFETY: exclusively owned body of type T (caller contract).
+        unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<T>()) };
+        // SAFETY: the chunk came from this arena and is no longer used.
+        unsafe { funder.free_chunk(ptr.as_ptr().cast::<u8>(), stack) };
+        return;
+    }
+    // cast_ptr_alignment: any other ancestor is a MemoryObject (header at
+    // offset 0).
     #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: the object's reference keeps its ancestor live until the dec_ref.
+    // SAFETY: as above.
     let ancestor_memory = unsafe { &*ancestor.as_ptr().cast::<MemoryObject>() };
     let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
     let offset = body_phys - ancestor_memory.base;
@@ -2326,8 +2512,9 @@ unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut 
 /// or `SYS_CAP_DERIVE_BADGE` from a slot naming `src` references, with the
 /// reference the new slot holds already taken.
 ///
-/// For an `Mmio` or `IoPort` capability this is a fresh SEED-backed object
-/// over the same range, in `src`'s lineage, so mappings and port bindings made
+/// For an `Mmio` or `IoPort` capability this is a fresh object over the same
+/// range, in `src`'s lineage, funded by the arena of `dest`, the `CSpace` that
+/// receives the new slot, so mappings and port bindings made
 /// through the new capability are withdrawn when it is deleted, consumed by a
 /// split, or revoked through an ancestor, whatever other capabilities to the
 /// range survive
@@ -2339,12 +2526,13 @@ unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut 
 ///
 /// # Errors
 /// For `Mmio` and `IoPort`: `QuotaExceeded` when the lineage already has
-/// [`RANGE_COPY_LIMIT`] live copies, and `OutOfMemory` when SEED cannot back
-/// the copy. For every other type: `QuotaExceeded` when `src`'s reference
-/// count is at [`REF_COUNT_LIMIT`].
+/// [`RANGE_COPY_LIMIT`] live copies, and `OutOfMemory` when `dest`'s arena
+/// cannot back the copy. For every other type: `QuotaExceeded` when `src`'s
+/// reference count is at [`REF_COUNT_LIMIT`].
 ///
 /// # Safety
-/// `src` is the live object of a slot tagged `tag`, pinned by the caller.
+/// `src` is the live object of a slot tagged `tag`, pinned by the caller, and
+/// `dest` is a live `CSpace` the caller pins.
 // cast_ptr_alignment: each object is constructed in place at a
 // size-class-aligned retype offset; the header sits at offset 0.
 #[allow(clippy::cast_ptr_alignment)]
@@ -2352,9 +2540,9 @@ unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut 
 pub unsafe fn object_for_new_slot(
     tag: crate::cap::slot::CapTag,
     src: NonNull<KernelObjectHeader>,
+    dest: *mut crate::cap::cspace::CSpace,
 ) -> Result<NonNull<KernelObjectHeader>, syscall::SyscallError>
 {
-    use crate::cap::retype::alloc_in_seed;
     use crate::cap::slot::CapTag;
 
     match tag
@@ -2369,13 +2557,16 @@ pub unsafe fn object_for_new_slot(
             let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
             let mut body = MmioObject::new_root(mo.base, mo.size, mo.flags);
             body.lineage = lineage;
-            alloc_in_seed(body).inspect_err(|_| {
-                // SAFETY: undoes the reservation above; src's own share keeps
-                // root's count above zero.
-                unsafe { lineage_of(root) }
-                    .live
-                    .fetch_sub(1, Ordering::AcqRel);
-            })
+            // SAFETY: dest is pinned (contract).
+            unsafe { arena_of(dest) }
+                .and_then(|funder| funder.alloc_body(body))
+                .inspect_err(|_| {
+                    // SAFETY: undoes the reservation above; src's own share keeps
+                    // root's count above zero.
+                    unsafe { lineage_of(root) }
+                        .live
+                        .fetch_sub(1, Ordering::AcqRel);
+                })
         }
         CapTag::IoPort =>
         {
@@ -2386,12 +2577,15 @@ pub unsafe fn object_for_new_slot(
             let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
             let mut body = IoPortObject::new_root(po.base, po.size);
             body.lineage = lineage;
-            alloc_in_seed(body).inspect_err(|_| {
-                // SAFETY: as the Mmio arm.
-                unsafe { lineage_of(root) }
-                    .live
-                    .fetch_sub(1, Ordering::AcqRel);
-            })
+            // SAFETY: as the Mmio arm.
+            unsafe { arena_of(dest) }
+                .and_then(|funder| funder.alloc_body(body))
+                .inspect_err(|_| {
+                    // SAFETY: as the Mmio arm.
+                    unsafe { lineage_of(root) }
+                        .live
+                        .fetch_sub(1, Ordering::AcqRel);
+                })
         }
         _ =>
         {
@@ -2463,6 +2657,61 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
     });
 }
 
+/// Return one donation to its ancestor Memory object and drop the reference the
+/// donation held on it, pushing the ancestor onto `stack` if that was its last
+/// reference.
+///
+/// # Safety
+/// `(anc_ptr, off, pages)` must be a donation record handed out by
+/// `PagePool::reclaim_donations` under that function's contract.
+#[cfg(not(test))]
+unsafe fn free_donation(
+    anc_ptr: *mut KernelObjectHeader,
+    off: u64,
+    pages: u64,
+    stack: &mut CascadeStack,
+)
+{
+    // SAFETY: anc_ptr was set at donation recording from a live
+    // MemoryObject's header; the inc_ref then is matched by the
+    // dec_ref here.
+    let anc_hdr = unsafe { &*anc_ptr };
+    // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: as above; the ancestor stays live until the dec_ref below.
+    let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
+    crate::cap::retype::retype_free(anc_memory, off, pages * crate::mm::PAGE_SIZE as u64);
+    if anc_hdr.dec_ref() == 0
+    {
+        // SAFETY: refcount reached 0; no live cap holds it, and the
+        // donation's bytes have been returned to it above.
+        unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
+    }
+}
+
+/// Return every donation of a dead `CSpace`'s pool, the create-time slab
+/// (holding the wrapper and the pool) last; `obj` is dangling afterwards.
+/// Unlike a `CSpace`'s derivation drain, this walk is not batched: no lock is
+/// held across it (each return takes only its ancestor's cap lock), so nothing
+/// else waits on it, and its length is the number of donations the owner paid
+/// for.
+///
+/// # Safety
+/// `obj`'s reference count is zero, its derivation drain has run and its
+/// in-place `CSpace` is dropped, no arena lease is outstanding, and no lock is
+/// held.
+#[cfg(not(test))]
+unsafe fn reclaim_cspace_donations(obj: &CSpaceKernelObject, stack: &mut CascadeStack)
+{
+    let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
+        // SAFETY: a record handed out by reclaim_donations under its
+        // contract; no lock held.
+        unsafe { free_donation(anc, off, pages, stack) }
+    };
+    // SAFETY: caller contract.
+    unsafe { obj.cs_pool.reclaim_donations(free) };
+}
+
 /// Reclaim one already-zero-refcount object. Every object the reclaim
 /// leaves unreferenced (its ancestor `MemoryObject` when `dec_ref` returns
 /// 0 against it, and the like) is pushed onto `stack` instead of recursing.
@@ -2487,37 +2736,6 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 #[cfg(not(test))]
 unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
-    /// Return one donation to its ancestor Memory object and drop the
-    /// reference the donation held on it, pushing the ancestor onto `stack`
-    /// if that was its last reference.
-    ///
-    /// # Safety
-    /// `(anc_ptr, off, pages)` must be a donation record handed out by
-    /// `PagePool::reclaim_donations` under that function's contract.
-    unsafe fn free_donation(
-        anc_ptr: *mut KernelObjectHeader,
-        off: u64,
-        pages: u64,
-        stack: &mut CascadeStack,
-    )
-    {
-        // SAFETY: anc_ptr was set at donation recording from a live
-        // MemoryObject's header; the inc_ref then is matched by the
-        // dec_ref here.
-        let anc_hdr = unsafe { &*anc_ptr };
-        // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-        #[allow(clippy::cast_ptr_alignment)]
-        // SAFETY: as above; the ancestor stays live until the dec_ref below.
-        let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-        crate::cap::retype::retype_free(anc_memory, off, pages * crate::mm::PAGE_SIZE as u64);
-        if anc_hdr.dec_ref() == 0
-        {
-            // SAFETY: refcount reached 0; no live cap holds it, and the
-            // donation's bytes have been returned to it above.
-            unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
-        }
-    }
-
     // SAFETY: ptr is NonNull<KernelObjectHeader>, validated at call site.
     let header = unsafe { ptr.as_ref() };
     match header.obj_type
@@ -2556,35 +2774,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 }
             }
 
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "Memory: every production cap is retype-backed (Phase-7 SEED, sys_memory_split SEED)"
-            );
-            // Retype-backed body lives inside the ancestor (the seed
-            // Memory cap). Drop in place, return the body bytes to the
-            // seed's per-Memory allocator, drop the retype-time lease.
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: ptr is the in-place MemoryObject; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MemoryObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<MemoryObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                // SAFETY: the reference just released was its last.
-                unsafe { stack.push(ancestor_nn) };
-            }
+            // SAFETY: refcount 0, exclusively owned MemoryObject (dealloc_object's
+            // contract); no lock is held.
+            unsafe { free_body::<MemoryObject>(ptr, stack) };
         }
         ObjectType::Mmio =>
         {
@@ -2621,32 +2813,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 unsafe { crate::irq::unregister(start) };
             }
 
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "Interrupt: every production cap is retype-backed (Phase-7 SEED, sys_irq_split SEED)"
-            );
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<InterruptObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<InterruptObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                // SAFETY: the reference just released was its last.
-                unsafe { stack.push(ancestor_nn) };
-            }
+            // SAFETY: refcount 0, exclusively owned InterruptObject (dealloc_object's
+            // contract); no lock is held.
+            unsafe { free_body::<InterruptObject>(ptr, stack) };
         }
         ObjectType::IoPort =>
         {
@@ -2660,61 +2829,15 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         }
         ObjectType::SchedControl =>
         {
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "SchedControl: every production cap is retype-backed (Phase-7 SEED)"
-            );
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SchedControlObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<SchedControlObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                // SAFETY: the reference just released was its last.
-                unsafe { stack.push(ancestor_nn) };
-            }
+            // SAFETY: refcount 0, exclusively owned SchedControlObject (dealloc_object's
+            // contract); no lock is held.
+            unsafe { free_body::<SchedControlObject>(ptr, stack) };
         }
         ObjectType::SbiControl =>
         {
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "SbiControl: every production cap is retype-backed (Phase-7 SEED)"
-            );
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SbiControlObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<SbiControlObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                // SAFETY: the reference just released was its last.
-                unsafe { stack.push(ancestor_nn) };
-            }
+            // SAFETY: refcount 0, exclusively owned SbiControlObject (dealloc_object's
+            // contract); no lock is held.
+            unsafe { free_body::<SbiControlObject>(ptr, stack) };
         }
 
         // ── Thread ────────────────────────────────────────────────────────
@@ -3441,6 +3564,17 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 "dealloc CSpaceObj: donation-less CSpace reached typed-memory dealloc path"
             );
 
+            // The second pop of a wrapper whose drain below found arena leases
+            // outstanding: the last of them has been released
+            // (`CSpaceKernelObject::release_lease`), so the donations go now.
+            if obj.arena_live.teardown_begun()
+            {
+                // SAFETY: the drain below ran, the in-place CSpace is dropped,
+                // no arena lease is outstanding, and no lock is held.
+                unsafe { reclaim_cspace_donations(obj, stack) };
+                return;
+            }
+
             // Captured for the final `free_cspace_id` after the lock release;
             // `needs_free_id` stays false when cs_ptr is null (no id to
             // recycle), which short-circuits the free-list push below.
@@ -3545,31 +3679,30 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 needs_free_id = true;
             }
 
-            // Return every donation, the create-time slab (holding the
-            // wrapper and this pool) last; `obj` is dangling afterwards.
-            // Unlike the derivation drain above, this walk is not batched:
-            // no lock is held across it (each return takes only its
-            // ancestor's cap lock), so nothing else waits on it, and its
-            // length is the number of donations the owner paid for.
-            let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
-                // SAFETY: a record handed out by reclaim_donations under its
-                // contract; no lock held.
-                unsafe { free_donation(anc, off, pages, stack) }
-            };
-            // SAFETY: refcount 0, no slot references the object, the
-            // in-place CSpace has been dropped, and no lock is held.
-            unsafe { obj.cs_pool.reclaim_donations(free) };
-
-            // Recycle the id last, after all of the dying CSpace's storage
-            // is reclaimed and DERIVATION_LOCK is released. Randomizing the
-            // epoch now invalidates any surviving SlotId stamped with the
-            // pre-recycle value — subsequent `lookup_cspace` returns None.
+            // Recycle the id once DERIVATION_LOCK is released and the CSpace
+            // is unregistered and dropped. Randomizing the epoch now
+            // invalidates any surviving SlotId stamped with the pre-recycle
+            // value — subsequent `lookup_cspace` returns None. The slot pages
+            // go back with the donations below or at the second pop; no live
+            // structure names them.
             if needs_free_id
             {
                 crate::cap::free_cspace_id(dying_id);
             }
 
-            // No separate free of the wrapper — it lives inside the slab reclaimed above.
+            // The donations go once no arena lease is outstanding: a body this
+            // CSpace funded may live on in another CSpace, its capability moved
+            // there (core/kernel/docs/capability-internals.md § Body Arena). The
+            // bodies of this CSpace's own slots, queued on `stack` above, are
+            // freed after this arm returns, and the last lease's release queues
+            // the wrapper again.
+            if obj.arena_live.begin_teardown()
+            {
+                // SAFETY: refcount 0, no slot references the object, the
+                // in-place CSpace has been dropped, no arena lease is
+                // outstanding, and no lock is held.
+                unsafe { reclaim_cspace_donations(obj, stack) };
+            }
         }
 
         // ── Endpoint ──────────────────────────────────────────────────────

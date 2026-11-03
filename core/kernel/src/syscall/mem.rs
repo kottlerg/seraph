@@ -526,7 +526,6 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::derivation::{DERIVATION_LOCK, link_child};
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype;
-    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, MemRights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
@@ -642,28 +641,36 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Mint tail MemoryObject ─────────────────────────────────────────────────
     //
-    // The wrapper body lives in the kernel SEED Memory cap; `header.ancestor`
-    // = SEED returns the wrapper bytes via `retype_free` on dealloc. The tail
-    // inherits `owns_memory` once it is inserted; the insert-failure path below
-    // clears the flag before destroying it, since the parent still covers the
-    // range and, after handoff, the buddy is sealed (`core/kernel/src/mm/buddy.rs`
-    // § Post-handoff sealing).
-    let tail_ptr = retype::alloc_in_seed(MemoryObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
-        base: parent_phys + split_offset,
-        size: tail_size,
-        available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
-        // Tail inherits the parent's ownership flag so the two halves together
-        // carry the original range's `owns_memory` accounting (the buddy is
-        // sealed after handoff; see `core/kernel/src/mm/buddy.rs`).
-        owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
-        allocator: crate::cap::retype::RetypeAllocator::new_inline(),
-        lock: core::sync::atomic::AtomicU32::new(0),
-    })
-    .inspect_err(|_| {
+    // The caller's CSpace, which receives the tail's slot, funds its body from
+    // its arena (core/kernel/docs/capability-internals.md § Body Arena); the
+    // dealloc returns the chunk there. The tail inherits `owns_memory` once it
+    // is inserted; the insert-failure path below clears the flag before
+    // destroying it, since the parent still covers the range and, after
+    // handoff, the buddy is sealed (`core/kernel/src/mm/buddy.rs` § Post-handoff
+    // sealing).
+    // SAFETY: caller_cspace is the running thread's own CSpace, live while the
+    // thread runs.
+    let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }.inspect_err(|_| {
         parent_ref.write_unlock();
         DERIVATION_LOCK.write_unlock();
     })?;
+    let tail_ptr = funder
+        .alloc_body(MemoryObject {
+            header: KernelObjectHeader::new(ObjectType::Memory),
+            base: parent_phys + split_offset,
+            size: tail_size,
+            available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
+            // Tail inherits the parent's ownership flag so the two halves together
+            // carry the original range's `owns_memory` accounting (the buddy is
+            // sealed after handoff; see `core/kernel/src/mm/buddy.rs`).
+            owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+            lock: core::sync::atomic::AtomicU32::new(0),
+        })
+        .inspect_err(|_| {
+            parent_ref.write_unlock();
+            DERIVATION_LOCK.write_unlock();
+        })?;
 
     // Insert under cspace.lock to keep the freelist/tag invariant against a
     // concurrent SYS_CAP_CREATE_* on the same cspace (lock order:
@@ -684,7 +691,7 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
         {
             // The parent still covers the tail's range, so the tail owns none of
             // it: clear the inherited flag so the dealloc returns only the
-            // wrapper bytes to SEED and frees nothing into the buddy.
+            // body's chunk to the arena and frees nothing into the buddy.
             // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
             // SAFETY: tail_ptr is the MemoryObject minted above (header at offset
             // 0), uninserted and reachable from no other thread.

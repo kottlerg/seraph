@@ -547,7 +547,6 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{MmioObject, dealloc_object};
-    use crate::cap::retype::alloc_in_seed;
     use crate::cap::slot::{CapTag, MmioRights};
     use crate::cap::split::install_split_children;
     use crate::mm::PAGE_SIZE;
@@ -621,15 +620,18 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Create two child MmioObjects ────────────────────────────────────
     //
-    // Both wrapper bodies live in the kernel SEED Memory cap; their
-    // `header.ancestor` points at SEED so dealloc returns the bytes via
-    // `retype_free`.
-
     // child1: [base, base + split_offset).
-    let child1_ptr = alloc_in_seed(MmioObject::new_root(mmio_phys, split_offset, mmio_flags))?;
+    // The caller's CSpace, which receives both children, funds their
+    // bodies from its arena (core/kernel/docs/capability-internals.md
+    // § Body Arena); dealloc returns each chunk there.
+    // SAFETY: caller_cspace is the running thread's own CSpace, live
+    // while the thread runs.
+    let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }?;
+    let child1_ptr =
+        funder.alloc_body(MmioObject::new_root(mmio_phys, split_offset, mmio_flags))?;
 
     // child2: [base + split_offset, end).
-    let child2_ptr = match alloc_in_seed(MmioObject::new_root(
+    let child2_ptr = match funder.alloc_body(MmioObject::new_root(
         mmio_phys + split_offset,
         mmio_size - split_offset,
         mmio_flags,
@@ -638,7 +640,7 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
         Ok(p) => p,
         Err(e) =>
         {
-            // SAFETY: child1_ptr is a freshly-allocated SEED-backed body
+            // SAFETY: child1_ptr is a freshly-allocated arena-backed body
             // with refcount 1 and not yet inserted into any CSpace.
             unsafe { dealloc_object(child1_ptr) };
             return Err(e);
@@ -648,7 +650,7 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
     // Install both children, rewire the derivation tree, and consume the
     // original — shared with the other range splits.
     // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
-    // children are freshly-allocated SEED-backed MmioObjects (refcount 1);
+    // children are freshly-allocated arena-backed MmioObjects (refcount 1);
     // orig_obj_ptr is the live original from lookup_cap.
     let (handle1, handle2) = unsafe {
         install_split_children(
@@ -696,8 +698,6 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
-    use crate::cap::retype::alloc_in_seed;
-    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, IrqRights};
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
@@ -751,18 +751,20 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     let lower_count = split_at - start;
     let upper_count = count - lower_count;
 
-    // Both wrapper bodies live in the kernel SEED Memory cap; their
-    // `header.ancestor` points at SEED so dealloc returns the bytes via
-    // `retype_free`.
-
-    let child1_ptr = alloc_in_seed(InterruptObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
+    // The caller's CSpace, which receives both children, funds their
+    // bodies from its arena (core/kernel/docs/capability-internals.md
+    // § Body Arena); dealloc returns each chunk there.
+    // SAFETY: caller_cspace is the running thread's own CSpace, live
+    // while the thread runs.
+    let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }?;
+    let child1_ptr = funder.alloc_body(InterruptObject {
+        header: KernelObjectHeader::new(ObjectType::Interrupt),
         start,
         count: lower_count,
     })?;
 
-    let child2_ptr = match alloc_in_seed(InterruptObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
+    let child2_ptr = match funder.alloc_body(InterruptObject {
+        header: KernelObjectHeader::new(ObjectType::Interrupt),
         start: split_at,
         count: upper_count,
     })
@@ -770,7 +772,7 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
         Ok(p) => p,
         Err(e) =>
         {
-            // SAFETY: child1_ptr is a freshly-allocated SEED-backed body
+            // SAFETY: child1_ptr is a freshly-allocated arena-backed body
             // with refcount 1 and not yet inserted into any CSpace.
             unsafe { dealloc_object(child1_ptr) };
             return Err(e);
@@ -780,7 +782,7 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     // Install both children, rewire the derivation tree, and consume the
     // original — shared with the other range splits.
     // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
-    // children are freshly-allocated SEED-backed InterruptObjects (refcount 1);
+    // children are freshly-allocated arena-backed InterruptObjects (refcount 1);
     // orig_obj_ptr is the live original from lookup_cap.
     let (handle1, handle2) = unsafe {
         install_split_children(
@@ -838,7 +840,6 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
 
     {
         use crate::cap::object::{IoPortObject, dealloc_object};
-        use crate::cap::retype::alloc_in_seed;
         use crate::cap::slot::{CapTag, IoPortRights};
         use crate::cap::split::install_split_children;
         use crate::syscall::current_tcb;
@@ -921,14 +922,20 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         let upper_count: u16 = (end - split_at) as u16;
         let split_at_u16: u16 = split_at as u16;
 
-        let child1_ptr = alloc_in_seed(IoPortObject::new_root(base, lower_count))?;
+        // The caller's CSpace, which receives both children, funds their
+        // bodies from its arena (core/kernel/docs/capability-internals.md
+        // § Body Arena); dealloc returns each chunk there.
+        // SAFETY: caller_cspace is the running thread's own CSpace, live
+        // while the thread runs.
+        let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }?;
+        let child1_ptr = funder.alloc_body(IoPortObject::new_root(base, lower_count))?;
 
-        let child2_ptr = match alloc_in_seed(IoPortObject::new_root(split_at_u16, upper_count))
+        let child2_ptr = match funder.alloc_body(IoPortObject::new_root(split_at_u16, upper_count))
         {
             Ok(p) => p,
             Err(e) =>
             {
-                // SAFETY: child1_ptr is a freshly-allocated SEED-backed body
+                // SAFETY: child1_ptr is a freshly-allocated arena-backed body
                 // with refcount 1 and not yet inserted into any CSpace.
                 unsafe { dealloc_object(child1_ptr) };
                 return Err(e);
@@ -938,7 +945,7 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         // Install both children, rewire the derivation tree, and consume the
         // original — shared with the other range splits.
         // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
-        // children are freshly-allocated SEED-backed IoPortObjects (refcount 1);
+        // children are freshly-allocated arena-backed IoPortObjects (refcount 1);
         // orig_obj_ptr is the live original from lookup_cap.
         let (handle1, handle2) = unsafe {
             install_split_children(

@@ -649,15 +649,12 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
-    use crate::cap::object::{
-        CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, PagePool,
-    };
+    use crate::cap::object::{CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CsRights, MemRights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
     use core::ptr::NonNull;
-    use core::sync::atomic::AtomicU64;
 
     let memory_idx = tf.arg(0) as u32;
     let augment_idx = tf.arg(1) as u32;
@@ -785,13 +782,10 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     unsafe {
         core::ptr::write(
             cs_kobj_ptr,
-            CSpaceKernelObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, memory_obj_nn),
-                cspace: cs_ptr,
-                cspace_growth_budget_bytes: AtomicU64::new(0),
-                cs_pool: PagePool::new(),
-                deferred_next: core::ptr::null_mut(),
-            },
+            CSpaceKernelObject::new(
+                KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, memory_obj_nn),
+                cs_ptr,
+            ),
         );
     }
 
@@ -1432,8 +1426,10 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
     // mappings and port bindings made through the new capability are withdrawn
     // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
-    // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
-    let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
+    // SAFETY: src_object is the object `src` pins, of tag `src_tag`;
+    // `dest_cs_slot` pins the destination CSpace, which funds a fresh object.
+    let new_object =
+        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, dest_cs_ptr) }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (the destination's cspace.lock nested per the documented order).
@@ -1566,8 +1562,10 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
     // mappings and port bindings made through the new capability are withdrawn
     // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
-    // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
-    let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
+    // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
+    // caller's own CSpace receives the new slot and funds a fresh object.
+    let new_object =
+        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, caller_cspace) }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -1692,8 +1690,10 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
     // mappings and port bindings made through the new capability are withdrawn
     // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
-    // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
-    let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
+    // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
+    // caller's own CSpace receives the new slot and funds a fresh object.
+    let new_object =
+        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, caller_cspace) }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was

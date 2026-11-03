@@ -156,20 +156,25 @@ For each matched device, devmgr:
    the order of step 1, with each cap's PCI BAR index as the matching data
    word; round 2 carries the positional slots service endpoint, IRQ, and a
    SEND badged with the device's badge on the private driver endpoint of the
-   class's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
+   driver's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
    word in `data[0]`), and ends the bootstrap. The IRQ slot is absent when the
    device has no private line; virtio-input then polls, and virtio-blk, which
    requires the IRQ, is not spawned. A driver checks the delivered BAR indices
    against the layout it computes from its `QUERY_DEVICE_INFO` reply and exits
    on a mismatch.
-7. Binds a death observer on the driver's thread to the batch's death event
-   queue, with the device badge as the correlator.
-8. Once every device of the class has been through steps 1-7, settles the
-   batch: serves the drivers' `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on
-   the private endpoint and takes their deaths until every driver has
-   reported ready or died, then takes every death still queued, revokes the
-   private endpoint, serves the drivers that reported ready and were not
-   seen to die, and withdraws the rest (see
+7. Binds a death observer on the driver's thread to devmgr's driver death
+   queue, with the device badge as the correlator, and keeps the driver's
+   process handle until its batch settles.
+8. Once every driver of the batch (the boot batch: virtio-blk, serial, and
+   framebuffer; the on-disk batch: the RTC and virtio-input) has been
+   spawned, settles the batch: serves the drivers' `QUERY_DEVICE_INFO` and
+   `DRIVER_READY` calls on the private endpoint and takes their deaths until
+   every driver has reported ready or died or the settle bound elapses, then
+   takes every death still queued, revokes the private endpoint, serves the
+   drivers that reported ready and were not seen to die, at instance
+   ordinals fixed from then on, and withdraws the rest, destroying any still
+   pending. A served driver's later death withdraws it and leaves a
+   tombstone at its ordinal (see
    [responsibilities.md](responsibilities.md#responsibilities)
    § Responsibilities).
 

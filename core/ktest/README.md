@@ -107,7 +107,7 @@ mirroring the kernel's own source layout.
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT` (`SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` and `SYS_SBI_CALL` are under `src/arch/<arch>/`) |
-| `sysinfo.rs` | `SYS_SYSTEM_INFO` |
+| `sysinfo.rs` | `SYS_SYSTEM_INFO`, including each `StackHighWater` class |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
 | `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
@@ -121,7 +121,9 @@ Architecture-only Tier 1 tests live under `src/arch/<arch>/` and run through
 (`0x7FFF_FFFF_F000` at 4-level paging, `0xFF_FFFF_FFFF_F000` at 5-level) with
 `InvalidAddress` and maps the page below it. Each architecture's
 `ioport_syscalls.rs` holds its `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` tests (a bind and a split
-of the initial `IoPort` caps on x86-64, `NotSupported` on RISC-V), and its `sbi_call.rs` its
+of the initial `IoPort` caps on x86-64, and a bind whose thread's `CSpace` is deleted first, which
+returns the binding table with the `CSpace`'s pages and leaves the thread refusing a bind;
+`NotSupported` on RISC-V), and its `sbi_call.rs` its
 `SYS_SBI_CALL` test: the call reaches the SBI firmware on RISC-V and returns `NotSupported` on
 x86-64.
 
@@ -157,7 +159,9 @@ concurrent notification and queue events.
 | `mem_map_retyped_refused.rs` | `mem_map` refuses, with `InvalidArgument`, the pages a Memory cap has retyped into a `CSpace`, and maps the page past its retype cursor ([docs/capability-model.md § Typed Memory](../../docs/capability-model.md#typed-memory)) |
 | `retype_over_mapped_refused.rs` | A retype from a Memory cap whose page some address space maps fails with `OutOfMemory` and leaves the cap's ledger and retype cursor as they were; the refusal follows the frame through a split and a merge, and lifts once the page is unmapped or the address space mapping it is destroyed; a reclaiming span unmap of 17 physically discontiguous pages releases every frame, past the kernel's 16-run release batch ([docs/capability-model.md § Typed Memory](../../docs/capability-model.md#typed-memory)) |
 | `mmio_revoke_unmaps.rs` | Revoking an `Mmio` cap unmaps, with TLB shootdown, the mapping made through its descendant while a reader on another CPU uses it; the reader's next load faults ([docs/capability-model.md § Mmio](../../docs/capability-model.md#mmio)) |
-| `range_copy_lineage.rs` | A range-capability lineage root (an `IoPort` split on x86-64, an `Mmio` split on riscv64) admits exactly 64 live copies, derived from it or from a copy; deleting the root keeps the copies counted, and deleting a copy frees its place ([core/kernel/docs/capability-internals.md § Copies and Lineages](../kernel/docs/capability-internals.md#copies-and-lineages)) |
+| `mmio_spill_withdrawn.rs` | An `Mmio` capability mapped at 12 distinct places of one address space (past its object's 4 inline mapping records, into two chained spill chunks), one of them twice, has every place unmapped when it is deleted ([core/kernel/docs/capability-internals.md § Mmio Mappings](../kernel/docs/capability-internals.md#mmio-mappings)) |
+| `range_copy_lineage.rs` | A range-capability lineage root (an `IoPort` split on x86-64, an `Mmio` split on riscv64) takes 129 live copies, derived from it or from a copy, and deleting the root keeps the lineage usable ([core/kernel/docs/capability-internals.md § Copies and Lineages](../kernel/docs/capability-internals.md#copies-and-lineages)); a copy into a `CSpace` whose pool cannot back both its body and its slot fails with `OutOfMemory` until an augment, and a copy moved out of that `CSpace` outlives it: the dead `CSpace` returns its donations at once but for the arena page holding the copy's body, which returns when the copy is deleted ([§ Body Arena](../kernel/docs/capability-internals.md#body-arena)) |
+| `arena_reclaim.rs` | A `CSpace` whose own pool donation holds a Memory tail its arena funded (the tail split by a thread bound to it, then donated to it), and a pair of `CSpace`s funding each other's donated tails, are reclaimed when they die: every donation comes back while the tails live, and every page, the kept arena pages included, is back in the Memory capability once the tails go; a `CSpace` with free slots but a spent growth budget refuses an `Mmio` copy with `OutOfMemory` until the top-up `syscall_abi::cspace_topup_pages` computes; a donation recorded on a record page, with at least two kept arena pages holding bodies moved out of the dead `CSpace`, comes back cut around them and is whole once they go, as does, on x86-64, a donation two of whose kept pages were carved from a freed port-binding table's pages ([core/kernel/docs/capability-internals.md § Body Arena](../kernel/docs/capability-internals.md#body-arena)) |
 | `irq_shared_line.rs` | Two derivations of the UART's interrupt line (the stand-in device: setting its transmit-empty interrupt enable raises the line), bound to two notifications, are each signalled by one raise; the line stays masked until both acknowledge, an acknowledgement through an unbound derivation changes nothing, deleting an owing derivation unmasks the line for the other, and a rebind keeps one binding; the line holds 64 bindings and refuses a 65th with `QuotaExceeded`, and deleting the one notification all 64 name removes every binding: none having acknowledged, a binding left would keep the line masked, yet once a fresh copy binds and acknowledges, a raise signals it, and the 64 caps bind again ([core/kernel/docs/syscalls.md § `SYS_IRQ_REGISTER`](../kernel/docs/syscalls.md#sys_irq_register-30)) |
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
@@ -328,6 +332,7 @@ wait), where a lost wake is the defect the watchdog reports.
 | `split_delete_race.rs` | A same-CSpace sibling deletes the original while this thread splits it across three reparent batches; the split's result classifies each cycle and the slot count returns to baseline | `CYCLES=40`, `CHILDREN=600` |
 | `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn (≥ 2 CPUs) | `CYCLES=100` |
 | `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence | `NUM_PRODUCERS=4`, `MESSAGES_PER_PRODUCER=64` |
+| `stack_depth.rs` | Runs last in Tier S: reads `SYS_SYSTEM_INFO(StackHighWater)` for the idle stacks, the thread kernel stacks, and the handoff stack and logs each depth beside its stack size; a report, failing only on an overflow: a class reading full, or the handoff stack's base mark gone | none |
 
 ### Tier 3 — `src/bench/`
 

@@ -213,9 +213,10 @@ mappings are unmapped when that syscall releases it. A page the address space ha
 remapped to other memory is left alone. The revoked capability itself is preserved (see
 [Revocation](#revocation)), so mappings made through it remain. Each recorded mapping holds
 a reference on its address space, so an address space an Mmio capability's object has mapped
-into outlives its own last capability until that Mmio object is freed. A range's copies are
-bounded: at most 64 copies of one boot-minted or split capability's range are live at once,
-and a further copy returns `QuotaExceeded`.
+into outlives its own last capability until that Mmio object is freed. A copy's object is
+funded by the `CSpace` that receives it, so a range's copies are bounded only by the memory their
+holders donate (and the lineage count's encoding, 2^31 - 1 live copies, past which a copy returns
+`QuotaExceeded`).
 
 Any holder of an ancestor capability, in any process, can withdraw a mapping this way, so
 the soundness obligation sits on the mapper: the userspace `mmio_map` wrapper is `unsafe`, and
@@ -264,7 +265,7 @@ port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed
 `devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
 
 Every IoPort capability references an object of its own, as for [Mmio](#mmio): a copy or
-derivation references a fresh object over the same range, bounded the same way. Each thread
+derivation references a fresh object over the same range, funded the same way. Each thread
 records its bindings against the objects they were made through. When an IoPort capability
 goes — deleted, consumed by a split, or revoked through an ancestor — the kernel withdraws
 every binding made through it from every bound thread, rebuilding each thread's I/O
@@ -613,9 +614,13 @@ Every kernel object's backing storage is accounted to a specific Memory
 capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
 against Memory caps it holds with `Retype` rights. The exceptions are
-the objects the kernel carves from its own SEED reserve on a process's
-behalf: range-split children, Mmio, IoPort, and Interrupt copies (bounded per range
-lineage, see [Mmio](#mmio)), and per-thread port-binding tables.
+the objects a syscall creates with no Memory cap to name: range-split
+children, Mmio, IoPort, and Interrupt copies, spilled Mmio mapping records,
+and per-thread port-binding tables. The `CSpace` the call inserts into or
+resolves through, or a bound thread's own `CSpace` for its port-binding
+table, funds them from the pages donated to it, as it funds its slots (see
+[Address-space and CSpace growth budgets](#address-space-and-cspace-growth-budgets)).
+The kernel's own SEED reserve backs only the objects the boot mints.
 
 Kernel objects and user mappings never share a page, in either order. A Memory capability
 cannot map bytes it has retyped into kernel objects: retype carves a cap's region upward from its
@@ -675,6 +680,19 @@ of bookkeeping a donation seeds one page fewer than it carried; the
 budget reported by `SYS_CAP_INFO` is authoritative. See
 [capability-internals.md](../core/kernel/docs/capability-internals.md)
 § Page Pools.
+
+A `CSpace`'s budget also funds the kernel objects a syscall inserting into
+or resolving through it creates without a Memory cap (split children,
+range-capability copies, spilled mapping records, and the port-binding
+tables of its threads), so such a call returns the refillable `OutOfMemory`
+when the budget is spent; a funder therefore keeps a page of budget beyond
+the slots it funds. A split child or copy can outlive the `CSpace` when its
+capability moves elsewhere: a dead `CSpace` returns its donations at once
+but for the pages such bodies sit on, each of which stays held to its
+Memory cap until its last body goes, the analogue of a retyped object
+pinning its Memory cap (see
+[capability-internals.md](../core/kernel/docs/capability-internals.md)
+§ Body Arena).
 
 A `CSpace` has two independent growth bounds, distinguishable by error
 code at the failure site:

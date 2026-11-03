@@ -182,9 +182,11 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
 - **`cspace_slot_headroom`** returns `CAP_INFO_CSPACE_CAPACITY` less `CAP_INFO_CSPACE_USED`
   and the reserve.
 - **`fund_cspace_slot_budget`** requests a memmgr-backed Memory cap through the object slab
-  when the headroom falls short of `n`, and donates it with augment-mode `cap_create_cspace`:
-  one page per `CSPACE_SLOTS_PER_PAGE` missing slots, plus one. It returns `false` if the
-  headroom still falls short after the funding rounds.
+  when the headroom falls short of `n` plus a page's slots, or the growth budget
+  (`CAP_INFO_CSPACE_BUDGET`) below a page, and donates it with augment-mode `cap_create_cspace`,
+  sized by `syscall_abi::cspace_topup_pages`. The page beyond `n` is for the `CSpace`'s body
+  arena, which a split or a range-capability copy draws on. It returns `false` if either still
+  falls short after the funding rounds.
 
 A process calls it before a known burst of capability acquisitions; fatfs funds its page cache
 this way. A long-lived service calls it when the headroom drops below a low-water mark, as

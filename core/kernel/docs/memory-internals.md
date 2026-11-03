@@ -117,13 +117,14 @@ allocator returns, its header records the source, and the bytes go back to that 
 the object's reference count reaches zero, whether a capability (deleted, or removed by a
 revoke) or a kernel-internal owner releases the last reference (see
 [capability-internals.md](capability-internals.md) § Kernel Object Reference Counting). The
-kernel's own objects are retyped from the SEED reserve, pinned at the Phase 7 handoff from
+objects the boot mints are retyped from the SEED reserve, pinned at the Phase 7 handoff from
 the front of the largest extent drained from the buddy allocator
-([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies of
+([initialization.md](initialization.md) § Phase 7: Capability System). The bodies of
 split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
-split children), the bodies of Mmio, IoPort, and Interrupt copies and derivations
-([capability-internals.md](capability-internals.md) § Copies and Lineages), and per-thread
-port-binding tables (the IOPB and its binding records) are also carved from SEED at runtime;
+split children), of Mmio, IoPort, and Interrupt copies and derivations, and the spilled mapping
+records of Mmio objects are placed in the body arena of the `CSpace` the call inserts into or
+resolves through, and per-thread port-binding tables in pages of the bound thread's `CSpace`, each
+funded from that `CSpace`'s pool ([capability-internals.md](capability-internals.md) § Body Arena);
 every other userspace object comes from the capability a `cap_create_*` syscall names.
 Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
@@ -131,23 +132,20 @@ Address spaces and CSpaces additionally own a page pool for their page tables an
 The retype allocator (`core/kernel/src/cap/retype.rs`) rounds each request to a size class: two
 sub-page classes of 128 and 512 bytes, or a page multiple. A sub-page request is placed from its
 class's free list, else at the bump cursor, else, once the bump cursor cannot fit the request, in
-one page taken from the page free list and cut into that class's slots. A page-multiple request
-is placed from the page free list, else at the bump cursor. The page free list is kept in
-ascending address order, a freed block merging with the free blocks on either side, so it holds
-one node per run of free pages and a first-fit walk visits at most `size / PAGE_SIZE` nodes; a
-node that starts below its predecessor's end, or lies outside the object, is corruption, which the
-walk reports once per boot and stops at. The carve keeps freed page blocks
-usable by sub-page requests, which SEED depends on: init's bootstrap objects return to it as page
-blocks at init's reap, and its runtime bodies are sub-page apart from x86_64's per-thread
-port-binding tables. Free bytes held in the other sub-page class, or in sub-page slots for a
-page-multiple request, are not placeable, so a request can still fail while the object's
-`available_bytes` counts enough bytes. A carve is permanent while the object holds a live
-retype (only the drain reset, when every retyped byte is freed, undoes it, and SEED never drains,
-as it is pinned), so on SEED the carve trades page blocks for sub-page capacity: sustained
-sub-page demand can leave too few contiguous pages for a port-binding table, and
-`sys_ioport_bind` then returns `OutOfMemory`. A carve happens only once the bump cursor cannot
-serve the class, so the bump frontier is by then spent and the class's free list empty: without
-the carve, the sub-page request fails instead.
+one page taken from the page free list and cut into that class's slots. A page-multiple request is
+placed from the page free list, else at the bump cursor. The page free list is kept in ascending
+address order, a freed block merging with the free blocks on either side, so it holds one node per
+run of free pages and a first-fit walk visits at most `size / PAGE_SIZE` nodes; a node that starts
+below its predecessor's end, or lies outside the object, is corruption, which the walk reports once
+per boot and stops at. The carve keeps freed page blocks usable by sub-page requests (SEED's, for
+one, become page blocks when init's bootstrap objects return to it at init's reap). Free bytes held
+in the other sub-page class, or in sub-page slots for a page-multiple request, are not placeable, so
+a request can still fail while the object's `available_bytes` counts enough bytes. A carve is
+permanent while the object holds a live retype (only the drain reset, when every retyped byte is
+freed, undoes it, and SEED never drains, as it is pinned), so the carve trades page blocks for
+sub-page capacity. A carve happens only once the bump cursor cannot serve the class, so the bump
+frontier is by then spent and the class's free list empty: without the carve, the sub-page request
+fails instead.
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail
@@ -508,6 +506,40 @@ exist:
   reference count reaches zero (see [capability-internals.md](capability-internals.md)
   § Kernel Object Reference Counting).
 
+### Kernel Stack Depth
+
+Every idle, thread, and handoff stack is filled with `STACK_PAINT` (`boot_protocol::layout`)
+when it is allocated, so its deepest use is the span from its top down to its lowest word
+that no longer holds the paint (`stack_depth.rs`). `SYS_SYSTEM_INFO(StackHighWater)` reports the
+span per class ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
+
+- Idle stacks: painted in Phase 4 as each is drawn from the buddy, and sampled across
+  every CPU at the query, one CPU at a time with interrupts enabled and preemption
+  disabled. The owning CPU may be running on the stack, so each word is read with the
+  arch's opaque racy load (`load_word_racy`); the result is a depth the stack reached
+  during the scan.
+- Thread stacks: painted when `SYS_CAP_CREATE_THREAD` carves the slab, a full overwrite
+  of the stack pages (and for init's thread when boot code carves it), and scanned when
+  the thread's slab is freed; the query also scans the caller's own stack. A live
+  thread's stack other than the caller's is not counted until it is freed.
+- The handoff stack: painted by the bootloader, which marks its lowest word with
+  `HANDOFF_STACK_BASE_MARK` ([boot-flow.md](../../boot/docs/boot-flow.md) § Step 6). The
+  kernel records its stack pointer at `kernel_entry`'s first statement, rounds it up to
+  a page boundary for the stack's top (the reference bootloader's top is page-aligned and
+  `kernel_entry`'s frame is smaller than a page), confirms the bottom by the mark, and
+  scans the stack in `sched::enter`, after the BSP's deepest remaining call on it and just
+  before it leaves for init's kernel stack (the shallow entry frames below are not counted).
+  The class reads as unlocated when the mark is absent, which an overflow of the stack, or a
+  bootloader that does not mark it, causes; the error the selector then returns is in
+  [syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`.
+
+The x86-64 interrupt stacks (the IST stacks for the NMI, double-fault and machine-check
+paths) are not painted and this report does not measure them; their budget rests on the
+static audit stated at `IST_STACK_SIZE` ([limits.md](../../../docs/limits.md)).
+
+The ktest cell `stress::stack_depth` reports the three classes after Tier S. The bounds
+it measured are stated at `KERNEL_STACK_PAGES` (`sched/mod.rs`) and `HANDOFF_STACK_BYTES`.
+
 ---
 
 ## Page Table Node Ownership
@@ -553,6 +585,8 @@ donation-record mechanism.
 
 ## Summarized By
 
+[Boot Flow](../../boot/docs/boot-flow.md),
+[Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
 [Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),

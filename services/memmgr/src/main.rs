@@ -1494,7 +1494,8 @@ fn cspace_headroom(self_cspace: u32) -> u64
         .saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
 }
 
-/// Keep memmgr's `CSpace` above [`CSPACE_LOW_WATER`] general slots by
+/// Keep memmgr's `CSpace` above [`CSPACE_LOW_WATER`] general slots, with a
+/// page of growth budget beyond them for its body arena, by
 /// donating pool frames to its slot-page pool (augment-mode
 /// `cap_create_cspace`), so its own splits and derivations never meet an
 /// exhausted `CSpace` and its receives keep the IPC receive reserve
@@ -1506,7 +1507,11 @@ fn cspace_headroom(self_cspace: u32) -> u64
 /// before the next receive; a refused augment returns the frame to the pool.
 fn hold_cspace_headroom(self_cspace: u32)
 {
-    if cspace_headroom(self_cspace) >= CSPACE_LOW_WATER
+    // Every grant's split takes a body from the arena as well as a slot, and
+    // the arena draws whole pages from the same growth budget, so a page of it
+    // is held beyond the slots (`syscall_abi::cspace_topup_pages`).
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    if syscall_abi::cspace_topup_pages(cspace_headroom(self_cspace), budget, CSPACE_LOW_WATER) == 0
     {
         return;
     }

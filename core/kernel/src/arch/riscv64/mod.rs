@@ -57,9 +57,10 @@ pub const HAS_SBI: bool = true;
 /// teardown of a cap naming one leaves the routing table and the PLIC untouched.
 pub const ROOT_IRQ_COUNT: u32 = 1024;
 
-/// Size of the I/O Permission Bitmap (re-exported from gdt for use in
-/// architecture-independent code such as `ThreadControlBlock`).
-pub use gdt::IOPB_SIZE;
+/// A thread's I/O permission bitmap and its page-sized parts (re-exported from
+/// gdt for architecture-independent code: `ThreadControlBlock` and the
+/// port-binding table).
+pub use gdt::{IOPB_PART_BYTES, IOPB_PARTS, ThreadIopb};
 
 /// Forward a sanctioned SBI call to M-mode firmware, mapping any SBI error to a
 /// generic failure. Cap-rights enforcement happens in the neutral

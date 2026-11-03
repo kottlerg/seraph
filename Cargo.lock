@@ -1128,6 +1128,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-fault"
+version = "0.1.1"
+dependencies = [
+ "ipc",
+ "syscall",
+]
+
+[[package]]
 name = "test-orphan"
 version = "0.1.1"
 dependencies = [

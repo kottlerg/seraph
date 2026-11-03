@@ -889,18 +889,26 @@ pub fn cspace_slot_headroom(self_cspace: u32) -> u64 {
 }
 
 /// Fund `self_cspace`'s slot-page pool so at least `slots` general
-/// capability allocations succeed without further growth.
+/// capability allocations succeed without further growth, with one page of
+/// growth budget left beyond them for the `CSpace`'s body arena.
 ///
 /// A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free slots for IPC
 /// capability transfer, so general allocations (`cap_create_*`, `cap_copy`,
-/// `cap_derive`, splits, received grants that a handler then derives from)
-/// fail with `OutOfMemory` first. This helper measures the headroom above
-/// that reserve and, when it is short, requests Memory from memmgr and
-/// donates it to the pool via augment-mode `cap_create_cspace`. Call it
-/// before a known burst of cap acquisitions (a cache filling its slots) or
-/// periodically to hold headroom above a low-water mark.
+/// `cap_derive`, splits, received grants that a handler then derives from) fail
+/// with `OutOfMemory` first. A split, an `Mmio`, `IoPort`, or `Interrupt` copy,
+/// and an `Mmio` mapping past its object's inline records also take a body from
+/// the `CSpace`'s arena, which draws whole pages from the same growth budget.
+/// This helper measures the headroom above the reserve and the budget and, when
+/// either is short (`syscall_abi::cspace_topup_pages`), requests Memory from
+/// memmgr and donates it to the pool via augment-mode `cap_create_cspace`.
 ///
-/// `slots == 0` is a no-op success. Returns `false` if memmgr is
+/// After a success, `slots` general allocations succeed and the arena can still
+/// take one more page, 31 bodies; a burst of `n` splits needs `slots` of at
+/// least `n` plus 56 for each 31 bodies past those. Call it before a known
+/// burst of cap acquisitions (a cache filling its slots) or periodically to
+/// hold headroom above a low-water mark.
+///
+/// `slots == 0` still keeps the arena's page. Returns `false` if memmgr is
 /// unreachable, the request/augment fails, or the headroom still falls
 /// short after the funding rounds.
 #[stable(feature = "seraph_ext", since = "1.0.0")]

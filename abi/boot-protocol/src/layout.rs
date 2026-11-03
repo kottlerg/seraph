@@ -51,7 +51,30 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// The kernel's boot phases run on it until `kernel_entry` rebases it into the
 /// direct map, and the kernel's Phase 3 identity window over the stack is
 /// derived from it; the bootloader allocates exactly this many bytes.
+///
+/// Measured bound (the kernel's paint report, ktest `stress::stack_depth`): the
+/// kernel's boot phases use at most 9008 B of it, a margin of about 86%, over
+/// debug and release builds at 4, 16 and 128 CPUs on both architectures
+/// (debug 9008 B, release 7240 B). The report gives the depth, not the path
+/// that reached it.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
+
+/// Word every idle, thread, and handoff stack is filled with when it is allocated, so the
+/// deepest use of a stack is the lowest word that no longer holds it. The
+/// bootloader paints the handoff stack with it, and the kernel paints its
+/// idle and thread stacks (core/kernel/docs/memory-internals.md § Kernel
+/// Stack Depth). A diagnostic convention, not a layout field.
+pub const STACK_PAINT: u64 = 0x5EAF_57AC_5EAF_57AC;
+
+/// Word the bootloader writes at the lowest address of the handoff stack,
+/// below the painted words, so the kernel can confirm where the stack it
+/// derived from its entry stack pointer begins. An overflow of the stack
+/// overwrites it.
+pub const HANDOFF_STACK_BASE_MARK: u64 = 0xBA5E_0F57_ACC0_FFEE;
+
+// The paint must differ from zero (a zero-filled stack would read untouched)
+// and from the mark (the mark would read as paint).
+const _: () = assert!(STACK_PAINT != 0 && STACK_PAINT != HANDOFF_STACK_BASE_MARK);
 
 /// Choose a 2 MiB-aligned KASLR image slide from a raw entropy word.
 ///

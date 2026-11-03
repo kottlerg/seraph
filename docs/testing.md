@@ -98,7 +98,8 @@ sysroot/
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # and the test-only test-orphan)
+│   │                         # and the test-only test-orphan and
+│   │                         # test-fault)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn
@@ -121,11 +122,12 @@ sysroot/
 testers; those live under `/tests/`. Dropping `/tests/` does not by itself
 give a non-test distro, because test-only artifacts also install under
 `/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, and `/data/`.
-Under `/services/drivers/` is
-[`test-orphan`](../services/drivers/test-orphan/README.md), a test-only
-fault-injection driver installed there until the devmgr enumeration
+Under `/services/drivers/` are
+[`test-orphan`](../services/drivers/test-orphan/README.md) and
+[`test-fault`](../services/drivers/test-fault/README.md), test-only
+fault-injection drivers installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
-it. Under `/programs/` are the test fixtures the harnesses and per-program
+them. Under `/programs/` are the test fixtures the harnesses and per-program
 testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
 `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which
 consumer spawns or drives each one is owned by
@@ -492,19 +494,19 @@ report below (`--save-logs`).
 
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 16-hart
-# run, at 1x, takes ~95 s; the 128-hart run ~580 s at 8x hart
+# run, at 1x, takes ~80 s; the 128-hart run ~530 s at 8x hart
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
 cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 300 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1620 \
     --save-logs $T
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
-# run, at 1x, takes ~58 s; the 128-vCPU run, at 8x vCPU oversubscription,
-# ~75 s, since idle vCPUs halt; each budget is for HANG classification, see
+# run, at 1x, takes ~60 s; the 128-vCPU run, at 8x vCPU oversubscription,
+# ~78 s, since idle vCPUs halt; each budget is for HANG classification, see
 # below):
 cargo xtask clean
 cargo xtask build

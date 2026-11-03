@@ -25,8 +25,19 @@
 //! recovery is the observable that distinguishes #176's `DESTROY_PROCESS`
 //! teardown from a leak: a hung child is never reaped by procmgr's exit
 //! path, so without teardown its pages stay pinned and `free` never
-//! recovers. TODO(#165): retire the teardown phase and the test-label deny
-//! phase with the devmgr enumeration redesign and its shim.
+//! recovers.
+//!
+//! The withdrawal phase drives devmgr's `TEST_SPAWN_FAULT_DRIVERS` shim: one
+//! settle batch of three `test-fault` fixtures, two that report ready and one
+//! that never does. It asserts the settle ends at the batch's bound with the
+//! two ready fixtures served at ordinals 0 and 1 and the hung one not served,
+//! then makes the fixture at ordinal 0 exit with a call queued on its
+//! endpoint, and asserts that the queued call returns, that ordinal 0 then
+//! replies `WITHDRAWN`, that ordinal 1 still names its live fixture, and,
+//! once every fixture is gone, that memmgr's free pool recovers the memory
+//! the hung fixture held, which only its destruction returns.
+//! TODO(#165): retire the teardown, withdrawal, and test-label deny phases
+//! with the devmgr enumeration redesign and its shims.
 
 use std::os::seraph::startup_info;
 use std::time::Duration;
@@ -53,6 +64,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_orphan_teardown",
             run: orphan_teardown_phase,
+        },
+        Phase {
+            name: "devmgr_driver_withdrawal",
+            run: driver_withdrawal_phase,
         },
         Phase {
             name: "devmgr_test_label_deny",
@@ -297,10 +312,157 @@ fn orphan_teardown_phase(caps: &Caps)
     );
 }
 
+/// `TEST_QUERY_FAULT_DEVICE` at `ordinal` on `devmgr.test`.
+fn query_fault(devmgr: u32, ordinal: u64) -> ipc::IpcMessage
+{
+    let req = ipc::IpcMessage::builder(ipc::devmgr_labels::TEST_QUERY_FAULT_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .word(1, ordinal)
+        .build();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    unsafe { ipc::ipc_call(devmgr, &req, ipc_buf) }
+        .unwrap_or_else(|_| panic!("TEST_QUERY_FAULT_DEVICE ordinal {ordinal} ipc_call failed"))
+}
+
+/// The SEND a `SUCCESS` reply to `TEST_QUERY_FAULT_DEVICE` carries.
+fn fault_cap(reply: &ipc::IpcMessage, what: &str) -> u32
+{
+    assert_eq!(reply.label, ipc::devmgr_errors::SUCCESS, "{what}: status");
+    let cap = reply.caps().first().copied().unwrap_or(0);
+    assert!(cap != 0, "{what}: SUCCESS carried no cap");
+    cap
+}
+
+/// Call a fault fixture with `label` and no data.
+fn call_fixture(cap: u32, label: u64) -> Result<ipc::IpcMessage, i64>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    unsafe { ipc::ipc_call(cap, &ipc::IpcMessage::new(label), ipc_buf) }
+}
+
+/// devmgr's settle ends at its bound and withdraws a driver that never
+/// reports ready; a served driver's death withdraws its endpoint (a call
+/// queued on it returns) and leaves a tombstone at its ordinal while the
+/// later ordinal keeps its driver.
+fn driver_withdrawal_phase(caps: &Caps)
+{
+    use ipc::test_fault_labels::{FAULT_EXIT, FAULT_PING};
+
+    // A test wait bound: it limits only how long the phase polls for the
+    // fixtures' pages to return before it fails.
+    const RECLAIM_POLLS: u32 = 300;
+
+    let devmgr = caps.devmgr_test;
+    assert!(devmgr != 0, "devmgr_withdrawal: no devmgr.test cap seeded");
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let memmgr = startup_info().memmgr_endpoint;
+    let free_before = free_bytes(memmgr, ipc_buf);
+
+    let start = std::time::Instant::now();
+    let trigger = versioned(ipc::devmgr_labels::TEST_SPAWN_FAULT_DRIVERS);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let ack = unsafe { ipc::ipc_call(devmgr, &trigger, ipc_buf) }
+        .expect("TEST_SPAWN_FAULT_DRIVERS ipc_call failed");
+    assert_eq!(
+        ack.label,
+        ipc::devmgr_errors::SUCCESS,
+        "TEST_SPAWN_FAULT_DRIVERS ack"
+    );
+
+    // Served once devmgr returns to its registry loop, after the batch's
+    // settle: the never-ready fixture holds it until the bound.
+    let first = fault_cap(&query_fault(devmgr, 0), "fault ordinal 0");
+    let settle = start.elapsed();
+    let bound = Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
+    assert!(
+        settle >= bound,
+        "devmgr_withdrawal: the settle ended after {settle:?}, before its bound {bound:?}, \
+         with a fixture that never reports ready"
+    );
+    let second = fault_cap(&query_fault(devmgr, 1), "fault ordinal 1");
+    assert_eq!(
+        query_fault(devmgr, 2).label,
+        ipc::devmgr_errors::NO_DEVICE,
+        "the never-ready fixture must not be served"
+    );
+
+    // The fixture at ordinal 0 replies, then dies without receiving again, so
+    // the PING sent after the reply is queued on its endpoint until devmgr
+    // withdraws it.
+    let exit = call_fixture(first, FAULT_EXIT).expect("FAULT_EXIT call failed");
+    assert_eq!(exit.label, ipc::devmgr_errors::SUCCESS, "FAULT_EXIT reply");
+    assert!(
+        call_fixture(first, FAULT_PING).is_err(),
+        "a call queued on a dead served driver's endpoint must return an error"
+    );
+    assert_eq!(
+        query_fault(devmgr, 0).label,
+        ipc::devmgr_errors::WITHDRAWN,
+        "the dead fixture's ordinal must reply WITHDRAWN"
+    );
+
+    // The ordinal after the tombstone keeps its live fixture.
+    let again = fault_cap(
+        &query_fault(devmgr, 1),
+        "fault ordinal 1 after the withdrawal",
+    );
+    let ping = call_fixture(again, FAULT_PING).expect("FAULT_PING on ordinal 1 failed");
+    assert_eq!(ping.label, ipc::devmgr_errors::SUCCESS, "FAULT_PING reply");
+
+    // Retire the last fixture; its own withdrawal is not observed here.
+    let _ = call_fixture(second, FAULT_EXIT);
+    for cap in [first, second, again]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+
+    // With every fixture gone, memmgr's free pool returns to its baseline
+    // only if devmgr destroyed the never-ready fixture, which holds
+    // NEVER_READY_RESERVE_BYTES until it is destroyed; the two ready
+    // fixtures exited and are reaped. Half the reservation absorbs the
+    // pool's incidental movement (the fixture ELF's file-cache warming
+    // included).
+    let margin = (ipc::test_fault_labels::NEVER_READY_RESERVE_BYTES / 2) as u64;
+    let mut free_after = free_bytes(memmgr, ipc_buf);
+    for _ in 0..RECLAIM_POLLS
+    {
+        if free_after + margin >= free_before
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        free_after = free_bytes(memmgr, ipc_buf);
+    }
+    assert!(
+        free_after + margin >= free_before,
+        "devmgr_withdrawal: the never-ready fixture's pages did not return \
+         (free_before={free_before} free_after={free_after}); it was not destroyed"
+    );
+
+    std::os::seraph::log!(
+        "devmgr_driver_withdrawal passed: settle ended at its bound after {settle:?}, \
+         never-ready fixture destroyed, dead driver withdrawn, later ordinal kept"
+    );
+}
+
 /// The test labels on `devmgr.registry` (no `TEST_LABEL_AUTHORITY`) reply
 /// `UNAUTHORIZED`.
 fn test_label_deny_phase(caps: &Caps)
 {
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_SPAWN_FAULT_DRIVERS,
+        "TEST_SPAWN_FAULT_DRIVERS",
+        "TEST_LABEL_AUTHORITY",
+    );
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_QUERY_FAULT_DEVICE,
+        "TEST_QUERY_FAULT_DEVICE",
+        "TEST_LABEL_AUTHORITY",
+    );
     assert_registry_denies(
         caps,
         ipc::devmgr_labels::TEST_SPAWN_ORPHAN,

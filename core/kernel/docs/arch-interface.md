@@ -547,8 +547,15 @@ CS-keyed stubs do not depend on it. `FSGSBASE` is classified unsupported in
 pub fn current_cpu() -> u32;
 
 /// Read the current stack pointer (`rsp` / `sp`). Used by the panic-path
-/// backtrace scanner to bound the kernel-stack walk.
+/// backtrace scanner to bound the kernel-stack walk, and at `kernel_entry`'s
+/// first statement to locate the handoff stack (`stack_depth`).
 pub fn current_stack_pointer() -> u64;
+
+/// Load one aligned word another CPU may be writing, as an opaque machine
+/// load (`mov` / `ld`). Used by the idle-stack depth sample
+/// (`stack_depth`), where a Rust read racing a plain store would be undefined
+/// behaviour.
+pub unsafe fn load_word_racy(p: *const u64) -> u64;
 
 /// Verify the platform hardware baseline and refuse unsupported hardware with a
 /// clear diagnostic. Run once in early boot after the console is live. x86-64
@@ -766,9 +773,12 @@ pub const HAS_IO_PORTS: bool;
 /// true on RISC-V.
 pub const HAS_SBI: bool;
 
-/// Size in bytes of the per-thread I/O Permission Bitmap (8192 on x86-64; 0 on
-/// RISC-V). Sizes the `iopb` field in `ThreadControlBlock` uniformly.
-pub const IOPB_SIZE: usize;
+/// A thread's I/O Permission Bitmap as `IOPB_PARTS` page-sized parts
+/// (`IOPB_PART_BYTES` each) in separately allocated pages: two on x86-64, none on
+/// RISC-V. Types the `iopb` field in `ThreadControlBlock` uniformly.
+pub struct ThreadIopb { pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS] }
+pub const IOPB_PART_BYTES: usize;
+pub const IOPB_PARTS: usize;
 
 /// Forward a sanctioned SBI call to firmware, mapping SBI errors to `Err(())`
 /// (and always `Err(())` on x86-64, which has no SBI).
@@ -785,7 +795,7 @@ The `SYS_SBI_CALL` handler's rights check and `HAS_SBI` gate are specified in
 
 These items in otherwise arch-private submodules are also contract surface, because
 architecture-neutral code calls them:
-`gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, init_ap, bsp_tss_ptr, IOPB_SIZE}`,
+`gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, init_ap, bsp_tss_ptr}`,
 `platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions,
 MMIO_DIRECT_MAP_REGIONS}`,
 `fpu::{switch_out_save, switch_in_restore}`, `idt::load`, and
@@ -793,10 +803,12 @@ MMIO_DIRECT_MAP_REGIONS}`,
 of those modules is arch-private:
 
 ```rust
-/// Load a thread's IOPB into the TSS, or clear it (x86-64); no-op on RISC-V.
-pub unsafe fn gdt::load_iopb(iopb: Option<&[u8; IOPB_SIZE]>);
-/// Permit an I/O port range in a thread's IOPB (x86-64); no-op on RISC-V.
-pub fn gdt::permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32);
+/// Load a thread's IOPB into the TSS, part by part, or clear it (x86-64); no-op on
+/// RISC-V.
+pub unsafe fn gdt::load_iopb(iopb: Option<&ThreadIopb>);
+/// Permit the ports of a range that one part of a thread's IOPB covers, the part's
+/// first bit being port `first_port` (x86-64); no-op on RISC-V.
+pub fn gdt::permit_port_range(part: &mut [u8], first_port: u32, base: u32, count: u32);
 /// Make every CPU reload its TSS IOPB before its next ring-3 port access, after a
 /// thread's bitmap changed while it may be running on another CPU (an IoPort
 /// binding withdrawn, or a bind of a thread other than the caller) (x86-64);
@@ -806,9 +818,6 @@ pub fn gdt::invalidate_all_iopbs();
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);
 /// Virtual address of the BSP's static TSS (x86-64); 0 on RISC-V.
 pub fn gdt::bsp_tss_ptr() -> u64;
-/// Per-thread I/O Permission Bitmap size, which the module-level `IOPB_SIZE`
-/// re-exports (8192 on x86-64; 0 on RISC-V).
-pub const gdt::IOPB_SIZE: usize;
 
 /// Install the exception vector on the current AP: x86-64 `lidt` of the shared
 /// IDT the BSP populated; RISC-V reinstalls `stvec`.

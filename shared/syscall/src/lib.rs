@@ -871,9 +871,10 @@ pub unsafe fn mem_protect(
 /// parent has derivation children), `InvalidCapability` (also a parent a
 /// concurrent delete freed before the tail was linked), `InvalidState` (a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
-/// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (tail
-/// allocation or `CSpace` slot pool exhausted), or `QuotaExceeded` (`CSpace`
-/// directory structurally full).
+/// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's
+/// `CSpace` pool cannot back the tail's slot or its body, which comes from
+/// the pool's body arena; `syscall_abi::cspace_topup_pages`), or
+/// `QuotaExceeded` (`CSpace` directory structurally full).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: returned value is a cap handle — a 24-bit slot index plus an
 // 8-bit generation — so it fits u32.
@@ -954,8 +955,9 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: each returned handle is 32 bits (a 24-bit slot index
 // plus an 8-bit generation).
@@ -996,8 +998,9 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1053,8 +1056,9 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1100,8 +1104,9 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1255,19 +1260,21 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///
 /// Returns the new capability's handle in the destination `CSpace` (slot
 /// index and generation, per docs/capability-model.md § Capability Handle
-/// Format). The copy of an `Mmio` or `IoPort` capability references a fresh
-/// object over the same range, so mappings and port bindings made through it
-/// are withdrawn when it goes (docs/capability-model.md § Mmio).
+/// Format). The copy of an `Mmio`, `IoPort`, or `Interrupt` capability
+/// references a fresh object over the same range, so mappings, port bindings,
+/// and the interrupt binding made through it are withdrawn when it goes
+/// (docs/capability-model.md § Interrupt, § Mmio, § `IoPort`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
-/// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio` or
-/// `IoPort` source, `QuotaExceeded` also means its range already has 64 live
-/// copies, and `OutOfMemory` that the kernel's SEED reserve cannot back the
-/// fresh object; for any other source, `QuotaExceeded` also means the object's
-/// reference count is at its 2^31 ceiling. `InvalidCapability`
+/// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio`,
+/// `IoPort`, or `Interrupt` source, `QuotaExceeded` also means its range
+/// already has 2^31 - 1 live copies, and `OutOfMemory` that the destination
+/// `CSpace`'s pool cannot back the fresh object; for any other source,
+/// `QuotaExceeded` also means the object's reference count is at its 2^31
+/// ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
 /// capability transfer is in flight on the source.
@@ -1296,20 +1303,22 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// Attenuate a capability within the caller's own `CSpace` (`SYS_CAP_DERIVE`).
 ///
 /// Creates a new slot in the caller's `CSpace` with `rights_mask & src_rights`.
-/// The new slot is a derivation child of the source; for an `Mmio` or `IoPort`
-/// source it references a fresh object over the same range, as for
-/// [`cap_copy`].
+/// The new slot is a derivation child of the source; for an `Mmio`, `IoPort`,
+/// or `Interrupt` source it references a fresh object over the same range, as
+/// for [`cap_copy`].
 ///
 /// Returns the new capability handle (slot index plus generation).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
-/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling), or, as for [`cap_copy`], `QuotaExceeded` past 64 live
-/// copies of an `Mmio` or `IoPort` source's range or at any other source
-/// object's 2^31 reference-count ceiling, and `OutOfMemory` when SEED cannot
-/// back an `Mmio` or `IoPort` object. `InvalidCapability` also covers a source a concurrent
-/// delete, move, or revoke freed before the new slot was linked;
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`;
+/// `QuotaExceeded` at the structural ceiling), or, as for [`cap_copy`],
+/// `QuotaExceeded` past 2^31 - 1 live copies of an `Mmio`, `IoPort`, or
+/// `Interrupt` source's range or at any other source object's 2^31
+/// reference-count ceiling, and `OutOfMemory` when the caller's `CSpace` pool
+/// cannot back an `Mmio`, `IoPort`, or `Interrupt` object. `InvalidCapability`
+/// also covers a source a concurrent delete, move, or revoke freed before the
+/// new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
@@ -1337,7 +1346,7 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling),
-/// or as for [`cap_copy`] (the `Mmio` and `IoPort` copy limits, and any other
+/// or as for [`cap_copy`] (the `Mmio`, `IoPort`, and `Interrupt` copy limits, and any other
 /// source object's 2^31 reference-count ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
@@ -1586,10 +1595,36 @@ pub fn cap_insert(
 #[inline]
 pub fn system_info(kind: u64) -> Result<u64, i64>
 {
-    // Unused second arg is required because no syscall1 raw variant exists.
+    // The second arg is 0: only `StackHighWater` reads it (its class; see
+    // `stack_high_water`), and no syscall1 raw variant exists.
     // SAFETY: syscall2 issues raw syscall instruction; kind is SystemInfoType discriminant as u64;
     // kernel validates kind and returns queried value.
     let ret = unsafe { syscall2(SYS_SYSTEM_INFO, kind, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Deepest use, in bytes, of the kernel stack class `class`
+/// (`SystemInfoType::StackHighWater`; `syscall_abi::STACK_CLASS_*`).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` for an unknown class
+/// or from a kernel that predates the selector, and `NotSupported` for the
+/// handoff class when the kernel could not locate the handoff stack.
+// cast_sign_loss: a non-negative return is the queried value.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn stack_high_water(class: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the
+    // StackHighWater discriminant and arg1 the class, which the kernel
+    // validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::StackHighWater as u64,
+            class,
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
@@ -2103,9 +2138,10 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
 /// non-canonical, or the range leaves the user half), `InvalidCapability`,
 /// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
-/// size zero, unaligned, or overflowing), `QuotaExceeded` (the cap's object
-/// already records 4 other mappings), or `OutOfMemory` (page-table growth
-/// pool exhausted; refill with [`cap_create_aspace`] in augment mode). An
+/// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table growth
+/// pool exhausted; refill with [`cap_create_aspace`] in augment mode; or, for a
+/// mapping past the object's four inline records, the caller's `CSpace` pool
+/// cannot fund a spill chunk; refill with [`cap_create_cspace`]). An
 /// `OutOfMemory` failure keeps the mapping's record and the pages already
 /// mapped; a retry at the same `virt` reuses the record.
 #[inline]
@@ -2138,8 +2174,9 @@ pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) ->
 /// # Errors
 /// Returns a negative `i64` error code: `NotSupported` (RISC-V),
 /// `InvalidCapability`, `InsufficientRights` (a cap lacks Control/Use),
-/// `QuotaExceeded` (the thread already records 16 bindings through other
-/// caps), or `OutOfMemory` (binding-table allocation).
+/// `QuotaExceeded` (the thread already records 252 bindings through other
+/// caps), or `OutOfMemory` (the first bind's binding table cannot be taken
+/// from the target thread's `CSpace` pool).
 #[inline]
 pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 {

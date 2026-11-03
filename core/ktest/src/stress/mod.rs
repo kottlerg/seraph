@@ -37,6 +37,7 @@ mod reply_caller_delete;
 mod retype_concurrent;
 mod sleep_list_wide;
 mod split_delete_race;
+mod stack_depth;
 mod stop_claimed_delete;
 mod stop_fault_sender;
 mod stop_owed_wake;
@@ -193,4 +194,6 @@ pub fn run_all(ctx: &TestContext)
         "stress::concurrent_event_producers",
         concurrent_event_producers::run(ctx)
     );
+    // Last: reports the kernel stacks' deepest use after every other cell.
+    run_integration_test!("stress::stack_depth", stack_depth::run(ctx));
 }

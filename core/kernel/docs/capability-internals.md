@@ -107,20 +107,20 @@ under the CSpace spinlock and takes a reference on the object inside that hold, 
 live for as long as the handler uses it, whatever releases the slot's own reference meanwhile: a
 sibling's delete of the last capability, or another holder's revoke of an ancestor. A split child (a
 `SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
-object linked under the original's derivation parent, and so is every copy or derivation of an Mmio
-or IoPort capability ([§ Range Capability Objects](#range-capability-objects)), so another holder's
-revoke of that ancestor can release it directly; for a same-object derivation, as in the
-kill-process pattern, it is the delete following the revoke that releases it. Either way the object
-is freed only when its count reaches zero, which a held pin defers until the syscall drops it. Copy,
-derive, and derive-badge pin their source the same way, so the reference they take for the new slot
-never lands on a freed object, and still revalidate the source slot under the derivation write lock
-before they link the new one (see [§ Global Derivation Lock](#global-derivation-lock)). The IPC
-transfer pre-validation (`prevalidate_sender_caps`) holds the sender's CSpace lock, under which a
-slot stays occupied and its object live, so it also reads each object's reference count against
-the ceiling. The remaining lock-free readers, the capability-tree syscalls' unlocked pre-checks,
-read only the tag, generation, and in-flight pin of a slot and dereference no object. Neither holds
-the derivation lock: their tag, generation, and pin checks only narrow the race they act on, and
-the locked path re-decides.
+object linked under the original's derivation parent, and so is every copy or derivation of an Mmio,
+IoPort, or Interrupt capability ([§ Range Capability Objects](#range-capability-objects)), so
+another holder's revoke of that ancestor can release it directly; for a same-object derivation, as
+in the kill-process pattern, it is the delete following the revoke that releases it. Either way the
+object is freed only when its count reaches zero, which a held pin defers until the syscall drops
+it. Copy, derive, and derive-badge pin their source the same way, so the reference they take for the
+new slot never lands on a freed object, and still revalidate the source slot under the derivation
+write lock before they link the new one (see [§ Global Derivation Lock](#global-derivation-lock)).
+The IPC transfer pre-validation (`prevalidate_sender_caps`) holds the sender's CSpace lock, under
+which a slot stays occupied and its object live, so it also reads each object's reference count
+against the ceiling. The remaining lock-free readers, the capability-tree syscalls' unlocked
+pre-checks, read only the tag, generation, and in-flight pin of a slot and dereference no object.
+Neither holds the derivation lock: their tag, generation, and pin checks only narrow the race they
+act on, and the locked path re-decides.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -240,9 +240,13 @@ The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
 intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
-a record of every donation — its source Memory object, byte offset, and page
-count — so teardown can return each donation to its source wholesale. The
-wrapper, not the pool, keeps the byte budget the pool backs.
+a record of every donation — its source Memory object, byte offset, page
+count, and, at a `CSpace`'s teardown, the list of its arena pages kept past
+it — so teardown can return each donation to its source, whole or, for a
+`CSpace`, with those pages cut out ([§ Body Arena](#body-arena)). A
+`CSpace` pool's free page also carries, in its second word, the address of
+its donation's record. The wrapper, not the pool, keeps the byte budget the
+pool backs.
 
 ### Donation Records
 
@@ -279,25 +283,30 @@ The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked thro
 objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
 header's three padding bytes hold the link to the next, while the type and `ancestor` fields its
 teardown reads stay intact, and the link is cleared when it is popped. An object reaches zero once,
-so it is queued at most once, and the stack holds any number of objects without allocating. Every
-release a teardown makes pushes the object it orphans: an ancestor Memory object's retype lease, a
-donation's lease, the references a dying `CSpace`'s slots hold (a nested `CSpace` among them), a
-caller-sized wait set's member references, a thread's fault-handler binding, and the queue
-references of an owner's chain of death-observer nodes. The call pops and tears down the most recent
-object until the stack is empty, and no teardown calls `dealloc_object` itself, so a chain of
-`CSpace`s each holding the last reference to the next, or a `CSpace` releasing thousands of
-objects, is torn down iteratively with constant stack use, and no arm runs inside another's lock
-scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer arm has
-released it; a wait set's sources are torn down after `wait_set_drop` has released every source
-lock).
+so only the call that took it there queues it, at most once at a time, and the stack holds any
+number of objects without allocating. The one object queued twice is a `CSpace` wrapper: its arm's
+first run, having popped it, pushes it back beneath the objects its slots held, so its second run,
+which returns its pool, comes after their teardowns and every cascade they start ([§ Body
+Arena](#body-arena)). Every release a teardown makes pushes the object it orphans: an ancestor
+Memory object's retype lease, a donation's lease, the references a dying `CSpace`'s slots hold (a
+nested `CSpace` among them), a caller-sized wait set's member references, a thread's fault-handler
+binding, and the queue references of an owner's chain of death-observer nodes. The call pops and
+tears down the most recent object until the stack is empty, and no teardown calls `dealloc_object`
+itself, so a chain of `CSpace`s each holding the last reference to the next, or a `CSpace` releasing
+thousands of objects, is torn down iteratively with constant stack use, and no arm runs inside
+another's lock scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer
+arm has released it; a wait set's sources are torn down after `wait_set_drop` has released every
+source lock).
 
-The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
-its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
-`CSpace`'s derivation drain it is not batched), and runs to completion in whichever context drops
-the last reference: the deleting syscall, with interrupts masked on that CPU; or, when the owner is
-handed to the per-CPU deferred-reclaim stack (a thread deleting an object it is itself bound to, a
-syscall pin or a batched capability move dropping the last reference, or an Mmio object's mapping
-record releasing the address space at that object's teardown; the producer list is
+The walk costs one `retype_free` per donation (for a `CSpace` with kept arena pages, one
+`retype_free_runs` returning the runs between them through a single walk of the Memory object's page
+free list), holds no lock across records (each return takes only its ancestor's locks, the Memory
+object's read lock and its retype-allocator lock, so unlike a `CSpace`'s derivation drain it is not
+batched), and runs to completion in whichever context drops the last reference: the deleting
+syscall, with interrupts masked on that CPU; or, when the owner is handed to the per-CPU
+deferred-reclaim stack (a thread deleting an object it is itself bound to, a syscall pin or a
+batched capability move dropping the last reference, or an Mmio object's mapping record releasing
+the address space at that object's teardown; the producer list is
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next syscall
 epilogue on that CPU, with interrupts masked, or the idle thread's drain, with interrupts enabled
 ([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin locks"). So an
@@ -307,6 +316,80 @@ map retry donates one page per page-table shortfall (its budget top-up donates t
 call), so a process's count is of the order of its page-table page count, one per 2 MiB of mapped
 span. Bounding the walk, and the seeding of one donation, within a syscall is
 [#434](https://github.com/kottlerg/seraph/issues/434).
+
+### Body Arena
+
+Some kernel objects a syscall creates have no Memory capability in the call to be retyped from:
+the bodies of a range split (`SYS_MEMORY_SPLIT`'s tail, the two children of `SYS_MMIO_SPLIT`,
+`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`, and `SYS_SCHED_SPLIT`), the fresh object of an `Mmio`,
+`IoPort`, or `Interrupt` copy ([§ Copies and Lineages](#copies-and-lineages)), the mapping records
+past an `Mmio` object's inline ones ([§ Mmio Mappings](#mmio-mappings)), and a thread's
+port-binding table ([§ IoPort Bindings](#ioport-bindings)). A `CSpace` the call names funds them
+from its pool, as it funds the slot:
+
+| Body | Funded by |
+|---|---|
+| A split's children | the caller's `CSpace`, which receives them |
+| An `Mmio`, `IoPort`, or `Interrupt` copy | the destination `CSpace` |
+| An `Mmio` mapping-record spill chunk | the `CSpace` the map resolves through |
+| A port-binding table | the bound thread's own `CSpace` |
+
+The first three are 128-byte chunks of the `CSpace`'s body arena (`cap/arena.rs`). The arena
+carves a pool page into 32 chunks: chunk 0 holds the page's header, an `ArenaPage`, and the other
+31 go on the wrapper's free-chunk list, serialised by the pool's lock, from which
+`CSpaceKernelObject::alloc_body` places a body. The header is a kernel object of its own:
+
+| `ArenaPage` field | Content |
+|---|---|
+| `header` | a `KernelObjectHeader` whose reference count is the page's live chunks plus one hold, the owning `CSpace`'s while it lives and its teardown's while that runs; `ancestor` is null until the teardown keeps the page |
+| `owner` | the funding `CSpaceKernelObject`, null once its teardown has passed the page |
+| `next` | the owner's list of its arena pages, then its teardown's list of the pages it keeps |
+| `kept_next` | the teardown's list of every page it keeps |
+| `lock` | serialises `owner` against a chunk free, which pushes the chunk to the owner's list while the owner lives |
+| `record` | the address of the record of the donation the page lies in, taken from the free pool page it was carved from |
+
+A body's `header.ancestor` names its page, so its free returns the chunk there: to the owner's
+list while the owner lives, releasing the page's reference either way. A page the arena takes
+debits the growth budget like a slot page, so `CAP_INFO_CSPACE_CAPACITY` and
+`CAP_INFO_CSPACE_BUDGET` count it, and an empty pool fails the call with the refillable
+`OutOfMemory`, which an augment-mode `SYS_CAP_CREATE_CSPACE` lifts. Since a call may need a page
+for its body when slot headroom is ample, a funder holds a page of budget beyond the slots it funds
+(`syscall_abi::cspace_topup_pages`). A port-binding table takes three whole pool pages instead, and
+never outlives its pool: the thread's dealloc returns it, or, when the thread's `CSpace` dies
+first, that teardown does, under the thread's `sched_lock` in both cases, and a bind allocates and
+installs it under the same lock only while the thread is not `Exited`. No runtime body comes from
+the kernel's SEED reserve, which holds only the boot footprint (initialization.md § Phase 7).
+
+A chunk body can outlive its funder: a capability moved to another `CSpace` (`SYS_CAP_MOVE`, an IPC
+transfer) keeps its body in the funder's arena. The teardown keeps only the pages such bodies sit
+on. When the wrapper's reference count reaches zero, its dealloc arm runs twice. The first run
+stops the `CSpace`'s threads, frees their port-binding tables, drains and drops the `CSpace`, and
+queues the wrapper on the cascade stack beneath the objects its slots held, as [§
+Teardown](#teardown) describes; those objects, and every cascade they start, are torn down first,
+so the bodies the `CSpace`'s own slots held are freed to its arena before the second run. That run
+makes one pass over its arena pages, clearing each one's `owner` under the page's lock and keeping,
+with the owner's hold, every page whose count shows a live chunk; no chunk can be allocated any
+more, so a count of one stays one, and a higher count never falls below the hold. Each kept page
+goes onto its donation record's list (its `record` names it). Every donation then goes back at once
+with its kept pages, sorted once (`cap::arena::sort_list`), cut out of its span
+(`cap::arena::for_each_run`): each kept page takes a lease of its own on the Memory object its
+donation came from and records it as its `ancestor`, and the runs between kept pages go back
+through one walk of that Memory object's page free list (`cap::retype::retype_free_runs`). The
+teardown then releases its hold on each kept page, and the release of a page's last reference, its
+hold's or its last chunk's, returns the page to that Memory object (the `ArenaPage` arm of
+`dealloc_object`). A dead `CSpace` therefore holds, past its death, only the pages its surviving
+bodies sit on, each to its Memory object, the analogue of a retyped object pinning its Memory
+capability; nothing it donated depends on its own bodies, so neither a donation of a tail the
+`CSpace`'s own arena funded nor two `CSpace`s funding each other's donated tails can keep a pool
+alive.
+
+The cut sorts each donation's kept pages once and walks its span with them in order, so a teardown
+with `r` donation records and `h` kept pages costs `O(r + h log h)`, allocating nothing and on a
+fixed stack (the sort is a bottom-up merge through 64 sorted runs), plus one walk of each record's
+Memory object's page free list, as the return of a donation without kept pages costs ([§
+Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`: at most one
+per such body, and at most the `CSpace`'s arena pages, one per 31 bodies it funded. Each of those
+pages returns later, in the call that frees its last chunk, as a one-page `retype_free`.
 
 ---
 
@@ -497,7 +580,8 @@ pins (a few), its fault-handler binding (one), the lease of a retype it has in f
 `retype_allocate`'s check just before the count reached the limit (one), and the destinations of an
 IPC transfer it has in flight that passed the message check (at most `MSG_CAP_SLOTS_MAX`, four);
 fewer than 16 in all. Per other object: wait-set membership (one per source), Mmio mapping records
-(four per Mmio object, whose bodies are SEED-backed), SEED leases (bounded by the SEED reserve), and
+(each 16 bytes of a caller-funded body or spill chunk, so 2^31 of them hold 32 GiB), SEED leases
+(the boot mints, bounded by the SEED reserve), and
 the destinations IPC transfers' abandoned moves leave live (a message check refuses once the count
 is at the limit and transfers run one at a time under the derivation lock, so these keep an object's
 slot references within `MSG_CAP_SLOTS_MAX - 1` of the limit). Exhausting the headroom would take
@@ -512,12 +596,11 @@ The principal kernel-internal owners:
   page pool is referenced by the donation record until that AddressSpace or CSpace is
   freed. The Memory object an AddressSpace or CSpace is created from is referenced
   once, by donation record 0, which serves as its retype ancestry too.
-- **SEED scratch leases.** A per-thread x86-64 port-binding table (the IOPB and its
-  binding records, [§ IoPort Bindings](#ioport-bindings)) reserved by `sys_ioport_bind`
-  holds a reference on the SEED reserve until the thread is destroyed
-  (`alloc_seed_scratch` / `free_seed_scratch`). The body of every Mmio, IoPort, and Interrupt
-  object is retyped from SEED as well, a copy's included, so each live copy holds one more SEED
-  lease; [§ Copies and Lineages](#copies-and-lineages) bounds how many a range can have.
+- **Arena pages.** A body a `CSpace`'s arena funded (a split's children, an `Mmio`,
+  `IoPort`, or `Interrupt` copy, a mapping-record spill chunk) holds a reference on the arena
+  page it sits on, and the page a hold of its owner's; a page kept past its owner's death holds
+  a lease on the Memory object its donation came from until its last chunk goes
+  ([§ Body Arena](#body-arena)).
 - **Mmio mapping records.** Each `SYS_MMIO_MAP` mapping an Mmio object records holds a
   reference on the target `AddressSpace`, released when the object is freed and the
   mapping withdrawn ([§ Mmio Mappings](#mmio-mappings)), so an address space outlives
@@ -590,48 +673,61 @@ withdraws it when that object is freed.
 ### Copies and Lineages
 
 `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio, IoPort, or Interrupt
-capability do not share the source's object: `object_for_new_slot` retypes a fresh object over the
-same range from SEED, so every slot owns its object, and deleting the slot, consuming it with a
-split, or revoking an ancestor of it frees it (a syscall pin defers the free to the pinning
-syscall's end, as for any object). A boot mint or a range split produces a lineage *root*; a copy
-records its root (`RangeLineage`), and the root's lineage count holds a root share while the root
-has references plus one per live copy. A copy past `RANGE_COPY_LIMIT` (64) live copies of one root
-returns `QuotaExceeded`, counting the copies alone whether or not the root is still referenced; that
-bounds the SEED copying can consume per lineage, while a split of a copy produces two fresh roots,
-each with a lineage of its own. A copy's body is freed with its last reference; the root's body is
-freed when its last share goes, so a copy's root pointer never dangles.
+capability do not share the source's object: `object_for_new_slot` places a fresh object over the
+same range in the arena of the `CSpace` that receives the new slot ([§ Body Arena](#body-arena)),
+so every slot owns its object, and deleting the slot, consuming it with a split, or revoking an
+ancestor of it frees it (a syscall pin defers the free to the pinning syscall's end, as for any
+object). A boot mint or a range split produces a lineage *root*; a copy records its root
+(`RangeLineage`), and the root's lineage count holds a root share while the root has references plus
+one per live copy. A copy past `RANGE_COPY_LIMIT` live copies of one root returns `QuotaExceeded`,
+counting the copies alone whether or not the root is still referenced. The limit is the count's
+encoding bound below the root share (2^31 - 1), not a capacity: each copy costs its funder a slot
+and a chunk, so the limit's copies would hold more than 400 GiB of pools. A split of a copy produces
+two fresh roots, each with a lineage of its own. A copy's body is freed with its last reference;
+the root's body is freed when its last share goes, so a copy's root pointer never dangles.
 
 ### Mmio Mappings
 
-An `MmioObject` holds up to `MMIO_MAX_MAPPINGS` (4) mapping records, each an `AddressSpace` (with a
-reference) and the VA of the region's first page; mapping the object again at a place already
-recorded reuses its record, and a fifth distinct mapping returns `QuotaExceeded`. The records are
-atomics: `sys_mmio_map` claims a free record by compare-exchange, fills its VA, and publishes the
-address space last with Release, so concurrent maps through one object need no lock. Two maps racing
-to record the same place may each take a record, which costs a record and is otherwise harmless.
-`sys_mmio_map` records the mapping before it maps a page, and holds its pin on the object across
-both, so the teardown finds every page a call maps, a partial map included, and never sees a claimed
-record unfilled. The object's dealloc arm runs `withdraw_mappings`: for each record,
-`AddressSpace::unmap_region_if_phys` clears, under `pt_lock`, each leaf that still maps the matching
-device page (a page the user has since remapped to other memory is left alone), then issues one TLB
-invalidation for the span on every CPU that runs the space, after the lock is released (plus one
-under the lock each time the span's cleared frames overflow the frame-map release batch; see
-[memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)); the device
+An `MmioObject` holds `MMIO_INLINE_MAPPINGS` (4) mapping records inline, each an `AddressSpace`
+(with a reference) and the VA of the region's first page; mapping the object again at a place
+already recorded reuses its record. A mapping past the inline records goes to a spill chunk of seven
+records, taken from the arena of the `CSpace` the map resolves through ([§ Body Arena](#body-arena))
+and chained from the object, newest first; a map whose arena cannot fund a chunk returns
+`OutOfMemory`. The records are atomics: `sys_mmio_map` claims a free record by compare-exchange,
+fills its VA, and publishes the address space last with Release, and pushes a new chunk, its first
+record already claimed, onto the chain's head by compare-exchange, so concurrent maps through one
+object need no lock. Two maps racing to record the same place may each take a record, and two
+finding every record taken may each push a chunk, which costs a record or a chunk and is otherwise
+harmless. `sys_mmio_map` records the mapping before it maps a page, and holds its pin on the object
+across both, so the teardown finds every page a call maps, a partial map included, and never sees a
+claimed record unfilled. The object's dealloc arm runs `withdraw_mappings`: for each record, inline
+and spilled, `AddressSpace::unmap_region_if_phys` clears, under `pt_lock`, each leaf that still maps
+the matching device page (a page the user has since remapped to other memory is left alone), then
+issues one TLB invalidation for the span on every CPU that runs the space, after the lock is
+released (plus one under the lock each time the span's cleared frames overflow the frame-map release
+batch; see [memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)); the device
 frames are never reallocated, so no frame reuse waits on the shootdown. The record's address-space
 reference is then released through `release_ref`, so an address space it was the last reference to
 goes to this CPU's deferred reclaim, as for a syscall pin: an Mmio object can be freed in place
-inside IPC delivery, where an address-space teardown must not run.
+inside IPC delivery, where an address-space teardown must not run. Each spill chunk then returns to
+the arena that funded it.
 
 ### IoPort Bindings
 
 A bound thread's `iopb` pointer names the bitmap at the head of its port-binding table
-(`cap::ioport_bindings::IoPortBindings`, one SEED scratch block): the 8 KiB IOPB and up to
-`MAX_IOPORT_BINDINGS` (16) records of `(IoPort object, base, count)`. `sys_ioport_bind`
-records the binding and permits its ports under the thread's `sched_lock`; a bind through an
-object the thread already records changes nothing, and a seventeenth distinct object returns
-`QuotaExceeded`. A bind of another thread also invalidates every CPU's TSS bitmap (below),
-so a target already running elsewhere picks up the new ports at its next port access. The
-bitmap is always the union of the recorded bindings.
+(`cap::ioport_bindings::IoPortBindings`): one page holding the bitmap's two page-sized parts
+(`ThreadIopb`, ports 0 to 32767 and 32768 to 65535, each in a page of its own), the funder, and up
+to `MAX_IOPORT_BINDINGS` (252) records of `(IoPort object, base, count)`, after the record cells
+of its three pages. The three pages come from
+the pool of the bound thread's own `CSpace` ([§ Body Arena](#body-arena)), taken and installed under
+the thread's `sched_lock` while it is not `Exited`, and return there when the thread is destroyed
+or, first, when that `CSpace` dies. `sys_ioport_bind` records the binding and permits its ports
+under the thread's `sched_lock`; a bind through an object the thread already records changes
+nothing, and a distinct object past the 252nd returns `QuotaExceeded`. Each binding is made through
+a distinct `IoPort` object, so the bound is one thread's fan-out over separately held port ranges,
+and its page is funded by the thread's `CSpace`. A bind of another thread also invalidates every
+CPU's TSS bitmap (below), so a target already running elsewhere picks up the new ports at its next
+port access. The bitmap is always the union of the recorded bindings.
 
 The IoPort dealloc arm runs `withdraw_everywhere` before the object's bytes go. It walks
 the thread registry and, under each thread's `sched_lock`, drops the records naming the

@@ -221,6 +221,17 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: None,
     },
+    // TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    // fault-injection driver exercising devmgr's settle bound and driver
+    // withdrawal; it ships on the rootfs and is spawned only by devmgr's
+    // TEST_SPAWN_FAULT_DRIVERS shim under svctest.
+    Spec {
+        name: "test-fault",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
     Spec {
         name: "fatfs",
         install_name: None,

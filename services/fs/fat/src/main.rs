@@ -728,7 +728,7 @@ fn read_memory_at_slot(
         ancestor_cap: ancestor,
         eviction_queued: false,
     };
-    if !files[idx].track_outstanding(entry)
+    if !files[idx].track_outstanding(entry, cache.slot_ceiling())
     {
         let _ = syscall::cap_delete(child);
         let _ = syscall::cap_delete(ancestor);

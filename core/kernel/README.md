@@ -27,6 +27,7 @@ core/kernel/
 │   ├── irq.rs                  # IRQ routing table (sized at boot): lines to notifications
 │   ├── percpu.rs               # Per-CPU private state
 │   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
+│   ├── stack_depth.rs          # Kernel stack paint and deepest-use report (StackHighWater)
 │   ├── sync.rs                 # Kernel synchronisation primitives
 │   ├── uaccess.rs              # Fault-recoverable user-memory copies
 │   ├── validate.rs             # Phase 0 boot-info validation
@@ -79,6 +80,7 @@ core/kernel/
 │   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem
 │   │   ├── mod.rs
+│   │   ├── arena.rs            # CSpace body arena: chunk carving, span cuts
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
@@ -166,7 +168,9 @@ The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
 `object.rs` defines the kernel object headers and wrappers, the page pools that back
-address-space page tables and CSpace slot pages, and their allocation and teardown, including
+address-space page tables and CSpace slot pages, the CSpace body arena that funds the objects a
+split or a range-capability copy creates (its pure logic in `arena.rs`), and their allocation and
+teardown, including
 the withdrawal of the MMIO mappings an Mmio object records; `ioport_bindings.rs` records each
 thread's I/O-port bindings and withdraws those made through a freed IoPort object;
 `registry.rs` is the RAM-sized arena that maps each `CSpaceId` to its live CSpace and epoch;

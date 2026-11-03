@@ -181,7 +181,9 @@ derivation of it, so PCI functions that share an `INTx` line are all served
   their service endpoint and interrupt notification together and acknowledge on every wake
   ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md) rule 5).
   The serial driver acknowledges only when its client reads, so devmgr keeps the UART line
-  exclusive and shares no other device onto it.
+  exclusive and shares no other device onto it. The UART line is never a PCI `INTx` line on
+  either machine (x86-64 COM1 is ISA IRQ 4; the riscv64 `virt` NS16550 is PLIC source 10, against
+  `INTx` sources 32 to 35), so the exclusivity costs no device a cap in practice.
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,

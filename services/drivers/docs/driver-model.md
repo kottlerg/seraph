@@ -33,7 +33,9 @@ TODO: specify driver teardown.
    [docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
    § Interrupt Delivery). The VirtIO drivers wait on their service endpoint and IRQ notification
    together and acknowledge on every wake. The serial driver acknowledges only when its client
-   reads, so devmgr keeps the UART line exclusive.
+   reads, so devmgr keeps the UART line exclusive; the UART line is never a PCI `INTx` line on
+   either machine (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is PLIC source 10 against
+   `INTx` sources 32 to 35), so the exclusivity costs no device a cap in practice.
 6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
 

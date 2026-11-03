@@ -8,8 +8,10 @@
 //! `process_layout::growth_zones` sizes to the address space (see
 //! `Arena::ensure_init`). Hands out unmapped contiguous VA ranges; the caller
 //! is responsible for `mem_map` / `mem_unmap` against owned Memory caps. The
-//! arena holds no Memory caps and, beyond the one `getrandom` base draw, issues
-//! no syscalls — it is pure VA bookkeeping.
+//! arena holds no Memory caps; under its lock it issues only the one
+//! `getrandom` base draw, and it grows its run table from the byte heap with
+//! the lock released, so it never holds its lock across an allocation or IPC
+//! and takes no other lock while holding it.
 //!
 //! Used for foreign Memory mappings: MMIO from devmgr, DMA buffers from
 //! drivers, shmem backings, zero-copy file pages from fs drivers, ELF-load
@@ -20,8 +22,9 @@
 //! release, so it never holds more runs than there are live reservations plus
 //! one (each run lies below a reservation or at the arena's top). A
 //! reservation first makes room for that bound, growing the table into the
-//! byte heap when it is full, and fails with `OutOfSpace` when it cannot; a
-//! release therefore always has a slot, and freed VA is never dropped.
+//! byte heap when it is full (allocated outside the lock, then installed
+//! under it), and fails with `OutOfSpace` when it cannot; a release therefore
+//! always has a slot, and freed VA is never dropped.
 //!
 //! Concurrency: a single spin-lock guards the arena.
 
@@ -136,7 +139,7 @@ impl Arena {
 
     fn runs(&mut self) -> &mut [Run] {
         // SAFETY: `runs` points at `capacity >= len` slots whose first `len`
-        // are initialised (the inline table or a heap table `grow_table`
+        // are initialised (the inline table or a heap table `install_table`
         // filled), owned by this arena and reached only under its lock.
         unsafe { crate::slice::from_raw_parts_mut(self.runs, self.len) }
     }
@@ -160,45 +163,47 @@ impl Arena {
         self.len += 1;
     }
 
-    /// Make the table hold `live + 2` runs, the most a release can need
-    /// after one more reservation: doubles it into the byte heap when it is
-    /// full. Returns `false` when the heap cannot supply the table.
-    fn grow_table(&mut self) -> bool {
+    /// The capacity the table must grow to before one more reservation, so
+    /// that a release after it always has a slot (`live + 2` runs), or
+    /// `None` when the table already holds that many.
+    fn capacity_needed(&self) -> Option<usize> {
         if self.live + 2 <= self.capacity {
-            return true;
+            None
+        } else {
+            Some(self.capacity.saturating_mul(2))
         }
-        let Some(new_capacity) = self.capacity.checked_mul(2) else {
-            return false;
-        };
-        let Ok(layout) = Layout::array::<Run>(new_capacity) else {
-            return false;
-        };
-        // SAFETY: `layout` has a non-zero size (`new_capacity >= 128`).
-        let fresh = unsafe { alloc(layout) }.cast::<Run>();
-        if fresh.is_null() {
-            return false;
-        }
-        // SAFETY: `fresh` holds `new_capacity > len` runs and is disjoint
-        // from the current table, whose first `len` slots are initialised.
-        unsafe { ptr::copy_nonoverlapping(self.runs, fresh, self.len) };
-        if self.capacity != INLINE_RUNS {
-            if let Ok(old) = Layout::array::<Run>(self.capacity) {
-                // SAFETY: a table larger than the inline one came from
-                // `alloc` with this layout in an earlier grow, and nothing
-                // refers to it once its runs are copied.
-                unsafe { dealloc(self.runs.cast::<u8>(), old) };
-            }
-        }
-        self.runs = fresh;
-        self.capacity = new_capacity;
-        true
     }
 
-    fn alloc(&mut self, n: u64) -> Option<ReservedRange> {
-        self.ensure_init();
-        if !self.grow_table() {
-            return None;
+    /// Install `fresh`, a byte-heap table of `capacity` runs, unless another
+    /// thread already grew the table that far. Returns the table the caller
+    /// frees after releasing the lock: the replaced heap table, or `fresh`
+    /// itself when it was not needed. `None` when nothing is to be freed (the
+    /// replaced table was the inline one).
+    ///
+    /// # Safety
+    /// `fresh` came from `alloc` with `Layout::array::<Run>(capacity)` and
+    /// nothing else refers to it.
+    unsafe fn install_table(
+        &mut self,
+        fresh: *mut Run,
+        capacity: usize,
+    ) -> Option<(*mut Run, usize)> {
+        if capacity <= self.capacity {
+            return Some((fresh, capacity));
         }
+        // SAFETY: `fresh` holds `capacity > len` runs and is disjoint from
+        // the current table, whose first `len` slots are initialised.
+        unsafe { ptr::copy_nonoverlapping(self.runs, fresh, self.len) };
+        let old = (self.runs, self.capacity);
+        self.runs = fresh;
+        self.capacity = capacity;
+        (old.1 != INLINE_RUNS).then_some(old)
+    }
+
+    /// Take `n` pages, lowest-address first fit. The caller has grown the
+    /// table to [`Self::capacity_needed`].
+    fn alloc(&mut self, n: u64) -> Option<ReservedRange> {
+        debug_assert!(self.capacity_needed().is_none());
         // Lowest-address first fit.
         let i = self.runs().iter().position(|r| r.page_count >= n)?;
         let run = self.runs()[i];
@@ -233,7 +238,7 @@ impl Arena {
                 runs[i].va_start = va;
                 runs[i].page_count += pages;
             }
-            // `grow_table` kept `capacity >= live + 2` when this range was
+            // `reserve_pages` kept `capacity >= live + 2` when this range was
             // reserved, and maximal runs number at most `live + 1` after
             // this release, so the insert has a slot.
             (false, false) => self.insert_run(i, Run { va_start: va, page_count: pages }),
@@ -294,11 +299,40 @@ pub fn reserve_pages(n: u64) -> Result<ReservedRange, ReserveError> {
     if n == 0 {
         return Err(ReserveError::InvalidArgument);
     }
-    ARENA.lock.lock();
-    // SAFETY: lock held; single mutator.
-    let result = unsafe { (*ARENA.inner.get()).alloc(n) };
-    ARENA.lock.unlock();
-    result.ok_or(ReserveError::OutOfSpace)
+    loop {
+        ARENA.lock.lock();
+        // SAFETY: lock held; single mutator.
+        let arena = unsafe { &mut *ARENA.inner.get() };
+        arena.ensure_init();
+        let Some(capacity) = arena.capacity_needed() else {
+            let result = arena.alloc(n);
+            ARENA.lock.unlock();
+            return result.ok_or(ReserveError::OutOfSpace);
+        };
+        ARENA.lock.unlock();
+        // Grow the table with the lock released: the byte heap takes its own
+        // lock and may IPC to memmgr, neither of which may nest inside this
+        // spinlock.
+        let Ok(layout) = Layout::array::<Run>(capacity) else {
+            return Err(ReserveError::OutOfSpace);
+        };
+        // SAFETY: `layout` has a non-zero size (`capacity > INLINE_RUNS`).
+        let fresh = unsafe { alloc(layout) }.cast::<Run>();
+        if fresh.is_null() {
+            return Err(ReserveError::OutOfSpace);
+        }
+        ARENA.lock.lock();
+        // SAFETY: lock held; `fresh` is the allocation of `layout` above.
+        let spare = unsafe { (*ARENA.inner.get()).install_table(fresh, capacity) };
+        ARENA.lock.unlock();
+        if let Some((table, table_capacity)) = spare {
+            if let Ok(old) = Layout::array::<Run>(table_capacity) {
+                // SAFETY: `table` is a heap table of `table_capacity` runs
+                // that the arena no longer refers to.
+                unsafe { dealloc(table.cast::<u8>(), old) };
+            }
+        }
+    }
 }
 
 /// Release a reservation back to the arena. The caller must have

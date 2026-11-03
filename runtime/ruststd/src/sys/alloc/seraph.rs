@@ -719,8 +719,9 @@ static SLAB_BIN_512: ObjectSlab = empty_slab();
 /// memmgr endpoint shared by every slab path. Set once at process start.
 static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU32 = crate::sync::atomic::AtomicU32::new(0);
 
-/// Set the memmgr endpoint backing the object-slab refill path. Called once
-/// from `_start` after `heap_bootstrap`. Subsequent calls are ignored.
+/// Set the memmgr endpoint backing the object-slab refill path. The heap
+/// bootstrap sets it before funding a demand floor's page tables, and `_start`
+/// sets it again (to the same endpoint) after `heap_bootstrap`.
 pub fn object_slab_init(memmgr_ep: u32) {
     SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
 }
@@ -1004,15 +1005,17 @@ pub struct SlabGrant {
 /// caching — the cap is consumed entirely by the caller's single retype
 /// (or by a few retypes against the leftover sub-page tail, which the
 /// caller manages). Used by variable-size types (`EventQueue`, `Thread`,
-/// `AddressSpace`, `CSpace`) where caching offers no benefit.
-fn slab_acquire_fresh(need: u64, want_pages: u64) -> Option<SlabGrant> {
+/// `AddressSpace`, `CSpace`) where caching offers no benefit. `withheld` is
+/// the slack the grant must hold beyond `need`: [`ALLOCATOR_METADATA_RESERVE`]
+/// for a ledger-tracked grant, zero for one exact retype.
+fn slab_acquire_fresh(need: u64, want_pages: u64, withheld: u64) -> Option<SlabGrant> {
     let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
     if ep == 0 {
         return None;
     }
     let (new_cap, cap_pages, phys) = slab_request_pages(ep, want_pages)?;
     let total = cap_pages.saturating_mul(PAGE_SIZE);
-    if total.saturating_sub(ALLOCATOR_METADATA_RESERVE) < need {
+    if total.saturating_sub(withheld) < need {
         // Too small for this request. Delete the inner cap and return the run
         // to memmgr's pool — the slab is virgin (nothing retyped yet), and
         // deleting the inner alone would strand the run in memmgr's
@@ -1085,7 +1088,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
     } else if need <= 512 {
         slab_retype_pooled(&SLAB_BIN_512, need, want_pages, retype)
     } else {
-        let grant = slab_acquire_fresh(need, want_pages)?;
+        let grant = slab_acquire_fresh(need, want_pages, ALLOCATOR_METADATA_RESERVE)?;
         match retype(grant.cap) {
             Some(out) => {
                 // The retyped object holds its own ancestor ref on the
@@ -1110,10 +1113,12 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
 /// once every object retyped from the slab is deleted. For a
 /// per-unit-of-work retype (e.g. one Thread slab per spawn) this keeps the
 /// process's memmgr-pool footprint bounded instead of leaking a run per
-/// iteration until process death.
+/// iteration until process death. The grant covers exactly the class-rounded
+/// `min_bytes`, the kernel's debit for the one retype the caller makes, with
+/// no metadata reserve: a 6-page Thread takes 6 pages, not 7.
 pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
     let need = slab_round_to_class(min_bytes);
-    slab_acquire_fresh(need, slab_want_pages(need))
+    slab_acquire_fresh(need, need.div_ceil(PAGE_SIZE), 0)
 }
 
 /// memmgr's current free-pool size in bytes (`QUERY_POOL_STATUS`, reply

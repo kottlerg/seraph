@@ -814,18 +814,8 @@ unsafe fn populate_child_info(
     // TLS block base, or zero when the binary has no PT_TLS (mirrors
     // `tls_template_memsz == 0`); the block is mapped only in the TLS case.
     pi.main_tls_vaddr = if tls.memsz != 0 { layout.tls_base } else { 0 };
-    // Advertise the demand-paging pager so the runtime can inherit it onto
-    // spawned threads. The child's badged memmgr endpoint is the pager
-    // endpoint; the kernel stamps each fault with that cap's derivation
-    // badge, the child's memmgr badge, so the fault is attributed to the
-    // right memmgr record. `pager_badge` records the same value for the
-    // runtime's information; no binder passes it to the kernel.
-    // procmgr binds the main thread separately in `finalize_creation`.
-    if universals.demand_paged
-    {
-        pi.pager_endpoint_cap = pi.memmgr_endpoint_cap;
-        pi.pager_badge = universals.memmgr_badge;
-    }
+    // The pager fields stay zero here: `finalize_creation` writes them only
+    // once the pager binding has taken effect (`advertise_pager`).
 
     // Write the argv blob, then the env blob, into the page region
     // following the struct. Each blob begins at a u64-aligned offset so
@@ -1414,25 +1404,26 @@ fn finalize_creation(
     }
 
     // Demand-paged wiring (best-effort): delegate the child address space to
-    // memmgr and bind the main thread's fault handler to it. A failure here
-    // degrades to "no pager" (faults kill the thread) rather than failing an
-    // otherwise-complete creation, and the pager advertisement
-    // `populate_child_info` wrote is withdrawn so the child does not register
-    // demand regions no pager backs. Which processes are exempt from the
-    // default pager is in docs/fault-handling.md § Default System Pager.
+    // memmgr and bind the main thread's fault handler to it, then advertise
+    // the pager in `ProcessInfo`. A failure at any step degrades to "no
+    // pager" (the child keeps its memory eager) rather than failing an
+    // otherwise-complete creation; the advertisement is written last, so the
+    // page never names a pager the child does not have. Which processes are
+    // exempt from the default pager is in docs/fault-handling.md § Default
+    // System Pager.
     if demand_paged
-        && !(memmgr_send_cap != 0
-            && self_memmgr_ep != 0
-            && bind_pager(
-                child_aspace,
-                child_thread,
-                memmgr_send_cap,
-                memmgr_badge,
-                self_memmgr_ep,
-                ipc_buf,
-            ))
+        && memmgr_send_cap != 0
+        && self_memmgr_ep != 0
+        && bind_pager(
+            child_aspace,
+            child_thread,
+            memmgr_send_cap,
+            memmgr_badge,
+            self_memmgr_ep,
+            ipc_buf,
+        )
     {
-        withdraw_pager_advertisement(self_aspace, pi_memory_cap);
+        advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
     }
 
     Some(CreateResult {
@@ -1488,12 +1479,16 @@ fn bind_pager(
     syscall::thread_set_fault_handler(child_thread, memmgr_send_cap, FAULT_CLASS_ALL).is_ok()
 }
 
-/// Clear the pager fields of a child's `ProcessInfo` (still writable through
-/// `pi_memory_cap` until the child starts), so a child whose pager binding
-/// failed reads "no pager" and keeps its memory eager instead of registering
-/// demand regions whose first touch would kill it. Best-effort: when the
-/// page cannot be mapped the advertisement stays.
-fn withdraw_pager_advertisement(self_aspace: u32, pi_memory_cap: u32)
+/// Advertise the pager in a child's `ProcessInfo` (still writable through
+/// `pi_memory_cap` until the child starts), so the runtime inherits it onto
+/// spawned threads and backs its heap floor on demand. The child's badged
+/// memmgr endpoint is the pager endpoint: the kernel stamps each fault with
+/// that cap's derivation badge, `memmgr_badge`, so the fault is attributed to
+/// the right memmgr record, and `pager_badge` records the same value for the
+/// runtime's information. When the page cannot be mapped the fields stay
+/// zero and the child runs as if it had no pager, which is safe: its memory
+/// stays eager.
+fn advertise_pager(self_aspace: u32, pi_memory_cap: u32, memmgr_badge: u64)
 {
     let Some(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
     else
@@ -1503,8 +1498,8 @@ fn withdraw_pager_advertisement(self_aspace: u32, pi_memory_cap: u32)
     // SAFETY: the scratch mapping is the child's ProcessInfo page, mapped
     // writable for one page; the struct lives at offset 0 per the ABI.
     let pi = unsafe { process_abi::process_info_mut(scratch.va()) };
-    pi.pager_endpoint_cap = 0;
-    pi.pager_badge = 0;
+    pi.pager_endpoint_cap = pi.memmgr_endpoint_cap;
+    pi.pager_badge = memmgr_badge;
 }
 
 // ── Process creation (from memory) ──────────────────────────────────────────

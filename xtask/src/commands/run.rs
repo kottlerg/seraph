@@ -19,9 +19,11 @@ use anyhow::{Context as _, Result};
 use crate::arch::Arch;
 use crate::cli::RunArgs;
 use crate::context::Context as BuildContext;
+use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
+    validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
@@ -61,9 +63,19 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
     };
 
     let disk_path = ctx.disk_image();
+    let second_disk = match &args.second_disk
+    {
+        Some(path) => Some(SecondDisk {
+            path,
+            block_size: second_disk_block_size(path, args.second_disk_block_size)?,
+        }),
+        None => None,
+    };
     let spec = QemuLaunchSpec {
         arch: args.arch,
         disk_path: &disk_path,
+        disk_block_size: logical_block_size(&disk_path)?,
+        second_disk,
         firmware_code_path: &firmware_code,
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,

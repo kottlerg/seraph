@@ -7,15 +7,26 @@ shared spawn primitives, and criticality handling.
 
 ## Death detection
 
-svcmgr binds every supervised service's main thread to one shared
-EventQueue (`deaths_eq`) via `SYS_THREAD_BIND_NOTIFICATION`, using the
-service's table index as the correlator. When a thread exits — either
-cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
-kernel posts the death entry `(exit_reason, correlator)` to `deaths_eq` (per
+svcmgr binds every supervised service's main thread to one of its death
+EventQueues via `SYS_THREAD_BIND_NOTIFICATION`, using the service's table
+index, widened to the full `u64`, as the correlator. When a thread exits —
+either cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
+kernel posts the death entry `(exit_reason, correlator)` to that queue (per
 [syscalls.md](../../../core/kernel/docs/syscalls.md)).
 
-The WaitSet has two members: the service endpoint (badge 0) and the
-deaths queue (badge 1). On wakeup svcmgr drains the queue and routes
+A bind takes one death-observer node from its queue's pool, fixed when the
+queue is created, so svcmgr keeps a growable set of queues: a bind tries the
+newest queue first, then the older ones, and only when every queue is out of
+nodes creates a further queue, funded from svcmgr's own memory, with twice
+the last pool (4 nodes first, below a boot's seven supervised and adopted
+services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). Up
+to `DEATH_QUEUES_MAX` (24) queues hold more nodes than svcmgr's `CSpace` has
+slots, so their count never binds first; each further queue is one contiguous
+grant from memmgr, which fragmented RAM can refuse first. A bind that still
+fails fails the launch, restart, or adoption.
+
+The WaitSet holds the service endpoint (badge 0) and every death queue
+(badge 1). On wakeup svcmgr drains every queue and routes
 each payload to its `ServiceEntry` via the correlator, then dispatches
 through [`restart::handle_death`](../src/restart.rs). The service table
 grows on the heap and never reuses a slot, so an index names one service
@@ -23,9 +34,10 @@ for svcmgr's lifetime; a post whose service's current thread the kernel
 reports live (`CAP_INFO_THREAD_STATE`) is a dead instance's that a resync
 already handled, and is dropped.
 
-`deaths_eq` has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64), not
-one sized from the service count. The kernel drops a post to a full queue,
-so a drain that takes a full queue's worth of events or more resyncs: it
+Each death queue has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64),
+not one sized from the service count. The kernel drops a post to a full
+queue, so a drain that takes a full queue's worth of events or more from one
+queue resyncs: it
 routes a death for every active service whose thread the kernel reports
 exited. A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.

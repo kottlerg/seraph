@@ -217,20 +217,16 @@ so the virtqueue is sized to one three-descriptor chain (four descriptors,
 one ring page). A device whose queue cannot hold three descriptors is
 refused at setup: the driver logs and exits.
 
-A request the device loses, by timing out or by publishing a used-ring
-element the virtqueue refuses (an id heading no outstanding chain) or one
-naming another chain, may still be in flight, so its Memory cap cannot go
-back while the device can still DMA into or out of it. The driver resets the device first: once the
-reset is acknowledged, the device no longer accesses the virtqueue or
-the buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies
-`DEVICE_FAULT` with the cap moved back, and fails stop: every later read
-or write is answered `DEVICE_FAULT` with its cap moved back, so clients
-see an error rather than block on an endpoint nobody serves. A device
-that does not acknowledge the reset within a bounded poll may still be
-transferring (the driver waits up to five seconds on the monotonic clock),
-so the driver logs and exits without replying; the cap is
-destroyed with the driver's `CSpace` instead of returning to a caller
-who could reuse the memory.
+A request the device loses, by timing out or by publishing a used-ring element the virtqueue refuses
+(an id heading no outstanding chain) or one naming another chain, may still be in flight, so its
+Memory cap cannot go back while the device can still DMA into or out of it. The driver resets the
+device first: once the reset is acknowledged, the device no longer accesses the virtqueue or the
+buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies `DEVICE_FAULT` with the cap moved back,
+and fails stop: every later read or write is answered `DEVICE_FAULT` with its cap moved back, so
+clients see an error rather than block on an endpoint nobody serves. A device that does not
+acknowledge the reset within a bounded poll may still be transferring (the driver waits up to five
+seconds on the monotonic clock), so the driver logs and exits without replying; the cap is destroyed
+with the driver's `CSpace` instead of returning to a caller who could reuse the memory.
 
 The notify-after-avail-update memory-ordering pair (release fence on the
 producer, the device's implicit load-acquire on the doorbell MMIO)

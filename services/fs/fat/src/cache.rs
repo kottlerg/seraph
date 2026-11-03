@@ -5,7 +5,8 @@
 
 //! Page-granular sector cache for FAT block I/O.
 //!
-//! Up to [`SLOT_COUNT`] single-page slots, each backed by a Memory cap mapped
+//! Up to [`slot_ceiling`] single-page slots (at least [`SLOT_COUNT`], more on
+//! a machine with more RAM, fixed at init), each backed by a Memory cap mapped
 //! into the fs process's address space at a fixed VA. Each slot holds one
 //! *page* of contiguous on-disk sectors: [`PageCache::sectors_per_page`],
 //! `PAGE_SIZE` over the sector size (8 for 512-byte sectors, 1 for 4 KiB
@@ -29,9 +30,9 @@
 //! The cache grows on demand: a slot takes its page from memmgr
 //! `REQUEST_MEMORY_CAPS` (`REQUIRE_CONTIGUOUS`, one IPC per slot) the first
 //! time a miss finds every provisioned slot in use or none provisioned, up to
-//! [`SLOT_COUNT`] slots, so an idle mount pays for no page it never fills. A
-//! miss evicts the least recently used unreferenced slot only once all
-//! [`SLOT_COUNT`] are provisioned or memmgr refuses a page. The VA window for
+//! the slot ceiling, so an idle mount pays for no page it never fills. A
+//! miss evicts the least recently used unreferenced slot only once every slot
+//! is provisioned or memmgr refuses a page. The VA window for
 //! every slot is reserved at init and held for the fs process's lifetime; the
 //! reservation is intentionally leaked (`ReservedRange` has no `Drop`).
 //!
@@ -51,7 +52,7 @@
 //! 0, after a revoke that completed, becomes a spare. A revoke that does not
 //! complete (a holder deriving faster than revocation reaches) skips the slot
 //! or the page for that pick, so a surviving derivation can never map a page
-//! the cache reuses. The cache holds at most [`SLOT_COUNT`] + [`QUARANTINE_MAX`]
+//! the cache reuses. The cache holds at most its slot ceiling + [`QUARANTINE_MAX`]
 //! pages in all: it requests a replacement page from memmgr only while its
 //! spares and quarantined pages number fewer than `QUARANTINE_MAX`. Past that
 //! bound, a still-mapped slot stays out of service until its client unmaps,
@@ -66,7 +67,7 @@ use std::os::seraph::reserve_pages;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
-pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT};
+pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
 
 /// Process-static scratch memory cap used for single-sector writeback in
 /// [`PageCache::write_sector`] and single-sector device reads in
@@ -94,10 +95,14 @@ struct ScratchMemory
 }
 
 /// General capability slots [`PageCache::init`] funds in the fs process's
-/// own `CSpace` before filling the cache: one per slot page, one per page
-/// the quarantine may add, the scratch page, and headroom for the caps the
-/// fs takes at run time (per-read derivations, block-device replies).
-const CACHE_CSPACE_FUNDING: u64 = (SLOT_COUNT + QUARANTINE_MAX) as u64 + 1 + 64;
+/// own `CSpace` before filling a cache of `slots` slots: one per slot page,
+/// one per page the quarantine may add, the scratch page, and headroom for
+/// the caps the fs takes at run time (per-read derivations, block-device
+/// replies).
+fn cache_cspace_funding(slots: usize) -> u64
+{
+    (slots + QUARANTINE_MAX) as u64 + 1 + 64
+}
 
 /// Sector size before mount sets the device's ([`PageCache::set_sector_size`]).
 const DEFAULT_SECTOR_SIZE: u32 = 512;
@@ -144,9 +149,10 @@ struct Quarantine
 /// Process-wide page cache.
 pub struct PageCache
 {
-    /// Every slot the cache may hold. Only `slots[..provisioned]` has a
-    /// page; the rest are VA windows waiting for one.
-    slots: [CacheSlot; SLOT_COUNT],
+    /// Every slot the cache may hold, as many as its slot ceiling. Only
+    /// `slots[..provisioned]` has a page; the rest are VA windows waiting for
+    /// one.
+    slots: Box<[CacheSlot]>,
     /// Slots that have taken their page, in index order. Written only by the
     /// dispatch thread, the one that fills slots.
     provisioned: AtomicUsize,
@@ -158,6 +164,11 @@ pub struct PageCache
     /// The fs process's own address space, which maps every slot.
     self_aspace: u32,
     quarantine: Mutex<Quarantine>,
+    /// [`Self::pick_victim`]'s per-slot skip marks, one per slot, allocated
+    /// at init so an eviction, which runs when memory is short, allocates
+    /// nothing. Only the dispatch thread picks victims; the lock makes the
+    /// sharing explicit.
+    victim_skips: Mutex<Box<[bool]>>,
 }
 
 /// Cache-init failure cause.
@@ -174,14 +185,17 @@ pub enum InitError
     CSpace,
     /// `mem_map` failed for one of the slot memory caps.
     Map,
+    /// The heap could not hold the slot table.
+    Heap,
 }
 
 impl PageCache
 {
-    /// Fund the fs process's own `cspace` for the cache's caps, reserve a
-    /// contiguous VA window for [`SLOT_COUNT`] slots, allocate and map the
-    /// scratch page, and return the process-static cache. Slot pages come
-    /// later, one per slot on first use.
+    /// Size the cache to the machine ([`slot_ceiling`] of the RAM memmgr
+    /// reports, [`SLOT_COUNT`] if it reports none), fund the fs process's own
+    /// `cspace` for the cache's caps, reserve a contiguous VA window for the
+    /// slots, allocate and map the scratch page, and return the
+    /// process-static cache. Slot pages come later, one per slot on first use.
     pub fn init(
         memmgr_ep: u32,
         self_aspace: u32,
@@ -193,10 +207,12 @@ impl PageCache
         {
             return Err(InitError::NoMemmgr);
         }
+        let slot_count =
+            query_system_ram_pages(memmgr_ep, ipc_buf).map_or(SLOT_COUNT, slot_ceiling);
         // The slot pages and their quarantine replacements are one Memory cap
         // each; fund the slots up front so growing the cache never meets an
         // exhausted CSpace.
-        if !std::os::seraph::fund_cspace_slot_budget(cspace, CACHE_CSPACE_FUNDING)
+        if !std::os::seraph::fund_cspace_slot_budget(cspace, cache_cspace_funding(slot_count))
         {
             return Err(InitError::CSpace);
         }
@@ -205,19 +221,30 @@ impl PageCache
             // has no Drop, so letting it fall out of scope here leaks the VA
             // window — the intended outcome. The handle's only purpose is
             // the va_start() lookup.
-            let range = reserve_pages(SLOT_COUNT as u64).map_err(|_| InitError::Reserve)?;
+            let range = reserve_pages(slot_count as u64).map_err(|_| InitError::Reserve)?;
             range.va_start()
         };
 
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(slot_count)
+            .map_err(|_| InitError::Heap)?;
+        slots.extend((0..slot_count).map(|i| CacheSlot {
+            page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
+            memory_cap: AtomicU32::new(0),
+            va: base_va + (i as u64) * PAGE_SIZE,
+            refcount: AtomicU32::new(0),
+            lru_seq: AtomicU64::new(0),
+            exposed: AtomicBool::new(false),
+        }));
+        let mut skips = Vec::new();
+        skips
+            .try_reserve_exact(slot_count)
+            .map_err(|_| InitError::Heap)?;
+        skips.resize(slot_count, false);
+
         let cache: &'static mut Self = Box::leak(Box::new(Self {
-            slots: core::array::from_fn(|i| CacheSlot {
-                page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
-                memory_cap: AtomicU32::new(0),
-                va: base_va + (i as u64) * PAGE_SIZE,
-                refcount: AtomicU32::new(0),
-                lru_seq: AtomicU64::new(0),
-                exposed: AtomicBool::new(false),
-            }),
+            slots: slots.into_boxed_slice(),
             provisioned: AtomicUsize::new(0),
             sector_size: AtomicU32::new(DEFAULT_SECTOR_SIZE),
             next_seq: AtomicU64::new(1),
@@ -227,6 +254,7 @@ impl PageCache
                 held: Vec::with_capacity(QUARANTINE_MAX),
                 spare: Vec::with_capacity(QUARANTINE_MAX),
             }),
+            victim_skips: Mutex::new(skips.into_boxed_slice()),
         }));
 
         // Allocate and map the single-page scratch memory cap used for
@@ -285,6 +313,12 @@ impl PageCache
         (lba - page_base) * u64::from(self.sector_size.load(Ordering::Acquire))
     }
 
+    /// The cache's slot ceiling: the most slots it grows to, fixed at init.
+    pub fn slot_ceiling(&self) -> usize
+    {
+        self.slots.len()
+    }
+
     /// The slots that hold a page: the provisioned prefix of `slots`.
     fn live_slots(&self) -> &[CacheSlot]
     {
@@ -300,7 +334,7 @@ impl PageCache
         let idx = self.provisioned.load(Ordering::Acquire);
         let slot = self.slots.get(idx)?;
         let cap = request_one_page(self.memmgr_ep, ipc_buf)?;
-        // SAFETY: slot.va is a page of the `SLOT_COUNT`-page window reserved
+        // SAFETY: slot.va is a page of the slot-ceiling-page window reserved
         // at init from the per-process arena and owned by the cache, and no
         // page is mapped there yet: VA no Rust object or IPC page occupies.
         if unsafe { syscall::mem_map(cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_err()
@@ -587,7 +621,11 @@ impl PageCache
     /// next one. `None` when no slot qualifies.
     fn pick_victim(&self, ipc_buf: *mut u64) -> Option<usize>
     {
-        let mut skipped = [false; SLOT_COUNT];
+        let mut skipped = self
+            .victim_skips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        skipped.fill(false);
         loop
         {
             let candidate = self.lru_unreferenced(&skipped)?;
@@ -703,7 +741,7 @@ impl PageCache
 
     /// The least recently used slot with no reference that `skipped` does not
     /// exclude.
-    fn lru_unreferenced(&self, skipped: &[bool; SLOT_COUNT]) -> Option<usize>
+    fn lru_unreferenced(&self, skipped: &[bool]) -> Option<usize>
     {
         let mut best: Option<(usize, u64)> = None;
         for (i, slot) in self.live_slots().iter().enumerate()
@@ -894,6 +932,16 @@ fn read_one_via_block_dev(
     let returned = reply.caps().first().copied().unwrap_or(0);
     scratch.cap.store(returned, Ordering::Release);
     reply.label == blk_errors::SUCCESS && returned != 0
+}
+
+/// The pages of system RAM memmgr reports (`QUERY_POOL_STATUS` `data[0]`), or
+/// `None` when the query fails.
+fn query_system_ram_pages(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u64>
+{
+    let req = IpcMessage::builder(memmgr_labels::QUERY_POOL_STATUS).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }.ok()?;
+    (reply.label == memmgr_errors::SUCCESS).then(|| reply.word(0) / PAGE_SIZE)
 }
 
 /// Acquire one single-page Memory cap from memmgr.

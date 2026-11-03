@@ -25,7 +25,7 @@ pub fn run(ctx: &BuildContext, args: &ComposeBundleArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
     bundle::compose(ctx, args.harness)?;
-    disk::create_disk_image(ctx, args.arch)?;
+    disk::create_disk_image(ctx, args.arch, disk::DiskLayout::default())?;
     step(&format!(
         "compose-bundle complete (harness={:?}, {})",
         args.harness, args.arch

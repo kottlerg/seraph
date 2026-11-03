@@ -335,7 +335,10 @@ on x86_64; CI boots headless, so no framebuffer), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
 5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
-host whose CPU lacks LA57, are manual, same posture). The `virtio-rng` device is
+host whose CPU lacks LA57, are manual, same posture), disk logical block size (512 bytes —
+the 4Kn boot, a 4096-byte-block image on a 4096-byte-block device, runs in the release host
+runs, see Disk variations below), and disk count (one — the second-disk boots run there
+too). The `virtio-rng` device is
 a boot-entropy source for the pool seed and KASLR: the firmware's RNG driver
 binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF
 also backs the protocol with RDRAND on x86_64; on riscv64 the device is the
@@ -350,7 +353,7 @@ cells automatically; variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times and the memory variation once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times, and the memory variation and the disk variations once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -626,15 +629,47 @@ Any other HANG or failure of a run the PR does not owe (a memory-variation HANG 
 boundary failure no open Issue for that boundary names), and any HANG or failure of a run the PR
 owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
 
+**Disk variations.** Three svctest boots, on each architecture, vary the disk: a 4Kn disk
+(`mkdisk --block-size 4096`), booted from a 4096-byte-block ESP with its root and data
+partitions at 4096-byte blocks; the data partition alone on a second disk (`mkdisk
+--split-data`, booted with `--second-disk disk-data.img`), so `/data` lives only there; and a
+second disk at 8192-byte blocks (`--second-disk-block-size 8192`), above virtio-blk's
+`MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and device documents own
+what each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
+[device-management.md](device-management.md) § Relationship to Other Services), and
+[xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is staged as the
+canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is the
+larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
+boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
+follow; a change to that boot re-derives it.
+
+```sh
+# Disk variations, per architecture (clean between architectures):
+cargo xtask build --arch <arch>
+cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
+    sysroot/config/svcmgr/services/
+rm -f sysroot/config/svcmgr/services/terminal.svc
+cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
+cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420
+cargo xtask mkdisk --arch <arch> --repack-only --split-data
+cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+    --second-disk disk-data.img
+cargo xtask mkdisk --arch <arch> --repack-only
+cp disk.img target/xtask/second-disk.img
+cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+    --second-disk target/xtask/second-disk.img --second-disk-block-size 8192
+```
+
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
 (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
-(`--runs 3`) and the memory variation once, so every tag boots at each boundary
-CPU count, and runs the timing report on the boundary logs, which is reported and
-blocks nothing. A run whose outcome is not a pass, as When the runs are owed
-classifies outcomes, blocks the tag, MUST be filed as an Issue, and is bisected
-over the release's PRs.
+(`--runs 3`), and the memory variation and the disk variations once each, so every
+tag boots at each boundary CPU count, from a 4Kn disk, and from two disks, and runs
+the timing report on the boundary logs, which is reported and blocks nothing. A
+run whose outcome is not a pass, as When the runs are owed classifies outcomes,
+blocks the tag, MUST be filed as an Issue, and is bisected over the release's
+PRs.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

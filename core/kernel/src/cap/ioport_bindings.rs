@@ -16,16 +16,16 @@
 //! (`invalidate_all_iopbs`). See
 //! core/kernel/docs/capability-internals.md § `IoPort` Bindings.
 //!
-//! The table lives in one SEED scratch allocation per bound thread
-//! ([`TABLE_BYTES`]), its bitmap at offset 0 so the TCB's `iopb` pointer is
-//! the bitmap the context switch loads. On RISC-V the bitmap is empty
-//! (`IOPB_SIZE == 0`) and no thread ever binds.
+//! The table is one page, and the bitmap it heads is held in further pages
+//! (`ThreadIopb`, `IOPB_PARTS` page-sized parts), all taken from the pool of
+//! the bound thread's own `CSpace` ([`TABLE_PAGES`]). The table never outlives
+//! that pool: the thread's dealloc returns it, and if the `CSpace` dies first
+//! its teardown does ([`free_tables_bound_to`]), each under the thread's
+//! `sched_lock`. The bitmap sits at offset 0,
+//! so the TCB's `iopb` pointer is the bitmap the context switch loads. On
+//! RISC-V the bitmap has no part and no thread ever binds.
 
-use crate::arch::current::IOPB_SIZE;
-
-/// Most bindings one thread records. A bind past it returns `QuotaExceeded`;
-/// binding the same `IoPort` object again reuses its record.
-pub const MAX_IOPORT_BINDINGS: usize = 16;
+use crate::arch::current::{IOPB_PART_BYTES, IOPB_PARTS, ThreadIopb};
 
 /// One recorded binding: the `IoPort` object it was made through (its address,
 /// compared but never dereferenced) and the ports it grants.
@@ -38,19 +38,39 @@ struct IoPortBinding
     count: u32,
 }
 
-/// The port-binding table of one thread.
+/// Most bindings one thread records: as many as the table's page holds after
+/// its header (252 on x86-64). A bind past it returns `QuotaExceeded`; binding
+/// the same `IoPort` object again reuses its record. Each binding is made
+/// through a distinct `IoPort` object, and the page is funded by the bound
+/// thread's `CSpace`.
+pub const MAX_IOPORT_BINDINGS: usize = (crate::mm::PAGE_SIZE
+    - core::mem::size_of::<ThreadIopb>()
+    - (2 + TABLE_PAGES) * core::mem::size_of::<usize>())
+    / core::mem::size_of::<IoPortBinding>();
+
+/// The port-binding table of one thread: one page.
 #[repr(C)]
 pub struct IoPortBindings
 {
     /// I/O permission bitmap: bit N is port N, 0 permits, 1 denies. Always the
     /// union of the recorded bindings.
-    pub bitmap: [u8; IOPB_SIZE],
-    records: [IoPortBinding; MAX_IOPORT_BINDINGS],
+    pub bitmap: ThreadIopb,
+    /// The `CSpaceKernelObject` whose pool funded this page and the bitmap's
+    /// parts (the bound thread's), as an address.
+    funder: usize,
+    /// For this page and then each part's, the donation record cell its pool
+    /// page carried (`cap::object`'s `HolesCell`), restored when the page
+    /// goes back to the pool.
+    page_cells: [usize; TABLE_PAGES],
     count: usize,
+    records: [IoPortBinding; MAX_IOPORT_BINDINGS],
 }
 
-/// Bytes of the SEED scratch allocation backing one table.
-pub const TABLE_BYTES: u64 = core::mem::size_of::<IoPortBindings>() as u64;
+const _: () = assert!(core::mem::size_of::<IoPortBindings>() <= crate::mm::PAGE_SIZE);
+
+/// Pages one table takes from its funder: the table's own and the bitmap's
+/// parts.
+pub const TABLE_PAGES: usize = 1 + IOPB_PARTS;
 
 /// A bind the table cannot record.
 #[derive(Debug, PartialEq, Eq)]
@@ -58,17 +78,60 @@ pub struct TableFull;
 
 impl IoPortBindings
 {
-    /// Initialise a table in place: every port denied, no bindings.
+    /// Initialise a table in place: every port denied, no bindings, the
+    /// bitmap held in `parts`, all funded by `funder`, with the donation record
+    /// cells of the table's page and the parts' in `page_cells`.
     ///
     /// # Safety
-    /// `table` points at [`TABLE_BYTES`] writable bytes, suitably aligned, that
-    /// nothing else references.
-    pub unsafe fn init_in_place(table: *mut Self)
+    /// `table` points at a writable page and each of `parts` at a writable
+    /// [`IOPB_PART_BYTES`] block, page-aligned, that nothing else references
+    /// and that stay live, owned by the table, until it is freed.
+    pub unsafe fn init_in_place(
+        table: *mut Self,
+        parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS],
+        funder: usize,
+        page_cells: [usize; TABLE_PAGES],
+    )
     {
+        for &part in &parts
+        {
+            // SAFETY: caller contract.
+            unsafe { (*part).fill(0xFF) };
+        }
         // SAFETY: caller contract; the fields are plain data.
         unsafe {
-            core::ptr::addr_of_mut!((*table).bitmap).write_bytes(0xFF, 1);
+            core::ptr::addr_of_mut!((*table).bitmap).write(ThreadIopb { parts });
+            core::ptr::addr_of_mut!((*table).funder).write(funder);
+            core::ptr::addr_of_mut!((*table).page_cells).write(page_cells);
             core::ptr::addr_of_mut!((*table).count).write(0);
+        }
+    }
+
+    /// The address of the `CSpaceKernelObject` that funded the table.
+    pub fn funder(&self) -> usize
+    {
+        self.funder
+    }
+
+    /// The donation record cells of the table's page and the parts' pages.
+    pub fn page_cells(&self) -> [usize; TABLE_PAGES]
+    {
+        self.page_cells
+    }
+
+    /// Permit `count` ports from `base` in every part of the bitmap.
+    // cast_possible_truncation: a part's first port is below 65536.
+    #[allow(clippy::cast_possible_truncation)]
+    fn permit(&mut self, base: u32, count: u32)
+    {
+        for (i, &part) in self.bitmap.parts.iter().enumerate()
+        {
+            // SAFETY: each part is a live block the table owns
+            // (init_in_place's contract), and `&mut self` excludes every
+            // other use of it.
+            let part = unsafe { &mut *part };
+            let first_port = (i * IOPB_PART_BYTES * 8) as u32;
+            crate::arch::current::gdt::permit_port_range(part, first_port, base, count);
         }
     }
 
@@ -96,7 +159,7 @@ impl IoPortBindings
             count,
         };
         self.count += 1;
-        crate::arch::current::gdt::permit_port_range(&mut self.bitmap, base, count);
+        self.permit(base, count);
         Ok(())
     }
 
@@ -119,10 +182,15 @@ impl IoPortBindings
         {
             return false;
         }
-        self.bitmap.fill(0xFF);
-        for r in &self.records[..kept]
+        for &part in &self.bitmap.parts
         {
-            crate::arch::current::gdt::permit_port_range(&mut self.bitmap, r.base, r.count);
+            // SAFETY: as in `permit`.
+            unsafe { (*part).fill(0xFF) };
+        }
+        for i in 0..kept
+        {
+            let r = self.records[i];
+            self.permit(r.base, r.count);
         }
         true
     }
@@ -155,7 +223,7 @@ pub unsafe fn withdraw_everywhere(object: usize)
             // `iopb` and the table's bytes are owned by this lock; the Thread
             // arm of dealloc_object nulls the pointer under it before freeing.
             // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-            // IoPortBindings block (sys_ioport_bind).
+            // IoPortBindings page (sys_ioport_bind).
             #[allow(clippy::cast_ptr_alignment)]
             let table = (*tcb).iopb.cast::<IoPortBindings>();
             if !table.is_null() && (*table).withdraw(object)
@@ -171,57 +239,144 @@ pub unsafe fn withdraw_everywhere(object: usize)
     }
 }
 
+/// Free the port-binding table of every thread bound to the `CSpace` at
+/// `cspace`, whose pool funded them, before that pool is reclaimed. Each table
+/// is detached and freed under its thread's `sched_lock`, the lock a bind
+/// installs it and the Thread arm of `dealloc_object` frees it under, so no
+/// table of these threads is freed into the pool after this returns.
+///
+/// # Safety
+/// `cspace` is a dying `CSpace` whose bound threads are all stopped
+/// (`Exited`), so none binds again; its wrapper is live; no lock is held.
+#[cfg(not(test))]
+pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
+{
+    if !crate::arch::current::HAS_IO_PORTS
+    {
+        return;
+    }
+    // SAFETY: the closure takes only each thread's sched_lock, ordered after
+    // the registry lock, and the pool lock inside it; it waits on no other CPU.
+    unsafe {
+        crate::sched::thread_registry::for_each(|tcb| {
+            if !core::ptr::eq((*tcb).cspace, cspace)
+            {
+                return;
+            }
+            let saved = (*tcb).sched_lock.lock_raw();
+            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+            // IoPortBindings page (sys_ioport_bind).
+            #[allow(clippy::cast_ptr_alignment)]
+            let table = (*tcb).iopb.cast::<IoPortBindings>();
+            (*tcb).iopb = core::ptr::null_mut();
+            if !table.is_null()
+            {
+                // The thread is stopped and off every CPU, so no TSS load
+                // reads the table; its funder, the dying CSpace, is live.
+                crate::cap::object::free_port_binding_table(table);
+            }
+            (*tcb).sched_lock.unlock_raw(saved);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
 
-    fn table() -> Box<IoPortBindings>
+    /// A table with its parts, kept alive by the returned backing.
+    struct Table
     {
+        table: Box<IoPortBindings>,
+        _parts: Vec<Box<[u8; IOPB_PART_BYTES]>>,
+    }
+
+    fn table() -> Table
+    {
+        let mut parts_box: Vec<Box<[u8; IOPB_PART_BYTES]>> = (0..IOPB_PARTS)
+            .map(|_| Box::new([0u8; IOPB_PART_BYTES]))
+            .collect();
+        let mut parts = [core::ptr::null_mut(); IOPB_PARTS];
+        for (p, b) in parts.iter_mut().zip(parts_box.iter_mut())
+        {
+            *p = core::ptr::from_mut(&mut **b);
+        }
         let layout = std::alloc::Layout::new::<IoPortBindings>();
-        // SAFETY: a fresh allocation of the table's layout, initialised in
-        // place before use.
-        unsafe {
+        // SAFETY: a fresh allocation of the table's layout and fresh parts,
+        // initialised in place before use; the parts outlive the table.
+        let table = unsafe {
             let p = std::alloc::alloc(layout).cast::<IoPortBindings>();
             assert!(!p.is_null());
-            IoPortBindings::init_in_place(p);
+            IoPortBindings::init_in_place(p, parts, 0x5000, [0; TABLE_PAGES]);
             Box::from_raw(p)
+        };
+        Table {
+            table,
+            _parts: parts_box,
         }
     }
 
     fn permitted(t: &IoPortBindings, port: u32) -> bool
     {
-        t.bitmap[(port / 8) as usize] & (1 << (port % 8)) == 0
+        let bits = (IOPB_PART_BYTES * 8) as u32;
+        let part = t.bitmap.parts[(port / bits) as usize];
+        let rel = port % bits;
+        // SAFETY: the part is live for the table's life.
+        unsafe { (*part)[(rel / 8) as usize] & (1 << (rel % 8)) == 0 }
     }
 
     #[test]
     fn withdrawing_one_binding_keeps_ports_another_binding_grants()
     {
         let mut t = table();
+        let t = &mut *t.table;
         t.bind(0xA000, 0x60, 8).unwrap();
         t.bind(0xB000, 0x64, 8).unwrap();
         assert!(t.withdraw(0xA000));
         assert!(
-            !permitted(&t, 0x60),
+            !permitted(t, 0x60),
             "a port only the withdrawn binding granted is denied"
         );
         assert!(
-            permitted(&t, 0x64),
+            permitted(t, 0x64),
             "an overlapping port the other binding grants survives"
         );
-        assert!(permitted(&t, 0x6B));
+        assert!(permitted(t, 0x6B));
         assert!(!t.withdraw(0xA000), "a second withdrawal finds nothing");
+    }
+
+    // The defect caught: a binding that straddles two parts permits ports in
+    // only one of them, or a rebuild that resets only the first part.
+    #[test]
+    fn a_binding_across_the_parts_is_permitted_and_withdrawn_in_both()
+    {
+        let mut t = table();
+        let t = &mut *t.table;
+        let edge = (IOPB_PART_BYTES * 8) as u32;
+        t.bind(0xA000, edge - 4, 8).unwrap();
+        assert!(permitted(t, edge - 4) && permitted(t, edge + 3));
+        assert!(!permitted(t, edge - 5) && !permitted(t, edge + 4));
+        t.bind(0xB000, 0xFFF0, 16).unwrap();
+        assert!(t.withdraw(0xA000));
+        assert!(!permitted(t, edge - 1) && !permitted(t, edge));
+        assert!(
+            permitted(t, 0xFFFF),
+            "the other binding survives the rebuild"
+        );
     }
 
     #[test]
     fn a_full_table_refuses_a_new_object_but_not_a_rebind()
     {
         let mut t = table();
+        let t = &mut *t.table;
         for i in 0..MAX_IOPORT_BINDINGS
         {
             t.bind(0x1000 + i, 0x100 + i as u32, 1).unwrap();
         }
         assert_eq!(t.bind(0x9000, 0x200, 1), Err(TableFull));
         assert_eq!(t.bind(0x1000, 0x100, 1), Ok(()));
+        assert_eq!(t.funder(), 0x5000);
     }
 }

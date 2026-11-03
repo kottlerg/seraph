@@ -838,10 +838,11 @@ leaving the new capability an unlinked derivation root.
 **Errors:** `InvalidCapability` (source invalid, null, or freed meanwhile),
 `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight
 on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio`, `IoPort`, or
-`Interrupt` source, the kernel's SEED reserve cannot back the fresh object), `QuotaExceeded`
-(caller's CSpace directory structurally full; for an `Mmio`, `IoPort`, or `Interrupt` source, its
-range already has `RANGE_COPY_LIMIT` (64) live copies; for any other source, the object's
-reference count is at its 2^31 ceiling).
+`Interrupt` source, the caller's `CSpace` pool cannot back the fresh object; see
+[capability-internals.md](capability-internals.md) § Body Arena), `QuotaExceeded` (caller's CSpace
+directory structurally full; for an `Mmio`, `IoPort`, or `Interrupt` source, its range already has
+`RANGE_COPY_LIMIT` (2^31 - 1) live copies; for any other source, the object's reference count is
+at its 2^31 ceiling).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -1177,8 +1178,9 @@ with `InvalidState`.
 **Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`,
 leaving fewer than one page on the upper side, below the bump boundary, or the
 parent has derivation children), `InvalidCapability`, `InvalidState` (per
-above), `InsufficientRights` (cap lacks Map), `OutOfMemory` (tail wrapper
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
+above), `InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's
+`CSpace` pool cannot back the tail's body or its slot; see
+[capability-internals.md](capability-internals.md) § Body Arena), `QuotaExceeded` (caller's CSpace
 directory structurally full).
 
 ---
@@ -1205,24 +1207,24 @@ MMIO mappings are never executable, and mapping writability is derived from the
 `mmio_cap`'s Write right, not from `flags`. The kernel forces the uncacheable
 attribute unconditionally.
 
-The `mmio_cap`'s object records the mapping, holding a reference on the address space, before
-any page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted,
+The `mmio_cap`'s object records the mapping, holding a reference on the address space, before any
+page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted,
 consumed by a split, or revoked through an ancestor, every recorded mapping is unmapped with TLB
-shootdown, except a
-page the address space has since remapped to other memory (see
-[capability-model.md](../../../docs/capability-model.md) § Mmio). One object records at most
-`MMIO_MAX_MAPPINGS` (4) mappings; mapping it again at the same `virt` of the same address space
-reuses its record. A call that fails with `OutOfMemory` after the record is taken keeps the
-record and the pages it mapped (both go when the object is freed); a retry at the same `virt`
-reuses the record.
+shootdown, except a page the address space has since remapped to other memory (see
+[capability-model.md](../../../docs/capability-model.md) § Mmio). One object records
+`MMIO_INLINE_MAPPINGS` (4) mappings inline and each further one in a spill chunk funded by the
+caller's `CSpace` (see [capability-internals.md](capability-internals.md) § Mmio Mappings); mapping
+it again at the same `virt` of the same address space reuses its record. A call that fails with
+`OutOfMemory` after the record is taken keeps the record and the pages it mapped (both go when the
+object is freed); a retry at the same `virt` reuses the record.
 
 **Capability requirements:** `aspace_cap` (Map), `mmio_cap` (Map).
 
 **Errors:** `InvalidAddress` (unaligned or non-canonical `virt`, or range leaves the
 user half), `InvalidCapability`, `InsufficientRights` (a cap lacks Map), `InvalidArgument`
-(MMIO region size zero or not page-aligned, or size overflow), `QuotaExceeded` (the object
-already records `MMIO_MAX_MAPPINGS` other mappings), `OutOfMemory` (page table allocation
-failure).
+(MMIO region size zero or not page-aligned, or size overflow), `OutOfMemory` (page table
+allocation failure, or the caller's `CSpace` pool cannot fund a spill chunk for a mapping past the
+inline records).
 
 ---
 
@@ -1273,11 +1275,10 @@ intermediate.
 The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`,
 `SYS_SCHED_SPLIT`) share this tail and these two errors.
 
-**Errors:** `InvalidState`, `Interrupted` (per above),
-`InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`, or
-fewer than one page on the upper side), `InvalidCapability`, `InsufficientRights` (cap
-lacks Map), `OutOfMemory` (child allocation or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+**Errors:** `InvalidState`, `Interrupted` (per above), `InvalidArgument` (`split_offset` not
+page-aligned, zero, `>= size`, or fewer than one page on the upper side), `InvalidCapability`,
+`InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's `CSpace` pool cannot back the
+children's bodies or slots), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -1546,8 +1547,8 @@ Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as
 
 **Errors:** `InvalidState`, `Interrupted` (per above),
 `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
-(`split_at` outside `(min, max]`), `OutOfMemory` (child allocation or slot-page pool
-exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+(`split_at` outside `(min, max]`), `OutOfMemory` (the caller's `CSpace` pool cannot back the
+children's bodies or slots), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -1995,7 +1996,7 @@ Permission Bitmap (IOPB).
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Multiple bindings may be made to the same thread, each authorising a different port range; a
-thread records at most `MAX_IOPORT_BINDINGS` (16) bindings, and binding the same
+thread records at most `MAX_IOPORT_BINDINGS` (252) bindings, and binding the same
 `ioport_cap` object again reuses its record. A bind takes effect at the target's next port
 access even when the target is running on another CPU (every CPU's TSS IOPB is invalidated
 and reloaded lazily). The thread records each binding against the `ioport_cap`'s object.
@@ -2007,10 +2008,12 @@ next port access, a CPU running the thread included (see
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).
 
-**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidCapability`,
+**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidCapability` (also for a thread
+already `Exited`),
 `InsufficientRights` (a cap lacks Control/Use), `QuotaExceeded` (the thread already records
-`MAX_IOPORT_BINDINGS` bindings through other objects), `OutOfMemory` (binding-table allocation
-from SEED).
+`MAX_IOPORT_BINDINGS` bindings through other objects), `OutOfMemory` (the first bind's
+binding table, three pages, cannot be taken from the target thread's `CSpace` pool; see
+[capability-internals.md](capability-internals.md) § IoPort Bindings).
 
 ---
 
@@ -2041,11 +2044,10 @@ derivation parent. The original `irq_cap` is consumed.
 Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as for
 `SYS_MMIO_SPLIT`.
 
-**Errors:** `InvalidState`, `Interrupted` (per above),
-`InvalidArgument` (`split_at` outside `(start, start+count)`),
-`InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory` (child
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
-structurally full).
+**Errors:** `InvalidState`, `Interrupted` (per above), `InvalidArgument` (`split_at` outside
+`(start, start+count)`), `InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory`
+(the caller's `CSpace` pool cannot back the children's bodies or slots), `QuotaExceeded` (caller's
+CSpace directory structurally full).
 
 ---
 
@@ -2082,11 +2084,10 @@ that syscall releases it). A caller that needs the ports binds a child afterward
 Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as for
 `SYS_MMIO_SPLIT`.
 
-**Errors:** `InvalidState`, `Interrupted` (per above),
-`NotSupported` (RISC-V — no I/O ports), `InvalidArgument` (`split_at` 0,
-`> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`, `InsufficientRights`
-(cap lacks Use), `OutOfMemory` (child allocation or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace directory structurally full).
+**Errors:** `InvalidState`, `Interrupted` (per above), `NotSupported` (RISC-V — no I/O ports),
+`InvalidArgument` (`split_at` 0, `> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`,
+`InsufficientRights` (cap lacks Use), `OutOfMemory` (the caller's `CSpace` pool cannot back the
+children's bodies or slots), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -2179,10 +2180,10 @@ to it is stopped and the call never returns (see
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
-or SEED cannot back an `Mmio`, `IoPort`, or `Interrupt` copy's object), `QuotaExceeded` (dst
-CSpace directory structurally full, an `Mmio`, `IoPort`, or `Interrupt` source's range already has
-`RANGE_COPY_LIMIT` (64) live copies, or any other source's object has its reference count at its
-2^31 ceiling).
+or the dst CSpace pool cannot back an `Mmio`, `IoPort`, or `Interrupt` copy's object),
+`QuotaExceeded` (dst CSpace directory structurally full, an `Mmio`, `IoPort`, or `Interrupt`
+source's range already has `RANGE_COPY_LIMIT` (2^31 - 1) live copies, or any other source's object
+has its reference count at its 2^31 ceiling).
 
 ---
 

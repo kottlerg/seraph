@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::arch::Arch;
 use crate::bundle::Harness;
+use crate::disk::BlockSize;
 use crate::qemu::{RiscvMmu, X86Paging};
 
 /// Top-level CLI entry point.
@@ -228,6 +229,21 @@ pub struct RunArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Attach this image as a second disk: its own `virtio-blk-pci` device
+    /// (drive `hd1`) beside `disk.img`, presenting the logical block size of
+    /// the image's GPT unless `--second-disk-block-size` sets it (an image
+    /// with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask
+    /// mkdisk --split-data` authors `disk-data.img` for it.
+    #[arg(long, value_name = "PATH")]
+    pub second_disk: Option<PathBuf>,
+
+    /// Logical and physical block size, in bytes, of the second disk's
+    /// device, overriding the size read from its image (a power of two of at
+    /// least 512; a size above the guest driver's 4096 stages the boot whose
+    /// second device the driver refuses).
+    #[arg(long, value_name = "BYTES", requires = "second_disk")]
+    pub second_disk_block_size: Option<u32>,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -252,6 +268,19 @@ pub struct MkdiskArgs
     /// symbolization workflows. Omit to remove the knob and re-enable KASLR.
     #[arg(long)]
     pub no_kaslr: bool,
+
+    /// Logical block size of the authored images: the unit of their GPT LBAs
+    /// and the sector size of their FAT volumes. `run` and the other
+    /// launchers present the disk device at the size the image's GPT has.
+    #[arg(long, default_value = "512")]
+    pub block_size: BlockSize,
+
+    /// Author the data partition alone on a second image, `disk-data.img`,
+    /// and only the ESP and root partitions on `disk.img`; boot the pair with
+    /// `--second-disk disk-data.img`. Without it `disk.img` carries all three
+    /// and a `disk-data.img` an earlier authoring left is removed.
+    #[arg(long)]
+    pub split_data: bool,
 }
 
 // ── TestTerminal ──────────────────────────────────────────────────────────────
@@ -465,6 +494,21 @@ pub struct RunParallelArgs
     /// of the same name is overwritten.
     #[arg(long, value_name = "DIR")]
     pub save_logs: Option<PathBuf>,
+
+    /// Attach this image as a second disk: its own `virtio-blk-pci` device
+    /// (drive `hd1`) beside `disk.img`, presenting the logical block size of
+    /// the image's GPT unless `--second-disk-block-size` sets it (an image
+    /// with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask
+    /// mkdisk --split-data` authors `disk-data.img` for it.
+    #[arg(long, value_name = "PATH")]
+    pub second_disk: Option<PathBuf>,
+
+    /// Logical and physical block size, in bytes, of the second disk's
+    /// device, overriding the size read from its image (a power of two of at
+    /// least 512; a size above the guest driver's 4096 stages the boot whose
+    /// second device the driver refuses).
+    #[arg(long, value_name = "BYTES", requires = "second_disk")]
+    pub second_disk_block_size: Option<u32>,
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

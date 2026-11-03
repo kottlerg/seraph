@@ -2,6 +2,7 @@
 /sysroot/
 /target/
 /disk.img
+/disk-data.img
 
 # rustfmt backup files
 **/*.rs.bk

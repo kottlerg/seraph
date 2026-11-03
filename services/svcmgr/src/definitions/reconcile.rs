@@ -43,9 +43,10 @@ pub struct PendingRegistration
     /// `ipc::svcmgr_labels::NAME_MAX` bytes.
     pub name: String,
     pub thread_cap: u32,
-    /// Cleared to `true` once a `.svc` definition has consumed this
-    /// entry. Entries still `false` after the file scan get the
-    /// `registered without definition` error path.
+    /// Set to `true` once a `.svc` definition has consumed this entry, or
+    /// when the scan has no memory for the parsed recipes and releases it
+    /// unsupervised (`release_unsupervised`). Entries still `false` after
+    /// the file scan get the `registered without definition` error path.
     pub consumed: bool,
 }
 
@@ -86,12 +87,11 @@ impl ServiceTable
 
     /// Reserve the next slot, inactive, and return its index and the death
     /// correlator that names it. `None`, changing nothing, when the heap
-    /// cannot grow either vector or the index does not fit the 32-bit
-    /// correlator svcmgr binds.
-    fn reserve(&mut self) -> Option<(usize, u32)>
+    /// cannot grow either vector.
+    fn reserve(&mut self) -> Option<(usize, u64)>
     {
         let idx = self.services.len();
-        let correlator = u32::try_from(idx).ok()?;
+        let correlator = u64::try_from(idx).ok()?;
         self.services.try_reserve(1).ok()?;
         self.recipes.try_reserve(1).ok()?;
         self.services.push(ServiceEntry::empty());
@@ -106,12 +106,12 @@ impl ServiceTable
 /// definition through the right path. `pending` is consumed:
 /// entries that match a definition are marked `consumed`; entries
 /// left unconsumed after the scan are reported as a configuration
-/// error.
+/// error, except when the scan has no memory for the parsed recipes,
+/// when they run on unsupervised.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
-    deaths_eq: u32,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
 )
@@ -131,6 +131,11 @@ pub fn reconcile_and_launch(
         }
     };
 
+    // The copies and collections this scan makes are fallible, and both sorts
+    // sort in place: a recipe whose name or path the heap cannot hold is
+    // dropped with a log line and the others still launch, and with no room
+    // for the parsed list none launches. The directory walk (`DirEntry::path`)
+    // and `parse` allocate inside std and svc-defs.
     let mut entries: Vec<String> = Vec::new();
     for ent in read
     {
@@ -140,7 +145,7 @@ pub fn reconcile_and_launch(
             continue;
         };
         let path = ent.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()).map(str::to_owned)
+        let Some(name) = path.file_name().and_then(|s| s.to_str())
         else
         {
             continue;
@@ -153,26 +158,51 @@ pub fn reconcile_and_launch(
         {
             continue;
         }
+        if entries.try_reserve(1).is_err()
+        {
+            log!("svcmgr: no memory to list {name}; dropped");
+            continue;
+        }
+        let Some(name) = try_string(name)
+        else
+        {
+            log!("svcmgr: no memory to list {name}; dropped");
+            continue;
+        };
+        // Within the slot reserved above, so the push cannot grow.
         entries.push(name);
     }
     // Deterministic launch order — purely for grep-ability of the
     // boot log; svcmgr makes no policy claim about start sequencing
     // across /config/svcmgr/services/ (services that depend on each other use
-    // discovery-registry lookups, not file-system ordering).
-    entries.sort();
+    // discovery-registry lookups, not file-system ordering). File names in
+    // one directory are unique, so the unstable sort, which needs no scratch
+    // allocation, gives the same order a stable one would.
+    entries.sort_unstable();
 
     // Parse every recipe first, then order providers (services that
     // publish their own endpoint via `provides = ...`) ahead of pure
     // consumers, so a provided name is in the discovery registry before
-    // any consumer launched here resolves it. `sort_by_key` is stable, so
-    // alphabetical order is preserved within each group.
-    let mut defs: Vec<Definition> = Vec::with_capacity(entries.len());
+    // any consumer launched here resolves it. Service names are unique (one
+    // `.svc` suffix stripped from unique file names), so ordering by
+    // (consumer, service name) with the allocation-free unstable sort keeps
+    // each group in service-name order.
+    let mut defs: Vec<Definition> = Vec::new();
+    if defs.try_reserve_exact(entries.len()).is_err()
+    {
+        log!("svcmgr: no memory to parse {} recipes", entries.len());
+        release_unsupervised(pending);
+        return;
+    }
     for filename in &entries
     {
-        let service_name = filename.trim_end_matches(".svc");
-        let mut path = String::from(SERVICES_DIR);
-        path.push('/');
-        path.push_str(filename);
+        let service_name = filename.strip_suffix(".svc").unwrap_or(filename);
+        let Some(path) = recipe_path(filename)
+        else
+        {
+            log!("svcmgr: no memory for {filename}'s path; dropped");
+            continue;
+        };
 
         let contents = match fs::read_to_string(&path)
         {
@@ -185,15 +215,18 @@ pub fn reconcile_and_launch(
         };
         match parse(service_name, &contents)
         {
+            // Within the capacity reserved above, so the push cannot grow.
             Ok(d) => defs.push(d),
             Err(e) => log!("svcmgr: parse {path}: {e}"),
         }
     }
-    defs.sort_by_key(|d| d.provides.is_empty());
+    defs.sort_unstable_by(|a, b| {
+        (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
+    });
 
     for def in &defs
     {
-        handle_definition(def, pending, table, deaths_eq, ctx, registry);
+        handle_definition(def, pending, table, ctx, registry);
     }
 
     report_orphans(pending);
@@ -204,7 +237,6 @@ fn handle_definition(
     def: &Definition,
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
-    deaths_eq: u32,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
 )
@@ -222,7 +254,7 @@ fn handle_definition(
         // `restart::restart_process`. Bind happens after the fact (the
         // thread has been running since its bootstrap spawn); `bind_only`
         // states why a death in that window is still delivered.
-        bind_only(def, slot.thread_cap, table, deaths_eq);
+        bind_only(def, slot.thread_cap, table, &ctx.deaths);
         return;
     }
 
@@ -278,14 +310,14 @@ fn handle_definition(
     // Build the entry before launching, so a heap that cannot hold its name
     // and paths launches nothing rather than an instance svcmgr could not
     // supervise.
-    let Some(mut entry) = build_entry(def)
+    let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
     else
     {
         log!("svcmgr: no memory for {}'s entry; not launched", def.name);
         return;
     };
 
-    let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))
+    let Some(launched) = launch::launch(def, ctx, registry, Some(correlator))
     else
     {
         log!("svcmgr: launch failed: {}", def.name);
@@ -296,7 +328,7 @@ fn handle_definition(
     entry.process_handle = launched.process_handle;
     entry.provided_endpoint = launched.provided_endpoint;
     table.services[idx] = entry;
-    table.recipes[idx] = Some(recipe_from(def));
+    table.recipes[idx] = Some(recipe);
 }
 
 /// Bind-only path: bind death-notification on a thread init already
@@ -307,9 +339,14 @@ fn handle_definition(
 /// Race-free despite binding after the thread was started: the kernel
 /// retains a thread's `exit_reason` past death and `thread_bind_notification`
 /// serialises on the thread's `sched_lock`. A death in the window between
-/// init's spawn and this bind is therefore delivered to `deaths_eq` when the
+/// init's spawn and this bind is therefore delivered to the death queues when the
 /// bind lands on the already-exited thread, not dropped (#106 Window 2).
-fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths_eq: u32)
+fn bind_only(
+    def: &Definition,
+    thread_cap: u32,
+    table: &mut ServiceTable,
+    deaths: &crate::death_queues::DeathSet,
+)
 {
     let Some((idx, correlator)) = table.reserve()
     else
@@ -321,7 +358,7 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     };
-    let Some(mut entry) = build_entry(def)
+    let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
     else
     {
         log!(
@@ -331,7 +368,7 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     };
-    if syscall::thread_bind_notification(thread_cap, deaths_eq, u64::from(correlator)).is_err()
+    if deaths.bind_thread(thread_cap, correlator).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
         let _ = syscall::cap_delete(thread_cap);
@@ -341,24 +378,54 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
     // handle (see `restart::restart_process`).
     entry.thread_cap = thread_cap;
     table.services[idx] = entry;
-    table.recipes[idx] = Some(recipe_from(def));
+    table.recipes[idx] = Some(recipe);
 }
 
 /// Clone the launch surfaces the restart path replays from a parsed
 /// definition: argv/env/cwd/seed byte-for-byte, the log-sink flag, and the
 /// scheduling fields. The name, binary, policy and namespace live on the
-/// `ServiceEntry` instead ([`build_entry`]).
-fn recipe_from(def: &Definition) -> RestartRecipe
+/// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
+/// the copies.
+fn recipe_from(def: &Definition) -> Option<RestartRecipe>
 {
-    RestartRecipe {
-        argv: def.argv.clone(),
-        env: def.env.clone(),
-        cwd: def.cwd.clone(),
-        seed: def.seed.clone(),
+    let cwd = match &def.cwd
+    {
+        Some(cwd) => Some(try_string(cwd)?),
+        None => None,
+    };
+    Some(RestartRecipe {
+        argv: try_strings(&def.argv)?,
+        env: try_strings(&def.env)?,
+        cwd,
+        seed: try_strings(&def.seed)?,
         log_sink: def.log_sink,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
+    })
+}
+
+/// Copy every string of `strings`, or `None` when the heap cannot hold them.
+fn try_strings(strings: &[String]) -> Option<Vec<String>>
+{
+    let mut out = Vec::new();
+    out.try_reserve_exact(strings.len()).ok()?;
+    for s in strings
+    {
+        out.push(try_string(s)?);
     }
+    Some(out)
+}
+
+/// `SERVICES_DIR/<filename>`, or `None` when the heap cannot hold it.
+fn recipe_path(filename: &str) -> Option<String>
+{
+    let mut path = String::new();
+    path.try_reserve_exact(SERVICES_DIR.len() + 1 + filename.len())
+        .ok()?;
+    path.push_str(SERVICES_DIR);
+    path.push('/');
+    path.push_str(filename);
+    Some(path)
 }
 
 /// Construct a `ServiceEntry` from the parsed definition, with no caps yet:
@@ -402,6 +469,25 @@ fn build_entry(def: &Definition) -> Option<ServiceEntry>
     }
 
     Some(entry)
+}
+
+/// Release the thread cap of every pending registration when the scan has
+/// no memory to parse the recipes: the init-spawned services run on,
+/// unsupervised, and none is reported as a configuration error.
+fn release_unsupervised(pending: &mut [PendingRegistration])
+{
+    for slot in pending.iter_mut().filter(|p| !p.consumed)
+    {
+        log!(
+            "svcmgr: no memory for the recipes; {} runs unsupervised",
+            slot.name_str()
+        );
+        if slot.thread_cap != 0
+        {
+            let _ = syscall::cap_delete(slot.thread_cap);
+        }
+        slot.consumed = true;
+    }
 }
 
 /// Log every entry in `pending` that was never matched by a `.svc`

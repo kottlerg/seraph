@@ -417,11 +417,10 @@ pub fn free_cluster_chain(
 /// cluster 2.
 ///
 /// A failed read, a signature mismatch, or no memory for the sector
-/// buffer is logged and treated as "no `FSInfo` sector": the hints stay at
-/// the sentinel and `fsinfo_sector`
-/// is reset to `u32::MAX`, so [`flush_fsinfo`] never writes hints into a
-/// sector that is not an `FSInfo` sector. The allocator still operates
-/// from the FAT itself.
+/// buffer is logged and treated as "no `FSInfo` sector": the hints stay
+/// at the sentinel and `fsinfo_sector` is reset to `u32::MAX`, so
+/// [`flush_fsinfo`] never writes hints into a sector that is not an
+/// `FSInfo` sector. The allocator still operates from the FAT itself.
 pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_buf: *mut u64)
 {
     if !matches!(state.fat_type, FatType::Fat32) || state.fsinfo_sector == u32::MAX

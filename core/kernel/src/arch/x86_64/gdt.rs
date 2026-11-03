@@ -82,6 +82,25 @@ pub struct Tss
 /// Size of the I/O Permission Bitmap in bytes (65536 ports / 8 bits each).
 pub const IOPB_SIZE: usize = 8192;
 
+/// Bytes of one part of a thread's I/O permission bitmap: one page.
+pub const IOPB_PART_BYTES: usize = 4096;
+
+/// Parts of a thread's I/O permission bitmap.
+pub const IOPB_PARTS: usize = IOPB_SIZE / IOPB_PART_BYTES;
+
+const _: () = assert!(IOPB_PARTS * IOPB_PART_BYTES == IOPB_SIZE);
+
+/// A thread's I/O permission bitmap, held as [`IOPB_PARTS`] page-sized parts
+/// in separately allocated pages: part `i` covers ports
+/// `i * 8 * IOPB_PART_BYTES` onward. Bit N of the whole is port N; 0 permits,
+/// 1 denies. [`load_iopb`] copies the parts into the TSS in order.
+#[repr(C)]
+pub struct ThreadIopb
+{
+    /// The parts, each a page-aligned [`IOPB_PART_BYTES`]-byte block.
+    pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS],
+}
+
 /// `Tss::iopb_offset` while the CPU's TSS bitmap is current: the offset of
 /// `TssWithIopb::iopb`.
 const IOPB_OFFSET_VALID: u16 = core::mem::size_of::<Tss>() as u16;
@@ -642,8 +661,8 @@ unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::A
 /// Copy `iopb` into the TSS I/O Permission Bitmap for the current CPU and
 /// mark the bitmap current.
 ///
-/// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB.
-/// If `None`, the bitmap is filled with 0xFF (all ports denied).
+/// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB,
+/// part by part. If `None`, the bitmap is filled with 0xFF (all ports denied).
 ///
 /// Called on every context switch: for an incoming non-idle thread under its
 /// `sched_lock`, in the hold that marks it running (with `None` when it has
@@ -653,9 +672,12 @@ unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::A
 ///
 /// # Safety
 /// Must be called with interrupts disabled or from a single-CPU context.
-/// GS-base must point to a valid `PerCpuData` with `tss_ptr` set.
+/// GS-base must point to a valid `PerCpuData` with `tss_ptr` set. Each part of
+/// `iopb` is a live [`IOPB_PART_BYTES`]-byte block that no other CPU writes for
+/// the duration (the thread's `sched_lock` is held, or the thread is the
+/// caller's own and only it binds itself).
 #[cfg(not(test))]
-pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
+pub unsafe fn load_iopb(iopb: Option<&ThreadIopb>)
 {
     // SAFETY: caller contract.
     let tss = unsafe { current_tss() };
@@ -665,7 +687,17 @@ pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
     let tss_iopb = unsafe { &mut *core::ptr::addr_of_mut!((*tss).iopb) };
     match iopb
     {
-        Some(src) => tss_iopb.copy_from_slice(src),
+        Some(src) =>
+        {
+            for (dst, &part) in tss_iopb
+                .chunks_exact_mut(IOPB_PART_BYTES)
+                .zip(src.parts.iter())
+            {
+                // SAFETY: each part is a live IOPB_PART_BYTES block no other
+                // CPU writes meanwhile (caller contract).
+                dst.copy_from_slice(unsafe { &*part });
+            }
+        }
         None => tss_iopb.fill(0xFF),
     }
     // Release: the bitmap bytes precede the offset that makes them live.
@@ -753,7 +785,10 @@ pub unsafe fn reload_invalidated_iopb() -> bool
     }
 }
 
-/// Set bits [base, base+count) to 0 in `iopb`, permitting those ports.
+/// Set to 0, permitting them, the bits of the ports in `[base, base + count)`
+/// that `part` covers: `part` is the stretch of a bitmap whose first bit is
+/// port `first_port` (a part of a [`ThreadIopb`], or a whole bitmap with
+/// `first_port` 0).
 ///
 /// `base` and `count` are `u32` so the full 64K range (`base = 0`,
 /// `count = 65536`) is expressible. Ports not covered by this call remain 1
@@ -762,7 +797,9 @@ pub unsafe fn reload_invalidated_iopb() -> bool
 ///
 /// # Panics
 /// Panics in debug mode if `base + count > 65536`.
-pub fn permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32)
+// cast_possible_truncation: a port index within a part is below 65536.
+#[allow(clippy::cast_possible_truncation)]
+pub fn permit_port_range(part: &mut [u8], first_port: u32, base: u32, count: u32)
 {
     if count == 0
     {
@@ -770,14 +807,11 @@ pub fn permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32)
     }
     let end = base + count;
     debug_assert!(end <= 65536, "port range exceeds 0xFFFF");
-    for port in base..end
+    let part_end = first_port.saturating_add((part.len() * 8) as u32);
+    for port in base.max(first_port)..end.min(part_end)
     {
-        let byte = (port / 8) as usize;
-        let bit = port % 8;
-        if byte < IOPB_SIZE
-        {
-            iopb[byte] &= !(1 << bit);
-        }
+        let rel = port - first_port;
+        part[(rel / 8) as usize] &= !(1 << (rel % 8));
     }
 }
 
@@ -831,7 +865,7 @@ mod tests
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
         // Ports 3-10 span the tail of byte 0 and the head of byte 1.
-        permit_port_range(&mut iopb, 3, 8);
+        permit_port_range(&mut iopb, 0, 3, 8);
         assert_eq!(iopb[0], 0x07, "ports 0-2 stay denied, 3-7 permitted");
         assert_eq!(iopb[1], 0xF8, "ports 8-10 permitted, 11-15 stay denied");
         assert!(
@@ -844,7 +878,7 @@ mod tests
     fn permit_port_range_zero_count_is_nop()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        permit_port_range(&mut iopb, 100, 0);
+        permit_port_range(&mut iopb, 0, 100, 0);
         assert!(iopb.iter().all(|&b| b == 0xFF));
     }
 
@@ -853,7 +887,7 @@ mod tests
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
         // Port 65535 is the last valid port.
-        permit_port_range(&mut iopb, 65535, 1);
+        permit_port_range(&mut iopb, 0, 65535, 1);
         assert_eq!(iopb[IOPB_SIZE - 1], 0xFF & !(1 << 7));
         assert!(iopb[..IOPB_SIZE - 1].iter().all(|&b| b == 0xFF));
     }
@@ -862,16 +896,34 @@ mod tests
     fn permit_port_range_covers_the_full_port_space()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        permit_port_range(&mut iopb, 0, 65536);
+        permit_port_range(&mut iopb, 0, 0, 65536);
         assert!(iopb.iter().all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn permit_port_range_on_a_part_clears_only_the_ports_it_covers()
+    {
+        let mut part = [0xFFu8; IOPB_PART_BYTES];
+        let first = (IOPB_PART_BYTES * 8) as u32;
+        // Ports first-2 .. first+2: the two below the part are not its own.
+        permit_port_range(&mut part, first, first - 2, 4);
+        assert_eq!(part[0], 0xFC, "the part's first two ports permitted");
+        assert!(part[1..].iter().all(|&b| b == 0xFF));
+        let mut low = [0xFFu8; IOPB_PART_BYTES];
+        permit_port_range(&mut low, 0, first - 2, 4);
+        assert_eq!(
+            low[IOPB_PART_BYTES - 1],
+            0x3F,
+            "the low part's last two ports"
+        );
     }
 
     #[test]
     fn permit_port_range_accumulates()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        permit_port_range(&mut iopb, 0, 4); // ports 0-3
-        permit_port_range(&mut iopb, 4, 4); // ports 4-7
+        permit_port_range(&mut iopb, 0, 0, 4); // ports 0-3
+        permit_port_range(&mut iopb, 0, 4, 4); // ports 4-7
         assert_eq!(iopb[0], 0x00, "all 8 ports in byte 0 should be permitted");
     }
 

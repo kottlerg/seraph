@@ -404,8 +404,9 @@ unsafe fn kernel_entry_post_rebase(
     // ── Phase 4: typed-memory cap surface ────────────────────────────────────
     // The kernel does not run a `GlobalAlloc`; every kernel-object body is
     // sourced from a Memory cap via `crate::cap::retype` (caller-supplied at
-    // userspace `cap_create_*` boundaries; SEED-backed at boot time and for
-    // split-derived wrappers). Phase 4 carries no setup cost — the typed-
+    // userspace `cap_create_*` boundaries; SEED-backed at boot time; and,
+    // for split-derived and copied range wrappers, chunks of the receiving
+    // CSpace's pool). Phase 4 carries no setup cost — the typed-
     // memory machinery is ready as soon as `SEED_MEMORY` is installed in
     // Phase 7.
     //
@@ -763,27 +764,13 @@ unsafe fn kernel_entry_post_rebase(
         let init_layout = mm::address_space::choose_init_layout();
 
         // Create init's user address space via the typed-memory boot path:
-        // a slab is retyped from `SEED_MEMORY` (page 0 = wrapper page holding
-        // `AddressSpaceObject` + inlined `AddressSpace`; page 1 = root PT;
-        // pages 2..init_pages = PT growth pool). The wrapper header is the
-        // cap object inserted into init's CSpace below.
-        // 18 pages = 1 wrapper + 1 root PT + 16 PT pool. Phase 9 mappings
-        // (ELF segments, InitInfo, stack) go through `map_page`, a
-        // kernel-direct call whose intermediate PT pages come from
-        // `kernel_pt_pool`, not this wrapper's pool. The wrapper's pool
-        // serves init's userspace pooled paths: `sys_mem_map`
-        // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and `sys_mmio_map` for
-        // init's own MMIO (the riscv64 serial UART, one page). 16 pool
-        // pages cover that footprint with margin. The footprint is fixed by
-        // init's own code, so no hardware count grows it; the pool also takes
-        // augment-mode `SYS_CAP_CREATE_ASPACE` donations, which ktest uses.
-        // items_after_statements: the constant is documented by the comment
-        // above, next to its only use.
-        #[allow(clippy::items_after_statements)]
-        const INIT_ASPACE_PAGES: u64 = 18;
+        // a slab of `cap::INIT_ASPACE_PAGES` is retyped from `SEED_MEMORY`
+        // (page 0 = wrapper page holding `AddressSpaceObject` + inlined
+        // `AddressSpace`; page 1 = root PT; the rest = PT growth pool). The
+        // wrapper header is the cap object inserted into init's CSpace below.
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
         let (init_as_obj_nn, init_as_ptr) =
-            unsafe { cap::boot_retype_aspace(cap::seed_memory_ref(), INIT_ASPACE_PAGES) };
+            unsafe { cap::boot_retype_aspace(cap::seed_memory_ref(), cap::INIT_ASPACE_PAGES) };
         // init's AS is built from typed memory (boot_retype_aspace), so the
         // buddy allocator is unused here.
         let _ = allocator;
@@ -1297,19 +1284,12 @@ unsafe fn kernel_entry_post_rebase(
             "post-handoff buddy is not empty — a Phase-7 reservation or drain leak",
         );
 
-        // Retype a 6-page slab from SEED_MEMORY for init's Thread:
-        //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
-        //   page 4   — ThreadObject (32 B) followed by ThreadControlBlock
-        //   page 5   — per-thread FPU/SIMD/V save area
-        // Mirrors the layout established in `sys_cap_create_thread`.
-        // items_after_statements: the constant is documented by the comment
-        // above, next to its only use.
-        #[allow(clippy::items_after_statements)]
-        const INIT_THREAD_PAGES: u64 = (sched::KERNEL_STACK_PAGES + 2) as u64;
+        // Retype a `cap::INIT_THREAD_PAGES` slab from SEED_MEMORY for init's
+        // Thread (the layout is at the constant).
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
             use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 
-            let bytes = INIT_THREAD_PAGES * mm::PAGE_SIZE as u64;
+            let bytes = cap::INIT_THREAD_PAGES * mm::PAGE_SIZE as u64;
             let seed = cap::seed_memory_ref();
             let offset = cap::retype::retype_allocate(seed, bytes)
                 .unwrap_or_else(|_| fatal("Phase 9: SEED too small for init Thread slab"));
@@ -1547,9 +1527,9 @@ unsafe fn kernel_entry_post_rebase(
 
         // ── Boot-handover ledger ────────────────────────────────────────────
         // Report MemoryObject.available_bytes summed across every Memory cap in
-        // init's CSpace, SEED's residual reserve (the kernel's ongoing body source
-        // for split-derived wrappers and per-thread IOPB pages), and the per-CPU
-        // kernel stacks. The RAM accounting identity is defined in
+        // init's CSpace, SEED's residual reserve (the unused part of the boot
+        // footprint; nothing draws on it after boot), and the per-CPU kernel
+        // stacks. The RAM accounting identity is defined in
         // docs/userspace-memory-model.md § Ownership Boundaries.
         // SAFETY: init_cspace_ptr is init's CSpace, held by init's self-cap
         // inside it. Init, though enqueued, cannot run before `sched::enter`

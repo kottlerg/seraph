@@ -62,7 +62,7 @@ use syscall::SyscallError;
 /// must be the capability handle (index + generation) that resolved the
 /// original cap (tag `tag`) in that `CSpace` via `lookup_cap`, and
 /// `orig_obj_ptr` must be the object it resolved to (refcount > 0).
-/// `child1_ptr` and `child2_ptr` must be freshly-allocated SEED-backed bodies
+/// `child1_ptr` and `child2_ptr` must be freshly-allocated arena-backed bodies
 /// of tag `tag`, each with refcount 1, not yet inserted into any `CSpace`.
 // too_many_arguments: the split tail genuinely needs the original cap's
 // coordinates (cspace, id, slot, tag, rights, object) plus both children;
@@ -86,7 +86,7 @@ pub(crate) unsafe fn install_split_children(
     {
         // Unreachable for the in-tree callers (each resolves orig_handle with
         // lookup_cap, which rejects slot 0), but fail as the other arms do:
-        // return both uninserted children to SEED.
+        // return both uninserted children to their arena.
         // SAFETY: both bodies are fresh (refcount 1) and were never inserted
         // anywhere (caller contract).
         unsafe {

@@ -20,6 +20,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+mod death_queues;
 mod init_reap;
 mod loader;
 mod process;
@@ -106,19 +107,6 @@ fn main() -> !
     let mut table = process::ProcessTable::new();
     let mut recent = process::RecentExits::new();
 
-    // Death-EQ slab request: the kernel's raw EventQueue debit for
-    // `DEATH_EQ_CAPACITY` entries and `DEATH_EQ_OBSERVERS` observer nodes.
-    let death_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
-        u64::from(DEATH_EQ_CAPACITY),
-        u64::from(DEATH_EQ_OBSERVERS),
-    );
-    let Some(death_eq) = std::os::seraph::object_slab_retype(death_eq_slab_bytes, |slab| {
-        syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS).ok()
-    })
-    else
-    {
-        syscall::thread_exit();
-    };
     let Some(ws_cap) = std::os::seraph::object_slab_retype(
         std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
         |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
@@ -131,10 +119,12 @@ fn main() -> !
     {
         syscall::thread_exit();
     }
-    if syscall::wait_set_add(ws_cap, death_eq, WS_BADGE_DEATH).is_err()
+    // The first death queue; further ones join the wait set as pools run out.
+    let Some(deaths) = death_queues::DeathSet::new(ws_cap, WS_BADGE_DEATH)
+    else
     {
         syscall::thread_exit();
-    }
+    };
 
     let mut ctx = ProcmgrCtx {
         self_aspace,
@@ -142,7 +132,7 @@ fn main() -> !
         log_ep: boot.log_ep,
         registry_ep: boot.registry_ep,
         memmgr_ep: startup.memmgr_endpoint,
-        death_eq,
+        deaths,
         ws_cap,
         sched_baseline: startup.sched_control_cap,
     };
@@ -174,13 +164,7 @@ fn main() -> !
         // per-process record until the next loop iteration. Under fast
         // spawn-after-wait churn that races allocations against pool
         // reclaim. dispatch_death is a no-op when the EQ is empty.
-        dispatch_death(
-            ctx.death_eq,
-            ctx.memmgr_ep,
-            ipc_buf,
-            &mut table,
-            &mut recent,
-        );
+        dispatch_death(&ctx.deaths, ctx.memmgr_ep, ipc_buf, &mut table, &mut recent);
 
         match badge
         {
@@ -204,22 +188,9 @@ fn main() -> !
     }
 }
 
-/// Capacity of procmgr's shared death `EventQueue`: a tuning value, not a
-/// process ceiling. The kernel drops a death post to a full queue, so a burst
-/// of more deaths than this between drains is recovered by
-/// [`resync_deaths`], which [`dispatch_death`] runs after any drain that took
-/// a full queue's worth of events; the table itself has no fixed size.
-const DEATH_EQ_CAPACITY: u32 = 256;
-
-/// Death-observer nodes in procmgr's death queue: each live process binds two
-/// (its main thread and its address space) and the init reap binds init's
-/// two threads; a node returns when its thread or address space is destroyed.
-/// A spawn whose main-thread bind finds the pool empty fails, so this caps
-/// live processes at about half of it; no process table binds before it.
-const DEATH_EQ_OBSERVERS: u32 = 1024;
-
-/// The main wait set's member capacity: the service endpoint and the death queue.
-const WS_MEMBERS: u32 = 2;
+/// The main wait set's member capacity: the service endpoint and every death
+/// queue procmgr may create.
+const WS_MEMBERS: u32 = 1 + death_queues::DEATH_QUEUES_MAX as u32;
 
 /// Monotonic time since the first call, in nanoseconds, for the
 /// recent-exits retention window and the init-reap probe budget. Saturates
@@ -233,7 +204,7 @@ pub(crate) fn now_ns() -> u64
 
 /// `WaitSet` badge for procmgr's service endpoint.
 const WS_BADGE_SERVICE: u64 = 0;
-/// `WaitSet` badge for procmgr's shared death event queue.
+/// `WaitSet` badge for procmgr's death event queues, all of them.
 const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
@@ -432,14 +403,20 @@ const CSPACE_LOW_WATER: u64 = 256;
 /// Headroom a top-up funds: about 18 slot pages.
 const CSPACE_TOPUP_SLOTS: u64 = 1024;
 
-/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, with
+/// a page of growth budget beyond them for its body arena, so
 /// its allocations never meet an exhausted `CSpace` and its receives keep the
 /// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). A
 /// failed top-up is retried on the next loop pass; `warned` limits the log
 /// to the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u32, warned: &mut bool)
 {
-    if std::os::seraph::cspace_slot_headroom(self_cspace) >= CSPACE_LOW_WATER
+    // The growth budget also funds the body arena (the bodies of procmgr's
+    // splits), so a page of it is held beyond the slots
+    // (`syscall_abi::cspace_topup_pages`).
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    let headroom = std::os::seraph::cspace_slot_headroom(self_cspace);
+    if syscall_abi::cspace_topup_pages(headroom, budget, CSPACE_LOW_WATER) == 0
     {
         *warned = false;
         return;
@@ -562,7 +539,7 @@ fn dispatch_ipc(
 
         procmgr_labels::REGISTER_DEATH_EQ =>
         {
-            handle_register_death_eq(&req, ipc_buf, table);
+            handle_register_death_eq(&req, ipc_buf);
         }
 
         procmgr_labels::QUERY_LIVE_PROCESSES =>
@@ -573,7 +550,7 @@ fn dispatch_ipc(
 
         procmgr_labels::REGISTER_INIT_TEARDOWN =>
         {
-            init_reap::handle_register(&req, ipc_buf, ctx.death_eq);
+            init_reap::handle_register(&req, ipc_buf, &ctx.deaths);
         }
 
         procmgr_labels::INIT_TEARDOWN_DONE =>
@@ -608,9 +585,9 @@ pub(crate) fn release_caps(caps: &[u32])
     }
 }
 
-/// Handle `REGISTER_DEATH_EQ` — store the caller's `EventQueue` cap
-/// as procmgr's logd-death observer, then retroactively bind it to
-/// the main thread of every process currently in the process table.
+/// Handle `REGISTER_DEATH_EQ` — store the caller's `EventQueue` cap as
+/// logd's death queue, to which every later teardown posts the dead
+/// process's death entry (`process::forward_death_to_logd`).
 ///
 /// Wire format:
 /// * `caller badge` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
@@ -618,12 +595,12 @@ pub(crate) fn release_caps(caps: &[u32])
 ///   § `REGISTER_DEATH_EQ`).
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
-/// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
+/// Reply: `procmgr_errors::SUCCESS` once stored, `UNAUTHORIZED` if the
 /// caller lacks the authority badge or a death EQ is already
 /// registered, `INVALID_ARGUMENT` if no cap (or a zero cap) arrives.
 /// Every refused request has its transferred caps deleted, and so do caps
 /// past `caps[0]`.
-fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let caps = req.caps();
     if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY
@@ -644,12 +621,10 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut pro
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    // install_logd_death_eq is first-wins: it stores the cap and
-    // binds it as a second observer on the main thread of every
-    // process in the table, or returns false if a previous
-    // registration already filled the slot. Future spawns pick it up
-    // inside finalize_creation by reading the same atomic.
-    if process::install_logd_death_eq(table, logd_eq)
+    // install_logd_death_eq is first-wins: it stores the cap, or returns
+    // false if a previous registration already filled the slot. Every
+    // teardown after it reads the same atomic to forward the death.
+    if process::install_logd_death_eq(logd_eq)
     {
         reply_empty(ipc_buf, procmgr_errors::SUCCESS);
     }
@@ -745,34 +720,26 @@ fn resolve_query_state(
     }
 }
 
-/// Death-queue dispatch. Drains all pending death events on the shared
-/// queue, reaps each by correlator, and records the exit reason in the
-/// recent-exits ring for `QUERY_PROCESS`.
+/// Death-queue dispatch. Drains all pending death events on every death
+/// queue, reaps each by correlator (the process badge), and records the exit
+/// reason in the recent-exits ring for `QUERY_PROCESS`.
 ///
-/// A drain that takes [`DEATH_EQ_CAPACITY`] events or more may have followed
-/// a full queue, and the kernel drops a post to a full queue. Any dropped post
-/// leaves at least a full queue of events behind it, which this drain or the
-/// next one receives, so the drain that crosses the capacity ends after the
-/// drop; [`resync_deaths`] then finds the process whose post was lost.
+/// A drain that takes [`death_queues::DEATH_EQ_CAPACITY`] events or more
+/// from one queue may have followed a full queue, and the kernel drops a post
+/// to a full queue. Any dropped post leaves at least a full queue of events
+/// behind it, which this drain or the next one receives, so the drain that
+/// crosses the capacity ends after the drop; [`resync_deaths`] then finds the
+/// process whose post was lost.
 fn dispatch_death(
-    death_eq: u32,
+    deaths: &death_queues::DeathSet,
     memmgr_ep: u32,
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
     recent: &mut process::RecentExits,
 )
 {
-    let mut drained: u32 = 0;
-    while let Ok(death) = syscall::event_try_recv_death(death_eq)
-    {
-        drained = drained.saturating_add(1);
-        // Every bind passes a 32-bit value widened to u64, so the low word is
-        // the whole correlator.
-        // cast_possible_truncation: see above; the high word is always zero.
-        #[allow(clippy::cast_possible_truncation)]
-        let correlator = death.correlator as u32;
-        let exit_reason = death.exit_reason;
-        if correlator == procmgr_labels::INIT_REAP_CORRELATOR
+    let full = deaths.drain(|death| {
+        if death.correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
             // An init thread exited. `run_reap` counts down the two init
             // threads and, on the last exit, tears down init's Thread and
@@ -781,19 +748,17 @@ fn dispatch_death(
             // and releases the caps init still holds
             // (`docs/process-lifecycle.md` § Init reap).
             init_reap::run_reap(memmgr_ep, ipc_buf);
-            continue;
+            return;
         }
-        if let Some(entry) = table.take_by_correlator(correlator)
+        if let Some(entry) = table.take_by_badge(death.correlator)
         {
-            recent.record(entry.badge(), exit_reason, now_ns());
-            process::teardown_entry(entry, memmgr_ep, ipc_buf);
+            recent.record(entry.badge(), death.exit_reason, now_ns());
+            process::teardown_entry(entry, death.exit_reason, memmgr_ep, ipc_buf);
         }
-    }
-    if drained >= DEATH_EQ_CAPACITY
+    });
+    if full
     {
-        std::os::seraph::log!(
-            "procmgr: death queue drained {drained} events; resyncing the process table"
-        );
+        std::os::seraph::log!("procmgr: a death queue drained full; resyncing the process table");
         resync_deaths(memmgr_ep, ipc_buf, table, recent);
     }
 }
@@ -850,7 +815,7 @@ fn resync_deaths(
         if let Some(entry) = table.take_by_badge(badge)
         {
             recent.record(badge, exit_reason, now_ns());
-            process::teardown_entry(entry, memmgr_ep, ipc_buf);
+            process::teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf);
         }
     }
 }
@@ -1123,7 +1088,7 @@ fn handle_create(
         &universals,
         &blobs.args(),
         &blobs.env(),
-        ctx.death_eq,
+        &ctx.deaths,
         sched,
     );
 
@@ -1213,14 +1178,13 @@ pub struct ProcmgrCtx
     /// memory-cap allocations (memmgr auto-registers procmgr's badge at
     /// bootstrap so `REQUEST_MEMORY_CAPS` on this cap is allowed).
     pub memmgr_ep: u32,
-    /// Single shared death-notification event queue. Every spawned child
-    /// binds its thread to this queue (via multi-bind in the kernel) with
-    /// `correlator = process_table::correlator_of(entry.badge)`. Multiplexed
-    /// alongside the service endpoint via the wait-set in `ws_cap`.
-    pub death_eq: u32,
+    /// The death-notification event queues. Every spawned child binds its
+    /// main thread and its address space on them with `correlator =
+    /// entry.badge`. Multiplexed alongside the service endpoint via the
+    /// wait-set in `ws_cap`.
+    pub deaths: death_queues::DeathSet,
     /// Wait-set cap. Multiplexes procmgr's service endpoint
-    /// (`WS_BADGE_SERVICE`) and the shared death event queue
-    /// (`WS_BADGE_DEATH`). Fixed two members.
+    /// (`WS_BADGE_SERVICE`) and every death event queue (`WS_BADGE_DEATH`).
     pub ws_cap: u32,
     /// Procmgr's baseline `SchedControl` cap, delivered via its own
     /// `ProcessInfo.sched_control_cap` (band
@@ -1302,7 +1266,7 @@ fn handle_create_from_file(
         caps.creator,
         &blobs.args(),
         &blobs.env(),
-        ctx.death_eq,
+        &ctx.deaths,
         label & procmgr_labels::CREATE_PINNED == 0,
         caps.relay,
         sched,

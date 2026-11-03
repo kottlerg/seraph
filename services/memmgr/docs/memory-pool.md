@@ -63,9 +63,10 @@ surfacing as an intermittent consumer fault.
 
 Each free run (a Memory cap, its page count, and its physical base) is a node
 in the metadata arena (below), linked on one list sorted by physical base. The
-run count is therefore bounded by RAM, not by a constant: no run is ever
-turned away for want of a slot. The pool keeps running totals of its free
-pages and runs. Selection walks the list:
+run count is therefore bounded by RAM, not by a constant: no run is turned
+away for want of a slot, short of the arena being unable to grow with its
+reserve spent. The pool keeps running totals of its free pages and runs.
+Selection walks the list:
 
 - **Smallest fit.** The smallest run covering at least `N` pages serves a
   `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
@@ -82,11 +83,13 @@ fund an arena page, the returned run funds it itself: its first page (all of
 it, for a one-page run) becomes the arena page. When that carve fails (both
 arena zones are spent, the split of its first page fails, or the page cannot
 be mapped because memmgr's page tables cannot be funded), the run takes a
-reserved node. A run a growth path takes from the pool and cannot use goes
-back without growing the arena: merged back into the remainder its split
-left, else into a free node, the reserve included. A run stays owned and
-counted in `pool_total` but out of circulation only when it reaches the
-reserve with the reserve already spent and the arena unable to grow.
+reserved node; when the split of its first page cannot be merged back, the
+remainder takes the reserved node before the head page. A run a growth path
+takes from the pool and cannot use goes back without growing the arena: merged
+back into the remainder its split left, else into a free node, the reserve
+included. A run stays owned and counted in `pool_total` but out of circulation
+only when it reaches the reserve with the reserve already spent and the arena
+unable to grow.
 
 ---
 
@@ -242,18 +245,21 @@ lock with an atomic add.
 
 ## CSpace headroom
 
-memmgr's own `CSpace` takes a slot for every frame split and inner derivation a grant makes, so a
-burst of requests draws slots fast. A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free
+memmgr's own `CSpace` takes a slot for every frame split and inner derivation a grant makes, and
+each split's tail body a 128-byte chunk of its body arena, which takes whole pages from the same
+growth budget (core/kernel/docs/capability-internals.md § Body Arena), so a burst of requests draws
+both fast. A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free
 slots for IPC capability transfer, so general allocations fail before receives do
 ([docs/capability-model.md](../../../docs/capability-model.md) § Address-space and CSpace growth
 budgets). memmgr cannot request memory from anyone else, so it funds its own slot-page pool:
 
-- Before every receive, memmgr reads its headroom: `CAP_INFO_CSPACE_CAPACITY` less
-  `CAP_INFO_CSPACE_USED` and the reserve.
-- Below `CSPACE_LOW_WATER` (256 slots), it pulls a contiguous run of `CSPACE_TOPUP_PAGES` (16)
-  frames from the pool, or a single frame when no such run is free, and donates it with
-  augment-mode `cap_create_cspace` against its own `CSpace` cap. It then deletes the frame's cap:
-  the donation holds its own reference on the frame.
+- Before every receive, memmgr reads its headroom (`CAP_INFO_CSPACE_CAPACITY` less
+  `CAP_INFO_CSPACE_USED` and the reserve) and its growth budget (`CAP_INFO_CSPACE_BUDGET`).
+- When the headroom falls below `CSPACE_LOW_WATER` (256 slots) plus a page, or the budget below a
+  page, so a split could not carve an arena page (`syscall_abi::cspace_topup_pages`), it pulls a
+  contiguous run of `CSPACE_TOPUP_PAGES` (16) frames from the pool, or a single frame when no such
+  run is free, and donates it with augment-mode `cap_create_cspace` against its own `CSpace` cap. It
+  then deletes the frame's cap: the donation holds its own reference on the frame.
 - A refused donation returns the frame to the pool, and the check runs again before the next
   receive.
 

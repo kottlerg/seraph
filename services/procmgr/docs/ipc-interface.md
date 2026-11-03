@@ -349,7 +349,7 @@ retains the original caps for process lifecycle management.
 
 ---
 
-## REGISTER_DEATH_EQ — install logd's death observer
+## REGISTER_DEATH_EQ — install logd's death queue
 
 Wire format:
 
@@ -357,20 +357,22 @@ Wire format:
 |---|---|
 | label | `procmgr_labels::REGISTER_DEATH_EQ` (14) |
 | caller's cap badge | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY` (`1 << 62`); svcmgr mints this badged `SEND\|GRANT` cap for real-logd on each launch, from the badge-0 `SEND\|GRANT` procmgr source init hands it at the handover (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)) |
-| `caps[0]` | `EventQueue` cap with `POST` right and an observer node per supervised process; procmgr binds it as a second death observer on the main thread of every supervised process |
+| `caps[0]` | `EventQueue` cap with `POST` right; it needs no death-observer nodes, since nothing binds it |
 
 Procmgr stores the cap in
-[`process::LOGD_DEATH_EQ`](../src/process.rs) and immediately
-walks its process table, calling
-`sys_thread_bind_notification(entry.thread_cap, logd_eq,
-correlator_of(entry.badge))` on every live entry, where `entry.thread_cap`
-is the process's main thread and the correlator is the badge's low 32 bits,
-which procmgr keeps unique among live processes. From that moment onward,
-[`finalize_creation`](../src/process.rs) also binds the same EQ on
-the main thread of every newly spawned child (the same correlator). Threads
-a process creates itself carry no logd binding.
+[`process::LOGD_DEATH_EQ`](../src/process.rs). From that moment onward,
+every teardown procmgr runs (`teardown_entry`: the reap of a death event, the
+death resync, and `DESTROY_PROCESS`) posts the two-word death entry
+`(exit_reason, process badge)` to it with `SYS_EVENT_POST`, the full `u64`
+badge in the correlator word (`syscall::DeathEvent`), after the process's
+objects are torn down. procmgr, not the kernel, is the source of logd's death
+events: a worker thread's terminal fault that tears down its process reaches
+logd too, and `DESTROY_PROCESS` posts `EXIT_KILLED`. A process torn down
+before the registration posts nothing. A post the full queue refuses
+(`QueueFull`) is dropped, as the kernel drops a post to a full queue; logd's
+full-drain resync recovers it.
 
-Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
+Reply: `procmgr_errors::SUCCESS` once stored, `UNAUTHORIZED` if the
 caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,
 `INVALID_ARGUMENT` if no cap was transferred. Registration is first-wins:
 procmgr deletes the cap a second registration transfers and keeps the first,
@@ -438,9 +440,11 @@ procmgr's un-badged endpoint from before any badge is minted; a verb bit would
 only add a badged cap for init to derive and for svcmgr's mint source to be
 able to forge.
 
-On the first round procmgr stores the kernel-object caps and binds a death-EQ
-observer on both init threads under the same correlator:
-`syscall::thread_bind_notification(main_thread, death_eq, procmgr_labels::INIT_REAP_CORRELATOR)`
+On the first round procmgr stores the kernel-object caps and binds a death
+observer from its death queues (§ Process table and death queues of the
+[README](../README.md#process-table-and-death-queues)) on both init threads
+under the same correlator:
+`deaths.bind_thread(main_thread, procmgr_labels::INIT_REAP_CORRELATOR)`
 and the same call on `logd_thread`, expecting two deaths; the reap runs on the
 second death. Either bind failing rejects the round with `INVALID_ARGUMENT`.
 Subsequent rounds append to the donation Memory cap list. `INIT_TEARDOWN_DONE`
@@ -471,7 +475,7 @@ reap ran) or the state machine is already armed; it deletes any cap the message
 carried. Init proceeds to `sys_thread_exit` immediately (per
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#handover) § Handover).
 Each death-EQ event with
-`INIT_REAP_CORRELATOR` (reserved `u32::MAX`) calls
+`INIT_REAP_CORRELATOR` (reserved `u64::MAX`) calls
 [`init_reap::run_reap`](../src/init_reap.rs), which counts the death and, on the
 second, executes the six-step teardown (Threads → AddressSpace →
 DONATE_MEMORY_CAPS → revoke and delete procmgr's CSpace capability, the last

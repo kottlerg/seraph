@@ -327,7 +327,9 @@ pub const CAP_INFO_ASPACE_PT_BUDGET: u64 = 4;
 /// the remaining growth-budget pages would back, clamped to the highest
 /// reachable count (the directory's structural ceiling minus the
 /// permanently reserved slot 0). Grows with augment-mode
-/// `cap_create_cspace` donations. A mild over-estimate: the first page's
+/// `cap_create_cspace` donations. Pages the `CSpace`'s body arena or a thread's
+/// port-binding table takes spend the same budget ([`CAP_INFO_CSPACE_BUDGET`]),
+/// so the capacity falls by a page's slots for each. A mild over-estimate: the first page's
 /// reserved slot 0 is counted before that page exists, and deep growth
 /// spends an occasional budget page on a directory page that backs no
 /// slots. Subtracting [`CAP_INFO_CSPACE_USED`] yields headroom, which
@@ -341,7 +343,12 @@ pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
 /// returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_USED: u64 = 6;
 
-/// `CSpace` only — bytes available to back new slot pages.
+/// `CSpace` only — bytes available to back new slot pages, the pages of the
+/// `CSpace`'s body arena (the objects a split, an `Mmio`, `IoPort`, or
+/// `Interrupt` copy, or a spilled `Mmio` mapping record funded by this `CSpace`
+/// needs; see
+/// [`cspace_topup_pages`]), and the three pages of the port-binding table of a
+/// thread bound to it, taken at the thread's first `ioport_bind`.
 ///
 /// Returns the current value of `CSpaceKernelObject::cspace_growth_budget_bytes`.
 /// Calling on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
@@ -594,6 +601,36 @@ pub const CSPACE_IPC_RECV_RESERVE: u64 = MSG_CAP_SLOTS_MAX as u64;
 /// [`CAP_INFO_CSPACE_CAPACITY`] (less an occasional page spent on a
 /// directory page past the direct region).
 pub const CSPACE_SLOTS_PER_PAGE: u64 = 56;
+
+/// Pages to donate to a `CSpace` (augment-mode `cap_create_cspace`) so that it
+/// holds `slots` general slots of headroom and, beyond them, one page of growth
+/// budget for its body arena; zero when it already does.
+///
+/// `headroom` is the `CSpace`'s general headroom
+/// (`CAP_INFO_CSPACE_CAPACITY - CAP_INFO_CSPACE_USED - CSPACE_IPC_RECV_RESERVE`)
+/// and `budget_bytes` its [`CAP_INFO_CSPACE_BUDGET`]. The body arena takes
+/// whole pages from the same budget as slot pages, for the objects a split, an
+/// `Mmio`, `IoPort`, or `Interrupt` copy, or a spilled `Mmio` mapping record
+/// needs: headroom
+/// of one page beyond `slots` keeps a page for it after `slots` allocations
+/// drawn from the budget, and a budget of a page keeps one when the slots come
+/// from pages already in use. A thread's first `ioport_bind` takes three more
+/// pages from its `CSpace`'s budget, which this floor does not cover. The
+/// result counts one more page for a donation record or a directory page the
+/// donation may spend.
+#[must_use]
+pub const fn cspace_topup_pages(headroom: u64, budget_bytes: u64, slots: u64) -> u64
+{
+    let slot_short = (slots + CSPACE_SLOTS_PER_PAGE).saturating_sub(headroom);
+    let budget_short = budget_bytes < PAGE_SIZE;
+    if slot_short == 0 && !budget_short
+    {
+        return 0;
+    }
+    let pages = slot_short.div_ceil(CSPACE_SLOTS_PER_PAGE);
+    let pages = if pages == 0 { 1 } else { pages };
+    pages + 1
+}
 
 // The two-word transfer layout (`pack_cap_handles` / `unpack_cap_handles`)
 // holds exactly four 32-bit fields; raising MSG_CAP_SLOTS_MAX past 4 would
@@ -1136,6 +1173,33 @@ pub const STACK_CLASS_HANDOFF: u64 = 2;
 mod tests
 {
     use super::*;
+
+    // The defect caught: a top-up that leaves the body arena no page after
+    // the slots it funds (a split then fails while slot headroom looked
+    // ample), or one that donates when nothing is short.
+    #[test]
+    fn a_cspace_top_up_keeps_a_page_for_the_arena_beyond_the_slots()
+    {
+        let p = PAGE_SIZE;
+        let s = CSPACE_SLOTS_PER_PAGE;
+        assert_eq!(cspace_topup_pages(256 + s, p, 256), 0, "nothing short");
+        assert_eq!(
+            cspace_topup_pages(1000, 0, 256),
+            2,
+            "slots on pages, no budget"
+        );
+        assert_eq!(
+            cspace_topup_pages(256, p, 256),
+            2,
+            "no page beyond the slots"
+        );
+        assert_eq!(
+            cspace_topup_pages(0, 0, 256),
+            7,
+            "ceil((256 + 56) / 56) + 1"
+        );
+        assert_eq!(cspace_topup_pages(256 + s - 1, p, 256), 2);
+    }
 
     #[test]
     fn cap_handle_pack_round_trips_all_four_fields()

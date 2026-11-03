@@ -143,7 +143,7 @@ claims.
    candidate's hunk and each type or constant change as that section says.
    The boundary set is owed only when a non-inert line meets the Boundary
    surface definition, the memory variation only when one meets the Memory
-   surface definition, and the riscv64 64- and 65-hart and x86_64 256-vCPU
+   surface definition, and the riscv64 64- and 65-hart and x86_64 128-vCPU
    boundaries at `--runs 3` whenever the PR states a concurrency-fix purpose
    as Repeat count defines it and has a non-inert line, whether or not a
    line meets either surface. Outside those cases no run is owed: a

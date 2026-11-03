@@ -8,6 +8,7 @@
 pub mod build;
 pub mod clean;
 pub mod compose_bundle;
+pub mod ktest_timing;
 pub mod lint_docs;
 pub mod mkdisk;
 pub mod run;

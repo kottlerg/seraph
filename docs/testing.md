@@ -355,7 +355,7 @@ cells automatically; variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times, and the memory variation and the disk variations once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and the disk variations once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -504,6 +504,16 @@ cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeou
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1620 \
     --save-logs $T
 
+# Release-profile boundary boots, riscv64 (release host runs only, once each;
+# the same-architecture rebuild needs no clean, only an architecture switch
+# does; no timing logs are saved because the baselines below are debug-profile;
+# the memory variation below runs on whatever sysroot is current, so it
+# follows a debug-profile build, never the release boots above it):
+cargo xtask build --arch riscv64 --release
+cargo xtask compose-bundle --harness ktest --arch riscv64
+cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 300
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1620
+
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
 # run, at 1x, takes ~60 s; the 128-vCPU run, at 8x vCPU oversubscription,
 # ~78 s, since idle vCPUs halt; each budget is for HANG classification, see
@@ -516,6 +526,12 @@ cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout
 cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 900 \
     --save-logs $T
 
+# Release-profile boundary boots, x86_64 (release host runs only, as above):
+cargo xtask build --release
+cargo xtask compose-bundle --harness ktest
+cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180
+cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 900
+
 # Timing report (report only; see below):
 B=xtask/baselines/ktest-timing
 for a in riscv64 x86_64; do
@@ -526,11 +542,15 @@ for w in riscv64-16 riscv64-128 x86_64-16 x86_64-128; do
 done
 ```
 
-Each budget is the larger of three times the measured run and the measured run plus the longest
-failing bound ktest stretches at that width (`split_delete_race`'s 100 s exit poll, through
-`scaled_polls`: 100 s at 16 CPUs, 800 s at 128), rounded up to a minute, so a stuck cell reaches its
-own FAIL line before `run-parallel` classifies the run as a HANG. A change to the measured runs or
-to the longest stretched bound re-derives the budgets.
+The release-profile boots, which only the release host runs make, reuse the debug budgets
+provisionally, since no release boot time has been measured at these widths; a release run that
+outlives one is a HANG to be examined, and its measured time re-derives the budget. Each debug
+budget is the larger of three times the measured run and the measured run plus the longest failing
+bound ktest stretches at that width
+(`split_delete_race`'s 100 s exit poll, through `scaled_polls`: 100 s at 16 CPUs, 800 s at 128),
+rounded up to a minute, so a stuck cell reaches its own FAIL line before `run-parallel` classifies
+the run as a HANG. A change to the measured runs or to the longest stretched bound re-derives the
+budgets.
 
 The two 16-CPU runs are the 1x width the scaling below starts past (`UNSCALED_CPUS`, the reference
 host's core count) and each architecture's base for the timing report's cross-width comparison.
@@ -591,7 +611,7 @@ M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
-# Memory variation (either arch):
+# Memory variation (either arch; boots the current sysroot, so a debug-profile build):
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
@@ -666,12 +686,14 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
 (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
-(`--runs 3`), and the memory variation and the disk variations once each, so every
-tag boots at each boundary CPU count, from a 4Kn disk, and from two disks, and runs
-the timing report on the boundary logs, which is reported and blocks nothing. A
-run whose outcome is not a pass, as When the runs are owed classifies outcomes,
-blocks the tag, MUST be filed as an Issue, and is bisected over the release's
-PRs.
+(`--runs 3`) in the debug profile and once each in the release profile
+(`cargo xtask build --release`, then the same `run-parallel` command at
+`--runs 1`, per the boundary commands above), and the memory variation and the disk variations
+once each, so every tag boots at each boundary CPU count in both profiles (CI boots release builds
+only at 4 CPUs), from a 4Kn disk, and from two disks, and runs the timing report on the boundary
+logs, which is reported and blocks nothing. A run whose outcome is not a pass, as When the runs
+are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the
+release's PRs.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

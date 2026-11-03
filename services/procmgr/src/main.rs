@@ -432,14 +432,20 @@ const CSPACE_LOW_WATER: u64 = 256;
 /// Headroom a top-up funds: about 18 slot pages.
 const CSPACE_TOPUP_SLOTS: u64 = 1024;
 
-/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, with
+/// a page of growth budget beyond them for its body arena, so
 /// its allocations never meet an exhausted `CSpace` and its receives keep the
 /// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). A
 /// failed top-up is retried on the next loop pass; `warned` limits the log
 /// to the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u32, warned: &mut bool)
 {
-    if std::os::seraph::cspace_slot_headroom(self_cspace) >= CSPACE_LOW_WATER
+    // The growth budget also funds the body arena (the bodies of procmgr's
+    // splits), so a page of it is held beyond the slots
+    // (`syscall_abi::cspace_topup_pages`).
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    let headroom = std::os::seraph::cspace_slot_headroom(self_cspace);
+    if syscall_abi::cspace_topup_pages(headroom, budget, CSPACE_LOW_WATER) == 0
     {
         *warned = false;
         return;

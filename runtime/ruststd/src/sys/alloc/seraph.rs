@@ -1208,31 +1208,37 @@ pub fn cspace_general_headroom(self_cspace: u32) -> u64 {
 }
 
 /// Fund `self_cspace`'s slot-page pool so at least `slots` general
-/// allocations succeed without further growth.
+/// allocations succeed without further growth, with one page of growth budget
+/// left beyond them for the `CSpace`'s body arena.
 ///
 /// Reads the `CSpace`'s headroom (`CAP_INFO_CSPACE_CAPACITY` less
-/// `CAP_INFO_CSPACE_USED` and the IPC receive reserve) and, when it falls
-/// short, requests Memory from memmgr (via the object slab) and donates it to
-/// the pool with augment-mode `cap_create_cspace`, one page per
-/// `CSPACE_SLOTS_PER_PAGE` missing slots plus one for a directory or
-/// donation-record page. Call before a known burst of cap acquisitions, or
-/// periodically to keep headroom above a low-water mark, so a service never
-/// meets the hard `OutOfMemory` of an exhausted `CSpace`.
+/// `CAP_INFO_CSPACE_USED` and the IPC receive reserve) and its growth budget
+/// (`CAP_INFO_CSPACE_BUDGET`) and, when either falls short of
+/// `syscall_abi::cspace_topup_pages`, requests Memory from memmgr (via the
+/// object slab) and donates it to the pool with augment-mode
+/// `cap_create_cspace`. After a success, `slots` general allocations succeed,
+/// and the body arena can still take one more page: up to 31 further bodies
+/// (split children, `Mmio` or `IoPort` copies, spilled mapping records). A
+/// burst of `n` splits therefore needs `slots` of at least `n` plus 56 for
+/// each 31 bodies past the first page. Call before a known burst of cap
+/// acquisitions, or periodically to keep headroom above a low-water mark, so
+/// a service never meets the hard `OutOfMemory` of an exhausted `CSpace`.
 ///
-/// `slots == 0` is a no-op success. Returns `false` if memmgr is
+/// `slots == 0` still keeps the arena's page. Returns `false` if memmgr is
 /// unreachable, the request/augment fails (the object slab's own cap needs
 /// one free general slot), or the headroom still falls short after
 /// `CSPACE_FUND_ROUNDS` rounds.
 pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
-    if slots == 0 {
-        return true;
-    }
+    let short = || {
+        let budget =
+            syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+        syscall_abi::cspace_topup_pages(cspace_general_headroom(self_cspace), budget, slots)
+    };
     for _ in 0..CSPACE_FUND_ROUNDS {
-        let have = cspace_general_headroom(self_cspace);
-        if have >= slots {
+        let pages = short();
+        if pages == 0 {
             return true;
         }
-        let pages = (slots - have).div_ceil(syscall_abi::CSPACE_SLOTS_PER_PAGE) + 1;
         if object_slab_retype(pages * PAGE_SIZE, |frame| {
             syscall::cap_create_cspace(frame, self_cspace, pages).ok()
         })
@@ -1241,7 +1247,7 @@ pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
             return false;
         }
     }
-    cspace_general_headroom(self_cspace) >= slots
+    short() == 0
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

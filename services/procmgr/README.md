@@ -221,7 +221,8 @@ terminal-fault post, for a worker thread's fault while the main thread runs, is
 not recovered, since the kernel exposes no address-space fault state to read
 back; that process is reaped when its main thread exits. A reaped or destroyed
 (`DESTROY_PROCESS`) child stays in a recent-exits record for 30 s, so
-`QUERY_PROCESS` answers `EXITED` for it (see
+`QUERY_PROCESS` answers `EXITED` for it, unless procmgr's heap ran out of room
+for the record (see
 [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9: `QUERY_PROCESS`).
 
 ---

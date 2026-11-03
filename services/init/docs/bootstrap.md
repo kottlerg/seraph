@@ -254,8 +254,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   (from the forwarding stop on: the first cap with no `InitInfo`
   descriptor, headroom of memmgr's or init's `CSpace` already below its
   limit, or a refused derive or copy; see [Raw bootstrap](#raw-bootstrap)),
-  and
-  `MemoryAlloc`'s orphaned remainders) to procmgr in further
+  and `MemoryAlloc`'s orphaned remainders) to procmgr in further
   `REGISTER_INIT_TEARDOWN` rounds, then send `INIT_TEARDOWN_DONE`
   (`finish_init_reap_handoff` in `../src/service.rs`). The usable-RAM
   prefix already forwarded to memmgr (below the reap floor), the

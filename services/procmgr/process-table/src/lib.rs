@@ -50,9 +50,10 @@ use alloc::vec::Vec;
 ///
 /// A `QUERY_PROCESS` on such a badge answers `EXITED` with its reason for
 /// this long, then `UNKNOWN`. The window is a time bound, not a count, so a
-/// burst of later deaths cannot rotate a child out early; the ring's size is
-/// the death rate times the window, paid for on the heap only while it holds
-/// entries.
+/// burst of later deaths cannot rotate a child out early while the heap can
+/// hold their records (when it cannot, [`RecentExits::record`] drops the
+/// oldest); the ring's size is the death rate times the window, paid for on
+/// the heap only while it holds entries.
 pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 
 // ── Process table ───────────────────────────────────────────────────────────

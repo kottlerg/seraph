@@ -697,15 +697,19 @@ pub mod procmgr_process_state
     /// suspended post-CREATE state). Rare for external queriers to see.
     pub const CREATED: u64 = 1;
     /// No entry for this badge — reaped or destroyed more than the
-    /// recent-exit window ago (30 s), or the badge was never valid.
-    /// Equivalent to `ESRCH`.
+    /// recent-exit window ago (30 s), or within it but no longer recorded
+    /// (retention is best-effort: when procmgr's heap cannot hold a new
+    /// record, the oldest record makes room, or the new one is dropped), or
+    /// the badge was never valid. Equivalent to `ESRCH`.
     pub const UNKNOWN: u64 = 2;
     /// The process has exited: its main thread is already `Exited` (before
     /// procmgr's death-event drain reaps it), or procmgr reaped or destroyed
-    /// (`DESTROY_PROCESS`) it within the recent-exit window (30 s). Reply
-    /// word 1 carries the kernel-encoded `exit_reason` (`EXIT_KILLED` for a
-    /// process destroyed while its main thread ran). After the window,
-    /// queries on the same badge return `UNKNOWN`.
+    /// (`DESTROY_PROCESS`) it within the recent-exit window (30 s) and still
+    /// holds its record (best-effort; see [`UNKNOWN`]). Reply word 1 carries
+    /// the kernel-encoded `exit_reason`; for a destroyed process, `EXIT_KILLED`
+    /// unless its main thread had already exited, when the reason the kernel
+    /// retained. After the window, queries on the same badge return
+    /// `UNKNOWN`.
     pub const EXITED: u64 = 3;
 }
 

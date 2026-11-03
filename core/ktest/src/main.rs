@@ -31,15 +31,18 @@
 //! scratch VAs: the low band `[0x1_4000_0000, 0x2_0000_0000)`, the high band
 //! `[0x3E_0000_0000, 0x3F_0000_0000)`, the top page of the user half
 //! (`sysinfo::user_va_top`), and, on x86-64, the top two pages of the user
-//! half. ktest's own memory lies in none of them: the kernel places its
-//! image (every static: child stacks, IPC pages, argument blocks), its boot
-//! stack, and its `InitInfo` page in the `shared/process-layout` windows
-//! (`0x21_0000_0000` up to the image window's end below `0x38_4000_0000`) or
-//! at the kernel's fallback addresses above `0x3F_FFFF_0000`; the framebuffer
-//! and serial MMIO mappings end below the low band ([`SCRATCH_LOW_BASE`],
-//! checked where they are mapped); ktest has no heap. A test
-//! that forms a Rust reference into a scratch page ends it before the page is
-//! unmapped or remapped, so a mapping change at a scratch VA meets the
+//! half. ktest's own memory lies in none of them: the kernel places its image
+//! (every static: child stacks, IPC pages, argument blocks), its boot stack,
+//! and its `InitInfo` page in the `shared/process-layout` windows
+//! (`0x21_0000_0000` up to the image's end) or at the kernel's fallback
+//! addresses above `0x3F_FFFF_0000`. The image window ends at `0x38_0000_0000`;
+//! the kernel's placement check admits an image up to
+//! `process_layout::FIXED_IMAGE_ZONE_END`, so the image clears the high band
+//! only because ktest's image is far smaller than the 24 GiB below it. The
+//! framebuffer and serial MMIO mappings end below the low band
+//! ([`SCRATCH_LOW_BASE`], checked where they are mapped); ktest has no heap. A
+//! test that forms a Rust reference into a scratch page ends it before the page
+//! is unmapped or remapped, so a mapping change at a scratch VA meets the
 //! `# Safety` contracts of `syscall::mem_map` and its siblings. Tests run one
 //! at a time; children reach a scratch page only as their test directs.
 

@@ -166,10 +166,10 @@ pub fn user_va_top(ctx: &TestContext) -> TestResult
     // test's premise), so the call maps nothing.
     let at_top = unsafe { mem_map(memory_cap, ctx.aspace_cap, top, 0, 1, MAP_WRITABLE) };
     let below = top - PAGE_SIZE;
-    // SAFETY: ktest maps nothing in the top page of any supported user half:
-    // its image, windows, and scratch lie below 2^38, and under Sv39 its
-    // fallback addresses end at the kernel's `DEFAULT_INIT_STACK_TOP`, below
-    // that page.
+    // SAFETY: `below` is a ktest scratch page (the top page of the user half,
+    // or on x86-64 one of its top two; see the crate's § Scratch VAs): tests
+    // run one at a time and none leaves a scratch page mapped, so nothing
+    // lives there, and no reference into it is formed.
     let under_top = unsafe { mem_map(memory_cap, ctx.aspace_cap, below, 0, 1, MAP_WRITABLE) };
     if under_top.is_ok()
     {

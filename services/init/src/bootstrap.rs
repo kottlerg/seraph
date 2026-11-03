@@ -364,8 +364,9 @@ fn elf_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> Option<u64>
     Some(total)
 }
 
-/// One backing page for the main TLS block when `ehdr` declares a non-empty
-/// `PT_TLS`, else zero. Mirrors the presence check in [`place_main_tls`].
+/// The pages the main TLS block spans (`process_abi::tls_block_layout`) when
+/// `ehdr` declares a non-empty `PT_TLS`, else zero. Mirrors the presence check
+/// and the block size in [`place_main_tls`].
 fn tls_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> u64
 {
     match elf::tls_segment(ehdr, module_bytes)

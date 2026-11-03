@@ -24,7 +24,7 @@
 //!
 //! The draw windows and the per-process zone map are specified in
 //! `docs/userspace-memory-model.md` § Bootstrap Cross-Boundary VAs,
-//! § Image Placement, and § Growth zones. Each window's base, slot count,
+//! § Image Placement, and § Growth Zones. Each window's base, slot count,
 //! and the disjointness and ordering of every possible draw are
 //! const-asserted below.
 //!
@@ -104,8 +104,9 @@ pub struct VaWindow
     pub base: u64,
     /// Log2 of the number of page-granular slots (= bits of entropy per
     /// draw). The windows' values are an ASLR budget, not a capacity: they
-    /// are sized so every zone fits below [`LAYOUT_VA_CEILING`], which the
-    /// zone-map asserts check.
+    /// are sized so every zone fits its tier, below [`LAYOUT_VA_CEILING`]
+    /// for the fixed tier and inside the user half for a [`GrowthZone`],
+    /// which the zone-map asserts check.
     pub slots_log2: u32,
 }
 

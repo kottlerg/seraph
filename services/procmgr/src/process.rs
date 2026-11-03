@@ -1302,6 +1302,7 @@ fn finalize_creation(
     band_max: u8,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
+    self_aspace: u32,
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
@@ -1389,47 +1390,23 @@ fn finalize_creation(
     // Demand-paged wiring (best-effort): delegate the child address space to
     // memmgr and bind the main thread's fault handler to it. A failure here
     // degrades to "no pager" (faults kill the thread) rather than failing an
-    // otherwise-complete creation. Which processes are exempt from the default
-    // pager is in docs/fault-handling.md § Default System Pager.
-    if demand_paged && memmgr_send_cap != 0 && self_memmgr_ep != 0
+    // otherwise-complete creation, and the pager advertisement
+    // `populate_child_info` wrote is withdrawn so the child does not register
+    // demand regions no pager backs. Which processes are exempt from the
+    // default pager is in docs/fault-handling.md § Default System Pager.
+    if demand_paged
+        && !(memmgr_send_cap != 0
+            && self_memmgr_ep != 0
+            && bind_pager(
+                child_aspace,
+                child_thread,
+                memmgr_send_cap,
+                memmgr_badge,
+                self_memmgr_ep,
+                ipc_buf,
+            ))
     {
-        // Hand memmgr its own copy of the child AS, keyed by the child's
-        // memmgr badge, over procmgr's (procmgr-badged) endpoint so it lands
-        // on the privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`.
-        // Mask out CONTROL: memmgr only maps pages into the AS; the authority
-        // to register terminal-fault death observers stays with procmgr (the
-        // creator), which holds the CONTROL-bearing `child_aspace`.
-        if let Ok(as_copy) = syscall::cap_derive(
-            child_aspace,
-            syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_CONTROL,
-        )
-        {
-            let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
-                .word(0, memmgr_badge)
-                .cap(as_copy)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let delegated = unsafe { ipc::ipc_call(self_memmgr_ep, &msg, ipc_buf) }
-                .is_ok_and(|r| r.label == memmgr_errors::SUCCESS);
-            if delegated
-            {
-                // Bind only after the AS is delegated, so memmgr can service
-                // the first fault. The kernel stamps each fault with the
-                // derivation badge of memmgr_send_cap, which memmgr minted as
-                // the child's memmgr badge.
-                let _ = syscall::thread_set_fault_handler(
-                    child_thread,
-                    memmgr_send_cap,
-                    FAULT_CLASS_ALL,
-                );
-            }
-            else
-            {
-                // Call failed or memmgr declined: drop the copy if the IPC did
-                // not transfer it (deleting an already-moved slot is harmless).
-                let _ = syscall::cap_delete(as_copy);
-            }
-        }
+        withdraw_pager_advertisement(self_aspace, pi_memory_cap);
     }
 
     Some(CreateResult {
@@ -1437,6 +1414,71 @@ fn finalize_creation(
         thread_for_caller,
         badge,
     })
+}
+
+/// Delegate a child's address space to memmgr and bind its main thread's
+/// fault handler to `memmgr_send_cap`. Returns `true` only when both took
+/// effect, so the child's demand faults reach a pager that can map them.
+fn bind_pager(
+    child_aspace: u32,
+    child_thread: u32,
+    memmgr_send_cap: u32,
+    memmgr_badge: u64,
+    self_memmgr_ep: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    // Hand memmgr its own copy of the child AS, keyed by the child's memmgr
+    // badge, over procmgr's (procmgr-badged) endpoint so it lands on the
+    // privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`. Mask out
+    // CONTROL: memmgr only maps pages into the AS; the authority to register
+    // terminal-fault death observers stays with procmgr (the creator), which
+    // holds the CONTROL-bearing `child_aspace`.
+    let Ok(as_copy) = syscall::cap_derive(
+        child_aspace,
+        syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_CONTROL,
+    )
+    else
+    {
+        return false;
+    };
+    let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
+        .word(0, memmgr_badge)
+        .cap(as_copy)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let delegated = unsafe { ipc::ipc_call(self_memmgr_ep, &msg, ipc_buf) }
+        .is_ok_and(|r| r.label == memmgr_errors::SUCCESS);
+    if !delegated
+    {
+        // Call failed or memmgr declined: drop the copy if the IPC did not
+        // transfer it (deleting an already-moved slot is harmless).
+        let _ = syscall::cap_delete(as_copy);
+        return false;
+    }
+    // Bind only after the AS is delegated, so memmgr can service the first
+    // fault. The kernel stamps each fault with the derivation badge of
+    // memmgr_send_cap, which memmgr minted as the child's memmgr badge.
+    syscall::thread_set_fault_handler(child_thread, memmgr_send_cap, FAULT_CLASS_ALL).is_ok()
+}
+
+/// Clear the pager fields of a child's `ProcessInfo` (still writable through
+/// `pi_memory_cap` until the child starts), so a child whose pager binding
+/// failed reads "no pager" and keeps its memory eager instead of registering
+/// demand regions whose first touch would kill it. Best-effort: when the
+/// page cannot be mapped the advertisement stays.
+fn withdraw_pager_advertisement(self_aspace: u32, pi_memory_cap: u32)
+{
+    let Some(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
+    else
+    {
+        return;
+    };
+    // SAFETY: the scratch mapping is the child's ProcessInfo page, mapped
+    // writable for one page; the struct lives at offset 0 per the ABI.
+    let pi = unsafe { process_abi::process_info_mut(scratch.va()) };
+    pi.pager_endpoint_cap = 0;
+    pi.pager_badge = 0;
 }
 
 // ── Process creation (from memory) ──────────────────────────────────────────
@@ -1702,6 +1744,7 @@ fn create_process_from_bytes(
         sched.band_max,
         ipc_buf,
         &layout,
+        self_aspace,
     )?;
     let _ = child_objs.disarm();
     let _ = pi_memory.disarm();
@@ -2637,6 +2680,7 @@ pub fn create_process_from_file(
         sched.band_max,
         ipc_buf,
         &layout,
+        self_aspace,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);
     if result.is_ok()

@@ -123,7 +123,10 @@ depend on the fault path — a DMA driver. init, memmgr, and procmgr are pre-pag
 and never routed through this path, so they are pinned by construction. See
 [docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
 best-effort: a failure degrades to "no pager" (faults kill), never blocking
-creation.
+creation, and procmgr then clears `pager_endpoint_cap` and `pager_badge` in the
+child's `ProcessInfo`, so the page names a pager only when the delegation and the
+main thread's binding both took effect, and the runtime keeps such a child's
+memory eager.
 
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and

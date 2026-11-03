@@ -511,9 +511,11 @@ pub struct ProcessInfo
 
     /// `CSpace` slot of an `Endpoint` cap on the process's demand-paging
     /// pager (memmgr's service endpoint). Nonzero for ordinary processes —
-    /// demand paging is the system-wide default — and zero only for pinned
-    /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers) and the
-    /// pre-pager bootstrap (memmgr/procmgr).
+    /// demand paging is the system-wide default — and zero for pinned
+    /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers), the
+    /// pre-pager bootstrap (memmgr/procmgr), and a process whose pager
+    /// binding failed at creation, so a nonzero value always names a pager
+    /// that backs this process's demand faults.
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
     /// creation; the runtime reads this slot to bind the same handler onto
@@ -525,8 +527,8 @@ pub struct ProcessInfo
     /// The derivation badge of [`Self::pager_endpoint_cap`], identifying this
     /// process to the pager: the badge the kernel stamps on this process's
     /// fault messages. Informational: `SYS_THREAD_SET_FAULT_HANDLER` takes no
-    /// badge, so no binder passes it to the kernel. Zero when the process is
-    /// pinned (no pager).
+    /// badge, so no binder passes it to the kernel. Zero whenever
+    /// [`Self::pager_endpoint_cap`] is.
     pub pager_badge: u64,
 
     /// Mapped base virtual address of the main thread's TLS block — the value

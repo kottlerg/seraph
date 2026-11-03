@@ -25,6 +25,7 @@ pub mod bundle;
 pub mod layout;
 pub mod riscv_paging;
 pub mod role_guids;
+pub mod x86_paging;
 
 pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_address};
 
@@ -128,7 +129,12 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     MADT PLIC structure's total external interrupt sources). Zero when
 ///     undiscovered. The kernel sizes its PLIC programming and the IRQ
 ///     routing table from it.
-pub const BOOT_PROTOCOL_VERSION: u32 = 15;
+/// v16: On x86-64 the bootloader enables 5-level paging (`CR4.LA57`) when
+///     CPUID reports LA57, so the kernel may be entered on a PML5 root; the
+///     kernel takes its paging depth from `CR4.LA57` at entry
+///     ([`x86_paging`]), and `direct_map_base` lies at or above that
+///     depth's kernel-half floor. No layout change.
+pub const BOOT_PROTOCOL_VERSION: u32 = 16;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 

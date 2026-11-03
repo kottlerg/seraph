@@ -34,10 +34,11 @@ pub const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
 /// Allocate pages at any available physical address.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 /// Allocate pages at or below a specified maximum physical address
-/// (`AllocateMaxAddress`). Referenced only by [`allocate_pages_max_addr`].
+/// (`AllocateMaxAddress`). Referenced only by `allocate_typed_max_addr`.
 pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
 
-/// Memory type used for all bootloader allocations.
+/// Memory type used for every bootloader allocation but the x86-64 LA57
+/// toggle page ([`allocate_code_pages_max_addr`]).
 ///
 /// `EfiLoaderData` regions appear in the final memory map as `Loaded` in the
 /// boot protocol, notifying to the kernel that these regions are in-use.
@@ -186,7 +187,8 @@ pub struct EfiMemoryDescriptor
 }
 
 /// UEFI memory types referenced by the memory map translation and the
-/// aperture derivation.
+/// aperture derivation (`EFI_LOADER_CODE` also by
+/// [`allocate_code_pages_max_addr`]).
 pub const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 pub const EFI_LOADER_CODE: u32 = 1;
 // EFI_LOADER_DATA is 2, shared with the allocation constant above.
@@ -704,10 +706,12 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 ///
 /// This is the arch-neutral UEFI wrapper. Its callers are x86-64's
 /// `arch::current::allocate_ap_trampoline`, whose SIPI-vector constraint
-/// requires a frame below 1 MiB, and x86-64's
+/// requires a frame below 1 MiB, x86-64's
 /// `arch::current::allocate_kernel_span`, which keeps the kernel image below
-/// 4 GiB; the helper is not gated on architecture because
-/// `AllocateMaxAddress` is part of the UEFI spec on every supported platform.
+/// 4 GiB, and the x86-64 boot page-table root, which the LA57 toggle
+/// trampoline loads with a 32-bit move; the helper is not gated on
+/// architecture because `AllocateMaxAddress` is part of the UEFI spec on
+/// every supported platform.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -719,12 +723,53 @@ pub unsafe fn allocate_pages_max_addr(
     count: usize,
 ) -> Result<u64, BootError>
 {
+    // SAFETY: forwarded caller contract.
+    unsafe { allocate_typed_max_addr(bs, EFI_LOADER_DATA, max_phys, count) }
+}
+
+/// Allocate `count` pages of `EfiLoaderCode` lying wholly at or below the
+/// `max_phys` physical address.
+///
+/// The firmware's NX policy (`PcdDxeNxMemoryProtectionPolicy`) may map
+/// `EfiLoaderData` pages non-executable under its own tables, never
+/// `EfiLoaderCode` ones, so code the bootloader runs under those tables
+/// from an allocated page (the x86-64 LA57 toggle trampoline) needs this type.
+/// The region appears as `Loaded` in the boot protocol memory map.
+///
+/// # Safety
+/// `bs` must be valid boot services.
+// Used only by the x86-64 LA57 toggle installation; dead on riscv64.
+#[allow(dead_code)]
+pub unsafe fn allocate_code_pages_max_addr(
+    bs: *mut EfiBootServices,
+    max_phys: u64,
+    count: usize,
+) -> Result<u64, BootError>
+{
+    // SAFETY: forwarded caller contract.
+    unsafe { allocate_typed_max_addr(bs, EFI_LOADER_CODE, max_phys, count) }
+}
+
+/// `AllocatePages(AllocateMaxAddress, memory_type, count)` with the address
+/// seeded to `max_phys`; returns the allocated physical base.
+///
+/// # Safety
+/// `bs` must be valid boot services.
+// Reached only through the x86-64 max-address wrappers; dead on riscv64.
+#[allow(dead_code)]
+unsafe fn allocate_typed_max_addr(
+    bs: *mut EfiBootServices,
+    memory_type: u32,
+    max_phys: u64,
+    count: usize,
+) -> Result<u64, BootError>
+{
     let mut addr: u64 = max_phys;
     // SAFETY: bs is valid; addr is an in-out parameter.
     let status = unsafe {
         ((*bs).allocate_pages)(
             ALLOCATE_MAX_ADDRESS,
-            EFI_LOADER_DATA,
+            memory_type,
             count,
             core::ptr::addr_of_mut!(addr),
         )

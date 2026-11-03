@@ -228,7 +228,7 @@ Each process virtual address space is represented by an `AddressSpace` object:
 ```rust
 pub struct AddressSpace
 {
-    /// Physical address of the root page table frame (PML4 / RISC-V root).
+    /// Physical address of the root page table frame (PML4 or PML5 / RISC-V root).
     root_phys: u64,
 
     /// Virtual address of the root frame (via the direct physical map).
@@ -510,11 +510,11 @@ exist:
 
 ## Page Table Node Ownership
 
-Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below
-the root on RISC-V — two to four of them depending on the negotiated paging
-mode) are one 4 KiB page each and are owned exclusively by the address space
-that contains them; no reference counting is needed. Their source depends on
-the mapping path:
+Intermediate page table nodes (every level below the root: PML3/PML2/PML1 on
+x86-64, plus the PML4 under 5-level paging; two to four of them on RISC-V,
+depending on the negotiated paging mode) are one 4 KiB page each and are owned
+exclusively by the address space that contains them; no reference counting is
+needed. Their source depends on the mapping path:
 
 - `SYS_MEM_MAP` and `SYS_MMIO_MAP` into a retype-backed address space (every
   user address space, including init's bootstrap space) draw them from the

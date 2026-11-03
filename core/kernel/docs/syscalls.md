@@ -97,7 +97,8 @@ On `SYSCALL`:
    restores the user's `IF`
 10. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
 
-No return `rip` with any of bits 63:47 set can reach `SYSRET`, which would fault in
+No non-canonical return `rip` (at or above the boot paging depth's lower-half limit,
+`1 << 47`, or `1 << 56` under `CR4.LA57`) can reach `SYSRET`, which would fault in
 ring 0 on the user stack: the top user page is unmappable (`user_va_top`, see
 [arch-interface.md](arch-interface.md) § `paging`), so the address after a `SYSCALL`
 instruction is canonical, and `SYS_THREAD_CONFIGURE` and `SYS_THREAD_WRITE_REGS` reject
@@ -2225,8 +2226,9 @@ Translate a user virtual address to its mapped physical address.
 
 **Errors:**
 - `InvalidAddress` — `virt` is not page-aligned, outside the user half
-  (at or above `user_va_top`: `(1 << 47) - 4096` on x86-64; on riscv64 the active paging
-  mode's boundary, `1 << 38` / `1 << 47` / `1 << 56`), or not currently mapped.
+  (at or above `user_va_top`: `(1 << 47) - 4096` on x86-64, `(1 << 56) - 4096` under
+  5-level paging; on riscv64 the active paging mode's boundary, `1 << 38` / `1 << 47` /
+  `1 << 56`), or not currently mapped.
 - `InvalidCapability` — cap slot is null, wrong type, or the object is gone.
 - `InsufficientRights` — cap does not have the `READ` right.
 
@@ -2371,8 +2373,9 @@ pub enum SystemInfoType
 
     /// Exclusive top of the user half: the first virtual address a mapping
     /// syscall refuses (`user_va_top`). Fixed per architecture and boot paging
-    /// mode: `(1 << 47) - 4096` on x86-64, whose top user page is unmappable;
-    /// `1 << 38`, `1 << 47`, or `1 << 56` under riscv64 Sv39, Sv48, or Sv57.
+    /// mode: `(1 << 47) - 4096` or `(1 << 56) - 4096` on x86-64 at 4- or
+    /// 5-level paging, whose top user page is unmappable; `1 << 38`, `1 << 47`,
+    /// or `1 << 56` under riscv64 Sv39, Sv48, or Sv57.
     /// ruststd sizes a process's heap and reservation-arena zones from it.
     UserVaTop           = 8,
 }
@@ -2530,7 +2533,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
-| `BOOT_PROTOCOL_VERSION` | 14 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 16 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

@@ -17,9 +17,10 @@
 //! [`pre_serial_init`], [`uart_mmio_region`], [`discover_boot_hart_id`],
 //! [`default_mmio_apertures`], and [`default_pci_windows`].
 //!
-//! Submodules: [`paging`] (4-level page tables), [`handoff`] (kernel entry
-//! transfer), [`serial`] (COM1 UART), [`acpi_kernel_mmio`] (LAPIC/IOAPIC
-//! extraction from the MADT).
+//! Submodules: [`paging`] (depth negotiation and 4- or 5-level page tables),
+//! [`handoff`] (kernel entry transfer and the LA57 toggle trampoline),
+//! [`serial`] (COM1 UART), [`acpi_kernel_mmio`] (LAPIC/IOAPIC extraction
+//! from the MADT).
 
 pub mod acpi_kernel_mmio;
 pub mod handoff;
@@ -83,21 +84,26 @@ pub unsafe fn allocate_kernel_span(bs: *mut EfiBootServices, pages: usize)
 /// `_st` is unused; the function is safe to call at any point.
 pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable) {}
 
-/// No-op on x86-64: 4-level paging is the only supported mode, so there is
-/// nothing to negotiate. Cross-arch hook for RISC-V, where the bootloader
-/// selects Sv39/Sv48/Sv57 from the DTB `mmu-type` plus a `satp` write-probe.
+/// Negotiate the paging depth: 5-level when CPUID reports LA57, else 4-level
+/// (see [`paging::negotiate_paging`]). The DTB and boot hart arguments belong
+/// to the riscv64 hook, which selects Sv39/Sv48/Sv57 from the DTB `mmu-type`
+/// plus a `satp` write-probe; x86-64 publishes no DTB.
 ///
 /// # Safety
-/// Safe to call at any point; the arguments are unused.
+/// `bs` must be valid boot services (before `ExitBootServices`), and the call
+/// must precede step 6.
 // unnecessary_wraps: Result signature is the cross-arch contract with the
-// riscv64 hook, whose probe can genuinely fail.
+// riscv64 hook, whose probe can genuinely fail; x86-64 falls back to the
+// firmware's depth instead of failing.
 #[allow(clippy::unnecessary_wraps)]
 pub unsafe fn negotiate_paging(
-    _bs: *mut EfiBootServices,
+    bs: *mut EfiBootServices,
     _dtb_addr: u64,
     _boot_hart_id: u64,
 ) -> Result<(), crate::error::BootError>
 {
+    // SAFETY: forwarded caller contract.
+    unsafe { paging::negotiate_paging(bs) };
     Ok(())
 }
 
@@ -125,11 +131,11 @@ pub fn uart_mmio_region() -> u64
     0
 }
 
-/// Deterministic direct-map base: the kernel half's floor (PML4 entry 256);
-/// x86-64 has a single paging mode.
+/// Deterministic direct-map base: the negotiated depth's kernel-half floor
+/// (root entry 256). Valid only after [`negotiate_paging`] has run.
 pub fn default_direct_map_base() -> u64
 {
-    0xFFFF_8000_0000_0000
+    paging::negotiated_depth().kernel_va_base()
 }
 
 /// Returns 0: x86-64 has no boot hart ID concept.
@@ -171,6 +177,19 @@ fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32)
         );
     }
     (eax, ebx, ecx, edx)
+}
+
+/// Read `CR4`. The bootloader runs at ring 0 under UEFI.
+#[cfg(not(test))]
+fn read_cr4() -> u64
+{
+    let cr4: u64;
+    // SAFETY: reading CR4 is a ring-0 primitive; UEFI x86-64 runs at ring 0.
+    // Reads a control register only: no memory, no stack, no flags.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    cr4
 }
 
 /// Return the hardware identifier of the bootstrap processor.

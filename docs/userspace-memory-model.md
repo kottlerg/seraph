@@ -323,7 +323,7 @@ addresses in every mode.
 | User half | Heap zone | Arena zone | Image zone end |
 |---|---|---|---|
 | Sv39 (2³⁸), or unknown | base window `[1 GiB, 3 GiB)`, 60 GiB above the base | base window `[64 GiB, 96 GiB)`, 32 GiB above the base | `0x3F_0000_0000` |
-| `H` = 2⁴⁷ (x86-64, Sv48) or 2⁵⁶ (Sv57) | base window at `H/8`, `H/64` wide, `H/4` above the base | base window at `H/2`, `H/64` wide, `H/4` above the base | `H/8` |
+| `H` = 2⁴⁷ (x86-64 4-level, Sv48) or 2⁵⁶ (x86-64 5-level, Sv57) | base window at `H/8`, `H/64` wide, `H/4` above the base | base window at `H/2`, `H/64` wide, `H/4` above the base | `H/8` |
 
 Under Sv39 both zones lie below the bootstrap windows; in a wider half they
 lie above the whole fixed tier, so they grow with the address space (32 TiB

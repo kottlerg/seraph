@@ -346,7 +346,7 @@ pub unsafe fn enable_pcid() -> bool
     // Bit 17 = PCIDE.
     let cr4 = read_cr4();
     // SAFETY: CPUID confirmed PCID + INVPCID; CR3 low bits are zero (kernel
-    // root); long mode and PAE are active (4-level paging). The new CR4 value
+    // root); long mode and PAE are active (4- or 5-level paging). The new CR4 value
     // is valid.
     unsafe {
         write_cr4(cr4 | (1 << 17));

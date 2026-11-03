@@ -81,6 +81,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         vmgenid_guid: Some("auto"),
         incoming: None,
         riscv_mmu: args.riscv_mmu,
+        x86_paging: args.x86_paging,
     };
     let qemu_args = build_qemu_argv(&spec)?;
 

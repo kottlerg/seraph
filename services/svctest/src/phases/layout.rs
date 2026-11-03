@@ -69,7 +69,14 @@ pub fn growth_zones_phase(_: &Caps)
 {
     let top = std::os::seraph::user_va_top();
     assert!(
-        [1 << 38, (1 << 47) - 4096, 1 << 47, 1 << 56].contains(&top),
+        [
+            1 << 38,
+            (1 << 47) - 4096,
+            1 << 47,
+            (1 << 56) - 4096,
+            1 << 56
+        ]
+        .contains(&top),
         "user_va_top {top:#x} is no supported mode's user top"
     );
     let zones = process_layout::growth_zones(top);

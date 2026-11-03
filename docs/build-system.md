@@ -329,9 +329,10 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 `xtask/src/qemu.rs` passes
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
 plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
-`-cpu max,migratable=no` on x86-64 TCG. The explicit feature string is the source of
-truth on every supported QEMU, including the 10.2 the pinned CI image ships (§ Continuous
-Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
+`-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
+`,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
+string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
+ships (§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
 required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
 the first userspace mapping (see [platform-requirements.md](platform-requirements.md)). The
 named `-cpu rva23s64` model (QEMU ≥ 10.0, 2025-04) is a superset of this string that adds the
@@ -382,7 +383,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1 --timeout 180` iteration; ktest cells then run `test-kaslr`, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days; ktest cells then run `test-kaslr`, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20 --timeout 180`. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |

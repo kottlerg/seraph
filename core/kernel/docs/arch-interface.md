@@ -118,23 +118,26 @@ pub unsafe fn read_root_phys() -> u64;
 /// Publish the active paging mode and the KASLR-chosen direct-map base at
 /// kernel entry, before any consumer of the VA layout runs, from the validated
 /// `BootInfo`. RISC-V decodes `satp.MODE` (the bootloader hands over a running
-/// translation regime under the negotiated Sv39/Sv48/Sv57 mode); x86-64 is
-/// unconditionally 4-level and records only the direct-map base. Halts the CPU
-/// on a base outside the active mode's kernel half or not 1 GiB-aligned.
+/// translation regime under the negotiated Sv39/Sv48/Sv57 mode); x86-64 reads
+/// `CR4.LA57` (the bootloader hands over 4-level paging, or 5-level when CPUID
+/// reports LA57). Halts the CPU on a base outside the active mode's kernel half
+/// or not 1 GiB-aligned.
 pub fn init_paging_mode(info: &boot_protocol::BootInfo);
 
 /// Base virtual address of the direct physical map: the KASLR-chosen base from
 /// `BootInfo` — a 1 GiB-aligned base at or above the kernel-half floor
-/// (0xFFFF800000000000 on x86-64 / Sv48; see docs/memory-model.md § Virtual
-/// Address Space Layout), published by `init_paging_mode`. A runtime
+/// (0xFFFF800000000000 at x86-64 4-level and Sv48, 0xFF00000000000000 at
+/// x86-64 5-level and Sv57; see docs/memory-model.md § Virtual Address Space
+/// Layout), published by `init_paging_mode`. A runtime
 /// `AtomicU64` on both arches (a single relaxed load); wrapped by
 /// `mm::paging::direct_map_base()` for architecture-neutral consumers.
 pub fn direct_map_base() -> u64;
 
-/// Exclusive upper bound of user-accessible virtual addresses: constant
-/// `(1 << 47) - 4096` on x86-64 (the canonical lower half less its top page,
-/// kept unmappable so every hardware-saved ring-3 return RIP is canonical); the
-/// active mode's half boundary on RISC-V. Wrapped by `mm::user_va_top()` — the
+/// Exclusive upper bound of user-accessible virtual addresses: on x86-64 the
+/// boot depth's canonical lower half less its top page (`(1 << 47) - 4096`, or
+/// `(1 << 56) - 4096` under `CR4.LA57`), the page kept unmappable so every
+/// hardware-saved ring-3 return RIP is canonical; the active mode's half
+/// boundary on RISC-V. Wrapped by `mm::user_va_top()` — the
 /// single kernel-wide user-VA gate.
 pub fn user_va_top() -> u64;
 

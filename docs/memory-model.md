@@ -23,21 +23,29 @@ Memory).
 
 ### x86-64
 
-x86-64 with 4-level paging provides 48-bit virtual addresses. Only addresses in two
-canonical ranges are valid — the hardware raises a fault on any access to a
-non-canonical address, providing a natural guard between userspace and kernel space.
+x86-64 runs 4-level paging (48-bit virtual addresses) or, when the CPU reports LA57, 5-level
+paging (57-bit virtual addresses). The bootloader negotiates the depth from CPUID and enables
+`CR4.LA57` for 5-level ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md)
+§ x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57` at entry. One
+kernel binary supports both depths; every VA-layout constant that varies with the depth is derived
+from it at runtime. CI and development boots run 4-level (`cargo xtask` pins the QEMU CPU's `la57`
+property off by default; its `--x86-paging` flag selects 5-level, per
+[xtask/README.md](../xtask/README.md)). Only addresses in two canonical ranges are valid — the
+hardware raises a fault on any access to a non-canonical address, providing a natural guard
+between userspace and kernel space:
 
 ```
-  0xFFFFFFFFFFFFFFFF ┐
-                     │  Kernel space (128 TiB)
-  0xFFFF800000000000 ┘
-  ~~~~~~~~~~~~~~~~~~~~  (non-canonical gap — hardware enforced)
-  0x00007FFFFFFFFFFF ┐
-                     │  Userspace (128 TiB)
-  0x0000000000000000 ┘
+  Depth    VA bits  Userspace (lower half)      Kernel space (upper half)
+  4-level  48       [0, 0x0000800000000000)     [0xFFFF800000000000, top]   (128 TiB each)
+  5-level  57       [0, 0x0100000000000000)     [0xFF00000000000000, top]   (64 PiB each)
+  ~~~~~~~~~~~~~~~~~~~~ (non-canonical gap between the halves — hardware enforced)
 ```
 
-The top 4 KiB page of the userspace half (from `0x00007FFFFFFFF000`) is never mapped:
+The kernel half's base is root-table entry 256 at either depth (the PML4 at 4-level, the PML5 at
+5-level), so kernel-half sharing between address spaces is depth-invariant.
+
+The top 4 KiB page of the userspace half (from `0x00007FFFFFFFF000` at 4-level,
+`0x00FFFFFFFFFFF000` at 5-level) is never mapped:
 with it unmappable no user instruction ends at the canonical boundary, so every return RIP
 the hardware saves on a ring-3 interrupt, trap, or `syscall` is canonical, and the
 kernel's ring-3 `iretq` / `sysretq` never faults in ring 0 (`user_va_top`,
@@ -51,7 +59,8 @@ Kernel space is divided into regions:
                      │    base randomized per boot (KASLR)
                      │
                      │  Physical memory direct map (all RAM, read/write),
-  0xFFFF800000000000 ┘    base randomized per boot at or above this floor (KASLR)
+  kernel-half floor  ┘    base randomized per boot at or above this floor (KASLR):
+                          0xFFFF800000000000 at 4-level, 0xFF00000000000000 at 5-level
 ```
 
 The physical memory direct map gives the kernel a virtual address for every physical
@@ -74,7 +83,7 @@ RISC-V supports three address-translation modes on this port, negotiated at boot
 ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation); the kernel
 recovers the active mode from `satp` at entry. Sv39 is the RVA23 platform minimum, Sv48 the standing
 default in CI and development (`cargo xtask` caps the QEMU guest at Sv48 by default, aligning with
-x86-64's address-space size; its `--riscv-mmu` flag selects another mode, per
+x86-64's default 4-level address-space size; its `--riscv-mmu` flag selects another mode, per
 [xtask/README.md](../xtask/README.md)), Sv57 a wider expansion
 ([platform-requirements.md](platform-requirements.md)). One kernel binary supports all three; every
 VA-layout constant that varies with the mode is derived from it at runtime.

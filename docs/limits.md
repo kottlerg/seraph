@@ -69,12 +69,14 @@ An entry an existing open Issue already names cites it in the recommendation.
 
 ## Cross-Cutting Findings
 
-- **RAM ceiling.** No kernel memory-management structure bounds RAM: the Phase 3 tables come
-  from a carve of RAM sized to the machine, the frame map's and the `CSpace` registry's chunk
-  tables are sized from the memory map, and the buddy allocator keeps its free-list links in the
-  free blocks. What binds is the address space: x86_64's 4-level paging gives the direct map a
-  128 TiB kernel half (LA57 is the decided expansion), and the `u32` `CSpaceId` stops the
-  registry at 16 TiB of DRAM.
+- **RAM ceiling.** Within a 4-level or Sv48 kernel half no kernel memory-management
+  structure bounds RAM: the Phase 3 tables come from a carve of RAM sized to the machine, the
+  frame map's and the `CSpace` registry's chunk tables are sized from the memory map, and the
+  buddy allocator keeps its free-list links in the free blocks. What binds there is the address
+  space: x86_64's 4-level paging gives the direct map a 128 TiB kernel half. Where the CPU
+  reports LA57 (5-level paging, negotiated at boot) or under Sv57 the half is 64 PiB, and the
+  fixed stage-1 seed (`BOOT_TABLE_POOL_SIZE`) binds first, at petabytes of RAM. The `u32`
+  `CSpaceId` stops the registry at 16 TiB of DRAM.
 - **CPU ceiling.** The binding CPU ceiling is `MAX_CPUS` itself, inline in the one-page
   `BootInfo`; shipping two-socket servers already exceed 512 logical CPUs. A per-CPU slab may
   span several buddy blocks, so `MAX_ORDER` no longer caps the CPU count.
@@ -116,7 +118,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 |---|---|---|---|---|---|---|
 | `BuddyAllocator.free_lists` (`FreeHeader` in each free block) | `core/kernel/src/mm/buddy.rs` | none: one 16 B header inside each free block, linked by physical address | provable unreachability (no metadata outside the free pages) | 96 B BSS (the 12 list heads) | correct as is | None |
 | `MAX_ORDER` | `core/kernel/src/mm/buddy.rs` | 11 (8 MiB largest block) | tuning (block granularity; a boot allocation past one block takes a run of blocks, `alloc_contiguous`) | none | correct as is | None |
-| `BOOT_TABLE_POOL_SIZE` (`BootTablePool.frames`) | `core/kernel/src/mm/paging.rs` | 64 frames | provable unreachability (stage 1 maps only the image, the handoff stack window and the stage-2 carve, whose tables fit the seed for any direct map within the 128 TiB kernel half) | 256 KiB BSS | correct as is | None |
+| `BOOT_TABLE_POOL_SIZE` (`BootTablePool.frames`) | `core/kernel/src/mm/paging.rs` | 64 frames | static-footprint (BSS) budget (stage 1 maps only the image, the handoff stack window and the stage-2 carve, whose tables fit the seed for any direct map within the 128 TiB 4-level or Sv48 kernel half, at any paging depth) | 256 KiB BSS | make pay-as-you-go | Under x86-64 5-level paging or Sv57 a direct map of petabytes (one more carve directory per 256 TiB of RAM) outgrows the seed before the 64 PiB half and fails Phase 3 by name; size the stage-1 need from the memory map |
 | Phase 3 stage-2 carve (`stage2_table_bound`, `find_boot_table_carve`) | `core/kernel/src/mm/paging.rs`, `init.rs` | an upper bound on the stage-2 tables, about one frame per GiB of direct map | provable unreachability (sized from the machine; a host test checks the bound against a real allocation) | about 4 KiB per GiB of RAM | correct as is | None |
 | `LARGE_PAGE_SIZE` | `core/kernel/src/mm/paging.rs` | 2 MiB | hardware spec (x86-64 and Sv39 large leaf) | none | correct as is | None |
 | `init_kernel_page_tables` `mmio_regions` | `core/kernel/src/mm/paging.rs` | `[(u64, u64); MMIO_DIRECT_MAP_REGIONS]`: `1 + MAX_IOAPICS` on x86_64, 0 on riscv64 | ABI width (derived from the producer's own bound) | 144 B stack | correct as is | None |
@@ -141,7 +143,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `DEFAULT_INIT_INFO_VA`, `DEFAULT_INIT_STACK_TOP` | `core/kernel/src/mm/address_space.rs` | fixed VAs under the Sv39 user top | encoding artefact (fallback layout) | none | correct as is | Not a count |
 | `INIT_MAX_SEGMENTS` RELRO split | `core/kernel/src/mm/init_reloc.rs` | 8 | ABI width (boot protocol) | none | correct as is | A split past 8 is a clean error |
 | `kernel_pt_pool` seed | `core/kernel/src/mm/kernel_pt_pool.rs` | 64 pages (`POOL_SEED_PAGES`), never returned | provable unreachability (only the Phase 9 bootstrap maps of init's image, `InitInfo` and stack draw from it, measured 6 to 7 pages; no map syscall does, since every address space records its create-time donation before it is published and `AddressSpaceObject::require_create_donation` refuses a map otherwise) | 256 KiB | correct as is | None |
-| x86_64 4-level paging (`user_va_top`) | `core/kernel/src/arch/x86_64/paging.rs` | user 128 TiB, kernel half 128 TiB | hardware spec (4-level paging; LA57 not yet implemented) | none | raise | Below the #177 target of 526 TB; decided: opportunistic LA57, as riscv64 Sv57 (docs/platform-requirements.md); tracked by #675 |
+| x86_64 paging depth (`user_va_top`) | `core/kernel/src/arch/x86_64/paging.rs` | 4-level: user 128 TiB, kernel half 128 TiB; 5-level (LA57): 64 PiB each | hardware spec (4-level paging, or 5-level when CPUID reports LA57, negotiated at boot as riscv64 negotiates Sv57; docs/platform-requirements.md) | none | correct as is | 5-level meets the #177 target of 526 TB; a CPU without LA57 stays below it |
 | `PerCpuData`, `CPU_APIC_IDS` slabs | `core/kernel/src/percpu.rs` | `cpu_count`-sized | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x about 76 B | correct as is | Already pay-as-you-go |
 | `CPU_APIC_IDS` element | `core/kernel/src/percpu.rs` | `u32` | ABI width (`BootInfo.cpu_ids`; x2APIC IDs are 32-bit) | 4 B per CPU | correct as is | riscv64 `mhartid` is XLEN-wide; a hart id above 2^32 is refused |
 | `PerCpuData.cpu_id`, `preempt_count` | `core/kernel/src/percpu.rs` | `u32` | provably unreachable (CPUs and nesting are far below 2^32) | embedded | correct as is | None |
@@ -274,7 +276,7 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | `IOPB_SIZE` (`TssWithIopb.iopb`) | `core/kernel/src/arch/x86_64/gdt.rs` | 8192 B | hardware spec (65536 ports / 8) | about 8.3 KiB per CPU | correct as is | None |
 | `IST_STACK_SIZE` (`BSP_IST_STACKS`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 8 KiB x 2 | stack budget for the fixed NMI, #DF and #MC paths, audited: worst case under 3.7 KiB, debug and release builds | 16 KiB BSS | correct as is | None |
 | `AP_IST_PAIR_SIZE` | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 16384 | encoding artefact (two IST stacks) | `cpu_count` x 16 KiB | correct as is | Derive as `2 * IST_STACK_SIZE` |
-| Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; PML4 below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
+| Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; root table (PML4 or PML5) below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
 | `wait_icr_idle` (`ICR_IDLE_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based) | none | correct as is | None |
 | `wait_for_ack` ladder | `core/kernel/src/arch/*/interrupts.rs` | 250 / 750 / 5000 ms, on the spin-count estimate before the timer is calibrated | tuning (time-based) | none | correct as is | None |
 | `MAX_SPINS_PER_UNIT` | `core/kernel/src/bounded_wait.rs` | 10 000 spins per us | provable unreachability (a 10 GHz clock), so the fallback never times out early | none | correct as is | None |
@@ -369,7 +371,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 | `FILE_INFO_BUF_LEN` | `core/boot/src/uefi.rs` | `size_of::<EfiFileInfo>() + 256` | provably unreachable (fixed short ESP file names) | about 350 B stack | correct as is | None |
 | `TARGET_FB_WIDTH`, `TARGET_FB_HEIGHT` | `core/boot/src/uefi.rs` | 1280 x 720 | policy (bounds no capacity) | none | correct as is | None |
 | `MAX_LOAD_SEGMENTS` (`KernelInfo.segments`) | `core/boot/src/elf.rs` | 8 | provably unreachable (the in-tree kernel has 5 LOAD segments on x86_64; overflow is an error) | embedded | correct as is | None |
-| `FRAME_LOG_CAP` | `core/boot/src/arch/x86_64/paging.rs`, `arch/riscv64/paging.rs` | 128 / 160 | current peak plus headroom | about 1 KiB embedded | raise | Grows with framebuffer and bundle size; 2 MiB leaves or coalescing |
+| `FRAME_LOG_CAP` | `core/boot/src/arch/x86_64/paging.rs`, `arch/riscv64/paging.rs` | 160 / 160 (the x86-64 log also holds the LA57 toggle page) | current peak plus headroom | about 1 KiB embedded | raise | Grows with framebuffer and bundle size; 2 MiB leaves or coalescing |
 | dtb `MAX_DEPTH` | `core/boot/src/dtb.rs` | 8 | unknown | stack | raise | Deeper nodes are skipped silently |
 | dtb `MAX_REG_ENTRIES`, `MAX_IRQ_ENTRIES` | `core/boot/src/dtb.rs` | 8 / 4 | unknown | embedded per node | needs a design | Truncation is silent; diagnose |
 | dtb `MAX_RANGES_ENTRIES` | `core/boot/src/dtb.rs` | 4 | unknown | 96 B per node | raise | Host-bridge `ranges` can carry more windows |

@@ -74,14 +74,8 @@ const NUM_WORKERS: usize = 32;
 /// Wake + churn cycles in Phase 1. Each cycle issues one wake + one priority
 /// write per worker; 600 cycles issue 19,200 wakes and 19,200 priority writes
 /// (plus 4,800 affinity flips) against the enqueue chokepoint, well under a
-/// second on a healthy kernel. Fewer past 16 CPUs; see
-/// [`super::scaled_attempts`].
+/// second on a healthy kernel.
 const CYCLES: u32 = 600;
-
-/// Fewest cycles at any width: each cycle wakes and re-prioritises every
-/// worker, so a few dozen cycles still land wakes on queue entries in
-/// relocation.
-const MIN_CYCLES: u32 = 64;
 
 /// Notification bit the controller wakes workers with (any non-zero value;
 /// `notification_send` rejects zero-bit sends).
@@ -95,9 +89,6 @@ pub fn run(ctx: &TestContext) -> TestResult
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "stress::double_enqueue_storm: system_info(CpuCount) failed")?;
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
-    // Each cycle's cross-CPU wakes and relocations grow with the width; the
-    // count shrinks with it.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::double_enqueue_storm: cap_create_notification failed")?;
 
@@ -177,7 +168,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Affinity flips every 4 cycles relocate the queue entry across CPUs via
     // migrate_ready_thread / the cross-CPU outgoing branch — so a wake can land
     // on a TCB mid-relocation, the transient window the #244 class lives in.
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         for i in 0..NUM_WORKERS
         {

@@ -752,11 +752,11 @@ pub fn bind_fault_handler(thread: u32, endpoint: u32, badge: u64) -> Result<(), 
 /// their own set to test the capacity.
 pub const WS_CAPACITY: u32 = 16;
 
-/// The widest CPU count at which ktest's attempt counts and wall-clock
-/// budgets apply as written. Past it a boot is an oversubscribed boundary
-/// run, where every cross-CPU handoff waits for a host core, so an
-/// attempt's wall time and a step's latency grow with the width; see
-/// core/ktest/README.md § Tier S for the scaling rule and its intent.
+/// The widest CPU count at which ktest's wall-clock bounds and budgets apply
+/// as written. Past it a boot is an oversubscribed boundary run, where every
+/// cross-CPU handoff waits for a host core, so a step's latency grows with
+/// the width; see core/ktest/README.md § Tier S for the scaling rule and its
+/// intent.
 pub const UNSCALED_CPUS: u64 = 16;
 
 /// `base`, a wall-clock bound or budget whose expiry fails a test (in any

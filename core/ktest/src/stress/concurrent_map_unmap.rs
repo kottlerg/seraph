@@ -6,25 +6,18 @@
 //! Stress test: concurrent memory map/unmap from multiple threads.
 //!
 //! `NUM_CHILDREN` threads each map and unmap a distinct VA range
-//! `MAP_ITERATIONS` times (fewer past 16 CPUs, see
-//! [`super::scaled_attempts`]), sharing the same address space. Exercises
+//! `MAP_ITERATIONS` times, sharing the same address space. Exercises
 //! page table lock contention and TLB shootdown under load.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, notification_send,
-    notification_wait, system_info, thread_exit,
+    notification_wait, thread_exit,
 };
-use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
 const MAP_ITERATIONS: u32 = 1000;
-
-/// Fewest iterations per child at any width: every unmap broadcasts a
-/// shootdown to the CPUs running the address space, so a few dozen still
-/// contend the page-table lock and the shootdown from every child.
-const MIN_MAP_ITERATIONS: u32 = 64;
 
 /// A child's `done` bit is `1 << index`; [`ERROR_BIT`] above them all marks
 /// a child that failed.
@@ -76,11 +69,6 @@ fn child_va(index: usize) -> u64
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let cpus = system_info(SystemInfoType::CpuCount as u64)
-        .map_err(|_| "concurrent_map_unmap: system_info(CpuCount) failed")?;
-    // Each unmap's shootdown reaches more CPUs, and costs more, with the
-    // width; the count shrinks with it.
-    let iterations = super::scaled_attempts(MAP_ITERATIONS, MIN_MAP_ITERATIONS, cpus);
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
@@ -91,7 +79,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         spawned: 0,
     };
     let result =
-        start_mappers(ctx, done, iterations, &mut mappers).and_then(|()| await_mappers(done));
+        start_mappers(ctx, done, MAP_ITERATIONS, &mut mappers).and_then(|()| await_mappers(done));
     let released = release(ctx, &mut mappers);
     cap_delete(done).ok();
     result?;

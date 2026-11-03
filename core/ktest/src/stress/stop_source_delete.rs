@@ -47,7 +47,7 @@
 //! and one racing a Thread delete. A long-lived racer, pinned to CPU 2, takes the
 //! phase's action (stop the waiter, or delete its Thread capability) in each
 //! round it is armed for. The controller, pinned to CPU 0, runs [`CYCLES`]
-//! rounds per phase (fewer past 16 CPUs, see [`super::scaled_attempts`]).
+//! rounds per phase.
 //! Each round creates a fresh source and a waiter pinned to CPU 1 that loops
 //! waiting on it, counting each wait it enters and classifying each result;
 //! the controller waits until the waiter has entered a wait (bounded by
@@ -126,10 +126,6 @@ const CELL: &str = "stress::stop_source_delete";
 
 /// Rounds per phase; each creates and deletes one source and one waiter.
 const CYCLES: u32 = 200;
-
-/// Fewest rounds per phase at any width: the settle spread puts a good share
-/// of the races on a parked waiter, so a few dozen rounds still land some.
-const MIN_CYCLES: u32 = 32;
 
 /// CPUs needed: one each for the controller, the waiter, and the racer.
 const MIN_CPUS: u64 = 3;
@@ -369,9 +365,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_source_delete: pin controller failed")?;
-    // Each round's waiter start, cross-CPU action and teardown grow with the
-    // width; the count shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus), cpus);
+    let result = phases(ctx, CYCLES, cpus);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_source_delete: restore controller affinity failed");
     result?;

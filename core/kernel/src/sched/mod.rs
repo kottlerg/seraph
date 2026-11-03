@@ -5686,8 +5686,8 @@ pub unsafe fn schedule(requeue: Requeue)
                 );
             }
             // SAFETY: under next.sched_lock, which serialises `iopb` and its
-            // bytes against SYS_IOPORT_BIND; the pointer is null or a live
-            // IOPB_SIZE block carved from SEED; interrupts are disabled.
+            // bytes against SYS_IOPORT_BIND; the pointer is null or the live
+            // bitmap of the thread's port-binding table; interrupts are disabled.
             #[cfg(not(test))]
             unsafe {
                 let iopb_ptr = (*next).iopb;

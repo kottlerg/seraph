@@ -11,10 +11,25 @@
 //!
 //! `tss_ptr` in `PerCpuData` is unused on RISC-V; this returns 0.
 
-/// I/O Permission Bitmap size. Zero on RISC-V (no I/O port space): it types
-/// the `ThreadControlBlock::iopb` pointer (`*mut [u8; IOPB_SIZE]`) uniformly
-/// across arches, and RISC-V threads always leave that pointer null.
+/// I/O Permission Bitmap size. Zero on RISC-V (no I/O port space).
 pub const IOPB_SIZE: usize = 0;
+
+/// Bytes of one part of a thread's I/O permission bitmap; one page, as on
+/// x86-64, though RISC-V holds no part.
+pub const IOPB_PART_BYTES: usize = 4096;
+
+/// Parts of a thread's I/O permission bitmap: none on RISC-V.
+pub const IOPB_PARTS: usize = 0;
+
+/// A thread's I/O permission bitmap: empty on RISC-V, which has no I/O port
+/// space. It types the `ThreadControlBlock::iopb` pointer uniformly across
+/// arches, and RISC-V threads always leave that pointer null.
+#[repr(C)]
+pub struct ThreadIopb
+{
+    /// No parts.
+    pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS],
+}
 
 /// Return the BSP TSS pointer. On RISC-V this is always 0 — there is no TSS.
 pub fn bsp_tss_ptr() -> u64
@@ -42,14 +57,14 @@ pub unsafe fn init_ap(_cpu_id: u32, _rsp0: u64, _ist1_top: u64, _ist2_top: u64) 
 /// No preconditions — the body is empty. The `unsafe` qualifier exists only to
 /// match the x86-64 surface signature.
 #[cfg(not(test))]
-pub unsafe fn load_iopb(_iopb: Option<&[u8; IOPB_SIZE]>) {}
+pub unsafe fn load_iopb(_iopb: Option<&ThreadIopb>) {}
 
 /// Permit an I/O port range in a thread's IOPB — no-op on RISC-V.
 ///
 /// RISC-V has no I/O port space, so there is nothing to permit. Present so
 /// `sys_ioport_bind` compiles on both arches; the `HAS_IO_PORTS` gate makes
 /// this unreachable on RISC-V.
-pub fn permit_port_range(_iopb: &mut [u8; IOPB_SIZE], _base: u32, _count: u32) {}
+pub fn permit_port_range(_part: &mut [u8], _first_port: u32, _base: u32, _count: u32) {}
 
 /// Make every CPU reload its I/O permission bitmap — no-op on RISC-V.
 ///

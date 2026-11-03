@@ -15,7 +15,8 @@
 //!
 //! Every supervised service binds death notification onto svcmgr's death
 //! queues with `correlator = service_index`; a further queue joins when
-//! every pool is out of nodes (`death_queues`). The wait set holds the
+//! every pool is out of nodes (`death_queues`). The main wait set, which
+//! `death_queues::DeathSet` owns and widens as the queues fill it, holds the
 //! service endpoint (badge 0) and every death queue (badge 1). On death
 //! wakeup svcmgr drains the queues and routes each payload to its
 //! `ServiceEntry` via the correlator. Multiplexing avoids consuming a
@@ -37,10 +38,6 @@ use ipc::{IpcMessage, svcmgr_labels};
 use registry::{Resolver, Visibility};
 use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
-
-/// The main wait set's member capacity: the service endpoint and every death
-/// queue svcmgr may create.
-const WS_MEMBERS: u32 = 1 + death_queues::DEATH_QUEUES_MAX as u32;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
@@ -113,26 +110,14 @@ fn main() -> !
         halt_loop();
     }
 
-    let Some(ws_cap) = std::os::seraph::object_slab_retype(
-        std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
-        |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
-    )
+    // The main wait set, holding the service endpoint and the first death
+    // queue; further queues join it as pools run out, and it is replaced by a
+    // wider one as they fill it.
+    let Some(deaths) =
+        death_queues::DeathSet::new(caps.service_ep, WS_BADGE_SERVICE, WS_BADGE_DEATHS)
     else
     {
-        std::os::seraph::log!("failed to create wait set");
-        halt_loop();
-    };
-
-    if syscall::wait_set_add(ws_cap, caps.service_ep, WS_BADGE_SERVICE).is_err()
-    {
-        std::os::seraph::log!("failed to add service endpoint to wait set");
-        halt_loop();
-    }
-    // The first death queue; further ones join the wait set as pools run out.
-    let Some(deaths) = death_queues::DeathSet::new(ws_cap, WS_BADGE_DEATHS)
-    else
-    {
-        std::os::seraph::log!("failed to create the first death queue");
+        std::os::seraph::log!("failed to create the main wait set and first death queue");
         halt_loop();
     };
 
@@ -145,7 +130,7 @@ fn main() -> !
 
     std::os::seraph::log!("endowed; waiting for handover");
 
-    event_loop(info, &caps, ws_cap, deaths, ipc_buf, &mut state);
+    event_loop(info, &caps, deaths, ipc_buf, &mut state);
 }
 
 /// Publish the well-known names svcmgr owns into its own discovery
@@ -374,7 +359,6 @@ pub struct SvcmgrState
 fn event_loop(
     info: &StartupInfo,
     caps: &service::SvcmgrCaps,
-    ws_cap: u32,
     deaths: death_queues::DeathSet,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
@@ -396,7 +380,9 @@ fn event_loop(
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        let badge = match syscall::wait_set_wait(ws_cap)
+        // Read every time: a bind that grows the death queues may have
+        // replaced the wait set.
+        let badge = match syscall::wait_set_wait(restart_ctx.deaths.ws_cap())
         {
             Ok(badge) => badge,
             Err(e) =>

@@ -3,20 +3,24 @@
 
 // services/procmgr/src/death_queues.rs
 
-//! procmgr's death queues: the growable set every death observer procmgr
-//! binds (each child's main thread and address space, and init's two threads)
-//! lands on.
+//! procmgr's death queues and the main wait set they share with its service
+//! endpoint: the growable set every death observer procmgr binds (each
+//! child's main thread and address space, and init's two threads) lands on.
 //!
 //! Each bind takes one node from its queue's pool, fixed when the queue is
 //! created, so a pool that runs out is followed by a further queue funded
-//! from procmgr's own memory with twice the nodes; where a bind goes is
-//! [`process_table::DeathQueues`]'s policy. Every queue sits in the main wait
-//! set under `WS_BADGE_DEATH`, and a drain empties them all.
+//! from procmgr's own memory with twice the nodes (half again, down to the
+//! first pool's size, when memmgr refuses a contiguous grant that large).
+//! [`DeathSet`] owns the main wait set: the service endpoint under
+//! `WS_BADGE_SERVICE` and every queue under `WS_BADGE_DEATH`. When the
+//! queues fill it, it is replaced by a wait set of twice the members, up to
+//! `WAIT_SET_MAX_MEMBERS`, and every member moves across. Where a bind goes,
+//! and when either grows, is [`process_table::DeathQueues`]'s policy.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use process_table::DeathQueues;
-use process_table::death_queues::FIRST_POOL_OBSERVERS;
+use process_table::death_queues::{FIRST_POOL_OBSERVERS, FIRST_WAIT_SET_MEMBERS};
 use syscall::DeathEvent;
 use syscall_abi::SyscallError;
 
@@ -27,48 +31,73 @@ use syscall_abi::SyscallError;
 /// full queue's worth of events from one queue.
 pub const DEATH_EQ_CAPACITY: u32 = 256;
 
-/// Most death queues procmgr creates. From [`FIRST_POOL_OBSERVERS`] doubling,
-/// 24 queues hold more than 11 M nodes, past twice the about 1 M children
-/// procmgr's `CSpace` can hold (docs/limits.md, `MAX_SLOTS_STRUCTURAL`), so
-/// their count never binds before that bound does. Each further queue is one
-/// contiguous grant from memmgr (about 24 MiB once a pool reaches the kernel
-/// maximum), which fragmented RAM can refuse first.
-pub const DEATH_QUEUES_MAX: usize = 24;
+/// The error a create or a wait-set replacement returns when procmgr's
+/// memory cannot fund it.
+const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
 
-/// The death queues and the wait set they are members of. procmgr's
-/// dispatch is single-threaded, and [`Self::drain`] holds no borrow while
-/// its callback runs, so the `RefCell` borrows never overlap.
+/// The death queues and the main wait set. procmgr's dispatch is
+/// single-threaded, and [`Self::drain`] holds no borrow while its callback
+/// runs, so the `RefCell` borrows never overlap.
 pub struct DeathSet
 {
-    ws_cap: u32,
-    ws_badge: u64,
+    /// The main wait set; replaced when the queues fill it.
+    ws_cap: Cell<u32>,
+    service_ep: u32,
+    service_badge: u64,
+    death_badge: u64,
     queues: RefCell<DeathQueues>,
 }
 
 impl DeathSet
 {
-    /// Create the first death queue and add it to `ws_cap` under `ws_badge`.
-    /// `None` if the queue cannot be funded, created, or added.
-    pub fn new(ws_cap: u32, ws_badge: u64) -> Option<Self>
+    /// Create the main wait set, add `service_ep` to it under
+    /// `service_badge`, and create the first death queue under `death_badge`.
+    /// `None` if any of them cannot be funded, created, or added.
+    pub fn new(service_ep: u32, service_badge: u64, death_badge: u64) -> Option<Self>
     {
+        let ws_cap = create_wait_set(FIRST_WAIT_SET_MEMBERS).ok()?;
+        if syscall::wait_set_add(ws_cap, service_ep, service_badge).is_err()
+        {
+            let _ = syscall::cap_delete(ws_cap);
+            return None;
+        }
         let set = Self {
-            ws_cap,
-            ws_badge,
-            queues: RefCell::new(DeathQueues::new(FIRST_POOL_OBSERVERS, DEATH_QUEUES_MAX)),
+            ws_cap: Cell::new(ws_cap),
+            service_ep,
+            service_badge,
+            death_badge,
+            queues: RefCell::new(DeathQueues::new(
+                FIRST_POOL_OBSERVERS,
+                FIRST_WAIT_SET_MEMBERS,
+            )),
         };
         set.queues
             .borrow_mut()
-            .grow(|observers| create_queue(ws_cap, ws_badge, observers, 0))
+            .grow(
+                |observers| create_queue(ws_cap, death_badge, observers, 0),
+                |_, _| Err(OUT_OF_MEMORY),
+            )
             .ok()?;
         Some(set)
+    }
+
+    /// The main wait set to wait on. It changes when the queues outgrow it,
+    /// so the main loop reads it before every wait.
+    pub fn ws_cap(&self) -> u32
+    {
+        self.ws_cap.get()
     }
 
     /// Bind a death observer on `thread_cap`, posting `correlator` at its
     /// death, growing the set when every queue is out of nodes.
     ///
     /// # Errors
-    /// The `SYS_THREAD_BIND_NOTIFICATION` error, or `OutOfMemory` when no
-    /// further queue can be created.
+    /// The `SYS_THREAD_BIND_NOTIFICATION` error; `OutOfMemory` when no
+    /// further queue can be created, or when the main wait set must widen
+    /// and cannot (it is already `WAIT_SET_MAX_MEMBERS` wide, or the wider
+    /// set cannot be funded); or the `SYS_WAIT_SET_REMOVE` /
+    /// `SYS_WAIT_SET_ADD` error that stopped the move into a wider set (every
+    /// member is back in the old one).
     pub fn bind_thread(&self, thread_cap: u32, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::thread_bind_notification(thread_cap, q, correlator))
@@ -78,8 +107,8 @@ impl DeathSet
     /// growing the set as [`Self::bind_thread`] does.
     ///
     /// # Errors
-    /// The `SYS_ASPACE_BIND_NOTIFICATION` error, or `OutOfMemory` when no
-    /// further queue can be created.
+    /// The `SYS_ASPACE_BIND_NOTIFICATION` error, or a growth error as for
+    /// [`Self::bind_thread`].
     pub fn bind_aspace(&self, aspace_cap: u32, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::aspace_bind_notification(aspace_cap, q, correlator))
@@ -89,12 +118,65 @@ impl DeathSet
     where
         B: FnMut(u32) -> Result<(), i64>,
     {
-        let (ws_cap, ws_badge) = (self.ws_cap, self.ws_badge);
         let mut queues = self.queues.borrow_mut();
         let made = queues.queues().len();
-        queues.bind(bind, |observers| {
-            create_queue(ws_cap, ws_badge, observers, made)
-        })
+        queues.bind(
+            bind,
+            // Read the wait set at create time: `grow_ws` runs first and may
+            // have replaced it.
+            |observers| create_queue(self.ws_cap.get(), self.death_badge, observers, made),
+            |existing, members| self.replace_wait_set(existing, members),
+        )
+    }
+
+    /// Replace the main wait set with one of `members` members and move the
+    /// service endpoint and every queue in `queues` across. On any failure
+    /// every member is back in the old set and the new one is deleted.
+    fn replace_wait_set(&self, queues: &[u32], members: u32) -> Result<(), i64>
+    {
+        let old = self.ws_cap.get();
+        // Reserve before creating the new set, so a heap that cannot hold
+        // the move list leaves no new set behind.
+        let mut moved: Vec<(u32, u64)> = Vec::new();
+        moved
+            .try_reserve_exact(queues.len() + 1)
+            .map_err(|_| OUT_OF_MEMORY)?;
+        let new = create_wait_set(members)?;
+        let sources = core::iter::once((self.service_ep, self.service_badge))
+            .chain(queues.iter().map(|&q| (q, self.death_badge)));
+        for (source, badge) in sources
+        {
+            // A source is a member of one wait set at a time. The kernel
+            // queues a source that is already ready when it is added, so a
+            // pending caller or death post is not lost in the move.
+            let result = syscall::wait_set_remove(old, source)
+                .and_then(|()| syscall::wait_set_add(new, source, badge));
+            if let Err(e) = result
+            {
+                // `source` is out of the old set if the add failed after the
+                // remove; put it and every moved member back.
+                let _ = syscall::wait_set_add(old, source, badge);
+                for &(m, b) in &moved
+                {
+                    let _ = syscall::wait_set_remove(new, m);
+                    let _ = syscall::wait_set_add(old, m, b);
+                }
+                let _ = syscall::cap_delete(new);
+                return Err(e);
+            }
+            moved.push((source, badge));
+        }
+        self.ws_cap.set(new);
+        // A wait set of 32 members or more is a page-sized retype whose grant
+        // `object_slab_retype` keeps no handle to return, so the old set's
+        // pages stay charged to this service: at most 14 over its life
+        // (docs/limits.md, `FIRST_WAIT_SET_MEMBERS`). A move the kernel
+        // refused would strand the new set the same way, but no path here
+        // makes it refuse: the new set has room for every member, and each
+        // source was just removed from the old one.
+        let _ = syscall::cap_delete(old);
+        std::os::seraph::log!("procmgr: main wait set widened to {members} members");
+        Ok(())
     }
 
     /// Hand every pending death event of every queue to `f`, oldest queue
@@ -129,9 +211,20 @@ impl DeathSet
     }
 }
 
+/// Fund and create a wait set of `members` members from procmgr's memory.
+fn create_wait_set(members: u32) -> Result<u32, i64>
+{
+    std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(members)),
+        |slab| syscall::wait_set_create(slab, members).ok(),
+    )
+    .ok_or(OUT_OF_MEMORY)
+}
+
 /// Fund and create one death queue of [`DEATH_EQ_CAPACITY`] entries and
 /// `observers` nodes from procmgr's memory, and add it to `ws_cap`. `made` is
-/// the number of queues already created, for the growth log line.
+/// the number of queues already created, for the growth log line. A refused
+/// grant is `OutOfMemory`, which the policy retries at a smaller pool.
 fn create_queue(ws_cap: u32, ws_badge: u64, observers: u32, made: usize) -> Result<u32, i64>
 {
     let bytes = std::os::seraph::event_queue_retype_bytes(
@@ -141,7 +234,7 @@ fn create_queue(ws_cap: u32, ws_badge: u64, observers: u32, made: usize) -> Resu
     let queue = std::os::seraph::object_slab_retype(bytes, |slab| {
         syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, observers).ok()
     })
-    .ok_or(SyscallError::OutOfMemory as i64)?;
+    .ok_or(OUT_OF_MEMORY)?;
     if let Err(e) = syscall::wait_set_add(ws_cap, queue, ws_badge)
     {
         let _ = syscall::cap_delete(queue);

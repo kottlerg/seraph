@@ -214,9 +214,10 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// The `Mmio` object records the mapping, holding a reference on the address
 /// space, before any page is mapped; freeing the object (its capability
 /// deleted, consumed by a split, or revoked through an ancestor) unmaps it,
-/// with TLB shootdown (docs/capability-model.md § Mmio). Returns
-/// `QuotaExceeded` when the object already records `MMIO_MAX_MAPPINGS` other
-/// mappings.
+/// with TLB shootdown (docs/capability-model.md § Mmio). A record past the
+/// object's `MMIO_INLINE_MAPPINGS` inline ones is a spill chunk from the
+/// caller's `CSpace` arena; the map returns `OutOfMemory` when that arena
+/// cannot fund one.
 ///
 /// Intermediate page-table pages come from the target AS's PT growth pool;
 /// the map fails with `OutOfMemory` when that pool is exhausted, so a caller
@@ -323,7 +324,14 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     // finds every page this call maps, including after a partial failure.
     // SAFETY: `mmio_slot` pins the Mmio object and `as_slot` the address
     // space for the whole call.
-    unsafe { (*mmio_obj).record_mapping(aso_raw, virt_base) }?;
+    // A record past the object's inline ones is funded by the caller's CSpace
+    // (core/kernel/docs/capability-internals.md § Mmio Mappings).
+    // SAFETY: as above; the caller's own CSpace is live while it runs.
+    unsafe {
+        (*mmio_obj).record_mapping(aso_raw, virt_base, || {
+            crate::cap::object::arena_of(cspace)?.alloc_mmio_spill()
+        })
+    }?;
 
     // Map each page.
     for i in 0..page_count

@@ -570,10 +570,14 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
     }
 }
 
-/// Most `SYS_MMIO_MAP` mappings one `Mmio` object records. A map past it
-/// returns `QuotaExceeded`; mapping the same region again at the same VA of
-/// the same address space reuses its record.
-pub const MMIO_MAX_MAPPINGS: usize = 4;
+/// `SYS_MMIO_MAP` mapping records an `Mmio` object holds inline. Mappings past
+/// them go to spill chunks ([`MmioSpill`]) funded by the mapping caller's
+/// `CSpace`; mapping the same region again at the same VA of the same address
+/// space reuses its record.
+pub const MMIO_INLINE_MAPPINGS: usize = 4;
+
+/// Mapping records one spill chunk holds.
+const MMIO_SPILL_RECORDS: usize = 7;
 
 /// One `SYS_MMIO_MAP` mapping of an `Mmio` object's whole region.
 ///
@@ -596,6 +600,80 @@ struct MmioMapping
 /// filled; never dereferenced.
 const MMIO_RECORD_CLAIMED: *mut AddressSpaceObject = core::ptr::dangling_mut();
 
+impl MmioMapping
+{
+    const fn vacant() -> Self
+    {
+        Self {
+            aso: AtomicPtr::new(core::ptr::null_mut()),
+            va: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether this record maps `va` in `aso`.
+    fn names(&self, aso: *mut AddressSpaceObject, va: u64) -> bool
+    {
+        core::ptr::eq(self.aso.load(Ordering::Acquire), aso)
+            && self.va.load(Ordering::Relaxed) == va
+    }
+
+    /// Claim this record if it is empty.
+    fn claim(&self) -> bool
+    {
+        self.aso
+            .compare_exchange(
+                core::ptr::null_mut(),
+                MMIO_RECORD_CLAIMED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Fill a claimed record with `va` in `aso`, taking a reference on `aso`.
+    ///
+    /// # Safety
+    /// The caller claimed the record; `aso` is a live `AddressSpaceObject` the
+    /// caller holds a reference on.
+    unsafe fn fill(&self, aso: *mut AddressSpaceObject, va: u64)
+    {
+        // SAFETY: aso is live and referenced by the caller (contract).
+        unsafe { (*aso).header.inc_ref() };
+        self.va.store(va, Ordering::Relaxed);
+        self.aso.store(aso, Ordering::Release);
+    }
+}
+
+/// A chunk of further mapping records of one `Mmio` object, chained from
+/// [`MmioObject`]'s spill head, newest first. Taken from the arena of the
+/// `CSpace` the map that needed it resolved through, and returned there when
+/// the object is freed.
+#[repr(C)]
+pub struct MmioSpill
+{
+    /// The next (older) chunk, or null.
+    next: AtomicPtr<MmioSpill>,
+    /// The wrapper whose arena funded this chunk; null in host tests.
+    funder: *const CSpaceKernelObject,
+    records: [MmioMapping; MMIO_SPILL_RECORDS],
+}
+
+const _: () = assert!(core::mem::size_of::<MmioSpill>() <= crate::cap::arena::CHUNK_BYTES);
+
+impl MmioSpill
+{
+    /// An empty chunk funded by `funder`.
+    #[must_use]
+    pub const fn new(funder: *const CSpaceKernelObject) -> Self
+    {
+        Self {
+            next: AtomicPtr::new(core::ptr::null_mut()),
+            funder,
+            records: [const { MmioMapping::vacant() }; MMIO_SPILL_RECORDS],
+        }
+    }
+}
+
 /// Kernel object for a memory-mapped I/O region (`Mmio` capability).
 ///
 /// Records every `SYS_MMIO_MAP` mapping made through it; freeing the object
@@ -615,11 +693,13 @@ pub struct MmioObject
     /// The lineage this object belongs to (see [`RangeLineage`]).
     lineage: RangeLineage,
     /// Mappings made through this object.
-    mappings: [MmioMapping; MMIO_MAX_MAPPINGS],
+    mappings: [MmioMapping; MMIO_INLINE_MAPPINGS],
+    /// Newest spill chunk of further mappings, or null.
+    spill: AtomicPtr<MmioSpill>,
 }
 
-// MmioObject fits the 128-byte retype size class every SEED mint and copy
-// carves it from (`retype::round_to_class`).
+// MmioObject fits the 128-byte size class of the SEED mints
+// (`retype::round_to_class`) and of an arena chunk.
 const _: () = assert!(core::mem::size_of::<MmioObject>() <= 128);
 
 impl MmioObject
@@ -637,12 +717,8 @@ impl MmioObject
             flags,
             _pad: 0,
             lineage: RangeLineage::new_root(),
-            mappings: [const {
-                MmioMapping {
-                    aso: AtomicPtr::new(core::ptr::null_mut()),
-                    va: AtomicU64::new(0),
-                }
-            }; MMIO_MAX_MAPPINGS],
+            mappings: [const { MmioMapping::vacant() }; MMIO_INLINE_MAPPINGS],
+            spill: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -650,45 +726,80 @@ impl MmioObject
     /// reference on `aso` for the record. A mapping already recorded at the same
     /// place is not recorded again; two maps racing to record the same place
     /// may each take a record, which costs a record and is otherwise harmless
-    /// (the teardown withdraws both).
+    /// (the teardown withdraws both). When every record is taken, a spill chunk
+    /// from `new_spill` is chained on with this mapping's record in it.
     ///
     /// # Errors
-    /// `QuotaExceeded` when [`MMIO_MAX_MAPPINGS`] mappings are already recorded.
+    /// The error of `new_spill` (`OutOfMemory` when the caller's arena cannot
+    /// fund a chunk), with nothing recorded.
     ///
     /// # Safety
     /// `aso` is a live `AddressSpaceObject` the caller holds a reference on, and
-    /// the caller pins this object.
+    /// the caller pins this object. A chunk `new_spill` returns is a fresh
+    /// [`MmioSpill`] the object then owns, freed by its teardown.
     pub unsafe fn record_mapping(
         &self,
         aso: *mut AddressSpaceObject,
         va: u64,
+        new_spill: impl FnOnce() -> Result<NonNull<MmioSpill>, syscall::SyscallError>,
     ) -> Result<(), syscall::SyscallError>
     {
-        if self.mappings.iter().any(|m| {
-            core::ptr::eq(m.aso.load(Ordering::Acquire), aso) && m.va.load(Ordering::Relaxed) == va
-        })
+        if self.records().any(|m| m.names(aso, va))
         {
             return Ok(());
         }
-        for m in &self.mappings
+        if let Some(m) = self.records().find(|m| m.claim())
         {
-            if m.aso
-                .compare_exchange(
-                    core::ptr::null_mut(),
-                    MMIO_RECORD_CLAIMED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
+            // SAFETY: claimed above; aso is live and referenced (contract).
+            unsafe { m.fill(aso, va) };
+            return Ok(());
+        }
+        let chunk = new_spill()?;
+        // SAFETY: a fresh chunk, ours alone until published below.
+        let fresh = unsafe { chunk.as_ref() };
+        let first = &fresh.records[0];
+        let claimed = first.claim();
+        debug_assert!(claimed, "a fresh spill chunk has a vacant first record");
+        let mut head = self.spill.load(Ordering::Acquire);
+        loop
+        {
+            fresh.next.store(head, Ordering::Relaxed);
+            match self.spill.compare_exchange_weak(
+                head,
+                chunk.as_ptr(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             {
-                // SAFETY: aso is live and referenced by the caller (contract).
-                unsafe { (*aso).header.inc_ref() };
-                m.va.store(va, Ordering::Relaxed);
-                m.aso.store(aso, Ordering::Release);
-                return Ok(());
+                Ok(_) => break,
+                Err(now) => head = now,
             }
         }
-        Err(syscall::SyscallError::QuotaExceeded)
+        // SAFETY: claimed above; aso is live and referenced (contract).
+        unsafe { first.fill(aso, va) };
+        Ok(())
+    }
+
+    /// Every record: the inline ones, then each spill chunk's, newest chunk
+    /// first.
+    fn records(&self) -> impl Iterator<Item = &MmioMapping>
+    {
+        self.mappings
+            .iter()
+            .chain(self.spill_chunks().flat_map(|c| c.records.iter()))
+    }
+
+    /// The spill chunks, newest first.
+    fn spill_chunks(&self) -> impl Iterator<Item = &MmioSpill>
+    {
+        let mut next = self.spill.load(Ordering::Acquire);
+        core::iter::from_fn(move || {
+            // SAFETY: a published chunk stays live, owned by this object, until
+            // its teardown frees the chain.
+            let chunk = unsafe { next.as_ref() }?;
+            next = chunk.next.load(Ordering::Acquire);
+            Some(chunk)
+        })
     }
 
     /// Unmap every recorded mapping, with TLB shootdown, and release each
@@ -700,6 +811,9 @@ impl MmioObject
     /// has since remapped to other memory is left in place
     /// (`AddressSpace::unmap_region_if_phys`).
     ///
+    /// The spill chunks then go back to the arenas that funded them; a release
+    /// that completes a funder's begun teardown pushes it onto `stack`.
+    ///
     /// # Safety
     /// No capability slot or syscall pin references the object (its reference
     /// count is zero), so no map can be recording into it; only its lineage
@@ -709,10 +823,10 @@ impl MmioObject
     // targets the kernel supports.
     #[allow(clippy::cast_possible_truncation)]
     #[cfg(not(test))]
-    unsafe fn withdraw_mappings(&self)
+    unsafe fn withdraw_mappings(&self, stack: &mut CascadeStack)
     {
         let pages = (self.size / crate::mm::PAGE_SIZE as u64) as usize;
-        for m in &self.mappings
+        for m in self.records()
         {
             let Some(aso) = NonNull::new(m.aso.swap(core::ptr::null_mut(), Ordering::Acquire))
             else
@@ -732,6 +846,18 @@ impl MmioObject
             // SAFETY: the record held this reference; no lock is held and the
             // CPU is stable (contract).
             unsafe { release_ref(aso.cast::<KernelObjectHeader>()) };
+        }
+        let mut next = self.spill.swap(core::ptr::null_mut(), Ordering::Acquire);
+        while let Some(chunk) = NonNull::new(next)
+        {
+            // SAFETY: a chunk of this object's chain, which nothing else reads
+            // at refcount zero; its funder's lease keeps the funder live.
+            let funder = unsafe {
+                next = chunk.as_ref().next.load(Ordering::Acquire);
+                &*chunk.as_ref().funder
+            };
+            // SAFETY: the chunk came from the funder's arena and is unused now.
+            unsafe { funder.free_chunk(chunk.as_ptr().cast::<u8>(), stack) };
         }
     }
 }
@@ -1660,6 +1786,25 @@ impl CSpaceKernelObject
         }
         // SAFETY: chunk is non-null.
         Ok(unsafe { NonNull::new_unchecked(header) })
+    }
+
+    /// Take an empty [`MmioSpill`] chunk from the arena; the `Mmio` object that
+    /// chains it frees it at its teardown.
+    ///
+    /// # Errors
+    /// `OutOfMemory` when no chunk is free and the pool has no page to carve.
+    #[cfg(not(test))]
+    pub fn alloc_mmio_spill(&self) -> Result<NonNull<MmioSpill>, syscall::SyscallError>
+    {
+        // cast_ptr_alignment: a chunk is CHUNK_BYTES-aligned within its page,
+        // which satisfies MmioSpill's alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let chunk = self.alloc_chunk()?.cast::<MmioSpill>();
+        // SAFETY: the chunk is CHUNK_BYTES (MmioSpill fits, asserted with its
+        // definition), chunk-aligned, and exclusively ours.
+        unsafe { core::ptr::write(chunk, MmioSpill::new(core::ptr::from_ref(self))) };
+        // SAFETY: chunk is non-null.
+        Ok(unsafe { NonNull::new_unchecked(chunk) })
     }
 
     /// Take one chunk from the arena, carving a fresh pool page when none is
@@ -2932,7 +3077,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: refcount 0, so no slot or pin names the object and no map
             // records into it; no lock is held; the CPU is stable
             // (dealloc_object's contract).
-            unsafe { (*ptr.as_ptr().cast::<MmioObject>()).withdraw_mappings() };
+            unsafe { (*ptr.as_ptr().cast::<MmioObject>()).withdraw_mappings(stack) };
             // SAFETY: a refcount-0 Mmio object; no lock held.
             unsafe { release_range_object::<MmioObject>(ptr, stack) };
         }
@@ -4506,13 +4651,17 @@ mod tests
         );
     }
 
+    // The defect caught: a mapping past the inline records that is refused or
+    // dropped (so the teardown misses its pages), a repeat that takes a second
+    // reference, or a spill chunk taken while a record is still free.
     #[test]
-    fn a_full_mapping_table_refuses_a_new_mapping_but_not_a_repeat()
+    fn mappings_past_the_inline_records_spill_into_chained_chunks()
     {
+        const N: usize = MMIO_INLINE_MAPPINGS + 2 * MMIO_SPILL_RECORDS + 1;
         let mmio = MmioObject::new_root(0x1000_0000, 0x1000, 0);
-        let mut spaces: [core::mem::MaybeUninit<AddressSpaceObject>; MMIO_MAX_MAPPINGS + 1] =
-            [const { core::mem::MaybeUninit::uninit() }; MMIO_MAX_MAPPINGS + 1];
-        let mut asos = [core::ptr::null_mut::<AddressSpaceObject>(); MMIO_MAX_MAPPINGS + 1];
+        let mut spaces: [core::mem::MaybeUninit<AddressSpaceObject>; N] =
+            [const { core::mem::MaybeUninit::uninit() }; N];
+        let mut asos = [core::ptr::null_mut::<AddressSpaceObject>(); N];
         for (slot, aso) in spaces.iter_mut().zip(asos.iter_mut())
         {
             let p = slot.as_mut_ptr();
@@ -4523,19 +4672,62 @@ mod tests
             }
             *aso = p;
         }
-        for &aso in &asos[..MMIO_MAX_MAPPINGS]
+        let mut chunks = Vec::new();
+        let mut spill = || {
+            let c = Box::into_raw(Box::new(MmioSpill::new(core::ptr::null())));
+            chunks.push(c);
+            Ok(NonNull::new(c).unwrap())
+        };
+        for &aso in &asos
         {
             // SAFETY: each aso has a live header; mmio is exclusively ours.
-            unsafe { mmio.record_mapping(aso, 0x4000_0000) }.unwrap();
+            unsafe { mmio.record_mapping(aso, 0x4000_0000, &mut spill) }.unwrap();
         }
         // SAFETY: as above.
-        let full = unsafe { mmio.record_mapping(asos[MMIO_MAX_MAPPINGS], 0x4000_0000) };
-        assert!(matches!(full, Err(syscall::SyscallError::QuotaExceeded)));
+        unsafe { mmio.record_mapping(asos[N - 1], 0x4000_0000, &mut spill) }.unwrap();
+        assert_eq!(
+            chunks.len(),
+            3,
+            "a chunk is taken only once every record is full"
+        );
+        let recorded = mmio
+            .records()
+            .filter(|m| !m.aso.load(Ordering::Relaxed).is_null())
+            .count();
+        assert_eq!(recorded, N, "every distinct mapping holds one record");
+        for &aso in &asos
+        {
+            // SAFETY: the header was initialised above.
+            let refs = unsafe { (*aso).header.ref_count.load(Ordering::Relaxed) };
+            assert_eq!(refs, 2, "one record reference per mapping, repeat or not");
+        }
+        // An unfunded spill leaves nothing recorded.
+        let mut extra: core::mem::MaybeUninit<AddressSpaceObject> =
+            core::mem::MaybeUninit::uninit();
+        let extra = extra.as_mut_ptr();
         // SAFETY: as above.
-        unsafe { mmio.record_mapping(asos[0], 0x4000_0000) }.unwrap();
-        // SAFETY: the header was initialised above.
-        let refs = unsafe { (*asos[0]).header.ref_count.load(Ordering::Relaxed) };
-        assert_eq!(refs, 2, "a repeat mapping takes no second reference");
+        unsafe {
+            core::ptr::addr_of_mut!((*extra).header)
+                .write(KernelObjectHeader::new(ObjectType::AddressSpace));
+        }
+        // SAFETY: as above; every record is taken (N fills the third chunk but
+        // one, so first take the last free record).
+        let free_left = MMIO_INLINE_MAPPINGS + 3 * MMIO_SPILL_RECORDS - N;
+        assert_eq!(free_left, MMIO_SPILL_RECORDS - 1);
+        let refused = unsafe {
+            mmio.record_mapping(extra, 0x5000_0000 + 0x1000 * free_left as u64, || {
+                Err(syscall::SyscallError::OutOfMemory)
+            })
+        };
+        assert!(
+            refused.is_ok(),
+            "a free record in the newest chunk is used first"
+        );
+        for chunk in chunks
+        {
+            // SAFETY: allocated above; mmio is no longer used.
+            drop(unsafe { Box::from_raw(chunk) });
+        }
     }
 
     #[test]

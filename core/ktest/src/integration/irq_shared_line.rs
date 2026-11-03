@@ -32,9 +32,9 @@
 //! line's `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration
 //! returns `QuotaExceeded`, and succeeds once a binding goes. Deleting that
 //! notification removes every binding naming it: none having acknowledged,
-//! any binding left would keep the line masked, yet once the line's own cap
-//! binds a fresh notification and acknowledges, a raise signals it; the other
-//! 63 caps then bind again.
+//! any binding left would keep the line masked, yet once a fresh copy binds a
+//! fresh notification and acknowledges, a raise signals it; the 64 caps then
+//! bind again.
 
 use syscall::{
     RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive, irq_ack, irq_register,
@@ -175,23 +175,24 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     bound[1] = extra;
 
     // Every binding has owed since it was taken, none having acknowledged, so
-    // one the teardown left in place would keep the line masked below: only
-    // the line's own cap binds and acknowledges again. (A registration through
-    // a binding still in place would succeed as a rebind, so registering all
-    // 64 could not tell.)
+    // one the teardown left in place would keep the line masked below. The
+    // probe is a fresh copy, so no binding left in place is rebound or
+    // acknowledged by it (a registration through a binding still in place
+    // succeeds as a rebind).
     cap_delete(ntf).map_err(|_| "integration::irq_shared_line: cap_delete(notification) failed")?;
     let fresh = held.push(notification(ctx)?);
-    irq_register(bound[0], fresh).map_err(
-        |_| "integration::irq_shared_line: rebinding the line after the teardown refused",
-    )?;
-    acknowledge(&bound[..1])?;
+    let probe = held.push(derive(line)?);
+    irq_register(probe, fresh)
+        .map_err(|_| "integration::irq_shared_line: binding a probe after the teardown refused")?;
+    acknowledge(&[probe])?;
     raise_expect(
         &[fresh],
         &[],
         "a binding outlived its notification's teardown",
     )?;
-    // The other 63 caps bind again, filling the line.
-    bound[1..]
+    cap_delete(probe).map_err(|_| "integration::irq_shared_line: cap_delete(probe) failed")?;
+    // The 64 caps bind again, filling the line.
+    bound
         .iter()
         .try_for_each(|&cap| irq_register(cap, fresh))
         .map_err(|_| "integration::irq_shared_line: refilling the line after the teardown failed")

@@ -669,7 +669,7 @@ unsafe fn populate_child_info(
     // `::log::install_badged_cap`; `seraph::log!` writes ride it
     // directly with no discovery roundtrip. Logd attributes the
     // writes by the kernel-delivered badge, which equals procmgr's
-    // process badge, which equals the death-EQ correlator —
+    // process badge, whose low 32 bits are the death-EQ correlator —
     // self-reconciliation across the three views.
     let log_send_in_child = if universals.log_send_source != 0
     {

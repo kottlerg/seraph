@@ -74,8 +74,8 @@ procmgr/
   `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
   it retroactively on the main thread of every existing process, and
   bind it on the main thread of every new spawn alongside procmgr's own
-  death observer (correlator = process badge, equal to logd's
-  per-sender slot key). Threads a process creates itself carry no logd
+  death observer (correlator = the process badge's low 32 bits, the
+  low word of logd's per-sender slot key). Threads a process creates itself carry no logd
   binding. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during

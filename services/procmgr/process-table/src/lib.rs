@@ -229,9 +229,9 @@ pub enum InsertError
 /// #643). Lookups by badge are binary searches. The death correlator procmgr
 /// binds is still the badge's low 32 bits ([`correlator_of`]), and
 /// [`Self::insert`] keeps those unique among live entries, so a death event
-/// resolves to one process; once the
-/// correlator carries the full badge, the correlator lookup becomes the badge
-/// lookup and the low-word rule stays as defence in depth.
+/// resolves to one process; once the correlator carries the full badge, the
+/// correlator lookup becomes the badge lookup and the low-word rule stays as
+/// defence in depth.
 #[derive(Default)]
 pub struct ProcessTable
 {

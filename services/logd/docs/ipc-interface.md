@@ -129,10 +129,10 @@ evicted before logd processes any of its still-queued
 Every process spawned by procmgr is bound to two death observers
 at creation:
 
-1. Procmgr's own death `EventQueue` (correlator = process badge,
-   for procmgr's auto-reap path).
-2. logd's death `EventQueue` (correlator = process badge, for
-   logd's slot eviction).
+1. Procmgr's own death `EventQueue` (correlator = the process
+   badge's low 32 bits, for procmgr's auto-reap path).
+2. logd's death `EventQueue` (correlator = the process badge's low
+   32 bits, for logd's slot eviction).
 
 Procmgr installs the second binding inside
 [`finalize_creation`](../../procmgr/src/process.rs) when its

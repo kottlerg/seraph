@@ -200,7 +200,7 @@ skipping levels, risks deadlock.
    victim's lock — the FIFO ticket convoy that livelocked the guest system-wide under vCPU
    oversubscription (#375). The wait-set cascade rule is unchanged in spirit: `wait_set_drop`
    releases its source/ws locks before handing any zero-refcount source to the `WaitSet` arm,
-   which reclaims it through a nested cascade, so the source's own dealloc runs after every IPC
+   which queues it on the dealloc cascade, so the source's own dealloc runs after every IPC
    source/ws lock has been released.
 
 6. **Derivation tree lock is ordered after IPC object locks.** `SYS_CAP_REVOKE` MUST NOT acquire IPC
@@ -1299,9 +1299,9 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
    `inc_ref` under the source's lock together with the back-pointer publication;
    `sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. A source whose
    `dec_ref` drops to zero inside `wait_set_drop` is handed to the WaitSet arm of
-   `dealloc_object_one`, which reclaims it through a nested cascade (a set's members outnumber the
-   bounded worklist) — the source's own dealloc therefore runs after every IPC source/ws lock has
-   been released, satisfying rule 5 of the Lock Hierarchy.
+   `dealloc_object_one`, which queues it on the dealloc cascade — the source's own dealloc
+   therefore runs after every IPC source/ws lock has been released, satisfying rule 5 of the Lock
+   Hierarchy.
    Sources can no longer be reclaimed while a member references them, so `waitset_wait` cannot
    dereference a dangling `source_ptr`. The member structure and add/remove paths are in
    [ipc-internals.md](ipc-internals.md) § Wait Set Add/Remove; the reference counting is in

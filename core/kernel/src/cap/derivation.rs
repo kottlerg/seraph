@@ -403,6 +403,15 @@ pub const MAX_REPARENT_EDITS: usize = MAX_REVOKE_EDITS;
 /// concurrent deriver is extending the child list at least as fast as it
 /// is being moved; the caller returns `Interrupted` instead of looping
 /// in-kernel forever.
+///
+/// The bound caps the work of one call, not the size of a child list it can
+/// move: every batch re-links its children for good, and none of the callers
+/// moves them back when the backstop trips (a delete returns, a split rolls
+/// back only its two new children, an abandoned move leaves the moved
+/// children under the destination). A retry therefore continues from the
+/// children still under the node, so a list of any length completes in
+/// finitely many calls (core/kernel/docs/capability-internals.md
+/// § Revocation Algorithm, § Move).
 pub const MAX_REPARENT_BATCHES: u32 = 1 << 20;
 
 /// Move up to `max_edits` children of `node` to `new_parent` (or make them

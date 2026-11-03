@@ -272,19 +272,24 @@ page tables by a bit in the parent entry, not by the records; see
 
 Teardown walks the record pages newest first, returning each page's other records before its
 record 0 (whose donation holds the page), then the inline records, the create-time slab last. A
-donation's Memory object that reaches zero there is reclaimed through its own nested cascade, not
-the bounded worklist the dealloc cascade otherwise uses, since the number of donations is
-unbounded. The cascade re-enters for three other fan-outs whose width is unbounded or
-caller-chosen: the `CSpace` arm's release of the objects its slots reference, the `WaitSet` arm's
-release of each member source whose last reference the membership held, and an owner's release of
-its death-observer queues (`release_death_observers`, from the Thread and `AddressSpace` arms). A
-nested `CSpace` that a release drops to zero is not torn down in that frame: it is linked, through
-its deferred-reclaim link, onto a pending list the outermost `dealloc_object` call drains once its
-worklist is empty, so a chain of `CSpace`s each holding the last reference to the next is torn down
-iteratively. No re-entry can reach a `CSpace`, and the only re-entries that nest are a `CSpace`
-slot's Thread, `AddressSpace` or `WaitSet` releasing its queues, sources or donations, whose objects
-re-enter no further. So the re-entry depth is at most two frames, and the teardown's stack use is
-bounded by a constant, whatever the nesting depth.
+donation's Memory object that reaches zero there is queued on the dealloc cascade like every other
+object a teardown orphans.
+
+The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked through the queued
+objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
+header's three padding bytes hold the link to the next, while the type and `ancestor` fields its
+teardown reads stay intact, and the link is cleared when it is popped. An object reaches zero once,
+so it is queued at most once, and the stack holds any number of objects without allocating. Every
+release a teardown makes pushes the object it orphans: an ancestor Memory object's retype lease, a
+donation's lease, the references a dying `CSpace`'s slots hold (a nested `CSpace` among them), a
+caller-sized wait set's member references, a thread's fault-handler binding, and the queue
+references of an owner's chain of death-observer nodes. The call pops and tears down the most recent
+object until the stack is empty, and no teardown calls `dealloc_object` itself, so a chain of
+`CSpace`s each holding the last reference to the next, or a `CSpace` releasing thousands of
+objects, is torn down iteratively with constant stack use, and no arm runs inside another's lock
+scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer arm has
+released it; a wait set's sources are torn down after `wait_set_drop` has released every source
+lock).
 
 The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
 its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
@@ -536,9 +541,9 @@ The principal kernel-internal owners:
   `SYS_ASPACE_BIND_NOTIFICATION` take a reference on the bound EventQueue, under the owner's
   lock (the thread's `sched_lock`, the address space's `death_lock`), held for the binding's
   lifetime. The owner's teardown (the `dealloc_object` Thread and `AddressSpace` arms)
-  returns each observer node to its queue's pool and then releases the reference, reclaiming a
-  queue it drops to zero through a nested cascade; a death walk runs on the dying thread or on a
-  faulting thread of the live address space, so the owner, and with it every observer
+  returns each observer node to its queue's pool and then releases the reference, queueing a
+  queue it drops to zero on the dealloc cascade (§ Teardown); a death walk runs on the dying
+  thread or on a faulting thread of the live address space, so the owner, and with it every observer
   reference, outlives every post. A bind after the death posts at once under the binder's
   syscall pin and takes no reference.
 - **Syscall pins.** Every syscall that resolves a handle to use the object it names
@@ -1086,7 +1091,7 @@ specific slot numbers.
 | 2 | 7 | Mmio capabilities, Map and Write rights (one over the kernel console UART on RISC-V, then one per validated `BootInfo.mmio_apertures` entry) |
 | 3 | 7 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
 | 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture) |
-| 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, up to eight, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
+| 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, as many as the map reports, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
 | 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
 | 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
 | 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |

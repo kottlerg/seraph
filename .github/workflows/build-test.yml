@@ -143,10 +143,37 @@ jobs:
           esac
 
       - name: Run ${{ matrix.tester }}
+        # Per-cell run-parallel budget, for HANG classification, derived as
+        # docs/build-system.md § Continuous Integration states from each
+        # cell's worst pass over the 28 build-test runs of 2026-11-03 (the
+        # latest attempt of each); the worst passes are beside the values.
+        # riscv64 debug svctest's worst pass is 179.0 s, against its former
+        # 180 s budget, because its fsbench phase runs about 3x slower on
+        # 4-core TCG than before #679 (#666) and runner-queue contention
+        # adds on top.
         run: |
+          case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
+            riscv64-debug-svctest)    budget=540 ;;  # worst pass 179.0 s
+            riscv64-debug-usertest)   budget=360 ;;  # worst pass 108.2 s
+            riscv64-debug-ktest)      budget=300 ;;  # worst pass 97.9 s
+            riscv64-release-svctest)  budget=300 ;;  # worst pass 89.5 s
+            riscv64-release-usertest) budget=180 ;;  # worst pass 46.8 s
+            riscv64-release-ktest)    budget=300 ;;  # worst pass 88.6 s
+            x86_64-debug-svctest)     budget=360 ;;  # worst pass 114.6 s
+            x86_64-debug-usertest)    budget=180 ;;  # worst pass 56.9 s
+            x86_64-debug-ktest)       budget=360 ;;  # worst pass 112.7 s
+            x86_64-release-svctest)   budget=240 ;;  # worst pass 69.1 s
+            x86_64-release-usertest)  budget=180 ;;  # worst pass 24.6 s
+            x86_64-release-ktest)     budget=360 ;;  # worst pass 116.3 s
+            *) echo "no budget for this cell" >&2; exit 1 ;;
+          esac
+          # --save-logs keeps every run's log, a PASS included, for the
+          # run-parallel-saved artifact below, so a cell's per-phase timings
+          # can be compared across heads.
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 1 --runs 1 --timeout 180
+            --parallel 1 --runs 1 --timeout "$budget" \
+            --save-logs target/xtask/run-parallel-saved
           if [ "${{ matrix.tester }}" = "ktest" ]; then
             # Extra boots: the KASLR randomization test (#252). Boots the
             # ktest bundle already composed above twice and asserts the
@@ -184,3 +211,15 @@ jobs:
           name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
           path: target/xtask/run-parallel/**/*.log
           if-no-files-found: ignore
+
+      - name: Upload saved run logs
+        # Every run's log, a PASS included, kept only as long as a cross-head
+        # timing comparison needs; the failure logs above keep the
+        # repository's default retention.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: run-parallel-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
+          path: target/xtask/run-parallel-saved/*.log
+          if-no-files-found: ignore
+          retention-days: 14

@@ -63,11 +63,11 @@ rather than proceed with a mismatched structure (see
 | Mode | 64-bit long mode |
 | Interrupts | Disabled (`IF` = 0) |
 | Direction flag | Clear (`DF` = 0) |
-| Paging | Enabled; kernel mapped at intended virtual addresses |
+| Paging | Enabled at the negotiated depth: 5-level (`CR4.LA57` = 1, PML5 root) when CPUID reports LA57, else 4-level (PML4 root); recoverable from `CR4.LA57`; kernel mapped at intended virtual addresses |
 | Stack | Valid; at least `HANDOFF_STACK_BYTES` (64 KiB, `boot_protocol::layout`) available |
 | `rdi` | Physical address of `BootInfo` structure |
 | Floating point | Not initialised; kernel must not use SSE/AVX before enabling |
-| GDT | UEFI firmware's (bootloader installs none); kernel replaces it in Phase 5 |
+| GDT | UEFI firmware's, or, when the handoff changed the paging depth, the LA57 toggle trampoline's (in a page the boot tables identity-map; CS is its 64-bit code selector); kernel replaces it in Phase 5 |
 | IDT | Firmware's IDTR; not to be relied on; interrupts stay disabled until the kernel installs its own |
 
 ### RISC-V (RV64IMAC, soft-float)
@@ -98,8 +98,10 @@ handoff stack, the BootInfo pointer is loaded into the first-argument register, 
 flags are established per the contract above, and control transfers to `kernel_entry` via an
 unconditional jump that does not return.
 
-The UEFI firmware's GDT (x86-64), which the bootloader leaves loaded because it installs none,
-remains active at entry; the kernel replaces it in Phase 5 (see
+On x86-64 the GDT active at entry is the UEFI firmware's, which the bootloader leaves loaded,
+or, when the handoff changed the paging depth, the one the LA57 toggle trampoline loads to pass
+through compatibility mode ([page-tables.md](page-tables.md) § x86-64: Negotiated Paging Depth);
+the kernel replaces either in Phase 5 (see
 [initialization.md](../../kernel/docs/initialization.md) § Phase 5). IDTR likewise still references
 the firmware's IDT, which the kernel must not rely on; interrupts stay disabled until the kernel
 installs its own. The kernel replaces the bootloader's root page table in Phase 3

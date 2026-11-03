@@ -355,7 +355,7 @@ pub unsafe fn first_entry_to_user(
         root
     };
 
-    // SAFETY: cr3 is a valid CR3 value (PML4 root + optional PCID, bit 63 clear);
+    // SAFETY: cr3 is a valid CR3 value (root table + optional PCID, bit 63 clear);
     // tf satisfies switch_and_enter_user's contract; TSS RSP0 and
     // PerCpuData::kernel_rsp are set (caller's contract).
     unsafe { switch_and_enter_user(cr3, tf) }
@@ -371,13 +371,13 @@ pub unsafe fn first_entry_to_user(
 /// user address space shares, so the ordering is not needed to keep it mapped.
 ///
 /// # Parameters
-/// - `cr3` (rdi): the CR3 value to load — init's PML4 root, optionally OR'd with
+/// - `cr3` (rdi): the CR3 value to load — init's root table, optionally OR'd with
 ///   a PCID in bits \[11:0\] (bit 63 clear, so the load flushes that PCID).
 /// - `tf` (rsi): pointer to the zeroed-and-filled [`TrapFrame`] on init's
 ///   kernel stack (at `kernel_stack_top - sizeof(TrapFrame)`).
 ///
 /// # Safety
-/// - `cr3` must encode a valid 4 KiB-aligned PML4 that maps the kernel upper
+/// - `cr3` must encode a valid 4 KiB-aligned root table that maps the kernel upper
 ///   half (entries 256–511) and the direct map; any PCID bits require
 ///   `CR4.PCIDE` set.
 /// - `tf` must point to a `TrapFrame` on the direct-mapped init kernel stack,

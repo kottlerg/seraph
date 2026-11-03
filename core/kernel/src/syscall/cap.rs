@@ -372,7 +372,7 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 ///   followed by the wrapped [`AddressSpace`]. Both are constructed in place
 ///   via `core::ptr::write`; the wrapper's `address_space` pointer indexes
 ///   into this same page.
-/// - page 1 — root page table (PML4 / RISC-V root), zeroed, kernel-half PT
+/// - page 1 — root page table (PML4 or PML5 / RISC-V root), zeroed, kernel-half PT
 ///   entries copied from the active root.
 /// - pages `2..init_pages` — PT growth pool. Drawn on demand by
 ///   [`AddressSpace::map_page_pooled`](crate::mm::address_space::AddressSpace::map_page_pooled)

@@ -201,10 +201,12 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         (as_inner, aso)
     };
 
-    // Choose the PT-page source by whether the AS records a create-time
-    // donation (`core/kernel/docs/memory-internals.md` § Page Table Node Ownership).
+    // Page-table pages come from the address space's own pool, which its
+    // create-time donation seeds: every address space records that donation
+    // before it is published, so the kernel page-table pool is never drawn on
+    // here (`core/kernel/docs/memory-internals.md` § Page Table Node Ownership).
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
-    let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
+    unsafe { (*aso_raw).require_create_donation() }?;
 
     // ── Mapping loop ──────────────────────────────────────────────────────────
 
@@ -215,20 +217,9 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 
         // SAFETY: virt is in user range (validated above); phys is from a
         // Memory cap confirmed by the kernel at capability creation.
-        // as_ptr validated non-null. Pooled vs kernel-direct dispatch is
-        // chosen once above from whether the AS records a donation.
-        let result = if pooled
-        {
-            // SAFETY: aso_raw is valid; it wraps as_ptr.
-            unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
-        }
-        else
-        {
-            // SAFETY: AS without a recorded donation; map_page acquires
-            // pt_lock and the kernel page-table pool lock internally.
-            unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
-        };
-        result.map_err(|()| SyscallError::OutOfMemory)?;
+        // as_ptr validated non-null; aso_raw is valid and wraps as_ptr.
+        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
+            .map_err(|()| SyscallError::OutOfMemory)?;
     }
 
     drop(pins);

@@ -5,8 +5,8 @@
 
 //! User-mode address space management.
 //!
-//! An [`AddressSpace`] owns one root page table (PML4 on x86-64, the
-//! negotiated-mode root on RISC-V). Intermediate page table frames are
+//! An [`AddressSpace`] owns one root page table (the boot depth's PML4 or
+//! PML5 on x86-64, the negotiated-mode root on RISC-V). Intermediate page table frames are
 //! drawn on demand from the wrapper object's page pool on the pooled map
 //! path, or from the kernel page-table pool (`mm::kernel_pt_pool`) on the
 //! kernel-direct path.
@@ -17,9 +17,10 @@
 //! ABI constants.
 //!
 //! ## Kernel mapping inheritance
-//! `new_user_with_root` copies kernel PML4 entries [256..512] from the currently active
-//! page table root into the new user PML4, so kernel memory is reachable from
-//! user address spaces without per-process kernel mapping maintenance.
+//! `new_user_with_root` copies kernel root entries [256..512] (PML4 or PML5 entries
+//! on x86-64, by boot depth) from the currently active page table root into the
+//! new user root, so kernel memory is reachable from user address spaces without
+//! per-process kernel mapping maintenance.
 //!
 //! On RISC-V the equivalent root entries are 256–511 of the negotiated
 //! mode's root table — the kernel half starts at root entry 256 in every
@@ -185,7 +186,7 @@ pub fn choose_init_layout() -> InitLayout
 /// defined in `core/kernel/docs/memory-internals.md` § Page Table Node Ownership.
 pub struct AddressSpace
 {
-    /// Physical address of the root page table frame (PML4 / RISC-V root).
+    /// Physical address of the root page table frame (PML4 or PML5 / RISC-V root).
     pub root_phys: u64,
     /// Virtual address of the root frame (via the direct physical map).
     pub root_virt: u64,
@@ -590,11 +591,10 @@ impl AddressSpace
     ///
     /// Used by:
     /// - [`map_segment`](Self::map_segment) and the Phase 9 init bootstrap
-    ///   (image, `InitInfo`, stack), and by `sys_mem_map` / `sys_mmio_map` for an
-    ///   address space with no recorded donation — PT pages come from
-    ///   `kernel_pt_pool`.
-    /// - Address spaces with a recorded donation go through
-    ///   [`map_page_pooled`](Self::map_page_pooled).
+    ///   (image, `InitInfo`, stack) — PT pages come from `kernel_pt_pool`.
+    /// - The map syscalls go through [`map_page_pooled`](Self::map_page_pooled):
+    ///   every address space records its create-time donation before it is
+    ///   published (`AddressSpaceObject::require_create_donation`).
     ///
     /// # Safety
     /// `virt` must be in the user half of the active paging mode (see

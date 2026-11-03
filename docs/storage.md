@@ -129,11 +129,11 @@ or on-disk UUID. The model is:
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
-  serves, and parses each
-  disk's GPT. A role lookup, at the root self-mount, the auto-mounts, and
-  a runtime `MOUNT`, considers the partitions of every held disk; a disk
-  whose GPT cannot be read or validated contributes none. The partition's
-  `REGISTER_PARTITION` goes to the block driver of the disk that holds it.
+  serves, and parses each disk's GPT. A role lookup, at the root
+  self-mount, the auto-mounts, and a runtime `MOUNT`, considers the
+  partitions of every held disk; a disk whose GPT cannot be read or
+  validated contributes none. The partition's `REGISTER_PARTITION` goes
+  to the block driver of the disk that holds it.
 - **DPS-style priority tie-break.** Where multiple partitions match
   a role GUID, on one disk or across disks, GPT attribute bits 48–63 are
   compared as an unsigned priority; the highest wins, whichever disk holds

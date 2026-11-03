@@ -693,6 +693,7 @@ Every entry here is `correct as is`; none is tracked.
 | cmos `UIP_POLL_LIMIT` | `services/drivers/cmos/src/lib.rs` | 10 000 | hardware spec (UIP held at most about 2 ms) | none | correct as is | None |
 | cmos `FALLBACK_CENTURY` | `services/drivers/cmos/src/lib.rs` | 2000 to 2099, only without a century register (FADT `CENTURY` 0) | hardware spec (two-digit year) | none | correct as is | None |
 | test-orphan `RESERVE_BYTES` | `services/drivers/test-orphan/src/main.rs` | 1 MiB | test fixture | 1 MiB heap | correct as is | None |
+| test-fault `NEVER_READY_RESERVE_BYTES` | `shared/ipc/src/lib.rs` (`test_fault_labels`) | 4 MiB | test fixture (held by the never-ready fixture until devmgr destroys it; svctest watches it return) | 4 MiB heap while the fixture hangs | correct as is | None |
 
 ### fs-fat
 

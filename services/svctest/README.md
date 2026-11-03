@@ -93,10 +93,9 @@ skip and return when their cap is zero; the devmgr deny and input-ordinal phases
 orphan-teardown, driver-withdrawal, and drivers deny phases (`caps[3]`), the svcmgr seed-only
 phase (every seed-only seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves), the
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), and the vfsd phases (`caps[4]`,
-`caps[5]`) instead fail their assertions. The seed-only phase
-thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's
-own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
-and the run ends idle.
+`caps[5]`) instead fail their assertions. The seed-only phase thus fails the run on a zero
+`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
+reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and

@@ -90,11 +90,10 @@ vfsd/
   for every block device (`QUERY_BLOCK_DEVICE` at instance ordinals 0,
   1, …, passing a `WITHDRAWN` one, until another reply is not
   `SUCCESS`) and parses each disk's GPT partition table through one
-  scratch memory cap reused across the
-  reads (replaced from memmgr before the next disk when a failed read
-  left it lost), keeping every used entry of each header's
-  `num_parts`-entry array (a disk whose GPT cannot be read or validated
-  contributes none). It then resolves the
+  scratch memory cap reused across the reads (replaced from memmgr
+  before the next disk when a failed read left it lost), keeping every
+  used entry of each header's `num_parts`-entry array (a disk whose GPT
+  cannot be read or validated contributes none). It then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
   `gpt::lookup_partition_by_type_guid` over the partitions of every disk
   for the self-mount; the DPS priority tie-break runs across disks, and

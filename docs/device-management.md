@@ -282,10 +282,9 @@ devmgr loads driver binaries from one of two places:
   `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
   times (the terminal does), while a client with a no-device path treats the first `NO_DEVICE` as
   terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns
-  the rule). Keeping non-essentials out
-  of the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is
-  mounted, so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place
-  critical path.
+  the rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the
+  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on
+  the read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

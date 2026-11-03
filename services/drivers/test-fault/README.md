@@ -27,7 +27,7 @@ test-fault/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Two-round bootstrap, the mode, the ping/exit service loop
+    └── main.rs            # Two-round bootstrap, mode, 4 MiB never-ready hold, ping/exit loop
 ```
 
 ---

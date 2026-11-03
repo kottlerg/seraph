@@ -12,8 +12,9 @@
 //! cap. In `MODE_READY` it reports `DRIVER_READY` and serves `FAULT_PING`
 //! and `FAULT_EXIT`; `FAULT_EXIT` replies and then exits without receiving
 //! again, so a call queued after it reaches a dead driver. In
-//! `MODE_NEVER_READY` it neither reports ready nor exits, so devmgr's settle
-//! ends at its bound and destroys it.
+//! `MODE_NEVER_READY` it holds `NEVER_READY_RESERVE_BYTES` of touched memory
+//! and neither reports ready nor exits, so devmgr's settle ends at its bound
+//! and destroys it; svctest watches the memory return to memmgr.
 //!
 //! TODO(#165): remove with the devmgr enumeration redesign.
 
@@ -88,21 +89,17 @@ fn main() -> !
 /// that returns the reserved pages to memmgr, which the harness observes.
 fn hang() -> !
 {
+    // `vec!` writes every byte, faulting the pages in; `black_box` below keeps
+    // the buffer observable, so the stores are not elided.
     let reserved = std::vec![0xA5_u8; test_fault_labels::NEVER_READY_RESERVE_BYTES];
-    // Defeat dead-store elimination with a volatile read of the first byte.
-    // SAFETY: `reserved` owns NEVER_READY_RESERVE_BYTES bytes; offset 0 is in
-    // bounds.
-    let probe = unsafe { core::ptr::read_volatile(reserved.as_ptr()) };
     std::os::seraph::log!(
-        "test-fault: holding {} bytes (probe={:#x}), never reporting ready",
-        test_fault_labels::NEVER_READY_RESERVE_BYTES,
-        u64::from(probe)
+        "test-fault: holding {} bytes, never reporting ready",
+        test_fault_labels::NEVER_READY_RESERVE_BYTES
     );
     loop
     {
-        let _ = syscall::thread_sleep(u64::from(u32::MAX));
-        // Keep `reserved` live across the wait.
         core::hint::black_box(&reserved);
+        let _ = syscall::thread_sleep(u64::from(u32::MAX));
     }
 }
 

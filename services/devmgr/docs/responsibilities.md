@@ -61,7 +61,7 @@ devmgr's responsibilities are:
   regions name.
 
   devmgr serves a driver's endpoint only once the driver has set its device
-  up. It spawns its drivers in two settle batches: the boot batch (every
+  up. It spawns its drivers in two production settle batches: the boot batch (every
   virtio-blk driver, then the serial and framebuffer drivers) and the
   on-disk batch (the RTC driver, then every virtio-input driver). Each
   driver's devmgr query cap is a SEND, badged with its device badge, on its
@@ -69,13 +69,13 @@ devmgr's responsibilities are:
   entries that carry no startup info. Once a driver's bootstrap is served,
   devmgr binds a death observer on the driver's thread to its driver death
   queue: one queue for the boot, sized at enumeration to every driver the
-  boot can spawn (one per virtio-blk and virtio-input device, and the serial,
+  boot can spawn (one per virtio-blk and virtio-input device, the serial,
   framebuffer, and RTC drivers, and the three fixtures of the test-only fault
-  batch below), so every bind is funded and no death is
-  dropped. A driver that needs startup info (the VirtIO drivers, the
-  framebuffer) calls `QUERY_DEVICE_INFO` on its query cap before its device
-  setup, and every driver calls `DRIVER_READY` on it after, immediately
-  before its service loop. devmgr waits on a wait set over the batch's
+  batch below), so every bind is funded and no death is dropped. A driver
+  that needs startup info (the VirtIO drivers, the framebuffer) calls
+  `QUERY_DEVICE_INFO` on its query cap before its device setup, and every
+  driver calls `DRIVER_READY` on it after, immediately before its service
+  loop. devmgr waits on a wait set over the batch's
   private endpoint, the death queue, and a timer, serving those two labels on
   the private endpoint and taking deaths from the queue, until every driver
   of the batch has reported ready or died or the settle bound elapses, and

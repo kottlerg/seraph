@@ -105,7 +105,8 @@ device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
 Every matching device gets its own driver process, in segment, bus, device,
 function order, except a virtio-blk device that cannot get a private IRQ
 line: virtio-blk requires one, and a line another device already holds is
-not served until shared lines are (#664). Class-based matching is design intent (#165).
+not served until shared lines are (#664; the sharing step 3 describes is
+design intent, not yet implemented). Class-based matching is design intent (#165).
 
 ---
 
@@ -136,7 +137,13 @@ For each matched device, devmgr:
 3. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback) off devmgr's
    Interrupt range cap. The lines below and above it stay in devmgr's
-   interrupt table, so devices are served in any GSI order.
+   interrupt table, so devices are served in any GSI order. Design intent,
+   not yet implemented (#664): devmgr keeps the split line cap in a table
+   of held lines, one entry per GSI, and gives the device a derivation of
+   it (`SYS_CAP_DERIVE`, NOTIFY); a later device whose GSI is already held
+   gets another derivation of the same cap rather than none, so devices on
+   a shared `INTx` line each bind their own receiver
+   (docs/device-management.md § Interrupt Delivery).
 4. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is

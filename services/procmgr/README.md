@@ -204,11 +204,20 @@ observer, with the child's full `u64` badge as the correlator, on one of procmgr
 procmgr keeps a growable set of queues: a bind tries the newest queue first, then the older ones,
 whose nodes return as their processes are destroyed, and only when every queue is out of nodes
 creates a further queue, funded from procmgr's own memory, with twice the last pool (64 nodes first,
-up to `EVENT_QUEUE_MAX_CAPACITY`). Up to `DEATH_QUEUES_MAX` (24) queues hold more nodes than twice
-the children procmgr's `CSpace` can hold, so their count never binds first; each further queue is
-one contiguous grant from memmgr (about 24 MiB once a pool reaches the kernel maximum), which
-fragmented RAM can refuse first. A bind that still fails (procmgr out of memory) fails the spawn,
-the address-space bind included.
+up to `EVENT_QUEUE_MAX_CAPACITY`). A further queue is one contiguous grant from memmgr (about 24 MiB
+once a pool reaches the kernel maximum); when memmgr refuses it, procmgr retries at half the pool,
+down to the first pool's size, a grant of about two pages.
+
+The queues share procmgr's main wait set with its service endpoint, and procmgr's death-queue set
+(`DeathSet`, `src/death_queues.rs`) owns that wait set: it starts with room for two members (the
+endpoint and the first queue), and when the queues fill it, procmgr creates one with twice the
+members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one;
+the main loop waits on whichever is current. The kernel queues a member that is already ready when
+it is added, so the move loses no pending request or death post. Up to 1023 queues then hold far
+more nodes than twice the children procmgr's `CSpace` can hold; only RAM so fragmented that every
+grant above the first pool's is refused keeps the queues at that size, which caps procmgr near
+32 K live processes. A bind that still fails (procmgr out of memory) fails the spawn, the
+address-space bind included.
 
 Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
 procmgr drains every queue on each death wakeup. The kernel drops a post to a

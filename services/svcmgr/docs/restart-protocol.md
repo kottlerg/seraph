@@ -19,14 +19,21 @@ queue is created, so svcmgr keeps a growable set of queues: a bind tries the
 newest queue first, then the older ones, and only when every queue is out of
 nodes creates a further queue, funded from svcmgr's own memory, with twice
 the last pool (4 nodes first, below a boot's seven supervised and adopted
-services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). Up
-to `DEATH_QUEUES_MAX` (24) queues hold more nodes than svcmgr's `CSpace` has
-slots, so their count never binds first; each further queue is one contiguous
-grant from memmgr, which fragmented RAM can refuse first. A bind that still
-fails fails the launch, restart, or adoption.
+services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). A
+further queue is one contiguous grant from memmgr; when memmgr refuses it,
+svcmgr retries at half the pool, down to the first pool's size. A bind that
+still fails fails the launch, restart, or adoption.
 
 The WaitSet holds the service endpoint (badge 0) and every death queue
-(badge 1). On wakeup svcmgr drains every queue and routes
+(badge 1), and svcmgr's death-queue set (`DeathSet`,
+[`src/death_queues.rs`](../src/death_queues.rs)) owns it: it starts with room
+for two members, and when the queues fill it, svcmgr creates one with twice
+the members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across,
+and deletes the old one; the event loop waits on whichever is current, and
+every boot widens it once its queues pass the first. The kernel queues a
+member that is already ready when it is added, so the move loses no pending
+request or death post. Up to 1023 queues hold more nodes than svcmgr's
+`CSpace` has slots. On wakeup svcmgr drains every queue and routes
 each payload to its `ServiceEntry` via the correlator, then dispatches
 through [`restart::handle_death`](../src/restart.rs). The service table
 grows on the heap and never reuses a slot, so an index names one service

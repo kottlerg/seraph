@@ -11,10 +11,7 @@
 
 use crate::loader::{self, ScratchMapping};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
-use process_abi::{
-    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION,
-    PROCESS_MAIN_TLS_MAX_PAGES,
-};
+use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
 use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
@@ -84,6 +81,15 @@ fn choose_child_layout() -> ProcessLayout
         std::os::seraph::log!("procmgr: layout entropy draw failed; using default layout");
     }
     choose_process_layout(entropy.as_ref())
+}
+
+/// Whether a child's `ET_DYN` image with load span `[span_min, span_end)` may
+/// load at `bias`: against the image zone sized to the address space, which
+/// every process of this boot shares with procmgr (`std::os::seraph::user_va_top`).
+fn child_image_fits(bias: u64, span_min: u64, span_end: u64) -> bool
+{
+    let zones = process_layout::growth_zones(std::os::seraph::user_va_top());
+    process_layout::validate_image_placement_below(bias, span_min, span_end, zones.image_zone_end)
 }
 
 /// Draw an `ET_DYN` image load bias (ASLR, #39), degrading to the window base
@@ -921,6 +927,8 @@ struct MainTlsAlloc
     /// Mapped base VA of the TLS block (the chosen `layout.tls_base`); the block
     /// is mapped here and `tls_base_va = tls_block_base + tls_base_offset`.
     tls_block_base: u64,
+    /// Pages the block spans, mapped at the scratch VA and then in the child.
+    pages: u64,
 }
 
 impl MainTlsAlloc
@@ -929,16 +937,25 @@ impl MainTlsAlloc
     {
         self.scratch.va()
     }
+
+    /// Bytes mapped at the scratch VA: the whole block, page-rounded.
+    fn scratch_bytes(&self) -> u64
+    {
+        self.pages * PAGE_SIZE
+    }
 }
 
 /// Allocate a memory cap for the main thread's TLS block, map it writable in
 /// procmgr's own aspace at a transient scratch VA, and zero it.
 ///
-/// Returns `None` when the binary has no TLS, when the block exceeds the
-/// single-page budget, or when alignment demands would outrun the page
-/// mapping. Callers write the `.tdata` template starting at the scratch
-/// VA and then call [`finalize_main_tls`] to install the TCB self-pointer
-/// and remap the memory cap into the child.
+/// The block spans the pages its `PT_TLS` memsz needs
+/// ([`process_abi::tls_block_layout`]), from one contiguous Memory cap.
+/// Returns `None` when the binary has no TLS, when the block exceeds
+/// `PROCESS_MAIN_TLS_MAX_PAGES` (the region the layout leaves after the TLS
+/// draw), when alignment demands would outrun the page mapping, or when
+/// memmgr cannot supply the pages. Callers write the `.tdata` template
+/// starting at the scratch VA and then call [`finalize_main_tls`] to install
+/// the TCB self-pointer and remap the memory cap into the child.
 fn alloc_main_tls_memory(
     self_aspace: u32,
     tls: &ChildTlsTemplate,
@@ -950,20 +967,27 @@ fn alloc_main_tls_memory(
     let (block_size, block_align, tls_base_offset) =
         process_abi::tls_block_layout(tls.memsz, tls.align);
 
-    if block_size == 0
-        || block_size > PAGE_SIZE * PROCESS_MAIN_TLS_MAX_PAGES
-        || block_size > PAGE_SIZE
-        || block_align > PAGE_SIZE
+    let pages = block_size.div_ceil(PAGE_SIZE);
+    if block_size == 0 || pages > PROCESS_MAIN_TLS_MAX_PAGES || block_align > PAGE_SIZE
     {
         return None;
     }
 
-    let tls_memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
-    let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), 1, syscall::MAP_WRITABLE)?;
+    let tls_memory = CapGuard::new(
+        if pages == 1
+        {
+            crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?
+        }
+        else
+        {
+            crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)?
+        },
+    );
+    let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), pages, syscall::MAP_WRITABLE)?;
     let scratch_va = scratch.va();
 
-    // SAFETY: scratch_va is mapped writable for one page.
-    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
+    // SAFETY: scratch_va is mapped writable for `pages` pages.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, (pages * PAGE_SIZE) as usize) };
 
     Some(MainTlsAlloc {
         scratch,
@@ -971,6 +995,7 @@ fn alloc_main_tls_memory(
         tls_base_offset,
         tls_base_va: layout.tls_base + tls_base_offset,
         tls_block_base: layout.tls_base,
+        pages,
     })
 }
 
@@ -988,7 +1013,8 @@ unsafe fn finalize_main_tls(
     child_aspace: u32,
 ) -> Option<MainTls>
 {
-    // SAFETY: scratch_va is mapped writable for one page; the block fits.
+    // SAFETY: scratch_va is mapped writable for the whole block, which holds
+    // the TCB at `tls_base_offset`.
     unsafe {
         process_abi::tls_install_tcb(
             alloc.scratch_va() as *mut u8,
@@ -1009,7 +1035,7 @@ unsafe fn finalize_main_tls(
             child_aspace,
             alloc.tls_block_base,
             0,
-            1,
+            alloc.pages,
             syscall::MAP_FROM_CAP,
         )
     }
@@ -1053,11 +1079,11 @@ unsafe fn prepare_main_tls_from_bytes(
     {
         return Some(MainTls::default());
     }
-    if template_bytes.len() > PAGE_SIZE as usize
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
+    if template_bytes.len() as u64 > alloc.scratch_bytes()
     {
         return None;
     }
-    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
     // SAFETY: scratch_va is mapped writable; length was bounded above.
     unsafe {
@@ -1105,15 +1131,15 @@ unsafe fn prepare_main_tls_from_vfs(
     {
         return Some(MainTls::default());
     }
-    if tls.filesz > PAGE_SIZE
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
+    if tls.filesz > alloc.scratch_bytes()
     {
         return None;
     }
-    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
 
-    // SAFETY: scratch_va is mapped writable for one page and
-    // `tls.filesz <= PAGE_SIZE` was checked above; the mapping stays until
+    // SAFETY: scratch_va is mapped writable for the whole block and
+    // `tls.filesz` fits it (checked above); the mapping stays until
     // finalize drops it, after the last use of `template`.
     let template =
         unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, tls.filesz as usize) };
@@ -1516,7 +1542,7 @@ fn create_process_from_bytes(
     let (span_min, span_end) = elf::load_span(ehdr, module_bytes).ok()?;
     if kind == elf::ElfKind::Dyn
     {
-        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        if !child_image_fits(bias, span_min, span_end)
         {
             return None;
         }
@@ -1554,9 +1580,8 @@ fn create_process_from_bytes(
         .ok()?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
-    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
-        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-        .clamp(1, MAX_PROCESS_STACK_PAGES);
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    let stack_pages = resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))?;
     let layout = choose_child_layout();
 
     // The child's kernel objects and per-child memory caps are guarded from
@@ -2391,7 +2416,7 @@ pub fn create_process_from_file(
         elf::load_span(ehdr, header_data).map_err(|_| procmgr_errors::INVALID_ELF)?;
     if kind == elf::ElfKind::Dyn
     {
-        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        if !child_image_fits(bias, span_min, span_end)
         {
             return Err(procmgr_errors::INVALID_ELF);
         }
@@ -2448,11 +2473,13 @@ pub fn create_process_from_file(
     // section are fetched on demand via `vfs_read`; the helper hands a
     // closure that drives the same primitive used to stream `PT_LOAD`
     // pages, so no extra IPC machinery is involved.
-    let stack_pages = elf::parse_stack_note_streaming(ehdr, file_size, |off, dst| {
-        vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)
-    })
-    .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-    .clamp(1, MAX_PROCESS_STACK_PAGES);
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    let stack_pages = resolve_stack_pages(elf::parse_stack_note_streaming(
+        ehdr,
+        file_size,
+        |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+    ))
+    .ok_or(procmgr_errors::INVALID_ELF)?;
     let layout = choose_child_layout();
 
     // The three child kernel-object caps, guarded from creation so

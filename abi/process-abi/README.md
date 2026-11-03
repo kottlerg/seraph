@@ -215,10 +215,15 @@ static of type `StackNote` (defined in this crate). Both macro paths
 emit identical bytes; the std re-export simply lets std-using binaries
 declare a stack size without an extra Cargo dep on `process-abi`.
 
-`MAX_PROCESS_STACK_PAGES` is a loader-side hard cap (256 pages = 1 MiB)
-that catches a corrupt or hostile note. The pool's available RAM is the remaining gate on the
+`MAX_PROCESS_STACK_PAGES` (2^18 - 1 pages, just under 1 GiB) is a loader-side hard cap: loaders
+refuse a binary whose note declares zero pages or more than it (`resolve_stack_pages`), rather
+than clamping. It is the largest stack whose reservation, guard page included, fills the region
+tail `shared/process-layout` leaves after each draw window, which that crate pins with a const
+assert, so the cap costs VA only. The pool's available RAM is the remaining gate on the
 resulting `REQUEST_MEMORY_CAPS` calls; memmgr enforces no per-process quota (see
 [services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Non-Goals).
+`PROCESS_MAIN_TLS_MAX_PAGES` (2^18 pages) bounds the main-thread TLS block the same way: loaders
+map the pages the binary's `PT_TLS` memsz needs (`tls_block_layout`) and refuse a larger block.
 
 The on-disk shape is read by `elf::parse_stack_note` (full-bytes path,
 used by init) and `elf::parse_stack_note_streaming` (header-page +

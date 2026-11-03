@@ -941,7 +941,8 @@ unsafe fn kernel_entry_post_rebase(
             };
 
             // The descriptors are already in the InitInfo block, written there
-            // at Phase 7 right after the header (cap::INIT_INFO_DESCRIPTOR_CAPACITY).
+            // in Phases 7 and 8 right after the header
+            // (cap::INIT_INFO_DESCRIPTOR_CAPACITY).
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
             // SAFETY: single-threaded boot; cspace_layout produced by Phase 7.
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
@@ -980,8 +981,7 @@ unsafe fn kernel_entry_post_rebase(
             // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
             // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES
             // follows from the descriptor capacity Phases 7 and 8 enforce
-            // (asserted above), so
-            // it fits within the reserved extent.
+            // (asserted above), so it fits within the reserved extent.
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
             // The block was zeroed when Phase 7 reserved it, before the

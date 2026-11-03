@@ -372,13 +372,15 @@ pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 pub(crate) const INIT_THREAD_PAGES: u64 = (crate::sched::KERNEL_STACK_PAGES + 2) as u64;
 
 /// Descriptors the `InitInfo` block holds: its [`init_protocol::INIT_INFO_MAX_PAGES`]
-/// pages past the header, one [`CapDescriptor`] slot each. Phase 7 writes the
-/// boot capability descriptors straight into the block (and the buddy drain
-/// its RAM extents before them, [`drain_and_install_seed`]), so this is the
-/// one bound on the capabilities the boot mints: [`push_descriptor`] halts the
-/// boot by name past it. At `INIT_INFO_MAX_PAGES` = 4 that is about 655
-/// capabilities, which also bounds the ACPI region caps (one per
-/// `AcpiReclaimable` memory-map entry; real firmware reports 1 or 2).
+/// pages past the header, one [`CapDescriptor`] slot each. Phases 7 and 8 write
+/// the boot capability descriptors straight into the block (and the buddy
+/// drain its RAM extents before them, [`drain_and_install_seed`]), so this is
+/// the one bound on the capabilities that carry a descriptor: [`push_descriptor`]
+/// halts the boot by name past it. At `INIT_INFO_MAX_PAGES` = 4 that is about
+/// 655 capabilities, which also bounds the ACPI region caps (one per
+/// `AcpiReclaimable` memory-map entry; real firmware reports 1 or 2). Phase 9's
+/// Memory caps reach init through header fields instead ([`BOOT_BODY_BOUND`]
+/// counts them).
 pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = (init_protocol::INIT_INFO_MAX_PAGES
     * crate::mm::PAGE_SIZE
     - core::mem::size_of::<init_protocol::InitInfo>())
@@ -686,8 +688,9 @@ fn reserve_init_backing()
 pub(crate) fn take_init_info_block_phys() -> u64
 {
     // The block goes to init now, so the descriptor array is retired with it:
-    // a later `descriptor_array()` halts, naming the array's Phase 7-8
-    // lifetime, instead of writing into it.
+    // a later `descriptor_array()` halts, naming the array's lifetime (its
+    // Phase 7 reservation to this Phase 9 hand-off), instead of writing into
+    // it.
     DESCRIPTOR_ARRAY.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
@@ -1170,8 +1173,8 @@ pub struct CSpaceLayout
 
 /// Start of the `InitInfo` descriptor array: the reserved `InitInfo` block's
 /// bytes past the header, [`INIT_INFO_DESCRIPTOR_CAPACITY`] slots, set by
-/// `reserve_init_backing` at Phase 7. Phase 7 writes every boot capability's
-/// descriptor there, the buddy drain's RAM extents first (in the slots their
+/// `reserve_init_backing` at Phase 7. Phases 7 and 8 write every boot
+/// capability's descriptor there, the buddy drain's RAM extents first (in the slots their
 /// descriptors take), and Phase 9 writes the header in front of them, so no
 /// copy of the array exists; after hand-off it is init's, and
 /// `take_init_info_block_phys` nulls this pointer.
@@ -1198,7 +1201,10 @@ fn descriptor_array() -> *mut CapDescriptor
         let p = DESCRIPTOR_ARRAY.load(core::sync::atomic::Ordering::Relaxed);
         if p.is_null()
         {
-            crate::fatal("cap: InitInfo descriptor array used outside Phases 7 and 8");
+            crate::fatal(
+                "cap: InitInfo descriptor array used before Phase 7 reserves it or after Phase 9 \
+                 hands it to init",
+            );
         }
         p
     }

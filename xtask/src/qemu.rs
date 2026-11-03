@@ -265,14 +265,14 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 }
 
 /// PCI slots of the two disks of a two-disk launch (a single disk takes
-/// QEMU's next free slot). devmgr serves a virtio-blk device only on an
-/// `INTx` line no other device holds (#664), so the two disks must land on
-/// distinct lines, and two slots apart they do on both machines: on `x86_64`
-/// OVMF programs the line from `{10, 10, 11, 11}` indexed by
+/// QEMU's next free slot). devmgr does not serve a virtio-blk device on an
+/// `INTx` line another device already holds (#664), so the two disks must
+/// land on distinct lines, and two slots apart they do on both machines: on
+/// `x86_64` OVMF programs the line from `{10, 10, 11, 11}` indexed by
 /// `(slot + 1) % 4`, which pairs adjacent slots, and on riscv64 the `virt`
 /// host swizzles `INTA` onto PLIC source `32 + slot % 4`. Both slots sit
-/// below 25, past which q35 routes every slot to one line, and above the
-/// slots QEMU's default and auto-placed devices take.
+/// below 25, past which q35 routes every slot to one line, above the slots
+/// auto-placed devices take, and clear of q35's built-in slot 0x1f.
 const FIRST_DISK_SLOT: u8 = 0x10;
 const SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 2;
 

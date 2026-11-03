@@ -440,16 +440,15 @@ the kernel's timer started, the stamp the kernel console prints too. A cell runs
 `ktest: RUN <name>` (Tier 1) or `ktest: <name> starting` (Tier 2, Tier S) line to its
 `ktest: PASS <name>` or `ktest: FAIL <name>` line; a cell whose log ends before its end line is
 `unfinished` and runs to the log's last stamp of any kind (a watchdog dump included), which locates
-a HANG. Kernel
-output can share a serial line with a ktest line, since ktest writes its stamp, its message, and
-the newline separately, and its UART writes take no lock the kernel console shares, so kernel
-output can also land inside a message: a ktest message ends where the next stamp begins, a
-`ktest: ` line whose stamp a kernel line took takes the latest stamp before it, and a cell whose
-end line the output broke up is `end-lost` when ktest goes on (a later cell, tier marker, or
-summary follows; ktest runs its cells one at a time), its time running to that line, an upper
-bound. A tier runs from its `ktest: --- Tier <id>: ... ---` marker to the next marker or the
-`ktest: passed=` summary. A name logged twice is matched by occurrence (`<name> #2`). The width
-is read from the kernel's `scheduler initialised, N CPUs` line and the architecture from its
+a HANG. Kernel output can share a serial line with a ktest line, since ktest writes its stamp, its
+message, and the newline separately, and its UART writes take no lock the kernel console shares, so
+kernel output can also land inside a message: a ktest message ends where the next stamp begins, a
+`ktest: ` line whose stamp a kernel line took takes the latest stamp before it, and a cell whose end
+line the output broke up is `end-lost` when ktest goes on (a later cell, tier marker, or summary
+follows; ktest runs its cells one at a time), its time running to that line, an upper bound. A tier
+runs from its `ktest: --- Tier <id>: ... ---` marker to the next marker or the `ktest: passed=`
+summary. A name logged twice is matched by occurrence (`<name> #2`). The width is read from the
+kernel's `scheduler initialised, N CPUs` line and the architecture from its
 `Seraph kernel v<version> (<arch>)` banner, each else from the trailer, which also gives the host
 wall time.
 

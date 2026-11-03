@@ -106,10 +106,32 @@ jobs:
           esac
 
       - name: Burn in ${{ matrix.tester }} (20 iterations, 2 parallel)
+        # Per-cell run-parallel budget, for HANG classification, derived as
+        # docs/build-system.md § Continuous Integration states from each
+        # cell's worst pass over the 20 2-way runs of burn-in run
+        # 41666083117 (2026-11-03, master 1896b7f4's boot image); the worst
+        # passes are beside the values. riscv64 debug svctest's worst pass
+        # carries the fsbench slowdown on 4-core TCG since #679 (#666), as
+        # build-test.yml's budget for that cell does.
         run: |
+          case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
+            riscv64-debug-svctest)    budget=600 ;;  # worst pass 191.1 s
+            riscv64-debug-usertest)   budget=420 ;;  # worst pass 139.4 s
+            riscv64-debug-ktest)      budget=420 ;;  # worst pass 139.9 s
+            riscv64-release-svctest)  budget=420 ;;  # worst pass 132.4 s
+            riscv64-release-usertest) budget=180 ;;  # worst pass 32.7 s
+            riscv64-release-ktest)    budget=360 ;;  # worst pass 110.4 s
+            x86_64-debug-svctest)     budget=240 ;;  # worst pass 60.2 s
+            x86_64-debug-usertest)    budget=240 ;;  # worst pass 77.1 s
+            x86_64-debug-ktest)       budget=480 ;;  # worst pass 150.0 s
+            x86_64-release-svctest)   budget=240 ;;  # worst pass 78.2 s
+            x86_64-release-usertest)  budget=180 ;;  # worst pass 33.1 s
+            x86_64-release-ktest)     budget=480 ;;  # worst pass 144.7 s
+            *) echo "no budget for this cell" >&2; exit 1 ;;
+          esac
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 2 --runs 20 --timeout 180
+            --parallel 2 --runs 20 --timeout "$budget"
 
       - name: Upload run-parallel logs
         if: always()

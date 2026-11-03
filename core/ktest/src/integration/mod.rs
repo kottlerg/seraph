@@ -31,6 +31,7 @@ pub mod fault_resume_modifies_pc;
 pub mod fpu_survives_ipc_call;
 pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
+pub mod irq_shared_line;
 pub mod mem_map_retyped_refused;
 pub mod memory_lifecycle;
 pub mod mmio_revoke_unmaps;
@@ -136,6 +137,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::range_copy_lineage",
         range_copy_lineage::run(ctx)
     );
+    run_integration_test!("integration::irq_shared_line", irq_shared_line::run(ctx));
     run_integration_test!(
         "integration::priority_preemption",
         priority_preemption::run(ctx)

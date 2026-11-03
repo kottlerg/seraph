@@ -124,6 +124,8 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
     let spec = QemuLaunchSpec {
         arch: args.arch,
         disk_path: &disk_path,
+        disk_block_size: crate::disk::logical_block_size(&disk_path)?,
+        second_disk: None,
         firmware_code_path: &firmware_code,
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,

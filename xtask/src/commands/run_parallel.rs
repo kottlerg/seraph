@@ -29,9 +29,11 @@ use crate::accel::detect_for_arch;
 use crate::arch::Arch;
 use crate::cli::RunParallelArgs;
 use crate::context::Context as BuildContext;
+use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
+    validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::util::{require_tool, step};
@@ -167,6 +169,17 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     ));
 
     let disk_src = ctx.disk_image();
+    let disk_block_size = logical_block_size(&disk_src)?;
+    // Each slot boots its own copy of the second image too, so concurrent
+    // QEMUs never share a writable drive.
+    let second_src = match &args.second_disk
+    {
+        Some(path) => Some((
+            path.clone(),
+            second_disk_block_size(path, args.second_disk_block_size)?,
+        )),
+        None => None,
+    };
     let next_run = Arc::new(AtomicU32::new(1));
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(args.runs as usize);
 
@@ -184,9 +197,11 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let slot_dir = workdir.join(slot.to_string());
             let log_path = workdir.join(run_log_name(IN_FLIGHT_LOG_PREFIX, run_id));
             let disk_dst = slot_dir.join("disk.img");
+            let second_dst = slot_dir.join("disk2.img");
             let vars_dst = slot_dir.join("VARS.fd");
 
             let disk_src = disk_src.clone();
+            let second_src = second_src.clone();
             let firmware_code = firmware.code.clone();
             let firmware_vars_template = firmware.vars_template.clone();
             let arch = args.arch;
@@ -214,6 +229,16 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                         disk_dst.display()
                     )
                 })?;
+                if let Some((src, _)) = &second_src
+                {
+                    std::fs::copy(src, &second_dst).with_context(|| {
+                        format!(
+                            "copying second disk image {} -> {}",
+                            src.display(),
+                            second_dst.display()
+                        )
+                    })?;
+                }
                 let vars_path_for_qemu = if arch == Arch::Riscv64
                 {
                     let template = firmware_vars_template
@@ -236,6 +261,11 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 let spec = QemuLaunchSpec {
                     arch,
                     disk_path: &disk_dst,
+                    disk_block_size,
+                    second_disk: second_src.as_ref().map(|&(_, block_size)| SecondDisk {
+                        path: &second_dst,
+                        block_size,
+                    }),
                     firmware_code_path: &firmware_code,
                     firmware_vars_path: vars_path_for_qemu.as_deref(),
                     cpus,

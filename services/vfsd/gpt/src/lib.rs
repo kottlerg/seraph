@@ -151,8 +151,11 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
 }
 
 /// Whether `size` is a logical block size the parser takes: a power of two
-/// from [`MIN_BLOCK_SIZE`] to [`MAX_BLOCK_SIZE`].
-fn is_block_size(size: usize) -> bool
+/// from [`MIN_BLOCK_SIZE`] to [`MAX_BLOCK_SIZE`]. [`parse_header`] refuses a
+/// block of any other length, so a caller that sizes its reads from a device
+/// checks the device's block size with this before reading.
+#[must_use]
+pub fn is_block_size(size: usize) -> bool
 {
     size.is_power_of_two() && (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&size)
 }

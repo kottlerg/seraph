@@ -1905,7 +1905,7 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Re-enable interrupt delivery for `irq_cap` after handling the interrupt.
+/// Acknowledge the interrupt `irq_cap`'s binding was signalled for, after handling it.
 ///
 /// Must be called once the interrupt source in the device has been cleared,
 /// otherwise the interrupt will fire again immediately on unmask. Clears the
@@ -1920,7 +1920,7 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; irq_cap is cap index as u64;
-    // kernel validates cap and unmasks IRQ to re-enable delivery.
+    // kernel validates cap and acknowledges its binding, unmasking once none owes.
     let ret = unsafe { syscall2(SYS_IRQ_ACK, u64::from(irq_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }

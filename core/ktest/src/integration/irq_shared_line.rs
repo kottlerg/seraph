@@ -30,7 +30,9 @@
 //!
 //! Then the line and 63 of its copies, bound to one notification, fill the
 //! line's `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration
-//! returns `QuotaExceeded`, and succeeds once a binding goes.
+//! returns `QuotaExceeded`, and succeeds once a binding goes. Deleting that
+//! notification removes every binding naming it: all 64 caps bind a fresh
+//! notification again, and once each acknowledges a raise signals it.
 
 use syscall::{
     RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive, irq_ack, irq_register,
@@ -144,21 +146,20 @@ fn shared_line(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
 }
 
 /// The line's binding bound: [`MAX_IRQ_BINDINGS`] bindings fit, one more is
-/// refused, and a freed binding makes room.
+/// refused, and a freed binding makes room; then the teardown of the one
+/// notification every binding names removes them all, and the line binds and
+/// delivers again.
 fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
 {
     let ntf = held.push(notification(ctx)?);
+    // `bound[0]` is the line's own cap; the rest are its copies.
+    let mut bound = [line; MAX_IRQ_BINDINGS];
     irq_register(line, ntf)
         .map_err(|_| "integration::irq_shared_line: binding the line refused")?;
-    let mut first_copy = 0;
-    for i in 1..MAX_IRQ_BINDINGS
+    for slot in &mut bound[1..]
     {
-        let copy = held.push(derive(line)?);
-        if i == 1
-        {
-            first_copy = copy;
-        }
-        irq_register(copy, ntf)
+        *slot = held.push(derive(line)?);
+        irq_register(*slot, ntf)
             .map_err(|_| "integration::irq_shared_line: a binding under the bound was refused")?;
     }
     let extra = held.push(derive(line)?);
@@ -166,9 +167,23 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     {
         return Err("integration::irq_shared_line: a binding past the bound was not refused");
     }
-    cap_delete(first_copy).map_err(|_| "integration::irq_shared_line: cap_delete(copy) failed")?;
+    cap_delete(bound[1]).map_err(|_| "integration::irq_shared_line: cap_delete(copy) failed")?;
     irq_register(extra, ntf)
-        .map_err(|_| "integration::irq_shared_line: a freed binding did not make room")
+        .map_err(|_| "integration::irq_shared_line: a freed binding did not make room")?;
+    bound[1] = extra;
+
+    cap_delete(ntf).map_err(|_| "integration::irq_shared_line: cap_delete(notification) failed")?;
+    let fresh = held.push(notification(ctx)?);
+    bound
+        .iter()
+        .try_for_each(|&cap| irq_register(cap, fresh))
+        .map_err(|_| "integration::irq_shared_line: a binding outlived its notification")?;
+    acknowledge(&bound)?;
+    raise_expect(
+        &[fresh],
+        &[],
+        "the line was not served after its notification's teardown",
+    )
 }
 
 fn derive(line: u32) -> Result<u32, &'static str>

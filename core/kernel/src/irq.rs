@@ -116,9 +116,10 @@ impl IrqBinding
 /// owe an acknowledgement).
 ///
 /// The transitions are kept here, apart from the routing that drives them, so
-/// they are host-tested. Every method but [`LineMasks::deliver`] runs under the
-/// routing lock; `deliver` only sets bits in `owing`. A bit is set in `owing`
-/// only while it is set in `bound`, or between an unbind's
+/// they are host-tested. A delivery calls [`LineMasks::bound`] and
+/// [`LineMasks::deliver`] lock-free, and `deliver` only sets bits in `owing`;
+/// every other method runs under the routing lock. A bit is set in `owing` only
+/// while it is set in `bound`, or between an unbind's
 /// [`LineMasks::unbind_begin`] and [`LineMasks::unbind_settle`], which clears it
 /// once no delivery that read the old bound mask is in flight.
 struct LineMasks
@@ -161,8 +162,8 @@ impl LineMasks
     /// acknowledgement, so the line stays masked until it gives it.
     fn take(&self, bit: u32)
     {
-        self.owing.fetch_or(1 << bit, Ordering::SeqCst);
         self.bound.fetch_or(1 << bit, Ordering::SeqCst);
+        self.owing.fetch_or(1 << bit, Ordering::SeqCst);
     }
 
     /// A delivery: every binding in `bound` (the mask the delivery read) now
@@ -232,6 +233,11 @@ struct IrqRoute
     /// The line's bound and owing masks.
     masks: LineMasks,
 }
+
+// docs/limits.md states the routing table's per-line cost from this size (with
+// the routed-line set's two `u32` entries, `table_bytes`): an 8-byte list head,
+// the in-flight count padded to 8 bytes, and the two 8-byte masks.
+const _: () = assert!(core::mem::size_of::<IrqRoute>() == 32);
 
 /// Why a line could not be bound (`register`).
 // dead_code: host test builds compile out `register` and the controller routing

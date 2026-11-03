@@ -998,7 +998,8 @@ pub fn unmask(irq: u32)
 /// its target hart (the next in turn, `irq::next_target_cpu`) and record it. The
 /// driver unmasks via `SYS_IRQ_ACK` once it has registered a handler. Called by
 /// `irq::register` for the source's first binding; the route is kept while any binding
-/// remains. A source routed again is disabled on its old target first.
+/// remains, and released (`unroute_device_irq`) when the last goes, so the source is not
+/// routed when this runs; the leading disable is defensive.
 ///
 /// # Errors
 /// `NoSuchLine` for a source outside `1..=plic_ndev()`.

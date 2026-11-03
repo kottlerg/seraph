@@ -9,9 +9,10 @@
 //! `syscall`, and `ipc`, pulled into std's dep graph through
 //! `library/std/Cargo.toml` — mirrors the `hermit-abi` /
 //! `fortanix-sgx-abi` pattern. The overlay itself holds no inline asm
-//! and duplicates no protocol numbers. Heap-zone VAs are private
-//! constants below; the page-reservation allocator (`std::sys::reserve`)
-//! owns its own arena disjoint from the heap.
+//! and duplicates no protocol numbers. The heap zone is the one
+//! `process_layout::growth_zones` sizes to this process's address
+//! space; the page-reservation allocator (`std::sys::reserve`) owns the
+//! arena zone disjoint from it.
 //!
 //! Bootstrap is explicit: `_start` (`std::os::seraph`) calls
 //! `heap_bootstrap(memmgr_ep, self_aspace)` with
@@ -40,46 +41,25 @@ use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use ipc::memmgr_labels::{QUERY_POOL_STATUS, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
-// Heap-zone VAs are private to the std-overlay allocator. The base is drawn
-// per process at bootstrap (ASLR, #39) from a fixed window that keeps the
-// whole heap zone `[1 GiB, 4 GiB)` well below the page-reservation arena
-// (`reserve/seraph.rs`); the zone bound is mirrored in
-// `shared/process-layout` for the cross-zone const-asserts.
+// The heap zone (base window and span) comes from
+// `process_layout::growth_zones`, sized to this process's address
+// space (`std::os::seraph::user_va_top`); the base is drawn per process at
+// bootstrap (ASLR, #39) and the zone lies below the reservation arena's
+// (`reserve/seraph.rs`).
 
-/// Degraded-fallback heap base (inclusive), used when the entropy draw fails.
-/// Also the base of the draw window.
-const HEAP_BASE_DEFAULT: u64 = 0x0000_0000_4000_0000;
-
-/// Log2 of the number of page-aligned heap-base slots (= bits of base
-/// entropy). The drawn base lies in `[1 GiB, 3 GiB)`. The value is an
-/// encoding artefact of the zone map: 2^19 pages span the 2 GiB draw window
-/// that keeps base plus `HEAP_SPAN` under 4 GiB, so it bounds entropy only.
-const HEAP_BASE_SLOTS_LOG2: u32 = 19;
-
-/// Maximum heap size from the drawn base. Growth beyond `base + HEAP_SPAN`
-/// surfaces OOM.
-const HEAP_SPAN: u64 = 0x0000_0000_4000_0000;
-
-/// Initial heap size at `_start`, in 4 KiB pages. Sized to cover stdio's
-/// lazy line-buffer, two worker-thread stacks plus their per-thread IPC
-/// buffer pages, typical collection workloads, AND the peak of a piped
-/// `Command::spawn` (parent-side `Pipe×3` + death-bridge thread stack +
-/// per-thread IPC buffer + Arc<Packet> for join-handle) without ever
-/// needing `grow`. Cost is one `REQUEST_MEMORY_CAPS` round-trip at bootstrap,
-/// ≈ 2 MiB of physical RAM.
+/// Heap floor installed at `_start`, in 4 KiB pages (2 MiB). Sized to cover
+/// stdio's lazy line buffer, two worker-thread stacks plus their per-thread
+/// IPC buffer pages, typical collection workloads, and the peak of a piped
+/// `Command::spawn` without needing `grow`. In a demand-paged process the
+/// floor is a registered demand region (`REGISTER_REGION`), so it costs VA
+/// and only the frames the allocator hands out; a process with no pager
+/// (pinned, or whose registration failed) maps it eagerly instead.
 const HEAP_INITIAL_PAGES: u64 = 512;
 
 /// Minimum grow increment in pages. Allocation-failure retries extend the
 /// heap by at least this many 4 KiB pages to amortise the memmgr IPC
 /// round-trip over many small follow-up allocations. 16 pages = 64 KiB.
 const GROW_MIN_PAGES: u64 = 16;
-
-/// Upper bound on a single `grow` call's page count. memmgr's reply is
-/// bounded by `MSG_CAP_SLOTS_MAX = 4` Memory caps per round; with
-/// best-effort allocation each cap may cover many pages, so this cap is
-/// not driven by per-page CSpace consumption. It is sized so typical
-/// large `Vec` reallocations stay within a single round.
-const GROW_MAX_PAGES: u64 = 256;
 
 /// Augment rounds a page-table funding path may make before giving up: the
 /// map retry alternates a map attempt with a one-page augment, the budget
@@ -151,13 +131,19 @@ struct Heap {
     /// `max` as `grow` maps fresh pages. Zero before bootstrap.
     mapped_end: usize,
     /// Heap zone upper bound (exclusive): the per-process drawn base plus
-    /// `HEAP_SPAN`. Zero before bootstrap.
+    /// the heap zone's span. Zero before bootstrap.
     max: usize,
     /// Cached memmgr endpoint cap used by `grow` to request additional
     /// pages. Zero before bootstrap; `grow` returns false in that state.
     memmgr_ep: u32,
     /// Cached aspace cap for mapping grow-path pages. Zero before bootstrap.
     self_aspace: u32,
+    /// Exclusive end of the demand-backed floor, or zero when the floor was
+    /// mapped eagerly. Pages above it are always mapped eagerly by `grow`.
+    floor_end: usize,
+    /// Every floor page below this address has been touched, so the pager
+    /// has backed it. Advanced by [`Self::back_floor_to`].
+    floor_backed_end: usize,
 }
 
 impl Heap {
@@ -168,7 +154,26 @@ impl Heap {
             max: 0,
             memmgr_ep: 0,
             self_aspace: 0,
+            floor_end: 0,
+            floor_backed_end: 0,
         }
+    }
+
+    /// Touch every demand-floor page below `end` not yet touched, so the
+    /// pager backs it before the allocator hands it out.
+    fn back_floor_to(&mut self, end: usize) {
+        // Kernel user copies fail on an unbacked page rather than fault to the pager.
+        let end = end.min(self.floor_end);
+        let page = PAGE_SIZE as usize;
+        let mut va = self.floor_backed_end;
+        while va < end {
+            // SAFETY: `va` is a page of the registered RW floor region, which
+            // only this heap uses; a read leaves its contents (possibly a free
+            // node) unchanged and makes the pager back the page.
+            let _ = unsafe { core::ptr::read_volatile(va as *const u8) };
+            va += page;
+        }
+        self.floor_backed_end = self.floor_backed_end.max(va);
     }
 
     /// # Safety
@@ -256,6 +261,7 @@ impl Heap {
                         None => self.head = node_next,
                     }
                 }
+                self.back_floor_to(payload + want);
                 return payload as *mut u8;
             }
             prev = Some(c);
@@ -264,15 +270,39 @@ impl Heap {
         null_mut()
     }
 
+    /// Free bytes at the top of the mapped heap: the size of the free block
+    /// that ends at `mapped_end`, or zero. A grow maps directly above it and
+    /// [`Self::insert`] coalesces the two, so a grow need only cover the rest
+    /// of a request.
+    fn tail_free_bytes(&self) -> usize {
+        let mut cur = self.head;
+        let mut last: Option<NonNull<FreeNode>> = None;
+        while let Some(c) = cur {
+            last = Some(c);
+            // SAFETY: `c` is a node of this heap's free list.
+            cur = unsafe { (*c.as_ptr()).next };
+        }
+        let Some(l) = last else {
+            return 0;
+        };
+        // SAFETY: `l` is the free list's last (highest) node.
+        let size = unsafe { (*l.as_ptr()).size };
+        if l.as_ptr() as usize + size == self.mapped_end { size } else { 0 }
+    }
+
     /// Extend the heap by requesting fresh pages from memmgr, mapping
     /// them immediately above `mapped_end`, and appending the new region
     /// to the free list.
     ///
-    /// Returns `true` if the heap grew by enough pages to cover
-    /// `want_bytes`, `false` on any IPC / map failure or when the heap
-    /// has reached its zone bound. A partial failure (some pages mapped,
-    /// then a later batch fails) still adds the mapped pages to the free
-    /// list and advances `mapped_end` past them (see [`Self::grow_exact`]).
+    /// The grow covers `want_bytes` beyond the free block at the heap's top
+    /// ([`Self::tail_free_bytes`]), at least `GROW_MIN_PAGES`, with no other
+    /// bound: a request the rest of the zone cannot hold fails without
+    /// mapping anything. Returns `true` if the grow mapped at least one
+    /// page, `false` on any IPC / map failure before the first page or when
+    /// the zone cannot hold the request. A grow that mapped some pages and
+    /// then failed still adds them to the free list and advances
+    /// `mapped_end` past them (see [`Self::grow_exact`]), so the caller's
+    /// retry loop makes progress on every `true`.
     ///
     /// Called with the heap lock held. IPC wrappers and `mem_map` are
     /// themselves non-allocating — the bootstrap IPC buffer is the
@@ -289,12 +319,15 @@ impl Heap {
         }
 
         let page_size_usize = PAGE_SIZE as usize;
-        let pages_needed = want_bytes.div_ceil(page_size_usize) as u64;
-        let pages_wanted = core::cmp::max(pages_needed, GROW_MIN_PAGES).min(GROW_MAX_PAGES);
-
-        // Clamp to what fits in the remaining [mapped_end, max) window.
+        let short_bytes = want_bytes.saturating_sub(self.tail_free_bytes());
+        let pages_needed = short_bytes.div_ceil(page_size_usize) as u64;
         let remaining_pages = (heap_max - start_va) / PAGE_SIZE;
-        let pages = pages_wanted.min(remaining_pages);
+        if pages_needed > remaining_pages {
+            return false;
+        }
+        // The minimum increment is clamped to what fits in the remaining
+        // [mapped_end, max) window; the request itself fits (checked above).
+        let pages = pages_needed.max(GROW_MIN_PAGES).min(remaining_pages);
         if pages == 0 {
             return false;
         }
@@ -302,7 +335,8 @@ impl Heap {
         // SAFETY: `[start_va, start_va + pages * PAGE_SIZE)` lies in the
         // heap's zone at or above `mapped_end` and below `max`, which only
         // this heap maps and where nothing is mapped yet.
-        unsafe { self.grow_exact(pages, start_va) }
+        unsafe { self.grow_exact(pages, start_va) };
+        self.mapped_end as u64 > start_va
     }
 
     /// Request and map exactly `pages` pages starting at `start_va`,
@@ -327,7 +361,7 @@ impl Heap {
     ///
     /// # Safety
     /// `[start_va, start_va + pages * PAGE_SIZE)` must lie in this heap's
-    /// zone (`HEAP_SPAN` from the drawn base, which nothing else in the
+    /// zone (the zone's span from the drawn base, which nothing else in the
     /// process maps) at or above `mapped_end`, so no live Rust object or IPC
     /// page lies in it.
     unsafe fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
@@ -506,41 +540,81 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
     ready
 }
 
-/// Draw the heap base, record the heap's zone and caps, and map the initial
-/// `HEAP_INITIAL_PAGES` through [`Heap::grow_exact`]. On failure the heap is
-/// reset to its unbootstrapped state, so it serves no allocation; pages the
-/// failed attempt mapped stay mapped and accounted until the process exits.
+/// Draw the heap base in the heap zone sized to this process's address space
+/// ([`crate::os::seraph::growth_zones`]), record the heap's zone and
+/// caps, and install the `HEAP_INITIAL_PAGES` floor: demand-backed
+/// ([`register_demand_floor`]) when the process has a pager, else mapped
+/// through [`Heap::grow_exact`]. On failure the heap is reset to its
+/// unbootstrapped state, so it serves no allocation; pages the failed attempt
+/// mapped stay mapped and accounted until the process exits.
 fn heap_install(memmgr_ep: u32, self_aspace: u32) -> bool {
     // The base draw happens before the allocator exists: the raw getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
     // the IPC wrappers `grow_exact` uses. A failed draw degrades to the
-    // deterministic default base (no log surface exists this early).
+    // deterministic window base (no log surface exists this early).
+    let zone = crate::os::seraph::growth_zones().heap;
     let mut entropy = [0u8; 8];
-    let heap_base = match syscall::getrandom(&mut entropy) {
-        Ok(n) if n == entropy.len() as u64 => {
-            HEAP_BASE_DEFAULT
-                + ((u64::from_le_bytes(entropy) & ((1 << HEAP_BASE_SLOTS_LOG2) - 1)) << 12)
-        }
-        _ => HEAP_BASE_DEFAULT,
+    let drawn = match syscall::getrandom(&mut entropy) {
+        Ok(n) if n == entropy.len() as u64 => Some(u64::from_le_bytes(entropy)),
+        _ => None,
     };
+    let heap_base = zone.base(drawn);
+    let demand_floor = register_demand_floor(memmgr_ep, self_aspace, heap_base);
 
     HEAP.lock.lock();
     // SAFETY: lock held; the heap is unbootstrapped, so no allocation holds
     // a pointer into it.
     let heap = unsafe { &mut *HEAP.inner.get() };
     heap.mapped_end = heap_base as usize;
-    heap.max = (heap_base + HEAP_SPAN) as usize;
+    heap.max = (heap_base + zone.span) as usize;
     heap.memmgr_ep = memmgr_ep;
     heap.self_aspace = self_aspace;
-    // SAFETY: the heap zone starts at `heap_base`, which nothing in the
-    // process has mapped yet (the heap is unbootstrapped), and
-    // `HEAP_INITIAL_PAGES` pages fit `HEAP_SPAN`.
-    let ok = unsafe { heap.grow_exact(HEAP_INITIAL_PAGES, heap_base) };
+    let floor_end = heap_base + HEAP_INITIAL_PAGES * PAGE_SIZE;
+    let ok = if demand_floor {
+        heap.mapped_end = floor_end as usize;
+        heap.floor_end = floor_end as usize;
+        heap.floor_backed_end = heap_base as usize;
+        // SAFETY: `[heap_base, floor_end)` is this heap's registered demand
+        // floor, which nothing else uses; the node write below faults its
+        // first page in.
+        unsafe { heap.insert(heap_base as usize, (HEAP_INITIAL_PAGES * PAGE_SIZE) as usize) };
+        true
+    } else {
+        // SAFETY: the heap zone starts at `heap_base`, which nothing in the
+        // process has mapped yet (the heap is unbootstrapped), and
+        // `HEAP_INITIAL_PAGES` pages fit every zone's span.
+        unsafe { heap.grow_exact(HEAP_INITIAL_PAGES, heap_base) }
+    };
     if !ok {
         *heap = Heap::new();
     }
     HEAP.lock.unlock();
     ok
+}
+
+/// Register the heap floor `[heap_base, + HEAP_INITIAL_PAGES)` as a demand
+/// region with this process's pager, funding the page tables the pager's
+/// maps will need. Returns `false`, leaving the floor to be mapped eagerly,
+/// when the process has no pager (`ProcessInfo.pager_endpoint_cap` zero:
+/// pinned, or procmgr's binding failed) or funding or registration fails.
+/// Allocates nothing: it runs before the heap exists.
+fn register_demand_floor(memmgr_ep: u32, self_aspace: u32, heap_base: u64) -> bool {
+    let has_pager =
+        crate::os::seraph::try_startup_info().is_some_and(|i| i.pager_endpoint_cap != 0);
+    let ipc_buf = current_ipc_buf();
+    if !has_pager || ipc_buf.is_null() {
+        return false;
+    }
+    // The page-table funding retypes from the object slab, whose refill path
+    // `_start` otherwise wires after the heap.
+    object_slab_init(memmgr_ep);
+    if !fund_aspace_pt_budget(self_aspace, HEAP_INITIAL_PAGES) {
+        return false;
+    }
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    unsafe {
+        crate::os::seraph::register_rw_region(memmgr_ep, ipc_buf, heap_base, HEAP_INITIAL_PAGES)
+    }
 }
 
 /// Returns `true` once `heap_bootstrap` has completed successfully.
@@ -1179,25 +1253,20 @@ unsafe impl GlobalAlloc for System {
         // SAFETY: lock held, single mutator.
         let heap = unsafe { &mut *HEAP.inner.get() };
         let mut ptr = heap.alloc(layout);
-        if ptr.is_null() {
-            // Grow once, bounded by `GROW_MAX_PAGES`, then retry. A
-            // successful grow covers single allocations up to one
-            // grow-increment larger than the largest existing free block;
-            // anything beyond that returns null to `handle_alloc_error`.
-            // The single bounded grow bounds the work done under the heap
-            // lock per allocation: memmgr's `REQUEST_MEMORY_CAPS` reply
-            // carries up to `MSG_CAP_SLOTS_MAX` caps, each covering a
-            // contiguous run of one or more pages
-            // (services/memmgr/docs/ipc-interface.md § Label 1), so one
-            // grow is at most `grow_exact`'s bounded count of IPC rounds,
-            // and a refused or failed round fails the grow. IPC wrappers
-            // under the lock are non-allocating (the IPC buffer is the
-            // pre-registered page, not heap-backed), so there is no
-            // re-entrant allocation here.
-            // A grow that failed partway still adds the pages it mapped to
-            // the free list, so the retry runs whatever `grow` returns.
-            let want = layout.size().saturating_add(layout.align());
-            let _ = heap.grow(want);
+        // Grow to fit and retry, for as long as each grow maps at least one
+        // page: `grow` sizes itself to the request beyond the free block at
+        // the heap's top, so one round normally suffices, and a partial
+        // grant (memmgr's reply carries at most `MSG_CAP_SLOTS_MAX` runs,
+        // services/memmgr/docs/ipc-interface.md § Label 1) takes another.
+        // Every iteration that continues advances `mapped_end` toward the
+        // zone bound, so the loop ends: on success, on a grow that maps
+        // nothing (memmgr out of memory, or the zone cannot hold the
+        // request), and null then reaches `handle_alloc_error`. IPC wrappers
+        // under the lock are non-allocating (the IPC buffer is the
+        // pre-registered page, not heap-backed), so there is no re-entrant
+        // allocation here.
+        let want = layout.size().saturating_add(layout.align());
+        while ptr.is_null() && heap.grow(want) {
             ptr = heap.alloc(layout);
         }
         HEAP.lock.unlock();

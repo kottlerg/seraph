@@ -944,7 +944,8 @@ unsafe fn kernel_entry_post_rebase(
             // in Phases 7 and 8 right after the header
             // (cap::INIT_INFO_DESCRIPTOR_CAPACITY).
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
-            // SAFETY: single-threaded boot; cspace_layout produced by Phase 7.
+            // SAFETY: single-threaded boot; cspace_layout produced by Phases 7
+            // and 8.
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
             let total_bytes = descriptors_offset as usize + core::mem::size_of_val(desc_slice);

@@ -1174,9 +1174,9 @@ pub struct CSpaceLayout
 /// Start of the `InitInfo` descriptor array: the reserved `InitInfo` block's
 /// bytes past the header, [`INIT_INFO_DESCRIPTOR_CAPACITY`] slots, set by
 /// `reserve_init_backing` at Phase 7. Phases 7 and 8 write every boot
-/// capability's descriptor there, the buddy drain's RAM extents first (in the slots their
-/// descriptors take), and Phase 9 writes the header in front of them, so no
-/// copy of the array exists; after hand-off it is init's, and
+/// capability's descriptor there, the buddy drain's RAM extents first (in the
+/// slots their descriptors take), and Phase 9 writes the header in front of
+/// them, so no copy of the array exists; after hand-off it is init's, and
 /// `take_init_info_block_phys` nulls this pointer.
 #[cfg(not(test))]
 static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
@@ -1251,7 +1251,7 @@ static OWNS_MEMORY_MINTED_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Record `bytes` of a newly-minted `owns_memory` `Memory` cap toward the
-/// minted-to-init ledger. Called at every Phase-7/Phase-9 mint site.
+/// minted-to-init ledger. Called at every Phase 7, 8 and 9 mint site.
 pub(crate) fn note_owns_memory_minted(bytes: u64)
 {
     OWNS_MEMORY_MINTED_BYTES.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
@@ -2268,7 +2268,14 @@ fn mint_reclaim_pass(
             cspace,
             MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
             ptr,
-            "Phase 7: cannot allocate Memory capability for reclaimed boot scratch",
+            if late
+            {
+                "Phase 8: cannot allocate Memory capability for late-reclaimed boot scratch"
+            }
+            else
+            {
+                "Phase 7: cannot allocate Memory capability for reclaimed boot scratch"
+            },
         );
         push_descriptor(
             &mut layout.descriptor_count,

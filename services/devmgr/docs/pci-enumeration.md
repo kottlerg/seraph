@@ -160,8 +160,9 @@ For each matched device, devmgr:
 8. Once every device of the class has been through steps 1-7, settles the
    batch: serves the drivers' `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on
    the private endpoint and takes their deaths until every driver has
-   reported ready or died, then revokes the private endpoint, serves the
-   drivers that reported ready, and withdraws the rest (see
+   reported ready or died, then takes every death still queued, revokes the
+   private endpoint, serves the drivers that reported ready and were not
+   seen to die, and withdraws the rest (see
    [responsibilities.md](responsibilities.md#responsibilities)
    § Responsibilities).
 

@@ -61,6 +61,69 @@ impl ReadyReport
     }
 }
 
+/// The label values a settle batch's private endpoint answers, and the
+/// label-set version a `DRIVER_READY` call carries in its first word.
+#[derive(Clone, Copy, Debug)]
+pub struct DriverLabels
+{
+    /// `QUERY_DEVICE_INFO`.
+    pub device_info: u64,
+    /// `DRIVER_READY`.
+    pub ready: u64,
+    /// The receiver's label-set version.
+    pub version: u64,
+}
+
+/// How a settle batch answers one call on its private endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverReply
+{
+    /// A `QUERY_DEVICE_INFO` call, answered from the device catalog.
+    DeviceInfo,
+    /// A `DRIVER_READY` call carrying another label-set version; the roster
+    /// is unchanged.
+    VersionMismatch,
+    /// A `DRIVER_READY` call the roster took as accepted.
+    ReadyAccepted,
+    /// A `DRIVER_READY` call the roster refused; the driver exits.
+    ReadyRefused,
+    /// Any other label.
+    UnknownLabel,
+}
+
+/// Decide the reply to a call with `label`, first word `word0`, and caller
+/// `badge` on a settle batch's private endpoint, taking a `DRIVER_READY`
+/// report with the matching version into `roster`.
+pub fn answer_driver_call<T>(
+    roster: &mut Roster<T>,
+    labels: DriverLabels,
+    label: u64,
+    word0: u64,
+    badge: u64,
+) -> DriverReply
+{
+    if label == labels.device_info
+    {
+        DriverReply::DeviceInfo
+    }
+    else if label != labels.ready
+    {
+        DriverReply::UnknownLabel
+    }
+    else if word0 != labels.version
+    {
+        DriverReply::VersionMismatch
+    }
+    else if roster.mark_ready(badge).is_accepted()
+    {
+        DriverReply::ReadyAccepted
+    }
+    else
+    {
+        DriverReply::ReadyRefused
+    }
+}
+
 /// What woke a settle loop's wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettleWake
@@ -511,6 +574,46 @@ mod tests
             (0xFFFF_FFFF, 0x8000_0001)
         );
         assert_eq!(death_post_parts(0), (0, 0));
+    }
+
+    const LABELS: DriverLabels = DriverLabels {
+        device_info: 2,
+        ready: 13,
+        version: 12,
+    };
+
+    #[test]
+    fn driver_calls_are_routed_by_label_and_version()
+    {
+        let mut r = roster_of(&[1, 2]);
+        assert_eq!(
+            answer_driver_call(&mut r, LABELS, 2, 0, 1),
+            DriverReply::DeviceInfo
+        );
+        assert_eq!(
+            answer_driver_call(&mut r, LABELS, 99, 12, 1),
+            DriverReply::UnknownLabel
+        );
+        assert_eq!(
+            answer_driver_call(&mut r, LABELS, 13, 11, 1),
+            DriverReply::VersionMismatch
+        );
+        // Neither the mismatched report nor the other labels marked driver 1.
+        assert_eq!(r.state(1), Some(DriverState::Pending));
+        assert_eq!(
+            answer_driver_call(&mut r, LABELS, 13, 12, 1),
+            DriverReply::ReadyAccepted
+        );
+        assert_eq!(r.state(1), Some(DriverState::Ready));
+        assert!(r.mark_dead(2));
+        assert_eq!(
+            answer_driver_call(&mut r, LABELS, 13, 12, 2),
+            DriverReply::ReadyRefused
+        );
+        assert_eq!(
+            answer_driver_call(&mut r, LABELS, 13, 12, 9),
+            DriverReply::ReadyRefused
+        );
     }
 
     #[test]

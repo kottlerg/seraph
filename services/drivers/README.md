@@ -95,9 +95,9 @@ The full driver lifecycle is specified in
   [registry-query endpoint](../devmgr/docs/responsibilities.md#capabilities-received);
   for the VirtIO PCI drivers, on the private endpoint of their spawn batch, on which
   each also reports `DRIVER_READY` once its device is set up (devmgr serves a VirtIO
-  driver only after that report, then revokes the private endpoint).
-  See [docs/capability-model.md](../../docs/capability-model.md) for capability
-  types and rights.
+  driver only after that report, and revokes the private endpoint once the batch
+  settles). See [docs/capability-model.md](../../docs/capability-model.md) for
+  capability types and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   discovers devices (PCI enumeration, firmware tables), matches them to driver
   binaries, and requests procmgr to create driver processes. devmgr then delegates

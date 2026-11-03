@@ -16,14 +16,13 @@
 //! it serves the drivers' `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on the
 //! private endpoint and takes their deaths from the event queue until the
 //! [`Roster`] is settled, then takes every death still queued. It does not
-//! receive on the
-//! registry endpoint, so registry callers stay queued until devmgr returns to
-//! its registry loop: devmgr replies to a received call before its next
-//! receive and holds no saved reply capability, so it cannot serve other
-//! labels while a query on the settling class waits. See
+//! receive on the registry endpoint, so registry callers stay queued until
+//! devmgr returns to its registry loop: devmgr replies to a received call
+//! before its next receive and holds no saved reply capability, so it cannot
+//! serve other labels while a query on the settling class waits. See
 //! `services/devmgr/docs/responsibilities.md` § Responsibilities.
 
-use firmware::roster::{self, Roster, SettleEvents, SettleWake};
+use firmware::roster::{self, DriverLabels, DriverReply, Roster, SettleEvents, SettleWake};
 use ipc::IpcMessage;
 use ipc::recv_guard::RecvGuard;
 
@@ -205,7 +204,8 @@ impl Drop for SettleBatch
 }
 
 /// Serve one driver call on the private endpoint: `QUERY_DEVICE_INFO` as on
-/// the registry endpoint, `DRIVER_READY` against `roster`.
+/// the registry endpoint, `DRIVER_READY` against `roster`, as the
+/// host-tested [`roster::answer_driver_call`] decides.
 fn serve_driver<T>(
     msg: &IpcMessage,
     roster: &mut Roster<T>,
@@ -213,29 +213,22 @@ fn serve_driver<T>(
     ipc_buf: *mut u64,
 )
 {
-    match msg.label
+    let labels = DriverLabels {
+        device_info: ipc::devmgr_labels::QUERY_DEVICE_INFO,
+        ready: ipc::devmgr_labels::DRIVER_READY,
+        version: u64::from(ipc::DEVMGR_LABELS_VERSION),
+    };
+    let code = match roster::answer_driver_call(roster, labels, msg.label, msg.word(0), msg.badge)
     {
-        ipc::devmgr_labels::QUERY_DEVICE_INFO =>
+        DriverReply::DeviceInfo =>
         {
             crate::reply_device_info(catalog, msg, ipc_buf);
+            return;
         }
-        ipc::devmgr_labels::DRIVER_READY =>
-        {
-            if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-            {
-                crate::reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                return;
-            }
-            let code = if roster.mark_ready(msg.badge).is_accepted()
-            {
-                ipc::devmgr_errors::SUCCESS
-            }
-            else
-            {
-                ipc::devmgr_errors::INVALID_REQUEST
-            };
-            crate::reply_status(code, ipc_buf);
-        }
-        _ => crate::reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
-    }
+        DriverReply::VersionMismatch => ipc::devmgr_errors::LABEL_VERSION_MISMATCH,
+        DriverReply::ReadyAccepted => ipc::devmgr_errors::SUCCESS,
+        DriverReply::ReadyRefused => ipc::devmgr_errors::INVALID_REQUEST,
+        DriverReply::UnknownLabel => ipc::devmgr_errors::UNKNOWN_OPCODE,
+    };
+    crate::reply_status(code, ipc_buf);
 }

@@ -468,9 +468,8 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     }
 
     // Observe the driver's death from here on. Bound only once every round
-    // has succeeded, so no torn-down child of a failed spawn posts a badge
-    // the catalog may hand the next device; a child that already died posts
-    // at once.
+    // has succeeded, so the batch's death queue takes posts only from the
+    // drivers its roster records; a child that already died posts at once.
     if syscall::thread_bind_notification(thread_cap, config.death_eq, correlator).is_err()
     {
         std::os::seraph::log!("driver death observer bind failed");

@@ -31,8 +31,10 @@
 //! Then the line and 63 of its copies, bound to one notification, fill the
 //! line's `MAX_IRQ_BINDINGS` (64) bindings: one more copy's registration
 //! returns `QuotaExceeded`, and succeeds once a binding goes. Deleting that
-//! notification removes every binding naming it: all 64 caps bind a fresh
-//! notification again, and once each acknowledges a raise signals it.
+//! notification removes every binding naming it: none having acknowledged,
+//! any binding left would keep the line masked, yet once the line's own cap
+//! binds a fresh notification and acknowledges, a raise signals it; the other
+//! 63 caps then bind again.
 
 use syscall::{
     RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive, irq_ack, irq_register,
@@ -172,18 +174,27 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
         .map_err(|_| "integration::irq_shared_line: a freed binding did not make room")?;
     bound[1] = extra;
 
+    // Every binding has owed since it was taken, none having acknowledged, so
+    // one the teardown left in place would keep the line masked below: only
+    // the line's own cap binds and acknowledges again. (A registration through
+    // a binding still in place would succeed as a rebind, so registering all
+    // 64 could not tell.)
     cap_delete(ntf).map_err(|_| "integration::irq_shared_line: cap_delete(notification) failed")?;
     let fresh = held.push(notification(ctx)?);
-    bound
-        .iter()
-        .try_for_each(|&cap| irq_register(cap, fresh))
-        .map_err(|_| "integration::irq_shared_line: a binding outlived its notification")?;
-    acknowledge(&bound)?;
+    irq_register(bound[0], fresh).map_err(
+        |_| "integration::irq_shared_line: rebinding the line after the teardown refused",
+    )?;
+    acknowledge(&bound[..1])?;
     raise_expect(
         &[fresh],
         &[],
-        "the line was not served after its notification's teardown",
-    )
+        "a binding outlived its notification's teardown",
+    )?;
+    // The other 63 caps bind again, filling the line.
+    bound[1..]
+        .iter()
+        .try_for_each(|&cap| irq_register(cap, fresh))
+        .map_err(|_| "integration::irq_shared_line: refilling the line after the teardown failed")
 }
 
 fn derive(line: u32) -> Result<u32, &'static str>

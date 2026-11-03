@@ -245,11 +245,17 @@ pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
     std::os::seraph::log!("fs_removed_node_id_stays_dead phase passed");
 }
 
+/// Timed iterations the `fs_crossover_bench` phase asks of `fsbench`: enough
+/// to drive both read paths at every size. The phase proves the paths work;
+/// the full 256-iteration count is for a manual benchmark run.
+const FSBENCH_PHASE_ITERS: &str = "8";
+
 pub fn fs_crossover_bench_phase(_: &Caps)
 {
     use std::process::Command;
 
     let mut child = Command::new("/programs/fsbench")
+        .arg(FSBENCH_PHASE_ITERS)
         .spawn()
         .expect("spawn /programs/fsbench failed");
     let status = child.wait().expect("fsbench wait failed");

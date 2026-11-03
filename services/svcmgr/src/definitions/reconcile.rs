@@ -131,6 +131,8 @@ pub fn reconcile_and_launch(
         }
     };
 
+    // Every copy below is fallible: a recipe the heap cannot hold is dropped
+    // with a log line, and the others still launch.
     let mut entries: Vec<String> = Vec::new();
     for ent in read
     {
@@ -140,7 +142,7 @@ pub fn reconcile_and_launch(
             continue;
         };
         let path = ent.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()).map(str::to_owned)
+        let Some(name) = path.file_name().and_then(|s| s.to_str())
         else
         {
             continue;
@@ -153,6 +155,13 @@ pub fn reconcile_and_launch(
         {
             continue;
         }
+        let Some(name) = try_string(name).filter(|_| entries.try_reserve(1).is_ok())
+        else
+        {
+            log!("svcmgr: no memory to list {name}; dropped");
+            continue;
+        };
+        // Within the slot reserved above, so the push cannot grow.
         entries.push(name);
     }
     // Deterministic launch order — purely for grep-ability of the
@@ -166,13 +175,22 @@ pub fn reconcile_and_launch(
     // consumers, so a provided name is in the discovery registry before
     // any consumer launched here resolves it. `sort_by_key` is stable, so
     // alphabetical order is preserved within each group.
-    let mut defs: Vec<Definition> = Vec::with_capacity(entries.len());
+    let mut defs: Vec<Definition> = Vec::new();
+    if defs.try_reserve_exact(entries.len()).is_err()
+    {
+        log!("svcmgr: no memory to parse {} recipes", entries.len());
+        report_orphans(pending);
+        return;
+    }
     for filename in &entries
     {
         let service_name = filename.trim_end_matches(".svc");
-        let mut path = String::from(SERVICES_DIR);
-        path.push('/');
-        path.push_str(filename);
+        let Some(path) = recipe_path(filename)
+        else
+        {
+            log!("svcmgr: no memory for {filename}'s path; dropped");
+            continue;
+        };
 
         let contents = match fs::read_to_string(&path)
         {
@@ -185,6 +203,7 @@ pub fn reconcile_and_launch(
         };
         match parse(service_name, &contents)
         {
+            // Within the capacity reserved above, so the push cannot grow.
             Ok(d) => defs.push(d),
             Err(e) => log!("svcmgr: parse {path}: {e}"),
         }
@@ -278,7 +297,7 @@ fn handle_definition(
     // Build the entry before launching, so a heap that cannot hold its name
     // and paths launches nothing rather than an instance svcmgr could not
     // supervise.
-    let Some(mut entry) = build_entry(def)
+    let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
     else
     {
         log!("svcmgr: no memory for {}'s entry; not launched", def.name);
@@ -296,7 +315,7 @@ fn handle_definition(
     entry.process_handle = launched.process_handle;
     entry.provided_endpoint = launched.provided_endpoint;
     table.services[idx] = entry;
-    table.recipes[idx] = Some(recipe_from(def));
+    table.recipes[idx] = Some(recipe);
 }
 
 /// Bind-only path: bind death-notification on a thread init already
@@ -321,7 +340,7 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
         let _ = syscall::cap_delete(thread_cap);
         return;
     };
-    let Some(mut entry) = build_entry(def)
+    let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
     else
     {
         log!(
@@ -341,24 +360,54 @@ fn bind_only(def: &Definition, thread_cap: u32, table: &mut ServiceTable, deaths
     // handle (see `restart::restart_process`).
     entry.thread_cap = thread_cap;
     table.services[idx] = entry;
-    table.recipes[idx] = Some(recipe_from(def));
+    table.recipes[idx] = Some(recipe);
 }
 
 /// Clone the launch surfaces the restart path replays from a parsed
 /// definition: argv/env/cwd/seed byte-for-byte, the log-sink flag, and the
 /// scheduling fields. The name, binary, policy and namespace live on the
-/// `ServiceEntry` instead ([`build_entry`]).
-fn recipe_from(def: &Definition) -> RestartRecipe
+/// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
+/// the copies.
+fn recipe_from(def: &Definition) -> Option<RestartRecipe>
 {
-    RestartRecipe {
-        argv: def.argv.clone(),
-        env: def.env.clone(),
-        cwd: def.cwd.clone(),
-        seed: def.seed.clone(),
+    let cwd = match &def.cwd
+    {
+        Some(cwd) => Some(try_string(cwd)?),
+        None => None,
+    };
+    Some(RestartRecipe {
+        argv: try_strings(&def.argv)?,
+        env: try_strings(&def.env)?,
+        cwd,
+        seed: try_strings(&def.seed)?,
         log_sink: def.log_sink,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
+    })
+}
+
+/// Copy every string of `strings`, or `None` when the heap cannot hold them.
+fn try_strings(strings: &[String]) -> Option<Vec<String>>
+{
+    let mut out = Vec::new();
+    out.try_reserve_exact(strings.len()).ok()?;
+    for s in strings
+    {
+        out.push(try_string(s)?);
     }
+    Some(out)
+}
+
+/// `SERVICES_DIR/<filename>`, or `None` when the heap cannot hold it.
+fn recipe_path(filename: &str) -> Option<String>
+{
+    let mut path = String::new();
+    path.try_reserve_exact(SERVICES_DIR.len() + 1 + filename.len())
+        .ok()?;
+    path.push_str(SERVICES_DIR);
+    path.push('/');
+    path.push_str(filename);
+    Some(path)
 }
 
 /// Construct a `ServiceEntry` from the parsed definition, with no caps yet:

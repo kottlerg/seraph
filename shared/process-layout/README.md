@@ -58,7 +58,7 @@ zones are const-asserted disjoint and inside the address space for every support
 | `GrowthZone`, `AddressSpaceZones`, `SV39_ZONES`, `growth_zones(u64) -> AddressSpaceZones` | Heap, arena, and image zones sized to a user half; the Sv39 zones also serve an unknown size. |
 | `LAYOUT_ENTROPY_BYTES` | Entropy bytes one layout draw consumes. |
 | `DEFAULT_PROCESS_INFO_VA`, `DEFAULT_STACK_TOP`, `DEFAULT_MAIN_TLS_VA`, `DEFAULT_IPC_BUFFER_VA` | Degraded-fallback addresses (outside the draw windows by design, each with its window's region tail). |
-| `LAYOUT_VA_CEILING` | Exclusive ceiling of the fixed tier, every creator-placed surface: the smallest supported user half (Sv39, 2^38). |
+| `LAYOUT_VA_CEILING` | Exclusive ceiling of the fixed tier (every draw window and `DEFAULT_*` fallback): the smallest supported user half (Sv39, 2^38). |
 
 Page counts are not part of the layout: stack size comes from the binary's
 `.note.seraph.stack` ELF note and TLS size from its `PT_TLS` segment, both

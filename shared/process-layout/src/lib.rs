@@ -30,15 +30,17 @@
 //!
 //! # Two tiers
 //!
-//! Every surface a creator places (the bootstrap windows, init's windows,
-//! the image window, and the degraded-fallback defaults) lies below
-//! [`LAYOUT_VA_CEILING`], the smallest user half, because init and the
-//! kernel place them without knowing the paging mode. The byte heap and the
-//! reservation arena are drawn by the process itself, which knows its
+//! Every window a creator draws a surface from (the bootstrap windows,
+//! init's windows, and the image window) and every degraded-fallback default
+//! lies below [`LAYOUT_VA_CEILING`], the smallest user half, because init and
+//! the kernel place them without knowing the paging mode. The byte heap and
+//! the reservation arena are drawn by the process itself, which knows its
 //! address space's size (`SystemInfoType::UserVaTop`), so their zones are
-//! sized to it by [`growth_zones`]: under Sv39 they share the space
-//! below the bootstrap windows, and in a wider user half they move above
-//! the fixed tier and grow with it.
+//! sized to it by [`growth_zones`]: under Sv39 they share the space below the
+//! bootstrap windows, and in a wider user half they move above the fixed
+//! tier and grow with it. The same function sizes the image zone procmgr
+//! validates its children's images against, so a procmgr child's image may
+//! extend above the ceiling in a wider half.
 //!
 //! When the creator has no entropy (a draw failed), it passes `None` and the
 //! layout degrades to the deterministic `DEFAULT_*` addresses. The defaults
@@ -67,12 +69,16 @@ use process_abi::MAX_PROCESS_STACK_PAGES;
 /// Page size shared by every layout computation in this crate.
 const PAGE_SIZE: u64 = 4096;
 
-/// Exclusive ceiling of the fixed tier: every surface a creator places lies
-/// below it. It is the smallest user half among the supported paging modes
-/// (riscv64 Sv39's 2^38), so one static layout of those surfaces is
-/// canonical under every mode on both architectures. The process-drawn
-/// growth zones ([`growth_zones`]) are sized to the actual user half
-/// instead (2^47 on x86-64 and Sv48, 2^56 on Sv57).
+/// Exclusive ceiling of the fixed tier: every draw window a creator places a
+/// surface in, and every `DEFAULT_*` fallback, lies below it. It is the
+/// smallest user half among the supported paging modes (riscv64 Sv39's
+/// 2^38), so one static layout of those windows is canonical under every
+/// mode on both architectures. The zones that follow the actual user half
+/// instead (2^47 on x86-64 and Sv48, 2^56 on Sv57) are the process-drawn
+/// heap and arena and the image zone procmgr validates its children's
+/// images against ([`growth_zones`]), so in a wider half a procmgr child's
+/// image, drawn from [`IMAGE_WINDOW`] below this ceiling, may extend above
+/// it.
 pub const LAYOUT_VA_CEILING: u64 = 1 << 38;
 
 /// Default base (region start) of the main-thread TLS block (degraded

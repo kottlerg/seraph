@@ -96,7 +96,7 @@ mirroring the kernel's own source layout.
 | File | Syscalls / behaviour exercised |
 |---|---|
 | `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE` |
-| `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields) |
+| `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps |
 | `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY` |
 | `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument` |

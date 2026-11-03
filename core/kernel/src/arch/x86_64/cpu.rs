@@ -9,8 +9,8 @@
 //! control and halt, the fence ahead of an x2APIC MSR write, and the debug-build
 //! kernel-entry RFLAGS check.
 //!
-//! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`,
-//! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
+//! `current_stack_pointer`, `load_word_racy`, the CR4/MSR accessors, `x2apic_wrmsr_fence`,
+//! `copy_user`, `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
 //! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
 //! host stubs). `cpuid`, `current_cpu` (which returns 0 under test),
@@ -65,7 +65,12 @@ pub unsafe fn load_word_racy(p: *const u64) -> u64
     // SAFETY: p is mapped and aligned per the contract; a load has no side
     // effect.
     unsafe {
-        core::arch::asm!("mov {}, [{}]", out(reg) v, in(reg) p, options(nostack, readonly, preserves_flags));
+        core::arch::asm!(
+            "mov {}, [{}]",
+            out(reg) v,
+            in(reg) p,
+            options(nostack, readonly, preserves_flags)
+        );
     }
     v
 }

@@ -15,9 +15,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use boot_protocol::layout::STACK_PAINT;
 #[cfg(not(test))]
-use boot_protocol::layout::{HANDOFF_STACK_BASE_MARK, HANDOFF_STACK_BYTES};
+use boot_protocol::layout::HANDOFF_STACK_BYTES;
+use boot_protocol::layout::STACK_PAINT;
 #[cfg(not(test))]
 use syscall::{STACK_CLASS_HANDOFF, STACK_CLASS_IDLE, STACK_CLASS_THREAD, SyscallError};
 
@@ -84,12 +84,40 @@ pub unsafe fn used_bytes(base: u64, bytes: usize) -> u64
     })
 }
 
-/// The handoff stack's `(base, bytes)` for an entry stack pointer: its top is
-/// `entry_sp` rounded up to a page, and it spans `stack_bytes` below that top.
-fn handoff_span(entry_sp: u64, page: u64, stack_bytes: u64) -> (u64, u64)
+/// The handoff stack's base for an entry stack pointer: its top is `entry_sp`
+/// rounded up to a page, and it spans `stack_bytes` below that top.
+fn handoff_base(entry_sp: u64, page: u64, stack_bytes: u64) -> u64
 {
-    let top = entry_sp.next_multiple_of(page);
-    (top - stack_bytes, stack_bytes)
+    entry_sp.next_multiple_of(page) - stack_bytes
+}
+
+/// The handoff class's answer for a recorded value: the depth, or
+/// `NotSupported` when the stack was not located.
+fn handoff_class(recorded: u64) -> Result<u64, syscall::SyscallError>
+{
+    if recorded == HANDOFF_UNLOCATED
+    {
+        Err(syscall::SyscallError::NotSupported)
+    }
+    else
+    {
+        Ok(recorded)
+    }
+}
+
+/// Depth recorded for a handoff stack whose lowest word reads `mark` and whose
+/// painted span above it reads as `used` bytes: the depth when the mark is
+/// [`boot_protocol::layout::HANDOFF_STACK_BASE_MARK`], else unlocated.
+fn handoff_record(mark: u64, used: impl FnOnce() -> u64) -> u64
+{
+    if mark == boot_protocol::layout::HANDOFF_STACK_BASE_MARK
+    {
+        used()
+    }
+    else
+    {
+        HANDOFF_UNLOCATED
+    }
 }
 
 /// Record the stack pointer at `kernel_entry`'s first statement, from which
@@ -113,8 +141,9 @@ pub unsafe fn record_thread_stack(base: u64)
 }
 
 /// Record the handoff stack's deepest use. Called on the handoff stack itself,
-/// by the BSP in `sched::enter` after its last call on that stack and just
-/// before it leaves for init's kernel stack.
+/// by the BSP in `sched::enter` after its deepest remaining call on that stack
+/// and just before it leaves for init's kernel stack; the entry frames below
+/// it (`first_entry_to_user`) are shallow and not counted.
 ///
 /// The stack's top is the entry stack pointer rounded up to a page: the
 /// reference bootloader allocates the stack in whole pages and enters the
@@ -130,7 +159,7 @@ pub fn record_handoff_stack()
     {
         return;
     }
-    let (base_phys, bytes) = handoff_span(
+    let base_phys = handoff_base(
         entry,
         crate::mm::PAGE_SIZE as u64,
         HANDOFF_STACK_BYTES as u64,
@@ -141,16 +170,13 @@ pub fn record_handoff_stack()
     // SAFETY: base is the direct-map view of the handoff stack's lowest page,
     // which the bootloader allocated in RAM the direct map covers.
     let mark = unsafe { (base as *const u64).read() };
-    if mark != HANDOFF_STACK_BASE_MARK
-    {
-        return;
-    }
     let word = core::mem::size_of::<u64>();
-    // SAFETY: as above; the words above the mark are the painted stack, and
-    // only this CPU, running on it, writes it.
-    let used = unsafe { used_bytes(base + word as u64, HANDOFF_STACK_BYTES - word) };
-    debug_assert_eq!(bytes, HANDOFF_STACK_BYTES as u64);
-    HANDOFF_HIGH_WATER.store(used, Ordering::Relaxed);
+    let recorded = handoff_record(mark, || {
+        // SAFETY: as above; the words above the mark are the painted stack,
+        // and only this CPU, running on it, writes it.
+        unsafe { used_bytes(base + word as u64, HANDOFF_STACK_BYTES - word) }
+    });
+    HANDOFF_HIGH_WATER.store(recorded, Ordering::Relaxed);
 }
 
 /// Size of one idle or thread kernel stack, in bytes.
@@ -236,18 +262,7 @@ pub fn high_water(class: u64) -> Result<u64, SyscallError>
             };
             Ok(own.max(THREAD_HIGH_WATER.load(Ordering::Relaxed)))
         }
-        STACK_CLASS_HANDOFF =>
-        {
-            let used = HANDOFF_HIGH_WATER.load(Ordering::Relaxed);
-            if used == HANDOFF_UNLOCATED
-            {
-                Err(SyscallError::NotSupported)
-            }
-            else
-            {
-                Ok(used)
-            }
-        }
+        STACK_CLASS_HANDOFF => handoff_class(HANDOFF_HIGH_WATER.load(Ordering::Relaxed)),
         _ => Err(SyscallError::InvalidArgument),
     }
 }
@@ -298,29 +313,37 @@ mod tests
     }
 
     #[test]
-    fn the_handoff_span_ends_at_the_page_above_the_entry_stack_pointer()
+    fn the_handoff_top_is_the_entry_stack_pointer_rounded_up_to_a_page()
     {
         const PAGE: u64 = 4096;
         const STACK: u64 = 64 * 1024;
         // The reference bootloader enters at the page-aligned top itself.
-        assert_eq!(
-            handoff_span(0x8_0000, PAGE, STACK),
-            (0x8_0000 - STACK, STACK)
-        );
+        assert_eq!(handoff_base(0x8_0000, PAGE, STACK), 0x8_0000 - STACK);
         // A first statement below the top by less than a page (the entry
         // function's frame) rounds back up to it.
+        assert_eq!(handoff_base(0x8_0000 - 2624, PAGE, STACK), 0x8_0000 - STACK);
+        assert_eq!(handoff_base(0x7_F001, PAGE, STACK), 0x8_0000 - STACK);
+        // An entry stack pointer on a page boundary is that page's top.
+        assert_eq!(handoff_base(0x7_F000, PAGE, STACK), 0x7_F000 - STACK);
+    }
+
+    #[test]
+    fn an_absent_base_mark_makes_the_handoff_class_not_supported()
+    {
+        use boot_protocol::layout::HANDOFF_STACK_BASE_MARK;
+        // The mark present: the scanned depth is recorded and answered.
+        let recorded = handoff_record(HANDOFF_STACK_BASE_MARK, || 7248);
+        assert_eq!(handoff_class(recorded), Ok(7248));
+        // The mark overwritten (an overflow) or never written: unlocated, and
+        // the scan is not run.
+        let recorded = handoff_record(0, || unreachable!("no scan without the mark"));
         assert_eq!(
-            handoff_span(0x8_0000 - 2624, PAGE, STACK),
-            (0x8_0000 - STACK, STACK)
+            handoff_class(recorded),
+            Err(syscall::SyscallError::NotSupported)
         );
         assert_eq!(
-            handoff_span(0x7_F001, PAGE, STACK),
-            (0x8_0000 - STACK, STACK)
-        );
-        // One byte below a page boundary is a different page's top.
-        assert_eq!(
-            handoff_span(0x7_F000, PAGE, STACK),
-            (0x7_F000 - STACK, STACK)
+            handoff_class(handoff_record(STACK_PAINT, || 0)),
+            Err(syscall::SyscallError::NotSupported)
         );
     }
 }

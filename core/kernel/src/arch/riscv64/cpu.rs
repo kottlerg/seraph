@@ -50,13 +50,15 @@ pub fn halt_until_interrupt()
     }
 }
 
+// ── Stack and memory sampling ─────────────────────────────────────────────────
+
 /// Load one word that another CPU may be writing concurrently, as an opaque
 /// machine load the compiler neither elides nor reasons about.
 ///
 /// For diagnostics that sample memory a running CPU owns (the idle-stack depth
 /// scan, `crate::stack_depth`): a Rust read racing a plain store is undefined
-/// behaviour, an `ld` instruction is not, and a torn or stale value only
-/// changes the sample.
+/// behaviour, an `ld` instruction is not, and a stale value only changes the
+/// sample.
 ///
 /// # Safety
 /// `p` is a mapped, 8-byte aligned kernel address.
@@ -67,7 +69,12 @@ pub unsafe fn load_word_racy(p: *const u64) -> u64
     // SAFETY: p is mapped and aligned per the contract; a load has no side
     // effect.
     unsafe {
-        core::arch::asm!("ld {}, 0({})", out(reg) v, in(reg) p, options(nostack, readonly, preserves_flags));
+        core::arch::asm!(
+            "ld {}, 0({})",
+            out(reg) v,
+            in(reg) p,
+            options(nostack, readonly, preserves_flags)
+        );
     }
     v
 }

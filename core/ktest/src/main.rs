@@ -576,6 +576,11 @@ fn write_timestamp()
     }
 }
 
+/// Size of an idle or thread kernel stack, for the stack-depth cells: a mirror
+/// of the kernel-private `KERNEL_STACK_PAGES` (4) pages, listed under
+/// docs/limits.md § Cross-Cutting Findings, Unpinned couplings.
+pub const KERNEL_STACK_BYTES: u64 = 4 * syscall_abi::PAGE_SIZE;
+
 /// Write a string to all available output channels (serial + framebuffer).
 ///
 /// Each line is prefixed with a `[S.NNNNNN] ` timestamp matching the kernel

@@ -38,7 +38,6 @@ mod retype_concurrent;
 mod sleep_list_wide;
 mod split_delete_race;
 mod stack_depth;
-pub(crate) use stack_depth::KERNEL_STACK_BYTES;
 mod stop_claimed_delete;
 mod stop_fault_sender;
 mod stop_owed_wake;

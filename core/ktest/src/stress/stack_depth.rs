@@ -16,16 +16,9 @@
 
 use boot_protocol::layout::HANDOFF_STACK_BYTES;
 use syscall::stack_high_water;
-use syscall_abi::{
-    PAGE_SIZE, STACK_CLASS_HANDOFF, STACK_CLASS_IDLE, STACK_CLASS_THREAD, SyscallError,
-};
+use syscall_abi::{STACK_CLASS_HANDOFF, STACK_CLASS_IDLE, STACK_CLASS_THREAD, SyscallError};
 
-use crate::TestResult;
-
-/// Size of an idle or thread kernel stack: a mirror of the kernel-private
-/// `KERNEL_STACK_PAGES` (4) pages, listed under docs/limits.md § Unpinned
-/// couplings.
-pub const KERNEL_STACK_BYTES: u64 = 4 * PAGE_SIZE;
+use crate::{KERNEL_STACK_BYTES, TestResult};
 
 /// Size of the handoff stack's painted span: `HANDOFF_STACK_BYTES` less the
 /// base-mark word below it.

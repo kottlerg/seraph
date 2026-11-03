@@ -223,7 +223,8 @@ pub enum SyscallError
     ObjectGone = -7,
     /// No memory available to satisfy the request.
     OutOfMemory = -8,
-    /// The operation is not supported on this object type.
+    /// The operation is not supported: on this object type, on this
+    /// architecture, or (for a diagnostic query) in this boot.
     NotSupported = -9,
     /// The capability rights bitmask violates the W^X constraint.
     WxViolation = -10,
@@ -2559,9 +2560,10 @@ source of truth.
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
-[Scheduler Internals](scheduler.md),
+[Memory Subsystem Internals](memory-internals.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
+[Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
 [core/ktest/README.md](../../ktest/README.md),
 [Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),

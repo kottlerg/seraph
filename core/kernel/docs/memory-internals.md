@@ -529,9 +529,11 @@ span per class ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
   kernel records its stack pointer at `kernel_entry`'s first statement, rounds it up to
   a page boundary for the stack's top (the reference bootloader's top is page-aligned and
   `kernel_entry`'s frame is smaller than a page), confirms the bottom by the mark, and
-  scans the stack in `sched::enter`, after the BSP's last call on it and just before it
-  leaves for init's kernel stack. The class returns `NotSupported` when the mark is
-  absent, which an overflow of the stack, or a bootloader that does not mark it, causes.
+  scans the stack in `sched::enter`, after the BSP's deepest remaining call on it and just
+  before it leaves for init's kernel stack (the shallow entry frames below are not counted).
+  The class reads as unlocated when the mark is absent, which an overflow of the stack, or a
+  bootloader that does not mark it, causes; the error the selector then returns is in
+  [syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`.
 
 The x86-64 interrupt stacks (the IST stacks for the NMI, double-fault and machine-check
 paths) are not painted and this report does not measure them; their budget rests on the
@@ -585,8 +587,9 @@ donation-record mechanism.
 
 ## Summarized By
 
-[Page Tables](../../boot/docs/page-tables.md), [Boot Flow](../../boot/docs/boot-flow.md),
-[core/kernel/README.md](../README.md),
+[Boot Flow](../../boot/docs/boot-flow.md),
+[Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
+[Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),

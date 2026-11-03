@@ -101,8 +101,11 @@ unconditional jump that does not return.
 Beyond the contract, the reference bootloader enters with the stack pointer at the handoff
 stack's page-aligned top, and paints the stack with `STACK_PAINT` and marks its lowest word with
 `HANDOFF_STACK_BASE_MARK` ([boot-flow.md](boot-flow.md) § Step 6). The kernel's stack depth
-report relies on those properties for the handoff class only; under a bootloader without them,
-that class reads `NotSupported` and the kernel otherwise runs as the contract states.
+report ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth)
+§ Kernel Stack Depth) relies on those properties for the handoff class only; under a
+bootloader without them, that class reads as unlocated (the error in
+[syscalls.md](../../kernel/docs/syscalls.md) § `SYS_SYSTEM_INFO`), and the kernel otherwise
+runs as the contract states.
 
 On x86-64 the GDT active at entry is the UEFI firmware's, which the bootloader leaves loaded,
 or, when the handoff changed the paging depth, the one the LA57 toggle trampoline loads to pass

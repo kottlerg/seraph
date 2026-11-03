@@ -210,7 +210,7 @@ pub fn stack_high_water_classes(_ctx: &TestContext) -> TestResult
     use syscall::stack_high_water;
     use syscall_abi::{STACK_CLASS_HANDOFF, STACK_CLASS_IDLE, STACK_CLASS_THREAD};
 
-    let kernel_stack = crate::stress::KERNEL_STACK_BYTES;
+    let kernel_stack = crate::KERNEL_STACK_BYTES;
     // The calling thread's own stack is in use, so the thread class reads
     // above zero; an idle stack has at least run its idle loop.
     let thread = stack_high_water(STACK_CLASS_THREAD)

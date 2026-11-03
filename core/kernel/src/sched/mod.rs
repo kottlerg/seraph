@@ -6424,8 +6424,8 @@ pub unsafe fn enter() -> !
 
     crate::kprintln!("sched: enter - handing control to init");
 
-    // The BSP's last call on the handoff stack is above; it leaves the stack
-    // for init's kernel stack below. Record the handoff stack's depth.
+    // The BSP's deepest remaining call on the handoff stack is above; it
+    // leaves the stack for init's kernel stack below. Record its depth.
     crate::stack_depth::record_handoff_stack();
 
     // Activate init's address space (tagged when tagging is enabled) and enter

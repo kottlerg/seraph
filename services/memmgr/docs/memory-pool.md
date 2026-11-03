@@ -63,9 +63,10 @@ surfacing as an intermittent consumer fault.
 
 Each free run (a Memory cap, its page count, and its physical base) is a node
 in the metadata arena (below), linked on one list sorted by physical base. The
-run count is therefore bounded by RAM, not by a constant: no run is ever
-turned away for want of a slot. The pool keeps running totals of its free
-pages and runs. Selection walks the list:
+run count is therefore bounded by RAM, not by a constant: no run is turned
+away for want of a slot, short of the arena being unable to grow with its
+reserve spent. The pool keeps running totals of its free pages and runs.
+Selection walks the list:
 
 - **Smallest fit.** The smallest run covering at least `N` pages serves a
   `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
@@ -82,11 +83,13 @@ fund an arena page, the returned run funds it itself: its first page (all of
 it, for a one-page run) becomes the arena page. When that carve fails (both
 arena zones are spent, the split of its first page fails, or the page cannot
 be mapped because memmgr's page tables cannot be funded), the run takes a
-reserved node. A run a growth path takes from the pool and cannot use goes
-back without growing the arena: merged back into the remainder its split
-left, else into a free node, the reserve included. A run stays owned and
-counted in `pool_total` but out of circulation only when it reaches the
-reserve with the reserve already spent and the arena unable to grow.
+reserved node; when the split of its first page cannot be merged back, the
+remainder takes the reserved node before the head page. A run a growth path
+takes from the pool and cannot use goes back without growing the arena: merged
+back into the remainder its split left, else into a free node, the reserve
+included. A run stays owned and counted in `pool_total` but out of circulation
+only when it reaches the reserve with the reserve already spent and the arena
+unable to grow.
 
 ---
 

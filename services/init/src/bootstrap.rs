@@ -1059,15 +1059,20 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
     }
 }
 
-/// Delegate every remaining RAM Memory cap from init's pool into memmgr's
-/// `CSpace`, forward the in-use bootstrap arenas (memmgr's, procmgr's, and
-/// init's own backing), then `thread_configure` + `thread_start` memmgr.
+/// Delegate the remaining RAM Memory caps from init's pool into memmgr's
+/// `CSpace` up to the forwarding stop (the first cap that has no `InitInfo`
+/// descriptor, that comes once memmgr's or init's `CSpace` headroom is already
+/// below its limit, or whose derive or copy is refused), forward the in-use
+/// bootstrap arenas (memmgr's, procmgr's, and init's own backing), then
+/// `thread_configure` + `thread_start` memmgr. The descriptor-bearing caps from
+/// the stop on reach memmgr's pool through the reap donation
+/// (`finish_init_reap_handoff`); a cap with no descriptor is not donated.
 ///
 /// Call after every `alloc.alloc_page()` consumer (memmgr's own setup,
 /// procmgr's setup) has run — at that point everything left in init's
-/// memory-cap pool is RAM that memmgr should own. After this call, init has
-/// no more memory caps; subsequent allocations route through memmgr like any
-/// other process.
+/// memory-cap pool is RAM that memmgr should own. After this call, init
+/// allocates nothing more from its pool; subsequent allocations route through
+/// memmgr like any other process.
 ///
 /// `pm_arena_cap` is procmgr's backing arena and `init_arena_cap` is init's own
 /// (from [`ProcmgrBootstrap`] and [`crate::run`]); both are forwarded alongside
@@ -1092,10 +1097,12 @@ pub fn finalize_memmgr(
     // (memmgr reads each cap's size and physical base from the kernel), so it
     // carries every remaining RAM cap while memmgr's `CSpace` keeps
     // [`MEMMGR_FORWARD_HEADROOM`] general slots and init's own keeps
-    // [`INIT_FORWARD_HEADROOM`]. A cap past either headroom, or one
-    // the copy cannot take, ends the forwarded prefix; that cap and every later
-    // one reach memmgr's pool through the reap donation
-    // (`finish_init_reap_handoff` → procmgr → `DONATE_MEMORY_CAPS`) instead.
+    // [`INIT_FORWARD_HEADROOM`]. The first cap that has no `InitInfo`
+    // descriptor, that comes once either headroom is already below its limit,
+    // or whose derive or copy is refused ends the forwarded prefix; the
+    // descriptor-bearing caps from there on reach memmgr's pool through the
+    // reap donation (`finish_init_reap_handoff` → procmgr →
+    // `DONATE_MEMORY_CAPS`) instead.
     // (The MemoryAlloc tail and the phys-table page have no InitInfo
     // descriptor, so the reap walk cannot reach them; they must ride here, in
     // the headroom the loop leaves.)
@@ -1106,7 +1113,8 @@ pub fn finalize_memmgr(
     {
         let src_slot = info.memory_base + alloc.next_idx + i;
         // Keep the forwarded set a contiguous prefix: stop here and let the
-        // reap route donate this memory cap and everything after it.
+        // reap route donate this memory cap and everything after it that has
+        // an `InitInfo` descriptor (a cap with none is not donated).
         if descriptor_for(info, src_slot).is_none()
             || cspace_general_headroom(mm.mm_cspace) < MEMMGR_FORWARD_HEADROOM
             || cspace_general_headroom(info.cspace_cap) < INIT_FORWARD_HEADROOM

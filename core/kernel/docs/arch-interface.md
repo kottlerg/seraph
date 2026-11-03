@@ -805,8 +805,6 @@ pub fn gdt::invalidate_all_iopbs();
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);
 /// Virtual address of the BSP's static TSS (x86-64); 0 on RISC-V.
 pub fn gdt::bsp_tss_ptr() -> u64;
-/// I/O Permission Bitmap size (8192 on x86-64; 0 on RISC-V).
-pub const gdt::IOPB_SIZE: usize;
 
 /// Install the exception vector on the current AP: x86-64 `lidt` of the shared
 /// IDT the BSP populated; RISC-V reinstalls `stvec`.

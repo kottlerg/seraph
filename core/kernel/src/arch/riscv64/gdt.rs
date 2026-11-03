@@ -11,9 +11,6 @@
 //!
 //! `tss_ptr` in `PerCpuData` is unused on RISC-V; this returns 0.
 
-/// I/O Permission Bitmap size. Zero on RISC-V (no I/O port space).
-pub const IOPB_SIZE: usize = 0;
-
 /// Bytes of one part of a thread's I/O permission bitmap; one page, as on
 /// x86-64, though RISC-V holds no part.
 pub const IOPB_PART_BYTES: usize = 4096;

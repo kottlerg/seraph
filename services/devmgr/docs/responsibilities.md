@@ -80,7 +80,7 @@ devmgr's responsibilities are:
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
-  the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
+  every block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
   (`QUERY_SERIAL_DEVICE`), `programs/terminal` resolves the framebuffer and
   input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
   resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd (design intent; not

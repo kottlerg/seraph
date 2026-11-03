@@ -230,10 +230,11 @@ contiguous bytes across the boundary.
 ### Measured per-call cost (`fsbench`, debug builds)
 
 Source: [programs/fsbench/README.md](../../../programs/fsbench/README.md), which owns the
-method. The bench loops 256 timed iterations of "seek to 0; read N bytes via the chosen
-path" against a 64 KiB fixture (`/data/svctest/bench.bin`); the per-path buffer sizes and
-cycle sources are in that README's
-[§ Method](../../../programs/fsbench/README.md#method). Numbers below are `cycles_mean`.
+method. The full benchmark (`fsbench` with no iteration argument) loops 256 timed
+iterations of "seek to 0; read N bytes via the chosen path" against a 64 KiB fixture
+(`/data/svctest/bench.bin`); the per-path buffer sizes and cycle sources are in that
+README's [§ Method](../../../programs/fsbench/README.md#method). Numbers below are
+`cycles_mean`.
 
 **x86_64 (KVM-accelerated, TSC = hardware cycles)**
 

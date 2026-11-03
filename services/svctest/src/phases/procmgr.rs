@@ -556,7 +556,7 @@ pub fn command_non_utf8_refused_phase(_: &Caps)
 /// check through procmgr that the child is gone.
 pub fn command_from_spawned_thread_phase(_: &Caps)
 {
-    use ipc::procmgr_process_state::{EXITED, UNKNOWN};
+    use ipc::procmgr_process_state::EXITED;
     use std::process::Command;
 
     let spawner = std::thread::Builder::new()
@@ -588,10 +588,13 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
                 "killed",
                 "a killed child must report killed, got {status}"
             );
-            let state = process_state(child.id());
-            assert!(
-                matches!(state, UNKNOWN | EXITED),
-                "Child::kill from a spawned thread left the child in state {state}"
+            // `Child::kill` sends `DESTROY_PROCESS`, which records the exit:
+            // the parked child answers `EXITED` with `EXIT_KILLED`.
+            let (state, reason) = process_state_and_reason(child.id());
+            assert_eq!(
+                (state, reason),
+                (EXITED, syscall_abi::EXIT_KILLED),
+                "Child::kill from a spawned thread left the child in state {state} (reason {reason:#x})"
             );
 
             let unwaited = Command::new("/tests/svctest")
@@ -600,12 +603,15 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
                 .expect("spawning the park child to drop failed");
             let handle = syscall::cap_derive(unwaited.id(), syscall::RIGHTS_ALL)
                 .expect("copying the unwaited child's process handle failed");
+            // Dropping an unwaited `Child` destroys it (`DESTROY_PROCESS`),
+            // which records the exit as the kill cell's does.
             drop(unwaited);
-            let state = process_state(handle);
+            let (state, reason) = process_state_and_reason(handle);
             let _ = syscall::cap_delete(handle);
-            assert!(
-                matches!(state, UNKNOWN | EXITED),
-                "dropping an unwaited Child on a spawned thread left the child in state {state}"
+            assert_eq!(
+                (state, reason),
+                (EXITED, syscall_abi::EXIT_KILLED),
+                "dropping an unwaited Child on a spawned thread left the child in state {state} (reason {reason:#x})"
             );
         })
         .expect("command_from_spawned_thread spawn failed");
@@ -615,12 +621,13 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
     std::os::seraph::log!("command_from_spawned_thread phase passed");
 }
 
-/// The `procmgr_process_state` value procmgr reports for the process
-/// behind `handle`, asked through the calling thread's IPC buffer. After
-/// teardown procmgr still answers on the handle, with `UNKNOWN` (or
-/// `EXITED` while the badge is in its recent-exits ring), so a failed call
-/// or a refusal is a test failure, not a sign the process is gone.
-fn process_state(handle: u32) -> u64
+/// The `procmgr_process_state` value and exit reason procmgr reports for the
+/// process behind `handle`, asked through the calling thread's IPC buffer.
+/// After a destroy or reap procmgr still answers on the handle, with
+/// `EXITED` while it holds the exit record (the recent-exit window, best
+/// effort) and `UNKNOWN` after, so a failed call or a refusal is a test
+/// failure, not a sign the process is gone.
+fn process_state_and_reason(handle: u32) -> (u64, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
@@ -632,7 +639,7 @@ fn process_state(handle: u32) -> u64
         ipc::procmgr_errors::SUCCESS,
         "QUERY_PROCESS refused the child's process handle"
     );
-    reply.word(0)
+    (reply.word(0), reply.word(1))
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

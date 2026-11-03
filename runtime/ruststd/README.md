@@ -259,6 +259,15 @@ protocol is in
 
 ---
 
+## Directory entries
+
+`std::os::seraph::fs::DirEntryExt::file_name_ref` borrows a directory
+entry's name from the entry. `DirEntry::file_name` and `DirEntry::path`
+allocate a copy, so a caller that must handle out-of-memory reads a
+listing's names through the extension (svcmgr's recipe scan does).
+
+---
+
 ## Implementation order
 
 ruststd is implemented before [`libc/`](../libc/README.md), which is design intent and not

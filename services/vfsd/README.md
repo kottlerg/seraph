@@ -22,7 +22,7 @@ vfsd/
 ├── src/
 │   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT handler
 │   ├── driver.rs            # Spawning fatfs driver instances
-│   ├── partition.rs         # Boot-disk partition discovery: block I/O over the gpt crate
+│   ├── partition.rs         # Disk and partition discovery: block I/O over the gpt crate
 │   ├── role_guids.rs        # Compile-time arch-conditional root + ESP GUIDs
 │   ├── worker.rs            # Worker thread implementation
 │   └── worker_pool.rs       # Bootstrap-endpoint pool for spawned drivers
@@ -40,16 +40,16 @@ vfsd/
   entries on the synthetic system root, and forwards unmatched
   lookups to the root mount via transparent delegation. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
-- **Root self-mount** — at startup, after parsing the GPT, vfsd mounts
-  the Seraph root partition at `/`, the ESP at `/esp`, and the data
-  partition at `/data` on its own initiative, before any service thread
-  begins serving. The namespace dispatcher is spawned first because the
-  `/esp` and `/data` mounts re-enter vfsd's namespace endpoint to
-  resolve `/services/fs/fatfs`; service threads are spawned only after
-  the mounts, so `GET_SYSTEM_ROOT_CAP` is never served against an
-  unmounted root. The `/esp` and `/data` mounts are best-effort: an
-  absent partition is skipped (non-fatal) and the mount point falls
-  through to the root partition. See
+- **Root self-mount** — at startup, after parsing every disk's GPT,
+  vfsd mounts the Seraph root partition at `/`, the ESP at `/esp`, and
+  the data partition at `/data` on its own initiative, before any
+  service thread begins serving. The namespace dispatcher is spawned
+  first because the `/esp` and `/data` mounts re-enter vfsd's namespace
+  endpoint to resolve `/services/fs/fatfs`; service threads are spawned
+  only after the mounts, so `GET_SYSTEM_ROOT_CAP` is never served
+  against an unmounted root. The `/esp` and `/data` mounts are
+  best-effort: an absent partition is skipped (non-fatal) and the mount
+  point falls through to the root partition. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md#two-endpoints-one-process)
   and [`docs/storage.md`](../../docs/storage.md).
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
@@ -86,24 +86,32 @@ vfsd/
   [`services/fs/docs/fs-driver-protocol.md`](../fs/docs/fs-driver-protocol.md#bootstrap-caps)).
   See [`docs/namespace-composition.md`](docs/namespace-composition.md)
   and [`docs/storage.md`](../../docs/storage.md).
-- **GPT enumeration + mount discovery** — parses the GPT partition
-  table from a single scratch memory cap at startup, keeping every used
-  entry of the header's `num_parts`-entry array, then resolves the
+- **GPT enumeration + mount discovery** — at startup, queries devmgr
+  for every block device (`QUERY_BLOCK_DEVICE` at instance ordinals 0,
+  1, … until the reply is not `SUCCESS`) and parses each disk's GPT
+  partition table through one scratch memory cap reused across the
+  reads (replaced from memmgr before the next disk when a failed read
+  left it lost), keeping every used entry of each header's
+  `num_parts`-entry array (a disk whose GPT cannot be read or validated
+  contributes none). It then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
-  `gpt::lookup_partition_by_type_guid` for the self-mount. The EFI
-  System Partition (standard type GUID) and the Seraph data partition
-  (arch-neutral `SERAPH_DATA` GUID) auto-mount at `/esp` and `/data`
-  immediately after root; there is no `mounts.conf` and no
-  `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT` handler decodes a
-  `MountRole` byte from the wire payload and reuses the same
-  resolution path. See
+  `gpt::lookup_partition_by_type_guid` over the partitions of every disk
+  for the self-mount; the DPS priority tie-break runs across disks, and
+  a tie at the highest priority is ambiguous whether or not the tied
+  partitions share a disk. The EFI System Partition (standard type
+  GUID) and the Seraph data partition (arch-neutral `SERAPH_DATA` GUID)
+  auto-mount at `/esp` and `/data` immediately after root; there is no
+  `mounts.conf` and no `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT`
+  handler decodes a `MountRole` byte from the wire payload and reuses
+  the same resolution path. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md),
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md), and
   [`docs/storage.md`](../../docs/storage.md).
 
 vfsd does not touch hardware directly. All storage I/O is mediated
-through partition-scoped block device IPC endpoints derived from
-virtio-blk's whole-disk endpoint. See
+through partition-scoped block device IPC endpoints derived from the
+whole-disk endpoint of the virtio-blk instance that holds the
+partition. See
 [`docs/storage.md`](../../docs/storage.md).
 
 ---
@@ -123,9 +131,11 @@ not on the request path. See
 
 devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
-registry at startup to obtain the `MOUNT_AUTHORITY`-badged whole-disk
-virtio-blk cap. vfsd sends `REGISTER_PARTITION` on that cap, and
-virtio-blk mints and returns a partition-badged cap per mount. See
+registry at startup, once per instance ordinal, to obtain the
+`MOUNT_AUTHORITY`-badged whole-disk cap on every virtio-blk instance.
+For each mount vfsd sends `REGISTER_PARTITION` on the cap of the disk
+that holds the partition, and that virtio-blk instance mints and returns
+a partition-badged cap. See
 [`docs/device-management.md`](../../docs/device-management.md) and
 [`docs/storage.md`](../../docs/storage.md).
 

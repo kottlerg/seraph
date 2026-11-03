@@ -40,14 +40,31 @@ pub const MIN_SECTOR_SIZE: usize = 512;
 
 // ── Page-cache bounds ──────────────────────────────────────────────────────
 
-/// Most cache slots a `fatfs` page cache holds, each one page. The cache
+/// Fewest cache slots a `fatfs` page cache may grow to, each one page: its
+/// ceiling on a machine of up to [`SLOT_RAM_DIVISOR`] × 256 pages (512 MiB) of
+/// RAM. Above that the ceiling grows with RAM ([`slot_ceiling`]). The cache
 /// takes a slot's page from memmgr on the slot's first use, so a mount pays
-/// only for the slots it fills. Defined here, in the host-tested library,
-/// so the svctest harness that checks the cache's bounds reads the same
-/// value the driver uses.
-pub const SLOT_COUNT: usize = 128;
+/// only for the slots it fills. Defined here, in the host-tested library, so
+/// the svctest harness that checks the cache's bounds reads the same values
+/// the driver uses.
+pub const SLOT_COUNT: usize = 256;
 
-/// Most pages the `fatfs` cache holds beyond [`SLOT_COUNT`]: it requests a
+/// Pages of system RAM per cache slot above [`SLOT_COUNT`]: a cache grows to
+/// at most 1/512 of RAM.
+pub const SLOT_RAM_DIVISOR: u64 = 512;
+
+/// The slot ceiling of a `fatfs` page cache on a machine of
+/// `system_ram_pages` pages of RAM: one slot per [`SLOT_RAM_DIVISOR`] pages,
+/// and never fewer than [`SLOT_COUNT`].
+#[must_use]
+pub fn slot_ceiling(system_ram_pages: u64) -> usize
+{
+    usize::try_from(system_ram_pages / SLOT_RAM_DIVISOR)
+        .unwrap_or(usize::MAX)
+        .max(SLOT_COUNT)
+}
+
+/// Most pages the `fatfs` cache holds beyond its slot ceiling: it requests a
 /// replacement page from memmgr only while its quarantined pages (still
 /// mapped by a client) and clean spares number fewer than this. Shared with
 /// svctest as [`SLOT_COUNT`] is.
@@ -1281,6 +1298,23 @@ mod tests
     fn fat32_sector(fsinfo: u16) -> [u8; 512]
     {
         bpb_sector(512, 1, 32, 2, 0, 0, 0, 300_000, 2400, 2, fsinfo)
+    }
+
+    // The defect caught: a ceiling that drops below the floor on a small
+    // machine, stops growing with RAM, or overflows on a huge one.
+    #[test]
+    fn the_slot_ceiling_is_the_floor_up_to_512_mib_and_grows_with_ram_past_it()
+    {
+        let mib = |n: u64| n * 256;
+        assert_eq!(slot_ceiling(0), SLOT_COUNT);
+        assert_eq!(slot_ceiling(mib(128)), SLOT_COUNT);
+        assert_eq!(slot_ceiling(mib(512)), SLOT_COUNT);
+        assert_eq!(slot_ceiling(mib(1024)), 2 * SLOT_COUNT);
+        assert_eq!(slot_ceiling(mib(64 * 1024)), 128 * SLOT_COUNT);
+        assert_eq!(
+            slot_ceiling(u64::MAX),
+            (u64::MAX / SLOT_RAM_DIVISOR) as usize
+        );
     }
 
     #[test]

@@ -192,8 +192,8 @@ and init looks each module up by name there.
 
 Device drivers run as unprivileged userspace processes. No driver code executes in
 kernel space. Hardware access is granted explicitly via capabilities and is fully
-revocable: deleting the capability an MMIO mapping or a port binding was made through,
-consuming it with a split, or revoking an ancestor of it withdraws it.
+revocable: deleting the capability an MMIO mapping, a port binding, or an interrupt binding was
+made through, consuming it with a split, or revoking an ancestor of it withdraws it.
 
 **MMIO**
 Physical MMIO regions are mapped into a driver’s address space under capability

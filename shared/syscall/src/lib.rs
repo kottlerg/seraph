@@ -1593,6 +1593,30 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// Deepest use, in bytes, of the kernel stack class `class`
+/// (`SystemInfoType::StackHighWater`; `syscall_abi::STACK_CLASS_*`).
+///
+/// # Errors
+/// Returns a negative `i64` error code for an unknown class, or from a kernel
+/// that predates the selector (`InvalidArgument`).
+// cast_sign_loss: a non-negative return is the queried value.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn stack_high_water(class: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the
+    // StackHighWater discriminant and arg1 the class, which the kernel
+    // validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::StackHighWater as u64,
+            class,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
 /// Exclusive top of the user half of the caller's address space
 /// (`SystemInfoType::UserVaTop`): the first virtual address a mapping syscall
 /// refuses, fixed per architecture and boot paging mode.

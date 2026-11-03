@@ -3281,6 +3281,15 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
             let block_phys = wrapper_phys - kstack_pages_bytes;
             let offset = block_phys - ancestor_memory.base;
+            // Count this thread's stack depth before the slot is freed.
+            // SAFETY: the kstack pages lie below the wrapper in the retype
+            // slot, mapped through the direct map; the thread is dead, so
+            // nothing runs on them.
+            unsafe {
+                crate::stack_depth::record_thread_stack(crate::mm::paging::phys_to_virt(
+                    block_phys,
+                ));
+            }
 
             // SAFETY: ptr is in-place ThreadObject.
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };

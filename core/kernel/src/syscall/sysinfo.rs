@@ -73,6 +73,12 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             Ok(crate::mm::user_va_top())
         }
+        9 =>
+        // StackHighWater — deepest use of the stack class in arg1
+        // (`crate::stack_depth::high_water`).
+        {
+            crate::stack_depth::high_water(tf.arg(1)).ok_or(SyscallError::InvalidArgument)
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }

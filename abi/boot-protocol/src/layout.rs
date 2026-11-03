@@ -53,6 +53,19 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// derived from it; the bootloader allocates exactly this many bytes.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
+/// Word every kernel stack is filled with when it is allocated, so the
+/// deepest use of a stack is the lowest word that no longer holds it. The
+/// bootloader paints the handoff stack with it, and the kernel paints its
+/// idle and thread stacks (core/kernel/docs/memory-internals.md § Kernel
+/// Stack Depth). A diagnostic convention, not a layout field.
+pub const STACK_PAINT: u64 = 0x5EAF_57AC_5EAF_57AC;
+
+/// Word the bootloader writes at the lowest address of the handoff stack,
+/// below the painted words, so the kernel can confirm where the stack it
+/// derived from its entry stack pointer begins. An overflow of the stack
+/// overwrites it.
+pub const HANDOFF_STACK_BASE_MARK: u64 = 0xBA5E_0F57_ACC0_FFEE;
+
 /// Choose a 2 MiB-aligned KASLR image slide from a raw entropy word.
 ///
 /// The image occupies `[KERNEL_LINK_BASE + slide, + slide + span]` inside

@@ -508,6 +508,34 @@ exist:
   reference count reaches zero (see [capability-internals.md](capability-internals.md)
   § Kernel Object Reference Counting).
 
+### Kernel Stack Depth
+
+Every kernel stack is filled with `STACK_PAINT` (`boot_protocol::layout`) when it is
+allocated, so its deepest use is the span from its top down to its lowest word that no
+longer holds the paint (`stack_depth.rs`). `SYS_SYSTEM_INFO(StackHighWater)` reports the
+span per class ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
+
+- Idle stacks: painted in Phase 4 as each is drawn from the buddy, and scanned across
+  every CPU at the query.
+- Thread stacks: painted when `SYS_CAP_CREATE_THREAD` carves the slab, a full overwrite
+  of the stack pages (and for init's thread when boot code carves it), and scanned when
+  the thread's slab is freed; the query also scans the caller's own stack. A live
+  thread's stack other than the caller's is not counted until it is freed.
+- The handoff stack: painted by the bootloader, which marks its lowest word with
+  `HANDOFF_STACK_BASE_MARK` ([boot-flow.md](../../boot/docs/boot-flow.md) § Step 6). The
+  kernel records its stack pointer at `kernel_entry`'s first statement, takes the page
+  above it as the stack's top (the bootloader's top is page-aligned and `kernel_entry`'s
+  frame is smaller than a page), confirms the bottom by the mark, and scans the stack
+  when the BSP leaves it for the scheduler at the end of Phase 9. The class reads
+  `u64::MAX` when the mark is absent, which an overflow of the stack causes.
+
+The x86-64 interrupt stacks (the IST stacks for the NMI, double-fault and machine-check
+paths) are not painted and this report does not measure them; their budget rests on the
+static audit stated at `IST_STACK_SIZE` ([limits.md](../../../docs/limits.md)).
+
+The ktest cell `stress::stack_depth` reports the three classes after Tier S. The bounds
+it measured are stated at `KERNEL_STACK_PAGES` (`sched/mod.rs`) and `HANDOFF_STACK_BYTES`.
+
 ---
 
 ## Page Table Node Ownership

@@ -2600,6 +2600,12 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
         // Stack grows downward; top = base + size (direct map).
         let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+        // Paint it for the depth report (crate::stack_depth).
+        // SAFETY: the fresh order-`stack_order` block is this CPU's idle stack
+        // alone, mapped through the direct map; no thread runs on it yet.
+        unsafe {
+            crate::stack_depth::paint(phys_to_virt(stack_phys), KERNEL_STACK_PAGES * PAGE_SIZE);
+        }
         // SAFETY: tops_ptr covers n slots; cpu < n.
         unsafe { core::ptr::write(tops_ptr.add(cpu), stack_top) };
     }

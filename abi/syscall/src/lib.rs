@@ -1113,7 +1113,22 @@ pub enum SystemInfoType
     /// Sv39, Sv48, or Sv57), so a process sizes the zones it places itself to
     /// its address space.
     UserVaTop = 8,
+    /// Deepest use, in bytes, of the kernel stack class named in arg1
+    /// (`STACK_CLASS_IDLE`, `STACK_CLASS_THREAD`, or `STACK_CLASS_HANDOFF`),
+    /// measured from the paint the stack was filled with at allocation. A
+    /// diagnostic: the handoff class reads `u64::MAX` when the kernel could not
+    /// locate the stack, and an unknown class returns `InvalidArgument`. The
+    /// classes and what each counts are in core/kernel/docs/syscalls.md
+    /// § `SYS_SYSTEM_INFO`.
+    StackHighWater = 9,
 }
+
+/// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.
+pub const STACK_CLASS_IDLE: u64 = 0;
+/// `SystemInfoType::StackHighWater` class: thread kernel stacks.
+pub const STACK_CLASS_THREAD: u64 = 1;
+/// `SystemInfoType::StackHighWater` class: the bootloader's handoff stack.
+pub const STACK_CLASS_HANDOFF: u64 = 2;
 
 #[cfg(test)]
 mod tests

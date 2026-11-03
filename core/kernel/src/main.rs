@@ -55,6 +55,7 @@ mod mm;
 mod percpu;
 mod platform;
 mod sched;
+mod stack_depth;
 mod sync;
 mod syscall;
 mod uaccess;
@@ -151,6 +152,11 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 {
+    // First: the handoff stack's span is derived from the entry stack pointer
+    // (`stack_depth::record_handoff_stack`).
+    #[cfg(not(test))]
+    stack_depth::note_boot_entry(arch::current::cpu::current_stack_pointer());
+
     // ── Phase 0: validate BootInfo ──────────────────────────────────────────
     // Pre-console. On failure the kernel halts silently; no output is possible
     // yet. GDB can distinguish this halt from a successful boot by checking
@@ -1310,6 +1316,12 @@ unsafe fn kernel_entry_post_rebase(
             let block_phys = seed.base + offset;
             let block_virt = mm::paging::phys_to_virt(block_phys);
             let kstack_top = block_virt + (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u64;
+            // Paint init's kernel stack for the depth report (stack_depth).
+            // SAFETY: the slab's first KERNEL_STACK_PAGES pages are init's
+            // stack, owned here; no thread runs on them yet.
+            unsafe {
+                stack_depth::paint(block_virt, sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE);
+            }
             let thread_obj_ptr = kstack_top as *mut ThreadObject;
             let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
             let tcb_ptr = (kstack_top + tcb_offset) as *mut sched::thread::ThreadControlBlock;
@@ -1558,6 +1570,9 @@ unsafe fn kernel_entry_post_rebase(
             boot_cpu_count,
             (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE / 1024) as u64,
         );
+
+        // The BSP leaves the handoff stack below for good; record its depth.
+        stack_depth::record_handoff_stack();
 
         // Hand off to the scheduler. Never returns. APs are already
         // idle (Phase 8 brought them online).

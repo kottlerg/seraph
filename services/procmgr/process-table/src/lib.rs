@@ -8,22 +8,23 @@
 //!
 //! Holds the plain-data process record ([`ProcessEntry`]), the heap-backed
 //! table ([`ProcessTable`]) with its insert/find/take/query operations, the
-//! time-bounded recently-reaped ring ([`RecentExits`]), the pure badge-acceptance
-//! predicate ([`badge_is_acceptable`]), the argv/env blob decoder for
-//! create requests ([`CreateBlobs`]), which parses client-controlled label
-//! fields and data words, the `CREATE_FROM_FILE` cap-layout split
+//! time-bounded ring of recently reaped or destroyed processes
+//! ([`RecentExits`]), the pure badge-acceptance predicate
+//! ([`badge_is_acceptable`]), the argv/env blob decoder for create requests
+//! ([`CreateBlobs`]), which parses client-controlled label fields and data
+//! words, the `CREATE_FROM_FILE` cap-layout split
 //! ([`split_create_from_file_caps`]), the bounds procmgr applies to fs-driver
 //! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
 //! init-reap handoff state machine ([`InitReap`]), and the bind order and
-//! growth of the death queues ([`DeathQueues`]). None of these touch a
-//! syscall, IPC, or `std::os::seraph` surface — the cap fields are slot
-//! *indices* (plain integers), never live capabilities, and the decoder reads
-//! a stack [`ipc::IpcMessage`] snapshot — so the whole crate is
-//! host-reachable and host-tested. The syscall/IPC-bearing operations
-//! (pipe/namespace configuration, the death-queue binds and creates, the logd
-//! death forward, random process-badge minting, ELF load, the init-reap
-//! teardown, and process teardown) stay in `procmgr` and drive this logic
-//! across the crate boundary. See
+//! growth of the death queues ([`DeathQueues`]). None of these touch a syscall,
+//! IPC, or `std::os::seraph` surface — the cap fields are slot *indices* (plain
+//! integers), never live capabilities, and the decoder reads a stack
+//! [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
+//! host-tested. The syscall/IPC-bearing operations (pipe/namespace
+//! configuration, the death-queue binds and creates, the logd death forward,
+//! random process-badge minting, ELF load, the init-reap teardown, and process
+//! teardown) stay in `procmgr` and drive this logic across the crate boundary.
+//! See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
@@ -44,9 +45,10 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-/// How long a reaped child stays in [`RecentExits`], in nanoseconds: 30 s.
+/// How long a reaped or destroyed child stays in [`RecentExits`], in
+/// nanoseconds: 30 s.
 ///
-/// A `QUERY_PROCESS` on a reaped badge answers `EXITED` with its reason for
+/// A `QUERY_PROCESS` on such a badge answers `EXITED` with its reason for
 /// this long, then `UNKNOWN`. The window is a time bound, not a count, so a
 /// burst of later deaths cannot rotate a child out early; the ring's size is
 /// the death rate times the window, paid for on the heap only while it holds

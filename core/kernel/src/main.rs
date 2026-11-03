@@ -935,12 +935,13 @@ unsafe fn kernel_entry_post_rebase(
                 },
             };
 
+            // The descriptors are already in the InitInfo block, written there
+            // at Phase 7 right after the header (cap::INIT_INFO_DESCRIPTOR_CAPACITY).
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
             // SAFETY: single-threaded boot; cspace_layout produced by Phase 7.
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
-            let desc_byte_len = core::mem::size_of_val(desc_slice);
-            let total_bytes = descriptors_offset as usize + desc_byte_len;
+            let total_bytes = descriptors_offset as usize + core::mem::size_of_val(desc_slice);
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
             // Allocate and map each page.
@@ -950,43 +951,22 @@ unsafe fn kernel_entry_post_rebase(
                 executable: false,
                 uncacheable: false,
             };
-            /// Resolve a byte offset within the `InitInfo` region to a writable
-            /// direct-map pointer, handling page boundaries.
-            // items_after_statements: the helper is scoped to this block and
-            // has no other use.
-            #[allow(clippy::items_after_statements)]
-            fn info_ptr(page_ptrs: &[*mut u8], offset: usize) -> *mut u8
-            {
-                let page_idx = offset / mm::PAGE_SIZE;
-                let page_off = offset % mm::PAGE_SIZE;
-                // SAFETY: page_ptrs[page_idx] is a valid direct-map pointer.
-                unsafe { page_ptrs[page_idx].add(page_off) }
-            }
 
-            // Allocate the InitInfo region as one physically contiguous
-            // buddy extent so the descriptor array (which can span pages
-            // once CapDescriptor.name is included) lives in a single
-            // backing allocation. Per-page allocation works for the
-            // kernel-side `copy_nonoverlapping` writes, but init reads
-            // the descriptor slice as one cross-page Rust slice; on
-            // release builds LLVM exploits provenance assumptions about
-            // single-allocation slices to mis-load fields of descriptors
-            // that straddle page boundaries. A contiguous physical
-            // extent eliminates the discrepancy between virtual and
-            // physical contiguity, so the optimiser sees one allocation
-            // backing the slice.
-            if info_pages > init_protocol::INIT_INFO_MAX_PAGES
-            {
-                kprintln!(
-                    "Phase 9: InitInfo region needs {} pages ({} descriptors, {} bytes) \
-                     but INIT_INFO_MAX_PAGES = {}",
-                    info_pages,
-                    desc_count,
-                    total_bytes,
-                    init_protocol::INIT_INFO_MAX_PAGES,
-                );
-                fatal("Phase 9: InitInfo region too large");
-            }
+            // The InitInfo region is one physically contiguous extent, reserved
+            // at Phase 7, so the descriptor array (which spans pages) lives in a
+            // single backing allocation. init reads the descriptor slice as one
+            // cross-page Rust slice; on release builds LLVM exploits provenance
+            // assumptions about single-allocation slices to mis-load fields of
+            // descriptors that straddle page boundaries, and a contiguous
+            // physical extent removes the discrepancy between virtual and
+            // physical contiguity. The region always fits the block:
+            // push_descriptor halts the boot at INIT_INFO_DESCRIPTOR_CAPACITY,
+            // the descriptors INIT_INFO_MAX_PAGES pages hold past the header.
+            debug_assert!(
+                info_pages <= init_protocol::INIT_INFO_MAX_PAGES,
+                "Phase 9: {info_pages} InitInfo pages for {desc_count} descriptors \
+                 ({total_bytes} bytes)"
+            );
             // Round to next power of two for buddy allocation; for
             // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
             let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
@@ -997,14 +977,8 @@ unsafe fn kernel_entry_post_rebase(
             // enforced above, so it fits within the reserved extent.
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
-            // SAFETY: block_phys is the InitInfo block reserved at Phase 7
-            // (cap::reserve_init_backing: 2^INIT_INFO_RESERVE_ORDER contiguous
-            // pages, kernel-owned); block_pages = next_power_of_two(info_pages)
-            // <= next_power_of_two(INIT_INFO_MAX_PAGES), which is that extent, so
-            // the range is valid through the direct map.
-            unsafe {
-                core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
-            }
+            // The block was zeroed when Phase 7 reserved it, before the
+            // descriptors were written into it.
 
             // Sized by the init protocol's `INIT_INFO_MAX_PAGES`; an
             // `info_pages` above it is fatal before these arrays fill.
@@ -1069,21 +1043,6 @@ unsafe fn kernel_entry_post_rebase(
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 core::ptr::write(info_base.cast::<InitInfo>(), info);
-            }
-
-            // Write CapDescriptor array — may span page boundaries.
-            let desc_src = desc_slice.as_ptr().cast::<u8>();
-            let mut written = 0usize;
-            while written < desc_byte_len
-            {
-                let offset = descriptors_offset as usize + written;
-                let chunk = (mm::PAGE_SIZE - offset % mm::PAGE_SIZE).min(desc_byte_len - written);
-                // SAFETY: offset is within the mapped region; desc_src is valid.
-                unsafe {
-                    let dst = info_ptr(&page_ptrs, offset);
-                    core::ptr::copy_nonoverlapping(desc_src.add(written), dst, chunk);
-                }
-                written += chunk;
             }
 
             // Mint a reclaimable Memory cap per InitInfo page so init's

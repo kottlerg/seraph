@@ -574,7 +574,7 @@ within the definition of, one of these items: the boot memory map and the direct
 (`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
 `init_kernel_page_tables`, `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve,
 `stage2_table_bound` and `find_boot_table_carve`), and the drain of RAM into Memory caps
-(`drain_and_install_seed`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
+(`drain_and_install_seed`, `INIT_INFO_DESCRIPTOR_CAPACITY`, `populate_cspace`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
 `frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
@@ -585,7 +585,7 @@ git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/in
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
 M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
 M="$M|drain_and_install_seed"
-M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
+M="$M|INIT_INFO_DESCRIPTOR_CAPACITY|populate_cspace|INIT_INFO_MAX_PAGES"
 M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"

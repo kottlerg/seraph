@@ -122,9 +122,10 @@ the front of the largest extent drained from the buddy allocator
 ([initialization.md](initialization.md) § Phase 7: Capability System). The bodies of
 split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
 split children), of Mmio and IoPort copies and derivations, the spilled mapping records of Mmio
-objects, and per-thread port-binding tables are placed in the body arena of the `CSpace` the call
-inserts into or resolves through, funded from that `CSpace`'s pool
-([capability-internals.md](capability-internals.md) § Body Arena); every other userspace object
+objects are placed in the body arena of the `CSpace` the call inserts into or resolves through,
+and per-thread port-binding tables in pages of the bound thread's `CSpace`, each funded from that
+`CSpace`'s pool ([capability-internals.md](capability-internals.md) § Body Arena); every other
+userspace object
 comes from the capability a `cap_create_*` syscall names.
 Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).

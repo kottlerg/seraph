@@ -1973,10 +1973,11 @@ next port access, a CPU running the thread included (see
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).
 
-**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidCapability`,
+**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidCapability` (also for a thread
+already `Exited`),
 `InsufficientRights` (a cap lacks Control/Use), `QuotaExceeded` (the thread already records
 `MAX_IOPORT_BINDINGS` bindings through other objects), `OutOfMemory` (the first bind's
-binding table, three pages, cannot be taken from the caller's `CSpace` pool; see
+binding table, three pages, cannot be taken from the target thread's `CSpace` pool; see
 [capability-internals.md](capability-internals.md) § IoPort Bindings).
 
 ---

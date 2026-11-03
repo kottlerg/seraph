@@ -196,9 +196,10 @@ the map and the retype came in. A `CSpace`'s pool pages also hold its body
 arena ([capability-internals.md](capability-internals.md) § Body Arena): the
 bodies of split children and range-capability copies (Memory, Mmio, Interrupt,
 IoPort and SchedControl objects, with lineage and ancestor pointers), Mmio
-mapping-record spill chunks (address-space pointers), the free-chunk links
-(kernel virtual addresses), and x86-64 port-binding tables (object addresses
-and bitmap-part pointers). They are pool pages retyped from the donating
+mapping-record spill chunks (address-space pointers), the arena page headers
+(their owner and list pointers, and the Memory object of a kept page), the
+free-chunk links (kernel virtual addresses), and x86-64 port-binding tables
+(object addresses and bitmap-part pointers). They are pool pages retyped from the donating
 capability like the slot pages, so the same two rules keep them from every user
 mapping.
 
@@ -277,10 +278,7 @@ the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, and the register file serial-o
 error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL EXCEPTION` dump (`sepc`,
 `stval`, `satp`, and the register file serial-only; `scause` and `sstatus` on the console), the
 riscv64 unknown-interrupt path (`sepc` serial-only), and the riscv64 `BUG: ecall return sepc` path
-(`sepc`, `ra`, `sp`, and `a7` serial-only). `free_seed_scratch`'s corrupt-lease report, which
-returns rather than halting, prints the lease's size and the seed's physical range via `kprintln!`
-and the lease pointer and its derived physical address, whose difference is the direct-map base,
-only via `kprintln_serial!`.
+(`sepc`, `ra`, `sp`, and `a7` serial-only).
 
 ## Maintaining this inventory
 

@@ -668,12 +668,14 @@ budget reported by `SYS_CAP_INFO` is authoritative. See
 
 A `CSpace`'s budget also funds the kernel objects a syscall inserting into
 or resolving through it creates without a Memory cap (split children,
-range-capability copies, spilled mapping records, port-binding tables), so
-such a call returns the refillable `OutOfMemory` when the budget is spent.
-Those objects can outlive the `CSpace` when their capabilities move
-elsewhere: a dead `CSpace`'s donations stay held while a body it funded
-lives elsewhere, the analogue of a retyped object pinning its Memory cap,
-and return to their Memory caps when the last such body goes (see
+range-capability copies, spilled mapping records, and the port-binding
+tables of its threads), so such a call returns the refillable `OutOfMemory`
+when the budget is spent; a funder therefore keeps a page of budget beyond
+the slots it funds. A split child or copy can outlive the `CSpace` when its
+capability moves elsewhere: a dead `CSpace` returns its donations at once
+but for the pages such bodies sit on, each of which stays held to its
+Memory cap until its last body goes, the analogue of a retyped object
+pinning its Memory cap (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md)
 § Body Arena).
 

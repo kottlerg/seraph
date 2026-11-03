@@ -79,7 +79,7 @@ core/kernel/
 │   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem
 │   │   ├── mod.rs
-│   │   ├── arena.rs            # CSpace body arena: lease count, chunk carving
+│   │   ├── arena.rs            # CSpace body arena: chunk carving, span cuts
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm

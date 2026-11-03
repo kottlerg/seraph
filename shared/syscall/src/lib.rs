@@ -2137,7 +2137,7 @@ pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) ->
 /// `InvalidCapability`, `InsufficientRights` (a cap lacks Control/Use),
 /// `QuotaExceeded` (the thread already records 254 bindings through other
 /// caps), or `OutOfMemory` (the first bind's binding table cannot be taken
-/// from the caller's `CSpace` pool).
+/// from the target thread's `CSpace` pool).
 #[inline]
 pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 {

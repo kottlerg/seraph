@@ -33,7 +33,9 @@
 //! two ready fixtures served at ordinals 0 and 1 and the hung one not served,
 //! then makes the fixture at ordinal 0 exit with a call queued on its
 //! endpoint, and asserts that the queued call returns, that ordinal 0 then
-//! replies `WITHDRAWN`, and that ordinal 1 still names its live fixture.
+//! replies `WITHDRAWN`, that ordinal 1 still names its live fixture, and,
+//! once every fixture is gone, that memmgr's free pool recovers the memory
+//! the hung fixture held, which only its destruction returns.
 //! TODO(#165): retire the teardown, withdrawal, and test-label deny phases
 //! with the devmgr enumeration redesign and its shims.
 
@@ -348,9 +350,15 @@ fn driver_withdrawal_phase(caps: &Caps)
 {
     use ipc::test_fault_labels::{FAULT_EXIT, FAULT_PING};
 
+    // A test wait bound: it limits only how long the phase polls for the
+    // fixtures' pages to return before it fails.
+    const RECLAIM_POLLS: u32 = 300;
+
     let devmgr = caps.devmgr_test;
     assert!(devmgr != 0, "devmgr_withdrawal: no devmgr.test cap seeded");
     let ipc_buf = std::os::seraph::current_ipc_buf();
+    let memmgr = startup_info().memmgr_endpoint;
+    let free_before = free_bytes(memmgr, ipc_buf);
 
     let start = std::time::Instant::now();
     let trigger = versioned(ipc::devmgr_labels::TEST_SPAWN_FAULT_DRIVERS);
@@ -410,9 +418,32 @@ fn driver_withdrawal_phase(caps: &Caps)
         let _ = syscall::cap_delete(cap);
     }
 
+    // With every fixture gone, memmgr's free pool returns to its baseline
+    // only if devmgr destroyed the never-ready fixture, which holds
+    // NEVER_READY_RESERVE_BYTES until it is destroyed; the two ready
+    // fixtures exited and are reaped. Half the reservation absorbs the
+    // pool's incidental movement (the fixture ELF's file-cache warming
+    // included).
+    let margin = (ipc::test_fault_labels::NEVER_READY_RESERVE_BYTES / 2) as u64;
+    let mut free_after = free_bytes(memmgr, ipc_buf);
+    for _ in 0..RECLAIM_POLLS
+    {
+        if free_after + margin >= free_before
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        free_after = free_bytes(memmgr, ipc_buf);
+    }
+    assert!(
+        free_after + margin >= free_before,
+        "devmgr_withdrawal: the never-ready fixture's pages did not return \
+         (free_before={free_before} free_after={free_after}); it was not destroyed"
+    );
+
     std::os::seraph::log!(
         "devmgr_driver_withdrawal passed: settle ended at its bound after {settle:?}, \
-         dead driver withdrawn, later ordinal kept"
+         never-ready fixture destroyed, dead driver withdrawn, later ordinal kept"
     );
 }
 

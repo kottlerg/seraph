@@ -70,22 +70,40 @@ fn main() -> !
 
     if caps.mode == test_fault_labels::MODE_NEVER_READY
     {
-        // Hang in "setup": no ready report, no exit. Only devmgr's
-        // DESTROY_PROCESS at the end of the settle ends this process.
-        std::os::seraph::log!("test-fault: never reporting ready");
-        loop
-        {
-            let _ = syscall::thread_sleep(u64::from(u32::MAX));
-        }
+        hang();
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if !unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
     {
-        std::os::seraph::log!("test-fault: DRIVER_READY refused; exiting");
+        std::os::seraph::log!("test-fault: DRIVER_READY failed ({:?}); exiting", e);
         syscall::thread_exit();
     }
     serve(caps.service_ep, ipc_buf);
+}
+
+/// Hang in "setup": hold [`test_fault_labels::NEVER_READY_RESERVE_BYTES`]
+/// of touched memory and neither report ready nor exit. Only devmgr's
+/// `DESTROY_PROCESS` at the end of the settle ends this process, and only
+/// that returns the reserved pages to memmgr, which the harness observes.
+fn hang() -> !
+{
+    let reserved = std::vec![0xA5_u8; test_fault_labels::NEVER_READY_RESERVE_BYTES];
+    // Defeat dead-store elimination with a volatile read of the first byte.
+    // SAFETY: `reserved` owns NEVER_READY_RESERVE_BYTES bytes; offset 0 is in
+    // bounds.
+    let probe = unsafe { core::ptr::read_volatile(reserved.as_ptr()) };
+    std::os::seraph::log!(
+        "test-fault: holding {} bytes (probe={:#x}), never reporting ready",
+        test_fault_labels::NEVER_READY_RESERVE_BYTES,
+        u64::from(probe)
+    );
+    loop
+    {
+        let _ = syscall::thread_sleep(u64::from(u32::MAX));
+        // Keep `reserved` live across the wait.
+        core::hint::black_box(&reserved);
+    }
 }
 
 /// Serve `FAULT_PING` until a `FAULT_EXIT`, then exit after its delay

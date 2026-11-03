@@ -97,7 +97,8 @@ fn main() -> !
     // version + opaque payload bytes, and its index + 1 is the device badge
     // of the driver spawned for it. virtio populates entries with kind
     // VIRTIO_PCI, the framebuffer with kind FRAMEBUFFER; the serial and RTC
-    // entries carry no startup info.
+    // entries, and those of the test-only `test-fault` fixtures, carry no
+    // startup info.
     let mut catalog = DeviceCatalog::default();
 
     // Every driver this boot can spawn, each at most once: one per
@@ -188,9 +189,11 @@ fn main() -> !
     // queue together, so a served driver's death withdraws it between
     // registry calls. Should the wait set refuse the registry endpoint, the
     // loop receives on it directly and observes no further death.
-    if !watch.open_registry()
+    if let Err(e) = watch.open_registry()
     {
-        std::os::seraph::log!("registry loop observes no driver death");
+        std::os::seraph::log!(
+            "registry endpoint not added to the wait set (err={e}); registry loop observes no driver death"
+        );
     }
     std::os::seraph::log!("enumeration complete, entering registry loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
@@ -493,8 +496,6 @@ fn main() -> !
                 // SAFETY: ipc_buf is the registered IPC buffer.
                 let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
-            // TODO(#165): remove with the test labels. Do not `seraph::log!`
-            // here, as in the device queries it mirrors.
             // TODO(#165): remove with the test labels. Spawn and settle the
             // fault batch after the ack, as SET_DRIVERS_DIR spawns after its
             // reply; a query on the fixtures waits in the registry queue
@@ -521,7 +522,8 @@ fn main() -> !
                     ipc_buf,
                 );
             }
-            // TODO(#165): remove with the test labels.
+            // TODO(#165): remove with the test labels. Do not `seraph::log!`
+            // here, as in the device queries it mirrors.
             ipc::devmgr_labels::TEST_QUERY_FAULT_DEVICE =>
             {
                 if !test_label_admitted(&msg, badge, ipc_buf)
@@ -535,6 +537,8 @@ fn main() -> !
                     ipc_buf,
                 );
             }
+            // TODO(#165): remove with the test labels. Do not `seraph::log!`
+            // here, as in the device queries it mirrors.
             ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE =>
             {
                 if !test_label_admitted(&msg, badge, ipc_buf)
@@ -1054,7 +1058,8 @@ impl DeviceCatalog
 
     /// Append an entry that carries no startup info and return its badge,
     /// or `None` when the catalog cannot grow: the device badge of a driver
-    /// that fetches no runtime metadata (serial, RTC), so its ready report
+    /// that fetches no runtime metadata (serial, RTC, the test-only
+    /// `test-fault` fixtures), so its ready report
     /// and death post name it like every other driver's.
     pub fn add_without_info(&mut self) -> Option<u64>
     {
@@ -1316,7 +1321,7 @@ impl ServedDrivers
                 DriverState::Dead =>
                 {
                     std::os::seraph::log!(
-                        "{}: driver did not report its device ready; not served",
+                        "{}: driver died before its batch settled; not served",
                         name
                     );
                     spawned.driver.withdraw();

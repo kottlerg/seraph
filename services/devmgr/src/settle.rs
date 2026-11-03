@@ -13,15 +13,19 @@
 //! correlator, and a wait set over that queue and, once the registry opens,
 //! the registry endpoint. devmgr spawns its drivers in two batches (the
 //! virtio-blk, serial, and framebuffer drivers at boot; the RTC and
-//! virtio-input drivers after `SET_DRIVERS_DIR`), each against a
-//! [`SettleBatch`]: a private driver endpoint on which each driver's round-2
-//! devmgr query cap is a SEND badged with its device badge.
+//! virtio-input drivers after `SET_DRIVERS_DIR`), and, on svctest's
+//! test-only `TEST_SPAWN_FAULT_DRIVERS`, a third of `test-fault` fixtures
+//! (TODO(#165)), each against a [`SettleBatch`]: a private driver endpoint
+//! on which each driver's round-2 devmgr query cap is a SEND badged with
+//! its device badge.
 //! [`SettleBatch::settle`] takes the registry endpoint out of the wait set,
 //! adds the private endpoint and a timer notification, and runs the
 //! host-tested [`roster::settle`] loop: it serves the drivers'
 //! `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on the private endpoint and
-//! takes their deaths until the [`Roster`] is settled or [`SETTLE_TIMEOUT`]
-//! elapses, then takes every death still queued. A death of a driver an
+//! takes their deaths until the [`Roster`] is settled or the batch's bound
+//! elapses ([`SETTLE_TIMEOUT`] for the two production batches,
+//! `TEST_FAULT_SETTLE_TIMEOUT_MS` for the fault batch), then takes every
+//! death still queued. A death of a driver an
 //! earlier batch settled goes to the caller, which withdraws it. While a
 //! batch settles devmgr receives on no registry endpoint, so registry callers
 //! stay queued until it returns to its registry loop: devmgr replies to a
@@ -159,20 +163,21 @@ impl DriverWatch
     }
 
     /// Add the registry endpoint to the wait set, so [`wait`](Self::wait)
-    /// reports its calls beside the drivers' deaths. Returns `false`, logged,
-    /// when the kernel refuses the membership.
-    pub fn open_registry(&mut self) -> bool
+    /// reports its calls beside the drivers' deaths. A no-op when it is
+    /// already a member.
+    ///
+    /// # Errors
+    /// The `SYS_WAIT_SET_ADD` error when the kernel refuses the membership;
+    /// the registry endpoint is then not a member
+    /// ([`registry_open`](Self::registry_open) is `false`).
+    pub fn open_registry(&mut self) -> Result<(), i64>
     {
         if !self.registry_open
         {
-            self.registry_open =
-                syscall::wait_set_add(self.wait_set, self.registry_ep, WS_BADGE_REGISTRY).is_ok();
-            if !self.registry_open
-            {
-                std::os::seraph::log!("watch: registry endpoint not added to the wait set");
-            }
+            syscall::wait_set_add(self.wait_set, self.registry_ep, WS_BADGE_REGISTRY)?;
+            self.registry_open = true;
         }
-        self.registry_open
+        Ok(())
     }
 
     /// Whether the registry endpoint is in the wait set, so the registry loop
@@ -293,9 +298,11 @@ impl SettleBatch
             std::os::seraph::log!("settle: driver endpoint not added to the wait set");
             SettleEnd::Settled
         };
-        if reopen
+        if reopen && let Err(e) = watch.open_registry()
         {
-            watch.open_registry();
+            std::os::seraph::log!(
+                "settle: registry endpoint not re-added to the wait set (err={e})"
+            );
         }
         end
     }

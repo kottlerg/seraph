@@ -1488,8 +1488,9 @@ pub mod devmgr_labels
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
     /// entry, or an entry that carries no startup info (the serial and RTC
-    /// drivers' entries), gets `INVALID_REQUEST`. The catalog only grows
-    /// (the entry of a driver that failed to spawn or was withdrawn stays),
+    /// drivers', and the test-only `test-fault` fixtures'), gets
+    /// `INVALID_REQUEST`. The catalog only grows (the entry of a driver that
+    /// failed to spawn or was withdrawn stays),
     /// so a badge is never recycled and its `u64` width bounds no catalog
     /// size. No authority bit is checked. Devmgr stores the payload bytes
     /// opaquely; the per-class shape lives in the driver crate. Reply schema
@@ -1727,10 +1728,10 @@ pub mod devmgr_labels
     /// [`TEST_SPAWN_ORPHAN`].
     pub const TEST_SPAWN_FAULT_DRIVERS: u64 = 14;
     /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. Test-only label:
-    /// mint a SEND badged [`TEST_DENY_BADGE`] on the service endpoint of the
-    /// served fault fixture at instance ordinal `data[1]` (absent means 0),
-    /// counted as [`QUERY_BLOCK_DEVICE`]'s ordinals are. Reply: `SUCCESS`
-    /// with the SEND in `caps[0]`; `WITHDRAWN` at a withdrawn fixture's
+    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the service
+    /// endpoint of the served fault fixture at instance ordinal `data[1]`
+    /// (absent means 0), counted as [`QUERY_BLOCK_DEVICE`]'s ordinals are.
+    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` at a withdrawn fixture's
     /// ordinal; `NO_DEVICE` past the served fixtures; `INVALID_REQUEST` for a
     /// failed derive. Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
@@ -1820,8 +1821,13 @@ pub mod test_fault_labels
 {
     /// Mode word: set up, report `DRIVER_READY`, and serve.
     pub const MODE_READY: u64 = 0;
-    /// Mode word: neither report ready nor exit; sleep until destroyed.
+    /// Mode word: reserve and touch [`NEVER_READY_RESERVE_BYTES`], then
+    /// neither report ready nor exit; sleep until destroyed.
     pub const MODE_NEVER_READY: u64 = 1;
+    /// Bytes a `MODE_NEVER_READY` fixture holds while it hangs, so a harness
+    /// sees its destruction as their return to memmgr's free pool (4 MiB,
+    /// well above the pool's incidental movement in a test boot).
+    pub const NEVER_READY_RESERVE_BYTES: usize = 4 << 20;
     /// Reply `SUCCESS`.
     pub const FAULT_PING: u64 = 1;
     /// Reply `SUCCESS`, then exit after [`FAULT_EXIT_DELAY_MS`] without
@@ -1832,25 +1838,47 @@ pub mod test_fault_labels
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
 }
 
+/// Why [`report_driver_ready`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyError
+{
+    /// The `ipc_call` itself failed, with this syscall error.
+    Call(i64),
+    /// devmgr replied this non-`SUCCESS` label
+    /// ([`devmgr_errors::INVALID_REQUEST`] for a refused report,
+    /// [`devmgr_errors::LABEL_VERSION_MISMATCH`] for another label-set
+    /// version).
+    Refused(u64),
+}
+
 /// Report a driver's device set up to devmgr: [`devmgr_labels::DRIVER_READY`]
 /// on `devmgr_ep`, the driver's round-2 devmgr query cap. A driver calls it
 /// immediately before its service loop, since devmgr serves the driver's
-/// endpoint only after the report. Returns `true` when devmgr accepted the
-/// report; on `false` (a refusal or a failed call) devmgr serves no client
-/// the driver, which then exits. It logs nothing, so the serial and
+/// endpoint only after the report. It logs nothing, so the serial and
 /// framebuffer drivers, which must not log, call it too.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
-#[must_use]
-pub unsafe fn report_driver_ready(devmgr_ep: u32, ipc_buf: *mut u64) -> bool
+///
+/// # Errors
+/// [`ReadyError::Call`] when the call fails, and [`ReadyError::Refused`]
+/// with devmgr's reply label when devmgr does not accept the report. Either
+/// way devmgr serves no client the driver, which then exits.
+pub unsafe fn report_driver_ready(devmgr_ep: u32, ipc_buf: *mut u64) -> Result<(), ReadyError>
 {
     let request = IpcMessage::builder(devmgr_labels::DRIVER_READY)
         .word(0, u64::from(DEVMGR_LABELS_VERSION))
         .build();
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-    let reply = unsafe { ipc_call(devmgr_ep, &request, ipc_buf) };
-    matches!(reply, Ok(reply) if reply.label == devmgr_errors::SUCCESS)
+    let reply = unsafe { ipc_call(devmgr_ep, &request, ipc_buf) }.map_err(ReadyError::Call)?;
+    if reply.label == devmgr_errors::SUCCESS
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(ReadyError::Refused(reply.label))
+    }
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]

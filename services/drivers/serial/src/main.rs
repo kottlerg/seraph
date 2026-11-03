@@ -226,7 +226,7 @@ fn main() -> !
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if !unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    if unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }.is_err()
     {
         syscall::thread_exit();
     }

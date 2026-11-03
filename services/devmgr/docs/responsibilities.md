@@ -70,7 +70,8 @@ devmgr's responsibilities are:
   devmgr binds a death observer on the driver's thread to its driver death
   queue: one queue for the boot, sized at enumeration to every driver the
   boot can spawn (one per virtio-blk and virtio-input device, and the serial,
-  framebuffer, and RTC drivers), so every bind is funded and no death is
+  framebuffer, and RTC drivers, and the three fixtures of the test-only fault
+  batch below), so every bind is funded and no death is
   dropped. A driver that needs startup info (the VirtIO drivers, the
   framebuffer) calls `QUERY_DEVICE_INFO` on its query cap before its device
   setup, and every driver calls `DRIVER_READY` on it after, immediately
@@ -99,6 +100,17 @@ devmgr's responsibilities are:
   one past the bound is withdrawn like a hung one. A thread devmgr starts per
   settle sleeps the bound and signals the timer notification; when it cannot
   be started, that settle has no bound.
+
+  A third, test-only batch (TODO(#165)) runs only on
+  `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`, gated on `TEST_LABEL_AUTHORITY`,
+  which only svctest's seed-only `devmgr.test` cap carries, and at most once
+  per boot: three [`test-fault`](../../drivers/test-fault/README.md) fixtures
+  from `/services/drivers/`, two that report ready and one that never does,
+  each with a catalog entry that carries no startup info. It settles under
+  `TEST_FAULT_SETTLE_TIMEOUT_MS` (1 s) instead of `SETTLE_TIMEOUT`, the
+  fixtures making no bounded wait in their setup, and in every other respect
+  as the production batches do; its served fixtures form a class of their
+  own, queried with `TEST_QUERY_FAULT_DEVICE`.
 
   The instance ordinals of a class count its served drivers in spawn order
   and are fixed once its batch settles. devmgr observes every driver's death
@@ -154,10 +166,9 @@ devmgr's responsibilities are:
     `ipc_recv`, settling the on-disk batch there (above). Each spawn is
     at-most-once per boot; failure, including an on-disk driver's death, or
     its overrun of the settle bound, before it reports ready, is sticky and
-    surfaced as
-    `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE` and
-    `QUERY_INPUT_DEVICE` queries, the same reply as before the spawn has run,
-    so a client retries it only a bounded number of times. See
+    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE`
+    and `QUERY_INPUT_DEVICE` queries, the same reply as before the spawn has
+    run, so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
@@ -267,6 +278,7 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md),
 [services/drivers/goldfish-rtc/README.md](../../drivers/goldfish-rtc/README.md),
 [services/drivers/serial/README.md](../../drivers/serial/README.md),
+[services/drivers/test-fault/README.md](../../drivers/test-fault/README.md),
 [services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md),
 [services/drivers/virtio/input/README.md](../../drivers/virtio/input/README.md),
 [services/init/README.md](../../init/README.md),

@@ -205,9 +205,9 @@ fn main() -> !
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if !unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    if let Err(e) = unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
     {
-        std::os::seraph::log!("DRIVER_READY refused; exiting");
+        std::os::seraph::log!("DRIVER_READY failed ({:?}); exiting", e);
         syscall::thread_exit();
     }
     service_loop(caps.service_ep, ipc_buf, base_va);

@@ -280,9 +280,9 @@ devmgr loads driver binaries from one of two places:
   ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
   `QUERY_INPUT_DEVICE` consumer, logs and exits). Before the spawn has run the reply is the same
   `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
-  times (the terminal does), while a
-  client with a no-device path treats the first `NO_DEVICE` as terminal; no client retries without
-  a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the rule). Keeping non-essentials out
+  times (the terminal does), while a client with a no-device path treats the first `NO_DEVICE` as
+  terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns
+  the rule). Keeping non-essentials out
   of the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is
   mounted, so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place
   critical path.
@@ -303,6 +303,7 @@ specified in [`docs/storage.md`](storage.md).
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
+[services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),
 [services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
 [services/drivers/virtio/input/README.md](../services/drivers/virtio/input/README.md),

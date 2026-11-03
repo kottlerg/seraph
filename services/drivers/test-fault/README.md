@@ -9,8 +9,9 @@ first round's `data[0]` is the mode (`ipc::test_fault_labels`):
 - `MODE_READY` reports `DRIVER_READY` and serves `FAULT_PING` (reply `SUCCESS`) and
   `FAULT_EXIT` (reply `SUCCESS`, then exit after `FAULT_EXIT_DELAY_MS` without receiving
   again, so a call queued after the reply reaches a dead driver until devmgr withdraws it).
-- `MODE_NEVER_READY` neither reports ready nor exits, so the batch's settle ends at its bound
-  and devmgr destroys it.
+- `MODE_NEVER_READY` holds `NEVER_READY_RESERVE_BYTES` (4 MiB) of touched memory and neither
+  reports ready nor exits, so the batch's settle ends at its bound and devmgr destroys it,
+  returning the memory, which svctest observes.
 
 [svctest](../../svctest/README.md)'s devmgr withdrawal phase drives it. Slated for removal with
 the devmgr enumeration redesign ([#165](https://github.com/kottlerg/seraph/issues/165)). See
@@ -42,4 +43,5 @@ test-fault/
 
 ## Summarized By
 
-[services/drivers/README.md](../README.md), [services/svctest/README.md](../../svctest/README.md)
+[Testing](../../../docs/testing.md), [services/drivers/README.md](../README.md),
+[services/svctest/README.md](../../svctest/README.md)

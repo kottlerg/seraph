@@ -78,6 +78,13 @@ impl Context
         self.root.join("disk.img")
     }
 
+    /// Path to the second disk image that carries the data partition alone,
+    /// authored by `cargo xtask mkdisk --split-data`.
+    pub fn data_disk_image(&self) -> PathBuf
+    {
+        self.root.join("disk-data.img")
+    }
+
     /// Cargo output directory for a given target triple and build profile.
     ///
     /// Cargo outputs the `dev` profile to `debug/`; all other profiles use the

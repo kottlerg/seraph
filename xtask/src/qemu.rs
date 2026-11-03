@@ -105,6 +105,16 @@ impl X86Paging
     }
 }
 
+/// A second disk for a QEMU launch: its image and the logical block size its
+/// device presents.
+pub struct SecondDisk<'a>
+{
+    pub path: &'a Path,
+    /// Logical and physical block size of the `virtio-blk-pci` device, in
+    /// bytes.
+    pub block_size: u32,
+}
+
 /// Specification for one QEMU launch.
 ///
 /// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`
@@ -114,6 +124,13 @@ pub struct QemuLaunchSpec<'a>
 {
     pub arch: Arch,
     pub disk_path: &'a Path,
+    /// Logical and physical block size the disk's `virtio-blk-pci` device
+    /// presents, in bytes; launch sites read it from the image
+    /// ([`crate::disk::logical_block_size`]) so the device matches its GPT.
+    pub disk_block_size: u32,
+    /// A second disk attached as its own `virtio-blk-pci` device (drive
+    /// `hd1`), or `None` for the single-disk default.
+    pub second_disk: Option<SecondDisk<'a>>,
     pub firmware_code_path: &'a Path,
     pub firmware_vars_path: Option<&'a Path>,
     pub cpus: u32,
@@ -161,6 +178,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     {
         bail!("--mem 0 is not a bootable guest memory size");
     }
+    check_block_size(spec.disk_block_size)?;
 
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -173,7 +191,24 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             spec.disk_path.display()
         ),
         "-device".into(),
-        "virtio-blk-pci,drive=hd0,disable-legacy=on".into(),
+        blk_device("hd0", spec.disk_block_size),
+    ];
+
+    // The second disk's device follows the first's, so the two take
+    // adjacent PCI slots and, by the slot swizzle, distinct INTx lines:
+    // devmgr serves a virtio-blk device only on a line no other device holds.
+    if let Some(second) = &spec.second_disk
+    {
+        check_block_size(second.block_size)?;
+        args.extend([
+            "-drive".into(),
+            format!("if=none,id=hd1,format=raw,file={}", second.path.display()),
+            "-device".into(),
+            blk_device("hd1", second.block_size),
+        ]);
+    }
+
+    args.extend([
         // Keyboard back-end for the virtio-input driver. PCI on both arches
         // (the riscv64 `virt` machine has a PCIe bridge, same as virtio-blk).
         // `id=kbd0` lets the QMP interactive-test harness target it.
@@ -190,7 +225,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         "-serial".into(),
         "stdio".into(),
         "-no-reboot".into(),
-    ];
+    ]);
 
     if spec.headless
     {
@@ -226,6 +261,29 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     }
 
     Ok(args)
+}
+
+/// The `virtio-blk-pci` device for `drive`, presenting `block_size`-byte
+/// logical and physical blocks (QEMU requires the physical size to be at
+/// least the logical).
+fn blk_device(drive: &str, block_size: u32) -> String
+{
+    format!(
+        "virtio-blk-pci,drive={drive},disable-legacy=on,logical_block_size={block_size},\
+         physical_block_size={block_size}"
+    )
+}
+
+/// Refuse a device block size QEMU cannot present: a power of two of at
+/// least 512 bytes. A size the guest's driver refuses (above its
+/// `MAX_BLOCK_SIZE`) is a valid launch.
+fn check_block_size(block_size: u32) -> Result<()>
+{
+    if !block_size.is_power_of_two() || block_size < 512
+    {
+        bail!("block size {block_size} out of range: must be a power of two of at least 512");
+    }
+    Ok(())
 }
 
 /// Whether the host CPU reports LA57 (`CPUID.(EAX=07H,ECX=0):ECX[16]`),
@@ -597,6 +655,8 @@ mod tests
         QemuLaunchSpec {
             arch: Arch::Riscv64,
             disk_path: Path::new("disk.img"),
+            disk_block_size: 512,
+            second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Some(Path::new("vars.fd")),
             cpus,
@@ -680,6 +740,8 @@ mod tests
         let spec = QemuLaunchSpec {
             arch: Arch::X86_64,
             disk_path: Path::new("disk.img"),
+            disk_block_size: 512,
+            second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: None,
             cpus: 4,
@@ -703,6 +765,8 @@ mod tests
         QemuLaunchSpec {
             arch: Arch::X86_64,
             disk_path: Path::new("disk.img"),
+            disk_block_size: 512,
+            second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: None,
             cpus: 4,
@@ -744,6 +808,64 @@ mod tests
         assert!(check_x86_paging(X86Paging::Five, Accel::Kvm, true).is_ok());
         assert!(check_x86_paging(X86Paging::Five, Accel::Tcg, false).is_ok());
         assert!(check_x86_paging(X86Paging::Four, Accel::Kvm, false).is_ok());
+    }
+
+    /// The `virtio-blk-pci` device argument backed by `drive`.
+    fn blk_device_arg<'a>(argv: &'a [String], drive: &str) -> Option<&'a str>
+    {
+        argv.iter()
+            .find(|a| a.starts_with(&format!("virtio-blk-pci,drive={drive},")))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn disk_device_presents_the_image_block_size()
+    {
+        // A device at 512 under a 4Kn image would put the GPT header at the
+        // wrong LBA, and the firmware would find no ESP.
+        let mut spec = riscv_spec(1, 512);
+        spec.disk_block_size = 4096;
+        let argv = build_qemu_argv(&spec).unwrap();
+        let dev = blk_device_arg(&argv, "hd0").unwrap();
+        assert!(dev.contains(",logical_block_size=4096,"), "{dev}");
+        assert!(dev.ends_with(",physical_block_size=4096"), "{dev}");
+        assert!(blk_device_arg(&argv, "hd1").is_none());
+    }
+
+    #[test]
+    fn second_disk_adds_its_own_drive_and_device()
+    {
+        let mut spec = riscv_spec(1, 512);
+        spec.second_disk = Some(SecondDisk {
+            path: Path::new("disk-data.img"),
+            block_size: 8192,
+        });
+        let argv = build_qemu_argv(&spec).unwrap();
+        assert!(
+            argv.iter()
+                .any(|a| a == "if=none,id=hd1,format=raw,file=disk-data.img")
+        );
+        let dev = blk_device_arg(&argv, "hd1").unwrap();
+        assert!(dev.contains(",logical_block_size=8192,"), "{dev}");
+        assert!(blk_device_arg(&argv, "hd0").unwrap().contains("=512,"));
+    }
+
+    #[test]
+    fn block_size_qemu_cannot_present_is_refused()
+    {
+        for size in [0, 256, 1000]
+        {
+            let mut spec = riscv_spec(1, 512);
+            spec.disk_block_size = size;
+            assert!(build_qemu_argv(&spec).is_err(), "disk {size}");
+
+            let mut spec = riscv_spec(1, 512);
+            spec.second_disk = Some(SecondDisk {
+                path: Path::new("second.img"),
+                block_size: size,
+            });
+            assert!(build_qemu_argv(&spec).is_err(), "second disk {size}");
+        }
     }
 
     #[test]

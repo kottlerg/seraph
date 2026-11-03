@@ -246,7 +246,7 @@ fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 /// A single-id Interrupt cap for `id`, split off a derived copy of the first
 /// cap in the test's `CSpace` whose range contains it; `None` when no cap does
 /// or the split that cuts the id off from the ids above it is refused.
-fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u32>
+pub fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u32>
 {
     let bound = scan_bound(ctx);
     for slot in 1u32..=bound

@@ -186,7 +186,8 @@ risk panic/fault backtrace symbolization.
 ## Build Output: the Sysroot
 
 Build artifacts are staged in `sysroot/`, which is then packaged into the
-top-level `disk.img` GPT image consumed by QEMU. The sysroot is built for
+top-level `disk.img` GPT image consumed by QEMU (with the data partition on a
+second image, `disk-data.img`, under `mkdisk --split-data`). The sysroot is built for
 one architecture at a time; the active architecture is recorded in
 `sysroot/.arch`. Switching architectures requires a clean rebuild.
 

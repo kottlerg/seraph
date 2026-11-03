@@ -491,7 +491,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             // init bundle. Operators who want ktest run
             // `cargo xtask compose-bundle --harness ktest` after `build`.
             crate::bundle::compose(ctx, crate::bundle::Harness::Init)?;
-            crate::disk::create_disk_image(ctx, args.arch)?;
+            crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())?;
         }
         c =>
         {

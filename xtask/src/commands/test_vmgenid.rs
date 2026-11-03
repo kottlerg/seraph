@@ -179,6 +179,8 @@ impl Guest
         let spec = QemuLaunchSpec {
             arch: Arch::X86_64,
             disk_path: &disk_path,
+            disk_block_size: crate::disk::logical_block_size(&disk_path)?,
+            second_disk: None,
             firmware_code_path: &firmware_code,
             firmware_vars_path: None,
             cpus: args.cpus,

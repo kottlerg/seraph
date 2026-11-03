@@ -98,7 +98,8 @@ sysroot/
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # and the test-only test-orphan)
+│   │                         # and the test-only test-orphan and
+│   │                         # test-fault)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn

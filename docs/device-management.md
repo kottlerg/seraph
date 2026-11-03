@@ -257,8 +257,10 @@ devmgr loads driver binaries from one of two places:
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
   driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` binary also lives there;
-  devmgr spawns it only on `devmgr_labels::TEST_SPAWN_ORPHAN` (gated on `TEST_LABEL_AUTHORITY`).
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries
+  also live there; devmgr spawns them only on `devmgr_labels::TEST_SPAWN_ORPHAN` and
+  `TEST_SPAWN_FAULT_DRIVERS` (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only
+  `devmgr.test` cap carries), so a boot without svctest spawns neither.
   virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
   then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
   critical path. A PCI device that shares an `INTx` line may get no private IRQ cap; such a driver

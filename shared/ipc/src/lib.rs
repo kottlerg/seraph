@@ -1709,6 +1709,42 @@ pub mod devmgr_labels
     /// may badge an un-badged SEND itself
     /// (docs/capability-model.md § Verb-bit authority pattern).
     pub const TEST_DENY_BADGE: u64 = 1;
+    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    /// label: spawn and settle the fault batch, three `test-fault` fixture
+    /// drivers from `/services/drivers/` in one settle batch, the first two
+    /// in [`super::test_fault_labels::MODE_READY`] and the third in
+    /// [`super::test_fault_labels::MODE_NEVER_READY`], so a harness observes
+    /// a settle that ends at its bound and the withdrawal of a served driver
+    /// that dies. The batch's bound is [`TEST_FAULT_SETTLE_TIMEOUT_MS`], not
+    /// the production settle bound, so the fault batch costs a test boot
+    /// little time. The handler replies `SUCCESS` before it spawns (the
+    /// spawns do nested `ipc_call`s), then spawns and settles; the served
+    /// fixtures are queried with [`TEST_QUERY_FAULT_DEVICE`], which waits in
+    /// the registry queue until the settle has ended. At most once per boot:
+    /// a repeated request, or one before [`SET_DRIVERS_DIR`], replies
+    /// `INVALID_REQUEST` and spawns nothing. Request: `data[0]` = caller's
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
+    /// [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_SPAWN_FAULT_DRIVERS: u64 = 14;
+    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. Test-only label:
+    /// mint a SEND badged [`TEST_DENY_BADGE`] on the service endpoint of the
+    /// served fault fixture at instance ordinal `data[1]` (absent means 0),
+    /// counted as [`QUERY_BLOCK_DEVICE`]'s ordinals are. Reply: `SUCCESS`
+    /// with the SEND in `caps[0]`; `WITHDRAWN` at a withdrawn fixture's
+    /// ordinal; `NO_DEVICE` past the served fixtures; `INVALID_REQUEST` for a
+    /// failed derive. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_QUERY_FAULT_DEVICE: u64 = 15;
+    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. The settle bound
+    /// of the fault batch, in milliseconds. The fixtures make no bounded wait
+    /// in their setup, so a short bound suffices; the production bound is
+    /// devmgr's `SETTLE_TIMEOUT`, which the batch shares every other part of
+    /// its settle with.
+    pub const TEST_FAULT_SETTLE_TIMEOUT_MS: u64 = 1000;
+    /// TODO(#165): remove with [`TEST_SPAWN_FAULT_DRIVERS`]. The fixtures
+    /// one fault batch spawns, which devmgr's driver death queue reserves
+    /// room for.
+    pub const TEST_FAULT_DRIVERS: usize = 3;
 
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
@@ -1754,8 +1790,9 @@ pub mod devmgr_labels
     /// holds the bit. Disjoint position from the other authority bits.
     pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
     /// TODO(#165): remove with the test labels. Authority bit gating
-    /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`], and
-    /// [`TEST_QUERY_DENY_DEVICE`]. svcmgr mints it,
+    /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
+    /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`], and
+    /// [`TEST_QUERY_FAULT_DEVICE`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
@@ -1768,6 +1805,31 @@ pub mod devmgr_labels
     /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
     /// Disjoint position from the other authority bits.
     pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
+}
+
+/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_FAULT_DRIVERS`. The
+/// `test-fault` fixture driver's bootstrap mode word and service labels.
+///
+/// The fixture's first bootstrap round carries its mode in `data[0]`. On its
+/// service endpoint it answers [`FAULT_PING`] with `SUCCESS`, and
+/// [`FAULT_EXIT`] with `SUCCESS` before it receives nothing more and exits
+/// once [`FAULT_EXIT_DELAY_MS`] has passed, so a call sent on the endpoint
+/// after the reply stays queued until devmgr withdraws the dead fixture.
+/// Every request carries no data; no badge bit is checked.
+pub mod test_fault_labels
+{
+    /// Mode word: set up, report `DRIVER_READY`, and serve.
+    pub const MODE_READY: u64 = 0;
+    /// Mode word: neither report ready nor exit; sleep until destroyed.
+    pub const MODE_NEVER_READY: u64 = 1;
+    /// Reply `SUCCESS`.
+    pub const FAULT_PING: u64 = 1;
+    /// Reply `SUCCESS`, then exit after [`FAULT_EXIT_DELAY_MS`] without
+    /// receiving again.
+    pub const FAULT_EXIT: u64 = 2;
+    /// How long the fixture waits between its `FAULT_EXIT` reply and its
+    /// exit, so the caller's next call is queued before the fixture dies.
+    pub const FAULT_EXIT_DELAY_MS: u64 = 200;
 }
 
 /// Report a driver's device set up to devmgr: [`devmgr_labels::DRIVER_READY`]

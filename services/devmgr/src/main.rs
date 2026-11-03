@@ -101,14 +101,16 @@ fn main() -> !
     let mut catalog = DeviceCatalog::default();
 
     // Every driver this boot can spawn, each at most once: one per
-    // virtio-blk and virtio-input device, and the simple-device drivers. The
+    // virtio-blk and virtio-input device, the simple-device drivers, and the
+    // test-only fault batch (TODO(#165): drop it with that shim). The
     // watch's death queue is sized to them, so every death observer is
     // funded and no death is dropped.
     let driver_count = devices
         .iter()
         .filter(|d| pci::is_virtio_blk(d) || pci::is_virtio_input(d))
         .count()
-        + SIMPLE_DEVICE_DRIVERS;
+        + SIMPLE_DEVICE_DRIVERS
+        + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count, caps.registry_ep)
     else
     {
@@ -165,6 +167,10 @@ fn main() -> !
     // so timed degrades gracefully to its no-RTC path.
     let mut drivers_dir_cap: u32 = 0;
     let mut on_disk_spawn_attempted: bool = false;
+    // TODO(#165): remove with the test labels. Whether the test-only fault
+    // batch has been spawned: at most once per boot, so the death queue's
+    // reservation for it holds.
+    let mut fault_spawn_attempted: bool = false;
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
     // last TEST_SPAWN_ORPHAN trigger, reported by TEST_ORPHAN_RESULT. 0=not
@@ -489,6 +495,46 @@ fn main() -> !
             }
             // TODO(#165): remove with the test labels. Do not `seraph::log!`
             // here, as in the device queries it mirrors.
+            // TODO(#165): remove with the test labels. Spawn and settle the
+            // fault batch after the ack, as SET_DRIVERS_DIR spawns after its
+            // reply; a query on the fixtures waits in the registry queue
+            // until the settle has ended.
+            ipc::devmgr_labels::TEST_SPAWN_FAULT_DRIVERS =>
+            {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
+                if fault_spawn_attempted || drivers_dir_cap == 0
+                {
+                    reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+                    continue;
+                }
+                fault_spawn_attempted = true;
+                reply_status(ipc::devmgr_errors::SUCCESS, ipc_buf);
+                spawn_test_fault_drivers(
+                    &mut caps,
+                    drivers_dir_cap,
+                    &mut watch,
+                    &mut catalog,
+                    &mut served,
+                    ipc_buf,
+                );
+            }
+            // TODO(#165): remove with the test labels.
+            ipc::devmgr_labels::TEST_QUERY_FAULT_DEVICE =>
+            {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
+                reply_served(
+                    lookup_ordinal(&served.test_fault, &msg),
+                    ipc::devmgr_labels::TEST_DENY_BADGE,
+                    ipc::devmgr_errors::NO_DEVICE,
+                    ipc_buf,
+                );
+            }
             ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE =>
             {
                 if !test_label_admitted(&msg, badge, ipc_buf)
@@ -552,8 +598,9 @@ fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, i
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// TODO(#165): remove with the test labels. Admit a `TEST_SPAWN_ORPHAN`,
-/// `TEST_ORPHAN_RESULT`, or `TEST_QUERY_DENY_DEVICE` request: the badge
+/// TODO(#165): remove with the test labels. Admit a request on a test label
+/// (`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`,
+/// `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`): the badge
 /// carries `TEST_LABEL_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
 /// Otherwise reply the rejection and return `false`.
 fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
@@ -1133,6 +1180,9 @@ enum DriverClass
     Serial,
     Framebuffer,
     Rtc,
+    /// TODO(#165): remove with `TEST_SPAWN_FAULT_DRIVERS`. The `test-fault`
+    /// fixtures of the test-only fault batch.
+    TestFault,
 }
 
 impl DriverClass
@@ -1147,6 +1197,7 @@ impl DriverClass
             Self::Serial => "serial",
             Self::Framebuffer => "framebuffer",
             Self::Rtc => "rtc",
+            Self::TestFault => "test-fault",
         }
     }
 }
@@ -1216,6 +1267,7 @@ struct ServedDrivers
     serial: Served<ServedDriver>,
     framebuffer: Served<ServedDriver>,
     rtc: Served<ServedDriver>,
+    test_fault: Served<ServedDriver>,
 }
 
 impl ServedDrivers
@@ -1229,6 +1281,7 @@ impl ServedDrivers
             DriverClass::Serial => &mut self.serial,
             DriverClass::Framebuffer => &mut self.framebuffer,
             DriverClass::Rtc => &mut self.rtc,
+            DriverClass::TestFault => &mut self.test_fault,
         }
     }
 
@@ -1294,6 +1347,7 @@ impl ServedDrivers
             DriverClass::Serial,
             DriverClass::Framebuffer,
             DriverClass::Rtc,
+            DriverClass::TestFault,
         ]
         {
             if let Some(driver) = self.class_mut(class).withdraw(post.badge)
@@ -1330,17 +1384,24 @@ fn settle_batch(
     watch: &mut settle::DriverWatch,
     catalog: &DeviceCatalog,
     served: &mut ServedDrivers,
+    bound: core::time::Duration,
     ipc_buf: *mut u64,
 )
 {
-    let end = batch.settle(watch, &mut roster, catalog, ipc_buf, &mut |post| {
-        served.withdraw_dead(post);
-    });
+    let mut on_other_death = |post| served.withdraw_dead(post);
+    let end = batch.settle(
+        watch,
+        &mut roster,
+        catalog,
+        ipc_buf,
+        &mut on_other_death,
+        bound,
+    );
     if end == firmware::roster::SettleEnd::TimedOut
     {
         std::os::seraph::log!(
-            "settle: bound of {} s elapsed with drivers pending",
-            settle::SETTLE_TIMEOUT.as_secs()
+            "settle: bound of {} ms elapsed with drivers pending",
+            u64::try_from(bound.as_millis()).unwrap_or(u64::MAX)
         );
     }
     drop(batch);
@@ -1401,7 +1462,15 @@ fn spawn_boot_drivers(
         ipc_buf,
     );
     spawn_framebuffer(caps, &batch, death_eq, &mut roster, catalog, ipc_buf);
-    settle_batch(batch, roster, watch, catalog, served, ipc_buf);
+    settle_batch(
+        batch,
+        roster,
+        watch,
+        catalog,
+        served,
+        settle::SETTLE_TIMEOUT,
+        ipc_buf,
+    );
 }
 
 /// Spawn a `VirtIO` block driver for every virtio-blk device that gets a
@@ -1763,7 +1832,15 @@ fn spawn_on_disk_drivers(
             record_spawned(&mut roster, spawned, ipc_buf);
         }
     }
-    settle_batch(batch, roster, watch, catalog, served, ipc_buf);
+    settle_batch(
+        batch,
+        roster,
+        watch,
+        catalog,
+        served,
+        settle::SETTLE_TIMEOUT,
+        ipc_buf,
+    );
 }
 
 /// Spawn the on-disk virtio-input driver for one stashed device into the
@@ -2185,6 +2262,124 @@ fn spawn_rtc_from_disk(
         priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
     };
     spawn_simple_into(DriverClass::Rtc, &config, &slots, roster, ipc_buf);
+}
+
+/// TODO(#165): remove with the devmgr enumeration redesign.
+///
+/// Spawn and settle the test-only fault batch: three `test-fault` fixtures
+/// from `/services/drivers/`, two that report ready and one that never does,
+/// in one settle batch bounded by `TEST_FAULT_SETTLE_TIMEOUT_MS`, served as
+/// the `TestFault` class. svctest observes the never-ready fixture withdrawn
+/// and destroyed at the bound, then makes a served one die and observes its
+/// withdrawal and tombstone.
+fn spawn_test_fault_drivers(
+    caps: &mut caps::DevmgrCaps,
+    drivers_dir_cap: u32,
+    watch: &mut settle::DriverWatch,
+    catalog: &mut DeviceCatalog,
+    served: &mut ServedDrivers,
+    ipc_buf: *mut u64,
+)
+{
+    use ipc::test_fault_labels::{MODE_NEVER_READY, MODE_READY};
+
+    let Some(batch) = settle::SettleBatch::new()
+    else
+    {
+        std::os::seraph::log!("test-fault: no settle batch; no fixture spawned");
+        return;
+    };
+    let mut roster = Roster::new();
+    let death_eq = watch.death_eq();
+    for mode in [MODE_READY, MODE_READY, MODE_NEVER_READY]
+    {
+        spawn_one_test_fault(
+            caps,
+            drivers_dir_cap,
+            mode,
+            &batch,
+            death_eq,
+            &mut roster,
+            catalog,
+            ipc_buf,
+        );
+    }
+    let bound = core::time::Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
+    settle_batch(batch, roster, watch, catalog, served, bound, ipc_buf);
+}
+
+/// TODO(#165): remove with [`spawn_test_fault_drivers`]. Spawn one
+/// `test-fault` fixture in `mode` into the settle `batch`, recording it in
+/// `roster`; its hardware cap is a throwaway endpoint, since the fixture
+/// drives no device.
+// too_many_arguments: the fixture's mode, the batch's objects, and the
+// roster are each consumed per spawn, as for the production spawns.
+#[allow(clippy::too_many_arguments)]
+fn spawn_one_test_fault(
+    caps: &caps::DevmgrCaps,
+    drivers_dir_cap: u32,
+    mode: u64,
+    batch: &settle::SettleBatch,
+    death_eq: u32,
+    roster: &mut Roster<SpawnedDriver>,
+    catalog: &mut DeviceCatalog,
+    ipc_buf: *mut u64,
+)
+{
+    if roster.try_reserve_one().is_err()
+    {
+        std::os::seraph::log!("test-fault: no memory to record a fixture; not spawned");
+        return;
+    }
+    let Some(device_badge) = catalog.add_without_info()
+    else
+    {
+        std::os::seraph::log!("test-fault: catalog entry not added; not spawned");
+        return;
+    };
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let Some(walked) = (unsafe {
+        ns_client::walk_to_file(drivers_dir_cap, b"test-fault", requested_rights, ipc_buf)
+    })
+    else
+    {
+        std::os::seraph::log!("test-fault: walk_to_file failed (binary missing on rootfs)");
+        return;
+    };
+    let Some(slots) = SimpleDeviceSlots::new("test-fault", device_badge, batch)
+    else
+    {
+        let _ = syscall::cap_delete(walked.file_cap);
+        return;
+    };
+    let Some(hw_cap) = create_service_endpoint()
+    else
+    {
+        std::os::seraph::log!("test-fault: no placeholder hardware cap");
+        let _ = syscall::cap_delete(walked.file_cap);
+        slots.release();
+        return;
+    };
+    let words = [mode];
+    let config = spawn::SimpleSpawnConfig {
+        procmgr_ep: caps.procmgr_ep,
+        bootstrap_ep: caps.self_bootstrap_ep,
+        source: spawn::CreateSource::File {
+            file_cap: walked.file_cap,
+            size: walked.size,
+        },
+        service_ep: slots.service_ep,
+        hw_cap,
+        irq_cap: 0,
+        query_ep: slots.query_ep,
+        death_eq: Some(death_eq),
+        device_badge,
+        round1_words: &words,
+        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
+    };
+    spawn_simple_into(DriverClass::TestFault, &config, &slots, roster, ipc_buf);
 }
 
 /// TODO(#165): remove with the devmgr enumeration redesign.

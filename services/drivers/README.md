@@ -36,6 +36,11 @@ services/drivers/
 │   └── src/
 │       ├── main.rs
 │       └── arch/                   # Per-arch UART access (x86_64 COM1, riscv64 NS16550)
+├── test-fault/                     # Test-only fault-injection driver for devmgr settle (binary)
+│   ├── Cargo.toml
+│   ├── README.md
+│   └── src/
+│       └── main.rs
 ├── test-orphan/                    # Test-only fault-injection driver for devmgr (binary)
 │   ├── Cargo.toml
 │   ├── README.md
@@ -127,6 +132,7 @@ The full driver lifecycle is specified in
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
+| [`test-fault/`](test-fault/README.md) | Binary | Test-only fault-injection driver — reports ready and dies on request, or never reports ready, so svctest exercises devmgr's settle bound and driver withdrawal |
 | [`test-orphan/`](test-orphan/README.md) | Binary | Test-only fault-injection driver — forces a mid-bootstrap spawn failure so svctest exercises devmgr's orphan-teardown path |
 
 ---

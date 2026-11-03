@@ -246,7 +246,8 @@ impl SettleBatch
     }
 
     /// Serve the batch's drivers until `roster` is settled (every driver
-    /// has called `DRIVER_READY` or died) or [`SETTLE_TIMEOUT`] elapses, then
+    /// has called `DRIVER_READY` or died) or `bound` elapses ([`SETTLE_TIMEOUT`]
+    /// for every production batch), then
     /// take every death still queued; a death post naming no driver of the
     /// batch goes to `on_other_death`. Returns how the settle ended. A
     /// wait-set failure ends the settle early, logged, and the drivers still
@@ -259,6 +260,7 @@ impl SettleBatch
         catalog: &DeviceCatalog,
         ipc_buf: *mut u64,
         on_other_death: &mut dyn FnMut(DeathPost),
+        bound: Duration,
     ) -> SettleEnd
     {
         let reopen = watch.registry_open;
@@ -269,7 +271,7 @@ impl SettleBatch
         }
         let end = if syscall::wait_set_add(watch.wait_set, self.driver_ep, WS_BADGE_DRIVER).is_ok()
         {
-            let timer = Timer::arm(watch.wait_set);
+            let timer = Timer::arm(watch.wait_set, bound);
             let mut events = BatchEvents {
                 batch: self,
                 watch,
@@ -309,7 +311,7 @@ impl Drop for SettleBatch
 }
 
 /// A settle's bound: a notification in the wait set that a timer thread
-/// signals once [`SETTLE_TIMEOUT`] has elapsed. The thread holds its own
+/// signals once the settle's bound has elapsed. The thread holds its own
 /// copy of the notification and deletes it after signalling, so a signal
 /// after the settle has ended reaches an object no wait set holds, and the
 /// thread never touches a slot devmgr may have reused.
@@ -324,7 +326,7 @@ impl Timer
     /// Create the notification, add it to `wait_set`, and start the timer
     /// thread. Returns `None`, logged and with what it created released,
     /// when any step fails; the settle then has no bound.
-    fn arm(wait_set: u32) -> Option<Self>
+    fn arm(wait_set: u32, bound: Duration) -> Option<Self>
     {
         let Some(sig) = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,
@@ -349,7 +351,7 @@ impl Timer
             return None;
         };
         let spawned = std::thread::Builder::new().spawn(move || {
-            std::thread::sleep(SETTLE_TIMEOUT);
+            std::thread::sleep(bound);
             let _ = syscall::notification_send(copy, 1);
             let _ = syscall::cap_delete(copy);
         });

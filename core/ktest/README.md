@@ -224,6 +224,14 @@ step a scaled count's placements across the whole CPU range (`stress::rotation_s
 `concurrent_ipc` logs the cycles it has done at most every 10 s, so a long run of it at a wide CPU
 count is not silent.
 
+The boundary runs measure the scaling rather than assume it: they save their logs, and
+`cargo xtask ktest-timing` reports each cell's wall time between its start line and its `PASS` or
+`FAIL` line, the ratio of its x86_64 128-vCPU time to its 16-vCPU time against the width factor
+(8), and each width's times against a checked-in baseline of that width
+([docs/testing.md § Coverage tiers](../../docs/testing.md#coverage-tiers), Timing report). A
+cell whose time grows faster than the width shows there before it outlives a budget; the report
+flags it and blocks nothing until its threshold is made a gate.
+
 For the same reason, the wall-clock bounds and budgets listed here, each of whose expiry fails a
 test, apply through `scaled_bound` (`src/main.rs`), or through `scaled_polls` for a `u32` count of
 1 ms polls: as written up to 16 CPUs, so the tight budgets the CI widths check are unchanged, and

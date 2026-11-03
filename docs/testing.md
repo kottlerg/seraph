@@ -398,18 +398,21 @@ changed line that names one of these items as a whole identifier or lies within 
 (its attributes, signature, fields, or body):
 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
-- per-CPU storage: `alloc_zeroed_slab`, and the definition of every function that calls it (the
-  per-CPU storage initialisers; a call to one is on the surface only when it names another listed
-  item, as a call to an `init_ap_*` initialiser does); every `init_storage` and
-  `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
-  one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
-  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
-  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, and `TlbShootdownRequest` (`git grep -n -E
-  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the single-slot
-  entropy pool slab, which is not per-CPU). A change that alters an element type's size is on the
-  surface whether it edits the type's own fields or a type or constant the element holds by value
-  (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
+- per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`), and the
+  definition of every function that calls `alloc_zeroed_slab` (the per-CPU storage initialisers; a
+  call to one is on the surface only when it names another listed item, as a call to an `init_ap_*`
+  initialiser does), except `frame_map::init` and `init_cspace_registry`, which size RAM tables
+  through it and are on the memory surface instead; every `init_storage` and `init_per_cpu_storage`,
+  which take the boot CPU count and size per-CPU storage from it (a call to one names it, so a
+  change to the count it passes is on the surface); `kernel_reserve_pages` (the CPU-scaled kernel
+  reserve); and the element types of the per-CPU arrays and slabs, today `PerCpuData`,
+  `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`,
+  `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
+  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the slabs that
+  are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk tables of
+  `frame_map::init` and `init_cspace_registry`). A change that alters an element type's size is on
+  the surface whether it edits the type's own fields or a type or constant the element holds by
+  value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
   `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
   for the idle stacks);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
@@ -442,8 +445,9 @@ changes. The second prints every file header of the diff and every line, changed
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it: the
-set is owed when a non-inert changed line lies within that function, read in the widened hunk. The
+hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it
+(except `frame_map::init` and `init_cspace_registry`, which the memory surface covers): the set is
+owed when a non-inert changed line lies within that function, read in the widened hunk. The
 screen finds named items and changes inside their definitions; it does not follow a size
 change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
 constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
@@ -456,9 +460,9 @@ B=$(git merge-base <head> origin/master)
 git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
     core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
     'core/kernel/src/arch/*/ap_trampoline.rs'
-S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
+S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
-S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|TlbShootdownRequest|CpuTopology"
+S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
 S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
@@ -559,19 +563,21 @@ guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
 `core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
 within the definition of, one of these items: the boot memory map and the direct map
 (`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
-`init_kernel_page_tables`, and `BOOT_TABLE_POOL_SIZE`), and the drain of RAM into Memory caps
+`init_kernel_page_tables`, `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve,
+`stage2_table_bound` and `find_boot_table_carve`), and the drain of RAM into Memory caps
 (`drain_and_install_seed`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
-`frame_map::init`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
+`frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
 boundary one does:
 
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
-M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed"
+M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
+M="$M|drain_and_install_seed"
 M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
-M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|CHUNK_ORDER"
+M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
@@ -647,11 +653,11 @@ list as the tracking Issues move):
 - x86_64 > 256 CPUs ([#376](https://github.com/kottlerg/seraph/issues/376),
   fixed): the per-CPU boot slabs (`AP_IST_STACKS`, `AP_TSS`) exceeded the
   buddy allocator's old `MAX_ORDER = 10` single-allocation cap (4 MiB) at
-  257+ CPUs, failing Phase 4 regardless of guest memory size. `MAX_ORDER`
-  is now 11 (8 MiB — exactly `AP_IST_STACKS` at `MAX_CPUS = 512`), with
-  compile-time asserts at the slab consumer sites so the envelope breaks
-  the build, not the boot. No local run boots past 128 vCPUs; the residual
-  entry below states what covers the widths past it.
+  257+ CPUs, failing Phase 4 regardless of guest memory size. A per-CPU slab
+  may now span several buddy blocks (`alloc_zeroed_slab` through
+  `BuddyAllocator::alloc_contiguous`), so no block size caps the CPU count.
+  No local run boots past 128 vCPUs; the residual entry below states what
+  covers the widths past it.
 - riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377),
   fixed): boot died in UEFI (`ConvertPages: Incompatible memory types`) while
   loading the kernel ELF, because the bootloader requested the image at a fixed
@@ -673,15 +679,16 @@ list as the tracking Issues move):
 - Both arches, widths past 128 CPUs (residual): the boundary set stops at 128,
   so no local run exercises x2APIC destinations above APIC id 255, threshold
   effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
-  with the width), or the runtime sizing of the per-CPU slabs past 128 (the
-  block order `alloc_zeroed_slab` computes, which no host test reaches,
+  with the width), or the runtime sizing of the per-CPU slabs past 128 (each
+  slab's byte count at the wider widths,
   [#698](https://github.com/kottlerg/seraph/issues/698)). What covers
   `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
-  (`core/kernel/src/cpu_mask.rs`), the compile-time asserts that the
-  `AP_IST_STACKS` slab (`core/kernel/src/arch/x86_64/ap_trampoline.rs`) and the
-  `AP_TSS` slab (`core/kernel/src/arch/x86_64/gdt.rs`) each fit one buddy block
-  at `MAX_CPUS`, the 65-hart boot for the first mask-word crossing, and the
-  128-CPU boots for two full words.
+  (`core/kernel/src/cpu_mask.rs`), the host tests of
+  `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
+  past one block, a run that cannot be found, and requests of one block or
+  less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
+  (`sched::slab_pages`), the 65-hart boot for the first mask-word crossing,
+  and the 128-CPU boots for two full words.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

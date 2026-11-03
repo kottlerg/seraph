@@ -24,6 +24,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::sched::MAX_CPUS;
 
 /// Number of 64-bit words needed to cover every CPU index in `[0, MAX_CPUS)`.
+///
+/// Every mask is this wide whatever the boot CPU count, and is held by value in
+/// each `AddressSpace` and TLB-shootdown request: 64 B at today's 512. That is
+/// paid while `MAX_CPUS` is the inline `BootInfo.cpu_ids` bound. When that bound
+/// goes (the boot ABI moving `cpu_ids` out of `BootInfo`), the masks take a
+/// per-boot width, `cpu_count.div_ceil(64)` words, held in storage sized with
+/// their object, so a mask costs only the CPUs booted. A hierarchical mask is
+/// not the design: it still fixes a maximum, and adds a level to every bit test
+/// on the shootdown and context-switch paths.
 pub const CPU_MASK_WORDS: usize = MAX_CPUS.div_ceil(64);
 
 /// Map a CPU index to its `(word, bit)` position.

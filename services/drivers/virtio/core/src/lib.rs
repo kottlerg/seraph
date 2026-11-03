@@ -386,7 +386,7 @@ mod tests
         // and each region sits at its own BAR's window offset.
         let layout = layout_of([
             cap(4, 0, 0x38),
-            cap(2, 0, 0x1000),
+            cap(2, 0, 0x100),
             cap(4, 0x1000, 4),
             cap(4, 0x2000, 8),
         ])
@@ -403,8 +403,9 @@ mod tests
             (layout.common, layout.notify, layout.isr, layout.device),
             (0x1000, 0, 0x2000, 0x3000)
         );
-        // The doorbell bound is the notification region's own length.
-        assert_eq!(layout.notify_len, 0x1000);
+        // The doorbell bound is the notification region's own length, not
+        // the span of the page its BAR maps.
+        assert_eq!(layout.notify_len, 0x100);
     }
 
     #[test]

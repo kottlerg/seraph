@@ -7,9 +7,9 @@
 //!
 //! Provides the modern PCI transport, virtqueue management, device negotiation,
 //! the startup message format used by devmgr to pass PCI capability info
-//! to `VirtIO` drivers, the register layout a driver maps every BAR it names
-//! by ([`RegisterLayout`]), and the devmgr-to-driver bootstrap rounds
-//! ([`bootstrap`]).
+//! to `VirtIO` drivers, the register layout by which a driver maps every BAR
+//! the register regions name ([`RegisterLayout`]), and the devmgr-to-driver
+//! bootstrap rounds ([`bootstrap`]).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -173,6 +173,7 @@ impl VirtioPciStartupInfo
             notify: 0,
             isr: 0,
             device: 0,
+            notify_len: u64::from(self.notify_cfg.length),
             notify_off_multiplier: self.notify_off_multiplier,
         };
         layout.common = layout.region_offset(&self.common_cfg);
@@ -227,6 +228,9 @@ pub struct RegisterLayout
     pub isr: u64,
     /// Window offset of the device-specific configuration region.
     pub device: u64,
+    /// Length in bytes of the notification region; every queue's doorbell
+    /// must lie inside it ([`pci::doorbell_fits`]).
+    pub notify_len: u64,
     /// Multiplier for queue-specific notification offsets.
     pub notify_off_multiplier: u32,
 }

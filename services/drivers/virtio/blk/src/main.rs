@@ -393,6 +393,11 @@ fn setup_virtqueue(
 
     // Save notification offset for this queue before changing selection.
     let queue_notify_off = transport.queue_notify_off();
+    if !transport.doorbell_in_region(queue_notify_off)
+    {
+        std::os::seraph::log!("queue doorbell outside the notification region");
+        syscall::thread_exit();
+    }
 
     let desc_size = virtqueue::desc_table_size(queue_size);
     let used_off = virtqueue::used_ring_offset(queue_size);

@@ -61,6 +61,8 @@ pub struct PciTransport
     notify_off: u64,
     isr_off: u64,
     device_off: u64,
+    /// Length of the notification region, which bounds every doorbell.
+    notify_len: u64,
     notify_off_multiplier: u32,
 }
 
@@ -79,6 +81,18 @@ pub fn notify_addr_offset(notify_off: u64, queue_notify_off: u16, notify_off_mul
     notify_off + u64::from(queue_notify_off) * u64::from(notify_off_multiplier)
 }
 
+/// Whether a queue's 16-bit doorbell, `queue_notify_off` scaled by
+/// `notify_off_multiplier` into the notification region, lies inside the
+/// region's `notify_len` bytes, as `VirtIO` 1.2 §4.1.4.4 requires of the
+/// device (`cap.length >= queue_notify_off * notify_off_multiplier + 2`).
+/// In the multi-BAR register window a doorbell past the region could
+/// otherwise reach another region or another BAR's mapping.
+#[must_use]
+pub fn doorbell_fits(queue_notify_off: u16, notify_off_multiplier: u32, notify_len: u64) -> bool
+{
+    u64::from(queue_notify_off) * u64::from(notify_off_multiplier) + 2 <= notify_len
+}
+
 impl PciTransport
 {
     /// Create a PCI transport over a register window mapped as `layout`
@@ -95,6 +109,7 @@ impl PciTransport
             notify_off: layout.notify,
             isr_off: layout.isr,
             device_off: layout.device,
+            notify_len: layout.notify_len,
             notify_off_multiplier: layout.notify_off_multiplier,
         }
     }
@@ -163,6 +178,20 @@ impl PciTransport
         self.read_common_u16(0x1E)
     }
 
+    /// Whether the doorbell of a queue with `queue_notify_off` lies inside
+    /// the notification region ([`doorbell_fits`]). A driver checks it once
+    /// at queue setup and refuses the device otherwise; [`notify`](Self::notify)
+    /// writes no doorbell that fails it.
+    #[must_use]
+    pub fn doorbell_in_region(&self, queue_notify_off: u16) -> bool
+    {
+        doorbell_fits(
+            queue_notify_off,
+            self.notify_off_multiplier,
+            self.notify_len,
+        )
+    }
+
     /// Set descriptor table physical address (low 32 bits).
     pub fn queue_set_desc_lo(&self, addr: u32)
     {
@@ -216,8 +245,15 @@ impl PciTransport
     /// intermittent hangs at `cpus>1` on RISC-V, where the required ordering
     /// is not implicit and raw `write_volatile` is the `writel_relaxed`
     /// analogue.
+    ///
+    /// A doorbell outside the notification region
+    /// ([`doorbell_in_region`](Self::doorbell_in_region)) is not written.
     pub fn notify(&self, queue_idx: u16, queue_notify_off: u16)
     {
+        if !self.doorbell_in_region(queue_notify_off)
+        {
+            return;
+        }
         mmio::dma_to_mmio_barrier();
 
         let offset = notify_addr_offset(
@@ -226,7 +262,8 @@ impl PciTransport
             self.notify_off_multiplier,
         );
         let addr = (self.window_va + offset) as *mut u16;
-        // SAFETY: notification region is within its BAR's mapping; addr is
+        // SAFETY: the doorbell lies inside the notification region (checked
+        // above), which is within its BAR's mapping; addr is
         // naturally aligned (notify_off and multiplier are set by the device
         // to maintain u16 alignment per VirtIO 1.2 §4.1.4.4).
         #[allow(clippy::cast_ptr_alignment)]
@@ -433,5 +470,17 @@ mod tests
         // A zero multiplier collapses every queue onto notify_off: the queue
         // term must be multiplied, not added.
         assert_eq!(notify_addr_offset(0x3000, 2, 0), 0x3000);
+    }
+
+    #[test]
+    fn a_doorbell_fits_only_with_its_two_bytes_inside_the_region()
+    {
+        // 0x3FF * 4 = 0xFFC: the 16-bit doorbell ends at 0xFFE, inside.
+        assert!(doorbell_fits(0x3FF, 4, 0x1000));
+        // 0x400 * 4 = 0x1000: the doorbell starts at the region's end.
+        assert!(!doorbell_fits(0x400, 4, 0x1000));
+        // A zero multiplier puts every doorbell at the region's start.
+        assert!(doorbell_fits(0xFFFF, 0, 2));
+        assert!(!doorbell_fits(0, 4, 1));
     }
 }

@@ -118,9 +118,10 @@ For each matched device, devmgr:
    notification, ISR, and device-configuration regions name, at most four,
    in ascending BAR index, each sized to the pages the regions in it reach.
    The scan (`firmware::scan`) takes, for each type, the first structure in
-   the capability list that lies in one of the device's MMIO BARs (VirtIO 1.2
-   § 4.1.4.1), skipping a later structure of a type already located, one in
-   an I/O BAR, and one naming a reserved BAR index. A device left with no
+   the capability list that lies wholly inside one of the device's MMIO BARs
+   (VirtIO 1.2 § 4.1.4.1), skipping a later structure of a type already
+   located, one in an I/O BAR, one naming a reserved BAR index, and one
+   reaching past its BAR's end. A device left with no
    region of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
    block or input device) is refused, logged.
 2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided

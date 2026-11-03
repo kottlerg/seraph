@@ -293,11 +293,12 @@ fn record_bar(dev: &mut PciDevice, bar_idx: u8, phys: u64, size: u64, is_mmio: b
 /// locations of its four register regions.
 ///
 /// A device may present several structures of one type. Each type takes the
-/// first one in list order that lies in one of the device's MMIO BARs, the
-/// only BARs a driver maps (`VirtIO` 1.2 § 4.1.4.1: the driver SHOULD use the
-/// first instance of each type it can support, and MUST ignore one naming a
-/// reserved BAR index). A later structure of a type already located, an
-/// I/O-BAR structure, and one naming no probed BAR are skipped.
+/// first one in list order that lies wholly inside one of the device's MMIO
+/// BARs, the only BARs a driver maps (`VirtIO` 1.2 § 4.1.4.1: the driver
+/// SHOULD use the first instance of each type it can support, and MUST
+/// ignore one naming a reserved BAR index). A later structure of a type
+/// already located, an I/O-BAR structure, one naming no probed BAR, and one
+/// reaching past its BAR's end are skipped.
 fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 {
     let (b, d, f) = (dev.bus, dev.dev, dev.func);
@@ -324,7 +325,7 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
                 length: cfg.read32(b, d, f, ptr + 12),
             };
             let ty = cfg.read8(b, d, f, ptr + 3);
-            let usable = names_mmio_bar(dev, loc.bar);
+            let usable = fits_mmio_bar(dev, &loc);
             let info = &mut dev.virtio_info;
             let slot = match ty
             {
@@ -350,11 +351,14 @@ fn read_virtio_pci_caps(cfg: &impl ConfigSpace, dev: &mut PciDevice)
     }
 }
 
-/// Whether `bar` (a `VirtIO` capability's BAR index) names one of `dev`'s
-/// probed MMIO BARs. A reserved index (above 5) names none.
-fn names_mmio_bar(dev: &PciDevice, bar: u8) -> bool
+/// Whether the `VirtIO` structure at `loc` lies wholly inside one of `dev`'s
+/// probed MMIO BARs: its BAR index names one (a reserved index, above 5,
+/// names none) and its offset plus length is within that BAR's size.
+fn fits_mmio_bar(dev: &PciDevice, loc: &VirtioCapLocation) -> bool
 {
-    (0..dev.bar_count).any(|i| dev.bar_pci_idx[i] == bar && dev.bar_is_mmio[i])
+    let reach = u64::from(loc.offset) + u64::from(loc.length);
+    (0..dev.bar_count)
+        .any(|i| dev.bar_pci_idx[i] == loc.bar && dev.bar_is_mmio[i] && reach <= dev.bar_size[i])
 }
 
 /// Check if a PCI device is a `VirtIO` block device.
@@ -631,6 +635,8 @@ mod tests
                 // Notify in the I/O BAR first: skipped for the MMIO one.
                 (2, 1, 0, 4),
                 (2, 4, 0x3000, 0x1000),
+                // ISR reaching one byte past the 16 KiB BAR 4: skipped.
+                (3, 4, 0x3FFD, 4),
                 (3, 4, 0x1000, 4),
                 // Device configuration naming reserved BAR 7 first: skipped.
                 (4, 7, 0, 8),
@@ -640,6 +646,9 @@ mod tests
                 (1, 2, 0x100, 0x38),
             ],
         );
+        // The skipped I/O-BAR notify structure (the second, at 0x54) carries
+        // multiplier 8; the selected one carries the helper's 4.
+        space.set32(bdf, 0x54 + 16, 8);
         space.set_bar(bdf, 1, 0xC041, !0x1F & !0x3);
         mmio_bar(&space, bdf, 2, 0xFEC0_0000);
         mmio_bar(&space, bdf, 4, 0xFEC1_0000);
@@ -649,6 +658,7 @@ mod tests
         assert_eq!(at(info.notify_cfg), (4, 0x3000, 0x1000));
         assert_eq!(at(info.isr_cfg), (4, 0x1000, 4));
         assert_eq!(at(info.device_cfg), (4, 0x2000, 8));
+        assert_eq!(info.notify_off_multiplier, 4);
     }
 
     #[test]
@@ -727,6 +737,7 @@ mod tests
         let space = FakeSpace::default();
         let bdf = (0, 3, 0);
         virtio_with_caps(&space, bdf, &[(1, 4, 0, 0x38)]);
+        mmio_bar(&space, bdf, 4, 0xFEB0_0000);
         space.set32(bdf, 0x04, 0);
         let found = scan_all(&space, 0, 0);
         assert_eq!(found[0].virtio_info.common_cfg.length, 0);

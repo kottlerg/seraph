@@ -666,7 +666,8 @@ list as the tracking Issues move):
   so no local run exercises x2APIC destinations above APIC id 255, threshold
   effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
   with the width), or the runtime sizing of the per-CPU slabs past 128 (the
-  block order `alloc_zeroed_slab` computes, which no host test reaches). What covers
+  block order `alloc_zeroed_slab` computes, which no host test reaches,
+  [#698](https://github.com/kottlerg/seraph/issues/698)). What covers
   `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
   (`core/kernel/src/cpu_mask.rs`), the compile-time asserts that the
   `AP_IST_STACKS` slab (`core/kernel/src/arch/x86_64/ap_trampoline.rs`) and the

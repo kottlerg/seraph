@@ -26,7 +26,8 @@ virtio/input/
 ## Endpoint
 
 Devmgr enumerates the virtio-input PCI device, carves its per-device
-capabilities (BAR MMIO, and an IRQ unless the device shares an `INTx` line), and
+capabilities (an `Mmio` cap for every BAR its VirtIO register regions name, and an
+IRQ unless the device shares an `INTx` line), and
 spawns this driver from the rootfs (`/services/drivers/virtio-input`) — it is not
 bootstrap-essential, so it loads lazily through devmgr's `SET_DRIVERS_DIR` subtree cap,
 like the RTC drivers (see

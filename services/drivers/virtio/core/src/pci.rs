@@ -10,7 +10,7 @@
 
 use core::time::Duration;
 
-use crate::{STATUS_FEATURES_OK, VirtioPciStartupInfo};
+use crate::{RegisterLayout, STATUS_FEATURES_OK};
 
 /// How long [`PciTransport::try_reset`] waits, on the caller's clock, for a
 /// reset to complete. QEMU completes a reset within the status write; the
@@ -48,16 +48,19 @@ pub fn poll_until(
 
 /// Modern PCI transport backed by MMIO-mapped BAR regions.
 ///
-/// The four register regions are located within BAR MMIO mappings at offsets
-/// provided by devmgr via [`VirtioPciStartupInfo`].
+/// The four register regions are reached through the driver's register
+/// window, which maps every BAR they name as a [`RegisterLayout`] lays it
+/// out; each region sits at its window offset, inside its own BAR's
+/// mapping.
 pub struct PciTransport
 {
-    /// Virtual address of the mapped BAR containing common/notify/ISR/device regions.
-    bar_va: u64,
-    common_off: u32,
-    notify_off: u32,
-    isr_off: u32,
-    device_off: u32,
+    /// Virtual address of the register window.
+    window_va: u64,
+    /// Window offsets of the common, notification, ISR, and device regions.
+    common_off: u64,
+    notify_off: u64,
+    isr_off: u64,
+    device_off: u64,
     notify_off_multiplier: u32,
 }
 
@@ -65,32 +68,34 @@ pub struct PciTransport
 /// notification capability region (`VirtIO` 1.2 §4.1.4.4).
 ///
 /// `queue_notify_off` is the per-queue offset the device reports; scaling it
-/// by `notify_off_multiplier` and adding the capability's own `notify_off`
-/// yields the doorbell address. Operands widen to `u64` before the multiply,
-/// matching the address arithmetic in [`PciTransport::notify`].
+/// by `notify_off_multiplier` and adding the notification region's own
+/// offset `notify_off` yields the doorbell's offset. Operands widen to `u64`
+/// before the multiply, matching the address arithmetic in
+/// [`PciTransport::notify`].
 #[must_use]
-pub fn notify_addr_offset(notify_off: u32, queue_notify_off: u16, notify_off_multiplier: u32)
+pub fn notify_addr_offset(notify_off: u64, queue_notify_off: u16, notify_off_multiplier: u32)
 -> u64
 {
-    u64::from(notify_off) + u64::from(queue_notify_off) * u64::from(notify_off_multiplier)
+    notify_off + u64::from(queue_notify_off) * u64::from(notify_off_multiplier)
 }
 
 impl PciTransport
 {
-    /// Create a new PCI transport from a mapped BAR base address and startup info.
+    /// Create a PCI transport over a register window mapped as `layout`
+    /// lays it out.
     ///
-    /// `bar_va` is the virtual address where the BAR is mapped.
-    /// All four capability regions must reside in the same BAR (BAR0).
+    /// `window_va` is the virtual address of the window: the mapping of
+    /// `layout`'s first BAR, followed by each later BAR's.
     #[must_use]
-    pub fn new(bar_va: u64, info: &VirtioPciStartupInfo) -> Self
+    pub fn new(window_va: u64, layout: &RegisterLayout) -> Self
     {
         Self {
-            bar_va,
-            common_off: info.common_cfg.offset,
-            notify_off: info.notify_cfg.offset,
-            isr_off: info.isr_cfg.offset,
-            device_off: info.device_cfg.offset,
-            notify_off_multiplier: info.notify_off_multiplier,
+            window_va,
+            common_off: layout.common,
+            notify_off: layout.notify,
+            isr_off: layout.isr,
+            device_off: layout.device,
+            notify_off_multiplier: layout.notify_off_multiplier,
         }
     }
 
@@ -98,7 +103,7 @@ impl PciTransport
 
     fn common_addr(&self, offset: u32) -> u64
     {
-        self.bar_va + u64::from(self.common_off) + u64::from(offset)
+        self.window_va + self.common_off + u64::from(offset)
     }
 
     /// Read device feature bits (selected by `device_feature_select`).
@@ -220,8 +225,8 @@ impl PciTransport
             queue_notify_off,
             self.notify_off_multiplier,
         );
-        let addr = (self.bar_va + offset) as *mut u16;
-        // SAFETY: notification region is within the mapped BAR; addr is
+        let addr = (self.window_va + offset) as *mut u16;
+        // SAFETY: notification region is within its BAR's mapping; addr is
         // naturally aligned (notify_off and multiplier are set by the device
         // to maintain u16 alignment per VirtIO 1.2 §4.1.4.4).
         #[allow(clippy::cast_ptr_alignment)]
@@ -237,8 +242,8 @@ impl PciTransport
     #[must_use]
     pub fn read_isr(&self) -> u8
     {
-        let addr = (self.bar_va + u64::from(self.isr_off)) as *const u8;
-        // SAFETY: ISR region is within the mapped BAR.
+        let addr = (self.window_va + self.isr_off) as *const u8;
+        // SAFETY: ISR region is within its BAR's mapping.
         unsafe { core::ptr::read_volatile(addr) }
     }
 
@@ -248,8 +253,8 @@ impl PciTransport
     #[must_use]
     pub fn config_read_u32(&self, offset: u32) -> u32
     {
-        let addr = self.bar_va + u64::from(self.device_off) + u64::from(offset);
-        // SAFETY: device cfg region is within the mapped BAR; offset is
+        let addr = self.window_va + self.device_off + u64::from(offset);
+        // SAFETY: device cfg region is within its BAR's mapping; offset is
         // caller-provided and must be u32-aligned.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {

@@ -353,20 +353,6 @@ pub fn is_virtio_input(dev: &PciDevice) -> bool
     dev.vendor_id == VIRTIO_VENDOR && (dev.device_id == 0x1012 || dev.device_id == 0x1052)
 }
 
-/// The BAR index of the first present `VirtIO` register region (one with a
-/// non-zero length) that lies outside the common-configuration region's
-/// BAR, or `None` when every region shares that BAR. A `VirtIO` driver is
-/// delivered one BAR, so a device that names a second one cannot be driven.
-#[must_use]
-pub fn virtio_second_bar(info: &VirtioPciStartupInfo) -> Option<u8>
-{
-    let common = info.common_cfg.bar;
-    [info.notify_cfg, info.isr_cfg, info.device_cfg]
-        .iter()
-        .find(|c| c.length != 0 && c.bar != common)
-        .map(|c| c.bar)
-}
-
 #[cfg(test)]
 mod tests
 {
@@ -605,7 +591,7 @@ mod tests
     }
 
     #[test]
-    fn virtio_capabilities_are_located_and_a_second_bar_is_reported()
+    fn virtio_capabilities_are_located_in_the_bars_they_name()
     {
         let space = FakeSpace::default();
         virtio_with_caps(
@@ -625,8 +611,16 @@ mod tests
             (one.notify_cfg.offset, one.notify_off_multiplier),
             (0x3000, 4)
         );
-        assert_eq!(virtio_second_bar(&one), None);
-        assert_eq!(virtio_second_bar(&found[1].virtio_info), Some(2));
+        assert_eq!(one.notify_cfg.bar, 4);
+        let two = found[1].virtio_info;
+        assert_eq!(
+            (
+                two.common_cfg.bar,
+                two.notify_cfg.bar,
+                two.notify_cfg.length
+            ),
+            (4, 2, 0x1000)
+        );
     }
 
     #[test]

@@ -253,8 +253,8 @@ pub(crate) const THREAD_RETYPE_PAGES: u64 =
 /// shared PML4, under 5-level paging), and ASLR (#39) spreads the four
 /// bootstrap surfaces across distinct 64 GiB window strides — one shared
 /// PDPT plus up to 3 pages per surface (~13 pooled pages) where the
-/// pre-ASLR clustered layout shared one PDPT/PD/PT triple. Larger processes refill via augment-mode
-/// `cap_create_aspace`.
+/// pre-ASLR clustered layout shared one PDPT/PD/PT triple. Larger
+/// processes refill via augment-mode `cap_create_aspace`.
 pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 
 /// Pages requested from memmgr for the child's `CSpace` retype slab.

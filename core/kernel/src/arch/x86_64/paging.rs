@@ -1712,106 +1712,153 @@ mod tests
         assert!(!fault_is_spurious_given(va, false, false, unmapped));
     }
 
-    // ── User-page walk ────────────────────────────────────────────────────────
+    // ── Host page-table frames ────────────────────────────────────────────────
 
     /// A page-table frame on the host heap; its host address stands for its
     /// physical address (host addresses lie below bit 52, so `PHYS_MASK` keeps
-    /// them), and the walk reaches it through an identity `to_virt`.
+    /// them), and the walks reach it through an identity translation.
     #[repr(C, align(4096))]
     struct Table([PageTableEntry; 512]);
 
-    impl Table
+    /// Host frames for the walk and descent tests: each address is taken from
+    /// a `&mut` borrow once its box sits in its final heap place, and the
+    /// tests reach the frames only through those addresses until the boxes
+    /// drop, so a walk may read and a descent write through them (`table_at`
+    /// forms `&mut`).
+    struct Frames
     {
-        fn new() -> Box<Table>
-        {
-            Box::new(Table([PageTableEntry(0); 512]))
-        }
+        _boxes: Vec<Box<Table>>,
+        addrs: Vec<u64>,
+    }
 
-        fn addr(&self) -> u64
-        {
-            core::ptr::from_ref(self) as u64
+    fn frames(count: usize) -> Frames
+    {
+        let mut boxes: Vec<Box<Table>> = (0..count)
+            .map(|_| Box::new(Table([PageTableEntry(0); 512])))
+            .collect();
+        let addrs = boxes
+            .iter_mut()
+            .map(|t| core::ptr::from_mut::<Table>(t) as u64)
+            .collect();
+        Frames {
+            _boxes: boxes,
+            addrs,
         }
     }
 
-    /// A user VA and the path from a root at `depth` to it, root first and the
-    /// PD last; the PD entry is left for the test to fill. Every entry of
-    /// `bait` is a present, user, writable "leaf", so a walk that read a large
-    /// leaf's frame (`bait`) as a page table would return a permitting entry.
-    struct Path
+    /// Write `e` at `index` of the frame at `table`, a `Frames` address.
+    fn set_entry(table: u64, index: usize, e: PageTableEntry)
     {
-        va: u64,
-        top: usize,
-        tables: Vec<Box<Table>>,
-        bait: Box<Table>,
+        // SAFETY: `table` names a live host frame with write provenance
+        // (`Frames`), and no other reference to it is live.
+        unsafe { table_at(table)[index] = e };
     }
 
-    impl Path
+    /// The address of the table `table` refers to.
+    fn addr_of(table: &[PageTableEntry; 512]) -> u64
     {
-        fn pd(&mut self) -> &mut Table
-        {
-            let last = self.tables.len() - 1;
-            &mut self.tables[last]
-        }
-
-        fn pdpt(&mut self) -> &mut Table
-        {
-            let at = self.tables.len() - 2;
-            &mut self.tables[at]
-        }
+        core::ptr::from_ref(table) as u64
     }
+
+    const DEPTHS: [PagingDepth; 2] = [PagingDepth::Four, PagingDepth::Five];
 
     /// The 4-level VA sits below `1 << 47`; the 5-level one above it, with a
     /// non-zero PML5 index, so a walk that skipped the PML5 or read the wrong
     /// bits for it would leave the path.
-    fn path(depth: PagingDepth) -> Path
+    fn va_for(depth: PagingDepth) -> u64
     {
-        let va = match depth
+        match depth
         {
             PagingDepth::Four => 0x7F_4060_3000_u64,
             PagingDepth::Five => 0x00F0_7F40_6060_3000_u64,
-        };
-        let top = depth.levels() - 1;
-        let mut bait = Table::new();
-        let lure = PageTableEntry(PRESENT | USER_BIT | WRITABLE | (bait.addr() & PHYS_MASK));
-        bait.0 = [lure; 512];
-        let mut tables: Vec<Box<Table>> = (1..=top).map(|_| Table::new()).collect();
-        for (i, level) in (2..=top).rev().enumerate()
-        {
-            let child = tables[i + 1].addr();
-            tables[i].0[table_index(level, va)] =
-                PageTableEntry(PageTableEntry::new_table(child).0 | USER_BIT);
         }
-        Path {
+    }
+
+    // ── User-page walk ────────────────────────────────────────────────────────
+
+    /// A user VA and the path from a root at `depth` to it: `top` frames, root
+    /// first and the PD last, each linked to the next at `va`; the PD entry is
+    /// left for the test to fill. Two more frames follow them: the PT, and the
+    /// bait, every entry of which is a present, user, writable "leaf", so a
+    /// walk that read a large leaf's frame (the bait) as a page table would
+    /// return a permitting entry.
+    struct Path
+    {
+        va: u64,
+        top: usize,
+        f: Frames,
+    }
+
+    impl Path
+    {
+        fn root(&self) -> u64
+        {
+            self.f.addrs[0]
+        }
+
+        fn pdpt(&self) -> u64
+        {
+            self.f.addrs[self.top - 2]
+        }
+
+        fn pd(&self) -> u64
+        {
+            self.f.addrs[self.top - 1]
+        }
+
+        fn pt(&self) -> u64
+        {
+            self.f.addrs[self.top]
+        }
+
+        fn bait(&self) -> u64
+        {
+            self.f.addrs[self.top + 1]
+        }
+    }
+
+    fn path(depth: PagingDepth) -> Path
+    {
+        let va = va_for(depth);
+        let top = depth.levels() - 1;
+        let p = Path {
             va,
             top,
-            tables,
-            bait,
+            f: frames(top + 2),
+        };
+        let lure = PageTableEntry(PRESENT | USER_BIT | WRITABLE | (p.bait() & PHYS_MASK));
+        for index in 0..512
+        {
+            set_entry(p.bait(), index, lure);
         }
+        for (i, level) in (2..=top).rev().enumerate()
+        {
+            let child = PageTableEntry(PageTableEntry::new_table(p.f.addrs[i + 1]).0 | USER_BIT);
+            set_entry(p.f.addrs[i], table_index(level, va), child);
+        }
+        p
     }
 
     fn walk(p: &Path) -> Option<PageTableEntry>
     {
-        // SAFETY: every table on the path is a live host `Table`, and the
-        // identity `to_virt` maps each entry's address back to it.
-        unsafe { walk_to_4k_leaf(p.tables[0].addr(), p.top, p.va, |pa| pa) }
+        // SAFETY: every table on the path is a live host frame reached through
+        // its `Frames` address (identity translation), and no reference to
+        // any of them is live while the walk reads.
+        unsafe { walk_to_4k_leaf(p.root(), p.top, p.va, |pa| pa) }
     }
-
-    const DEPTHS: [PagingDepth; 2] = [PagingDepth::Four, PagingDepth::Five];
 
     #[test]
     fn walk_reaches_a_present_4k_leaf_at_either_depth()
     {
         for depth in DEPTHS
         {
-            let mut p = path(depth);
-            let mut pt = Table::new();
+            let p = path(depth);
             let leaf = PageTableEntry(PRESENT | USER_BIT | 0x1234_5000);
-            pt.0[table_index(0, p.va)] = leaf;
-            let va = p.va;
-            p.pd().0[table_index(1, va)] =
-                PageTableEntry(PageTableEntry::new_table(pt.addr()).0 | USER_BIT);
+            set_entry(p.pt(), table_index(0, p.va), leaf);
+            let pt = PageTableEntry(PageTableEntry::new_table(p.pt()).0 | USER_BIT);
+            set_entry(p.pd(), table_index(1, p.va), pt);
             assert_eq!(walk(&p).map(|e| e.0), Some(leaf.0), "{depth:?}");
-            pt.0[table_index(0, p.va)] = PageTableEntry(0);
+            set_entry(p.pt(), table_index(0, p.va), PageTableEntry(0));
             assert!(walk(&p).is_none(), "{depth:?}");
         }
     }
@@ -1824,10 +1871,9 @@ mod tests
         // return the bait's permitting entry.
         for depth in DEPTHS
         {
-            let mut p = path(depth);
-            let (va, bait) = (p.va, p.bait.addr());
-            p.pd().0[table_index(1, va)] =
-                PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (bait & PHYS_MASK));
+            let p = path(depth);
+            let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait() & PHYS_MASK));
+            set_entry(p.pd(), table_index(1, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
         }
     }
@@ -1837,55 +1883,28 @@ mod tests
     {
         for depth in DEPTHS
         {
-            let mut p = path(depth);
-            let (va, bait) = (p.va, p.bait.addr());
-            p.pdpt().0[table_index(2, va)] =
-                PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (bait & PHYS_MASK));
+            let p = path(depth);
+            let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait() & PHYS_MASK));
+            set_entry(p.pdpt(), table_index(2, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
         }
     }
 
     // ── Level descent ─────────────────────────────────────────────────────────
 
-    /// Host frames for a descent: each address is taken from a `&mut` borrow
-    /// once its box sits in its final heap place, and the tests reach the
-    /// frames only through those addresses until the boxes drop, so a descent
-    /// may write through them (`table_at` forms `&mut`).
-    struct Frames
+    /// An `ensure` for `descend_alloc` that hands out `addrs` in order, one per
+    /// absent entry it is handed, linking each into that entry; `handed`
+    /// counts the frames handed out.
+    fn hand_out<'a>(
+        addrs: &'a [u64],
+        handed: &'a mut usize,
+    ) -> impl FnMut(&mut PageTableEntry) -> Result<u64, ()> + 'a
     {
-        _boxes: Vec<Box<Table>>,
-        addrs: Vec<u64>,
-    }
-
-    fn frames(count: usize) -> Frames
-    {
-        let mut boxes: Vec<Box<Table>> = (0..count).map(|_| Table::new()).collect();
-        let addrs = boxes
-            .iter_mut()
-            .map(|t| core::ptr::from_mut::<Table>(t) as u64)
-            .collect();
-        Frames {
-            _boxes: boxes,
-            addrs,
-        }
-    }
-
-    /// The address of the table `table` refers to.
-    fn addr_of(table: &[PageTableEntry; 512]) -> u64
-    {
-        core::ptr::from_ref(table) as u64
-    }
-
-    /// Hands out `addrs` in order as the child tables of absent entries,
-    /// linking each into the entry it is handed; counts the tables handed out.
-    fn hand_out(addrs: &[u64]) -> impl FnMut(&mut PageTableEntry) -> Result<u64, ()> + '_
-    {
-        let mut next = 0;
         move |e: &mut PageTableEntry| {
             if !e.is_present()
             {
-                *e = PageTableEntry::new_table(addrs[next]);
-                next += 1;
+                *e = PageTableEntry::new_table(addrs[*handed]);
+                *handed += 1;
             }
             Ok(e.phys_addr())
         }
@@ -1896,9 +1915,18 @@ mod tests
     fn link_to_pd(f: &Frames, depth: PagingDepth, va: u64) -> u64
     {
         let top = depth.levels() - 1;
+        let mut handed = 0;
         // SAFETY: every address names a live, zeroed host frame with write
         // provenance (`Frames`), and the identity addresses are their VAs.
-        let pd = unsafe { descend_alloc(f.addrs[0], va, top, 1, hand_out(&f.addrs[1..top])) };
+        let pd = unsafe {
+            descend_alloc(
+                f.addrs[0],
+                va,
+                top,
+                1,
+                hand_out(&f.addrs[1..top], &mut handed),
+            )
+        };
         pd.map(|t| addr_of(t)).unwrap()
     }
 
@@ -1908,12 +1936,13 @@ mod tests
         for depth in DEPTHS
         {
             let top = depth.levels() - 1;
-            let va = path(depth).va;
-            // The root plus one table per level below it, and one spare that a
-            // descent allocating too many tables would take.
+            let va = va_for(depth);
+            // The root plus one table per level below it, and one spare, so a
+            // descent that allocated too many tables is counted, not stopped.
             let f = frames(top + 2);
             let children = &f.addrs[1..];
-            let mut ensure = hand_out(children);
+            let mut handed = 0;
+            let mut ensure = hand_out(children, &mut handed);
             // SAFETY: as in `link_to_pd`.
             let pt =
                 unsafe { descend_alloc(f.addrs[0], va, top, 0, &mut ensure) }.map(|t| addr_of(t));
@@ -1921,30 +1950,27 @@ mod tests
             let again =
                 unsafe { descend_alloc(f.addrs[0], va, top, 0, &mut ensure) }.map(|t| addr_of(t));
             drop(ensure);
-            // The PT is the last of the `top` tables handed out, and the second
-            // descent built none.
+            // One table per level below the root, all by the first descent:
+            // the PT is the last of them, and the second descent built none.
+            assert_eq!(handed, top, "{depth:?}");
             assert_eq!(pt, Ok(children[top - 1]), "{depth:?}");
             assert_eq!(again, pt, "{depth:?}");
             // SAFETY: the root is a live host frame with write provenance;
             // `read_entry` forms no reference.
             let root_entry = unsafe { read_entry(f.addrs[0], table_index(top, va)) };
             assert_eq!(root_entry.phys_addr(), children[0], "{depth:?}");
-            // SAFETY: as above; the spare frame stayed zeroed.
-            let spare = unsafe { read_entry(children[top], 0) };
-            assert!(!spare.is_present(), "{depth:?}");
         }
     }
 
     #[test]
     fn descend_alloc_propagates_an_allocation_failure()
     {
-        let va = path(PagingDepth::Five).va;
         let f = frames(1);
         let mut calls = 0;
         // SAFETY: the root is a live host frame with write provenance; `ensure`
         // fails before any child is named.
         let result = unsafe {
-            descend_alloc(f.addrs[0], va, 4, 0, |_| {
+            descend_alloc(f.addrs[0], va_for(PagingDepth::Five), 4, 0, |_| {
                 calls += 1;
                 Err::<u64, &str>("out of frames")
             })
@@ -1959,7 +1985,7 @@ mod tests
         for depth in DEPTHS
         {
             let top = depth.levels() - 1;
-            let va = path(depth).va;
+            let va = va_for(depth);
             let f = frames(top);
             let pd = link_to_pd(&f, depth, va);
             // SAFETY: the path is built of live host frames with write
@@ -1983,22 +2009,16 @@ mod tests
     #[test]
     fn descend_existing_never_descends_a_large_pd_leaf()
     {
-        // The leaf names a frame of present "entries" (the bait), so a descent
-        // that read the leaf's frame as a PT would return it.
+        // A descent that read the leaf's frame as a PT would return that frame.
         for depth in DEPTHS
         {
             let top = depth.levels() - 1;
-            let va = path(depth).va;
+            let va = va_for(depth);
             let f = frames(top + 1);
             let pd = link_to_pd(&f, depth, va);
-            let bait = f.addrs[top];
-            // SAFETY: `pd` and `bait` are live host frames with write
-            // provenance; no other reference to either is live.
-            unsafe {
-                table_at(bait)[0] = PageTableEntry(PRESENT | USER_BIT | WRITABLE);
-                table_at(pd)[table_index(1, va)] =
-                    PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (bait & PHYS_MASK));
-            }
+            let data = f.addrs[top];
+            let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (data & PHYS_MASK));
+            set_entry(pd, table_index(1, va), large);
             // SAFETY: as in the test above.
             let pt = unsafe { descend_existing(f.addrs[0], va, top, 0, |pa| pa) };
             assert!(pt.is_none(), "{depth:?}");

@@ -43,9 +43,10 @@ pub struct PendingRegistration
     /// `ipc::svcmgr_labels::NAME_MAX` bytes.
     pub name: String,
     pub thread_cap: u32,
-    /// Cleared to `true` once a `.svc` definition has consumed this
-    /// entry. Entries still `false` after the file scan get the
-    /// `registered without definition` error path.
+    /// Set to `true` once a `.svc` definition has consumed this entry, or
+    /// when the scan has no memory for the parsed recipes and releases it
+    /// unsupervised (`release_unsupervised`). Entries still `false` after
+    /// the file scan get the `registered without definition` error path.
     pub consumed: bool,
 }
 
@@ -106,7 +107,8 @@ impl ServiceTable
 /// definition through the right path. `pending` is consumed:
 /// entries that match a definition are marked `consumed`; entries
 /// left unconsumed after the scan are reported as a configuration
-/// error.
+/// error, except when the scan has no memory for the parsed recipes,
+/// when they run on unsupervised.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
@@ -183,9 +185,10 @@ pub fn reconcile_and_launch(
     // Parse every recipe first, then order providers (services that
     // publish their own endpoint via `provides = ...`) ahead of pure
     // consumers, so a provided name is in the discovery registry before
-    // any consumer launched here resolves it. Names are unique, so ordering
-    // by (consumer, name) with the allocation-free unstable sort keeps
-    // alphabetical order within each group.
+    // any consumer launched here resolves it. Service names are unique (one
+    // `.svc` suffix stripped from unique file names), so ordering by
+    // (consumer, service name) with the allocation-free unstable sort keeps
+    // each group in service-name order.
     let mut defs: Vec<Definition> = Vec::new();
     if defs.try_reserve_exact(entries.len()).is_err()
     {
@@ -195,7 +198,7 @@ pub fn reconcile_and_launch(
     }
     for filename in &entries
     {
-        let service_name = filename.trim_end_matches(".svc");
+        let service_name = filename.strip_suffix(".svc").unwrap_or(filename);
         let Some(path) = recipe_path(filename)
         else
         {
@@ -466,12 +469,6 @@ fn build_entry(def: &Definition) -> Option<ServiceEntry>
     Some(entry)
 }
 
-/// Log every entry in `pending` that was never matched by a `.svc`
-/// definition and release its thread cap. Per the reconciliation
-/// contract these are hard errors but non-fatal — svcmgr keeps
-/// running for the services that did resolve cleanly. Releasing the
-/// thread cap here avoids leaking a slot per orphaned registration
-/// over svcmgr's lifetime.
 /// Release the thread cap of every pending registration when the scan has
 /// no memory to parse the recipes: the init-spawned services run on,
 /// unsupervised, and none is reported as a configuration error.
@@ -491,6 +488,12 @@ fn release_unsupervised(pending: &mut [PendingRegistration])
     }
 }
 
+/// Log every entry in `pending` that was never matched by a `.svc`
+/// definition and release its thread cap. Per the reconciliation
+/// contract these are hard errors but non-fatal — svcmgr keeps
+/// running for the services that did resolve cleanly. Releasing the
+/// thread cap here avoids leaking a slot per orphaned registration
+/// over svcmgr's lifetime.
 fn report_orphans(pending: &[PendingRegistration])
 {
     for slot in pending

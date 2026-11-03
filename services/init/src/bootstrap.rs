@@ -1097,10 +1097,12 @@ pub fn finalize_memmgr(
     // (memmgr reads each cap's size and physical base from the kernel), so it
     // carries every remaining RAM cap while memmgr's `CSpace` keeps
     // [`MEMMGR_FORWARD_HEADROOM`] general slots and init's own keeps
-    // [`INIT_FORWARD_HEADROOM`]. A cap past either headroom, or one
-    // the copy cannot take, ends the forwarded prefix; that cap and every later
-    // one reach memmgr's pool through the reap donation
-    // (`finish_init_reap_handoff` → procmgr → `DONATE_MEMORY_CAPS`) instead.
+    // [`INIT_FORWARD_HEADROOM`]. The first cap that has no `InitInfo`
+    // descriptor, that comes once either headroom is already below its limit,
+    // or whose derive or copy is refused ends the forwarded prefix; the
+    // descriptor-bearing caps from there on reach memmgr's pool through the
+    // reap donation (`finish_init_reap_handoff` → procmgr →
+    // `DONATE_MEMORY_CAPS`) instead.
     // (The MemoryAlloc tail and the phys-table page have no InitInfo
     // descriptor, so the reap walk cannot reach them; they must ride here, in
     // the headroom the loop leaves.)

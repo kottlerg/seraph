@@ -2532,9 +2532,9 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
 /// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
 /// object (refcount 0), apart from a `CSpace` wrapper's arena pages' `owner`
 /// back-pointer, used only for the wrapper's `cs_pool.lock` and `arena_free`
-/// (`free_arena_chunk`), never its `deferred_next`. A `Thread` pushed by a self-teardown is already
-/// `Exited` and unlinked from every run queue; one pushed by
-/// `release_ref` may be in any state, and the drain's Thread arm
+/// (`free_arena_chunk`), never its `deferred_next`. A `Thread` pushed by a
+/// self-teardown is already `Exited` and unlinked from every run queue; one
+/// pushed by `release_ref` may be in any state, and the drain's Thread arm
 /// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
 /// when the draining thread is that thread. `cpu` is the local CPU index
 /// (`< MAX_CPUS`) and its scheduler is initialised.
@@ -2618,13 +2618,16 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
         .cast::<KernelObjectHeader>();
     while !node.is_null()
     {
-        // SAFETY: node is an exclusively-owned object pushed by
-        // push_deferred_reclaim; the link field is stable until freed.
+        // SAFETY: node was pushed by push_deferred_reclaim (refcount 0;
+        // exclusively owned but for the `owner` back-pointer its contract
+        // allows, which never reaches the link field); the link field is
+        // stable until freed.
         let nn = unsafe { NonNull::new_unchecked(node) };
         // SAFETY: nn is a linkable object pushed by push_deferred_reclaim.
         let next = unsafe { *deferred_link(nn) };
-        // SAFETY: refcount 0, exclusive ownership; re-enters the object's arm
-        // from a context bound to nothing queued here, running the full free.
+        // SAFETY: refcount 0 and no slot references it (dealloc_object's
+        // contract); re-enters the object's arm from a context bound to
+        // nothing queued here, running the full free.
         unsafe { dealloc_object(nn) };
         node = next;
     }
@@ -2664,8 +2667,9 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
     {
         log_self_teardown(cur, what);
     }
-    // SAFETY: object exclusively owned (refcount 0) and of a linkable type;
-    // queued for off-CPU reclaim on this CPU.
+    // SAFETY: refcount 0, exclusively owned but for a `CSpace` wrapper's
+    // arena-page `owner` back-pointer, which `push_deferred_reclaim` allows,
+    // and of a linkable type; queued for off-CPU reclaim on this CPU.
     unsafe { push_deferred_reclaim(this_cpu, ptr) };
 }
 
@@ -2820,8 +2824,8 @@ impl CascadeStack
     /// `obj` is a header on this stack.
     unsafe fn read_link(obj: NonNull<KernelObjectHeader>) -> u64
     {
-        // SAFETY: caller contract; the queued object is exclusively this
-        // stack's, so nothing writes the fields concurrently.
+        // SAFETY: caller contract; the queued object's link fields are this
+        // stack's alone, so nothing writes them concurrently.
         let (lo, hi) = unsafe {
             (
                 (*obj.as_ptr()).ref_count.load(Ordering::Relaxed),
@@ -2837,7 +2841,7 @@ impl CascadeStack
     /// Store `word` in `obj`'s link fields.
     ///
     /// # Safety
-    /// `obj` is exclusively owned by the caller and no reference to its
+    /// `obj`'s link fields are the caller's alone and no reference to its
     /// header is used across this call.
     unsafe fn write_link(obj: NonNull<KernelObjectHeader>, word: u64)
     {
@@ -2880,7 +2884,8 @@ impl CascadeStack
     {
         let top = self.top?;
         // SAFETY: `top` was queued by `push`, whose contract keeps it live,
-        // exclusively this stack's, and unreferenced until it is popped here.
+        // its link fields this stack's alone, and unreferenced but for the
+        // `owner` back-pointer it allows until it is popped here.
         unsafe {
             self.top = Self::decode(Self::read_link(top));
             Self::write_link(top, 0);
@@ -3190,7 +3195,8 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
     run_cascade(ptr, |next, stack| {
         // SAFETY: `next` is the caller's object (this function's contract)
         // or one an arm pushed, which `CascadeStack::push`'s contract leaves
-        // unreferenced and exclusively owned; no lock is held between arms.
+        // unreferenced and exclusively owned but for a `CSpace` wrapper's
+        // arena-page `owner` back-pointer; no lock is held between arms.
         unsafe { dealloc_object_one(next, stack) };
     });
 }

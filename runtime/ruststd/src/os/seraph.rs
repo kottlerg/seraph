@@ -894,12 +894,11 @@ pub fn cspace_slot_headroom(self_cspace: u32) -> u64 {
 ///
 /// A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free slots for IPC
 /// capability transfer, so general allocations (`cap_create_*`, `cap_copy`,
-/// `cap_derive`, splits, received grants that a handler then derives from)
-/// fail with `OutOfMemory` first. A split, an `Mmio`, `IoPort`, or `Interrupt`
-/// copy, and an `Mmio` mapping past its object's inline records also take a
-/// body from the `CSpace`'s arena, which draws whole pages from the same
-/// growth budget. This
-/// helper measures the headroom above the reserve and the budget and, when
+/// `cap_derive`, splits, received grants that a handler then derives from) fail
+/// with `OutOfMemory` first. A split, an `Mmio`, `IoPort`, or `Interrupt` copy,
+/// and an `Mmio` mapping past its object's inline records also take a body from
+/// the `CSpace`'s arena, which draws whole pages from the same growth budget.
+/// This helper measures the headroom above the reserve and the budget and, when
 /// either is short (`syscall_abi::cspace_topup_pages`), requests Memory from
 /// memmgr and donates it to the pool via augment-mode `cap_create_cspace`.
 ///

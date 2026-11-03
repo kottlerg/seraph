@@ -405,23 +405,28 @@ changed line that names one of these items as a whole identifier or lies within 
 (its attributes, signature, fields, or body):
 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
-- per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`), and the
-  definition of every function that calls `alloc_zeroed_slab` (the per-CPU storage initialisers; a
-  call to one is on the surface only when it names another listed item, as a call to an `init_ap_*`
-  initialiser does), except `frame_map::init` and `init_cspace_registry`, which size RAM tables
-  through it and are on the memory surface instead; every `init_storage` and `init_per_cpu_storage`,
-  which take the boot CPU count and size per-CPU storage from it (a call to one names it, so a
-  change to the count it passes is on the surface); `kernel_reserve_pages` (the CPU-scaled kernel
-  reserve); and the element types of the per-CPU arrays and slabs, today `PerCpuData`,
-  `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`,
-  `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
-  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the slabs that
-  are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk tables of
-  `frame_map::init` and `init_cspace_registry`). A change that alters an element type's size is on
-  the surface whether it edits the type's own fields or a type or constant the element holds by
-  value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
-  `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
-  for the idle stacks);
+- per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`); the per-CPU
+  slab descriptor `PerCpuSlab`, whose `bytes` gives each per-CPU slab's byte count, every constant
+  of that type (each slab's descriptor, which names the type), and `alloc_per_cpu_slab`, which
+  allocates a slab from its descriptor; the definition of every function that calls
+  `alloc_per_cpu_slab` or `alloc_zeroed_slab` (the per-CPU storage initialisers; a call to one is
+  on the surface only when it names another listed item, as a call to an `init_ap_*` initialiser
+  does), except `frame_map::init` and `init_cspace_registry`, which size RAM tables through
+  `alloc_zeroed_slab` and are on the memory surface instead; every `init_storage` and
+  `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
+  one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
+  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
+  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
+  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
+  'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the
+  slabs that are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk
+  tables of `frame_map::init` and `init_cspace_registry`). A change that alters an element type's
+  size is on the surface whether it edits the type's own fields or a type or constant the element
+  holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or
+  `Prng` inside `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation
+  (`KERNEL_STACK_PAGES` for the idle stacks, and the element sizes the descriptors of the types
+  host builds compile out take: `CPURNG_BYTES`, `JITTER_ACC_BYTES`, `SELFTEST_SAMPLE_BYTES`,
+  `TLB_REQUEST_BYTES`, and `TAG_STATE_BYTES`);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
   and the MADT walk behind it (`madt_topology` and its per-CPU `record_cpu_id`),
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
@@ -453,8 +458,9 @@ changes. The second prints every file header of the diff and every line, changed
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it
-(except `frame_map::init` and `init_cspace_registry`, which the memory surface covers): the set is
+hunk. A printed `alloc_per_cpu_slab` or `alloc_zeroed_slab` call is a candidate for the initialiser
+that encloses it (except `frame_map::init` and `init_cspace_registry`, which the memory surface
+covers): the set is
 owed when a non-inert changed line lies within that function, read in the widened hunk. The
 screen finds named items and changes inside their definitions; it does not follow a size
 change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
@@ -469,6 +475,7 @@ git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percp
     core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
     'core/kernel/src/arch/*/ap_trampoline.rs'
 S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|init_per_cpu_storage'
+S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
@@ -746,15 +753,20 @@ list as the tracking Issues move):
 - Both arches, widths past 128 CPUs (residual): the boundary set stops at 128,
   so no local run exercises x2APIC destinations above APIC id 255, threshold
   effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
-  with the width), or the runtime sizing of the per-CPU slabs past 128 (each
-  slab's byte count at the wider widths,
-  [#698](https://github.com/kottlerg/seraph/issues/698)). What covers
-  `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
-  (`core/kernel/src/cpu_mask.rs`), the host tests of
+  with the width), or a boot that allocates the per-CPU slabs past 128. What
+  covers `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
+  (`core/kernel/src/cpu_mask.rs`); the host tests of
   `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
   past one block, a run that cannot be found, and requests of one block or
   less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
-  (`sched::slab_pages`), and the 128-CPU boots for two full words.
+  (`sched::slab_pages`); the sizing of every per-CPU slab, whose byte count
+  each initialiser takes from its `sched::PerCpuSlab` descriptor: host tests
+  that every descriptor's count does not overflow and that its `slab_pages`
+  cover it at `MAX_CPUS` and at each width where its page count crosses a
+  `2^MAX_ORDER` block (`sched::slab_tests`), and a compile-time assert beside
+  each descriptor of a fixed per-CPU count that checks the same at every
+  width up to `MAX_CPUS` against the target's own layout on both
+  architectures; and the 128-CPU boots for two full words.
 - Both arches, a partial second `CpuMask` word (residual): no local run boots
   a count past one 64-bit word that does not fill the next (65 to 127 CPUs).
   The host tests of `CpuMask::range` cover those mask paths instead:

@@ -45,14 +45,17 @@ struct Acc
     count: AtomicU64,
 }
 
+// The slab descriptor (`super::JITTER_SLAB`) sizes the slab from this
+// constant in host builds too, which compile this type out.
+const _: () = assert!(core::mem::size_of::<Acc>() == super::JITTER_ACC_BYTES);
+
 static ACC_PTR: AtomicPtr<Acc> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU accumulator slab. Called once from
 /// `entropy::init_storage` (Phase 4).
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<Acc>();
-    let ptr = crate::sched::alloc_zeroed_slab::<Acc>(bytes, allocator, "ENTROPY_JITTER");
+    let ptr = crate::sched::alloc_per_cpu_slab::<Acc>(super::JITTER_SLAB, cpu_count, allocator);
     ACC_PTR.store(ptr, Ordering::Release);
 }
 

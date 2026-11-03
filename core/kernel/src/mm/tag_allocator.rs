@@ -237,8 +237,15 @@ pub fn tag_count(hw_tags: usize, cpu_count: usize) -> Option<usize>
     Some(hw.min(fit).max(gate))
 }
 
-/// Size of one per-CPU, per-tag record (`TagState`: two `u64` generations).
+/// Size of one per-CPU, per-tag record (`TagState`: two `u64` generations),
+/// for the budget above and the slab's descriptor in builds that compile the
+/// type out; a compile-time assert beside the type ties the two.
 const TAG_STATE_BYTES: usize = 16;
+
+/// The per-CPU tag-state slab: [`tag_count`] `TagState` records per CPU, so
+/// [`enable`](glue::enable) sets the per-CPU element count at boot.
+pub(crate) const TAG_STATE_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::new("PER_CPU_TAG_STATE", TAG_STATE_BYTES);
 
 // ── Global pool, lock, and per-CPU state (kernel-only) ──────────────────────────
 
@@ -335,6 +342,11 @@ mod glue
         pub synced_tlb_gen: u64,
     }
 
+    // `tag_count`'s budget and the slab descriptor (`super::TAG_STATE_SLAB`)
+    // size the records from this constant in host builds too, which compile
+    // this type out.
+    const _: () = assert!(core::mem::size_of::<TagState>() == super::TAG_STATE_BYTES);
+
     /// Base of the per-CPU tag-state slab (`cpu_count * NUM_TAGS` records,
     /// row-major by CPU). Null until [`enable`] runs.
     static PER_CPU_TAG_STATE: AtomicPtr<TagState> = AtomicPtr::new(core::ptr::null_mut());
@@ -419,9 +431,11 @@ mod glue
 
         // Zero-filled slab: owner_gen 0 never matches a real tag_gen, so the
         // first activate of any tag on any CPU flushes it.
-        let bytes = cpu_count * n * core::mem::size_of::<TagState>();
-        let slab =
-            crate::sched::alloc_zeroed_slab::<TagState>(bytes, allocator, "PER_CPU_TAG_STATE");
+        let slab = crate::sched::alloc_per_cpu_slab::<TagState>(
+            super::TAG_STATE_SLAB.with_elems_per_cpu(n),
+            cpu_count,
+            allocator,
+        );
         PER_CPU_TAG_STATE.store(slab, Ordering::Release);
 
         // The pool's arrays, sized to `n` tags; zeroed, so every tag starts free.

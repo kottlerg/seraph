@@ -82,6 +82,11 @@ pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> 
 #[cfg(not(test))]
 pub fn init_ap_percpu_storage(_cpu_count: usize, _allocator: &mut crate::mm::BuddyAllocator) {}
 
+/// The per-CPU slabs [`init_ap_percpu_storage`] allocates (none on RISC-V),
+/// for the host tests of every per-CPU slab's sizing (`sched::slab_tests`).
+#[cfg(test)]
+pub(crate) const PER_CPU_SLABS: &[crate::sched::PerCpuSlab] = &[];
+
 // MMIO regions that must be direct-mapped during Phase 3 page-table setup
 // are supplied by [`platform::collect_mmio_direct_map_regions`], which always
 // returns 0 entries on RISC-V: the PLIC and UART on the QEMU `virt` machine

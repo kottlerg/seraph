@@ -32,13 +32,17 @@ struct Sample
     captured: bool,
 }
 
+// The slab descriptor (`super::SELFTEST_SLAB`) sizes the slab from this
+// constant in host builds too, which compile this type out.
+const _: () = assert!(core::mem::size_of::<Sample>() == super::SELFTEST_SAMPLE_BYTES);
+
 static SAMPLES_PTR: AtomicPtr<Sample> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU sample slab. Called from `entropy::init_storage`.
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<Sample>();
-    let ptr = crate::sched::alloc_zeroed_slab::<Sample>(bytes, allocator, "ENTROPY_SELFTEST");
+    let ptr =
+        crate::sched::alloc_per_cpu_slab::<Sample>(super::SELFTEST_SLAB, cpu_count, allocator);
     SAMPLES_PTR.store(ptr, Ordering::Release);
 }
 

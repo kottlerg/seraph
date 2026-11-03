@@ -33,6 +33,10 @@ pub struct CpuRng
     last_reseed_us: u64,
 }
 
+// The slab descriptor (`super::CPURNG_SLAB`) sizes the slab from this
+// constant in host builds too, which compile this type out.
+const _: () = assert!(core::mem::size_of::<CpuRng>() == super::CPURNG_BYTES);
+
 impl CpuRng
 {
     /// A zero-initialized generator (matches a zeroed slab slot).

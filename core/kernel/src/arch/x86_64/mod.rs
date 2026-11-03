@@ -84,6 +84,16 @@ pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut crate::mm::Buddy
     interrupts::init_nmi_backtrace_storage(cpu_count, allocator);
 }
 
+/// The per-CPU slabs [`init_ap_percpu_storage`] allocates, for the host tests
+/// of every per-CPU slab's sizing (`sched::slab_tests`).
+#[cfg(test)]
+pub(crate) const PER_CPU_SLABS: &[crate::sched::PerCpuSlab] = &[
+    gdt::AP_TSS_SLAB,
+    gdt::AP_GDT_SLAB,
+    ap_trampoline::AP_IST_STACKS_SLAB,
+    interrupts::NMI_BACKTRACE_SLAB,
+];
+
 // MMIO regions that must be direct-mapped during Phase 3 page-table setup are
 // supplied by [`platform::collect_mmio_direct_map_regions`], which reads
 // xAPIC + I/O APIC bases from `BootInfo.kernel_mmio`.

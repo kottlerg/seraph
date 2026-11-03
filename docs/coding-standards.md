@@ -264,7 +264,7 @@ defect is visible in review rather than only in a boot at the boundary CPU count
 ([testing.md](testing.md#coverage-tiers) § Coverage tiers).
 
 - A structure with one entry or one bit per CPU MUST take its width from `MAX_CPUS`: an array
-  `[T; MAX_CPUS]`, a `CpuMask`, or a per-CPU slab the kernel's `alloc_zeroed_slab` sizes at the
+  `[T; MAX_CPUS]`, a `CpuMask`, or a per-CPU slab the kernel's `alloc_per_cpu_slab` sizes at the
   boot CPU count. A literal (`64`, `256`, or any other) MUST NOT stand in for the CPU count or a
   CPU-mask width, and a fixed-width integer (`u64`, `u128`) MUST NOT hold a set of CPUs.
 - A CPU index or CPU count MUST NOT be converted with `as` to an integer type that cannot

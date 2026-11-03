@@ -1092,13 +1092,35 @@ impl DeviceCatalog
     }
 }
 
-/// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio`, its
-/// optional single-IRQ cap, and the badge of its catalog entry.
+/// The `Mmio` caps carved for every BAR a `VirtIO` device's register
+/// regions name, in ascending BAR index.
+struct VirtioBars
+{
+    bars: [spawn::BarSpec; virtio_core::MAX_VIRTIO_BARS],
+    count: usize,
+}
+
+impl VirtioBars
+{
+    fn as_slice(&self) -> &[spawn::BarSpec]
+    {
+        &self.bars[..self.count]
+    }
+
+    fn release(&self)
+    {
+        for bar in self.as_slice()
+        {
+            let _ = syscall::cap_delete(bar.cap);
+        }
+    }
+}
+
+/// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio` caps,
+/// its optional single-IRQ cap, and the badge of its catalog entry.
 struct VirtioDeviceCaps
 {
-    bar_cap: u32,
-    bar_base: u64,
-    bar_size: u64,
+    bars: VirtioBars,
     irq_cap: Option<u32>,
     device_badge: u64,
 }
@@ -1108,7 +1130,7 @@ impl VirtioDeviceCaps
     /// Release the BAR and IRQ caps of a device whose driver is not spawned.
     fn release(&self)
     {
-        let _ = syscall::cap_delete(self.bar_cap);
+        self.bars.release();
         if let Some(irq) = self.irq_cap
         {
             let _ = syscall::cap_delete(irq);
@@ -1118,9 +1140,9 @@ impl VirtioDeviceCaps
 
 /// Carve a `VirtIO` device's BAR and IRQ caps and add its catalog entry.
 /// Returns `None`, logging why and releasing what it carved, when the
-/// device's register regions span more than one BAR (a `VirtIO` driver is
-/// delivered one), no aperture covers the BAR, or the catalog entry cannot
-/// be added. The IRQ is optional here; a driver that requires one checks.
+/// device presents no complete set of register regions, a BAR they name is
+/// not an MMIO BAR or no aperture covers it, or the catalog entry cannot be
+/// added. The IRQ is optional here; a driver that requires one checks.
 fn carve_virtio_device(
     name: &str,
     pci_dev: &pci::PciDevice,
@@ -1139,17 +1161,7 @@ fn carve_virtio_device(
         pci_dev.irq_line,
         pci_dev.irq_pin
     );
-    if let Some(second) = firmware::scan::virtio_second_bar(&pci_dev.virtio_info)
-    {
-        std::os::seraph::log!(
-            "{}: registers span BAR {} and BAR {}; a VirtIO driver is delivered one BAR, not spawned",
-            name,
-            pci_dev.virtio_info.common_cfg.bar,
-            second
-        );
-        return None;
-    }
-    let (bar_cap, bar_base, bar_size) = find_virtio_bar_cap(pci_dev, caps)?;
+    let bars = carve_virtio_bars(name, pci_dev, caps)?;
     // Serialise the virtio startup info into the generic catalog entry.
     // Devmgr stores the bytes opaquely; the driver's `from_bytes` (verified
     // via kind/version) deserialises on the QUERY_DEVICE_INFO reply.
@@ -1168,13 +1180,11 @@ fn carve_virtio_device(
             "{}: catalog entry not added (payload or memory); not spawned",
             name
         );
-        let _ = syscall::cap_delete(bar_cap);
+        bars.release();
         return None;
     };
     Some(VirtioDeviceCaps {
-        bar_cap,
-        bar_base,
-        bar_size,
+        bars,
         irq_cap: acquire_single_irq_cap(pci_dev, irq_range),
         device_badge,
     })
@@ -1245,10 +1255,10 @@ fn spawn_one_virtio_blk(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    // virtio-blk requires an IRQ: it rejects the 2-cap no-IRQ round 1 and
-    // exits, which would leave `spawn_driver` blocked serving round 2.
-    // Refuse the spawn instead; a disk on a line another device holds is
-    // not served until shared lines are (#664).
+    // virtio-blk requires an IRQ: delivered an absent IRQ slot, it exits
+    // after its bootstrap, which would leave the device registered with no
+    // driver serving it. Refuse the spawn instead; a disk on a line another
+    // device holds is not served until shared lines are (#664).
     let Some(irq_cap) = dev_caps.irq_cap
     else
     {
@@ -1272,18 +1282,11 @@ fn spawn_one_virtio_blk(
         let _ = syscall::cap_delete(module_copy);
         return None;
     }
-    let bar_caps = [dev_caps.bar_cap];
-    let bar_bases = [dev_caps.bar_base];
-    let bar_sizes = [dev_caps.bar_size];
     let config = spawn::DriverSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
         source: spawn::CreateSource::Module(module_copy),
-        bars: spawn::BarSpec {
-            caps: &bar_caps,
-            bases: &bar_bases,
-            sizes: &bar_sizes,
-        },
+        bars: dev_caps.bars.as_slice(),
         irq_cap: Some(irq_cap),
         service_ep: blk_ep,
         registry_ep: caps.registry_ep,
@@ -1353,42 +1356,73 @@ fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
     arch::current::intx_fallback_gsi(pci_dev.irq_pin, pci_dev.dev)
 }
 
-/// Carve the cap for the `VirtIO` device's register BAR, the one its
-/// common-configuration region names. Returns `(cap, base, size)`, or
-/// `None`, logged, when the device has no such MMIO BAR or no aperture
-/// covers it.
-fn find_virtio_bar_cap(
+/// Carve an `Mmio` cap for every BAR a `VirtIO` device's register regions
+/// name, in the order of its [`virtio_core::RegisterLayout::bars`].
+/// Returns `None`, logged and with every cap carved so far released, when
+/// the device presents no complete set of register regions, a BAR they name
+/// is not an MMIO BAR, or no aperture covers one.
+fn carve_virtio_bars(
+    name: &str,
     pci_dev: &pci::PciDevice,
     caps: &mut caps::DevmgrCaps,
-) -> Option<(u32, u64, u64)>
+) -> Option<VirtioBars>
 {
-    let virtio_bar_idx = pci_dev.virtio_info.common_cfg.bar;
-    let Some(b) = (0..pci_dev.bar_count)
-        .find(|&b| pci_dev.bar_pci_idx[b] == virtio_bar_idx && pci_dev.bar_is_mmio[b])
-    else
-    {
-        std::os::seraph::log!("devmgr: VirtIO BAR {} is not an MMIO BAR", virtio_bar_idx);
-        return None;
-    };
-    std::os::seraph::log!(
-        "devmgr: VirtIO BAR phys={:#018x} size={:#018x}",
-        pci_dev.bar_phys[b],
-        pci_dev.bar_size[b]
-    );
-    // The driver reserves `bar_aperture_pages` of VA for the BAR and
-    // `mmio_map` maps the whole cap region, so the cap covers no more of the
-    // BAR than the VirtIO capability structures reach.
-    let size = pci_dev.bar_size[b].min(pci_dev.virtio_info.bar_aperture_pages() * PAGE_SIZE);
-    let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
+    let Some(layout) = pci_dev.virtio_info.register_layout()
     else
     {
         std::os::seraph::log!(
-            "devmgr: VirtIO BAR not covered by any aperture virtio_bar_idx={:#x}",
-            u64::from(virtio_bar_idx)
+            "{}: device presents no complete set of VirtIO register regions; not spawned",
+            name
         );
         return None;
     };
-    Some((cap, pci_dev.bar_phys[b], size))
+    let mut bars = VirtioBars {
+        bars: [spawn::BarSpec::default(); virtio_core::MAX_VIRTIO_BARS],
+        count: 0,
+    };
+    for aperture in layout.bars()
+    {
+        let Some(b) = (0..pci_dev.bar_count)
+            .find(|&b| pci_dev.bar_pci_idx[b] == aperture.bar && pci_dev.bar_is_mmio[b])
+        else
+        {
+            std::os::seraph::log!(
+                "{}: VirtIO BAR {} is not an MMIO BAR; not spawned",
+                name,
+                aperture.bar
+            );
+            bars.release();
+            return None;
+        };
+        std::os::seraph::log!(
+            "{}: VirtIO BAR {} phys={:#018x} size={:#018x}",
+            name,
+            aperture.bar,
+            pci_dev.bar_phys[b],
+            pci_dev.bar_size[b]
+        );
+        // The driver maps the BAR into `aperture.pages` pages of its register
+        // window and `mmio_map` maps the whole cap region, so the cap covers
+        // no more of the BAR than the regions in it reach.
+        let size = pci_dev.bar_size[b].min(aperture.pages * PAGE_SIZE);
+        let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
+        else
+        {
+            std::os::seraph::log!(
+                "{}: VirtIO BAR {} not covered by any aperture; not spawned",
+                name,
+                aperture.bar
+            );
+            bars.release();
+            return None;
+        };
+        bars.bars[bars.count] = spawn::BarSpec {
+            bar: aperture.bar,
+            cap,
+        };
+        bars.count += 1;
+    }
+    Some(bars)
 }
 
 // ── VirtIO input (keyboard) driver: deferred on-disk spawn ──────────────────
@@ -1465,9 +1499,6 @@ fn spawn_virtio_input_from_disk(
         return None;
     }
 
-    let bar_caps = [pending.bar_cap];
-    let bar_bases = [pending.bar_base];
-    let bar_sizes = [pending.bar_size];
     let config = spawn::DriverSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
@@ -1475,11 +1506,7 @@ fn spawn_virtio_input_from_disk(
             file_cap: walked.file_cap,
             size: walked.size,
         },
-        bars: spawn::BarSpec {
-            caps: &bar_caps,
-            bases: &bar_bases,
-            sizes: &bar_sizes,
-        },
+        bars: pending.bars.as_slice(),
         irq_cap: pending.irq_cap,
         service_ep: input_ep,
         registry_ep: caps.registry_ep,

@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 ipc = { path = "../../../../shared/ipc" }
 mmio = { path = "../../../../shared/mmio" }
+syscall-abi = { path = "../../../../abi/syscall" }
 
 [lints]
 workspace = true

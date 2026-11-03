@@ -113,18 +113,26 @@ not served until shared lines are (#664). Class-based matching is design intent 
 
 For each matched device, devmgr:
 
-1. Refuses the device, logging both BAR indices, when a VirtIO register
-   region it names (notify, ISR, or device configuration) lies in a BAR other
-   than the common-configuration region's: a VirtIO driver is delivered one
-   BAR.
-2. Carves an `Mmio` sub-cap for the device's VirtIO common-config BAR out of
-   the boot-provided MMIO aperture that covers it, spanning the BAR's first
-   `bar_aperture_pages` pages at most (the reach of its VirtIO capability
-   structures). The driver reserves that many pages of VA for the BAR, and
-   `SYS_MMIO_MAP` maps a cap's whole region, so a larger cap would map past
-   the driver's reservation. The aperture's lower and upper remainders stay
-   in devmgr's growable aperture table (`firmware::resource::SpanTable`) as
-   caps of their own.
+1. Locates the device's VirtIO register regions
+   (`VirtioPciStartupInfo::register_layout`): the distinct BARs the common,
+   notification, ISR, and device-configuration regions name, at most four,
+   in ascending BAR index, each sized to the pages the regions in it reach.
+   The scan (`firmware::scan`) takes, for each type, the first structure in
+   the capability list that lies wholly inside one of the device's MMIO BARs
+   (VirtIO 1.2 § 4.1.4.1), skipping a later structure of a type already
+   located, one in an I/O BAR, one naming a reserved BAR index, and one
+   reaching past its BAR's end. A device left with no
+   region of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
+   block or input device) is refused, logged.
+2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided
+   MMIO aperture that covers it, spanning the BAR's first pages up to that
+   reach at most. The driver maps each BAR into that many pages of its
+   register window, and `SYS_MMIO_MAP` maps a cap's whole region, so a
+   larger cap would map past the BAR's share of the window. A BAR that is
+   not an MMIO BAR, or that no aperture covers, refuses the device, logged,
+   with the caps already carved released. The aperture's lower and upper
+   remainders stay in devmgr's growable aperture table
+   (`firmware::resource::SpanTable`) as caps of their own.
 3. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback) off devmgr's
    Interrupt range cap. The lines below and above it stay in devmgr's
@@ -136,11 +144,16 @@ For each matched device, devmgr:
    steps 4-6 run later, once `SET_DRIVERS_DIR` delivers the drivers
    directory).
 5. Starts the driver (`START_PROCESS`).
-6. Serves the driver's bootstrap rounds over `ipc::bootstrap`: round 1
-   carries the BAR `Mmio`, the IRQ, and the driver's service endpoint (BAR
-   and service only when there is no IRQ, a shape only virtio-input accepts,
-   so virtio-blk is not spawned without one); round 2 carries a per-device
-   badged SEND on devmgr's registry endpoint and ends the bootstrap.
+6. Serves the driver's bootstrap rounds over `ipc::bootstrap`, in the shape
+   `virtio_core::bootstrap` specifies: round 1 carries the BAR `Mmio` caps in
+   the order of step 1, with each cap's PCI BAR index as the matching data
+   word; round 2 carries the positional slots service endpoint, IRQ, and a
+   per-device badged SEND on devmgr's registry endpoint, packed with
+   `ipc::bootstrap::pack_slots` (presence word in `data[0]`), and ends the
+   bootstrap. The IRQ slot is absent when the device has no private line;
+   virtio-input then polls, and virtio-blk, which requires the IRQ, is not
+   spawned. A driver checks the delivered BAR indices against the layout it
+   computes from its `QUERY_DEVICE_INFO` reply and exits on a mismatch.
 
 ---
 

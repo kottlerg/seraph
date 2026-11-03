@@ -11,6 +11,8 @@
 //! `ProcessInfo` and are not part of this protocol.
 
 use ipc::{IpcMessage, procmgr_labels};
+use virtio_core::MAX_VIRTIO_BARS;
+use virtio_core::bootstrap::{ROUND2_SLOTS, SLOT_DEVMGR_QUERY, SLOT_IRQ, SLOT_SERVICE};
 
 /// Source the child's ELF binary is loaded from. Selected per spawn site:
 /// boot-bundle modules (the bootstrap-essential drivers virtio-blk,
@@ -160,14 +162,13 @@ fn mint_bootstrap_badge() -> Option<u64>
     }
 }
 
-/// Per-device BAR capability set delivered to a driver. `bases` and `sizes`
-/// parallel `caps` and are retained for future multi-BAR drivers; only the
-/// first BAR is consumed by the current block driver path.
-pub struct BarSpec<'a>
+/// One BAR `Mmio` cap delivered to a driver, with the PCI BAR index (0-5)
+/// it covers.
+#[derive(Clone, Copy, Default)]
+pub struct BarSpec
 {
-    pub caps: &'a [u32],
-    pub bases: &'a [u64],
-    pub sizes: &'a [u64],
+    pub bar: u8,
+    pub cap: u32,
 }
 
 /// Endpoints and identifiers needed to spawn a driver process and hand it
@@ -183,7 +184,10 @@ pub struct DriverSpawnConfig<'a>
     /// after vfsd-mount, e.g. virtio-input). Both spawn `CREATE_PINNED` — a PCI
     /// device with a BAR/IRQ is DMA-capable and must be eager-mapped.
     pub source: CreateSource,
-    pub bars: BarSpec<'a>,
+    /// The device's BAR caps, one per distinct BAR its `VirtIO` register
+    /// regions name, in ascending BAR index
+    /// ([`virtio_core::RegisterLayout::bars`]); 1 to [`MAX_VIRTIO_BARS`].
+    pub bars: &'a [BarSpec],
     pub irq_cap: Option<u32>,
     pub service_ep: u32,
     pub registry_ep: u32,
@@ -203,12 +207,13 @@ pub struct DriverSpawnConfig<'a>
 /// used to derive a per-device badged send cap from `registry_ep` so the
 /// driver can query devmgr for its device configuration.
 ///
-/// Layout matches `services/drivers/virtio/blk/src/main.rs::bootstrap_caps`
-/// and the virtio-input driver's:
-///   Round 1: BAR MMIO, IRQ, driver service endpoint; or BAR MMIO and
-///     driver service endpoint when `irq_cap` is `None`, a shape only
-///     virtio-input decodes.
-///   Round 2 (1 cap): devmgr query endpoint.
+/// The rounds are the ones [`virtio_core::bootstrap`] specifies and the
+/// virtio-blk and virtio-input drivers decode:
+///   Round 1: one `Mmio` cap per entry of `bars`, in its order, with that
+///     entry's BAR index as the matching data word.
+///   Round 2 (terminal): the positional slots service endpoint, IRQ, and
+///     devmgr query endpoint, packed with [`ipc::bootstrap::pack_slots`];
+///     the IRQ slot is absent when `irq_cap` is `None`.
 ///
 /// log + procmgr endpoints arrive via `ProcessInfo`.
 // clippy::too_many_lines: driver spawn is a single transaction — derive the
@@ -220,9 +225,6 @@ pub struct DriverSpawnConfig<'a>
 #[allow(clippy::too_many_lines)]
 pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 {
-    let _ = config.bars.bases;
-    let _ = config.bars.sizes;
-
     // Release the source ELF cap on every exit before the create call consumes
     // it (missing BAR/IRQ, badge-derive failure, ipc_call failure). Disarmed
     // once the ipc_call returns, which transfers the cap to procmgr.
@@ -233,12 +235,11 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     };
     let mut module_guard = ModuleCapGuard::new(source_cap);
 
-    let Some(bar_cap) = config.bars.caps.first().copied()
-    else
+    if config.bars.is_empty() || config.bars.len() > MAX_VIRTIO_BARS
     {
-        std::os::seraph::log!("driver spawn: no BAR cap");
+        std::os::seraph::log!("driver spawn: BAR count outside 1..={}", MAX_VIRTIO_BARS);
         return false;
-    };
+    }
     let procmgr_ep = config.procmgr_ep;
     let bootstrap_ep = config.bootstrap_ep;
     let service_ep = config.service_ep;
@@ -319,12 +320,29 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     // Derive all per-child caps for delivery via bootstrap. Each derivation
     // owns a devmgr slot that must be released on later failure paths so devmgr
     // does not leak it; the child itself is reaped by `child_guard`.
-    let Ok(bar_copy) = syscall::cap_derive(bar_cap, syscall::RIGHTS_ALL)
-    else
-    {
-        std::os::seraph::log!("driver bar cap derivation failed");
-        return false;
+    let mut bar_copies = [0u32; MAX_VIRTIO_BARS];
+    let mut bar_indices = [0u64; MAX_VIRTIO_BARS];
+    let bar_count = config.bars.len();
+    let drop_bars = |copies: &[u32]| {
+        for &c in copies
+        {
+            let _ = syscall::cap_delete(c);
+        }
     };
+    for (i, bar) in config.bars.iter().enumerate()
+    {
+        let Ok(copy) = syscall::cap_derive(bar.cap, syscall::RIGHTS_ALL)
+        else
+        {
+            std::os::seraph::log!("driver bar cap derivation failed");
+            drop_bars(&bar_copies[..i]);
+            return false;
+        };
+        bar_copies[i] = copy;
+        bar_indices[i] = u64::from(bar.bar);
+    }
+    let bar_copies = &bar_copies[..bar_count];
+    let bar_indices = &bar_indices[..bar_count];
     // IRQ is optional. A device sharing an INTx line (so devmgr could not carve
     // it a private IRQ cap) is delivered a null IRQ slot; the driver then polls
     // its queue instead of waiting on interrupts.
@@ -336,7 +354,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
             else
             {
                 std::os::seraph::log!("driver irq cap derivation failed");
-                let _ = syscall::cap_delete(bar_copy);
+                drop_bars(bar_copies);
                 return false;
             };
             c
@@ -356,7 +374,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     else
     {
         std::os::seraph::log!("driver devmgr query cap derivation failed");
-        let _ = syscall::cap_delete(bar_copy);
+        drop_bars(bar_copies);
         let _ = syscall::cap_delete(irq_copy);
         if service_copy != 0
         {
@@ -369,7 +387,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     // serve_round transfer already consumed is a no-op, so it is safe on any
     // post-derive failure arm.
     let drop_derived = || {
-        let _ = syscall::cap_delete(bar_copy);
+        drop_bars(bar_copies);
         let _ = syscall::cap_delete(irq_copy);
         if service_copy != 0
         {
@@ -392,24 +410,17 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
         return false;
     }
 
-    // Serve bootstrap round 1. With an IRQ: [bar, irq, service]. Without:
-    // [bar, service] — a null IRQ slot cannot be transferred, so it is
-    // omitted and the driver infers "no IRQ" from the 2-cap round and polls
-    // instead. Only virtio-input decodes the 2-cap shape; virtio-blk
-    // requires the IRQ, so its spawn site refuses to spawn without one.
-    let round1_with_irq = [bar_copy, irq_copy, service_copy];
-    let round1_no_irq = [bar_copy, service_copy];
-    let round1_caps: &[u32] = if irq_copy != 0
-    {
-        &round1_with_irq
-    }
-    else
-    {
-        &round1_no_irq
-    };
+    // Round 1: the BAR caps, each with its BAR index.
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {
-        ipc::bootstrap::serve_round(bootstrap_ep, child_badge, ipc_buf, false, round1_caps, &[])
+        ipc::bootstrap::serve_round(
+            bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            false,
+            bar_copies,
+            bar_indices,
+        )
     }
     .is_err()
     {
@@ -418,7 +429,15 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
         return false;
     }
 
-    // Round 2: [devmgr_query], done.
+    // Round 2: [service, irq, devmgr_query] as positional slots, done. A
+    // null slot cannot be transferred, so an absent IRQ (a device sharing
+    // an INTx line) or service endpoint is named absent in the presence
+    // word instead.
+    let mut slots = [0u32; ROUND2_SLOTS];
+    slots[SLOT_SERVICE] = service_copy;
+    slots[SLOT_IRQ] = irq_copy;
+    slots[SLOT_DEVMGR_QUERY] = devmgr_copy;
+    let round2 = ipc::bootstrap::pack_slots(&slots);
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {
         ipc::bootstrap::serve_round(
@@ -426,8 +445,8 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
             child_badge,
             ipc_buf,
             true,
-            &[devmgr_copy],
-            &[],
+            round2.caps(),
+            &[round2.presence()],
         )
     }
     .is_err()

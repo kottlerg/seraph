@@ -590,11 +590,10 @@ impl AddressSpace
     ///
     /// Used by:
     /// - [`map_segment`](Self::map_segment) and the Phase 9 init bootstrap
-    ///   (image, `InitInfo`, stack), and by `sys_mem_map` / `sys_mmio_map` for an
-    ///   address space with no recorded donation — PT pages come from
-    ///   `kernel_pt_pool`.
-    /// - Address spaces with a recorded donation go through
-    ///   [`map_page_pooled`](Self::map_page_pooled).
+    ///   (image, `InitInfo`, stack) — PT pages come from `kernel_pt_pool`.
+    /// - The map syscalls go through [`map_page_pooled`](Self::map_page_pooled):
+    ///   every address space records its create-time donation before it is
+    ///   published (`AddressSpaceObject::require_create_donation`).
     ///
     /// # Safety
     /// `virt` must be in the user half of the active paging mode (see

@@ -271,10 +271,10 @@ chain).
    Context Switch TLB Handling below).
 
 3. **Modification** (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`): acquire
-   `pt_lock`, call `arch::current::paging::map_user_page_pooled` (`map_user_page` for
-   a space with no recorded donation) / `unmap_user_page` (`unmap_user_region_pooled`
-   for a `MEM_UNMAP_RECLAIM_PTS` unmap) / `protect_user_page`, then perform TLB
-   management (see TLB Management section below).
+   `pt_lock`, call `arch::current::paging::map_user_page_pooled` / `unmap_user_page`
+   (`unmap_user_region_pooled` for a `MEM_UNMAP_RECLAIM_PTS` unmap) /
+   `protect_user_page`, then perform TLB management (see TLB Management section
+   below).
 
 4. **Destruction**: when the address space's reference count reaches zero (see
    [capability-internals.md](capability-internals.md) § Kernel Object Reference
@@ -527,8 +527,12 @@ the mapping path:
   (`MEM_UNMAP_RECLAIM_PTS`) returns a now-empty node to that pool only when
   its parent entry carries the bit.
 - Kernel-direct mappings through `map_page` (the Phase 9 init image, InitInfo
-  page, and stack) and any address space without a recorded donation draw
-  them from the fixed kernel page-table pool (`mm::kernel_pt_pool`).
+  page, and stack) draw them from the fixed kernel page-table pool
+  (`mm::kernel_pt_pool`). No map syscall reaches that pool: every address space
+  records its create-time donation before it is published (both constructors
+  fail rather than publish one without), so `SYS_MEM_MAP` and `SYS_MMIO_MAP`
+  always take the pooled path, and refuse with `OutOfMemory` should that
+  invariant ever break (`AddressSpaceObject::require_create_donation`).
 
 No per-node tracking structure exists. On address-space destruction the kernel
 does not walk the tables: the wrapper returns every donation wholesale to its

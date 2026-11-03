@@ -89,15 +89,17 @@ pub enum ObjectType
 pub struct KernelObjectHeader
 {
     /// Reference count; starts at 1 when created. Bounded by
-    /// [`REF_COUNT_LIMIT`] for the references userspace can multiply.
+    /// [`REF_COUNT_LIMIT`] for the references userspace can multiply. While
+    /// the object waits on a dealloc cascade ([`CascadeStack`]) its count is
+    /// 0 and this field holds the low 32 bits of the stack link instead.
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
-    // Padding to reach 8-byte alignment for the ancestor pointer below. Public
-    // because mint sites outside this module build the header by struct literal;
-    // the underscore marks it as carrying no value.
-    #[allow(clippy::pub_underscore_fields)]
-    pub _pad: [u8; 3],
+    /// The high 24 bits of the dealloc-cascade link ([`CascadeStack`]) while
+    /// the object is queued on one, and zero at every other time. The bytes
+    /// also pad the header to 8-byte alignment for `ancestor`. Public because
+    /// mint sites outside this module build the header by struct literal.
+    pub cascade_link_hi: [u8; 3],
     /// Pointer to the `MemoryObject`'s header this object was retyped from;
     /// every production object has one (null only in host tests). Set once at
     /// creation, read at deallocation. `AtomicPtr` for the unforgeable null
@@ -163,7 +165,7 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            _pad: [0; 3],
+            cascade_link_hi: [0; 3],
             ancestor: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -178,7 +180,7 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            _pad: [0; 3],
+            cascade_link_hi: [0; 3],
             ancestor: AtomicPtr::new(ancestor.as_ptr()),
         }
     }
@@ -1020,9 +1022,10 @@ impl PagePool
     /// Whether record 0, the create-time slab, is populated. Records are
     /// appended from index 0, and every wrapper the kernel constructs
     /// records its slab before the wrapper is published, so this is true
-    /// for every live object. The pooled map paths' fallback to the kernel
-    /// page-table pool and the dealloc arms' debug assertions check that
-    /// invariant rather than support an unrecorded object.
+    /// for every live object. The map syscalls' check
+    /// ([`AddressSpaceObject::require_create_donation`]) and the dealloc
+    /// arms' debug assertions check that invariant rather than support an
+    /// unrecorded object.
     #[cfg(not(test))]
     #[must_use]
     pub fn has_create_donation(&self) -> bool
@@ -1243,8 +1246,8 @@ impl PagePool
     /// The owner is being torn down at refcount 0: no other reference to
     /// it, the pool, or any recorded page exists, and `free` must not touch
     /// the pool. `self` is dangling once this returns. `free` receives raw
-    /// records and may run a full nested object teardown, so the caller
-    /// must hold no lock.
+    /// records and may push onto the dealloc cascade stack; the caller
+    /// holds no lock.
     #[cfg(not(test))]
     unsafe fn reclaim_donations<F>(&self, mut free: F)
     where
@@ -1460,6 +1463,40 @@ unsafe fn pool_push(head_phys: &AtomicU64, phys: u64)
 
 impl AddressSpaceObject
 {
+    /// Check, at a map syscall's entry, that this address space records its
+    /// create-time donation, so its page-table pages come from its own pool.
+    ///
+    /// Both constructors record the donation before the object is published
+    /// (`sys_cap_create_aspace` rolls the create back, and
+    /// `boot_retype_aspace` halts the boot, if `add_donation` fails; record 0
+    /// of a new pool is always vacant), and record 0 is cleared only at
+    /// dealloc. So the check cannot fail on a live object, and no map
+    /// syscall draws on the kernel page-table pool, whose only consumers are
+    /// the Phase 9 bootstrap maps (core/kernel/docs/memory-internals.md
+    /// § Page Table Node Ownership).
+    ///
+    /// # Errors
+    ///
+    /// `OutOfMemory`, the error of a map with no page-table page to draw, if
+    /// the invariant is broken (debug builds assert it first).
+    #[cfg(not(test))]
+    pub fn require_create_donation(&self) -> Result<(), syscall::SyscallError>
+    {
+        let recorded = self.pt_pool.has_create_donation();
+        debug_assert!(
+            recorded,
+            "address space published without its create-time donation"
+        );
+        if recorded
+        {
+            Ok(())
+        }
+        else
+        {
+            Err(syscall::SyscallError::OutOfMemory)
+        }
+    }
+
     /// Pop a free PT page from this AS's pool, charging the growth budget.
     /// Returns the page's physical address, or `None` if the pool is empty.
     /// Called under the address space's `pt_lock`, which serialises this
@@ -2031,49 +2068,187 @@ unsafe fn unlink_dying_waiter(
     }
 }
 
-/// Push `obj`, a refcount-0 object, onto a dealloc cascade worklist. Drops the
-/// entry on overflow — see `MAX_CASCADE` in [`dealloc_object`]. Overflow is
-/// unreachable in practice for the derivation depths this kernel actually
-/// produces; dropping is preferable to a panic in the dealloc path.
-#[cfg(not(test))]
-fn push_cascade(
-    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
-    head: &mut usize,
-    obj: NonNull<KernelObjectHeader>,
-)
+// ── Dealloc cascade stack ─────────────────────────────────────────────────────
+
+/// Width of the cascade link a queued header holds: the 32 bits of
+/// `ref_count` and the 24 of `cascade_link_hi`.
+const CASCADE_LINK_BITS: u32 = 56;
+
+/// The objects a [`dealloc_object`] call has orphaned and not yet torn down:
+/// a LIFO linked through the objects' own headers, so it holds any number of
+/// them without allocating.
+///
+/// Only a refcount-0 object that nothing else references is pushed, and an
+/// object reaches 0 once, so it is on at most one stack, at most once. While
+/// it is queued, the header's `ref_count` and `cascade_link_hi` hold the link
+/// to the object below it (its virtual address shifted right by 3, every
+/// header being 8-byte aligned, kept to [`CASCADE_LINK_BITS`] and
+/// sign-extended back, which every canonical address of up to 59 significant
+/// bits survives); `obj_type` and `ancestor`, which the teardown reads, are
+/// never written. [`Self::pop`] zeroes both link fields again, so the object
+/// it returns reads `ref_count == 0`, as when it was pushed.
+struct CascadeStack
 {
-    if *head < worklist.len()
+    top: Option<NonNull<KernelObjectHeader>>,
+}
+
+impl CascadeStack
+{
+    /// An empty stack.
+    const fn new() -> Self
     {
-        worklist[*head] = Some(obj);
-        *head += 1;
+        Self { top: None }
+    }
+
+    /// The link word that names `next` (0 for none).
+    fn encode(next: Option<NonNull<KernelObjectHeader>>) -> u64
+    {
+        let Some(next) = next
+        else
+        {
+            return 0;
+        };
+        let va = next.as_ptr() as u64;
+        debug_assert!(
+            va.trailing_zeros() >= 3,
+            "cascade: header {va:#x} not 8-byte aligned"
+        );
+        let word = (va >> 3) & ((1 << CASCADE_LINK_BITS) - 1);
+        debug_assert!(
+            Self::decode(word) == Some(next),
+            "cascade: header {va:#x} outside the link's address range"
+        );
+        word
+    }
+
+    /// The header a link word names (`None` for 0).
+    fn decode(word: u64) -> Option<NonNull<KernelObjectHeader>>
+    {
+        // Sign-extend the CASCADE_LINK_BITS-bit word, then restore the three
+        // alignment bits: `(word << 8) >> 5`, arithmetic.
+        // cast_possible_wrap, cast_sign_loss: the casts reinterpret the bits
+        // for the arithmetic shift; no value is converted.
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let va = (((word << (64 - CASCADE_LINK_BITS)) as i64) >> (61 - CASCADE_LINK_BITS)) as u64;
+        NonNull::new(va as *mut KernelObjectHeader)
+    }
+
+    /// Read the link word `obj`'s header holds.
+    ///
+    /// # Safety
+    /// `obj` is a header on this stack.
+    unsafe fn read_link(obj: NonNull<KernelObjectHeader>) -> u64
+    {
+        // SAFETY: caller contract; the queued object is exclusively this
+        // stack's, so nothing writes the fields concurrently.
+        let (lo, hi) = unsafe {
+            (
+                (*obj.as_ptr()).ref_count.load(Ordering::Relaxed),
+                (*obj.as_ptr()).cascade_link_hi,
+            )
+        };
+        u64::from(lo)
+            | (u64::from(hi[0]) << 32)
+            | (u64::from(hi[1]) << 40)
+            | (u64::from(hi[2]) << 48)
+    }
+
+    /// Store `word` in `obj`'s link fields.
+    ///
+    /// # Safety
+    /// `obj` is exclusively owned by the caller and no reference to its
+    /// header is used across this call.
+    unsafe fn write_link(obj: NonNull<KernelObjectHeader>, word: u64)
+    {
+        // cast_possible_truncation: each cast keeps exactly the bits its
+        // field holds.
+        #[allow(clippy::cast_possible_truncation)]
+        let (lo, hi) = (
+            word as u32,
+            [(word >> 32) as u8, (word >> 40) as u8, (word >> 48) as u8],
+        );
+        // SAFETY: caller contract.
+        unsafe {
+            (*obj.as_ptr()).ref_count.store(lo, Ordering::Relaxed);
+            core::ptr::addr_of_mut!((*obj.as_ptr()).cascade_link_hi).write(hi);
+        }
+    }
+
+    /// Queue `obj` for teardown.
+    ///
+    /// # Safety
+    /// `obj` is a live object's header whose reference count is 0, that no
+    /// capability slot, pin, or other kernel owner references, that is on no
+    /// cascade stack, and that the caller owns exclusively; no reference to
+    /// its header is used after this call.
+    unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
+    {
+        // SAFETY: caller contract (a live header).
+        let refs = unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed);
+        debug_assert_eq!(refs, 0, "cascade: pushed object is still referenced");
+        // SAFETY: caller contract (exclusively owned).
+        unsafe { Self::write_link(obj, Self::encode(self.top)) };
+        self.top = Some(obj);
+    }
+
+    /// Take the most recently pushed object, its link fields zeroed.
+    fn pop(&mut self) -> Option<NonNull<KernelObjectHeader>>
+    {
+        let top = self.top?;
+        // SAFETY: `top` was queued by `push`, whose contract keeps it live,
+        // exclusively this stack's, and unreferenced until it is popped here.
+        unsafe {
+            self.top = Self::decode(Self::read_link(top));
+            Self::write_link(top, 0);
+        }
+        Some(top)
+    }
+}
+
+/// Tear down `first` and everything its teardown orphans: `teardown` runs on
+/// `first`, then on each object it or a later run pushed onto the stack, most
+/// recent first, until the stack is empty.
+///
+/// The driver of [`dealloc_object`]; generic so the host tests drive the same
+/// loop with a model teardown.
+fn run_cascade<F>(first: NonNull<KernelObjectHeader>, mut teardown: F)
+where
+    F: FnMut(NonNull<KernelObjectHeader>, &mut CascadeStack),
+{
+    let mut stack = CascadeStack::new();
+    teardown(first, &mut stack);
+    while let Some(next) = stack.pop()
+    {
+        teardown(next, &mut stack);
     }
 }
 
 /// Return each death-observer node of the chain starting at `first` to its
-/// queue's pool and release the `EventQueueObject` reference the node held.
-/// A queue whose last reference this was is reclaimed through its own nested
-/// cascade, not the caller's bounded worklist: a chain may hold any number of
-/// nodes, each of a distinct queue (the re-entry `free_donation` makes).
-/// Called by an owner's teardown (the Thread and `AddressSpace` arms) with the
-/// chain it took, once no death walk can read it.
+/// queue's pool and release the `EventQueueObject` reference the node held,
+/// queueing a queue whose last reference this was on the cascade stack (its
+/// dealloc then runs from the caller's loop, not by recursion). Called by an
+/// owner's teardown (the Thread and `AddressSpace` arms) with the chain it
+/// took, once no death walk can read it.
 ///
 /// # Safety
-/// The caller owns every node of the chain and holds no lock: the nested
-/// cascade takes its own.
+/// The caller owns every node of the chain and holds no lock.
 #[cfg(not(test))]
-unsafe fn release_death_observers(first: *mut crate::sched::thread::DeathObserver)
+unsafe fn release_death_observers(
+    first: *mut crate::sched::thread::DeathObserver,
+    stack: &mut CascadeStack,
+)
 {
     // SAFETY: the caller took the chain, so it owns every node; each lives in
     // its queue, which the node's reference keeps live until the dec_ref
     // below, issued after the node is back in the pool. A queue at zero has no
-    // capability or binding left, as dealloc_object requires.
+    // capability or binding left, so it is unreferenced for the push.
     unsafe {
         crate::sched::thread::for_each_observer(first, |node| {
             let eq = (*node).eq;
             crate::ipc::event_queue::event_queue_return_observer((*eq).state, node);
             if (*eq).header.dec_ref() == 0
             {
-                dealloc_object(NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()));
+                stack.push(NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()));
             }
         });
     }
@@ -2081,18 +2256,14 @@ unsafe fn release_death_observers(first: *mut crate::sched::thread::DeathObserve
 
 /// Free the SEED-backed body of an object of concrete type `T`: drop it in
 /// place, return its bytes to its ancestor Memory object, and release the
-/// ancestor reference, pushing the ancestor onto `worklist` if that was the
+/// ancestor reference, pushing the ancestor onto `stack` if that was the
 /// last.
 ///
 /// # Safety
 /// `ptr` is an exclusively owned, retype-backed `T` (header at offset 0) that
 /// nothing references; no lock is held.
 #[cfg(not(test))]
-unsafe fn free_body<T>(
-    ptr: NonNull<KernelObjectHeader>,
-    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
-    head: &mut usize,
-)
+unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
     // SAFETY: caller contract.
     let ancestor_ptr = unsafe { ptr.as_ref().ancestor.load(Ordering::Acquire) };
@@ -2112,7 +2283,8 @@ unsafe fn free_body<T>(
     crate::cap::retype::retype_free(ancestor_memory, offset, core::mem::size_of::<T>() as u64);
     if ancestor_memory.header.dec_ref() == 0
     {
-        push_cascade(worklist, head, ancestor);
+        // SAFETY: the body's lease was the ancestor's last reference.
+        unsafe { stack.push(ancestor) };
     }
 }
 
@@ -2126,11 +2298,7 @@ unsafe fn free_body<T>(
 /// `ptr` is a refcount-0 `T`, exclusively owned, whose mappings or bindings
 /// have been withdrawn; no lock is held.
 #[cfg(not(test))]
-unsafe fn release_range_object<T>(
-    ptr: NonNull<KernelObjectHeader>,
-    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
-    head: &mut usize,
-)
+unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
     // SAFETY: a live Mmio or IoPort object (caller contract).
     let root = unsafe { lineage_of(ptr) }.root_of(ptr);
@@ -2138,7 +2306,7 @@ unsafe fn release_range_object<T>(
     {
         // A copy: nothing names its body once its references are gone.
         // SAFETY: caller contract.
-        unsafe { free_body::<T>(ptr, worklist, head) };
+        unsafe { free_body::<T>(ptr, stack) };
     }
     // The root's `live` share of this object: the root's own on a root, the
     // copy's on a copy. The last share frees the root.
@@ -2150,7 +2318,7 @@ unsafe fn release_range_object<T>(
         == share
     {
         // SAFETY: no reference and no live copy names the root any more.
-        unsafe { free_body::<T>(root, worklist, head) };
+        unsafe { free_body::<T>(root, stack) };
     }
 }
 
@@ -2269,88 +2437,35 @@ pub unsafe fn object_for_new_slot(
 ///
 /// # Cascade handling
 ///
-/// Reclaiming a retype-backed object may credit bytes back to its ancestor
-/// `MemoryObject` and decrement the ancestor's refcount. If the ancestor's
-/// refcount reaches zero (transitively, when reclaiming a chain of caps
-/// whose only ref was the descendant), the ancestor must also be freed.
-/// This is handled via an explicit stack-local worklist driven by this
-/// function rather than by recursion: each arm pushes the freshly-orphaned
-/// ancestor into the worklist, and the outer loop processes it on the next
-/// iteration. Recursion would risk deadlock if a future change introduced a
-/// lock above this point. Four fan-outs nevertheless re-enter this function
-/// with no lock held, because their width is unbounded or caller-chosen and
-/// the worklist is not: the `CSpaceObj` arm for the objects a dying
-/// `CSpace`'s slots reference; the `AddressSpace` and `CSpaceObj` arms'
-/// `free_donation` (nested in `dealloc_object_one`) for a pool donation's
-/// Memory object that reaches zero; the `WaitSet` arm for each member source
-/// whose last reference the membership held; and `release_death_observers`,
-/// from the Thread and `AddressSpace` arms, for each observer queue that
-/// reaches zero. No re-entry can reach a `CSpace`: a nested `CSpace` whose
-/// last reference a dying one held is linked, through its `deferred_next`
-/// field, onto this call's pending list instead, and the outer loop below
-/// tears it down once the worklist is empty. A `CSpace` slot's Thread,
-/// `AddressSpace` or `WaitSet` may itself re-enter once more for its queues,
-/// sources or donations, whose objects re-enter no further, so the re-entry
-/// depth is at most two frames whatever the nesting depth of `CSpace`s
+/// Tearing an object down releases references it held: its ancestor
+/// `MemoryObject`'s retype lease, a pool donation's lease on its Memory
+/// object, the references a dying `CSpace`'s slots hold, a wait set's
+/// member references, a thread's fault-handler binding, death-observer
+/// nodes' queue references. Each object one of those releases leaves
+/// unreferenced is pushed onto a [`CascadeStack`] local to this call,
+/// linked through the objects' own headers, and this function tears the
+/// stack down, most recent first, until it is empty. No arm recurses into
+/// `dealloc_object`, so the call's stack use is a constant whatever the
+/// fan-out (a caller-sized wait set, a chain of observer nodes, a
+/// `CSpace`'s slots) or the depth of the chain (a `CSpace` holding the last
+/// reference to another, a Memory object whose last child frees it), and no
+/// arm runs inside another's lock scope. The stack is unbounded and
+/// allocates nothing
 /// (core/kernel/docs/capability-internals.md § Teardown).
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {
-    /// Maximum nested-cascade depth handled. Real-world derivation chains
-    /// (memmgr-memory → child-bootstrap split → kernel object) sit at depth
-    /// `<= 4`, and each arm pushes at most a few entries per pop. Thirty-two
-    /// entries fit comfortably on the kernel stack (256 B). The fan-outs whose
-    /// width is unbounded or caller-chosen do not go through this worklist:
-    /// `free_donation` runs each pool donation ancestor that reaches zero
-    /// through its own nested cascade, and so do the `WaitSet` arm for each
-    /// member source and `release_death_observers` for each observer's queue.
-    const MAX_CASCADE: usize = 32;
-
-    let mut worklist: [Option<core::ptr::NonNull<KernelObjectHeader>>; MAX_CASCADE] =
-        [None; MAX_CASCADE];
-    worklist[0] = Some(ptr);
-    let mut head: usize = 1;
-    // Nested `CSpace`s a dying `CSpace` released the last reference to,
-    // linked through `CSpaceKernelObject::deferred_next` (see `# Cascade
-    // handling`). Each is exclusively owned (refcount 0) and on no other list.
-    let mut pending: *mut KernelObjectHeader = core::ptr::null_mut();
-
-    loop
-    {
-        while head > 0
-        {
-            head -= 1;
-            let Some(next) = worklist[head]
-            else
-            {
-                continue;
-            };
-            worklist[head] = None;
-            // SAFETY: `next` is a NonNull<KernelObjectHeader> that was the
-            // original caller-supplied pointer, pushed onto the worklist by an
-            // ancestor-reclaim arm, or taken from `pending` below — every
-            // contract requires that no slot references the object (refcount
-            // 0, or a never-published body) and exclusive ownership.
-            unsafe { dealloc_object_one(next, &mut worklist, &mut head, &mut pending) };
-        }
-        let Some(nested) = NonNull::new(pending)
-        else
-        {
-            break;
-        };
-        // SAFETY: `nested` is a refcount-0 CSpaceObj the CSpaceObj arm linked
-        // here; its link field is read before its teardown can reuse it (a
-        // self-teardown re-queues it on the per-CPU stack through the same
-        // field).
-        pending = unsafe { *deferred_link(nested) };
-        worklist[0] = Some(nested);
-        head = 1;
-    }
+    run_cascade(ptr, |next, stack| {
+        // SAFETY: `next` is the caller's object (this function's contract)
+        // or one an arm pushed, which `CascadeStack::push`'s contract leaves
+        // unreferenced and exclusively owned; no lock is held between arms.
+        unsafe { dealloc_object_one(next, stack) };
+    });
 }
 
-/// Reclaim one already-zero-refcount object. If the reclaim cascades into
-/// the ancestor (`dec_ref` returns 0 against the source `MemoryObject`),
-/// pushes the ancestor's pointer onto the worklist instead of recursing.
+/// Reclaim one already-zero-refcount object. Every object the reclaim
+/// leaves unreferenced (its ancestor `MemoryObject` when `dec_ref` returns
+/// 0 against it, and the like) is pushed onto `stack` instead of recursing.
 ///
 /// # Safety
 ///
@@ -2370,26 +2485,21 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
     clippy::items_after_statements
 )]
 #[cfg(not(test))]
-unsafe fn dealloc_object_one(
-    ptr: core::ptr::NonNull<KernelObjectHeader>,
-    worklist: &mut [Option<core::ptr::NonNull<KernelObjectHeader>>],
-    head: &mut usize,
-    pending: &mut *mut KernelObjectHeader,
-)
+unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
     /// Return one donation to its ancestor Memory object and drop the
-    /// reference the donation held on it. An ancestor that reaches zero is
-    /// reclaimed through its own nested cascade rather than the caller's
-    /// worklist: a pool may hold any number of donations, each from a
-    /// distinct Memory object, and the worklist is bounded. The nested call
-    /// is the same re-entry the `CSpaceObj` arm already makes for the
-    /// objects its slots reference.
+    /// reference the donation held on it, pushing the ancestor onto `stack`
+    /// if that was its last reference.
     ///
     /// # Safety
     /// `(anc_ptr, off, pages)` must be a donation record handed out by
-    /// `PagePool::reclaim_donations` under that function's contract, and the
-    /// caller must hold no lock: the nested cascade takes its own.
-    unsafe fn free_donation(anc_ptr: *mut KernelObjectHeader, off: u64, pages: u64)
+    /// `PagePool::reclaim_donations` under that function's contract.
+    unsafe fn free_donation(
+        anc_ptr: *mut KernelObjectHeader,
+        off: u64,
+        pages: u64,
+        stack: &mut CascadeStack,
+    )
     {
         // SAFETY: anc_ptr was set at donation recording from a live
         // MemoryObject's header; the inc_ref then is matched by the
@@ -2404,7 +2514,7 @@ unsafe fn dealloc_object_one(
         {
             // SAFETY: refcount reached 0; no live cap holds it, and the
             // donation's bytes have been returned to it above.
-            unsafe { dealloc_object(NonNull::new_unchecked(anc_ptr)) };
+            unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
         }
     }
 
@@ -2472,7 +2582,8 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
         ObjectType::Mmio =>
@@ -2484,7 +2595,7 @@ unsafe fn dealloc_object_one(
             // (dealloc_object's contract).
             unsafe { (*ptr.as_ptr().cast::<MmioObject>()).withdraw_mappings() };
             // SAFETY: a refcount-0 Mmio object; no lock held.
-            unsafe { release_range_object::<MmioObject>(ptr, worklist, head) };
+            unsafe { release_range_object::<MmioObject>(ptr, stack) };
         }
         ObjectType::Interrupt =>
         {
@@ -2533,7 +2644,8 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
         ObjectType::IoPort =>
@@ -2544,7 +2656,7 @@ unsafe fn dealloc_object_one(
             // dereferenced, by the withdrawal walk.
             unsafe { crate::cap::ioport_bindings::withdraw_everywhere(ptr.as_ptr() as usize) };
             // SAFETY: a refcount-0 IoPort object; no lock held.
-            unsafe { release_range_object::<IoPortObject>(ptr, worklist, head) };
+            unsafe { release_range_object::<IoPortObject>(ptr, stack) };
         }
         ObjectType::SchedControl =>
         {
@@ -2571,7 +2683,8 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
         ObjectType::SbiControl =>
@@ -2599,7 +2712,8 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
 
@@ -3017,24 +3131,23 @@ unsafe fn dealloc_object_one(
                 // binding held an inc_ref on the endpoint object for its lifetime
                 // (see ThreadControlBlock::fault_handler); drop it, and if this
                 // was its last reference enqueue the orphaned endpoint on the
-                // cascade worklist (rather than recursing into `dealloc_object`,
-                // which this function's worklist mechanism exists to avoid). Done
+                // cascade stack (rather than recursing into `dealloc_object`,
+                // which the cascade exists to avoid). Done
                 // after the unlink above (which removed this thread from the
                 // endpoint's send queue if it was a queued faulter) so the
                 // endpoint dealloc cannot observe this thread still on its queue.
                 // SAFETY: tcb valid (not yet freed); fault_handler is atomic; no
-                // lock is held here.
+                // lock is held here; a binding's reference that was the
+                // endpoint's last leaves it unreferenced for the push.
                 unsafe {
                     let ep = (*tcb)
                         .fault_handler
                         .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
                     if !ep.is_null() && (*ep).header.dec_ref() == 0
                     {
-                        push_cascade(
-                            worklist,
-                            head,
-                            core::ptr::NonNull::new_unchecked(ep.cast::<KernelObjectHeader>()),
-                        );
+                        stack.push(core::ptr::NonNull::new_unchecked(
+                            ep.cast::<KernelObjectHeader>(),
+                        ));
                     }
                 }
 
@@ -3045,7 +3158,7 @@ unsafe fn dealloc_object_one(
                 // other path.
                 let first = unsafe { (*tcb).death_observers.take() };
                 // SAFETY: the chain was just taken; no lock is held here.
-                unsafe { release_death_observers(first) };
+                unsafe { release_death_observers(first, stack) };
 
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
@@ -3181,7 +3294,8 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0.
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
 
@@ -3269,7 +3383,7 @@ unsafe fn dealloc_object_one(
                 let first =
                     unsafe { crate::mm::address_space::AddressSpace::take_death_observers(as_ptr) };
                 // SAFETY: the chain was just taken; no lock is held here.
-                unsafe { release_death_observers(first) };
+                unsafe { release_death_observers(first, stack) };
 
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic
@@ -3288,7 +3402,7 @@ unsafe fn dealloc_object_one(
             let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
                 // SAFETY: a record handed out by reclaim_donations under
                 // its contract; no lock held.
-                unsafe { free_donation(anc, off, pages) }
+                unsafe { free_donation(anc, off, pages, stack) }
             };
             // SAFETY: refcount 0, no slot references the object, the
             // in-place AddressSpace (if any) has been dropped, and no lock
@@ -3376,13 +3490,12 @@ unsafe fn dealloc_object_one(
                 // critical section so any concurrent foreign reader sees a
                 // consistent "drained, then absent" transition.
                 //
-                // The lock MUST be released BEFORE the `for_each_object`
-                // dec_ref cascade below: a slot in the dying CSpace may hold
-                // a CSpace cap whose dec_ref drives a nested
-                // `dealloc_object(CSpaceObj)` call, which would re-enter
-                // this same non-recursive lock and deadlock. The drain
-                // already removed every foreign link before this point, so
-                // the dec_ref cascade has no derivation-tree work to do —
+                // The lock is released BEFORE the `for_each_object` dec_ref
+                // pass below: the objects that pass orphans are torn down
+                // later from the cascade stack, and a `CSpace` among them
+                // takes this same non-recursive lock for its own drain. The
+                // drain already removed every foreign link before this point,
+                // so the dec_ref pass has no derivation-tree work to do —
                 // releasing is safe.
                 let mut drain_cursor: u32 = 0;
                 loop
@@ -3403,34 +3516,19 @@ unsafe fn dealloc_object_one(
                     crate::cap::derivation::DERIVATION_LOCK.write_unlock();
                 }
 
-                // Dec-ref all objects referenced by non-null slots. Runs
-                // without DERIVATION_LOCK so the nested deallocs can take it.
-                // A nested CSpace reaching zero is not torn down here: it is
-                // linked onto the outer `dealloc_object`'s pending list, so a
-                // chain of CSpaces each holding the last reference to the
-                // next is torn down iteratively, not one recursion per level.
-                // No other type's teardown can release a CSpace, so the
-                // re-entry below adds one frame, and a slot's Thread,
-                // AddressSpace or WaitSet at most one more (see
-                // `dealloc_object`).
-                // SAFETY: cs_ptr non-null; for_each_object handles iteration.
+                // Dec-ref all objects referenced by non-null slots, queueing
+                // each one this leaves unreferenced, a nested CSpace
+                // included, on the cascade stack: a chain of CSpaces each
+                // holding the last reference to the next is torn down
+                // iteratively, not one recursion per level.
+                // SAFETY: cs_ptr non-null; for_each_object handles iteration;
+                // each slot's reference is released once, and one that was
+                // its object's last leaves the object unreferenced and ours.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
-                        let hdr = obj_ptr.as_ref();
-                        let rc = hdr.dec_ref();
-                        if rc != 0
+                        if obj_ptr.as_ref().dec_ref() == 0
                         {
-                            return;
-                        }
-                        if hdr.obj_type == ObjectType::CSpaceObj
-                        {
-                            // Refcount 0: the object is ours and on no list.
-                            *deferred_link(obj_ptr) = *pending;
-                            *pending = obj_ptr.as_ptr();
-                        }
-                        else
-                        {
-                            dealloc_object(obj_ptr);
+                            stack.push(obj_ptr);
                         }
                     });
                 }
@@ -3456,7 +3554,7 @@ unsafe fn dealloc_object_one(
             let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
                 // SAFETY: a record handed out by reclaim_donations under its
                 // contract; no lock held.
-                unsafe { free_donation(anc, off, pages) }
+                unsafe { free_donation(anc, off, pages, stack) }
             };
             // SAFETY: refcount 0, no slot references the object, the
             // in-place CSpace has been dropped, and no lock is held.
@@ -3587,7 +3685,7 @@ unsafe fn dealloc_object_one(
             // Wrapper + state live in-place inside the ancestor Memory cap's
             // region. Drop in place, return the slot to the per-Memory
             // allocator, then dec_ref the ancestor — cascading through the
-            // worklist if it hits zero.
+            // cascade stack if it hits zero.
             use crate::cap::retype::{dispatch_for, retype_free};
             // dispatch_for is total over the kernel's retypable types; the
             // Endpoint arm always returns Some. Unwrap-or-fall-through with
@@ -3625,7 +3723,7 @@ unsafe fn dealloc_object_one(
             retype_free(ancestor_memory, offset, raw_bytes);
 
             // Drop the retype-time refcount lease. If this was the Memory cap's last
-            // reference, push it onto the cascade worklist; dealloc_object frees it on
+            // reference, push it onto the cascade stack; dealloc_object frees it on
             // a later iteration (the Memory arm returns its buddy pages).
             let ancestor_nn =
                 // SAFETY: ancestor_ptr is non-null per debug_assert.
@@ -3633,9 +3731,10 @@ unsafe fn dealloc_object_one(
             let new_rc = ancestor_memory.header.dec_ref();
             if new_rc == 0
             {
-                // SAFETY: refcount reached 0; the worklist runs the Memory
-                // arm above (which frees the buddy pages).
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last; the
+                // cascade runs the Memory arm above (which frees the buddy
+                // pages).
+                unsafe { stack.push(ancestor_nn) };
             }
         }
 
@@ -3729,15 +3828,15 @@ unsafe fn dealloc_object_one(
             retype_free(ancestor_memory, offset, raw_bytes);
 
             // Drop the retype-time refcount lease; on full release, queue the Memory
-            // cap on the cascade worklist.
+            // cap on the cascade stack.
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
                 unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
             let new_rc = ancestor_memory.header.dec_ref();
             if new_rc == 0
             {
-                // SAFETY: refcount reached 0; queue the Memory cap on the cascade worklist.
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
 
@@ -3822,7 +3921,8 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0.
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
 
@@ -3850,17 +3950,15 @@ unsafe fn dealloc_object_one(
                 // wait_set_drop wakes any blocked waiter, clears every source
                 // back-pointer, and drops the +1 cap-level ref each member
                 // held on its source. A source whose ref drops to zero is
-                // reclaimed only after its back-pointer clear released every
-                // source/ws IPC lock (see scheduling-internals.md § Lock
-                // Hierarchy). A set may hold up to WAIT_SET_MAX_MEMBERS last
-                // references, more than the bounded worklist, so each zeroed
-                // source is reclaimed through its own nested cascade (the
-                // re-entry `free_donation` makes); `wait_set_drop` calls back
-                // with no lock held.
+                // queued on the cascade stack, and so torn down only after
+                // `wait_set_drop` has returned and released every source/ws
+                // IPC lock (see scheduling-internals.md § Lock Hierarchy),
+                // however many members the caller-sized set held.
                 // SAFETY: state non-null and live; each zeroed header has no
-                // capability or membership left, as dealloc_object requires.
+                // capability or membership left, so it is unreferenced for
+                // the push.
                 unsafe {
-                    crate::ipc::wait_set::wait_set_drop(state, |source| dealloc_object(source));
+                    crate::ipc::wait_set::wait_set_drop(state, |source| stack.push(source));
                 }
             }
 
@@ -3893,7 +3991,8 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0.
-                push_cascade(worklist, head, ancestor_nn);
+                // SAFETY: the reference just released was its last.
+                unsafe { stack.push(ancestor_nn) };
             }
         }
     }
@@ -4187,5 +4286,266 @@ mod tests
         // A release below the ceiling admits a new reference again.
         assert_eq!(h.dec_ref(), REF_COUNT_LIMIT - 1);
         assert!(h.try_inc_ref().is_ok());
+    }
+
+    /// A model kernel object for the cascade tests: a real header followed by
+    /// the model's index for the object.
+    #[repr(C)]
+    struct ModelObject
+    {
+        header: KernelObjectHeader,
+        index: usize,
+    }
+
+    /// Distinct non-null `ancestor` value for model object `i`, to check that
+    /// queueing never touches the field.
+    fn model_ancestor(i: usize) -> *mut KernelObjectHeader
+    {
+        ((i + 1) * 64) as *mut KernelObjectHeader
+    }
+
+    /// Heap model objects of `types`, object `i` with `refs[i]` references,
+    /// as raw pointers: the cascade writes their headers, so every pointer it
+    /// is handed must come from a raw (not a shared-reference) source, as the
+    /// kernel's do. [`free_models`] reclaims them.
+    fn alloc_models(types: &[ObjectType], refs: &[u32]) -> Vec<*mut ModelObject>
+    {
+        types
+            .iter()
+            .enumerate()
+            .map(|(index, &obj_type)| {
+                let header = KernelObjectHeader::new(obj_type);
+                header.ref_count.store(refs[index], Ordering::Relaxed);
+                header
+                    .ancestor
+                    .store(model_ancestor(index), Ordering::Relaxed);
+                Box::into_raw(Box::new(ModelObject { header, index }))
+            })
+            .collect()
+    }
+
+    /// The header of model object `raw`, as the cascade's pointer to it.
+    fn model_header(raw: *mut ModelObject) -> NonNull<KernelObjectHeader>
+    {
+        // SAFETY: `raw` is a live `alloc_models` object; the header is
+        // addressed without creating a reference.
+        unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).header)) }
+    }
+
+    /// Reclaim the objects [`alloc_models`] returned.
+    fn free_models(objects: Vec<*mut ModelObject>)
+    {
+        for raw in objects
+        {
+            // SAFETY: each pointer came from `Box::into_raw` and is freed once.
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
+
+    /// Run `run_cascade` from object 0 over a model in which object `i` holds
+    /// one reference on each object in `holds[i]` and its teardown releases
+    /// them; every object starts with as many references as it has holders,
+    /// object 0 with none. Returns how many times each object was torn down.
+    fn run_model_cascade(types: &[ObjectType], holds: &[Vec<usize>]) -> Vec<u32>
+    {
+        let mut refs = vec![0u32; types.len()];
+        for held in holds
+        {
+            for &h in held
+            {
+                refs[h] += 1;
+            }
+        }
+        assert_eq!(refs[0], 0, "the model's first object must be unreferenced");
+        let objects = alloc_models(types, &refs);
+        let ptrs: Vec<NonNull<KernelObjectHeader>> =
+            objects.iter().map(|&raw| model_header(raw)).collect();
+        let mut torn = vec![0u32; types.len()];
+        run_cascade(ptrs[0], |obj, stack| {
+            // SAFETY: every pointer the model queues is one of `objects`,
+            // popped and so no longer written by the stack.
+            let model = unsafe { &*obj.as_ptr().cast::<ModelObject>() };
+            let i = model.index;
+            assert_eq!(model.header.ref_count.load(Ordering::Relaxed), 0);
+            assert_eq!(model.header.cascade_link_hi, [0; 3]);
+            assert_eq!(model.header.obj_type, types[i]);
+            assert_eq!(
+                model.header.ancestor.load(Ordering::Relaxed),
+                model_ancestor(i)
+            );
+            torn[i] += 1;
+            for &h in &holds[i]
+            {
+                // SAFETY: `ptrs[h]` is a live model header.
+                if unsafe { ptrs[h].as_ref() }.dec_ref() == 0
+                {
+                    // SAFETY: that was the model object's last reference,
+                    // and its pointer has a raw source.
+                    unsafe { stack.push(ptrs[h]) };
+                }
+            }
+        });
+        free_models(objects);
+        torn
+    }
+
+    /// Add to the model a tree of CSpaces under `root`: `width` CSpaces per
+    /// CSpace to `depth` levels, each non-leaf CSpace (the root included)
+    /// also holding an endpoint and a thread, and below the first level the
+    /// level's first CSpace also held by the previous level's last, in
+    /// another subtree.
+    fn add_nested_cspaces(
+        types: &mut Vec<ObjectType>,
+        holds: &mut Vec<Vec<usize>>,
+        root: usize,
+        width: usize,
+        depth: usize,
+    )
+    {
+        let mut level = vec![root];
+        let mut extra_holder: Option<usize> = None;
+        for _ in 0..depth
+        {
+            let mut next = Vec::new();
+            for &parent in &level
+            {
+                for _ in 0..width
+                {
+                    let c = types.len();
+                    types.push(ObjectType::CSpaceObj);
+                    holds.push(Vec::new());
+                    holds[parent].push(c);
+                    next.push(c);
+                }
+                for t in [ObjectType::Endpoint, ObjectType::Thread]
+                {
+                    let o = types.len();
+                    types.push(t);
+                    holds.push(Vec::new());
+                    holds[parent].push(o);
+                }
+            }
+            if let Some(holder) = extra_holder
+            {
+                holds[holder].push(next[0]);
+            }
+            extra_holder = next.last().copied();
+            level = next;
+        }
+    }
+
+    // Defect guarded: a cascade that loses an entry (as any fixed-size
+    // worklist does past its size), tears one object down twice, or corrupts
+    // the type or ancestor a teardown reads while the object is queued.
+    #[test]
+    fn a_cascade_with_wide_fan_out_and_deep_chains_tears_every_object_down_once()
+    {
+        // Object 0, a CSpace, holds 40 objects (more than a 32-entry array
+        // holds): 20 endpoints and 20 wait sets, each wait set holding 16
+        // notifications. Every one of those holds a lease on one of the Memory
+        // objects, which form a 64-deep ancestor chain, each holding the next.
+        // Object 0 also holds a tree of CSpaces, 3 wide and 4 deep, whose
+        // teardowns release further CSpaces and the objects they hold, with
+        // one CSpace per level held from two subtrees.
+        const CHAIN: usize = 64;
+        let mut types = vec![ObjectType::CSpaceObj];
+        let mut holds: Vec<Vec<usize>> = vec![Vec::new()];
+        let memory_base = 1;
+        for m in 0..CHAIN
+        {
+            types.push(ObjectType::Memory);
+            holds.push(
+                if m + 1 < CHAIN
+                {
+                    vec![memory_base + m + 1]
+                }
+                else
+                {
+                    Vec::new()
+                },
+            );
+        }
+        holds[0].push(memory_base);
+        for e in 0..40
+        {
+            let obj = types.len();
+            types.push(
+                if e < 20
+                {
+                    ObjectType::Endpoint
+                }
+                else
+                {
+                    ObjectType::WaitSet
+                },
+            );
+            holds.push(vec![memory_base + e % CHAIN]);
+            holds[0].push(obj);
+            if e >= 20
+            {
+                for _ in 0..16
+                {
+                    let n = types.len();
+                    types.push(ObjectType::Notification);
+                    holds.push(vec![memory_base]);
+                    holds[obj].push(n);
+                }
+            }
+        }
+        add_nested_cspaces(&mut types, &mut holds, 0, 3, 4);
+        let torn = run_model_cascade(&types, &holds);
+        assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
+    }
+
+    // Defect guarded: a link encoding that loses address bits (a header that
+    // pops back as another), or a pop that leaves link bits in the reference
+    // count or the type and ancestor fields disturbed.
+    #[test]
+    fn a_cascade_stack_pops_lifo_and_restores_each_header()
+    {
+        let types = [ObjectType::Endpoint; 100];
+        let objects = alloc_models(&types, &[0; 100]);
+        let mut stack = CascadeStack::new();
+        for &raw in &objects
+        {
+            // SAFETY: an unreferenced model header with a raw source, queued
+            // once.
+            unsafe { stack.push(model_header(raw)) };
+        }
+        for &raw in objects.iter().rev()
+        {
+            assert_eq!(stack.pop(), Some(model_header(raw)));
+            // SAFETY: popped, so the stack no longer writes it.
+            let o = unsafe { &*raw };
+            assert_eq!(o.header.ref_count.load(Ordering::Relaxed), 0);
+            assert_eq!(o.header.cascade_link_hi, [0; 3]);
+            assert_eq!(o.header.obj_type, ObjectType::Endpoint);
+            assert_eq!(
+                o.header.ancestor.load(Ordering::Relaxed),
+                model_ancestor(o.index)
+            );
+        }
+        assert_eq!(stack.pop(), None);
+        free_models(objects);
+    }
+
+    // Defect guarded: a decode that fails to sign-extend, so a kernel
+    // (upper-half) header address pops back as a lower-half one.
+    #[test]
+    fn the_cascade_link_round_trips_upper_and_lower_half_addresses()
+    {
+        for va in [
+            0xFFFF_8000_0000_0040u64,
+            0xFFFF_FFFF_FFFF_FFF8,
+            0xFF00_0000_0000_0008,
+            0x0000_7FFF_FFFF_FFF8,
+            0x0000_0000_0000_1000,
+        ]
+        {
+            let p = NonNull::new(va as *mut KernelObjectHeader);
+            assert_eq!(CascadeStack::decode(CascadeStack::encode(p)), p, "{va:#x}");
+        }
+        assert_eq!(CascadeStack::encode(None), 0);
+        assert_eq!(CascadeStack::decode(0), None);
     }
 }

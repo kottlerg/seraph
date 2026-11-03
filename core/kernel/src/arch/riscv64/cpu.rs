@@ -81,7 +81,9 @@ pub unsafe fn load_word_racy(p: *const u64) -> u64
 
 /// Read the current stack pointer (`sp`, x2).
 ///
-/// Used by the panic-path backtrace scanner to bound the kernel-stack walk.
+/// Used by the panic-path backtrace scanner to bound the kernel-stack walk,
+/// and at `kernel_entry`'s first statement to locate the handoff stack
+/// (`crate::stack_depth::note_boot_entry`).
 #[cfg(not(test))]
 pub fn current_stack_pointer() -> u64
 {

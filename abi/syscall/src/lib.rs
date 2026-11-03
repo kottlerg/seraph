@@ -497,7 +497,8 @@ pub enum SyscallError
     /// No memory available to satisfy the request.
     OutOfMemory = -8,
     /// The operation is not supported: on this object type, on this
-    /// architecture, or (for a diagnostic query) in this boot.
+    /// architecture, or (for a diagnostic query) in this boot; or the firmware
+    /// returned an error (`SYS_SBI_CALL`).
     NotSupported = -9,
     /// The capability rights bitmask violates the W^X constraint.
     WxViolation = -10,

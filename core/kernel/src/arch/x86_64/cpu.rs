@@ -36,7 +36,9 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32)
 
 /// Read the current stack pointer (`rsp`).
 ///
-/// Used by the panic-path backtrace scanner to bound the kernel-stack walk.
+/// Used by the panic-path backtrace scanner to bound the kernel-stack walk,
+/// and at `kernel_entry`'s first statement to locate the handoff stack
+/// (`crate::stack_depth::note_boot_entry`).
 #[cfg(not(test))]
 pub fn current_stack_pointer() -> u64
 {

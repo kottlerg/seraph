@@ -150,8 +150,8 @@ the devmgr-registry cap for its lifetime (see
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
-| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |
-| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with and the `BoundedStr` diagnostic formatter |
+| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, and the `reclaim:` line logd logs when it evicts a slot |
+| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line formatter, and the `BoundedStr` diagnostic formatter |
 
 ---
 

@@ -68,7 +68,7 @@ fn logd_reclaim_child_main() -> !
 /// `reclaim: badge=<b> exit_reason=0x17 name=svctest-logd-reclaim`. logd has
 /// no read surface, so svctest cannot observe the eviction:
 /// `cargo xtask test-logd-reclaim` checks the line in the boot's serial log
-/// (docs/testing.md § Gating).
+/// (docs/testing.md § Death forward to logd).
 pub fn logd_death_forward_phase(_: &Caps)
 {
     let status = std::process::Command::new("/tests/svctest")

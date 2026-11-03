@@ -1006,7 +1006,10 @@ fn emit_line(_badge: u64, name: &[u8], line: &[u8])
     out.push(b'[');
     if name.is_empty()
     {
-        out.push(b'?');
+        for &b in logd_codec::reclaim::UNNAMED.as_bytes()
+        {
+            out.push(b);
+        }
     }
     else
     {

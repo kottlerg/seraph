@@ -443,6 +443,13 @@ pub enum TestComponent
 pub const DEFAULT_FAIL_REGEX: &str =
     r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL";
 
+/// Default `run-parallel --pass` regex: the cross-harness terminal pass
+/// marker `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker).
+pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
+
+/// Default `run-parallel --fail-grace-secs`.
+pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
+
 #[derive(Parser)]
 pub struct RunParallelArgs
 {
@@ -488,7 +495,7 @@ pub struct RunParallelArgs
     /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
     /// [`docs/testing.md`](../../docs/testing.md); override for other
     /// rootfs configurations.
-    #[arg(long, default_value = "ALL TESTS PASSED")]
+    #[arg(long, default_value = DEFAULT_PASS_REGEX)]
     pub pass: String,
 
     /// Regex marking a failed run. On match the log is preserved as
@@ -528,7 +535,7 @@ pub struct RunParallelArgs
     /// truncates the diagnostics. The run is killed at whichever is first:
     /// this window, or the `--timeout` deadline. 0 kills on the next poll
     /// after the match.
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value_t = DEFAULT_FAIL_GRACE_SECS)]
     pub fail_grace_secs: u64,
 
     /// Also copy every run's log, whatever its outcome, to

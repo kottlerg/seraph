@@ -587,8 +587,12 @@ cargo xtask test-logd-reclaim [--arch x86_64|riscv64] [--timeout SECS] [--cpus N
 
 With no `--log`, the boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass
 and fail markers, `--timeout` defaulting to 900 s) with `--save-logs` into
-`target/xtask/test-logd-reclaim/`, and the check reads the log saved there; a boot that does not
-pass fails the command before the check. Stage svctest first, as
+`target/xtask/test-logd-reclaim/`, and the check reads the log saved there (a log an earlier
+boot left there is removed first). A boot that ends `FAIL`, `HANG`, `OK` or `ERR` fails the command
+before the check, as it fails `run-parallel`. A `QEMU-CRASH` boot, a host-emulator crash that
+`run-parallel` does not count as a failure, leaves a log without the pass marker: the check reads
+the outcome from the log's `[run-parallel]` trailer and reports itself skipped, which passes the
+command, for a saved log given with `--log` as well. Stage svctest first, as
 [docs/testing.md](../docs/testing.md) § Gating describes.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.

@@ -152,8 +152,9 @@ reclaim: badge=<badge> exit_reason=0x<reason> name=<name>
 The badge is decimal, the exit reason lower-case hex (the death entry's
 `exit_reason`), and the name is the slot's registered display name
 (`STREAM_REGISTER_NAME`), `?` for a slot that registered none. The name is
-the last field and runs to the end of the line; an invalid UTF-8 sequence in
-it prints as U+FFFD. A badge with no slot logs nothing. The line is a test
+the last field and runs to the end of the line; each invalid UTF-8 sequence
+and each control character in it, a line break among them, prints as U+FFFD.
+A badge with no slot logs nothing. The line is a test
 contract: `cargo xtask test-logd-reclaim` reads it from svctest's serial log
 (see [docs/testing.md](../../../docs/testing.md#death-forward-to-logd-test-logd-reclaim)).
 `logd_codec::reclaim` formats it.
@@ -200,4 +201,5 @@ ordering).
 
 ## Summarized By
 
-[services/logd/README.md](../README.md)
+[Testing](../../../docs/testing.md), [services/logd/README.md](../README.md),
+[services/logd/codec/README.md](../codec/README.md), [xtask/README.md](../../../xtask/README.md)

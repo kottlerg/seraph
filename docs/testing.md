@@ -294,8 +294,9 @@ profiles), after the `ktest` run-parallel boot.
 
 ### Death forward to logd (`test-logd-reclaim`)
 
-procmgr forwards every process death to logd's death queue, and logd evicts the
-dead sender's slot (see
+Once logd has registered its death queue with procmgr, procmgr posts the death
+of every process it then tears down to that queue, and logd evicts the dead
+sender's slot (see
 [services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
 § Death-notification cascade). No harness can observe the eviction from inside
 the guest, because logd has no read surface. svctest's `logd_death_forward` phase
@@ -310,7 +311,9 @@ reason shows the forward carries the reason as well as the badge.
 The check reads a serial log and does not need its own boot. In CI it runs
 inside each `svctest` cell (both arches, both profiles), after the svctest
 `run-parallel` boot, against the log that boot's `--save-logs` saved
-(`--log`). Run with no `--log`, it boots the current sysroot once through
+(`--log`). A boot that `run-parallel` records as `QEMU-CRASH`, a host-emulator
+crash it does not count as a failure, is skipped, since its log shows nothing
+of the guest. Run with no `--log`, it boots the current sysroot once through
 `run-parallel` and checks that boot's log, so svctest must be staged as above
 (command reference:
 [xtask/README.md § test-logd-reclaim](../xtask/README.md#cargo-xtask-test-logd-reclaim)).

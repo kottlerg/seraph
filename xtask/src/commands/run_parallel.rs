@@ -38,6 +38,10 @@ use crate::qemu::{
 use crate::term::filter::FilterWriter;
 use crate::util::{require_tool, step};
 
+/// The label of a `Status::QemuCrash` run, first in its summary line and its
+/// `--save-logs` trailer's `outcome=` field (`QEMU-CRASH_rc=<code>`).
+pub(crate) const QEMU_CRASH_LABEL: &str = "QEMU-CRASH";
+
 /// How often the watchdog poll loop checks child exit status.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -85,7 +89,7 @@ impl Status
             Status::Fail => "FAIL".into(),
             Status::Hang => "HANG".into(),
             Status::Err(rc) => format!("ERR rc={rc}"),
-            Status::QemuCrash(rc) => format!("QEMU-CRASH rc={rc}"),
+            Status::QemuCrash(rc) => format!("{QEMU_CRASH_LABEL} rc={rc}"),
         }
     }
 
@@ -748,7 +752,13 @@ struct SavedRun
 /// File name `--save-logs` gives a run's copy: `<arch>-<cpus>cpu-<run>.log`.
 fn saved_log_name(saved: &SavedRun) -> String
 {
-    format!("{}-{}cpu-{}.log", saved.arch, saved.cpus, saved.run)
+    saved_log_file(saved.arch, saved.cpus, saved.run)
+}
+
+/// File name `--save-logs` gives run `run` of a batch at `arch` and `cpus`.
+pub(crate) fn saved_log_file(arch: Arch, cpus: u32, run: u32) -> String
+{
+    format!("{arch}-{cpus}cpu-{run}.log")
 }
 
 /// The trailer line `--save-logs` appends, in the `key=value` shape

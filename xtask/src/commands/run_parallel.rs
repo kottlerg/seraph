@@ -25,8 +25,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use regex::Regex;
 
+use crate::accel::detect_for_arch;
 use crate::arch::Arch;
 use crate::cli::RunParallelArgs;
+use crate::commands::ktest_timing::accel_name;
 use crate::context::Context as BuildContext;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
@@ -149,6 +151,12 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     std::fs::create_dir_all(&workdir)
         .with_context(|| format!("creating workdir {}", workdir.display()))?;
     purge_prior_logs(&workdir);
+    if let Some(dir) = &args.save_logs
+    {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating --save-logs dir {}", dir.display()))?;
+    }
+    let accel = accel_name(detect_for_arch(args.arch));
 
     step(&format!(
         "Starting run-parallel: arch={:?} parallel={} runs={} timeout={}s workdir={}",
@@ -194,6 +202,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let fail_re = fail_re.clone();
             let workdir = workdir.clone();
             let qemu_binary = qemu_binary.clone();
+            let save_logs = args.save_logs.clone();
 
             handles.push(thread::spawn(move || -> Result<RunOutcome> {
                 std::fs::create_dir_all(&slot_dir)
@@ -302,6 +311,16 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     matched,
                 };
 
+                if let Some(dir) = &save_logs
+                {
+                    let saved = SavedRun {
+                        arch,
+                        cpus,
+                        accel,
+                        run: run_id,
+                    };
+                    save_log(dir, &log_path, &saved, &outcome)?;
+                }
                 finalize_log(&workdir, &log_path, run_id, &outcome.status)?;
                 println!("{}", format_outcome_line(&outcome));
                 Ok(outcome)
@@ -686,6 +705,52 @@ fn line_containing(text: &str, byte_offset: usize) -> String
     text[start..end].trim_end_matches(['\r', '\n']).to_string()
 }
 
+/// What `--save-logs` records of a run beside its outcome.
+struct SavedRun
+{
+    arch: Arch,
+    cpus: u32,
+    accel: &'static str,
+    run: u32,
+}
+
+/// File name `--save-logs` gives a run's copy: `<arch>-<cpus>cpu-<run>.log`.
+fn saved_log_name(saved: &SavedRun) -> String
+{
+    format!("{}-{}cpu-{}.log", saved.arch, saved.cpus, saved.run)
+}
+
+/// The trailer line `--save-logs` appends, in the `key=value` shape
+/// `crate::timing` reads.
+fn trailer_line(saved: &SavedRun, outcome: &RunOutcome) -> String
+{
+    format!(
+        "{}arch={} cpus={} accel={} run={} outcome={} wall_s={:.3}",
+        crate::timing::TRAILER_PREFIX,
+        saved.arch,
+        saved.cpus,
+        saved.accel,
+        saved.run,
+        outcome.status.label().replace(' ', "_"),
+        outcome.elapsed.as_secs_f64()
+    )
+}
+
+/// Copy a classified run's log into `dir` with the trailer appended.
+fn save_log(dir: &Path, log_path: &Path, saved: &SavedRun, outcome: &RunOutcome) -> Result<()>
+{
+    let mut body = std::fs::read(log_path)
+        .with_context(|| format!("reading {} for --save-logs", log_path.display()))?;
+    if body.last().is_some_and(|b| *b != b'\n')
+    {
+        body.push(b'\n');
+    }
+    body.extend_from_slice(trailer_line(saved, outcome).as_bytes());
+    body.push(b'\n');
+    let dest = dir.join(saved_log_name(saved));
+    std::fs::write(&dest, body).with_context(|| format!("writing {}", dest.display()))
+}
+
 fn finalize_log(workdir: &Path, log_path: &Path, run_id: u32, status: &Status) -> Result<()>
 {
     match status.log_prefix()
@@ -1046,6 +1111,34 @@ mod tests
     }
 
     // SIGKILL (our own timeout kill, or OOM) is NOT a tolerated QEMU crash.
+    #[test]
+    fn a_saved_log_trailer_carries_what_the_timing_parser_reads()
+    {
+        let saved = SavedRun {
+            arch: Arch::Riscv64,
+            cpus: 65,
+            accel: "tcg",
+            run: 2,
+        };
+        let outcome = RunOutcome {
+            run: 2,
+            slot: 0,
+            status: Status::Hang,
+            elapsed: Duration::from_millis(71_250),
+            matched: None,
+        };
+        assert_eq!(saved_log_name(&saved), "riscv64-65cpu-2.log");
+        let text = format!(
+            "[1.000000] ktest: starting\n{}\n",
+            trailer_line(&saved, &outcome)
+        );
+        let t = crate::timing::parse_log(&text).unwrap();
+        assert_eq!(t.arch.as_deref(), Some("riscv64"));
+        assert_eq!(t.cpus, Some(65));
+        assert_eq!(t.accel.as_deref(), Some("tcg"));
+        assert!((t.wall_secs.unwrap() - 71.25).abs() < 1e-9);
+    }
+
     #[test]
     fn sigkill_is_not_qemu_crash()
     {

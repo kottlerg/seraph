@@ -8,6 +8,8 @@
 //! Add a new top-level command by adding a variant to `CliCommand` and a
 //! corresponding `Args` struct below, then handle it in `main.rs`.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::arch::Arch;
@@ -47,6 +49,14 @@ pub enum CliCommand
     /// classifying each run's outcome via user-supplied pass/fail regexes.
     /// Requires a populated sysroot — run `cargo xtask build` first.
     RunParallel(RunParallelArgs),
+
+    /// Read preserved ktest boot logs (from `run-parallel --save-logs`) and
+    /// print per-tier and per-cell wall times; with `--base` and `--wide`,
+    /// compare two widths against their width factor; with `--baseline`,
+    /// compare one log against a checked-in baseline of the same width; with
+    /// `--write-baseline`, write one. Report-only: a flagged row never fails
+    /// the command. See xtask/README.md for the tables and the baseline format.
+    KtestTiming(KtestTimingArgs),
 
     /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
     /// and regenerate `disk.img` without invoking cargo. The mirror is
@@ -429,6 +439,55 @@ pub struct RunParallelArgs
     /// after the match.
     #[arg(long, default_value = "10")]
     pub fail_grace_secs: u64,
+
+    /// Also copy every run's log, whatever its outcome, to
+    /// `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run-parallel]`
+    /// trailer line that records the run's arch, width, accelerator, outcome,
+    /// and host wall time. DIR is created if absent and never purged; a file
+    /// of the same name is overwritten.
+    #[arg(long, value_name = "DIR")]
+    pub save_logs: Option<PathBuf>,
+}
+
+// ── KtestTiming ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct KtestTimingArgs
+{
+    /// ktest boot logs: each is tabulated on its own, or the one log
+    /// `--baseline` and `--write-baseline` take.
+    pub logs: Vec<PathBuf>,
+
+    /// The narrower-width log of a cross-width comparison (requires `--wide`).
+    #[arg(long, requires = "wide", conflicts_with_all = ["baseline", "write_baseline"])]
+    pub base: Option<PathBuf>,
+
+    /// The wider-width log of a cross-width comparison (requires `--base`).
+    #[arg(long, requires = "base", conflicts_with_all = ["baseline", "write_baseline"])]
+    pub wide: Option<PathBuf>,
+
+    /// Compare the one LOG against this baseline file (same arch and width).
+    #[arg(long, value_name = "FILE", conflicts_with = "write_baseline")]
+    pub baseline: Option<PathBuf>,
+
+    /// Write the one LOG's timing to this baseline file, with the commit and
+    /// the host's CPU, kernel, QEMU, and accelerator settings in its header.
+    #[arg(long, value_name = "FILE")]
+    pub write_baseline: Option<PathBuf>,
+
+    /// The commit the LOG ran at, recorded by `--write-baseline`.
+    #[arg(long, default_value = "HEAD")]
+    pub commit: String,
+
+    /// Flag a row whose normalised ratio exceeds this (R/F across widths,
+    /// the plain ratio against a baseline).
+    #[arg(long, default_value = "1.5")]
+    pub threshold: f64,
+
+    /// Flag a row only when its time exceeds the expected time (F times the
+    /// base, or the baseline's) by at least this many seconds.
+    #[arg(long, default_value = "1.0")]
+    pub min_secs: f64,
 }
 
 // ── LintDocs ──────────────────────────────────────────────────────────────────

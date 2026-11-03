@@ -37,6 +37,7 @@ mod qmp;
 mod rust_src;
 mod sysroot;
 mod term;
+mod timing;
 mod util;
 
 use cli::{Cli, CliCommand};
@@ -71,6 +72,7 @@ fn main()
         CliCommand::Clean(args) => commands::clean::run(&ctx, args),
         CliCommand::Test(args) => commands::test::run(&ctx, args),
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
+        CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),

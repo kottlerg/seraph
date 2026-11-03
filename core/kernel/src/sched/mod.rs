@@ -47,11 +47,13 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 /// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total).
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
-/// `stress::stack_depth` after Tier S): the deepest thread stack uses 4304 B
-/// and the deepest idle stack 1752 B, a margin of about 74% and 89%, over
-/// debug and release builds at 4, 16 and 128 CPUs on both architectures
-/// (release: thread 4304 B, idle 1616 B; debug: thread 4200 B, idle 1752 B).
-/// The report gives the depth, not the path that reached it.
+/// `stress::stack_depth` after Tier S), on both architectures: debug builds at
+/// 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle stack
+/// (`riscv64`; 3296 B and 1328 B on `x86_64`), margins of about 77% and 90%;
+/// release builds at 4, 16 and 128 CPUs use at most 4304 B (thread) and 1616 B
+/// (idle), and debug builds at 4 CPUs at most 4200 B and 1752 B, so the deepest
+/// bounds leave margins of about 74% and 89%. The report gives the depth, not
+/// the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's

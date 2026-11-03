@@ -347,7 +347,7 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; the latter runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
 | Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times and the memory variation once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
@@ -521,9 +521,9 @@ done
 
 Each budget is the larger of three times the measured run and the measured run plus the longest
 failing bound ktest stretches at that width (`split_delete_race`'s 100 s exit poll, through
-`scaled_polls`: 100 s at 16 CPUs, 800 s at 128), rounded up to a minute, so a
-stuck cell reaches its own FAIL line before `run-parallel` classifies the run as a HANG. A change
-to the measured runs or to the longest stretched bound re-derives the budgets.
+`scaled_polls`: 100 s at 16 CPUs, 800 s at 128), rounded up to a minute, so a stuck cell reaches its
+own FAIL line before `run-parallel` classifies the run as a HANG. A change to the measured runs or
+to the longest stretched bound re-derives the budgets.
 
 The two 16-CPU runs are the 1x width the scaling below starts past (`UNSCALED_CPUS`, the reference
 host's core count) and each architecture's base for the timing report's cross-width comparison.
@@ -690,10 +690,13 @@ list as the tracking Issues move):
   `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
   past one block, a run that cannot be found, and requests of one block or
   less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
-  (`sched::slab_pages`), the host tests of the partial-word mask paths in
-  place of a boot at a count past one word (`range_spans_words`, and
-  `range_at_max_cpus_covers_every_index_and_one_less_drops_the_top` for the
-  top index), and the 128-CPU boots for two full words.
+  (`sched::slab_pages`), and the 128-CPU boots for two full words.
+- Both arches, a partial second `CpuMask` word (residual): no local run boots
+  a count past one 64-bit word that does not fill the next (65 to 127 CPUs).
+  The host tests of `CpuMask::range` cover those mask paths instead:
+  `range_spans_words` (a partial second word) and
+  `range_at_max_cpus_covers_every_index_and_one_less_drops_the_top` (a partial
+  top word), in `core/kernel/src/cpu_mask.rs`.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

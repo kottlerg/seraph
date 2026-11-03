@@ -214,9 +214,11 @@ impl Condvar {
             };
             // SAFETY: `node.thread` is the calling thread's own handle.
             unsafe { node.thread.park_timeout(left) };
-            // A timed park can return before its deadline (a coalesced wake,
-            // or a stop and restart of this thread); with more than a
-            // millisecond left, yield rather than spin on the syscall, as
+            // A timed park can return before its deadline, for example on a
+            // stale or coalesced wake, a stop and restart of this thread, a
+            // deadline rounded down to whole milliseconds, or no notification
+            // to wait on (the park then spins once); with more than a
+            // millisecond left, yield rather than spin on the park, as
             // `thread::sleep` does.
             if !node.notified.load(Acquire)
                 && timeout.saturating_sub(start.elapsed()) > Duration::from_millis(1)

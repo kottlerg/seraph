@@ -8,9 +8,9 @@
 //! sinks.
 //!
 //! Slots are keyed by the kernel-delivered badge on every IPC message —
-//! the same `u64` procmgr uses as the child's process badge and the
-//! correlator on its death-EQ binding. Slot eviction is driven by the
-//! death-EQ event drained inside logd's main loop.
+//! the same `u64` procmgr uses as the child's process badge, whose low 32
+//! bits are the correlator on its death-EQ binding. Slot eviction is
+//! driven by the death-EQ event drained inside logd's main loop.
 
 use std::collections::HashMap;
 

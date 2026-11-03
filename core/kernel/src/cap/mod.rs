@@ -311,9 +311,9 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// per-RAM-extent-count growth (more drained extents ⇒ more init-time
 /// Memory-cap derivations) and per-service growth (more boot modules ⇒
 /// more module-memory caps) without revisiting this knob. The boot mint is
-/// itself bounded by [`BOOT_BODY_BOUND`] (about 670 caps, the `InitInfo`
-/// descriptor capacity), so a boot at that bound, an ACPI-region-heavy memory
-/// map among them, still leaves init about 866 slots.
+/// itself bounded by [`BOOT_BODY_BOUND`] (about 690 caps: the `InitInfo`
+/// descriptor capacity and Phase 9's Memory caps), so a boot at that bound, an
+/// ACPI-region-heavy memory map among them, still leaves init about 850 slots.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -393,9 +393,14 @@ const _: () = assert!(
 
 /// Most boot-minted capability bodies: one per descriptor the `InitInfo`
 /// block can carry ([`INIT_INFO_DESCRIPTOR_CAPACITY`]), since every capability
-/// Phase 7 and Phase 9 mint into the root `CSpace` is described to init there.
+/// Phases 7 and 8 mint into the root `CSpace` is described to init there, plus
+/// the `Memory` bodies Phase 9 mints that init learns of through header fields
+/// instead: one per init segment, `InitInfo` page and init stack page.
 #[cfg(not(test))]
-const BOOT_BODY_BOUND: usize = INIT_INFO_DESCRIPTOR_CAPACITY;
+const BOOT_BODY_BOUND: usize = INIT_INFO_DESCRIPTOR_CAPACITY
+    + boot_protocol::INIT_MAX_SEGMENTS
+    + init_protocol::INIT_INFO_MAX_PAGES
+    + INIT_STACK_PAGES;
 
 /// Bytes of one boot-minted body: the 128-byte retype size class, which
 /// every body type fits (asserted below).
@@ -430,17 +435,17 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// - init's bootstrap `AddressSpace` and Thread slabs ([`INIT_ASPACE_PAGES`]
 ///   18, [`INIT_THREAD_PAGES`] 6);
 /// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (about
-///   670) of [`BOOT_BODY_BYTES`] each (about 21 pages): one RAM `MemoryObject`
+///   690) of [`BOOT_BODY_BYTES`] each (about 22 pages): one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
 ///   `SchedControl` and `SbiControl` roots, the firmware-table, boot-module,
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
-/// That is about 94 pages (376 KiB). Nothing draws on SEED at runtime: the
+/// That is about 95 pages (380 KiB). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
-/// capabilities pass the body bound exhausts SEED with a named fatal in
-/// Phase 7, as it would overflow `InitInfo` in Phase 9.
+/// capabilities pass the descriptor capacity halts the boot by name in
+/// Phase 7 (`push_descriptor`) before it could exhaust SEED.
 ///
 /// The remainder of the largest extent is exposed to userspace as a
 /// regular retype-backed RAM Memory cap (the "seed-tail"), so init and
@@ -680,6 +685,9 @@ fn reserve_init_backing()
 #[cfg(not(test))]
 pub(crate) fn take_init_info_block_phys() -> u64
 {
+    // The block goes to init now, so the descriptor array is retired with it:
+    // a later `descriptor_array()` halts by name instead of writing into it.
+    DESCRIPTOR_ARRAY.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
     phys
@@ -1497,9 +1505,10 @@ fn populate_cspace(
     // tracks how many have been written.
     //
     // ORDER: the RAM Memory caps are minted first, one per drained extent and
-    // in drain order, with nothing minted between them, because the drain left
-    // extent i in descriptor slot i (`drain_and_install_seed`) and descriptor i
-    // is written over it. Minting anything before them, or between them, would
+    // in slot order (the drain's, with the largest extent promoted to slot 0),
+    // with nothing minted between them, because the drain left extent i in
+    // descriptor slot i (`drain_and_install_seed`) and descriptor i is written
+    // over it. Minting anything before them, or between them, would
     // overwrite extents not yet read.
     let mut desc_count: usize = 0;
 

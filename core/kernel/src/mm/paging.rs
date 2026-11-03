@@ -242,9 +242,11 @@ impl MapOutcome
 /// first two direct-map chunks of the stage-2 carve, whose frames map the rest
 /// of it ([`map_carve_rest`]), so the seed's need is fixed by the image size,
 /// not by RAM: the image's tables (one per 2 MiB of image plus its upper
-/// levels), about eight for the stack window, and one table chain for the two
-/// carve chunks. 64 frames leave room for a 64 MiB image at any paging depth (a
-/// fifth level adds one table to each chain). A seed too small fails the boot
+/// levels), about eight for the stack window, and for the two carve chunks at
+/// most two table chains (they can straddle a table boundary at their virtual
+/// address) and two leaf tables (a chunk holding a kernel MMIO page). 64
+/// frames leave room for a 64 MiB image at any paging depth (a fifth level
+/// adds one table to each chain). A seed too small fails the boot
 /// in Phase 3 by name.
 pub const BOOT_TABLE_POOL_SIZE: usize = 64;
 
@@ -452,7 +454,9 @@ pub fn carve_frames_below(base: u64, frames: usize, end: u64) -> usize
 /// frames it holds. A chunk's mapping takes at most one table per level below the
 /// root, and each chunk mapped makes 512 more frames reachable, so the
 /// frames handed out stay inside the mapped prefix, which starts with the
-/// chunks stage 1 mapped ([`carve_bootstrap_end`]).
+/// chunks stage 1 mapped ([`carve_bootstrap_end`]). `map_chunk` makes the
+/// chunk usable before it returns, the TLB fence a fresh mapping needs
+/// included, since its frames are handed out, and written, next.
 ///
 /// # Errors
 /// [`PagingError::OutOfFrames`] if a chunk's tables outrun the mapped prefix
@@ -750,7 +754,18 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
         &mut pool,
         (carve, carve_frames as usize, dm_base),
         (bootstrap_end, carve_chunks.1),
-        |pool, phys| map_direct_chunk(root_va, dm_base, phys, mmio_regions, pool),
+        |pool, phys| {
+            map_direct_chunk(root_va, dm_base, phys, mmio_regions, pool)?;
+            // The next frames handed out lie in the chunk just mapped, and
+            // stage 2 writes them through these entries at once: RISC-V may
+            // cache an invalid entry, so the full fence (both operands zero,
+            // non-leaf entries included) precedes those writes. A CR3 reload
+            // on x86-64, which caches no not-present entry.
+            // SAFETY: Phase 3, single-threaded, on the tables activated
+            // above; nothing relies on a translation the flush drops.
+            unsafe { arch_paging::flush_tlb_all() };
+            Ok(())
+        },
     )?;
 
     // Direct physical map of [0, max_phys_rounded) in 2 MiB pages, except a

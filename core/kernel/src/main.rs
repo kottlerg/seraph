@@ -315,8 +315,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 ///
 /// # Safety
 /// Phase 3 has completed (the direct map is active), `boot_info_phys` is the
-/// `BootInfo` Phase 0 validated (`count <= MAX_CPUS`), its page is not yet
-/// scrubbed, and nothing writes its `cpu_ids` while the slice lives.
+/// `BootInfo` Phase 0 validated, its page is not yet scrubbed, and nothing
+/// writes its `cpu_ids` while the slice lives. `count` is the producer's
+/// `cpu_count`, at most `MAX_CPUS` by the boot protocol's contract; the slice
+/// is clamped to the array in any case.
 #[cfg(not(test))]
 unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 {
@@ -343,18 +345,22 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 /// from the boot thread, and never returns.
 // too_many_arguments: the boot state read out of BootInfo before Phase 3 must
 // cross the `#[inline(never)]` boundary as explicit arguments.
-// too_many_lines, similar_names: the same rationale as `kernel_entry`, whose
-// body this continues.
-// needless_range_loop: each indexed loop runs to a validated count narrower
-// than the fixed-capacity array it indexes, and keeps the index in view: the
-// AP-startup loop uses cpu_idx as both slice index and CPU ID; the init-segment
+// too_many_lines: the same rationale as `kernel_entry`, whose body this
+// continues.
+// similar_names: boot_cpu_count/boot_info_phys name the BootInfo fields they
+// come from, and info_pages/info_order the InitInfo region's sizes; the shared
+// prefixes keep that provenance visible.
+// needless_range_loop: each indexed loop runs to a count it keeps in view: the
+// AP-startup loop uses cpu_idx as both the hw_ids index and the CPU ID; the
+// init-segment
 // Memory-cap loop (i < segment_count) and the InitInfo Memory-cap loop
 // (pg < info_pages) test the index for the first slot; the init-segment map
 // loop takes the same i < segment_count form as the cap loop after it.
 // cast_possible_truncation: every usize -> u32 cast is of a bounded value:
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
-// desc_count and info_pages are bounded by the INIT_INFO_MAX_PAGES check
-// (fatal past it); size_of::<InitInfo>() and STACK_PAGES are small constants.
+// desc_count and info_pages are bounded by the descriptor capacity Phase 7
+// enforces (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
+// size_of::<InitInfo>() and STACK_PAGES are small constants.
 // large_types_passed_by_value: init_image (304 B) crosses the
 // by-value/by-reference threshold. The `#[inline(never)]` boundary is what
 // defeats the cross-rebase hoist; the by-value signature is incidental — the
@@ -652,11 +658,11 @@ unsafe fn kernel_entry_post_rebase(
                 let entry_fn = kernel_entry_ap as *const () as u64;
                 // SAFETY: the BootInfo page is intact until the reclaim scrub at
                 // the end of boot, and nothing writes its CPU ids.
-                let cpu_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
+                let hw_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
 
                 for cpu_idx in 1..=ap_count
                 {
-                    let hw_id = cpu_ids[cpu_idx];
+                    let hw_id = hw_ids[cpu_idx];
                     // SAFETY: the idle stacks and their tops slab come from
                     // Phase 4 storage (sched::init_storage), and the idle TCBs
                     // were initialised in Phase 8 (sched::init);
@@ -973,15 +979,16 @@ unsafe fn kernel_entry_post_rebase(
             let block_pages = 1usize << info_order;
             // The block was reserved from the pristine buddy at Phase 7
             // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
-            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES is
-            // enforced above, so it fits within the reserved extent.
+            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES
+            // follows from Phase 7's descriptor capacity (asserted above), so
+            // it fits within the reserved extent.
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
             // The block was zeroed when Phase 7 reserved it, before the
             // descriptors were written into it.
 
-            // Sized by the init protocol's `INIT_INFO_MAX_PAGES`; an
-            // `info_pages` above it is fatal before these arrays fill.
+            // Sized by the init protocol's `INIT_INFO_MAX_PAGES`, which
+            // `info_pages` stays within (Phase 7's descriptor capacity).
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
             let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =

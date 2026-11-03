@@ -156,7 +156,9 @@ again from the recorded BootInfo address.
 5. Stage 2, from the carve, reached through the direct map. First map the carve's other
    chunks, each from frames of the part already mapped (mm::paging::map_carve_rest: a chunk
    takes at most one table per level and makes 512 more frames reachable, and the pool hands
-   out only frames the direct map reaches). Then map the direct physical map —
+   out only frames the direct map reaches), with a full local TLB fence after each chunk,
+   since its frames are written through the new entries next and RISC-V may cache an
+   invalid entry. Then map the direct physical map —
    - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
      AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
      — at direct_map_base() + phys, less the carve's chunks
@@ -437,16 +439,18 @@ Phase 7.
    descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 670 at
    INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
    Phase 7: drained RAM extents exceed the InitInfo descriptor capacity", the one check the in-place
-   mint of step 3a relies on. Every capability Phase 7 and Phase 9 mint then has its descriptor
-   written into that array, in place, so no copy of it exists, and a boot whose capabilities
-   outnumber the slots halts by name in Phase 7 ("cap: boot capabilities exceed the InitInfo
-   descriptor capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such
-   boot. SEED_RESERVE_BYTES is the boot footprint, about 376 KiB: the root CSpace slab, init's
-   address-space and thread slabs, and one 128-byte body for each descriptor slot, plus alignment
-   slack. Every drained extent exposed to userspace (each drained extent, and the seed extent's tail
-   past the reserve) is zeroed through the direct map before step 3 mints it: free RAM still holds
-   what firmware and the bootloader left there, the UEFI stack among it, and the buddy's free-list
-   headers. The "Phase 7: drained" line reports the time the zeroing took
+   mint of step 3a relies on. Every capability Phases 7 and 8 mint then has its descriptor written
+   into that array, in place, so no copy of it exists, and a boot whose capabilities outnumber the
+   slots halts by name in Phase 7 ("cap: boot capabilities exceed the InitInfo descriptor
+   capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such boot. Phase
+   9's capabilities reach init through InitInfo header fields instead. SEED_RESERVE_BYTES is the
+   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs, and
+   one 128-byte body for each descriptor slot and for each Memory capability Phase 9 mints (init
+   segments, InitInfo pages, init stack pages), plus alignment slack. Every drained extent exposed
+   to userspace (each drained extent, and the seed extent's tail past the reserve) is zeroed through
+   the direct map before step 3 mints it: free RAM still holds what firmware and the bootloader left
+   there, the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
+   reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
    pages: one wrapper page plus a slot-page pool holding at least
    ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots and ROOT_CSPACE_BODY_PAGES = 16 pages for the
@@ -455,7 +459,8 @@ Phase 7.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
       drained contiguous extent, the seed extent contributing only its tail past
-      SEED_RESERVE_BYTES. They are the first capabilities minted, in drain order, with
+      SEED_RESERVE_BYTES. They are the first capabilities minted, in slot order (the drain's,
+      the largest extent promoted to slot 0), with
       nothing between them: each extent is read whole from its slot, and its descriptor is
       written over it, so slot i holds extent i and then descriptor i, and every extent not
       yet read lies in a slot above the one being written

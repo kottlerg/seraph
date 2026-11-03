@@ -567,14 +567,15 @@ from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
 `master`, taken again when `master` changes that code before the merge.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
-a non-inert change to the memory surface: the code that sizes or maps physical memory by the
-guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
-`core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
-within the definition of, one of these items: the boot memory map and the direct map
-(`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
-`init_kernel_page_tables`, `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve,
-`stage2_table_bound` and `find_boot_table_carve`), and the drain of RAM into Memory caps
-(`drain_and_install_seed`, `INIT_INFO_DESCRIPTOR_CAPACITY`, `populate_cspace`, and
+a non-inert change to the memory surface: the code that sizes or maps physical memory by the guest's
+RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and `core/kernel/src/mm/init.rs` as
+a whole, and, in any other file, a changed line that names, or lies within the definition of, one of
+these items: the boot memory map and the direct map (`translate_memory_map`, `max_ram_address`,
+`direct_map_ceiling`, `compute_max_physical_address`, `init_kernel_page_tables`,
+`BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve, `stage2_table_bound`, `find_boot_table_carve`,
+and its bootstrap, `carve_bootstrap_end`, `carve_frames_below`, `map_carve_rest`, `switch_to_carve`,
+and `extend_carve_mapped`), and the drain of RAM into Memory caps (`drain_and_install_seed`,
+`INIT_INFO_DESCRIPTOR_CAPACITY`, `populate_cspace`, `complete_extent_descriptors`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
 `frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
@@ -584,7 +585,8 @@ boundary one does:
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
 M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
-M="$M|drain_and_install_seed"
+M="$M|carve_bootstrap_end|carve_frames_below|map_carve_rest|switch_to_carve|extend_carve_mapped"
+M="$M|drain_and_install_seed|complete_extent_descriptors"
 M="$M|INIT_INFO_DESCRIPTOR_CAPACITY|populate_cspace|INIT_INFO_MAX_PAGES"
 M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"

@@ -1203,7 +1203,7 @@ fn fatfs_slot_ceiling(ipc_buf: *mut u64) -> usize
         ipc::memmgr_errors::SUCCESS,
         "slot reuse: QUERY_POOL_STATUS status"
     );
-    fat_parse::slot_ceiling(reply.word(0) / SLOT_REUSE_PAGE as u64)
+    fat_parse::slot_ceiling(reply.word(0) / syscall_abi::PAGE_SIZE)
 }
 
 /// Pages the first case holds mapped: more than the quarantine bound, so

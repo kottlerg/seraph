@@ -67,7 +67,7 @@ pub fn slot_ceiling(system_ram_pages: u64) -> usize
 /// Most pages the `fatfs` cache holds beyond its slot ceiling: it requests a
 /// replacement page from memmgr only while its quarantined pages (still
 /// mapped by a client) and clean spares number fewer than this. Shared with
-/// svctest as [`SLOT_COUNT`] is.
+/// svctest as [`slot_ceiling`] is.
 pub const QUARANTINE_MAX: usize = 32;
 
 /// FAT variant detected from cluster count.

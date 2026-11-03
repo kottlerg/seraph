@@ -164,6 +164,11 @@ pub struct PageCache
     /// The fs process's own address space, which maps every slot.
     self_aspace: u32,
     quarantine: Mutex<Quarantine>,
+    /// [`Self::pick_victim`]'s per-slot skip marks, one per slot, allocated
+    /// at init so an eviction, which runs when memory is short, allocates
+    /// nothing. Only the dispatch thread picks victims; the lock makes the
+    /// sharing explicit.
+    victim_skips: Mutex<Box<[bool]>>,
 }
 
 /// Cache-init failure cause.
@@ -180,6 +185,8 @@ pub enum InitError
     CSpace,
     /// `mem_map` failed for one of the slot memory caps.
     Map,
+    /// The heap could not hold the slot table.
+    Heap,
 }
 
 impl PageCache
@@ -218,17 +225,26 @@ impl PageCache
             range.va_start()
         };
 
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(slot_count)
+            .map_err(|_| InitError::Heap)?;
+        slots.extend((0..slot_count).map(|i| CacheSlot {
+            page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
+            memory_cap: AtomicU32::new(0),
+            va: base_va + (i as u64) * PAGE_SIZE,
+            refcount: AtomicU32::new(0),
+            lru_seq: AtomicU64::new(0),
+            exposed: AtomicBool::new(false),
+        }));
+        let mut skips = Vec::new();
+        skips
+            .try_reserve_exact(slot_count)
+            .map_err(|_| InitError::Heap)?;
+        skips.resize(slot_count, false);
+
         let cache: &'static mut Self = Box::leak(Box::new(Self {
-            slots: (0..slot_count)
-                .map(|i| CacheSlot {
-                    page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
-                    memory_cap: AtomicU32::new(0),
-                    va: base_va + (i as u64) * PAGE_SIZE,
-                    refcount: AtomicU32::new(0),
-                    lru_seq: AtomicU64::new(0),
-                    exposed: AtomicBool::new(false),
-                })
-                .collect(),
+            slots: slots.into_boxed_slice(),
             provisioned: AtomicUsize::new(0),
             sector_size: AtomicU32::new(DEFAULT_SECTOR_SIZE),
             next_seq: AtomicU64::new(1),
@@ -238,6 +254,7 @@ impl PageCache
                 held: Vec::with_capacity(QUARANTINE_MAX),
                 spare: Vec::with_capacity(QUARANTINE_MAX),
             }),
+            victim_skips: Mutex::new(skips.into_boxed_slice()),
         }));
 
         // Allocate and map the single-page scratch memory cap used for
@@ -604,7 +621,11 @@ impl PageCache
     /// next one. `None` when no slot qualifies.
     fn pick_victim(&self, ipc_buf: *mut u64) -> Option<usize>
     {
-        let mut skipped = vec![false; self.slots.len()];
+        let mut skipped = self
+            .victim_skips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        skipped.fill(false);
         loop
         {
             let candidate = self.lru_unreferenced(&skipped)?;
@@ -913,7 +934,6 @@ fn read_one_via_block_dev(
     reply.label == blk_errors::SUCCESS && returned != 0
 }
 
-/// Acquire one single-page Memory cap from memmgr.
 /// The pages of system RAM memmgr reports (`QUERY_POOL_STATUS` `data[0]`), or
 /// `None` when the query fails.
 fn query_system_ram_pages(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u64>
@@ -924,6 +944,7 @@ fn query_system_ram_pages(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u64>
     (reply.label == memmgr_errors::SUCCESS).then(|| reply.word(0) / PAGE_SIZE)
 }
 
+/// Acquire one single-page Memory cap from memmgr.
 fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 {
     let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);

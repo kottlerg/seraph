@@ -152,18 +152,19 @@ that cap's address.
 
 ## Interrupt Delivery
 
-Implementation status: the kernel's binding mechanism below is implemented; devmgr's sharing of a
-line among the devices on it, and the x86-64 trigger and polarity word, are design intent, not yet
-implemented ([#664](https://github.com/kottlerg/seraph/issues/664)). Today devmgr delegates a line
-to one device only.
+Implementation status: the kernel's binding mechanism below and devmgr's sharing of a line among
+the devices on it are implemented; the x86-64 trigger and polarity word is design intent, not yet
+implemented ([#664](https://github.com/kottlerg/seraph/issues/664)).
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
 Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
 `MAX_IRQ_BINDINGS` (64) bindings, one per bound Interrupt object; a copy or derivation of an
 Interrupt cap references a fresh object over the same line, so every capability to a line is a
-binding of its own. devmgr is to split each line once from its range and hand every driver on the
-line, the first included, a derivation of that cap, so PCI functions that share an `INTx` line are
-all served (design intent, not yet implemented).
+binding of its own. devmgr splits each line once from its range, the first time a device on it
+needs it, holds that cap for the boot, and hands every driver on the line, the first included, a
+derivation of it, so PCI functions that share an `INTx` line are all served
+([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md)
+§ Per-Device Capability Creation).
 
 - **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
   routes it at its controller, and every new binding masks the line and owes an acknowledgement,
@@ -225,9 +226,8 @@ init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those con
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
 devmgr spawns one driver for every virtio-input device it enumerates and for every virtio-blk
-device it can give a private IRQ line (virtio-blk requires one; a disk whose line another device
-already holds is not served until shared lines are,
-[#664](https://github.com/kottlerg/seraph/issues/664)), each with its own service endpoint.
+device it can give an IRQ cap (virtio-blk requires one; a device on a line another device already
+holds gets a derivation of that line, § Interrupt Delivery), each with its own service endpoint.
 devmgr serves any driver it spawns, those and the serial, framebuffer, and RTC drivers, only once
 it has reported its device set up (`devmgr_labels::DRIVER_READY`). A driver that dies first, its
 device setup failed, or that neither reports nor dies within devmgr's settle bound
@@ -263,8 +263,9 @@ devmgr loads driver binaries from one of two places:
   `devmgr.test` cap carries), so a boot without svctest spawns neither.
   virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
   then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
-  critical path. A PCI device that shares an `INTx` line may get no private IRQ cap; such a driver
-  is delivered a bootstrap that names its IRQ slot absent, and polls its queue. Post-handover,
+  critical path. A PCI device devmgr can give no IRQ cap (its line lies outside the Interrupt range
+  devmgr holds) is delivered a bootstrap that names its IRQ slot absent, and its driver polls its
+  queue. Post-handover,
   svcmgr walks its universal root to `/services/drivers/` and hands devmgr that subtree cap via
   `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
   devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr

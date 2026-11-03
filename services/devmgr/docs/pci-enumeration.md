@@ -103,10 +103,10 @@ VirtIO PCI devices use vendor ID `0x1AF4`. Device IDs:
 devmgr matches discovered devices against its driver binaries by vendor and
 device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
 Every matching device gets its own driver process, in segment, bus, device,
-function order, except a virtio-blk device that cannot get a private IRQ
-line: virtio-blk requires one, and a line another device already holds is
-not served until shared lines are (#664; the sharing step 3 describes is
-design intent, not yet implemented). Class-based matching is design intent (#165).
+function order, except a virtio-blk device that gets no IRQ cap (its line
+lies outside the Interrupt range devmgr holds): virtio-blk requires one. A
+device on a line another device already holds gets an IRQ cap too (step 3).
+Class-based matching is design intent (#165).
 
 ---
 
@@ -134,16 +134,18 @@ For each matched device, devmgr:
    with the caps already carved released. The aperture's lower and upper
    remainders stay in devmgr's growable aperture table
    (`firmware::resource::SpanTable`) as caps of their own.
-3. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
-   firmware-programmed IRQ line, else the arch `INTx` fallback) off devmgr's
-   Interrupt range cap. The lines below and above it stay in devmgr's
-   interrupt table, so devices are served in any GSI order. Design intent,
-   not yet implemented (#664): devmgr keeps the split line cap in a table
-   of held lines, one entry per GSI, and gives the device a derivation of
+3. Gives the device its own single-line `Interrupt` cap for its GSI (its
+   firmware-programmed IRQ line, else the arch `INTx` fallback). The first
+   time any device asks for a GSI, devmgr splits the line's cap off its
+   Interrupt range cap; the lines below and above it stay in devmgr's
+   interrupt table, so devices are served in any GSI order. devmgr keeps
+   the split line cap for the boot in a table of held lines, one entry per
+   GSI (`firmware::lines::HeldLines`), and gives the device a derivation of
    it (`SYS_CAP_DERIVE`, NOTIFY); a later device whose GSI is already held
-   gets another derivation of the same cap rather than none, so devices on
-   a shared `INTx` line each bind their own receiver
-   (docs/device-management.md § Interrupt Delivery).
+   gets another derivation of the same cap, so devices on a shared `INTx`
+   line each bind their own receiver (docs/device-management.md
+   § Interrupt Delivery). Releasing a device's caps deletes only its own
+   derivation; the line stays held for the others.
 4. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is
@@ -158,8 +160,8 @@ For each matched device, devmgr:
    SEND badged with the device's badge on the private driver endpoint of the
    driver's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
    word in `data[0]`), and ends the bootstrap. The IRQ slot is absent when the
-   device has no private line; virtio-input then polls, and virtio-blk, which
-   requires the IRQ, is not spawned. A driver checks the delivered BAR indices
+   device got no IRQ cap in step 3; virtio-input then polls, and virtio-blk,
+   which requires the IRQ, is not spawned. A driver checks the delivered BAR indices
    against the layout it computes from its `QUERY_DEVICE_INFO` reply and exits
    on a mismatch.
 7. Binds a death observer on the driver's thread to devmgr's driver death

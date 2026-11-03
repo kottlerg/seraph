@@ -183,6 +183,10 @@ pub enum BuildComponent
 
 // ── Run ───────────────────────────────────────────────────────────────────────
 
+// struct_excessive_bools: each bool is an independent command-line switch
+// (`--gdb`, `--headless`, `--verbose`, `--second-disk-shared-line`) that clap
+// maps one-to-one; they are not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
 pub struct RunArgs
 {

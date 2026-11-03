@@ -55,10 +55,12 @@ devmgr's responsibilities are:
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
   devmgr spawns one driver for every virtio-input device and for every
-  virtio-blk device it can give a private IRQ line (a disk whose line another
-  device already holds is not served, #664), each with its own service
-  endpoint and an `Mmio` cap for every BAR the device's VirtIO register
-  regions name.
+  virtio-blk device it can give an IRQ cap, each with its own service
+  endpoint, an `Mmio` cap for every BAR the device's VirtIO register regions
+  name, and its own derivation of its line's held `Interrupt` cap, so devices
+  that share an `INTx` line are all served (see
+  [docs/pci-enumeration.md](pci-enumeration.md) § Per-Device Capability
+  Creation).
 
   devmgr serves a driver's endpoint only once the driver has set its device
   up. It spawns its drivers in two production settle batches: the boot batch

@@ -639,7 +639,7 @@ fn main() -> !
     }
     else
     {
-        std::os::seraph::log!("no private IRQ; polling the eventq");
+        std::os::seraph::log!("no IRQ cap; polling the eventq");
     }
 
     // Tell the device its event buffers are available.

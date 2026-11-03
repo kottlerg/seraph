@@ -22,6 +22,13 @@
 //!    needs a fresh arena page, with `OutOfMemory` however many slots are free;
 //!    the top-up `syscall_abi::cspace_topup_pages` computes for one slot
 //!    restores a page of budget, and the copy then succeeds.
+//! 4. Kept pages in a spilled record: a `CSpace` takes 16 donations, which
+//!    fill its inline records, then a 16-page donation from its own Memory
+//!    piece P, recorded on a record page. A thread bound to it derives
+//!    `MANY` `Mmio` capabilities, three arena pages of bodies, and moves each
+//!    out to ktest's `CSpace`. When the `CSpace` dies, P comes back but for
+//!    the arena pages the moved bodies sit on, at least two, so P's span is
+//!    cut into several runs; P is whole again once the moved capabilities go.
 //!
 //! A RAM tail cannot be deleted in ktest (its destruction would free into the
 //! sealed buddy), so each tail is moved out to ktest's own `CSpace` before its
@@ -37,7 +44,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use init_protocol::{CapType, InitInfo};
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_notification, cap_create_thread,
-    cap_delete, cap_info, cap_move, memory_merge, memory_split, notification_wait,
+    cap_delete, cap_derive, cap_info, cap_move, memory_merge, memory_split, notification_wait,
 };
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
@@ -61,6 +68,18 @@ static SPLIT_DONE: AtomicU32 = AtomicU32::new(0);
 static SPLIT_HEAD: AtomicU32 = AtomicU32::new(0);
 static SPLIT_TAIL: AtomicU32 = AtomicU32::new(0);
 
+/// Bodies case 4 places: three arena pages' worth at 31 bodies a page.
+const MANY: usize = 70;
+/// Pages of case 4's Memory piece P, donated in one augment.
+const P_PAGES: u64 = 16;
+/// The copier's inputs, handles in its `CSpace`: the `Mmio` capability to
+/// derive from, ktest's `CSpace`, and the notification it signals when done.
+static COPY_SRC: AtomicU32 = AtomicU32::new(0);
+static COPY_DEST: AtomicU32 = AtomicU32::new(0);
+static COPY_DONE: AtomicU32 = AtomicU32::new(0);
+/// The copier's results, handles in ktest's `CSpace` (0 where it stopped).
+static COPIES: [AtomicU32; MANY] = [const { AtomicU32::new(0) }; MANY];
+
 /// Splitter entry, bound to the funding `CSpace`: split the two-page cap at
 /// one page, so the tail's body is a chunk of this `CSpace`'s arena, then
 /// move both halves into ktest's `CSpace` and signal done.
@@ -76,6 +95,51 @@ extern "C" fn splitter_entry(_arg: u64) -> !
     }
     syscall::notification_send(SPLIT_DONE.load(Ordering::Acquire), 1).ok();
     syscall::thread_exit();
+}
+
+/// Copier entry, bound to the funding `CSpace`: derive `MANY` `Mmio`
+/// capabilities from the one it is given, each a fresh object in this
+/// `CSpace`'s arena, and move each into ktest's `CSpace`; then signal done.
+extern "C" fn copier_entry(_arg: u64) -> !
+{
+    let src = COPY_SRC.load(Ordering::Acquire);
+    let dest = COPY_DEST.load(Ordering::Acquire);
+    for out in &COPIES
+    {
+        let Ok(derived) = cap_derive(src, RIGHTS_ALL)
+        else
+        {
+            break;
+        };
+        let Ok(moved) = cap_move(derived, dest, 0)
+        else
+        {
+            cap_delete(derived).ok();
+            break;
+        };
+        out.store(moved, Ordering::Release);
+    }
+    syscall::notification_send(COPY_DONE.load(Ordering::Acquire), 1).ok();
+    syscall::thread_exit();
+}
+
+/// Run `entry` on a thread bound to `cs` and wait on `done`, which the
+/// entry signals through its copy in `cs`; the caller has set the entry's
+/// inputs.
+fn run_bound(ctx: &TestContext, cs: u32, done: u32, entry: extern "C" fn(u64) -> !) -> TestResult
+{
+    let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
+        .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
+    let mut guard = crate::spawn::SpawnedChild { th, cs: 0 };
+    let stack_top = ChildStack::top(core::ptr::addr_of!(SPLITTER_STACK));
+    // SAFETY: the stack is `SPLITTER_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule): the bound
+    // threads run one after the other, each waited for here.
+    unsafe { crate::spawn::configure_and_start(&guard, entry, stack_top, 0) }
+        .map_err(|_| "integration::arena_reclaim: configure_and_start failed")?;
+    notification_wait(done).ok();
+    guard.delete_thread().ok();
+    Ok(())
 }
 
 /// A two-page piece of `memory_base` and a tail of one page split from it by
@@ -104,22 +168,12 @@ fn split_in(ctx: &TestContext, cs: u32) -> Result<Funded, &'static str>
     let result = (|| {
         let child_done = cap_copy(done, cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "integration::arena_reclaim: cap_copy(done) failed")?;
-        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
-            .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
-        let mut guard = crate::spawn::SpawnedChild { th, cs: 0 };
         SPLIT_HEAD.store(0, Ordering::Relaxed);
         SPLIT_TAIL.store(0, Ordering::Relaxed);
         SPLIT_SRC.store(in_cs, Ordering::Relaxed);
         SPLIT_DEST.store(dest, Ordering::Relaxed);
         SPLIT_DONE.store(child_done, Ordering::Release);
-        let stack_top = ChildStack::top(core::ptr::addr_of!(SPLITTER_STACK));
-        // SAFETY: the stack is `SPLITTER_STACK`, this test's own `ChildStack`,
-        // on which no other live thread runs (`ChildStack`'s rule): the two
-        // splitters run one after the other.
-        unsafe { crate::spawn::configure_and_start(&guard, splitter_entry, stack_top, 0) }
-            .map_err(|_| "integration::arena_reclaim: configure_and_start failed")?;
-        notification_wait(done).ok();
-        guard.delete_thread().ok();
+        run_bound(ctx, cs, done, splitter_entry)?;
         let (head, tail) = (
             SPLIT_HEAD.load(Ordering::Acquire),
             SPLIT_TAIL.load(Ordering::Acquire),
@@ -153,19 +207,26 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     self_funded(ctx)?;
     mutually_funded(ctx)?;
-    budget_floor(ctx)
+    budget_floor(ctx)?;
+    kept_in_spilled_record(ctx)
+}
+
+/// The probe `Mmio` capability init hands ktest, if the platform has one.
+fn probe_mmio(ctx: &TestContext) -> Option<u32>
+{
+    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+    // ktest's lifetime.
+    let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
+    crate::init_info::descriptors(info)
+        .iter()
+        .find(|d| d.cap_type == CapType::Mmio && d.aux0 == crate::arch::MMIO_PROBE_PHYS)
+        .map(|d| d.slot)
 }
 
 /// Case 3: slot headroom alone does not fund a body; the budget floor does.
 fn budget_floor(ctx: &TestContext) -> TestResult
 {
-    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
-    // ktest's lifetime.
-    let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
-    let Some(probe) = crate::init_info::descriptors(info)
-        .iter()
-        .find(|d| d.cap_type == CapType::Mmio && d.aux0 == crate::arch::MMIO_PROBE_PHYS)
-        .map(|d| d.slot)
+    let Some(probe) = probe_mmio(ctx)
     else
     {
         crate::log("ktest: integration::arena_reclaim budget_floor SKIP (no probe Mmio cap)");
@@ -288,6 +349,98 @@ fn mutually_funded(ctx: &TestContext) -> TestResult
     if base_after != base_before
     {
         return Err("integration::arena_reclaim: a page of the dead CSpaces never came back");
+    }
+    Ok(())
+}
+
+/// Case 4: several kept pages in one donation recorded on a record page.
+fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
+{
+    let Some(probe) = probe_mmio(ctx)
+    else
+    {
+        crate::log(
+            "ktest: integration::arena_reclaim kept_in_spilled_record SKIP (no probe Mmio cap)",
+        );
+        return Ok(());
+    };
+    let base_before = available(ctx.memory_base);
+    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
+    let piece = memory_split(ctx.memory_base, size - P_PAGES * PAGE)
+        .map_err(|_| "integration::arena_reclaim: memory_split(memory_base) failed")?;
+    let Ok(a) = cap_create_cspace(ctx.memory_base, 0, 4)
+    else
+    {
+        memory_merge(ctx.memory_base, piece).ok();
+        return Err("integration::arena_reclaim: cap_create_cspace(A) failed");
+    };
+    let done = cap_create_notification(ctx.memory_base);
+    let placed = (|| {
+        let done =
+            done.map_err(|_| "integration::arena_reclaim: cap_create_notification failed")?;
+        // The create-time slab and 15 augments fill the 16 inline records; P's
+        // donation goes on a record page, taken from P itself.
+        for _ in 0..15
+        {
+            cap_create_cspace(ctx.memory_base, a, 1)
+                .map_err(|_| "integration::arena_reclaim: an inline augment failed")?;
+        }
+        cap_create_cspace(piece, a, P_PAGES)
+            .map_err(|_| "integration::arena_reclaim: the spilled augment failed")?;
+        let src = cap_copy(probe, a, RIGHTS_ALL)
+            .map_err(|_| "integration::arena_reclaim: cap_copy(probe) failed")?;
+        let dest = cap_copy(ctx.cspace_cap, a, RIGHTS_ALL)
+            .map_err(|_| "integration::arena_reclaim: cap_copy(cspace) failed")?;
+        let child_done = cap_copy(done, a, syscall_abi::RIGHTS_NTF_NOTIFY)
+            .map_err(|_| "integration::arena_reclaim: cap_copy(done) failed")?;
+        for out in &COPIES
+        {
+            out.store(0, Ordering::Relaxed);
+        }
+        COPY_SRC.store(src, Ordering::Relaxed);
+        COPY_DEST.store(dest, Ordering::Relaxed);
+        COPY_DONE.store(child_done, Ordering::Release);
+        run_bound(ctx, a, done, copier_entry)
+    })();
+    if let Ok(done) = done
+    {
+        cap_delete(done).ok();
+    }
+    let moved = COPIES
+        .iter()
+        .filter(|c| c.load(Ordering::Acquire) != 0)
+        .count();
+    let deleted = cap_delete(a).is_ok();
+    let held = available(piece);
+    for out in &COPIES
+    {
+        let c = out.swap(0, Ordering::AcqRel);
+        if c != 0
+        {
+            cap_delete(c).ok();
+        }
+    }
+    let whole = available(piece);
+    memory_merge(ctx.memory_base, piece)
+        .map_err(|_| "integration::arena_reclaim: memory_merge(memory_base, P) failed")?;
+    let base_after = available(ctx.memory_base);
+    placed?;
+    if moved != MANY || !deleted
+    {
+        return Err("integration::arena_reclaim: the bodies were not placed and moved out");
+    }
+    if held > (P_PAGES - 2) * PAGE
+    {
+        return Err("integration::arena_reclaim: fewer than two of P's arena pages were kept");
+    }
+    if whole != P_PAGES * PAGE
+    {
+        return Err("integration::arena_reclaim: P's kept pages never came back");
+    }
+    if base_after != base_before
+    {
+        return Err("integration::arena_reclaim: a page of the dead CSpace never came back");
     }
     Ok(())
 }

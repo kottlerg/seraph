@@ -50,9 +50,8 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, NUM_CALLERS> = spawn::ArgBlock::
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let cycles = CYCLES;
     let mut logged_at = crate::elapsed_us();
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         let now = crate::elapsed_us();
         if now.saturating_sub(logged_at) >= PROGRESS_INTERVAL_US

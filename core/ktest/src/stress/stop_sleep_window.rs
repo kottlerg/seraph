@@ -81,10 +81,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     INTERRUPTED.store(0, Ordering::Relaxed);
     BAD.store(0, Ordering::Relaxed);
 
-    let cycles = CYCLES;
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::stop_sleep_window: pin controller failed")?;
-    let result = with_sleeper(ctx, cycles);
+    let result = with_sleeper(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_sleep_window: restore controller affinity failed");
     result?;

@@ -224,11 +224,10 @@ of whose expiry fails a test, apply through `scaled_bound` (`src/main.rs`), or t
 `scaled_polls` for a `u32` count of 1 ms polls: as written up to 16 CPUs, so the tight budgets
 the CI widths check are unchanged, and multiplied past it by the oversubscription factor the
 width implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound still separates a
-slow step from a stuck or wrong one. They
-are the report bound of `tally::await_report` and `tally::await_all`; the round bounds of
-`configure_start_race`, `stop_target_vanishes`, `thread_cap_delete_under_use`,
-`copy_source_delete` and `affinity_swap_handoff`, and the exit polls of
-`thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU report wait of
+slow step from a stuck or wrong one. They are the report bound of `tally::await_report` and
+`tally::await_all`; the round bounds of `configure_start_race`, `stop_target_vanishes`,
+`thread_cap_delete_under_use`, `copy_source_delete` and `affinity_swap_handoff`, and the exit
+polls of `thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU report wait of
 `priority_dealloc_race`; the acknowledgement, result, approach, sync and entry bounds of
 `stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
 acknowledgement and exit bounds of `stop_source_delete`; the preemption budget of

@@ -213,8 +213,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         Phases::AloneThenRacing => STARTER_CPU,
         Phases::AloneOnly => 0,
     };
-    let cycles = CYCLES;
-    let result = with_children(ctx, [waiter_cpu, 0, starter_cpu], phases, cycles);
+    let result = with_children(ctx, [waiter_cpu, 0, starter_cpu], phases, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_owed_wake: restore controller affinity failed");
     let armed = result?;

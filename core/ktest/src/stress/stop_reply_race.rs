@@ -199,7 +199,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_count = u32::try_from(cpus).unwrap_or(2);
-    let count = CYCLES;
     let second_stopper = cpus >= 4;
     if !second_stopper
     {
@@ -211,7 +210,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                 span: cpu_count,
             },
             Stops::Single,
-            count,
+            CYCLES,
         );
     }
     // The controller takes CPU 0 so a floor-priority child never shares its
@@ -225,7 +224,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             span: cpu_count - 1,
         },
         Stops::Double,
-        count,
+        CYCLES,
     );
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_reply_race: restore controller affinity failed");

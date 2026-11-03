@@ -97,9 +97,8 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const CELL: &str = "stress::reply_caller_delete";
 
 /// Rounds to run, rotating over the three kinds and the four order slots
-/// ([`ORDERS`]); half are race rounds, so an unscaled run (up to
-/// [`crate::UNSCALED_CPUS`] CPUs) races the reply against the delete 600
-/// times.
+/// ([`ORDERS`]); half are race rounds, so every run races the reply against
+/// the delete 600 times.
 const CYCLES: u32 = 1200;
 
 /// The controller's, the server's, and the caller's CPUs.
@@ -240,10 +239,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     BAD_CALLER.reset();
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::reply_caller_delete: pin controller failed")?;
-    let count = CYCLES;
     let mut outcomes = Outcomes::default();
     let mut result = Ok(());
-    for cycle in 0..count
+    for cycle in 0..CYCLES
     {
         if let Err(e) = one_round(ctx, cycle, &mut outcomes)
         {

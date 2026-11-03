@@ -109,7 +109,7 @@ static FINISHED: AtomicU32 = AtomicU32::new(0);
 static RESULT: AtomicU32 = AtomicU32::new(0);
 /// Controller → peer: the last cycle whose result the controller consumed. A
 /// peer starts cycle `n + 1` only after `ACKED == n`, and exits only after
-/// `ACKED == ROUNDS`, so it never runs ahead of the race it is part of.
+/// `ACKED == CYCLES`, so it never runs ahead of the race it is part of.
 static ACKED: AtomicU32 = AtomicU32::new(0);
 
 /// IPC buffers for the call peer and the server (one live user each).
@@ -400,8 +400,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// Peer loop: announce each cycle's park, run it, classify and publish.
 fn peer_loop(mut park: impl FnMut() -> u32) -> !
 {
-    let rounds = CYCLES;
-    for cycle in 1..=rounds
+    for cycle in 1..=CYCLES
     {
         while ACKED.load(Ordering::Acquire) != cycle - 1
         {
@@ -415,7 +414,7 @@ fn peer_loop(mut park: impl FnMut() -> u32) -> !
     // Exit only once the last race is over: a park that returned at once (a
     // rescue left pending by an earlier cycle) must not let the thread exit
     // before the controller's stop lands.
-    while ACKED.load(Ordering::Acquire) != rounds
+    while ACKED.load(Ordering::Acquire) != CYCLES
     {
         core::hint::spin_loop();
     }

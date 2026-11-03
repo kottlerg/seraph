@@ -17,11 +17,10 @@ const ITERATIONS: u32 = 1000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let iterations = ITERATIONS;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "thread_churn: create_notification failed")?;
 
-    for _i in 0..iterations
+    for _i in 0..ITERATIONS
     {
         let mut child =
             spawn::new_child(ctx).map_err(|_| "thread_churn: spawn::new_child failed")?;

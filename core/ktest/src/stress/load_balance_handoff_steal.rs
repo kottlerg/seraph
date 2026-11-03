@@ -189,8 +189,6 @@ pub fn run(ctx: &TestContext) -> TestResult
     OBSERVED_CPUS.store(0, Ordering::Relaxed);
     MIGRATIONS.store(0, Ordering::Relaxed);
 
-    let iters = ITERS;
-
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::load_balance_handoff_steal: cap_create_notification failed")?;
     let ready = cap_create_notification(ctx.memory_base)
@@ -288,7 +286,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                     ep: client_ep,
                     done: client_done,
                     idx: i,
-                    iters,
+                    iters: ITERS,
                 },
             )
         };
@@ -363,7 +361,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         u64::from(migrations),
     );
 
-    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::from(iters);
+    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::from(ITERS);
     if roundtrips != expected
     {
         return Err("stress::load_balance_handoff_steal: not all round-trips completed");

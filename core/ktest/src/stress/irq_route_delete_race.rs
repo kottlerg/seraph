@@ -59,7 +59,7 @@ use syscall_abi::SystemInfoType;
 use crate::arch::serial::{UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt};
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Rounds at up to [`crate::UNSCALED_CPUS`] CPUs.
+/// Rounds to run.
 const CYCLES: u32 = 400;
 const MIN_CPUS: u64 = 2;
 const CONTROLLER_CPU: u32 = 0;

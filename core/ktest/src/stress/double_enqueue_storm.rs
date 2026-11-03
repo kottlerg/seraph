@@ -89,7 +89,6 @@ pub fn run(ctx: &TestContext) -> TestResult
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "stress::double_enqueue_storm: system_info(CpuCount) failed")?;
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
-    let cycles = CYCLES;
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::double_enqueue_storm: cap_create_notification failed")?;
 
@@ -169,7 +168,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Affinity flips every 4 cycles relocate the queue entry across CPUs via
     // migrate_ready_thread / the cross-CPU outgoing branch — so a wake can land
     // on a TCB mid-relocation, the transient window the #244 class lives in.
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         for i in 0..NUM_WORKERS
         {

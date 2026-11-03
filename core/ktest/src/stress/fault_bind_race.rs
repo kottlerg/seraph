@@ -54,7 +54,7 @@ use syscall_abi::{
 use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Rounds at up to [`crate::UNSCALED_CPUS`] CPUs.
+/// Rounds to run.
 const CYCLES: u32 = 100;
 /// E1/E2 rebinds per round.
 const REBINDS: u32 = 64;

@@ -104,10 +104,9 @@ fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::timed_wait_source_delete: create done failed")?;
-    let count = CYCLES;
     let mut interrupted = 0u64;
     let mut result = Ok(());
-    for cycle in 0..count
+    for cycle in 0..CYCLES
     {
         match one_cycle(ctx, done, cycle, cpus)
         {

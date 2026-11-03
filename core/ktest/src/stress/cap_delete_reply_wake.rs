@@ -128,16 +128,15 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
-    let cycles = CYCLES;
 
     // Anti-vacuous accumulators: every cycle must arm the reply binding and then
     // observe the client's wake.
     let mut armed_cycles = 0u32;
     let mut woke_cycles = 0u32;
 
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
-        let server_cpu = super::rotation_slot(cycle, cycles, cpu_mod);
+        let server_cpu = super::rotation_slot(cycle, CYCLES, cpu_mod);
         // Different CPU from the server: the dealloc-free and the client's
         // wake-enqueue must run on different cores to exercise the cross-CPU
         // strand. With cpus >= 2, `(slot + 1) % cpus != slot`.
@@ -267,11 +266,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Non-vacuous on both halves: every cycle armed the reply binding and then
     // observed the owed wake, so a clean boot reflects the dealloc reply-wake
     // liveness path actually executing on every cycle.
-    if armed_cycles != cycles
+    if armed_cycles != CYCLES
     {
         return Err("stress::cap_delete_reply_wake: reply binding never armed on some cycle");
     }
-    if woke_cycles != cycles
+    if woke_cycles != CYCLES
     {
         return Err("stress::cap_delete_reply_wake: client wake missing on some cycle");
     }

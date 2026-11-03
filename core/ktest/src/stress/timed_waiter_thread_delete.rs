@@ -79,9 +79,8 @@ fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
         let _ = cap_delete(sig);
         return Err("stress::timed_waiter_thread_delete: create event queue failed");
     };
-    let count = CYCLES;
     let mut result = Ok(());
-    for cycle in 0..count
+    for cycle in 0..CYCLES
     {
         result = one_cycle(ctx, cycle, cpus, sig, eq);
         if result.is_err()

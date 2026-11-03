@@ -69,7 +69,6 @@ fn child_va(index: usize) -> u64
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let iterations = MAP_ITERATIONS;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
@@ -80,7 +79,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         spawned: 0,
     };
     let result =
-        start_mappers(ctx, done, iterations, &mut mappers).and_then(|()| await_mappers(done));
+        start_mappers(ctx, done, MAP_ITERATIONS, &mut mappers).and_then(|()| await_mappers(done));
     let released = release(ctx, &mut mappers);
     cap_delete(done).ok();
     result?;

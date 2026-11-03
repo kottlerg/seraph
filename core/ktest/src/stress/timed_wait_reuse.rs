@@ -454,8 +454,7 @@ extern "C" fn waiter_entry(arg: u64) -> !
 {
     let sig = (arg & 0xFFFF_FFFF) as u32;
     let eq = (arg >> 32) as u32;
-    let rounds = CYCLES;
-    for cycle in 1..=rounds
+    for cycle in 1..=CYCLES
     {
         while ACKED.load(Ordering::Acquire) != cycle - 1
         {
@@ -486,7 +485,7 @@ extern "C" fn waiter_entry(arg: u64) -> !
         UNTIMED_OK.store(u32::from(untimed), Ordering::Release);
         FINISHED.store(cycle, Ordering::Release);
     }
-    while ACKED.load(Ordering::Acquire) != rounds
+    while ACKED.load(Ordering::Acquire) != CYCLES
     {
         core::hint::spin_loop();
     }

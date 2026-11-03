@@ -18,8 +18,10 @@
 //!
 //! The table is one page, and the bitmap it heads is held in further pages
 //! (`ThreadIopb`, `IOPB_PARTS` page-sized parts), all taken from the pool of
-//! the `CSpace` the first bind resolves through ([`TABLE_PAGES`], arena
-//! leases of `cap::object::CSpaceKernelObject`). The bitmap sits at offset 0,
+//! the bound thread's own `CSpace` ([`TABLE_PAGES`]). The table never outlives
+//! that pool: the thread's dealloc returns it, and if the `CSpace` dies first
+//! its teardown does ([`free_tables_bound_to`]), each under the thread's
+//! `sched_lock`. The bitmap sits at offset 0,
 //! so the TCB's `iopb` pointer is the bitmap the context switch loads. On
 //! RISC-V the bitmap has no part and no thread ever binds.
 
@@ -39,8 +41,8 @@ struct IoPortBinding
 /// Most bindings one thread records: as many as the table's page holds after
 /// its header (254 on x86-64). A bind past it returns `QuotaExceeded`; binding
 /// the same `IoPort` object again reuses its record. Each binding is made
-/// through a distinct `IoPort` object, and the page is funded by the binding
-/// caller's `CSpace`.
+/// through a distinct `IoPort` object, and the page is funded by the bound
+/// thread's `CSpace`.
 pub const MAX_IOPORT_BINDINGS: usize =
     (crate::mm::PAGE_SIZE - core::mem::size_of::<ThreadIopb>() - 2 * core::mem::size_of::<usize>())
         / core::mem::size_of::<IoPortBinding>();
@@ -53,7 +55,7 @@ pub struct IoPortBindings
     /// union of the recorded bindings.
     pub bitmap: ThreadIopb,
     /// The `CSpaceKernelObject` whose pool funded this page and the bitmap's
-    /// parts, as an address.
+    /// parts (the bound thread's), as an address.
     funder: usize,
     count: usize,
     records: [IoPortBinding; MAX_IOPORT_BINDINGS],
@@ -220,6 +222,47 @@ pub unsafe fn withdraw_everywhere(object: usize)
     if changed
     {
         crate::arch::current::gdt::invalidate_all_iopbs();
+    }
+}
+
+/// Free the port-binding table of every thread bound to the `CSpace` at
+/// `cspace`, whose pool funded them, before that pool is reclaimed. Each table
+/// is detached and freed under its thread's `sched_lock`, the lock a bind
+/// installs it and the Thread arm of `dealloc_object` frees it under, so no
+/// table of these threads is freed into the pool after this returns.
+///
+/// # Safety
+/// `cspace` is a dying `CSpace` whose bound threads are all stopped
+/// (`Exited`), so none binds again; its wrapper is live; no lock is held.
+#[cfg(not(test))]
+pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
+{
+    if !crate::arch::current::HAS_IO_PORTS
+    {
+        return;
+    }
+    // SAFETY: the closure takes only each thread's sched_lock, ordered after
+    // the registry lock, and the pool lock inside it; it waits on no other CPU.
+    unsafe {
+        crate::sched::thread_registry::for_each(|tcb| {
+            if !core::ptr::eq((*tcb).cspace, cspace)
+            {
+                return;
+            }
+            let saved = (*tcb).sched_lock.lock_raw();
+            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+            // IoPortBindings page (sys_ioport_bind).
+            #[allow(clippy::cast_ptr_alignment)]
+            let table = (*tcb).iopb.cast::<IoPortBindings>();
+            (*tcb).iopb = core::ptr::null_mut();
+            if !table.is_null()
+            {
+                // The thread is stopped and off every CPU, so no TSS load
+                // reads the table; its funder, the dying CSpace, is live.
+                crate::cap::object::free_port_binding_table(table);
+            }
+            (*tcb).sched_lock.unlock_raw(saved);
+        });
     }
 }
 

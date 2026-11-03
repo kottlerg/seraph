@@ -8,110 +8,40 @@
 //!
 //! A range split (`SYS_MEMORY_SPLIT`, `SYS_MMIO_SPLIT`, `SYS_IRQ_SPLIT`,
 //! `SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`), a copy or derivation of an `Mmio` or
-//! `IoPort` capability, an `Mmio` object's spilled mapping records, and a
-//! thread's I/O-port binding table are funded by the `CSpace` the syscall
-//! inserts into or resolves through: each takes 128-byte chunks, or whole
-//! pages, from that `CSpace`'s slot-page pool, which its holder funds the way
-//! it funds slots. The `CSpace` wrapper keeps the chunk free list and the
-//! count of leases this module defines; core/kernel/docs/capability-internals.md
-//! § Body Arena owns the design, including why a `CSpace`'s donations outlive
-//! it while a body it funded lives on.
+//! `IoPort` capability, and an `Mmio` object's spilled mapping records are
+//! funded by the `CSpace` the syscall inserts into or resolves through: each
+//! takes a 128-byte chunk of a page from that `CSpace`'s slot-page pool, which
+//! its holder funds the way it funds slots. Chunk 0 of each arena page holds
+//! the page's header (`cap::object::ArenaPage`), a kernel object whose
+//! reference count counts the page's live chunks; the wrapper keeps the
+//! free-chunk list and the list of its arena pages.
+//! core/kernel/docs/capability-internals.md § Body Arena owns the design,
+//! including how a dying `CSpace` keeps only the pages that still hold a live
+//! body.
 //!
-//! This module holds the parts that are pure logic: the lease count and its
-//! teardown transition ([`ArenaLive`]), and the carving and linking of chunks
-//! within a page ([`carve_page`], [`push_chunk`], [`pop_chunk`]). The caller
-//! serialises the chunk list (the wrapper's pool lock).
+//! This module holds the parts that are pure logic: the carving and linking of
+//! chunks within a page ([`carve_page`], [`push_chunk`], [`pop_chunk`]) and the
+//! cut of a donation's span around the arena pages that outlive their
+//! `CSpace` ([`next_run`]). The caller serialises the chunk list (the
+//! wrapper's pool lock).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes of one arena chunk: the size class of every body an arena backs.
 pub const CHUNK_BYTES: usize = 128;
 
-/// Chunks one page holds.
+/// Chunks one page holds, the header's chunk 0 included.
 pub const CHUNKS_PER_PAGE: usize = crate::mm::PAGE_SIZE / CHUNK_BYTES;
 
-/// The bit of [`ArenaLive`]'s word set once the funding `CSpace`'s teardown
-/// has begun. The count of leases below it never reaches it: each lease is a
-/// chunk or a page of donated memory.
-const DYING: u64 = 1 << 63;
-
-/// The leases an arena has outstanding (chunks and pages handed out and not
-/// yet returned), and whether its `CSpace`'s teardown has begun.
-///
-/// The funding `CSpace`'s teardown reclaims its donations only once both
-/// hold: its teardown has begun ([`begin_teardown`](Self::begin_teardown)),
-/// and no lease is outstanding. Whichever of those two events comes last
-/// reports it, exactly once: `begin_teardown` returns `true` when no lease is
-/// outstanding, and otherwise the [`release`](Self::release) of the last
-/// lease returns `true`. Leases are never taken after the teardown begins,
-/// since a `CSpace` with no references accepts no insert.
-pub struct ArenaLive(AtomicU64);
-
-impl ArenaLive
-{
-    /// No lease outstanding, teardown not begun.
-    #[must_use]
-    pub const fn new() -> Self
-    {
-        Self(AtomicU64::new(0))
-    }
-
-    /// Count one lease handed out.
-    pub fn retain(&self)
-    {
-        let prev = self.0.fetch_add(1, Ordering::AcqRel);
-        debug_assert!(
-            prev & DYING == 0,
-            "arena lease taken after its CSpace's teardown began"
-        );
-    }
-
-    /// Count one lease returned. Returns `true` when it was the last one and
-    /// the teardown has begun: the caller then completes the teardown.
-    #[must_use]
-    pub fn release(&self) -> bool
-    {
-        let prev = self.0.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prev & !DYING != 0, "arena lease released twice");
-        prev == DYING | 1
-    }
-
-    /// Mark the teardown begun. Returns `true` when no lease is outstanding:
-    /// the caller then completes the teardown itself.
-    #[must_use]
-    pub fn begin_teardown(&self) -> bool
-    {
-        let prev = self.0.fetch_or(DYING, Ordering::AcqRel);
-        debug_assert!(prev & DYING == 0, "arena teardown begun twice");
-        prev == 0
-    }
-
-    /// Whether the teardown has begun: the funding `CSpace` has been drained
-    /// and waits only for its last lease.
-    #[must_use]
-    pub fn teardown_begun(&self) -> bool
-    {
-        self.0.load(Ordering::Acquire) & DYING != 0
-    }
-}
-
-impl Default for ArenaLive
-{
-    fn default() -> Self
-    {
-        Self::new()
-    }
-}
-
-/// Link every chunk of the page at `page` onto the list headed by `head`,
-/// lowest address first.
+/// Link every chunk of the page at `page` but chunk 0, which holds the page's
+/// header, onto the list headed by `head`, lowest address first.
 ///
 /// # Safety
-/// `page` is a page-aligned, page-sized, writable block that nothing else
-/// references; the caller serialises `head`.
+/// `page` is a page-aligned, page-sized, writable block whose chunks 1 and up
+/// nothing else references; the caller serialises `head`.
 pub unsafe fn carve_page(head: &AtomicU64, page: *mut u8)
 {
-    for i in (0..CHUNKS_PER_PAGE).rev()
+    for i in (1..CHUNKS_PER_PAGE).rev()
     {
         // SAFETY: i < CHUNKS_PER_PAGE keeps the chunk inside the page
         // (caller contract).
@@ -162,78 +92,67 @@ pub unsafe fn pop_chunk(head: &AtomicU64) -> Option<*mut u8>
     Some(chunk)
 }
 
+/// The page that holds `chunk`: its header sits at the page's first byte.
+#[must_use]
+pub fn page_of(chunk: usize) -> usize
+{
+    chunk & !(crate::mm::PAGE_SIZE - 1)
+}
+
+/// The next run of a donation's span to return, from page address `cur` up to
+/// `end`, and the hole that ends it: the lowest of `holes` (page addresses of
+/// arena pages kept past their `CSpace`) in `[cur, end)`. Returns
+/// `(run_end, Some(hole))` when the run stops at a hole, which the caller skips
+/// past (`hole + PAGE_SIZE`), or `(end, None)` when no hole lies ahead. The
+/// cost is one pass over `holes`, so a span with `k` holes among `h` costs
+/// `O(k * h)`.
+#[must_use]
+pub fn next_run(cur: u64, end: u64, holes: impl Iterator<Item = u64>) -> (u64, Option<u64>)
+{
+    match holes.filter(|&h| h >= cur && h < end).min()
+    {
+        Some(h) => (h, Some(h)),
+        None => (end, None),
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
 
-    /// Every order of `n` lease releases and one teardown begin, as the
-    /// position of the begin among the releases (0 = before the first).
-    fn completions_for(n: u64, begin_at: u64) -> u32
-    {
-        let live = ArenaLive::new();
-        for _ in 0..n
-        {
-            live.retain();
-        }
-        let mut completions = 0;
-        for i in 0..=n
-        {
-            if i == begin_at && live.begin_teardown()
-            {
-                completions += 1;
-            }
-            if i < n && live.release()
-            {
-                completions += 1;
-            }
-        }
-        completions
-    }
+    const P: u64 = crate::mm::PAGE_SIZE as u64;
 
-    // The defect caught: a teardown that never completes (donations leaked)
-    // or completes twice (donations returned twice), for the begin landing
-    // before, between, or after the releases of the last leases.
-    #[test]
-    fn teardown_completes_exactly_once_whatever_the_order_of_the_last_releases()
+    /// A zeroed, page-aligned page, freed when the guard drops.
+    struct Page(*mut u8);
+
+    impl Drop for Page
     {
-        for n in 0..6
+        fn drop(&mut self)
         {
-            for begin_at in 0..=n
-            {
-                assert_eq!(
-                    completions_for(n, begin_at),
-                    1,
-                    "{n} leases, teardown begun after {begin_at} releases"
-                );
-            }
+            // SAFETY: allocated by page() with this layout.
+            unsafe { std::alloc::dealloc(self.0, layout()) };
         }
     }
 
-    #[test]
-    fn a_release_before_the_teardown_begins_completes_nothing()
+    fn layout() -> std::alloc::Layout
     {
-        let live = ArenaLive::new();
-        live.retain();
-        live.retain();
-        assert!(!live.release());
-        assert!(!live.teardown_begun());
-        assert!(!live.begin_teardown(), "one lease is still out");
-        assert!(live.teardown_begun());
-        assert!(live.release(), "the last lease completes the teardown");
+        std::alloc::Layout::from_size_align(crate::mm::PAGE_SIZE, crate::mm::PAGE_SIZE).unwrap()
     }
 
-    fn page() -> (Vec<u64>, *mut u8)
+    fn page() -> (Page, *mut u8)
     {
-        let mut backing = vec![0u64; crate::mm::PAGE_SIZE / 8];
-        let p = backing.as_mut_ptr().cast::<u8>();
-        (backing, p)
+        // SAFETY: a non-zero-size layout.
+        let p = unsafe { std::alloc::alloc_zeroed(layout()) };
+        assert!(!p.is_null());
+        (Page(p), p)
     }
 
-    // The defect caught: a carve that overlaps chunks, hands out a chunk
-    // outside the page, or loses one, and a pop that returns stale contents.
+    // The defect caught: a carve that overlaps chunks, hands out the header's
+    // chunk 0 or a chunk outside the page, or loses one, and a pop that
+    // returns stale contents.
     #[test]
-    fn a_carved_page_yields_each_of_its_chunks_once_zeroed()
+    fn a_carved_page_yields_each_chunk_but_the_header_once_zeroed()
     {
         let (_backing, p) = page();
         let head = AtomicU64::new(0);
@@ -245,7 +164,9 @@ mod tests
         {
             let off = c as usize - p as usize;
             assert_eq!(off % CHUNK_BYTES, 0);
+            assert!(off >= CHUNK_BYTES, "chunk 0 is the page header");
             assert!(off < crate::mm::PAGE_SIZE);
+            assert_eq!(page_of(c as usize), p as usize);
             // SAFETY: c is a popped chunk of CHUNK_BYTES.
             assert!(
                 unsafe { core::slice::from_raw_parts(c, CHUNK_BYTES) }
@@ -256,7 +177,7 @@ mod tests
         }
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), CHUNKS_PER_PAGE);
+        assert_eq!(seen.len(), CHUNKS_PER_PAGE - 1);
     }
 
     #[test]
@@ -272,5 +193,43 @@ mod tests
         unsafe { push_chunk(&head, a) };
         // SAFETY: as above.
         assert_eq!(unsafe { pop_chunk(&head) }, Some(a));
+    }
+
+    /// The runs `next_run` cuts `[start, end)` into around `holes`.
+    fn runs(start: u64, end: u64, holes: &[u64]) -> Vec<(u64, u64)>
+    {
+        let mut out = Vec::new();
+        let mut cur = start;
+        while cur < end
+        {
+            let (run_end, hole) = next_run(cur, end, holes.iter().copied());
+            if run_end > cur
+            {
+                out.push((cur, run_end));
+            }
+            cur = hole.map_or(run_end, |h| h + P);
+        }
+        out
+    }
+
+    // The defect caught: a hole returned with its span (a live body freed
+    // under its holder), a page of the span never returned (a leak), or a
+    // hole outside the span cutting it.
+    #[test]
+    fn a_span_is_returned_whole_but_for_its_holes()
+    {
+        let (s, e) = (10 * P, 20 * P);
+        assert_eq!(runs(s, e, &[]), [(s, e)]);
+        assert_eq!(runs(s, e, &[2 * P, 30 * P]), [(s, e)], "holes outside");
+        assert_eq!(
+            runs(s, e, &[15 * P, 11 * P]),
+            [(s, 11 * P), (12 * P, 15 * P), (16 * P, e)]
+        );
+        assert_eq!(
+            runs(s, e, &[s, e - P]),
+            [(s + P, e - P)],
+            "holes at both ends"
+        );
+        assert_eq!(runs(s, s + P, &[s]), [], "a one-page span that is a hole");
     }
 }

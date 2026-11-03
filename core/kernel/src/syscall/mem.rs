@@ -701,11 +701,12 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
                     .owns_memory
                     .store(false, core::sync::atomic::Ordering::Release);
             }
-            // SAFETY: tail_ptr just allocated; refcount is 1 with no other
-            // holders.
-            unsafe { crate::cap::object::dealloc_object(tail_ptr) };
             parent_ref.write_unlock();
             DERIVATION_LOCK.write_unlock();
+            // Freed after both locks go, as `dealloc_object` requires.
+            // SAFETY: tail_ptr just allocated; refcount is 1 with no other
+            // holders, and no lock is held.
+            unsafe { crate::cap::object::dealloc_object(tail_ptr) };
             return Err(e.into());
         }
     };

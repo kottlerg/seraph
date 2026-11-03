@@ -1147,7 +1147,8 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         | ObjectType::Interrupt
         | ObjectType::IoPort
         | ObjectType::SchedControl
-        | ObjectType::SbiControl => None,
+        | ObjectType::SbiControl
+        | ObjectType::ArenaPage => None,
     }
 }
 

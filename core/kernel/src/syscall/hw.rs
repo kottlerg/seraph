@@ -364,8 +364,8 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// On first bind, a per-thread port-binding table (`cap::ioport_bindings`: the
 /// 8 KiB IOPB bitmap in page-sized parts, all ports denied, and the record of
-/// each binding) is taken from the pool of the caller's `CSpace`, three pages
-/// in all. The bind records the `IoPort` object it is
+/// each binding) is taken from the pool of the target thread's own `CSpace`,
+/// three pages in all. The bind records the `IoPort` object it is
 /// made through and clears the range's bits (0 = allowed); freeing that object
 /// withdraws the binding (docs/capability-model.md § `IoPort`). On context
 /// switch the bitmap is copied into the TSS IOPB region. The install and the
@@ -440,56 +440,54 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             (obj.as_ptr() as usize, u32::from(po.base), po.port_count())
         };
 
-        // The per-thread binding table is allocated on first bind from the
-        // pool of the caller's CSpace (core/kernel/docs/capability-internals.md
-        // § IoPort Bindings) and returned there on thread dealloc via the
-        // Thread arm of `dealloc_object`. The pointer and the table's bytes
-        // are owned by the target's `sched_lock`
-        // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership,
-        // Address-space / capability row), which `schedule()` also holds when
-        // it loads the bitmap into a CPU's TSS. The allocation is not made
-        // under that lock: a first bind peeks under it, allocates outside it,
-        // and installs under it only if the slot is still empty; a concurrent
-        // bind that installed first wins, and the loser's pages go back to
-        // the pool.
-        // SAFETY: target_tcb validated non-null; lock_raw/unlock_raw paired.
-        let needs_iopb = unsafe {
-            let saved = (*target_tcb).sched_lock.lock_raw();
-            let empty = (*target_tcb).iopb.is_null();
-            (*target_tcb).sched_lock.unlock_raw(saved);
-            empty
-        };
-        let mut fresh: *mut IoPortBindings = core::ptr::null_mut();
-        if needs_iopb
-        {
-            // SAFETY: cspace is the running thread's own CSpace, live while
-            // the thread runs.
-            let funder = unsafe { crate::cap::object::arena_of(cspace) }?;
-            fresh = crate::cap::object::alloc_port_binding_table(funder)?;
-        }
-
+        // The per-thread binding table is allocated on the first bind from
+        // the pool of the target thread's own CSpace
+        // (core/kernel/docs/capability-internals.md § IoPort Bindings) and
+        // returned there on thread dealloc via the Thread arm of
+        // `dealloc_object`, or by that CSpace's teardown, whichever comes
+        // first. The pointer and the table's bytes are owned by the target's
+        // `sched_lock` (core/kernel/docs/scheduling-internals.md § Cross-CPU
+        // TCB Ownership, Address-space / capability row), which `schedule()`
+        // also holds when it loads the bitmap into a CPU's TSS. The table is
+        // allocated and installed inside that lock, with the thread not yet
+        // `Exited`: the CSpace's teardown marks its threads `Exited` and then
+        // frees their tables, each under the same lock, so a table installed
+        // here is one that teardown frees, and its pool is live while it is
+        // taken.
         // SAFETY: target_tcb validated non-null; under its sched_lock, iopb is
-        // null or the bitmap of a live table installed by a bind, and `fresh`
-        // (when non-null) is ours alone; lock_raw/unlock_raw paired, interrupts
-        // disabled between.
+        // null or the bitmap of a live table installed by a bind, and the
+        // thread's cspace is live while the thread is not Exited (above);
+        // lock_raw/unlock_raw paired, interrupts disabled between.
         let bound = unsafe {
             let saved = (*target_tcb).sched_lock.lock_raw();
-            if (*target_tcb).iopb.is_null() && !fresh.is_null()
+            let bound = if (*target_tcb).state == crate::sched::thread::ThreadState::Exited
+                || (*target_tcb).cspace.is_null()
             {
-                (*target_tcb).iopb = fresh.cast::<crate::arch::current::ThreadIopb>();
-                fresh = core::ptr::null_mut();
-            }
-            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-            // IoPortBindings page (the allocation above or an earlier bind's).
-            #[allow(clippy::cast_ptr_alignment)]
-            let table = (*target_tcb).iopb.cast::<IoPortBindings>();
-            let bound = if table.is_null()
-            {
-                Ok(())
+                Err(SyscallError::InvalidCapability)
             }
             else
             {
-                let r = (*table).bind(port_object, port_base, port_count);
+                let mut table = (*target_tcb).iopb.cast::<IoPortBindings>();
+                if table.is_null()
+                {
+                    match crate::cap::object::arena_of((*target_tcb).cspace)
+                        .and_then(crate::cap::object::alloc_port_binding_table)
+                    {
+                        Ok(fresh) =>
+                        {
+                            (*target_tcb).iopb = fresh.cast::<crate::arch::current::ThreadIopb>();
+                            table = fresh;
+                        }
+                        Err(e) =>
+                        {
+                            (*target_tcb).sched_lock.unlock_raw(saved);
+                            return Err(e);
+                        }
+                    }
+                }
+                let r = (*table)
+                    .bind(port_object, port_base, port_count)
+                    .map_err(|_| SyscallError::QuotaExceeded);
                 // Binding the running thread: reload this CPU's TSS IOPB so in/out
                 // instructions work without a context switch.
                 if r.is_ok() && target_tcb == caller_tcb
@@ -502,16 +500,7 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             bound
         };
 
-        // A concurrent bind installed its table first: return ours to the
-        // pool.
-        if !fresh.is_null()
-        {
-            // SAFETY: `fresh` was never installed, so nothing references it;
-            // no lock is held.
-            unsafe { crate::cap::object::free_uninstalled_port_binding_table(fresh) };
-        }
-
-        bound.map_err(|_| SyscallError::QuotaExceeded)?;
+        bound?;
         // A target running on another CPU loaded its bitmap before this bind:
         // invalidate every TSS so its next port access reloads the grown
         // bitmap (the lazy reload of `gdt::reload_invalidated_iopb`) instead

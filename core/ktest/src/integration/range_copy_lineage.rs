@@ -18,9 +18,10 @@
 //!    `CSpace` whose one pool page its body takes, the slot cannot be backed
 //!    and the copy fails with `OutOfMemory`; after an augment it succeeds.
 //! 3. A copy moved out of its funding `CSpace` outlives it: the dead `CSpace`
-//!    keeps its donations (the augment frame stays retyped) while the moved
-//!    copy lives and can still be derived from, and returns them (the frame's
-//!    bytes are available again) once that copy is deleted.
+//!    returns its donations at once (the augment frame's bytes are available
+//!    again) but for the one arena page that holds the copy's body, which can
+//!    still be derived from, and that page returns to its Memory capability
+//!    once the copy is deleted.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -142,25 +143,26 @@ fn outlives_funder(ctx: &TestContext, source: u32, cs: u32, frame: u32) -> TestR
 
     // The funder is gone (the caller deletes `cs` on every path; here first).
     cap_delete(cs).map_err(|_| "integration::range_copy_lineage: cap_delete(cs) failed")?;
-    let pinned = cap_info(frame, CAP_INFO_MEMORY_AVAILABLE).unwrap_or(u64::MAX);
+    let frame_back = cap_info(frame, CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
+    let base_before = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
     let derived = cap_derive(moved, RIGHTS_ALL);
     if let Ok(d) = derived
     {
         cap_delete(d).ok();
     }
     cap_delete(moved).map_err(|_| "integration::range_copy_lineage: cap_delete(moved) failed")?;
-    let returned = cap_info(frame, CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
-    if pinned != 0
+    let base_after = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
+    if frame_back != PAGE
     {
-        return Err("integration::range_copy_lineage: a dead funder returned its donations early");
+        return Err("integration::range_copy_lineage: a dead funder held a donation no body uses");
     }
     if derived.is_err()
     {
         return Err("integration::range_copy_lineage: a copy outliving its funder is unusable");
     }
-    if returned != PAGE
+    if base_after != base_before + PAGE
     {
-        return Err("integration::range_copy_lineage: the funder's donations were not returned");
+        return Err("integration::range_copy_lineage: the kept arena page did not return");
     }
     Ok(())
 }

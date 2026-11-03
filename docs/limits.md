@@ -582,7 +582,7 @@ Every entry here is `correct as is`; none is tracked.
 | `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
 | `discover_disks` disk list | `services/vfsd/src/partition.rs` | heap `Vec`, one `Disk` per block driver devmgr serves, found once at startup | per-instance (devmgr's block-driver count, one per virtio-blk device; an allocation failure stops discovery with a log, keeping the disks found before it) | none | correct as is | None |
 | `collect_partitions` entry list | `services/vfsd/gpt/src/lib.rs` | heap `Vec`, every used entry of the header's `num_parts` array | hardware spec (UEFI GPT: `parse_header` requires the array to lie between LBA 2 and the header's own `first_usable_lba`); a header that also inflates `first_usable_lba` is bounded by the device capacity, and a read or allocation failure stops the walk with a log | none | correct as is | None |
-| gpt `MAX_BLOCK_SIZE` | `services/vfsd/gpt/src/lib.rs` | 4096; the block size itself comes from `BLK_GET_GEOMETRY` | hardware spec (the block driver's `MAX_BLOCK_SIZE`, one page) | 4 KiB stack during a walk | correct as is | None (4Kn boot: #669) |
+| gpt `MAX_BLOCK_SIZE` | `services/vfsd/gpt/src/lib.rs` | 4096; the block size itself comes from `BLK_GET_GEOMETRY` | hardware spec (the block driver's `MAX_BLOCK_SIZE`, one page) | 4 KiB stack during a walk | correct as is | None |
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
 | `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
@@ -727,7 +727,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637) (the `SLOT_COUN
 | LFN write (`encode_lfn`) | `services/fs/fat/fat-parse/src/lib.rs` | 255 UTF-16 code units | hardware spec (FAT LFN) | 510 B stack | correct as is | None |
 | `MAX_LFN_CHARS`, `MAX_LFN_UTF8` | `services/fs/fat/fat-parse/src/lib.rs` | 255 / 765 | hardware spec (FAT LFN) | embedded | correct as is | None |
 | `MAX_SLOT_RUN` | `services/fs/fat/fat-parse/src/lib.rs` | 21 | hardware spec (FAT LFN) | embedded | correct as is | None |
-| fat-parse `MAX_SECTOR_SIZE` | `services/fs/fat/fat-parse/src/lib.rs` | 4096; the volume's sector size must equal the device block size | hardware spec (FAT sector sizes 512 to 4096) | 4 KiB per sector buffer | correct as is | None (4Kn boot: #669) |
+| fat-parse `MAX_SECTOR_SIZE` | `services/fs/fat/fat-parse/src/lib.rs` | 4096; the volume's sector size must equal the device block size | hardware spec (FAT sector sizes 512 to 4096) | 4 KiB per sector buffer | correct as is | None |
 
 ### Test harnesses
 

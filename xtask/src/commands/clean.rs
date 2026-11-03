@@ -3,7 +3,8 @@
 
 // xtask/src/commands/clean.rs
 
-//! Clean command: remove the sysroot and optionally the cargo target/ directory.
+//! Clean command: remove the sysroot and the disk images, and optionally the
+//! cargo target/ directory.
 
 use std::process::Command;
 
@@ -27,12 +28,14 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
         step("Sysroot already clean");
     }
 
-    let disk_img = ctx.disk_image();
-    if disk_img.exists()
+    for disk_img in [ctx.disk_image(), ctx.data_disk_image()]
     {
-        step(&format!("Removing disk image: {}", disk_img.display()));
-        std::fs::remove_file(&disk_img)
-            .map_err(|e| anyhow::anyhow!("failed to remove {}: {}", disk_img.display(), e))?;
+        if disk_img.exists()
+        {
+            step(&format!("Removing disk image: {}", disk_img.display()));
+            std::fs::remove_file(&disk_img)
+                .map_err(|e| anyhow::anyhow!("failed to remove {}: {}", disk_img.display(), e))?;
+        }
     }
 
     if args.all

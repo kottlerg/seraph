@@ -352,14 +352,13 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 // prefixes keep that provenance visible.
 // needless_range_loop: each indexed loop runs to a count it keeps in view: the
 // AP-startup loop uses cpu_idx as both the hw_ids index and the CPU ID; the
-// init-segment
-// Memory-cap loop (i < segment_count) and the InitInfo Memory-cap loop
-// (pg < info_pages) test the index for the first slot; the init-segment map
-// loop takes the same i < segment_count form as the cap loop after it.
+// init-segment Memory-cap loop (i < segment_count) and the InitInfo Memory-cap
+// loop (pg < info_pages) test the index for the first slot; the init-segment
+// map loop takes the same i < segment_count form as the cap loop after it.
 // cast_possible_truncation: every usize -> u32 cast is of a bounded value:
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
-// desc_count and info_pages are bounded by the descriptor capacity Phase 7
-// enforces (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
+// desc_count and info_pages are bounded by the descriptor capacity Phases 7
+// and 8 enforce (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
 // size_of::<InitInfo>() and STACK_PAGES are small constants.
 // large_types_passed_by_value: init_image (304 B) crosses the
 // by-value/by-reference threshold. The `#[inline(never)]` boundary is what
@@ -980,7 +979,8 @@ unsafe fn kernel_entry_post_rebase(
             // The block was reserved from the pristine buddy at Phase 7
             // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
             // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES
-            // follows from Phase 7's descriptor capacity (asserted above), so
+            // follows from the descriptor capacity Phases 7 and 8 enforce
+            // (asserted above), so
             // it fits within the reserved extent.
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
@@ -988,7 +988,8 @@ unsafe fn kernel_entry_post_rebase(
             // descriptors were written into it.
 
             // Sized by the init protocol's `INIT_INFO_MAX_PAGES`, which
-            // `info_pages` stays within (Phase 7's descriptor capacity).
+            // `info_pages` stays within (the descriptor capacity Phases 7 and
+            // 8 enforce).
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
             let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =

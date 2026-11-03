@@ -436,12 +436,12 @@ Phase 7.
    as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
    buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
-   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 670 at
+   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 655 at
    INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
    Phase 7: drained RAM extents exceed the InitInfo descriptor capacity", the one check the in-place
    mint of step 3a relies on. Every capability Phases 7 and 8 mint then has its descriptor written
    into that array, in place, so no copy of it exists, and a boot whose capabilities outnumber the
-   slots halts by name in Phase 7 ("cap: boot capabilities exceed the InitInfo descriptor
+   slots halts by name in Phase 7 or 8 ("cap: boot capabilities exceed the InitInfo descriptor
    capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such boot. Phase
    9's capabilities reach init through InitInfo header fields instead. SEED_RESERVE_BYTES is the
    boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs, and

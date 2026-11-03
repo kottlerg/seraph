@@ -311,9 +311,9 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// per-RAM-extent-count growth (more drained extents ⇒ more init-time
 /// Memory-cap derivations) and per-service growth (more boot modules ⇒
 /// more module-memory caps) without revisiting this knob. The boot mint is
-/// itself bounded by [`BOOT_BODY_BOUND`] (about 690 caps: the `InitInfo`
+/// itself bounded by [`BOOT_BODY_BOUND`] (about 675 caps: the `InitInfo`
 /// descriptor capacity and Phase 9's Memory caps), so a boot at that bound, an
-/// ACPI-region-heavy memory map among them, still leaves init about 850 slots.
+/// ACPI-region-heavy memory map among them, still leaves init about 860 slots.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -376,7 +376,7 @@ pub(crate) const INIT_THREAD_PAGES: u64 = (crate::sched::KERNEL_STACK_PAGES + 2)
 /// boot capability descriptors straight into the block (and the buddy drain
 /// its RAM extents before them, [`drain_and_install_seed`]), so this is the
 /// one bound on the capabilities the boot mints: [`push_descriptor`] halts the
-/// boot by name past it. At `INIT_INFO_MAX_PAGES` = 4 that is about 670
+/// boot by name past it. At `INIT_INFO_MAX_PAGES` = 4 that is about 655
 /// capabilities, which also bounds the ACPI region caps (one per
 /// `AcpiReclaimable` memory-map entry; real firmware reports 1 or 2).
 pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = (init_protocol::INIT_INFO_MAX_PAGES
@@ -435,7 +435,7 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// - init's bootstrap `AddressSpace` and Thread slabs ([`INIT_ASPACE_PAGES`]
 ///   18, [`INIT_THREAD_PAGES`] 6);
 /// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (about
-///   690) of [`BOOT_BODY_BYTES`] each (about 22 pages): one RAM `MemoryObject`
+///   675) of [`BOOT_BODY_BYTES`] each (about 22 pages): one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
 ///   `SchedControl` and `SbiControl` roots, the firmware-table, boot-module,
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
@@ -445,7 +445,7 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
 /// capabilities pass the descriptor capacity halts the boot by name in
-/// Phase 7 (`push_descriptor`) before it could exhaust SEED.
+/// Phase 7 or 8 (`push_descriptor`) before it could exhaust SEED.
 ///
 /// The remainder of the largest extent is exposed to userspace as a
 /// regular retype-backed RAM Memory cap (the "seed-tail"), so init and
@@ -686,7 +686,8 @@ fn reserve_init_backing()
 pub(crate) fn take_init_info_block_phys() -> u64
 {
     // The block goes to init now, so the descriptor array is retired with it:
-    // a later `descriptor_array()` halts by name instead of writing into it.
+    // a later `descriptor_array()` halts, naming the array's Phase 7-8
+    // lifetime, instead of writing into it.
     DESCRIPTOR_ARRAY.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
@@ -1172,7 +1173,8 @@ pub struct CSpaceLayout
 /// `reserve_init_backing` at Phase 7. Phase 7 writes every boot capability's
 /// descriptor there, the buddy drain's RAM extents first (in the slots their
 /// descriptors take), and Phase 9 writes the header in front of them, so no
-/// copy of the array exists; after hand-off it is init's.
+/// copy of the array exists; after hand-off it is init's, and
+/// `take_init_info_block_phys` nulls this pointer.
 #[cfg(not(test))]
 static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
@@ -1196,7 +1198,7 @@ fn descriptor_array() -> *mut CapDescriptor
         let p = DESCRIPTOR_ARRAY.load(core::sync::atomic::Ordering::Relaxed);
         if p.is_null()
         {
-            crate::fatal("cap: InitInfo descriptor array used before its block is reserved");
+            crate::fatal("cap: InitInfo descriptor array used outside Phases 7 and 8");
         }
         p
     }
@@ -1257,8 +1259,9 @@ pub(crate) fn owns_memory_minted_bytes() -> u64
 }
 
 /// Write `desc` to slot `*count` of the `InitInfo` descriptor array and bump
-/// the count. Halts the boot, naming the capacity, when the array is full: a
-/// boot mints at most [`INIT_INFO_DESCRIPTOR_CAPACITY`] capabilities.
+/// the count. Halts the boot, naming the capacity, when the array is full: the
+/// boot describes at most [`INIT_INFO_DESCRIPTOR_CAPACITY`] capabilities, in
+/// Phases 7 and 8.
 fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 {
     if *count >= INIT_INFO_DESCRIPTOR_CAPACITY

@@ -121,7 +121,9 @@ Architecture-only Tier 1 tests live under `src/arch/<arch>/` and run through
 (`0x7FFF_FFFF_F000` at 4-level paging, `0xFF_FFFF_FFFF_F000` at 5-level) with
 `InvalidAddress` and maps the page below it. Each architecture's
 `ioport_syscalls.rs` holds its `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` tests (a bind and a split
-of the initial `IoPort` caps on x86-64, `NotSupported` on RISC-V), and its `sbi_call.rs` its
+of the initial `IoPort` caps on x86-64, and a bind whose thread's `CSpace` is deleted first, which
+returns the binding table with the `CSpace`'s pages and leaves the thread refusing a bind;
+`NotSupported` on RISC-V), and its `sbi_call.rs` its
 `SYS_SBI_CALL` test: the call reaches the SBI firmware on RISC-V and returns `NotSupported` on
 x86-64.
 

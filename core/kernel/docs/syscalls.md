@@ -1961,7 +1961,7 @@ Permission Bitmap (IOPB).
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Multiple bindings may be made to the same thread, each authorising a different port range; a
-thread records at most `MAX_IOPORT_BINDINGS` (254) bindings, and binding the same
+thread records at most `MAX_IOPORT_BINDINGS` (252) bindings, and binding the same
 `ioport_cap` object again reuses its record. A bind takes effect at the target's next port
 access even when the target is running on another CPU (every CPU's TSS IOPB is invalidated
 and reloaded lazily). The thread records each binding against the `ioport_cap`'s object.

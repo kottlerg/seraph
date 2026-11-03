@@ -239,9 +239,13 @@ The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
 intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
-a record of every donation — its source Memory object, byte offset, and page
-count — so teardown can return each donation to its source wholesale. The
-wrapper, not the pool, keeps the byte budget the pool backs.
+a record of every donation — its source Memory object, byte offset, page
+count, and, at a `CSpace`'s teardown, the list of its arena pages kept past
+it — so teardown can return each donation to its source, whole or, for a
+`CSpace`, with those pages cut out ([§ Body Arena](#body-arena)). A
+`CSpace` pool's free page also carries, in its second word, the address of
+its donation's record. The wrapper, not the pool, keeps the byte budget the
+pool backs.
 
 ### Donation Records
 
@@ -290,22 +294,22 @@ scope (a nested `CSpace`'s derivation drain takes the derivation lock after the 
 released it; a wait set's sources are torn down after `wait_set_drop` has released every source
 lock).
 
-The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
-its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
-`CSpace`'s derivation drain it is not batched), and runs to completion in whichever context drops
-the last reference: the deleting syscall, with interrupts masked on that CPU; or, when the owner is
-handed to the per-CPU deferred-reclaim stack (a thread deleting an object it is itself bound to, a
-syscall pin or a batched capability move dropping the last reference, or an Mmio object's mapping
-record releasing the address space at that object's teardown; the producer list is
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next syscall
-epilogue on that CPU, with interrupts masked, or the idle thread's drain, with interrupts enabled
-([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin locks"). So an
-owner's teardown latency scales with how finely it donated, and can land on an unrelated thread's
-syscall: the same memory donated as single pages costs one return per page. The standard runtime's
-map retry donates one page per page-table shortfall (its budget top-up donates the shortfall in one
-call), so a process's count is of the order of its page-table page count, one per 2 MiB of mapped
-span. Bounding the walk, and the seeding of one donation, within a syscall is
-[#434](https://github.com/kottlerg/seraph/issues/434).
+The walk costs one `retype_free` per donation (per run of it, for a `CSpace` with kept arena pages),
+holds no lock across records (each return takes only its ancestor's locks, the Memory object's read
+lock and its retype-allocator lock, so unlike a `CSpace`'s derivation drain it is not batched), and
+runs to completion in whichever context drops the last reference: the deleting syscall, with
+interrupts masked on that CPU; or, when the owner is handed to the per-CPU deferred-reclaim stack (a
+thread deleting an object it is itself bound to, a syscall pin or a batched capability move dropping
+the last reference, or an Mmio object's mapping record releasing the address space at that object's
+teardown; the producer list is [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) §
+Self-teardown) — the next syscall epilogue on that CPU, with interrupts masked, or the idle thread's
+drain, with interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy,
+"Bare spin locks"). So an owner's teardown latency scales with how finely it donated, and can land
+on an unrelated thread's syscall: the same memory donated as single pages costs one return per page.
+The standard runtime's map retry donates one page per page-table shortfall (its budget top-up
+donates the shortfall in one call), so a process's count is of the order of its page-table page
+count, one per 2 MiB of mapped span. Bounding the walk, and the seeding of one donation, within a
+syscall is [#434](https://github.com/kottlerg/seraph/issues/434).
 
 ### Body Arena
 
@@ -334,7 +338,9 @@ carves a pool page into 32 chunks: chunk 0 holds the page's header, an `ArenaPag
 | `header` | a `KernelObjectHeader` whose reference count is the page's live chunks plus one hold, the owning `CSpace`'s while it lives and its teardown's while that runs; `ancestor` is null until the teardown keeps the page |
 | `owner` | the funding `CSpaceKernelObject`, null once its teardown has passed the page |
 | `next` | the owner's list of its arena pages, then its teardown's list of the pages it keeps |
+| `kept_next` | the teardown's list of every page it keeps |
 | `lock` | serialises `owner` against a chunk free, which pushes the chunk to the owner's list while the owner lives |
+| `record` | the address of the record of the donation the page lies in, taken from the free pool page it was carved from |
 
 A body's `header.ancestor` names its page, so its free returns the chunk there: to the owner's
 list while the owner lives, releasing the page's reference either way. A page the arena takes
@@ -351,25 +357,26 @@ the kernel's SEED reserve, which holds only the boot footprint (initialization.m
 A chunk body can outlive its funder: a capability moved to another `CSpace` (`SYS_CAP_MOVE`, an IPC
 transfer) keeps its body in the funder's arena. The teardown keeps only the pages such bodies sit
 on. When the wrapper's reference count reaches zero, its dealloc arm stops its threads, frees their
-port-binding tables, drains and drops the `CSpace`, and queues the objects its slots held, as
-[§ Teardown](#teardown) describes. It then makes one pass over its arena pages, clearing each one's
+port-binding tables, drains and drops the `CSpace`, and queues the objects its slots held, as [§
+Teardown](#teardown) describes. It then makes one pass over its arena pages, clearing each one's
 `owner` under the page's lock and keeping, with the owner's hold, every page whose count shows a
 live chunk; no chunk can be allocated any more, so a count of one stays one, and a higher count
-never falls below the hold. Every donation then goes back at once with the kept pages cut out of
-its span (`cap::arena::next_run`): each kept page takes a lease of its own on the Memory object
-its donation came from and records it as its `ancestor`. The teardown then releases its hold on
-each kept page, and the release of a page's last reference, its hold's or its last chunk's,
-returns the page to that Memory object (the `ArenaPage` arm of `dealloc_object`). A dead `CSpace`
-therefore holds, past its death, only the pages its surviving bodies sit on, each to its Memory
-object, the analogue of a retyped object pinning its Memory capability; nothing it donated depends
-on its own bodies, so neither a donation of a tail the `CSpace`'s own arena funded nor two
-`CSpace`s funding each other's donated tails can keep a pool alive. The bodies of the `CSpace`'s
-own slots are freed from the cascade stack after the arm, so most kept pages return within the
-same `dealloc_object` call.
+never falls below the hold. Each kept page goes onto its donation record's list (its `record` names
+it). Every donation then goes back at once with its kept pages, sorted once
+(`cap::arena::sort_list`), cut out of its span (`cap::arena::for_each_run`): each kept page takes a
+lease of its own on the Memory object its donation came from and records it as its `ancestor`. The
+teardown then releases its hold on each kept page, and the release of a page's last reference, its
+hold's or its last chunk's, returns the page to that Memory object (the `ArenaPage` arm of
+`dealloc_object`). A dead `CSpace` therefore holds, past its death, only the pages its surviving
+bodies sit on, each to its Memory object, the analogue of a retyped object pinning its Memory
+capability; nothing it donated depends on its own bodies, so neither a donation of a tail the
+`CSpace`'s own arena funded nor two `CSpace`s funding each other's donated tails can keep a pool
+alive. The bodies of the `CSpace`'s own slots are freed from the cascade stack after the arm, so
+most kept pages return within the same `dealloc_object` call.
 
-The cut costs one pass over the kept pages for each run of a donation's span, so a teardown with
-`r` donation records and `h` kept pages costs `O(r * h)` on top of the walk of the records, and `h`
-is at most the arena pages, one per 31 bodies the `CSpace` funded.
+The cut sorts each donation's kept pages once and walks its span with them in order, so a teardown
+with `r` donation records and `h` kept pages costs `O(r + h log h)`, allocating nothing, and `h` is
+at most the arena pages, one per 31 bodies the `CSpace` funded.
 
 ---
 
@@ -696,12 +703,13 @@ the arena that funded it.
 A bound thread's `iopb` pointer names the bitmap at the head of its port-binding table
 (`cap::ioport_bindings::IoPortBindings`): one page holding the bitmap's two page-sized parts
 (`ThreadIopb`, ports 0 to 32767 and 32768 to 65535, each in a page of its own), the funder, and up
-to `MAX_IOPORT_BINDINGS` (254) records of `(IoPort object, base, count)`. The three pages come from
+to `MAX_IOPORT_BINDINGS` (252) records of `(IoPort object, base, count)`, after the record cells
+of its three pages. The three pages come from
 the pool of the bound thread's own `CSpace` ([§ Body Arena](#body-arena)), taken and installed under
 the thread's `sched_lock` while it is not `Exited`, and return there when the thread is destroyed
 or, first, when that `CSpace` dies. `sys_ioport_bind` records the binding and permits its ports
 under the thread's `sched_lock`; a bind through an object the thread already records changes
-nothing, and a distinct object past the 254th returns `QuotaExceeded`. Each binding is made through
+nothing, and a distinct object past the 252nd returns `QuotaExceeded`. Each binding is made through
 a distinct `IoPort` object, so the bound is one thread's fan-out over separately held port ranges,
 and its page is funded by the thread's `CSpace`. A bind of another thread also invalidates every
 CPU's TSS bitmap (below), so a target already running elsewhere picks up the new ports at its next

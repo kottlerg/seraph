@@ -327,7 +327,9 @@ pub const CAP_INFO_ASPACE_PT_BUDGET: u64 = 4;
 /// the remaining growth-budget pages would back, clamped to the highest
 /// reachable count (the directory's structural ceiling minus the
 /// permanently reserved slot 0). Grows with augment-mode
-/// `cap_create_cspace` donations. A mild over-estimate: the first page's
+/// `cap_create_cspace` donations. Pages the `CSpace`'s body arena or a thread's
+/// port-binding table takes spend the same budget ([`CAP_INFO_CSPACE_BUDGET`]),
+/// so the capacity falls by a page's slots for each. A mild over-estimate: the first page's
 /// reserved slot 0 is counted before that page exists, and deep growth
 /// spends an occasional budget page on a directory page that backs no
 /// slots. Subtracting [`CAP_INFO_CSPACE_USED`] yields headroom, which
@@ -341,10 +343,11 @@ pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
 /// returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_USED: u64 = 6;
 
-/// `CSpace` only — bytes available to back new slot pages and the pages of the
-/// `CSpace`'s body arena (the objects a split, an `Mmio` or `IoPort` copy, a
-/// spilled `Mmio` mapping record, or a port-binding table funded by this
-/// `CSpace` needs; see [`cspace_topup_pages`]).
+/// `CSpace` only — bytes available to back new slot pages, the pages of the
+/// `CSpace`'s body arena (the objects a split, an `Mmio` or `IoPort` copy, or a
+/// spilled `Mmio` mapping record funded by this `CSpace` needs; see
+/// [`cspace_topup_pages`]), and the three pages of the port-binding table of a
+/// thread bound to it, taken at the thread's first `ioport_bind`.
 ///
 /// Returns the current value of `CSpaceKernelObject::cspace_growth_budget_bytes`.
 /// Calling on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
@@ -604,11 +607,13 @@ pub const CSPACE_SLOTS_PER_PAGE: u64 = 56;
 /// (`CAP_INFO_CSPACE_CAPACITY - CAP_INFO_CSPACE_USED - CSPACE_IPC_RECV_RESERVE`)
 /// and `budget_bytes` its [`CAP_INFO_CSPACE_BUDGET`]. The body arena takes
 /// whole pages from the same budget as slot pages, for the objects a split, an
-/// `Mmio` or `IoPort` copy, a spilled `Mmio` mapping record, or a port-binding
-/// table needs: headroom of one page beyond `slots` keeps a page for it after
-/// `slots` allocations drawn from the budget, and a budget of a page keeps one
-/// when the slots come from pages already in use. The result counts one more
-/// page for a donation record or a directory page the donation may spend.
+/// `Mmio` or `IoPort` copy, or a spilled `Mmio` mapping record needs: headroom
+/// of one page beyond `slots` keeps a page for it after `slots` allocations
+/// drawn from the budget, and a budget of a page keeps one when the slots come
+/// from pages already in use. A thread's first `ioport_bind` takes three more
+/// pages from its `CSpace`'s budget, which this floor does not cover. The
+/// result counts one more page for a donation record or a directory page the
+/// donation may spend.
 #[must_use]
 pub const fn cspace_topup_pages(headroom: u64, budget_bytes: u64, slots: u64) -> u64
 {

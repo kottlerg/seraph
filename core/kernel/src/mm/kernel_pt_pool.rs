@@ -6,10 +6,9 @@
 //! Kernel-internal intermediate page-table frame pool.
 //!
 //! Backs the kernel-direct `map_user_page` PT-growth path
-//! ([`crate::mm::address_space::AddressSpace::map_page`]). Which mappings
-//! draw from this pool (the Phase-9 bootstrap maps of init's or ktest's
-//! boot address space, and the `sys_mem_map` / `sys_mmio_map` fallback for
-//! an address space with no recorded donation) is defined in
+//! ([`crate::mm::address_space::AddressSpace::map_page`]). The mappings that
+//! draw from this pool, the Phase-9 bootstrap maps of init's or ktest's boot
+//! address space and no map syscall, are defined in
 //! `core/kernel/docs/memory-internals.md` § Page Table Node Ownership.
 //!
 //! Pages are seeded once during Phase 7 — `POOL_SEED_PAGES` allocated from the

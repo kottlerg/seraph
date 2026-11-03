@@ -1021,9 +1021,10 @@ impl PagePool
     /// Whether record 0, the create-time slab, is populated. Records are
     /// appended from index 0, and every wrapper the kernel constructs
     /// records its slab before the wrapper is published, so this is true
-    /// for every live object. The pooled map paths' fallback to the kernel
-    /// page-table pool and the dealloc arms' debug assertions check that
-    /// invariant rather than support an unrecorded object.
+    /// for every live object. The map syscalls' check
+    /// ([`AddressSpaceObject::require_create_donation`]) and the dealloc
+    /// arms' debug assertions check that invariant rather than support an
+    /// unrecorded object.
     #[cfg(not(test))]
     #[must_use]
     pub fn has_create_donation(&self) -> bool
@@ -1461,6 +1462,40 @@ unsafe fn pool_push(head_phys: &AtomicU64, phys: u64)
 
 impl AddressSpaceObject
 {
+    /// Check, at a map syscall's entry, that this address space records its
+    /// create-time donation, so its page-table pages come from its own pool.
+    ///
+    /// Both constructors record the donation before the object is published
+    /// (`sys_cap_create_aspace` rolls the create back, and
+    /// `boot_retype_aspace` halts the boot, if `add_donation` fails; record 0
+    /// of a new pool is always vacant), and record 0 is cleared only at
+    /// dealloc. So the check cannot fail on a live object, and no map
+    /// syscall draws on the kernel page-table pool, whose only consumers are
+    /// the Phase 9 bootstrap maps (core/kernel/docs/memory-internals.md
+    /// § Page Table Node Ownership).
+    ///
+    /// # Errors
+    ///
+    /// `OutOfMemory`, the error of a map with no page-table page to draw, if
+    /// the invariant is broken (debug builds assert it first).
+    #[cfg(not(test))]
+    pub fn require_create_donation(&self) -> Result<(), syscall::SyscallError>
+    {
+        let recorded = self.pt_pool.has_create_donation();
+        debug_assert!(
+            recorded,
+            "address space published without its create-time donation"
+        );
+        if recorded
+        {
+            Ok(())
+        }
+        else
+        {
+            Err(syscall::SyscallError::OutOfMemory)
+        }
+    }
+
     /// Pop a free PT page from this AS's pool, charging the growth budget.
     /// Returns the page's physical address, or `None` if the pool is empty.
     /// Called under the address space's `pt_lock`, which serialises this
@@ -2074,7 +2109,10 @@ impl CascadeStack
             return 0;
         };
         let va = next.as_ptr() as u64;
-        debug_assert!(va.trailing_zeros() >= 3, "cascade: header {va:#x} not 8-byte aligned");
+        debug_assert!(
+            va.trailing_zeros() >= 3,
+            "cascade: header {va:#x} not 8-byte aligned"
+        );
         let word = (va >> 3) & ((1 << CASCADE_LINK_BITS) - 1);
         debug_assert!(
             Self::decode(word) == Some(next),
@@ -2125,7 +2163,10 @@ impl CascadeStack
         // cast_possible_truncation: each cast keeps exactly the bits its
         // field holds.
         #[allow(clippy::cast_possible_truncation)]
-        let (lo, hi) = (word as u32, [(word >> 32) as u8, (word >> 40) as u8, (word >> 48) as u8]);
+        let (lo, hi) = (
+            word as u32,
+            [(word >> 32) as u8, (word >> 40) as u8, (word >> 48) as u8],
+        );
         // SAFETY: caller contract.
         unsafe {
             (*obj.as_ptr()).ref_count.store(lo, Ordering::Relaxed);
@@ -2143,11 +2184,8 @@ impl CascadeStack
     pub(crate) unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract (a live header).
-        debug_assert_eq!(
-            unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed),
-            0,
-            "cascade: pushed object is still referenced"
-        );
+        let refs = unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed);
+        debug_assert_eq!(refs, 0, "cascade: pushed object is still referenced");
         // SAFETY: caller contract (exclusively owned).
         unsafe { Self::write_link(obj, Self::encode(self.top)) };
         self.top = Some(obj);
@@ -2258,10 +2296,7 @@ unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStac
 /// `ptr` is a refcount-0 `T`, exclusively owned, whose mappings or bindings
 /// have been withdrawn; no lock is held.
 #[cfg(not(test))]
-unsafe fn release_range_object<T>(
-    ptr: NonNull<KernelObjectHeader>,
-    stack: &mut CascadeStack,
-)
+unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
     // SAFETY: a live Mmio or IoPort object (caller contract).
     let root = unsafe { lineage_of(ptr) }.root_of(ptr);
@@ -2446,10 +2481,7 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
     clippy::items_after_statements
 )]
 #[cfg(not(test))]
-unsafe fn dealloc_object_one(
-    ptr: core::ptr::NonNull<KernelObjectHeader>,
-    stack: &mut CascadeStack,
-)
+unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
 {
     /// Return one donation to its ancestor Memory object and drop the
     /// reference the donation held on it, pushing the ancestor onto `stack`
@@ -4280,14 +4312,14 @@ mod tests
             .map(|(index, &obj_type)| {
                 let header = KernelObjectHeader::new(obj_type);
                 header.ref_count.store(refs[index], Ordering::Relaxed);
-                header.ancestor.store(model_ancestor(index), Ordering::Relaxed);
+                header
+                    .ancestor
+                    .store(model_ancestor(index), Ordering::Relaxed);
                 Box::new(ModelObject { header, index })
             })
             .collect();
-        let ptrs: Vec<NonNull<KernelObjectHeader>> = objects
-            .iter()
-            .map(|o| NonNull::from(&o.header))
-            .collect();
+        let ptrs: Vec<NonNull<KernelObjectHeader>> =
+            objects.iter().map(|o| NonNull::from(&o.header)).collect();
         let mut torn = vec![0u32; types.len()];
         run_cascade(ptrs[0], |obj, stack| {
             // SAFETY: every pointer the model queues is one of `objects`.
@@ -4296,7 +4328,10 @@ mod tests
             assert_eq!(model.header.ref_count.load(Ordering::Relaxed), 0);
             assert_eq!(model.header.cascade_link_hi, [0; 3]);
             assert_eq!(model.header.obj_type, types[i]);
-            assert_eq!(model.header.ancestor.load(Ordering::Relaxed), model_ancestor(i));
+            assert_eq!(
+                model.header.ancestor.load(Ordering::Relaxed),
+                model_ancestor(i)
+            );
             torn[i] += 1;
             for &h in &holds[i]
             {
@@ -4311,13 +4346,13 @@ mod tests
         torn
     }
 
-    // Defect guarded: a cascade that loses an entry (as a bounded worklist
-    // did past 32), tears one object down twice, or corrupts the type or
-    // ancestor a teardown reads while the object is queued.
+    // Defect guarded: a cascade that loses an entry (as any fixed-size
+    // worklist does past its size), tears one object down twice, or corrupts
+    // the type or ancestor a teardown reads while the object is queued.
     #[test]
     fn a_cascade_with_wide_fan_out_and_deep_chains_tears_every_object_down_once()
     {
-        // Object 0 holds 40 objects (past the old 32-entry worklist): 20
+        // Object 0 holds 40 objects (more than a 32-entry array holds): 20
         // endpoints and 20 wait sets, each wait set holding 16 notifications.
         // Every object holds a lease on one of the Memory objects, which form
         // a 64-deep ancestor chain, each holding the next.
@@ -4328,13 +4363,31 @@ mod tests
         for m in 0..CHAIN
         {
             types.push(ObjectType::Memory);
-            holds.push(if m + 1 < CHAIN { vec![memory_base + m + 1] } else { Vec::new() });
+            holds.push(
+                if m + 1 < CHAIN
+                {
+                    vec![memory_base + m + 1]
+                }
+                else
+                {
+                    Vec::new()
+                },
+            );
         }
         holds[0].push(memory_base);
         for e in 0..40
         {
             let obj = types.len();
-            types.push(if e < 20 { ObjectType::Endpoint } else { ObjectType::WaitSet });
+            types.push(
+                if e < 20
+                {
+                    ObjectType::Endpoint
+                }
+                else
+                {
+                    ObjectType::WaitSet
+                },
+            );
             holds.push(vec![memory_base + e % CHAIN]);
             holds[0].push(obj);
             if e >= 20
@@ -4381,7 +4434,11 @@ mod tests
                     holds[parent].push(c);
                     next.push(c);
                 }
-                for t in [ObjectType::Endpoint, ObjectType::Endpoint, ObjectType::Thread]
+                for t in [
+                    ObjectType::Endpoint,
+                    ObjectType::Endpoint,
+                    ObjectType::Thread,
+                ]
                 {
                     let o = types.len();
                     types.push(t);
@@ -4410,7 +4467,9 @@ mod tests
             .map(|index| {
                 let header = KernelObjectHeader::new(ObjectType::Endpoint);
                 header.ref_count.store(0, Ordering::Relaxed);
-                header.ancestor.store(model_ancestor(index), Ordering::Relaxed);
+                header
+                    .ancestor
+                    .store(model_ancestor(index), Ordering::Relaxed);
                 Box::new(ModelObject { header, index })
             })
             .collect();
@@ -4426,7 +4485,10 @@ mod tests
             assert_eq!(o.header.ref_count.load(Ordering::Relaxed), 0);
             assert_eq!(o.header.cascade_link_hi, [0; 3]);
             assert_eq!(o.header.obj_type, ObjectType::Endpoint);
-            assert_eq!(o.header.ancestor.load(Ordering::Relaxed), model_ancestor(o.index));
+            assert_eq!(
+                o.header.ancestor.load(Ordering::Relaxed),
+                model_ancestor(o.index)
+            );
         }
         assert_eq!(stack.pop(), None);
     }

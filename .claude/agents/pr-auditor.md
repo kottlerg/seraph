@@ -143,10 +143,10 @@ claims.
    candidate's hunk and each type or constant change as that section says.
    The boundary set is owed only when a non-inert line meets the Boundary
    surface definition, the memory variation only when one meets the Memory
-   surface definition, and the riscv64 16-hart and x86_64 16- and 128-vCPU
-   boundaries at `--runs 3` whenever the PR states a concurrency-fix purpose
-   as Repeat count defines it and has a non-inert line, whether or not a
-   line meets either surface. Outside those cases no run is owed: a
+   surface definition, and the whole boundary set (riscv64 16 and 128 harts,
+   x86_64 16 and 128 vCPUs) at `--runs 3` whenever the PR states a
+   concurrency-fix purpose as Repeat count defines it and has a non-inert
+   line, whether or not a line meets either surface. Outside those cases no run is owed: a
    non-inert change to a file under `core/kernel/` or `core/boot/` that
    meets neither surface owes none. A run's surface is the one that owes it,
    as When the runs are owed defines it; for the runs a concurrency-fix

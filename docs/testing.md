@@ -347,8 +347,8 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; the latter runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times and the memory variation once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -377,7 +377,7 @@ states. The surfaces below, and Repeat count, are judged on the non-inert lines 
 
 **Boundary surface.** The boundary set below is owed when, and only when, the PR's own diff (see
 When the runs are owed below) makes a non-inert change to the CPU-count surface; a stated
-concurrency-fix purpose owes three of its boundaries on its own (see Repeat count below). The
+concurrency-fix purpose owes the whole boundary set on its own (see Repeat count below). The
 CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
 per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
 reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs is not on it unless it lies in a
@@ -591,11 +591,11 @@ cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1
 **Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
 its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
 cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
-the riscv64 16-hart and the x86_64 16- and 128-vCPU boundaries three times each (`--runs 3`),
-whether or not its diff changes the CPU-count surface: a race in those mechanisms can fail rarely
-enough that one run misses it. That PR's other owed runs stay at `--runs 1`. A concurrency fix
-elsewhere is not a concurrency-fix purpose, and a change to those mechanisms' files without that
-stated purpose does not raise the count.
+the whole boundary set, every boundary three times (`--runs 3`), whether or not its diff changes the
+CPU-count surface: a race in those mechanisms can fail rarely enough that one run misses it. That
+PR's other owed runs stay at `--runs 1`. A concurrency fix elsewhere is not a concurrency-fix
+purpose, and a change to those mechanisms' files without that stated purpose does not raise the
+count.
 
 **When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
@@ -626,13 +626,13 @@ owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a 
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), the maintainer MUST run, on the commit to be tagged, the riscv64 16-hart and
-the x86_64 16- and 128-vCPU boundaries three times each (`--runs 3`), the
-riscv64 128-hart boundary once, and the memory
-variation once, so every tag boots at each boundary CPU count, and runs the timing
-report on the boundary logs, which is reported and blocks nothing. A run whose
-outcome is not a pass, as When the runs are owed classifies outcomes, blocks the
-tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
+(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
+(`--runs 3`) and the memory variation once, so every tag boots at each boundary
+CPU count, and runs the timing report on the boundary logs, which is reported and
+blocks nothing. A run whose outcome is not a pass, as When the runs are owed
+classifies outcomes, blocks the tag, MUST be filed as an Issue, and is bisected
+over the release's PRs.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

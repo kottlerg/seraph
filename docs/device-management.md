@@ -132,7 +132,7 @@ holds no per-IOMMU state.
 
 When devmgr binds a DMA-capable (PCI BAR + IRQ) driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,
-and delivers its BAR `Mmio`, optional IRQ, and endpoint caps. No
+and delivers its BAR `Mmio` caps, optional IRQ, and endpoint caps. No
 DMA-authorising capability type exists, and with no IOMMU programmed the
 physical isolation is absent; whether to refuse, warn, or restrict is a
 userspace policy decision, not a kernel-enforced mode. The kernel is
@@ -217,7 +217,7 @@ devmgr loads driver binaries from one of two places:
   virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
   then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
   critical path. A PCI device that shares an `INTx` line may get no private IRQ cap; such a driver
-  is delivered a 2-cap bootstrap round (BAR + service, no IRQ) and polls its queue. Post-handover,
+  is delivered a bootstrap that names its IRQ slot absent, and polls its queue. Post-handover,
   svcmgr walks its universal root to `/services/drivers/` and hands devmgr that subtree cap via
   `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
   devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr

@@ -55,8 +55,8 @@ devmgr's responsibilities are:
   devmgr spawns one driver for every virtio-input device and for every
   virtio-blk device it can give a private IRQ line (a disk whose line another
   device already holds is not served, #664), each with its own service
-  endpoint, and refuses, logged, a VirtIO device whose register regions span
-  more than one BAR.
+  endpoint and an `Mmio` cap for every BAR the device's VirtIO register
+  regions name.
 
   Driver binaries are sourced from one of two places:
 

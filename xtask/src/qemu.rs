@@ -75,6 +75,36 @@ impl RiscvMmu
     }
 }
 
+/// Guest x86-64 paging depth for a QEMU launch.
+///
+/// Pins the guest CPU's `la57` property on every accelerator, so the CPUID
+/// LA57 bit the bootloader reads (and with it the depth the kernel recovers
+/// from `CR4.LA57`) is the one the run asks for. The 4-level default keeps a
+/// TCG `-cpu max` guest, which otherwise advertises LA57, on 4-level paging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum X86Paging
+{
+    /// 4-level paging (`la57=off`) — the default.
+    #[value(name = "4")]
+    Four,
+    /// 5-level paging (`la57=on`).
+    #[value(name = "5")]
+    Five,
+}
+
+impl X86Paging
+{
+    /// `-cpu` property suffix that pins the guest's LA57 bit.
+    fn cpu_la57_prop(self) -> &'static str
+    {
+        match self
+        {
+            Self::Four => ",la57=off",
+            Self::Five => ",la57=on",
+        }
+    }
+}
+
 /// Specification for one QEMU launch.
 ///
 /// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`
@@ -106,6 +136,8 @@ pub struct QemuLaunchSpec<'a>
     pub incoming: Option<&'a str>,
     /// Guest paging-mode ceiling; riscv64 only, ignored on `x86_64`.
     pub riscv_mmu: RiscvMmu,
+    /// Guest paging depth; `x86_64` only, ignored on riscv64.
+    pub x86_paging: X86Paging,
 }
 
 /// Construct the full QEMU argv for a launch spec.
@@ -189,15 +221,58 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     let accel = accel::detect_for_arch(spec.arch);
     match spec.arch
     {
-        Arch::X86_64 => extend_x86(&mut args, spec, accel),
+        Arch::X86_64 => extend_x86(&mut args, spec, accel, host_cpu_has_la57())?,
         Arch::Riscv64 => extend_riscv(&mut args, spec)?,
     }
 
     Ok(args)
 }
 
-fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
+/// Whether the host CPU reports LA57 (`CPUID.(EAX=07H,ECX=0):ECX[16]`),
+/// which a native accelerator needs to give an `x86_64` guest 5-level paging.
+#[cfg(target_arch = "x86_64")]
+fn host_cpu_has_la57() -> bool
 {
+    let max_leaf = std::arch::x86_64::__cpuid_count(0, 0).eax;
+    max_leaf >= 7 && std::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 16) != 0
+}
+
+/// A host that is not `x86_64` runs an `x86_64` guest under TCG only, where
+/// the host CPU's features do not reach the guest.
+#[cfg(not(target_arch = "x86_64"))]
+fn host_cpu_has_la57() -> bool
+{
+    false
+}
+
+/// Refuse a 5-level request a native accelerator cannot honour.
+///
+/// A native accelerator passes the host CPU's paging features through, and
+/// QEMU drops a requested `la57=on` the host lacks with a warning only, so
+/// the guest would boot 4-level while the run claims 5. TCG emulates LA57 on
+/// any host.
+fn check_x86_paging(paging: X86Paging, accel: Accel, host_has_la57: bool) -> Result<()>
+{
+    if paging == X86Paging::Five && accel != Accel::Tcg && !host_has_la57
+    {
+        bail!(
+            "--x86-paging 5 needs LA57, which this host's CPU does not report, so the \
+             {accel:?} accelerator cannot provide it; boot 5-level under TCG instead: \
+             SERAPH_ACCEL=tcg cargo xtask <command> --x86-paging 5"
+        );
+    }
+    Ok(())
+}
+
+fn extend_x86(
+    args: &mut Vec<String>,
+    spec: &QemuLaunchSpec,
+    accel: Accel,
+    host_has_la57: bool,
+) -> Result<()>
+{
+    check_x86_paging(spec.x86_paging, accel, host_has_la57)?;
+    let la57 = spec.x86_paging.cpu_la57_prop();
     args.extend(["-machine".into(), "q35".into()]);
 
     if let Some(guid) = spec.vmgenid_guid
@@ -212,13 +287,18 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
             // -cpu host inherits the development host's microarchitecture;
             // the kernel asserts x86-64-v3 in early init, so the host must
             // advertise AVX2/BMI2/FMA (Haswell+ / Excavator+).
-            args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
+            args.extend(["-enable-kvm".into(), "-cpu".into(), format!("host{la57}")]);
         }
         Accel::Hvf =>
         {
             // macOS Hypervisor.framework. Same -cpu host rationale as KVM;
             // HVF passes host features through to the guest natively.
-            args.extend(["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()]);
+            args.extend([
+                "-accel".into(),
+                "hvf".into(),
+                "-cpu".into(),
+                format!("host{la57}"),
+            ]);
         }
         Accel::Whpx =>
         {
@@ -229,7 +309,7 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
                 "-accel".into(),
                 "whpx".into(),
                 "-cpu".into(),
-                "max,migratable=no".into(),
+                format!("max,migratable=no{la57}"),
             ]);
         }
         Accel::Nvmm =>
@@ -238,7 +318,7 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
                 "-accel".into(),
                 "nvmm".into(),
                 "-cpu".into(),
-                "max,migratable=no".into(),
+                format!("max,migratable=no{la57}"),
             ]);
         }
         Accel::Tcg =>
@@ -251,7 +331,7 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
                 "-accel".into(),
                 "tcg,thread=multi".into(),
                 "-cpu".into(),
-                "max,migratable=no".into(),
+                format!("max,migratable=no{la57}"),
             ]);
         }
     }
@@ -271,6 +351,7 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
     {
         args.extend(["-vga".into(), "none".into()]);
     }
+    Ok(())
 }
 
 fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
@@ -526,6 +607,7 @@ mod tests
             vmgenid_guid: None,
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
+            x86_paging: X86Paging::Four,
         }
     }
 
@@ -608,11 +690,60 @@ mod tests
             vmgenid_guid: Some("auto"),
             incoming: Some("exec:cat state.bin"),
             riscv_mmu: RiscvMmu::Sv48,
+            x86_paging: X86Paging::Four,
         };
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(argv.iter().any(|a| a == "vmgenid,guid=auto"));
         let inc = argv.iter().position(|a| a == "-incoming").unwrap();
         assert_eq!(argv[inc + 1], "exec:cat state.bin");
+    }
+
+    fn x86_spec(x86_paging: X86Paging) -> QemuLaunchSpec<'static>
+    {
+        QemuLaunchSpec {
+            arch: Arch::X86_64,
+            disk_path: Path::new("disk.img"),
+            firmware_code_path: Path::new("code.fd"),
+            firmware_vars_path: None,
+            cpus: 4,
+            mem_mib: 512,
+            headless: true,
+            gdb: GdbMode::Off,
+            qmp_socket: None,
+            vmgenid_guid: None,
+            incoming: None,
+            riscv_mmu: RiscvMmu::Sv48,
+            x86_paging,
+        }
+    }
+
+    #[test]
+    fn x86_cpu_pins_la57_to_the_requested_depth_on_every_accelerator()
+    {
+        // A missing pin would let TCG's `-cpu max` (or an LA57 host under
+        // KVM) boot 5-level when the run asks for 4, and the reverse.
+        for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
+        {
+            for (paging, prop) in [
+                (X86Paging::Four, ",la57=off"),
+                (X86Paging::Five, ",la57=on"),
+            ]
+            {
+                let mut argv = Vec::new();
+                extend_x86(&mut argv, &x86_spec(paging), accel, true).unwrap();
+                assert!(cpu_arg(&argv).ends_with(prop), "{accel:?} {paging:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn five_level_is_refused_on_a_native_accelerator_without_host_la57()
+    {
+        let err = check_x86_paging(X86Paging::Five, Accel::Kvm, false).unwrap_err();
+        assert!(err.to_string().contains("SERAPH_ACCEL=tcg"));
+        assert!(check_x86_paging(X86Paging::Five, Accel::Kvm, true).is_ok());
+        assert!(check_x86_paging(X86Paging::Five, Accel::Tcg, false).is_ok());
+        assert!(check_x86_paging(X86Paging::Four, Accel::Kvm, false).is_ok());
     }
 
     #[test]

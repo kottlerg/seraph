@@ -225,9 +225,10 @@ const WS_BADGE_SERVICE: u64 = 0;
 const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
-/// retype slab: `KERNEL_STACK_PAGES + 2 = 6` pages (4 kstack, 1
-/// wrapper/TCB, 1 extended-state save area), all consumed by the kernel.
-pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
+/// retype slab: `syscall_abi::THREAD_RETYPE_BYTES` in pages (kernel stack,
+/// wrapper/TCB, extended-state save area), all consumed by the kernel.
+pub(crate) const THREAD_RETYPE_PAGES: u64 =
+    syscall_abi::THREAD_RETYPE_BYTES / syscall_abi::PAGE_SIZE;
 
 /// Pages requested from memmgr for the child's `AddressSpace` retype slab.
 /// Every page reaches the kernel: page 0 holds the wrapper, page 1 the

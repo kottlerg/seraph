@@ -16,7 +16,7 @@
 use crate::logging::log;
 use crate::{MemoryAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
 use init_protocol::{CapDescriptor, InitInfo};
-use process_abi::{DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION};
+use process_abi::PROCESS_ABI_VERSION;
 use process_layout::{ProcessLayout, choose_process_layout};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -364,13 +364,16 @@ fn elf_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> Option<u64>
     Some(total)
 }
 
-/// One backing page for the main TLS block when `ehdr` declares a non-empty
-/// `PT_TLS`, else zero. Mirrors the presence check in [`place_main_tls`].
+/// The pages the main TLS block spans (`process_abi::tls_block_layout`) when
+/// `ehdr` declares a non-empty `PT_TLS`, else zero. Mirrors the presence check
+/// and the block size in [`place_main_tls`].
 fn tls_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> u64
 {
     match elf::tls_segment(ehdr, module_bytes)
     {
-        Ok(Some(seg)) if seg.memsz > 0 => 1,
+        Ok(Some(seg)) if seg.memsz > 0 => process_abi::tls_block_layout(seg.memsz, seg.align)
+            .0
+            .div_ceil(PAGE_SIZE),
         _ => 0,
     }
 }
@@ -434,12 +437,13 @@ unsafe fn place_main_tls(
         align: seg.align,
     };
 
+    // The block spans the pages its memsz needs (`tls_backing_pages` reserved
+    // them in the arena), up to the region the layout leaves after the TLS
+    // draw.
     let (block_size, block_align, tls_base_offset) =
         process_abi::tls_block_layout(seg.memsz, seg.align);
-    if block_size == 0
-        || block_size > PAGE_SIZE
-        || block_size > PAGE_SIZE * process_abi::PROCESS_MAIN_TLS_MAX_PAGES
-        || block_align > PAGE_SIZE
+    let pages = block_size.div_ceil(PAGE_SIZE);
+    if block_size == 0 || pages > process_abi::PROCESS_MAIN_TLS_MAX_PAGES || block_align > PAGE_SIZE
     {
         return None;
     }
@@ -452,24 +456,13 @@ unsafe fn place_main_tls(
     }
 
     let tls_base_va = tls_base + tls_base_offset;
-    let populate = |scratch_va: u64| {
-        // SAFETY: scratch_va is mapped writable and zeroed; the copy
-        // length is bounded by the tls_block_layout fit check above.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                module_bytes[tdata_start..tdata_end].as_ptr(),
-                scratch_va as *mut u8,
-                seg.filesz as usize,
-            );
-        }
+    let populate = |span: &mut [u8]| {
+        // `filesz <= memsz <= block_size <= span.len()`: the template fits.
+        let template = &mut span[..seg.filesz as usize];
+        template.copy_from_slice(&module_bytes[tdata_start..tdata_end]);
         if let Some(t) = rela
         {
             let table = &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-            // SAFETY: the template region [0, filesz) was just populated
-            // and stays mapped writable for the rest of this closure.
-            let template = unsafe {
-                core::slice::from_raw_parts_mut(scratch_va as *mut u8, seg.filesz as usize)
-            };
             let _ = elf::apply_relative_relocs(
                 table,
                 arch::current::EXPECTED_ELF_MACHINE,
@@ -478,14 +471,24 @@ unsafe fn place_main_tls(
                 template,
             );
         }
-        // SAFETY: scratch_va is mapped writable; the block fits one page.
+        // SAFETY: `span` is the zeroed, writable block of `block_size` or
+        // more bytes, which holds the TCB at `tls_base_offset`.
         unsafe {
-            process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
+            process_abi::tls_install_tcb(span.as_mut_ptr(), tls_base_offset, tls_base_va);
         }
     };
     // SAFETY: the caller's contract: `target_aspace` is a child's address space,
     // never init's own.
-    unsafe { arena.place_page(target_aspace, tls_base, syscall::MAP_WRITABLE, populate) }?;
+    unsafe {
+        arena.place_segment(
+            target_aspace,
+            tls_base,
+            pages,
+            syscall::MAP_WRITABLE,
+            0,
+            populate,
+        )
+    }?;
 
     Some((tls_base_va, meta))
 }
@@ -869,9 +872,8 @@ pub fn bootstrap_memmgr(
         }
         None => 0,
     };
-    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
-        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-        .clamp(1, MAX_PROCESS_STACK_PAGES);
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    let stack_pages = process_abi::resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))?;
     let layout = choose_child_layout();
 
     // memmgr's bespoke `_start` configures no TLS, so its arena reserves
@@ -1606,9 +1608,8 @@ pub fn bootstrap_procmgr(
         }
         None => 0,
     };
-    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
-        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-        .clamp(1, MAX_PROCESS_STACK_PAGES);
+    // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
+    let stack_pages = process_abi::resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))?;
     let layout = choose_child_layout();
 
     // procmgr is std-using: its arena reserves ELF segments + the main TLS

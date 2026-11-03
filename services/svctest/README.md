@@ -29,6 +29,7 @@ services/svctest/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding; identity
+        ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
         ├── procmgr.rs         # `Command` spawn, cwd, error paths; refused requests; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults

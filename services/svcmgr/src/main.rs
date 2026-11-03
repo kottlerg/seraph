@@ -434,7 +434,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 /// Handle an IPC message on the service endpoint (registration, handover,
 /// or discovery-registry publish/query). `ctx` carries the procmgr /
-/// bootstrap / deaths-EQ state the `HANDOVER_COMPLETE` →
+/// bootstrap / death-queue state the `HANDOVER_COMPLETE` →
 /// `reconcile_and_launch` path needs to spawn `.svc`-defined services.
 fn dispatch_ipc(
     service_ep: u32,

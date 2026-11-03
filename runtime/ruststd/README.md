@@ -250,6 +250,11 @@ spawner's `root_dir_cap()` (parent-inherit); explicit override via
 path and delivers the resulting cap as the child's initial
 `current_dir_cap`.
 
+`std::os::seraph::fs::DirEntryExt::file_name_ref` borrows a directory
+entry's name from the entry. `DirEntry::file_name` and `DirEntry::path`
+allocate a copy, so a caller that must handle out-of-memory reads a
+listing's names through the extension (svcmgr's recipe scan does).
+
 The cap-as-namespace model that defines this surface lives in
 [`docs/namespace-model.md`](../../docs/namespace-model.md); the wire
 protocol is in

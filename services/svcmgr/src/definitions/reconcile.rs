@@ -24,6 +24,7 @@
 //! After reconciliation the supervision loop runs unchanged.
 
 use std::fs;
+use std::os::seraph::fs::DirEntryExt;
 use std::os::seraph::log;
 
 use super::parse::parse;
@@ -106,9 +107,8 @@ impl ServiceTable
 /// definition through the right path. `pending` is consumed:
 /// entries that match a definition are marked `consumed`; entries
 /// left unconsumed after the scan are reported as a configuration
-/// error, except when the scan has no memory for the parsed recipes,
-/// when they run on unsupervised.
-#[allow(clippy::too_many_arguments)]
+/// error; when the scan has no memory for the parsed recipes they are
+/// released to run unsupervised instead.
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
@@ -131,11 +131,13 @@ pub fn reconcile_and_launch(
         }
     };
 
-    // The copies and collections this scan makes are fallible, and both sorts
-    // sort in place: a recipe whose name or path the heap cannot hold is
-    // dropped with a log line and the others still launch, and with no room
-    // for the parsed list none launches. The directory walk (`DirEntry::path`)
-    // and `parse` allocate inside std and svc-defs.
+    // The copies and collections this scan and `parse` make are fallible, and
+    // both sorts sort in place: a recipe whose name, path or fields the heap
+    // cannot hold is dropped with a log line and the others still launch, and
+    // with no room for the parsed list none launches. Each entry's name is
+    // read borrowed (`DirEntryExt::file_name_ref`); the directory iteration
+    // and `fs::read_to_string`, which returns `OutOfMemory`, allocate inside
+    // std.
     let mut entries: Vec<String> = Vec::new();
     for ent in read
     {
@@ -144,8 +146,7 @@ pub fn reconcile_and_launch(
         {
             continue;
         };
-        let path = ent.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str())
+        let Some(name) = ent.file_name_ref().to_str()
         else
         {
             continue;
@@ -293,7 +294,7 @@ fn handle_definition(
     //
     // The correlator is deliberately the service-table index, not a
     // randomized value (#249): it is opaque to the kernel, delivered only to
-    // svcmgr's own private death EQ (never in an IPC body, cap, or logged
+    // svcmgr's own private death queues (never in an IPC body, cap, or logged
     // value), and consumed directly as `services[idx]` on death dispatch.
     // With no untrusted observer there is nothing to enumerate, and a
     // (random-epoch, index) split would buy nothing.

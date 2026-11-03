@@ -331,6 +331,13 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind death-notification (when `restart != never`, so the observer is in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
+Out of memory changes two outcomes. When the scan has no room for the list of parsed recipes, it
+launches nothing and releases every pending registration's thread cap: each endowed service runs
+on unsupervised, and none is reported as a configuration error. When a **bind only** entry's
+`ServiceEntry` or restart recipe cannot be built, svcmgr logs `no memory for <name>'s entry;
+running unsupervised` and releases that thread cap; a **launching** entry in the same state is
+not launched. A recipe the heap cannot copy at parse time is dropped like a malformed one.
+
 ## Relevant Design Documents
 
 | Document | Content |

@@ -1216,6 +1216,32 @@ pub use crate::__seraph_stack_pages as stack_pages;
 // the attenuated cap rather than the parent-inherit default. Wire shape
 // lives in `procmgr_labels::CONFIGURE_NAMESPACE`.
 
+/// Seraph-specific extensions to `std::fs`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod fs {
+    use crate::ffi::OsStr;
+    use crate::fs::DirEntry;
+    use crate::sys::AsInner;
+
+    /// Seraph-specific extensions to [`DirEntry`].
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub trait DirEntryExt {
+        /// The entry's file name, borrowed from the entry. Unlike
+        /// [`DirEntry::file_name`] and [`DirEntry::path`], which copy it, this
+        /// allocates nothing, so a caller that must handle out-of-memory can
+        /// read a directory listing's names.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn file_name_ref(&self) -> &OsStr;
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl DirEntryExt for DirEntry {
+        fn file_name_ref(&self) -> &OsStr {
+            self.as_inner().file_name_ref()
+        }
+    }
+}
+
 /// Seraph-specific extensions to `std::process::Command`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub mod process {

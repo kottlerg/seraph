@@ -139,11 +139,15 @@ pub fn reservation_holes_reused_phase(_: &Caps)
 {
     const HOLES: usize = 100;
 
+    // Reserve every range first, then free every other one, so each freed
+    // page lies between two live reservations and stays its own run.
+    let ranges: Vec<ReservedRange> = (0..=2 * HOLES)
+        .map(|_| reserve_pages(1).expect("reserve_pages(1) while making holes"))
+        .collect();
     let mut kept: Vec<ReservedRange> = Vec::with_capacity(HOLES + 1);
     let mut holes: BTreeSet<u64> = BTreeSet::new();
-    for i in 0..=2 * HOLES
+    for (i, range) in ranges.into_iter().enumerate()
     {
-        let range = reserve_pages(1).expect("reserve_pages(1) while making holes");
         if i % 2 == 1
         {
             holes.insert(range.va_start());

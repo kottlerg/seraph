@@ -349,8 +349,9 @@ pub const fn growth_zones(user_va_top: u64) -> AddressSpaceZones
 // tail) ends before the next zone begins, and everything stays inside the
 // fixed tier. Region ordering and stack-guard gaps then hold for all draws.
 const _: () = {
-    // Region tails fit the stride gap they hang into.
-    assert!(1 + MAX_PROCESS_STACK_PAGES as u64 <= MAX_WINDOW_REGION_PAGES);
+    // Region tails fit the stride gap they hang into: the stack reservation
+    // (`1 + MAX_PROCESS_STACK_PAGES`, guard page included) and the TLS block.
+    assert!((MAX_PROCESS_STACK_PAGES as u64) < MAX_WINDOW_REGION_PAGES);
     assert!(process_abi::PROCESS_MAIN_TLS_MAX_PAGES <= MAX_WINDOW_REGION_PAGES);
     // Sv39 growth zones: heap below arena, arena below the bootstrap windows.
     assert!(SV39_ZONES.heap.end_bound() <= SV39_ZONES.arena.window.base);

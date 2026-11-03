@@ -115,7 +115,7 @@ pub const fn resolve_stack_pages(note: Option<u32>) -> Option<u32>
     match note
     {
         None => Some(DEFAULT_PROCESS_STACK_PAGES),
-        Some(pages) if pages >= 1 && pages <= MAX_PROCESS_STACK_PAGES => Some(pages),
+        Some(pages @ 1..=MAX_PROCESS_STACK_PAGES) => Some(pages),
         Some(_) => None,
     }
 }

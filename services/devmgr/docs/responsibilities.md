@@ -41,7 +41,13 @@ devmgr's responsibilities are:
   `goldfish-rtc` on RISC-V) spawn through a simpler path whose first
   bootstrap round delivers a service endpoint and one arch authority cap
   (`IoPort` for COM1 and CMOS, `Mmio` for an NS16550, the framebuffer, or
-  the goldfish RTC at `0x101000`), with the UART's interrupt cap after it,
+  the goldfish RTC at `0x101000`), with the UART's interrupt cap after it
+  (devmgr carves the UART line exclusive and holds nothing of it: the
+  serial driver acknowledges a delivery only when its client reads
+  ([services/drivers/serial/README.md](../../drivers/serial/README.md#interrupts)
+  § Interrupts), so no other device may share its line; every PCI device's
+  line is instead held and shared,
+  [docs/pci-enumeration.md](pci-enumeration.md) step 3),
   and whose second, terminal round delivers the driver's devmgr query cap
   (below). The `cmos-rtc` first round also carries one data word: the CMOS
   RAM index of the century register the FADT's `CENTURY` field names, or 0
@@ -55,10 +61,12 @@ devmgr's responsibilities are:
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
   devmgr spawns one driver for every virtio-input device and for every
-  virtio-blk device it can give a private IRQ line (a disk whose line another
-  device already holds is not served, #664), each with its own service
-  endpoint and an `Mmio` cap for every BAR the device's VirtIO register
-  regions name.
+  virtio-blk device it can give an IRQ cap, each with its own service
+  endpoint, an `Mmio` cap for every BAR the device's VirtIO register regions
+  name, and its own derivation of its line's held `Interrupt` cap, so devices
+  that share an `INTx` line are all served (see
+  [docs/pci-enumeration.md](pci-enumeration.md) § Per-Device Capability
+  Creation).
 
   devmgr serves a driver's endpoint only once the driver has set its device
   up. It spawns its drivers in two production settle batches: the boot batch

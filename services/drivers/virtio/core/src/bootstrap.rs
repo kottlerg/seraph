@@ -15,7 +15,7 @@
 //! - Round 2 (terminal) carries the positional slots [`SLOT_SERVICE`],
 //!   [`SLOT_IRQ`], and [`SLOT_DEVMGR_QUERY`], packed with
 //!   [`ipc::bootstrap::pack_slots`] and its presence word in `data[0]`. The
-//!   IRQ slot is absent when devmgr could carve the device no private line.
+//!   IRQ slot is absent when devmgr could give the device no IRQ cap.
 //!
 //! The protocol carries no version constant; a round of another shape fails
 //! the checks here and the driver exits.

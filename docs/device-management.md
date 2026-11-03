@@ -152,18 +152,21 @@ that cap's address.
 
 ## Interrupt Delivery
 
-Implementation status: the kernel's binding mechanism below is implemented; devmgr's sharing of a
-line among the devices on it, and the x86-64 trigger and polarity word, are design intent, not yet
-implemented ([#664](https://github.com/kottlerg/seraph/issues/664)). Today devmgr delegates a line
-to one device only.
+Implementation status: the kernel's binding mechanism below and devmgr's sharing of a line among
+the devices on it are implemented; the x86-64 trigger and polarity word is design intent, not yet
+implemented ([#664](https://github.com/kottlerg/seraph/issues/664)).
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
 Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
 `MAX_IRQ_BINDINGS` (64) bindings, one per bound Interrupt object; a copy or derivation of an
 Interrupt cap references a fresh object over the same line, so every capability to a line is a
-binding of its own. devmgr is to split each line once from its range and hand every driver on the
-line, the first included, a derivation of that cap, so PCI functions that share an `INTx` line are
-all served (design intent, not yet implemented).
+binding of its own. devmgr splits each PCI device's line once from its range, the first time a
+device on it needs it, holds that cap for the boot, and hands every driver on the line, the first
+included, a derivation of it, so PCI functions that share an `INTx` line are all served
+([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md)
+§ Per-Device Capability Creation). The UART line is the exception: devmgr carves it exclusive,
+holds nothing, and moves the cap itself to the serial driver (devmgr's
+[responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 - **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
   routes it at its controller, and every new binding masks the line and owes an acknowledgement,
@@ -172,7 +175,21 @@ all served (design intent, not yet implemented).
   `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
   signals every bound notification, and completes at the controller. A receiver whose device did
-  not assert reads its device's interrupt status and finds nothing.
+  not assert reads its device's interrupt status and finds nothing. Every receiver on a line
+  devmgr may share MUST acknowledge each delivery promptly, whether or not it has a request in
+  flight: the line stays masked until every binding has acknowledged, so a receiver that
+  acknowledges only while it serves a request of its own holds the line masked for the others on
+  it while it is idle, and their devices' interrupts are lost (x86-64) or delayed (riscv64) until
+  it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges
+  every delivery ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
+  rule 5) and also reads its device's interrupt status on a bounded timeout, which the x86-64
+  limit below needs. A driver that does not acknowledge promptly needs its line kept exclusive:
+  the serial driver acknowledges only when its client reads
+  ([services/drivers/serial/README.md](../services/drivers/serial/README.md#interrupts)
+  § Interrupts), so devmgr keeps the UART line exclusive and shares no other device onto it. The
+  UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA IRQ 4; the riscv64
+  `virt` NS16550 is PLIC source 10, against `INTx` sources 32 to 35), so the exclusivity costs no
+  device a cap in practice.
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
@@ -184,8 +201,10 @@ The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/
 assertion that persists while the line is masked is delivered at the unmask. On x86-64 the I/O
 APIC entries are programmed edge-triggered, active-high (core/kernel/src/arch/x86_64/ioapic.rs),
 and on a shared level-triggered line an assertion while the line is masked or another device holds
-it high raises no new edge, so its receiver is not signalled until the line interrupts again; a
-driver's timed poll then finds its completion (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
+it high raises no new edge, and the device stays asserted until its interrupt status is read, so
+no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed read
+(`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
+finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
 `POLL_INTERVAL_MS`), so the loss is latency, not a hang. That is the x86-64 limit until
 `SYS_IRQ_REGISTER` takes a trigger and polarity word, which devmgr sets to level, active-low for
 PCI `INTx` (design intent, not yet implemented). Devices that need several interrupts are to get
@@ -225,9 +244,8 @@ init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those con
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
 devmgr spawns one driver for every virtio-input device it enumerates and for every virtio-blk
-device it can give a private IRQ line (virtio-blk requires one; a disk whose line another device
-already holds is not served until shared lines are,
-[#664](https://github.com/kottlerg/seraph/issues/664)), each with its own service endpoint.
+device it can give an IRQ cap (virtio-blk requires one; a device on a line another device already
+holds gets a derivation of that line, § Interrupt Delivery), each with its own service endpoint.
 devmgr serves any driver it spawns, those and the serial, framebuffer, and RTC drivers, only once
 it has reported its device set up (`devmgr_labels::DRIVER_READY`). A driver that dies first, its
 device setup failed, or that neither reports nor dies within devmgr's settle bound
@@ -257,17 +275,17 @@ devmgr loads driver binaries from one of two places:
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
   driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries
-  also live there; devmgr spawns them only on `devmgr_labels::TEST_SPAWN_ORPHAN` and
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries also
+  live there; devmgr spawns them only on `devmgr_labels::TEST_SPAWN_ORPHAN` and
   `TEST_SPAWN_FAULT_DRIVERS` (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only
-  `devmgr.test` cap carries), so a boot without svctest spawns neither.
-  virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
-  then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
-  critical path. A PCI device that shares an `INTx` line may get no private IRQ cap; such a driver
-  is delivered a bootstrap that names its IRQ slot absent, and polls its queue. Post-handover,
-  svcmgr walks its universal root to `/services/drivers/` and hands devmgr that subtree cap via
-  `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
-  devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
+  `devmgr.test` cap carries), so a boot without svctest spawns neither. virtio-input is
+  PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed then — but its
+  spawn is deferred to this path, since a keyboard is not on the read-the-disk critical path. A PCI
+  device devmgr can give no IRQ cap (for instance, its line lies outside the Interrupt range devmgr
+  holds) is delivered a bootstrap that names its IRQ slot absent, and its driver polls its queue.
+  Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
+  subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
+  the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
   cannot reach outside the drivers subtree). The handshake is specified in
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
@@ -281,10 +299,10 @@ devmgr loads driver binaries from one of two places:
   `QUERY_INPUT_DEVICE` consumer, logs and exits). Before the spawn has run the reply is the same
   `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
   times (the terminal does), while a client with a no-device path treats the first `NO_DEVICE` as
-  terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns
-  the rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the
-  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on
-  the read-the-disk-in-the-first-place critical path.
+  terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the
+  rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the system
+  needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
+  read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is
@@ -301,6 +319,7 @@ specified in [`docs/storage.md`](storage.md).
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),
+[Driver Model](../services/drivers/docs/driver-model.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
 [services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),
 [services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),

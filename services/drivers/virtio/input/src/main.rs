@@ -444,8 +444,12 @@ struct InputRuntime
     vq: SplitVirtqueue,
     transport: PciTransport,
     queue_notify_off: u16,
-    irq_notification: u32,
-    irq_cap: u32,
+    /// Notification the read loop waits on: signalled by the
+    /// interrupt-service thread after each delivery it acknowledged and each
+    /// interrupt its timed ISR read finds ([`start_isr_thread`]), never
+    /// signalled when no IRQ is bound, in which case the bounded wait is a
+    /// timed poll.
+    wake: u32,
     ring: EventRing,
     mods: ModifierState,
 }
@@ -484,15 +488,12 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
         {
             break;
         }
-        // Wait for input. When an IRQ is bound the notification wakes on the
-        // device interrupt; otherwise this is a timed poll. The bounded wait
-        // re-drains every tick, so a lost or absent IRQ cannot wedge the read.
-        let _ = syscall::notification_wait_timeout(rt.irq_notification, POLL_INTERVAL_MS);
-        let _ = rt.transport.read_isr();
-        if rt.irq_cap != 0
-        {
-            let _ = syscall::irq_ack(rt.irq_cap);
-        }
+        // Wait for input. When an IRQ is bound the interrupt-service thread
+        // signals `wake` on each interrupt, having read the ISR and
+        // acknowledged any delivery; otherwise this is a timed poll. The
+        // bounded wait re-drains every tick, so a lost or absent IRQ cannot
+        // wedge the read.
+        let _ = syscall::notification_wait_timeout(rt.wake, POLL_INTERVAL_MS);
     }
 
     let mut builder = IpcMessage::builder(input_errors::SUCCESS).word(0, count as u64);
@@ -503,6 +504,44 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
     let reply = builder.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Start the interrupt-service thread, which runs
+/// [`virtio_core::isr::serve_interrupts`] over `irq_notification`, the
+/// notification bound to the device's line: it acknowledges every delivery
+/// at once, a read in flight or not, and signals `wake` for the read loop.
+/// Returns whether the thread started.
+fn start_isr_thread(transport: PciTransport, irq_notification: u32, irq_cap: u32, wake: u32)
+-> bool
+{
+    std::thread::Builder::new()
+        .spawn(move || {
+            virtio_core::isr::serve_interrupts(
+                &transport,
+                irq_notification,
+                irq_cap,
+                wake,
+                isr_diag,
+            )
+        })
+        .is_ok()
+}
+
+/// Diagnostic hook of the interrupt-service loop's `RecvGuard`: one line at
+/// the start of a failure streak, one more before the fatal exit.
+fn isr_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("interrupt wait failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("interrupt wait wedged (err={err}); exiting");
+        }
+    }
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -612,34 +651,56 @@ fn main() -> !
     transport
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
-    // Create the notification the read path waits on. The IRQ is optional:
-    // virtio-input may share an INTx line (devmgr then delivers no IRQ cap), and
-    // the read path polls the eventq regardless. When an IRQ cap is present, bind
-    // the notification to it for low-latency wakeups; otherwise the bounded wait
-    // degrades to timed polling.
-    let Some(irq_notification) =
+    // Create the notification the read path waits on (`wake`). The IRQ is
+    // optional: devmgr delivers no IRQ cap when it can give the device none,
+    // and the read path polls the eventq regardless. When an IRQ cap is
+    // present, bind a second notification to it and start the
+    // interrupt-service thread, which acknowledges every delivery and signals
+    // `wake`; otherwise the bounded wait degrades to timed polling.
+    let create_notification = || {
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
             syscall::cap_create_notification(slab).ok()
         })
+    };
+    let Some(wake) = create_notification()
     else
     {
         std::os::seraph::log!("failed to create notification");
         syscall::thread_exit();
     };
     let irq_cap = caps.irq_slot;
-    if irq_cap != 0
+    if irq_cap == 0
     {
+        std::os::seraph::log!("no IRQ cap; polling the eventq");
+    }
+    else
+    {
+        let Some(irq_notification) = create_notification()
+        else
+        {
+            std::os::seraph::log!("failed to create IRQ notification");
+            syscall::thread_exit();
+        };
         if syscall::irq_register(irq_cap, irq_notification).is_err()
         {
             std::os::seraph::log!("irq_register failed");
             syscall::thread_exit();
         }
+        // The interrupt-service thread acknowledges every delivery from here
+        // on, a read in flight or not, so this driver never holds a shared
+        // line masked. Its transport is a copy over the same register window.
+        if !start_isr_thread(
+            PciTransport::new(window_va, &layout),
+            irq_notification,
+            irq_cap,
+            wake,
+        )
+        {
+            std::os::seraph::log!("failed to start the interrupt-service thread");
+            syscall::thread_exit();
+        }
         // irq_register leaves the entry masked; the first ack unmasks it.
         let _ = syscall::irq_ack(irq_cap);
-    }
-    else
-    {
-        std::os::seraph::log!("no private IRQ; polling the eventq");
     }
 
     // Tell the device its event buffers are available.
@@ -659,8 +720,7 @@ fn main() -> !
         vq,
         transport,
         queue_notify_off,
-        irq_notification,
-        irq_cap,
+        wake,
         ring,
         mods: ModifierState::new(),
     };

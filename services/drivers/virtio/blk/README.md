@@ -18,7 +18,7 @@ virtio/blk/
 └── src/
     ├── lib.rs                 # Geometry, transfer-length bound, partition table,
     │                          #   outcome-to-reply mapping (host-tested)
-    ├── main.rs                # Driver entry, IPC service loop, fail-stop
+    ├── main.rs                # Driver entry, IPC service loop, interrupt-service thread, fail-stop
     └── io.rs                  # IoLayout (header + status DMA), descriptor chain submission
 ```
 
@@ -210,8 +210,15 @@ The Memory cap is moved back to the caller in every reply, so it never
 accumulates in the driver's `CSpace`.
 
 The driver keeps one request in flight and waits for the completion of
-that chain, polling and parking on the IRQ notification, for at most
-50 seconds. The depth of 1 is the design: the service loop receives one
+that chain, polling and parking on the completion notification, for at most
+50 seconds. An interrupt-service thread, the only waiter on the
+notification bound to the device's line, signals the completion
+notification: it runs virtio-core's `isr::serve_interrupts`, which reads
+the ISR and acknowledges every delivery at once, a request in flight or
+not, as a driver on a shared line must
+([driver-model.md](../../docs/driver-model.md) rule 5), and reads the ISR
+on a bounded timeout too, so an interrupt whose edge was lost is still
+seen. The depth of 1 is the design: the service loop receives one
 request, waits for its completion, and replies before it receives the next,
 so the virtqueue is sized to one three-descriptor chain (four descriptors,
 one ring page). A device whose queue cannot hold three descriptors is

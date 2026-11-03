@@ -94,6 +94,13 @@ pub enum CliCommand
     /// sysroot with the ktest bundle composed (see xtask/README.md).
     TestKaslr(TestKaslrArgs),
 
+    /// Check that a child's death reaches logd and evicts its slot: read a
+    /// svctest boot's serial log for logd's `reclaim:` line naming svctest's
+    /// `svctest-logd-reclaim` child. `--log` reads a saved log and boots
+    /// nothing; with no log, boots the current sysroot once (svctest staged)
+    /// through `run-parallel` and reads the log it saves (see xtask/README.md).
+    TestLogdReclaim(TestLogdReclaimArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
@@ -339,6 +346,43 @@ pub struct TestKaslrArgs
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
     /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
     /// when CPUID reports LA57, so this selects the depth a run exercises.
+    #[arg(long, default_value = "4")]
+    pub x86_paging: X86Paging,
+}
+
+// ── TestLogdReclaim ───────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestLogdReclaimArgs
+{
+    /// Target architecture (the boot's; with `--log`, unused).
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// A svctest boot's saved serial log to check. With it, nothing boots.
+    #[arg(long, value_name = "FILE")]
+    pub log: Option<PathBuf>,
+
+    /// Boot timeout, in seconds, for HANG classification (ignored with
+    /// `--log`).
+    #[arg(long, default_value = "900")]
+    pub timeout: u64,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp; ignored with
+    /// `--log`).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m; ignored with `--log`).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+
+    /// riscv64 paging mode to negotiate (ignored on x86-64 and with
+    /// `--log`).
+    #[arg(long, default_value = "sv48")]
+    pub riscv_mmu: RiscvMmu,
+
+    /// Guest x86-64 paging depth (`x86_64` only; ignored with `--log`).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
 }

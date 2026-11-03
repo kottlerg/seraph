@@ -31,7 +31,8 @@ services/svctest/
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
-        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; death queues; init reap
+        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; death queues;
+        │                      # logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
@@ -168,6 +169,7 @@ token falls through to the normal run.
 | `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
+| `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |

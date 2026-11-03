@@ -473,6 +473,44 @@ mod tests
     }
 
     #[test]
+    fn notify_writes_only_a_doorbell_inside_the_notification_region()
+    {
+        let cap = |offset, length| crate::VirtioCapLocation {
+            bar: 0,
+            pad: [0; 3],
+            offset,
+            length,
+        };
+        let layout = crate::VirtioPciStartupInfo {
+            common_cfg: cap(0, 0x38),
+            notify_cfg: cap(0x800, 0x100),
+            isr_cfg: cap(0x900, 4),
+            device_cfg: cap(0xA00, 8),
+            notify_off_multiplier: 4,
+            pad: 0,
+        }
+        .register_layout()
+        .expect("every region present");
+        assert_eq!(layout.notify_len, 0x100);
+        // A host buffer stands in for the one-page register window; the
+        // barriers `notify` issues are no-ops on the host.
+        let mut window = vec![0u16; 0x800];
+        let transport = PciTransport::new(window.as_mut_ptr() as u64, &layout);
+
+        // Queue offset 2: the doorbell is 0x800 + 2 * 4 = 0x808, inside.
+        assert!(transport.doorbell_in_region(2));
+        transport.notify(7, 2);
+        assert_eq!(window[0x808 / 2], 7);
+
+        // Queue offset 0x40: 0x40 * 4 = 0x100 is the region's end, so the
+        // doorbell at 0x900 (the ISR region) is not written.
+        assert!(!transport.doorbell_in_region(0x40));
+        transport.notify(9, 0x40);
+        assert_eq!(window[0x900 / 2], 0);
+        assert_eq!(window.iter().filter(|&&w| w != 0).count(), 1);
+    }
+
+    #[test]
     fn a_doorbell_fits_only_with_its_two_bytes_inside_the_region()
     {
         // 0x3FF * 4 = 0xFFC: the 16-bit doorbell ends at 0xFFE, inside.

@@ -623,7 +623,7 @@ mod tests
     }
 
     #[test]
-    fn each_virtio_structure_type_takes_its_first_one_in_an_mmio_bar()
+    fn each_virtio_structure_type_takes_its_first_one_wholly_inside_an_mmio_bar()
     {
         let space = FakeSpace::default();
         let bdf = (0, 5, 0);
@@ -644,11 +644,15 @@ mod tests
                 // A second common configuration, in an MMIO BAR: the first
                 // one stays.
                 (1, 2, 0x100, 0x38),
+                // A second notify, in an MMIO BAR: the first one stays.
+                (2, 2, 0, 0x1000),
             ],
         );
-        // The skipped I/O-BAR notify structure (the second, at 0x54) carries
-        // multiplier 8; the selected one carries the helper's 4.
+        // Each skipped notify structure carries its own multiplier: the
+        // I/O-BAR one before the selected one (at 0x54) 8, the duplicate after
+        // it (the ninth, at 0xE0) 16. The selected one carries the helper's 4.
         space.set32(bdf, 0x54 + 16, 8);
+        space.set32(bdf, 0xE0 + 16, 16);
         space.set_bar(bdf, 1, 0xC041, !0x1F & !0x3);
         mmio_bar(&space, bdf, 2, 0xFEC0_0000);
         mmio_bar(&space, bdf, 4, 0xFEC1_0000);

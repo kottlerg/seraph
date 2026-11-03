@@ -129,8 +129,8 @@ impl VirtioPciStartupInfo
     /// type with device-specific configuration (block and input both have
     /// one) to present that region too, each in a BAR of the device's
     /// choosing; devmgr's scan keeps the first structure of each type that
-    /// lies in an MMIO BAR, so an absent region means the device presents
-    /// none the driver can map.
+    /// lies wholly inside one of the device's MMIO BARs, so an absent region
+    /// means the device presents none the driver can map.
     #[must_use]
     pub fn register_layout(&self) -> Option<RegisterLayout>
     {
@@ -403,6 +403,8 @@ mod tests
             (layout.common, layout.notify, layout.isr, layout.device),
             (0x1000, 0, 0x2000, 0x3000)
         );
+        // The doorbell bound is the notification region's own length.
+        assert_eq!(layout.notify_len, 0x1000);
     }
 
     #[test]

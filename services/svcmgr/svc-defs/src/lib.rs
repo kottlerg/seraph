@@ -52,6 +52,14 @@ pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
     badge & ipc::svcmgr_labels::HANDOVER_AUTHORITY != 0 && !handover_done
 }
 
+/// The byte length of the blob [`build_blob`] packs from `tokens`: each token
+/// and its NUL terminator.
+#[must_use]
+pub fn blob_len(tokens: &[String]) -> usize
+{
+    tokens.iter().map(|t| t.len() + 1).sum()
+}
+
 /// Build the NUL-separated, NUL-terminated wire blob procmgr's
 /// stack-envelope writer expects from a list of tokens. Returns
 /// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
@@ -67,7 +75,7 @@ pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
     {
         return (Vec::new(), 0);
     }
-    let mut blob: Vec<u8> = Vec::with_capacity(tokens.iter().map(|t| t.len() + 1).sum());
+    let mut blob: Vec<u8> = Vec::with_capacity(blob_len(tokens));
     for tok in tokens
     {
         blob.extend_from_slice(tok.as_bytes());

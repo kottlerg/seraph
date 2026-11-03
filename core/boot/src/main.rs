@@ -82,8 +82,10 @@ static BUNDLE_PATH: [u16; 29] = [
 
 // ── Size constants ────────────────────────────────────────────────────────────
 
-/// Number of 4 KiB pages allocated for the kernel stack (64 KiB).
-const KERNEL_STACK_PAGES: usize = 16;
+/// Number of 4 KiB pages allocated for the kernel's handoff stack: the shared
+/// `HANDOFF_STACK_BYTES`, which the kernel's Phase 3 identity window over the
+/// stack is derived from too.
+const KERNEL_STACK_PAGES: usize = boot_protocol::layout::HANDOFF_STACK_BYTES / 4096;
 
 /// Number of 4 KiB pages allocated for the translated `MemoryMapEntry` output
 /// array. At 24 bytes per entry this accommodates roughly 680 entries, which

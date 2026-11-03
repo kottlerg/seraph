@@ -237,8 +237,8 @@ impl PerCpuData
 #[cfg(not(test))]
 static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Allocate the per-CPU [`PerCpuData`] and APIC-ID slabs, each sized to
-/// `cpu_count`, and publish their base pointers. Called from
+/// Allocate the per-CPU [`PerCpuData`], APIC-ID and TLB-shootdown request
+/// slabs, each sized to `cpu_count`, and publish their base pointers. Called from
 /// `sched::init_per_cpu_storage` (Phase 4), before [`init_bsp`] /
 /// [`init_apic_ids`] and before any SMP startup. The `PerCpuData` slab is
 /// zero-filled, which equals [`PerCpuData::new`] for every field.
@@ -272,6 +272,8 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
     let id_bytes = cpu_count * core::mem::size_of::<u32>();
     let id_ptr = crate::sched::alloc_zeroed_slab::<u32>(id_bytes, allocator, "CPU_APIC_IDS");
     CPU_APIC_IDS_PTR.store(id_ptr, Ordering::Release);
+
+    crate::mm::tlb_shootdown::init_storage(cpu_count, allocator);
 }
 
 /// Pointer to CPU `cpu`'s [`PerCpuData`]. Caller guarantees `cpu < CPU_COUNT`

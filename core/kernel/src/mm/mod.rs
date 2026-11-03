@@ -65,24 +65,24 @@ pub(crate) static mut FRAME_ALLOCATOR: BuddyAllocator = BuddyAllocator::new();
 /// Acquired by `with_frame_allocator` to serialise multi-CPU buddy access.
 static FRAME_ALLOC_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Spin until `FRAME_ALLOC_LOCK` is taken, halting the boot if it stays held
+/// past [`crate::bounded_wait::DEADLOCK_BUDGET_US`]: the bound is elapsed time,
+/// so it does not shrink on a faster CPU or stretch under contention.
 #[cfg(not(test))]
 fn acquire_frame_alloc_lock()
 {
-    let mut spins = 0u64;
-    while FRAME_ALLOC_LOCK
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
+    let acquired = crate::bounded_wait::spin_until(
+        || {
+            FRAME_ALLOC_LOCK
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        },
+        crate::arch::current::timer::elapsed_us,
+        crate::bounded_wait::DEADLOCK_BUDGET_US,
+    );
+    if !acquired
     {
-        spins += 1;
-        if spins > 500_000
-        {
-            crate::kprintln!("[frame_alloc] DEADLOCK after {}k spins", spins / 1000);
-            loop
-            {
-                core::hint::spin_loop();
-            }
-        }
-        core::hint::spin_loop();
+        crate::fatal("frame_alloc: FRAME_ALLOC_LOCK held past the deadlock budget");
     }
 }
 

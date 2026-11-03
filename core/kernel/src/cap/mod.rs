@@ -72,7 +72,7 @@ pub use slot::{
     SlotId, ThreadRights, TypedRights, WsRights,
 };
 
-use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType, MmioAperture};
+use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use init_protocol::CapDescriptor;
@@ -144,10 +144,11 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 
 use registry::CSPACE_REGISTRY;
 
-/// Carve the `CSpace` registry arena from the buddy: one entry per page of
-/// DRAM ([`crate::mm::init::system_ram_bytes`]), in
+/// Carve the `CSpace` registry arena from the buddy: a chunk table sized from
+/// DRAM, then one entry per page of DRAM
+/// ([`crate::mm::init::system_ram_bytes`]), in
 /// [`registry::REGISTRY_CHUNK_ORDER`] blocks. Fatal when the buddy cannot
-/// supply a chunk.
+/// supply the table or a chunk.
 ///
 /// # Safety
 /// The single boot thread, once, after Phase 3 (the chunks are written
@@ -157,10 +158,14 @@ use registry::CSPACE_REGISTRY;
 pub unsafe fn init_cspace_registry(alloc: &mut crate::mm::BuddyAllocator)
 {
     let chunks = registry::chunks_for_ram(crate::mm::init::system_ram_bytes());
-    if chunks > registry::MAX_REGISTRY_CHUNKS
-    {
-        crate::fatal("Phase 4: DRAM exceeds the CSpace registry's chunk table");
-    }
+    let table = crate::sched::alloc_zeroed_slab::<AtomicPtr<registry::RegistryEntry>>(
+        chunks * core::mem::size_of::<AtomicPtr<registry::RegistryEntry>>(),
+        alloc,
+        "CSPACE_REGISTRY_TABLE",
+    );
+    // SAFETY: `chunks` zeroed (null) slots owned by the registry for the
+    // kernel's life; the boot thread is alone.
+    unsafe { CSPACE_REGISTRY.install_table(table, chunks) };
     for _ in 0..chunks
     {
         let Some(phys) = alloc.alloc(registry::REGISTRY_CHUNK_ORDER)
@@ -1162,8 +1167,10 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 ///
 /// Preconditions: called exactly once, single-threaded, after Phase 4
 /// (per-CPU storage allocated) and Phase 3 (direct map active).
-pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u64)
--> CSpaceLayout
+pub fn init_capability_system(
+    mmio_apertures: crate::platform::ValidatedApertures,
+    boot_info_phys: u64,
+) -> CSpaceLayout
 {
     // Re-derive BootInfo via the direct physical map to access the memory map.
     // SAFETY: boot_info_phys was validated in Phase 0; direct map active since Phase 3.
@@ -1269,7 +1276,7 @@ fn populate_cspace(
     cspace: &mut CSpace,
     ram_blocks: &[RamBlock],
     mmap: &[MemoryMapEntry],
-    mmio_apertures: &[MmioAperture],
+    mmio_apertures: crate::platform::ValidatedApertures,
     info: &BootInfo,
 ) -> CSpaceLayout
 {
@@ -1459,7 +1466,7 @@ fn populate_cspace(
         );
     }
 
-    for ap in mmio_apertures
+    for ap in mmio_apertures.iter()
     {
         let ptr = mint_phase7_body(MmioObject::new_root(ap.phys_base, ap.size, 0));
         let slot = insert_or_fatal(

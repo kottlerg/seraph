@@ -149,6 +149,10 @@ pub fn run_all(ctx: &TestContext)
         cap_info::memory_caps_carry_retype_right(ctx)
     );
     run_test!(
+        "cap_info::ram_descriptors_match_caps",
+        cap_info::ram_descriptors_match_caps(ctx)
+    );
+    run_test!(
         "cap_info::creation_masks_match_abi",
         cap_info::creation_masks_match_abi(ctx)
     );

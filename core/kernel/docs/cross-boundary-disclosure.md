@@ -230,9 +230,10 @@ physical address of the next free block and the block's order
 ([memory-internals.md](memory-internals.md) § Buddy Allocator). No header reaches
 a user-visible page. Only free blocks carry a header (a merge clears the header
 of every buddy it absorbs), `BuddyAllocator::alloc` zeroes the header bytes of
-every block it hands out, and the pre-drain blocks that reach userspace, init's
-`InitInfo` block and stack pages, are zeroed whole at Phase 9 before they are
-mapped. The drain hands its extents out with their headers in place, and Phase 7
+every block it hands out, and the pre-drain blocks that reach userspace are zeroed
+whole before they are mapped: init's `InitInfo` block at Phase 7, when it is
+reserved and before the drain and the descriptors are written into it, and its
+stack pages at Phase 9. The drain hands its extents out with their headers in place, and Phase 7
 zeroes all of them, the seed reserve included, before minting any, as above, so
 the Memory caps userspace retypes and maps start from zeroed RAM.
 

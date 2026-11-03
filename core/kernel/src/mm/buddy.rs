@@ -97,7 +97,7 @@ unsafe impl PhysWindow for DirectMap
     }
 }
 
-/// The drain's output did not fit the caller's buffer.
+/// The drain's extents outnumbered the caller's capacity.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DrainOverflow
 {
@@ -485,13 +485,14 @@ impl<W: PhysWindow> BuddyAllocator<W>
         self.total_pages
     }
 
-    /// Drain every free block, writing the free memory into `out` as
-    /// address-sorted, maximally coalesced `(base, size_bytes)` extents.
+    /// Drain every free block, handing the free memory to `emit` as
+    /// address-sorted, maximally coalesced extents: `emit(index, base,
+    /// size_bytes)` for each index below `capacity`.
     ///
-    /// Returns the number of extents written. Every free page leaves the
-    /// allocator whatever the outcome. When the extents outnumber `out`, the
-    /// first `out.len()` are written and `Err` carries the full extent count,
-    /// so the caller can report both.
+    /// Returns the number of extents emitted. Every free page leaves the
+    /// allocator whatever the outcome. When the extents outnumber `capacity`,
+    /// the first `capacity` are emitted and `Err` carries the full extent
+    /// count, so the caller can report both.
     ///
     /// The extents still hold the drained blocks' headers in their first
     /// bytes; the caller zeroes each extent before exposing it
@@ -501,8 +502,12 @@ impl<W: PhysWindow> BuddyAllocator<W>
     ///
     /// # Errors
     ///
-    /// [`DrainOverflow`] when the coalesced extents do not fit `out`.
-    pub fn drain_coalesced(&mut self, out: &mut [(u64, u64)]) -> Result<usize, DrainOverflow>
+    /// [`DrainOverflow`] when the coalesced extents outnumber `capacity`.
+    pub fn drain_coalesced(
+        &mut self,
+        capacity: usize,
+        mut emit: impl FnMut(usize, u64, u64),
+    ) -> Result<usize, DrainOverflow>
     {
         let sorted = self.drain_sorted();
 
@@ -518,11 +523,11 @@ impl<W: PhysWindow> BuddyAllocator<W>
             current = match current
             {
                 Some((base, len)) if base + len == cursor => Some((base, len + size)),
-                Some(done) =>
+                Some((base, len)) =>
                 {
-                    if let Some(slot) = out.get_mut(extents)
+                    if extents < capacity
                     {
-                        *slot = done;
+                        emit(extents, base, len);
                     }
                     extents += 1;
                     Some((cursor, size))
@@ -531,16 +536,16 @@ impl<W: PhysWindow> BuddyAllocator<W>
             };
             cursor = header.next;
         }
-        if let Some(done) = current
+        if let Some((base, len)) = current
         {
-            if let Some(slot) = out.get_mut(extents)
+            if extents < capacity
             {
-                *slot = done;
+                emit(extents, base, len);
             }
             extents += 1;
         }
 
-        if extents > out.len()
+        if extents > capacity
         {
             return Err(DrainOverflow { extents });
         }
@@ -1016,7 +1021,9 @@ mod tests
         let free_before = alloc.free_page_count() as u64;
 
         let mut out = [(0u64, 0u64); 8];
-        let n = alloc.drain_coalesced(&mut out).expect("fits");
+        let n = alloc
+            .drain_coalesced(out.len(), |i, base, size| out[i] = (base, size))
+            .expect("fits");
         let extents = &out[..n];
         assert!(extents.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0));
         assert_eq!(extents.iter().map(|e| e.1).sum::<u64>(), pages(free_before));
@@ -1040,7 +1047,7 @@ mod tests
         }
         let mut out = [(0u64, 0u64); 2];
         assert_eq!(
-            alloc.drain_coalesced(&mut out),
+            alloc.drain_coalesced(out.len(), |i, base, size| out[i] = (base, size)),
             Err(DrainOverflow { extents: 3 })
         );
         assert_eq!(out, [(BASE, pages(1)), (BASE + pages(2), pages(1))]);

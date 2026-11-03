@@ -141,9 +141,9 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 // obscure the sequential phase structure without reducing actual complexity.
 // not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
-// similar_names: boot_cpu_count/boot_cpu_ids and kaslr_image_base/kaslr_dm_base
-// copy the BootInfo cpu_count/cpu_ids and kernel_virtual_base/direct_map_base
-// pairs; the shared prefix keeps that provenance visible.
+// similar_names: kaslr_image_base/kaslr_dm_base copy the BootInfo
+// kernel_virtual_base/direct_map_base pair; the shared prefix keeps that
+// provenance visible.
 #[allow(
     clippy::too_many_lines,
     clippy::not_unsafe_ptr_arg_deref,
@@ -180,8 +180,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // Copy all fields needed beyond Phase 3 out of BootInfo now, while the
     // identity mapping is still live. After Phase 3 activates the kernel page
     // tables, the physical address in `info` is no longer mapped.
+    // The CPU ids stay in the BootInfo page, read through the direct map
+    // after Phase 3 (`boot_cpu_ids`); only their count is copied.
     let boot_cpu_count = info.cpu_count.max(1);
-    let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
     // KASLR: copy the status flags and the slid/randomized bases out of the
@@ -301,7 +302,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         kernel_entry_post_rebase(
             boot_info as u64,
             boot_cpu_count,
-            boot_cpu_ids,
             trampoline_pa,
             init_image,
             vmgenid_paddr,
@@ -314,6 +314,25 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // the function must type-check as returning `!`.
     #[cfg(test)]
     arch::current::cpu::halt_loop()
+}
+
+/// The CPU ids `BootInfo` lists, `cpu_ids[..count]`, read in place through the
+/// direct map: the BSP's first, then the APs'.
+///
+/// # Safety
+/// Phase 3 has completed (the direct map is active), `boot_info_phys` is the
+/// `BootInfo` Phase 0 validated, its page is not yet scrubbed, and nothing
+/// writes its `cpu_ids` while the slice lives. `count` is the producer's
+/// `cpu_count`, at most `MAX_CPUS` by the boot protocol's contract; the slice
+/// is clamped to the array in any case.
+#[cfg(not(test))]
+unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
+{
+    let bi = mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo;
+    // SAFETY: caller contract; the borrow covers `cpu_ids` alone, so a write
+    // elsewhere in the page (the Phase-5 seed scrub) does not alias it.
+    let ids: &[u32; boot_protocol::MAX_CPUS] = unsafe { &*core::ptr::addr_of!((*bi).cpu_ids) };
+    &ids[..(count as usize).min(boot_protocol::MAX_CPUS)]
 }
 
 /// Continuation of [`kernel_entry`] after the boot-stack rebase.
@@ -332,24 +351,27 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// from the boot thread, and never returns.
 // too_many_arguments: the boot state read out of BootInfo before Phase 3 must
 // cross the `#[inline(never)]` boundary as explicit arguments.
-// too_many_lines, similar_names: the same rationale as `kernel_entry`, whose
-// body this continues.
-// needless_range_loop: each indexed loop runs to a validated count narrower
-// than the fixed-capacity array it indexes, and keeps the index in view: the
-// AP-startup loop uses cpu_idx as both slice index and CPU ID; the init-segment
-// Memory-cap loop (i < segment_count) and the InitInfo Memory-cap loop
-// (pg < info_pages) test the index for the first slot; the init-segment map
-// loop takes the same i < segment_count form as the cap loop after it.
+// too_many_lines: the same rationale as `kernel_entry`, whose body this
+// continues.
+// similar_names: boot_cpu_count/boot_info_phys name the BootInfo fields they
+// come from, and info_pages/info_order the InitInfo region's sizes; the shared
+// prefixes keep that provenance visible.
+// needless_range_loop: each indexed loop runs to a count it keeps in view: the
+// AP-startup loop uses cpu_idx as both the hw_ids index and the CPU ID; the
+// init-segment Memory-cap loop (i < segment_count) and the InitInfo Memory-cap
+// loop (pg < info_pages) test the index for the first slot; the init-segment
+// map loop takes the same i < segment_count form as the cap loop after it.
 // cast_possible_truncation: every usize -> u32 cast is of a bounded value:
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
-// desc_count and info_pages are bounded by the INIT_INFO_MAX_PAGES check
-// (fatal past it); size_of::<InitInfo>() and STACK_PAGES are small constants.
-// large_types_passed_by_value: boot_cpu_ids ([u32; 512] = 2 KiB) and init_image
-// (304 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
-// boundary is what defeats the cross-rebase hoist; the by-value signature is
-// incidental — the ABI passes both via hidden-pointer and emits an explicit
-// memcpy into the callee's stack frame either way. Single boot-path copy;
-// nothing on the hot path.
+// desc_count and info_pages are bounded by the descriptor capacity Phases 7
+// and 8 enforce (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
+// size_of::<InitInfo>() and STACK_PAGES are small constants.
+// large_types_passed_by_value: init_image (304 B) crosses the
+// by-value/by-reference threshold. The `#[inline(never)]` boundary is what
+// defeats the cross-rebase hoist; the by-value signature is incidental — the
+// ABI passes it via hidden-pointer and emits an explicit memcpy into the
+// callee's stack frame either way. Single boot-path copy; nothing on the hot
+// path.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -363,7 +385,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 unsafe fn kernel_entry_post_rebase(
     boot_info_phys: u64,
     boot_cpu_count: u32,
-    boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
     vmgenid_paddr: u64,
@@ -465,11 +486,11 @@ unsafe fn kernel_entry_post_rebase(
     // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
     // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.
     #[cfg(not(test))]
-    // SAFETY: single-threaded boot; boot_cpu_ids copied from BootInfo above;
-    // init_storage allocated the id slab; init_apic_ids writes it once before
-    // SMP is active.
+    // SAFETY: single-threaded boot; the ids are read from the validated
+    // BootInfo page through the direct map; init_storage allocated the id slab;
+    // init_apic_ids writes it once before SMP is active.
     unsafe {
-        percpu::init_apic_ids(&boot_cpu_ids);
+        percpu::init_apic_ids(boot_cpu_ids(boot_info_phys, boot_cpu_count));
     }
 
     // ── Phase 5: architecture hardware initialization ─────────────────────────
@@ -640,10 +661,13 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 let entry_fn = kernel_entry_ap as *const () as u64;
+                // SAFETY: the BootInfo page is intact until the reclaim scrub at
+                // the end of boot, and nothing writes its CPU ids.
+                let hw_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
 
                 for cpu_idx in 1..=ap_count
                 {
-                    let hw_id = boot_cpu_ids[cpu_idx];
+                    let hw_id = hw_ids[cpu_idx];
                     // SAFETY: the idle stacks and their tops slab come from
                     // Phase 4 storage (sched::init_storage), and the idle TCBs
                     // were initialised in Phase 8 (sched::init);
@@ -922,12 +946,15 @@ unsafe fn kernel_entry_post_rebase(
                 },
             };
 
+            // The descriptors are already in the InitInfo block, written there
+            // in Phases 7 and 8 right after the header
+            // (cap::INIT_INFO_DESCRIPTOR_CAPACITY).
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
-            // SAFETY: single-threaded boot; cspace_layout produced by Phase 7.
+            // SAFETY: single-threaded boot; cspace_layout produced by Phases 7
+            // and 8.
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
-            let desc_byte_len = core::mem::size_of_val(desc_slice);
-            let total_bytes = descriptors_offset as usize + desc_byte_len;
+            let total_bytes = descriptors_offset as usize + core::mem::size_of_val(desc_slice);
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
             // Allocate and map each page.
@@ -937,64 +964,39 @@ unsafe fn kernel_entry_post_rebase(
                 executable: false,
                 uncacheable: false,
             };
-            /// Resolve a byte offset within the `InitInfo` region to a writable
-            /// direct-map pointer, handling page boundaries.
-            // items_after_statements: the helper is scoped to this block and
-            // has no other use.
-            #[allow(clippy::items_after_statements)]
-            fn info_ptr(page_ptrs: &[*mut u8], offset: usize) -> *mut u8
-            {
-                let page_idx = offset / mm::PAGE_SIZE;
-                let page_off = offset % mm::PAGE_SIZE;
-                // SAFETY: page_ptrs[page_idx] is a valid direct-map pointer.
-                unsafe { page_ptrs[page_idx].add(page_off) }
-            }
 
-            // Allocate the InitInfo region as one physically contiguous
-            // buddy extent so the descriptor array (which can span pages
-            // once CapDescriptor.name is included) lives in a single
-            // backing allocation. Per-page allocation works for the
-            // kernel-side `copy_nonoverlapping` writes, but init reads
-            // the descriptor slice as one cross-page Rust slice; on
-            // release builds LLVM exploits provenance assumptions about
-            // single-allocation slices to mis-load fields of descriptors
-            // that straddle page boundaries. A contiguous physical
-            // extent eliminates the discrepancy between virtual and
-            // physical contiguity, so the optimiser sees one allocation
-            // backing the slice.
-            if info_pages > init_protocol::INIT_INFO_MAX_PAGES
-            {
-                kprintln!(
-                    "Phase 9: InitInfo region needs {} pages ({} descriptors, {} bytes) \
-                     but INIT_INFO_MAX_PAGES = {}",
-                    info_pages,
-                    desc_count,
-                    total_bytes,
-                    init_protocol::INIT_INFO_MAX_PAGES,
-                );
-                fatal("Phase 9: InitInfo region too large");
-            }
+            // The InitInfo region is one physically contiguous extent, reserved
+            // at Phase 7, so the descriptor array (which spans pages) lives in a
+            // single backing allocation. init reads the descriptor slice as one
+            // cross-page Rust slice; on release builds LLVM exploits provenance
+            // assumptions about single-allocation slices to mis-load fields of
+            // descriptors that straddle page boundaries, and a contiguous
+            // physical extent removes the discrepancy between virtual and
+            // physical contiguity. The region always fits the block:
+            // push_descriptor halts the boot at INIT_INFO_DESCRIPTOR_CAPACITY,
+            // the descriptors INIT_INFO_MAX_PAGES pages hold past the header.
+            debug_assert!(
+                info_pages <= init_protocol::INIT_INFO_MAX_PAGES,
+                "Phase 9: {info_pages} InitInfo pages for {desc_count} descriptors \
+                 ({total_bytes} bytes)"
+            );
             // Round to next power of two for buddy allocation; for
             // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
             let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
             let block_pages = 1usize << info_order;
             // The block was reserved from the pristine buddy at Phase 7
             // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
-            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES is
-            // enforced above, so it fits within the reserved extent.
+            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES
+            // follows from the descriptor capacity Phases 7 and 8 enforce
+            // (asserted above), so it fits within the reserved extent.
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
-            // SAFETY: block_phys is the InitInfo block reserved at Phase 7
-            // (cap::reserve_init_backing: 2^INIT_INFO_RESERVE_ORDER contiguous
-            // pages, kernel-owned); block_pages = next_power_of_two(info_pages)
-            // <= next_power_of_two(INIT_INFO_MAX_PAGES), which is that extent, so
-            // the range is valid through the direct map.
-            unsafe {
-                core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
-            }
+            // The block was zeroed when Phase 7 reserved it, before the
+            // descriptors were written into it.
 
-            // Sized by the init protocol's `INIT_INFO_MAX_PAGES`; an
-            // `info_pages` above it is fatal before these arrays fill.
+            // Sized by the init protocol's `INIT_INFO_MAX_PAGES`, which
+            // `info_pages` stays within (the descriptor capacity Phases 7 and
+            // 8 enforce).
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
             let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =
@@ -1056,21 +1058,6 @@ unsafe fn kernel_entry_post_rebase(
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 core::ptr::write(info_base.cast::<InitInfo>(), info);
-            }
-
-            // Write CapDescriptor array — may span page boundaries.
-            let desc_src = desc_slice.as_ptr().cast::<u8>();
-            let mut written = 0usize;
-            while written < desc_byte_len
-            {
-                let offset = descriptors_offset as usize + written;
-                let chunk = (mm::PAGE_SIZE - offset % mm::PAGE_SIZE).min(desc_byte_len - written);
-                // SAFETY: offset is within the mapped region; desc_src is valid.
-                unsafe {
-                    let dst = info_ptr(&page_ptrs, offset);
-                    core::ptr::copy_nonoverlapping(desc_src.add(written), dst, chunk);
-                }
-                written += chunk;
             }
 
             // Mint a reclaimable Memory cap per InitInfo page so init's

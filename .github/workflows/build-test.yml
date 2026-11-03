@@ -143,10 +143,43 @@ jobs:
           esac
 
       - name: Run ${{ matrix.tester }}
+        # Per-cell run-parallel budget, for HANG classification. Each value is
+        # derived as docs/testing.md § Coverage tiers derives the boundary
+        # budgets: the larger of three times the cell's measured worst and
+        # that worst plus 100 s (ktest's longest failing bound at 4 CPUs,
+        # split_delete_race's exit poll), rounded up to a minute. The measured
+        # worst is the slowest run-parallel `elapsed` of the cell over the
+        # 28 build-test runs sampled for #702 (the latest attempt of each).
+        # riscv64 debug svctest takes 180 s, a HANG at a 180 s budget, since
+        # its passes reach 179 s: its fsbench phase runs about 3x slower on
+        # 4-core TCG than the timings it was sized for (#666), and
+        # runner-queue contention adds on top (52-180 s on the same code
+        # within one hour). A real hang costs the cell its whole budget
+        # before it fails. A change to the measured worst re-derives the
+        # values.
         run: |
+          case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
+            riscv64-debug-svctest)    budget=540 ;;  # worst 180.0 s (HANG)
+            riscv64-debug-usertest)   budget=360 ;;  # worst 108.2 s
+            riscv64-debug-ktest)      budget=300 ;;  # worst 97.9 s
+            riscv64-release-svctest)  budget=300 ;;  # worst 89.5 s
+            riscv64-release-usertest) budget=180 ;;  # worst 46.8 s
+            riscv64-release-ktest)    budget=300 ;;  # worst 88.6 s
+            x86_64-debug-svctest)     budget=360 ;;  # worst 114.6 s
+            x86_64-debug-usertest)    budget=180 ;;  # worst 56.9 s
+            x86_64-debug-ktest)       budget=360 ;;  # worst 112.7 s
+            x86_64-release-svctest)   budget=240 ;;  # worst 69.1 s
+            x86_64-release-usertest)  budget=180 ;;  # worst 24.6 s
+            x86_64-release-ktest)     budget=360 ;;  # worst 116.3 s
+            *) echo "no budget for this cell" >&2; exit 1 ;;
+          esac
+          # --save-logs keeps every run's log, a PASS included, under the
+          # directory the upload step below collects, so a cell's per-phase
+          # timings can be compared across heads.
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 1 --runs 1 --timeout 180
+            --parallel 1 --runs 1 --timeout "$budget" \
+            --save-logs target/xtask/run-parallel-saved
           if [ "${{ matrix.tester }}" = "ktest" ]; then
             # Extra boots: the KASLR randomization test (#252). Boots the
             # ktest bundle already composed above twice and asserts the
@@ -182,5 +215,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
-          path: target/xtask/run-parallel/**/*.log
+          path: |
+            target/xtask/run-parallel/**/*.log
+            target/xtask/run-parallel-saved/*.log
           if-no-files-found: ignore
+          # PASS logs ride every run now; keep them only as long as a
+          # cross-head comparison needs.
+          retention-days: 14

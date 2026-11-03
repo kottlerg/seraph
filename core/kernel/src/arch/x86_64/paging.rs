@@ -1746,12 +1746,22 @@ mod tests
         }
     }
 
-    /// Write `e` at `index` of the frame at `table`, a `Frames` address.
-    fn set_entry(table: u64, index: usize, e: PageTableEntry)
+    impl Frames
     {
-        // SAFETY: `table` names a live host frame with write provenance
-        // (`Frames`), and no other reference to it is live.
-        unsafe { table_at(table)[index] = e };
+        /// Write `e` at `index` of this set's frame at `table`.
+        ///
+        /// # Panics
+        /// When `table` is not one of this set's addresses.
+        fn set_entry(&self, table: u64, index: usize, e: PageTableEntry)
+        {
+            assert!(self.addrs.contains(&table), "not a frame of this set");
+            // SAFETY: `table` is one of this set's addresses (checked above):
+            // a live host frame with write provenance, alive while `self` is.
+            // The tests reach the frames only through these addresses and
+            // hold no reference into one across this call, so the `&mut`
+            // `table_at` forms is the only one.
+            unsafe { table_at(table)[index] = e };
+        }
     }
 
     /// The address of the table `table` refers to.
@@ -1829,12 +1839,12 @@ mod tests
         let lure = PageTableEntry(PRESENT | USER_BIT | WRITABLE | (p.bait() & PHYS_MASK));
         for index in 0..512
         {
-            set_entry(p.bait(), index, lure);
+            p.f.set_entry(p.bait(), index, lure);
         }
         for (i, level) in (2..=top).rev().enumerate()
         {
             let child = PageTableEntry(PageTableEntry::new_table(p.f.addrs[i + 1]).0 | USER_BIT);
-            set_entry(p.f.addrs[i], table_index(level, va), child);
+            p.f.set_entry(p.f.addrs[i], table_index(level, va), child);
         }
         p
     }
@@ -1854,11 +1864,11 @@ mod tests
         {
             let p = path(depth);
             let leaf = PageTableEntry(PRESENT | USER_BIT | 0x1234_5000);
-            set_entry(p.pt(), table_index(0, p.va), leaf);
+            p.f.set_entry(p.pt(), table_index(0, p.va), leaf);
             let pt = PageTableEntry(PageTableEntry::new_table(p.pt()).0 | USER_BIT);
-            set_entry(p.pd(), table_index(1, p.va), pt);
+            p.f.set_entry(p.pd(), table_index(1, p.va), pt);
             assert_eq!(walk(&p).map(|e| e.0), Some(leaf.0), "{depth:?}");
-            set_entry(p.pt(), table_index(0, p.va), PageTableEntry(0));
+            p.f.set_entry(p.pt(), table_index(0, p.va), PageTableEntry(0));
             assert!(walk(&p).is_none(), "{depth:?}");
         }
     }
@@ -1873,7 +1883,7 @@ mod tests
         {
             let p = path(depth);
             let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait() & PHYS_MASK));
-            set_entry(p.pd(), table_index(1, p.va), large);
+            p.f.set_entry(p.pd(), table_index(1, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
         }
     }
@@ -1885,7 +1895,7 @@ mod tests
         {
             let p = path(depth);
             let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait() & PHYS_MASK));
-            set_entry(p.pdpt(), table_index(2, p.va), large);
+            p.f.set_entry(p.pdpt(), table_index(2, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
         }
     }
@@ -1938,7 +1948,7 @@ mod tests
             let top = depth.levels() - 1;
             let va = va_for(depth);
             // The root plus one table per level below it, and one spare, so a
-            // descent that allocated too many tables is counted, not stopped.
+            // descent that took one table too many is counted.
             let f = frames(top + 2);
             let children = &f.addrs[1..];
             let mut handed = 0;
@@ -2018,7 +2028,7 @@ mod tests
             let pd = link_to_pd(&f, depth, va);
             let data = f.addrs[top];
             let large = PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (data & PHYS_MASK));
-            set_entry(pd, table_index(1, va), large);
+            f.set_entry(pd, table_index(1, va), large);
             // SAFETY: as in the test above.
             let pt = unsafe { descend_existing(f.addrs[0], va, top, 0, |pa| pa) };
             assert!(pt.is_none(), "{depth:?}");

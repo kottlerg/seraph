@@ -833,9 +833,11 @@ fn release_reply_caps(
 /// Bytes withheld from a fresh grant's local ledger as slack against any
 /// kernel-side retype cost the mirror does not model. The kernel debits
 /// exactly the class-rounded dispatch cost, so this is conservative; the
-/// slow-path resync reads the authoritative ledger anyway. Every request
-/// asks memmgr for the pages covering the class plus this reserve
-/// ([`slab_want_pages`]).
+/// slow-path resync reads the authoritative ledger anyway. Every pooled and
+/// [`object_slab_retype`] request asks memmgr for the pages covering the
+/// class plus this reserve ([`slab_want_pages`]); a dedicated grant from
+/// [`object_slab_acquire_fresh`] carries one exact retype and withholds
+/// nothing.
 const ALLOCATOR_METADATA_RESERVE: u64 = 64;
 
 /// Pages a slab request asks memmgr for: the fewest that cover the

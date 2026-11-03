@@ -519,9 +519,9 @@ pub struct UniversalCaps
     /// Whether the child is demand-paged. Demand paging is the default; this
     /// is false only when the caller set `procmgr_labels::CREATE_PINNED` (a
     /// DMA driver that must be eager-mapped). When true, `finalize_creation`
-    /// binds the child's main-thread fault handler to memmgr and delegates the
-    /// child `AddressSpace`, and `populate_child_info` advertises the pager in
-    /// `ProcessInfo`.
+    /// delegates the child `AddressSpace` to memmgr, binds the child's
+    /// main-thread fault handler to it, and, once both took effect,
+    /// advertises the pager in `ProcessInfo` (`advertise_pager`).
     pub demand_paged: bool,
     /// Procmgr's own (procmgr-badged) SEND cap on memmgr's endpoint, used to
     /// issue the procmgr-only `DELEGATE_ASPACE`. Distinct from

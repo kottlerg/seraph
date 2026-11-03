@@ -871,9 +871,10 @@ pub unsafe fn mem_protect(
 /// parent has derivation children), `InvalidCapability` (also a parent a
 /// concurrent delete freed before the tail was linked), `InvalidState` (a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
-/// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (tail
-/// allocation or `CSpace` slot pool exhausted), or `QuotaExceeded` (`CSpace`
-/// directory structurally full).
+/// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's
+/// `CSpace` pool cannot back the tail's slot or its body, which comes from
+/// the pool's body arena; `syscall_abi::cspace_topup_pages`), or
+/// `QuotaExceeded` (`CSpace` directory structurally full).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: returned value is a cap handle — a 24-bit slot index plus an
 // 8-bit generation — so it fits u32.
@@ -954,8 +955,9 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: each returned handle is 32 bits (a 24-bit slot index
 // plus an 8-bit generation).
@@ -996,8 +998,9 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1053,8 +1056,9 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1100,8 +1104,9 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
-/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
-/// ceiling).
+/// `CSpace` pool cannot back two more slots or the children's bodies, which
+/// come from its body arena (`syscall_abi::cspace_topup_pages`;
+/// `QuotaExceeded` at the structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]

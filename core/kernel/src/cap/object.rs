@@ -1449,7 +1449,8 @@ impl PagePool
     }
 
     /// Hand every recorded donation to `free` as `(ancestor, base_offset,
-    /// page_count)`, in an order that keeps each record readable until it is
+    /// page_count, holes)`, `holes` being the record's list of kept arena
+    /// pages (null for an `AddressSpace` pool, or a record with none), in an order that keeps each record readable until it is
     /// used: spilled records newest page first and, within a page, last to
     /// first so record 0 (whose donation holds the page) goes last; then the
     /// inline records, snapshotted up front, with record 0 (the create-time
@@ -2091,7 +2092,8 @@ impl CSpaceKernelObject
         pool_unlock(&self.cs_pool.lock);
     }
 
-    /// Pass over every arena page at teardown: clear its owner under its lock,
+    /// Pass over every arena page at teardown, after the objects the
+    /// `CSpace`'s slots held are torn down: clear its owner under its lock,
     /// so no later chunk free touches this wrapper, and keep the pages that
     /// still hold a live chunk, each with the teardown's hold (the owner's,
     /// carried over): each is linked onto its donation record's list of kept
@@ -3207,8 +3209,11 @@ unsafe fn free_donation(
 /// onto `stack` if that was its last.
 ///
 /// The record's kept pages are sorted once and the span walked with them in
-/// order, so a donation with `k` kept pages costs `O(k log k)` and a teardown
-/// with `r` records and `h` kept pages `O(r + h log h)`.
+/// order, its runs returned through one walk of the Memory object's page free
+/// list (`retype::retype_free_runs`): a donation with `k` kept pages costs
+/// `O(k log k)` plus that walk, and a teardown with `r` records and `h` kept
+/// pages `O(r + h log h)` plus one walk per record, as a wholesale return of
+/// each record costs.
 ///
 /// # Safety
 /// The record is one `PagePool::reclaim_donations` hands out, `holes` its
@@ -3255,8 +3260,10 @@ unsafe fn free_donation_around(
         })
     };
     let p = crate::mm::PAGE_SIZE as u64;
-    crate::cap::arena::for_each_run(off, off + pages * p, kept(), |from, to| {
-        crate::cap::retype::retype_free(anc_memory, from, to - from);
+    crate::cap::retype::retype_free_runs(anc_memory, |free_run| {
+        crate::cap::arena::for_each_run(off, off + pages * p, kept(), |from, to| {
+            free_run(from, to - from);
+        });
     });
     // SAFETY: the record's reference, released once, after every run.
     if unsafe { &*anc_ptr }.dec_ref() == 0
@@ -3275,7 +3282,8 @@ unsafe fn free_donation_around(
 /// derivation drain, this walk is not batched: no lock is held across it
 /// (each return takes only its ancestor's cap lock), so nothing else waits on
 /// it; its length is the number of donations the owner paid for plus the
-/// sort of the kept pages ([`free_donation_around`]).
+/// sort of the kept pages, and each donation's return one walk of its
+/// Memory object's page free list ([`free_donation_around`]).
 ///
 /// # Safety
 /// `obj`'s reference count is zero, its derivation drain has run and its
@@ -4165,9 +4173,16 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         // lands in a slab from a Memory cap (`sys_cap_create_cspace`). Both
         // inline `CSpace` directly into the wrapper page; both record the
         // create-time slab (wrapper plus slot-page pool) as the pool's first
-        // donation. Reclamation returns every donation to its Memory object
-        // wholesale and drops the reference each held, the create-time slab
-        // last.
+        // donation.
+        //
+        // The arm runs twice. The first run stops the bound threads, drains
+        // and drops the `CSpace`, and queues itself on the cascade stack
+        // beneath the objects its slots held, so those objects, and every
+        // cascade they start, are torn down first, their arena chunks freed.
+        // The second run, with `cspace` null, returns every donation to its
+        // Memory object but for the arena pages still holding a live body,
+        // cut out of their donations' spans, and drops the reference each
+        // donation held, the create-time slab last.
         //
         // Before `unregister_cspace` and the dec_ref cascade run, the
         // derivation tree's external back-links into this dying `CSpace`
@@ -4186,12 +4201,6 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 obj.cs_pool.has_create_donation(),
                 "dealloc CSpaceObj: donation-less CSpace reached typed-memory dealloc path"
             );
-
-            // Captured for the final `free_cspace_id` after the lock release;
-            // `needs_free_id` stays false when cs_ptr is null (no id to
-            // recycle), which short-circuits the free-list push below.
-            let mut dying_id: crate::cap::slot::CSpaceId = 0;
-            let mut needs_free_id = false;
 
             if !cs_ptr.is_null()
             {
@@ -4229,7 +4238,6 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
                 // SAFETY: cs_ptr non-null; allocated at creation.
                 let id = unsafe { (*cs_ptr).id() };
-                dying_id = id;
                 let dying_epoch = crate::cap::registry_epoch(id);
 
                 // ── Batched pre-unregister derivation drain ──
@@ -4268,6 +4276,16 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     crate::cap::derivation::DERIVATION_LOCK.write_unlock();
                 }
 
+                // The wrapper's second run, which returns the pool, comes
+                // after the objects the slots queue below: `cspace` null marks
+                // it, and pushing the wrapper first puts it beneath them.
+                // SAFETY: refcount 0 and exclusively ours; the arm reads only
+                // the wrapper's body, never its header, until it is popped.
+                unsafe {
+                    (*ptr.as_ptr().cast::<CSpaceKernelObject>()).cspace = core::ptr::null_mut();
+                    stack.push(ptr);
+                }
+
                 // Dec-ref all objects referenced by non-null slots, queueing
                 // each one this leaves unreferenced, a nested CSpace
                 // included, on the cascade stack: a chain of CSpaces each
@@ -4287,31 +4305,28 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
                 // Drop the inline CSpace before reclaiming its storage; its
                 // own `Drop` is a no-op for retype-backed (pool pages flow
-                // back through the donation reclaim below).
+                // back through the donation reclaim of the second run).
                 // SAFETY: cs_ptr is about to be reclaimed; no outside
                 // reference outlives the cap deletion that brought us here.
                 unsafe {
                     core::ptr::drop_in_place(cs_ptr);
                 }
 
-                needs_free_id = true;
+                // Recycle the id once DERIVATION_LOCK is released and the
+                // CSpace is unregistered and dropped. Randomizing the epoch
+                // now invalidates any surviving SlotId stamped with the
+                // pre-recycle value — subsequent `lookup_cspace` returns None.
+                // The slot pages go back with the donations in the second
+                // run; no live structure names them.
+                crate::cap::free_cspace_id(id);
+                return;
             }
 
-            // Recycle the id once DERIVATION_LOCK is released and the CSpace
-            // is unregistered and dropped. Randomizing the epoch now
-            // invalidates any surviving SlotId stamped with the pre-recycle
-            // value — subsequent `lookup_cspace` returns None. The slot pages
-            // go back with the donations below; no live structure names them.
-            if needs_free_id
-            {
-                crate::cap::free_cspace_id(dying_id);
-            }
-
-            // Every donation goes back now but for the arena pages that still
-            // hold a live body: a body this CSpace funded may live on in
-            // another CSpace, its capability moved there, and the bodies of
-            // this CSpace's own slots, queued on `stack` above, are freed after
-            // this arm returns. Each kept page returns to its donation's Memory
+            // Second run (or a wrapper that never had a CSpace): the objects
+            // the slots held are torn down. Every donation goes back now but
+            // for the arena pages that still hold a live body, one this
+            // CSpace funded that lives on in another CSpace, its capability
+            // moved there. Each kept page returns to its donation's Memory
             // object with its last chunk (core/kernel/docs/capability-internals.md
             // § Body Arena).
             // SAFETY: refcount 0, the CSpace is drained and dropped, so no

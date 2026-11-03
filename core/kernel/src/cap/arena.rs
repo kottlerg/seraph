@@ -7,8 +7,9 @@
 //! makes at runtime without a Memory capability to retype them from.
 //!
 //! A range split (`SYS_MEMORY_SPLIT`, `SYS_MMIO_SPLIT`, `SYS_IRQ_SPLIT`,
-//! `SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`), a copy or derivation of an `Mmio` or
-//! `IoPort` capability, and an `Mmio` object's spilled mapping records are
+//! `SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`), a copy or derivation of an `Mmio`,
+//! `IoPort`, or `Interrupt` capability, and an `Mmio` object's spilled mapping
+//! records are
 //! funded by the `CSpace` the syscall inserts into or resolves through: each
 //! takes a 128-byte chunk of a page from that `CSpace`'s slot-page pool, which
 //! its holder funds the way it funds slots. Chunk 0 of each arena page holds
@@ -130,10 +131,14 @@ pub fn for_each_run(
     }
 }
 
+/// Number of bins [`sort_list`] merges through: bin `i` holds a sorted run of
+/// `2^i` nodes, so 64 bins cover any list a 64-bit address space can hold.
+const SORT_BINS: usize = 64;
+
 /// Sort the intrusive singly linked list headed by `head` ascending by `key`
-/// and return its new head: a merge sort, `O(n log n)` with recursion depth
-/// `O(log n)`, which allocates nothing. `next` reads a node's link and
-/// `set_next` writes it.
+/// and return its new head: a bottom-up merge sort through [`SORT_BINS`]
+/// sorted runs, `O(n log n)` with a fixed stack, which allocates nothing and
+/// does not recurse. `next` reads a node's link and `set_next` writes it.
 ///
 /// # Safety
 /// Every node on the list is valid for `next`, `set_next`, and `key`, and
@@ -145,57 +150,71 @@ pub unsafe fn sort_list<N>(
     key: &impl Fn(*mut N) -> u64,
 ) -> *mut N
 {
-    if head.is_null() || next(head).is_null()
-    {
-        return head;
-    }
-    // Split at the middle: `slow` ends on the last node of the first half.
-    let mut slow = head;
-    let mut fast = next(head);
-    while !fast.is_null()
-    {
-        fast = next(fast);
-        if !fast.is_null()
+    let merge = |mut a: *mut N, mut b: *mut N| -> *mut N {
+        let mut merged: *mut N = core::ptr::null_mut();
+        let mut tail: *mut N = core::ptr::null_mut();
+        while !a.is_null() || !b.is_null()
         {
-            slow = next(slow);
-            fast = next(fast);
+            // `a` holds the earlier nodes, so ties keep their list order.
+            let take_a = b.is_null() || (!a.is_null() && key(a) <= key(b));
+            let node = if take_a { a } else { b };
+            if take_a
+            {
+                a = next(a);
+            }
+            else
+            {
+                b = next(b);
+            }
+            set_next(node, core::ptr::null_mut());
+            if tail.is_null()
+            {
+                merged = node;
+            }
+            else
+            {
+                set_next(tail, node);
+            }
+            tail = node;
         }
-    }
-    let second = next(slow);
-    set_next(slow, core::ptr::null_mut());
-    // SAFETY: both halves are null-terminated sublists of the caller's list.
-    let (mut a, mut b) = unsafe {
-        (
-            sort_list(head, next, set_next, key),
-            sort_list(second, next, set_next, key),
-        )
+        merged
     };
-    let mut merged: *mut N = core::ptr::null_mut();
-    let mut tail: *mut N = core::ptr::null_mut();
-    while !a.is_null() || !b.is_null()
+    let mut bins: [*mut N; SORT_BINS] = [core::ptr::null_mut(); SORT_BINS];
+    let mut cur = head;
+    while !cur.is_null()
     {
-        let take_a = b.is_null() || (!a.is_null() && key(a) <= key(b));
-        let node = if take_a { a } else { b };
-        if take_a
+        let after = next(cur);
+        set_next(cur, core::ptr::null_mut());
+        // Carry the one-node run up through the occupied bins, as a binary
+        // counter carries a bit.
+        let mut run = cur;
+        let mut i = 0;
+        while i < SORT_BINS - 1 && !bins[i].is_null()
         {
-            a = next(a);
+            run = merge(bins[i], run);
+            bins[i] = core::ptr::null_mut();
+            i += 1;
+        }
+        bins[i] = if bins[i].is_null()
+        {
+            run
         }
         else
         {
-            b = next(b);
-        }
-        set_next(node, core::ptr::null_mut());
-        if tail.is_null()
-        {
-            merged = node;
-        }
-        else
-        {
-            set_next(tail, node);
-        }
-        tail = node;
+            merge(bins[i], run)
+        };
+        cur = after;
     }
-    merged
+    // Higher bins hold earlier nodes; merge them in last, each as `a`.
+    let mut sorted: *mut N = core::ptr::null_mut();
+    for &bin in &bins
+    {
+        if !bin.is_null()
+        {
+            sorted = merge(bin, sorted);
+        }
+    }
+    sorted
 }
 
 #[cfg(test)]
@@ -320,7 +339,7 @@ mod tests
     #[test]
     fn an_intrusive_list_sorts_ascending_keeping_every_node()
     {
-        for n in [0usize, 1, 2, 3, 7, 64, 257]
+        for n in [0usize, 1, 2, 3, 7, 64, 257, 1030, 4096]
         {
             let mut nodes: Vec<Box<Node>> = (0..n)
                 .map(|i| {

@@ -46,7 +46,8 @@ pub(crate) fn negotiated_depth() -> PagingDepth
 /// When the chosen depth differs from the one the firmware runs (its
 /// `CR4.LA57`), the handoff must leave long mode to change it; this reserves
 /// an `EfiLoaderCode` page below 4 GiB for the LA57 toggle trampoline and
-/// copies the trampoline into it. When no such page can be allocated, the
+/// copies the trampoline into it. When no such page can be allocated, or the
+/// assembled trampoline does not fit one (the page is then freed), the
 /// firmware's depth is kept, which needs no toggle.
 ///
 /// # Safety
@@ -71,23 +72,29 @@ pub unsafe fn negotiate_paging(bs: *mut crate::uefi::EfiBootServices)
     if depth != firmware
     {
         // SAFETY: bs is valid pre-ExitBootServices (caller contract).
-        let page = unsafe { crate::uefi::allocate_code_pages_max_addr(bs, 0xFFFF_FFFF, 1) }.ok();
-        // SAFETY: page is a fresh, exclusively-owned EfiLoaderCode frame below
-        // 4 GiB, identity-mapped by the firmware; step 6 has not run.
-        let installed =
-            page.is_some_and(|page| unsafe { super::handoff::install_la57_toggle(page) });
-        if !installed
+        let page = unsafe { crate::uefi::allocate_code_pages_max_addr(bs, 0xFFFF_FFFF, 1) };
+        if let Ok(page) = page
         {
-            if let Some(page) = page
+            // SAFETY: page is a fresh, exclusively-owned EfiLoaderCode frame
+            // below 4 GiB, identity-mapped by the firmware; step 6 has not run.
+            if !unsafe { super::handoff::install_la57_toggle(page) }
             {
                 // SAFETY: bs is valid pre-ExitBootServices; page is our
                 // allocation, not installed and not touched again. A refused
                 // free only leaves the page `Loaded`.
                 let _ = unsafe { crate::uefi::free_pages(bs, page, 1) };
+                crate::bprintln!(
+                    "[--------] boot: WARNING: the LA57 toggle template does not fit \
+                     one page; keeping the firmware's paging depth"
+                );
+                depth = firmware;
             }
+        }
+        else
+        {
             crate::bprintln!(
-                "[--------] boot: WARNING: no LA57 toggle page below 4 GiB, or the \
-                 template does not fit one; keeping the firmware's paging depth"
+                "[--------] boot: WARNING: no page below 4 GiB for the LA57 toggle; \
+                 keeping the firmware's paging depth"
             );
             depth = firmware;
         }

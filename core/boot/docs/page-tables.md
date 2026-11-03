@@ -124,8 +124,9 @@ firmware runs one of the two depths itself, which the bootloader reads from its 
 When the negotiated depth differs from the firmware's, the handoff must change `CR4.LA57`,
 which the CPU accepts only outside IA-32e mode; the bootloader then reserves one
 `EfiLoaderCode` page below 4 GiB and copies the LA57 toggle trampoline into it (§ Activation).
-When no such page can be allocated, the bootloader keeps the firmware's depth, which needs no
-toggle. The negotiated depth, the firmware's, and the handoff path are printed at step 5.
+When no such page can be allocated, or the assembled trampoline does not fit one (the page is
+then freed), the bootloader keeps the firmware's depth, which needs no toggle. The negotiated
+depth, the firmware's, and the handoff path are printed at step 5.
 
 ### Hierarchy
 
@@ -144,9 +145,8 @@ Virtual address bits:
 
 The root table (PML5 or PML4) occupies one 4 KiB frame, allocated below 4 GiB because the
 LA57 toggle trampoline loads it into `CR3` with paging off, in legacy protected mode, with a
-32-bit move. Each
-entry is a 64-bit value. Present entries above PML1 point to the next-level table's physical
-frame. PML1 entries (PTEs) point to the final 4 KiB data frame.
+32-bit move. Each entry is a 64-bit value. Present entries above PML1 point to the next-level
+table's physical frame. PML1 entries (PTEs) point to the final 4 KiB data frame.
 
 ### PTE Format
 

@@ -8,20 +8,12 @@
 //! Tracks open files by badge value (assigned via `cap_derive_badge`) in a
 //! table that grows with the files read through `FS_READ_MEMORY` and reuses
 //! a closed file's slot. Each open file carries a table of outstanding cache
-//! pages handed out via `FS_READ_MEMORY`, grown on demand up to
-//! [`MAX_OUTSTANDING`]; each entry holds the cookie the
+//! pages handed out via `FS_READ_MEMORY`, grown on demand up to the cache's
+//! slot ceiling; each entry holds the cookie the
 //! client uses to reference the page, the cache slot the page lives in
 //! (so the slot's refcount can be decremented on release), and an
 //! ancestor cap interposed between the slot's parent cap and the
 //! caller-side child cap so per-cookie revocation is possible.
-
-/// Maximum outstanding `FS_READ_MEMORY` pages per open file: the cache's
-/// slot count. Each outstanding page holds a cache slot, so one file cannot
-/// usefully hold more pages than the cache has slots, and the bound scales
-/// with the cache. The per-call ancestor caps live in the fs's `CSpace`
-/// until released or close; the table grows only with the pages a client
-/// holds.
-pub const MAX_OUTSTANDING: usize = crate::cache::SLOT_COUNT;
 
 /// One outstanding page handed to a client via `FS_READ_MEMORY`.
 #[derive(Clone, Copy)]
@@ -84,16 +76,21 @@ impl OpenFile
     }
 
     /// Insert `entry` into a free outstanding slot, growing the table while
-    /// it holds fewer than [`MAX_OUTSTANDING`]. Returns `false` when the
-    /// file already holds that many pages, or the table cannot grow.
-    pub fn track_outstanding(&mut self, entry: OutstandingPage) -> bool
+    /// it holds fewer than `limit` pages, the cache's slot ceiling: each
+    /// outstanding page holds a cache slot, so one file cannot usefully hold
+    /// more pages than the cache has slots, and the bound scales with the
+    /// cache. The per-call ancestor caps live in the fs's `CSpace` until
+    /// released or close; the table grows only with the pages a client
+    /// holds. Returns `false` when the file already holds `limit` pages, or
+    /// the table cannot grow.
+    pub fn track_outstanding(&mut self, entry: OutstandingPage, limit: usize) -> bool
     {
         if let Some(slot) = self.outstanding.iter_mut().find(|s| s.is_none())
         {
             *slot = Some(entry);
             return true;
         }
-        if self.outstanding.len() >= MAX_OUTSTANDING || self.outstanding.try_reserve(1).is_err()
+        if self.outstanding.len() >= limit || self.outstanding.try_reserve(1).is_err()
         {
             return false;
         }

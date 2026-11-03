@@ -8,7 +8,12 @@
 //! Spawned by devmgr with the platform UART authority cap — an `IoPort`
 //! covering COM1 on x86-64, an `Mmio` covering the QEMU `virt` NS16550 at
 //! its platform-static address on RISC-V — a RECV cap on its service
-//! endpoint, and (optionally) the UART interrupt cap. Owns the UART
+//! endpoint, and (optionally) the UART interrupt cap in a first bootstrap
+//! round, and its devmgr query cap in a second, terminal one. Once the UART
+//! is set up it reports ready (`devmgr_labels::DRIVER_READY`) on the query
+//! cap, immediately before its service loop: devmgr serves the driver's
+//! endpoint only after that report, and the driver exits when devmgr refuses
+//! it. Owns the UART
 //! end-to-end and is the sole driver-mediated path for userspace serial
 //! bytes in both directions: real-logd and every other writer reach it via
 //! [`serial_labels::SERIAL_WRITE_BYTES`]; the terminal reads input via
@@ -38,8 +43,13 @@ struct BootCaps
     /// devmgr delivered no IRQ: RX then degrades to timeout polling on the
     /// client side, and `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
     irq_cap: u32,
+    /// devmgr query cap: a SEND badged with this device's badge on its spawn
+    /// batch's private endpoint, for `DRIVER_READY`.
+    devmgr_query_ep: u32,
 }
 
+/// Request the two bootstrap rounds: round 1 (not terminal)
+/// `[service_ep, hw_cap, irq_cap?]`, round 2 (terminal) `[devmgr_query_ep]`.
 fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
@@ -47,22 +57,22 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
         return None;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let round = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if round.cap_count < 2 || !round.done
+    let r1 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
+    if r1.cap_count < 2 || r1.done
+    {
+        return None;
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let r2 = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
+    if r2.cap_count < 1 || !r2.done
     {
         return None;
     }
     Some(BootCaps {
-        service_ep: round.caps[0],
-        hw_cap: round.caps[1],
-        irq_cap: if round.cap_count >= 3
-        {
-            round.caps[2]
-        }
-        else
-        {
-            0
-        },
+        service_ep: r1.caps[0],
+        hw_cap: r1.caps[1],
+        irq_cap: if r1.cap_count >= 3 { r1.caps[2] } else { 0 },
+        devmgr_query_ep: r2.caps[0],
     })
 }
 
@@ -195,7 +205,7 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    if caps.service_ep == 0 || caps.hw_cap == 0
+    if caps.service_ep == 0 || caps.hw_cap == 0 || caps.devmgr_query_ep == 0
     {
         syscall::thread_exit();
     }
@@ -215,5 +225,10 @@ fn main() -> !
         syscall::thread_exit();
     }
 
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }.is_err()
+    {
+        syscall::thread_exit();
+    }
     service_loop(caps.service_ep, caps.irq_cap, ipc_buf);
 }

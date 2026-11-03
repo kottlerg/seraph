@@ -240,8 +240,10 @@ address, the reason, and the span's end.
 ```
 1. No kernel heap is set up: the kernel runs no `GlobalAlloc`, and every
    kernel-object body is carved out of a Memory capability by retype
-   (`core/kernel/src/cap/retype.rs`) — the SEED reserve for the kernel's own objects from
-   Phase 7 on, a caller-supplied capability at each `cap_create_*` syscall.
+   (`core/kernel/src/cap/retype.rs`) — the SEED reserve for the objects the boot mints from
+   Phase 7 on, a caller-supplied capability at each `cap_create_*` syscall — or placed in a
+   chunk of the body arena of the `CSpace` a split or range-capability copy inserts into
+   ([capability-internals.md](capability-internals.md) § Body Arena).
    The phase carries no setup cost; the machinery is live once `SEED_MEMORY`
    is installed in Phase 7.
 2. Emit: "Phase 4: Typed-Memory Cap Surface (no kernel heap)"
@@ -428,14 +430,20 @@ Phase 7.
    more extents than MAX_DRAIN_BLOCKS halt the boot with
    "FATAL: Phase 7: drained RAM extents exceed MAX_DRAIN_BLOCKS"), seal the buddy, and
    install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
-   (`cap::drain_and_install_seed`). Every drained extent exposed to userspace (each drained
+   (`cap::drain_and_install_seed`). SEED_RESERVE_BYTES is the boot footprint, about 376 KiB:
+   the root CSpace slab, init's address-space and thread slabs, and one 128-byte body for each
+   capability the InitInfo block can describe (about 670 at INIT_INFO_MAX_PAGES = 4), plus
+   alignment slack. A boot whose capabilities outnumber the block halts by name, in Phase 7 at
+   SEED or in Phase 9 at InitInfo; a memory map of more than about 640 AcpiReclaimable regions
+   is one such boot. Every drained extent exposed to userspace (each drained
    extent, and the seed extent's tail past the reserve) is zeroed through the direct map
    before step 3 mints it: free RAM still holds what firmware and the bootloader left there,
    the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
    reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
    pages: one wrapper page plus a slot-page pool holding at least
-   ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots) and register it as CSpace id 0:
+   ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots and ROOT_CSPACE_BODY_PAGES = 16 pages for the
+   bodies of init's own splits) and register it as CSpace id 0:
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per

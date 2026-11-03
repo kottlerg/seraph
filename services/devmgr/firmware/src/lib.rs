@@ -11,12 +11,14 @@
 //! broker's check) and flattened device trees for the PCI ECAM windows,
 //! computes ECAM register offsets and BAR sizes, walks PCI configuration
 //! space through a caller-supplied accessor, keeps the table of MMIO and
-//! interrupt range caps devmgr carves per-device caps from, and tracks which
-//! spawned drivers reported their device ready. The functions read
-//! caller-mapped byte slices or values, or reach the platform only through a
-//! caller-supplied accessor or split operation, and touch no syscall, IPC, or
-//! `std::os::seraph` surface, so the crate is host-reachable and
-//! host-tested; devmgr maps the tables and config space and drives them.
+//! interrupt range caps devmgr carves per-device caps from, tracks which
+//! spawned drivers reported their device ready, and keeps each class's served
+//! drivers by instance ordinal, a withdrawn one's ordinal held by a tombstone.
+//! The functions read caller-mapped byte slices or values, or reach the
+//! platform only through a caller-supplied accessor or split operation, and
+//! touch no syscall, IPC, or `std::os::seraph` surface, so the crate is
+//! host-reachable and host-tested; devmgr maps the tables and config space
+//! and drives them.
 //! If another service needs the same walks, promote this to
 //! `shared/firmware`. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
@@ -30,6 +32,7 @@ pub mod pci;
 pub mod resource;
 pub mod roster;
 pub mod scan;
+pub mod served;
 
 /// Location of one PCI ECAM configuration-space window discovered from an
 /// MCFG entry (ACPI) or a `pci-host-ecam-generic` DTB node, or the arch

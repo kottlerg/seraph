@@ -57,6 +57,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of the frames in a window of a Memory region | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
+| `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
@@ -192,7 +193,16 @@ Nor can a retype carve a page any address space maps: the kernel counts the
 user mappings of every frame of RAM and refuses a retype over a mapped page
 ([memory-internals.md](memory-internals.md) § Frame Map Table), so no kernel
 object state in donated memory sits behind a live user mapping, whichever order
-the map and the retype came in.
+the map and the retype came in. A `CSpace`'s pool pages also hold its body
+arena ([capability-internals.md](capability-internals.md) § Body Arena): the
+bodies of split children and range-capability copies (Memory, Mmio, Interrupt,
+IoPort and SchedControl objects, with lineage and ancestor pointers), Mmio
+mapping-record spill chunks (address-space pointers), the arena page headers
+(their owner and list pointers, and the Memory object of a kept page), the
+free-chunk links (kernel virtual addresses), and x86-64 port-binding tables
+(object addresses and bitmap-part pointers). They are pool pages retyped from the donating
+capability like the slot pages, so the same two rules keep them from every user
+mapping.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained
@@ -269,10 +279,7 @@ the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, and the register file serial-o
 error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL EXCEPTION` dump (`sepc`,
 `stval`, `satp`, and the register file serial-only; `scause` and `sstatus` on the console), the
 riscv64 unknown-interrupt path (`sepc` serial-only), and the riscv64 `BUG: ecall return sepc` path
-(`sepc`, `ra`, `sp`, and `a7` serial-only). `free_seed_scratch`'s corrupt-lease report, which
-returns rather than halting, prints the lease's size and the seed's physical range via `kprintln!`
-and the lease pointer and its derived physical address, whose difference is the direct-map base,
-only via `kprintln_serial!`.
+(`sepc`, `ra`, `sp`, and `a7` serial-only).
 
 ## Maintaining this inventory
 

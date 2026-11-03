@@ -232,8 +232,10 @@ memmgr caps), so spawning draws its own `CSpace`'s slots. A `CSpace` keeps its l
 `CSPACE_IPC_RECV_RESERVE` free slots for IPC capability transfer, and general allocations fail
 first ([docs/capability-model.md](../../docs/capability-model.md) § Address-space and CSpace
 growth budgets). Before every wait, procmgr compares its headroom
-(`std::os::seraph::cspace_slot_headroom`) against `CSPACE_LOW_WATER` (256 slots). Below it,
-procmgr funds the slot-page pool to `CSPACE_TOPUP_SLOTS` (1024) through
+(`std::os::seraph::cspace_slot_headroom`) and its growth budget (`CAP_INFO_CSPACE_BUDGET`)
+against `CSPACE_LOW_WATER` (256 slots) plus a page for its body arena
+(`syscall_abi::cspace_topup_pages`). Short of either, procmgr funds the slot-page pool to
+`CSPACE_TOPUP_SLOTS` (1024) through
 `std::os::seraph::fund_cspace_slot_budget`, which draws the pages from memmgr. A failed top-up is
 logged once per streak of failures and retried on the next pass.
 

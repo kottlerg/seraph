@@ -96,10 +96,9 @@ vfsd/
   `gpt::lookup_partition_by_type_guid` over the partitions of every disk
   for the self-mount; the DPS priority tie-break runs across disks, and
   a tie at the highest priority is ambiguous whether or not the tied
-  partitions share a disk. The EFI
-  System Partition (standard type GUID) and the Seraph data partition
-  (arch-neutral `SERAPH_DATA` GUID) auto-mount at `/esp` and `/data`
-  immediately after root; there is no `mounts.conf` and no
+  partitions share a disk. The EFI System Partition (standard type
+  GUID) and the Seraph data partition (arch-neutral `SERAPH_DATA` GUID)
+  auto-mount at `/esp` and `/data` immediately after root; there is no `mounts.conf` and no
   `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT` handler decodes a
   `MountRole` byte from the wire payload and reuses the same
   resolution path. See

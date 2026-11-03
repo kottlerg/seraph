@@ -59,11 +59,20 @@ pub struct Disk
 /// on it (`gpt::lookup_partition_by_type_guid`). A disk whose GPT cannot be
 /// parsed is held with no partitions. An allocation failure for the list
 /// stops discovery with a log, keeping the disks found before it.
+///
+/// `*scratch_cap` and `*scratch_va` are the scratch page from
+/// [`alloc_scratch`]. A driver that dies while it holds the page during a
+/// read destroys the cap with its `CSpace`, so before each disk a lost page
+/// is replaced from memmgr (`memmgr_ep`, mapped into `self_aspace`); one
+/// failed disk does not blind the disks after it. The lost page's VA
+/// reservation stays leaked, one page per such disk.
 pub fn discover_disks(
     registry_ep: u32,
+    memmgr_ep: u32,
+    self_aspace: u32,
     ipc_buf: *mut u64,
     scratch_cap: &mut u32,
-    scratch_va: u64,
+    scratch_va: &mut u64,
 ) -> Vec<Disk>
 {
     let mut disks = Vec::new();
@@ -72,7 +81,14 @@ pub fn discover_disks(
     {
         match query_block_device(registry_ep, ordinal, ipc_buf)
         {
-            BlockDeviceReply::End => break,
+            BlockDeviceReply::End(label) =>
+            {
+                std::os::seraph::log!(
+                    "disk {ordinal}: QUERY_BLOCK_DEVICE replied {label}; disk discovery ends"
+                );
+                break;
+            }
+            BlockDeviceReply::CallFailed => break,
             BlockDeviceReply::NoCap =>
             {
                 std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE reply carried no cap");
@@ -80,7 +96,18 @@ pub fn discover_disks(
             BlockDeviceReply::Disk(blk_ep) =>
             {
                 std::os::seraph::log!("disk {ordinal}: block device endpoint acquired");
-                let partitions = match parse_gpt(ordinal, blk_ep, ipc_buf, scratch_cap, scratch_va)
+                if *scratch_cap == 0
+                {
+                    replace_scratch(
+                        ordinal,
+                        memmgr_ep,
+                        self_aspace,
+                        ipc_buf,
+                        scratch_cap,
+                        scratch_va,
+                    );
+                }
+                let partitions = match parse_gpt(ordinal, blk_ep, ipc_buf, scratch_cap, *scratch_va)
                 {
                     Ok(parts) => parts,
                     Err(e) =>
@@ -110,12 +137,38 @@ pub fn discover_disks(
     disks
 }
 
+/// Replace a scratch page an earlier disk's driver destroyed, before disk
+/// `ordinal` is read. On failure `*scratch_cap` stays 0, so the disk's GPT
+/// read fails and the disk is held with no partitions.
+fn replace_scratch(
+    ordinal: u64,
+    memmgr_ep: u32,
+    self_aspace: u32,
+    ipc_buf: *mut u64,
+    scratch_cap: &mut u32,
+    scratch_va: &mut u64,
+)
+{
+    if let Some((cap, va)) = alloc_scratch(memmgr_ep, self_aspace, ipc_buf)
+    {
+        std::os::seraph::log!("disk {ordinal}: scratch page lost on an earlier disk; replaced");
+        *scratch_cap = cap;
+        *scratch_va = va;
+    }
+    else
+    {
+        std::os::seraph::log!("disk {ordinal}: scratch page lost and not replaced");
+    }
+}
+
 /// The outcome of one `QUERY_BLOCK_DEVICE`.
 enum BlockDeviceReply
 {
-    /// A failed call, or a reply other than `SUCCESS`: no driver runs at
-    /// this ordinal, and discovery ends.
-    End,
+    /// A reply other than `SUCCESS`, with its label: no driver is served
+    /// at this ordinal, and discovery ends.
+    End(u64),
+    /// A failed call (logged where it fails): discovery ends.
+    CallFailed,
     /// A `SUCCESS` reply that carried no cap.
     NoCap,
     /// The whole-disk cap on the driver at this ordinal.
@@ -134,11 +187,11 @@ fn query_block_device(registry_ep: u32, ordinal: u64, ipc_buf: *mut u64) -> Bloc
     else
     {
         std::os::seraph::log!("disk {ordinal}: QUERY_BLOCK_DEVICE ipc_call failed");
-        return BlockDeviceReply::End;
+        return BlockDeviceReply::CallFailed;
     };
     if reply.label != devmgr_errors::SUCCESS
     {
-        return BlockDeviceReply::End;
+        return BlockDeviceReply::End(reply.label);
     }
     match reply.caps().first().copied()
     {

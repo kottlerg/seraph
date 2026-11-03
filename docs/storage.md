@@ -33,9 +33,9 @@ Four system-scope invariants govern the stack:
 - **Block access is partition-scoped at the capability layer.** The
   block driver serves only badged callers: vfsd holds a
   `blk_labels::MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr for
-  each block driver, and fs
-  drivers hold partition-identity-badged caps the block driver mints
-  on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd is the
+  each block driver, and fs drivers hold partition-identity-badged caps
+  the block driver mints on `REGISTER_PARTITION`; unbadged callers are
+  rejected. vfsd is the
   sole holder of the whole-disk caps: devmgr mints one on
   `QUERY_BLOCK_DEVICE` only for a caller whose registry cap carries
   `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's registry cap

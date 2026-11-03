@@ -156,9 +156,9 @@ fn main() -> !
     // Allocate a single scratch memory cap for GPT block reads. The
     // BLK_READ_INTO_MEMORY contract requires the caller to supply the DMA
     // target memory cap; vfsd reuses one scratch page across every disk's
-    // GPT reads. The memory cap and its VA reservation are
-    // process-lifetime-leaked.
-    let Some((mut scratch_cap, scratch_va)) =
+    // GPT reads, replacing it only when a dying driver destroys it. The
+    // memory cap and its VA reservation are process-lifetime-leaked.
+    let Some((mut scratch_cap, mut scratch_va)) =
         partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
     {
@@ -169,7 +169,14 @@ fn main() -> !
     // Hold every block device devmgr serves and parse each one's GPT; role
     // lookups on MOUNT consider the partitions of all of them.
     std::os::seraph::log!("querying devmgr for block devices");
-    let disks = partition::discover_disks(caps.registry_ep, ipc_buf, &mut scratch_cap, scratch_va);
+    let disks = partition::discover_disks(
+        caps.registry_ep,
+        caps.memmgr_ep,
+        caps.self_aspace,
+        ipc_buf,
+        &mut scratch_cap,
+        &mut scratch_va,
+    );
     if disks.is_empty()
     {
         std::os::seraph::log!("no block device available");
@@ -929,9 +936,9 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 
 /// One-shot best-effort mount of the partition tagged `type_guid` at
 /// `mount_path`. Scans every held disk's parsed GPT for a matching
-/// partition; if none is present (or its role lookup is ambiguous), logs a diagnostic
-/// and returns without mounting, leaving `mount_path` to resolve through
-/// the root-fs fall-through. On a match, runs the mount transaction and
+/// partition; if none is present (or its role lookup is ambiguous), logs
+/// a diagnostic and returns without mounting, leaving `mount_path` to
+/// resolve through the root-fs fall-through. On a match, runs the mount transaction and
 /// logs the outcome. Never fatal — distinct from the root self-mount,
 /// whose failure gates boot. Idempotent if invoked twice: a mount on an
 /// already-terminal mount path is rejected by
@@ -994,10 +1001,10 @@ fn mount_path_is_root(path: &[u8]) -> bool
 ///
 /// Looks the role's type GUID up across every held disk's GPT, registers
 /// the partition bound with the block driver of the disk that holds it,
-/// spawns a fatfs driver, registers a mount entry,
-/// and captures the driver's namespace endpoint (terminal mounts) or a
-/// badged SEND on the root fs (the root mount) into [`VfsdRootBackend`]
-/// so the system-root cap can resolve through the new mount.
+/// spawns a fatfs driver, registers a mount entry, and captures the
+/// driver's namespace endpoint (terminal mounts) or a badged SEND on the
+/// root fs (the root mount) into [`VfsdRootBackend`] so the system-root
+/// cap can resolve through the new mount.
 ///
 /// On success returns a fresh badged SEND for the caller (zero if
 /// minting failed; the mount itself still landed). On failure

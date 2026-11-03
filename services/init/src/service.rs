@@ -197,12 +197,11 @@ fn serve_checked(
 /// is a comfortable upper bound.
 const MAX_APERTURE_CAPS: usize = 32;
 
-/// Maximum number of ACPI reclaimable-region Memory caps. Matches the
-/// kernel's `MAX_ACPI_REGIONS`; 8 is generous.
-const MAX_ACPI_REGION_CAPS: usize = 8;
-
 /// Collected hardware caps: init forwards raw firmware + MMIO surfaces
 /// to devmgr. Parsing (MCFG / DTB → ECAM, FADT → `PM1a`) lives in devmgr.
+/// The ACPI reclaimable-region caps are not collected here: they are
+/// streamed to devmgr straight from the `InitInfo` descriptors
+/// ([`acpi_region_caps`]), however many the kernel minted.
 struct HwCaps
 {
     /// Root `Interrupt` range cap. Zero if the kernel did not mint one.
@@ -217,9 +216,6 @@ struct HwCaps
     /// All MMIO aperture caps (slot, base, size).
     apertures: [(u32, u64, u64); MAX_APERTURE_CAPS],
     aperture_count: usize,
-    /// ACPI reclaimable-region Memory caps (slot, base, size).
-    acpi_regions: [(u32, u64, u64); MAX_ACPI_REGION_CAPS],
-    acpi_region_count: usize,
 }
 
 impl HwCaps
@@ -235,8 +231,6 @@ impl HwCaps
             dtb_size: 0,
             apertures: [(0, 0, 0); MAX_APERTURE_CAPS],
             aperture_count: 0,
-            acpi_regions: [(0, 0, 0); MAX_ACPI_REGION_CAPS],
-            acpi_region_count: 0,
         }
     }
 }
@@ -250,8 +244,8 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
     hw.rsdp_slot = info.acpi_rsdp_memory_cap;
     hw.dtb_slot = info.dtb_memory_cap;
 
-    // Walk the descriptor array once to capture aperture + ACPI-region
-    // metadata. RSDP / DTB base + size come from their descriptors too.
+    // Walk the descriptor array once to capture aperture metadata. RSDP /
+    // DTB base + size come from their descriptors too.
     for d in crate::descriptors(info)
     {
         match d.cap_type
@@ -275,27 +269,22 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
         }
     }
 
-    // ACPI region caps occupy a contiguous slot range starting at
-    // `acpi_region_memory_base`. Walk the descriptor array a second time
-    // to pick them out by slot range; their aux0/aux1 carry (base, size).
-    let ar_start = info.acpi_region_memory_base;
-    let ar_end = ar_start + info.acpi_region_memory_count;
-    if info.acpi_region_memory_count != 0
-    {
-        for d in crate::descriptors(info)
-        {
-            if d.cap_type == CapType::Memory
-                && d.slot >= ar_start
-                && d.slot < ar_end
-                && hw.acpi_region_count < MAX_ACPI_REGION_CAPS
-            {
-                hw.acpi_regions[hw.acpi_region_count] = (d.slot, d.aux0, d.aux1);
-                hw.acpi_region_count += 1;
-            }
-        }
-    }
-
     hw
+}
+
+/// The ACPI reclaimable-region Memory caps the kernel minted, as
+/// `(slot, base, size)`: they occupy the contiguous slot range
+/// `[acpi_region_memory_base, + acpi_region_memory_count)`, and their
+/// descriptors' aux0/aux1 carry the region. One per region the boot memory
+/// map reports, with no bound of init's own.
+fn acpi_region_caps(info: &InitInfo) -> impl Iterator<Item = (u32, u64, u64)> + '_
+{
+    let start = info.acpi_region_memory_base;
+    let end = start.saturating_add(info.acpi_region_memory_count);
+    crate::descriptors(info)
+        .iter()
+        .filter(move |d| d.cap_type == CapType::Memory && d.slot >= start && d.slot < end)
+        .map(|d| (d.slot, d.aux0, d.aux1))
 }
 
 // ── devmgr creation ──────────────────────────────────────────────────────────
@@ -346,16 +335,17 @@ fn serve_region_rounds(
     child_badge: u64,
     ipc_buf: *mut u64,
     round_kind: u64,
-    regions: &[(u32, u64, u64)],
+    regions: impl IntoIterator<Item = (u32, u64, u64)>,
     context: &str,
 ) -> bool
 {
-    for batch in regions.chunks(4)
+    let mut regions = regions.into_iter().peekable();
+    while regions.peek().is_some()
     {
         let mut caps = [0u32; 4];
         let mut data = [0u64; 2 + 4 * 2];
         let mut n = 0usize;
-        for &(slot, base, size) in batch
+        for (slot, base, size) in regions.by_ref().take(4)
         {
             let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
             else
@@ -558,14 +548,14 @@ pub fn create_devmgr_with_caps(
         child_badge,
         ipc_buf,
         kind::APERTURE,
-        &hw.apertures[..hw.aperture_count],
+        hw.apertures[..hw.aperture_count].iter().copied(),
         "devmgr: bootstrap aperture round failed",
     ) || !serve_region_rounds(
         bootstrap_ep,
         child_badge,
         ipc_buf,
         kind::ACPI_REGION,
-        &hw.acpi_regions[..hw.acpi_region_count],
+        acpi_region_caps(info),
         "devmgr: bootstrap ACPI region round failed",
     )
     {

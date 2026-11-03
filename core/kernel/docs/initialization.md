@@ -454,8 +454,8 @@ Phase 7.
       IRQ id on the architecture (ROOT_IRQ_COUNT: 2048 on x86-64, 1024 on RISC-V);
       userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
    e. Map-only Memory capabilities over firmware tables (not retypable, not
-      buddy-backed): one per `AcpiReclaimable` memory-map region (up to
-      eight), then the page holding `BootInfo.acpi_rsdp`, then the
+      buddy-backed): one per `AcpiReclaimable` memory-map region (as many
+      as the map reports), then the page holding `BootInfo.acpi_rsdp`, then the
       `BootInfo.device_tree` blob.
    f. One root IoPort capability (x86-64 only, Use rights) covering the full
       64K I/O port space, which init subdivides for services that need port

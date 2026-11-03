@@ -41,6 +41,12 @@ from), per [console-model.md](../../../docs/console-model.md#ownership-across-th
 The interrupt cap is optional: without it the driver still answers reads (RX then relies on
 the client's bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
 
+The bootstrap is two rounds: the first carries the service endpoint, the arch authority cap, and
+the interrupt cap when present; the second, terminal one carries the driver's devmgr query cap.
+Once the UART is set up the driver reports `devmgr_labels::DRIVER_READY` on that cap,
+immediately before its service loop, and exits when devmgr refuses it: devmgr serves the
+driver's endpoint only after the report, and withdraws it when the driver dies.
+
 Clients obtain a read/write cap through devmgr, not svcmgr: a UART is a device,
 not a service
 ([console-model.md](../../../docs/console-model.md#the-serial-driver-as-sole-userspace-uart-owner)).

@@ -126,7 +126,9 @@ or on-disk UUID. The model is:
   image (see [build-system.md](build-system.md)) carries the tree on the
   partition only.
 - **Every disk is searched.** At startup vfsd sends `QUERY_BLOCK_DEVICE`
-  at instance ordinals 0, 1, … until the reply is not `SUCCESS`, holds
+  at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
+  driver devmgr withdrew when it died), until another reply is not
+  `SUCCESS`, holds
   the whole-disk cap of every block driver devmgr serves, and parses each
   disk's GPT. A role lookup, at the root self-mount, the auto-mounts, and
   a runtime `MOUNT`, considers the partitions of every held disk; a disk

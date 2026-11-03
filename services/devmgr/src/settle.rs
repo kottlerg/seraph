@@ -98,20 +98,24 @@ impl DriverWatch
     /// Create the watch for a boot that spawns at most `drivers` drivers:
     /// the death queue holds one post and one death-observer node per
     /// driver, since devmgr spawns each at most once and binds one observer
-    /// on each, so no death is dropped and every bind is funded. Returns
-    /// `None`, logging why and releasing what it created, when `drivers` is
-    /// 0 or exceeds the kernel's event-queue capacity, or an object cannot
-    /// be created.
+    /// on each, so no death is dropped and every bind is funded. The queue
+    /// holds at most the kernel's `EVENT_QUEUE_MAX_CAPACITY`; past it, the
+    /// bind of a driver beyond the queue's nodes fails and that driver is not
+    /// spawned, logged. Returns `None`, logging why and releasing what it
+    /// created, when an object cannot be created.
     pub fn new(drivers: usize, registry_ep: u32) -> Option<Self>
     {
-        let Some(capacity) = u32::try_from(drivers)
-            .ok()
-            .filter(|&c| (1..=syscall_abi::EVENT_QUEUE_MAX_CAPACITY).contains(&c))
-        else
+        let capacity = u32::try_from(drivers)
+            .unwrap_or(u32::MAX)
+            .clamp(1, syscall_abi::EVENT_QUEUE_MAX_CAPACITY);
+        if usize::try_from(capacity).is_ok_and(|c| c < drivers)
         {
-            std::os::seraph::log!("watch: {} drivers out of range", drivers as u64);
-            return None;
-        };
+            std::os::seraph::log!(
+                "watch: {} drivers past the death queue's capacity {}",
+                drivers as u64,
+                capacity
+            );
+        }
         let eq_bytes =
             std::os::seraph::event_queue_retype_bytes(u64::from(capacity), u64::from(capacity));
         let Some(death_eq) = std::os::seraph::object_slab_retype(eq_bytes, |slab| {

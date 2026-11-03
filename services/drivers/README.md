@@ -89,15 +89,14 @@ The full driver lifecycle is specified in
   § DMA Safety Model and [docs/architecture.md](../../docs/architecture.md)).
 - **Per-device capabilities** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   delegates the minimum capability set for each device: MMIO region, optional
-  interrupt line, the service endpoint, IoPort (x86-64) where applicable, and, for
-  drivers that fetch runtime metadata, a badged SEND devmgr answers device-info
-  queries on: for the framebuffer, on devmgr's
-  [registry-query endpoint](../devmgr/docs/responsibilities.md#capabilities-received);
-  for the VirtIO PCI drivers, on the private endpoint of their spawn batch, on which
-  each also reports `DRIVER_READY` once its device is set up (devmgr serves a VirtIO
-  driver only after that report, and revokes the private endpoint once the batch
-  settles). See [docs/capability-model.md](../../docs/capability-model.md) for
-  capability types and rights.
+  interrupt line, the service endpoint, IoPort (x86-64) where applicable, and a
+  devmgr query cap: a badged SEND on the private endpoint of the driver's spawn
+  batch, on which a driver that fetches runtime metadata (the framebuffer, the
+  VirtIO PCI drivers) sends device-info queries, and every driver reports
+  `DRIVER_READY` once its device is set up (devmgr serves a driver only after that
+  report, and revokes the private endpoint once the batch settles). See
+  [docs/capability-model.md](../../docs/capability-model.md) for capability types
+  and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   discovers devices (PCI enumeration, firmware tables), matches them to driver
   binaries, and requests procmgr to create driver processes. devmgr then delegates

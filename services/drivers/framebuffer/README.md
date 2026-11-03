@@ -44,9 +44,13 @@ so the bootloader is the only entity that can carry this information to
 userspace (see [docs/console-model.md](../../../docs/console-model.md)).
 
 Devmgr spawns the driver via the `simple-device` path with a round-2
-badged SEND on its registry endpoint so the driver can fetch its
-geometry via `QUERY_DEVICE_INFO` (generic kind/version/bytes payload
-schema, shared with virtio).
+devmgr query cap, a badged SEND on the private endpoint of the driver's
+spawn batch, so the driver can fetch its geometry via `QUERY_DEVICE_INFO`
+(generic kind/version/bytes payload schema, shared with virtio). Once the
+framebuffer is mapped the driver reports `DRIVER_READY` on the same cap,
+immediately before its service loop, and exits when devmgr refuses it:
+devmgr serves the driver's endpoint only after the report, and withdraws
+it when the driver dies.
 
 Clients obtain a write cap through
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities), not svcmgr: a framebuffer

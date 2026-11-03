@@ -757,7 +757,7 @@ production value is raised.
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |
 | `DEPTH` | `core/ktest/src/integration/cspace_nested_teardown.rs` | 256 | test fixture (past the kernel-stack recursion depth) | none | correct as is | None |
 | `CHILDREN` | `core/ktest/src/integration/cap_transfer_large.rs` | 300 | test fixture (more than one reparent batch) | none | correct as is | None |
-| `MANY`, `P_PAGES` | `core/ktest/src/integration/arena_reclaim.rs` | 70 / 16 | test fixture (three arena pages of bodies; a donation past the inline records) | 280 B BSS | correct as is | None |
+| `MANY`, `P_PAGES`, `T_PAGES` | `core/ktest/src/integration/arena_reclaim.rs` | 70 / 16 / 8 | test fixture (three arena pages of bodies; a donation past the inline records; a slab holding a port-binding table) | 280 B BSS | correct as is | None |
 | `fatfs_slot_ceiling`, `FATFS_QUARANTINE_MAX` | `services/svctest/src/phases/fs_ipc.rs` | fs-fat's `slot_ceiling` of the RAM memmgr reports / `QUARANTINE_MAX`, imported | follows fs-fat | none | correct as is | None |
 | `INLINE_CHUNK` | `services/svctest/src/phases/fs_ipc.rs` | 504 | ABI width | none | correct as is | Use the derived constant |
 | `SYSTEM_TIME_BEFORE_2100_SECS` | `services/svctest/src/phases/timed.rs` | 4 102 444 800 | mirror of the cmos century fallback | none | correct as is | None |

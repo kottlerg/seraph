@@ -29,6 +29,11 @@
 //!    out to ktest's `CSpace`. When the `CSpace` dies, P comes back but for
 //!    the arena pages the moved bodies sit on, at least two, so P's span is
 //!    cut into several runs; P is whole again once the moved capabilities go.
+//! 5. Kept pages on freed table pages (x86-64): a `CSpace` made from one
+//!    8-page piece binds an `IoPort` to a thread of its own and deletes the
+//!    thread, whose port-binding table's pages go back to the top of its pool
+//!    with their record cell; the arena pages of case 4's bodies are carved
+//!    from them, and the piece comes back cut around them as in case 4.
 //!
 //! A RAM tail cannot be deleted in ktest (its destruction would free into the
 //! sealed buddy), so each tail is moved out to ktest's own `CSpace` before its
@@ -72,6 +77,9 @@ static SPLIT_TAIL: AtomicU32 = AtomicU32::new(0);
 const MANY: usize = 70;
 /// Pages of case 4's Memory piece P, donated in one augment.
 const P_PAGES: u64 = 16;
+/// Pages of case 5's Memory piece, the funding `CSpace`'s whole slab.
+#[cfg(target_arch = "x86_64")]
+const T_PAGES: u64 = 8;
 /// The copier's inputs, handles in its `CSpace`: the `Mmio` capability to
 /// derive from, ktest's `CSpace`, and the notification it signals when done.
 static COPY_SRC: AtomicU32 = AtomicU32::new(0);
@@ -208,7 +216,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     self_funded(ctx)?;
     mutually_funded(ctx)?;
     budget_floor(ctx)?;
-    kept_in_spilled_record(ctx)
+    kept_in_spilled_record(ctx)?;
+    #[cfg(target_arch = "x86_64")]
+    kept_on_freed_table_pages(ctx)?;
+    Ok(())
 }
 
 /// The probe `Mmio` capability init hands ktest, if the platform has one.
@@ -365,20 +376,14 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
         return Ok(());
     };
     let base_before = available(ctx.memory_base);
-    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
-        .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
-    let piece = memory_split(ctx.memory_base, size - P_PAGES * PAGE)
-        .map_err(|_| "integration::arena_reclaim: memory_split(memory_base) failed")?;
+    let piece = split_piece(ctx, P_PAGES)?;
     let Ok(a) = cap_create_cspace(ctx.memory_base, 0, 4)
     else
     {
         memory_merge(ctx.memory_base, piece).ok();
         return Err("integration::arena_reclaim: cap_create_cspace(A) failed");
     };
-    let done = cap_create_notification(ctx.memory_base);
     let placed = (|| {
-        let done =
-            done.map_err(|_| "integration::arena_reclaim: cap_create_notification failed")?;
         // The create-time slab and 15 augments fill the 16 inline records; P's
         // donation goes on a record page, taken from P itself.
         for _ in 0..15
@@ -388,6 +393,77 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
         }
         cap_create_cspace(piece, a, P_PAGES)
             .map_err(|_| "integration::arena_reclaim: the spilled augment failed")?;
+        place_moved_bodies(ctx, a, probe)
+    })();
+    finish_kept(ctx, a, piece, P_PAGES, base_before, placed)
+}
+
+/// Case 5 (x86-64): kept pages carved from pool pages a port-binding table
+/// gave back, which carry their donation record's cell from the table.
+#[cfg(target_arch = "x86_64")]
+fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
+{
+    let Some(probe) = probe_mmio(ctx)
+    else
+    {
+        crate::log(
+            "ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (no probe Mmio cap)",
+        );
+        return Ok(());
+    };
+    let base_before = available(ctx.memory_base);
+    let piece = split_piece(ctx, T_PAGES)?;
+    // Every page of A is P's: its create-time slab is P, its only donation.
+    let Ok(a) = cap_create_cspace(piece, 0, T_PAGES)
+    else
+    {
+        memory_merge(ctx.memory_base, piece).ok();
+        return Err("integration::arena_reclaim: cap_create_cspace(A from P) failed");
+    };
+    let mut bound = false;
+    let placed = (|| {
+        // A bound thread's first bind takes its table's three pages from A's
+        // pool; deleting the thread returns them to the top of the pool, each
+        // with its record's cell, where the arena then carves its pages.
+        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, a, 0, 0)
+            .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
+        bound = (1..=crate::unit::hw::scan_bound(ctx))
+            .any(|slot| syscall::ioport_bind(th, slot).is_ok());
+        cap_delete(th).ok();
+        if !bound
+        {
+            return Ok(());
+        }
+        place_moved_bodies(ctx, a, probe)
+    })();
+    if placed.is_ok() && !bound
+    {
+        cap_delete(a).ok();
+        memory_merge(ctx.memory_base, piece).ok();
+        crate::log(
+            "ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (no IoPort cap bound)",
+        );
+        return Ok(());
+    }
+    finish_kept(ctx, a, piece, T_PAGES, base_before, placed)
+}
+
+/// Split a piece of `pages` pages off the top of `memory_base`.
+fn split_piece(ctx: &TestContext, pages: u64) -> Result<u32, &'static str>
+{
+    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
+    memory_split(ctx.memory_base, size - pages * PAGE)
+        .map_err(|_| "integration::arena_reclaim: memory_split(memory_base) failed")
+}
+
+/// Have a thread bound to `a` derive `MANY` `Mmio` capabilities from a copy of
+/// `probe` in `a`, each a body in `a`'s arena, and move each into `COPIES`.
+fn place_moved_bodies(ctx: &TestContext, a: u32, probe: u32) -> TestResult
+{
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "integration::arena_reclaim: cap_create_notification failed")?;
+    let result = (|| {
         let src = cap_copy(probe, a, RIGHTS_ALL)
             .map_err(|_| "integration::arena_reclaim: cap_copy(probe) failed")?;
         let dest = cap_copy(ctx.cspace_cap, a, RIGHTS_ALL)
@@ -403,10 +479,24 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
         COPY_DONE.store(child_done, Ordering::Release);
         run_bound(ctx, a, done, copier_entry)
     })();
-    if let Ok(done) = done
-    {
-        cap_delete(done).ok();
-    }
+    cap_delete(done).ok();
+    result
+}
+
+/// Delete `a`, which `piece` (`pages` pages) funded and whose arena holds the
+/// bodies of `COPIES`, then the copies, and merge `piece` back. `placed` is the
+/// fixture's outcome. Checks that `piece` came back but for at least two kept
+/// pages while the copies lived, so its span was cut into several runs, and is
+/// whole once they go.
+fn finish_kept(
+    ctx: &TestContext,
+    a: u32,
+    piece: u32,
+    pages: u64,
+    base_before: u64,
+    placed: TestResult,
+) -> TestResult
+{
     let moved = COPIES
         .iter()
         .filter(|c| c.load(Ordering::Acquire) != 0)
@@ -430,11 +520,11 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
     {
         return Err("integration::arena_reclaim: the bodies were not placed and moved out");
     }
-    if held > (P_PAGES - 2) * PAGE
+    if held > (pages - 2) * PAGE
     {
         return Err("integration::arena_reclaim: fewer than two of P's arena pages were kept");
     }
-    if whole != P_PAGES * PAGE
+    if whole != pages * PAGE
     {
         return Err("integration::arena_reclaim: P's kept pages never came back");
     }

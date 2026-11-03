@@ -148,13 +148,20 @@ again from the recorded BootInfo address.
    rebased onto the direct map right after Phase 3 (wide enough to hold the HANDOFF_STACK_BYTES
    of stack the entry contract guarantees below the entry stack pointer, whatever its
    alignment), and the direct map of the
-   2 MiB chunks covering the carve.
+   first two 2 MiB chunks covering the carve (mm::paging::carve_bootstrap_end; all of them
+   when there are fewer), which hold at least 513 of its frames whenever it spans more, so
+   the seed's need is fixed by the image, not by RAM.
 4. Activate the tables: arch::current::paging::activate(root_phys). From here nothing
    reads BootInfo until step 9: everything later steps map was read from it before.
-5. Stage 2, from the carve, reached through the direct map: map the direct physical map —
+5. Stage 2, from the carve, reached through the direct map. First map the carve's other
+   chunks, each from frames of the part already mapped (mm::paging::map_carve_rest: a chunk
+   takes at most one table per level and makes 512 more frames reachable, and the pool hands
+   out only frames the direct map reaches), with a full local TLB fence after each chunk,
+   since its frames are written through the new entries next and RISC-V may cache an
+   invalid entry. Then map the direct physical map —
    - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
      AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
-     — at direct_map_base() + phys, less the carve's chunks mapped in step 3
+     — at direct_map_base() + phys, less the carve's chunks
    - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used, except that a
      2 MiB chunk holding an arch kernel MMIO page (xAPIC or I/O APIC on x86-64) is mapped as
      4 KiB pages, the MMIO pages uncacheable
@@ -424,21 +431,25 @@ Phase 7.
 ## Phase 7: Capability System
 
 ```
-1. Reserve init's Phase 9 backing (the InitInfo block and INIT_STACK_PAGES stack frames)
-   and seed the kernel page-table pool from the pristine buddy, then drain the remaining
-   buddy RAM as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`;
-   more extents than MAX_DRAIN_BLOCKS halt the boot with
-   "FATAL: Phase 7: drained RAM extents exceed MAX_DRAIN_BLOCKS"), seal the buddy, and
-   install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
-   (`cap::drain_and_install_seed`). SEED_RESERVE_BYTES is the boot footprint, about 376 KiB:
-   the root CSpace slab, init's address-space and thread slabs, and one 128-byte body for each
-   capability the InitInfo block can describe (about 670 at INIT_INFO_MAX_PAGES = 4), plus
-   alignment slack. A boot whose capabilities outnumber the block halts by name, in Phase 7 at
-   SEED or in Phase 9 at InitInfo; a memory map of more than about 640 AcpiReclaimable regions
-   is one such boot. Every drained extent exposed to userspace (each drained
-   extent, and the seed extent's tail past the reserve) is zeroed through the direct map
-   before step 3 mints it: free RAM still holds what firmware and the bootloader left there,
-   the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
+1. Reserve init's Phase 9 backing (the InitInfo block, zeroed, and INIT_STACK_PAGES stack frames)
+   and seed the kernel page-table pool from the pristine buddy, then drain the remaining buddy RAM
+   as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
+   buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
+   (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
+   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 655 at
+   INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
+   Phase 7: drained RAM extents exceed the InitInfo descriptor capacity", the one check the in-place
+   mint of step 3a relies on. Every capability Phases 7 and 8 mint then has its descriptor written
+   into that array, in place, so no copy of it exists, and a boot whose capabilities outnumber the
+   slots halts by name in Phase 7 or 8 ("cap: boot capabilities exceed the InitInfo descriptor
+   capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such boot. Phase
+   9's capabilities reach init through InitInfo header fields instead. SEED_RESERVE_BYTES is the
+   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs, and
+   one 128-byte body for each descriptor slot and for each Memory capability Phase 9 mints (init
+   segments, InitInfo pages, init stack pages), plus alignment slack. Every drained extent exposed
+   to userspace (each drained extent, and the seed extent's tail past the reserve) is zeroed through
+   the direct map before step 3 mints it: free RAM still holds what firmware and the bootloader left
+   there, the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
    reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
    pages: one wrapper page plus a slot-page pool holding at least
@@ -448,7 +459,11 @@ Phase 7.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
       drained contiguous extent, the seed extent contributing only its tail past
-      SEED_RESERVE_BYTES
+      SEED_RESERVE_BYTES. They are the first capabilities minted, in slot order (the drain's,
+      the largest extent promoted to slot 0), with
+      nothing between them: each extent is read whole from its slot, and its descriptor is
+      written over it, so slot i holds extent i and then descriptor i, and every extent not
+      yet read lies in a slot above the one being written
    b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
       kernel console UART (`BootInfo.kernel_mmio.uart_base`, or the platform
       default when that is zero; the range can also lie inside an aperture), then one per
@@ -655,8 +670,8 @@ calls `sched::enter()`.
       (page-aligned base and size, full rights, `owns_memory = true`, the
       range added to the buddy ledger by `register_owned_range`) so init can
       donate the frames to memmgr on reap
-   c. Fill the InitInfo region (InitInfo header, CapDescriptor array) in the
-      contiguous block reserved in Phase 7, map it read-only at the chosen
+   c. Write the InitInfo header in front of the CapDescriptor array Phases 7 and 8 left in the
+      contiguous block it reserved, map the region read-only at the chosen
       InitInfo VA (`choose_init_layout().init_info_va`), and mint a
       reclaimable Memory cap per mapped InitInfo page into the root CSpace
 4. Map init's user stack (inlined in `kernel_entry_post_rebase`):
@@ -788,8 +803,8 @@ through its drain until a teardown commits `Exited` over it (see
 | 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
-| 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents exceed MAX_DRAIN_BLOCKS |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace); a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window); an entropy self-test FAIL is printed and the boot continues |
+| 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

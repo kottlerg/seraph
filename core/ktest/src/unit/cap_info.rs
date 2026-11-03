@@ -18,6 +18,8 @@
 //! - `CAP_INFO_MEMORY_*` against a Memory cap, including `CAP_INFO_MEMORY_MAPPINGS`
 //!   following a frame's mappings into two address spaces and out again.
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
+//! - The `InitInfo` RAM Memory descriptors against their caps
+//!   (`ram_descriptors_match_caps`).
 //! - Negative paths: null slot index (`InvalidCapability`) and tag-mismatched
 //!   selector (`InvalidArgument`).
 
@@ -28,7 +30,7 @@ use syscall::{
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
-    CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, SyscallError,
+    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, SyscallError,
 };
 
 use crate::{TestContext, TestResult};
@@ -320,6 +322,54 @@ pub fn memory_caps_carry_retype_right(ctx: &TestContext) -> TestResult
     if has_retype != 1
     {
         return Err("memory_caps_carry_retype_right: MEMORY_HAS_RETYPE != 1");
+    }
+    Ok(())
+}
+
+/// Every RAM Memory descriptor `InitInfo` carries describes the cap in its
+/// slot: the `memory_count` descriptors for slots `memory_base..`, in slot
+/// order, each a `Memory` descriptor whose base is its cap's
+/// `CAP_INFO_MEMORY_PHYS_BASE` and whose size is at least its cap's
+/// `CAP_INFO_MEMORY_SIZE` (ktest's own start-up splits tails off some of
+/// them). The kernel writes these descriptors over the drained RAM extents
+/// they describe, in the `InitInfo` block itself
+/// (core/kernel/docs/initialization.md § Phase 7), so a write that overtook
+/// an extent not yet read would show here as a base or size of another
+/// extent.
+pub fn ram_descriptors_match_caps(ctx: &TestContext) -> TestResult
+{
+    use init_protocol::{CapType, InitInfo};
+    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+    // ktest's lifetime.
+    let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
+    let ram = || {
+        crate::init_info::descriptors(info).iter().filter(|d| {
+            d.cap_type == CapType::Memory
+                && (info.memory_base..info.memory_base + info.memory_count).contains(&d.slot)
+        })
+    };
+    if ram().count() != info.memory_count as usize || info.memory_count == 0
+    {
+        return Err("ram_descriptors_match_caps: not one descriptor per RAM Memory cap");
+    }
+    for (d, slot) in ram().zip(info.memory_base..)
+    {
+        if d.slot != slot
+        {
+            return Err("ram_descriptors_match_caps: RAM descriptors out of slot order");
+        }
+        let base = cap_info(d.slot, CAP_INFO_MEMORY_PHYS_BASE)
+            .map_err(|_| "ram_descriptors_match_caps: cap_info(PHYS_BASE) failed")?;
+        let size = cap_info(d.slot, CAP_INFO_MEMORY_SIZE)
+            .map_err(|_| "ram_descriptors_match_caps: cap_info(SIZE) failed")?;
+        if base != d.aux0
+        {
+            return Err("ram_descriptors_match_caps: a descriptor's base is not its cap's");
+        }
+        if size > d.aux1 || size == 0
+        {
+            return Err("ram_descriptors_match_caps: a cap is larger than its descriptor");
+        }
     }
     Ok(())
 }

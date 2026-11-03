@@ -427,9 +427,10 @@ changed line that names one of these items as a whole identifier or lies within 
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
   `discover_boot_hart_id` and `bsp_hardware_id` (the source of the BSP id that becomes
   `cpu_ids[0]`), and the handoff of the count and the CPU ids into `BootInfo` (`cpus.count` and
-  `cpus.cpu_ids`); in the kernel, the boot CPU count and ids (`info.cpu_count`, `info.cpu_ids`,
-  `boot_cpu_count`, and `boot_cpu_ids`), `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every
-  `init_ap`, and the `init_ap_*` per-CPU storage initialisers;
+  `cpus.cpu_ids`); in the kernel, the boot CPU count and ids (`info.cpu_count`,
+  `boot_cpu_count`, and `boot_cpu_ids`, which reads the ids in place), `start_ap`,
+  `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the `init_ap_*` per-CPU storage
+  initialisers;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
@@ -471,7 +472,7 @@ S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|ini
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
-S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
+S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
@@ -588,14 +589,15 @@ from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
 `master`, taken again when `master` changes that code before the merge.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
-a non-inert change to the memory surface: the code that sizes or maps physical memory by the
-guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
-`core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
-within the definition of, one of these items: the boot memory map and the direct map
-(`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
-`init_kernel_page_tables`, `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve,
-`stage2_table_bound` and `find_boot_table_carve`), and the drain of RAM into Memory caps
-(`drain_and_install_seed`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
+a non-inert change to the memory surface: the code that sizes or maps physical memory by the guest's
+RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and `core/kernel/src/mm/init.rs` as
+a whole, and, in any other file, a changed line that names, or lies within the definition of, one of
+these items: the boot memory map and the direct map (`translate_memory_map`, `max_ram_address`,
+`direct_map_ceiling`, `compute_max_physical_address`, `init_kernel_page_tables`,
+`BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve, `stage2_table_bound`, `find_boot_table_carve`,
+and its bootstrap, `carve_bootstrap_end`, `carve_frames_below`, `map_carve_rest`, `switch_to_carve`,
+and `extend_carve_mapped`), and the drain of RAM into Memory caps (`drain_and_install_seed`,
+`INIT_INFO_DESCRIPTOR_CAPACITY`, `populate_cspace`, `complete_extent_descriptors`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
 `frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
@@ -605,8 +607,9 @@ boundary one does:
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
 M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
-M="$M|drain_and_install_seed"
-M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
+M="$M|carve_bootstrap_end|carve_frames_below|map_carve_rest|switch_to_carve|extend_carve_mapped"
+M="$M|drain_and_install_seed|complete_extent_descriptors"
+M="$M|INIT_INFO_DESCRIPTOR_CAPACITY|populate_cspace|INIT_INFO_MAX_PAGES"
 M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
@@ -777,11 +780,11 @@ list as the tracking Issues move):
   into the fewest contiguous Memory caps before minting (see
   [process-lifecycle.md § Kernel → init](process-lifecycle.md#kernel--init)), so the descriptor
   count tracks memory-map fragmentation (a small fixed number of usable extents
-  plus reservation holes), not total RAM. The Phase-9 size check now logs the
-  descriptor count, page need, and `INIT_INFO_MAX_PAGES` before fatal-ing, so
-  any residual overflow on a pathologically fragmented map is diagnosable rather
-  than bare. Verified booting clean to the ktest pass marker on both arches at
-  `--mem 4096`.
+  plus reservation holes), not total RAM. The capacity check now runs at Phase 7,
+  where the drain and `push_descriptor` log the count against
+  `INIT_INFO_DESCRIPTOR_CAPACITY` before fatal-ing, so any residual overflow on a
+  pathologically fragmented map is diagnosable rather than bare. Verified booting
+  clean to the ktest pass marker on both arches at `--mem 4096`.
 
 ---
 

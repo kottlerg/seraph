@@ -259,8 +259,8 @@ written.
 
 The boundary runs measure the scaling rather than assume it: they save their logs, and
 `cargo xtask ktest-timing` reports each cell's wall time between its start line and its `PASS` or
-`FAIL` line, the ratio of its x86_64 128-vCPU time to its 16-vCPU time against the width factor
-(8), and each width's times against a checked-in baseline of that width
+`FAIL` line, the ratio of its 128-CPU time to its 16-CPU time on each architecture against the
+width factor (8), and each width's times against a checked-in baseline of that width
 ([docs/testing.md § Coverage tiers](../../docs/testing.md#coverage-tiers), Timing report). A
 cell whose time grows faster than the width shows there before it outlives a budget; the report
 flags it and blocks nothing until its threshold is made a gate.

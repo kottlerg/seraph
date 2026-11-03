@@ -348,10 +348,10 @@ cells automatically; variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 64, 65, and 128 harts; x86_64 16 and 128 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
-65-vCPU guest is a ~16× thread oversubscription and a 128-vCPU guest a
+16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
 ~32×. High `-smp` coverage is local by design, not an oversight. The local
 host runs below are procedurally REQUIRED for the PRs that owe them, and the
 release host runs for each tag — binding the same way the
@@ -477,23 +477,22 @@ git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```
 
 The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
-count says): riscv64 64, 65, and 128 harts, and x86_64 16 and 128 vCPUs. No run is wider than 128
-CPUs, on either architecture: the 256- and 512-vCPU runs are removed from every set by the
-maintainer's decision on [#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU
-run (`MAX_CPUS`) took most of an hour and saturated the host, and a raised `MAX_CPUS` is past any
-local host's reach; Known boundaries below states what covers the widths past 128. Every run
-saves its log for the timing report below (`--save-logs`).
+count says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
+vCPUs. No run is wider than 128 CPUs, on either architecture: the 256- and 512-vCPU runs are removed
+from every set by the maintainer's decision on
+[#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU run (`MAX_CPUS`) took most
+of an hour and saturated the host, and a raised `MAX_CPUS` is past any local host's reach; Known
+boundaries below states what covers the widths past 128. Every run saves its log for the timing
+report below (`--save-logs`).
 
 ```sh
-# Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 64- and
-# 65-hart runs take ~230 s each, the 128-hart run ~580 s at 8x hart
+# Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 16-hart
+# run, at 1x, takes ~95 s; the 128-hart run ~580 s at 8x hart
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 720 \
-    --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 720 \
+cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 300 \
     --save-logs $T
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
     --save-logs $T
@@ -512,23 +511,27 @@ cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeou
 
 # Timing report (report only; see below):
 B=xtask/baselines/ktest-timing
-cargo xtask ktest-timing --base $T/x86_64-16cpu-1.log --wide $T/x86_64-128cpu-1.log
-for w in riscv64-64 riscv64-65 riscv64-128 x86_64-16 x86_64-128; do
+for a in riscv64 x86_64; do
+    cargo xtask ktest-timing --base $T/$a-16cpu-1.log --wide $T/$a-128cpu-1.log
+done
+for w in riscv64-16 riscv64-128 x86_64-16 x86_64-128; do
     cargo xtask ktest-timing --baseline $B/${w}cpu.txt $T/${w}cpu-1.log
 done
 ```
 
 Each budget is the larger of three times the measured run and the measured run plus the longest
 failing bound ktest stretches at that width (`split_delete_race`'s 100 s exit poll, through
-`scaled_polls`: 100 s at 16 CPUs, 400 s at 64 and 65, 800 s at 128), rounded up to a minute, so a
+`scaled_polls`: 100 s at 16 CPUs, 800 s at 128), rounded up to a minute, so a
 stuck cell reaches its own FAIL line before `run-parallel` classifies the run as a HANG. A change
 to the measured runs or to the longest stretched bound re-derives the budgets.
 
-The 16-vCPU run is the 1x width the scaling below starts past (`UNSCALED_CPUS`, the reference
-host's core count); the 65-hart run is the first count past a 64-bit word; the 128-hart run is the
-count at which hart-scaled firmware allocations once collided with the kernel image's load address
-([#377](https://github.com/kottlerg/seraph/issues/377)); the two 128-CPU runs are the widest, two
-full mask words at 8x oversubscription.
+The two 16-CPU runs are the 1x width the scaling below starts past (`UNSCALED_CPUS`, the reference
+host's core count) and each architecture's base for the timing report's cross-width comparison.
+The two 128-CPU runs are the widest, two full mask words at 8x oversubscription; 128 harts is also
+the count at which hart-scaled firmware allocations once collided with the kernel image's load
+address ([#377](https://github.com/kottlerg/seraph/issues/377)). The partial-word mask paths, a
+count past one 64-bit word that does not fill the next, are host-tested rather than booted (Known
+boundaries below).
 
 Past 16 CPUs ktest stretches the wall-clock bounds
 [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists by the
@@ -541,19 +544,19 @@ width; the boundary runs measure it. `cargo xtask ktest-timing`
 ([xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) reads the saved logs and reports,
 per tier and per cell, the wall time between the stamps ktest prints (a cell's start line and its
 `PASS` or `FAIL` line), with the boot to ktest's start, ktest's span, and the host's wall time for
-the run below them. Across widths it reports the x86_64 16- and 128-vCPU times, their ratio `R`,
-and `R/F`, the ratio over the width factor `F` (8). Within a width it compares each log with the
-baseline of its architecture and width under `xtask/baselines/ktest-timing/`, whose header records
-the commit and the reference host's CPU, kernel, QEMU, and accelerator settings (KVM's module
-parameters on x86_64), and warns when the host running the comparison differs. A row is flagged
-when `R/F`, or its ratio to the baseline, exceeds 1.5 and its time exceeds the expected one (`F`
-times the base, or the baseline's) by at least 1 s; the cells are listed by that ratio, highest
+the run below them. Across widths it reports, per architecture, the 16- and 128-CPU times, their
+ratio `R`, and `R/F`, the ratio over the width factor `F` (8). Within a width it compares each log
+with the baseline of its architecture and width under `xtask/baselines/ktest-timing/`, whose header
+records the commit and the reference host's CPU, kernel, QEMU, and accelerator settings (KVM's
+module parameters on x86_64), and warns when the host running the comparison differs. A row is
+flagged when `R/F`, or its ratio to the baseline, exceeds 1.5 and its time exceeds the expected one
+(`F` times the base, or the baseline's) by at least 1 s; the cells are listed by that ratio, highest
 first. Every cell makes the same attempts at both widths, so `R` is the growth of the cell's whole
 cost. The report is a report, not a gate: a PR that owes the boundary set carries it in its body,
-and no flag blocks a PR or a tag until the threshold is calibrated against the baselines and made
-a gate. A baseline is rewritten on the reference host: from runs at a `master` commit when the
-host's QEMU, kernel, or accelerator settings change, and by the PR that changes a cell's cost on
-purpose, from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
+and no flag blocks a PR or a tag until the threshold is calibrated against the baselines and made a
+gate. A baseline is rewritten on the reference host: from runs at a `master` commit when the host's
+QEMU, kernel, or accelerator settings change, and by the PR that changes a cell's cost on purpose,
+from runs at a commit of that PR whose boot-image code (the `ktest-commit` of
 [xtask/README.md](../xtask/README.md#cargo-xtask-ktest-timing)) is the code its merge brings to
 `master`, taken again when `master` changes that code before the merge.
 
@@ -588,7 +591,7 @@ cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1
 **Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
 its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
 cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
-the riscv64 64- and 65-hart and the x86_64 128-vCPU boundaries three times each (`--runs 3`),
+the riscv64 16-hart and the x86_64 16- and 128-vCPU boundaries three times each (`--runs 3`),
 whether or not its diff changes the CPU-count surface: a race in those mechanisms can fail rarely
 enough that one run misses it. That PR's other owed runs stay at `--runs 1`. A concurrency fix
 elsewhere is not a concurrency-fix purpose, and a change to those mechanisms' files without that
@@ -623,9 +626,9 @@ owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a 
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), the maintainer MUST run, on the commit to be tagged, the riscv64 64- and
-65-hart and the x86_64 128-vCPU boundaries three times each (`--runs 3`), the
-riscv64 128-hart and the x86_64 16-vCPU boundaries once each, and the memory
+4), the maintainer MUST run, on the commit to be tagged, the riscv64 16-hart and
+the x86_64 16- and 128-vCPU boundaries three times each (`--runs 3`), the
+riscv64 128-hart boundary once, and the memory
 variation once, so every tag boots at each boundary CPU count, and runs the timing
 report on the boundary logs, which is reported and blocks nothing. A run whose
 outcome is not a pass, as When the runs are owed classifies outcomes, blocks the
@@ -687,8 +690,10 @@ list as the tracking Issues move):
   `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
   past one block, a run that cannot be found, and requests of one block or
   less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
-  (`sched::slab_pages`), the 65-hart boot for the first mask-word crossing,
-  and the 128-CPU boots for two full words.
+  (`sched::slab_pages`), the host tests of the partial-word mask paths in
+  place of a boot at a count past one word (`range_spans_words`, and
+  `range_at_max_cpus_covers_every_index_and_one_less_drops_the_top` for the
+  top index), and the 128-CPU boots for two full words.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

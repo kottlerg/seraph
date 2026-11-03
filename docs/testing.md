@@ -474,35 +474,38 @@ git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 
 The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
 count says): riscv64 64, 65, and 128 harts, and x86_64 16 and 128 vCPUs. No run is wider than 128
-CPUs, on either architecture: `MAX_CPUS` (512) is wider than a local host boots in a bounded time,
-and Known boundaries below states what covers the widths past 128. Every run saves its log for the
-timing report below (`--save-logs`).
+CPUs, on either architecture: the 256- and 512-vCPU runs are removed from every set by the
+maintainer's decision on [#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU
+run (`MAX_CPUS`) took most of an hour and saturated the host, and a raised `MAX_CPUS` is past any
+local host's reach; Known boundaries below states what covers the widths past 128. Every run
+saves its log for the timing report below (`--save-logs`).
 
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 64- and
-# 65-hart runs take ~70 s each, the 128-hart run ~2-3 min at 8x hart
-# oversubscription; each budget, about three times the run, is for HANG
-# classification):
+# 65-hart runs take ~115 s and ~120 s, the 128-hart run ~220 s at 8x hart
+# oversubscription; each budget, three times the run rounded up to a minute,
+# is for HANG classification):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 600 \
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 360 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 600 \
+cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 420 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 660 \
     --save-logs $T
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
-# run is 1x and the 128-vCPU run 8x vCPU oversubscription, where every
-# cross-CPU step can wait for a host core; each budget, about three times the
-# run, is for HANG classification):
+# run, at 1x, takes ~55 s; the 128-vCPU run, at 8x vCPU oversubscription,
+# ~27 s, since its scaled cells make an eighth of their attempts and idle
+# vCPUs halt; each budget, three times the run rounded up to a minute, is for
+# HANG classification):
 cargo xtask clean
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 600 \
+cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
     --save-logs $T
-cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 1800 \
+cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 120 \
     --save-logs $T
 
 # Timing report (report only; see below):
@@ -539,7 +542,9 @@ times the base, or the baseline's) by at least 1 s; the cells are listed by that
 first. A cell whose attempt count is scaled (a † knob of
 [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress)) makes `1/F` of its
 attempts at the wide width, down to its floor, so its `R/F` understates the growth of one attempt by
-up to `F`; the baseline comparison is the check for such a cell. The report is a report, not a
+up to `F`: on the reference host the whole of Tier S at 128 vCPUs takes 0.28 times its 16-vCPU
+time, which, at one eighth of the attempts, is about 2.2 times the cost of one attempt. The
+baseline comparison is the check for such a cell. The report is a report, not a
 gate: a PR that owes the boundary set carries it in its body, and no flag blocks a PR or a tag
 until the threshold is calibrated against the baselines and made a gate. A baseline is rewritten,
 on the reference host and from runs at a `master` commit, by the PR that changes a cell's cost on

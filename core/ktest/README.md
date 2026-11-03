@@ -249,7 +249,8 @@ event and memory polls of `integration::fault_kills_thread`,
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of
 `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`, the
-convergence polls of `thread::load_balancer_redistributes_skewed`; the exit and come-up polls of
+convergence polls of `thread::load_balancer_redistributes_skewed`, the exit wait of
+`thread::bind_notification_nodes_come_from_the_queue`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, the
 controller polls of `sleep_list_wide`, the first-fault and death polls of `fault_bind_race`, and the

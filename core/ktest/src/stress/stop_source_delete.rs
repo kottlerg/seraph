@@ -377,7 +377,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_source_delete: pin controller failed")?;
     // Each round's waiter start, cross-CPU action and teardown grow with the
-    // width; the count shrinks with it.
+    // width; the count shrinks with it (a phase not yet armed runs on, up to
+    // `CYCLES`, see `rounds`).
     let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus), cpus);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_source_delete: restore controller affinity failed");
@@ -385,8 +386,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     restore
 }
 
-/// Run every phase of `cycles` rounds and check each; the served-call phases
-/// only with [`SERVED_MIN_CPUS`] CPUs.
+/// Run every phase (at least `cycles` rounds each, see [`rounds`]) and check
+/// each; the served-call phases only with [`SERVED_MIN_CPUS`] CPUs.
 fn phases(ctx: &TestContext, cycles: u32, cpus: u64) -> TestResult
 {
     for race in [Race::Stop, Race::ThreadDelete]
@@ -603,18 +604,17 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen,
             released = Err("stress::stop_source_delete: delete racer or server failed");
         }
     }
-    let mut seen = result?;
+    let seen = result?;
     ended?;
     server_ended?;
     released?;
-    load_child_tallies(&mut seen);
     Ok(seen)
 }
 
-/// Copy the waiters' and the server's tallies into `seen`. Stable between
-/// rounds: by a round's end the racer and the server have acknowledged it
-/// and its waiter has exited, been deleted, or (served-call stop phase) is
-/// stopped.
+/// Copy the waiters' and the server's tallies into `seen`. Stable once a
+/// round is released: the racer and the server have acknowledged it, and its
+/// waiter has exited or been deleted (the round's teardown deletes a stopped
+/// served-call caller).
 fn load_child_tallies(seen: &mut Seen)
 {
     seen.interrupted = INTERRUPTED.load(Ordering::Acquire);

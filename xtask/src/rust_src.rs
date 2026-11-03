@@ -60,6 +60,7 @@
 //! assembly time); our overlays apply to files by unlink-then-write so
 //! the shared inode with the real toolchain is never mutated.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -705,10 +706,11 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
             .join(rel)
             .canonicalize()
             .with_context(|| format!("canonicalising {rel}"))?;
-        block.push_str(&format!(
-            "{name} = {{ path = \"{}\"{extra}, features = [\"rustc-dep-of-std\"] }}\n",
+        writeln!(
+            block,
+            "{name} = {{ path = \"{}\"{extra}, features = [\"rustc-dep-of-std\"] }}",
             path.display()
-        ));
+        )?;
     }
 
     let text = fs::read_to_string(&cargo_toml)

@@ -12,14 +12,18 @@
 //!
 //! Two-round bootstrap (mirrors `services/drivers/virtio/blk`):
 //!   Round 1 (non-terminal): `[service_ep, mmio_cap]`
-//!   Round 2 (terminal):     `[devmgr_query_ep]` (badged SEND for
-//!                            `QUERY_DEVICE_INFO` with this device's
-//!                            catalog index in the badge)
+//!   Round 2 (terminal):     `[devmgr_query_ep]` (a SEND badged with this
+//!                            device's catalog badge on the private driver
+//!                            endpoint of its devmgr spawn batch)
 //!
 //! After bootstrap the driver queries devmgr for its
 //! [`boot_protocol::FramebufferInfo`] (geometry: width, height,
-//! stride, pixel format) and uses the `byte_len` in the reply to size
-//! the MMIO mapping (`stride * height` rounded up to pages).
+//! stride, pixel format) on the query cap and uses the `byte_len` in the
+//! reply to size the MMIO mapping (`stride * height` rounded up to pages).
+//! Once the framebuffer is mapped it reports ready (`DRIVER_READY`) on the
+//! same cap, immediately before its service loop: devmgr serves the
+//! driver's endpoint only after that report, and the driver exits when
+//! devmgr refuses it.
 //!
 //! `FB_WRITE_BYTES` payloads are UTF-8. The service loop holds a single
 //! `text::Utf8Decoder`; partial multi-byte sequences are buffered across
@@ -335,5 +339,10 @@ fn main() -> !
         syscall::thread_exit();
     };
 
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if !unsafe { ipc::report_driver_ready(caps.devmgr_query_ep, ipc_buf) }
+    {
+        syscall::thread_exit();
+    }
     service_loop(caps.service_ep, writer, ipc_buf);
 }

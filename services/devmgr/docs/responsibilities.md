@@ -67,11 +67,13 @@ devmgr's responsibilities are:
   `DRIVER_READY` after it, immediately before its service loop. devmgr waits on
   the batch's wait set, serving those two labels on the private endpoint and
   taking deaths from the queue, until every driver of the batch has reported
-  ready or died. It then revokes the private endpoint and withdraws each driver
-  that died (its service endpoint revoked and deleted, its BAR and IRQ caps
-  released, its catalog entry kept so the badge is never reused), so no
-  `QUERY_*` reply hands out the endpoint of a VirtIO driver that failed its
-  device setup. The instance ordinals count only the served drivers.
+  ready or died, and then takes every death still queued. It then revokes the
+  private endpoint and withdraws each driver that died (its service endpoint
+  revoked and deleted, its BAR and IRQ caps released). The catalog entry of a
+  withdrawn driver, or of one that failed to spawn, stays, so a badge is never
+  reused. No `QUERY_*` reply hands out the endpoint of a VirtIO driver that
+  failed its device setup. The instance ordinals count only the served
+  drivers.
 
   The serving order follows from where each batch settles. The virtio-blk
   batch settles during initial enumeration, before the registry loop opens.
@@ -97,7 +99,7 @@ devmgr's responsibilities are:
   handler already has the same deadlock window. A driver that hangs in its
   setup without dying stalls the settle, since the wait has no timeout. A
   driver that dies after reporting ready stays served, because devmgr keeps
-  no death observation past the settle. Neither case is handled; the serial,
+  no death observation past the settle. Neither case is handled (#695); the serial,
   framebuffer, and RTC drivers, which spawn through the simple-device path,
   report no readiness.
 
@@ -230,6 +232,7 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md),
 [services/drivers/goldfish-rtc/README.md](../../drivers/goldfish-rtc/README.md),
 [services/drivers/serial/README.md](../../drivers/serial/README.md),
+[services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md),
 [services/drivers/virtio/input/README.md](../../drivers/virtio/input/README.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),

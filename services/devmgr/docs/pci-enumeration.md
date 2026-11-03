@@ -141,19 +141,29 @@ For each matched device, devmgr:
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is
    served) or `CREATE_FROM_FILE` for an on-disk one (virtio-input, whose
-   steps 4-6 run later, once `SET_DRIVERS_DIR` delivers the drivers
+   steps 4-8 run later, once `SET_DRIVERS_DIR` delivers the drivers
    directory).
 5. Starts the driver (`START_PROCESS`).
 6. Serves the driver's bootstrap rounds over `ipc::bootstrap`, in the shape
    `virtio_core::bootstrap` specifies: round 1 carries the BAR `Mmio` caps in
    the order of step 1, with each cap's PCI BAR index as the matching data
    word; round 2 carries the positional slots service endpoint, IRQ, and a
-   per-device badged SEND on devmgr's registry endpoint, packed with
-   `ipc::bootstrap::pack_slots` (presence word in `data[0]`), and ends the
-   bootstrap. The IRQ slot is absent when the device has no private line;
-   virtio-input then polls, and virtio-blk, which requires the IRQ, is not
-   spawned. A driver checks the delivered BAR indices against the layout it
-   computes from its `QUERY_DEVICE_INFO` reply and exits on a mismatch.
+   SEND badged with the device's badge on the private driver endpoint of the
+   class's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
+   word in `data[0]`), and ends the bootstrap. The IRQ slot is absent when the
+   device has no private line; virtio-input then polls, and virtio-blk, which
+   requires the IRQ, is not spawned. A driver checks the delivered BAR indices
+   against the layout it computes from its `QUERY_DEVICE_INFO` reply and exits
+   on a mismatch.
+7. Binds a death observer on the driver's thread to the batch's death event
+   queue, with the device badge as the correlator.
+8. Once every device of the class has been through steps 1-7, settles the
+   batch: serves the drivers' `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on
+   the private endpoint and takes their deaths until every driver has
+   reported ready or died, then revokes the private endpoint, serves the
+   drivers that reported ready, and withdraws the rest (see
+   [responsibilities.md](responsibilities.md#responsibilities)
+   § Responsibilities).
 
 ---
 

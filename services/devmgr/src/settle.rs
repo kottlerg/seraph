@@ -12,17 +12,20 @@
 //! set over both. Each driver's round-2 devmgr query cap is a SEND on the
 //! private endpoint badged with its device badge, and devmgr binds a death
 //! observer on the driver's thread with that badge as the correlator.
-//! [`SettleBatch::settle`] then serves the drivers' `QUERY_DEVICE_INFO` and
-//! `DRIVER_READY` calls on the private endpoint and takes their deaths from
-//! the event queue until the [`Roster`] is settled. It does not receive on the
+//! [`SettleBatch::settle`] then runs the host-tested [`roster::settle`] loop:
+//! it serves the drivers' `QUERY_DEVICE_INFO` and `DRIVER_READY` calls on the
+//! private endpoint and takes their deaths from the event queue until the
+//! [`Roster`] is settled, then takes every death still queued. It does not
+//! receive on the
 //! registry endpoint, so registry callers stay queued until devmgr returns to
 //! its registry loop: devmgr replies to a received call before its next
 //! receive and holds no saved reply capability, so it cannot serve other
 //! labels while a query on the settling class waits. See
-//! `services/devmgr/docs/responsibilities.md` § Relationship to drivers.
+//! `services/devmgr/docs/responsibilities.md` § Responsibilities.
 
-use firmware::roster::{ReadyReport, Roster};
+use firmware::roster::{self, Roster, SettleEvents, SettleWake};
 use ipc::IpcMessage;
+use ipc::recv_guard::RecvGuard;
 
 use crate::DeviceCatalog;
 
@@ -120,56 +123,73 @@ impl SettleBatch
     }
 
     /// Serve the batch's drivers until `roster` is settled: every driver has
-    /// called `DRIVER_READY` or died. A wait-set failure ends the settle
-    /// early, logged, and the drivers still pending are not served.
+    /// called `DRIVER_READY` or died; then take every death still queued. A
+    /// wait-set failure ends the settle early, logged, and the drivers still
+    /// pending are not served.
     pub fn settle<T>(&self, roster: &mut Roster<T>, catalog: &DeviceCatalog, ipc_buf: *mut u64)
     {
-        let mut guard = ipc::recv_guard::RecvGuard::new(crate::recv_diag);
-        while !roster.is_settled()
+        let mut events = BatchEvents {
+            batch: self,
+            catalog,
+            ipc_buf,
+            guard: RecvGuard::new(crate::recv_diag),
+        };
+        if let Err(e) = roster::settle(&mut events, roster)
         {
-            match syscall::wait_set_wait(self.wait_set)
+            std::os::seraph::log!("settle: wait set failed (err={e}); pending not served");
+        }
+    }
+}
+
+/// A [`SettleBatch`]'s kernel objects as the settle loop drives them.
+struct BatchEvents<'a>
+{
+    batch: &'a SettleBatch,
+    catalog: &'a DeviceCatalog,
+    ipc_buf: *mut u64,
+    guard: RecvGuard,
+}
+
+impl<T> SettleEvents<T> for BatchEvents<'_>
+{
+    type Error = i64;
+
+    fn wait(&mut self) -> Result<SettleWake, i64>
+    {
+        Ok(match syscall::wait_set_wait(self.batch.wait_set)?
+        {
+            WS_BADGE_DEATH => SettleWake::Death,
+            WS_BADGE_DRIVER => SettleWake::Driver,
+            _ => SettleWake::Other,
+        })
+    }
+
+    fn try_death(&mut self) -> Option<u64>
+    {
+        syscall::event_try_recv(self.batch.death_eq).ok()
+    }
+
+    fn serve_driver(&mut self, roster: &mut Roster<T>)
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        match unsafe { ipc::ipc_recv(self.batch.driver_ep, self.ipc_buf) }
+        {
+            Ok(msg) =>
             {
-                Ok(WS_BADGE_DEATH) => self.drain_deaths(roster),
-                Ok(WS_BADGE_DRIVER) =>
-                {
-                    // SAFETY: ipc_buf is the registered IPC buffer.
-                    match unsafe { ipc::ipc_recv(self.driver_ep, ipc_buf) }
-                    {
-                        Ok(msg) =>
-                        {
-                            guard.on_success();
-                            serve_driver(&msg, roster, catalog, ipc_buf);
-                        }
-                        Err(e) => guard.on_failure(e),
-                    }
-                }
-                Ok(_) =>
-                {}
-                Err(e) =>
-                {
-                    std::os::seraph::log!("settle: wait set failed (err={e}); pending not served");
-                    return;
-                }
+                self.guard.on_success();
+                serve_driver(&msg, roster, self.catalog, self.ipc_buf);
             }
+            Err(e) => self.guard.on_failure(e),
         }
     }
 
-    /// Mark dead every driver whose death the event queue holds. The
-    /// correlator, the post's high 32 bits, is the driver's device badge.
-    fn drain_deaths<T>(&self, roster: &mut Roster<T>)
+    fn on_death(&mut self, badge: u64, reason: u64)
     {
-        while let Ok(post) = syscall::event_try_recv(self.death_eq)
-        {
-            let badge = post >> 32;
-            if roster.mark_dead(badge)
-            {
-                std::os::seraph::log!(
-                    "settle: driver of device {} died before it was served (reason={:#x})",
-                    badge,
-                    post & 0xFFFF_FFFF
-                );
-            }
-        }
+        std::os::seraph::log!(
+            "settle: driver of device {} died before the batch settled (reason={:#x})",
+            badge,
+            reason
+        );
     }
 }
 
@@ -206,13 +226,13 @@ fn serve_driver<T>(
                 crate::reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
                 return;
             }
-            let code = match roster.mark_ready(msg.badge)
+            let code = if roster.mark_ready(msg.badge).is_accepted()
             {
-                ReadyReport::Accepted | ReadyReport::Repeated => ipc::devmgr_errors::SUCCESS,
-                ReadyReport::AfterDeath | ReadyReport::Unknown =>
-                {
-                    ipc::devmgr_errors::INVALID_REQUEST
-                }
+                ipc::devmgr_errors::SUCCESS
+            }
+            else
+            {
+                ipc::devmgr_errors::INVALID_REQUEST
             };
             crate::reply_status(code, ipc_buf);
         }

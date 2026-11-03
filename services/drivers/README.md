@@ -90,9 +90,12 @@ The full driver lifecycle is specified in
 - **Per-device capabilities** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   delegates the minimum capability set for each device: MMIO region, optional
   interrupt line, the service endpoint, IoPort (x86-64) where applicable, and, for
-  drivers that fetch runtime metadata (PCI drivers, the framebuffer), a badged SEND
-  on devmgr's
-  [registry-query endpoint](../devmgr/docs/responsibilities.md#capabilities-received).
+  drivers that fetch runtime metadata, a badged SEND devmgr answers device-info
+  queries on: for the framebuffer, on devmgr's
+  [registry-query endpoint](../devmgr/docs/responsibilities.md#capabilities-received);
+  for the VirtIO PCI drivers, on the private endpoint of their spawn batch, on which
+  each also reports `DRIVER_READY` once its device is set up (devmgr serves a VirtIO
+  driver only after that report, then revokes the private endpoint).
   See [docs/capability-model.md](../../docs/capability-model.md) for capability
   types and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)

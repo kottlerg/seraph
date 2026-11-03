@@ -20,7 +20,9 @@ TODO: specify driver teardown.
    It MUST NOT assume any capabilities beyond what devmgr delegates.
 4. A driver serves client requests on the service endpoint devmgr creates and delivers in its
    bootstrap round; devmgr keeps the endpoint and mints client SEND caps from its device
-   registry (`QUERY_*_DEVICE`); see
+   registry (`QUERY_*_DEVICE`). A VirtIO PCI driver MUST report `DRIVER_READY` on its devmgr
+   query cap once its device is set up, immediately before its service loop: devmgr serves its
+   endpoint only after that report; see
    [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities.
 5. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where

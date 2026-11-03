@@ -97,8 +97,9 @@ fn main() -> !
     // VIRTIO_PCI; framebuffer (spawned later) uses kind FRAMEBUFFER.
     let mut catalog = DeviceCatalog::default();
 
-    // One service endpoint per running virtio-blk driver, in BDF order:
-    // `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it.
+    // One service endpoint per served virtio-blk driver (one that reported
+    // its device ready), in BDF order: `QUERY_BLOCK_DEVICE`'s instance
+    // ordinal indexes it.
     let blk_eps = spawn_virtio_blk_all(&devices, &mut caps, &mut irq_range, ipc_buf, &mut catalog);
 
     // Spawn the serial (UART) driver via the non-PCI simple-device path.
@@ -155,7 +156,8 @@ fn main() -> !
     // Service endpoints of the on-disk virtio-input drivers, in BDF order.
     // devmgr owns them and mints client SEND caps on `QUERY_INPUT_DEVICE`,
     // whose instance ordinal indexes this list. Empty until the
-    // `SET_DRIVERS_DIR` handler spawns the drivers; a failed spawn adds none.
+    // `SET_DRIVERS_DIR` handler spawns and settles the drivers; a driver that
+    // fails to spawn or dies before reporting ready adds none.
     let mut input_eps: Vec<u32> = Vec::new();
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
@@ -503,8 +505,9 @@ fn main() -> !
             {
                 // Like QUERY_RTC_DEVICE: the drivers are spawned on-disk by the
                 // SET_DRIVERS_DIR handler, so `input_eps` is empty until then
-                // and holds no entry for a failed spawn — reply NO_DEVICE for an
-                // ordinal no running driver has.
+                // and holds no entry for a driver that failed to spawn or died
+                // before reporting ready — reply NO_DEVICE for an ordinal no
+                // served driver has.
                 // Do not `seraph::log!` here (deadlock risk if logd ever fans
                 // input queries through devmgr).
                 if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
@@ -1058,7 +1061,8 @@ impl DeviceInfoEntry
 /// drivers are spawned. Devmgr does not interpret payload bytes; the
 /// per-class shape lives in the driver crate (e.g.
 /// `virtio_core::VirtioPciStartupInfo::from_bytes`). An entry's badge is
-/// its index + 1.
+/// its index + 1. Entries are never removed, a failed or withdrawn driver's
+/// included, so a badge is never recycled.
 #[derive(Default)]
 pub struct DeviceCatalog
 {
@@ -1080,13 +1084,6 @@ impl DeviceCatalog
         self.entries.try_reserve(1).ok()?;
         self.entries.push(entry);
         u64::try_from(self.entries.len()).ok()
-    }
-
-    /// Drop the newest entry, whose driver failed to spawn before its badge
-    /// was delivered, so no live badge ever names a recycled slot.
-    pub fn drop_newest(&mut self)
-    {
-        self.entries.pop();
     }
 }
 
@@ -1308,7 +1305,6 @@ fn spawn_virtio_blk_all(
         else
         {
             dev_caps.release();
-            catalog.drop_newest();
         }
     }
     batch.settle(&mut roster, catalog, ipc_buf);

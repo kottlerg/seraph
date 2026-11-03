@@ -1481,9 +1481,9 @@ pub mod devmgr_labels
     ///
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
-    /// entry gets `INVALID_REQUEST`. The catalog only grows (a failed spawn
-    /// drops its own entry before the badge is delivered), so a live badge
-    /// is never recycled and its `u64` width bounds no catalog size. No
+    /// entry gets `INVALID_REQUEST`. The catalog only grows (the entry of a
+    /// driver that failed to spawn or was withdrawn stays), so a badge is
+    /// never recycled and its `u64` width bounds no catalog size. No
     /// authority bit is checked. Devmgr
     /// stores the
     /// payload bytes opaquely; the per-class shape lives in the driver
@@ -2494,8 +2494,10 @@ pub mod devmgr_errors
     /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet), or (b) attempted the
     /// lazy disk-walked spawn and failed (missing binary, ELF corrupt,
     /// hardware carve failed, OOM, etc.), or, for `QUERY_INPUT_DEVICE`, no
-    /// input driver runs at the requested instance ordinal. Case (a) is
-    /// transient: it ends once the `SET_DRIVERS_DIR` spawns complete, so a
+    /// input driver is served at the requested instance ordinal (none
+    /// enumerated there, its spawn failed, or it died before reporting
+    /// ready). Case (a) is transient: it ends once the `SET_DRIVERS_DIR`
+    /// spawns and the input settle complete, so a
     /// client that cannot proceed without the device MAY retry with a
     /// bounded number of attempts. Case (b) is sticky for the boot, since a
     /// single attempt is made, and a client cannot tell (a) from (b): a

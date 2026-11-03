@@ -88,8 +88,9 @@ pub struct Cell
     /// The cell's name; a later run of a name already seen in the log carries
     /// ` #<n>`, so cells match across logs by name and occurrence.
     pub name: String,
-    /// Seconds from the cell's start stamp to its end stamp, or to the log's
-    /// last stamp for an unfinished cell.
+    /// Seconds from the cell's start stamp to its end stamp; for an unfinished
+    /// cell, to the log's last stamp; for an end-lost cell, to the ktest line
+    /// that followed it (an upper bound).
     pub secs: f64,
     /// How the cell ended.
     pub outcome: CellOutcome,
@@ -1336,6 +1337,19 @@ mod tests
     {
         let mut t = parse_log(&log(128, &[("stress::a", 3.5)])).unwrap();
         t.wall_secs = Some(90.5);
+        for (name, outcome) in [
+            ("stress::lost", CellOutcome::EndLost),
+            ("stress::hung", CellOutcome::Unfinished),
+            ("stress::failed", CellOutcome::Fail),
+        ]
+        {
+            t.cells.push(Cell {
+                tier: "Tier S".to_string(),
+                name: name.to_string(),
+                secs: 1.25,
+                outcome,
+            });
+        }
         let headers = vec![
             ("commit".to_string(), "abc123".to_string()),
             (
@@ -1349,6 +1363,10 @@ mod tests
         assert_eq!(parsed.timing.cpus, t.cpus);
         assert_eq!(parsed.timing.marker, t.marker);
         assert_eq!(parsed.timing.cells.len(), t.cells.len());
+        for (sent, read) in t.cells.iter().zip(&parsed.timing.cells)
+        {
+            assert_eq!((&read.name, read.outcome), (&sent.name, sent.outcome));
+        }
         assert!(close(cell(&parsed.timing, "stress::a").secs, 3.5));
         assert!(close(parsed.timing.wall_secs.unwrap(), 90.5));
         assert!(close(parsed.timing.tiers[1].secs, t.tiers[1].secs));

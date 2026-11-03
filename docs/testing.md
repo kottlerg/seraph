@@ -549,8 +549,7 @@ attempts at the wide width, down to its floor, so its `R/F` understates the grow
 up to `F`: on the reference host the whole of Tier S at 128 vCPUs takes 0.27 times its 16-vCPU
 time, which, were every Tier S cell scaled to one eighth of its attempts, would be about 2.2 times
 the cost of one attempt (an approximation: some cells are unscaled and some stop at their
-floor). The
-baseline comparison is the check for such a cell. The report is a report, not a
+floor). The baseline comparison is the check for such a cell. The report is a report, not a
 gate: a PR that owes the boundary set carries it in its body, and no flag blocks a PR or a tag
 until the threshold is calibrated against the baselines and made a gate. A baseline is rewritten,
 on the reference host and from runs at a `master` commit, by the PR that changes a cell's cost on

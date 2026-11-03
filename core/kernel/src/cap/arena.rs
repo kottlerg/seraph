@@ -9,10 +9,9 @@
 //! A range split (`SYS_MEMORY_SPLIT`, `SYS_MMIO_SPLIT`, `SYS_IRQ_SPLIT`,
 //! `SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`), a copy or derivation of an `Mmio`,
 //! `IoPort`, or `Interrupt` capability, and an `Mmio` object's spilled mapping
-//! records are
-//! funded by the `CSpace` the syscall inserts into or resolves through: each
-//! takes a 128-byte chunk of a page from that `CSpace`'s slot-page pool, which
-//! its holder funds the way it funds slots. Chunk 0 of each arena page holds
+//! records are funded by the `CSpace` the syscall inserts into or resolves
+//! through: each takes a 128-byte chunk of a page from that `CSpace`'s
+//! slot-page pool, which its holder funds the way it funds slots. Chunk 0 of each arena page holds
 //! the page's header (`cap::object::ArenaPage`), a kernel object whose
 //! reference count counts the page's live chunks; the wrapper keeps the
 //! free-chunk list and the list of its arena pages.

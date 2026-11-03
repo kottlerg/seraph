@@ -238,7 +238,9 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(ep_obj_ptr);
                 core::ptr::drop_in_place(ep_state_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e.into())
@@ -346,7 +348,9 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(sig_obj_ptr);
                 core::ptr::drop_in_place(sig_state_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e.into())
@@ -462,14 +466,18 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
             Ok(slot) => slot,
             Err(e) =>
             {
-                retype_free(memory, offset, entry.raw_bytes);
+                // SAFETY: this call's own `retype_allocate` return, holding no live
+                // object (none placed yet, or dropped above) and published nowhere.
+                unsafe { retype_free(memory, offset, entry.raw_bytes) };
                 return Err(e);
             }
         };
         let Some(target_aso_nn) = target_slot.object
         else
         {
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             return Err(SyscallError::InvalidCapability);
         };
         // SAFETY: tag confirmed AddressSpace.
@@ -487,7 +495,9 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
         };
         if res.is_err()
         {
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { memory_obj_nn.as_ref().dec_ref() };
             return Err(SyscallError::OutOfMemory);
@@ -499,7 +509,9 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     // Requires `init_pages >= 2`.
     if init_pages < 2
     {
-        retype_free(memory, offset, entry.raw_bytes);
+        // SAFETY: this call's own `retype_allocate` return, holding no live
+        // object (none placed yet, or dropped above) and published nowhere.
+        unsafe { retype_free(memory, offset, entry.raw_bytes) };
         return Err(SyscallError::InvalidArgument);
     }
 
@@ -573,7 +585,9 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(aso_ptr);
             core::ptr::drop_in_place(aspace_ptr);
         }
-        retype_free(memory, offset, entry.raw_bytes);
+        // SAFETY: this call's own `retype_allocate` return, holding no live
+        // object (none placed yet, or dropped above) and published nowhere.
+        unsafe { retype_free(memory, offset, entry.raw_bytes) };
         // SAFETY: matches inc_ref above.
         unsafe { memory_obj_nn.as_ref().dec_ref() };
         return Err(SyscallError::OutOfMemory);
@@ -603,7 +617,9 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(aso_ptr);
                 core::ptr::drop_in_place(aspace_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches inc_ref above.
             unsafe { memory_obj_nn.as_ref().dec_ref() };
             return Err(e.into());
@@ -709,14 +725,18 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
             Ok(slot) => slot,
             Err(e) =>
             {
-                retype_free(memory, offset, entry.raw_bytes);
+                // SAFETY: this call's own `retype_allocate` return, holding no live
+                // object (none placed yet, or dropped above) and published nowhere.
+                unsafe { retype_free(memory, offset, entry.raw_bytes) };
                 return Err(e);
             }
         };
         let Some(target_kobj_nn) = target_slot.object
         else
         {
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             return Err(SyscallError::InvalidCapability);
         };
         // SAFETY: tag confirmed CSpace.
@@ -733,7 +753,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
         };
         if res.is_err()
         {
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches inc_ref above.
             unsafe { memory_obj_nn.as_ref().dec_ref() };
             return Err(SyscallError::OutOfMemory);
@@ -768,7 +790,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
         // so unreachable while the caller's pages still pay for this one).
         // Surface to userspace; the retype carve is undone below by
         // `retype_free` after the error return.
-        retype_free(memory, offset, entry.raw_bytes);
+        // SAFETY: this call's own `retype_allocate` return, holding no live
+        // object (none placed yet, or dropped above) and published nowhere.
+        unsafe { retype_free(memory, offset, entry.raw_bytes) };
         return Err(SyscallError::OutOfMemory);
     };
 
@@ -809,7 +833,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
         // The id was drawn but never registered; return it or the
         // registry leaks one id per failed create.
         crate::cap::free_cspace_id(id);
-        retype_free(memory, offset, entry.raw_bytes);
+        // SAFETY: this call's own `retype_allocate` return, holding no live
+        // object (none placed yet, or dropped above) and published nowhere.
+        unsafe { retype_free(memory, offset, entry.raw_bytes) };
         return Err(SyscallError::OutOfMemory);
     }
 
@@ -834,7 +860,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
         }
         crate::cap::unregister_cspace(id);
         crate::cap::free_cspace_id(id);
-        retype_free(memory, offset, entry.raw_bytes);
+        // SAFETY: this call's own `retype_allocate` return, holding no live
+        // object (none placed yet, or dropped above) and published nowhere.
+        unsafe { retype_free(memory, offset, entry.raw_bytes) };
         // SAFETY: matches inc_ref above.
         unsafe { memory_obj_nn.as_ref().dec_ref() };
         return Err(SyscallError::OutOfMemory);
@@ -875,7 +903,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(cs_kobj_ptr);
                 core::ptr::drop_in_place(cs_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the `memory_obj_nn.as_ref().inc_ref()` above.
             unsafe { memory_obj_nn.as_ref().dec_ref() };
             return Err(e.into());
@@ -1233,7 +1263,9 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(tcb_ptr);
                 core::ptr::drop_in_place(thread_obj_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e)
@@ -2516,7 +2548,9 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(eq_state_ptr);
                 core::ptr::drop_in_place(eq_obj_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e.into())
@@ -2630,7 +2664,9 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(ws_obj_ptr);
                 core::ptr::drop_in_place(ws_state_ptr);
             }
-            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (none placed yet, or dropped above) and published nowhere.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e.into())

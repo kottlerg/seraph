@@ -1450,8 +1450,9 @@ impl PagePool
 
     /// Hand every recorded donation to `free` as `(ancestor, base_offset,
     /// page_count, holes)`, `holes` being the record's list of kept arena
-    /// pages (null for an `AddressSpace` pool, or a record with none), in an order that keeps each record readable until it is
-    /// used: spilled records newest page first and, within a page, last to
+    /// pages (null for an `AddressSpace` pool, or a record with none), in an
+    /// order that keeps each record readable until it is used: spilled
+    /// records newest page first and, within a page, last to
     /// first so record 0 (whose donation holds the page) goes last; then the
     /// inline records, snapshotted up front, with record 0 (the create-time
     /// slab that holds the owner and this pool) last. The walk is linear in the
@@ -2741,8 +2742,12 @@ const CASCADE_LINK_BITS: u32 = 56;
 /// a LIFO linked through the objects' own headers, so it holds any number of
 /// them without allocating.
 ///
-/// Only a refcount-0 object that nothing else references is pushed, and an
-/// object reaches 0 once, so it is on at most one stack, at most once. While
+/// Only a refcount-0 object that nothing else references, and that is on no
+/// stack, is pushed. An object reaches 0 once, so only the stack of the call
+/// that took it there holds it, and at most once at a time: the one object
+/// pushed twice is a `CSpace` wrapper, whose first teardown run, having been
+/// popped, re-queues it beneath the objects its slots held for its second
+/// (core/kernel/docs/capability-internals.md § Teardown). While
 /// it is queued, the header's `ref_count` and `cascade_link_hi` hold the link
 /// to the object below it (its virtual address shifted right by 3, every
 /// header being 8-byte aligned, kept to [`CASCADE_LINK_BITS`] and
@@ -2958,7 +2963,11 @@ unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStac
     let offset = body_phys - ancestor_memory.base;
     // SAFETY: exclusively owned body of type T (caller contract).
     unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<T>()) };
-    crate::cap::retype::retype_free(ancestor_memory, offset, core::mem::size_of::<T>() as u64);
+    // SAFETY: the body was retyped from its ancestor at this offset with this
+    // size, and was dropped above; nothing references it (caller contract).
+    unsafe {
+        crate::cap::retype::retype_free(ancestor_memory, offset, core::mem::size_of::<T>() as u64);
+    }
     if ancestor_memory.header.dec_ref() == 0
     {
         // SAFETY: the body's lease was the ancestor's last reference.
@@ -3148,7 +3157,9 @@ pub unsafe fn object_for_new_slot(
 /// object, the references a dying `CSpace`'s slots hold, a wait set's
 /// member references, a thread's fault-handler binding, death-observer
 /// nodes' queue references. Each object one of those releases leaves
-/// unreferenced is pushed onto a [`CascadeStack`] local to this call,
+/// unreferenced is pushed onto a [`CascadeStack`] local to this call (and a
+/// `CSpace` wrapper's first run re-pushes the wrapper beneath its slots'
+/// objects, for the second run that returns its pool),
 /// linked through the objects' own headers, and this function tears the
 /// stack down, most recent first, until it is empty. No arm recurses into
 /// `dealloc_object`, so the call's stack use is a constant whatever the
@@ -3192,7 +3203,11 @@ unsafe fn free_donation(
     #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: as above; the ancestor stays live until the dec_ref below.
     let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-    crate::cap::retype::retype_free(anc_memory, off, pages * crate::mm::PAGE_SIZE as u64);
+    // SAFETY: the record names a page-class retype of this Memory object, which
+    // the dead pool no longer uses (caller contract).
+    unsafe {
+        crate::cap::retype::retype_free(anc_memory, off, pages * crate::mm::PAGE_SIZE as u64);
+    }
     if anc_hdr.dec_ref() == 0
     {
         // SAFETY: refcount reached 0; no live cap holds it, and the
@@ -3260,11 +3275,15 @@ unsafe fn free_donation_around(
         })
     };
     let p = crate::mm::PAGE_SIZE as u64;
-    crate::cap::retype::retype_free_runs(anc_memory, |free_run| {
-        crate::cap::arena::for_each_run(off, off + pages * p, kept(), |from, to| {
-            free_run(from, to - from);
+    // SAFETY: the runs are the parts of the record's page-class retype that
+    // no kept page covers, in ascending order; the dead pool uses none of them.
+    unsafe {
+        crate::cap::retype::retype_free_runs(anc_memory, |free_run| {
+            crate::cap::arena::for_each_run(off, off + pages * p, kept(), |from, to| {
+                free_run(from, to - from);
+            });
         });
-    });
+    }
     // SAFETY: the record's reference, released once, after every run.
     if unsafe { &*anc_ptr }.dec_ref() == 0
     {
@@ -3456,7 +3475,16 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             let ancestor_memory = unsafe { &*ancestor.as_ptr().cast::<MemoryObject>() };
             let offset =
                 crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64) - ancestor_memory.base;
-            crate::cap::retype::retype_free(ancestor_memory, offset, crate::mm::PAGE_SIZE as u64);
+            // SAFETY: the page lies in a donation retyped from this Memory object
+            // and was left out of its return; its last chunk and its CSpace have
+            // gone, so nothing uses it.
+            unsafe {
+                crate::cap::retype::retype_free(
+                    ancestor_memory,
+                    offset,
+                    crate::mm::PAGE_SIZE as u64,
+                );
+            }
             if ancestor_memory.header.dec_ref() == 0
             {
                 // SAFETY: the page's lease was the ancestor's last reference.
@@ -4037,7 +4065,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ptr is in-place ThreadObject.
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
 
-            retype_free(ancestor_memory, offset, raw_bytes);
+            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+            // with `raw_bytes`, and is dropped above; nothing references it.
+            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
 
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
@@ -4279,8 +4309,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // The wrapper's second run, which returns the pool, comes
                 // after the objects the slots queue below: `cspace` null marks
                 // it, and pushing the wrapper first puts it beneath them.
-                // SAFETY: refcount 0 and exclusively ours; the arm reads only
-                // the wrapper's body, never its header, until it is popped.
+                // SAFETY: refcount 0, so no capability or pin reaches the
+                // wrapper, and it was popped, so it is on no stack. Between the
+                // runs another CPU reaches it only through an arena page's
+                // `owner`, which a chunk free uses for `cs_pool`'s lock and
+                // `arena_free` alone, never `cspace` or the header; this arm
+                // uses neither after the push.
                 unsafe {
                     (*ptr.as_ptr().cast::<CSpaceKernelObject>()).cspace = core::ptr::null_mut();
                     stack.push(ptr);
@@ -4484,7 +4518,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EndpointObject>()) };
 
             // Return the bytes to the per-Memory allocator.
-            retype_free(ancestor_memory, offset, raw_bytes);
+            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+            // with `raw_bytes`, and is dropped above; nothing references it.
+            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
 
             // Drop the retype-time refcount lease. If this was the Memory cap's last
             // reference, push it onto the cascade stack; dealloc_object frees it on
@@ -4589,7 +4625,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ptr is the in-place NotificationObject; unique access.
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<NotificationObject>()) };
 
-            retype_free(ancestor_memory, offset, raw_bytes);
+            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+            // with `raw_bytes`, and is dropped above; nothing references it.
+            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
 
             // Drop the retype-time refcount lease; on full release, queue the Memory
             // cap on the cascade stack.
@@ -4676,7 +4714,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ptr is in-place EventQueueObject.
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EventQueueObject>()) };
 
-            retype_free(ancestor_memory, offset, raw_bytes);
+            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+            // with `raw_bytes`, and is dropped above; nothing references it.
+            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
 
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
@@ -4746,7 +4786,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ptr is in-place WaitSetObject.
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<WaitSetObject>()) };
 
-            retype_free(ancestor_memory, offset, raw_bytes);
+            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+            // with `raw_bytes`, and is dropped above; nothing references it.
+            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
 
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
@@ -5214,8 +5256,11 @@ mod tests
     /// Run `run_cascade` from object 0 over a model in which object `i` holds
     /// one reference on each object in `holds[i]` and its teardown releases
     /// them; every object starts with as many references as it has holders,
-    /// object 0 with none. Returns how many times each object was torn down.
-    fn run_model_cascade(types: &[ObjectType], holds: &[Vec<usize>]) -> Vec<u32>
+    /// object 0 with none. A `CSpaceObj` runs twice, as the kernel's arm does:
+    /// its first run queues itself, then releases its holds, and its second
+    /// run tears it down. Returns how many times each object was torn down,
+    /// and the step at which each was (its last run).
+    fn run_model_cascade(types: &[ObjectType], holds: &[Vec<usize>]) -> (Vec<u32>, Vec<usize>)
     {
         let mut refs = vec![0u32; types.len()];
         for held in holds
@@ -5230,6 +5275,9 @@ mod tests
         let ptrs: Vec<NonNull<KernelObjectHeader>> =
             objects.iter().map(|&raw| model_header(raw)).collect();
         let mut torn = vec![0u32; types.len()];
+        let mut torn_at = vec![usize::MAX; types.len()];
+        let mut requeued = vec![false; types.len()];
+        let mut step = 0;
         run_cascade(ptrs[0], |obj, stack| {
             // SAFETY: every pointer the model queues is one of `objects`,
             // popped and so no longer written by the stack.
@@ -5242,20 +5290,36 @@ mod tests
                 model.header.ancestor.load(Ordering::Relaxed),
                 model_ancestor(i)
             );
-            torn[i] += 1;
-            for &h in &holds[i]
+            step += 1;
+            let first_of_two = types[i] == ObjectType::CSpaceObj && !requeued[i];
+            if first_of_two
             {
-                // SAFETY: `ptrs[h]` is a live model header.
-                if unsafe { ptrs[h].as_ref() }.dec_ref() == 0
+                requeued[i] = true;
+                // SAFETY: popped and unreferenced, as the kernel's wrapper is
+                // when its first run re-queues it.
+                unsafe { stack.push(obj) };
+            }
+            else
+            {
+                torn[i] += 1;
+                torn_at[i] = step;
+            }
+            if first_of_two || types[i] != ObjectType::CSpaceObj
+            {
+                for &h in &holds[i]
                 {
-                    // SAFETY: that was the model object's last reference,
-                    // and its pointer has a raw source.
-                    unsafe { stack.push(ptrs[h]) };
+                    // SAFETY: `ptrs[h]` is a live model header.
+                    if unsafe { ptrs[h].as_ref() }.dec_ref() == 0
+                    {
+                        // SAFETY: that was the model object's last reference,
+                        // and its pointer has a raw source.
+                        unsafe { stack.push(ptrs[h]) };
+                    }
                 }
             }
         });
         free_models(objects);
-        torn
+        (torn, torn_at)
     }
 
     /// Add to the model a tree of CSpaces under `root`: `width` CSpaces per
@@ -5362,8 +5426,47 @@ mod tests
             }
         }
         add_nested_cspaces(&mut types, &mut holds, 0, 3, 4);
-        let torn = run_model_cascade(&types, &holds);
+        let (torn, _) = run_model_cascade(&types, &holds);
         assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
+    }
+
+    // Defect guarded: a CSpace whose pool is returned before the objects its
+    // slots held are torn down keeps every arena page their bodies sit on,
+    // each returned later by a walk of its Memory object's free list.
+    #[test]
+    fn a_cspace_is_torn_down_after_everything_its_slots_alone_held()
+    {
+        let mut types = vec![ObjectType::CSpaceObj];
+        let mut holds: Vec<Vec<usize>> = vec![Vec::new()];
+        add_nested_cspaces(&mut types, &mut holds, 0, 3, 3);
+        let (torn, torn_at) = run_model_cascade(&types, &holds);
+        assert!(torn.iter().all(|&t| t == 1), "torn-down counts: {torn:?}");
+        let mut holders = vec![0usize; types.len()];
+        for held in &holds
+        {
+            for &h in held
+            {
+                holders[h] += 1;
+            }
+        }
+        for c in (0..types.len()).filter(|&c| types[c] == ObjectType::CSpaceObj)
+        {
+            // Everything reachable from `c` through objects held only once is
+            // released by `c`'s first run or a cascade it starts.
+            let mut owned: Vec<usize> = holds[c]
+                .iter()
+                .copied()
+                .filter(|&h| holders[h] == 1)
+                .collect();
+            while let Some(o) = owned.pop()
+            {
+                assert!(
+                    torn_at[o] < torn_at[c],
+                    "object {o} torn down after CSpace {c}, which alone held it"
+                );
+                owned.extend(holds[o].iter().copied().filter(|&h| holders[h] == 1));
+            }
+        }
     }
 
     // Defect guarded: a link encoding that loses address bits (a header that

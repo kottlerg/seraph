@@ -283,7 +283,11 @@ The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked thro
 objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
 header's three padding bytes hold the link to the next, while the type and `ancestor` fields its
 teardown reads stay intact, and the link is cleared when it is popped. An object reaches zero once,
-so it is queued at most once, and the stack holds any number of objects without allocating. Every
+so only the call that took it there queues it, at most once at a time, and the stack holds any
+number of objects without allocating. The one object queued twice is a `CSpace` wrapper: its arm's
+first run, having popped it, pushes it back beneath the objects its slots held, so its second run,
+which returns its pool, comes after their teardowns and every cascade they start ([§ Body
+Arena](#body-arena)). Every
 release a teardown makes pushes the object it orphans: an ancestor Memory object's retype lease, a
 donation's lease, the references a dying `CSpace`'s slots hold (a nested `CSpace` among them), a
 caller-sized wait set's member references, a thread's fault-handler binding, and the queue
@@ -384,8 +388,9 @@ The cut sorts each donation's kept pages once and walks its span with them in or
 with `r` donation records and `h` kept pages costs `O(r + h log h)`, allocating nothing and on a
 fixed stack (the sort is a bottom-up merge through 64 sorted runs), plus one walk of each record's
 Memory object's page free list, as the return of a donation without kept pages costs ([§
-Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`, at most one
-per 31 such bodies; each of those pages returns later, in the call that frees its last chunk, as a
+Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`: at most one
+per such body, and at most the `CSpace`'s arena pages, one per 31 bodies it funded. Each of those
+pages returns later, in the call that frees its last chunk, as a
 one-page `retype_free`.
 
 ---

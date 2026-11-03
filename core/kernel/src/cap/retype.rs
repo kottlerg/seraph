@@ -902,7 +902,7 @@ pub fn current_bump(memory: &MemoryObject) -> u64
 /// kernel object — caller has dropped any state, drained wait queues, etc.,
 /// before calling.
 #[track_caller]
-pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
+pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
     let need = round_to_class(bytes);
 
@@ -970,12 +970,17 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 /// `produce` runs under `memory`'s allocator lock and read guard: it takes no
 /// lock and calls no retype function.
 ///
-/// Each run is held to [`retype_free`]'s contract: a page-aligned run of whole
+/// # Safety
+///
+/// Each run meets [`retype_free`]'s contract: a page-aligned run of whole
 /// pages within one page-class allocation of `memory`, each page freed
 /// exactly once and holding no live kernel object. The runs ascend and do not
 /// overlap.
 #[track_caller]
-pub fn retype_free_runs(memory: &MemoryObject, produce: impl FnOnce(&mut dyn FnMut(u64, u64)))
+pub unsafe fn retype_free_runs(
+    memory: &MemoryObject,
+    produce: impl FnOnce(&mut dyn FnMut(u64, u64)),
+)
 {
     let p = PAGE_SIZE as u64;
     // Read-locked as in retype_free, for the drain reset's size comparison.
@@ -1315,6 +1320,21 @@ mod tests
 {
     use super::*;
 
+    /// [`retype_free`] of an allocation a test made from its own region.
+    fn free(memory: &MemoryObject, offset: u64, bytes: u64)
+    {
+        // SAFETY: every test frees only what it allocated from its own host
+        // region, once, and places no object in it.
+        unsafe { retype_free(memory, offset, bytes) };
+    }
+
+    /// [`retype_free_runs`] of runs of an allocation a test made.
+    fn free_runs(memory: &MemoryObject, produce: impl FnOnce(&mut dyn FnMut(u64, u64)))
+    {
+        // SAFETY: as for `free`; the tests hand ascending, disjoint runs.
+        unsafe { retype_free_runs(memory, produce) };
+    }
+
     #[test]
     fn round_to_class_zero()
     {
@@ -1510,7 +1530,7 @@ mod tests
         let a = retype_allocate(&memory, 96).unwrap();
         let b = retype_allocate(&memory, 96).unwrap();
         assert_eq!((a, b), (0, BIN_128));
-        retype_free(&memory, a, 96);
+        free(&memory, a, 96);
         // SAFETY: offset 0 is the freed slot's link cell in the live buffer.
         unsafe { write_u64_at(memory.base, 0, 0x3F_FFFF_D048) };
         assert_eq!(retype_allocate(&memory, 96), Ok(0));
@@ -1532,7 +1552,7 @@ mod tests
         let low = retype_allocate(&memory, p).unwrap();
         let high = retype_allocate(&memory, p).unwrap();
         assert_eq!((low, high), (0, p));
-        retype_free(&memory, low, p);
+        free(&memory, low, p);
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), p);
 
         // Every 128-byte slot of the freed page is allocatable, each once.
@@ -1562,7 +1582,7 @@ mod tests
         {
             retype_allocate(&memory, 96).unwrap();
         }
-        retype_free(&memory, low, p);
+        free(&memory, low, p);
 
         let slots = p / BIN_512;
         for _ in 0..slots
@@ -1588,8 +1608,8 @@ mod tests
         let a = retype_allocate(&memory, p).unwrap();
         let b = retype_allocate(&memory, p).unwrap();
         let _c = retype_allocate(&memory, p).unwrap();
-        retype_free(&memory, a, p);
-        retype_free(&memory, b, p);
+        free(&memory, a, p);
+        free(&memory, b, p);
         // Carve both freed pages into 128-byte slots, then free every slot:
         // two pages of bytes are available again, but only as sub-page slots.
         let carved: Vec<u64> = (0..=p / BIN_128)
@@ -1597,7 +1617,7 @@ mod tests
             .collect();
         for off in carved
         {
-            retype_free(&memory, off, 96);
+            free(&memory, off, 96);
         }
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), 2 * p);
         assert_eq!(retype_allocate(&memory, p), Err(SyscallError::OutOfMemory));
@@ -1649,10 +1669,10 @@ mod tests
         let _guard = retype_allocate(&memory, p).unwrap();
         // The block is freed first, the holes after it (the order that buried
         // the block 1030 nodes deep under the former head-pushed list).
-        retype_free(&memory, block, 4 * p);
+        free(&memory, block, 4 * p);
         for &off in singles.iter().step_by(2)
         {
-            retype_free(&memory, off, p);
+            free(&memory, off, p);
         }
         assert_eq!(
             retype_allocate(&memory, 4 * p),
@@ -1674,9 +1694,9 @@ mod tests
         let _d = retype_allocate(&memory, p).unwrap();
         // Free the outer two first, then the middle one: the middle free joins
         // both neighbours.
-        retype_free(&memory, a, p);
-        retype_free(&memory, c, p);
-        retype_free(&memory, b, p);
+        free(&memory, a, p);
+        free(&memory, c, p);
+        free(&memory, b, p);
         assert_eq!(retype_allocate(&memory, 3 * p), Ok(a));
     }
 
@@ -1691,11 +1711,11 @@ mod tests
         let _b = retype_allocate(&memory, p).unwrap();
         let c = retype_allocate(&memory, p).unwrap();
         let _d = retype_allocate(&memory, p).unwrap();
-        retype_free(&memory, a, p);
+        free(&memory, a, p);
         // Zero a's size word: a node no well-formed list holds.
         // SAFETY: a's size cell lies in the live buffer.
         unsafe { write_u64_at(memory.base, a, 0) };
-        retype_free(&memory, c, p);
+        free(&memory, c, p);
         assert_eq!(
             retype_allocate(&memory, p),
             Ok(c),
@@ -1719,8 +1739,8 @@ mod tests
         let _b = retype_allocate(&memory, p).unwrap();
         let c = retype_allocate(&memory, p).unwrap();
         let _d = retype_allocate(&memory, p).unwrap();
-        retype_free(&memory, a, p);
-        retype_free(&memory, c, p);
+        free(&memory, a, p);
+        free(&memory, c, p);
         // Point c's next link back at a: a cycle the order check rejects.
         // SAFETY: c's next cell lies in the live buffer.
         unsafe { write_u64_at(memory.base, c + 8, a) };
@@ -1745,8 +1765,8 @@ mod tests
         let hi = retype_allocate(&memory, p).unwrap();
         let _guard = retype_allocate(&memory, p).unwrap();
         assert_eq!((lo, span, hi), (0, p, 11 * p));
-        retype_free(&memory, lo, p);
-        retype_free_runs(&memory, |run| {
+        free(&memory, lo, p);
+        free_runs(&memory, |run| {
             let mut from = span;
             for &k in &KEPT
             {
@@ -1791,9 +1811,9 @@ mod tests
         let (_buf, memory, hi) = free_span_around_kept();
         for &k in KEPT.iter().rev()
         {
-            retype_free(&memory, k * p, p);
+            free(&memory, k * p, p);
         }
-        retype_free(&memory, hi, p);
+        free(&memory, hi, p);
         assert_eq!(retype_allocate(&memory, 12 * p), Ok(0));
     }
 
@@ -1806,13 +1826,45 @@ mod tests
         let p = PAGE_SIZE as u64;
         let (_buf, memory) = host_region(4);
         let span = retype_allocate(&memory, 4 * p).unwrap();
-        retype_free_runs(&memory, |run| {
+        free_runs(&memory, |run| {
             run(span, p);
             run(span + 2 * p, 2 * p);
         });
         assert_eq!(memory.allocator.bump_offset.load(Ordering::Acquire), 2 * p);
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), 3 * p);
-        retype_free(&memory, span + p, p);
+        free(&memory, span + p, p);
         assert_eq!(retype_allocate(&memory, 4 * p), Ok(0), "the region drained");
+    }
+
+    // Defect guarded: runs freed through a cursor that meets a malformed node
+    // follow it, drop a run, or place a later run past the node, instead of
+    // pushing every run from that node on at the head.
+    #[test]
+    fn runs_freed_past_a_malformed_page_node_all_stay_allocatable()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(8);
+        let a = retype_allocate(&memory, p).unwrap();
+        let span = retype_allocate(&memory, 6 * p).unwrap();
+        let _guard = retype_allocate(&memory, p).unwrap();
+        free(&memory, a, p);
+        // Zero a's size word: a node no well-formed list holds.
+        // SAFETY: a's size cell lies in the live buffer.
+        unsafe { write_u64_at(memory.base, a, 0) };
+        free_runs(&memory, |run| {
+            run(span, p);
+            run(span + 2 * p, p);
+            run(span + 4 * p, 2 * p);
+        });
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 5 * p);
+        // Every run went to the head, the last one first.
+        assert_eq!(retype_allocate(&memory, 2 * p), Ok(span + 4 * p));
+        assert_eq!(retype_allocate(&memory, p), Ok(span + 2 * p));
+        assert_eq!(retype_allocate(&memory, p), Ok(span));
+        assert_eq!(
+            retype_allocate(&memory, p),
+            Err(SyscallError::OutOfMemory),
+            "the walk stops at the malformed node"
+        );
     }
 }

@@ -89,19 +89,21 @@ vfsd/
 - **GPT enumeration + mount discovery** — at startup, queries devmgr
   for every block device (`QUERY_BLOCK_DEVICE` at instance ordinals 0,
   1, … until the reply is not `SUCCESS`) and parses each disk's GPT
-  partition table through one shared scratch memory cap, keeping every
-  used entry of each header's `num_parts`-entry array (a disk whose GPT
-  cannot be read or validated contributes none). It then resolves the
+  partition table through one scratch memory cap reused across the
+  reads (replaced from memmgr before the next disk when a failed read
+  left it lost), keeping every used entry of each header's
+  `num_parts`-entry array (a disk whose GPT cannot be read or validated
+  contributes none). It then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
   `gpt::lookup_partition_by_type_guid` over the partitions of every disk
   for the self-mount; the DPS priority tie-break runs across disks, and
   a tie at the highest priority is ambiguous whether or not the tied
   partitions share a disk. The EFI System Partition (standard type
   GUID) and the Seraph data partition (arch-neutral `SERAPH_DATA` GUID)
-  auto-mount at `/esp` and `/data` immediately after root; there is no `mounts.conf` and no
-  `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT` handler decodes a
-  `MountRole` byte from the wire payload and reuses the same
-  resolution path. See
+  auto-mount at `/esp` and `/data` immediately after root; there is no
+  `mounts.conf` and no `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT`
+  handler decodes a `MountRole` byte from the wire payload and reuses
+  the same resolution path. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md),
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md), and
   [`docs/storage.md`](../../docs/storage.md).

@@ -156,8 +156,9 @@ fn main() -> !
     // Allocate a single scratch memory cap for GPT block reads. The
     // BLK_READ_INTO_MEMORY contract requires the caller to supply the DMA
     // target memory cap; vfsd reuses one scratch page across every disk's
-    // GPT reads, replacing it only when a dying driver destroys it. The
-    // memory cap and its VA reservation are process-lifetime-leaked.
+    // GPT reads, replacing it before the next disk when a failed read left
+    // the slot empty (`partition::discover_disks`). vfsd never frees a
+    // scratch page or its VA reservation.
     let Some((mut scratch_cap, mut scratch_va)) =
         partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
@@ -938,10 +939,10 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 /// `mount_path`. Scans every held disk's parsed GPT for a matching
 /// partition; if none is present (or its role lookup is ambiguous), logs
 /// a diagnostic and returns without mounting, leaving `mount_path` to
-/// resolve through the root-fs fall-through. On a match, runs the mount transaction and
-/// logs the outcome. Never fatal — distinct from the root self-mount,
-/// whose failure gates boot. Idempotent if invoked twice: a mount on an
-/// already-terminal mount path is rejected by
+/// resolve through the root-fs fall-through. On a match, runs the mount
+/// transaction and logs the outcome. Never fatal — distinct from the root
+/// self-mount, whose failure gates boot. Idempotent if invoked twice: a
+/// mount on an already-terminal mount path is rejected by
 /// [`VfsdRootBackend::can_install`] before any partition is registered or
 /// driver spawned.
 fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)

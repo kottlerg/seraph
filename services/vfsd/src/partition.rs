@@ -14,8 +14,10 @@
 //! the host-tested [`gpt`] crate.
 //!
 //! Block reads use [`BLK_READ_INTO_MEMORY`](ipc::blk_labels::BLK_READ_INTO_MEMORY):
-//! a single scratch Memory cap (allocated via [`alloc_scratch`] at startup) is
-//! reused across every read, moved out and back through IPC each call. The
+//! one scratch Memory cap (allocated via [`alloc_scratch`] at startup) is
+//! reused across the reads, moved out and back through IPC each call, and
+//! replaced before the next disk when a failed read leaves the slot empty
+//! ([`discover_disks`]). The
 //! block lands at offset 0 of the scratch page per the wire contract; vfsd
 //! copies one logical block from there into a stack buffer. The logical
 //! block size, the unit of every GPT LBA, comes from the driver's
@@ -61,11 +63,15 @@ pub struct Disk
 /// stops discovery with a log, keeping the disks found before it.
 ///
 /// `*scratch_cap` and `*scratch_va` are the scratch page from
-/// [`alloc_scratch`]. A driver that dies while it holds the page during a
-/// read destroys the cap with its `CSpace`, so before each disk a lost page
-/// is replaced from memmgr (`memmgr_ep`, mapped into `self_aspace`); one
-/// failed disk does not blind the disks after it. The lost page's VA
-/// reservation stays leaked, one page per such disk.
+/// [`alloc_scratch`]. A read whose call fails or whose reply carries no cap
+/// leaves `*scratch_cap` 0: a driver that dies while it holds the page
+/// destroys the cap with its `CSpace`, and a failed or refused transfer
+/// leaves the cap where vfsd cannot tell. Before each disk an empty slot is
+/// refilled with a fresh page from memmgr (`memmgr_ep`, mapped into
+/// `self_aspace`), so one failed disk does not blind the disks after it.
+/// The replaced page's VA reservation leaks, and, when the transfer was
+/// only refused, so do the old page and its slot: at most one page per
+/// such disk, at startup.
 pub fn discover_disks(
     registry_ep: u32,
     memmgr_ep: u32,
@@ -164,8 +170,9 @@ fn replace_scratch(
 /// The outcome of one `QUERY_BLOCK_DEVICE`.
 enum BlockDeviceReply
 {
-    /// A reply other than `SUCCESS`, with its label: no driver is served
-    /// at this ordinal, and discovery ends.
+    /// A reply other than `SUCCESS`, with its label: past the last driver,
+    /// or devmgr's refusal at a live ordinal (a failed badge derivation, an
+    /// unauthorized caller, a label-version mismatch). Discovery ends.
     End(u64),
     /// A failed call (logged where it fails): discovery ends.
     CallFailed,
@@ -217,9 +224,10 @@ fn log_gpt_error(ordinal: u64, e: &GptError)
 /// Allocate one scratch Memory cap from memmgr, reserve a 1-page VA window,
 /// and map the memory cap into vfsd's AS at that VA.
 ///
-/// Returns `(cap_slot, scratch_va)`. Both the cap and the VA reservation live
-/// for the vfsd process's lifetime; the `ReservedRange` has no Drop and the
-/// memory cap is intentionally not released.
+/// Returns `(cap_slot, scratch_va)`. vfsd never frees either: the
+/// `ReservedRange` has no Drop and the memory cap is intentionally not
+/// released. A driver that dies while it holds the cap during a read
+/// destroys it ([`discover_disks`] then allocates a replacement).
 pub fn alloc_scratch(memmgr_ep: u32, self_aspace: u32, ipc_buf: *mut u64) -> Option<(u32, u64)>
 {
     let scratch_va = {

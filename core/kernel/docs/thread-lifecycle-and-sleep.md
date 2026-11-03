@@ -344,14 +344,15 @@ stated explicitly.
     under that lock.
 13. Release tcb's fault-handler binding, if any: atomically swap
     tcb.fault_handler to null and dec_ref the prior EndpointObject; if its
-    refcount reaches 0, enqueue the orphaned endpoint header on the cascade
-    worklist (step 19's mechanism) rather than recursing into dealloc_object.
+    refcount reaches 0, push the orphaned endpoint header onto the dealloc
+    cascade stack (`CascadeStack`, step 19's mechanism) rather than recursing
+    into dealloc_object.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
     thread still on its send queue. Then take the death_observers chain and,
     for each node, return it to its queue's pool under that queue's lock and
     release the EventQueue reference it held (`release_death_observers`),
-    reclaiming a queue whose count reaches 0 through its own nested cascade
-    (the chain's queues are unbounded in number, the worklist is not). The TCB is
+    queueing a queue whose count reaches 0 on the dealloc cascade, which holds
+    any number of them. The TCB is
     read without its lock: tcb is off every CPU (steps 8-9), so its death walk
     is over or never runs, and its refcount is 0, so no binder can pin it to
     link a node.
@@ -365,9 +366,9 @@ stated explicitly.
 16. Unregister tcb from the live-thread registry.
 17. Poison: tcb.magic = 0; tcb.priority = 0xFF.
 18. drop_in_place(tcb).
-19. retype_free + ancestor dec_ref + cascade (the worklist driven by
-    dealloc_object; step 13's orphaned endpoint and event queues, if any, are
-    processed here).
+19. retype_free + ancestor dec_ref + cascade (the dealloc cascade stack,
+    `CascadeStack`, that dealloc_object drains; step 13's orphaned endpoint
+    and event queues, if any, are torn down from it after this arm returns).
 ```
 
 ### Self-teardown (the caller is the freed thread)
@@ -499,10 +500,10 @@ Registry).
 8. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding
    (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler`
    EndpointObject. The drain swaps the field to null and dec_refs; if the endpoint's refcount
-   reaches 0 it is enqueued on the cascade worklist (step 19), not freed by a nested
-   `dealloc_object` call — the function's worklist mechanism exists precisely to keep the cascade
-   non-recursive. Ordering after step 11 ensures a queued faulter is off the endpoint's send queue
-   before the endpoint can be torn down.
+   reaches 0 it is pushed onto the dealloc cascade stack (`CascadeStack`, step 19), not freed by a
+   nested `dealloc_object` call — the stack exists precisely to keep the cascade non-recursive.
+   Ordering after step 11 ensures a queued faulter is off the endpoint's send queue before the
+   endpoint can be torn down.
 
 9. **Step 17's poison precedes step 18's drop.** `magic = 0` and `priority = 0xFF` are the
    use-after-free traps — any later code that reads these fields and dereferences will fail loudly

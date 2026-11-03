@@ -390,7 +390,7 @@ static mut SEED_MEMORY: object::MemoryObject = object::MemoryObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
         obj_type: object::ObjectType::Memory,
-        _pad: [0; 3],
+        cascade_link_hi: [0; 3],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
     },
     base: 0,
@@ -1050,21 +1050,32 @@ pub struct CSpaceLayout
     pub module_names: [init_protocol::InitModuleName; init_protocol::INIT_MAX_NAMED_MODULES],
 }
 
+/// The [`CSPACE_LAYOUT_MAX_DESCRIPTORS`] term for the ACPI region caps:
+/// Phase 7 mints one per `AcpiReclaimable` entry of the boot memory map, so
+/// their number is bounded by the map's length, which the bootloader's map
+/// buffer (`MEM_MAP_ENTRY_PAGES`, 4 pages of 24-byte entries, 682 entries)
+/// keeps below this term. Firmware reports 1 to 2. A map past the buffer's
+/// total halts the boot in [`push_descriptor`] instead of truncating.
+const ACPI_REGION_DESCRIPTOR_TERM: usize = 1024;
+
 /// Capacity of the [`CSPACE_LAYOUT_DESCRIPTORS`] backing buffer. Bounded
 /// by every cap kind minted at boot:
 /// - [`MAX_DRAIN_BLOCKS`] RAM Memory caps (worst case from the buddy drain).
 /// - ~32 hardware caps (MMIO + IRQ + `IoPort`/`SbiControl` + `SchedControl`).
-/// - 8 ACPI region caps (`MAX_ACPI_REGIONS`), 1 ACPI RSDP, 1 DTB.
+/// - The ACPI region caps, one per `AcpiReclaimable` memory-map entry
+///   ([`ACPI_REGION_DESCRIPTOR_TERM`]); 1 ACPI RSDP, 1 DTB.
 /// - ~8 init segment caps + ~16 boot module caps.
 /// - [`boot_protocol::MAX_RECLAIM_RANGES`] reclaim Memory caps (worst case
 ///   from `mint_reclaim_memory_caps`).
 ///
-/// `4096 + 256 + 128 = 4480` covers the worst case with headroom; BSS
-/// cost is 4480 × 24 B ≈ 105 KiB, comfortably small relative to total
-/// system RAM. The `4096` term matches `MAX_DRAIN_BLOCKS` in the
-/// production-only branch; `256` is `boot_protocol::MAX_RECLAIM_RANGES`;
-/// the trailing `128` covers every other Phase-7 cap kind.
-pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + boot_protocol::MAX_RECLAIM_RANGES + 128;
+/// `4096 + 256 + 1024 + 128 = 5504` covers the worst case with headroom;
+/// BSS cost is 5504 × 24 B ≈ 129 KiB. The `4096` term matches
+/// `MAX_DRAIN_BLOCKS` in the production-only branch; `256` is
+/// `boot_protocol::MAX_RECLAIM_RANGES`; `1024` is
+/// [`ACPI_REGION_DESCRIPTOR_TERM`]; the trailing `128` covers every other
+/// Phase-7 cap kind.
+pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize =
+    4096 + boot_protocol::MAX_RECLAIM_RANGES + ACPI_REGION_DESCRIPTOR_TERM + 128;
 
 /// Backing storage for [`CSpaceLayout::descriptor_count`]. `static mut`
 /// because [`populate_cspace`] writes entries during single-threaded
@@ -1262,6 +1273,80 @@ pub fn init_capability_system(
     }
 }
 
+/// Mint a read-only Memory cap over each `AcpiReclaimable` region of `mmap`
+/// (userspace parses XSDT / MADT / MCFG through them), in consecutive slots,
+/// with a descriptor each, handed to `record`. Returns the run's first slot
+/// and its length, the `CSpaceLayout`'s `acpi_region_memory_base` and
+/// `acpi_region_memory_count`.
+///
+/// There is one cap per region, however many the map reports: the map's
+/// length bounds them ([`ACPI_REGION_DESCRIPTOR_TERM`]), and a root `CSpace`
+/// or descriptor buffer they overflowed would halt the boot with a message
+/// rather than drop tables.
+fn mint_acpi_region_caps(
+    cspace: &mut CSpace,
+    mmap: &[MemoryMapEntry],
+    mut record: impl FnMut(CapDescriptor),
+) -> (u32, u32)
+{
+    let mut base: u32 = 0;
+    let mut count: u32 = 0;
+    for entry in mmap
+    {
+        if entry.memory_type != MemoryType::AcpiReclaimable
+        {
+            continue;
+        }
+        // UEFI memory map entries are page-aligned per UEFI spec §7.2,
+        // but mask defensively to uphold MemoryObject's alignment invariant.
+        let aligned_base = entry.physical_base & !0xFFF;
+        let size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF;
+        if size == 0
+        {
+            continue;
+        }
+        let ptr = mint_phase7_body(firmware_table_memory(aligned_base, size));
+        let slot = insert_or_fatal(
+            cspace,
+            MemRights::MAP,
+            ptr,
+            "Phase 7: cannot allocate Memory capability for ACPI region",
+        );
+        extend_slot_run_or_fatal(
+            &mut base,
+            count,
+            slot,
+            "Phase 7: ACPI region Memory caps are not in consecutive slots",
+        );
+        record(CapDescriptor {
+            slot,
+            cap_type: init_protocol::CapType::Memory,
+            pad: [0; 3],
+            aux0: aligned_base,
+            aux1: size,
+        });
+        count += 1;
+    }
+    (base, count)
+}
+
+/// The body of a read-only Memory cap over the firmware table at
+/// `[base, base + size)`: not retypable, and not buddy-backed.
+fn firmware_table_memory(base: u64, size: u64) -> MemoryObject
+{
+    MemoryObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
+        base,
+        size,
+        // Firmware table: not retypable; cap minted without RETYPE.
+        available_bytes: core::sync::atomic::AtomicU64::new(0),
+        // Firmware-reserved memory; not buddy-backed.
+        owns_memory: core::sync::atomic::AtomicBool::new(false),
+        allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+        lock: AtomicU32::new(0),
+    }
+}
+
 /// Core `CSpace` population logic, separated for testability.
 ///
 /// Creates one capability per usable memory region, one `Mmio`
@@ -1289,11 +1374,6 @@ fn populate_cspace(
     /// implements, and the routing table ignores one past its discovered size,
     /// so oversizing is safe.
     const ROOT_IRQ_COUNT: u32 = crate::arch::current::ROOT_IRQ_COUNT;
-
-    /// Maximum number of `AcpiReclaimable` regions to mint caps for.
-    /// Real firmware reports 1–2; the cap guards against pathological
-    /// memory maps exhausting the `CSpace`.
-    const MAX_ACPI_REGIONS: usize = 8;
 
     // Descriptor entries land in the global CSPACE_LAYOUT_DESCRIPTORS
     // buffer; this counter tracks how many have been written.
@@ -1553,69 +1633,8 @@ fn populate_cspace(
         },
     );
 
-    // Read-only Memory caps covering each AcpiReclaimable region. userspace
-    // parses XSDT / MADT / MCFG through these. Capped by `MAX_ACPI_REGIONS`
-    // so a pathological firmware cannot exhaust the CSpace here.
-    let mut acpi_region_memory_base: u32 = 0;
-    let mut acpi_region_memory_count: u32 = 0;
-    for entry in mmap
-    {
-        if entry.memory_type != MemoryType::AcpiReclaimable
-        {
-            continue;
-        }
-        if (acpi_region_memory_count as usize) >= MAX_ACPI_REGIONS
-        {
-            #[cfg(not(test))]
-            crate::kprintln!(
-                "Phase 7: AcpiReclaimable region count exceeds {}; truncating",
-                MAX_ACPI_REGIONS
-            );
-            break;
-        }
-        // UEFI memory map entries are page-aligned per UEFI spec §7.2,
-        // but mask defensively to uphold MemoryObject's alignment invariant.
-        let aligned_base = entry.physical_base & !0xFFF;
-        let size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF;
-        if size == 0
-        {
-            continue;
-        }
-        let ptr = mint_phase7_body(MemoryObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
-            base: aligned_base,
-            size,
-            // Firmware table: not retypable; cap minted without RETYPE.
-            available_bytes: core::sync::atomic::AtomicU64::new(0),
-            // Firmware-reserved memory; not buddy-backed.
-            owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
-            lock: core::sync::atomic::AtomicU32::new(0),
-        });
-        let slot = insert_or_fatal(
-            cspace,
-            MemRights::MAP,
-            ptr,
-            "Phase 7: cannot allocate Memory capability for ACPI region",
-        );
-        extend_slot_run_or_fatal(
-            &mut acpi_region_memory_base,
-            acpi_region_memory_count,
-            slot,
-            "Phase 7: ACPI region Memory caps are not in consecutive slots",
-        );
-        push_descriptor(
-            &mut desc_count,
-            CapDescriptor {
-                slot,
-                cap_type: CapType::Memory,
-                pad: [0; 3],
-                aux0: aligned_base,
-                aux1: size,
-            },
-        );
-        acpi_region_memory_count += 1;
-    }
+    let (acpi_region_memory_base, acpi_region_memory_count) =
+        mint_acpi_region_caps(cspace, mmap, |d| push_descriptor(&mut desc_count, d));
 
     // RO Memory cap over the single 4 KiB page containing the ACPI RSDP.
     // RSDP commonly sits in firmware-reserved memory outside
@@ -2500,6 +2519,45 @@ mod tests
         let mut base = 0;
         extend_slot_run_or_fatal(&mut base, 0, 42, "runs: not in consecutive slots");
         assert_eq!(base, 42);
+    }
+
+    // Defect guarded: ACPI regions past a fixed count silently
+    // dropped, so the tables in them never reach devmgr; and a region other
+    // than an AcpiReclaimable one, or a zero-length one, minted as ACPI.
+    #[test]
+    fn every_acpi_reclaimable_region_gets_one_consecutive_cap()
+    {
+        let mut mmap = Vec::new();
+        for i in 0..20u64
+        {
+            mmap.push(MemoryMapEntry {
+                physical_base: 0x1000_0000 + i * 0x10_0000,
+                size: 0x2000,
+                memory_type: MemoryType::AcpiReclaimable,
+            });
+            mmap.push(MemoryMapEntry {
+                physical_base: 0x1000_8000 + i * 0x10_0000,
+                size: 0x1000,
+                memory_type: MemoryType::Usable,
+            });
+        }
+        mmap.push(MemoryMapEntry {
+            physical_base: 0x2000_0000,
+            size: 0,
+            memory_type: MemoryType::AcpiReclaimable,
+        });
+        let mut cspace = CSpace::new(0);
+        let mut descs = Vec::new();
+        let (base, count) = mint_acpi_region_caps(&mut cspace, &mmap, |d| descs.push(d));
+        assert_eq!(count, 20);
+        assert_eq!(descs.len(), 20);
+        for (i, d) in descs.iter().enumerate()
+        {
+            assert_eq!(d.slot, base + i as u32);
+            assert_eq!(d.aux0, 0x1000_0000 + i as u64 * 0x10_0000);
+            assert_eq!(d.aux1, 0x2000);
+            assert!(cspace.slot(d.slot).is_some_and(|s| s.tag == CapTag::Memory));
+        }
     }
 
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────

@@ -313,12 +313,11 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
         uncacheable: true,
     };
 
-    // Choose the PT-page source, mirroring sys_mem_map. An AS that recorded
-    // its create-time donation pulls intermediate PT pages from its own
-    // caller-funded growth pool; one without falls back to the kernel PT
-    // pool.
+    // Intermediate PT pages come from the address space's own caller-funded
+    // pool, as in sys_mem_map; the kernel page-table pool is never drawn on
+    // (`core/kernel/docs/memory-internals.md` § Page Table Node Ownership).
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
-    let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
+    unsafe { (*aso_raw).require_create_donation() }?;
 
     // Record the mapping before mapping a page, so the object's teardown
     // finds every page this call maps, including after a partial failure.
@@ -333,21 +332,10 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
         let phys = mmio_phys + (i * PAGE_SIZE) as u64;
 
         // SAFETY: virt in user range (validated above); phys from a
-        // kernel-provisioned Mmio boot object. Pooled vs kernel-direct
-        // dispatch is chosen once above from whether the AS records a
-        // donation.
-        let result = if pooled
-        {
-            // SAFETY: aso_raw is valid; it wraps as_ptr.
-            unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
-        }
-        else
-        {
-            // SAFETY: AS without a recorded donation; map_page acquires
-            // pt_lock and the kernel page-table pool lock internally.
-            unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
-        };
-        result.map_err(|()| SyscallError::OutOfMemory)?;
+        // kernel-provisioned Mmio boot object; aso_raw is valid and wraps
+        // as_ptr.
+        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
+            .map_err(|()| SyscallError::OutOfMemory)?;
     }
 
     Ok(0)

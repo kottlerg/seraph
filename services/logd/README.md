@@ -68,14 +68,14 @@ targets; only the one-time init-logd history pull
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
   (authorised by the `DEATH_EQ_AUTHORITY` badged `SEND|GRANT` cap svcmgr mints
-  into logd's bootstrap round). Procmgr binds that EQ as an
-  additional death observer on the main thread of every existing
-  process and of every future spawn, so only a process's own exit
-  posts to it; a worker thread's exit does not (see
-  [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)).
-  When a process exits, logd's EQ receives the death entry
-  `(exit_reason, process_badge as u32)`; logd evicts the matching
-  slot from its hash-keyed badge table (see
+  into logd's bootstrap round). Nothing binds that EQ as a death observer:
+  procmgr posts to it the death entry `(exit_reason, process badge)` of
+  every process it tears down after the registration, so procmgr, not the
+  kernel, is the source of logd's death events, and the EQ needs no
+  death-observer nodes (see
+  [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)
+  § `REGISTER_DEATH_EQ`). logd evicts the slot of exactly that badge from
+  its hash-keyed badge table (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md)). The EQ has a fixed
   tuning capacity. A death posted to a full EQ is dropped, so a drain that
   took a full queue's worth starts a resync: a helper thread walks procmgr's
@@ -146,7 +146,7 @@ the devmgr-registry cap for its lifetime (see
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client and a framebuffer-driver consumer |
 | [services/init/README.md](../init/README.md) | init-logd's role + termination, and the reserved log-sink sources init endows svcmgr |
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
-| [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
+| [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with and the `BoundedStr` diagnostic formatter |

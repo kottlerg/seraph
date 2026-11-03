@@ -126,33 +126,27 @@ evicted before logd processes any of its still-queued
 
 ## Death-notification cascade
 
-Every process spawned by procmgr is bound to two death observers
-at creation:
+procmgr, not the kernel, is the source of logd's death events. Every
+process spawned by procmgr is bound to death observers on procmgr's own
+death queues only (correlator = the full process badge, for procmgr's
+auto-reap path). logd's death `EventQueue` has no death-observer nodes and
+nothing binds it: once logd's
+[`REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md) has stored it in
+procmgr's `LOGD_DEATH_EQ` static, every teardown procmgr runs (the reap of
+a death event, its death resync, and `DESTROY_PROCESS`) posts the death
+entry `(exit_reason, process badge)` to it. A process torn down before the
+registration posts nothing.
 
-1. Procmgr's own death `EventQueue` (correlator = the process
-   badge's low 32 bits, for procmgr's auto-reap path).
-2. logd's death `EventQueue` (correlator = the process badge's low
-   32 bits, for logd's slot eviction).
-
-Procmgr installs the second binding inside
-[`finalize_creation`](../../procmgr/src/process.rs) when its
-`LOGD_DEATH_EQ` static is non-zero, AND retroactively across every
-existing process table entry when logd's
-[`REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md) IPC arrives. Children spawned before logd
-registers see only the first binding until the retroactive bind
-catches them up.
-
-logd's drain consumes each event as the death entry
-`(exit_reason, process_badge as u32)` (`syscall::DeathEvent`) and evicts the
-matching slot from the hash-keyed badge table. Idempotent on
-already-evicted badges. procmgr keeps the low 32 bits unique among live
-processes, so a death evicts only the dead sender's slot.
+logd's drain consumes each event as that death entry (`syscall::DeathEvent`,
+the full `u64` badge in the correlator word) and evicts the slot of exactly
+that badge from the hash-keyed badge table, so a death evicts only the dead
+sender's slot. Idempotent on already-evicted badges.
 
 ## Death-queue resync
 
 logd's death `EventQueue` has a fixed tuning capacity (`DEATH_EQ_CAPACITY`,
-128), not one sized from any process count. The kernel drops a post to a full
-queue, which would leave that sender's slot unevicted. A drain that takes a full
+128), not one sized from any process count. procmgr drops a post the full
+queue refuses, which would leave that sender's slot unevicted. A drain that takes a full
 queue's worth of events or more may have followed such a drop (a dropped post
 leaves a full queue of events behind it for that drain or the next), so it starts
 a resync:

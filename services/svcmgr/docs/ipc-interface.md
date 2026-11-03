@@ -10,8 +10,8 @@ query surface.
 
 svcmgr listens on a single IPC endpoint (the svcmgr service endpoint).
 svcmgr holds the Receive-side capability (delivered in the handover
-endowment) and multiplexes it with the shared death-notification
-EventQueue via a WaitSet.
+endowment) and multiplexes it with the death-notification EventQueues
+via a WaitSet.
 
 A SEND on the same endpoint (carrying neither the
 [`PUBLISH_AUTHORITY`](#publish-authority) nor the
@@ -258,16 +258,16 @@ See [`docs/capability-model.md`](../../../docs/capability-model.md)
 
 ## Death notification
 
-svcmgr maintains one shared EventQueue (`deaths_eq`). At
+svcmgr maintains a growable set of death EventQueues. At
 reconciliation time, every supervised service has its main thread
-bound to `deaths_eq` with `correlator = service_table_index`. The
-WaitSet has two members: the service endpoint (badge 0) and the
-deaths queue (badge 1).
+bound to one of them with `correlator = service_table_index`. The
+WaitSet holds the service endpoint (badge 0) and every death queue
+(badge 1).
 
 When a thread exits (clean or fault), the kernel posts the death entry
-`(exit_reason, correlator)` to `deaths_eq` (see
-[restart-protocol.md](restart-protocol.md#death-detection)). svcmgr drains the
-queue and routes each payload to its `ServiceEntry` via the
+`(exit_reason, correlator)` to the queue its observer was bound on (see
+[restart-protocol.md](restart-protocol.md#death-detection)). svcmgr drains
+every queue and routes each payload to its `ServiceEntry` via the
 correlator, then dispatches through
 [`restart::handle_death`](../src/restart.rs).
 

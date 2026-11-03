@@ -197,9 +197,8 @@ fn main() -> !
 /// Capacity of logd's death-notification `EventQueue`: a tuning value, not
 /// a process ceiling. procmgr's post of a death is refused, and dropped,
 /// when the queue is full, so a drain that takes this many events or more
-/// starts a resync ([`Resync`]), which
-/// evicts the slots of senders procmgr no longer lists as live; no process
-/// count sizes the queue.
+/// starts a resync ([`Resync`]), which evicts the slots of senders procmgr no
+/// longer lists as live; no process count sizes the queue.
 const DEATH_EQ_CAPACITY: u32 = 128;
 
 /// Allocate the slab and create the death-notification `EventQueue` of

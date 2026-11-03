@@ -84,9 +84,10 @@ An entry an existing open Issue already names cites it in the recommendation.
   RAM-bound, and the kernel's `CSpace` registry is sized from RAM and does not bind first. The
   death queues' observer pools grow too: procmgr and svcmgr each add a queue, funded from their
   own memory, when every pool is out of nodes, and logd's queue needs none, since procmgr posts
-  each death to it. The death correlators are the full `u64` badge or table index. The first
-  bound past RAM is procmgr's `CSpace` (about 1 M children, `MAX_SLOTS_STRUCTURAL`), and behind it
-  sits the cap handle's 8-bit wrapping generation.
+  each death to it. The death correlators are the full `u64` badge or table index. A further
+  queue is one contiguous memmgr grant, so on fragmented RAM it can bind before RAM runs out
+  (#677). The first bound past RAM is procmgr's `CSpace` (about 1 M children,
+  `MAX_SLOTS_STRUCTURAL`), and behind it sits the cap handle's 8-bit wrapping generation.
 - **Per-process address space.** The surfaces a creator places stay in one static map below
   Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
@@ -522,14 +523,15 @@ Every entry here is `correct as is`; none is tracked.
 
 ### procmgr
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
-[#666](https://github.com/kottlerg/seraph/issues/666) (address-space fault read-back).
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv),
+[#666](https://github.com/kottlerg/seraph/issues/666) (address-space fault read-back), and
+[#677](https://github.com/kottlerg/seraph/issues/677) (the death queues' grant fallback).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `ProcessTable.entries` | `services/procmgr/process-table/src/lib.rs` | heap `Vec` sorted by badge | per-instance (the table fails only when the heap cannot grow it) | none | correct as is | None |
 | `DEATH_EQ_CAPACITY` | `services/procmgr/src/death_queues.rs` | 256 per death queue | tuning (a drain of a full queue's worth rescans every live entry's main-thread state, recovering any dropped main-thread post) | about 4.1 KiB per queue | needs a design | A dropped address-space terminal-fault post (a worker thread's fault) is not recovered: no kernel state reports an address space's terminal fault (#666) |
-| `FIRST_POOL_OBSERVERS`, `DEATH_QUEUES_MAX` (`DeathQueues`) | `services/procmgr/process-table/src/death_queues.rs`, `services/procmgr/src/death_queues.rs` | 64 nodes in the first queue, each further queue twice the last up to `EVENT_QUEUE_MAX_CAPACITY`, at most 24 queues | per-call bound (two nodes per live process; the 24 pools hold more than 11 M nodes, past twice the about 1 M children procmgr's `CSpace` holds, so their count never binds first; each further queue is one contiguous memmgr grant, about 24 MiB once a pool reaches the kernel maximum, which fragmented RAM can refuse first) | 1.5 KiB of nodes up front; a further queue only when every pool is out | correct as is | Hoist `DeathQueues` into the runtime with svcmgr's copy (#677) |
+| `FIRST_POOL_OBSERVERS`, `DEATH_QUEUES_MAX` (`DeathQueues`) | `services/procmgr/process-table/src/death_queues.rs`, `services/procmgr/src/death_queues.rs` | 64 nodes in the first queue, each further queue twice the last up to `EVENT_QUEUE_MAX_CAPACITY`, at most 24 queues | per-call bound (two nodes per live process; the 24 pools hold more than 11 M nodes, past twice the about 1 M children procmgr's `CSpace` holds, so their count never binds first; each further queue is one contiguous memmgr grant, about 24 MiB once a pool reaches the kernel maximum, which fragmented RAM can refuse first) | 1.5 KiB of nodes up front; a further queue only when every pool is out | needs a design | Fall back to a smaller pool on a refused grant, with a queue count that grows past 24; hoist `DeathQueues` into the runtime with svcmgr's copy (#677) |
 | `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
 | death correlator | `services/procmgr/src/process.rs` (`finalize_creation`) | the full `u64` process badge | ABI width (`SYS_THREAD_BIND_NOTIFICATION`'s `u64` correlator) | none | correct as is | None |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
@@ -548,7 +550,8 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 
 ### svcmgr and registry
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
+[#677](https://github.com/kottlerg/seraph/issues/677) (the death queues' grant fallback).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -556,7 +559,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
 | `SvcmgrState.registry` | `services/svcmgr/src/main.rs` | growable `Registry` | per-instance | none | correct as is | None (#75) |
 | `SvcmgrState.pending` | `services/svcmgr/src/main.rs` | heap `Vec`, one per substrate round | per-instance | none | correct as is | None |
 | `DEATHS_EQ_CAPACITY` | `services/svcmgr/src/death_queues.rs` | 64 per death queue | tuning (a drain of a full queue's worth rescans every active service's thread state) | about 1.1 KiB per queue | correct as is | None |
-| `FIRST_POOL_OBSERVERS`, `DEATH_QUEUES_MAX` (`DeathQueues`) | `services/svcmgr/src/death_queues.rs`, `services/svcmgr/svc-defs/src/death_queues.rs` | 4 nodes in the first queue, each further queue twice the last up to `EVENT_QUEUE_MAX_CAPACITY`, at most 24 queues | per-call bound (one node per supervised service, plus restarts in flight; the 24 pools hold more than 7 M nodes, past the 3.6 M slots svcmgr's `CSpace` holds, so their count never binds first; each further queue is one contiguous memmgr grant, which fragmented RAM can refuse first) | 96 B of nodes up front; a further queue only when every pool is out (every boot's seven supervised and adopted services grow the set) | correct as is | Hoist `DeathQueues` into the runtime with procmgr's copy (#677) |
+| `FIRST_POOL_OBSERVERS`, `DEATH_QUEUES_MAX` (`DeathQueues`) | `services/svcmgr/src/death_queues.rs`, `services/svcmgr/svc-defs/src/death_queues.rs` | 4 nodes in the first queue, each further queue twice the last up to `EVENT_QUEUE_MAX_CAPACITY`, at most 24 queues | per-call bound (one node per supervised service, plus restarts in flight; the 24 pools hold more than 7 M nodes, past the 3.6 M slots svcmgr's `CSpace` holds, so their count never binds first; each further queue is one contiguous memmgr grant, which fragmented RAM can refuse first) | 96 B of nodes up front; a further queue only when every pool is out (every boot's seven supervised and adopted services grow the set) | needs a design | Fall back to a smaller pool on a refused grant, with a queue count that grows past 24; hoist `DeathQueues` into the runtime with procmgr's copy (#677) |
 | `RESTART_BURST`, `RESTART_WINDOW_NS` (`RestartBudget`) | `services/svcmgr/svc-defs/src/restart_budget.rs` | 3 restarts per 60 s window | tuning (stops a crash loop; a rarer crash always restarts) | 16 B per service | correct as is | None (#262 for clean cap-holder restart) |
 | `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |

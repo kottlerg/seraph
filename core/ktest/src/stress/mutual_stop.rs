@@ -37,8 +37,7 @@
 //! while it waited, is tallied but not required), and count a loop. Each
 //! child is the only stopper of the other, and each stop lands on a peer
 //! that is running, usually inside its own stop of the stopper. The
-//! controller, pinned to CPU 0, runs [`CYCLES`] rounds (fewer past 16 CPUs,
-//! see [`super::scaled_attempts`]): restart both
+//! controller, pinned to CPU 0, runs [`CYCLES`] rounds: restart both
 //! children (`Ok`, or `InvalidArgument` for one not stopped), wait, bounded
 //! by [`ROUND_WAIT_US`], for both to count another loop (a round that times
 //! out is tallied), and spin a varying delay. A pair that a mutual stop left
@@ -90,10 +89,6 @@ const CELL: &str = "stress::mutual_stop";
 
 /// Controller rounds.
 const CYCLES: u32 = 200;
-
-/// Fewest rounds at any width: a mutual stop leaves both children stopped
-/// on most rounds, so a few dozen rounds still witness one.
-const MIN_CYCLES: u32 = 32;
 
 /// The two children.
 const CHILDREN: usize = 2;
@@ -224,9 +219,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::mutual_stop: pin controller failed")?;
-    // Each round's cross-CPU stops and restarts grow with the width; the
-    // count shrinks with it.
-    let result = with_children(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = with_children(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::mutual_stop: restore controller affinity failed");
     let tally = result?;

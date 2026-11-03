@@ -56,8 +56,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Rounds at up to [`crate::UNSCALED_CPUS`] CPUs.
 const CYCLES: u32 = 100;
-/// Fewest rounds at any width ([`super::scaled_attempts`]).
-const MIN_CYCLES: u32 = 24;
 /// E1/E2 rebinds per round.
 const REBINDS: u32 = 64;
 /// Fewest CPUs: controller, faulter, and handlers each on their own.
@@ -151,11 +149,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::fault_bind_race: pin controller failed")?;
     let mut parts = Parts::default();
-    let result = race(
-        ctx,
-        &mut parts,
-        super::scaled_attempts(CYCLES, MIN_CYCLES, cpus),
-    );
+    let result = race(ctx, &mut parts, CYCLES);
     parts.release();
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::fault_bind_race: restore controller affinity failed");

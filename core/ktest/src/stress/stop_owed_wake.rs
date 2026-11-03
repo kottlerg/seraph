@@ -35,8 +35,7 @@
 //! A waiter loops `notification_wait` on one notification; a sender on CPU 0
 //! loops `notification_send` on it. The waiter runs on CPU 2, or shares CPU 0
 //! with the sender at 2 CPUs. The controller, pinned to CPU 1, stops and
-//! restarts the waiter [`CYCLES`] times (fewer past 16 CPUs, see
-//! [`super::scaled_attempts`]), waiting after each restart until the
+//! restarts the waiter [`CYCLES`] times, waiting after each restart until the
 //! waiter has run and entered a wait (bounded; a starved round is logged), then
 //! spinning a varying time, in two phases: alone, then while a starter on
 //! CPU 3 (a CPU no other participant uses) loops `thread_start` on the waiter.
@@ -79,11 +78,6 @@ const CELL: &str = "stress::stop_owed_wake";
 
 /// Stop/start rounds per phase.
 const CYCLES: u32 = 2000;
-
-/// Fewest rounds per phase at any width: most stops land on a parked waiter
-/// and the starter wins a fair share of the racing restarts, so a few dozen
-/// rounds still cancel waits and give the starter wins.
-const MIN_CYCLES: u32 = 64;
 
 /// Bound, in 1 ms sleeps, on the controller's polls for the starter to go
 /// idle and for every child to exit.
@@ -219,9 +213,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         Phases::AloneThenRacing => STARTER_CPU,
         Phases::AloneOnly => 0,
     };
-    // Each round's cross-CPU stop drain and restart grow with the width; the
-    // count shrinks with it.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
+    let cycles = CYCLES;
     let result = with_children(ctx, [waiter_cpu, 0, starter_cpu], phases, cycles);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_owed_wake: restore controller affinity failed");

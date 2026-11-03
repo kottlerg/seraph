@@ -72,10 +72,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// is rarer than the #317 UAF, so give the cross-CPU strand many chances.
 const CYCLES: u32 = 2000;
 
-/// Fewest races at any width ([`super::scaled_attempts`]): the gates hold on
-/// every cycle, so the floor only keeps the cross-CPU strand tried often.
-const MIN_CYCLES: u32 = 64;
-
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
@@ -132,9 +128,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
-    // Each race's starts, wakes and dealloc cross CPUs, whose cost grows with
-    // the width; the count shrinks with it and the placements stay spread.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
+    let cycles = CYCLES;
 
     // Anti-vacuous accumulators: every cycle must arm the reply binding and then
     // observe the client's wake.

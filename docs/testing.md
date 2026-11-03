@@ -501,10 +501,11 @@ The 65-hart run is the first count past a 64-bit word; the 128-hart run is the c
 hart-scaled firmware allocations once collided with the kernel image's load address
 ([#377](https://github.com/kottlerg/seraph/issues/377)); the 512-vCPU run is `MAX_CPUS`.
 
-Past 16 CPUs ktest scales its round-based stress cells' attempt counts, and stretches the
-wall-clock bounds [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists,
-by the oversubscription factor the width implies, so the boundary runs stay inside their budgets
-while the CI widths keep the full counts and tight budgets.
+Past 16 CPUs ktest stretches the wall-clock bounds
+[core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists by the
+oversubscription factor the width implies, so a slow step at a boundary run is not taken for a
+stuck one while the CI widths keep the tight budgets; its stress cells make their full attempt
+counts at every width.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
 a non-inert change to the memory surface: the code that sizes or maps physical memory by the

@@ -47,9 +47,7 @@
 //! and one racing a Thread delete. A long-lived racer, pinned to CPU 2, takes the
 //! phase's action (stop the waiter, or delete its Thread capability) in each
 //! round it is armed for. The controller, pinned to CPU 0, runs [`CYCLES`]
-//! rounds per phase (fewer past 16 CPUs, see [`super::scaled_attempts`]; a
-//! phase whose race has not armed by then runs on, up to [`CYCLES`], until it
-//! does, since each round's chance of arming falls with the oversubscription).
+//! rounds per phase.
 //! Each round creates a fresh source and a waiter pinned to CPU 1 that loops
 //! waiting on it, counting each wait it enters and classifying each result;
 //! the controller waits until the waiter has entered a wait (bounded by
@@ -128,13 +126,6 @@ const CELL: &str = "stress::stop_source_delete";
 
 /// Rounds per phase; each creates and deletes one source and one waiter.
 const CYCLES: u32 = 200;
-
-/// Fewest rounds per phase at any width: the settle spread puts a good share
-/// of the races on a parked waiter, so a few dozen rounds still land some.
-/// Under oversubscription a served-call phase's server can miss the endpoint
-/// for that many rounds, so a phase whose race has not armed after its
-/// scaled count runs on, up to [`CYCLES`] in all ([`rounds`]).
-const MIN_CYCLES: u32 = 32;
 
 /// CPUs needed: one each for the controller, the waiter, and the racer.
 const MIN_CPUS: u64 = 3;
@@ -337,8 +328,6 @@ struct RoundParts
 #[derive(Default)]
 struct Seen
 {
-    /// Rounds the phase ran.
-    rounds: u32,
     /// Rounds in which the waiter entered no wait within [`ENTRY_WAIT_US`].
     starved: u32,
     /// Stop phase: rounds whose stop landed on a waiter inside a wait, and
@@ -376,18 +365,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_source_delete: pin controller failed")?;
-    // Each round's waiter start, cross-CPU action and teardown grow with the
-    // width; the count shrinks with it (a phase not yet armed runs on, up to
-    // `CYCLES`, see `rounds`).
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus), cpus);
+    let result = phases(ctx, CYCLES, cpus);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_source_delete: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run every phase (at least `cycles` rounds each, see [`rounds`]) and check
-/// each; the served-call phases only with [`SERVED_MIN_CPUS`] CPUs.
+/// Run every phase of `cycles` rounds and check each; the served-call phases
+/// only with [`SERVED_MIN_CPUS`] CPUs.
 fn phases(ctx: &TestContext, cycles: u32, cpus: u64) -> TestResult
 {
     for race in [Race::Stop, Race::ThreadDelete]
@@ -468,7 +454,6 @@ fn phase_name(kind: Kind, race: Race) -> &'static str
 fn log_seen(seen: &Seen)
 {
     for (label, value) in [
-        (" rounds=", seen.rounds),
         (" starved=", seen.starved),
         (" stopped_in_wait=", seen.stopped_in_wait),
         (" stopped_between=", seen.stopped_between),
@@ -486,8 +471,10 @@ fn log_seen(seen: &Seen)
     }
 }
 
-/// Check a phase's tallies: nothing failed, and the race armed
-/// ([`unarmed`]).
+/// Check a phase's tallies: nothing failed, and the race armed (a stop or a
+/// Thread delete landed on a waiter inside a wait; a stop phase's restarted
+/// waiters saw `Interrupted`; a served-call phase's server was parked on the
+/// endpoint at some delete).
 fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
 {
     BAD_WAITS.check(
@@ -498,36 +485,24 @@ fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
         CELL,
         "stress::stop_source_delete: a racer action or a restart returned an unaccepted result",
     )?;
-    unarmed(seen, kind, race).map_or(Ok(()), Err)
-}
-
-/// The first of the phase's arming requirements that `seen` does not yet
-/// meet, as its failure message, or `None` once the race armed: a stop or a
-/// Thread delete landed on a waiter inside a wait, a stop phase's restarted
-/// waiters saw `Interrupted`, and a served-call phase's server was parked on
-/// the endpoint at some delete.
-fn unarmed(seen: &Seen, kind: Kind, race: Race) -> Option<&'static str>
-{
     match race
     {
         Race::Stop =>
         {
             if seen.stopped_in_wait == 0
             {
-                return Some(
-                    "stress::stop_source_delete: no stop landed on a waiter inside a wait",
-                );
+                return Err("stress::stop_source_delete: no stop landed on a waiter inside a wait");
             }
             if kind != Kind::CallServed && seen.interrupted == 0
             {
-                return Some("stress::stop_source_delete: no restarted wait returned Interrupted");
+                return Err("stress::stop_source_delete: no restarted wait returned Interrupted");
             }
         }
         Race::ThreadDelete =>
         {
             if seen.died_in_wait == 0
             {
-                return Some(
+                return Err(
                     "stress::stop_source_delete: no Thread delete ended a waiter inside a wait",
                 );
             }
@@ -535,16 +510,15 @@ fn unarmed(seen: &Seen, kind: Kind, race: Race) -> Option<&'static str>
     }
     if kind == Kind::CallServed && seen.server_interrupted == 0
     {
-        return Some(
+        return Err(
             "stress::stop_source_delete: no server receive was parked on a deleted endpoint",
         );
     }
-    None
+    Ok(())
 }
 
-/// One phase: start the racer, run the phase's rounds ([`rounds`], at least
-/// `cycles`), end the racer, and delete it whatever the outcome. Returns what
-/// the phase saw.
+/// One phase: start the racer, run `cycles` rounds, end the racer, and
+/// delete it whatever the outcome. Returns what the phase saw.
 fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen, &'static str>
 {
     for counter in [
@@ -604,23 +578,15 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen,
             released = Err("stress::stop_source_delete: delete racer or server failed");
         }
     }
-    let seen = result?;
+    let mut seen = result?;
     ended?;
     server_ended?;
     released?;
-    Ok(seen)
-}
-
-/// Copy the waiters' and the server's tallies into `seen`. Stable once a
-/// round is released: the racer and the server have acknowledged it, and its
-/// waiter has exited or been deleted (the round's teardown deletes a stopped
-/// served-call caller).
-fn load_child_tallies(seen: &mut Seen)
-{
     seen.interrupted = INTERRUPTED.load(Ordering::Acquire);
     seen.gone = GONE.load(Ordering::Acquire);
     seen.served = SERVED.load(Ordering::Acquire);
     seen.server_interrupted = SERVER_INTERRUPTED.load(Ordering::Acquire);
+    Ok(seen)
 }
 
 /// Start the served-call phases' server (none for any other kind).
@@ -665,27 +631,18 @@ fn finish_racer() -> TestResult
     }
 }
 
-/// Run the phase's rounds, stopping at the first that fails: `cycles`
-/// rounds, then, while the race has not armed ([`unarmed`]), more, up to
-/// [`CYCLES`] in all. Past 16 CPUs `cycles` is scaled down, and each round's
-/// chance of arming falls with the oversubscription (a served-call server
-/// whose vCPU waits for a host core can reach the endpoint only after its
-/// delete), so a phase can end its scaled count unarmed; the unscaled count
-/// bounds the extra rounds. Returns the tallies.
+/// Run the phase's rounds, stopping at the first that fails. Returns the
+/// controller-side tallies.
 fn rounds(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
-    let mut cycle = 0;
-    while cycle < cycles || (cycle < CYCLES && unarmed(&seen, kind, race).is_some())
+    for cycle in 0..cycles
     {
         let mut parts = RoundParts::default();
         let result = round(ctx, kind, race, cycle, &mut parts, &mut seen);
         let released = release_round(&parts);
         result?;
         released?;
-        load_child_tallies(&mut seen);
-        cycle += 1;
-        seen.rounds = cycle;
     }
     Ok(seen)
 }

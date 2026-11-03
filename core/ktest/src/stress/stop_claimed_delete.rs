@@ -54,8 +54,7 @@
 //! serves each wait the round's waiter enters: it spins a varying delay,
 //! then delivers to the round's source, which it reads from a shared handle
 //! whenever the round is flagged live. The controller, pinned to CPU 0, runs
-//! [`CYCLES`] rounds per phase (fewer past 16 CPUs, see
-//! [`super::scaled_attempts`]). Each round creates a fresh source, publishes
+//! [`CYCLES`] rounds per phase. Each round creates a fresh source, publishes
 //! its handle, and spawns a waiter pinned to CPU 1 that loops waiting on
 //! that source, counting each wait it enters and each result; the controller
 //! waits until the waiter has entered a wait (bounded by [`ENTRY_WAIT_US`];
@@ -106,11 +105,6 @@ const CELL: &str = "stress::stop_claimed_delete";
 
 /// Rounds per phase; each creates and deletes one source and one waiter.
 const CYCLES: u32 = 1000;
-
-/// Fewest rounds per phase at any width. A second stop that commits is the
-/// rarest outcome the cell requires, a few rounds in a hundred at some
-/// widths, so the floor keeps over a hundred rounds.
-const MIN_CYCLES: u32 = 128;
 
 /// CPUs needed: one each for the controller, the waiter, the sender, and
 /// the second stopper.
@@ -284,9 +278,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_claimed_delete: pin controller failed")?;
-    // Each round's waiter start, cross-CPU stop drain and teardown grow with
-    // the width; the count shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = phases(ctx, CYCLES);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_claimed_delete: restore controller affinity failed");
     result?;

@@ -51,13 +51,8 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// `u64` report bitmask.
 const MAX_PAIRS: usize = 8;
 
-/// Affinity swaps per pair. Fewer past 16 CPUs; see
-/// [`super::scaled_attempts`].
+/// Affinity swaps per pair.
 const ROUNDS: u32 = 400;
-
-/// Fewest swaps per pair at any width: enough rounds for the two CPUs of a
-/// pair to meet in the cross-affinity requeue at a wide boundary run.
-const MIN_ROUNDS: u32 = 50;
 
 /// Bound on a round's wait for every worker to report its new CPU, in
 /// slices of [`ROUND_SLICE_MS`]; applied through [`crate::scaled_bound`].
@@ -119,7 +114,7 @@ fn swap_rounds(
     let pairs = usize::try_from(cpus / 2)
         .unwrap_or(MAX_PAIRS)
         .min(MAX_PAIRS);
-    let rounds = super::scaled_attempts(ROUNDS, MIN_ROUNDS, cpus);
+    let rounds = ROUNDS;
 
     // Worker 2p starts on its pair's first CPU and 2p + 1 on the next one:
     // two distinct CPUs whenever there are two.

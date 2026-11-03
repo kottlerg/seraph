@@ -24,9 +24,8 @@
 //!
 //! A sleeper pinned to CPU 0 — the CPU whose timer tick pops and claims
 //! expired sleepers — loops `thread_sleep(1)` and tallies each result. The
-//! controller, pinned to CPU 1, stops and restarts it [`CYCLES`] times (fewer
-//! past 16 CPUs, see [`super::scaled_attempts`]) with a
-//! varying spin between pairs, so stops also land between the timer's pop
+//! controller, pinned to CPU 1, stops and restarts it [`CYCLES`] times with
+//! a varying spin between pairs, so stops also land between the timer's pop
 //! and its wake. The tripwires are the kernel's debug assertions (CI debug
 //! cells run them): a listed TCB with a zero deadline at the pop, a
 //! duplicate add, a popped binding that no timed park arms, and the
@@ -51,10 +50,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Stop/start pairs to issue against the sleeper.
 const CYCLES: u32 = 2000;
-
-/// Fewest pairs at any width: the sleeper spends most of its time asleep, so
-/// a few dozen stops already cancel sleeps and land around the timer's claim.
-const MIN_CYCLES: u32 = 64;
 
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
@@ -86,9 +81,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     INTERRUPTED.store(0, Ordering::Relaxed);
     BAD.store(0, Ordering::Relaxed);
 
-    // Each pair's cross-CPU stop drain grows with the width; the count
-    // shrinks with it.
-    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
+    let cycles = CYCLES;
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::stop_sleep_window: pin controller failed")?;
     let result = with_sleeper(ctx, cycles);

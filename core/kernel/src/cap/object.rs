@@ -467,9 +467,14 @@ impl Drop for MemoryReadGuard<'_>
 
 /// Most copies of one range-capability lineage that may be live at once: the
 /// `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` copies of an
-/// `Mmio` or `IoPort` capability, each a fresh SEED-backed object
-/// ([`object_for_new_slot`]). A copy past it returns `QuotaExceeded`.
-pub const RANGE_COPY_LIMIT: u32 = 64;
+/// `Mmio` or `IoPort` capability, each a fresh object funded by the arena of
+/// the `CSpace` that receives it ([`object_for_new_slot`]). A copy past it
+/// returns `QuotaExceeded` rather than carry the lineage count into
+/// [`ROOT_SHARE`]. The bound is the count's encoding, not a capacity: each copy
+/// costs its funder a 72-byte slot and a 128-byte chunk, so the limit's
+/// 2^31 - 1 copies would hold more than 400 GiB of `CSpace` pools against one
+/// range.
+pub const RANGE_COPY_LIMIT: u32 = ROOT_SHARE - 1;
 
 /// The lineage an `Mmio` or `IoPort` object belongs to.
 ///
@@ -494,7 +499,8 @@ pub struct RangeLineage
 }
 
 /// The share of a lineage root's `live` count the root's own references hold.
-/// The copy count below it is capped at `RANGE_COPY_LIMIT`, so the two never collide.
+/// The copy count below it is capped at `RANGE_COPY_LIMIT`, so the two never
+/// collide.
 const ROOT_SHARE: u32 = 1 << 31;
 
 impl RangeLineage
@@ -4631,24 +4637,32 @@ mod tests
         assert_eq!(offset_of!(SchedControlObject, header), 0);
     }
 
+    // The defect caught: a copy count that runs into the root's share (the
+    // root's body freed while copies live, or never freed), whether or not the
+    // root itself is still referenced.
     #[test]
     fn a_range_lineage_admits_exactly_the_copy_limit()
     {
-        let mut root = MmioObject::new_root(0x1000_0000, 0x1000, 0);
-        let root_hdr = NonNull::from(&mut root).cast::<KernelObjectHeader>();
-        for _ in 0..RANGE_COPY_LIMIT
+        for share in [ROOT_SHARE, 0]
         {
-            // SAFETY: root is a live lineage root with its own share held.
+            let mut root = MmioObject::new_root(0x1000_0000, 0x1000, 0);
+            let root_hdr = NonNull::from(&mut root).cast::<KernelObjectHeader>();
+            // Copies up to one short of the limit, as if reserved one by one.
+            root.lineage
+                .live
+                .store(share + RANGE_COPY_LIMIT - 1, Ordering::Relaxed);
+            // SAFETY: root is a live lineage root whose count is held above zero.
             let copy = unsafe { RangeLineage::reserve_copy(root_hdr) }.unwrap();
             assert_eq!(copy.root_of(NonNull::dangling()), root_hdr);
+            // SAFETY: as above.
+            let refused = unsafe { RangeLineage::reserve_copy(root_hdr) };
+            assert!(matches!(refused, Err(syscall::SyscallError::QuotaExceeded)));
+            assert_eq!(
+                root.lineage.live.load(Ordering::Relaxed),
+                share + RANGE_COPY_LIMIT,
+                "the limit is reached without touching the root's share"
+            );
         }
-        // SAFETY: as above.
-        let refused = unsafe { RangeLineage::reserve_copy(root_hdr) };
-        assert!(matches!(refused, Err(syscall::SyscallError::QuotaExceeded)));
-        assert_eq!(
-            root.lineage.live.load(Ordering::Relaxed),
-            ROOT_SHARE + RANGE_COPY_LIMIT
-        );
     }
 
     // The defect caught: a mapping past the inline records that is refused or

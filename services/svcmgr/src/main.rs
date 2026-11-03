@@ -4,7 +4,7 @@
 // services/svcmgr/src/main.rs
 
 //! Seraph service manager — monitors services, detects crashes via a
-//! single shared death-notification event queue, and restarts them per
+//! growable set of death-notification event queues, and restarts them per
 //! their restart policy.
 //!
 //! svcmgr is loaded from the root filesystem by init (via procmgr's
@@ -13,13 +13,13 @@
 //! `HANDOVER_AUTHORITY`-badged SEND and exits. svcmgr runs for the lifetime
 //! of the system.
 //!
-//! Every supervised service binds death notification onto the same
-//! `deaths_eq` with `correlator = service_index`. The wait set has two
-//! members: the service endpoint (badge 0) and the deaths queue
-//! (badge 1). On death wakeup svcmgr drains the queue and routes each
-//! payload to its `ServiceEntry` via the correlator. Multiplexing
-//! avoids consuming a wait-set slot per supervised process and keeps
-//! the wait set inside the 16-member retype-bin sizing.
+//! Every supervised service binds death notification onto svcmgr's death
+//! queues with `correlator = service_index`; a further queue joins when
+//! every pool is out of nodes (`death_queues`). The wait set holds the
+//! service endpoint (badge 0) and every death queue (badge 1). On death
+//! wakeup svcmgr drains the queues and routes each payload to its
+//! `ServiceEntry` via the correlator. Multiplexing avoids consuming a
+//! wait-set slot per supervised process.
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 
@@ -27,6 +27,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+mod death_queues;
 mod definitions;
 mod restart;
 mod service;
@@ -37,21 +38,9 @@ use registry::{Resolver, Visibility};
 use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
 
-/// Capacity of svcmgr's shared death `EventQueue`: a tuning value, not a
-/// service ceiling. The kernel drops a death post to a full queue, so a burst
-/// of more deaths than this between drains is recovered by
-/// [`resync_deaths`], which [`dispatch_deaths`] runs after any drain that
-/// took a full queue's worth of events; the service table has no fixed size.
-const DEATHS_EQ_CAPACITY: u32 = 64;
-
-/// Death-observer nodes in the deaths queue: one per supervised service's
-/// main thread, and a restarted service binds its new thread before the old
-/// one's node returns. A bind past the pool fails the launch, restart, or
-/// adoption (#643 grows the pool).
-const DEATHS_EQ_OBSERVERS: u32 = 256;
-
-/// The main wait set's member capacity: the service endpoint and the deaths queue.
-const WS_MEMBERS: u32 = 2;
+/// The main wait set's member capacity: the service endpoint and every death
+/// queue svcmgr may create.
+const WS_MEMBERS: u32 = 1 + death_queues::DEATH_QUEUES_MAX as u32;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
@@ -134,32 +123,18 @@ fn main() -> !
         halt_loop();
     };
 
-    // One shared death-notification queue of `DEATHS_EQ_CAPACITY` entries and
-    // `DEATHS_EQ_OBSERVERS` observer nodes; the slab request is the kernel's
-    // raw EventQueue debit for both.
-    let deaths_eq_slab_bytes = std::os::seraph::event_queue_retype_bytes(
-        u64::from(DEATHS_EQ_CAPACITY),
-        u64::from(DEATHS_EQ_OBSERVERS),
-    );
-    let Some(deaths_eq) = std::os::seraph::object_slab_retype(deaths_eq_slab_bytes, |slab| {
-        syscall::event_queue_create_observed(slab, DEATHS_EQ_CAPACITY, DEATHS_EQ_OBSERVERS).ok()
-    })
-    else
-    {
-        std::os::seraph::log!("failed to create deaths event queue");
-        halt_loop();
-    };
-
     if syscall::wait_set_add(ws_cap, caps.service_ep, WS_BADGE_SERVICE).is_err()
     {
         std::os::seraph::log!("failed to add service endpoint to wait set");
         halt_loop();
     }
-    if syscall::wait_set_add(ws_cap, deaths_eq, WS_BADGE_DEATHS).is_err()
+    // The first death queue; further ones join the wait set as pools run out.
+    let Some(deaths) = death_queues::DeathSet::new(ws_cap, WS_BADGE_DEATHS)
+    else
     {
-        std::os::seraph::log!("failed to add deaths event queue to wait set");
+        std::os::seraph::log!("failed to create the first death queue");
         halt_loop();
-    }
+    };
 
     // Publish the well-known names svcmgr owns and hand devmgr its
     // drivers dir — both from the handover endowment caps — before the
@@ -170,7 +145,7 @@ fn main() -> !
 
     std::os::seraph::log!("endowed; waiting for handover");
 
-    event_loop(info, &caps, ws_cap, deaths_eq, ipc_buf, &mut state);
+    event_loop(info, &caps, ws_cap, deaths, ipc_buf, &mut state);
 }
 
 /// Publish the well-known names svcmgr owns into its own discovery
@@ -366,7 +341,7 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
 
 /// `WaitSet` badge for svcmgr's service endpoint.
 const WS_BADGE_SERVICE: u64 = 0;
-/// `WaitSet` badge for svcmgr's shared death event queue.
+/// `WaitSet` badge for svcmgr's death event queues, all of them.
 const WS_BADGE_DEATHS: u64 = 1;
 
 /// Monitored service table, pending-registration table, discovery
@@ -400,7 +375,7 @@ fn event_loop(
     info: &StartupInfo,
     caps: &service::SvcmgrCaps,
     ws_cap: u32,
-    deaths_eq: u32,
+    deaths: death_queues::DeathSet,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !
@@ -409,7 +384,7 @@ fn event_loop(
         procmgr_ep: info.procmgr_endpoint,
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
-        deaths_eq,
+        deaths,
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
         devmgr_registry: caps.devmgr_registry,
@@ -434,7 +409,7 @@ fn event_loop(
         match badge
         {
             WS_BADGE_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx, &mut guard),
-            WS_BADGE_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
+            WS_BADGE_DEATHS => dispatch_deaths(state, &restart_ctx),
             _ => std::os::seraph::log!("unexpected wait-set badge"),
         }
     }
@@ -505,7 +480,6 @@ fn dispatch_ipc(
             definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
                 &mut state.table,
-                ctx.deaths_eq,
                 ctx,
                 &mut state.registry,
             );
@@ -655,33 +629,24 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
     }
 }
 
-/// Drain all pending death notifications from the shared queue. Each
+/// Drain all pending death notifications from every death queue. Each
 /// death event carries the dying service's table index as its correlator
 /// (set at `thread_bind_notification` time) and the exit reason. The wait-set notifies once per
 /// not-empty → empty transition, so a single wakeup may cover several
-/// deaths; the try-recv loop runs until the queue empties.
+/// deaths; the try-recv loop runs until every queue empties.
 ///
-/// A drain that takes [`DEATHS_EQ_CAPACITY`] events or more may have
-/// followed a full queue, whose dropped posts leave a full queue's worth of
-/// events behind them for this drain or the next; the drain that crosses the
-/// capacity then runs [`resync_deaths`].
-fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
+/// A drain that takes [`death_queues::DEATHS_EQ_CAPACITY`] events or more
+/// from one queue may have followed a full queue, whose dropped posts leave a
+/// full queue's worth of events behind them for this drain or the next; the
+/// drain that crosses the capacity then runs [`resync_deaths`].
+fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    let mut drained: u32 = 0;
-    while let Ok(death) = syscall::event_try_recv_death(deaths_eq)
+    let full = ctx.deaths.drain(|death| {
+        route_death(death.correlator, death.exit_reason, state, ctx);
+    });
+    if full
     {
-        drained = drained.saturating_add(1);
-        // Every bind passes the service index widened to u64, so the low word
-        // is the whole correlator.
-        // cast_possible_truncation: see above; the high word is always zero.
-        #[allow(clippy::cast_possible_truncation)]
-        let correlator = death.correlator as u32;
-        let exit_reason = death.exit_reason;
-        route_death(correlator, exit_reason, state, ctx);
-    }
-    if drained >= DEATHS_EQ_CAPACITY
-    {
-        std::os::seraph::log!("death queue drained {drained} events; resyncing services");
+        std::os::seraph::log!("a death queue drained full; resyncing services");
         resync_deaths(state, ctx);
     }
 }
@@ -689,18 +654,20 @@ fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::Resta
 /// Route one death to its `ServiceEntry` by correlator (the table index) and
 /// run the restart decision for an active entry.
 fn route_death(
-    correlator: u32,
+    correlator: u64,
     exit_reason: u64,
     state: &mut SvcmgrState,
     ctx: &restart::RestartCtx,
 )
 {
-    let idx = correlator as usize;
-    if idx >= state.table.services.len()
+    let Some(idx) = usize::try_from(correlator)
+        .ok()
+        .filter(|&idx| idx < state.table.services.len())
+    else
     {
         std::os::seraph::log!("death notification with unknown correlator");
         return;
-    }
+    };
     let svc = &state.table.services[idx];
     if !svc.active
     {
@@ -763,9 +730,9 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
         {
             continue;
         }
-        // `idx` came from the table, whose slots each have a `u32`
+        // `idx` came from the table, whose slots each have a `u64`
         // correlator (`ServiceTable::reserve`).
-        let Ok(correlator) = u32::try_from(idx)
+        let Ok(correlator) = u64::try_from(idx)
         else
         {
             continue;

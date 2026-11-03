@@ -13,25 +13,29 @@
 //! create requests ([`CreateBlobs`]), which parses client-controlled label
 //! fields and data words, the `CREATE_FROM_FILE` cap-layout split
 //! ([`split_create_from_file_caps`]), the bounds procmgr applies to fs-driver
-//! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), and
-//! the init-reap handoff state machine ([`InitReap`]). None of these touch a
+//! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
+//! init-reap handoff state machine ([`InitReap`]), and the bind order and
+//! growth of the death queues ([`DeathQueues`]). None of these touch a
 //! syscall, IPC, or `std::os::seraph` surface — the cap fields are slot
 //! *indices* (plain integers), never live capabilities, and the decoder reads
 //! a stack [`ipc::IpcMessage`] snapshot — so the whole crate is
 //! host-reachable and host-tested. The syscall/IPC-bearing operations
-//! (pipe/namespace configuration, logd death-EQ binding, random process-badge
-//! minting, ELF load, the init-reap teardown, and process teardown) stay in
-//! `procmgr` and drive this logic across the crate boundary. See
+//! (pipe/namespace configuration, the death-queue binds and creates, the logd
+//! death forward, random process-badge minting, ELF load, the init-reap
+//! teardown, and process teardown) stay in `procmgr` and drive this logic
+//! across the crate boundary. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod create_blobs;
+pub mod death_queues;
 pub mod fs_reads;
 pub mod init_reap;
 pub mod request_caps;
 
 pub use create_blobs::{ChildArgs, ChildEnv, CreateBlobs};
+pub use death_queues::DeathQueues;
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{FileCreateCaps, split_create_from_file_caps};
 
@@ -48,22 +52,6 @@ use alloc::vec::Vec;
 /// the death rate times the window, paid for on the heap only while it holds
 /// entries.
 pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
-
-/// The death-EQ correlator of a process badge: its low 32 bits.
-///
-/// The kernel carries a `u64` death correlator, but procmgr still binds each
-/// child's observers with the low word of its `u64` badge, and logd keys its
-/// eviction on the same word. [`ProcessTable::insert`] refuses a badge whose
-/// low word a live entry already holds, so the correlator names exactly one
-/// live process.
-#[must_use]
-pub const fn correlator_of(badge: u64) -> u32
-{
-    // The low-32 extraction is the point: it is the correlator procmgr binds.
-    #[allow(clippy::cast_possible_truncation)]
-    let low = badge as u32;
-    low
-}
 
 // ── Process table ───────────────────────────────────────────────────────────
 
@@ -215,8 +203,8 @@ impl RecentExits
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertError
 {
-    /// A live entry already holds the badge's correlator ([`correlator_of`]).
-    CorrelatorInUse,
+    /// A live entry already holds the badge.
+    BadgeInUse,
     /// The heap could not grow the table.
     OutOfMemory,
 }
@@ -224,18 +212,13 @@ pub enum InsertError
 /// procmgr's live processes, kept on the heap and sorted by badge.
 ///
 /// The table grows with the number of live processes and holds no fixed
-/// ceiling of its own; a spawn fails when the heap cannot grow it, or when
-/// procmgr's death queue has no free observer node (`DEATH_EQ_OBSERVERS`,
-/// #643). Lookups by badge are binary searches. The death correlator procmgr
-/// binds is still the badge's low 32 bits ([`correlator_of`]), and
-/// [`Self::insert`] keeps those unique among live entries, so a death event
-/// resolves to one process; once the correlator carries the full badge, the
-/// correlator lookup becomes the badge lookup and the low-word rule stays as
-/// defence in depth.
+/// ceiling of its own; a spawn fails when the heap cannot grow it. Lookups by
+/// badge are binary searches. The death correlator procmgr binds is the full
+/// `u64` badge, so a death event resolves to its process by the badge lookup.
 #[derive(Default)]
 pub struct ProcessTable
 {
-    /// Entries sorted by badge, no two sharing a badge or a correlator.
+    /// Entries sorted by badge, no two sharing a badge.
     entries: Vec<ProcessEntry>,
 }
 
@@ -261,14 +244,6 @@ impl ProcessTable
         self.search(badge).ok()
     }
 
-    /// Index of the live entry holding `correlator`.
-    fn index_of_correlator(&self, correlator: u32) -> Option<usize>
-    {
-        self.entries
-            .iter()
-            .position(|e| correlator_of(e.badge) == correlator)
-    }
-
     /// Number of live entries.
     #[must_use]
     pub fn len(&self) -> usize
@@ -283,31 +258,25 @@ impl ProcessTable
         self.entries.is_empty()
     }
 
-    /// Whether a live entry's badge has `correlator` as its low word. Badge
-    /// minting redraws such a candidate, so [`Self::insert`] does not refuse
-    /// it later.
+    /// Whether a live entry holds `badge`. Badge minting redraws such a
+    /// candidate, so [`Self::insert`] does not refuse it later.
     #[must_use]
-    pub fn correlator_in_use(&self, correlator: u32) -> bool
+    pub fn badge_in_use(&self, badge: u64) -> bool
     {
-        self.index_of_correlator(correlator).is_some()
+        self.index_of_badge(badge).is_some()
     }
 
     /// Insert `entry`, changing nothing on refusal.
     ///
     /// # Errors
-    /// [`InsertError::CorrelatorInUse`] when a live entry already holds the
-    /// badge's correlator (a live entry with the same badge holds it too);
+    /// [`InsertError::BadgeInUse`] when a live entry already holds the badge;
     /// [`InsertError::OutOfMemory`] when the heap cannot grow the table.
     pub fn insert(&mut self, entry: ProcessEntry) -> Result<(), InsertError>
     {
-        if self.correlator_in_use(correlator_of(entry.badge))
-        {
-            return Err(InsertError::CorrelatorInUse);
-        }
         let Err(idx) = self.search(entry.badge)
         else
         {
-            return Err(InsertError::CorrelatorInUse);
+            return Err(InsertError::BadgeInUse);
         };
         self.entries
             .try_reserve(1)
@@ -324,7 +293,10 @@ impl ProcessTable
         Some(&mut self.entries[idx])
     }
 
-    /// Remove and return the entry whose badge matches.
+    /// Remove and return the entry whose badge matches. The death dispatch
+    /// resolves a death event's correlator, the full badge, through it; a
+    /// stale correlator (entry already reaped) returns `None`, and the caller
+    /// drops that event.
     #[must_use]
     pub fn take_by_badge(&mut self, badge: u64) -> Option<ProcessEntry>
     {
@@ -332,21 +304,8 @@ impl ProcessTable
         Some(self.entries.remove(idx))
     }
 
-    /// Remove and return the entry whose badge's low 32 bits are
-    /// `correlator`. Used by the death dispatch to resolve a death event back
-    /// to its process. Stale correlators (entry already reaped) return
-    /// `None`; callers drop such events silently.
-    #[must_use]
-    pub fn take_by_correlator(&mut self, correlator: u32) -> Option<ProcessEntry>
-    {
-        let idx = self.index_of_correlator(correlator)?;
-        Some(self.entries.remove(idx))
-    }
-
-    /// Visit every live entry in badge order. Used by
-    /// `install_logd_death_eq` to retroactively bind logd's EQ as a
-    /// second death observer on each child's main thread, and by the death
-    /// resync to read each child's thread state.
+    /// Visit every live entry in badge order. Used by the death resync to
+    /// read each child's thread state.
     pub fn for_each<F: FnMut(&ProcessEntry)>(&self, f: F)
     {
         self.entries.iter().for_each(f);
@@ -465,16 +424,14 @@ pub fn resolve_spawn_sched(
 
 /// Whether a candidate badge may be handed out as a process badge.
 ///
-/// The low 32 bits of a process badge serve double duty — the death-EQ
-/// correlator procmgr binds and the logd source badge — so
-/// they must clear every reserved low-word value:
-/// - **below `min_low`** — the reserved log-badge range. `log_badges` reserves
+/// A process badge is also the death-EQ correlator procmgr binds and the logd
+/// source badge, so it must clear every reserved value:
+/// - **below `min`** — the reserved log-badge range. `log_badges` reserves
 ///   `0..LOG_BADGE_FIRST_CHILD` for system specials: the kernel's `0`
 ///   "no correlator" death sentinel, init (`1`), procmgr (`2`), and `3..16`.
-///   A badge whose low word lands here would bind an unroutable death
-///   correlator or evict/contaminate a reserved logd slot — logd evicts every
-///   slot whose low word matches a death correlator.
-/// - **equal to `reserved_low32`** — the init-reap correlator
+///   A badge here would bind an unroutable death correlator or alias a
+///   reserved logd slot.
+/// - **equal to `reserved`** — the init-reap correlator
 ///   (`INIT_REAP_CORRELATOR`), which `dispatch_death` routes to init teardown.
 ///
 /// and no bit of `verb_bits` may be set: the badge rides every SEND procmgr
@@ -485,10 +442,9 @@ pub fn resolve_spawn_sched(
 /// All are reachable under random badge minting; the old monotonic counter
 /// started at `LOG_BADGE_FIRST_CHILD` and so upheld the floor structurally.
 #[must_use]
-pub fn badge_is_acceptable(badge: u64, min_low: u64, reserved_low32: u32, verb_bits: u64) -> bool
+pub fn badge_is_acceptable(badge: u64, min: u64, reserved: u64, verb_bits: u64) -> bool
 {
-    let low = correlator_of(badge);
-    u64::from(low) >= min_low && low != reserved_low32 && badge & verb_bits == 0
+    badge >= min && badge != reserved && badge & verb_bits == 0
 }
 
 #[cfg(test)]
@@ -519,71 +475,51 @@ mod tests
     }
 
     #[test]
-    fn badge_is_rejected_when_low_32_bits_equal_reserved_correlator()
+    fn badge_is_rejected_when_equal_to_reserved_correlator()
     {
-        // A bare match and a high-bits-set u64 whose low word equals the
-        // sentinel must both be rejected — proving the `as u32` narrowing
-        // rather than a full-u64 compare. (Floor 16 = LOG_BADGE_FIRST_CHILD.)
-        assert!(!badge_is_acceptable(u64::from(u32::MAX), 16, u32::MAX, 0));
-        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, 16, u32::MAX, 0));
+        // (Floor 16 = LOG_BADGE_FIRST_CHILD; the init-reap sentinel is u64::MAX.)
+        assert!(!badge_is_acceptable(u64::MAX, 16, u64::MAX, 0));
+        // A badge sharing only the sentinel's low word is a distinct correlator.
+        assert!(badge_is_acceptable(0x0000_0005_FFFF_FFFF, 16, u64::MAX, 0));
     }
 
     #[test]
-    fn badge_is_rejected_when_low_word_below_floor()
+    fn badge_is_rejected_when_below_floor()
     {
-        // The reserved log-badge / no-correlator range (low word 0..16) is
-        // rejected regardless of the high word, so every minted badge carries
-        // a routable correlator and never aliases a reserved logd slot.
-        assert!(!badge_is_acceptable(0, 16, u32::MAX, 0));
-        assert!(!badge_is_acceptable(1, 16, u32::MAX, 0));
-        assert!(!badge_is_acceptable(2, 16, u32::MAX, 0));
-        assert!(!badge_is_acceptable(15, 16, u32::MAX, 0));
-        assert!(!badge_is_acceptable(0x0000_0007_0000_000F, 16, u32::MAX, 0));
+        // The reserved log-badge / no-correlator range (0..16) is refused, so
+        // every minted badge carries a routable correlator and never aliases a
+        // reserved logd slot.
+        assert!(!badge_is_acceptable(0, 16, u64::MAX, 0));
+        assert!(!badge_is_acceptable(1, 16, u64::MAX, 0));
+        assert!(!badge_is_acceptable(15, 16, u64::MAX, 0));
+        assert!(badge_is_acceptable(16, 16, u64::MAX, 0));
+        // The floor is on the whole badge: a low word under it with high bits
+        // set is above it, and names no reserved slot.
+        assert!(badge_is_acceptable(0x0000_0007_0000_000F, 16, u64::MAX, 0));
     }
 
     #[test]
     fn badge_is_rejected_when_a_verb_bit_is_set()
     {
         // Bits 59..=63 are the verb bits (svcmgr's HANDOVER_AUTHORITY /
-        // PUBLISH_AUTHORITY on the child's registry SEND among them); a low
-        // word that clears every other check must not save a badge carrying
-        // any of them.
+        // PUBLISH_AUTHORITY on the child's registry SEND among them); a badge
+        // that clears every other check must not carry any of them.
         let verbs = ipc::VERB_BIT_MASK;
-        assert!(!badge_is_acceptable(
-            0x8000_0000_0000_0010,
-            16,
-            u32::MAX,
-            verbs
-        ));
-        assert!(!badge_is_acceptable(
-            0x4000_0000_0000_0010,
-            16,
-            u32::MAX,
-            verbs
-        ));
-        for bit in [61, 60, 59]
+        for bit in [63, 62, 61, 60, 59]
         {
             assert!(!badge_is_acceptable(
                 (1u64 << bit) | 0x10,
                 16,
-                u32::MAX,
+                u64::MAX,
                 verbs
             ));
         }
         assert!(badge_is_acceptable(
             0x07FF_FFFF_0000_0010,
             16,
-            u32::MAX,
+            u64::MAX,
             verbs
         ));
-    }
-
-    #[test]
-    fn badge_is_accepted_when_low_word_clears_floor_and_correlator()
-    {
-        assert!(badge_is_acceptable(16, 16, u32::MAX, 0));
-        // High bits set, low word clears the floor and the sentinel: accepted.
-        assert!(badge_is_acceptable(0x0000_0001_0000_0010, 16, u32::MAX, 0));
     }
 
     #[test]
@@ -603,32 +539,42 @@ mod tests
     }
 
     #[test]
-    fn insert_refuses_a_badge_whose_correlator_a_live_entry_holds()
+    fn badges_sharing_low_32_bits_live_together_and_reap_separately()
     {
+        // The correlator is the whole badge: two live processes whose badges
+        // share the low word are distinct, and reaping one leaves the other.
         let mut table = ProcessTable::new();
         assert_eq!(
             table.insert(entry_with_badge(0x0000_0001_0000_0020)),
             Ok(())
         );
-        assert!(table.correlator_in_use(0x20));
-        // Same low word, different high word: refused, table unchanged.
-        assert_eq!(
-            table.insert(entry_with_badge(0x0000_0002_0000_0020)),
-            Err(InsertError::CorrelatorInUse)
-        );
-        assert_eq!(table.len(), 1);
-        assert!(table.find_mut_by_badge(0x0000_0002_0000_0020).is_none());
-        // Once the holder is reaped, the low word is free again.
-        let _ = table.take_by_correlator(0x20);
-        assert!(!table.correlator_in_use(0x20));
         assert_eq!(
             table.insert(entry_with_badge(0x0000_0002_0000_0020)),
             Ok(())
         );
+        assert_eq!(
+            table.take_by_badge(0x0000_0002_0000_0020).map(|e| e.badge),
+            Some(0x0000_0002_0000_0020)
+        );
+        assert!(table.badge_in_use(0x0000_0001_0000_0020));
+        assert!(!table.badge_in_use(0x0000_0002_0000_0020));
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
-    fn badge_lookups_miss_a_badge_that_only_shares_a_live_correlator()
+    fn insert_refuses_a_badge_a_live_entry_holds()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.insert(entry_with_badge(0x20)), Ok(()));
+        assert_eq!(
+            table.insert(entry_with_badge(0x20)),
+            Err(InsertError::BadgeInUse)
+        );
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn badge_lookups_miss_a_badge_that_only_shares_a_live_low_word()
     {
         let mut table = ProcessTable::new();
         assert_eq!(
@@ -661,23 +607,6 @@ mod tests
         // The entry is gone: a second take misses and find no longer sees it.
         assert!(table.take_by_badge(16).is_none());
         assert!(table.find_mut_by_badge(16).is_none());
-    }
-
-    #[test]
-    fn take_by_correlator_matches_low_32_bits_of_badge_and_removes_entry()
-    {
-        let mut table = ProcessTable::new();
-        // High bits set; correlator is only the low word. A full-u64 compare
-        // would miss this match.
-        assert_eq!(
-            table.insert(entry_with_badge(0x0000_0001_0000_002A)),
-            Ok(())
-        );
-        assert_eq!(
-            table.take_by_correlator(0x2A).map(|e| e.badge),
-            Some(0x0000_0001_0000_002A)
-        );
-        assert!(table.take_by_correlator(0x2A).is_none());
     }
 
     #[test]

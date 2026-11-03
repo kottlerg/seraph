@@ -8,10 +8,11 @@
 //! Holds the plain-data recipe record ([`Definition`] and its component
 //! enums), the `key = value` parser ([`parse`]), the argv/env wire-blob
 //! encoder ([`build_blob`]) the parser validates against procmgr's
-//! `CREATE_FROM_FILE` limits, and two decisions svcmgr applies at runtime:
-//! the rights of a recipe's `cwd` cap ([`cwd_rights`]) and the
-//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), and the windowed
-//! restart budget ([`RestartBudget`]). Nothing here touches a syscall, IPC, or
+//! `CREATE_FROM_FILE` limits, and the policies svcmgr applies at runtime:
+//! the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
+//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the windowed restart
+//! budget ([`RestartBudget`]), and the bind order and growth of the death
+//! queues ([`DeathQueues`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
 //! host-tested — the `.svc` files are external input and their parser
 //! carries unit tests per
@@ -19,9 +20,11 @@
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
+pub mod death_queues;
 pub mod parse;
 pub mod restart_budget;
 
+pub use death_queues::DeathQueues;
 pub use restart_budget::RestartBudget;
 
 use namespace_protocol::rights as ns_rights;

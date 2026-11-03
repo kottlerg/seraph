@@ -83,6 +83,8 @@ impl Guest
         let spec = QemuLaunchSpec {
             arch: args.arch,
             disk_path: &disk_path,
+            disk_block_size: crate::disk::logical_block_size(&disk_path)?,
+            second_disk: None,
             firmware_code_path: firmware_code,
             firmware_vars_path: firmware_vars,
             cpus: args.cpus,
@@ -241,13 +243,16 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
     // ── Knob: deterministic layout ──────────────────────────────────────────
     // Stage the knob, always restore it, even on failure.
     stage_nokaslr_knob(ctx, true).context("staging nokaslr knob")?;
-    crate::disk::create_disk_image(ctx, args.arch).context("repacking disk with knob")?;
+    crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
+        .context("repacking disk with knob")?;
     let knob_result = scrape("boot C (--no-kaslr)");
     // Always restore first and surface its failure ahead of the boot-C result:
     // leaving the knob staged would silently disable KASLR for later runs, so a
     // failed restore is the more urgent error to report.
     stage_nokaslr_knob(ctx, false)
-        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch))
+        .and_then(|()| {
+            crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
+        })
         .context("restoring KASLR-enabled disk")?;
     let c = knob_result?;
 

@@ -91,9 +91,9 @@ of that list (`remove_block`), so a free costs up to MAX_ORDER levels, each line
 order's free-list length. Coalescing eliminates long-term fragmentation.
 
 **Drain:** `drain_coalesced` empties every free list into one chain, sorts it by address with
-a bottom-up merge sort over the intrusive links (no buffer), and writes the free memory as
-maximal contiguous `(base, size)` extents. The extent count therefore follows the
-fragmentation of free RAM, not its amount; an output buffer too small for it is reported with
+a bottom-up merge sort over the intrusive links (no buffer), and hands the free memory to its
+caller as maximal contiguous `(base, size)` extents. The extent count therefore follows the
+fragmentation of free RAM, not its amount; a caller capacity too small for it is reported with
 the full count.
 
 ### Thread Safety

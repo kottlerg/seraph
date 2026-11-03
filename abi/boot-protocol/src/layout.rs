@@ -52,11 +52,12 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// direct map, and the kernel's Phase 3 identity window over the stack is
 /// derived from it; the bootloader allocates exactly this many bytes.
 ///
-/// Measured bound (the kernel's paint report, ktest `stress::stack_depth`): the
-/// kernel's boot phases use at most 9008 B of it, a margin of about 86%, over
-/// debug and release builds at 4, 16 and 128 CPUs on both architectures
-/// (debug 9008 B, release 7240 B). The report gives the depth, not the path
-/// that reached it.
+/// Measured bound (the kernel's paint report, ktest `stress::stack_depth`), on
+/// both architectures: debug builds at 16 and 128 CPUs peak at 6880 B of it
+/// (`riscv64`; 6072 B on `x86_64`), a margin of about 89%; release builds at 4, 16
+/// and 128 CPUs use at most 7240 B, and debug builds at 4 CPUs at most 9008 B,
+/// a margin of about 86%. The report gives the depth, not the path that reached
+/// it.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
 /// Word every idle, thread, and handoff stack is filled with when it is allocated, so the

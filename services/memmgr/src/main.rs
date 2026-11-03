@@ -555,6 +555,9 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
             Some(rest) if merge(run.cap_slot, rest.cap_slot) => push_last_resort(l, run),
             Some(rest) =>
             {
+                // The multi-page remainder first: with one reserve slot left,
+                // the larger run is the one kept in circulation.
+                push_last_resort(l, rest);
                 push_last_resort(
                     l,
                     FreeRun {
@@ -562,7 +565,6 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
                         ..run
                     },
                 );
-                push_last_resort(l, rest);
             }
             None => push_last_resort(l, run),
         }

@@ -954,6 +954,28 @@ mod tests
     }
 
     #[test]
+    fn a_contiguous_request_of_a_power_of_two_takes_exactly_that_block()
+    {
+        let mut alloc = with_region(8);
+        assert_eq!(alloc.alloc_contiguous(4), Some(BASE));
+        assert_eq!(alloc.free_page_count(), 4);
+    }
+
+    #[test]
+    fn a_contiguous_request_of_exactly_one_largest_block_takes_no_run()
+    {
+        let mut alloc = with_region(2 * M);
+        let first = alloc.alloc_contiguous(M as usize).expect("one block");
+        assert_eq!(alloc.free_page_count() as u64, M);
+        // The other block is whole: one more largest-block request takes it.
+        let second = alloc.alloc(MAX_ORDER).expect("the other block");
+        let mut bases = [first, second];
+        bases.sort_unstable();
+        assert_eq!(bases, [BASE, BASE + pages(M)]);
+        assert_eq!(alloc.free_page_count(), 0);
+    }
+
+    #[test]
     fn a_contiguous_request_for_no_pages_is_refused()
     {
         let mut alloc = with_region(8);

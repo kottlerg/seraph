@@ -2646,8 +2646,16 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     crate::arch::current::init_ap_percpu_storage(n, allocator);
 }
 
-/// Allocate `bytes` of contiguous physical pages, zero-fill, return a
-/// typed pointer to the start. Halts on buddy exhaustion.
+/// The pages a slab of `bytes` takes: `bytes` rounded up to whole pages, and
+/// at least one page, so a zero-byte slab still has a base to return.
+pub(crate) const fn slab_pages(bytes: usize) -> usize
+{
+    let pages = bytes.div_ceil(PAGE_SIZE);
+    if pages == 0 { 1 } else { pages }
+}
+
+/// Allocate `bytes` of contiguous physical pages ([`slab_pages`]), zero-fill,
+/// return a typed pointer to the start. Halts on buddy exhaustion.
 ///
 /// A slab may span several buddy blocks
 /// ([`BuddyAllocator::alloc_contiguous`]), so no per-CPU slab size, and no
@@ -2659,7 +2667,7 @@ pub(crate) fn alloc_zeroed_slab<T>(
     label: &'static str,
 ) -> *mut T
 {
-    let pages = bytes.div_ceil(PAGE_SIZE).max(1);
+    let pages = slab_pages(bytes);
     let phys = allocator.alloc_contiguous(pages).unwrap_or_else(|| {
         crate::kprintln!("alloc_zeroed_slab: no {pages} contiguous free pages for {label}");
         crate::fatal("alloc_zeroed_slab: buddy exhausted")
@@ -6452,5 +6460,41 @@ pub unsafe fn enter() -> !
     // tf_ptr points to a valid, initialized TrapFrame on init's kernel stack.
     unsafe {
         crate::arch::current::context::first_entry_to_user(init_tcb.address_space, tf_ptr);
+    }
+}
+
+#[cfg(test)]
+mod slab_tests
+{
+    use super::slab_pages;
+    use crate::mm::PAGE_SIZE;
+
+    #[test]
+    fn a_zero_byte_slab_takes_one_page()
+    {
+        assert_eq!(slab_pages(0), 1);
+    }
+
+    #[test]
+    fn a_sub_page_slab_takes_one_page()
+    {
+        assert_eq!(slab_pages(1), 1);
+        assert_eq!(slab_pages(PAGE_SIZE - 1), 1);
+    }
+
+    #[test]
+    fn an_exact_power_of_two_page_count_takes_exactly_those_pages()
+    {
+        assert_eq!(slab_pages(PAGE_SIZE), 1);
+        assert_eq!(slab_pages(4 * PAGE_SIZE), 4);
+        assert_eq!(slab_pages(2048 * PAGE_SIZE), 2048);
+    }
+
+    #[test]
+    fn one_byte_past_a_page_boundary_takes_one_more_page()
+    {
+        assert_eq!(slab_pages(PAGE_SIZE + 1), 2);
+        assert_eq!(slab_pages(4 * PAGE_SIZE + 1), 5);
+        assert_eq!(slab_pages(2048 * PAGE_SIZE + 1), 2049);
     }
 }

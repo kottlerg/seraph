@@ -398,22 +398,23 @@ changed line that names one of these items as a whole identifier or lies within 
 (its attributes, signature, fields, or body):
 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
-- per-CPU storage: `alloc_zeroed_slab`, and the definition of every function that calls it (the
-  per-CPU storage initialisers; a call to one is on the surface only when it names another listed
-  item, as a call to an `init_ap_*` initialiser does), except `frame_map::init` and
-  `init_cspace_registry`, which size RAM tables through it and are on the memory surface instead;
-  every `init_storage` and `init_per_cpu_storage`, which take the boot CPU count and size per-CPU
-  storage from it (a call to one names it, so a change to the count it passes is on the surface);
-  `kernel_reserve_pages` (the CPU-scaled kernel reserve); and the element types of the per-CPU
-  arrays and slabs, today `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through
-  `MaybeUninit`), `TssWithIopb`, `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and
-  `TlbShootdownRequest` (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the
-  arrays and slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag
-  pool, and the RAM-sized chunk tables of `frame_map::init` and `init_cspace_registry`). A change
-  that alters an element type's size is on the surface whether it edits the type's own fields or a
-  type or constant the element holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS`
-  inside `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes
-  a per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks);
+- per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`), and the
+  definition of every function that calls `alloc_zeroed_slab` (the per-CPU storage initialisers; a
+  call to one is on the surface only when it names another listed item, as a call to an `init_ap_*`
+  initialiser does), except `frame_map::init` and `init_cspace_registry`, which size RAM tables
+  through it and are on the memory surface instead; every `init_storage` and `init_per_cpu_storage`,
+  which take the boot CPU count and size per-CPU storage from it (a call to one names it, so a
+  change to the count it passes is on the surface); `kernel_reserve_pages` (the CPU-scaled kernel
+  reserve); and the element types of the per-CPU arrays and slabs, today `PerCpuData`,
+  `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`,
+  `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
+  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the slabs that
+  are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk tables of
+  `frame_map::init` and `init_cspace_registry`). A change that alters an element type's size is on
+  the surface whether it edits the type's own fields or a type or constant the element holds by
+  value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
+  `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
+  for the idle stacks);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
   and the MADT walk behind it (`madt_topology` and its per-CPU `record_cpu_id`),
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
@@ -458,7 +459,7 @@ B=$(git merge-base <head> origin/master)
 git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
     core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
     'core/kernel/src/arch/*/ap_trampoline.rs'
-S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
+S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
@@ -682,8 +683,9 @@ list as the tracking Issues move):
   block). What covers `MAX_CPUS` instead: the host tests of `CpuMask` at
   `MAX_CPUS` (`core/kernel/src/cpu_mask.rs`), the host tests of
   `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
-  past one block, a run that cannot be found, and a request within one
-  block), the 65-hart boot for the first mask-word crossing, and the 128-CPU
+  past one block, a run that cannot be found, and requests of one block or
+  less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
+  (`sched::slab_pages`), the 65-hart boot for the first mask-word crossing, and the 128-CPU
   boots for two full words.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`

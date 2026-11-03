@@ -1794,9 +1794,10 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
 /// an idempotent Null slot (or, after the first batch, a slot a concurrent
 /// delete finished), else the rejecting error. `expected` is the object the
 /// first batch resolved (`None` on the first batch): a later batch that finds
-/// the generation current but a different object is looking at a recycled
-/// slot whose generation wrapped while the lock was released, and reports
-/// success like the finished-delete case.
+/// the generation current but a different object reports success like the
+/// finished-delete case. No recycle produces that state, since a slot is
+/// retired rather than its generation wrapped (`CSpace::free_slot`); the
+/// check is a backstop.
 ///
 /// # Safety
 ///

@@ -551,7 +551,8 @@ pub struct CapabilitySlot
     /// Explicit padding: aligns `rights` to offset 4 and `badge` to offset 8.
     /// `pad[0]` doubles as the intrusive free-list membership marker
     /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
-    /// list); `pad[1]` holds the per-slot generation counter (see
+    /// list, [`RETIRED_MARKER`] when it was retired at its generation's last
+    /// value); `pad[1]` holds the per-slot generation counter (see
     /// [`CapabilitySlot::generation`]); `pad[2]` holds the in-flight pin
     /// (see [`CapabilitySlot::pinned`]).
     pad: [u8; 3],
@@ -601,6 +602,11 @@ const _: () = assert!(core::mem::size_of::<CapabilitySlot>() == 72);
 /// marker is the O(1) discriminator that lets `free_slot` reject a double-free
 /// of any slot, not just the current free-list head.
 const FREE_LIST_MARKER: u8 = 1;
+
+/// Value stamped into `CapabilitySlot::pad[0]` of a Null slot retired at its
+/// generation's last value ([`CapabilitySlot::retire`]): off every free list,
+/// and refused by `free_slot` and `insert_cap_at`.
+const RETIRED_MARKER: u8 = 2;
 
 impl CapabilitySlot
 {
@@ -659,15 +665,45 @@ impl CapabilitySlot
         self.pad[1]
     }
 
-    /// Increment the per-slot generation, wrapping at 256.
+    /// Whether the per-slot generation has reached its last value, so the
+    /// slot's next free must retire it ([`retire`](Self::retire)) instead of
+    /// bumping the generation back to a value an earlier handle carried.
+    pub fn generation_exhausted(&self) -> bool
+    {
+        self.pad[1] == u8::MAX
+    }
+
+    /// Increment the per-slot generation.
     ///
     /// Called by `CSpace::free_slot` when a slot is recycled, so every handle to
-    /// the prior occupant becomes stale. Wraparound is a bounded ABA window
-    /// (256 reuses of the same index); acceptable for a fail-closed backstop
-    /// (#349). See [`generation`](Self::generation).
+    /// the prior occupant becomes stale. Never called on an exhausted
+    /// generation ([`generation_exhausted`](Self::generation_exhausted)): that
+    /// free retires the slot instead, so a generation never wraps and no handle
+    /// is ever reissued (#349). See [`generation`](Self::generation).
     pub fn bump_generation(&mut self)
     {
+        debug_assert!(!self.generation_exhausted(), "slot generation wrapped");
         self.pad[1] = self.pad[1].wrapping_add(1);
+    }
+
+    /// Retire the slot: clear it to null, stamp [`RETIRED_MARKER`], and keep
+    /// the exhausted generation, so it is neither a free-list member nor
+    /// occupied, and no lookup, allocation, or explicit placement reaches it
+    /// again for the life of its `CSpace`.
+    ///
+    /// Called by `CSpace::free_slot` in place of the bump-and-push when the
+    /// generation is exhausted.
+    pub fn retire(&mut self)
+    {
+        self.clear_keep_generation();
+        self.pad[0] = RETIRED_MARKER;
+    }
+
+    /// Whether the slot was retired at its generation's last value
+    /// ([`retire`](Self::retire)).
+    pub fn is_retired(&self) -> bool
+    {
+        self.tag == CapTag::Null && self.pad[0] == RETIRED_MARKER
     }
 
     // ── In-flight pin (`pad[2]`) ──────────────────────────────────────────────
@@ -995,16 +1031,26 @@ mod tests
         assert_eq!(s.generation(), 0, "clear() must zero the generation");
     }
 
-    // 8-bit generation wraps after 256 recycles — bounded ABA, documented (#349).
+    // Defect guarded: a retired slot that reads as a free-list member (so a
+    // double free or an allocation reissues it), or that loses the exhausted
+    // generation a later explicit placement would otherwise re-mint.
     #[test]
-    fn bump_generation_wraps_at_256()
+    fn a_retired_slot_is_off_list_and_keeps_its_last_generation()
     {
         let mut s = CapabilitySlot::null();
-        for _ in 0..256
+        for _ in 0..u8::MAX
         {
+            assert!(!s.generation_exhausted());
             s.bump_generation();
         }
-        assert_eq!(s.generation(), 0);
+        assert!(s.generation_exhausted());
+        s.retire();
+        assert!(s.is_null());
+        assert!(s.is_retired());
+        assert!(!s.is_on_free_list());
+        assert_eq!(s.generation(), u8::MAX);
+        s.clear();
+        assert!(!s.is_retired(), "clear() drops the retired marker");
     }
 
     // Cap-handle encoding round-trips index and generation, and a gen-0 handle is

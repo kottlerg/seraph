@@ -168,7 +168,9 @@ any slot — re-pushing a slot already on the list would splice it in twice and 
 the list, after which allocation could hand back an occupied slot. The marker is set
 when a slot is linked (`set_next_free`) and cleared when it leaves the list (on
 allocation, and when `remove_from_free_list` unlinks a specific index);
-`allocate_slot` debug-asserts the popped slot was a genuine member.
+`allocate_slot` debug-asserts the popped slot was a genuine member. A slot retired at its
+generation's last value (§ Per-Slot Generation) carries a second marker in `pad[0]`: it is on
+no list, and `free_slot` rejects it as it does a double-free.
 
 This gives amortised O(1) allocation and O(1) deallocation.
 
@@ -271,15 +273,22 @@ page tables by a bit in the parent entry, not by the records; see
 
 Teardown walks the record pages newest first, returning each page's other records before its
 record 0 (whose donation holds the page), then the inline records, the create-time slab last. A
-donation's Memory object that reaches zero there is reclaimed through its own nested cascade, not
-the bounded worklist the dealloc cascade otherwise uses, since the number of donations is
-unbounded. The cascade's other re-entry is the `CSpace` arm's release of the objects its slots
-reference. A nested `CSpace` that release drops to zero is not torn down in that frame: it is
-linked, through its deferred-reclaim link, onto a pending list the outermost `dealloc_object` call
-drains once its worklist is empty, so a chain of `CSpace`s each holding the last reference to the
-next is torn down iteratively. No other object's teardown can release a `CSpace`, so each re-entry
-is one frame deep and the teardown's stack use is bounded by a constant, whatever the nesting
-depth.
+donation's Memory object that reaches zero there is queued on the dealloc cascade like every other
+object a teardown orphans.
+
+The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked through the queued
+objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
+header's three padding bytes hold the link to the next, while the type and `ancestor` fields its
+teardown reads stay intact, and the link is cleared when it is popped. An object reaches zero once,
+so it is queued at most once, and the stack holds any number of objects without allocating. Every
+release a teardown makes pushes the object it orphans: an ancestor Memory object's retype lease, a
+donation's lease, the references a dying `CSpace`'s slots hold (a nested `CSpace` among them), a
+wait set's member references, a thread's fault-handler binding, and death observers'. The call
+pops and tears down the most recent object until the stack is empty, and no teardown calls
+`dealloc_object` itself, so a chain of `CSpace`s each holding the last reference to the next, or a
+`CSpace` releasing thousands of objects, is torn down iteratively with constant stack use, and no
+arm runs inside another's lock scope (a nested `CSpace`'s derivation drain takes the derivation lock
+after the outer arm has released it).
 
 The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
 its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
@@ -372,10 +381,18 @@ The generation is distinct from `SlotId.epoch` (the `CSpace` registry epoch, a r
 each time the id is recycled) and from the `pad[0]` free-list marker. It must survive the
 free→reallocate transition: `free_slot` bumps it *before* threading the slot onto the free list,
 `set_next_free` preserves `pad[1]`, and `allocate_slot` clears the slot with `clear_keep_generation`
-(which keeps `pad[1]`). The 8-bit counter wraps after 256 recycles of one index — a bounded ABA
-window: on wrap a replayed handle is no better protected than under the pre-generation scheme, and
-no worse. No pad byte is spare (`pad[2]` holds the in-flight pin), so widening the generation past 8
-bits would need a byte reclaimed elsewhere in the 72-byte layout.
+(which keeps `pad[1]`).
+
+The counter never wraps. A free that finds the generation at its last value (255) retires the slot
+instead of recycling it: `free_slot` leaves it Null with the retired marker in `pad[0]` and the
+generation kept, off the free list and outside `free_count`, and `insert_cap_at` refuses it with
+`InvalidIndex`, so each index serves 256 occupants and no handle is ever issued twice in a
+`CSpace`'s life. The cost is one 72-byte slot per 256 frees, never reused: a `CSpace` can make at
+most about `MAX_SLOTS_STRUCTURAL` × 256 (about 9.4 × 10^8) frees in its life, which a server
+receiving and deleting 10,000 capabilities a second reaches in about 26 hours. That lifetime bound
+goes with the handle width ([docs/limits.md](../../../docs/limits.md) § Kernel: capabilities). No
+pad byte is spare (`pad[2]` holds the in-flight pin), so widening the generation past 8 bits would
+need a byte reclaimed elsewhere in the 72-byte layout.
 
 ### Capability Tags
 

@@ -712,13 +712,23 @@ impl CSpace
         {
             return;
         };
-        if slot.is_on_free_list()
+        if slot.is_on_free_list() || slot.is_retired()
         {
             #[cfg(not(test))]
             crate::kprintln!(
-                "free_slot: double-free index={} ignored (already on free list)",
+                "free_slot: double-free index={} ignored (already free or retired)",
                 index
             );
+            return;
+        }
+        // A slot whose generation has served its last value is retired, not
+        // recycled: bumping would wrap the generation back to one an earlier
+        // occupant's handle carries, so that stale handle would name the next
+        // occupant. The retired index stays out of use for this CSpace's life
+        // (core/kernel/docs/capability-internals.md § Per-Slot Generation).
+        if slot.generation_exhausted()
+        {
+            slot.retire();
             return;
         }
         // Bump the per-slot generation before returning the slot to the free
@@ -942,7 +952,9 @@ impl CSpace
     ///
     /// # Errors
     ///
-    /// - [`CapError::InvalidIndex`] — index is 0, out of range, or occupied.
+    /// - [`CapError::InvalidIndex`] — index is 0, out of range, occupied, or
+    ///   retired at its generation's last value
+    ///   ([`CapabilitySlot::is_retired`]).
     /// - [`CapError::PoolExhausted`] — slot-page pool empty during grow,
     ///   including the grow that keeps [`IPC_RECV_RESERVE`] free slots
     ///   behind the placement.
@@ -985,10 +997,12 @@ impl CSpace
             self.grow()?;
         }
 
-        // Verify slot is currently Null (free).
+        // Verify slot is currently Null (free) and not retired: a retired
+        // slot's generation is exhausted, so a placement there would re-mint
+        // the handle its last occupant carried.
         {
             let slot = self.slot(index).ok_or(CapError::InvalidIndex)?;
-            if !slot.is_null()
+            if !slot.is_null() || slot.is_retired()
             {
                 return Err(CapError::InvalidIndex);
             }
@@ -1682,5 +1696,42 @@ mod tests
         }
         assert_eq!(drained, free_before + L2_SIZE);
         assert!(cs.free_head.is_none() && cs.free_tail.is_none());
+    }
+
+    // Defect guarded: a generation that wraps after 256 recycles of one index,
+    // so a handle from the index's first occupant names a later one; and an
+    // explicit placement or a second free that brings the retired index back.
+    #[test]
+    fn an_index_recycled_256_times_is_retired_and_never_reissued()
+    {
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        let mut handles = std::collections::BTreeSet::new();
+        let first = cs.insert_cap(CapTag::Memory, Rights::NONE, obj).unwrap();
+        let free_before = cs.free_count;
+        let mut idx = first;
+        // The free list is LIFO, so each insert after a free reuses `first`
+        // while its generation lasts.
+        for _ in 0..256
+        {
+            assert_eq!(idx, first);
+            assert!(handles.insert(cs.cap_handle(idx)), "handle reissued");
+            cs.free_slot(idx.get());
+            idx = cs.insert_cap(CapTag::Memory, Rights::NONE, obj).unwrap();
+        }
+        assert_ne!(idx, first, "the retired index was handed out again");
+        assert!(handles.insert(cs.cap_handle(idx)));
+        let retired = cs.slot(first.get()).unwrap();
+        assert!(retired.is_retired() && retired.is_null());
+        // The retired slot is out of the free count, and neither a second free
+        // nor an explicit placement brings it back.
+        assert_eq!(cs.free_count, free_before - 1);
+        cs.free_slot(first.get());
+        assert!(cs.slot(first.get()).unwrap().is_retired());
+        assert_eq!(cs.free_count, free_before - 1);
+        assert_eq!(
+            cs.insert_cap_at(first.get(), CapTag::Memory, Rights::NONE, obj),
+            Err(CapError::InvalidIndex)
+        );
     }
 }

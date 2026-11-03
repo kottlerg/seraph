@@ -38,11 +38,18 @@ pub const TRAILER_PREFIX: &str = "[run-parallel] ";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellOutcome
 {
+    /// The cell's `ktest: PASS <name>` line closed it.
     Pass,
+    /// The cell's `ktest: FAIL <name>` line closed it.
     Fail,
     /// The cell's start stamp has no end stamp: the log ends inside it (a
     /// HANG, or a kill). Its time runs to the log's last stamp.
     Unfinished,
+    /// The cell's end line is missing but ktest went on (a later cell, tier
+    /// marker, or summary followed), so output interleaved into the end line
+    /// hid it. ktest runs its cells one at a time, so its time runs to the
+    /// line that followed: an upper bound.
+    EndLost,
 }
 
 impl CellOutcome
@@ -54,6 +61,7 @@ impl CellOutcome
             CellOutcome::Pass => "PASS",
             CellOutcome::Fail => "FAIL",
             CellOutcome::Unfinished => "unfinished",
+            CellOutcome::EndLost => "end-lost",
         }
     }
 
@@ -64,6 +72,7 @@ impl CellOutcome
             "PASS" => Some(CellOutcome::Pass),
             "FAIL" => Some(CellOutcome::Fail),
             "unfinished" => Some(CellOutcome::Unfinished),
+            "end-lost" => Some(CellOutcome::EndLost),
             _ => None,
         }
     }
@@ -226,8 +235,24 @@ impl Scan
         }
     }
 
+    /// Close every open cell as `EndLost` at `at`: ktest has moved on to
+    /// another cell, tier, or its summary, so their end lines were lost.
+    fn lose_open_cells(&mut self, at: f64)
+    {
+        for cell in std::mem::take(&mut self.open)
+        {
+            self.timing.cells.push(Cell {
+                tier: cell.tier,
+                name: cell.name,
+                secs: at - cell.start,
+                outcome: CellOutcome::EndLost,
+            });
+        }
+    }
+
     fn open_cell(&mut self, name: &str, at: f64)
     {
+        self.lose_open_cells(at);
         let count = self.seen.entry(name.to_string()).or_insert(0);
         *count += 1;
         let name = if *count == 1
@@ -272,11 +297,13 @@ impl Scan
         }
         else if let Some(c) = p.tier.captures(msg)
         {
+            self.lose_open_cells(at);
             self.close_tier(at);
             self.tier = Some((c[1].to_string(), at));
         }
         else if msg.starts_with("passed=")
         {
+            self.lose_open_cells(at);
             self.close_tier(at);
         }
         else if let Some(c) = p.run.captures(msg).or_else(|| p.started.captures(msg))
@@ -297,7 +324,9 @@ impl Scan
         }
     }
 
-    fn line(&mut self, p: &Patterns, line: &str)
+    /// Take the trailer's fields, the width, and the architecture from `line`;
+    /// true when it is the trailer, which carries no stamp.
+    fn header_line(&mut self, p: &Patterns, line: &str) -> bool
     {
         if let Some(rest) = line.strip_prefix(TRAILER_PREFIX)
         {
@@ -305,7 +334,7 @@ impl Scan
             {
                 self.trailer.insert(k.to_string(), v.to_string());
             }
-            return;
+            return true;
         }
         if self.timing.cpus.is_none()
             && let Some(c) = p.width.captures(line)
@@ -317,18 +346,16 @@ impl Scan
         {
             self.timing.arch = Some(c[1].to_string());
         }
-        let stamps: Vec<Stamp> = p
-            .stamp
-            .captures_iter(line)
-            .filter_map(|c| {
-                let m = c.get(0)?;
-                Some(Stamp {
-                    start: m.start(),
-                    end: m.end(),
-                    at: c[1].parse().ok()?,
-                })
-            })
-            .collect();
+        false
+    }
+
+    fn line(&mut self, p: &Patterns, line: &str)
+    {
+        if self.header_line(p, line)
+        {
+            return;
+        }
+        let stamps = stamps_of(p, line);
         let before = self.last;
         if let Some(s) = stamps.last()
         {
@@ -378,6 +405,22 @@ impl Scan
         self.timing.wall_secs = self.trailer.get("wall_s").and_then(|v| v.parse().ok());
         self.timing
     }
+}
+
+/// Every `[S.uuuuuu] ` stamp on `line`, kernel or ktest, in line order.
+fn stamps_of(p: &Patterns, line: &str) -> Vec<Stamp>
+{
+    p.stamp
+        .captures_iter(line)
+        .filter_map(|c| {
+            let m = c.get(0)?;
+            Some(Stamp {
+                start: m.start(),
+                end: m.end(),
+                at: c[1].parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 /// The ktest message on `line`, its kind, and its time. ktest writes a line's
@@ -1139,6 +1182,29 @@ mod tests
         let c = cell(&t, "cap::a");
         assert_eq!(c.outcome, CellOutcome::Pass);
         assert!(close(c.secs, 0.25));
+    }
+
+    #[test]
+    fn a_cell_whose_end_line_output_broke_up_ends_when_ktest_moves_on()
+    {
+        // Kernel output landed inside `PASS cap::a`, so no end line matches;
+        // the next cell's start, and then the summary, show ktest went on.
+        let text = "[1.000000] ktest: --- Tier 1: syscall isolation ---\n\
+                    [1.000000] ktest: RUN cap::a\n\
+                    [1.200000] ktest: PASS cap[1.210000] kernel: noise\n\
+                    ::a\n\
+                    [1.300000] ktest: RUN cap::b\n\
+                    [1.400000] ktest: PASS c[1.410000] kernel: noise\n\
+                    [1.500000] ktest: passed=2\n\
+                    [9.000000] kernel: later output\n";
+        let t = parse_log(text).unwrap();
+        let a = cell(&t, "cap::a");
+        assert_eq!(a.outcome, CellOutcome::EndLost);
+        assert!(close(a.secs, 0.3));
+        let b = cell(&t, "cap::b");
+        assert_eq!(b.outcome, CellOutcome::EndLost);
+        assert!(close(b.secs, 0.2));
+        assert!(close(t.tiers[0].secs, 0.5));
     }
 
     #[test]

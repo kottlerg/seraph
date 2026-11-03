@@ -483,29 +483,27 @@ saves its log for the timing report below (`--save-logs`).
 ```sh
 # Boundary CPU counts, riscv64 (TCG on the 16-core reference host: the 64- and
 # 65-hart runs take ~115 s and ~120 s, the 128-hart run ~220 s at 8x hart
-# oversubscription; each budget, three times the run rounded up to a minute,
-# is for HANG classification):
+# oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 360 \
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 540 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 420 \
+cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 540 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 660 \
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1080 \
     --save-logs $T
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
 # run, at 1x, takes ~55 s; the 128-vCPU run, at 8x vCPU oversubscription,
 # ~27 s, since its scaled cells make an eighth of their attempts and idle
-# vCPUs halt; each budget, three times the run rounded up to a minute, is for
-# HANG classification):
+# vCPUs halt; each budget is for HANG classification, see below):
 cargo xtask clean
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
 cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
     --save-logs $T
-cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 120 \
+cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 840 \
     --save-logs $T
 
 # Timing report (report only; see below):
@@ -515,6 +513,12 @@ for w in riscv64-64 riscv64-65 riscv64-128 x86_64-16 x86_64-128; do
     cargo xtask ktest-timing --baseline $B/${w}cpu.txt $T/${w}cpu-1.log
 done
 ```
+
+Each budget is the larger of three times the measured run and the measured run plus the longest
+failing bound ktest stretches at that width (`split_delete_race`'s 100 s exit poll, through
+`scaled_polls`: 100 s at 16 CPUs, 400 s at 64 and 65, 800 s at 128), rounded up to a minute, so a
+stuck cell reaches its own FAIL line before `run-parallel` classifies the run as a HANG. A change
+to the measured runs or to the longest stretched bound re-derives the budgets.
 
 The 16-vCPU run is the 1x width the scaling below starts past (`UNSCALED_CPUS`, the reference
 host's core count); the 65-hart run is the first count past a 64-bit word; the 128-hart run is the
@@ -542,8 +546,10 @@ times the base, or the baseline's) by at least 1 s; the cells are listed by that
 first. A cell whose attempt count is scaled (a † knob of
 [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress)) makes `1/F` of its
 attempts at the wide width, down to its floor, so its `R/F` understates the growth of one attempt by
-up to `F`: on the reference host the whole of Tier S at 128 vCPUs takes 0.28 times its 16-vCPU
-time, which, at one eighth of the attempts, is about 2.2 times the cost of one attempt. The
+up to `F`: on the reference host the whole of Tier S at 128 vCPUs takes 0.27 times its 16-vCPU
+time, which, were every Tier S cell scaled to one eighth of its attempts, would be about 2.2 times
+the cost of one attempt (an approximation: some cells are unscaled and some stop at their
+floor). The
 baseline comparison is the check for such a cell. The report is a report, not a
 gate: a PR that owes the boundary set carries it in its body, and no flag blocks a PR or a tag
 until the threshold is calibrated against the baselines and made a gate. A baseline is rewritten,

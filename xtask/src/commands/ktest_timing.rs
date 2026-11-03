@@ -128,8 +128,9 @@ fn write_baseline_file(
 }
 
 /// `commit`, the full hash of `rev`, and `ktest-commit`, the newest commit at
-/// or before it that changed anything the boot image or its QEMU launch is
-/// built from (all but `TIMING_INERT_PATHS`), when that is another commit.
+/// or before it that changed anything outside `TIMING_INERT_PATHS` (a
+/// conservative stand-in for what the boot image and its QEMU launch are
+/// built from), when that is another commit.
 fn commit_headers(ctx: &BuildContext, rev: &str) -> Result<Vec<(String, String)>>
 {
     let git = |args: &[&str]| -> Result<String> {

@@ -212,7 +212,9 @@ counter, takes one shared stack for its victims, and carries its own 128 × 8 Ki
 
 The knobs marked † below are attempt counts the cell makes in full up to `UNSCALED_CPUS` (16)
 CPUs. Past it `stress::scaled_attempts` scales each by 16 / CPUs, down to a per-cell floor that
-keeps the cell's anti-vacuous checks met, and the cell's source states that floor's reason. The
+keeps the cell's anti-vacuous checks met, and the cell's source states that floor's reason; a cell
+whose checks the floor alone cannot keep met under oversubscription (`stop_source_delete`) instead
+runs on past its scaled count, up to the unscaled count, until they are met. The
 intent is a bounded wall time under oversubscription: a boot past 16 CPUs is a boundary run of
 [docs/testing.md § Coverage tiers](../../docs/testing.md#coverage-tiers), on a host with fewer
 cores than CPUs, where each attempt's wall time grows with the width. The defects those runs exist

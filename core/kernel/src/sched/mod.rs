@@ -44,7 +44,13 @@ pub const IDLE_PRIORITY: u8 = 0;
 /// reaches zero. A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
-/// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).
+/// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total).
+///
+/// Measured bound (the paint report, `crate::stack_depth`; ktest
+/// `stress::stack_depth` after Tier S): the deepest thread stack uses 4168 B
+/// and the deepest idle stack 1624 B at 4 CPUs, debug and release builds on
+/// both architectures, a margin of about 75% and 90%. The report gives the
+/// depth, not the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
@@ -6417,6 +6423,10 @@ pub unsafe fn enter() -> !
     BOOT_TRANSIENT_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
 
     crate::kprintln!("sched: enter - handing control to init");
+
+    // The BSP's last call on the handoff stack is above; it leaves the stack
+    // for init's kernel stack below. Record the handoff stack's depth.
+    crate::stack_depth::record_handoff_stack();
 
     // Activate init's address space (tagged when tagging is enabled) and enter
     // user mode. `first_entry_to_user` handles the arch-specific sequence:

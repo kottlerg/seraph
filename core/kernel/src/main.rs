@@ -1571,9 +1571,6 @@ unsafe fn kernel_entry_post_rebase(
             (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE / 1024) as u64,
         );
 
-        // The BSP leaves the handoff stack below for good; record its depth.
-        stack_depth::record_handoff_stack();
-
         // Hand off to the scheduler. Never returns. APs are already
         // idle (Phase 8 brought them online).
         // SAFETY: the single boot thread, once, at the end of Phase 9: page

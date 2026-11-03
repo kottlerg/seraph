@@ -1116,10 +1116,10 @@ pub enum SystemInfoType
     /// Deepest use, in bytes, of the kernel stack class named in arg1
     /// (`STACK_CLASS_IDLE`, `STACK_CLASS_THREAD`, or `STACK_CLASS_HANDOFF`),
     /// measured from the paint the stack was filled with at allocation. A
-    /// diagnostic: the handoff class reads `u64::MAX` when the kernel could not
-    /// locate the stack, and an unknown class returns `InvalidArgument`. The
-    /// classes and what each counts are in core/kernel/docs/syscalls.md
-    /// § `SYS_SYSTEM_INFO`.
+    /// diagnostic: the handoff class returns `NotSupported` when the kernel
+    /// could not locate the stack, and an unknown class returns
+    /// `InvalidArgument`. The classes and what each counts are in
+    /// core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`.
     StackHighWater = 9,
 }
 

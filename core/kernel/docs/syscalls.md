@@ -2328,7 +2328,9 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 
 **Capability requirement:** None.
 
-**Errors:** `InvalidArgument` (unknown `info_type`, or unknown `class` for `StackHighWater`).
+**Errors:** `InvalidArgument` (unknown `info_type`, or unknown `class` for `StackHighWater`);
+`NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
+stack).
 
 ### `SystemInfoType`
 
@@ -2384,8 +2386,9 @@ pub enum SystemInfoType
     /// `STACK_CLASS_IDLE` — the deepest idle stack, scanned at the call;
     /// `STACK_CLASS_THREAD` — the deepest of every freed thread's kernel stack
     /// and the caller's own, scanned at the call; `STACK_CLASS_HANDOFF` — the
-    /// bootloader's handoff stack, recorded when the BSP left it, or
-    /// `u64::MAX` when its base mark was not found. A diagnostic, read by ktest.
+    /// bootloader's handoff stack, recorded when the BSP left it, or the error
+    /// `NotSupported` when its base mark was not found. A diagnostic, read by
+    /// ktest.
     StackHighWater      = 9,
 }
 ```

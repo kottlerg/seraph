@@ -210,7 +210,7 @@ pub fn stack_high_water_classes(_ctx: &TestContext) -> TestResult
     use syscall::stack_high_water;
     use syscall_abi::{STACK_CLASS_HANDOFF, STACK_CLASS_IDLE, STACK_CLASS_THREAD};
 
-    let kernel_stack = 4 * PAGE_SIZE;
+    let kernel_stack = crate::stress::KERNEL_STACK_BYTES;
     // The calling thread's own stack is in use, so the thread class reads
     // above zero; an idle stack has at least run its idle loop.
     let thread = stack_high_water(STACK_CLASS_THREAD)
@@ -227,7 +227,7 @@ pub fn stack_high_water_classes(_ctx: &TestContext) -> TestResult
     }
     let handoff = stack_high_water(STACK_CLASS_HANDOFF)
         .map_err(|_| "sysinfo::stack_high_water: handoff class failed")?;
-    if handoff == 0 || handoff >= 64 * 1024
+    if handoff == 0 || handoff >= boot_protocol::layout::HANDOFF_STACK_BYTES as u64
     {
         return Err("sysinfo::stack_high_water: handoff depth outside (0, stack size)");
     }

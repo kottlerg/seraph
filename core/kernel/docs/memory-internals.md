@@ -510,24 +510,28 @@ exist:
 
 ### Kernel Stack Depth
 
-Every kernel stack is filled with `STACK_PAINT` (`boot_protocol::layout`) when it is
-allocated, so its deepest use is the span from its top down to its lowest word that no
-longer holds the paint (`stack_depth.rs`). `SYS_SYSTEM_INFO(StackHighWater)` reports the
+Every idle, thread, and handoff stack is filled with `STACK_PAINT` (`boot_protocol::layout`)
+when it is allocated, so its deepest use is the span from its top down to its lowest word
+that no longer holds the paint (`stack_depth.rs`). `SYS_SYSTEM_INFO(StackHighWater)` reports the
 span per class ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
 
-- Idle stacks: painted in Phase 4 as each is drawn from the buddy, and scanned across
-  every CPU at the query.
+- Idle stacks: painted in Phase 4 as each is drawn from the buddy, and sampled across
+  every CPU at the query, one CPU at a time with interrupts enabled and preemption
+  disabled. The owning CPU may be running on the stack, so each word is read with the
+  arch's opaque racy load (`load_word_racy`); the result is a depth the stack reached
+  during the scan.
 - Thread stacks: painted when `SYS_CAP_CREATE_THREAD` carves the slab, a full overwrite
   of the stack pages (and for init's thread when boot code carves it), and scanned when
   the thread's slab is freed; the query also scans the caller's own stack. A live
   thread's stack other than the caller's is not counted until it is freed.
 - The handoff stack: painted by the bootloader, which marks its lowest word with
   `HANDOFF_STACK_BASE_MARK` ([boot-flow.md](../../boot/docs/boot-flow.md) § Step 6). The
-  kernel records its stack pointer at `kernel_entry`'s first statement, takes the page
-  above it as the stack's top (the bootloader's top is page-aligned and `kernel_entry`'s
-  frame is smaller than a page), confirms the bottom by the mark, and scans the stack
-  when the BSP leaves it for the scheduler at the end of Phase 9. The class reads
-  `u64::MAX` when the mark is absent, which an overflow of the stack causes.
+  kernel records its stack pointer at `kernel_entry`'s first statement, rounds it up to
+  a page boundary for the stack's top (the reference bootloader's top is page-aligned and
+  `kernel_entry`'s frame is smaller than a page), confirms the bottom by the mark, and
+  scans the stack in `sched::enter`, after the BSP's last call on it and just before it
+  leaves for init's kernel stack. The class returns `NotSupported` when the mark is
+  absent, which an overflow of the stack, or a bootloader that does not mark it, causes.
 
 The x86-64 interrupt stacks (the IST stacks for the NMI, double-fault and machine-check
 paths) are not painted and this report does not measure them; their budget rests on the
@@ -581,7 +585,8 @@ donation-record mechanism.
 
 ## Summarized By
 
-[Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
+[Page Tables](../../boot/docs/page-tables.md), [Boot Flow](../../boot/docs/boot-flow.md),
+[core/kernel/README.md](../README.md),
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),

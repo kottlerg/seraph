@@ -316,5 +316,6 @@ the kernel has consumed them.
 [Page Tables](page-tables.md), [UEFI Environment](uefi-environment.md),
 [Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../../kernel/docs/initialization.md),
+[Memory Subsystem Internals](../../kernel/docs/memory-internals.md),
 [Architecture Overview](../../../docs/architecture.md),
 [System Bootstrap](../../../docs/bootstrap.md), [xtask/README.md](../../../xtask/README.md)

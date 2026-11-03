@@ -48,6 +48,28 @@ pub fn current_stack_pointer() -> u64
     sp
 }
 
+/// Load one word that another CPU may be writing concurrently, as an opaque
+/// machine load the compiler neither elides nor reasons about.
+///
+/// For diagnostics that sample memory a running CPU owns (the idle-stack depth
+/// scan, `crate::stack_depth`): a Rust read racing a plain store is undefined
+/// behaviour, a `mov` instruction is not, and a stale value only changes the
+/// sample.
+///
+/// # Safety
+/// `p` is a mapped, 8-byte aligned kernel address.
+#[cfg(not(test))]
+pub unsafe fn load_word_racy(p: *const u64) -> u64
+{
+    let v: u64;
+    // SAFETY: p is mapped and aligned per the contract; a load has no side
+    // effect.
+    unsafe {
+        core::arch::asm!("mov {}, [{}]", out(reg) v, in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    v
+}
+
 // ── CR4 ───────────────────────────────────────────────────────────────────────
 
 /// Read the current value of CR4.

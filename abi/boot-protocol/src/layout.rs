@@ -51,9 +51,14 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// The kernel's boot phases run on it until `kernel_entry` rebases it into the
 /// direct map, and the kernel's Phase 3 identity window over the stack is
 /// derived from it; the bootloader allocates exactly this many bytes.
+///
+/// Measured bound (the kernel's paint report, ktest `stress::stack_depth`): the
+/// kernel's boot phases use at most 7248 B of it at 4 CPUs, debug and release
+/// builds on both architectures, a margin of about 89%. The report gives the
+/// depth, not the path that reached it.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
-/// Word every kernel stack is filled with when it is allocated, so the
+/// Word every idle, thread, and handoff stack is filled with when it is allocated, so the
 /// deepest use of a stack is the lowest word that no longer holds it. The
 /// bootloader paints the handoff stack with it, and the kernel paints its
 /// idle and thread stacks (core/kernel/docs/memory-internals.md § Kernel
@@ -65,6 +70,10 @@ pub const STACK_PAINT: u64 = 0x5EAF_57AC_5EAF_57AC;
 /// derived from its entry stack pointer begins. An overflow of the stack
 /// overwrites it.
 pub const HANDOFF_STACK_BASE_MARK: u64 = 0xBA5E_0F57_ACC0_FFEE;
+
+// The paint must differ from zero (a zero-filled stack would read untouched)
+// and from the mark (the mark would read as paint).
+const _: () = assert!(STACK_PAINT != 0 && STACK_PAINT != HANDOFF_STACK_BASE_MARK);
 
 /// Choose a 2 MiB-aligned KASLR image slide from a raw entropy word.
 ///

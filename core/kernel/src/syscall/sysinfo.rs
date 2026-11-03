@@ -17,9 +17,13 @@ use syscall::SyscallError;
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
 /// arg0 = `SystemInfoType` discriminant (u64).
+/// arg1 = the stack class for `StackHighWater` (`syscall::STACK_CLASS_*`);
+/// ignored by every other discriminant.
 ///
 /// Returns the queried value as a scalar `u64`. No buffer is required.
-/// Returns `InvalidArgument` for unknown discriminants.
+/// Returns `InvalidArgument` for an unknown discriminant or an unknown
+/// `StackHighWater` class, and `NotSupported` for the handoff class when the
+/// kernel could not locate the handoff stack.
 #[cfg(not(test))]
 pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -77,7 +81,7 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         // StackHighWater — deepest use of the stack class in arg1
         // (`crate::stack_depth::high_water`).
         {
-            crate::stack_depth::high_water(tf.arg(1)).ok_or(SyscallError::InvalidArgument)
+            crate::stack_depth::high_water(tf.arg(1))
         }
         _ => Err(SyscallError::InvalidArgument),
     }

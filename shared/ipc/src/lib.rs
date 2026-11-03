@@ -1462,9 +1462,9 @@ pub mod devmgr_labels
     ///
     /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on the
     /// service endpoint of one block driver to the caller. devmgr spawns a
-    /// driver for every block device it enumerates and can give a private
-    /// IRQ line (one whose line another device already holds is not served,
-    /// #664); `data[1]`, when sent, selects which: an ordinal over the
+    /// driver for every block device it enumerates and can give an IRQ cap,
+    /// a line another device already holds included; `data[1]`, when sent,
+    /// selects which: an ordinal over the
     /// served block drivers in PCI segment, bus, device, function order,
     /// not stable across boots. A driver is served once it has reported its
     /// device ready ([`DRIVER_READY`]); one whose spawn failed, that died

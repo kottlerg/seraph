@@ -23,6 +23,7 @@ mod settle;
 mod spawn;
 mod tables;
 
+use firmware::lines::{HeldLines, HoldError, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use firmware::roster::{DeathPost, DriverState, Roster};
 use firmware::served::{Lookup, Served};
@@ -86,12 +87,18 @@ fn main() -> !
     );
 
     // IRQ allocator state: single-line caps carved out of devmgr's
-    // Interrupt range cap, every remainder kept.
+    // Interrupt range cap, every remainder kept; each PCI device's line held
+    // once carved, every device on it given a derivation, and the UART line
+    // carved exclusive.
     let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
 
-    // The UART line (`arch::current::UART_IRQ`); zero on failure, and the
-    // serial driver then degrades to client-side timeout polling for RX.
-    let uart_irq = irq_range.isolate_one(arch::current::UART_IRQ).unwrap_or(0);
+    // The UART line (`arch::current::UART_IRQ`), kept exclusive: the serial
+    // driver acknowledges a delivery only when its client reads, so no other
+    // device may share its line. Zero on failure, and the serial driver then
+    // degrades to client-side timeout polling for RX.
+    let uart_irq = irq_range
+        .exclusive_line(arch::current::UART_IRQ)
+        .unwrap_or(0);
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes, and its index + 1 is the device badge
@@ -923,12 +930,20 @@ pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Opti
 /// `SYS_IRQ_SPLIT`'s error for a split point outside the cap's range.
 const IRQ_SPLIT_OUT_OF_RANGE: i64 = syscall_abi::SyscallError::InvalidArgument as i64;
 
-/// Single-line `Interrupt` caps carved out of devmgr's Interrupt range cap,
-/// in any order: every line not yet carved stays in the table, so a device
-/// whose GSI lies below one already carved still gets its line.
+/// devmgr's interrupt lines: single-line `Interrupt` caps carved out of its
+/// Interrupt range cap, in any order (every line not yet carved stays in the
+/// range table, so a device whose GSI lies below one already carved still
+/// gets its line). A PCI device's line is held for the boot once carved
+/// ([`firmware::lines::HeldLines`], [`line_cap`](Self::line_cap)), and every
+/// device on it, the first included, gets a derivation of the held cap, so
+/// devices that share an `INTx` line each bind their own receiver on it
+/// (docs/device-management.md § Interrupt Delivery). The UART line is carved
+/// exclusive instead ([`exclusive_line`](Self::exclusive_line)): nothing is
+/// held, and its cap itself goes to the serial driver.
 struct IrqRangeAllocator
 {
     ranges: SpanTable<u32>,
+    held: HeldLines<u32>,
 }
 
 impl IrqRangeAllocator
@@ -946,28 +961,63 @@ impl IrqRangeAllocator
         {
             std::os::seraph::log!("IRQ range not recorded (no memory); no device IRQs");
         }
-        Self { ranges }
+        Self {
+            ranges,
+            held: HeldLines::new(),
+        }
     }
 
-    /// Isolate a single-IRQ cap for line `id`; [`CarveError::NotCovered`]
-    /// when no held range contains it (another device already holds the
-    /// line, it lies outside the range cap, or devmgr holds no range).
-    fn isolate_one(&mut self, id: u32) -> Result<u32, CarveError>
+    /// A device's own single-line cap on line `id`: a derivation of the
+    /// line's held cap, the line carved off the range the first time any
+    /// device asks for it. The caller owns the derivation and releases it
+    /// with its device; the held cap stays with devmgr.
+    ///
+    /// # Errors
+    /// [`LineError::Hold`] with [`HoldError::Split`]`(`[`CarveError::NotCovered`]`)`
+    /// when no held range contains the line (it lies outside the range cap,
+    /// or devmgr holds no range), another carve error when the split fails,
+    /// or [`HoldError::NoMemory`]; [`LineError::Derive`] with the
+    /// `SYS_CAP_DERIVE` error, the line staying held.
+    fn line_cap(&mut self, id: u32) -> Result<u32, LineError<i64>>
     {
-        self.ranges
-            .carve(u64::from(id), 1, 1, |span: &Span<u32>, at| {
-                let at = u32::try_from(at).map_err(|_| SplitError::OutOfRange)?;
-                syscall::irq_split(span.slot, at).map_err(|e| {
-                    if e == IRQ_SPLIT_OUT_OF_RANGE
-                    {
-                        SplitError::OutOfRange
-                    }
-                    else
-                    {
-                        SplitError::Failed
-                    }
-                })
+        let ranges = &mut self.ranges;
+        self.held.derive(
+            id,
+            |id| Self::isolate_one(ranges, id),
+            |held| syscall::cap_derive(held, syscall::RIGHTS_IRQ_NOTIFY),
+        )
+    }
+
+    /// Carve the single-line cap for line `id` off the range for one device
+    /// alone, holding nothing: no later device gets a cap on the line, which
+    /// [`line_cap`](Self::line_cap) then finds not covered. For a line whose
+    /// driver does not acknowledge each delivery promptly (the UART's).
+    ///
+    /// # Errors
+    /// [`CarveError::NotCovered`] when no held range contains the line, any
+    /// other carve error when the split fails.
+    fn exclusive_line(&mut self, id: u32) -> Result<u32, CarveError>
+    {
+        Self::isolate_one(&mut self.ranges, id)
+    }
+
+    /// Carve the single-line cap for line `id` off the range table;
+    /// [`CarveError::NotCovered`] when no held range contains it.
+    fn isolate_one(ranges: &mut SpanTable<u32>, id: u32) -> Result<u32, CarveError>
+    {
+        ranges.carve(u64::from(id), 1, 1, |span: &Span<u32>, at| {
+            let at = u32::try_from(at).map_err(|_| SplitError::OutOfRange)?;
+            syscall::irq_split(span.slot, at).map_err(|e| {
+                if e == IRQ_SPLIT_OUT_OF_RANGE
+                {
+                    SplitError::OutOfRange
+                }
+                else
+                {
+                    SplitError::Failed
+                }
             })
+        })
     }
 }
 
@@ -1414,7 +1464,7 @@ fn settle_batch(
 }
 
 /// Spawn and settle the boot batch: a virtio-blk driver for every virtio-blk
-/// device that gets a private IRQ line, in BDF order, then the serial and
+/// device that gets an IRQ cap, in BDF order, then the serial and
 /// framebuffer drivers, all from boot modules. The registry loop opens only
 /// after it, so every client sees the settled drivers.
 // too_many_arguments: the batch spans every device class the boot bundle
@@ -1478,12 +1528,12 @@ fn spawn_boot_drivers(
     );
 }
 
-/// Spawn a `VirtIO` block driver for every virtio-blk device that gets a
-/// private IRQ line, in BDF order, each from a copy of the boot module and
-/// with its own service endpoint, into the settle `batch`, recording each in
+/// Spawn a `VirtIO` block driver for every virtio-blk device that gets an
+/// IRQ cap, in BDF order, each from a copy of the boot module and with its
+/// own service endpoint, into the settle `batch`, recording each in
 /// `roster`. A device is skipped, logged, when no module was delivered, its
-/// caps cannot be carved, it gets no IRQ cap (virtio-blk requires one; a
-/// line another device already holds gives none, #664), or its spawn fails.
+/// caps cannot be carved, it gets no IRQ cap (virtio-blk requires one; for
+/// instance, a line no held range covers gives none), or its spawn fails.
 // too_many_arguments: the carve state, the batch's objects, and the roster
 // are each consumed per device.
 #[allow(clippy::too_many_arguments)]
@@ -1563,8 +1613,8 @@ fn spawn_one_virtio_blk(
 {
     // virtio-blk requires an IRQ: delivered an absent IRQ slot, it exits
     // after its bootstrap, which would leave the device registered with no
-    // driver serving it. Refuse the spawn instead; a disk on a line another
-    // device holds is not served until shared lines are (#664).
+    // driver serving it. Refuse the spawn instead. A disk on a line another
+    // device holds gets an IRQ cap too (a derivation of the held line).
     let Some(irq_cap) = dev_caps.irq_cap
     else
     {
@@ -1625,32 +1675,34 @@ fn create_service_endpoint() -> Option<u32>
     })
 }
 
-/// Split a single-IRQ `Interrupt` cap for a PCI device off devmgr's Interrupt range cap.
+/// A PCI device's own single-line `Interrupt` cap: a derivation of the held
+/// cap of its GSI's line ([`IrqRangeAllocator::line_cap`]), so a device whose
+/// line another device already holds gets one too. `None`, logged, when the
+/// device names no line or no cap can be had for it.
 fn acquire_single_irq_cap(
     pci_dev: &pci::PciDevice,
     irq_range: &mut IrqRangeAllocator,
 ) -> Option<u32>
 {
     let gsi = device_gsi(pci_dev)?;
-    match irq_range.isolate_one(gsi)
+    match irq_range.line_cap(gsi)
     {
         Ok(cap) =>
         {
-            std::os::seraph::log!("split single-IRQ cap for GSI {:#x}", u64::from(gsi));
+            std::os::seraph::log!("IRQ cap for GSI {:#x}", u64::from(gsi));
             Some(cap)
         }
-        Err(CarveError::NotCovered) =>
+        Err(LineError::Hold(HoldError::Split(CarveError::NotCovered))) =>
         {
-            // Shared INTx lines are not served yet (#664).
             std::os::seraph::log!(
-                "GSI {:#x} not in a held IRQ range (another device holds it, or no range); no IRQ cap",
+                "GSI {:#x} not in the held IRQ range (or no range); no IRQ cap",
                 u64::from(gsi)
             );
             None
         }
-        Err(_) =>
+        Err(e) =>
         {
-            std::os::seraph::log!("irq_split failed for GSI {:#x}", u64::from(gsi));
+            std::os::seraph::log!("no IRQ cap for GSI {:#x} ({:?})", u64::from(gsi), e);
             None
         }
     }

@@ -370,9 +370,10 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     }
     let bar_copies = &bar_copies[..bar_count];
     let bar_indices = &bar_indices[..bar_count];
-    // IRQ is optional. A device sharing an INTx line (so devmgr could not carve
-    // it a private IRQ cap) is delivered a null IRQ slot; the driver then polls
-    // its queue instead of waiting on interrupts.
+    // IRQ is optional. A device devmgr could give no IRQ cap (for instance,
+    // its line no held range covers, or the UART's exclusive line) is
+    // delivered a null IRQ slot; the driver then polls its queue instead of
+    // waiting on interrupts.
     let irq_copy = match config.irq_cap
     {
         Some(slot) =>

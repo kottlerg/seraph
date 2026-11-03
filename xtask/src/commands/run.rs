@@ -68,6 +68,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         Some(path) => Some(SecondDisk {
             path,
             block_size: second_disk_block_size(path, args.second_disk_block_size)?,
+            shared_line: args.second_disk_shared_line,
         }),
         None => None,
     };

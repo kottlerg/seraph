@@ -36,10 +36,9 @@
 //! `sysretq`, which would fault in ring 0 after the swap. None can arise: the
 //! top user page is unmappable (`paging::user_va_top`), so the address after a
 //! `syscall` is canonical, and configure and `WRITE_REGS` reject a
-//! non-canonical RIP. The exit
-//! path checks anyway and terminates such a thread as for an unhandled user #GP,
-//! without delivery to a bound fault handler (core/kernel/docs/syscalls.md
-//! § Syscall Entry and Exit).
+//! non-canonical RIP. The exit path checks anyway and terminates such a
+//! thread as for an unhandled user #GP, without delivery to a bound fault
+//! handler (core/kernel/docs/syscalls.md § Syscall Entry and Exit).
 //!
 //! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
 //! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to

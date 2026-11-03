@@ -71,18 +71,23 @@ pub unsafe fn negotiate_paging(bs: *mut crate::uefi::EfiBootServices)
     if depth != firmware
     {
         // SAFETY: bs is valid pre-ExitBootServices (caller contract).
-        let page = unsafe { crate::uefi::allocate_code_pages_max_addr(bs, 0xFFFF_FFFF, 1) };
-        if let Ok(page) = page
+        let page = unsafe { crate::uefi::allocate_code_pages_max_addr(bs, 0xFFFF_FFFF, 1) }.ok();
+        // SAFETY: page is a fresh, exclusively-owned EfiLoaderCode frame below
+        // 4 GiB, identity-mapped by the firmware; step 6 has not run.
+        let installed =
+            page.is_some_and(|page| unsafe { super::handoff::install_la57_toggle(page) });
+        if !installed
         {
-            // SAFETY: page is a fresh, exclusively-owned EfiLoaderCode frame
-            // below 4 GiB, identity-mapped by the firmware; step 6 has not run.
-            unsafe { super::handoff::install_la57_toggle(page) };
-        }
-        else
-        {
+            if let Some(page) = page
+            {
+                // SAFETY: bs is valid pre-ExitBootServices; page is our
+                // allocation, not installed and not touched again. A refused
+                // free only leaves the page `Loaded`.
+                let _ = unsafe { crate::uefi::free_pages(bs, page, 1) };
+            }
             crate::bprintln!(
-                "[--------] boot: WARNING: no page below 4 GiB for the LA57 toggle; \
-                 keeping the firmware's paging depth"
+                "[--------] boot: WARNING: no LA57 toggle page below 4 GiB, or the \
+                 template does not fit one; keeping the firmware's paging depth"
             );
             depth = firmware;
         }
@@ -131,7 +136,8 @@ const PAGE_SIZE: u64 = 4096;
 const TABLE_ENTRIES: usize = 512;
 
 /// Highest physical address the root table may occupy: the LA57 toggle
-/// trampoline loads it into CR3 from compatibility mode with a 32-bit move.
+/// trampoline loads it into CR3 with paging off, in legacy protected mode,
+/// with a 32-bit move.
 const ROOT_MAX_PHYS: u64 = 0xFFFF_FFFF;
 
 /// Capacity of the page-table frame log used for post-handoff reclamation.

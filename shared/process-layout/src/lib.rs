@@ -386,8 +386,15 @@ const _: () = {
 };
 
 /// The user tops of the supported paging modes: riscv64 Sv39, x86-64
-/// four-level (its top user page is unmappable), Sv48, and Sv57.
-const SUPPORTED_USER_TOPS: [u64; 4] = [1 << 38, (1 << 47) - PAGE_SIZE, 1 << 47, 1 << 56];
+/// four-level (its top user page is unmappable), Sv48, x86-64 five-level
+/// (likewise), and Sv57.
+const SUPPORTED_USER_TOPS: [u64; 5] = [
+    1 << 38,
+    (1 << 47) - PAGE_SIZE,
+    1 << 47,
+    (1 << 56) - PAGE_SIZE,
+    1 << 56,
+];
 
 // Growth zones under every supported mode: the heap below the arena, the
 // arena inside the address space, and both clear of the fixed tier (below

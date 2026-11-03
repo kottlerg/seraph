@@ -2532,7 +2532,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
-| `BOOT_PROTOCOL_VERSION` | 14 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 16 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

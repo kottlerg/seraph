@@ -188,6 +188,9 @@ pub fn la57_toggle_page() -> u64
 
 /// Copy the LA57 toggle trampoline into `page` and select it for the handoff.
 ///
+/// Returns `false`, installing nothing, when the assembled template does not
+/// fit the page; the caller then keeps the firmware's paging depth.
+///
 /// `page` must lie below 4 GiB (the compatibility-mode half runs with 32-bit
 /// addresses) and be executable under the firmware's tables (an
 /// `EfiLoaderCode` allocation); [`trampoline_page_range`] then names it, so
@@ -197,20 +200,25 @@ pub fn la57_toggle_page() -> u64
 /// `page` must be an exclusively-owned, identity-mapped, writable 4 KiB
 /// frame below 4 GiB, and the call must precede step 6, which maps the
 /// trampoline page.
-pub unsafe fn install_la57_toggle(page: u64)
+pub unsafe fn install_la57_toggle(page: u64) -> bool
 {
     let start = core::ptr::addr_of!(_la57_toggle);
     let end = core::ptr::addr_of!(_la57_toggle_end);
-    // The template is a few hundred bytes of `.text`; it fits one page.
     let len = end as usize - start as usize;
-    debug_assert!(len <= 4096, "LA57 toggle template exceeds one page");
+    // The template is a few hundred bytes of `.text`; a larger one is an
+    // assembly defect, refused here rather than copied past the page.
+    if len > 4096
+    {
+        return false;
+    }
     // SAFETY: start..end is the assembled template in this image's .text;
     // page is an exclusively-owned writable frame (caller contract) and the
-    // template fits it.
+    // template fits it (checked above).
     unsafe {
         core::ptr::copy_nonoverlapping(start, page as *mut u8, len);
     }
     LA57_TOGGLE_PAGE.store(page, Ordering::Relaxed);
+    true
 }
 
 /// Return the first and last 4 KiB page physical addresses that contain the
@@ -302,7 +310,10 @@ pub unsafe fn perform_handoff(
     // constrained directly, so no aliasing risk exists for those four; the
     // `_handoff_trampoline` stub ignores rsi.
     // No cld/cli here — the trampoline handles both.
-    // SAFETY: caller ensures all parameters are valid; asm clobbers no memory, never returns.
+    // SAFETY: caller ensures all parameters are valid; never returns. The
+    // asm writes no memory the compiler owns: `_handoff_trampoline` writes
+    // none, and the LA57 toggle writes only its own page's parameter block,
+    // GDTR base and far pointers, which no Rust object occupies.
     unsafe {
         core::arch::asm!(
             "mov rbx, {entry}",

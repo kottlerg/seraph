@@ -143,7 +143,8 @@ Virtual address bits:
 ```
 
 The root table (PML5 or PML4) occupies one 4 KiB frame, allocated below 4 GiB because the
-LA57 toggle trampoline loads it into `CR3` from compatibility mode with a 32-bit move. Each
+LA57 toggle trampoline loads it into `CR3` with paging off, in legacy protected mode, with a
+32-bit move. Each
 entry is a 64-bit value. Present entries above PML1 point to the next-level table's physical
 frame. PML1 entries (PTEs) point to the final 4 KiB data frame.
 

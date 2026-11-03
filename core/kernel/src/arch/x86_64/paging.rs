@@ -223,7 +223,6 @@ unsafe fn descend_alloc<E>(
 /// reachable child frames are all live; `to_virt` must map their physical
 /// addresses to valid VAs, and no other reference to a table on the path may
 /// be live while the returned one is.
-#[cfg(not(test))]
 unsafe fn descend_existing(
     root_va: u64,
     virt: u64,
@@ -1843,6 +1842,111 @@ mod tests
             p.pdpt().0[table_index(2, va)] =
                 PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (bait & PHYS_MASK));
             assert!(walk(&p).is_none(), "{depth:?}");
+        }
+    }
+
+    // ── Level descent ─────────────────────────────────────────────────────────
+
+    /// The address of the table `table` refers to.
+    fn addr_of(table: &[PageTableEntry; 512]) -> u64
+    {
+        core::ptr::from_ref(table) as u64
+    }
+
+    #[test]
+    fn descend_alloc_builds_one_table_per_level_below_the_root_at_either_depth()
+    {
+        for depth in DEPTHS
+        {
+            let top = depth.levels() - 1;
+            let va = path(depth).va;
+            let root = Table::new();
+            let mut frames: Vec<Box<Table>> = Vec::new();
+            let mut ensure = |e: &mut PageTableEntry| -> Result<u64, ()> {
+                if !e.is_present()
+                {
+                    let t = Table::new();
+                    *e = PageTableEntry::new_table(t.addr());
+                    frames.push(t);
+                }
+                Ok(e.phys_addr())
+            };
+            // SAFETY: the root and every frame `ensure` hands out are live host
+            // tables, kept alive by `root` and `frames`; addresses are identity.
+            let pt = unsafe { descend_alloc(root.addr(), va, top, 0, &mut ensure) }.unwrap();
+            let pt_addr = addr_of(pt);
+            // SAFETY: as above; the second descent walks the tables the first built.
+            let again = unsafe { descend_alloc(root.addr(), va, top, 0, &mut ensure) }.unwrap();
+            assert_eq!(addr_of(again), pt_addr, "{depth:?}");
+            drop(ensure);
+            // One table per level below the root (PML4 or PDPT .. PT), built once.
+            assert_eq!(frames.len(), top, "{depth:?}");
+            assert_eq!(frames.last().map(|t| t.addr()), Some(pt_addr), "{depth:?}");
+            // The root links the first of them at the depth's root index.
+            assert_eq!(
+                root.0[table_index(top, va)].phys_addr(),
+                frames[0].addr(),
+                "{depth:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descend_alloc_propagates_an_allocation_failure()
+    {
+        let va = path(PagingDepth::Five).va;
+        let root = Table::new();
+        let mut calls = 0;
+        // SAFETY: the root is a live host table; `ensure` fails before any
+        // child is named, so no other address is formed.
+        let result = unsafe {
+            descend_alloc(root.addr(), va, 4, 0, |_| {
+                calls += 1;
+                Err::<u64, &str>("out of frames")
+            })
+        };
+        assert_eq!(result.err(), Some("out of frames"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn descend_existing_reaches_the_pd_and_stops_at_absent_or_large_entries()
+    {
+        for depth in DEPTHS
+        {
+            let mut p = path(depth);
+            let pd_addr = p.pd().addr();
+            let (va, top) = (p.va, p.top);
+            // SAFETY: every table on the path is a live host `Table`, reached
+            // through the identity translation.
+            let pd = unsafe { descend_existing(p.tables[0].addr(), va, top, 1, |pa| pa) };
+            assert_eq!(pd.map(|t| addr_of(t)), Some(pd_addr), "{depth:?}");
+
+            // The PD entry is absent: no PT to reach.
+            // SAFETY: as above.
+            let pt = unsafe { descend_existing(p.tables[0].addr(), va, top, 0, |pa| pa) };
+            assert!(pt.is_none(), "{depth:?}");
+
+            // A large PD leaf names data, not a PT.
+            let bait = p.bait.addr();
+            p.pd().0[table_index(1, va)] =
+                PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (bait & PHYS_MASK));
+            // SAFETY: as above.
+            let pt = unsafe { descend_existing(p.tables[0].addr(), va, top, 0, |pa| pa) };
+            assert!(pt.is_none(), "{depth:?}");
+
+            // A VA whose root entry is absent leaves the path at the root.
+            // SAFETY: as above.
+            let other = unsafe {
+                descend_existing(
+                    p.tables[0].addr(),
+                    va ^ (1 << (12 + 9 * top)),
+                    top,
+                    1,
+                    |pa| pa,
+                )
+            };
+            assert!(other.is_none(), "{depth:?}");
         }
     }
 

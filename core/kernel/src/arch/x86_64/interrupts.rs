@@ -614,7 +614,8 @@ pub unsafe fn start_ap(target_apic_id: u32, trampoline_phys: u64)
 #[cfg(not(test))]
 pub unsafe fn init_ap()
 {
-    // Per-CPU CR4/CR0/XCR0 setup. The AP trampoline only sets CR4.PAE; SMEP,
+    // Per-CPU CR4/CR0/XCR0 setup. The AP trampoline only sets CR4.PAE (plus
+    // CR4.LA57 under 5-level paging); SMEP,
     // SMAP, OSXSAVE, and TS are per-CPU state that must be re-established on
     // each hart.
     // SAFETY: ring-0 AP boot; IDT loaded by caller (kernel_entry_ap); CPUID

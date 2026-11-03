@@ -254,7 +254,7 @@ mod tests
     fn kernel_image_base_is_in_the_last_root_entry()
     {
         // The kernel links at the top-2-GiB VA, canonical at either depth.
-        let image_base = 0xFFFF_FFFF_8000_0000u64;
+        let image_base = crate::layout::KERNEL_LINK_BASE;
         for depth in ALL
         {
             assert_eq!(table_index(depth.levels() - 1, image_base), 511);
@@ -264,13 +264,13 @@ mod tests
     #[test]
     fn table_index_reads_nine_bits_per_level()
     {
+        // 0x0123_4567_89AB_C000 split into 9-bit fields above the page offset,
+        // from the PT (level 0) up to the PML5 (level 4).
         let va = 0x0123_4567_89AB_C000u64;
-        for level in 0..5
+        let expected = [0x0BC, 0x04D, 0x19E, 0x08A, 0x123];
+        for (level, index) in expected.into_iter().enumerate()
         {
-            assert_eq!(
-                table_index(level, va),
-                ((va >> (12 + 9 * level)) & 0x1FF) as usize
-            );
+            assert_eq!(table_index(level, va), index, "level {level}");
         }
         // Level 4 (the PML5) reads bits 56:48.
         assert_eq!(table_index(4, 0x0100_0000_0000_0000), 256);

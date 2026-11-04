@@ -180,12 +180,27 @@ claims.
     Context the body gives about things outside the diff (motivation,
     history, settings outside the repository) is not checked against it.
 
+11. Auditor-only run: when the parent names this run the auditor-only
+    run `docs/conventions.md` § Branch and PR Workflow allows, with
+    `since` the head the last run with the reviewer reviewed, take the
+    range `git diff <since> <head>`. FAIL when that range alters, Markdown
+    aside, anything but comment lines (judged as step 9 judges a
+    validation delta), or when a commit in
+    `git log --merges <since>..<head>` merges the base branch: either one
+    owes a run with the reviewer. Compare every comment line and document
+    statement the range changes against the code it describes, citing
+    `path:line` on both sides, and FAIL each one the code contradicts.
+    Confirm that the range makes each fix the commits since `since` or
+    the PR body claim for a finding of that last run, and FAIL a claimed
+    fix the range does not make.
+
 ## Output
 
 A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
-unreconciled hit); test-plan honesty (FAIL on any bare tick); commit-message
-compliance; validation claim; PR-body claims. When invoked with a
+unreconciled hit); test-plan honesty (FAIL on any bare tick);
+commit-message compliance; validation claim; PR-body claims; and, in an
+auditor-only run, auditor-only checks. When invoked with a
 structured-output schema, fill it instead of the prose: one output section
 for each section named above, with its verdict and items, and the overall
 verdict; there is no final line in schema mode.

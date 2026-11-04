@@ -182,7 +182,8 @@ maintainer's acceptance of it, quoting the maintainer's words.
 ### Style
 
 - No emojis.
-- No tool or assistant attribution trailers.
+- No tool or assistant attribution, in a commit message or a PR description: no attribution
+  trailer and no link to an assistant session.
 - No `Co-authored-by` trailers unless the change was genuinely co-authored.
 
 ### Operations
@@ -226,12 +227,31 @@ are forbidden; `master` MUST NOT receive force pushes.
   `BLOCKING ISSUES` when a blocking finding is on the surface or a reviewer
   returned no result, `NON-BLOCKING ISSUES ONLY` when only non-blocking
   findings are on it, and `READY TO MERGE` when none is. The merge prompt
-  MUST follow a completed run with no failed agent and `AUDIT PASS` whose
+  MUST follow a completed run (one with the reviewer, or the auditor-only
+  run the next item allows) with no failed agent and `AUDIT PASS` whose
   reviewer verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` once
-  every finding the run leaves on the surface is recorded as the next item
-  says and no contested finding on the surface is unresolved; the prompt
-  offers the merge or one more fix round. `.claude/CLAUDE.md` § PR
-  workflow operations gives the assistant's procedure.
+  every finding the run leaves on the surface is recorded as the item on the
+  review surface below says and no contested finding on the surface is
+  unresolved; the prompt offers the merge or one more fix round.
+  `.claude/CLAUDE.md` § PR workflow operations gives the assistant's
+  procedure.
+- A fix round whose delta (from the head the last run with the reviewer
+  reviewed to the new head) is documentation or comments only, as
+  [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, MAY
+  be followed by an auditor-only run: the closure audit alone, checking the
+  PR body's claims, the recording of findings, the validated head, and the
+  closing conditions at the new head. Since no code read covers a changed
+  comment or document in that run, the audit owes a contract-drift check:
+  every comment or document statement the delta changes is compared against
+  the code it describes, and one the code contradicts is a FAIL; the audit
+  also confirms that the delta delivers each fix the round claims. The
+  reviewer verdict of an auditor-only run is that of the last run with the
+  reviewer, read with the delta's fixes: `READY TO MERGE` when the delta
+  fixes every finding that run left on the surface, `NON-BLOCKING ISSUES
+  ONLY` when every finding it leaves there is non-blocking and recorded as
+  the next item says, and `BLOCKING ISSUES` otherwise. The reviewer returns
+  at the next delta that changes anything but documentation or comments, or
+  that merges `master` into the branch.
 - The review surface of a change is what it touches: the changed hunks and
   the items that contain them (a function, a paragraph, a section, a table
   row, a list; for a hunk inside a file header, the header block of license,
@@ -240,20 +260,21 @@ are forbidden; `master` MUST NOT receive force pushes.
   or contract defect anywhere in a touched file is on the surface too,
   unless an open Issue already names it. In a re-review of a PR (a delta
   run), a standards, documentation-drift, coverage, or style finding is on
-  the surface only when the delta introduced it, wherever it anchors: a
-  statement the delta made stale, or a test the delta's new code lacks, is
-  one the delta introduced. Correctness, soundness, safety, and contract
-  findings stay on the surface as above. A finding on the surface is on one
-  of two tracks. It is blocking when it is of class correctness, safety
-  (which covers soundness), or contract, wherever it anchors, or a MUST
-  violation of a binding standard, of whatever class, anchored in a file
-  that is not a Markdown document; a blocking finding on the surface MUST
-  be fixed before merge. A document statement the code contradicts is a
-  contract or safety defect when it states behaviour a caller or user
-  relies on (a syscall, ABI, IPC, or command-line contract, or a safety
-  invariant); every other disagreement between a document and the code
-  (a stale name, count, path, or cross-reference, or a summary out of step
-  with its owner) is documentation drift. Every other finding on the
+  the surface only when the delta or the PR's own earlier commits
+  introduced it, wherever it anchors: a statement the delta made stale, a
+  test the delta's new code lacks, or a finding in a hunk an earlier commit
+  of the PR introduced is one the PR introduced. Correctness, soundness,
+  safety, and contract findings stay on the surface as above. A finding on
+  the surface is on one of two tracks. It is blocking when it is of class
+  correctness, safety (which covers soundness), or contract, wherever it
+  anchors, or a MUST violation of a binding standard, of whatever class,
+  anchored in a file that is not a Markdown document; a blocking finding on
+  the surface MUST be fixed before merge. A document statement the code
+  contradicts is a contract or safety defect when it states behaviour a
+  caller or user relies on (a syscall, ABI, IPC, or command-line contract,
+  or a safety invariant); every other disagreement between a document and
+  the code (a stale name, count, path, or cross-reference, or a summary out
+  of step with its owner) is documentation drift. Every other finding on the
   surface (one of class standards, documentation-drift, coverage, or style
   that is not a MUST violation or is one anchored in a Markdown document:
   wording, wrapping, nits) is non-blocking: when the reviewer verdict is

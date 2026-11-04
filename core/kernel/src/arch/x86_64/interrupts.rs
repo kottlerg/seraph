@@ -826,8 +826,8 @@ pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::
 /// its device did not raise. Vectors are assigned in turn and the cursor moves past a
 /// released one (`ioapic::assign_vector`), so the next route does not take it while other
 /// vectors are free. On a level-triggered line such a latched delivery also leaves the
-/// entry's Remote IRR set, with no entry carrying its vector's EOI; `ioapic::route` clears it
-/// before the line is programmed again.
+/// entry's Remote IRR set, which stays set when the line is routed again before that
+/// delivery's EOI; `ioapic::route` clears it before the line is programmed again.
 ///
 /// # Safety
 /// Must be called after Phase 5 init, under `irq`'s routing lock.

@@ -898,7 +898,22 @@ mod tests
         let last = table.len() - LOCAL_APIC.len();
         table[last + 1] = 200;
         assert!(!madt_well_formed(&table));
+    }
+
+    #[test]
+    fn a_single_trailing_byte_is_not_well_formed_and_ends_both_walks()
+    {
+        let table = madt(&[&source_override(10, 10, 0xd), &[0]]);
+        assert!(!madt_well_formed(&table));
+        assert_eq!(madt_source_overrides(&table).expect("MADT").count(), 1);
+    }
+
+    #[test]
+    fn a_header_short_of_the_first_structure_or_another_table_is_not_well_formed()
+    {
+        assert!(!madt_well_formed(&sdt(b"APIC", 40)));
         assert!(!madt_well_formed(&sdt(b"FACP", 64)));
+        assert!(!madt_well_formed(&[]));
     }
 
     #[test]

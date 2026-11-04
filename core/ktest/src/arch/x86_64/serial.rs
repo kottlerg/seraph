@@ -73,6 +73,12 @@ pub fn write_byte(byte: u8)
 /// with no interrupt-source override.
 pub const UART_IRQ: u32 = 4;
 
+/// Whether the UART line, bound level-triggered (`IRQ_MODE_LEVEL`), delivers again an
+/// assertion held across its receivers' acknowledgements: yes, since the mode programs the
+/// line's I/O APIC entry level-triggered, and the entry delivers a still-asserted line at the
+/// unmask.
+pub const UART_HELD_LEVEL_REDELIVERED: bool = true;
+
 /// IER bit 1: transmit-holding-register-empty interrupt enable.
 const IER_THRI: u8 = 0x02;
 

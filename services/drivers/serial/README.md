@@ -147,8 +147,9 @@ COM1 is ISA IRQ 4, which no MADT override reroutes). Because the x86 IOAPIC
 then delivers edge-triggered, a client must wait with a bounded
 timeout (the terminal uses 20 ms) so a byte racing the re-arm is recovered on
 the next drain; this also degrades gracefully to polling when no IRQ cap was
-delivered. The riscv PLIC is level-sensitive and re-asserts
-on its own, but clients use the same bounded wait for uniformity.
+delivered. The riscv PLIC is level-sensitive, but QEMU's PLIC model does not
+pend the UART's source again while it stays asserted across its claim and
+completion, so the same bounded wait also recovers a byte that arrives then.
 
 ---
 

@@ -3,10 +3,12 @@
 Driver lifecycle specification: device discovery, driver binding, per-device
 capability delegation, service-endpoint delivery, and driver teardown.
 
-§ Adding a Driver and § Withdrawal are written here; devmgr's discovery, binding, and delegation
-are specified in
+§ Adding a Driver is written here, and § Withdrawal summarizes devmgr's withdrawal of a driver;
+devmgr's discovery, binding, delegation, and withdrawal are specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md).
-TODO: specify the rest of driver teardown.
+TODO: specify a driver's own teardown: how a driver stops its device and releases what it holds
+when it exits on its own, and what devmgr does for a non-`VirtIO` device whose driver is
+withdrawn.
 
 ---
 
@@ -50,16 +52,16 @@ TODO: specify the rest of driver teardown.
 
 ## Withdrawal
 
-devmgr withdraws a driver that dies, fails its device setup, or overruns its settle bound. For a
-`VirtIO` PCI driver, devmgr resets the device as it withdraws the driver: it keeps the device's BAR
-caps for as long as it serves the device, maps the one holding the common configuration region,
-and writes 0 to `device_status`, which stops the device's DMA and drops its pending interrupt, and
-only then releases the device's caps. A driver that dies while its device asserts a shared
-level-triggered line therefore leaves the line's other receivers no assertion to loop on once the
-reset lands; between the driver's death, which releases its binding, and the reset, they may see
-re-deliveries their own devices did not raise
+devmgr withdraws every driver it does not, or no longer, serves: one that dies, fails its device
+setup, overruns its settle bound, or that devmgr cannot record or serve. It destroys a driver still
+running first; for a `VirtIO` PCI driver it then resets the device through a BAR cap it keeps
+(`device_status` 0), which stops the device's DMA and drops its pending interrupt, before it
+releases the device's caps. A driver that dies while its device asserts a shared level-triggered
+line therefore leaves the line's other receivers no assertion to loop on once the reset lands;
+between the driver's death, which releases its binding, and the reset, they may see re-deliveries
+their own devices did not raise
 ([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
-§ Interrupt Delivery). The withdrawal itself is specified in
+§ Interrupt Delivery). The withdrawal, the reset among its steps, is specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities.
 

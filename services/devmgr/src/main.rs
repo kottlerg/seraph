@@ -1196,7 +1196,9 @@ impl DeviceReset
 {
     /// The reset of the device `info` describes, through the cap in `bars`
     /// of the BAR holding its `device_status` byte; `None` when the layout
-    /// gives no such byte or no delivered BAR holds it.
+    /// gives no such byte, no delivered BAR holds it, or the byte lies past
+    /// the span that BAR's cap was carved to (a device whose common region
+    /// reaches past its BAR).
     fn for_device(
         info: &virtio_core::VirtioPciStartupInfo,
         bars: &[spawn::BarSpec],
@@ -1204,10 +1206,14 @@ impl DeviceReset
     ) -> Option<Self>
     {
         let status = info.status_register()?;
-        let bar_cap = bars.iter().find(|b| b.bar == status.bar)?.cap;
+        let bar = bars.iter().find(|b| b.bar == status.bar)?;
+        if status.offset >= bar.bytes
+        {
+            return None;
+        }
         Some(Self {
-            bar_cap,
-            bar_pages: status.bar_pages,
+            bar_cap: bar.cap,
+            bar_pages: bar.bytes.div_ceil(PAGE_SIZE),
             offset: status.offset,
             aspace,
         })
@@ -1245,9 +1251,9 @@ impl DeviceReset
             unreserve_pages(range);
             return;
         }
-        // SAFETY: `offset` lies inside the mapped BAR (`status_register` checks
-        // it against the common region's length, which the BAR's pages cover),
-        // and `device_status` is a byte register.
+        // SAFETY: `offset` is below the bytes the BAR's cap was carved to
+        // (`for_device`), all of which `mmio_map` mapped from `va`, and
+        // `device_status` is a byte register.
         unsafe { core::ptr::write_volatile((va + self.offset) as *mut u8, 0) };
         // SAFETY: the write above was the mapping's only use; the span is
         // `range`, owned here.
@@ -1404,7 +1410,7 @@ struct SpawnedDriver
     driver: ServedDriver,
 }
 
-/// Record a spawned driver in its batch's roster, withdrawing and destroying
+/// Record a spawned driver in its batch's roster, destroying and then withdrawing
 /// it when the roster cannot hold it (its room is reserved before each
 /// spawn, so only a repeated device badge, which the catalog never issues,
 /// reaches that).
@@ -1416,8 +1422,10 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
             "{}: driver not recorded; device not served",
             spawned.class.name()
         );
-        spawned.driver.withdraw();
+        // Destroy the live driver first, so the reset in `withdraw`
+        // is the last write its device sees.
         spawn::destroy_child(spawned.process_handle, ipc_buf);
+        spawned.driver.withdraw();
     }
 }
 
@@ -1468,8 +1476,10 @@ impl ServedDrivers
                     if class.try_reserve(1).is_err()
                     {
                         std::os::seraph::log!("{}: no memory to serve the driver; destroyed", name);
-                        spawned.driver.withdraw();
+                        // Destroy the live driver first, so the reset in `withdraw`
+                        // is the last write its device sees.
                         spawn::destroy_child(spawned.process_handle, ipc_buf);
+                        spawned.driver.withdraw();
                     }
                     else
                     {
@@ -1493,8 +1503,10 @@ impl ServedDrivers
                         "{}: driver reported neither ready nor death before the settle ended; destroyed",
                         name
                     );
-                    spawned.driver.withdraw();
+                    // Destroy the live driver first, so the reset in `withdraw`
+                    // is the last write its device sees.
                     spawn::destroy_child(spawned.process_handle, ipc_buf);
+                    spawned.driver.withdraw();
                 }
             }
         }
@@ -1898,6 +1910,7 @@ fn carve_virtio_bars(
         bars.bars[bars.count] = spawn::BarSpec {
             bar: aperture.bar,
             cap,
+            bytes: size,
         };
         bars.count += 1;
     }

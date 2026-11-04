@@ -286,16 +286,15 @@ impl RegisterLayout
 /// Offset of the `device_status` byte in the common configuration region
 /// (`VirtIO` 1.2 §4.1.4.3). Writing 0 to it resets the device, which stops its
 /// DMA and drops a pending interrupt (§2.4).
-pub const COMMON_DEVICE_STATUS: u64 = 0x14;
+pub const COMMON_DEVICE_STATUS: u32 = 0x14;
 
-/// Where a reset writes a device's `device_status` byte, for a holder of the
-/// BAR's `Mmio` cap that maps only that BAR: its PCI BAR index, the pages its
-/// cap spans ([`BarAperture::pages`]), and the byte's offset in the BAR.
+/// Where a reset writes a device's `device_status` byte: its PCI BAR index
+/// and the byte's offset in the BAR. A holder of that BAR's `Mmio` cap checks
+/// the offset against the span its cap covers before it writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusRegister
 {
     pub bar: u8,
-    pub bar_pages: u64,
     pub offset: u64,
 }
 
@@ -310,16 +309,15 @@ impl VirtioPciStartupInfo
     pub fn status_register(&self) -> Option<StatusRegister>
     {
         let layout = self.register_layout()?;
-        if u64::from(self.common_cfg.length) <= COMMON_DEVICE_STATUS
+        if self.common_cfg.length <= COMMON_DEVICE_STATUS
         {
             return None;
         }
         let bar = self.common_cfg.bar;
-        let bar_pages = layout.bars().iter().find(|b| b.bar == bar)?.pages;
+        layout.bars().iter().find(|b| b.bar == bar)?;
         Some(StatusRegister {
             bar,
-            bar_pages,
-            offset: u64::from(self.common_cfg.offset) + COMMON_DEVICE_STATUS,
+            offset: u64::from(self.common_cfg.offset) + u64::from(COMMON_DEVICE_STATUS),
         })
     }
 }
@@ -370,23 +368,14 @@ mod tests
         info.common_cfg.length = 0x38;
         let status = info.status_register().expect("complete layout");
         assert_eq!(status.bar, 1);
-        assert_eq!(status.offset, 0x100 + COMMON_DEVICE_STATUS);
-        let pages = info
-            .register_layout()
-            .expect("complete layout")
-            .bars()
-            .iter()
-            .find(|b| b.bar == 1)
-            .expect("BAR 1")
-            .pages;
-        assert_eq!(status.bar_pages, pages);
+        assert_eq!(status.offset, 0x100 + u64::from(COMMON_DEVICE_STATUS));
     }
 
     #[test]
     fn no_status_register_without_a_layout_or_room_for_the_byte()
     {
         let mut info = populated();
-        info.common_cfg.length = u32::try_from(COMMON_DEVICE_STATUS).expect("small");
+        info.common_cfg.length = COMMON_DEVICE_STATUS;
         assert_eq!(info.status_register(), None);
         let mut info = populated();
         info.isr_cfg.length = 0;

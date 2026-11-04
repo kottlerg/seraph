@@ -140,15 +140,22 @@ impl PciTransport
     #[must_use]
     pub fn get_status(&self) -> u8
     {
-        // SAFETY: common cfg region is mapped and offset 0x14 is within bounds.
-        unsafe { core::ptr::read_volatile(self.common_addr(0x14) as *const u8) }
+        // SAFETY: common cfg region is mapped and `device_status` (0x14) is within bounds.
+        unsafe {
+            core::ptr::read_volatile(self.common_addr(crate::COMMON_DEVICE_STATUS) as *const u8)
+        }
     }
 
     /// Write device status.
     pub fn set_status(&self, status: u8)
     {
-        // SAFETY: common cfg region is mapped and offset 0x14 is within bounds.
-        unsafe { core::ptr::write_volatile(self.common_addr(0x14) as *mut u8, status) }
+        // SAFETY: common cfg region is mapped and `device_status` (0x14) is within bounds.
+        unsafe {
+            core::ptr::write_volatile(
+                self.common_addr(crate::COMMON_DEVICE_STATUS) as *mut u8,
+                status,
+            );
+        }
         mmio::mmio_to_mmio_barrier();
     }
 

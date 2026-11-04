@@ -63,8 +63,9 @@
 //! suppression bit on every CPU, `interrupts::init` and `init_ap`). A device IRQ masks its entry
 //! before that EOI (`irq::dispatch_device_irq`), so an assertion still held at the unmask is
 //! delivered again. A delivery a CPU accepted while its line was being released leaves Remote
-//! IRR set with no entry left to carry its vector's EOI; [`route`] clears it before it programs
-//! the entry again ([`remote_irr_clear`]).
+//! IRR set, which stays set when the line is routed again, on another vector, before that
+//! delivery's EOI; [`route`] clears it before it programs the entry again
+//! ([`remote_irr_clear`]).
 //!
 //! # Limitations / deferred work
 //!
@@ -259,15 +260,17 @@ const REDIR_ACTIVE_LOW: u32 = 1 << 13;
 const REDIR_REMOTE_IRR: u32 = 1 << 14;
 
 /// The low dword [`route`] writes first, before the entry it programs, when the
-/// entry it replaces is `current`: a masked, edge-triggered entry when
-/// `current`'s Remote IRR is set, which clears it, and `None` otherwise.
+/// entry it replaces is `current`: when `current`'s Remote IRR is set, the same
+/// entry masked and edge-triggered, which clears Remote IRR, and `None`
+/// otherwise.
 ///
 /// A level delivery a CPU accepted while the line was being released leaves
-/// Remote IRR set, and its vector, released with the line, gets no EOI from an entry
-/// carrying it once the line is routed again on another vector; a level entry
-/// whose Remote IRR stays set delivers nothing more. Writing the trigger mode
-/// edge clears Remote IRR (the 82093AA, QEMU's and KVM's I/O APICs alike; Linux
-/// `clear_IO_APIC_pin` does the same).
+/// Remote IRR set. When the line is routed again, on another vector, before
+/// that delivery's EOI, the EOI of the old vector matches the entry no more,
+/// and a level entry whose Remote IRR stays set delivers nothing more. Writing
+/// the trigger mode edge clears Remote IRR (the 82093AA, QEMU's and KVM's I/O
+/// APICs alike); only the mask and trigger bits change, as Linux's
+/// `__eoi_ioapic_pin` does.
 const fn remote_irr_clear(current: u32) -> Option<u32>
 {
     if current & REDIR_REMOTE_IRR == 0
@@ -276,7 +279,7 @@ const fn remote_irr_clear(current: u32) -> Option<u32>
     }
     else
     {
-        Some(REDIR_MASK | (current & 0xFF))
+        Some((current | REDIR_MASK) & !REDIR_LEVEL & !REDIR_REMOTE_IRR)
     }
 }
 
@@ -516,7 +519,7 @@ pub unsafe fn route(gsi: u32, vector: u8, destination: u8, mode: u32)
     let high = u32::from(destination) << 24;
 
     // SAFETY: caller ensures init() has completed; entry remains masked
-    // until unmask(). IOAPIC_LOCK covers both select/window pairs.
+    // until unmask(). IOAPIC_LOCK covers every select/window pair below.
     unsafe {
         let saved = IOAPIC_LOCK.lock_raw();
         if let Some(clear) = remote_irr_clear(ioapic_read(base, 0x10 + 2 * pin))
@@ -681,6 +684,12 @@ mod tests
     {
         let stale = REDIR_LEVEL | REDIR_REMOTE_IRR | 0x45;
         assert_eq!(remote_irr_clear(stale), Some(REDIR_MASK | 0x45));
+        // The polarity bit is kept.
+        let stale = REDIR_LEVEL | REDIR_ACTIVE_LOW | REDIR_REMOTE_IRR | 0x45;
+        assert_eq!(
+            remote_irr_clear(stale),
+            Some(REDIR_MASK | REDIR_ACTIVE_LOW | 0x45)
+        );
     }
 
     #[test]

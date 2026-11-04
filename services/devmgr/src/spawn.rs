@@ -175,12 +175,13 @@ fn mint_bootstrap_badge() -> Option<u64>
 }
 
 /// One BAR `Mmio` cap delivered to a driver, with the PCI BAR index (0-5)
-/// it covers.
+/// it covers and the bytes of the BAR, from its start, the cap was carved to.
 #[derive(Clone, Copy, Default)]
 pub struct BarSpec
 {
     pub bar: u8,
     pub cap: u32,
+    pub bytes: u64,
 }
 
 /// Endpoints and identifiers needed to spawn a driver process and hand it

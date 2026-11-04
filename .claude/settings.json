@@ -1,36 +1,36 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(cargo xtask *)",
+    "permissions": {
+        "allow": [
+            "Bash(cargo xtask *)",
 
-      "Bash(readelf *)",
-      "Bash(nm *)",
-      "Bash(objdump *)",
-      "Bash(riscv64-linux-gnu-objdump *)",
-      "Bash(riscv64-unknown-elf-objdump *)",
+            "Bash(readelf *)",
+            "Bash(nm *)",
+            "Bash(objdump *)",
+            "Bash(riscv64-linux-gnu-objdump *)",
+            "Bash(riscv64-unknown-elf-objdump *)",
 
-      "Bash(gh pr view *)",
-      "Bash(gh pr diff *)",
-      "Bash(gh pr checks *)",
-      "Bash(gh issue view *)",
-      "Bash(gh issue list *)",
-      "Bash(gh search *)",
-      "Bash(gh run view *)",
-      "Bash(gh run watch *)",
-      "Bash(gh run list *)",
+            "Bash(gh pr view *)",
+            "Bash(gh pr diff *)",
+            "Bash(gh pr checks *)",
+            "Bash(gh issue view *)",
+            "Bash(gh issue list *)",
+            "Bash(gh search *)",
+            "Bash(gh run view *)",
+            "Bash(gh run watch *)",
+            "Bash(gh run list *)",
 
-      "Bash(git checkout -b *)"
-    ]
-  },
-  "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true
-  },
-  "showThinkingSummaries": true,
-  "outputStyle": "Focused",
-  "autoMemoryEnabled": false,
-  "attribution": {
-    "commit": "",
-    "pr": "",
-    "sessionUrl": false
-  }
+            "Bash(git checkout -b *)"
+        ]
+    },
+    "enabledPlugins": {
+        "rust-analyzer-lsp@claude-plugins-official": true
+    },
+    "showThinkingSummaries": true,
+    "outputStyle": "Focused",
+    "autoMemoryEnabled": false,
+    "attribution": {
+        "commit": "",
+        "pr": "",
+        "sessionUrl": false
+    }
 }

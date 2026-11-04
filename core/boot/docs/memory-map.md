@@ -93,8 +93,8 @@ init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init rea
 
 Every other `Loaded` page is permanent: the bootloader's own loaded image
 (firmware-allocated as `EfiLoaderCode` / `EfiLoaderData`; it contains the
-handoff trampoline), the kernel image, and the kernel handoff stack (kept as the
-BSP boot stack).
+handoff trampoline), the kernel image, and the kernel handoff stack with its guard page
+(the stack is kept as the BSP boot stack).
 
 Two scratch allocations never reach the final map: the kernel ELF file read
 buffer, freed in step 3 once `load_kernel` has copied the image out, and, on
@@ -119,7 +119,7 @@ The `Loaded` allocations are:
 - Translated `MemoryMapEntry` array (`BootInfo.memory_map`).
 - Reclaim-array page (the `BootInfo.reclaim_ranges` backing).
 - AP trampoline page, when allocated.
-- Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB).
+- Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB) and the guard page below it.
 - Page-table frames allocated for the initial mapping (see
   [page-tables.md](page-tables.md)).
 - The x86-64 LA57 toggle page (`EfiLoaderCode`), when the handoff changes the paging

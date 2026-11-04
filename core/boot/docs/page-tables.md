@@ -24,10 +24,11 @@ bootloader *builds*, described in later sections — is:
 - An identity map, read-write and non-executable, covers every page touched by the
   `BootInfo` page, the boot-module array page, the translated `MemoryMapEntry` array
   (`BootInfo.memory_map`), the `MmioAperture` array page, the reclaim-range array page, the
-  handoff stack, the `InitImage` segments (whose `phys_addr` carries the `p_vaddr` in-page
-  offset), the kernel segments' physical frames, the bundle blob (every boot module body),
-  the framebuffer when present, and the UART MMIO page on RISC-V, so the kernel can read
-  them using physical addresses before its own direct-physical map is established.
+  handoff stack (not the guard page below it), the `InitImage` segments (whose `phys_addr`
+  carries the `p_vaddr` in-page offset), the kernel segments' physical frames, the bundle
+  blob (every boot module body), the framebuffer when present, and the UART MMIO page on
+  RISC-V, so the kernel can read them using physical addresses before its own
+  direct-physical map is established.
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
   continues across the root-table switch (on x86-64, the LA57 toggle trampoline's page when
   the handoff changes the paging depth, § x86-64: Negotiated Paging Depth).

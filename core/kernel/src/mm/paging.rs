@@ -1015,16 +1015,14 @@ fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
 /// stack stays usable after the page-table switch until `kernel_entry`
 /// rebases it into the direct map.
 ///
-/// The entry contract guarantees [`HANDOFF_STACK_BYTES`] of stack below the
-/// entry stack pointer (core/boot/docs/kernel-handoff.md);
-/// [`handoff_stack_window`] covers that region from the current `sp` alone. It
-/// also maps up to `HANDOFF_STACK_BYTES` + 4 KiB of pages beside the stack,
-/// which are never accessed through this low-half alias.
+/// The window is [`handoff_stack_window`] of the stack pointer `kernel_entry`
+/// recorded at its first statement (`stack_depth::boot_entry_sp`), or of the
+/// current one when none was recorded. It leaves out the page below the stack,
+/// which the reference bootloader keeps unmapped as the stack's guard
+/// (core/boot/docs/boot-flow.md § Step 6).
 ///
 /// If the stack pointer is already within the kernel image mapping (unlikely
 /// but possible), this is a no-op.
-///
-/// [`HANDOFF_STACK_BYTES`]: boot_protocol::layout::HANDOFF_STACK_BYTES
 #[cfg(not(test))]
 fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result<(), PagingError>
 {
@@ -1038,7 +1036,12 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
         return Ok(());
     }
 
-    let (lo, hi) = handoff_stack_window(sp);
+    let entry_sp = match crate::stack_depth::boot_entry_sp()
+    {
+        0 => sp,
+        recorded => recorded,
+    };
+    let (lo, hi) = handoff_stack_window(entry_sp);
     let rw = PageFlags {
         readable: true,
         writable: true,
@@ -1055,24 +1058,26 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
     Ok(())
 }
 
-/// The page-aligned `[lo, hi)` that holds the guaranteed handoff stack, given
-/// the current stack pointer `sp` deeper in the same stack.
+/// The page-aligned `[lo, hi)` the kernel identity-maps over the handoff
+/// stack, given `entry_sp`, the stack pointer at `kernel_entry`'s first
+/// statement.
 ///
-/// With `S` = [`HANDOFF_STACK_BYTES`] and `e` the entry stack pointer, the
-/// stack the boot phases may use is `[e - S, e)`. The frames between `sp` and
-/// `e` lie in it, so `sp < e <= sp + S`; then `e - S > sp - S >= page(sp) - S`
-/// and `e <= sp + S < page(sp) + 4 KiB + S`.
+/// With `S` = [`HANDOFF_STACK_BYTES`] and `t` = `entry_sp` rounded up to a
+/// page, the window is `[t - S, t + S)`. Its floor is the base of the stack
+/// the kernel's depth report derives from the same pointer
+/// (`stack_depth::handoff_base`): under the reference bootloader, whose stack
+/// top is page-aligned, `t` is that top whenever `kernel_entry`'s frame is
+/// smaller than a page, so the window starts at the stack's lowest page and
+/// leaves out the guard page below it. Its ceiling lies at least `S` above
+/// `entry_sp`, so it holds the entry stack pointer and `kernel_entry`'s frame
+/// whatever their alignment, since that frame lies inside the stack.
 ///
 /// [`HANDOFF_STACK_BYTES`]: boot_protocol::layout::HANDOFF_STACK_BYTES
-fn handoff_stack_window(sp: u64) -> (u64, u64)
+fn handoff_stack_window(entry_sp: u64) -> (u64, u64)
 {
     let stack = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
-    let page = PAGE_SIZE as u64;
-    let sp_page = sp & !(page - 1);
-    (
-        sp_page.saturating_sub(stack),
-        sp_page.saturating_add(stack + page),
-    )
+    let lo = crate::stack_depth::handoff_base(entry_sp, PAGE_SIZE as u64, stack);
+    (lo, lo + 2 * stack)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1258,22 +1263,38 @@ mod tests
 
     // ── Boot stack window ────────────────────────────────────────────────────
 
-    // Defect caught: the former 64 KiB-aligned window around SP, which leaves
-    // the low part of a stack that is only 4 KiB-aligned unmapped.
+    // Defect caught: a window that reaches below the stack the depth report
+    // derives, mapping the reference bootloader's guard page so an overflow of
+    // the stack no longer faults.
     #[test]
-    fn the_stack_window_covers_the_guaranteed_stack_from_any_deeper_sp()
+    fn the_stack_window_starts_at_the_stack_and_leaves_out_its_guard_page()
     {
         let size = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
-        // Entry SPs on and off a page boundary, straddling a 64 KiB boundary.
+        let top = 0x5_3000u64;
+        // kernel_entry's frame is smaller than a page.
+        for entry_sp in [top - 8, top - 0x800, top - 0xff8]
+        {
+            let (lo, hi) = handoff_stack_window(entry_sp);
+            assert_eq!(lo, top - size, "entry sp {entry_sp:#x}");
+            assert!(top <= hi, "entry sp {entry_sp:#x}: {lo:#x}..{hi:#x}");
+        }
+    }
+
+    // Defect caught: a window whose ceiling is the derived top, which drops the
+    // entry stack pointer's page when kernel_entry's frame crosses a page
+    // boundary below an entry pointer that is not page-aligned.
+    #[test]
+    fn the_stack_window_holds_the_entry_frame_whatever_its_alignment()
+    {
+        let size = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
         for entry in [0x5_3000u64, 0x5_3008, 0x5_2ff8]
         {
-            // The guaranteed stack is [entry - size, entry); sp is anywhere in it.
-            for sp in [entry - 8, entry - 0x1000, entry - size / 2, entry - size]
+            for frame in [8u64, 0x200, 0x1000, 0x3000]
             {
-                let (lo, hi) = handoff_stack_window(sp);
+                let (lo, hi) = handoff_stack_window(entry - frame);
                 assert!(
-                    lo <= entry - size && entry <= hi,
-                    "entry {entry:#x}, sp {sp:#x}: {lo:#x}..{hi:#x}"
+                    lo < entry - frame && entry <= hi && hi - lo == 2 * size,
+                    "entry {entry:#x}, frame {frame:#x}: {lo:#x}..{hi:#x}"
                 );
             }
         }

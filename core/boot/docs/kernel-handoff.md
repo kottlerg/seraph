@@ -99,8 +99,9 @@ flags are established per the contract above, and control transfers to `kernel_e
 unconditional jump that does not return.
 
 Beyond the contract, the reference bootloader enters with the stack pointer at the handoff
-stack's page-aligned top, and paints the stack with `STACK_PAINT` and marks its lowest word with
-`HANDOFF_STACK_BASE_MARK` ([boot-flow.md](boot-flow.md) § Step 6). The kernel's stack depth
+stack's page-aligned top, leaves the page below the stack unmapped as its guard, and paints the
+stack with `STACK_PAINT` and marks its lowest word with `HANDOFF_STACK_BASE_MARK`
+([boot-flow.md](boot-flow.md) § Step 6). The kernel's stack depth
 report ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth)
 § Kernel Stack Depth) relies on those properties for the handoff class only; under a
 bootloader without them, that class reads as unlocated (the error in

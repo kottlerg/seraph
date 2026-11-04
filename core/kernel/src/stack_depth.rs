@@ -85,8 +85,10 @@ pub unsafe fn used_bytes(base: u64, bytes: usize) -> u64
 }
 
 /// The handoff stack's base for an entry stack pointer: its top is `entry_sp`
-/// rounded up to a page, and it spans `stack_bytes` below that top.
-fn handoff_base(entry_sp: u64, page: u64, stack_bytes: u64) -> u64
+/// rounded up to a page, and it spans `stack_bytes` below that top. The
+/// kernel's Phase 3 identity window over the stack starts here too
+/// (`mm::paging::handoff_stack_window`).
+pub fn handoff_base(entry_sp: u64, page: u64, stack_bytes: u64) -> u64
 {
     entry_sp.next_multiple_of(page) - stack_bytes
 }
@@ -125,6 +127,13 @@ fn handoff_record(mark: u64, used: impl FnOnce() -> u64) -> u64
 pub fn note_boot_entry(sp: u64)
 {
     BOOT_ENTRY_SP.store(sp, Ordering::Relaxed);
+}
+
+/// The stack pointer [`note_boot_entry`] recorded, or 0 when none was.
+#[cfg(not(test))]
+pub fn boot_entry_sp() -> u64
+{
+    BOOT_ENTRY_SP.load(Ordering::Relaxed)
 }
 
 /// Raise the thread-stack high-water mark with the stack at `base`

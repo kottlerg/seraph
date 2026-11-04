@@ -237,6 +237,22 @@ impl PerCpuData
 #[cfg(not(test))]
 static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut());
 
+/// The per-CPU data slab: one [`PerCpuData`] per CPU.
+const PER_CPU_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<PerCpuData>("PER_CPU");
+const _: () = assert!(
+    PER_CPU_SLAB.sized_at_every_width(),
+    "PER_CPU slab overflows"
+);
+
+/// The hardware-CPU-id slab: one APIC id (x86-64) or hart id (RISC-V) per CPU.
+const CPU_APIC_IDS_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<u32>("CPU_APIC_IDS");
+const _: () = assert!(
+    CPU_APIC_IDS_SLAB.sized_at_every_width(),
+    "CPU_APIC_IDS slab overflows"
+);
+
 /// Allocate the per-CPU [`PerCpuData`], APIC-ID and TLB-shootdown request
 /// slabs, each sized to `cpu_count`, and publish their base pointers. Called from
 /// `sched::init_per_cpu_storage` (Phase 4), before [`init_bsp`] /
@@ -256,8 +272,7 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
         "init_storage: cpu_count exceeds MAX_CPUS"
     );
 
-    let pc_bytes = cpu_count * core::mem::size_of::<PerCpuData>();
-    let pc_ptr = crate::sched::alloc_zeroed_slab::<PerCpuData>(pc_bytes, allocator, "PER_CPU");
+    let pc_ptr = crate::sched::alloc_per_cpu_slab::<PerCpuData>(PER_CPU_SLAB, cpu_count, allocator);
     // SAFETY: the slab covers cpu_count PerCpuData entries; initialise each in
     // place. PerCpuData::new() is all-zero (matching the slab's zero-fill); the
     // explicit write documents the contract and mirrors the scheduler slab.
@@ -269,8 +284,7 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
     }
     PER_CPU_PTR.store(pc_ptr, Ordering::Release);
 
-    let id_bytes = cpu_count * core::mem::size_of::<u32>();
-    let id_ptr = crate::sched::alloc_zeroed_slab::<u32>(id_bytes, allocator, "CPU_APIC_IDS");
+    let id_ptr = crate::sched::alloc_per_cpu_slab::<u32>(CPU_APIC_IDS_SLAB, cpu_count, allocator);
     CPU_APIC_IDS_PTR.store(id_ptr, Ordering::Release);
 
     crate::mm::tlb_shootdown::init_storage(cpu_count, allocator);

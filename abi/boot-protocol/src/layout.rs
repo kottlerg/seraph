@@ -55,11 +55,11 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// (core/boot/docs/boot-flow.md § Step 6).
 ///
 /// Measured bound (the kernel's paint report, ktest `stress::stack_depth`), on
-/// both architectures: debug builds at 16 and 128 CPUs peak at 6880 B of it
-/// (`riscv64`; 6072 B on `x86_64`), a margin of about 90%; release builds at 4, 16
-/// and 128 CPUs use at most 7240 B, and debug builds at 4 CPUs at most 9008 B, so
-/// the deepest bound leaves a margin of about 86%. The report gives the depth, not
-/// the path that reached it.
+/// both architectures: debug builds peak at 6880 B of it at 4 CPUs and 6592 B at
+/// 16 and 128 CPUs (`riscv64`; 6072 B at each width on `x86_64`), and release
+/// builds at 4, 16 and 128 CPUs at 4984 B (`riscv64`; 4520 B on `x86_64`), so the
+/// deepest bound leaves a margin of about 90%. The report gives the depth, not the
+/// path that reached it.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
 /// Word every idle, thread, and handoff stack is filled with when it is allocated, so the

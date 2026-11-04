@@ -201,6 +201,14 @@ static AP_TSS_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomi
 static AP_GDT_PTR: core::sync::atomic::AtomicPtr<[u64; 7]> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// The per-AP TSS slab: one [`TssWithIopb`] per CPU.
+const AP_TSS_SLAB: crate::sched::PerCpuSlab = crate::sched::PerCpuSlab::of::<TssWithIopb>("AP_TSS");
+const _: () = assert!(AP_TSS_SLAB.sized_at_every_width(), "AP_TSS slab overflows");
+
+/// The per-AP GDT slab: one seven-descriptor GDT per CPU.
+const AP_GDT_SLAB: crate::sched::PerCpuSlab = crate::sched::PerCpuSlab::of::<[u64; 7]>("AP_GDT");
+const _: () = assert!(AP_GDT_SLAB.sized_at_every_width(), "AP_GDT slab overflows");
+
 /// Allocate the per-CPU AP TSS and GDT slabs sized to `cpu_count`. Called
 /// from `sched::init_storage` (Phase 4, via `init_ap_percpu_storage`), before
 /// any AP startup. Each slab is page-aligned and
@@ -211,8 +219,8 @@ static AP_GDT_PTR: core::sync::atomic::AtomicPtr<[u64; 7]> =
 #[cfg(not(test))]
 pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
-    let tss_bytes = cpu_count * core::mem::size_of::<TssWithIopb>();
-    let tss_ptr = crate::sched::alloc_zeroed_slab::<TssWithIopb>(tss_bytes, allocator, "AP_TSS");
+    let tss_ptr =
+        crate::sched::alloc_per_cpu_slab::<TssWithIopb>(AP_TSS_SLAB, cpu_count, allocator);
     // Initialise IOPB regions to 0xFF (all ports denied) for slots not yet
     // touched by init_ap. iopb_offset is u16 inside a packed struct, so use
     // write_unaligned. SAFETY: tss_ptr covers cpu_count entries.
@@ -231,8 +239,7 @@ pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocat
     AP_TSS_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
     AP_TSS_PTR.store(tss_ptr, core::sync::atomic::Ordering::Release);
 
-    let gdt_bytes = cpu_count * core::mem::size_of::<[u64; 7]>();
-    let gdt_ptr = crate::sched::alloc_zeroed_slab::<[u64; 7]>(gdt_bytes, allocator, "AP_GDT");
+    let gdt_ptr = crate::sched::alloc_per_cpu_slab::<[u64; 7]>(AP_GDT_SLAB, cpu_count, allocator);
     AP_GDT_PTR.store(gdt_ptr, core::sync::atomic::Ordering::Release);
 }
 

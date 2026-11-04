@@ -151,6 +151,16 @@ fn find_vector(table: &[AtomicU32], gsi: u32) -> Option<u8>
     vector_at(index)
 }
 
+/// The index of the first free vector of `table` at or after index `start`, wrapping
+/// round; `None` when every vector is assigned. The one search [`assign_vector_in`] takes
+/// and [`release_vector_in`] predicts.
+fn first_free_from(table: &[AtomicU32], start: usize) -> Option<usize>
+{
+    (0..table.len())
+        .map(|offset| (start + offset) % table.len())
+        .find(|&index| table[index].load(Ordering::Relaxed) == 0)
+}
+
 /// The vector `table` assigns to `gsi` and the index the next search starts at: its
 /// existing vector, else the first free vector at or after index `start` (wrapping), now
 /// assigned to it. `None` when every vector is assigned (or `gsi` is `u32::MAX`, which no
@@ -162,9 +172,7 @@ fn assign_vector_in(table: &[AtomicU32], gsi: u32, start: usize) -> Option<(u8, 
         return Some((vector, start));
     }
     let tag = gsi.checked_add(1)?;
-    let index = (0..table.len())
-        .map(|offset| (start + offset) % table.len())
-        .find(|&index| table[index].load(Ordering::Relaxed) == 0)?;
+    let index = first_free_from(table, start)?;
     // Release: a dispatch that reads the tag (Acquire) once the redirection entry that
     // names this vector fires sees a complete assignment.
     table[index].store(tag, Ordering::Release);
@@ -187,10 +195,7 @@ fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
         if entry.load(Ordering::Relaxed) == tag
         {
             entry.store(0, Ordering::Release);
-            let first_free = (0..table.len())
-                .map(|offset| (cursor + offset) % table.len())
-                .find(|&i| table[i].load(Ordering::Relaxed) == 0);
-            if first_free == Some(index)
+            if first_free_from(table, cursor) == Some(index)
             {
                 cursor = (index + 1) % table.len();
             }
@@ -199,9 +204,11 @@ fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
     cursor
 }
 
-/// Assign `gsi` a device vector: its existing one if it has one, else the next free one in
-/// turn ([`NEXT_VECTOR_INDEX`]). `None` when every device vector is assigned. Called under
-/// `irq`'s routing lock.
+/// Assign `gsi` a device vector: the next free one in turn ([`NEXT_VECTOR_INDEX`]). `None`
+/// when every device vector is assigned. Called under `irq`'s routing lock, from
+/// `route_device_irq` for a line's first binding; the last unbind's `unroute_device_irq`
+/// releases the vector, so `gsi` holds none when this runs, and returning an existing
+/// vector instead is defensive.
 #[cfg(not(test))]
 #[must_use]
 pub fn assign_vector(gsi: u32) -> Option<u8>

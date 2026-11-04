@@ -69,6 +69,10 @@
 //!   target and leaves it masked, and `dispatch_external` forwards every claimed source
 //!   to `crate::irq::dispatch_device_irq`.
 
+use super::encoding::{
+    PLIC_MAX_SOURCES, enable_words, plic_context_in_window, plic_enable_base_for,
+    plic_threshold_offset_for, sbi_hart_mask,
+};
 use super::trap_frame::TrapFrame;
 use crate::mm::paging::phys_to_virt;
 
@@ -76,30 +80,6 @@ use crate::mm::paging::phys_to_virt;
 
 /// PLIC priority register base: base + 4 * `source_id` (source 1..=`plic_ndev`).
 const PLIC_PRIORITY_BASE: u64 = 0x0000;
-
-/// PLIC S-mode context of the hart with hardware id `hart`.
-///
-/// Assumes the context layout of the targeted platforms (QEMU `virt`,
-/// SiFive-style PLICs): M-mode = `hart*2`, S-mode = `hart*2+1`. The PLIC
-/// specification leaves the mapping to the platform (module doc).
-const fn plic_s_context(hart: u32) -> u64
-{
-    hart as u64 * 2 + 1
-}
-
-/// PLIC S-mode enable-bits base for the hart with hardware id `hart`:
-/// 0x2000 + context * 0x80.
-const fn plic_enable_base_for(hart: u32) -> u64
-{
-    0x2000 + plic_s_context(hart) * 0x80
-}
-
-/// PLIC S-mode threshold register offset for the hart with hardware id `hart`:
-/// `0x20_0000 + context * 0x1000`. The claim/complete register follows at +4.
-const fn plic_threshold_offset_for(hart: u32) -> u64
-{
-    0x0020_0000 + plic_s_context(hart) * 0x1000
-}
 
 /// Target hart of each PLIC source, plus one; 0 for an unrouted source, so the zeroed
 /// table routes none. Indexed by source id over the specification's id space. Written
@@ -143,23 +123,6 @@ fn current_hart() -> u32
     0
 }
 
-/// Whether the S-mode context registers of the hart with hardware id `hart`
-/// (its enable words and its threshold and claim/complete pair) lie inside the
-/// PLIC window of `window` bytes.
-///
-/// Hart ids come from firmware and can be sparse or large; a context past the
-/// window would turn a `plic_write` into a store to arbitrary physical memory
-/// through the direct map.
-const fn plic_context_in_window(hart: u32, window: u64) -> bool
-{
-    // With the standard register map the claim register always ends past the
-    // enable words, so the enable-word test is defensive: it keeps the bound
-    // correct should the enable span ever grow past the context block.
-    let enable_end = plic_enable_base_for(hart) + enable_words(PLIC_MAX_SOURCES) as u64 * 4;
-    let claim_end = plic_threshold_offset_for(hart) + 8;
-    enable_end <= window && claim_end <= window
-}
-
 /// Halt the boot unless hart `hart`'s PLIC context lies inside the PLIC window.
 #[cfg(not(test))]
 fn require_plic_context(hart: u32)
@@ -174,16 +137,6 @@ fn require_plic_context(hart: u32)
 fn plic_claim_complete_offset() -> u64
 {
     plic_threshold_offset_for(current_hart()) + 4
-}
-
-/// Largest PLIC source id the RISC-V PLIC specification allows (sources 1..=1023;
-/// source 0 is reserved).
-pub const PLIC_MAX_SOURCES: u32 = 1023;
-
-/// Number of 32-bit enable words a context needs for sources `0..=ndev`.
-const fn enable_words(ndev: u32) -> u32
-{
-    (ndev + 1).div_ceil(32)
 }
 
 // ── PLIC access helpers ───────────────────────────────────────────────────────
@@ -535,9 +488,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 // which writes the PLIC claim/complete register. Do NOT write it
                 // again here.
                 //
-                // `plic_enable` enables sources only on the BSP's S-mode context,
-                // so only the BSP takes this trap; a claim that reads 0 (no source
-                // pending for this context) dispatches nothing.
+                // `plic_enable` enables each source only on its routed target
+                // hart's S-mode context (`irq::next_target_cpu` picks the target
+                // at route time), so the hart taking this trap claims the sources
+                // routed to it; a claim that reads 0 (no source pending for this
+                // context) dispatches nothing.
                 let irq = plic_read(plic_claim_complete_offset());
                 if irq != 0
                 {
@@ -560,7 +515,7 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0
-        && super::fpu::is_fp_or_v_opcode(stval)
+        && super::encoding::is_fp_or_v_opcode(stval)
     {
         // U-mode illegal-instruction trap on an F/D/V opcode: lazy enable
         // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
@@ -1467,18 +1422,6 @@ pub unsafe fn send_wakeup_ipi(target_hart_id: u32)
     unsafe { sbi_send_ipi_to(target_hart_id) };
 }
 
-/// Split a hart ID into the SBI `(hart_mask, hart_mask_base)` pair.
-///
-/// The SBI hart-mask convention addresses a 64-hart window: `hart_mask_base`
-/// is the first hart ID of the window and `hart_mask` is a bitmask relative
-/// to that base, so any hart ID up to the platform limit is reachable.
-fn sbi_hart_mask(target_hart_id: u32) -> (u64, u64)
-{
-    let base = u64::from(target_hart_id) & !63;
-    let mask = 1u64 << (u64::from(target_hart_id) & 63);
-    (mask, base)
-}
-
 /// Send a supervisor software interrupt to `target_hart_id` via the SBI IPI
 /// extension (EID=0x735049 'sPI', FID=0 `SEND_IPI`).
 ///
@@ -1691,63 +1634,4 @@ fn dump_riscv_regs(f: &super::trap_frame::TrapFrame)
         f.t5,
         f.t6
     );
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn plic_context_registers_follow_the_hart_id()
-    {
-        // Hart 0: S-mode context 1.
-        assert_eq!(plic_enable_base_for(0), 0x2080);
-        assert_eq!(plic_threshold_offset_for(0), 0x0020_1000);
-        // Hart 3: S-mode context 7, so a boot hart other than 0 gets its own
-        // registers rather than hart 0's.
-        assert_eq!(plic_enable_base_for(3), 0x2000 + 7 * 0x80);
-        assert_eq!(plic_threshold_offset_for(3), 0x0020_0000 + 7 * 0x1000);
-    }
-
-    // Defect caught: a firmware hart id whose context lies past the PLIC window
-    // being accepted, which would turn the context writes into stores outside it.
-    #[test]
-    fn plic_context_outside_the_window_is_refused()
-    {
-        // A 4 MiB window holds 512 contexts after the 2 MiB of priority, pending
-        // and enable registers: the S-mode contexts of harts 0..=255 (context
-        // 511's claim register ends at 0x3F_F008); hart 256's is context 513.
-        assert!(plic_context_in_window(0, 0x40_0000));
-        assert!(plic_context_in_window(255, 0x40_0000));
-        assert!(!plic_context_in_window(256, 0x40_0000));
-        assert!(!plic_context_in_window(u32::MAX, 0x40_0000));
-    }
-
-    // Defect caught: a default window too small for the hart ids the PLIC
-    // specification admits, so a platform reporting no PLIC size halts the boot
-    // on a hart id at or above 256.
-    #[test]
-    fn default_plic_window_holds_every_context_the_specification_admits()
-    {
-        // Context 15871, the specification's last, is hart 7935's S-mode context.
-        let window = super::super::platform::DEFAULT_PLIC_SIZE;
-        assert!(plic_context_in_window(256, window));
-        assert!(plic_context_in_window(7935, window));
-        assert!(!plic_context_in_window(7936, window));
-    }
-
-    #[test]
-    fn sbi_hart_mask_windows()
-    {
-        assert_eq!(sbi_hart_mask(0), (1, 0));
-        assert_eq!(sbi_hart_mask(63), (1 << 63, 0));
-        assert_eq!(sbi_hart_mask(64), (1, 64));
-        assert_eq!(sbi_hart_mask(65), (1 << 1, 64));
-        assert_eq!(sbi_hart_mask(127), (1 << 63, 64));
-        assert_eq!(sbi_hart_mask(128), (1, 128));
-        assert_eq!(sbi_hart_mask(511), (1 << 63, 448));
-    }
 }

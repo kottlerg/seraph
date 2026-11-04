@@ -49,12 +49,11 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
-/// 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle stack
-/// (`riscv64`; 3296 B and 1328 B on `x86_64`), margins of about 77% and 90%;
-/// release builds at 4, 16 and 128 CPUs use at most 4304 B (thread) and 1616 B
-/// (idle), and debug builds at 4 CPUs at most 4200 B and 1752 B, so the deepest
-/// bounds leave margins of about 74% and 89%. The report gives the depth, not
-/// the path that reached it.
+/// 4, 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle
+/// stack (`riscv64`; 3296 B and 1328 B on `x86_64`), and release builds at 4, 16
+/// and 128 CPUs at 4304 B and 2080 B (`riscv64`; 3296 B and 1104 B on `x86_64`),
+/// so the deepest bounds leave margins of about 74% (thread) and 87% (idle). The
+/// report gives the depth, not the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
@@ -367,7 +366,6 @@ static mut OWED_WAKE_LAST_COUNT: usize = 0;
 /// One CPU's softlockup-watchdog breadcrumbs, held in the `cpu_count`-sized
 /// `CPU_DIAG` slab. Each field is written by its own CPU only and read by the
 /// watchdog on another. Diagnostic-only: no field gates control flow.
-#[cfg(not(test))]
 pub(crate) struct CpuDiag
 {
     /// `timer::current_tick()` stamp of this CPU's most recent `timer_tick`
@@ -2569,14 +2567,50 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 #[cfg(test)]
 pub unsafe fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
 
+/// The per-CPU scheduler slab: one [`PerCpuScheduler`] per CPU.
+const SCHEDULERS_SLAB: PerCpuSlab = PerCpuSlab::of::<PerCpuScheduler>("SCHEDULERS");
+const _: () = assert!(
+    SCHEDULERS_SLAB.sized_at_every_width(),
+    "SCHEDULERS slab overflows"
+);
+
+/// The idle-thread TCB slab: one uninitialised [`ThreadControlBlock`] per CPU.
+const IDLE_TCBS_SLAB: PerCpuSlab =
+    PerCpuSlab::of::<core::mem::MaybeUninit<ThreadControlBlock>>("IDLE_TCBS");
+const _: () = assert!(
+    IDLE_TCBS_SLAB.sized_at_every_width(),
+    "IDLE_TCBS slab overflows"
+);
+
+/// The idle-stack-top slab: one stack-top address per CPU.
+const IDLE_STACK_TOPS_SLAB: PerCpuSlab = PerCpuSlab::of::<u64>("IDLE_STACK_TOPS");
+const _: () = assert!(
+    IDLE_STACK_TOPS_SLAB.sized_at_every_width(),
+    "IDLE_STACK_TOPS slab overflows"
+);
+
+/// The watchdog's last-non-idle-tick slab: one tick stamp per CPU.
+const LAST_NON_IDLE_TICK_SLAB: PerCpuSlab =
+    PerCpuSlab::of::<core::sync::atomic::AtomicU64>("LAST_NON_IDLE_TICK");
+const _: () = assert!(
+    LAST_NON_IDLE_TICK_SLAB.sized_at_every_width(),
+    "LAST_NON_IDLE_TICK slab overflows"
+);
+
+/// The watchdog breadcrumb slab: one [`CpuDiag`] per CPU.
+const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
+const _: () = assert!(
+    CPU_DIAG_SLAB.sized_at_every_width(),
+    "CPU_DIAG slab overflows"
+);
+
 #[cfg(not(test))]
 fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 {
     let n = cpu_count as usize;
 
     // SCHEDULERS slab.
-    let sched_bytes = n * core::mem::size_of::<PerCpuScheduler>();
-    let sched_ptr = alloc_zeroed_slab::<PerCpuScheduler>(sched_bytes, allocator, "SCHEDULERS");
+    let sched_ptr = alloc_per_cpu_slab::<PerCpuScheduler>(SCHEDULERS_SLAB, n, allocator);
     // SAFETY: slab covers n * sizeof(PerCpuScheduler) bytes; we initialise
     // each slot in-place. PerCpuScheduler::new() is const so the writes are
     // straight stores; the previous zero-fill is overwritten.
@@ -2589,9 +2623,8 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     SCHEDULERS_PTR.store(sched_ptr, core::sync::atomic::Ordering::Release);
 
     // IDLE_TCBS slab — kept as MaybeUninit::uninit equivalent (zeroed by alloc).
-    let tcb_bytes = n * core::mem::size_of::<MaybeUninit<ThreadControlBlock>>();
     let tcb_ptr =
-        alloc_zeroed_slab::<MaybeUninit<ThreadControlBlock>>(tcb_bytes, allocator, "IDLE_TCBS");
+        alloc_per_cpu_slab::<MaybeUninit<ThreadControlBlock>>(IDLE_TCBS_SLAB, n, allocator);
     IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
 
     // Idle-stack-top slab, then one idle kernel stack per CPU drawn from the
@@ -2600,8 +2633,7 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     // blocks, so each order-2 stack is a clean split. After the drain the only
     // free blocks are the memory map's order-0/1 fragments, which cannot back
     // an order-2 stack. `init` reads the tops back from this slab.
-    let tops_bytes = n * core::mem::size_of::<u64>();
-    let tops_ptr = alloc_zeroed_slab::<u64>(tops_bytes, allocator, "IDLE_STACK_TOPS");
+    let tops_ptr = alloc_per_cpu_slab::<u64>(IDLE_STACK_TOPS_SLAB, n, allocator);
     let stack_order = idle_stack_order();
     for cpu in 0..n
     {
@@ -2622,18 +2654,13 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     IDLE_STACK_TOPS_PTR.store(tops_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU watchdog last-non-idle-tick slab (zeroed AtomicU64 per CPU).
-    let tick_bytes = n * core::mem::size_of::<core::sync::atomic::AtomicU64>();
-    let tick_ptr = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
-        tick_bytes,
-        allocator,
-        "LAST_NON_IDLE_TICK",
-    );
+    let tick_ptr =
+        alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(LAST_NON_IDLE_TICK_SLAB, n, allocator);
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU watchdog breadcrumbs. Zero is every field's idle value except
     // the last-syscall stamp, whose "none yet" is `u64::MAX`.
-    let diag_bytes = n * core::mem::size_of::<CpuDiag>();
-    let diag_ptr = alloc_zeroed_slab::<CpuDiag>(diag_bytes, allocator, "CPU_DIAG");
+    let diag_ptr = alloc_per_cpu_slab::<CpuDiag>(CPU_DIAG_SLAB, n, allocator);
     for cpu in 0..n
     {
         // SAFETY: the slab covers n zeroed records (zero is a valid atomic);
@@ -2658,6 +2685,125 @@ pub(crate) const fn slab_pages(bytes: usize) -> usize
 {
     let pages = bytes.div_ceil(PAGE_SIZE);
     if pages == 0 { 1 } else { pages }
+}
+
+/// One per-CPU slab's sizing: the label [`alloc_zeroed_slab`] reports, the
+/// bytes of one element, and the elements each CPU holds.
+///
+/// Every per-CPU storage initialiser allocates through
+/// [`alloc_per_cpu_slab`] with its slab's descriptor, so the byte count a boot
+/// asks for at any CPU count is [`bytes`](Self::bytes) of that descriptor. The
+/// compile-time assert beside each descriptor of a fixed per-CPU element count
+/// checks it at every width up to [`MAX_CPUS`] against the target's own
+/// layout; the tag-state slab's count is set at boot, so a host test checks it
+/// instead.
+#[derive(Clone, Copy)]
+pub(crate) struct PerCpuSlab
+{
+    label: &'static str,
+    elem_bytes: usize,
+    elems_per_cpu: usize,
+}
+
+impl PerCpuSlab
+{
+    /// A slab labelled `label` of one `elem_bytes`-byte element per CPU.
+    pub(crate) const fn new(label: &'static str, elem_bytes: usize) -> Self
+    {
+        Self {
+            label,
+            elem_bytes,
+            elems_per_cpu: 1,
+        }
+    }
+
+    /// A slab labelled `label` of one `T` per CPU.
+    pub(crate) const fn of<T>(label: &'static str) -> Self
+    {
+        Self::new(label, core::mem::size_of::<T>())
+    }
+
+    /// The same slab with `elems_per_cpu` elements per CPU.
+    pub(crate) const fn with_elems_per_cpu(self, elems_per_cpu: usize) -> Self
+    {
+        Self {
+            elems_per_cpu,
+            ..self
+        }
+    }
+
+    /// The slab's bytes at `cpu_count` CPUs, or `None` when the product
+    /// overflows `usize`.
+    pub(crate) const fn bytes(self, cpu_count: usize) -> Option<usize>
+    {
+        match cpu_count.checked_mul(self.elems_per_cpu)
+        {
+            Some(elems) => elems.checked_mul(self.elem_bytes),
+            None => None,
+        }
+    }
+
+    /// Whether the slab is sized at `cpu_count` CPUs: its byte count does not
+    /// overflow, and the [`slab_pages`] of it span at least that many bytes
+    /// without the span overflowing (`alloc_zeroed_slab` zero-fills it whole).
+    pub(crate) const fn sized_at(self, cpu_count: usize) -> bool
+    {
+        let Some(bytes) = self.bytes(cpu_count)
+        else
+        {
+            return false;
+        };
+        match slab_pages(bytes).checked_mul(PAGE_SIZE)
+        {
+            Some(span) => span >= bytes,
+            None => false,
+        }
+    }
+
+    /// Whether the slab is sized ([`sized_at`](Self::sized_at)) at every CPU
+    /// count from one to [`MAX_CPUS`]. The compile-time assert beside each
+    /// fixed-count descriptor calls it, so every build checks the target layout
+    /// of its architecture.
+    pub(crate) const fn sized_at_every_width(self) -> bool
+    {
+        let mut cpus = 1;
+        while cpus <= MAX_CPUS
+        {
+            if !self.sized_at(cpus)
+            {
+                return false;
+            }
+            cpus += 1;
+        }
+        true
+    }
+}
+
+/// Allocate `slab`'s storage for `cpu_count` CPUs through
+/// [`alloc_zeroed_slab`] and return a typed pointer to its first element.
+/// Halts when the byte count overflows (no fixed-count descriptor's
+/// compile-time assert, and for the tag-state slab no host test, admits one up
+/// to [`MAX_CPUS`]) or on buddy exhaustion.
+#[cfg(not(test))]
+pub(crate) fn alloc_per_cpu_slab<T>(
+    slab: PerCpuSlab,
+    cpu_count: usize,
+    allocator: &mut BuddyAllocator,
+) -> *mut T
+{
+    debug_assert_eq!(
+        slab.elem_bytes,
+        core::mem::size_of::<T>(),
+        "alloc_per_cpu_slab: the descriptor's element size is not T's"
+    );
+    let bytes = slab.bytes(cpu_count).unwrap_or_else(|| {
+        crate::kprintln!(
+            "alloc_per_cpu_slab: {} overflows at {cpu_count} CPUs",
+            slab.label
+        );
+        crate::fatal("alloc_per_cpu_slab: byte count overflows")
+    });
+    alloc_zeroed_slab::<T>(bytes, allocator, slab.label)
 }
 
 /// Allocate `bytes` of contiguous physical pages ([`slab_pages`]), zero-fill,
@@ -6447,9 +6593,10 @@ pub unsafe fn enter() -> !
 #[cfg(test)]
 mod slab_tests
 {
-    use super::slab_pages;
+    use super::{MAX_CPUS, PerCpuSlab, slab_pages};
     use crate::mm::PAGE_SIZE;
     use crate::mm::buddy::MAX_ORDER;
+    use crate::mm::tag_allocator::{MAX_HW_TAGS, TAG_STATE_SLAB, tag_count};
 
     /// Pages in one largest buddy block.
     const BLOCK_PAGES: usize = 1 << MAX_ORDER;
@@ -6481,5 +6628,52 @@ mod slab_tests
         assert_eq!(slab_pages(PAGE_SIZE + 1), 2);
         assert_eq!(slab_pages(4 * PAGE_SIZE + 1), 5);
         assert_eq!(slab_pages(BLOCK_PAGES * PAGE_SIZE + 1), BLOCK_PAGES + 1);
+    }
+
+    #[test]
+    fn a_per_cpu_slab_takes_its_per_cpu_share_once_per_cpu()
+    {
+        let slab = PerCpuSlab::new("T", 24).with_elems_per_cpu(3);
+        assert_eq!(slab.bytes(5), Some(5 * 3 * 24));
+        assert!(slab.sized_at(5));
+    }
+
+    #[test]
+    fn a_per_cpu_byte_count_that_overflows_is_refused()
+    {
+        let wide = PerCpuSlab::new("T", usize::MAX / 2 + 1);
+        assert_eq!(wide.bytes(2), None);
+        assert!(!wide.sized_at(2));
+        let many = PerCpuSlab::new("T", 1).with_elems_per_cpu(usize::MAX);
+        assert_eq!(many.bytes(2), None);
+        // Fits one CPU, overflows below MAX_CPUS.
+        assert!(!PerCpuSlab::new("T", usize::MAX / MAX_CPUS + 1).sized_at_every_width());
+    }
+
+    #[test]
+    fn a_byte_count_whose_page_span_overflows_is_refused()
+    {
+        let slab = PerCpuSlab::new("T", usize::MAX);
+        assert_eq!(slab.bytes(1), Some(usize::MAX));
+        assert!(!slab.sized_at(1));
+    }
+
+    // The fixed-count descriptors are checked by the compile-time assert
+    // beside each; the tag-state slab's per-CPU count is `tag_count`'s at boot,
+    // so it is checked here, at every width from one CPU to `MAX_CPUS`, with
+    // the most hardware tags any architecture reports. Its byte count does not
+    // grow monotonically with the width, so no subset of widths stands for the
+    // rest.
+    #[test]
+    fn the_tag_state_slab_is_sized_at_every_width_up_to_max_cpus()
+    {
+        for cpus in 1..=MAX_CPUS
+        {
+            let n = tag_count(MAX_HW_TAGS, cpus).expect("tagging is on at every width");
+            assert!(
+                TAG_STATE_SLAB.with_elems_per_cpu(n).sized_at(cpus),
+                "PER_CPU_TAG_STATE at {cpus} CPUs"
+            );
+        }
     }
 }

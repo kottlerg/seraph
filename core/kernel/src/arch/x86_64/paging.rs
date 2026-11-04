@@ -180,8 +180,6 @@ unsafe fn table_at(frame_va: u64) -> &'static mut [PageTableEntry; 512]
     unsafe { &mut *(frame_va as *mut [PageTableEntry; 512]) }
 }
 
-// ── Mapping functions ─────────────────────────────────────────────────────────
-
 // ── Level descent ─────────────────────────────────────────────────────────────
 
 /// Descend from the table at `root_va` (level `top`) to the table at level

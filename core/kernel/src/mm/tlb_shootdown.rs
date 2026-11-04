@@ -94,6 +94,14 @@ struct TlbShootdownRequest
     pending_cpus: AtomicCpuMask,
 }
 
+/// The TLB-shootdown request slab: one [`TlbShootdownRequest`] per CPU.
+const TLB_REQUESTS_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<TlbShootdownRequest>("TLB_REQUESTS");
+const _: () = assert!(
+    TLB_REQUESTS_SLAB.sized_at_every_width(),
+    "TLB_REQUESTS slab overflows"
+);
+
 impl TlbShootdownRequest
 {
     const fn new() -> Self
@@ -117,9 +125,11 @@ static TLB_REQUESTS_PTR: AtomicPtr<TlbShootdownRequest> = AtomicPtr::new(core::p
 /// from `percpu::init_storage` (Phase 4), on the BSP, before any AP starts.
 pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<TlbShootdownRequest>();
-    let base =
-        crate::sched::alloc_zeroed_slab::<TlbShootdownRequest>(bytes, allocator, "TLB_REQUESTS");
+    let base = crate::sched::alloc_per_cpu_slab::<TlbShootdownRequest>(
+        TLB_REQUESTS_SLAB,
+        cpu_count,
+        allocator,
+    );
     for cpu in 0..cpu_count
     {
         // SAFETY: the slab covers cpu_count slots and nothing reads it before

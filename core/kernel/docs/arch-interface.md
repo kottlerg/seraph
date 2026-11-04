@@ -36,7 +36,7 @@ build breaks. Items with no neutral caller are not checked this way: `interrupts
 ```
 core/kernel/src/arch/
 ├── mod.rs          # The only #[cfg(target_arch)] site; aliases the active arch as `current`;
-│                   # defines the shared `ThreadKind`
+│                   # defines the shared `ThreadKind`; host-test-builds riscv64's `encoding`
 ├── x86_64/
 │   ├── mod.rs      # Module declarations and arch constants (ARCH_NAME, …)
 │   ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
@@ -48,7 +48,8 @@ core/kernel/src/arch/
     ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
-    ├── platform.rs ├── ap_trampoline.rs └── entropy.rs
+    ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs
+    └── encoding.rs # PLIC map, SBI hart mask, F/D/V opcode decode; no arch-module deps
 ```
 
 `arch/mod.rs` performs the conditional compilation, and also defines the one type it holds
@@ -63,6 +64,11 @@ pub mod current;
 #[path = "riscv64/mod.rs"]
 pub mod current;
 ```
+
+It also compiles riscv64's `encoding` module, pure register-map and encoding arithmetic that
+depends on nothing else in its arch module, into the host test builds of the other
+architectures (`#[cfg(all(test, not(target_arch = "riscv64")))]`), so `cargo xtask test`, run
+on an x86_64 host, runs its tests.
 
 The sections below document the **cross-architecture contract surface** — the functions,
 types, and module-level constants architecture-neutral code depends on, plus the items every

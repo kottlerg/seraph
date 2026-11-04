@@ -132,16 +132,23 @@ const AP_IST_PAIR_SIZE: usize = 16384;
 static AP_IST_STACKS_PTR: core::sync::atomic::AtomicPtr<[u8; AP_IST_PAIR_SIZE]> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// The per-AP IST-stack slab: one IST1 + IST2 pair per CPU.
+const AP_IST_STACKS_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<[u8; AP_IST_PAIR_SIZE]>("AP_IST_STACKS");
+const _: () = assert!(
+    AP_IST_STACKS_SLAB.sized_at_every_width(),
+    "AP_IST_STACKS slab overflows"
+);
+
 /// Allocate the per-CPU IST-stack slab sized to `cpu_count`. Called from
 /// `sched::init`, before any AP startup.
 #[cfg(not(test))]
 pub fn init_ap_ist_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
-    let bytes = cpu_count * AP_IST_PAIR_SIZE;
-    let ptr = crate::sched::alloc_zeroed_slab::<[u8; AP_IST_PAIR_SIZE]>(
-        bytes,
+    let ptr = crate::sched::alloc_per_cpu_slab::<[u8; AP_IST_PAIR_SIZE]>(
+        AP_IST_STACKS_SLAB,
+        cpu_count,
         allocator,
-        "AP_IST_STACKS",
     );
     AP_IST_STACKS_PTR.store(ptr, core::sync::atomic::Ordering::Release);
 }

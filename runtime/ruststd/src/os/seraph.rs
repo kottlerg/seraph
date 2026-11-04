@@ -886,8 +886,8 @@ pub fn object_slab_retype_reclaimable<T>(
 /// memory-safe (the kernel does not hand out live bytes) but strands the run
 /// until the object is deleted: memmgr takes it off the process's ledger at
 /// once and returns it to its free pool, where it is re-grantable only whole
-/// and its next grantee cannot map it below the live object
-/// (`services/memmgr/docs/memory-pool.md` § Reclamation).
+/// and its next grantee cannot map it below its retype bump cursor, over the
+/// live object (`services/memmgr/docs/memory-pool.md` § Reclamation).
 /// Best-effort: a failed call leaves the run charged to the process until it
 /// dies.
 #[stable(feature = "seraph_ext", since = "1.0.0")]

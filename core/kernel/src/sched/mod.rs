@@ -2569,14 +2569,14 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 pub unsafe fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
 
 /// The per-CPU scheduler slab: one [`PerCpuScheduler`] per CPU.
-pub(crate) const SCHEDULERS_SLAB: PerCpuSlab = PerCpuSlab::of::<PerCpuScheduler>("SCHEDULERS");
+const SCHEDULERS_SLAB: PerCpuSlab = PerCpuSlab::of::<PerCpuScheduler>("SCHEDULERS");
 const _: () = assert!(
     SCHEDULERS_SLAB.sized_at_every_width(),
     "SCHEDULERS slab overflows"
 );
 
 /// The idle-thread TCB slab: one uninitialised [`ThreadControlBlock`] per CPU.
-pub(crate) const IDLE_TCBS_SLAB: PerCpuSlab =
+const IDLE_TCBS_SLAB: PerCpuSlab =
     PerCpuSlab::of::<core::mem::MaybeUninit<ThreadControlBlock>>("IDLE_TCBS");
 const _: () = assert!(
     IDLE_TCBS_SLAB.sized_at_every_width(),
@@ -2584,14 +2584,14 @@ const _: () = assert!(
 );
 
 /// The idle-stack-top slab: one stack-top address per CPU.
-pub(crate) const IDLE_STACK_TOPS_SLAB: PerCpuSlab = PerCpuSlab::of::<u64>("IDLE_STACK_TOPS");
+const IDLE_STACK_TOPS_SLAB: PerCpuSlab = PerCpuSlab::of::<u64>("IDLE_STACK_TOPS");
 const _: () = assert!(
     IDLE_STACK_TOPS_SLAB.sized_at_every_width(),
     "IDLE_STACK_TOPS slab overflows"
 );
 
 /// The watchdog's last-non-idle-tick slab: one tick stamp per CPU.
-pub(crate) const LAST_NON_IDLE_TICK_SLAB: PerCpuSlab =
+const LAST_NON_IDLE_TICK_SLAB: PerCpuSlab =
     PerCpuSlab::of::<core::sync::atomic::AtomicU64>("LAST_NON_IDLE_TICK");
 const _: () = assert!(
     LAST_NON_IDLE_TICK_SLAB.sized_at_every_width(),
@@ -2599,7 +2599,7 @@ const _: () = assert!(
 );
 
 /// The watchdog breadcrumb slab: one [`CpuDiag`] per CPU.
-pub(crate) const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
+const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
 const _: () = assert!(
     CPU_DIAG_SLAB.sized_at_every_width(),
     "CPU_DIAG slab overflows"

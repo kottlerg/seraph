@@ -202,13 +202,11 @@ static AP_GDT_PTR: core::sync::atomic::AtomicPtr<[u64; 7]> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// The per-AP TSS slab: one [`TssWithIopb`] per CPU.
-pub(crate) const AP_TSS_SLAB: crate::sched::PerCpuSlab =
-    crate::sched::PerCpuSlab::of::<TssWithIopb>("AP_TSS");
+const AP_TSS_SLAB: crate::sched::PerCpuSlab = crate::sched::PerCpuSlab::of::<TssWithIopb>("AP_TSS");
 const _: () = assert!(AP_TSS_SLAB.sized_at_every_width(), "AP_TSS slab overflows");
 
 /// The per-AP GDT slab: one seven-descriptor GDT per CPU.
-pub(crate) const AP_GDT_SLAB: crate::sched::PerCpuSlab =
-    crate::sched::PerCpuSlab::of::<[u64; 7]>("AP_GDT");
+const AP_GDT_SLAB: crate::sched::PerCpuSlab = crate::sched::PerCpuSlab::of::<[u64; 7]>("AP_GDT");
 const _: () = assert!(AP_GDT_SLAB.sized_at_every_width(), "AP_GDT slab overflows");
 
 /// Allocate the per-CPU AP TSS and GDT slabs sized to `cpu_count`. Called

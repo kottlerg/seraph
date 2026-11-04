@@ -34,7 +34,7 @@ pub struct CpuRng
 }
 
 /// The per-CPU generator slab: one [`CpuRng`] per CPU.
-pub(crate) const CPURNG_SLAB: crate::sched::PerCpuSlab =
+pub(super) const CPURNG_SLAB: crate::sched::PerCpuSlab =
     crate::sched::PerCpuSlab::of::<CpuRng>("ENTROPY_CPURNG");
 const _: () = assert!(
     CPURNG_SLAB.sized_at_every_width(),

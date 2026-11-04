@@ -4070,10 +4070,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 "Thread: every production cap is retype-backed"
             );
             use crate::cap::retype::{dispatch_for, retype_free};
-            let raw_bytes = dispatch_for(ObjectType::Thread, 0).map_or(
-                (crate::sched::KERNEL_STACK_PAGES as u64 + 2) * crate::mm::PAGE_SIZE as u64,
-                |e| e.raw_bytes,
-            );
+            let raw_bytes = dispatch_for(ObjectType::Thread, 0)
+                .map_or(crate::sched::thread_slot::thread_slot_bytes(), |e| {
+                    e.raw_bytes
+                });
             // SAFETY: ancestor_ptr is non-null: every production object is
             // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };

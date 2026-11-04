@@ -124,7 +124,7 @@ fn log_hex(prefix: &str, value: u64)
 // ── Bootstrap arena ────────────────────────────────────────────────────────────
 //
 // Each tier-1 service (memmgr, procmgr) is backed by one contiguous arena
-// Memory cap carved from init's pool. Its front `[0, RETYPE_RESERVE_PAGES)`
+// Memory cap carved from init's pool. Its front `[0, retype_reserve_pages())`
 // is consumed by the service's `AddressSpace` / `CSpace` / `Thread` retypes
 // (a monotonic page-aligned front bump in the cap's `RetypeAllocator`); the
 // remainder is offset-mapped page-by-page as the service's loaded backing
@@ -135,11 +135,14 @@ fn log_hex(prefix: &str, value: u64)
 // never frees into the post-handoff buddy.
 
 /// Front region of a tier-1 service arena reserved for the three kernel-object
-/// retypes, each of which consumes its `*_RETYPE_PAGES` pages. The retype bump
-/// is page-aligned and monotonic, so backing offsets at or above this bound
-/// never collide with a retype slab.
-const RETYPE_RESERVE_PAGES: u64 =
-    crate::ASPACE_RETYPE_PAGES + crate::CSPACE_RETYPE_PAGES + crate::THREAD_RETYPE_PAGES;
+/// retypes, each of which consumes its pages (`*_RETYPE_PAGES`,
+/// [`crate::thread_retype_pages`]). The retype bump is page-aligned and
+/// monotonic, so backing offsets at or above this bound never collide with a
+/// retype slab.
+fn retype_reserve_pages() -> u64
+{
+    crate::ASPACE_RETYPE_PAGES + crate::CSPACE_RETYPE_PAGES + crate::thread_retype_pages()
+}
 
 /// Front region of init's own arena reserved for its kernel-object retypes.
 ///
@@ -149,8 +152,9 @@ const RETYPE_RESERVE_PAGES: u64 =
 ///
 /// * 1 page for endpoints created before the log-thread retype (the retype
 ///   allocator packs ~32 endpoints per page; init creates well under that),
-/// * `THREAD_RETYPE_PAGES` (6) for the log thread, which page-aligns the bump
-///   upward — splitting endpoint packing across a page boundary, and
+/// * [`crate::thread_retype_pages`] (six or more) for the log thread, which
+///   page-aligns the bump upward — splitting endpoint packing across a page
+///   boundary, and
 /// * 1 page for endpoints created after the log-thread retype, so they never
 ///   bump into the offset-mapped backing region even without relying on the
 ///   allocator reusing the first page's recovered slack.
@@ -158,7 +162,10 @@ const RETYPE_RESERVE_PAGES: u64 =
 /// Sound for up to ~32 endpoints on each side of the log-thread retype; init
 /// creates roughly a dozen total. [`finalize_memmgr`] asserts the front bump
 /// never crossed this bound before forwarding the arena.
-pub(crate) const INIT_RETYPE_RESERVE_PAGES: u64 = 1 + crate::THREAD_RETYPE_PAGES + 1;
+pub(crate) fn init_retype_reserve_pages() -> u64
+{
+    1 + crate::thread_retype_pages() + 1
+}
 
 /// A service's contiguous backing arena: one Memory cap plus a page cursor
 /// into its offset-mapped backing region.
@@ -177,13 +184,13 @@ pub(crate) struct BootArena
 
 impl BootArena
 {
-    /// Carve a `RETYPE_RESERVE_PAGES + backing_pages` contiguous arena off
+    /// Carve a `retype_reserve_pages() + backing_pages` contiguous arena off
     /// `alloc` with the cursor positioned past the retype reserve. The
     /// caller performs the three retypes against [`Self::cap`] before
     /// placing any backing page.
     fn carve(alloc: &mut MemoryAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
     {
-        Self::carve_reserve(alloc, init_aspace, RETYPE_RESERVE_PAGES, backing_pages)
+        Self::carve_reserve(alloc, init_aspace, retype_reserve_pages(), backing_pages)
     }
 
     /// Carve a `reserve_pages + backing_pages` contiguous arena off `alloc`
@@ -647,7 +654,7 @@ pub struct InUseArena
 {
     /// Slot in memmgr's `CSpace` of the copied arena cap.
     pub cap_slot: u32,
-    /// Arena size in pages (`RETYPE_RESERVE_PAGES` + backing).
+    /// Arena size in pages (`retype_reserve_pages()` + backing).
     pub page_count: u32,
     /// Arena physical base.
     pub phys_base: u64,
@@ -1040,7 +1047,7 @@ fn cspace_general_headroom(cspace: u32) -> u64
 /// Assert init's arena retype front never crossed its reserve into the
 /// offset-mapped backing region. init's endpoint and log-thread retypes bump a
 /// monotonic cursor through the front; the backing was offset-mapped at
-/// `INIT_RETYPE_RESERVE_PAGES`. `available` is the arena's un-retyped byte
+/// `init_retype_reserve_pages()`. `available` is the arena's un-retyped byte
 /// count, so a front bump past the reserve shows up as a consumed span larger
 /// than the reserve. Endpoints created after `finalize_memmgr` (devmgr/vfsd
 /// registries, phase 3) stay within the reserve's documented headroom.
@@ -1053,7 +1060,7 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
     {
         let front_bump = size.saturating_sub(available);
         assert!(
-            front_bump <= INIT_RETYPE_RESERVE_PAGES * PAGE_SIZE,
+            front_bump <= init_retype_reserve_pages() * PAGE_SIZE,
             "init: arena retype front overran its reserve into backing",
         );
     }

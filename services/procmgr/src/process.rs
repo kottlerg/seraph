@@ -2151,7 +2151,7 @@ fn create_child_kernel_objects(
     drop(slab);
     let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
         memmgr_send,
-        crate::THREAD_RETYPE_PAGES,
+        crate::thread_retype_pages()?,
         ipc_buf,
     )?);
     let (sched_cap, create_priority) = if sched_baseline != 0

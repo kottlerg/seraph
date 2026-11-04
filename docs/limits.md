@@ -90,7 +90,7 @@ An entry an existing open Issue already names cites it in the recommendation.
   is one contiguous grant too, so RAM that refuses every request above three pages stops the
   set at 256 members, where the queues still hold about 16 K live processes: the death-queue
   set's floor, not a cap a system meets, since such RAM refuses each spawn's own contiguous
-  grants (a 48-page `AddressSpace`, a 6-page `Thread`) first. The
+  grants (a 48-page `AddressSpace`, a `Thread` slot of six pages or more) first. The
   first bound past RAM is procmgr's `CSpace` (about 1 M children, `MAX_SLOTS_STRUCTURAL`), and
   behind it sits the cap handle's 8-bit wrapping generation.
 - **Per-process address space.** The surfaces a creator places stay in one static map below
@@ -155,7 +155,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `Spinlock.next_ticket`, `now_serving` | `core/kernel/src/sync.rs` | `AtomicU32`, wrapping | provably unreachable (equality compare; waiters at most CPUs) | 8 B per lock | correct as is | None |
 | `boot_cpu_ids` | `core/kernel/src/main.rs` | `cpu_ids[..cpu_count]` of `BootInfo`, read in place through the direct map | ABI width (`BootInfo.cpu_ids`, `MAX_CPUS`) | none (no copy) | correct as is | None |
 | `INIT_ASPACE_PAGES` | `core/kernel/src/cap/mod.rs` | 18 | provably unreachable (init's fixed footprint: temp-map scratch and one UART page; augment can refill it, as ktest does) | 72 KiB from SEED | correct as is | None |
-| `INIT_THREAD_PAGES` | `core/kernel/src/cap/mod.rs` | `KERNEL_STACK_PAGES + 2` = 6 | encoding artefact (stack, TCB, FPU page) | 24 KiB from SEED | correct as is | None |
+| `thread_slot_bytes` (Thread retype slot, `sched::thread_slot`) | `core/kernel/src/sched/thread_slot.rs` | `KERNEL_STACK_PAGES` + 1 TCB page + the save-area pages, at least one: six pages on x86-64 (the 832 B x87, SSE and AVX XSAVE area) and on riscv64 up to `vlenb` 118, 70 pages at VLEN 65536 | encoding artefact (stack, TCB, and a save area sized at boot from the boot CPU: CPUID 0xD on x86-64, `304 + 32 * vlenb` on riscv64) | per thread; init's from SEED | correct as is | None |
 | `page_ptrs`, `page_phys` | `core/kernel/src/main.rs` | `[_; INIT_INFO_MAX_PAGES]` | ABI width (init protocol) | 64 B stack | correct as is | None; the descriptor capacity keeps the region within them |
 | `backtrace_scan` extent | `core/kernel/src/main.rs` | the thread's stack, SP to `stack_top` | provable unreachability (the stack's own extent) | none | correct as is | None |
 | `backtrace_scan` `MAX_HITS` | `core/kernel/src/main.rs` | 24 | diagnostic output cap | none | correct as is | None |
@@ -185,7 +185,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `CSpace.next_leaf`, `pool_exhaustions` | `core/kernel/src/cap/cspace.rs` | `u32` | encoding artefact (`next_leaf` asserted against `MAX_LEAVES`); `pool_exhaustions` is a wrapping diagnostic counter | embedded | correct as is | None |
 | `ROOT_CSPACE_INIT_SLOT_CAPACITY` | `core/kernel/src/cap/mod.rs` | 1536 slots | refillable seed (init augments) | about 29 pages | correct as is | None |
 | `ROOT_CSPACE_BODY_PAGES` | `core/kernel/src/cap/mod.rs` | 16 pages (496 bodies, 31 per page) | current peak plus headroom (init's per-page split bodies, about twice its peak; init never augments its own `CSpace`) | 64 KiB of SEED | make pay-as-you-go | Have init top its own `CSpace` up (`cspace_topup_pages`) from its RAM caps instead of a fixed SEED seed (#637) |
-| `SEED_RESERVE_BYTES` (`SEED_MEMORY`) | `core/kernel/src/cap/mod.rs` | about 380 KiB: the root `CSpace`, init address-space and init thread slabs, one 128 B body per `InitInfo` descriptor and per Phase-9 Memory cap (`BOOT_BODY_BOUND`, about 675), and 4 pages of alignment slack | ABI width (the boot mint is bounded by `INIT_INFO_DESCRIPTOR_CAPACITY`; nothing draws on SEED after boot) | about 380 KiB pinned | correct as is | None; a boot past the bound, a map of more than about 640 ACPI regions among them, halts by name |
+| `seed_reserve_bytes` (`SEED_MEMORY`) | `core/kernel/src/cap/mod.rs` | about 380 KiB: `SEED_FIXED_RESERVE_BYTES` (the root `CSpace` and init address-space slabs, one 128 B body per `InitInfo` descriptor and per Phase-9 Memory cap (`BOOT_BODY_BOUND`, about 675), and 4 pages of alignment slack) plus init's Thread slot (`thread_slot_bytes`) | ABI width (the boot mint is bounded by `INIT_INFO_DESCRIPTOR_CAPACITY`; nothing draws on SEED after boot) | about 380 KiB pinned | correct as is | None; a boot past the bound, a map of more than about 640 ACPI regions among them, halts by name |
 | `INIT_INFO_DESCRIPTOR_CAPACITY` (the `InitInfo` descriptor array) | `core/kernel/src/cap/mod.rs` | the descriptors `INIT_INFO_MAX_PAGES` pages hold past the header, about 655 | ABI width (`INIT_INFO_MAX_PAGES`; the drain writes its RAM extents and Phases 7 and 8 every boot descriptor straight into the reserved `InitInfo` block) | none (in the `InitInfo` block init receives) | correct as is | None here; the drain and `push_descriptor` halt the boot by name past it, a map of more than about 640 ACPI regions among the causes; raising it is the `INIT_INFO_MAX_PAGES` row |
 | `CSpaceLayout.module_names` | `core/kernel/src/cap/mod.rs` | 12 (`INIT_MAX_NAMED_MODULES`) | ABI width (init protocol) | embedded | needs a design | Names past 12 are dropped without a message; see the boot section |
 | `INIT_STACK_PHYS`, `INIT_INFO_RESERVE_ORDER` | `core/kernel/src/cap/mod.rs` | `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` | ABI width (init protocol) | 32 B | correct as is | None |
@@ -262,8 +262,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 
 The entries left open are tracked by the Issue each recommendation names: the vector space by
 [#325](https://github.com/kottlerg/seraph/issues/325), the per-CPU slabs by
-[#636](https://github.com/kottlerg/seraph/issues/636), the vector-register save area by
-[#658](https://github.com/kottlerg/seraph/issues/658), and `IOAPICS` by the boot section's Issue.
+[#636](https://github.com/kottlerg/seraph/issues/636), and `IOAPICS` by the boot section's Issue.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -297,7 +296,6 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | riscv64 `ROOT_IRQ_COUNT` | `core/kernel/src/arch/riscv64/mod.rs` | 1024 | hardware spec (PLIC id space) | none | correct as is | None |
 | riscv64 `DEFAULT_PLIC_SIZE` | `core/kernel/src/arch/riscv64/platform.rs` | 64 MiB | hardware spec (PLIC register map, 15 872 contexts) | none | correct as is | None |
 | device IRQ destination (`irq::next_target_cpu`) | `core/kernel/src/irq.rs` | one CPU per line, the CPUs in turn at route time; x86_64 only APIC ids below 255 | hardware spec (one PLIC context per source; the 8-bit physical destination of an I/O APIC entry without interrupt remapping, 255 being broadcast) | none | correct as is | None |
-| riscv64 `MAX_VLENB` | `core/kernel/src/arch/riscv64/fpu.rs` | 64 (VLEN 512) | BSS budget (one 4 KiB save page per thread) | one page per thread | make pay-as-you-go | Boot halts at VLEN above 512; size the save area from `vlenb` (#658) |
 | riscv64 ASID mask | `core/kernel/src/arch/riscv64/cpu.rs` | 16 bits | hardware spec (`satp`) | none | correct as is | None; the tag pool takes every probed ASID |
 | riscv64 `sbi_hart_mask` window | `core/kernel/src/arch/riscv64/interrupts.rs` | 64 harts per call | hardware spec (SBI `hart_mask`) | none | correct as is | None |
 | riscv64 `NAPOT_64K_PAGES` | `core/kernel/src/arch/riscv64/paging.rs` | 16 | hardware spec (Svnapot) | none | correct as is | None |
@@ -416,7 +414,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
 | `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | default (inline stack probes, #503, touch every page of a larger frame) | VA only | correct as is | None |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |
-| `THREAD_RETYPE_BYTES` | `abi/syscall/src/lib.rs` | 6 pages | encoding artefact (the kernel's `dispatch_for(Thread)`: kernel stack, TCB page, extended-state page) | 24 KiB per thread | correct as is | Pin the kernel's debit to it with a const assert in `cap/retype.rs` |
+| `SystemInfoType::ThreadRetypeBytes` | `abi/syscall/src/lib.rs` | the kernel's Thread slot (`thread_slot_bytes`), six pages or more | encoding artefact (the kernel's `dispatch_for(Thread)`: kernel stack, TCB page, extended-state pages, read at boot) | one slot per thread | correct as is | None |
 | `DEATH_EQ_CAPACITY` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 4 | provably unreachable (four post sources, each posting at most once per child) | about 168 B per child | correct as is | None |
 | `DEATH_EQ_OBSERVERS` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 2 nodes | provably unreachable (the main-thread bind and procmgr's relay bind) | 48 B per child | correct as is | None |
 | `Process::id` | `runtime/ruststd/src/sys/process/seraph.rs` | `u32` | ABI width (upstream `Child::id` is `u32`) | none | correct as is | None |
@@ -549,7 +547,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | `VFS_CHUNK_SIZE` | `services/procmgr/src/process.rs` | 504 | ABI width (`MSG_DATA_WORDS_MAX - 1` words) | none | correct as is | Derive from the ABI constant |
 | `RELA_CHUNK_RECORDS` | `services/procmgr/src/process.rs` | 128 | batch size (streaming chunk) | 3 KiB stack | correct as is | None |
 | `MAX_PROCESS_STACK_PAGES` check | `services/procmgr/src/process.rs` | notes outside `1..=MAX_PROCESS_STACK_PAGES` refused | see the process-layout section | none | correct as is | None |
-| `THREAD_RETYPE_PAGES` | `services/procmgr/src/main.rs` | 6, derived (`syscall_abi::THREAD_RETYPE_BYTES` in pages) | encoding artefact (kernel stack, TCB and FPU pages) | none | correct as is | None |
+| `thread_retype_pages` | `services/procmgr/src/main.rs` | `SystemInfoType::ThreadRetypeBytes` in pages, queried once and cached | encoding artefact (kernel stack, TCB and save-area pages) | none | correct as is | None |
 | `ASPACE_RETYPE_PAGES`, `CSPACE_RETYPE_PAGES` (per child) | `services/procmgr/src/main.rs` | 48 / 7 | refillable seed (augment) | per child | correct as is | None |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_SLOTS` | `services/procmgr/src/main.rs` | 256 / 1024 slots | tuning (headroom over a burst of spawns) | none | correct as is | None |
 | `INIT_THREADS`, `FIRST_ROUND_CAPS` | `services/procmgr/process-table/src/init_reap.rs` | 2 / 4 | provably unreachable (fixed init protocol) | none | correct as is | None |
@@ -611,7 +609,7 @@ The entries left open are tracked by the Issue each recommendation names.
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
 | `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | `INIT_INFO_MAX_PAGES * PAGE_SIZE / size_of::<CapDescriptor>()` = 682 | provably unreachable (at most one orphan per usable-RAM cap, each of which has an `InitInfo` descriptor; `memory_count` is clamped to it) | about 2.7 KiB BSS, reclaimed at init's reap | correct as is | None |
 | `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | refillable seed (augment) | 149 pages each for memmgr and procmgr | correct as is | None: both self-augment (#642, #643, #41) |
-| `THREAD_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 6, derived (`syscall_abi::THREAD_RETYPE_BYTES` in pages) | encoding artefact (kernel stack, TCB and FPU pages) | per tier-1 service | correct as is | None |
+| `thread_retype_pages` (tier-1) | `services/init/src/main.rs` | `SystemInfoType::ThreadRetypeBytes` in pages | encoding artefact (kernel stack, TCB and save-area pages) | per tier-1 service | correct as is | None |
 | `ASPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 48 | refillable seed (augment) | 48 pages per tier-1 service | correct as is | None: memmgr and procmgr both self-augment (#642) |
 | `INIT_RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 8 | provably unreachable (asserted against the fixed endpoint count) | 8 pages | correct as is | None |
 | `RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 203 | encoding artefact (sum) | per tier-1 service | correct as is | None |

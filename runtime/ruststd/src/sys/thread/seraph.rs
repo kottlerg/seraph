@@ -32,7 +32,22 @@ use crate::num::NonZero;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
-use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError, SystemInfoType};
+
+/// The kernel's debit for one Thread retype (`SystemInfoType::ThreadRetypeBytes`),
+/// fixed for the boot: the boot CPU's extended-state area sizes it. Queried
+/// once and cached; `None` if the query fails.
+fn thread_retype_bytes() -> Option<u64> {
+    use crate::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(cached);
+    }
+    let bytes = syscall::system_info(SystemInfoType::ThreadRetypeBytes as u64).ok()?;
+    CACHED.store(bytes, Ordering::Relaxed);
+    Some(bytes)
+}
 
 /// Default minimum stack size. Matches the upstream unsupported-PAL value.
 /// A default only: `Builder::stack_size` sets a thread's size past it.
@@ -264,9 +279,8 @@ impl Thread {
         // Dedicated slab for the Thread retype slot, sized to the kernel's
         // debit (kstack, wrapper and TCB, extended-state save area).
         let (thread_slab, thread_slab_phys) =
-            match crate::sys::alloc::seraph::object_slab_acquire_fresh(
-                syscall_abi::THREAD_RETYPE_BYTES,
-            ) {
+            match thread_retype_bytes().and_then(crate::sys::alloc::seraph::object_slab_acquire_fresh)
+            {
                 Some(g) => (g.cap, g.phys),
                 None => {
                     // SAFETY: `args` was just leaked via `Box::into_raw`.

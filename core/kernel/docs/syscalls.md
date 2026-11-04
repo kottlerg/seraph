@@ -674,7 +674,7 @@ CSpace.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, TCB, and FPU save area |
+| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, TCB, and FPU save area: `SystemInfoType::ThreadRetypeBytes` bytes |
 | 1 | `aspace_cap` | Address space capability (Map rights) the thread executes in |
 | 2 | `cspace_cap` | CSpace capability (Insert rights) the thread is bound to |
 | 3 | `sched_cap` | `SchedControl` capability governing the creation priority, or 0 |
@@ -2427,6 +2427,16 @@ pub enum SystemInfoType
     /// `NotSupported` when its base mark was not found. A diagnostic, read by
     /// ktest.
     StackHighWater      = 9,
+
+    /// Raw retype debit of one `Thread`, in bytes, and so the size of the
+    /// Memory capability `SYS_CAP_CREATE_THREAD` needs: the kernel stack, one
+    /// page holding the object wrapper and the TCB, and the extended-state
+    /// (FPU, SIMD, vector) save area, all whole pages. The save area is the
+    /// boot CPU's, sized once at Phase 5: on x86-64 the XSAVE size of the
+    /// components XCR0 enables (CPUID leaf 0xD), on riscv64 `304 + 32 * vlenb`,
+    /// each rounded up to pages, at least one. Fixed for a boot, not across
+    /// machines; ruststd, procmgr and init size every Thread slab from it.
+    ThreadRetypeBytes   = 10,
 }
 ```
 

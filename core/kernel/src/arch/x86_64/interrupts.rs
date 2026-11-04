@@ -220,6 +220,9 @@ pub unsafe fn init()
         fpu::enable_xsave();
         fpu::cr0_set_ts();
     }
+    // The XSAVE size of the components just enabled sizes every Thread's
+    // save area. Cores are assumed uniform, so only the BSP reports it.
+    crate::sched::thread_slot::set_extended_bytes(fpu::xsave_area_bytes());
 
     // 2. Carve the BSP IST stacks out of [`BSP_IST_STACKS`] (BSS).
     let ist_base = core::ptr::addr_of_mut!(BSP_IST_STACKS) as u64;

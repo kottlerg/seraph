@@ -344,7 +344,8 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SPP (so sret returns to U-mode by default)
    - Clear SUM (no supervisor access to user pages)
    - Set FS and VS Off for lazy FPU/vector save-restore and cache vlenb (halts without
-     the V extension)
+     the V extension, or with `vlenb == 0`), which sizes every Thread slot's save area
+     (`sched::thread_slot`)
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
 5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
@@ -438,7 +439,7 @@ Phase 7.
 1. Reserve init's Phase 9 backing (the InitInfo block, zeroed, and INIT_STACK_PAGES stack frames)
    and seed the kernel page-table pool from the pristine buddy, then drain the remaining buddy RAM
    as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
-   buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
+   buddy, and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
    descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 655 at
    INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
@@ -447,8 +448,9 @@ Phase 7.
    into that array, in place, so no copy of it exists, and a boot whose capabilities outnumber the
    slots halts by name in Phase 7 or 8 ("cap: boot capabilities exceed the InitInfo descriptor
    capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such boot. Phase
-   9's capabilities reach init through InitInfo header fields instead. SEED_RESERVE_BYTES is the
-   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs, and
+   9's capabilities reach init through InitInfo header fields instead. seed_reserve_bytes() is the
+   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs (the
+   thread slab sized from the boot CPU's save area, so it grows with a wider vector length), and
    one 128-byte body for each descriptor slot and for each Memory capability Phase 9 mints (init
    segments, InitInfo pages, init stack pages), plus alignment slack. Every drained extent exposed
    to userspace (each drained extent, and the seed extent's tail past the reserve) is zeroed through
@@ -463,7 +465,7 @@ Phase 7.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
       drained contiguous extent, the seed extent contributing only its tail past
-      SEED_RESERVE_BYTES. They are the first capabilities minted, in slot order (the drain's,
+      seed_reserve_bytes(). They are the first capabilities minted, in slot order (the drain's,
       the largest extent promoted to slot 0), with
       nothing between them: each extent is read whole from its slot, and its descriptor is
       written over it, so slot i holds extent i and then descriptor i, and every extent not

@@ -448,12 +448,6 @@ pub unsafe fn lazy_restore_fp_v(_area: *const u8, _frame: &mut super::trap_frame
 /// the lazy-trap path then skips V save/restore.
 static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Cap on supported `vlenb`. With 304 bytes of F/D + V-header prefix and
-/// 32 V registers, the per-thread 4 KiB save area accommodates
-/// `vlenb <= 118`; 64 (VLEN = 512) leaves comfortable headroom and covers
-/// every realistic RVA23-class implementation as of writing.
-const MAX_VLENB: u64 = 64;
-
 /// Return the cached `vlenb`. Returns 0 only before [`cache_vlenb`] runs at
 /// BSP init. Only the boot hart is probed: it halts in [`cache_vlenb`] when it
 /// lacks V, and a secondary hart is never probed, so one without V is not
@@ -466,15 +460,17 @@ pub fn vlenb() -> u64
     VLENB.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Read CSR `vlenb` on the running hart and cache it for later
-/// save-restore sizing. Must be called once at boot, before any user code
-/// runs. The CSR access requires `sstatus.VS != Off`; this function
+/// Read CSR `vlenb` on the running hart, cache it for the save-restore
+/// paths, and report the per-thread save area it needs
+/// (`crate::sched::thread_slot::riscv_extended_bytes`), which sizes every
+/// Thread retype slot. Must be called once at boot, before any Thread is
+/// created. The CSR access requires `sstatus.VS != Off`; this function
 /// temporarily promotes VS to Initial, reads `vlenb`, then restores
 /// VS = Off.
 ///
-/// Halts via [`crate::fatal`] if `vlenb` is zero or exceeds [`MAX_VLENB`]
-/// (the Vector requirement and `vlenb` ceiling are defined in
-/// `docs/platform-requirements.md` § riscv64 Classification).
+/// Halts via [`crate::fatal`] if `vlenb` is zero (the Vector requirement is
+/// defined in `docs/platform-requirements.md` § riscv64 Classification). Any
+/// nonzero `vlenb` is accepted: the save area grows with it.
 ///
 /// # Safety
 /// Must execute in supervisor mode.
@@ -511,11 +507,14 @@ pub unsafe fn cache_vlenb()
             options(nostack, nomem),
         );
     }
-    if v == 0 || v > MAX_VLENB
+    if v == 0
     {
-        crate::fatal("RISC-V vlenb out of range (0 or > MAX_VLENB) for this kernel build");
+        crate::fatal("RISC-V vlenb is zero: the boot hart's Vector extension is unusable");
     }
     VLENB.store(v, core::sync::atomic::Ordering::Relaxed);
+    crate::sched::thread_slot::set_extended_bytes(crate::sched::thread_slot::riscv_extended_bytes(
+        v,
+    ));
 }
 
 /// No-op test stub.
@@ -533,7 +532,7 @@ pub unsafe fn cache_vlenb() {}
 ///
 /// # Safety
 /// Must execute in supervisor mode. `sstatus.VS` must be non-Off. `area`
-/// must be the per-thread save area page (4 KiB).
+/// must be the per-thread save area (`thread_slot::extended_area_bytes`).
 #[cfg(not(test))]
 #[inline]
 unsafe fn save_v_to(area: *mut u8)

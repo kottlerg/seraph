@@ -40,10 +40,21 @@ pub(crate) use syscall_abi::PAGE_SIZE;
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
 /// Page span a single Thread retype consumes from its source Memory cap's
-/// front bump (`syscall_abi::THREAD_RETYPE_BYTES`, page-aligned: kernel
-/// stack, TCB and wrapper page, extended-state save page). Used to size the
-/// retype reserve of init's and the tier-1 services' bootstrap arenas.
-pub(crate) const THREAD_RETYPE_PAGES: u64 = syscall_abi::THREAD_RETYPE_BYTES / PAGE_SIZE;
+/// front bump (`SystemInfoType::ThreadRetypeBytes`, whole pages: kernel
+/// stack, TCB and wrapper page, extended-state save area, which the boot CPU
+/// sizes). Sizes the retype reserve of init's and the tier-1 services'
+/// bootstrap arenas. init cannot size them without it, so a failed query
+/// ends init.
+pub(crate) fn thread_retype_pages() -> u64
+{
+    let Ok(bytes) = syscall::system_info(syscall_abi::SystemInfoType::ThreadRetypeBytes as u64)
+    else
+    {
+        logging::log("init: FATAL: cannot query the Thread retype size");
+        syscall::thread_exit();
+    };
+    bytes.div_ceil(PAGE_SIZE)
+}
 
 /// Pages init carves for memmgr/procmgr's `AddressSpace`, all reaching
 /// the kernel: page 0 holds the wrapper, page 1 the root PT, and the
@@ -76,7 +87,7 @@ pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 /// Set once early in `run()` to init's bootstrap arena cap; carries full
 /// rights (incl. `MemRights::RETYPE`). Read by every `cap_create_endpoint`
 /// callsite — main.rs, service.rs. The arena's front reserve bounds the total
-/// retype bump; see `bootstrap::INIT_RETYPE_RESERVE_PAGES`.
+/// retype bump; see `bootstrap::init_retype_reserve_pages`.
 pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -431,7 +442,7 @@ fn run(info_ptr: u64) -> !
     let Some(mut init_arena) = bootstrap::BootArena::carve_reserve(
         &mut alloc,
         info.aspace_cap,
-        bootstrap::INIT_RETYPE_RESERVE_PAGES,
+        bootstrap::init_retype_reserve_pages(),
         backing_pages,
     )
     else

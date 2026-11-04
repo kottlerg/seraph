@@ -1067,14 +1067,16 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Reserve the 6-page slot from the source Memory cap. Layout:
+    // Reserve the slot from the source Memory cap
+    // (`sched::thread_slot::thread_slot_bytes`). Layout:
     //   pages 0..3 (16 KiB) — kstack
     //   page 4              — ThreadObject followed by TCB (at size_of::<ThreadObject>())
-    //   page 5              — per-thread FPU/SIMD/V save area
+    //   pages 5..           — per-thread FPU/SIMD/V save area, one page or more
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
+    let extended_bytes = crate::sched::thread_slot::extended_area_bytes();
     debug_assert_eq!(
         entry.raw_bytes,
-        (KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64
+        (KERNEL_STACK_PAGES + 1) as u64 * PAGE_SIZE as u64 + extended_bytes
     );
     let offset = retype_allocate(memory, entry.raw_bytes)?;
     let block_phys = memory.base + offset;
@@ -1091,16 +1093,17 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     let thread_obj_ptr = kstack_top as *mut ThreadObject;
     let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
     let tcb_ptr = (kstack_top + tcb_offset) as *mut ThreadControlBlock;
-    // Per-thread FPU/SIMD/V save area: one page directly after the wrapper
+    // Per-thread FPU/SIMD/V save area: its pages directly after the wrapper
     // page. Zero-initialised so the first XRSTOR / F-D restore sees the
     // architected initial state. The area's lifecycle is the Thread retype
     // slot's; `retype_free` reclaims it wholesale, so no separate free
     // path is needed.
     let extended_area = (kstack_top + PAGE_SIZE as u64) as *mut u8;
-    // SAFETY: extended_area points at a freshly-retyped page exclusively
-    // owned by this TCB construction.
+    // SAFETY: extended_area points at the freshly-retyped save-area pages,
+    // `extended_bytes` of them at the end of the slot, exclusively owned by
+    // this TCB construction.
     unsafe {
-        core::ptr::write_bytes(extended_area, 0u8, PAGE_SIZE);
+        core::ptr::write_bytes(extended_area, 0u8, extended_bytes as usize);
     }
 
     // Build the initial SavedState. The "entry point" is the user_thread_trampoline

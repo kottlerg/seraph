@@ -166,8 +166,9 @@ Each feature is classified per architecture as one of:
 ### Required
 
 - **Instruction baseline** — RV64GCV plus Zba/Zbb/Zbs. The Vector extension is a hard requirement;
-  the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0` or `vlenb` above `MAX_VLENB`
-  (VLEN 512).
+  the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0`. Any other vector length is
+  accepted: each thread's save area grows with it (`304 + 32 * vlenb` bytes, rounded up to pages;
+  `core/kernel/src/sched/thread_slot.rs`).
 - **Supervisor isolation — the U bit and `sstatus.SUM`** — S-mode never executes from user
   (U=1) pages, and the kernel keeps `SUM` clear outside its user-copy routines so supervisor
   accesses to user pages fault. See [memory-model.md](memory-model.md).
@@ -280,7 +281,6 @@ Independent of the feature classification, the kernel imposes fixed platform lim
   paging and Sv57, whose half is 64 PiB less 2 GiB (`BOOT_TABLE_POOL_SIZE`,
   [limits.md](limits.md)).
 - **CPU count** is at most `boot_protocol::MAX_CPUS` (512); CPUs beyond it are not brought up.
-- **riscv64 vector length** is at most VLEN 512 (`MAX_VLENB`); a wider boot hart is refused at boot.
 
 ---
 

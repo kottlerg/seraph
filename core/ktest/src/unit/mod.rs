@@ -632,6 +632,10 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::stack_high_water_classes",
         sysinfo::stack_high_water_classes(ctx)
     );
+    run_test!(
+        "sysinfo::thread_retype_bytes_funds_one_thread",
+        sysinfo::thread_retype_bytes_funds_one_thread(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

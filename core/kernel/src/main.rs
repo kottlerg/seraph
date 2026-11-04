@@ -365,7 +365,8 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
 // desc_count and info_pages are bounded by the descriptor capacity Phases 7
 // and 8 enforce (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
-// size_of::<InitInfo>() and STACK_PAGES are small constants.
+// size_of::<InitInfo>() and STACK_PAGES are small constants; the u64 -> usize
+// save-area byte count is a few pages, on a 64-bit target.
 // large_types_passed_by_value: init_image (304 B) crosses the
 // by-value/by-reference threshold. The `#[inline(never)]` boundary is what
 // defeats the cross-rebase hoist; the by-value signature is incidental — the
@@ -1271,12 +1272,14 @@ unsafe fn kernel_entry_post_rebase(
             "post-handoff buddy is not empty — a Phase-7 reservation or drain leak",
         );
 
-        // Retype a `cap::INIT_THREAD_PAGES` slab from SEED_MEMORY for init's
-        // Thread (the layout is at the constant).
+        // Retype a Thread slot (`sched::thread_slot::thread_slot_bytes`) from
+        // SEED_MEMORY for init's Thread, in the layout `sys_cap_create_thread`
+        // establishes: the kernel stack, then the `ThreadObject` followed by
+        // the TCB, then the per-thread FPU/SIMD/V save area.
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
             use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 
-            let bytes = cap::INIT_THREAD_PAGES * mm::PAGE_SIZE as u64;
+            let bytes = sched::thread_slot::thread_slot_bytes();
             let seed = cap::seed_memory_ref();
             let offset = cap::retype::retype_allocate(seed, bytes)
                 .unwrap_or_else(|_| fatal("Phase 9: SEED too small for init Thread slab"));
@@ -1292,13 +1295,18 @@ unsafe fn kernel_entry_post_rebase(
             let thread_obj_ptr = kstack_top as *mut ThreadObject;
             let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
             let tcb_ptr = (kstack_top + tcb_offset) as *mut sched::thread::ThreadControlBlock;
-            // Per-thread FPU/SIMD/V save area: one page directly after the
+            // Per-thread FPU/SIMD/V save area: its pages directly after the
             // wrapper page in the retyped slab.
             let init_extended_area = (kstack_top + mm::PAGE_SIZE as u64) as *mut u8;
-            // SAFETY: init_extended_area lies on page 5 of the freshly-retyped
-            // slab, exclusively owned by this init bootstrap.
+            // SAFETY: init_extended_area starts on page 5 of the freshly-retyped
+            // slab, and its `extended_area_bytes` end the slab, exclusively
+            // owned by this init bootstrap.
             unsafe {
-                core::ptr::write_bytes(init_extended_area, 0u8, mm::PAGE_SIZE);
+                core::ptr::write_bytes(
+                    init_extended_area,
+                    0u8,
+                    sched::thread_slot::extended_area_bytes() as usize,
+                );
             }
 
             // Prepare saved CPU state for init: user entry point + kernel stack.

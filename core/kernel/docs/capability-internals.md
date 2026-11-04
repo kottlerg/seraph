@@ -321,6 +321,15 @@ only by the memory donated — one donated page of bookkeeping per record
 page. A one-page donation that opens a record page seeds nothing; the
 budget reported by `SYS_CAP_INFO` is authoritative.
 
+Seeding pushes a donation's pool pages onto the free list in batches of
+`SEED_BATCH_PAGES`, each under its own hold of the pool lock and credited
+to the budget as it lands, and takes the interrupts pending on its CPU
+between batches (`interrupt_window`: preemption disabled, interrupts
+enabled for an instruction, then the caller's interrupt state restored).
+The syscall that seeds a donation therefore masks interrupts for at most
+one batch of pushes at a time, whatever its `init_pages`; its total length
+still grows with `init_pages`.
+
 A record page is kernel state kept in donated memory, like the wrapper page,
 the slot pages, and the page tables themselves: the kernel trusts its
 contents because the donating Memory capability cannot map what it has
@@ -335,9 +344,14 @@ page tables by a bit in the parent entry, not by the records; see
 ### Teardown
 
 Teardown walks the record pages newest first, returning each page's other records before its
-record 0 (whose donation holds the page), then the inline records, the create-time slab last. A
-donation's Memory object that reaches zero there is queued on the dealloc cascade like every other
-object a teardown orphans.
+record 0 (whose donation holds the page), then the inline records, the create-time slab last. It
+returns them in groups: a page's other records, and the inline records but record 0, are sorted in
+place by Memory object and offset, and each run of them that shares a Memory object goes back as
+one group, through one walk of that object's page free list (`retype_free_runs`); a record 0 is a
+group of its own. A group's donations that end contiguously at their Memory object's bump frontier
+roll it back over them all, as returning them one by one from the highest would. A donation's
+Memory object that reaches zero there is queued on the dealloc cascade like every other object a
+teardown orphans.
 
 The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked through the queued
 objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
@@ -358,24 +372,29 @@ another's lock scope (a nested `CSpace`'s derivation drain takes the derivation 
 arm has released it; a wait set's sources are torn down after `wait_set_drop` has released every
 source lock).
 
-The walk costs one `retype_free` per donation (for a `CSpace` with kept arena pages, one
-`retype_free_runs` returning the runs between them through a single walk of the Memory object's page
-free list), holds no lock across records (each return takes only its ancestor's locks, the Memory
-object's read lock and its retype-allocator lock, so unlike a `CSpace`'s derivation drain it is not
-batched), and runs to completion in whichever context drops the last reference: the deleting
-syscall, with interrupts masked on that CPU; or, when the owner is handed to the per-CPU
+The walk holds no lock across groups (each group's return takes only its Memory object's locks,
+its read lock and its retype-allocator lock), and takes the interrupts pending on its CPU after
+every group but the create-time slab's (`interrupt_window`, as seeding does, [§ Donation
+Records](#donation-records)). Between two windows it therefore masks interrupts for one group: at
+most `RECORDS_PER_PAGE` records of one Memory object, whose return costs one walk of that object's
+page free list (at most one node per page of the object, [docs/limits.md](../../../docs/limits.md)),
+an insertion per run, and the sort of the group and of its records' kept arena pages. The kept
+pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
+body at most. Neither the donation count nor any `init_pages` lengthens the window; the walk's
+total length still grows with the donation count. It runs to completion in whichever context drops
+the last reference: the deleting syscall, with interrupts masked on that CPU but in the windows; or,
+when the owner is handed to the per-CPU
 deferred-reclaim stack (a thread deleting an object it is itself bound to, a syscall pin or a
 batched capability move dropping the last reference, or an Mmio object's mapping record releasing
 the address space at that object's teardown; the producer list is
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next syscall
-epilogue on that CPU, with interrupts masked, or the idle thread's drain, with interrupts enabled
-([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin locks"). So an
-owner's teardown latency scales with how finely it donated, and can land on an unrelated thread's
-syscall: the same memory donated as single pages costs one return per page. The standard runtime's
-map retry donates one page per page-table shortfall (its budget top-up donates the shortfall in one
-call), so a process's count is of the order of its page-table page count, one per 2 MiB of mapped
-span. Bounding the walk, and the seeding of one donation, within a syscall is
-[#434](https://github.com/kottlerg/seraph/issues/434).
+epilogue on that CPU, with interrupts masked but in the windows, or the idle thread's drain, with
+interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin
+locks"). So an owner's teardown time scales with how finely it donated, and can land on an
+unrelated thread's syscall, which is not preempted during it: the same memory donated as single
+pages costs one record per page. The standard runtime's map retry donates one page per page-table
+shortfall (its budget top-up donates the shortfall in one call), so a process's count is of the
+order of its page-table page count, one per 2 MiB of mapped span.
 
 ### Body Arena
 
@@ -433,8 +452,9 @@ more, so a count of one stays one, and a higher count never falls below the hold
 goes onto its donation record's list (its `record` names it). Every donation then goes back at once
 with its kept pages, sorted once (`cap::arena::sort_list`), cut out of its span
 (`cap::arena::for_each_run`): each kept page takes a lease of its own on the Memory object its
-donation came from and records it as its `ancestor`, and the runs between kept pages go back
-through one walk of that Memory object's page free list (`cap::retype::retype_free_runs`). The
+donation came from and records it as its `ancestor`, and the runs between kept pages go back, with
+the runs of the other donations of its group ([§ Teardown](#teardown)), through one walk of that
+Memory object's page free list (`cap::retype::retype_free_runs`). The
 teardown then releases its hold on each kept page, and the release of a page's last reference, its
 hold's or its last chunk's, returns the page to that Memory object (the `ArenaPage` arm of
 `dealloc_object`). A dead `CSpace` therefore holds, past its death, only the pages its surviving

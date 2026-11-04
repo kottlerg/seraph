@@ -1474,8 +1474,9 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     // the new capability are withdrawn when it goes (docs/capability-model.md
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`;
-    // `dest_cs_slot` pins the destination CSpace, which funds a fresh object; `src.hidden_tag()` is `src_tag` as `pin_checked`
-    // hid it when it resolved `src`.
+    // `dest_cs_slot` pins the destination CSpace, which funds a fresh object;
+    // `src.hidden_tag()` is `src_tag` as `pin_checked` hid it when it
+    // resolved `src`.
     let new_object = unsafe {
         crate::cap::object::object_for_new_slot(src_tag, src.hidden_tag(), src_object, dest_cs_ptr)
     }?;
@@ -1613,8 +1614,9 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     // the new capability are withdrawn when it goes (docs/capability-model.md
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
-    // caller's own CSpace receives the new slot and funds a fresh object; `src.hidden_tag()` is `src_tag` as `pin_checked`
-    // hid it when it resolved `src`.
+    // caller's own CSpace receives the new slot and funds a fresh object;
+    // `src.hidden_tag()` is `src_tag` as `pin_checked` hid it when it
+    // resolved `src`.
     let new_object = unsafe {
         crate::cap::object::object_for_new_slot(
             src_tag,
@@ -1749,8 +1751,9 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // the new capability are withdrawn when it goes (docs/capability-model.md
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
-    // caller's own CSpace receives the new slot and funds a fresh object; `src.hidden_tag()` is `src_tag` as `pin_checked`
-    // hid it when it resolved `src`.
+    // caller's own CSpace receives the new slot and funds a fresh object;
+    // `src.hidden_tag()` is `src_tag` as `pin_checked` hid it when it
+    // resolved `src`.
     let new_object = unsafe {
         crate::cap::object::object_for_new_slot(
             src_tag,

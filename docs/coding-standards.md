@@ -259,14 +259,15 @@ let value = unsafe { ptr.read() };
 ### CPU-Count Width
 
 These rules bind the kernel and the bootloader (`core/kernel/`, `core/boot/`) and every in-tree
-crate either one depends on. They keep the CPU count a single definition, `MAX_CPUS`, so a width
-defect is visible in review rather than only in a boot at the boundary CPU counts
-([testing.md](testing.md#coverage-tiers) § Coverage tiers).
+crate either one depends on. They keep the CPU count a single definition, the boot's `cpu_count`,
+bounded by the sanity ceiling `MAX_CPUS`, so a width defect is visible in review rather than only
+in a boot at the boundary CPU counts ([testing.md](testing.md#coverage-tiers) § Coverage tiers).
 
-- A structure with one entry or one bit per CPU MUST take its width from `MAX_CPUS`: an array
-  `[T; MAX_CPUS]`, a `CpuMask`, or a per-CPU slab the kernel's `alloc_per_cpu_slab` sizes at the
-  boot CPU count. A literal (`64`, `256`, or any other) MUST NOT stand in for the CPU count or a
-  CPU-mask width, and a fixed-width integer (`u64`, `u128`) MUST NOT hold a set of CPUs.
+- A structure with one entry or one bit per CPU MUST take its width from the boot's CPU count: a
+  per-CPU slab the kernel's `alloc_per_cpu_slab` sizes at the boot CPU count, or a CPU set
+  (`AtomicCpuMask`, `cpu_count.div_ceil(64)` words held with its object). `MAX_CPUS` MUST NOT
+  size one. A literal (`64`, `256`, or any other) MUST NOT stand in for the CPU count or a
+  CPU-set width, and a fixed-width integer (`u64`, `u128`) MUST NOT hold a set of CPUs.
 - A CPU index or CPU count MUST NOT be converted with `as` to an integer type that cannot
   represent `MAX_CPUS` (an `as u8` truncates at 256 CPUs).
 - A fixed-width window an external interface defines (the SBI `hart_mask` and `hart_mask_base`

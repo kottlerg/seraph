@@ -7,6 +7,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 |---|---|
 | [`ansi/`](ansi/README.md) | Incremental ANSI SGR colour parser for the terminal output path |
 | [`crypto/`](crypto/README.md) | In-OS crypto primitives — SHA-512 hashing and Ed25519 signature verification, `no_std`, zero-dependency |
+| [`death-set/`](death-set/README.md) | Growable death-queue set and main wait set used by supervisor services |
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
 | [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |
 | [`ipc/`](ipc/README.md) | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops |

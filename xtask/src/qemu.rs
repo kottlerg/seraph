@@ -167,8 +167,8 @@ pub struct QemuLaunchSpec<'a>
 /// is suitable for `Command::new(binary).args(&argv)`.
 pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 {
-    // The kernel sizes its per-CPU structures from boot-protocol MAX_CPUS;
-    // a guest with more vCPUs than that cannot be represented.
+    // The boot protocol caps a BootInfo's CPU count at MAX_CPUS; a guest with
+    // more vCPUs than that would boot with the surplus dropped.
     let max_cpus = boot_protocol::MAX_CPUS;
     if spec.cpus == 0 || usize::try_from(spec.cpus).map_or(true, |c| c > max_cpus)
     {
@@ -761,7 +761,8 @@ mod tests
     fn cpus_out_of_range_rejected()
     {
         assert!(build_qemu_argv(&riscv_spec(0, 512)).is_err());
-        assert!(build_qemu_argv(&riscv_spec(513, 512)).is_err());
+        let past = u32::try_from(boot_protocol::MAX_CPUS + 1).unwrap();
+        assert!(build_qemu_argv(&riscv_spec(past, 512)).is_err());
     }
 
     #[test]

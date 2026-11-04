@@ -225,11 +225,11 @@ mod live
     unsafe fn shoot_down_kernel_page(virt: u64)
     {
         let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
-        let mut remote = crate::cpu_mask::CpuMask::range(cpu_count);
-        remote.clear(crate::arch::current::cpu::current_cpu() as usize);
+        let remote = crate::cpu_mask::MaskSource::Below(cpu_count);
         // SAFETY: the kernel root is the shared kernel half of every address
-        // space; `remote` holds only online CPUs, not this one; preemption is
-        // disabled (caller contract).
+        // space; `remote` names only online CPUs (the shootdown leaves this
+        // one out, and returns at once when it is the only one); preemption
+        // is disabled (caller contract).
         unsafe {
             crate::mm::tlb_shootdown::shootdown(
                 crate::mm::paging::kernel_root_table_pa(),

@@ -15,12 +15,11 @@
 //!
 //! Every supervised service binds death notification onto svcmgr's death
 //! queues with `correlator = service_index`; a further queue joins when
-//! every pool is out of nodes (`death_queues`). The main wait set, which
-//! `death_queues::DeathSet` owns and widens as the queues fill it, holds the
-//! service endpoint (badge 0) and every death queue (badge 1). On death
-//! wakeup svcmgr drains the queues and routes each payload to its
-//! `ServiceEntry` via the correlator. Multiplexing avoids consuming a
-//! wait-set slot per supervised process.
+//! every pool is out of nodes. The main wait set, which `death_set::DeathSet`
+//! owns and widens as the queues fill it, holds the service endpoint (badge
+//! 0) and every death queue (badge 1). On death wakeup svcmgr drains the
+//! queues and routes each payload to its `ServiceEntry` via the correlator.
+//! Multiplexing avoids consuming a wait-set slot per supervised process.
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 
@@ -113,8 +112,13 @@ fn main() -> !
     // The main wait set, holding the service endpoint and the first death
     // queue; further queues join it as pools run out, and it is replaced by a
     // wider one as they fill it.
-    let Some(deaths) =
-        death_queues::DeathSet::new(caps.service_ep, WS_BADGE_SERVICE, WS_BADGE_DEATHS)
+    let Some(deaths) = death_set::DeathSet::new(
+        caps.service_ep,
+        WS_BADGE_SERVICE,
+        WS_BADGE_DEATHS,
+        death_queues::DEATHS_EQ_CAPACITY,
+        death_queues::FIRST_POOL_OBSERVERS,
+    )
     else
     {
         std::os::seraph::log!("failed to create the main wait set and first death queue");
@@ -359,7 +363,7 @@ pub struct SvcmgrState
 fn event_loop(
     info: &StartupInfo,
     caps: &service::SvcmgrCaps,
-    deaths: death_queues::DeathSet,
+    deaths: death_set::DeathSet,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !

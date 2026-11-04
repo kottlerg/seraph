@@ -434,7 +434,7 @@ and, in any other file, a line that adds a structure with one entry or one bit p
 changed line that names one of these items as a whole identifier or lies within one's definition
 (its attributes, signature, fields, or body):
 
-- CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
+- CPU-count width: `MAX_CPUS`, `AtomicCpuMask`, `MaskSource`, `mask_words`, `set_boot_cpu_count`;
 - per-CPU storage: `alloc_zeroed_slab` and the page count it takes (`slab_pages`); the per-CPU
   slab descriptor `PerCpuSlab`, whose `bytes` gives each per-CPU slab's byte count, every constant
   of that type (each slab's descriptor, which names the type), and `alloc_per_cpu_slab`, which
@@ -449,7 +449,8 @@ changed line that names one of these items as a whole identifier or lies within 
   `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
   `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
   'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the
-  slabs that are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk
+  slabs that are not per-CPU: the single-slot entropy pool, the tag pool, the reschedule-pending CPU
+  set, and the RAM-sized chunk
   tables of `frame_map::init` and `init_cspace_registry`). A change that alters an element type's
   size is on the surface whether it edits the type's own fields or a type or constant the element
   holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or
@@ -505,7 +506,8 @@ B=$(git merge-base <head> origin/master)
 git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
     core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
     'core/kernel/src/arch/*/ap_trampoline.rs'
-S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|slab_pages|init_storage|init_per_cpu_storage'
+S='MAX_CPUS|AtomicCpuMask|MaskSource|mask_words|set_boot_cpu_count|alloc_zeroed_slab|slab_pages'
+S="$S|init_storage|init_per_cpu_storage"
 S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|CpuTopology"
@@ -527,8 +529,9 @@ The boundary set is every boundary CPU count below, each once (`--runs 1`, raise
 count says): 16 and 128 CPUs on both architectures, riscv64 16 and 128 harts and x86_64 16 and 128
 vCPUs. No run is wider than 128 CPUs, on either architecture: the 256- and 512-vCPU runs are removed
 from every set by the maintainer's decision on
-[#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU run (`MAX_CPUS`) took most
-of an hour and saturated the host, and a raised `MAX_CPUS` is past any local host's reach; Known
+[#694](https://github.com/kottlerg/seraph/issues/694), since the 512-vCPU run (the old
+`MAX_CPUS`) took most of an hour and saturated the host, and today's `MAX_CPUS` (8192) is past
+any local host's reach; Known
 boundaries below states what covers the widths past 128. Every run saves its log for the timing
 report below (`--save-logs`).
 
@@ -793,27 +796,33 @@ list as the tracking Issues move):
   RISC-V emulation, or real hardware.
 - Both arches, widths past 128 CPUs (residual): the boundary set stops at 128,
   so no local run exercises x2APIC destinations above APIC id 255, threshold
-  effects that begin past 128 CPUs (a third `CpuMask` word, a bound that grows
+  effects that begin past 128 CPUs (a third CPU-set word, a bound that grows
   with the width), or a boot that allocates the per-CPU slabs past 128. What
-  covers `MAX_CPUS` instead: the host tests of `CpuMask` at `MAX_CPUS`
-  (`core/kernel/src/cpu_mask.rs`); the host tests of
+  covers widths up to `MAX_CPUS` instead: the host tests of `AtomicCpuMask` at
+  1, 63, 64, 65, 512, 768 and `MAX_CPUS` CPUs (`core/kernel/src/cpu_mask.rs`);
+  the host test that an address space's wrapper page holds its active-CPU set
+  at `MAX_CPUS` (`core/kernel/src/mm/address_space.rs`); the host tests of
   `BuddyAllocator::alloc_contiguous` (`core/kernel/src/mm/buddy.rs`: a run
   past one block, a run that cannot be found, and requests of one block or
   less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
   (`sched::slab_pages`); the sizing of every per-CPU slab, whose byte count
   each initialiser takes from its `sched::PerCpuSlab` descriptor, checked at
-  every width from one CPU to `MAX_CPUS` for a count that does not overflow
-  and `slab_pages` that cover it: by a compile-time assert beside each
+  the widths of `sched::SLAB_CHECK_WIDTHS` (the word edges, 512, 768 and
+  `MAX_CPUS`; a slab sized at the ceiling is sized at every smaller count) for
+  a count that does not overflow and `slab_pages` that cover it: by a
+  compile-time assert beside each
   descriptor of a fixed per-CPU count, against the target's own layout on both
-  architectures, and for the tag-state slab, whose per-CPU count `tag_count`
-  sets at boot, by a host test (`sched::slab_tests`); and the 128-CPU boots
+  architectures, and for the tag-state and TLB acknowledgement-set slabs,
+  whose per-CPU counts `tag_count` and `cpu_mask::mask_words` set at boot, by
+  host tests (`sched::slab_tests`); and the 128-CPU boots
   for two full words.
-- Both arches, a partial second `CpuMask` word (residual): no local run boots
+- Both arches, a partial second CPU-set word (residual): no local run boots
   a count past one 64-bit word that does not fill the next (65 to 127 CPUs).
-  The host tests of `CpuMask::range` cover those mask paths instead:
-  `range_spans_words` (a partial second word) and
-  `range_at_max_cpus_covers_every_index_and_one_less_drops_the_top` (a partial
-  top word), in `core/kernel/src/cpu_mask.rs`.
+  The host tests of `AtomicCpuMask` cover those mask paths instead, at 63, 64
+  and 65 CPUs among their widths:
+  `every_cpu_of_a_boot_sets_tests_takes_and_clears_its_own_bit` and
+  `filling_from_every_cpu_below_a_count_excepts_one`, in
+  `core/kernel/src/cpu_mask.rs`.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

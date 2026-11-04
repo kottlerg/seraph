@@ -30,7 +30,8 @@ ruststd/
 │   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
 ├── death-queues/               # `ruststd-death-queues` crate: pure, host-tested death-queue
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
-│                               #   rustc-dep-of-std dep of overlaid std (not re-exported)
+│                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
+│                               #   and the policy shared/death-set follows for services
 ├── patches/                    # upstream library/std patches applied during overlay assembly
 └── src/                        # std PAL overlay, copied into vendored library/std at build time
     ├── os/

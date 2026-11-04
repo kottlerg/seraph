@@ -10,10 +10,10 @@ publish.workspace = true
 # Dual-mode: a host-tested workspace member AND a `rustc-dep-of-std`
 # dependency of the seraph std overlay (its thread reaper). Holds the pure
 # death-queue growth policy and ruststd's thread-reaper slot registry, so
-# they get host unit-test coverage; the syscalls stay with the callers. A
-# service takes it as an ordinary path dependency (procmgr and svcmgr move
-# onto it, #740): std does not re-export it, since std's dependencies are
-# unstable (`rustc_private`) to std's users.
+# they get host unit-test coverage; the syscalls stay with the callers.
+# shared/death-set takes it as an ordinary path dependency for procmgr's and
+# svcmgr's `DeathSet`: std does not re-export it, since std's dependencies
+# are unstable (`rustc_private`) to std's users.
 [lib]
 test = true
 doctest = false

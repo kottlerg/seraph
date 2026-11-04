@@ -4192,8 +4192,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // No CPU still has this address space loaded in satp/CR3
                 // (waited for above), so the root page table can go.
                 debug_assert!(
-                    // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire snapshot.
-                    unsafe { (*as_ptr).active_cpu_mask() }.is_empty(),
+                    // SAFETY: as_ptr non-null; inactive_everywhere reads the set with Acquire.
+                    unsafe { (*as_ptr).inactive_everywhere() },
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 

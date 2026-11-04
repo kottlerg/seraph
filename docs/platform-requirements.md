@@ -287,7 +287,7 @@ Independent of the feature classification, the kernel imposes fixed platform lim
   the fixed stage-1 seed maps only the first chunks of, so the same holds under x86-64 5-level
   paging and Sv57, whose half is 64 PiB less 2 GiB (`BOOT_TABLE_POOL_SIZE`,
   [limits.md](limits.md)).
-- **CPU count** is at most `boot_protocol::MAX_CPUS` (512); CPUs beyond it are not brought up.
+- **CPU count** is at most `boot_protocol::MAX_CPUS` (8192); CPUs beyond it are not brought up.
 
 ---
 

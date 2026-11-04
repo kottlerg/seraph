@@ -266,7 +266,9 @@ chain).
 ### Lifecycle
 
 1. **Creation** (`SYS_CAP_CREATE_ASPACE`): carve a slab from the source
-   Memory cap; page 0 holds the wrapper object and the in-place `AddressSpace`,
+   Memory cap; page 0 holds the wrapper object, the in-place `AddressSpace`, and
+   right after it the address space's active-CPU set (`cpu_count.div_ceil(64)` words,
+   `attach_active_cpus`; `ACTIVE_CPU_WORDS_FIT` checks the page holds it at `MAX_CPUS`),
    page 1 the zeroed root page table with the kernel higher half mapped (root
    entries 256–511 copied from the active root, so every address space shares the
    kernel's lower-level tables), and the remaining
@@ -415,13 +417,14 @@ page of the span inside one batched-invalidation window — for `tag` when the r
 a CPU that has since switched to another space still flushes the right translation; region
 teardown's and the Mmio withdrawal's range and full-flush requests carry `tag == 0` and rely on
 their `tlb_gen` bump for any CPU that switched away) and clears its bit. Range flushes from every
-slot matched in one service pass share a single window, and **every acknowledgement is deferred
-until the window closes**: a queued `sinval.vma` is architecturally complete only when the closing
-`sfence.inval.ir` retires, so acking earlier would let the initiator proceed against a translation
-the target can still use. A full-flush or single-page slot serviced after the window opens executes
-its `sfence.vma`-family instruction inside the open window — architecturally legal (the closing
-fence still completes the queued `sinval.vma`s), just not part of the batch. Preemption stays
-disabled across the whole edit-then-shootdown sequence.
+slot matched in one service pass share a single window, up to `ACK_BATCH` (64) serviced slots at a
+time, and **every acknowledgement is deferred until the window closes**: a queued `sinval.vma` is
+architecturally complete only when the closing `sfence.inval.ir` retires, so acking earlier would
+let the initiator proceed against a translation the target can still use. A full-flush or
+single-page slot serviced after the window opens executes its `sfence.vma`-family instruction
+inside the open window — architecturally legal (the closing fence still completes the queued
+`sinval.vma`s), just not part of the batch. Preemption stays disabled across the whole
+edit-then-shootdown sequence.
 
 The shootdown is **not** issued unconditionally. Each rewrite is classified as it
 commits (`MapOutcome`):

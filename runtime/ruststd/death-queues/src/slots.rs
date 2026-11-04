@@ -169,26 +169,26 @@ impl<T> Registry<T>
     /// unchanged on an error.
     pub fn reserve(&mut self) -> Result<(u32, u32), ReserveError>
     {
-        let slot = match self.free.pop()
+        let slot = if let Some(slot) = self.free.pop()
         {
-            Some(slot) => slot,
-            None =>
-            {
-                let slot = u32::try_from(self.slots.len())
-                    .ok()
-                    .filter(|&slot| slot < self.max_slots)
-                    .ok_or(ReserveError::IndexExhausted)?;
-                self.slots
-                    .try_reserve(1)
-                    .map_err(|_| ReserveError::NoMemory)?;
-                // Room for this slot's index in `free`, so freeing it never
-                // allocates.
-                self.free
-                    .try_reserve(self.slots.len() + 1 - self.free.len())
-                    .map_err(|_| ReserveError::NoMemory)?;
-                self.slots.push(Slot::vacant());
-                slot
-            }
+            slot
+        }
+        else
+        {
+            let slot = u32::try_from(self.slots.len())
+                .ok()
+                .filter(|&slot| slot < self.max_slots)
+                .ok_or(ReserveError::IndexExhausted)?;
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| ReserveError::NoMemory)?;
+            // Room for this slot's index in `free`, so freeing it never
+            // allocates.
+            self.free
+                .try_reserve(self.slots.len() + 1 - self.free.len())
+                .map_err(|_| ReserveError::NoMemory)?;
+            self.slots.push(Slot::vacant());
+            slot
         };
         let index = slot as usize;
         let generation = self.next_gen;

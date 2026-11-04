@@ -269,12 +269,14 @@ address, the reason, and the span's end.
    per 2 MiB chunk of RAM, from which the kernel-stack guard pages split the direct map
    (`mm::stack_guard::seed`; [memory-internals.md](memory-internals.md) § Kernel Stack
    Guards)
-4. Allocate per-CPU subsystem storage from the buddy allocator while it still
-   holds large contiguous blocks (before the Phase-7 user-cap drain): the scheduler
+4. Fix every CPU set's width at the boot's CPU count (`cpu_mask::set_boot_cpu_count`,
+   `cpu_count.div_ceil(64)` words), then allocate per-CPU subsystem storage from the buddy
+   allocator while it still holds large contiguous blocks (before the Phase-7 user-cap
+   drain): the reschedule-pending CPU set, the scheduler
    slabs (per-CPU schedulers, idle TCBs, idle-stack tops plus one idle kernel stack per
    CPU, above a guard page the direct map leaves unmapped, watchdog ticks and
-   breadcrumbs), the PerCpuData, APIC-ID and TLB-shootdown request
-   slabs, and on x86-64 the per-AP
+   breadcrumbs), the PerCpuData, APIC-ID, TLB-shootdown request
+   and TLB acknowledgement-set slabs, and on x86-64 the per-AP
    GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
    entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
    self-test sample slab (`entropy::init_storage`)

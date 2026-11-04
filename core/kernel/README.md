@@ -22,7 +22,7 @@ core/kernel/
 │   ├── main.rs                 # kernel_entry() — arch-neutral init sequence
 │   ├── bounded_wait.rs         # Clock-bounded busy waits with a spin-count fallback
 │   ├── console.rs              # Early console: serial and framebuffer output
-│   ├── cpu_mask.rs             # Fixed-capacity sets of logical CPU indices
+│   ├── cpu_mask.rs             # Sets of logical CPU indices, as wide as the boot's CPU count
 │   ├── framebuffer.rs          # Framebuffer text renderer
 │   ├── irq.rs                  # IRQ routing table (sized at boot): lines to notifications
 │   ├── percpu.rs               # Per-CPU private state

@@ -93,11 +93,12 @@ impl SlotTable
         self.slots.get(&badge)
     }
 
-    /// Evict the slot for `badge`. Called with each death event's
-    /// correlator, and by the resync. Idempotent on unknown badges.
-    pub fn evict(&mut self, badge: u64) -> bool
+    /// Evict the slot for `badge` and return it, for the reclaim line to
+    /// name. Called with each death event's correlator, and by the resync.
+    /// Idempotent on unknown badges, which return `None`.
+    pub fn evict(&mut self, badge: u64) -> Option<Slot>
     {
-        self.slots.remove(&badge).is_some()
+        self.slots.remove(&badge)
     }
 
     /// Install one slot's (badge, name) pair from the init-logd

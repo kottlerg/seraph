@@ -10,8 +10,9 @@
 //! tracker of names that change after their slot was sent, and release-retry
 //! deadline, and the receiver's chunk decoder; init-logd's captured-history
 //! byte ring ([`history`]); logd's death-queue resync decisions
-//! ([`resync`]); and the line and name widths both log receivers
-//! use ([`LINE_BUF_SIZE`], [`MAX_NAME_LEN`]).
+//! ([`resync`]); the line logd logs when it evicts a slot ([`reclaim`]);
+//! and the line and name widths both log receivers use ([`LINE_BUF_SIZE`],
+//! [`MAX_NAME_LEN`]).
 //! Also holds [`BoundedStr`], the fixed-capacity formatter logd uses for its
 //! own diagnostics. None of this touches a syscall, IPC, or `std::os::seraph`
 //! surface — the decoder reads a stack [`ipc::IpcMessage`] snapshot — so the
@@ -24,6 +25,7 @@
 
 pub mod handover;
 pub mod history;
+pub mod reclaim;
 pub mod resync;
 
 mod bounded_str;

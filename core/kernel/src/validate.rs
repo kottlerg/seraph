@@ -27,6 +27,9 @@ use boot_protocol::{BOOT_PROTOCOL_VERSION, BootInfo, KASLR_IMAGE_RANDOMIZED, lay
 ///    `kernel_virtual_base`.
 /// 10. A slid image (`kernel_virtual_base` above the link base) carries
 ///     `KASLR_IMAGE_RANDOMIZED` in `kaslr_flags`.
+/// 11. `cpu_ids` is non-null and its `cpu_count` entries (at most `MAX_CPUS`)
+///     end at or below the highest RAM address the memory map describes, so
+///     the direct map reaches them ([`cpu_ids_in_ram`]).
 ///
 /// Returns `true` if all checks pass, `false` on the first failure.
 ///
@@ -118,13 +121,35 @@ pub unsafe fn validate_boot_info(boot_info: *const BootInfo) -> bool
         return false;
     }
 
+    // 11. The CPU-id array lies in RAM the direct map covers.
+    if !cpu_ids_in_ram(
+        info.cpu_ids as u64,
+        info.cpu_count,
+        layout::max_ram_address(entries),
+    )
+    {
+        return false;
+    }
+
     true
+}
+
+/// Whether `count` CPU ids at `ids_phys` (at most `MAX_CPUS` of them, the
+/// slice the kernel reads) form a non-null array that ends at or below
+/// `ram_top`.
+fn cpu_ids_in_ram(ids_phys: u64, count: u32, ram_top: u64) -> bool
+{
+    let len = (count as usize).clamp(1, boot_protocol::MAX_CPUS) as u64;
+    ids_phys != 0
+        && ids_phys
+            .checked_add(len * core::mem::size_of::<u32>() as u64)
+            .is_some_and(|end| end <= ram_top)
 }
 
 #[cfg(test)]
 mod tests
 {
-    use super::validate_boot_info;
+    use super::{cpu_ids_in_ram, validate_boot_info};
     use boot_protocol::{
         BOOT_PROTOCOL_VERSION, BootInfo, KASLR_IMAGE_RANDOMIZED, MemoryMapEntry, MemoryType, layout,
     };
@@ -146,6 +171,8 @@ mod tests
         info.kernel_virtual_base = layout::KERNEL_LINK_BASE;
         info.kernel_size = 0x20_0000;
         info.direct_map_base = 0xFFFF_8000_0000_0000;
+        info.cpu_count = 1;
+        info.cpu_ids = 0x1000 as *const u32;
         info
     }
 
@@ -154,6 +181,23 @@ mod tests
         size: 0x4000_0000,
         memory_type: MemoryType::Usable,
     }];
+
+    // Defect caught: a CPU-id array the direct map does not reach, or a null
+    // one, accepted, so the kernel faults reading it at Phase 4.
+    #[test]
+    fn cpu_ids_must_be_non_null_and_end_within_ram()
+    {
+        let top = 0x4000_0000;
+        assert!(cpu_ids_in_ram(0x1000, 4, top));
+        assert!(cpu_ids_in_ram(top - 16, 4, top));
+        assert!(!cpu_ids_in_ram(top - 12, 4, top));
+        assert!(!cpu_ids_in_ram(0, 4, top));
+        assert!(!cpu_ids_in_ram(u64::MAX - 4, 4, top));
+        let mut info = valid(&RAM);
+        info.cpu_ids = core::ptr::null();
+        // SAFETY: `info` is a live, aligned `BootInfo` over a live map.
+        assert!(!unsafe { validate_boot_info(&raw const info) });
+    }
 
     #[test]
     fn unslid_image_without_randomized_flag_is_accepted()

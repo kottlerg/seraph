@@ -85,9 +85,11 @@ likewise assumes `#address-cells = 2` and `#size-cells = 2`).
 
 Walker limits: `MAX_DEPTH = 32` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`
-values, `MAX_RANGES_ENTRIES = 8` for PCI `ranges`. A walk skips the
-properties of nodes nested past `MAX_DEPTH` and drops the entries past a
-property's bound, and reports either with one console line — the
+values. A node's PCI `ranges` entries carry no bound: the walker records
+where the property lies and `Fdt::pci_ranges` reads every entry from the
+blob. A walk skips the properties of nodes nested past `MAX_DEPTH` and
+drops the entries past a `reg` or `interrupts` bound, and reports either
+with one console line per boot — the
 bootloader does not need exhaustive coverage, because device-level
 discovery is a userspace concern (see Responsibilities in
 [`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities)).
@@ -125,7 +127,7 @@ bootloader never halts on a DTB parse error.
 
 ## What Lives Elsewhere
 
-- Aperture merging / sort / cap-at-`MAX_APERTURES` invariants are owned
+- Aperture merging / sort / cap invariants are owned
   by [firmware-parsing.md](firmware-parsing.md)
   §"`mmio_apertures` construction" and implemented by
   `derive_mmio_apertures` in

@@ -58,7 +58,7 @@ use crate::sched::thread::ThreadControlBlock;
 /// Populated by [`init_apic_ids`] from `BootInfo::cpu_ids` at the end of Phase 4,
 /// before Phase 5's riscv64 PLIC setup names the BSP by its hart id.
 /// Accessed by [`apic_id_for`] to retrieve the APIC ID for a given logical CPU.
-/// Elements are `u32` because `BootInfo::cpu_ids` is `[u32; MAX_CPUS]`, which
+/// Elements are `u32` because `BootInfo::cpu_ids` is an array of `u32`s, which
 /// holds every x2APIC ID.
 ///
 /// # Safety
@@ -70,7 +70,7 @@ static CPU_APIC_IDS_PTR: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
 ///
 /// Must be called once during boot before any SMP operations that require
 /// sending IPIs to specific CPUs. Copies the first `CPU_COUNT` entries of
-/// `cpu_ids` (the caller passes the full `BootInfo::cpu_ids` array) into the
+/// `cpu_ids` (the caller passes the `BootInfo::cpu_ids` array) into the
 /// `CPU_COUNT`-sized slab; the `min` also bounds the copy by the slice length.
 ///
 /// # Safety
@@ -244,7 +244,7 @@ static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut()
 /// zero-filled, which equals [`PerCpuData::new`] for every field.
 ///
 /// Sized to the booted `cpu_count`, so the slabs cost only what is used;
-/// `MAX_CPUS`, the length of `BootInfo::cpu_ids`, is only the upper bound.
+/// `MAX_CPUS`, the cap on `BootInfo::cpu_count`, is only the upper bound.
 ///
 /// # Panics
 /// Halts via `crate::fatal` on buddy exhaustion.

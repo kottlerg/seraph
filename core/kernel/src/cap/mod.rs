@@ -311,9 +311,9 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// per-RAM-extent-count growth (more drained extents ⇒ more init-time
 /// Memory-cap derivations) and per-service growth (more boot modules ⇒
 /// more module-memory caps) without revisiting this knob. The boot mint is
-/// itself bounded by [`BOOT_BODY_BOUND`] (about 675 caps: the `InitInfo`
+/// itself bounded by [`BOOT_BODY_BOUND`] (about 550 caps: the `InitInfo`
 /// descriptor capacity and Phase 9's Memory caps), so a boot at that bound, an
-/// ACPI-region-heavy memory map among them, still leaves init about 860 slots.
+/// ACPI-region-heavy memory map among them, still leaves init about 985 slots.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -371,8 +371,9 @@ pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 /// the boot capability descriptors straight into the block (and the buddy
 /// drain its RAM extents before them, [`drain_and_install_seed`]), so this is
 /// the one bound on the capabilities that carry a descriptor: [`push_descriptor`]
-/// halts the boot by name past it. At `INIT_INFO_MAX_PAGES` = 4 that is about
-/// 655 capabilities, which also bounds the ACPI region caps (one per
+/// halts the boot by name past it. At `INIT_INFO_MAX_PAGES` = 4, past a header
+/// that holds the 85-entry module name table, that is 535 capabilities, which
+/// also bounds the ACPI region caps (one per
 /// `AcpiReclaimable` memory-map entry; real firmware reports 1 or 2). Phase 9's
 /// Memory caps reach init through header fields instead ([`BOOT_BODY_BOUND`]
 /// counts them).
@@ -382,8 +383,11 @@ pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = (init_protocol::INIT_INFO_MAX_P
     / core::mem::size_of::<CapDescriptor>();
 
 // `mint_module_memory_caps` copies each boot module's `BootModule.name`
-// straight into its `InitModuleName.name`, so the two widths are one ABI fact.
+// straight into its `InitModuleName.name`, so the two widths are one ABI fact,
+// and publishes one name per module, so the name table holds as many entries
+// as a `BootInfo` can list modules.
 const _: () = assert!(init_protocol::INIT_MODULE_NAME_LEN == boot_protocol::BOOT_MODULE_NAME_LEN);
+const _: () = assert!(init_protocol::INIT_MAX_NAMED_MODULES == boot_protocol::MAX_BOOT_MODULES);
 
 // The descriptor array starts right after the header, at an offset its
 // element alignment divides.
@@ -435,14 +439,14 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// - the root `CSpace` slab ([`ROOT_CSPACE_INIT_PAGES`]: 1 + 28 + 16 = 45
 ///   pages);
 /// - init's bootstrap `AddressSpace` slab ([`INIT_ASPACE_PAGES`] 18);
-/// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (about
-///   675) of [`BOOT_BODY_BYTES`] each (about 22 pages): one RAM `MemoryObject`
+/// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (551) of
+///   [`BOOT_BODY_BYTES`] each (18 pages): one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
 ///   `SchedControl` and `SbiControl` roots, the firmware-table, boot-module,
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
-/// That is about 89 pages (356 KiB), and init's Thread slot adds six or more
+/// That is 85 pages (340 KiB), and init's Thread slot adds six or more
 /// (`sched::thread_slot::thread_slot_bytes`). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
@@ -2054,15 +2058,16 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // Publish a name → slot entry in the InitInfo header table so
         // init can resolve modules by name without scanning descriptors.
         let name_slot = layout.module_name_count as usize;
-        if name_slot < init_protocol::INIT_MAX_NAMED_MODULES
+        if name_slot >= init_protocol::INIT_MAX_NAMED_MODULES
         {
-            layout.module_names[name_slot] = init_protocol::InitModuleName {
-                slot,
-                _pad: 0,
-                name: module.name,
-            };
-            layout.module_name_count += 1;
+            crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
         }
+        layout.module_names[name_slot] = init_protocol::InitModuleName {
+            slot,
+            _pad: 0,
+            name: module.name,
+        };
+        layout.module_name_count += 1;
     }
 
     layout.total_populated = cspace.populated_count();

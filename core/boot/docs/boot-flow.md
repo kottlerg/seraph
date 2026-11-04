@@ -125,7 +125,9 @@ the kernel's own consumption:
 
 - **CPU topology** — MADT Local APIC / Local x2APIC / `RINTC` entries (ACPI)
   and `/cpus` nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
-  Derived here in step 5 and written into `BootInfo` in step 9.
+  Derived here in step 5: a first walk counts the enabled CPU entries, which sizes the
+  `cpu_ids` pages (one more for a BSP the table omits, at most `MAX_CPUS`), and a second
+  fills them; their address and the count are written into `BootInfo` in step 9.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
   (from MADT), PLIC (MADT) / UART (SPCR) on RISC-V, or DTB compatible
   nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).
@@ -265,15 +267,15 @@ this donated page after consuming them. The `version` field is set to
 | `kernel_virtual_base` | KASLR-biased kernel image virtual base (link base + slide from step 5d) |
 | `kernel_size` | Total span of kernel ELF LOAD segments from step 3 |
 | `init_image` | Pre-parsed init ELF segments and entry point from step 4 |
-| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4; empty (null `entries`, zero `count`) if none |
+| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4, at most `MAX_BOOT_MODULES` (85, the entries one page holds; a larger bundle fails step 4 by name); empty (null `entries`, zero `count`) if none |
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
 | `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
-| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines). Empty if no MMIO regions were reported. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines), in pages allocated in step 6 and sized from the firmware's descriptor count (`memory_map::aperture_capacity`). Empty if no MMIO regions were reported. |
 | `cpu_count` | Count of distinct hardware IDs among the enabled or online-capable Local APIC / Local x2APIC entries from MADT (x86-64) or the enabled RINTC entries (RISC-V), the BSP counted once whether or not the MADT lists it, capped at `MAX_CPUS`; or the DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
-| `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
+| `cpu_ids` | Physical address of the per-CPU hardware identifiers, `cpu_count` `u32`s in pages of their own allocated in step 5; `cpu_ids[0] == bsp_id` |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel then halts at Phase 8 when more than one CPU is listed ([initialization.md § Phase 8](../../kernel/docs/initialization.md)). |
 | `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), the raw UEFI memory-map buffer from step 7 (zeroed after its last read here), `page_table.reclaim_spans()` (the bootloader's page-table frame pool as one range, and on x86-64 the LA57 toggle page when one is installed), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps`, which `cap::init_capability_system` calls in Phase 7 after `populate_cspace` returns ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)). |
 | `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5 ([entropy.md](../../kernel/docs/entropy.md)). The separate KASLR entropy words never appear in `BootInfo`. |

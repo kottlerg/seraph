@@ -35,7 +35,9 @@ layout) that Phase 0 depends on, see
     at or below kernel_virtual_base
 11. Validate that a slid image (kernel_virtual_base above KERNEL_LINK_BASE) carries
     KASLR_IMAGE_RANDOMIZED in kaslr_flags
-12. arch::current::paging::init_paging_mode: read the paging mode (RISC-V: satp.MODE;
+12. Validate that cpu_ids is non-null and its cpu_count entries (at most MAX_CPUS) end at or
+    below the highest RAM address the memory map describes, so the direct map reaches them
+13. arch::current::paging::init_paging_mode: read the paging mode (RISC-V: satp.MODE;
     x86-64: CR4.LA57, 4- or 5-level), halt if direct_map_base is below that mode's
     kernel-half base (RISC-V: also if satp names no supported mode), then publish the mode
     and direct_map_base
@@ -449,7 +451,7 @@ Phase 7.
    as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
    buddy, and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
-   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 655 at
+   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (535 at
    INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
    Phase 7: drained RAM extents exceed the InitInfo descriptor capacity", the one check the in-place
    mint of step 3a relies on. Every capability Phases 7 and 8 mint then has its descriptor written

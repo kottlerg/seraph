@@ -23,7 +23,7 @@ bootloader *builds*, described in later sections — is:
   so the mapped image is internally consistent.
 - An identity map, read-write and non-executable, covers every page touched by the
   `BootInfo` page, the boot-module array page, the translated `MemoryMapEntry` array
-  (`BootInfo.memory_map`), the `MmioAperture` array page, the reclaim-range array page, the
+  (`BootInfo.memory_map`), the `MmioAperture` array pages, the reclaim-range array page, the
   handoff stack (not the guard page below it), the `InitImage` segments (whose `phys_addr`
   carries the `p_vaddr` in-page offset), the kernel segments' physical frames, the bundle
   blob (every boot module body), the framebuffer when present, and the UART MMIO page on

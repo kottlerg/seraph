@@ -33,7 +33,7 @@
 //! exposed here but live under [`crate::arch`].
 
 use crate::bprintln;
-use boot_protocol::{MAX_CPUS, MmioAperture};
+use boot_protocol::MmioAperture;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -414,73 +414,90 @@ pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Walk the ACPI MADT starting from `rsdp_addr` and collect CPU topology.
+/// Walk the ACPI MADT starting from `rsdp_addr` and collect the CPU hardware
+/// IDs into `out`, sized by [`cpu_topology_capacity`].
 ///
-/// Returns `(cpu_count, bsp_id, cpu_ids)`:
-/// - `cpu_count`: number of distinct enabled CPUs, the BSP counted once
-///   whether or not the MADT lists it (at most [`MAX_CPUS`]).
-/// - `bsp_id`: hardware identifier of the bootstrap processor, passed in by
-///   the caller (LAPIC ID on x86-64 from CPUID; boot hart ID on RISC-V from
-///   `EFI_RISCV_BOOT_PROTOCOL`).
-/// - `cpu_ids`: per-CPU hardware IDs indexed by logical CPU index; `[0]` is
-///   always the BSP, `[1..cpu_count]` are APs in MADT discovery order.
+/// Returns `cpu_count`, the number of distinct enabled CPUs, the BSP counted
+/// once whether or not the MADT lists it (at most `out.len()`, itself at most
+/// [`boot_protocol::MAX_CPUS`]). `out[..cpu_count]` holds the per-CPU hardware IDs indexed by
+/// logical CPU index: `[0]` is always `bsp_id` (the LAPIC ID on x86-64 from
+/// CPUID; the boot hart ID on RISC-V from `EFI_RISCV_BOOT_PROTOCOL`), and
+/// `[1..cpu_count]` are the APs in MADT discovery order. The entry types read
+/// are [`madt_cpu_ids`]'.
 ///
-/// Parses MADT entry types:
-/// - Type 0 (Processor Local APIC, x86-64): enabled if `flags & 1 || flags & 2`.
-/// - Type 9 (Processor Local x2APIC, x86-64, 32-bit IDs): enabled if
-///   `flags & 1 || flags & 2`.
-/// - Type 0x18 (RISC-V INTC, RINTC): enabled if `flags & 1`.
+/// If the firmware reports more than [`boot_protocol::MAX_CPUS`] enabled CPUs, the surplus
+/// is dropped and a diagnostic is printed, so the kernel can still boot on
+/// the leading [`boot_protocol::MAX_CPUS`] processors.
 ///
-/// If the firmware reports more than [`MAX_CPUS`] enabled CPUs, the surplus
-/// is dropped and a diagnostic is printed; the caller is cap-bounded so the
-/// kernel can still boot on the leading [`MAX_CPUS`] processors.
-///
-/// Returns `(1, bsp_id, [bsp_id, 0, …])` on any parse failure so the system
+/// Returns 1, with `out[0] = bsp_id`, on any parse failure so the system
 /// falls back to single-CPU operation rather than refusing to boot.
 ///
 /// # Safety
-/// `rsdp_addr` must be a physical address of a valid, identity-mapped ACPI RSDP.
-pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32) -> (u32, u32, [u32; MAX_CPUS])
+/// `rsdp_addr` must be zero or the physical address of a valid, identity-mapped
+/// ACPI RSDP. `out` must hold at least one slot.
+pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
 {
-    let mut cpu_ids = [0u32; MAX_CPUS];
-    cpu_ids[0] = bsp_id;
+    // SAFETY: caller contract.
+    if let Some(table) = unsafe { find_madt(rsdp_addr) }
+    {
+        return parse_madt_topology(table, bsp_id, out);
+    }
+    out[0] = bsp_id;
+    1
+}
 
+/// Slots [`parse_cpu_topology`] needs in its `out` array for the MADT reached
+/// from `rsdp_addr`: one per enabled CPU entry plus one for a BSP the MADT may
+/// omit, capped at [`boot_protocol::MAX_CPUS`] (`firmware::cpu_id_capacity`). One when there
+/// is no valid MADT.
+///
+/// # Safety
+/// As [`parse_cpu_topology`].
+pub unsafe fn cpu_topology_capacity(rsdp_addr: u64) -> usize
+{
+    // SAFETY: caller contract.
+    let entries = unsafe { find_madt(rsdp_addr) }.map_or(0, |t| madt_cpu_ids(t).count());
+    crate::firmware::cpu_id_capacity(entries)
+}
+
+/// The MADT (`APIC`) the XSDT reached from `rsdp_addr` lists, or `None` when
+/// the RSDP, the XSDT or every MADT candidate fails validation.
+///
+/// # Safety
+/// `rsdp_addr` must be zero or the physical address of a valid,
+/// identity-mapped ACPI RSDP.
+unsafe fn find_madt(rsdp_addr: u64) -> Option<&'static [u8]>
+{
     if rsdp_addr == 0
     {
-        return (1, bsp_id, cpu_ids);
+        return None;
     }
-
-    // Validate RSDP.
     // SAFETY: caller guarantees rsdp_addr is valid, identity-mapped ACPI RSDP.
     let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
     if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
     {
-        return (1, bsp_id, cpu_ids);
+        return None;
     }
     let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
     if xsdt_addr == 0
     {
-        return (1, bsp_id, cpu_ids);
+        return None;
     }
-
-    // Validate XSDT.
     // SAFETY: xsdt_addr from validated RSDP; firmware guarantees physical mapping.
     let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
     if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
     {
-        return (1, bsp_id, cpu_ids);
+        return None;
     }
     let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
     if xsdt_len < SDT_HDR_LEN
     {
-        return (1, bsp_id, cpu_ids);
+        return None;
     }
     // SAFETY: xsdt_len validated >= SDT_HDR_LEN above; firmware guarantees mapping.
     let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
     let entries_bytes = &xsdt[SDT_HDR_LEN..];
-    let entry_count = entries_bytes.len() / 8;
-
-    for i in 0..entry_count
+    for i in 0..entries_bytes.len() / 8
     {
         let table_addr = read_u64(entries_bytes, i * 8);
         if table_addr == 0
@@ -495,24 +512,23 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32) -> (u32, u32, [u32
             if table_len >= SDT_HDR_LEN
             {
                 // SAFETY: table_len validated; firmware guarantees mapping.
-                let table = unsafe { phys_slice(table_addr, table_len) };
-                return parse_madt_topology(table, bsp_id);
+                return Some(unsafe { phys_slice(table_addr, table_len) });
             }
         }
     }
-
-    (1, bsp_id, cpu_ids)
+    None
 }
 
-/// Walk MADT entries to collect CPU hardware IDs (LAPIC, x2APIC, or RINTC).
+/// Walk MADT entries to collect CPU hardware IDs (LAPIC, x2APIC, or RINTC)
+/// into `out`.
 ///
-/// Returns `(cpu_count, bsp_id, cpu_ids)`. The BSP is placed at index 0,
-/// APs fill indices `1..cpu_count` in MADT order, each distinct hardware ID
-/// once; `cpu_count` counts the BSP once whether or not the MADT lists it.
-/// CPUs beyond [`MAX_CPUS`] are dropped with a diagnostic.
-fn parse_madt_topology(table: &[u8], bsp_id: u32) -> (u32, u32, [u32; MAX_CPUS])
+/// Returns `cpu_count`. The BSP is placed at index 0, APs fill indices
+/// `1..cpu_count` in MADT order, each distinct hardware ID once; `cpu_count`
+/// counts the BSP once whether or not the MADT lists it. CPUs beyond `out`'s
+/// length, at most [`boot_protocol::MAX_CPUS`], are dropped with a diagnostic.
+fn parse_madt_topology(table: &[u8], bsp_id: u32, out: &mut [u32]) -> u32
 {
-    let (cpu_count, cpu_ids, truncated) = madt_topology(table, bsp_id);
+    let (cpu_count, truncated) = madt_topology(table, bsp_id, out);
     if truncated
     {
         bprintln!(
@@ -520,115 +536,79 @@ fn parse_madt_topology(table: &[u8], bsp_id: u32) -> (u32, u32, [u32; MAX_CPUS])
              included); surplus dropped"
         );
     }
-    (cpu_count, bsp_id, cpu_ids)
+    cpu_count
 }
 
 /// The walk behind [`parse_madt_topology`], without the console output:
-/// returns `(cpu_count, cpu_ids, truncated)`, where `truncated` is set when a
-/// distinct enabled CPU found no slot, whether in the collection or when
-/// placed after the BSP.
-fn madt_topology(table: &[u8], bsp_id: u32) -> (u32, [u32; MAX_CPUS], bool)
+/// returns `(cpu_count, truncated)`, where `truncated` is set when a distinct
+/// enabled CPU found no slot in `out`.
+fn madt_topology(table: &[u8], bsp_id: u32, out: &mut [u32]) -> (u32, bool)
 {
-    let mut cpu_ids = [0u32; MAX_CPUS];
-    cpu_ids[0] = bsp_id;
+    crate::firmware::place_cpu_ids(bsp_id, madt_cpu_ids(table), out)
+}
 
-    // Collect all enabled IDs first, then place BSP at index 0.
-    let mut all_ids = [0u32; MAX_CPUS];
-    let mut all_count: usize = 0;
-    let mut truncated = false;
-
+/// The hardware IDs of the MADT's enabled CPU entries, in table order, a CPU
+/// listed in both a Local APIC and a Local x2APIC entry yielded twice:
+/// - Type 0 (Processor Local APIC, x86-64): enabled if `flags & 1 || flags & 2`.
+/// - Type 9 (Processor Local x2APIC, x86-64, 32-bit IDs): enabled if
+///   `flags & 1 || flags & 2`.
+/// - Type 0x18 (RISC-V INTC, RINTC): enabled if `flags & 1`.
+fn madt_cpu_ids(table: &[u8]) -> impl Iterator<Item = u32> + '_
+{
     let mut off = MADT_ENTRIES_OFF;
-    while off + 2 <= table.len()
-    {
-        let entry_type = read_u8(table, off);
-        let entry_len = read_u8(table, off + 1) as usize;
-        if entry_len < 2 || off + entry_len > table.len()
+    core::iter::from_fn(move || {
+        while off + 2 <= table.len()
         {
-            break;
-        }
-
-        match entry_type
-        {
-            MADT_TYPE_LAPIC if entry_len >= 8 =>
+            let entry_type = read_u8(table, off);
+            let entry_len = read_u8(table, off + 1) as usize;
+            if entry_len < 2 || off + entry_len > table.len()
             {
-                // Type 0 (Processor Local APIC), length 8:
-                //   off+0: type  off+1: length  off+2: acpi_proc_id  off+3: apic_id
-                //   off+4: flags(u32)  bit0=enabled  bit1=online-capable
-                let apic_id = u32::from(read_u8(table, off + 3));
-                let flags = read_u32(table, off + 4);
-                if (flags & 0x1 != 0) || (flags & 0x2 != 0)
-                {
-                    record_cpu_id(apic_id, &mut all_ids, &mut all_count, &mut truncated);
-                }
+                return None;
             }
-            MADT_TYPE_LOCAL_X2APIC if entry_len >= 16 =>
+            let at = off;
+            off += entry_len;
+            match entry_type
             {
-                // Type 9 (Processor Local x2APIC), length 16:
-                //   off+0: type  off+1: length  off+2: reserved(2)
-                //   off+4: x2apic_id(u32)
-                //   off+8: flags(u32)  bit0=enabled  bit1=online-capable
-                //   off+12: acpi_proc_uid(u32)
-                let apic_id = read_u32(table, off + 4);
-                let flags = read_u32(table, off + 8);
-                if (flags & 0x1 != 0) || (flags & 0x2 != 0)
+                MADT_TYPE_LAPIC if entry_len >= 8 =>
                 {
-                    record_cpu_id(apic_id, &mut all_ids, &mut all_count, &mut truncated);
+                    // Type 0 (Processor Local APIC), length 8:
+                    //   off+0: type  off+1: length  off+2: acpi_proc_id  off+3: apic_id
+                    //   off+4: flags(u32)  bit0=enabled  bit1=online-capable
+                    let flags = read_u32(table, at + 4);
+                    if (flags & 0x1 != 0) || (flags & 0x2 != 0)
+                    {
+                        return Some(u32::from(read_u8(table, at + 3)));
+                    }
                 }
-            }
-            MADT_TYPE_RINTC if entry_len >= 20 =>
-            {
+                MADT_TYPE_LOCAL_X2APIC if entry_len >= 16 =>
+                {
+                    // Type 9 (Processor Local x2APIC), length 16:
+                    //   off+0: type  off+1: length  off+2: reserved(2)
+                    //   off+4: x2apic_id(u32)
+                    //   off+8: flags(u32)  bit0=enabled  bit1=online-capable
+                    //   off+12: acpi_proc_uid(u32)
+                    let flags = read_u32(table, at + 8);
+                    if (flags & 0x1 != 0) || (flags & 0x2 != 0)
+                    {
+                        return Some(read_u32(table, at + 4));
+                    }
+                }
                 // Type 0x18 (RISC-V INTC / RINTC), length 36:
                 //   off+0: type  off+1: length  off+2: version  off+3: reserved
                 //   off+4: flags(u32)  bit0=enabled
                 //   off+8: hart_id(u64)  off+16: acpi_proc_uid(u32)  …
-                let flags = read_u32(table, off + 4);
-                // hart_id from MADT RINTC is u64 but only the lower 32 bits are used.
-                #[allow(clippy::cast_possible_truncation)]
-                let hart_id = read_u64(table, off + 8) as u32;
-                if flags & 0x1 != 0
+                MADT_TYPE_RINTC if entry_len >= 20 && read_u32(table, at + 4) & 0x1 != 0 =>
                 {
-                    record_cpu_id(hart_id, &mut all_ids, &mut all_count, &mut truncated);
+                    // hart_id from MADT RINTC is u64 but only the lower 32 bits are used.
+                    #[allow(clippy::cast_possible_truncation)]
+                    return Some(read_u64(table, at + 8) as u32);
                 }
+                _ =>
+                {}
             }
-            _ =>
-            {}
         }
-
-        off += entry_len;
-    }
-
-    if all_count == 0
-    {
-        // No processors found in MADT — single-CPU fallback.
-        return (1, cpu_ids, truncated);
-    }
-
-    // Place BSP at index 0, APs after it; a full MADT that omits the BSP
-    // leaves one AP without a slot, which `place_cpu_ids` reports.
-    let (cpu_count, cpu_ids, placement_truncated) =
-        crate::firmware::place_cpu_ids(bsp_id, &all_ids[..all_count]);
-    (cpu_count, cpu_ids, truncated || placement_truncated)
-}
-
-/// Append one enabled CPU's hardware ID to the MADT collection, skipping an
-/// ID already collected (firmware may list a CPU in both a Local APIC and a
-/// Local x2APIC entry) so no CPU is counted or started twice. Sets
-/// `truncated` when the collection is full.
-fn record_cpu_id(id: u32, ids: &mut [u32; MAX_CPUS], count: &mut usize, truncated: &mut bool)
-{
-    if ids[..*count].contains(&id)
-    {
-        return;
-    }
-    if *count < MAX_CPUS
-    {
-        ids[*count] = id;
-        *count += 1;
-    }
-    else
-    {
-        *truncated = true;
-    }
+        None
+    })
 }
 
 // ── Aperture seeder ──────────────────────────────────────────────────────────
@@ -939,6 +919,7 @@ fn mcfg_ecam_window(base: u64, start_bus: u8, end_bus: u8) -> Option<(u64, u64)>
 mod tests
 {
     use super::*;
+    use boot_protocol::MAX_CPUS;
 
     #[test]
     fn mcfg_window_from_bus_zero_starts_at_the_base()
@@ -1024,8 +1005,9 @@ mod tests
     /// filled IDs, and the truncation flag.
     fn topology_full(entries: &[(u8, u32)], bsp_id: u32) -> (u32, Vec<u32>, bool)
     {
-        let (count, ids, truncated) = madt_topology(&madt(entries), bsp_id);
-        assert!(ids[count as usize..].iter().all(|&id| id == 0));
+        let table = madt(entries);
+        let mut ids = vec![0u32; crate::firmware::cpu_id_capacity(madt_cpu_ids(&table).count())];
+        let (count, truncated) = madt_topology(&table, bsp_id, &mut ids);
         (count, ids[..count as usize].to_vec(), truncated)
     }
 

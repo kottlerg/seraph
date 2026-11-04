@@ -134,10 +134,17 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     kernel takes its paging depth from `CR4.LA57` at entry
 ///     ([`x86_paging`]), and `direct_map_base` lies at or above that
 ///     depth's kernel-half floor. No layout change.
-/// v17: [`MAX_APERTURES`] rose from 16 to 256, the capacity of the
+/// v17: `MAX_APERTURES` rose from 16 to 256, the capacity of the
 ///     aperture array's page, so `mmio_apertures.count` may reach 256. No
 ///     layout change.
-pub const BOOT_PROTOCOL_VERSION: u32 = 17;
+/// v18: `cpu_ids` moved out of the `BootInfo` page: it is now the physical
+///     address of `cpu_count` hardware IDs in pages of their own, sized from
+///     the firmware's CPU count, where it was an inline `[u32; MAX_CPUS]`.
+///     `MAX_IOAPICS` rose from 8 to 128, growing `KernelMmio`, and
+///     [`MAX_BOOT_MODULES`] (85) bounds `modules.count`. `MAX_APERTURES` is
+///     gone: the aperture array is sized from the firmware's memory map, so
+///     `mmio_apertures.count` has no protocol bound.
+pub const BOOT_PROTOCOL_VERSION: u32 = 18;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -227,6 +234,12 @@ unsafe impl Sync for MemoryMapSlice {}
 /// Matches [`bundle::BundleEntryHeader::name`] so the bootloader can copy
 /// the bundle entry's name verbatim into `BootModule.name`.
 pub const BOOT_MODULE_NAME_LEN: usize = 32;
+
+/// Maximum number of boot modules a `BootInfo` lists (`modules.count`): the
+/// [`BootModule`] entries the one page the bootloader allocates for the array
+/// holds. A bundle with more is refused by name, by the bootloader and the
+/// kernel alike.
+pub const MAX_BOOT_MODULES: usize = 4096 / core::mem::size_of::<BootModule>();
 
 /// A boot module loaded by the bootloader (raw ELF image for early services).
 ///
@@ -323,11 +336,11 @@ pub struct InitSegment
 /// rather than truncating.
 pub const INIT_MAX_SEGMENTS: usize = 8;
 
-/// Maximum number of logical CPUs representable in [`BootInfo::cpu_ids`].
+/// Maximum number of logical CPUs a `BootInfo` lists: the kernel's CPU-count
+/// width (its per-CPU masks hold `MAX_CPUS` bits).
 ///
-/// Sizes the fixed array at the ABI boundary. Producers MUST cap
-/// `cpu_count` at this value and diagnose truncation; consumers may assume
-/// `cpu_count <= MAX_CPUS` and `cpu_ids[cpu_count..]` is zero.
+/// Producers MUST cap `cpu_count` at this value and diagnose truncation;
+/// consumers may assume `cpu_count <= MAX_CPUS`.
 pub const MAX_CPUS: usize = 512;
 
 /// [`InitImage::flags`] bit 0: init is a position-independent executable
@@ -514,10 +527,12 @@ pub struct IoApicEntry
 
 /// Maximum number of I/O APICs the bootloader records.
 ///
-/// Oversize MADTs are truncated at this bound with a diagnostic; real
-/// systems with more than eight IOAPICs are out of the targeted envelope.
+/// A multi-socket server exposes one or more I/O APICs per PCI Express root complex,
+/// a few dozen on the largest; 128 covers them inline, at 24 B each, in the
+/// `BootInfo` page. Oversize MADTs are truncated at this bound with a
+/// diagnostic.
 #[cfg(target_arch = "x86_64")]
-pub const MAX_IOAPICS: usize = 8;
+pub const MAX_IOAPICS: usize = 128;
 
 /// Kernel-facing MMIO bases on x86-64.
 ///
@@ -666,20 +681,6 @@ pub struct MmioAperture
     /// Size of the aperture in bytes (page-aligned, non-zero).
     pub size: u64,
 }
-
-/// Maximum number of MMIO apertures the bootloader records: the capacity of
-/// the 4 KiB page the array lives in (256 × 16 B).
-///
-/// Derived from `EfiMemoryMappedIO` / `EfiMemoryMappedIOPortSpace`
-/// regions of the UEFI memory map, unioned with firmware-advertised PCI
-/// apertures (MCFG on x86-64, `/soc ranges` on RISC-V), then
-/// sorted-and-merged. A server with many PCI Express segments has a few disjoint
-/// windows per segment; a platform with more disjoint non-RAM regions
-/// than this loses the highest, which the bootloader diagnoses.
-pub const MAX_APERTURES: usize = 256;
-
-// The aperture array fits the one page the bootloader allocates for it.
-const _: () = assert!(MAX_APERTURES * core::mem::size_of::<MmioAperture>() <= 4096);
 
 /// A slice of [`MmioAperture`] values, passed by physical address.
 ///
@@ -863,8 +864,8 @@ pub struct BootInfo
     pub mmio_apertures: MmioApertureSlice,
 
     // ── SMP fields (added in protocol version 4) ──────────────────────────────
-    /// Number of logical CPUs present and usable: the BSP in `cpu_ids[0]`
-    /// plus the APs in `cpu_ids[1..cpu_count]`, at most [`MAX_CPUS`].
+    /// Number of logical CPUs present and usable: the BSP at `cpu_ids[0]`
+    /// plus the APs at `cpu_ids[1..cpu_count]`, at most [`MAX_CPUS`].
     ///
     /// The bootloader derives it from the ACPI MADT (enabled or
     /// online-capable Local APIC / Local x2APIC entries on x86-64, enabled
@@ -880,21 +881,19 @@ pub struct BootInfo
     /// On RISC-V: hart ID of the booting hart (from `EFI_RISCV_BOOT_PROTOCOL`).
     pub bsp_id: u32,
 
-    /// Hardware identifiers for all CPUs, indexed by logical CPU index.
+    /// Physical address of the hardware identifiers of all CPUs, `cpu_count`
+    /// `u32`s indexed by logical CPU index, in pages of their own outside this
+    /// one (a bootloader reclaim range).
     ///
     /// `cpu_ids[0]` is always the BSP (`bsp_id`). `cpu_ids[1..cpu_count]` are
-    /// the APs in discovery order. Entries beyond `cpu_count` are zero.
+    /// the APs in discovery order.
     ///
     /// On x86-64: LAPIC / x2APIC IDs from the ACPI MADT.
     /// On RISC-V: hart IDs.
     ///
-    /// The fixed array length is [`MAX_CPUS`] (512), chosen to cover
-    /// current dual-socket high-end server hardware (e.g. 192-core ×
-    /// 2-socket EPYC without SMT = 384; 128-core × 2-socket × 2-thread
-    /// Intel = 512) while keeping `BootInfo` inside a single 4 KiB page.
-    /// Producers that discover more enabled CPUs MUST cap at this length
-    /// and MUST diagnose the truncation.
-    pub cpu_ids: [u32; MAX_CPUS],
+    /// The kernel reads the array through its direct map, so it lies in RAM
+    /// the memory map describes; it is never null.
+    pub cpu_ids: *const u32,
 
     /// Physical address of a 4 KiB page reserved for the AP startup
     /// trampoline. The kernel writes AP startup code into this page before
@@ -982,6 +981,11 @@ pub struct BootInfo
     pub kaslr_flags: u32,
 }
 
+// The bootloader writes `BootInfo` into one page, and the boot-module array
+// into another.
+const _: () = assert!(core::mem::size_of::<BootInfo>() <= 4096);
+const _: () = assert!(MAX_BOOT_MODULES * core::mem::size_of::<BootModule>() <= 4096);
+
 // ── KASLR flags (protocol version 14) ────────────────────────────────────────
 
 /// `kaslr_flags` bit 0: the kernel image slide was drawn from the KASLR
@@ -1044,7 +1048,6 @@ mod tests
         assert_eq!(core::mem::size_of::<MmioApertureSlice>(), 16);
         assert_eq!(core::mem::size_of::<MmioAperture>(), 16);
         assert_eq!(FramebufferInfo::SIZE, 24);
-        assert!(core::mem::size_of::<BootInfo>() <= 4096);
     }
 
     /// Round-trip: a populated `FramebufferInfo` survives `to_bytes` then

@@ -28,7 +28,7 @@
 use crate::bprintln;
 use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::{
-    HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT, MAX_CPUS, MmioAperture,
+    HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT, MmioAperture,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -58,7 +58,7 @@ const FDT_END: u32 = 9;
 
 /// Maximum FDT node nesting depth the walkers track. Device trees in the wild
 /// nest well under it (buses inside buses inside `/soc`); the cost is stack
-/// only, one per-depth state per level, about 12 KiB for `walk_compatible`'s,
+/// only, one per-depth state per level, about 6 KiB for `walk_compatible`'s,
 /// and a deeper node's properties are skipped with a diagnostic.
 const MAX_DEPTH: usize = 32;
 
@@ -69,12 +69,9 @@ const MAX_REG_ENTRIES: usize = 8;
 /// Maximum number of `interrupts` values collected per node. No consumer reads
 /// them; surplus values are dropped with a diagnostic.
 const MAX_IRQ_ENTRIES: usize = 4;
-/// Maximum number of `ranges` entries collected per node. A PCI host bridge
-/// carries one per window, each an aperture seed; the QEMU virt bridge has
-/// three, and the PCI binding sets no limit. Surplus entries are dropped with a
-/// diagnostic. Eight keeps `walk_compatible`'s per-depth state, `MAX_DEPTH` of
-/// them, under clippy's 16 KiB `large_stack_arrays` limit.
-const MAX_RANGES_ENTRIES: usize = 8;
+/// Size of one PCI `ranges` entry: `#address-cells` = 3 child cells, 2 parent
+/// address cells and 2 size cells, each a big-endian `u32`.
+const PCI_RANGES_ENTRY_BYTES: usize = 28;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -114,12 +111,10 @@ pub struct FdtNode
     pub irq_entries: [u32; MAX_IRQ_ENTRIES],
     /// Number of valid entries in [`irq_entries`].
     pub irq_count: usize,
-    /// PCI-style `ranges` entries: `(child_flags, cpu_addr, size)` tuples.
-    /// `child_flags` encodes space type in bits 25:24 (1=I/O, 2=32-bit MMIO,
-    /// 3=64-bit MMIO).
-    pub ranges_entries: [(u32, u64, u64); MAX_RANGES_ENTRIES],
-    /// Number of valid entries in [`ranges_entries`].
-    pub ranges_count: usize,
+    /// Where the node's `ranges` property data lies in the struct block, as
+    /// `(offset, length)`; `(0, 0)` when it has none. [`Fdt::pci_ranges`]
+    /// reads its entries in place, so no entry bound applies.
+    pub ranges: (u32, u32),
     /// The `riscv,ndev` property (a PLIC's interrupt-source count), or 0
     /// when the node has none.
     pub riscv_ndev: u32,
@@ -136,8 +131,7 @@ struct NodeState
     reg_count: usize,
     irq_entries: [u32; MAX_IRQ_ENTRIES],
     irq_count: usize,
-    ranges_entries: [(u32, u64, u64); MAX_RANGES_ENTRIES],
-    ranges_count: usize,
+    ranges: (u32, u32),
     riscv_ndev: u32,
 }
 
@@ -151,8 +145,7 @@ impl NodeState
             reg_count: 0,
             irq_entries: [0; MAX_IRQ_ENTRIES],
             irq_count: 0,
-            ranges_entries: [(0, 0, 0); MAX_RANGES_ENTRIES],
-            ranges_count: 0,
+            ranges: (0, 0),
             riscv_ndev: 0,
         }
     }
@@ -178,8 +171,8 @@ fn report_walk_limits(too_deep: bool, truncated: bool)
     if truncated && !REPORTED_TRUNCATED.swap(true, Ordering::Relaxed)
     {
         bprintln!(
-            "[--------] boot: DTB: a reg, interrupts or ranges property past its entry bound; \
-             surplus entries dropped"
+            "[--------] boot: DTB: a reg or interrupts property past its entry bound; surplus \
+             entries dropped"
         );
     }
 }
@@ -295,6 +288,21 @@ impl Fdt
         unsafe { core::slice::from_raw_parts(start, len) }
     }
 
+    /// The PCI `ranges` entries of `node`, as `(child_flags, cpu_addr, size)`,
+    /// read from the blob in place: `#address-cells` = 3, parent
+    /// `#address-cells` = 2, `#size-cells` = 2, so each entry is
+    /// [`PCI_RANGES_ENTRY_BYTES`] of `child_hi child_mid child_lo parent_hi
+    /// parent_lo size_hi size_lo`. `child_flags` encodes the space type in bits
+    /// 25:24 (1 = I/O, 2 = 32-bit MMIO, 3 = 64-bit MMIO); the child bus address
+    /// is not returned, since resource extraction uses the parent address. A
+    /// trailing partial entry is ignored.
+    pub(crate) fn pci_ranges(&self, node: &FdtNode) -> impl Iterator<Item = (u32, u64, u64)> + '_
+    {
+        let data = self.struct_slice(node.ranges.0, node.ranges.1);
+        data.chunks_exact(PCI_RANGES_ENTRY_BYTES)
+            .map(|e| (read_be32(e), read_be64(&e[12..]), read_be64(&e[20..])))
+    }
+
     /// Walk the struct block, calling `callback` for every node whose
     /// `compatible` property contains `compat` as one of its strings.
     ///
@@ -355,8 +363,7 @@ impl Fdt
                             reg_count: s.reg_count,
                             irq_entries: s.irq_entries,
                             irq_count: s.irq_count,
-                            ranges_entries: s.ranges_entries,
-                            ranges_count: s.ranges_count,
+                            ranges: s.ranges,
                             riscv_ndev: s.riscv_ndev,
                         };
                         if !callback(node)
@@ -443,25 +450,9 @@ impl Fdt
                     }
                     else if name == b"ranges"
                     {
-                        // PCI ranges: (#address-cells=3, #size-cells=2, parent #address-cells=2)
-                        // Each entry = 28 bytes: child_hi(u32) child_mid(u32) child_lo(u32)
-                        //                        parent_hi(u32) parent_lo(u32)
-                        //                        size_hi(u32) size_lo(u32)
-                        let data = self.struct_slice(data_off, prop_len);
-                        let mut i = 0;
-                        while i + 28 <= data.len() && state.ranges_count < MAX_RANGES_ENTRIES
-                        {
-                            let child_flags = read_be32(&data[i..]);
-                            // child_mid:child_lo form the 64-bit child bus address
-                            // (ignored for resource extraction — we use parent addr).
-                            let parent_addr = read_be64(&data[i + 12..]);
-                            let size = read_be64(&data[i + 20..]);
-                            state.ranges_entries[state.ranges_count] =
-                                (child_flags, parent_addr, size);
-                            state.ranges_count += 1;
-                            i += 28;
-                        }
-                        truncated |= i + 28 <= data.len();
+                        // Recorded in place; `Fdt::pci_ranges` reads the
+                        // entries, however many the property holds.
+                        state.ranges = (data_off, prop_len);
                     }
                 }
                 FDT_NOP =>
@@ -910,7 +901,8 @@ fn read_be64(buf: &[u8]) -> u64
 
 // ── CPU topology parsing ──────────────────────────────────────────────────────
 
-/// Parse DTB CPU nodes and return `(cpu_count, hart_ids)`.
+/// Count the enabled DTB CPU nodes: the slots [`place_hart_ids`] needs, less
+/// one for a boot hart the tree may omit.
 ///
 /// Walks nodes with `compatible = "riscv"`, which is the standard compatible
 /// string for RISC-V CPU nodes. Under `/cpus`, `#address-cells=1, #size-cells=0`
@@ -919,49 +911,62 @@ fn read_be64(buf: &[u8]) -> u64
 /// The generic [`Fdt::walk_compatible`] assumes `#address-cells=2`, so this
 /// function uses [`Fdt::walk_cpu_nodes`], which reads the u32 `reg` field.
 ///
-/// Returns `(0, [0; MAX_CPUS])` if no CPU nodes are found or DTB is invalid
-/// — the caller (consulted only when ACPI is absent) then defaults to a single CPU. Harts beyond
-/// [`MAX_CPUS`] are dropped with a diagnostic.
+/// Returns 0 if no CPU nodes are found or the DTB is invalid; the caller
+/// (consulted only when ACPI is absent) then defaults to a single CPU.
 ///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
-pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
+pub unsafe fn parse_cpu_count(dtb_addr: u64) -> usize
 {
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
     let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
     else
     {
-        return (0, [0u32; MAX_CPUS]);
+        return 0;
     };
-
-    let mut hart_ids = [0u32; MAX_CPUS];
-    let mut count: u32 = 0;
-    let mut truncated = false;
-
-    // Walk enabled CPU nodes (an exact "riscv" compatible entry); walk_cpu_nodes
-    // supplies each node's reg as a single BE u32 hart ID.
-    // MAX_CPUS fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
-    let max_cpus_u32 = MAX_CPUS as u32;
-    fdt.walk_cpu_nodes(|reg_u32, _caps, _mmu| {
-        if count < max_cpus_u32
-        {
-            hart_ids[count as usize] = reg_u32;
-            count += 1;
-        }
-        else
-        {
-            truncated = true;
-        }
-        true // continue
+    let mut count: usize = 0;
+    fdt.walk_cpu_nodes(|_reg, _caps, _mmu| {
+        count += 1;
+        true
     });
+    count
+}
 
+/// Place the enabled DTB harts into `out` (`firmware::place_cpu_ids`): the
+/// boot hart `bsp_id` at index 0, then each other hart ID once, in tree order.
+/// Returns the hart count; harts past `out`, sized from [`parse_cpu_count`]
+/// and capped at `boot_protocol::MAX_CPUS`, are dropped with a diagnostic.
+///
+/// # Safety
+/// As [`parse_cpu_count`]. `out` must hold at least one slot.
+pub unsafe fn place_hart_ids(dtb_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
+{
+    // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
+    let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
+    else
+    {
+        out[0] = bsp_id;
+        return 1;
+    };
+    // walk_cpu_nodes takes a callback, so each hart is placed as it arrives.
+    let mut filled: usize = 1;
+    let mut truncated = false;
+    out[0] = bsp_id;
+    fdt.walk_cpu_nodes(|reg_u32, _caps, _mmu| {
+        crate::firmware::record_cpu_id(reg_u32, out, &mut filled, &mut truncated);
+        true
+    });
     if truncated
     {
-        bprintln!("[--------] boot: DTB: more than MAX_CPUS hart nodes; surplus dropped");
+        bprintln!(
+            "[--------] boot: DTB: more than MAX_CPUS distinct harts (boot hart included); surplus \
+             dropped"
+        );
     }
-
-    (count, hart_ids)
+    // filled is at most out.len(), at most MAX_CPUS, which fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let count = filled as u32;
+    count
 }
 
 /// Parse the DTB hart capabilities: the `/cpus` `timebase-frequency` and
@@ -1115,9 +1120,8 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     // child-space 2 (32-bit MMIO) or 3 (64-bit MMIO) are BAR windows.
     fdt.walk_compatible(b"pci-host-ecam-generic", |node| {
         push_first_reg(out, &mut n, &mut dropped, &node);
-        for i in 0..node.ranges_count
+        for (flags, cpu_addr, size) in fdt.pci_ranges(&node)
         {
-            let (flags, cpu_addr, size) = node.ranges_entries[i];
             let space = (flags >> 24) & 0x3;
             if (space == 2 || space == 3) && size > 0
             {
@@ -1376,13 +1380,13 @@ mod tests
         assert_eq!(reg, Some((0x1000_0000, 0x1000)));
     }
 
-    // Defect caught: a ranges bound below a PCIe host bridge's window count,
-    // dropping BAR windows the aperture seeds need.
+    // Defect caught: a bound on a host bridge's ranges entries, dropping BAR
+    // windows the aperture seeds need.
     #[test]
-    fn a_host_bridge_with_eight_ranges_keeps_them_all()
+    fn a_host_bridge_with_forty_ranges_keeps_them_all()
     {
         let mut ranges = Vec::new();
-        for i in 0..8u32
+        for i in 0..40u32
         {
             // child_hi (64-bit MMIO), child_mid, child_lo, parent (u64), size (u64)
             ranges.extend_from_slice(&0x0300_0000u32.to_be_bytes());
@@ -1403,10 +1407,10 @@ mod tests
         let fdt = unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.expect("valid FDT");
         let mut count = None;
         fdt.walk_compatible(b"pci-host-ecam-generic", |node| {
-            count = Some(node.ranges_count);
+            count = Some(fdt.pci_ranges(&node).count());
             false
         });
-        assert_eq!(count, Some(8));
+        assert_eq!(count, Some(40));
     }
 
     // Defect caught: a PLIC's `riscv,ndev` not reaching the walker's node, so the
@@ -1511,7 +1515,7 @@ mod tests
             .expect("the tree has a property");
         blob[prop + 4..prop + 8].copy_from_slice(&u32::MAX.to_be_bytes());
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
-        let (count, _) = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
+        let count = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
         assert_eq!(count, 0);
         assert_eq!(hart_caps(&blob), (0, 0));
     }
@@ -1643,9 +1647,15 @@ mod tests
             cpu_node(b, b"cpu@1", 9, &[]);
         });
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
-        let (count, ids) = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
+        let base = blob.as_ptr() as u64;
+        // SAFETY: as above.
+        let entries = unsafe { parse_cpu_count(base) };
+        assert_eq!(entries, 2);
+        let mut ids = vec![0u32; crate::firmware::cpu_id_capacity(entries)];
+        // SAFETY: as above.
+        let count = unsafe { place_hart_ids(base, 9, &mut ids) };
         assert_eq!(count, 2);
-        assert_eq!(&ids[..2], &[7, 9]);
+        assert_eq!(&ids[..2], &[9, 7]);
     }
 
     /// Build an FDT with a `/chosen` node carrying `rng-seed = seed`.

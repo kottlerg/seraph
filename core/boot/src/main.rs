@@ -38,15 +38,14 @@ use crate::uefi::{
 };
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
-    KernelMmio, MAX_APERTURES, MAX_CPUS, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice,
-    MmioAperture, MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
-    bundle,
+    KernelMmio, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
+    MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice, bundle,
 };
 
-/// Maximum boot modules carried in [`BootInfo::modules`]. Sized to comfortably
-/// cover the current set (`xtask/src/bundle.rs::MODULES`) plus future additions
-/// before the bundle entry count exceeds the array.
-const MAX_MODULES: usize = 16;
+/// Maximum boot modules carried in [`BootInfo::modules`]: the ABI bound, the
+/// `BootModule` entries the one-page module array holds. A bundle with more is
+/// refused by name ([`BootError::InvalidBundle`]).
+const MAX_MODULES: usize = boot_protocol::MAX_BOOT_MODULES;
 
 /// `\EFI\seraph\kernel` as a NUL-terminated UTF-16 path for
 /// `EFI_FILE_PROTOCOL.Open()`.
@@ -112,22 +111,22 @@ const MEM_MAP_SLACK_ENTRIES: usize = 32;
 const MAX_IDENTITY_REGIONS: usize = 64;
 
 /// Size of the aperture-seed buffer (firmware-advertised MMIO extents before
-/// merging with the UEFI memory map): one per aperture the output can hold,
-/// since every seed that survives the merge as its own window is an aperture.
-/// A seeder past it drops the surplus with a diagnostic.
-const MAX_APERTURE_SEEDS: usize = MAX_APERTURES;
+/// merging with the UEFI memory map). The aperture array is sized to hold every
+/// aperture a full buffer can yield (`memory_map::aperture_capacity`). A seeder
+/// past it drops the surplus with a diagnostic.
+const MAX_APERTURE_SEEDS: usize = memory_map::MAX_SEEDS_PER_CLASS;
 
 /// Size of the heuristic-window seed buffer (two layout-heuristic PCI windows
-/// per MCFG allocation entry plus the arch's default PCI windows): one per
-/// aperture the output can hold, for the reason [`MAX_APERTURE_SEEDS`] gives.
-const MAX_HEURISTIC_SEEDS: usize = MAX_APERTURES;
+/// per MCFG allocation entry plus the arch's default PCI windows), sized as
+/// [`MAX_APERTURE_SEEDS`] is.
+const MAX_HEURISTIC_SEEDS: usize = memory_map::MAX_SEEDS_PER_CLASS;
 
 /// Most entries step 9 records in `BootInfo.reclaim_ranges`: the `BootInfo`,
-/// module, memory-map entry, aperture and reclaim-array pages, the raw map
-/// buffer, the page-table pool, the x86-64 LA57 toggle page and the AP
-/// trampoline page (nine), and one bundle gap before, between and after the
-/// at most [`MAX_MODULES`] module bodies.
-const MAX_RECLAIM_ENTRIES: usize = 9 + MAX_MODULES + 1;
+/// module, memory-map entry, aperture, CPU-id and reclaim-array pages, the raw
+/// map buffer, the page-table pool, the x86-64 LA57 toggle page and the AP
+/// trampoline page (ten), and one bundle gap before, between and after the at
+/// most [`MAX_MODULES`] module bodies.
+const MAX_RECLAIM_ENTRIES: usize = 10 + MAX_MODULES + 1;
 
 // The reclaim array's page holds every entry step 9 can record, so the
 // overflow halt in step 9 is unreachable.
@@ -201,8 +200,11 @@ struct CpuTopology
     bsp_id: u32,
     /// Number of enabled CPUs (always ≥ 1).
     count: u32,
-    /// Per-CPU hardware identifiers; `[0] == bsp_id`.
-    cpu_ids: [u32; MAX_CPUS],
+    /// Physical address of the per-CPU hardware identifiers, `count` `u32`s
+    /// with `[0] == bsp_id`, in pages of their own (`BootInfo.cpu_ids`).
+    ids_phys: u64,
+    /// Pages of the allocation at `ids_phys`, recorded as a reclaim range.
+    ids_pages: usize,
 }
 
 /// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL` or, as a
@@ -280,6 +282,11 @@ struct BootAllocations
     /// [`MEM_MAP_SLACK_ENTRIES`].
     mem_entries_pages: usize,
     apertures_phys: u64,
+    /// Apertures the array at `apertures_phys` holds
+    /// (`memory_map::aperture_capacity`).
+    aperture_capacity: usize,
+    /// Pages of the array at `apertures_phys`.
+    apertures_pages: usize,
     stack_phys: u64,
     stack_top: u64,
     ap_trampoline_phys: u64,
@@ -353,7 +360,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: ctx.st is a valid UEFI system table.
     let firm = unsafe { step5_discover_firmware(&ctx) };
     // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.
-    let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm) };
+    let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm)? };
     // Negotiate the paging mode before step 6 fixes the table hierarchy depth
     // and step 10 installs it: Sv39/Sv48/Sv57 on riscv64, 4- or 5-level on
     // x86-64, where a depth other than the firmware's also reserves the LA57
@@ -745,10 +752,20 @@ unsafe fn step5_discover_firmware(ctx: &UefiContext) -> FirmwareInfo
 /// Derive the CPU topology from ACPI MADT (primary on both arches) or DTB
 /// `/cpus` (fallback on RISC-V when ACPI is absent).
 ///
+/// Each source is walked twice: once to count its enabled CPU entries, which
+/// sizes the `cpu_ids` allocation (`firmware::cpu_id_capacity`), and once to
+/// fill it.
+///
+/// # Errors
+/// [`BootError::OutOfMemory`] when the `cpu_ids` pages cannot be allocated.
+///
 /// # Safety
-/// `ctx.st` must be valid. `firm.acpi_rsdp` / `firm.device_tree` must be
-/// zero or the physical address of an identity-mapped table.
-unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) -> CpuTopology
+/// `ctx.st` and `ctx.bs` must be valid. `firm.acpi_rsdp` / `firm.device_tree`
+/// must be zero or the physical address of an identity-mapped table.
+unsafe fn step5_discover_cpu_topology(
+    ctx: &UefiContext,
+    firm: &FirmwareInfo,
+) -> Result<CpuTopology, BootError>
 {
     // SAFETY: ctx.st is valid.
     let boot_hart_id = unsafe { arch::current::discover_boot_hart_id(ctx.st) };
@@ -759,62 +776,87 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
     // Fallback on RISC-V: DTB /cpus if ACPI is absent.
     if firm.acpi_rsdp != 0
     {
-        // SAFETY: acpi_rsdp is identity-mapped; parse_cpu_topology validates the table.
-        let (count, _, cpu_ids) = unsafe { acpi::parse_cpu_topology(firm.acpi_rsdp, bsp_id) };
+        // SAFETY: acpi_rsdp is identity-mapped; the walk validates the tables.
+        let capacity = unsafe { acpi::cpu_topology_capacity(firm.acpi_rsdp) };
+        // SAFETY: bs is valid.
+        let (ids, ids_phys, ids_pages) = unsafe { allocate_cpu_ids(ctx.bs, capacity)? };
+        // SAFETY: as above.
+        let count = unsafe { acpi::parse_cpu_topology(firm.acpi_rsdp, bsp_id, ids) };
         bprintln!("[--------] boot: ACPI: {count} CPU(s) found via MADT");
-        CpuTopology {
+        return Ok(CpuTopology {
             boot_hart_id,
             bsp_id,
             count,
-            cpu_ids,
-        }
+            ids_phys,
+            ids_pages,
+        });
     }
-    else if firm.device_tree != 0
+    let entries = if firm.device_tree != 0
     {
         // SAFETY: device_tree is identity-mapped; parse_cpu_count validates the FDT.
-        let (count, hart_ids) = unsafe { dtb::parse_cpu_count(firm.device_tree) };
-        if count > 0
-        {
-            let (count, cpu_ids, truncated) =
-                firmware::place_cpu_ids(bsp_id, &hart_ids[..count as usize]);
-            if truncated
-            {
-                bprintln!(
-                    "[--------] boot: DTB: more than MAX_CPUS distinct harts (boot hart \
-                     included); surplus dropped"
-                );
-            }
-            bprintln!("[--------] boot: DTB: {count} hart(s) found");
-            CpuTopology {
-                boot_hart_id,
-                bsp_id,
-                count,
-                cpu_ids,
-            }
-        }
-        else
-        {
-            bprintln!("[--------] boot: DTB: no CPU nodes found, defaulting to 1");
-            single_cpu_topology(boot_hart_id, bsp_id)
-        }
+        unsafe { dtb::parse_cpu_count(firm.device_tree) }
     }
     else
     {
-        bprintln!("[--------] boot: CPU topology: no firmware tables, defaulting to 1");
-        single_cpu_topology(boot_hart_id, bsp_id)
+        0
+    };
+    // SAFETY: bs is valid.
+    let (ids, ids_phys, ids_pages) =
+        unsafe { allocate_cpu_ids(ctx.bs, firmware::cpu_id_capacity(entries))? };
+    let count = if entries > 0
+    {
+        // SAFETY: device_tree is identity-mapped; the walk validates the FDT.
+        let count = unsafe { dtb::place_hart_ids(firm.device_tree, bsp_id, ids) };
+        bprintln!("[--------] boot: DTB: {count} hart(s) found");
+        count
     }
-}
-
-fn single_cpu_topology(boot_hart_id: u64, bsp_id: u32) -> CpuTopology
-{
-    let mut cpu_ids = [0u32; MAX_CPUS];
-    cpu_ids[0] = bsp_id;
-    CpuTopology {
+    else
+    {
+        if firm.device_tree != 0
+        {
+            bprintln!("[--------] boot: DTB: no CPU nodes found, defaulting to 1");
+        }
+        else
+        {
+            bprintln!("[--------] boot: CPU topology: no firmware tables, defaulting to 1");
+        }
+        ids[0] = bsp_id;
+        1
+    };
+    Ok(CpuTopology {
         boot_hart_id,
         bsp_id,
-        count: 1,
-        cpu_ids,
-    }
+        count,
+        ids_phys,
+        ids_pages,
+    })
+}
+
+/// Allocate the zeroed pages for `capacity` CPU hardware IDs
+/// (`BootInfo.cpu_ids`). Returns the array, its physical address, and its
+/// page count.
+///
+/// # Errors
+/// [`BootError::OutOfMemory`] when `AllocatePages` fails.
+///
+/// # Safety
+/// `bs` must be valid boot services (before `ExitBootServices`).
+unsafe fn allocate_cpu_ids(
+    bs: *mut uefi::EfiBootServices,
+    capacity: usize,
+) -> Result<(&'static mut [u32], u64, usize), BootError>
+{
+    let pages = (capacity.max(1) * core::mem::size_of::<u32>()).div_ceil(4096);
+    // SAFETY: bs is valid.
+    let phys = unsafe { allocate_pages(bs, pages)? };
+    // SAFETY: allocate_pages returned `pages` identity-mapped pages this
+    // allocation owns and nothing else references; they hold `capacity` u32s,
+    // zeroed before the slice is formed.
+    let ids = unsafe {
+        core::ptr::write_bytes(phys as *mut u8, 0, pages * 4096);
+        core::slice::from_raw_parts_mut(phys as *mut u32, capacity.max(1))
+    };
+    Ok((ids, phys, pages))
 }
 
 // ── Step 5b: AP trampoline allocation ────────────────────────────────────────
@@ -1114,9 +1156,13 @@ unsafe fn step6_allocate_and_build_page_tables(
     // MemoryMapEntry output array.
     // SAFETY: bs is valid.
     let mem_entries_phys = unsafe { allocate_pages(ctx.bs, mem_entries_pages)? };
-    // MMIO aperture array: one page holds exactly MAX_APERTURES × 16 bytes.
+    // MMIO aperture array, sized from the same descriptor count
+    // (memory_map::aperture_capacity).
+    let aperture_capacity =
+        memory_map::aperture_capacity(firmware_descriptors + MEM_MAP_SLACK_ENTRIES);
+    let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
     // SAFETY: bs is valid.
-    let apertures_phys = unsafe { allocate_pages(ctx.bs, 1)? };
+    let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
     // Kernel handoff stack, above its guard page.
     // SAFETY: bs is valid.
     let stack_alloc_phys = unsafe { allocate_pages(ctx.bs, HANDOFF_STACK_ALLOC_PAGES)? };
@@ -1146,6 +1192,8 @@ unsafe fn step6_allocate_and_build_page_tables(
         mem_entries_phys,
         mem_entries_pages,
         apertures_phys,
+        aperture_capacity,
+        apertures_pages,
         stack_phys,
         stack_top,
         ap_trampoline_phys,
@@ -1245,7 +1293,10 @@ fn collect_identity_regions(
         push(uart_base, 4096);
     }
     // MMIO aperture array page.
-    push(allocs.apertures_phys, 4096);
+    push(
+        allocs.apertures_phys,
+        (allocs.apertures_pages as u64) * 4096,
+    );
     // Reclaim-array page: backs BootInfo.reclaim_ranges.
     push(allocs.reclaim_array_phys, 4096);
     n
@@ -1369,7 +1420,7 @@ unsafe fn step9_populate_boot_info(
     let modules_ptr = allocs.modules_phys as *mut BootModule;
     for (i, &module) in mods.modules.iter().enumerate().take(mods.count)
     {
-        // SAFETY: modules_phys is a 4096-byte allocation; count ≤ MAX_MODULES (16)
+        // SAFETY: modules_phys is a 4096-byte allocation; count ≤ MAX_MODULES (85)
         // so 16 × 48-byte BootModule entries (768 bytes) fit.
         unsafe { core::ptr::write(modules_ptr.add(i), module) };
     }
@@ -1442,15 +1493,20 @@ unsafe fn step9_populate_boot_info(
         }
     }
 
-    let apertures_out = allocs.apertures_phys as *mut MmioAperture;
-    // SAFETY: apertures_phys is a valid 4 KiB allocation with room for
-    // MAX_APERTURES × sizeof(MmioAperture) = 4096 bytes.
-    let apertures_buf: &mut [MmioAperture; MAX_APERTURES] =
-        unsafe { &mut *(apertures_out.cast::<[MmioAperture; MAX_APERTURES]>()) };
-    *apertures_buf = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; MAX_APERTURES];
+    // SAFETY: apertures_phys is the step 6 allocation of apertures_pages pages,
+    // identity-mapped and owned by the bootloader, with room for
+    // aperture_capacity entries; it is zeroed before the slice is formed.
+    let apertures_buf: &mut [MmioAperture] = unsafe {
+        core::ptr::write_bytes(
+            allocs.apertures_phys as *mut u8,
+            0,
+            allocs.apertures_pages * 4096,
+        );
+        core::slice::from_raw_parts_mut(
+            allocs.apertures_phys as *mut MmioAperture,
+            allocs.aperture_capacity,
+        )
+    };
     // SAFETY: uefi_map.buffer_phys is the raw UEFI map from step 7, still mapped.
     let aperture_count = unsafe {
         memory_map::derive_mmio_apertures(
@@ -1503,7 +1559,11 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0)?;
     }
-    push_reclaim(allocs.apertures_phys, 1, 0)?;
+    // The aperture array is a few pages at most, far below u32::MAX pages.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        push_reclaim(allocs.apertures_phys, allocs.apertures_pages as u32, 0)?;
+    }
     // The map buffer is a whole-page allocation far below u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
     {
@@ -1570,6 +1630,13 @@ unsafe fn step9_populate_boot_info(
     // AP trampoline page: flagged `RECLAIM_FLAG_LATE`; the kernel mints it after
     // SMP bringup (core/kernel/docs/initialization.md § Phase 8: Scheduler and
     // SMP Bringup).
+    // CPU-id pages: the kernel reads them through Phase 8 (SMP bringup), before
+    // init, the first user of a reclaimed page, runs.
+    // The array is a few pages at most (`MAX_CPUS` u32s), far below u32::MAX.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        push_reclaim(cpus.ids_phys, cpus.ids_pages as u32, 0)?;
+    }
     if allocs.ap_trampoline_phys != 0
     {
         push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE)?;
@@ -1667,7 +1734,7 @@ unsafe fn step9_populate_boot_info(
                 },
                 cpu_count: cpus.count.max(1),
                 bsp_id: cpus.bsp_id,
-                cpu_ids: cpus.cpu_ids,
+                cpu_ids: cpus.ids_phys as *const u32,
                 ap_trampoline_page: allocs.ap_trampoline_phys,
                 reclaim_ranges: ReclaimSlice {
                     entries: allocs.reclaim_array_phys as *const ReclaimRange,

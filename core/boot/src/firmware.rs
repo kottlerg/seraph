@@ -49,40 +49,62 @@ pub unsafe fn discover_firmware(st: *mut EfiSystemTable) -> FirmwareInfo
     }
 }
 
-/// Place the enabled CPU hardware IDs a firmware table lists into the
-/// `BootInfo.cpu_ids` layout: `bsp_id` at index 0, then each other distinct
-/// ID once, in table order.
+/// Place the enabled CPU hardware IDs a firmware table lists into `out`, the
+/// `BootInfo.cpu_ids` layout: `bsp_id` at index 0, then each other distinct ID
+/// once, in table order.
 ///
-/// Returns `(cpu_count, cpu_ids, truncated)`. `cpu_count` is the number of
-/// slots filled, so the BSP counts once whether or not the table lists it,
-/// and `cpu_ids[1..cpu_count]` holds exactly the APs. `truncated` is set when
-/// a distinct ID found no slot (more than [`MAX_CPUS`] CPUs, BSP included).
-pub fn place_cpu_ids(bsp_id: u32, ids: &[u32]) -> (u32, [u32; MAX_CPUS], bool)
+/// Returns `(cpu_count, truncated)`. `cpu_count` is the number of slots of
+/// `out` filled, so the BSP counts once whether or not the table lists it, and
+/// `out[1..cpu_count]` holds exactly the APs. `truncated` is set when a
+/// distinct ID found no slot. `out` must hold at least one slot; the caller
+/// sizes it from the table's entry count, capped at [`MAX_CPUS`], so only a
+/// table listing more than [`MAX_CPUS`] CPUs truncates.
+pub fn place_cpu_ids(
+    bsp_id: u32,
+    ids: impl IntoIterator<Item = u32>,
+    out: &mut [u32],
+) -> (u32, bool)
 {
-    let mut cpu_ids = [0u32; MAX_CPUS];
-    cpu_ids[0] = bsp_id;
+    out[0] = bsp_id;
     let mut filled: usize = 1;
     let mut truncated = false;
-    for &id in ids
+    for id in ids
     {
-        if cpu_ids[..filled].contains(&id)
-        {
-            continue;
-        }
-        if filled < MAX_CPUS
-        {
-            cpu_ids[filled] = id;
-            filled += 1;
-        }
-        else
-        {
-            truncated = true;
-        }
+        record_cpu_id(id, out, &mut filled, &mut truncated);
     }
-    // filled is at most MAX_CPUS, which fits in u32.
+    // filled is at most out.len(), at most MAX_CPUS, which fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let cpu_count = filled as u32;
-    (cpu_count, cpu_ids, truncated)
+    (cpu_count, truncated)
+}
+
+/// Append one enabled CPU's hardware ID to `ids[..*count]`, skipping an ID
+/// already there (the BSP, or a CPU a firmware table lists twice, as a Local
+/// APIC and a Local x2APIC entry) so no CPU is counted or started twice. Sets
+/// `truncated` when `ids` is full.
+pub fn record_cpu_id(id: u32, ids: &mut [u32], count: &mut usize, truncated: &mut bool)
+{
+    if ids[..*count].contains(&id)
+    {
+        return;
+    }
+    if *count < ids.len()
+    {
+        ids[*count] = id;
+        *count += 1;
+    }
+    else
+    {
+        *truncated = true;
+    }
+}
+
+/// Slots the `cpu_ids` array needs for a table listing `entries` enabled CPUs:
+/// one more for a BSP the table may omit, capped at [`MAX_CPUS`] (the kernel's
+/// CPU-count width) and never below one.
+pub fn cpu_id_capacity(entries: usize) -> usize
+{
+    entries.saturating_add(1).min(MAX_CPUS)
 }
 
 #[cfg(test)]
@@ -93,16 +115,18 @@ mod tests
     #[test]
     fn bsp_absent_from_the_list_still_counts_once()
     {
-        let (count, ids, truncated) = place_cpu_ids(0, &[1, 2, 3]);
+        let mut ids = [0u32; 4];
+        let (count, truncated) = place_cpu_ids(0, [1, 2, 3], &mut ids);
         assert_eq!(count, 4);
-        assert_eq!(ids[..4], [0, 1, 2, 3]);
+        assert_eq!(ids, [0, 1, 2, 3]);
         assert!(!truncated);
     }
 
     #[test]
     fn listed_bsp_is_not_placed_again()
     {
-        let (count, ids, _) = place_cpu_ids(2, &[0, 1, 2, 3]);
+        let mut ids = [0u32; 5];
+        let (count, _) = place_cpu_ids(2, [0, 1, 2, 3], &mut ids);
         assert_eq!(count, 4);
         assert_eq!(ids[..4], [2, 0, 1, 3]);
     }
@@ -110,7 +134,8 @@ mod tests
     #[test]
     fn duplicated_id_is_placed_once()
     {
-        let (count, ids, _) = place_cpu_ids(0, &[1, 2, 1]);
+        let mut ids = [0u32; 4];
+        let (count, _) = place_cpu_ids(0, [1, 2, 1], &mut ids);
         assert_eq!(count, 3);
         assert_eq!(ids[..3], [0, 1, 2]);
     }
@@ -118,15 +143,16 @@ mod tests
     #[test]
     fn empty_list_is_the_bsp_alone()
     {
-        let (count, ids, truncated) = place_cpu_ids(7, &[]);
+        let mut ids = [0u32; 1];
+        let (count, truncated) = place_cpu_ids(7, [], &mut ids);
         assert_eq!((count, ids[0], truncated), (1, 7, false));
     }
 
     #[test]
     fn full_list_including_the_bsp_fits_exactly()
     {
-        let ids: Vec<u32> = (0..MAX_CPUS as u32).collect();
-        let (count, _, truncated) = place_cpu_ids(0, &ids);
+        let mut out = vec![0u32; cpu_id_capacity(MAX_CPUS)];
+        let (count, truncated) = place_cpu_ids(0, 0..MAX_CPUS as u32, &mut out);
         assert_eq!(count as usize, MAX_CPUS);
         assert!(!truncated);
     }
@@ -134,10 +160,21 @@ mod tests
     #[test]
     fn full_list_omitting_the_bsp_drops_the_last_ap_and_says_so()
     {
-        let ids: Vec<u32> = (1..=MAX_CPUS as u32).collect();
-        let (count, placed, truncated) = place_cpu_ids(0, &ids);
+        let mut placed = vec![0u32; cpu_id_capacity(MAX_CPUS)];
+        let (count, truncated) = place_cpu_ids(0, 1..=MAX_CPUS as u32, &mut placed);
         assert_eq!(count as usize, MAX_CPUS);
         assert_eq!(placed[MAX_CPUS - 1], MAX_CPUS as u32 - 1);
         assert!(truncated);
+    }
+
+    // Defect caught: a capacity that leaves no slot for a BSP the table omits,
+    // or exceeds the kernel's CPU-count width.
+    #[test]
+    fn capacity_adds_the_bsp_and_caps_at_max_cpus()
+    {
+        assert_eq!(cpu_id_capacity(0), 1);
+        assert_eq!(cpu_id_capacity(3), 4);
+        assert_eq!(cpu_id_capacity(MAX_CPUS - 1), MAX_CPUS);
+        assert_eq!(cpu_id_capacity(MAX_CPUS + 100), MAX_CPUS);
     }
 }

@@ -92,9 +92,10 @@ Malformed tables are skipped, not fatal:
   window whose start or end overflows a 64-bit physical address is skipped, along with its
   derived PCI BAR windows.
 
-No diagnostic is logged for a malformed or absent table; the walker's
-only diagnostics report surplus MADT entries (more than `MAX_CPUS`
-enabled CPUs, or on x86-64 more than `MAX_IOAPICS` IOAPICs). The
+No diagnostic is logged for a malformed or absent table; the walkers'
+only diagnostics report surplus entries (more than `MAX_CPUS` enabled
+CPUs, on x86-64 more than `MAX_IOAPICS` IOAPICs, or aperture seeds past
+the seed buffers). The
 bootloader proceeds with whatever it successfully extracted. The kernel
 falls back to its compile-time defaults
 for any zero MMIO base field, but a zero riscv64 `timebase_freq` or a missing `hart_caps`
@@ -106,7 +107,7 @@ left it zero and ORs in further `hart_caps` bits) halts the kernel at Phase 5 (s
 
 ## What Lives Elsewhere
 
-- Aperture merging / sort / cap-at-`MAX_APERTURES` invariants are owned by
+- Aperture merging / sort / cap invariants are owned by
   [firmware-parsing.md](firmware-parsing.md) §"`mmio_apertures` construction"; the
   implementation is `derive_mmio_apertures` in
   [`core/boot/src/memory_map.rs`](../src/memory_map.rs).

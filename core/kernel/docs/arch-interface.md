@@ -351,7 +351,8 @@ pub unsafe fn flush_kernel_page(virt: u64);
 
 /// Drop every translation this CPU caches, in every address space: x86-64
 /// INVPCID's all-context form with tagged TLBs and a CR3 reload without them;
-/// RISC-V `sfence.vma zero, zero`. The kernel-stack guards' switch-in flush
+/// RISC-V `sfence.vma zero, zero`. The kernel-stack guards' flush at a
+/// switch-in and in `sched::enter` before init's first run
 /// (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn flush_all_contexts();
 ```

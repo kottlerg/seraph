@@ -6594,7 +6594,7 @@ pub unsafe fn enter() -> !
     let entry_point = init_tcb.saved_state.entry_point();
 
     // Disable interrupts before entering user mode.
-    // On x86-64: no-op (interrupts are re-enabled by iretq/sysret flags).
+    // On x86-64: `cli`; iretq restores IF from the frame's rflags.
     // On RISC-V: return_to_user sets sstatus to SPP=0/SPIE=1/SIE=0 before
     // sret; SIE is re-enabled atomically by sret. Disabling here prevents any
     // stray interrupt from arriving before return_to_user arms sscratch.

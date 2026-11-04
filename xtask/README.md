@@ -595,8 +595,8 @@ and fail markers, `--timeout` defaulting to 900 s) with `--save-logs` into
 boot left there is removed first). A boot that ends `FAIL`, `HANG`, `OK` or `ERR` fails the command
 before the check, as it fails `run-parallel`. A `QEMU-CRASH` boot, a host-emulator crash that
 `run-parallel` does not count as a failure, leaves a log without the pass marker: the check reads
-the outcome from the log's `[run-parallel]` trailer and reports itself skipped, which passes the
-command, for a saved log given with `--log` as well. Stage svctest first, as
+the outcome from the log's `[run-parallel]` trailer, its last line, and reports itself skipped,
+which passes the command, for a saved log given with `--log` as well. Stage svctest first, as
 [docs/testing.md](../docs/testing.md) § Gating describes.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.

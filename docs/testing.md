@@ -312,8 +312,9 @@ The check reads a serial log and does not need its own boot. In CI it runs
 inside each `svctest` cell (both arches, both profiles), after the svctest
 `run-parallel` boot, against the log that boot's `--save-logs` saved
 (`--log`). A boot that `run-parallel` records as `QEMU-CRASH`, a host-emulator
-crash it does not count as a failure, is skipped, since its log shows nothing
-of the guest. Run with no `--log`, it boots the current sysroot once through
+crash it does not count as a failure, is skipped: its log holds the guest's
+output only up to the crash and has no pass marker, so it cannot show whether
+the guest finished. Run with no `--log`, it boots the current sysroot once through
 `run-parallel` and checks that boot's log, so svctest must be staged as above
 (command reference:
 [xtask/README.md § test-logd-reclaim](../xtask/README.md#cargo-xtask-test-logd-reclaim)).

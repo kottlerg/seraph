@@ -10,9 +10,10 @@
 //! `reclaim (resync): badge=<b> name=<n>`. The badge is decimal, the exit
 //! reason lower-case hex, and the name, the last field, runs to the end of
 //! the line: a control character in it, a line break among them, prints as
-//! U+FFFD, as does each invalid UTF-8 sequence. `cargo xtask test-logd-reclaim` reads the death drain's shape
-//! from the serial log, so the shape is a contract, stated in
-//! `services/logd/docs/ipc-interface.md` § Death-notification cascade.
+//! U+FFFD, as does each invalid UTF-8 sequence. `cargo xtask
+//! test-logd-reclaim` reads the death drain's shape from the serial log, so
+//! the shape is a contract, stated in `services/logd/docs/ipc-interface.md`
+//! § Death-notification cascade.
 
 use core::fmt::{self, Write as _};
 

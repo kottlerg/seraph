@@ -65,7 +65,8 @@ enum Verdict
     /// logd reclaimed the child's slot; the child's badge.
     Pass(u64),
     /// The boot's `run-parallel` outcome, a host-emulator crash: the log
-    /// cannot show what the guest did, so nothing is checked.
+    /// holds the guest's output only up to the crash, so it cannot show
+    /// whether the guest completed, and nothing is checked.
     Skipped(String),
 }
 
@@ -106,11 +107,15 @@ fn parse_reclaim(line: &str) -> Option<Reclaim<'_>>
 }
 
 /// The `outcome=` field of the log's `run-parallel` trailer, when it has one.
+/// `--save-logs` appends the trailer as the log's last line, so only that
+/// line is read: a guest line with the same prefix cannot stand in for it.
 fn trailer_outcome(log: &str) -> Option<&str>
 {
     log.lines()
-        .filter_map(|l| l.strip_prefix(TRAILER_PREFIX))
-        .flat_map(str::split_whitespace)
+        .rev()
+        .find(|l| !l.trim().is_empty())?
+        .strip_prefix(TRAILER_PREFIX)?
+        .split_whitespace()
         .find_map(|kv| kv.strip_prefix("outcome="))
 }
 
@@ -342,6 +347,15 @@ mod tests
             check_log(log).expect("skipped"),
             Verdict::Skipped("QEMU-CRASH_rc=139".to_string())
         );
+    }
+
+    #[test]
+    fn a_guest_line_with_the_trailer_prefix_is_not_the_trailer()
+    {
+        let log = "[run-parallel] outcome=QEMU-CRASH_rc=139\n\
+                   [0.5] [svctest] SOME TESTS FAILED\n\
+                   [run-parallel] arch=riscv64 cpus=4 accel=tcg run=1 outcome=FAIL wall_s=12.000\n";
+        assert!(check_log(log).is_err());
     }
 
     #[test]

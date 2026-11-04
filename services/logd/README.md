@@ -75,8 +75,10 @@ targets; only the one-time init-logd history pull
   death-observer nodes (see
   [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)
   § `REGISTER_DEATH_EQ`). logd evicts the slot of exactly that badge from
-  its hash-keyed badge table (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md)). The EQ has a fixed
+  its hash-keyed badge table and logs a `reclaim:` line naming the badge,
+  the exit reason, and the slot's registered name (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Death-notification
+  cascade). The EQ has a fixed
   tuning capacity. A death posted to a full EQ is dropped, so a drain that
   took a full queue's worth starts a resync: a helper thread walks procmgr's
   live badges (`QUERY_LIVE_PROCESSES`) and logd evicts the slots it snapshotted
@@ -99,8 +101,8 @@ logd/
 ├── codec/                      # logd-codec, its own component shared
 │                               # with init-logd: handover wire contract,
 │                               # init-logd's history ring, the resync
-│                               # decisions, the shared line and name
-│                               # widths, and BoundedStr
+│                               # decisions, the reclaim line, the shared
+│                               # line and name widths, and BoundedStr
 │                               # (see codec/README.md)
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
@@ -148,8 +150,8 @@ the devmgr-registry cap for its lifetime (see
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
-| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |
-| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with and the `BoundedStr` diagnostic formatter |
+| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, and the `reclaim:` line logd logs when it evicts a slot |
+| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line formatter, and the `BoundedStr` diagnostic formatter |
 
 ---
 

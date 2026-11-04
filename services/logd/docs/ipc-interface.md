@@ -142,6 +142,23 @@ the full `u64` badge in the correlator word) and evicts the slot of exactly
 that badge from the hash-keyed badge table, so a death evicts only the dead
 sender's slot. Idempotent on already-evicted badges.
 
+When a death event evicts a slot, logd logs one line on the serial console,
+tagged `[logd]`:
+
+```
+reclaim: badge=<badge> exit_reason=0x<reason> name=<name>
+```
+
+The badge is decimal, the exit reason lower-case hex (the death entry's
+`exit_reason`), and the name is the slot's registered display name
+(`STREAM_REGISTER_NAME`), `?` for a slot that registered none. The name is
+the last field and runs to the end of the line; each invalid UTF-8 sequence
+and each control character in it, a line break among them, prints as U+FFFD.
+A badge with no slot logs nothing. The line is a test
+contract: `cargo xtask test-logd-reclaim` reads it from svctest's serial log
+(see [docs/testing.md](../../../docs/testing.md#death-forward-to-logd-test-logd-reclaim)).
+`logd_codec::reclaim` formats it.
+
 ## Death-queue resync
 
 logd's death `EventQueue` has a fixed tuning capacity (`DEATH_EQ_CAPACITY`,
@@ -160,8 +177,10 @@ a resync:
    the cursor, sends the list back over a channel, and signals the resync
    notification.
 3. On that wake the main thread evicts every snapshot badge the walk did not
-   list. A slot created after the snapshot is no candidate, so a sender that
-   starts during the walk keeps its slot. A failed walk evicts nothing.
+   list, logging `reclaim (resync): badge=<badge> name=<name>` for each (the
+   fields are those of the death drain's line). A slot created after the
+   snapshot is no candidate, so a sender that starts during the walk keeps its
+   slot. A failed walk evicts nothing.
 
 One walk runs at a time. A drain that crosses the capacity while one is in
 flight marks another due, and it starts as soon as the current walk ends, so the
@@ -182,4 +201,5 @@ ordering).
 
 ## Summarized By
 
-[services/logd/README.md](../README.md)
+[Testing](../../../docs/testing.md), [services/logd/README.md](../README.md),
+[services/logd/codec/README.md](../codec/README.md), [xtask/README.md](../../../xtask/README.md)

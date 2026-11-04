@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+use logd_codec::reclaim::{Cause, ReclaimLine};
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
@@ -484,13 +485,20 @@ fn evict_missing(snapshot: &[u64], live: &[u64], table: &mut SlotTable)
 {
     for badge in logd_codec::resync::evictable(snapshot, live)
     {
-        if table.evict(badge)
+        if let Some(slot) = table.evict(badge)
         {
-            let mut buf = SerialFmt::new();
-            let _ = write!(buf, "reclaim (resync): badge={badge}");
-            self_log(buf.as_str());
+            log_reclaim(badge, Cause::Resync, &slot.name);
         }
     }
+}
+
+/// Log the reclaim line for the evicted slot of `badge`, named `name`
+/// (`logd_codec::reclaim`).
+fn log_reclaim(badge: u64, cause: Cause, name: &[u8])
+{
+    let mut buf = SerialFmt::new();
+    let _ = write!(buf, "{}", ReclaimLine { badge, cause, name });
+    self_log(buf.as_str());
 }
 
 /// Walk procmgr's live badges (`QUERY_LIVE_PROCESSES`) page by page on the
@@ -556,15 +564,15 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable) -> bool
     {
         drained = drained.saturating_add(1);
         let badge = death.correlator;
-        if table.evict(badge)
+        if let Some(slot) = table.evict(badge)
         {
-            let mut buf = SerialFmt::new();
-            let _ = write!(
-                buf,
-                "reclaim: badge={badge} exit_reason=0x{:x}",
-                death.exit_reason
+            log_reclaim(
+                badge,
+                Cause::Death {
+                    exit_reason: death.exit_reason,
+                },
+                &slot.name,
             );
-            self_log(buf.as_str());
         }
     }
     if drained < DEATH_EQ_CAPACITY
@@ -998,7 +1006,10 @@ fn emit_line(_badge: u64, name: &[u8], line: &[u8])
     out.push(b'[');
     if name.is_empty()
     {
-        out.push(b'?');
+        for &b in logd_codec::reclaim::UNNAMED.as_bytes()
+        {
+            out.push(b);
+        }
     }
     else
     {

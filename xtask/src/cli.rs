@@ -94,6 +94,13 @@ pub enum CliCommand
     /// sysroot with the ktest bundle composed (see xtask/README.md).
     TestKaslr(TestKaslrArgs),
 
+    /// Check that a child's death reaches logd and evicts its slot: read a
+    /// svctest boot's serial log for logd's `reclaim:` line naming svctest's
+    /// `svctest-logd-reclaim` child. `--log` reads a saved log and boots
+    /// nothing; with no log, boots the current sysroot once (svctest staged)
+    /// through `run-parallel` and reads the log it saves (see xtask/README.md).
+    TestLogdReclaim(TestLogdReclaimArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
@@ -354,6 +361,43 @@ pub struct TestKaslrArgs
     pub x86_paging: X86Paging,
 }
 
+// ── TestLogdReclaim ───────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestLogdReclaimArgs
+{
+    /// Target architecture (the boot's; with `--log`, unused).
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// A svctest boot's saved serial log to check. With it, nothing boots.
+    #[arg(long, value_name = "FILE")]
+    pub log: Option<PathBuf>,
+
+    /// Boot timeout, in seconds, for HANG classification (ignored with
+    /// `--log`).
+    #[arg(long, default_value = "900")]
+    pub timeout: u64,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp; ignored with
+    /// `--log`).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m; ignored with `--log`).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+
+    /// riscv64 paging mode to negotiate (ignored on x86-64 and with
+    /// `--log`).
+    #[arg(long, default_value = "sv48")]
+    pub riscv_mmu: RiscvMmu,
+
+    /// Guest x86-64 paging depth (`x86_64` only; ignored with `--log`).
+    #[arg(long, default_value = "4")]
+    pub x86_paging: X86Paging,
+}
+
 // ── ComposeBundle ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -410,6 +454,13 @@ pub enum TestComponent
 pub const DEFAULT_FAIL_REGEX: &str =
     r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL";
 
+/// Default `run-parallel --pass` regex: the cross-harness terminal pass
+/// marker `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker).
+pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
+
+/// Default `run-parallel --fail-grace-secs`.
+pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
+
 #[derive(Parser)]
 pub struct RunParallelArgs
 {
@@ -455,7 +506,7 @@ pub struct RunParallelArgs
     /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
     /// [`docs/testing.md`](../../docs/testing.md); override for other
     /// rootfs configurations.
-    #[arg(long, default_value = "ALL TESTS PASSED")]
+    #[arg(long, default_value = DEFAULT_PASS_REGEX)]
     pub pass: String,
 
     /// Regex marking a failed run. On match the log is preserved as
@@ -495,7 +546,7 @@ pub struct RunParallelArgs
     /// truncates the diagnostics. The run is killed at whichever is first:
     /// this window, or the `--timeout` deadline. 0 kills on the next poll
     /// after the match.
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value_t = DEFAULT_FAIL_GRACE_SECS)]
     pub fail_grace_secs: u64,
 
     /// Also copy every run's log, whatever its outcome, to

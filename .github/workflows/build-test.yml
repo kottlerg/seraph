@@ -174,6 +174,13 @@ jobs:
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout "$budget" \
             --save-logs target/xtask/run-parallel-saved
+          if [ "${{ matrix.tester }}" = "svctest" ]; then
+            # No extra boot: the logd death-forward test reads the log the
+            # svctest boot above saved (--save-logs) for logd's reclaim line
+            # naming svctest's logd_death_forward child.
+            cargo xtask test-logd-reclaim --arch ${{ matrix.arch }} \
+              --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
+          fi
           if [ "${{ matrix.tester }}" = "ktest" ]; then
             # Extra boots: the KASLR randomization test (#252). Boots the
             # ktest bundle already composed above twice and asserts the

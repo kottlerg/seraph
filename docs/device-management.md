@@ -205,22 +205,24 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
 
 The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
 § `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the PLIC gateway is level-sensitive, so an
-assertion that persists while the line is masked is delivered at the unmask; the mode is validated
-and programs nothing. On x86-64 the line's I/O APIC entry is programmed with the mode's trigger
-and polarity (core/kernel/src/arch/x86_64/ioapic.rs), and a level-triggered entry likewise
-delivers at the unmask an assertion still held. devmgr gives each PCI driver the mode of its
-`INTx` line, which every driver on the line then passes: on x86-64 the trigger and polarity of the
-MADT Interrupt Source Override that names the line's GSI, field by field, with the PCI default
-(level-triggered, active-low) for a field the override leaves conforming to its bus and for a line
-no override names; on riscv64 level-triggered, active-high
-([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 3).
-On a line programmed edge-triggered and shared, an assertion while the line is masked or another
-device holds it high raises no new edge, and the device stays asserted until its interrupt status
-is read, so no later assertion on the line raises one either. The VirtIO interrupt-service
-thread's timed read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the
-driver's timed poll finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`,
-virtio-input's `POLL_INTERVAL_MS`), so the loss is latency, not a hang. Devices that need several
-interrupts are to get message-signaled ones (design intent, not yet implemented;
+assertion that arrives while the line is masked is delivered at the unmask (QEMU's PLIC model,
+though, does not pend a source again that stays asserted across its claim and completion, which the
+drivers' timed polls cover); the mode is validated and programs nothing. On x86-64 the line's I/O
+APIC entry is programmed with the mode's trigger and polarity
+(core/kernel/src/arch/x86_64/ioapic.rs), and a level-triggered entry likewise delivers at the unmask
+an assertion still held. devmgr gives each PCI driver the mode of its `INTx` line, which every
+driver on the line then passes: on x86-64 the trigger and polarity of the MADT Interrupt Source
+Override that names the line's GSI, field by field, with the PCI default (level-triggered,
+active-low) for a field the override leaves conforming to its bus and for a line no override names;
+on riscv64 level-triggered, active-high
+([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 3). On a
+line programmed edge-triggered and shared, an assertion while the line is masked or another device
+holds it high raises no new edge, and the device stays asserted until its interrupt status is read,
+so no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed
+read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
+finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
+`POLL_INTERVAL_MS`), so the loss is latency, not a hang. Devices that need several interrupts are to
+get message-signaled ones (design intent, not yet implemented;
 [#325](https://github.com/kottlerg/seraph/issues/325)), as further sources beside the wired ones.
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose

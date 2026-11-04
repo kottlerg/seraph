@@ -40,8 +40,8 @@
 //! records level-triggered, active-high; a second binding passing another mode
 //! is refused, as is a rebind of the first, and binds nothing (with the first
 //! acknowledged, a raise signals it alone); a second passing the same mode
-//! binds, a raise signals both, and with the line held asserted across both
-//! acknowledgements it signals both again at the unmask, which an
+//! binds, a raise signals both, and on x86-64, with the line held asserted
+//! across both acknowledgements, it signals both again at the unmask, which an
 //! edge-triggered entry would not; once both go, a new first binding records
 //! edge-triggered again; a mode with a bit outside `IRQ_MODE_MASK` is refused.
 //! Every mode used is active-high, the UART line's own polarity, so no binding
@@ -237,19 +237,30 @@ fn line_mode(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     raise_expect(&[n1], &[n2], "a refused registration bound the line")?;
     irq_register(b, n2, IRQ_MODE_LEVEL)
         .map_err(|_| "integration::irq_shared_line: a binding of the line's mode was refused")?;
-    // Level-triggered: a raise signals both, and the assertion, held across
-    // both acknowledgements, is delivered again at the unmask; an
-    // edge-triggered entry raises no new edge for it.
+    // A raise signals both. On x86-64, where the mode programs the line's I/O
+    // APIC entry level-triggered, the assertion, held across both
+    // acknowledgements, is delivered again at the unmask; an edge-triggered
+    // entry raises no new edge for it. riscv64 programs nothing from the mode,
+    // and QEMU's PLIC does not pend a source again that stays asserted across
+    // its claim and completion, so the second delivery is checked on x86-64
+    // only.
     acknowledge(&[a, b])?;
     raise_tx_interrupt();
     let redelivered = expect_signalled(&[n1, n2], &[], "a level line did not signal both bindings")
-        .and_then(|()| acknowledge(&[a, b]))
         .and_then(|()| {
-            expect_signalled(
-                &[n1, n2],
-                &[],
-                "a level line did not deliver an assertion held at the unmask",
-            )
+            if cfg!(target_arch = "x86_64")
+            {
+                acknowledge(&[a, b])?;
+                expect_signalled(
+                    &[n1, n2],
+                    &[],
+                    "a level line did not deliver an assertion held at the unmask",
+                )
+            }
+            else
+            {
+                Ok(())
+            }
         });
     quiet_tx_interrupt();
     redelivered?;

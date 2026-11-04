@@ -801,7 +801,9 @@ pub fn namespace_lookup_dir(
 // real object sizes, and a size change is an ABI-visible change by design.
 // They are defined here rather than re-exported because an item reached
 // through the sysroot-private ABI crate is unstable (`rustc_private`) to
-// std's users.
+// std's users: build-std compiles std's dependencies with
+// `-Zforce-unstable-if-unmarked`. The same holds for `ruststd-death-queues`,
+// which std uses internally and services take as a path dependency instead.
 
 /// Raw retype debit of one `Endpoint`, in bytes (`syscall_abi`'s
 /// `ENDPOINT_RETYPE_BYTES`).

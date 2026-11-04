@@ -32,8 +32,8 @@ services/svctest/
         │                      # object-slab release; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
-        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; death queues;
-        │                      # logd death forward; init reap
+        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
+        │                      # death queues; logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence

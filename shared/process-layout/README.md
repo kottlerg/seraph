@@ -41,6 +41,13 @@ whole fixed tier and growing with the half otherwise; see
 [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Growth Zones). Its
 zones are const-asserted disjoint and inside the address space for every supported paging mode.
 
+On the runtime side, `main_stack_growth` gives the range below a main-thread stack's committed
+pages, inside the stack reservation every layout leaves below the stack top, that ruststd's
+`_start` registers with the pager in a demand-paged process whose image is `ET_DYN`, so the stack
+grows on demand (see
+[docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Bootstrap
+Cross-Boundary VAs).
+
 ---
 
 ## Surface
@@ -57,6 +64,7 @@ zones are const-asserted disjoint and inside the address space for every support
 | `MAX_WINDOW_REGION_PAGES` | Largest region hanging off a window draw (1 GiB stride gap); bounds the stack reservation and the main TLS block. |
 | `GrowthZone`, `AddressSpaceZones`, `SV39_ZONES`, `growth_zones(u64) -> AddressSpaceZones` | Heap, arena, and image zones sized to a user half; the Sv39 zones also serve an unknown size. |
 | `LAYOUT_ENTROPY_BYTES` | Entropy bytes one layout draw consumes. |
+| `main_stack_growth(u64, u64, u64) -> Option<(u64, u64)>` | The demand-growth range below a main-thread stack's committed pages, inside the stack reservation; ruststd's `_start` registers it with the pager. |
 | `DEFAULT_PROCESS_INFO_VA`, `DEFAULT_STACK_TOP`, `DEFAULT_MAIN_TLS_VA`, `DEFAULT_IPC_BUFFER_VA` | Degraded-fallback addresses (outside the draw windows by design, each with its window's region tail). |
 | `LAYOUT_VA_CEILING` | Exclusive ceiling of the fixed tier (every draw window and `DEFAULT_*` fallback): the smallest supported user half (Sv39, 2^38). |
 
@@ -75,7 +83,8 @@ process-layout/
 └── src/
     └── lib.rs      # ProcessLayout, choose_process_layout, VaWindow and the per-surface
                     #   windows, image-bias placement, DEFAULT_* fallbacks, growth zones,
-                    #   const-asserted zone disjointness, host tests
+                    #   const-asserted zone disjointness, the main-thread stack growth
+                    #   range, host tests
 ```
 
 ---
@@ -94,4 +103,5 @@ process-layout/
 ## Summarized By
 
 [Process Lifecycle](../../docs/process-lifecycle.md),
-[Userspace Memory Model](../../docs/userspace-memory-model.md)
+[Userspace Memory Model](../../docs/userspace-memory-model.md),
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md)

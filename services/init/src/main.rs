@@ -127,8 +127,10 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     let count = info.cap_descriptor_count as usize;
     let desc_size = core::mem::size_of::<CapDescriptor>();
 
-    // Descriptor region may span up to INIT_INFO_MAX_PAGES pages (kernel-enforced).
-    let max_bytes = INIT_INFO_MAX_PAGES * PAGE_SIZE as usize;
+    // The region is the `init_info_memory_count` pages the kernel mapped, at
+    // most INIT_INFO_MAX_PAGES (kernel-enforced).
+    let pages = (info.init_info_memory_count as usize).min(INIT_INFO_MAX_PAGES);
+    let max_bytes = pages * PAGE_SIZE as usize;
     if count == 0 || offset + count * desc_size > max_bytes
     {
         return &[];
@@ -139,8 +141,8 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     // Take the page address as a bare integer via `.addr()` (no provenance) and
     // rebuild the pointer with `with_exposed_provenance` so the slice is not
     // bounded by the narrower `&InitInfo` provenance — descriptors may span
-    // pages beyond the first one, and a pointer derived from `info`'s
-    // 112-byte allocation would let the optimiser assume out-of-bounds reads.
+    // pages beyond the first one, and a pointer derived from the header's
+    // allocation would let the optimiser assume out-of-bounds reads.
     let base_addr = core::ptr::from_ref::<InitInfo>(info).addr() + offset;
     let ptr = core::ptr::with_exposed_provenance::<CapDescriptor>(base_addr);
     // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor bytes
@@ -185,11 +187,12 @@ pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) 
 
 /// Upper bound on Memory caps `advance_cap` can abandon with pages still free,
 /// and on the usable-RAM caps `MemoryAlloc` walks: the most `CapDescriptor`s
-/// the kernel can fit in the `InitInfo` region. `advance_cap` records at most
-/// one orphan per cap it moves to, and every usable-RAM cap has a descriptor,
-/// so the orphans never outnumber `InitInfo.memory_count` and the table holds
-/// them on any firmware map the kernel can describe. The table lives in init's
-/// BSS (about 2.7 KiB), whose pages memmgr's pool takes at init's reap.
+/// an `InitInfo` region can hold at the protocol's page ceiling.
+/// `advance_cap` records at most one orphan per cap it moves to, and every
+/// usable-RAM cap has a descriptor, so the orphans never outnumber
+/// `InitInfo.memory_count` and the table holds them on any firmware map the
+/// kernel can describe. The table lives in init's BSS (about 43 KiB, sized
+/// before init can allocate), whose pages memmgr's pool takes at init's reap.
 const MAX_ORPHAN_MEMORY_CAPS: usize =
     INIT_INFO_MAX_PAGES * PAGE_SIZE as usize / core::mem::size_of::<CapDescriptor>();
 

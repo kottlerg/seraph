@@ -8,9 +8,10 @@ awareness, prints nothing, and has no tester of its own; `cargo xtask build` ins
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 `overflow` (called from `main`) recurses without bound, and each of its frames holds a
-page-sized local buffer, so the stack pointer descends at least one page per call. Once the
-mapped stack is exhausted, the next write lands in the unmapped guard page below the stack
-base, per
+page-sized local buffer, so the stack pointer descends at least one page per call. The stack
+descends through its committed pages and then through the demand-growth range below them, which
+memmgr backs on first touch; once that range is exhausted, the next write lands in the
+unregistered guard page below it, per
 [docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas).
 procmgr binds memmgr as the fixture's pager, per
 [docs/fault-handling.md § Default System Pager](../../docs/fault-handling.md#default-system-pager),
@@ -56,7 +57,7 @@ listing of `/programs`.
 | Document | Content |
 |---|---|
 | [docs/testing.md](../../docs/testing.md) | Harness model and where test fixtures install |
-| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Main-thread stack placement and the guard page below it |
+| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Main-thread stack placement, its demand-growth range, and the guard page below it |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault delivery, `FAULT_REPLY_KILL`, and the fault exit reason |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | memmgr's fault reply: `FAULT_REPLY_KILL` for an address outside every registered region |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Exit-reason ranges and process death |

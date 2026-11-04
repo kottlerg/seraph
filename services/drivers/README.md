@@ -111,7 +111,10 @@ The full driver lifecycle is specified in
   vfsd; see [docs/storage.md](../../docs/storage.md)). See
   [docs/ipc-design.md](../../docs/ipc-design.md) for IPC semantics.
 - **DMA** — no DMA-authorising capability type exists. devmgr spawns each
-  DMA-capable (PCI BAR + IRQ) driver `CREATE_PINNED`, and DMA is unconfined
+  DMA-capable (PCI BAR + IRQ) driver `CREATE_PINNED` and `CREATE_DMA_HOLD`, so
+  its memory is freed only once devmgr has confirmed its device's DMA stopped
+  ([docs/device-management.md](../../docs/device-management.md#dma-safe-teardown)
+  § DMA-Safe Teardown), and DMA is unconfined
   until IOMMU support lands. DMA targets are Memory caps whose physical base the
   driver reads from memmgr's `REQUEST_MEMORY_CAPS` reply or via `SYS_CAP_INFO`
   (see [docs/device-management.md](../../docs/device-management.md#iommu-discovery-and-programming)

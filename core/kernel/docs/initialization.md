@@ -478,9 +478,8 @@ Phase 7.
    pages: one wrapper page plus a slot-page pool holding at least every capability body the boot
    mints (`boot_body_bound`), ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace,
    Thread and CSpace caps), and ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap,
-   and
-   ROOT_CSPACE_BODY_PAGES = 16 pages for the bodies of init's own splits) and register it as CSpace
-   id 0:
+   and ROOT_CSPACE_BODY_PAGES = 16 pages for the bodies of init's own splits) and register it as
+   CSpace id 0:
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per

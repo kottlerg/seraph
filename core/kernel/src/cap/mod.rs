@@ -745,8 +745,10 @@ pub(crate) struct DescriptorCounts
 
 impl DescriptorCounts
 {
-    /// The counts of `mmap`, `apertures` and `info`'s module and reclaim
-    /// arrays, as Phases 7 and 8 mint one descriptor per entry of each.
+    /// The counts of `mmap`'s `AcpiReclaimable` entries, `apertures` and
+    /// `info`'s module and reclaim arrays: Phases 7 and 8 mint at most one
+    /// descriptor per entry of each (a zero-length ACPI entry or reclaim range
+    /// gets none).
     fn of(
         mmap: &[MemoryMapEntry],
         apertures: &crate::platform::ValidatedApertures,
@@ -2885,7 +2887,7 @@ mod tests
     // bound overruns the region it reserved. The aperture, module and reclaim
     // descriptors are one per entry of the array each count reads.
     #[test]
-    fn the_descriptor_bound_counts_populate_cspaces_fixed_and_acpi_descriptors()
+    fn the_descriptor_bound_counts_every_fixed_and_acpi_descriptor_phase_7_mints()
     {
         let mut mmap = Vec::new();
         for i in 0..5u64
@@ -2938,8 +2940,10 @@ mod tests
         ];
         let fixed_here = fixed.iter().filter(|&&f| f).count();
         assert_eq!(non_ram - counts.acpi_regions, fixed_here);
-        // The most any build mints (IoPort and SbiControl are exclusive), with
-        // the two spare slots, is what the constant holds.
+        // The most any build mints (IoPort and SbiControl are exclusive, no
+        // architecture has both), with the two spare slots, is what the
+        // constant holds.
+        assert!(!(crate::arch::current::HAS_IO_PORTS && crate::arch::current::HAS_SBI));
         assert_eq!(fixed.len() - 1 + 2, FIXED_BOOT_DESCRIPTORS);
     }
 

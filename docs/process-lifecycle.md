@@ -491,7 +491,17 @@ The death-notification flow:
    transferred; procmgr deletes its copy afterwards). The badge identifies
    which per-process record memmgr reclaims (see
    [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)
-   § Label 4).
+   § Label 4). For a child created with `CREATE_DMA_HOLD` that was started,
+   procmgr holds this step back after the teardown, however the child died,
+   until the creator sends `RELEASE_HOLD` on the child's process handle; until
+   then memmgr keeps the child's frames on its record, out of the free pool,
+   and a creator that never releases leaves them there for the rest of the
+   boot. devmgr creates every DMA-capable driver so, and releases the hold only
+   once it has confirmed the driver's device stopped its DMA (see
+   [device-management.md](device-management.md#dma-safe-teardown)
+   § DMA-Safe Teardown and
+   [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#label-3-release_hold)
+   § Label 3).
 3. **Memmgr reclaims.** Memmgr walks the per-process frame list and
    inserts each Memory cap back into its free pool.
 4. **Memmgr coalesces.** Reverse-`memory_split` merges adjacent free

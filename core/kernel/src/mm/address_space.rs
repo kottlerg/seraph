@@ -69,10 +69,12 @@ use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
 
 /// Degraded-fallback base of the read-only `InitInfo` region mapped into init,
 /// used only when the entropy pool is unavailable at the layout draw. The
-/// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address.
-/// A fixed VA below the 256 GiB Sv39 user top, so the fallback is valid on both
-/// architectures; it bounds no count.
-pub const DEFAULT_INIT_INFO_VA: u64 = 0x3F_FFFF_5000;
+/// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address,
+/// which end at the fallback stack's guard page. A fixed VA below the 256 GiB
+/// Sv39 user top, so the fallback is valid on both architectures; it bounds no
+/// count.
+pub const DEFAULT_INIT_INFO_VA: u64 = DEFAULT_INIT_STACK_TOP
+    - (1 + INIT_STACK_PAGES as u64 + init_protocol::INIT_INFO_MAX_PAGES as u64) * PAGE_SIZE as u64;
 
 /// Degraded-fallback top of init's user stack. `INIT_STACK_PAGES` pages map
 /// immediately below, with one unmapped guard page beneath them. A fixed VA
@@ -1428,6 +1430,20 @@ mod init_layout_tests
             let info_end = layout.init_info_va + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
             assert!(info_end <= guard);
         }
+    }
+
+    // Defect caught: a fallback InitInfo region that, at the protocol's page
+    // ceiling, runs into the fallback stack's guard page or down into the
+    // fixed image zone.
+    #[test]
+    fn fallback_info_region_fits_between_the_image_zone_and_the_stack_guard()
+    {
+        let page = PAGE_SIZE as u64;
+        let guard = DEFAULT_INIT_STACK_TOP - (1 + INIT_STACK_PAGES as u64) * page;
+        let info_end = DEFAULT_INIT_INFO_VA + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
+        assert!(info_end <= guard);
+        assert!(DEFAULT_INIT_INFO_VA >= process_layout::FIXED_IMAGE_ZONE_END);
+        assert_eq!(DEFAULT_INIT_INFO_VA % page, 0);
     }
 
     #[test]

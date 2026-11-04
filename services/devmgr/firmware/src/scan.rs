@@ -32,8 +32,9 @@ pub const MAX_BARS: usize = 6;
 /// list longer than (256 - 64) / 4 entries must loop.
 const MAX_CAPABILITIES: u32 = 48;
 
-/// PCI Command register offset and its I/O- and Memory-space decode enables.
-const PCI_COMMAND: u16 = 0x04;
+/// PCI Command register offset ([`crate::pci::COMMAND`]) and its I/O- and
+/// Memory-space decode enables.
+const PCI_COMMAND: u16 = crate::pci::COMMAND;
 const PCI_COMMAND_DECODE: u16 = 0x3;
 /// Class-code register offsets (base class at 0x0B, subclass at 0x0A).
 const PCI_CLASS: u16 = 0x0B;

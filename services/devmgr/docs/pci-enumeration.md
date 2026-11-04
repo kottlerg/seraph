@@ -22,7 +22,12 @@ no window is skipped and the walk continues. For each window devmgr then
 carves the ECAM `Mmio` sub-cap from the boot-provided MMIO aperture cap that
 covers it, maps it, and scans it. A window no aperture covers, or that
 cannot be mapped, is logged and not scanned; the boot halts only when no
-window yields a scan.
+window yields a scan. After the scan devmgr unmaps the window and keeps its
+cap, with its location, in a table of its own (`DevmgrCaps.config_space`,
+apart from the apertures, so no BAR carve can reach configuration space),
+from which it carves each `VirtIO` function's configuration page (step 3 of
+§ Per-Device Capability Creation). A window that table cannot hold is
+logged, and its `VirtIO` functions get no driver.
 
 ### Address Calculation
 
@@ -106,7 +111,7 @@ Every matching device gets its own driver process, in segment, bus, device,
 function order, except a virtio-blk device that gets no IRQ cap (for
 instance, its line lies outside the Interrupt range devmgr holds):
 virtio-blk requires one. A
-device on a line another device already holds gets an IRQ cap too (step 3).
+device on a line another device already holds gets an IRQ cap too (step 4).
 Class-based matching is design intent (#165).
 
 ---
@@ -135,7 +140,15 @@ For each matched device, devmgr:
    with the caps already carved released. The aperture's lower and upper
    remainders stay in devmgr's growable aperture table
    (`firmware::resource::SpanTable`) as caps of their own.
-3. Gives the device its own single-line `Interrupt` cap for its GSI (its
+3. Carves the `Mmio` cap of the function's configuration page (4 KiB at
+   `firmware::pci::function_config_phys`) out of the kept ECAM window that
+   decodes its segment and bus. devmgr keeps the cap and delegates it to no
+   driver: when it withdraws the driver it clears the function's Bus Master
+   Enable through it before it takes the BAR caps (see
+   [responsibilities.md](responsibilities.md#responsibilities)
+   § Responsibilities). A function no kept window decodes, or whose carve
+   fails, refuses the device, logged, with its BAR caps released.
+4. Gives the device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
    Interrupt range cap; the lines below and above it stay in devmgr's
@@ -160,30 +173,32 @@ For each matched device, devmgr:
    later override would have named takes the default. On riscv64 every line
    takes level-triggered, active-high, which the kernel validates and
    programs nothing from.
-4. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
+5. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is
    served) or `CREATE_FROM_FILE` for an on-disk one (virtio-input, whose
-   steps 4-8 run later, once `SET_DRIVERS_DIR` delivers the drivers
-   directory).
-5. Starts the driver (`START_PROCESS`).
-6. Serves the driver's bootstrap rounds over `ipc::bootstrap`, in the shape
+   steps 5-9 run later, once `SET_DRIVERS_DIR` delivers the drivers
+   directory), each with `CREATE_PINNED` and `CREATE_DMA_HOLD`, so procmgr
+   holds the driver's memory after its death until devmgr releases it.
+6. Starts the driver (`START_PROCESS`). A driver whose bootstrap fails after
+   this step is withdrawn from its device as a live driver.
+7. Serves the driver's bootstrap rounds over `ipc::bootstrap`, in the shape
    `virtio_core::bootstrap` specifies: round 1 carries the BAR `Mmio` caps in
    the order of step 1, with each cap's PCI BAR index as the matching data
    word; round 2 carries the positional slots service endpoint, IRQ, and a
    SEND badged with the device's badge on the private driver endpoint of the
    driver's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
-   word in `data[0]`), with the IRQ line's mode of step 3 in `data[1]` (0 with
+   word in `data[0]`), with the IRQ line's mode of step 4 in `data[1]` (0 with
    no IRQ), which the driver passes to `SYS_IRQ_REGISTER`, and ends the
    bootstrap. The IRQ slot is absent when the
-   device got no IRQ cap in step 3; virtio-input then polls, and virtio-blk,
+   device got no IRQ cap in step 4; virtio-input then polls, and virtio-blk,
    which requires the IRQ, is not spawned. A driver checks the delivered BAR indices
    against the layout it computes from its `QUERY_DEVICE_INFO` reply and exits
    on a mismatch.
-7. Binds a death observer on the driver's thread to devmgr's driver death
+8. Binds a death observer on the driver's thread to devmgr's driver death
    queue, with the device badge as the correlator, and keeps the driver's
-   process handle until its batch settles.
-8. Once every driver of the batch (the boot batch: virtio-blk, serial, and
+   process handle for the rest of the boot.
+9. Once every driver of the batch (the boot batch: virtio-blk, serial, and
    framebuffer; the on-disk batch: the RTC and virtio-input) has been
    spawned, settles the batch: serves the drivers' `QUERY_DEVICE_INFO` and
    `DRIVER_READY` calls on the private endpoint and takes their deaths until

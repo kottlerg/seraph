@@ -53,7 +53,7 @@ const DIRECT_LEAVES: u64 = 128;
 /// Leaves per pool-paid directory page: mirrors the kernel's `DIR_FANOUT`,
 /// one page of leaf pointers.
 const DIR_FANOUT: u64 = syscall_abi::PAGE_SIZE / core::mem::size_of::<*const ()>() as u64;
-/// The index of [`INDIRECT_SLOT`], before its conversion to a slot index.
+/// The slot index of [`INDIRECT_SLOT`] as a `u64`, before its narrowing to `u32`.
 const INDIRECT_SLOT_INDEX: u64 = (DIRECT_LEAVES + 2) * syscall_abi::CSPACE_SLOTS_PER_PAGE + 20;
 const _: () = assert!(INDIRECT_SLOT_INDEX >> 32 == 0);
 /// A slot past the direct region's `DIRECT_LEAVES` × `CSPACE_SLOTS_PER_PAGE`

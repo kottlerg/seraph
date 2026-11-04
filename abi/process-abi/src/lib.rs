@@ -81,7 +81,7 @@ use core::prelude::rust_2024::*;
 ///      offsets are unchanged.
 /// v23: Capability handles are 64-bit (#637). Every `ProcessInfo` cap field
 ///      widens from `u32` to `u64`, so every field after
-///      [`ProcessInfo::self_thread_cap`] moves.
+///      [`ProcessInfo::version`] moves.
 pub const PROCESS_ABI_VERSION: u32 = 23;
 
 // ── Address space constants ──────────────────────────────────────────────────
@@ -243,7 +243,7 @@ pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 1 << 18;
 /// address.
 ///
 /// All slot indices refer to the process's own `CSpace`, and each cap field is
-/// a `u32`, the width of a capability handle. Only the cap slots named by
+/// a `u64`, the width of a capability handle. Only the cap slots named by
 /// this struct's fields are delivered through this page; service-specific
 /// capabilities come from the creator over IPC at startup (see
 /// `ipc::bootstrap`).

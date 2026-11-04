@@ -891,6 +891,20 @@ mod tests
         assert_eq!(acc, rw);
     }
 
+    // A syscall rights mask keeps the 16-bit word: `RIGHTS_ALL` must keep every
+    // right (a narrower mask would silently drop authority on every copy and
+    // derive), and bits past the word must not alias a right.
+    #[test]
+    fn rights_mask_keeps_the_low_16_bits()
+    {
+        assert_eq!(Rights::from_mask(syscall::RIGHTS_ALL), Rights(u16::MAX));
+        assert_eq!(Rights::from_mask(1 << 16), Rights::NONE);
+        assert_eq!(
+            Rights::from_mask((1 << 40) | syscall::RIGHTS_EP_GRANT),
+            EpRights::GRANT.erase()
+        );
+    }
+
     // TypedRights' operators and erase() are hand-written; a transposed bit op
     // or a lossy erase would widen or drop authority at every typed call site.
     #[test]

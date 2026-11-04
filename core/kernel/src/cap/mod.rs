@@ -387,7 +387,7 @@ pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 
 /// Most descriptors an `InitInfo` block can hold: the
 /// [`init_protocol::INIT_INFO_MAX_PAGES`] (64) pages of the protocol's ceiling
-/// past the header, one [`CapDescriptor`] slot each, 10,775. Phase 7 sizes
+/// past the header, one [`CapDescriptor`] slot each, 8,079. Phase 7 sizes
 /// each boot's block from its own counts ([`init_info_descriptor_bound`]), so
 /// this binds only a boot whose counts pass it, which halts by name at the
 /// reservation; no platform comes near it (see the ceiling's rustdoc).

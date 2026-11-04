@@ -3,16 +3,18 @@
 
 // core/kernel/src/ipc/message.rs
 
-//! IPC message type — label + inline data words + capability slot indices.
+//! IPC message type — label + inline data words + capability handles.
 //!
 //! A [`Message`] carries:
 //! - A 64-bit `label` — caller-defined tag identifying the operation.
 //! - Up to [`MSG_DATA_WORDS_MAX`] data words (u64 values).
-//! - Up to [`MSG_CAP_SLOTS_MAX`] capability slot indices (u32 values).
+//! - Up to [`MSG_CAP_SLOTS_MAX`] full capability handles (u64 values).
 //!
-//! The kernel copies a `Message` by value. Its data words are read from the
-//! sender's per-thread IPC buffer page (registered via `SYS_IPC_BUFFER_SET`)
-//! and written to the receiver's; no memory is shared between the threads.
+//! The kernel copies a `Message` by value. Its data words and the sender's
+//! cap handles (the cap block from `syscall::MSG_CAP_HANDLES_WORD`) are read
+//! from the sender's per-thread IPC buffer page (registered via
+//! `SYS_IPC_BUFFER_SET`); the data words and the delivered handles are
+//! written to the receiver's; no memory is shared between the threads.
 //! Bulk data travels as a shared memory capability (`docs/ipc-design.md`
 //! § Message Format and § Large Data Transfers).
 

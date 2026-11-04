@@ -1391,7 +1391,9 @@ extern "C" fn dup_reply_caller_entry(arg: u64) -> !
 /// A reply naming a stale cap handle is refused with `InvalidCapability`;
 /// the waiting caller is still woken with the synthetic
 /// `IPC_REPLY_TRANSFER_FAILED` label and the recycled slot's current
-/// occupant is untouched.
+/// occupant is untouched. The handle is 256 recycles stale, so the
+/// occupant's generation is past 255 and differs from the handle's only
+/// above the low byte: the reply's cap block must carry the full handle.
 ///
 /// Exercises the generation-mismatch branch of the reply direction's
 /// pre-validation — a distinct rejection cause from the duplicate-index
@@ -1406,16 +1408,24 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
     let victim = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(victim) for reply_stale test failed")?;
     cap_delete(victim).map_err(|_| "cap_delete(victim) for reply_stale test failed")?;
-    // Recycle the freed slot so `victim` is a stale handle to the
-    // occupant's slot (same shape as `call_stale_cap_handle_rejected`).
+    // Recycle the freed slot 256 times (the LIFO free list hands the same
+    // index back each time) so `victim` is a stale handle to the occupant's
+    // slot whose generation matches the occupant's in its low byte.
+    for _ in 0..255
+    {
+        let filler = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "cap_create_notification(filler) for reply_stale test failed")?;
+        cap_delete(filler).map_err(|_| "cap_delete(filler) for reply_stale test failed")?;
+    }
     let occupant = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(occupant) for reply_stale test failed")?;
     if syscall_abi::cap_handle_index(occupant) != syscall_abi::cap_handle_index(victim)
+        || syscall_abi::cap_handle_gen(occupant) != syscall_abi::cap_handle_gen(victim) + 256
     {
         cap_delete(occupant).ok();
         cap_delete(done).ok();
         cap_delete(ep).ok();
-        return Err("reply_stale: freed slot was not recycled by the next create");
+        return Err("reply_stale: freed slot was not recycled once per create");
     }
 
     let mut child =

@@ -39,9 +39,10 @@
 //!     `ChildStdin` / `ChildStdout` / `ChildStderr`.
 //!
 //! Identity:
-//!   * `Process::id()` returns the process-handle cap's handle (its
-//!     generation-tagged slot) in the caller's CSpace, unique only within
-//!     that CSpace and only while the handle is held. Not a POSIX pid —
+//!   * `Process::id()` returns the slot index of the process-handle cap in
+//!     the caller's CSpace, unique only within that CSpace and only while
+//!     the handle is held; `std::os::seraph::process::ChildExt::process_handle`
+//!     returns the full handle, generation included. Not a POSIX pid —
 //!     processes in Seraph are identified by capability, not pid.
 //!
 //! Argv/env:

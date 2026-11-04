@@ -95,7 +95,8 @@
 ///     [`CapDescriptor::slot`], and [`InitModuleName::slot`] widen to `u64`;
 ///     [`InitInfo::cap_descriptors_offset`] and [`InitInfo::module_name_count`]
 ///     move up beside the other `u32` header fields so the header has no
-///     implicit padding. Every field moves.
+///     implicit padding. Every field after [`InitInfo::cap_descriptor_count`]
+///     moves.
 pub const INIT_PROTOCOL_VERSION: u32 = 16;
 
 /// Length of [`InitModuleName::name`], matching
@@ -127,7 +128,7 @@ pub const INIT_STACK_PAGES: usize = 4;
 
 /// Ceiling on the 4 KiB pages of the [`InitInfo`] region (the header, which
 /// includes the boot-module name table, followed by the [`CapDescriptor`]
-/// array): 64 pages hold 10,775 descriptors past the header.
+/// array): 64 pages hold 8,079 descriptors past the header.
 ///
 /// The kernel sizes each boot's region from that boot's own counts, one
 /// descriptor per coalesced RAM extent, ACPI region, MMIO aperture, boot module

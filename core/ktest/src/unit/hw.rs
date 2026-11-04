@@ -27,7 +27,8 @@ use crate::{TestContext, TestResult};
 const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
 /// Upper bound for a slot scan over the test's own `CSpace`: its backed
-/// capacity, which the kernel clamps below 2^24 so the narrowing cannot fail;
+/// capacity, which the kernel clamps below its structural slot ceiling (under
+/// 2^32), so the narrowing cannot fail;
 /// the address-space cap's index if the query fails, which still covers every
 /// boot-minted cap.
 pub fn scan_bound(ctx: &TestContext) -> u32

@@ -169,7 +169,7 @@ concurrent notification and queue events.
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 | `cross_cspace_revoke_no_alias.rs` | A cross-`CSpace` `cap_revoke` does not let a recipient's stale handle alias a recycled slot (#349) |
 | `cap_generation_stale_handle.rs` | A same-`CSpace` stale cap handle fails closed after its slot is freed and recycled (#349) |
-| `cap_generation_wide.rs` | A slot recycled 256 times keeps the handle from 256 recycles earlier stale; a handle with an altered high half, a call transferring the stale handle, and a cap-bearing call with no IPC buffer are refused (#637) |
+| `cap_generation_wide.rs` | A slot recycled 256 times keeps the handle from 256 recycles earlier stale; a handle with an altered high half, a call transferring the stale handle, and a cap-bearing call or reply with no IPC buffer are refused (#637) |
 | `fpu_survives_ipc_call.rs` | The FPU register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration |
 | `fault_kills_thread.rs` | A genuine userspace page fault kills the thread |
 | `fault_pager_roundtrip.rs` | A userspace pager resolves a page fault and resumes the thread |

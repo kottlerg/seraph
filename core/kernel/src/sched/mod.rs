@@ -49,12 +49,11 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
-/// 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle stack
-/// (`riscv64`; 3296 B and 1328 B on `x86_64`), margins of about 77% and 90%;
-/// release builds at 4, 16 and 128 CPUs use at most 4304 B (thread) and 1616 B
-/// (idle), and debug builds at 4 CPUs at most 4200 B and 1752 B, so the deepest
-/// bounds leave margins of about 74% and 89%. The report gives the depth, not
-/// the path that reached it.
+/// 4, 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle
+/// stack (`riscv64`; 3296 B and 1328 B on `x86_64`), and release builds at 4, 16
+/// and 128 CPUs at 4304 B and 2080 B (`riscv64`; 3296 B and 1104 B on `x86_64`),
+/// so the deepest bounds leave margins of about 74% (thread) and 87% (idle). The
+/// report gives the depth, not the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
@@ -2569,14 +2568,14 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 pub unsafe fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
 
 /// The per-CPU scheduler slab: one [`PerCpuScheduler`] per CPU.
-pub(crate) const SCHEDULERS_SLAB: PerCpuSlab = PerCpuSlab::of::<PerCpuScheduler>("SCHEDULERS");
+const SCHEDULERS_SLAB: PerCpuSlab = PerCpuSlab::of::<PerCpuScheduler>("SCHEDULERS");
 const _: () = assert!(
     SCHEDULERS_SLAB.sized_at_every_width(),
     "SCHEDULERS slab overflows"
 );
 
 /// The idle-thread TCB slab: one uninitialised [`ThreadControlBlock`] per CPU.
-pub(crate) const IDLE_TCBS_SLAB: PerCpuSlab =
+const IDLE_TCBS_SLAB: PerCpuSlab =
     PerCpuSlab::of::<core::mem::MaybeUninit<ThreadControlBlock>>("IDLE_TCBS");
 const _: () = assert!(
     IDLE_TCBS_SLAB.sized_at_every_width(),
@@ -2584,14 +2583,14 @@ const _: () = assert!(
 );
 
 /// The idle-stack-top slab: one stack-top address per CPU.
-pub(crate) const IDLE_STACK_TOPS_SLAB: PerCpuSlab = PerCpuSlab::of::<u64>("IDLE_STACK_TOPS");
+const IDLE_STACK_TOPS_SLAB: PerCpuSlab = PerCpuSlab::of::<u64>("IDLE_STACK_TOPS");
 const _: () = assert!(
     IDLE_STACK_TOPS_SLAB.sized_at_every_width(),
     "IDLE_STACK_TOPS slab overflows"
 );
 
 /// The watchdog's last-non-idle-tick slab: one tick stamp per CPU.
-pub(crate) const LAST_NON_IDLE_TICK_SLAB: PerCpuSlab =
+const LAST_NON_IDLE_TICK_SLAB: PerCpuSlab =
     PerCpuSlab::of::<core::sync::atomic::AtomicU64>("LAST_NON_IDLE_TICK");
 const _: () = assert!(
     LAST_NON_IDLE_TICK_SLAB.sized_at_every_width(),
@@ -2599,7 +2598,7 @@ const _: () = assert!(
 );
 
 /// The watchdog breadcrumb slab: one [`CpuDiag`] per CPU.
-pub(crate) const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
+const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
 const _: () = assert!(
     CPU_DIAG_SLAB.sized_at_every_width(),
     "CPU_DIAG slab overflows"

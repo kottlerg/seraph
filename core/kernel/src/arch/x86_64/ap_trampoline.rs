@@ -133,7 +133,7 @@ static AP_IST_STACKS_PTR: core::sync::atomic::AtomicPtr<[u8; AP_IST_PAIR_SIZE]> 
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// The per-AP IST-stack slab: one IST1 + IST2 pair per CPU.
-pub(crate) const AP_IST_STACKS_SLAB: crate::sched::PerCpuSlab =
+const AP_IST_STACKS_SLAB: crate::sched::PerCpuSlab =
     crate::sched::PerCpuSlab::of::<[u8; AP_IST_PAIR_SIZE]>("AP_IST_STACKS");
 const _: () = assert!(
     AP_IST_STACKS_SLAB.sized_at_every_width(),

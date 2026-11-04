@@ -327,7 +327,7 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// Growth past the seeded pool returns the refillable `OutOfMemory`. init
 /// never augments this `CSpace`; it budgets its own use inside the pool: it
 /// stops its forward of RAM caps to memmgr at `INIT_FORWARD_HEADROOM` general
-/// slots, a reserve sized for what it mints after the loop
+/// slots, a reserve sized for what it mints after the forward
 /// (services/init/src/bootstrap.rs), and hands the rest over at its reap.
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
@@ -1798,16 +1798,7 @@ fn populate_cspace(
     let acpi_rsdp_memory_slot: u32 = if info.acpi_rsdp != 0
     {
         let page_base = info.acpi_rsdp & !0xFFF;
-        let ptr = mint_phase7_body(MemoryObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
-            base: page_base,
-            size: 0x1000,
-            // Firmware table: not retypable; cap minted without RETYPE.
-            available_bytes: core::sync::atomic::AtomicU64::new(0),
-            owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
-            lock: core::sync::atomic::AtomicU32::new(0),
-        });
+        let ptr = mint_phase7_body(firmware_table_memory(page_base, 0x1000));
         let slot = insert_or_fatal(
             cspace,
             MemRights::MAP,
@@ -1836,16 +1827,7 @@ fn populate_cspace(
     // the buddy.
     let dtb_memory_slot: u32 = if let Some((dtb_base, dtb_size)) = crate::mm::init::dtb_extent()
     {
-        let ptr = mint_phase7_body(MemoryObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
-            base: dtb_base,
-            size: dtb_size,
-            // Firmware table: not retypable; cap minted without RETYPE.
-            available_bytes: core::sync::atomic::AtomicU64::new(0),
-            owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
-            lock: core::sync::atomic::AtomicU32::new(0),
-        });
+        let ptr = mint_phase7_body(firmware_table_memory(dtb_base, dtb_size));
         let slot = insert_or_fatal(
             cspace,
             MemRights::MAP,
@@ -2143,9 +2125,10 @@ pub(crate) fn mint_late_reclaim_memory_caps(
 /// still reads the `BootInfo` page and the reclaim array through Phase 9, so
 /// the contents are cleared later, by [`scrub_reclaim_ranges`] right before
 /// init is enqueued, not here.
-// Linear Phase-7 sequence: per-range overlap check, owned-range
-// registration, MemoryObject mint, descriptor push. The debug-only
-// overlap assertion adds ~25 lines without a natural extraction point.
+// Linear sequence, run once in Phase 7 and once (the late pass) in Phase 8:
+// per-range overlap check, owned-range registration, MemoryObject mint,
+// descriptor push. The debug-only overlap assertion adds ~25 lines without a
+// natural extraction point.
 #[allow(clippy::too_many_lines)]
 fn mint_reclaim_pass(
     cspace: &mut CSpace,
@@ -2252,7 +2235,9 @@ fn mint_reclaim_pass(
         #[cfg(not(test))]
         // SAFETY: range pages were not added via `add_region`
         // (bootloader-typed `Loaded`, filtered by
-        // `mm::init::collect_usable_ranges`); single-threaded Phase 7.
+        // `mm::init::collect_usable_ranges`); single-threaded Phase 7, or for
+        // the late pass the BSP's Phase 8 boot path, before `sched::enter`,
+        // with the APs idle.
         unsafe {
             crate::mm::with_frame_allocator(|alloc| {
                 alloc.register_owned_range(phys_base, size_bytes);

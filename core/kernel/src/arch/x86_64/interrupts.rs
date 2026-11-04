@@ -332,7 +332,7 @@ static NMI_BACKTRACE_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::Atom
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// The NMI-backtrace request slab: one request count per CPU.
-pub(crate) const NMI_BACKTRACE_SLAB: crate::sched::PerCpuSlab =
+const NMI_BACKTRACE_SLAB: crate::sched::PerCpuSlab =
     crate::sched::PerCpuSlab::of::<core::sync::atomic::AtomicU32>("NMI_BACKTRACE");
 const _: () = assert!(
     NMI_BACKTRACE_SLAB.sized_at_every_width(),

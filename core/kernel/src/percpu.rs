@@ -238,7 +238,7 @@ impl PerCpuData
 static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut());
 
 /// The per-CPU data slab: one [`PerCpuData`] per CPU.
-pub(crate) const PER_CPU_SLAB: crate::sched::PerCpuSlab =
+const PER_CPU_SLAB: crate::sched::PerCpuSlab =
     crate::sched::PerCpuSlab::of::<PerCpuData>("PER_CPU");
 const _: () = assert!(
     PER_CPU_SLAB.sized_at_every_width(),
@@ -246,7 +246,7 @@ const _: () = assert!(
 );
 
 /// The hardware-CPU-id slab: one APIC id (x86-64) or hart id (RISC-V) per CPU.
-pub(crate) const CPU_APIC_IDS_SLAB: crate::sched::PerCpuSlab =
+const CPU_APIC_IDS_SLAB: crate::sched::PerCpuSlab =
     crate::sched::PerCpuSlab::of::<u32>("CPU_APIC_IDS");
 const _: () = assert!(
     CPU_APIC_IDS_SLAB.sized_at_every_width(),

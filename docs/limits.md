@@ -467,9 +467,9 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | `IpcMessage.data_len`, `cap_count` | `shared/ipc/src/lib.rs` | `u8` | provably unreachable (at most 64 and 4) | 2 B | correct as is | Pin both against `u8::MAX` with a const assert |
 | `from_ipc_buf` layout bound | `shared/ipc/src/lib.rs` | 69 words of 512 | ABI width | none | correct as is | Turn the comment into a const assert |
 | bootstrap reply-label fields | `shared/ipc/src/bootstrap.rs` | 8-bit base, caps, words | encoding artefact | none | correct as is | Pin against the ABI maxima |
-| `BootstrapRound.caps`, `data` | `shared/ipc/src/bootstrap.rs` | `[u64; 4]`, `[u64; 64]` | ABI width | about 580 B stack | correct as is | None |
+| `BootstrapRound.caps`, `data` | `shared/ipc/src/bootstrap.rs` | `[u64; 4]`, `[u64; 64]` | ABI width | about 570 B stack | correct as is | None |
 | `PackedSlots.presence` | `shared/ipc/src/bootstrap.rs` | `u64` mask | ABI width (`MSG_CAP_SLOTS_MAX <= 64`) | none | correct as is | Pin with a const assert |
-| `SlotAccumulator<N>.slots` | `shared/ipc/src/bootstrap.rs` | caller's `N` | per-instance | `4 * N` B | correct as is | None |
+| `SlotAccumulator<N>.slots` | `shared/ipc/src/bootstrap.rs` | caller's `N` | per-instance | `8 * N` B | correct as is | None |
 | `request_slots` round loop | `shared/ipc/src/bootstrap.rs` | unbounded until DONE | provably unreachable (the creator is trusted) | none | correct as is | None |
 | `RECV_FAILURE_FATAL_STREAK`, `RECV_FAILURE_BACKOFF_CAP_MS`, `RecvGuard.streak` | `shared/ipc/src/recv_guard.rs` | 32 / 128 ms / `u32` | tuning (bounds no capacity) | 4 B | correct as is | None |
 | `registry::NAME_MAX` | `shared/registry/src/lib.rs` | `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | per entry | correct as is | None |

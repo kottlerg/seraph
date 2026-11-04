@@ -28,9 +28,8 @@ const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
 /// Upper bound for a slot scan over the test's own `CSpace`: its backed
 /// capacity, which the kernel clamps below its structural slot ceiling (under
-/// 2^32), so the narrowing cannot fail;
-/// the address-space cap's index if the query fails, which still covers every
-/// boot-minted cap.
+/// 2^32), so the narrowing cannot fail; the address-space cap's index if the
+/// query fails, which still covers every boot-minted cap.
 pub fn scan_bound(ctx: &TestContext) -> u32
 {
     syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)

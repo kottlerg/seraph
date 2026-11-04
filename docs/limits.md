@@ -99,7 +99,7 @@ An entry an existing open Issue already names cites it in the recommendation.
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
   TLS block each reach 1 GiB of VA.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
-  copies: `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` (in `unit::cap_info`),
+  copies: the ktest mirrors of `L2_SIZE` (in `unit::cap_info`),
   `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
 - **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
   depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
@@ -378,7 +378,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 
 ### Process layout and ruststd
 
-Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
+Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (the `ProcessInfo` page).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -405,9 +405,9 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `SLAB_SHELF_SIZE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 4 | tuning (overflow strands a run until exit, bounded) | 192 B static | correct as is | None |
 | `ALLOCATOR_METADATA_RESERVE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 64 | tuning (slack) | none | correct as is | None |
 | reserve `INLINE_RUNS` (`Arena.inline`) | `runtime/ruststd/src/sys/reserve/seraph.rs` | 64 | tuning (the static run table before it grows into the byte heap) | 1 KiB static | correct as is | None; a process without a heap fails its 64th live reservation instead of losing freed VA |
-| `REAPER_SLOTS` (`Registry.slots`) | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 | unknown | about 6 KiB static | make pay-as-you-go | Detached threads past 64 leak until exit |
-| thread `EQ_CAPACITY` | `runtime/ruststd/src/sys/thread/seraph.rs` | 128 | unknown | about 2.1 KiB retype | raise | Overflow drops death posts |
-| `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (packed in 32 bits of the `u64` correlator) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
+| Reaper slot table (`death_queues::slots::Registry`) | `runtime/ruststd/death-queues/src/slots.rs` | grows a slot at a time, on the byte heap; slot index `u32` | provably unreachable (2^32 slots exceed the threads a process can fund) | about 96 B per slot, grown on demand | correct as is | None; a spawn whose slot cannot be allocated leaks its thread on detach, as without a reaper |
+| Reaper `FIRST_POOL_OBSERVERS` (death queues) | `runtime/ruststd/src/sys/thread/seraph.rs` | 16 nodes and entries in the first queue; each further queue twice the last, up to `EVENT_QUEUE_MAX_CAPACITY` (`death_queues::DeathQueues`) | tuning (a queue's entries equal its nodes, so it cannot overflow) | about 0.8 KiB retype at the first spawn, more as threads arrive | correct as is | None |
+| Reaper correlator | `runtime/ruststd/death-queues/src/slots.rs` | 32-bit slot index, 32-bit generation in the `u64` correlator | encoding artefact | none | correct as is | Freshness-only generation |
 | `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
 | `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | default (inline stack probes, #503, touch every page of a larger frame) | VA only | correct as is | None |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |

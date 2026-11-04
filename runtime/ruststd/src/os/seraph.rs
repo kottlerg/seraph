@@ -43,6 +43,14 @@ use process_abi::{PROCESS_ABI_VERSION, process_info_ref};
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use process_abi::StackNote;
 
+/// Death-observer bookkeeping, the `ruststd-death-queues` crate: the growth
+/// policy of a set of death `EventQueue`s (`death_queues::DeathQueues`),
+/// which the thread reaper builds on, and the reaper's slot registry
+/// (`death_queues::slots`). Re-exported so a service that binds death
+/// observers uses the same policy without a direct dependency.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub use death_queues;
+
 /// Startup information the kernel+procmgr hand to a process at spawn time,
 /// materialised by `_start` from the read-only `ProcessInfo` page and made
 /// available through [`startup_info`]. A std-local copy of the shape defined in

@@ -135,7 +135,7 @@ pub struct Thread {
     /// reaper-registry slot reserves this thread (the common case). `None` is
     /// the fallback when the reaper was unavailable at spawn — then a detached
     /// (un-joined) handle leaks its resources until process death, as before.
-    reaper: Option<(usize, u32)>,
+    reaper: Option<(u32, u32)>,
 }
 
 // SAFETY: every resource is a plain cap slot, an owned pointer to a distinct
@@ -559,92 +559,56 @@ impl Drop for Thread {
 /// `std::process::Child` reaps child processes.
 ///
 /// Every spawned thread binds a death observer (before `thread_start`) to one
-/// process-global death `EventQueue`, with a generation-tagged correlator that
-/// names a registry slot. A joined thread reclaims its own resources directly
-/// and frees its slot, unless its join wait failed, in which case it is handed
-/// to the registry like a detached one; a detached thread leaves its resources
-/// in the slot. `sweep` drains the `EventQueue` on every spawn/join and
-/// reclaims any thread left in a slot whose death-post has landed. The
-/// generation tag makes a stale post for an already-joined or reused slot a
-/// no-op.
+/// of the process's death `EventQueue`s, with a generation-tagged correlator
+/// that names a registry slot (`std::os::seraph::death_queues::slots`). The
+/// registry grows a slot at a time and the queues a queue at a time, each
+/// with twice the last one's nodes (`std::os::seraph::death_queues`), so the
+/// threads a process can have bound at once are bounded by memory, not by a
+/// fixed table. A joined thread reclaims its own resources directly and frees
+/// its slot, unless its join wait failed, in which case it is handed to the
+/// registry like a detached one; a detached thread leaves its resources in
+/// the slot. `sweep` drains every queue on every spawn/join and reclaims any
+/// thread left in a slot whose death-post has landed. The generation tag
+/// makes a stale post for an already-joined or reused slot a no-op.
 mod reaper {
     use super::ThreadResources;
     use crate::cell::UnsafeCell;
-    use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use crate::os::seraph::death_queues::DeathQueues;
+    use crate::os::seraph::death_queues::slots::{Detached, Registry, correlator};
+    use crate::sync::atomic::{AtomicBool, Ordering};
+    use syscall_abi::{SyscallError, WAIT_SET_MAX_MEMBERS};
 
-    /// Max concurrently-bound spawned threads. A spawn beyond this falls back to
-    /// leak-on-detach (join still reclaims directly, unless its wait fails, when
-    /// the thread leaks like a detached one). 64 covers realistic thread
-    /// fan-out; raising it only costs registry static size.
-    const REAPER_SLOTS: usize = 64;
-    /// Death `EventQueue` capacity. Drained on every spawn/join, so overflow
-    /// needs >128 detached threads dying between two thread ops — pathological;
-    /// the overflow remainder leaks only until process exit (kernel silently
-    /// drops a post to a full queue).
-    const EQ_CAPACITY: u32 = 128;
-    /// Correlator bit split: low `GEN_BITS` are the generation, the rest the
-    /// slot index (6 bits → 64 slots), packed in the low 32 bits of the `u64`
-    /// correlator `thread_bind_notification` carries. The generation is
-    /// freshness-only, so its wrap needs no wider field.
-    const GEN_BITS: u32 = 26;
-    const GEN_MASK: u32 = (1 << GEN_BITS) - 1;
+    /// Observer nodes, and entries, of the process's first death
+    /// `EventQueue`; each further queue has twice the last one's, up to
+    /// `EVENT_QUEUE_MAX_CAPACITY` ([`DeathQueues`]). A queue's entries equal
+    /// its nodes, and a bound thread holds one node from its bind until its
+    /// Thread object is destroyed and posts at most once, so a queue never
+    /// holds more pending posts than it has entries and cannot overflow. Sized
+    /// small so a process with few threads pays little.
+    const FIRST_POOL_OBSERVERS: u32 = 16;
 
-    fn correlator(slot: usize, generation: u32) -> u32 {
-        ((slot as u32) << GEN_BITS) | (generation & GEN_MASK)
-    }
-    fn split(correlator: u32) -> (usize, u32) {
-        ((correlator >> GEN_BITS) as usize, correlator & GEN_MASK)
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum SlotState {
-        /// No occupant.
-        Vacant,
-        /// Bound, handle still held (joinable). Resources live in the `Thread`.
-        Reserved,
-        /// Handle dropped (detached). Resources live in `res`, awaiting the
-        /// child's death-post.
-        Detached,
-    }
-
-    struct Slot {
-        state: SlotState,
-        generation: u32,
-        /// Set when a death-post arrives while still `Reserved` (child died
-        /// before the handle was joined/detached). `detach` consults it to
-        /// reclaim immediately instead of waiting for a post that already fired.
-        died: bool,
-        res: Option<ThreadResources>,
-    }
-
-    const fn vacant_slot() -> Slot {
-        Slot { state: SlotState::Vacant, generation: 0, died: false, res: None }
-    }
-
-    struct Registry {
-        next_gen: u32,
-        slots: [Slot; REAPER_SLOTS],
-    }
-
+    /// The slot registry and the death queues, serialised by one lock each.
+    /// The registry's operations are short; a queue bind may create a queue
+    /// (a memory grant), so it holds its own lock.
     struct Reaper {
-        lock: SpinLock,
-        inner: UnsafeCell<Registry>,
+        slots_lock: SpinLock,
+        slots: UnsafeCell<Registry<ThreadResources>>,
+        queues_lock: SpinLock,
+        queues: UnsafeCell<DeathQueues>,
     }
-    // SAFETY: all access to `inner` is serialised by `lock`; the resources held
-    // in slots are owned (not shared) and reclaimed exactly once.
+    // SAFETY: `slots` is reached only under `slots_lock` and `queues` only
+    // under `queues_lock`; the resources held in slots are owned (not shared)
+    // and reclaimed exactly once.
     unsafe impl Sync for Reaper {}
 
+    // No wait set holds the reaper's queues, so the set is created as wide as
+    // the kernel allows and never asked to grow below that many queues.
     static REAPER: Reaper = Reaper {
-        lock: SpinLock::new(),
-        inner: UnsafeCell::new(Registry {
-            next_gen: 1,
-            slots: [const { vacant_slot() }; REAPER_SLOTS],
-        }),
+        slots_lock: SpinLock::new(),
+        slots: UnsafeCell::new(Registry::new()),
+        queues_lock: SpinLock::new(),
+        queues: UnsafeCell::new(DeathQueues::new(FIRST_POOL_OBSERVERS, WAIT_SET_MAX_MEMBERS)),
     };
-
-    /// Process death `EventQueue` cap, lazily created on first spawn. `0` = not
-    /// yet created or unavailable.
-    static DEATH_EQ: AtomicU32 = AtomicU32::new(0);
 
     /// Minimal spinlock (mirrors the alloc module's; that one is private).
     struct SpinLock {
@@ -668,67 +632,53 @@ mod reaper {
         }
     }
 
-    /// Return the process death `EventQueue` cap, creating it on first use.
-    /// `0` if the reaper is unavailable (then callers fall back to leak-on-detach).
-    fn death_eq() -> u32 {
-        let cur = DEATH_EQ.load(Ordering::Acquire);
-        if cur != 0 {
-            return cur;
-        }
-        // As many observer nodes as entries: at most REAPER_SLOTS threads are
-        // bound at once, and a node returns when its thread is destroyed.
-        let want =
-            syscall_abi::event_queue_retype_bytes(u64::from(EQ_CAPACITY), u64::from(EQ_CAPACITY));
-        let made = crate::sys::alloc::seraph::object_slab_retype(want, |slab| {
-            syscall::event_queue_create_observed(slab, EQ_CAPACITY, EQ_CAPACITY).ok()
-        });
-        let Some(eq) = made else {
-            return 0;
-        };
-        match DEATH_EQ.compare_exchange(0, eq, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => eq,
-            // Lost the race: another thread installed one. Delete our duplicate.
-            Err(existing) => {
-                let _ = syscall::cap_delete(eq);
-                existing
-            }
-        }
+    /// Run `f` on the registry under its lock.
+    fn with_slots<R>(f: impl FnOnce(&mut Registry<ThreadResources>) -> R) -> R {
+        REAPER.slots_lock.lock();
+        // SAFETY: lock held; single mutator.
+        let out = f(unsafe { &mut *REAPER.slots.get() });
+        REAPER.slots_lock.unlock();
+        out
     }
 
-    /// Reserve a registry slot and bind a kernel death observer on `thread_cap`.
-    /// Returns `Some((slot, generation))` on success, `None` if the reaper is
-    /// unavailable or full (caller then leaks on detach). Call before
-    /// `thread_start`.
-    pub(super) fn register(thread_cap: u32) -> Option<(usize, u32)> {
-        let eq = death_eq();
-        if eq == 0 {
-            return None;
-        }
-
-        // Reserve a vacant slot.
-        REAPER.lock.lock();
+    /// Run `f` on the death queues under their lock.
+    fn with_queues<R>(f: impl FnOnce(&mut DeathQueues) -> R) -> R {
+        REAPER.queues_lock.lock();
         // SAFETY: lock held; single mutator.
-        let reg = unsafe { &mut *REAPER.inner.get() };
-        let reserved = (|| {
-            for (i, slot) in reg.slots.iter_mut().enumerate() {
-                if slot.state == SlotState::Vacant {
-                    let generation = reg.next_gen & GEN_MASK;
-                    reg.next_gen = reg.next_gen.wrapping_add(1);
-                    slot.state = SlotState::Reserved;
-                    slot.generation = generation;
-                    slot.died = false;
-                    slot.res = None;
-                    return Some((i, generation));
-                }
-            }
-            None
-        })();
-        REAPER.lock.unlock();
+        let out = f(unsafe { &mut *REAPER.queues.get() });
+        REAPER.queues_lock.unlock();
+        out
+    }
 
-        let (slot, generation) = reserved?;
-        // Bind the observer. On failure, release the slot and fall back.
-        let tag = u64::from(correlator(slot, generation));
-        if syscall::thread_bind_notification(thread_cap, eq, tag).is_err() {
+    /// Create one death queue of `observers` entries and observer nodes.
+    fn create_queue(observers: u32) -> Result<u32, i64> {
+        let bytes =
+            syscall_abi::event_queue_retype_bytes(u64::from(observers), u64::from(observers));
+        crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
+            syscall::event_queue_create_observed(slab, observers, observers).ok()
+        })
+        .ok_or(SyscallError::OutOfMemory as i64)
+    }
+
+    /// Reserve a registry slot and bind a kernel death observer on `thread_cap`,
+    /// on the newest death queue with a free node, a further queue created when
+    /// every queue is out of nodes ([`DeathQueues::bind`]). Returns
+    /// `Some((slot, generation))` on success, `None` when the registry cannot
+    /// grow or no queue can take the bind (the caller then leaks on detach).
+    /// Call before `thread_start`.
+    pub(super) fn register(thread_cap: u32) -> Option<(u32, u32)> {
+        let (slot, generation) = with_slots(Registry::reserve)?;
+        let tag = correlator(slot, generation);
+        let bound = with_queues(|queues| {
+            queues.bind(
+                |queue| syscall::thread_bind_notification(thread_cap, queue, tag),
+                create_queue,
+                // No wait set to widen: past `WAIT_SET_MAX_MEMBERS` queues
+                // the set is full.
+                |_, _| Err(SyscallError::OutOfMemory as i64),
+            )
+        });
+        if bound.is_err() {
             release(slot, generation);
             return None;
         }
@@ -736,20 +686,9 @@ mod reaper {
     }
 
     /// Release a slot on join (resources reclaimed directly by the caller). A
-    /// later death-post for this slot is ignored (state `Vacant` / generation
-    /// mismatch).
-    pub(super) fn release(slot: usize, generation: u32) {
-        if slot >= REAPER_SLOTS {
-            return;
-        }
-        REAPER.lock.lock();
-        // SAFETY: lock held; single mutator.
-        let reg = unsafe { &mut *REAPER.inner.get() };
-        let s = &mut reg.slots[slot];
-        if s.generation == generation && s.state != SlotState::Vacant {
-            *s = vacant_slot();
-        }
-        REAPER.lock.unlock();
+    /// later death-post for this slot is ignored.
+    pub(super) fn release(slot: u32, generation: u32) {
+        with_slots(|slots| slots.release(slot, generation));
     }
 
     /// Hand a detached thread's resources to the registry, or a joined
@@ -758,91 +697,39 @@ mod reaper {
     /// `Reserved`), returns the resources for the caller to reclaim
     /// immediately; otherwise stores them for `sweep` and returns `None`.
     pub(super) fn detach(
-        slot: usize,
+        slot: u32,
         generation: u32,
         res: ThreadResources,
     ) -> Option<ThreadResources> {
-        if slot >= REAPER_SLOTS {
-            // Out-of-range slot index can't be reclaimed safely (no death
-            // signal we can trust) — leak rather than risk a UAF.
-            core::mem::forget(res);
-            return None;
-        }
-        REAPER.lock.lock();
-        // SAFETY: lock held; single mutator.
-        let reg = unsafe { &mut *REAPER.inner.get() };
-        let s = &mut reg.slots[slot];
-        let outcome = if s.generation == generation && s.state == SlotState::Reserved {
-            if s.died {
-                // Child already dead, post already drained — reclaim now.
-                *s = vacant_slot();
-                Some(res)
-            } else {
-                s.state = SlotState::Detached;
-                s.res = Some(res);
+        match with_slots(|slots| slots.detach(slot, generation, res)) {
+            Detached::Reclaim(res) => Some(res),
+            Detached::Held => None,
+            Detached::Leak(res) => {
+                // The slot was released or reused under us: no death signal
+                // can be trusted for it, so leak rather than risk a UAF on a
+                // possibly live thread.
+                core::mem::forget(res);
                 None
             }
-        } else {
-            // Unexpected (slot reused/vacated under us). Leak rather than risk a
-            // UAF on a possibly-live thread.
-            core::mem::forget(res);
-            None
-        };
-        REAPER.lock.unlock();
-        outcome
+        }
     }
 
-    /// Drain the death `EventQueue` (non-blocking) and reclaim any detached
-    /// thread whose death-post has landed. Called on every spawn and join.
+    /// Drain every death queue (non-blocking) and reclaim any detached thread
+    /// whose death-post has landed. Called on every spawn and join.
     pub(super) fn sweep() {
-        let eq = DEATH_EQ.load(Ordering::Acquire);
-        if eq == 0 {
-            return;
-        }
-        loop {
-            let death = match syscall::event_try_recv_death(eq) {
-                Ok(d) => d,
-                // WouldBlock (empty) or the queue is gone — nothing more to do.
-                Err(_) => break,
-            };
-            // The bind passed a u32 correlator widened to u64; the low word is
-            // all of it.
-            let (slot, generation) = split(death.correlator as u32);
-
-            REAPER.lock.lock();
-            // SAFETY: lock held; single mutator.
-            let reg = unsafe { &mut *REAPER.inner.get() };
-            let to_reclaim = if slot < REAPER_SLOTS {
-                let s = &mut reg.slots[slot];
-                if s.generation == generation {
-                    match s.state {
-                        SlotState::Detached => {
-                            let res = s.res.take();
-                            *s = vacant_slot();
-                            res
-                        }
-                        SlotState::Reserved => {
-                            // Child died but the handle is still held; mark it so
-                            // `detach`/`release` reclaims when it runs.
-                            s.died = true;
-                            None
-                        }
-                        SlotState::Vacant => None,
+        with_queues(|queues| {
+            for &queue in queues.queues() {
+                // Empty (WouldBlock) or gone: nothing more on this queue.
+                while let Ok(death) = syscall::event_try_recv_death(queue) {
+                    if let Some(res) = with_slots(|slots| slots.death(death.correlator)) {
+                        // SAFETY: the death-post fired, so the thread has left
+                        // user-mode; its stack/IPC/TLS and Thread cap are safe
+                        // to reclaim.
+                        unsafe { res.reclaim() };
                     }
-                } else {
-                    None // stale post for a reused slot
                 }
-            } else {
-                None
-            };
-            REAPER.lock.unlock();
-
-            if let Some(res) = to_reclaim {
-                // SAFETY: the death-post fired, so the thread has left user-mode;
-                // its stack/IPC/TLS and Thread cap are safe to reclaim.
-                unsafe { res.reclaim() };
             }
-        }
+        });
     }
 }
 

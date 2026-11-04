@@ -28,6 +28,10 @@ ruststd/
 ├── README.md
 ├── argv-env/                   # `ruststd-argv-env` crate: pure, host-tested argv/env
 │   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
+├── death-queues/               # `ruststd-death-queues` crate: pure, host-tested death-queue
+│   └── src/                    #   growth policy and thread-reaper slot registry; a
+│                               #   rustc-dep-of-std dep, re-exported as
+│                               #   std::os::seraph::death_queues
 ├── patches/                    # upstream library/std patches applied during overlay assembly
 └── src/                        # std PAL overlay, copied into vendored library/std at build time
     ├── os/
@@ -162,8 +166,10 @@ of a joined thread whose join wait failed with an error other than `Interrupted`
 completion notification gone), is freed the same way by the next spawn, join, or detach in the
 process after the kernel posts that thread's death (or at once by that detach or join, when the
 death post has already landed), or leaks until process exit when the reaper could not register
-the thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
-dropped the death post because the process's death queue (128 entries) was full.
+the thread at spawn (its slot table could not grow, or no death queue could take the observer
+bind). The slot table and the death queues grow on demand, each further queue with twice the last
+one's entries and observer nodes (`std::os::seraph::death_queues`); a queue's entries equal its
+nodes, so no death post is dropped.
 
 ### CSpace slot headroom
 

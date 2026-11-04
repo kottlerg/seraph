@@ -18,7 +18,7 @@
 //! `ProcessInfo.main_tls_vaddr`, `ProcessInfo.ipc_buffer_vaddr`) and into the
 //! entry register that delivers the `ProcessInfo` page address. The created
 //! process reads them back from the struct and the register — it does not
-//! assume any fixed address. The created process's runtime also reads
+//! assume any fixed address. The created process's runtime also calls
 //! [`main_stack_growth`] for the demand-growth range below its main-thread
 //! stack's committed pages, inside the stack reservation every layout leaves.
 //!

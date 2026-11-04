@@ -60,9 +60,10 @@ It then reads the top of its user half once (`SystemInfoType::UserVaTop`, expose
 (`process_layout::growth_zones`), registers the IPC buffer, builds `std::os::seraph::StartupInfo`
 from the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the
 page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
-if that fails), and, when the page carries a pager, registers the main-thread stack's
-demand-growth range ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it
-runs the rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
+if that fails), and, when the page carries a pager and the image is `ET_DYN`, registers the
+main-thread stack's demand-growth range
+([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
+rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
 `fn main()`; when `main` returns, `_start` closes the stdio pipes and exits the process with its
 return code.
 
@@ -80,7 +81,7 @@ its version gating are defined in [abi/process-abi/README.md](../../abi/process-
 `std::sys::seraph` is the per-process owner of virtual-address policy. It
 exposes two distinct surfaces; the third (bootstrap-cross-boundary VAs) is
 chosen by the process creator and consumed by std at `_start`, which in a
-demand-paged process extends the main-thread stack below its committed pages
+demand-paged `ET_DYN` process extends the main-thread stack below its committed pages
 ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). See
 [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) for
 the full contract.
@@ -317,7 +318,7 @@ primitives.
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
 [Fault Handling](../../docs/fault-handling.md),
 [Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[Userspace Memory Model](../../docs/userspace-memory-model.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
-[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md),
-[Userspace Memory Model](../../docs/userspace-memory-model.md)
+[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

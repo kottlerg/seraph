@@ -3,14 +3,11 @@
 
 // programs/stackoverflow/src/main.rs
 
-//! Stack-overflow fixture for the main-thread stack guard page.
-//!
-//! Recurses with a page-sized local in every frame. The stack pointer
-//! descends through the stack's committed pages and then through the
-//! demand-growth range below them, which the pager backs on first touch,
-//! until a write lands in the unregistered guard page below the range. The
-//! pager declines that fault and the kernel terminates the thread with the
-//! architecture's page-fault exit reason.
+//! Stack-overflow fixture for the main-thread stack guard page: recursion
+//! without bound until the main thread's stack overflows onto its guard page
+//! and the thread is killed with a page-fault exit reason. The stack it
+//! overflows is described in `programs/stackoverflow/README.md` and
+//! docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs.
 //!
 //! Driven by `services/svctest`'s `stack_overflow_phase`, which spawns this
 //! binary, waits for exit, and asserts the non-zero fault reason.
@@ -29,7 +26,7 @@ fn overflow(depth: usize)
 {
     // One full page of stack per frame guarantees that overflow reaches
     // the guard page in a bounded number of recursions (about one per page
-    // of the 512-page stack, plus one for the guard). `black_box` prevents the
+    // of the `DEFAULT_DEMAND_STACK_PAGES` stack, plus one for the guard). `black_box` prevents the
     // optimiser from eliding the buffer or the tail call.
     let buf = [depth as u8; 4096];
     std::hint::black_box(&buf);

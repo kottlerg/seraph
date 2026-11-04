@@ -85,7 +85,7 @@ pub const PROCESS_ABI_VERSION: u32 = 22;
 
 /// Default main-thread stack size in 4 KiB pages (32 KiB total): the pages
 /// the loader maps, the stack's committed part. In a demand-paged process
-/// std's runtime grows the stack on demand below them (see
+/// std's runtime grows an `ET_DYN` image's stack on demand below them (see
 /// `docs/userspace-memory-model.md` § Bootstrap Cross-Boundary VAs).
 ///
 /// Loaders use this when the binary does not declare a custom size via

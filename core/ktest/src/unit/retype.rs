@@ -51,15 +51,18 @@ const TEST_VA_BASE: u64 = 0x0000_0001_4000_0000;
 /// `L1_DIRECT` (core/kernel/src/cap/cspace.rs).
 const DIRECT_LEAVES: u64 = 128;
 /// Leaves per pool-paid directory page: mirrors the kernel's `DIR_FANOUT`,
-/// one page of leaf pointers, which are 8 bytes on both 64-bit targets.
-const DIR_FANOUT: u64 = syscall_abi::PAGE_SIZE / 8;
+/// one page of leaf pointers.
+const DIR_FANOUT: u64 = syscall_abi::PAGE_SIZE / core::mem::size_of::<*const ()>() as u64;
+/// The index of [`INDIRECT_SLOT`], before its conversion to a slot index.
+const INDIRECT_SLOT_INDEX: u64 = (DIRECT_LEAVES + 2) * syscall_abi::CSPACE_SLOTS_PER_PAGE + 20;
+const _: () = assert!(INDIRECT_SLOT_INDEX >> 32 == 0);
 /// A slot past the direct region's `DIRECT_LEAVES` × `CSPACE_SLOTS_PER_PAGE`
 /// slots, under the first directory page: 20 slots into the third leaf past
 /// the direct region.
-// cast_possible_truncation: the assert below keeps the index within u32.
+// cast_possible_truncation: the assert above keeps INDIRECT_SLOT_INDEX
+// within u32.
 #[allow(clippy::cast_possible_truncation)]
-const INDIRECT_SLOT: u32 = ((DIRECT_LEAVES + 2) * syscall_abi::CSPACE_SLOTS_PER_PAGE + 20) as u32;
-const _: () = assert!(((DIRECT_LEAVES + 2) * syscall_abi::CSPACE_SLOTS_PER_PAGE + 20) >> 32 == 0);
+const INDIRECT_SLOT: u32 = INDIRECT_SLOT_INDEX as u32;
 
 /// Pool pages a `CSpace` with no grown leaf spends to cover slot `index`:
 /// every leaf through the covering one (`CSPACE_SLOTS_PER_PAGE` slots each,

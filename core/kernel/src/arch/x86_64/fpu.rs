@@ -215,7 +215,7 @@ pub unsafe fn enable_xsave()
 /// (`crate::sched::thread_slot`). Valid once [`enable_xsave`] has written
 /// XCR0.
 #[cfg(not(test))]
-pub fn xsave_area_bytes() -> u64
+fn xsave_area_bytes() -> u64
 {
     u64::from(super::cpu::cpuid(0xD).1)
 }

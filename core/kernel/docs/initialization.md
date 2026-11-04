@@ -272,14 +272,13 @@ address, the reason, and the span's end.
 4. Fix every CPU set's width at the boot's CPU count (`cpu_mask::set_boot_cpu_count`,
    `cpu_count.div_ceil(64)` words), then allocate per-CPU subsystem storage from the buddy
    allocator while it still holds large contiguous blocks (before the Phase-7 user-cap
-   drain): the reschedule-pending CPU set, the scheduler
-   slabs (per-CPU schedulers, idle TCBs, idle-stack tops plus one idle kernel stack per
-   CPU, above a guard page the direct map leaves unmapped, watchdog ticks and
-   breadcrumbs), the PerCpuData, APIC-ID, TLB-shootdown request
-   and TLB acknowledgement-set slabs, and on x86-64 the per-AP
-   GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
-   entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
-   self-test sample slab (`entropy::init_storage`)
+   drain): the reschedule-pending CPU set, the scheduler slabs (per-CPU schedulers, idle
+   TCBs, idle-stack tops plus one idle kernel stack per CPU, above a guard page the direct
+   map leaves unmapped, watchdog ticks and breadcrumbs), the PerCpuData, APIC-ID,
+   TLB-shootdown request and TLB acknowledgement-set slabs, and on x86-64 the per-AP
+   GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the entropy
+   subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and self-test sample slab
+   (`entropy::init_storage`)
 5. Allocate the frame map table: a chunk table with one slot per GiB of the DRAM span,
    and one 1 MiB chunk of per-frame user-mapping counts for each GiB that holds RAM
    (`mm::frame_map::init`; see [memory-internals.md](memory-internals.md) § Frame Map Table)

@@ -75,9 +75,9 @@ fault from `crate::arch::ILLEGAL_INSTRUCTION_VECTOR`, raise the latter through
 `crate::arch::illegal_instruction`, and take the register file's size and
 instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
 `crate::arch::IP_OFFSET` (the `abi/syscall` `REGS_<ARCH>_SIZE` and
-`REGS_<ARCH>_IP_OFFSET` constants). A cell that binds an I/O port runs only where
-`crate::arch::HAS_IO_PORTS` holds. The register-file probes of the FPU and
-callee-saved-register tests are `crate::arch::fpu` and
+`REGS_<ARCH>_IP_OFFSET` constants). A cell that binds an I/O port runs only
+where `crate::arch::HAS_IO_PORTS` holds. The register-file probes of the FPU
+and callee-saved-register tests are `crate::arch::fpu` and
 `crate::arch::callee_saved`, the machine-code stubs of `unit::retype`
 `crate::arch::code_stub`, and the harness's UART, I/O port seed, shutdown, and
 cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and

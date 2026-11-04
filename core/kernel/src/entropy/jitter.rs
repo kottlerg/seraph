@@ -45,8 +45,10 @@ struct Acc
     count: AtomicU64,
 }
 
-// The slab descriptor (`super::JITTER_SLAB`) sizes the slab from this
-// constant in host builds too, which compile this type out.
+// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
+// computes this slab's bytes from `JITTER_ACC_BYTES`, in builds that compile
+// this type out; the assert keeps the constant equal to the layout the
+// kernel allocates.
 const _: () = assert!(core::mem::size_of::<Acc>() == super::JITTER_ACC_BYTES);
 
 static ACC_PTR: AtomicPtr<Acc> = AtomicPtr::new(core::ptr::null_mut());

@@ -767,11 +767,11 @@ list as the tracking Issues move):
   (`sched::slab_pages`); the sizing of every per-CPU slab, whose byte count
   each initialiser takes from its `sched::PerCpuSlab` descriptor: host tests
   that every descriptor's count does not overflow and that its `slab_pages`
-  cover it at `MAX_CPUS` and at each width where its page count crosses a
-  `2^MAX_ORDER` block (`sched::slab_tests`), and a compile-time assert beside
-  each descriptor of a fixed per-CPU count that checks the same at every
-  width up to `MAX_CPUS` against the target's own layout on both
-  architectures; and the 128-CPU boots for two full words.
+  cover it at every width up to `MAX_CPUS`, each width where its page count
+  crosses a `2^MAX_ORDER` block among them (`sched::slab_tests`), and a
+  compile-time assert beside each descriptor of a fixed per-CPU count that
+  checks the same against the target's own layout on both architectures; and
+  the 128-CPU boots for two full words.
 - Both arches, a partial second `CpuMask` word (residual): no local run boots
   a count past one 64-bit word that does not fill the next (65 to 127 CPUs).
   The host tests of `CpuMask::range` cover those mask paths instead:

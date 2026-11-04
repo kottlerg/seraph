@@ -32,8 +32,10 @@ struct Sample
     captured: bool,
 }
 
-// The slab descriptor (`super::SELFTEST_SLAB`) sizes the slab from this
-// constant in host builds too, which compile this type out.
+// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
+// computes this slab's bytes from `SELFTEST_SAMPLE_BYTES`, in builds that
+// compile this type out; the assert keeps the constant equal to the layout
+// the kernel allocates.
 const _: () = assert!(core::mem::size_of::<Sample>() == super::SELFTEST_SAMPLE_BYTES);
 
 static SAMPLES_PTR: AtomicPtr<Sample> = AtomicPtr::new(core::ptr::null_mut());

@@ -94,8 +94,10 @@ struct TlbShootdownRequest
     pending_cpus: AtomicCpuMask,
 }
 
-// The slab descriptor (`super::TLB_REQUESTS_SLAB`) sizes the slab from this
-// constant in host builds too, which compile this type out.
+// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
+// computes this slab's bytes from `TLB_REQUEST_BYTES`, in builds that compile
+// this type out; the assert keeps the constant equal to the layout the
+// kernel allocates.
 const _: () = assert!(core::mem::size_of::<TlbShootdownRequest>() == super::TLB_REQUEST_BYTES);
 
 impl TlbShootdownRequest

@@ -788,6 +788,13 @@ pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> 
 /// Allocate architecture-specific per-CPU tables during SMP bring-up: x86-64
 /// per-AP GDT/TSS, AP IST stacks, and NMI-backtrace storage; a no-op on RISC-V.
 pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut mm::BuddyAllocator);
+
+/// The `sched::PerCpuSlab` descriptors of the slabs `init_ap_percpu_storage`
+/// allocates (x86-64: AP TSS, AP GDT, AP IST stacks, NMI backtrace; empty on
+/// RISC-V), for the host tests of every per-CPU slab's sizing
+/// (`sched::slab_tests`). Host test builds only.
+#[cfg(test)]
+pub(crate) const PER_CPU_SLABS: &[sched::PerCpuSlab];
 ```
 
 The `SYS_SBI_CALL` handler's rights check and `HAS_SBI` gate are specified in

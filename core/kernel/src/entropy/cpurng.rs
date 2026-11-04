@@ -33,8 +33,10 @@ pub struct CpuRng
     last_reseed_us: u64,
 }
 
-// The slab descriptor (`super::CPURNG_SLAB`) sizes the slab from this
-// constant in host builds too, which compile this type out.
+// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
+// computes this slab's bytes from `CPURNG_BYTES`, in builds that compile
+// this type out; the assert keeps the constant equal to the layout the
+// kernel allocates.
 const _: () = assert!(core::mem::size_of::<CpuRng>() == super::CPURNG_BYTES);
 
 impl CpuRng

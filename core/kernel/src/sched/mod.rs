@@ -2693,8 +2693,10 @@ pub(crate) const fn slab_pages(bytes: usize) -> usize
 /// Every per-CPU storage initialiser allocates through
 /// [`alloc_per_cpu_slab`] with its slab's descriptor, so the byte count a boot
 /// asks for at any CPU count is [`bytes`](Self::bytes) of that descriptor: the
-/// value the host tests and each descriptor's compile-time assert check up to
-/// [`MAX_CPUS`].
+/// value the host tests check at every width up to [`MAX_CPUS`], and the
+/// compile-time assert beside each descriptor of a fixed per-CPU element count
+/// checks against the target's own layout (the tag-state slab's count is set
+/// at boot, so the host tests alone check it).
 #[derive(Clone, Copy)]
 pub(crate) struct PerCpuSlab
 {
@@ -2759,8 +2761,9 @@ impl PerCpuSlab
     }
 
     /// Whether the slab is sized ([`sized_at`](Self::sized_at)) at every CPU
-    /// count from one to [`MAX_CPUS`]. Each descriptor's compile-time assert
-    /// calls it, so every build checks the target layout of its architecture.
+    /// count from one to [`MAX_CPUS`]. The compile-time assert beside each
+    /// fixed-count descriptor calls it, so every build checks the target layout
+    /// of its architecture.
     pub(crate) const fn sized_at_every_width(self) -> bool
     {
         let mut cpus = 1;
@@ -2778,8 +2781,9 @@ impl PerCpuSlab
 
 /// Allocate `slab`'s storage for `cpu_count` CPUs through
 /// [`alloc_zeroed_slab`] and return a typed pointer to its first element.
-/// Halts when the byte count overflows (no descriptor's compile-time assert
-/// admits one up to [`MAX_CPUS`]) or on buddy exhaustion.
+/// Halts when the byte count overflows (no fixed-count descriptor's
+/// compile-time assert, and for the tag-state slab no host test, admits one up
+/// to [`MAX_CPUS`]) or on buddy exhaustion.
 #[cfg(not(test))]
 pub(crate) fn alloc_per_cpu_slab<T>(
     slab: PerCpuSlab,
@@ -6654,20 +6658,12 @@ mod slab_tests
         assert!(!slab.sized_at(1));
     }
 
-    /// The widths at which `bytes` crosses into one more `2^MAX_ORDER` block,
-    /// with `MAX_CPUS` last.
-    fn checked_widths(bytes: impl Fn(usize) -> usize) -> Vec<usize>
-    {
-        let blocks = |cpus: usize| (slab_pages(bytes(cpus)) - 1) / BLOCK_PAGES;
-        let mut widths: Vec<usize> = (2..=MAX_CPUS)
-            .filter(|&cpus| blocks(cpus) > blocks(cpus - 1))
-            .collect();
-        widths.push(MAX_CPUS);
-        widths
-    }
-
+    // Every width from one CPU to `MAX_CPUS` is checked, which includes
+    // `MAX_CPUS` and each width where a slab's page count crosses into one
+    // more `2^MAX_ORDER` block; the tag-state slab's byte count does not grow
+    // monotonically with the width, so no subset of widths stands for the rest.
     #[test]
-    fn every_per_cpu_slab_is_sized_at_max_cpus_and_at_each_block_crossing()
+    fn every_per_cpu_slab_is_sized_at_every_width_up_to_max_cpus()
     {
         let fixed = [
             super::SCHEDULERS_SLAB,
@@ -6684,25 +6680,16 @@ mod slab_tests
         ];
         for slab in fixed.iter().chain(crate::arch::current::PER_CPU_SLABS)
         {
-            // `bytes` is checked first; the crossings are computed on it.
-            assert!(slab.bytes(MAX_CPUS).is_some(), "{} overflows", slab.label);
-            for cpus in checked_widths(|cpus| slab.bytes(cpus).unwrap_or(usize::MAX))
-            {
-                assert!(slab.sized_at(cpus), "{} at {cpus} CPUs", slab.label);
-            }
+            assert!(slab.sized_at_every_width(), "{} is not sized", slab.label);
         }
 
         // The tag-state slab holds `tag_count` records per CPU, at its widest
         // with the most hardware tags any architecture reports.
-        let tags = |cpus: usize| {
-            let n = tag_count(MAX_HW_TAGS, cpus).expect("tagging is on at every width");
-            TAG_STATE_SLAB.with_elems_per_cpu(n)
-        };
-        assert!(tags(MAX_CPUS).bytes(MAX_CPUS).is_some());
-        for cpus in checked_widths(|cpus| tags(cpus).bytes(cpus).unwrap_or(usize::MAX))
+        for cpus in 1..=MAX_CPUS
         {
+            let n = tag_count(MAX_HW_TAGS, cpus).expect("tagging is on at every width");
             assert!(
-                tags(cpus).sized_at(cpus),
+                TAG_STATE_SLAB.with_elems_per_cpu(n).sized_at(cpus),
                 "PER_CPU_TAG_STATE at {cpus} CPUs"
             );
         }

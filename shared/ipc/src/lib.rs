@@ -118,8 +118,10 @@ pub mod procmgr_labels
     /// * words after the env header — env blob, `env_bytes.div_ceil(8)` words
     ///
     /// Caps: `[file_cap, creator_endpoint?, death_relay?]`. `file_cap`
-    /// ownership transfers to procmgr; procmgr `FS_CLOSE`s and
-    /// `cap_delete`s it after the load completes (success or failure). The
+    /// ownership transfers to procmgr: procmgr opens it (`FS_OPEN`) and
+    /// `cap_delete`s it, then `FS_CLOSE`s and deletes its open after the load
+    /// (success or failure); a request refused before the open deletes
+    /// `file_cap` unopened. The
     /// optional `death_relay` POST-only `EventQueue` cap is present iff
     /// [`CREATE_DEATH_RELAY`] is set in the label; when present it is the
     /// LAST cap in the message (procmgr peels it off the tail, so the

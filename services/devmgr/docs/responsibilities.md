@@ -88,22 +88,28 @@ devmgr's responsibilities are:
   and taking deaths from the queue, until every driver of the batch has
   reported ready or died or the settle bound elapses, and then takes every
   death still queued. It then revokes the private endpoint, serves each driver
-  that reported ready, and withdraws the rest. A `VirtIO` device is reset
-  (devmgr maps the BAR cap it keeps that holds the common configuration
-  region and writes 0 to `device_status`, which stops the device's DMA and
-  drops its pending interrupt; a byte past the span that cap was carved to
-  is not written, and the reset is skipped). A driver still running (one
-  pending, or one devmgr has no memory to serve) is reset first, then
-  destroyed (`DESTROY_PROCESS` on the process handle devmgr keeps until the
-  batch settles, which returns once procmgr has torn it down and handed its
-  memory back to memmgr), so its device's DMA stops before that memory is
-  freed. Then its service endpoint is revoked and deleted, the device reset
-  again, so that reset is the last write the device sees, and its BAR and
-  IRQ caps released. A driver devmgr's batch cannot record at its spawn is
-  withdrawn the same way there. The catalog entry of a withdrawn driver, or of
-  one that failed to spawn, stays, so a badge is never reused. No `QUERY_*`
-  reply hands out the endpoint of a driver that has not reported its device
-  ready.
+  that reported ready, and withdraws the rest. Withdrawing a `VirtIO`
+  driver takes its device from it and resets the device: devmgr revokes
+  every cap derived from the BAR caps it keeps, which removes the driver's
+  mappings of the device before the revocation returns, then maps the BAR
+  cap holding the common configuration region, writes 0 to `device_status`,
+  and waits, bounded by `RESET_TIMEOUT`, for the status to read 0, which
+  completes the reset: the device has then stopped its DMA and dropped its
+  pending interrupt (a status byte past the span the cap was carved to is
+  not written, and the reset counts as unconfirmed). A driver still running
+  (one pending, or one devmgr has no memory to serve) is taken from its
+  device and reset first, and only then destroyed (`DESTROY_PROCESS` on the
+  process handle devmgr keeps until the batch settles, which returns once
+  procmgr has torn it down and handed its memory back to memmgr), so the
+  device can no longer reach that memory when it is freed. A driver whose
+  device does not confirm its reset is not destroyed: devmgr releases its
+  process handle, and the driver, which can no longer reach its device,
+  keeps its memory out of reuse. Then the driver's service endpoint is
+  revoked and deleted and its BAR and IRQ caps released. A driver devmgr's
+  batch cannot record at its spawn is withdrawn the same way there. The
+  catalog entry of a withdrawn driver, or of one that failed to spawn,
+  stays, so a badge is never reused. No `QUERY_*` reply hands out the
+  endpoint of a driver that has not reported its device ready.
 
   The settle bound, `SETTLE_TIMEOUT` (`services/devmgr/src/settle.rs`), is
   twice `virtio_core::pci::RESET_TIMEOUT` (5 s), so 10 s, counted from the

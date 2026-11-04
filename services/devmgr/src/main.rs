@@ -1219,26 +1219,30 @@ impl DeviceReset
         })
     }
 
-    /// Reset the device: map its status BAR into devmgr for the write, store
-    /// 0 to `device_status`, and unmap. A reset device stops its DMA and
-    /// drops its pending interrupt, so a driver that died while its device
-    /// asserted a shared level-triggered line leaves the line's other
-    /// receivers no assertion to loop on (docs/device-management.md
-    /// § Interrupt Delivery). Logged and skipped when the mapping fails.
-    fn reset(&self)
+    /// Reset the device: map its status BAR into devmgr, store 0 to
+    /// `device_status`, wait for the status to read 0, which completes the
+    /// reset (`VirtIO` 1.2 §4.1.4.3.2), bounded by
+    /// `virtio_core::pci::RESET_TIMEOUT`, and unmap. A device whose reset
+    /// completed has stopped its DMA and dropped its pending interrupt, so a
+    /// driver that died while its device asserted a shared level-triggered
+    /// line leaves the line's other receivers no assertion to loop on
+    /// (docs/device-management.md § Interrupt Delivery). Returns whether the
+    /// reset completed; `false`, logged, when the mapping fails or the status
+    /// does not read 0 within the bound.
+    fn reset(&self) -> bool
     {
         let Ok(range) = reserve_pages(self.bar_pages)
         else
         {
             std::os::seraph::log!("device reset: no VA for its status BAR; not reset");
-            return;
+            return false;
         };
         let va = range.va_start();
         if !std::os::seraph::fund_aspace_pt_budget(self.aspace, self.bar_pages)
         {
             std::os::seraph::log!("device reset: page-table budget not funded; not reset");
             unreserve_pages(range);
-            return;
+            return false;
         }
         // SAFETY: `va` starts `range`, a fresh reservation of the BAR cap's page
         // count from the per-process arena, owned here: VA no Rust object or IPC
@@ -1249,16 +1253,31 @@ impl DeviceReset
         {
             std::os::seraph::log!("device reset: mapping its status BAR failed; not reset");
             unreserve_pages(range);
-            return;
+            return false;
         }
+        let status = (va + self.offset) as *mut u8;
         // SAFETY: `offset` is below the bytes the BAR's cap was carved to
         // (`for_device`), all of which `mmio_map` mapped from `va`, and
         // `device_status` is a byte register.
-        unsafe { core::ptr::write_volatile((va + self.offset) as *mut u8, 0) };
-        // SAFETY: the write above was the mapping's only use; the span is
+        unsafe { core::ptr::write_volatile(status, 0) };
+        // The reset completes when the device reads back 0 (`VirtIO` 1.2
+        // §4.1.4.3.2); the status is device-written, so the wait is bounded.
+        let start = std::time::Instant::now();
+        let confirmed = virtio_core::pci::poll_until(
+            virtio_core::pci::RESET_TIMEOUT,
+            || start.elapsed(),
+            // SAFETY: as for the write above.
+            || unsafe { core::ptr::read_volatile(status) } == 0,
+        );
+        // SAFETY: the accesses above were the mapping's only use; the span is
         // `range`, owned here.
         let _ = unsafe { syscall::mem_unmap(self.aspace, va, self.bar_pages) };
         unreserve_pages(range);
+        if !confirmed
+        {
+            std::os::seraph::log!("device reset: not confirmed within its bound");
+        }
+        confirmed
     }
 }
 
@@ -1388,24 +1407,59 @@ impl ServedDriver
     {
         let _ = syscall::cap_revoke(self.ep);
         let _ = syscall::cap_delete(self.ep);
-        self.reset_device();
+        let _ = self.reset_device();
         if let Some(dev_caps) = &self.dev_caps
         {
             dev_caps.release();
         }
     }
 
-    /// Reset a `VirtIO` device ([`DeviceReset::reset`]); a no-op for a driver
-    /// with no `VirtIO` device. Called before a live driver is destroyed, so
-    /// the device's DMA stops before the driver's memory is freed, and by
-    /// [`Self::withdraw`].
-    fn reset_device(&self)
+    /// Take a `VirtIO` device from its driver and reset it: revoke every cap
+    /// derived from the BAR caps devmgr keeps (the driver's copies, whose
+    /// mappings the revocation removes before it returns), so the driver
+    /// can no longer reach the device, then reset the device and wait for it
+    /// to confirm ([`DeviceReset::reset`]). Returns whether the device is
+    /// known to be quiet: `true` for a driver with no `VirtIO` device, and
+    /// for a device that confirmed its reset; `false` when the reset was not
+    /// confirmed, and the device may still be accessing the driver's memory.
+    fn reset_device(&self) -> bool
     {
-        if let Some(reset) = self.dev_caps.as_ref().and_then(|d| d.reset)
+        let Some(dev_caps) = &self.dev_caps
+        else
         {
-            reset.reset();
+            return true;
+        };
+        for bar in dev_caps.bars.as_slice()
+        {
+            let _ = syscall::cap_revoke_all(bar.cap);
         }
+        dev_caps.reset.is_none_or(|reset| reset.reset())
     }
+}
+
+/// Withdraw a driver that is still running. devmgr first takes the device
+/// from it and resets the device ([`ServedDriver::reset_device`]), so the
+/// device's DMA has stopped and the driver can no longer re-arm it, then
+/// destroys the driver, which returns its memory to memmgr, and withdraws it.
+/// A device that does not confirm its reset may still be writing the
+/// driver's memory, so that driver is not destroyed: devmgr releases its
+/// process handle, and the driver, which can no longer reach its device,
+/// keeps its memory out of reuse.
+fn destroy_live_driver(spawned: &SpawnedDriver, ipc_buf: *mut u64)
+{
+    if spawned.driver.reset_device()
+    {
+        spawn::destroy_child(spawned.process_handle, ipc_buf);
+    }
+    else
+    {
+        std::os::seraph::log!(
+            "{}: device did not confirm its reset; driver kept so its memory stays out of reuse",
+            spawned.class.name()
+        );
+        let _ = syscall::cap_delete(spawned.process_handle);
+    }
+    spawned.driver.withdraw();
 }
 
 /// A spawned driver its settle batch's roster records: its class, its device
@@ -1419,8 +1473,8 @@ struct SpawnedDriver
     driver: ServedDriver,
 }
 
-/// Record a spawned driver in its batch's roster, destroying and then withdrawing
-/// it when the roster cannot hold it (its room is reserved before each
+/// Record a spawned driver in its batch's roster, withdrawing it as a live driver
+/// ([`destroy_live_driver`]) when the roster cannot hold it (its room is reserved before each
 /// spawn, so only a repeated device badge, which the catalog never issues,
 /// reaches that).
 fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ipc_buf: *mut u64)
@@ -1431,12 +1485,7 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
             "{}: driver not recorded; device not served",
             spawned.class.name()
         );
-        // Reset the device before destroying the live driver, so its
-        // DMA stops before the driver's memory returns to memmgr, and
-        // again in `withdraw`, so that reset is the last write it sees.
-        spawned.driver.reset_device();
-        spawn::destroy_child(spawned.process_handle, ipc_buf);
-        spawned.driver.withdraw();
+        destroy_live_driver(&spawned, ipc_buf);
     }
 }
 
@@ -1487,12 +1536,7 @@ impl ServedDrivers
                     if class.try_reserve(1).is_err()
                     {
                         std::os::seraph::log!("{}: no memory to serve the driver; destroyed", name);
-                        // Reset the device before destroying the live driver, so its
-                        // DMA stops before the driver's memory returns to memmgr, and
-                        // again in `withdraw`, so that reset is the last write it sees.
-                        spawned.driver.reset_device();
-                        spawn::destroy_child(spawned.process_handle, ipc_buf);
-                        spawned.driver.withdraw();
+                        destroy_live_driver(&spawned, ipc_buf);
                     }
                     else
                     {
@@ -1516,12 +1560,7 @@ impl ServedDrivers
                         "{}: driver reported neither ready nor death before the settle ended; destroyed",
                         name
                     );
-                    // Reset the device before destroying the live driver, so its
-                    // DMA stops before the driver's memory returns to memmgr, and
-                    // again in `withdraw`, so that reset is the last write it sees.
-                    spawned.driver.reset_device();
-                    spawn::destroy_child(spawned.process_handle, ipc_buf);
-                    spawned.driver.withdraw();
+                    destroy_live_driver(&spawned, ipc_buf);
                 }
             }
         }

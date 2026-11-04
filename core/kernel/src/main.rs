@@ -321,8 +321,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 ///
 /// # Safety
 /// Phase 3 has completed (the direct map is active), `boot_info_phys` is the
-/// `BootInfo` Phase 0 validated, its page is not yet scrubbed, and nothing
-/// writes its `cpu_ids` array while the slice lives. `count` is the producer's
+/// `BootInfo` Phase 0 validated, neither its page nor the CPU-id pages its
+/// `cpu_ids` names (a reclaim range of their own) are yet scrubbed by Phase 9's
+/// `cap::scrub_reclaim_ranges`, and nothing writes the ids while the slice lives. `count` is the producer's
 /// `cpu_count`, at most `MAX_CPUS` by the boot protocol's contract; the slice
 /// is clamped to `MAX_CPUS` in any case. Phase 0 confirmed the array lies below
 /// the RAM ceiling, so the direct map reaches it.
@@ -491,9 +492,10 @@ unsafe fn kernel_entry_post_rebase(
     // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
     // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.
     #[cfg(not(test))]
-    // SAFETY: single-threaded boot; the ids are read from the validated
-    // BootInfo page through the direct map; init_storage allocated the id slab;
-    // init_apic_ids writes it once before SMP is active.
+    // SAFETY: single-threaded boot; the ids are read through the direct map
+    // from the CPU-id pages the validated BootInfo names, unscrubbed until
+    // Phase 9; init_storage allocated the id slab; init_apic_ids writes it once
+    // before SMP is active.
     unsafe {
         percpu::init_apic_ids(boot_cpu_ids(boot_info_phys, boot_cpu_count));
     }
@@ -679,8 +681,8 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 let entry_fn = kernel_entry_ap as *const () as u64;
-                // SAFETY: the BootInfo page is intact until the reclaim scrub at
-                // the end of boot, and nothing writes its CPU ids.
+                // SAFETY: the BootInfo page and the CPU-id pages are intact
+                // until Phase 9's reclaim scrub, and nothing writes the ids.
                 let hw_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
 
                 for cpu_idx in 1..=ap_count

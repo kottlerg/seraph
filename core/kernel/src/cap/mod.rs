@@ -1515,8 +1515,8 @@ fn populate_cspace(
     use init_protocol::CapType;
 
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
-    /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 2048 GSIs on x86-64,
-    /// eight I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
+    /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 32768 GSIs on x86-64,
+    /// `MAX_IOAPICS` (128) I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
     /// sources 1-1023). `SYS_IRQ_REGISTER` refuses an id no discovered controller
     /// implements, and the routing table ignores one past its discovered size,
     /// so oversizing is safe.
@@ -1764,8 +1764,8 @@ fn populate_cspace(
     // this arch. Userspace narrows it to single-IRQ children via
     // `SYS_IRQ_SPLIT` and delegates one per device.
     //
-    // x86-64: 2048 GSI lines, every pin of the eight I/O APICs the boot
-    // protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
+    // x86-64: 32768 GSI lines, every pin of the `MAX_IOAPICS` (128) I/O
+    // APICs the boot protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
     // 1-1023) is the spec maximum; most platforms expose far fewer (e.g.
     // 95). Sizing the root at the id space is safe because
     // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
@@ -2078,9 +2078,9 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
 /// descriptor array, memory-map entry array, the raw UEFI memory-map buffer
 /// (zeroed by the bootloader after its last read), MMIO aperture array, the
-/// reclaim-array page itself, the bootloader's transient page-table
-/// frames, and the bundle's non-module pages (header + entry table +
-/// pad, init ELF source body, inter-module and trailing slack —
+/// reclaim-array page itself, the CPU-id pages, the bootloader's
+/// transient page-table frames, and the bundle's non-module pages (header +
+/// entry table + pad, init ELF source body, inter-module and trailing slack —
 /// module bodies are excluded because [`mint_module_memory_caps`]
 /// covers them) — and mints one reclaimable `MemoryObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
@@ -2335,8 +2335,8 @@ const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = (boot_protocol::MAX_RECLAIM_RANGES
 /// Zero every range `BootInfo.reclaim_ranges` records, late-flagged entries
 /// included, through the direct map, so no page the bootloader wrote (its
 /// transient page tables, which encode the slid kernel layout, the `BootInfo`
-/// page, the descriptor arrays, the bundle's non-module pages, and the AP
-/// trampoline page) reaches userspace with its contents intact
+/// page, the descriptor arrays, the CPU-id pages, the bundle's non-module
+/// pages, and the AP trampoline page) reaches userspace with its contents intact
 /// (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel state in donated
 /// memory).
 ///

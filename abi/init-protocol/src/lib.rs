@@ -294,8 +294,8 @@ pub struct InitInfo
 // Compile-time invariants for the `InitInfo` layout. The kernel writes
 // the `CapDescriptor` array at byte offset `cap_descriptors_offset =
 // size_of::<InitInfo>()` and the entries contain `u64` fields, so the
-// total size must be 8-byte aligned. The whole region must also fit
-// within `INIT_INFO_MAX_PAGES`.
+// total size must be 8-byte aligned. The header must also fit within the
+// region's first page.
 const _: () = assert!(
     core::mem::size_of::<InitInfo>().is_multiple_of(8),
     "InitInfo size must be 8-byte aligned so cap_descriptors_offset is 8-byte aligned",

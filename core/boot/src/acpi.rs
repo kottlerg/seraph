@@ -16,8 +16,10 @@
 //! § Revision Gating.
 //!
 //! # Surface
+//! - [`cpu_topology_capacity`]: MADT walk counting the CPU entries, which
+//!   sizes the CPU-id pages.
 //! - [`parse_cpu_topology`]: MADT walk producing `BootInfo.cpu_count` and
-//!   `BootInfo.cpu_ids`.
+//!   the hardware IDs `BootInfo.cpu_ids` names.
 //! - [`parse_aperture_seed`]: MADT + MCFG walk, plus the arch's
 //!   platform-default MMIO apertures and PCI windows
 //!   (`core/boot/docs/acpi.md` § Tables Consumed), producing the register

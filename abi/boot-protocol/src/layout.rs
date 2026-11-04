@@ -212,12 +212,14 @@ pub fn direct_map_ceiling(
 }
 
 /// Upper bound of entries [`collect_mmio_direct_map_regions`] can produce: one
-/// LAPIC window plus one per I/O APIC, `1 + MAX_IOAPICS` on x86-64, which the
-/// assert below pins.
-pub const MAX_MMIO_DIRECT_MAP_REGIONS: usize = 129;
-
+/// LAPIC window plus one per I/O APIC, `1 + MAX_IOAPICS` (129) on x86-64.
 #[cfg(target_arch = "x86_64")]
-const _: () = assert!(MAX_MMIO_DIRECT_MAP_REGIONS > crate::MAX_IOAPICS);
+pub const MAX_MMIO_DIRECT_MAP_REGIONS: usize = 1 + crate::MAX_IOAPICS;
+
+/// Upper bound of entries [`collect_mmio_direct_map_regions`] can produce:
+/// none on riscv64.
+#[cfg(target_arch = "riscv64")]
+pub const MAX_MMIO_DIRECT_MAP_REGIONS: usize = 0;
 
 // ── Kernel-internal MMIO regions mapped through the direct map ──────────────
 

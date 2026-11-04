@@ -8,8 +8,9 @@
 //! Scans the UEFI configuration table unconditionally for both
 //! `EFI_ACPI_20_TABLE_GUID` and `EFI_DTB_TABLE_GUID`, recording whichever
 //! are present. Full ACPI and Device Tree parsing is deferred to userspace
-//! (`devmgr`). Also holds [`place_cpu_ids`], the BSP-first CPU placement
-//! rule the MADT and DTB topology walks share.
+//! (`devmgr`). Also holds the CPU-id helpers the MADT and DTB topology walks
+//! share: [`cpu_id_capacity`] sizes the CPU-id pages, and [`place_cpu_ids`]
+//! and [`record_cpu_id`] apply the BSP-first placement rule.
 
 use crate::uefi::{EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID, EfiSystemTable, find_config_table};
 use boot_protocol::MAX_CPUS;

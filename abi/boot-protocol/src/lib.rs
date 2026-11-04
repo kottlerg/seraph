@@ -981,10 +981,9 @@ pub struct BootInfo
     pub kaslr_flags: u32,
 }
 
-// The bootloader writes `BootInfo` into one page, and the boot-module array
-// into another.
+// Hard size budget: the bootloader writes `BootInfo` into one page, and the
+// kernel validates and reads it there.
 const _: () = assert!(core::mem::size_of::<BootInfo>() <= 4096);
-const _: () = assert!(MAX_BOOT_MODULES * core::mem::size_of::<BootModule>() <= 4096);
 
 // ── KASLR flags (protocol version 14) ────────────────────────────────────────
 

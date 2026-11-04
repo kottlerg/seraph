@@ -1100,21 +1100,26 @@ mod tests
     #[test]
     fn the_aperture_capacity_holds_the_worst_case_derivation()
     {
-        // Alternating MMIO and RAM descriptors, each RAM one cutting every seed
-        // that spans it, and full seed buffers of short disjoint windows.
+        // Disjoint MMIO descriptors, each one aperture, and full seed buffers of
+        // disjoint three-page windows, each cut in two by a one-page RAM
+        // descriptor in its middle, so half the apertures start at the end of
+        // a clipped descriptor.
         let mut descs = Vec::new();
         for i in 0..40u64
         {
-            let base = 0x1_0000_0000 + i * 0x20_0000;
-            descs.push(mmio_desc(base, 1));
-            descs.push(desc(EFI_CONVENTIONAL_MEMORY, base + 0x10_0000, 1));
+            descs.push(mmio_desc(0x1_0000_0000 + i * 0x20_0000, 1));
         }
-        let seeds: Vec<_> = (0..MAX_SEEDS_PER_CLASS as u64)
-            .map(|i| ap(0x2_0000_0000 + i * 0x2000, 0x1000))
-            .collect();
-        let heuristic: Vec<_> = (0..MAX_SEEDS_PER_CLASS as u64)
-            .map(|i| ap(0x3_0000_0000 + i * 0x2000, 0x1000))
-            .collect();
+        let mut seeds = Vec::new();
+        let mut heuristic = Vec::new();
+        for i in 0..MAX_SEEDS_PER_CLASS as u64
+        {
+            let named = 0x2_0000_0000 + i * 0x10_0000;
+            seeds.push(ap(named, 0x3000));
+            descs.push(desc(EFI_CONVENTIONAL_MEMORY, named + 0x1000, 1));
+            let window = 0x3_0000_0000 + i * 0x10_0000;
+            heuristic.push(ap(window, 0x3000));
+            descs.push(desc(EFI_CONVENTIONAL_MEMORY, window + 0x1000, 1));
+        }
         let capacity = aperture_capacity(descs.len());
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
@@ -1126,8 +1131,12 @@ mod tests
         let mut out = vec![ap(0, 0); capacity];
         // SAFETY: `descs` is a live, aligned descriptor array covering `map_size`.
         let n = unsafe { derive_mmio_apertures(&uefi_map, &seeds, &heuristic, &mut out) };
-        assert_eq!(n, 40 + 2 * MAX_SEEDS_PER_CLASS);
+        assert_eq!(n, 40 + 4 * MAX_SEEDS_PER_CLASS);
         assert!(n <= capacity);
+        let derived = pairs(&out[..n]);
+        assert!(derived.contains(&(0x2_0000_0000, 0x1000)));
+        assert!(derived.contains(&(0x2_0000_2000, 0x1000)));
+        assert!(derived.contains(&(0x3_0000_2000, 0x1000)));
     }
 
     #[test]

@@ -48,12 +48,12 @@ pub const HAS_IO_PORTS: bool = true;
 pub const HAS_SBI: bool = false;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7, the GSI id space:
-/// `MAX_IOAPICS` I/O APICs of `ioapic::IOAPIC_MAX_PINS` (256) pins each, 2048 GSIs. The
+/// `MAX_IOAPICS` I/O APICs of `ioapic::IOAPIC_MAX_PINS` (256) pins each, 32768 GSIs. The
 /// discovered I/O APICs cover only their reported pins, which size the `irq` routing table;
 /// a split can name the other ids, `SYS_IRQ_REGISTER` refuses them, and the Interrupt
 /// teardown leaves the routing untouched for them. A GSI an I/O APIC reports above this
 /// space is logged at boot and not routable.
-// cast_possible_truncation: MAX_IOAPICS is 8, so the product fits u32.
+// cast_possible_truncation: MAX_IOAPICS is 128, so the product (32768) fits u32.
 #[allow(clippy::cast_possible_truncation)]
 pub const ROOT_IRQ_COUNT: u32 = boot_protocol::MAX_IOAPICS as u32 * ioapic::IOAPIC_MAX_PINS;
 

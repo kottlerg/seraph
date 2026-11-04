@@ -10,7 +10,10 @@
 //! validation, and error handling are specified in `core/boot/docs/dtb.md`.
 //!
 //! # Surface
-//! - [`parse_cpu_count`]: enumerate RISC-V hart IDs from the `/cpus` node.
+//! - [`parse_cpu_count`]: count the enabled RISC-V harts under `/cpus`,
+//!   which sizes the CPU-id pages.
+//! - [`place_hart_ids`]: write their hart IDs, the boot hart's first, into
+//!   those pages.
 //! - [`parse_hart_caps`]: extract the `/cpus` `timebase-frequency` and
 //!   the `HART_CAP_*` bits every enabled hart advertises.
 //! - [`parse_boot_cpu_mmu_type`]: read the boot hart's `mmu-type` paging

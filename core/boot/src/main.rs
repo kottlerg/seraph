@@ -107,7 +107,7 @@ const MEM_MAP_SLACK_ENTRIES: usize = 32;
 /// Covers kernel segments, all fixed allocations, and the framebuffer.
 ///
 /// Provably sufficient: `collect_identity_regions` pushes a fixed set of at
-/// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 regions.
+/// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 10` = 26 regions.
 const MAX_IDENTITY_REGIONS: usize = 64;
 
 /// Size of the aperture-seed buffer (firmware-advertised MMIO extents before
@@ -295,6 +295,11 @@ struct BootAllocations
     /// step 6, populates the `ReclaimRange` array in step 9, and records
     /// the page itself as a reclaim entry so the kernel reclaims it last.
     reclaim_array_phys: u64,
+    /// The CPU-id pages step 5 allocated (`BootInfo.cpu_ids`), carried here
+    /// so step 6 identity-maps them.
+    cpu_ids_phys: u64,
+    /// Pages of the array at `cpu_ids_phys`.
+    cpu_ids_pages: usize,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -389,6 +394,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &bundle_load,
             &kernel,
             &init,
+            &cpus,
             ap_trampoline_phys,
         )?
     };
@@ -1124,9 +1130,10 @@ unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
 
 /// Allocate the fixed pre-exit scratch pages (`BootInfo` page, modules
-/// descriptor page, memory-map entry pages, aperture page, stack,
-/// reclaim-ranges page), accumulate the identity-map region list, build initial
-/// page tables, and install the handoff-trampoline mapping.
+/// descriptor page, memory-map entry pages, aperture pages, stack,
+/// reclaim-ranges page), accumulate the identity-map region list (those pages
+/// and step 5's CPU-id pages, `cpus`, among others), build initial page
+/// tables, and install the handoff-trampoline mapping.
 ///
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel` and `init` must
@@ -1136,6 +1143,7 @@ unsafe fn step6_allocate_and_build_page_tables(
     bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
+    cpus: &CpuTopology,
     ap_trampoline_phys: u64,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
@@ -1198,6 +1206,8 @@ unsafe fn step6_allocate_and_build_page_tables(
         stack_top,
         ap_trampoline_phys,
         reclaim_array_phys,
+        cpu_ids_phys: cpus.ids_phys,
+        cpu_ids_pages: cpus.ids_pages,
     };
 
     let mut identity_regions: [(u64, u64); MAX_IDENTITY_REGIONS] =
@@ -1292,13 +1302,15 @@ fn collect_identity_regions(
     {
         push(uart_base, 4096);
     }
-    // MMIO aperture array page.
+    // MMIO aperture array pages.
     push(
         allocs.apertures_phys,
         (allocs.apertures_pages as u64) * 4096,
     );
     // Reclaim-array page: backs BootInfo.reclaim_ranges.
     push(allocs.reclaim_array_phys, 4096);
+    // CPU-id pages: back BootInfo.cpu_ids.
+    push(allocs.cpu_ids_phys, (allocs.cpu_ids_pages as u64) * 4096);
     n
 }
 
@@ -1421,7 +1433,7 @@ unsafe fn step9_populate_boot_info(
     for (i, &module) in mods.modules.iter().enumerate().take(mods.count)
     {
         // SAFETY: modules_phys is a 4096-byte allocation; count ≤ MAX_MODULES (85)
-        // so 16 × 48-byte BootModule entries (768 bytes) fit.
+        // so 85 × 48-byte BootModule entries (4080 bytes) fit.
         unsafe { core::ptr::write(modules_ptr.add(i), module) };
     }
 
@@ -1627,9 +1639,6 @@ unsafe fn step9_populate_boot_info(
         let tail_pages = ((bundle_end - bundle_cursor) / 4096) as u32;
         push_reclaim(bundle_cursor, tail_pages, 0)?;
     }
-    // AP trampoline page: flagged `RECLAIM_FLAG_LATE`; the kernel mints it after
-    // SMP bringup (core/kernel/docs/initialization.md § Phase 8: Scheduler and
-    // SMP Bringup).
     // CPU-id pages: the kernel reads them through Phase 8 (SMP bringup), before
     // init, the first user of a reclaimed page, runs.
     // The array is a few pages at most (`MAX_CPUS` u32s), far below u32::MAX.
@@ -1637,6 +1646,9 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(cpus.ids_phys, cpus.ids_pages as u32, 0)?;
     }
+    // AP trampoline page: flagged `RECLAIM_FLAG_LATE`; the kernel mints it after
+    // SMP bringup (core/kernel/docs/initialization.md § Phase 8: Scheduler and
+    // SMP Bringup).
     if allocs.ap_trampoline_phys != 0
     {
         push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE)?;

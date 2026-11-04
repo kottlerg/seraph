@@ -194,7 +194,7 @@ again from the recorded BootInfo address.
    as reclaimable Memory caps into init's CSpace during Phase 7 by
    `cap::mint_reclaim_memory_caps`, alongside the other bootloader
    scratch pages (`BootInfo` page, descriptor arrays, MMIO aperture
-   array, reclaim-array page) and the bundle's non-module pages
+   array, reclaim-array page, CPU-id pages) and the bundle's non-module pages
    (header + entry table + 4 KiB pad, init ELF source body, and any
    inter-module or trailing slack — module bodies are excluded because
    `mint_module_memory_caps` already covers them).
@@ -492,7 +492,7 @@ Phase 7.
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
    d. One root Interrupt range capability (Notify rights) covering every valid
-      IRQ id on the architecture (ROOT_IRQ_COUNT: 2048 on x86-64, 1024 on RISC-V);
+      IRQ id on the architecture (ROOT_IRQ_COUNT: 32768 on x86-64, 1024 on RISC-V);
       userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
    e. Map-only Memory capabilities over firmware tables (not retypable, not
       buddy-backed): one per `AcpiReclaimable` memory-map region (as many
@@ -546,7 +546,7 @@ consecutive slots also halts, naming the run and the first slot out of place (fo
 **Completion criterion:** Root CSpace exists and contains capabilities for all
 boot-provided hardware resources, including the reclaimable Memory caps
 covering bootloader scratch pages (`BootInfo` page, descriptor arrays,
-MMIO aperture array, reclaim-array page, transient page-table frames)
+MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames)
 and the bundle's non-module pages (header + entry table + 4 KiB pad,
 init ELF source body, inter-module and trailing slack — module bodies
 are excluded because `mint_module_memory_caps` already covers them).

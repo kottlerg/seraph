@@ -752,7 +752,7 @@ pub const ARCH_NAME: &str;
 /// (`EM_X86_64` / `EM_RISCV`); `mm::init_reloc` checks relocations against it.
 pub const EXPECTED_ELF_MACHINE: u16;
 
-/// External-interrupt id range (GSIs 0..=2047 on x86-64; PLIC sources 1..=1023
+/// External-interrupt id range (GSIs 0..=32767 on x86-64; PLIC sources 1..=1023
 /// on RISC-V, the specification's). `SYS_IRQ_REGISTER` refuses an id outside it
 /// with `InvalidArgument`, and within it an id no discovered controller
 /// implements (`irq_line_count`).

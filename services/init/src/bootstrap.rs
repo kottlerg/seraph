@@ -152,7 +152,7 @@ fn retype_reserve_pages() -> u64
 ///
 /// * 1 page for endpoints created before the log-thread retype (the retype
 ///   allocator packs ~32 endpoints per page; init creates well under that),
-/// * [`crate::thread_retype_pages`] (six or more) for the log thread, which
+/// * [`crate::thread_retype_pages`] (seven or more) for the log thread, which
 ///   page-aligns the bump upward — splitting endpoint packing across a page
 ///   boundary, and
 /// * 1 page for endpoints created after the log-thread retype, so they never

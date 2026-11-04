@@ -106,8 +106,11 @@ after `ExitBootServices` by
    `phys_base`, joining adjacent and overlapping entries, so the list is minimal
    and non-overlapping at every step and no scratch buffer bounds the input.
 4. Cap at `MAX_APERTURES` (256, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs),
-   the capacity of the array's page): when more entries stay disjoint, the highest
-   are dropped with a diagnostic.
+   the capacity of the array's page). When more pieces than that are disjoint at
+   once, a later piece could still bridge them, so the list is rebuilt by taking
+   the pieces in ascending `phys_base` order, which keeps exactly the lowest
+   `MAX_APERTURES` apertures of the full merge; when the full merge holds more, the
+   highest are dropped with a diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often

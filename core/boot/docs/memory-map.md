@@ -145,9 +145,9 @@ descriptors, so the slack covers them twice over.
 
 A final map that still holds more descriptors than the array does not boot
 silently short of memory: `translate_memory_map` counts the descriptors past the
-array by class, and step 9 halts with a `FATAL` console line when one of them is
-RAM (`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`), and drops the others
-with a diagnostic.
+array by class, and step 9 fails the boot with `BootError::MemoryMapTruncated` when
+one of them is RAM (`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`), and drops
+the others with a diagnostic.
 
 ---
 

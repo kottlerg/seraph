@@ -57,6 +57,16 @@ pub enum BootError
     /// the riscv64 negotiation path; x86-64 builds never produce it.
     #[allow(dead_code)]
     PagingModeUnsupported,
+
+    /// The final memory map held RAM descriptors past the translated
+    /// `MemoryMapEntry` array (step 9): the kernel would boot without that
+    /// memory. The `usize` is the number of RAM descriptors left out.
+    MemoryMapTruncated(usize),
+
+    /// Step 9 had more entries to record than the reclaim array's page holds
+    /// (`MAX_RECLAIM_RANGES`); the bootloader's compile-time count of the
+    /// entries it records (`MAX_RECLAIM_ENTRIES`) is wrong.
+    ReclaimRangesOverflow,
 }
 
 impl From<elf::ElfError> for BootError
@@ -122,6 +132,11 @@ impl BootError
             {
                 "no supported RISC-V paging mode (Sv39 is the platform minimum)"
             }
+            BootError::MemoryMapTruncated(_) =>
+            {
+                "memory map has RAM descriptors past the translated entry array"
+            }
+            BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
         }
     }
 }
@@ -138,6 +153,10 @@ impl core::fmt::Display for BootError
         if let BootError::UefiError(code) = self
         {
             write!(f, ": status={code:#018x}")?;
+        }
+        if let BootError::MemoryMapTruncated(ram) = self
+        {
+            write!(f, ": {ram} RAM descriptors left out")?;
         }
         Ok(())
     }
@@ -166,6 +185,8 @@ mod tests
             BootError::ExitBootServicesFailed,
             BootError::InvalidBundle("b"),
             BootError::PagingModeUnsupported,
+            BootError::MemoryMapTruncated(1),
+            BootError::ReclaimRangesOverflow,
         ];
         for v in variants
         {

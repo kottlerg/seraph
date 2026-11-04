@@ -279,9 +279,13 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
 ///
 /// No aperture therefore covers RAM. Each piece is merged into `out` as it
 /// arrives ([`insert_merged`]), so `out` holds the sorted, merged apertures at
-/// every step and no scratch buffer bounds the input. Returns the number of
-/// apertures in `out`; when more than `MAX_APERTURES` stay disjoint, the
-/// highest are dropped with a diagnostic.
+/// every step and no scratch buffer bounds the input. When more than
+/// `MAX_APERTURES` pieces are disjoint at once, which a later piece bridging
+/// them could still undo, `out` is rebuilt by [`sweep_merged`], which takes the
+/// pieces in ascending order and so keeps exactly the lowest `MAX_APERTURES`
+/// apertures of the full merge. Returns the number of apertures in `out`; when
+/// the full merge holds more than `MAX_APERTURES`, the highest are dropped with
+/// a diagnostic.
 ///
 /// Apertures are coarse by design; see `docs/device-management.md`
 /// § Raw Firmware Passthrough for where device-level discovery happens.
@@ -298,32 +302,56 @@ pub unsafe fn derive_mmio_apertures(
     out: &mut [MmioAperture; MAX_APERTURES],
 ) -> usize
 {
-    let mut n: usize = 0;
-    let mut dropped = false;
-    let mut push = |ap: MmioAperture| {
-        if !insert_merged(out, &mut n, ap)
-        {
-            dropped = true;
-        }
-    };
-
     // SAFETY: the caller's contract is `RawDescriptors::new`'s.
     let descriptors = unsafe { RawDescriptors::new(uefi_map) };
 
-    // Collect MMIO-class descriptors from the UEFI map.
+    let mut n: usize = 0;
+    let mut full = false;
+    for_each_piece(&descriptors, seed, heuristic, &mut |ap| {
+        if !full && !insert_merged(out, &mut n, ap)
+        {
+            full = true;
+        }
+    });
+    if !full
+    {
+        return n;
+    }
+    let (n, dropped) = sweep_merged(out, |emit| {
+        for_each_piece(&descriptors, seed, heuristic, emit);
+    });
+    if dropped
+    {
+        bprintln!(
+            "[--------] boot: MMIO apertures: more than MAX_APERTURES disjoint; the highest dropped"
+        );
+    }
+    n
+}
+
+/// Emit every aperture piece `derive_mmio_apertures` merges: the map's MMIO
+/// descriptors, then each named seed clipped to the gaps the map's RAM-class
+/// and firmware-exclusive ranges leave, then each heuristic window clipped to
+/// the map's holes and MMIO descriptors. Empty pieces are emitted too; the
+/// mergers skip them.
+fn for_each_piece(
+    descriptors: &RawDescriptors<'_>,
+    seed: &[MmioAperture],
+    heuristic: &[MmioAperture],
+    emit: &mut dyn FnMut(MmioAperture),
+)
+{
     for desc in descriptors.clone()
     {
         if is_mmio(desc.memory_type)
         {
-            push(MmioAperture {
+            emit(MmioAperture {
                 phys_base: desc.physical_start,
                 size: desc.number_of_pages.saturating_mul(4096),
             });
         }
     }
 
-    // Fold in the named seeds, each clipped to the gaps the map's RAM-class
-    // and firmware-exclusive ranges leave.
     let excluded = descriptors
         .clone()
         .filter(|d| excluded_from_apertures(d.memory_type))
@@ -332,40 +360,91 @@ pub unsafe fn derive_mmio_apertures(
     {
         if s.size != 0
         {
-            subtract_excluded(*s, &excluded, &mut push);
+            subtract_excluded(*s, &excluded, &mut *emit);
         }
     }
 
-    // Fold in the heuristic windows, each clipped to the map's holes and
-    // MMIO descriptors.
     let described = descriptors
+        .clone()
         .filter(|d| !is_mmio(d.memory_type))
         .map(|d| descriptor_range(&d));
     for s in heuristic
     {
         if s.size != 0
         {
-            subtract_excluded(*s, &described, &mut push);
+            subtract_excluded(*s, &described, &mut *emit);
         }
     }
+}
 
-    if dropped
+/// Merge the pieces `pieces` emits into `out` by taking them in ascending
+/// `phys_base` order: each pass over the pieces finds the lowest base above
+/// the last one taken and the furthest end among the pieces at that base,
+/// which either extends the last aperture (it overlaps or abuts it) or starts
+/// the next. Taken in order, a piece can never bridge apertures already
+/// written, so the result is the lowest `out.len()` apertures of the full
+/// merge. Returns their number and whether a further aperture was dropped.
+///
+/// One pass per distinct base: quadratic in the piece count, and only run when
+/// the incremental merge filled `out`.
+fn sweep_merged(
+    out: &mut [MmioAperture],
+    pieces: impl Fn(&mut dyn FnMut(MmioAperture)),
+) -> (usize, bool)
+{
+    let mut n: usize = 0;
+    let mut last_base: Option<u64> = None;
+    loop
     {
-        bprintln!(
-            "[--------] boot: MMIO apertures: more than MAX_APERTURES disjoint; the highest dropped"
-        );
+        let mut next: Option<(u64, u64)> = None;
+        pieces(&mut |ap| {
+            if ap.size == 0 || last_base.is_some_and(|b| ap.phys_base <= b)
+            {
+                return;
+            }
+            let end = ap.phys_base.saturating_add(ap.size);
+            next = match next
+            {
+                Some((b, e)) if b < ap.phys_base || (b == ap.phys_base && e >= end) => Some((b, e)),
+                _ => Some((ap.phys_base, end)),
+            };
+        });
+        let Some((base, end)) = next
+        else
+        {
+            return (n, false);
+        };
+        last_base = Some(base);
+        if n > 0 && base <= out[n - 1].phys_base.saturating_add(out[n - 1].size)
+        {
+            let top = out[n - 1].phys_base.saturating_add(out[n - 1].size);
+            if end > top
+            {
+                out[n - 1].size = end - out[n - 1].phys_base;
+            }
+        }
+        else if n < out.len()
+        {
+            out[n] = MmioAperture {
+                phys_base: base,
+                size: end - base,
+            };
+            n += 1;
+        }
+        else
+        {
+            // Every piece still to come starts above this one, so none can
+            // join the apertures already written.
+            return (n, true);
+        }
     }
-
-    n
 }
 
 /// Merge `ap` into the sorted, disjoint, non-adjacent apertures `set[..*len]`,
 /// keeping them so: `ap` joins every entry it overlaps or abuts.
 ///
-/// Returns `false` when an aperture was dropped: `ap` stays disjoint from every
-/// entry and `set` is full, in which case the highest of the `set.len() + 1`
-/// apertures is the one dropped (`ap` itself when it is the highest), so the
-/// lowest bases are kept. An empty `ap` changes nothing.
+/// Returns `false`, changing nothing, when `ap` stays disjoint from every entry
+/// and `set` is full. An empty `ap` changes nothing.
 fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) -> bool
 {
     if ap.size == 0
@@ -388,18 +467,11 @@ fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) ->
         end = end.max(set[j].phys_base.saturating_add(set[j].size));
         j += 1;
     }
-    let mut kept = true;
     if j == i
     {
         if *len == set.len()
         {
-            kept = false;
-            if i == *len
-            {
-                return false;
-            }
-            // Drop the highest entry to make room below it.
-            *len -= 1;
+            return false;
         }
         set.copy_within(i..*len, i + 1);
         *len += 1;
@@ -413,7 +485,7 @@ fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) ->
         phys_base: base,
         size: end - base,
     };
-    kept
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -888,6 +960,50 @@ mod tests
         assert_eq!(
             pairs(&out),
             vec![(0x1000_0000, 0x5000), (0x2000_0000, 0x1000)]
+        );
+    }
+
+    // Defect caught: a full list that drops a piece arriving above every
+    // aperture, or keeps it past the cap.
+    #[test]
+    fn surplus_arriving_highest_last_is_the_one_dropped()
+    {
+        let descs: Vec<_> = (0..=MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x10_0000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(
+            out[MAX_APERTURES - 1].phys_base,
+            0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x10_0000
+        );
+    }
+
+    // Defect caught: a cap applied while pieces arrive, which loses an
+    // aperture once a later piece bridges several and the full merge fits.
+    #[test]
+    fn a_full_list_a_later_seed_bridges_keeps_every_aperture()
+    {
+        // MAX_APERTURES disjoint pieces 2 MiB apart, plus one between the
+        // first two: the list overflows while pieces arrive.
+        let mut descs: Vec<_> = (0..MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x20_0000, 1))
+            .collect();
+        descs.push(mmio_desc(0x1010_0000, 1));
+        // A seed over the first eleven pieces and the extra one merges twelve
+        // pieces into one aperture.
+        let seed = [MmioAperture {
+            phys_base: 0x1000_0000,
+            size: 10 * 0x20_0000 + 0x1000,
+        }];
+        let out = run_derive(&descs, &seed);
+        assert_eq!(out.len(), MAX_APERTURES - 10);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(out[0].size, 10 * 0x20_0000 + 0x1000);
+        assert_eq!(
+            out[MAX_APERTURES - 11].phys_base,
+            0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x20_0000
         );
     }
 

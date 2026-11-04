@@ -406,7 +406,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &allocs,
             &uefi_map,
             &page_table,
-        );
+        )?;
     }
     // Scrub the bootloader's own copies of the KASLR entropy words
     // (`boot_entropy.kaslr`, and the `kaslr.dm_rand` copy step 9 consumed) and
@@ -1330,13 +1330,18 @@ unsafe fn step8_exit_boot_services(
 /// auxiliary module descriptor array, translated memory map, and MMIO
 /// aperture list.
 ///
+/// # Errors
+/// [`BootError::MemoryMapTruncated`] when the final map holds RAM descriptors
+/// past the translated entry array, and [`BootError::ReclaimRangesOverflow`]
+/// when step 9 has more reclaim entries than `MAX_RECLAIM_ENTRIES` allows for.
+///
 /// # Safety
 /// All physical allocations named in `allocs` must remain identity-mapped and
 /// writable. `uefi_map` must be the exited-boot memory map from step 7.
 // BootInfo population is the fan-in point for every earlier step: bundle,
 // kernel, init, modules, firmware, cpu topology, boot entropy, KASLR
 // decision, framebuffer, boot allocations, the memory map, and the page-table
-// frame list all contribute distinct fields. Bundling
+// frame pool all contribute distinct fields. Bundling
 // them would only rename the argument list into an ad-hoc struct. The
 // too_many_lines allowance covers the inline reclaim-array build below,
 // which sits between aperture derivation and the BootInfo write.
@@ -1354,7 +1359,7 @@ unsafe fn step9_populate_boot_info(
     allocs: &BootAllocations,
     uefi_map: &uefi::MemoryMapResult,
     page_table: &arch::current::BootPageTable,
-)
+) -> Result<(), BootError>
 {
     bprintln!("[--------] boot: step 9/10: populate BootInfo");
 
@@ -1373,7 +1378,7 @@ unsafe fn step9_populate_boot_info(
     // SAFETY: entry_out is a valid allocated buffer of max_entries entries;
     // uefi_map is a valid map buffer populated by UEFI GetMemoryMap.
     let translation = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
-    report_map_truncation(&translation);
+    report_map_truncation(&translation)?;
     let entry_count = translation.count;
     // SAFETY: elements [0..entry_count] were written by the call above.
     unsafe { memory_map::insertion_sort_memory_map(entry_out, entry_count) };
@@ -1480,17 +1485,14 @@ unsafe fn step9_populate_boot_info(
     let mut push_reclaim = |phys_base: u64, page_count: u32, flags: u32| {
         if page_count == 0
         {
-            return;
+            return Ok(());
         }
+        // Unreachable: MAX_RECLAIM_ENTRIES bounds the pushes below at compile
+        // time. Reported rather than written past the page if that count is
+        // ever wrong.
         if reclaim_len >= MAX_RECLAIM_RANGES
         {
-            bprintln!("[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)");
-            // Post-exit, pre-handoff: BootInfo will be malformed; halt
-            // explicitly so the failure is obvious rather than silent.
-            loop
-            {
-                core::hint::spin_loop();
-            }
+            return Err(BootError::ReclaimRangesOverflow);
         }
         reclaim_ranges[reclaim_len] = ReclaimRange {
             phys_base,
@@ -1498,16 +1500,17 @@ unsafe fn step9_populate_boot_info(
             flags,
         };
         reclaim_len += 1;
+        Ok(())
     };
-    push_reclaim(allocs.boot_info_phys, 1, 0);
-    push_reclaim(allocs.modules_phys, 1, 0);
+    push_reclaim(allocs.boot_info_phys, 1, 0)?;
+    push_reclaim(allocs.modules_phys, 1, 0)?;
     // The entry array is a few pages per thousand descriptors, far below
     // u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
     {
-        push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0);
+        push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0)?;
     }
-    push_reclaim(allocs.apertures_phys, 1, 0);
+    push_reclaim(allocs.apertures_phys, 1, 0)?;
     // The map buffer is a whole-page allocation far below u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
     {
@@ -1515,7 +1518,7 @@ unsafe fn step9_populate_boot_info(
             uefi_map.buffer_phys,
             (uefi_map.buffer_size / 4096) as u32,
             0,
-        );
+        )?;
     }
     for &(base, pages) in page_table.reclaim_spans()
     {
@@ -1523,7 +1526,7 @@ unsafe fn step9_populate_boot_info(
         // u32::MAX pages, and the LA57 toggle span is one page.
         #[allow(clippy::cast_possible_truncation)]
         {
-            push_reclaim(base, pages as u32, 0);
+            push_reclaim(base, pages as u32, 0)?;
         }
     }
     // Bundle blob: emit reclaim ranges over every bundle page NOT
@@ -1560,7 +1563,7 @@ unsafe fn step9_populate_boot_info(
             // reaches u32::MAX pages (16 TiB), so the cast is exact.
             #[allow(clippy::cast_possible_truncation)]
             let gap_pages = ((module_base - bundle_cursor) / 4096) as u32;
-            push_reclaim(bundle_cursor, gap_pages, 0);
+            push_reclaim(bundle_cursor, gap_pages, 0)?;
         }
         bundle_cursor = module_end;
     }
@@ -1569,18 +1572,18 @@ unsafe fn step9_populate_boot_info(
         // The tail lies inside the bundle allocation (see the gap cast above).
         #[allow(clippy::cast_possible_truncation)]
         let tail_pages = ((bundle_end - bundle_cursor) / 4096) as u32;
-        push_reclaim(bundle_cursor, tail_pages, 0);
+        push_reclaim(bundle_cursor, tail_pages, 0)?;
     }
     // AP trampoline page: flagged `RECLAIM_FLAG_LATE`; the kernel mints it after
     // SMP bringup (core/kernel/docs/initialization.md § Phase 8: Scheduler and
     // SMP Bringup).
     if allocs.ap_trampoline_phys != 0
     {
-        push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE);
+        push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE)?;
     }
     // The reclaim-array page itself is reclaim-safe once the kernel has
     // walked it — record it last so the kernel processes it in order.
-    push_reclaim(allocs.reclaim_array_phys, 1, 0);
+    push_reclaim(allocs.reclaim_array_phys, 1, 0)?;
     bprintln!("[--------] boot: reclaim_ranges: {reclaim_len} entries recorded");
 
     // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation).
@@ -1694,13 +1697,18 @@ unsafe fn step9_populate_boot_info(
         );
         core::ptr::addr_of_mut!((*bi).boot_entropy_len).write(boot_entropy.len);
     }
+    Ok(())
 }
 
-/// Report the descriptors the translated memory map had no room for, and halt
-/// when one of them is RAM: the kernel would boot without knowing that memory
-/// (core/boot/docs/memory-map.md § Sizing the Entry Array). Descriptors of
-/// other types are dropped with a diagnostic and the boot goes on.
-fn report_map_truncation(t: &memory_map::MapTranslation)
+/// Report the descriptors the translated memory map had no room for. A RAM
+/// descriptor among them is [`BootError::MemoryMapTruncated`]: the kernel
+/// would boot without knowing that memory (core/boot/docs/memory-map.md
+/// § Sizing the Entry Array). Descriptors of other types are dropped with a
+/// diagnostic and the boot goes on.
+///
+/// # Errors
+/// [`BootError::MemoryMapTruncated`] when `t.dropped_ram` is non-zero.
+fn report_map_truncation(t: &memory_map::MapTranslation) -> Result<(), BootError>
 {
     if t.dropped_other != 0
     {
@@ -1711,16 +1719,9 @@ fn report_map_truncation(t: &memory_map::MapTranslation)
     }
     if t.dropped_ram != 0
     {
-        bprintln!(
-            "[--------] boot: FATAL: memory map: {} RAM descriptors past the entry array",
-            t.dropped_ram
-        );
-        // Post-exit, pre-handoff: a BootInfo missing RAM is not handed over.
-        loop
-        {
-            core::hint::spin_loop();
-        }
+        return Err(BootError::MemoryMapTruncated(t.dropped_ram));
     }
+    Ok(())
 }
 
 // ── Step 10: Kernel handoff ──────────────────────────────────────────────────
@@ -1758,8 +1759,8 @@ unsafe fn step10_handoff(
 mod tests
 {
     use super::{
-        BootEntropy, ElfKind, HANDOFF_STACK_ALLOC_PAGES, KaslrOverride, choose_kaslr_layout,
-        handoff_stack_span, scrub,
+        BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES, KaslrOverride,
+        choose_kaslr_layout, handoff_stack_span, memory_map, report_map_truncation, scrub,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -1849,6 +1850,28 @@ mod tests
             boot_protocol::layout::HANDOFF_STACK_BYTES as u64
         );
         assert_eq!(top, alloc + (HANDOFF_STACK_ALLOC_PAGES as u64) * 4096);
+    }
+
+    // Defect caught: a truncated map that drops RAM yet boots, or one that
+    // drops only non-RAM descriptors and fails the boot.
+    #[test]
+    fn only_lost_ram_fails_the_boot()
+    {
+        let lost_ram = memory_map::MapTranslation {
+            count: 4,
+            dropped_ram: 2,
+            dropped_other: 1,
+        };
+        assert!(matches!(
+            report_map_truncation(&lost_ram),
+            Err(BootError::MemoryMapTruncated(2))
+        ));
+        let lost_other = memory_map::MapTranslation {
+            count: 4,
+            dropped_ram: 0,
+            dropped_other: 3,
+        };
+        assert!(report_map_truncation(&lost_other).is_ok());
     }
 
     #[test]

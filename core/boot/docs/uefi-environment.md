@@ -228,14 +228,16 @@ defined in [`core/boot/src/error.rs`](../src/error.rs). The variant set covers
 protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
 failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
-and, on RISC-V, no supported paging mode passing the satp probe (`PagingModeUnsupported`);
-the source is the authority on the variant list and payloads.
+on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
+and, in step 9, RAM descriptors past the translated memory map (`MemoryMapTruncated`,
+[memory-map.md](memory-map.md) § Sizing the Entry Array) and a `reclaim_ranges` overflow
+(`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
+source is the authority on the variant list and payloads.
 
 The top-level `efi_main` propagates every `BootError` to a single fatal handler
-(`error::fatal_error`) that reports the error and halts. Two halts bypass it: a
-`reclaim_ranges` overflow in step 9 prints
-`[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)` and spins in
-place, and a panic prints `SERAPH BOOT PANIC: <panic info>` from the panic handler.
+(`error::fatal_error`) that reports the error and halts; it needs no boot service, so
+the step 9 failures, after `ExitBootServices`, reach it too. Only a panic bypasses it,
+printing `SERAPH BOOT PANIC: <panic info>` from the panic handler.
 
 ### Error Reporting
 

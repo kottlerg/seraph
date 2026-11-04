@@ -30,6 +30,7 @@ use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::{
     HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT, MAX_CPUS, MmioAperture,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// ISA-extension names the CPU-node walker recognizes, with the
 /// `hart_caps` bit each one confirms. Shared by the DTB stringlist /
@@ -68,9 +69,11 @@ const MAX_REG_ENTRIES: usize = 8;
 /// Maximum number of `interrupts` values collected per node. No consumer reads
 /// them; surplus values are dropped with a diagnostic.
 const MAX_IRQ_ENTRIES: usize = 4;
-/// Maximum number of `ranges` entries collected per node: a PCI host bridge
-/// carries one per window (I/O, and 32-bit and 64-bit memory, prefetchable or
-/// not), each an aperture seed. Surplus entries are dropped with a diagnostic.
+/// Maximum number of `ranges` entries collected per node. A PCI host bridge
+/// carries one per window, each an aperture seed; the QEMU virt bridge has
+/// three, and the PCI binding sets no limit. Surplus entries are dropped with a
+/// diagnostic. Eight keeps `walk_compatible`'s per-depth state, `MAX_DEPTH` of
+/// them, under clippy's 16 KiB `large_stack_arrays` limit.
 const MAX_RANGES_ENTRIES: usize = 8;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -155,16 +158,24 @@ impl NodeState
     }
 }
 
+/// Whether a walk has reported nodes past [`MAX_DEPTH`]; every walk visits
+/// the whole tree, so the boot reports it once.
+static REPORTED_TOO_DEEP: AtomicBool = AtomicBool::new(false);
+/// Whether a walk has reported a property past its entry bound, once per boot
+/// for the reason [`REPORTED_TOO_DEEP`] gives.
+static REPORTED_TRUNCATED: AtomicBool = AtomicBool::new(false);
+
 /// Report, after a walk, that it skipped the properties of nodes past
 /// [`MAX_DEPTH`] (`too_deep`) or dropped entries past a property's
-/// `MAX_*_ENTRIES` bound (`truncated`).
+/// `MAX_*_ENTRIES` bound (`truncated`), each the first time a walk of this
+/// boot meets it.
 fn report_walk_limits(too_deep: bool, truncated: bool)
 {
-    if too_deep
+    if too_deep && !REPORTED_TOO_DEEP.swap(true, Ordering::Relaxed)
     {
         bprintln!("[--------] boot: DTB: nodes nested past MAX_DEPTH; their properties skipped");
     }
-    if truncated
+    if truncated && !REPORTED_TRUNCATED.swap(true, Ordering::Relaxed)
     {
         bprintln!(
             "[--------] boot: DTB: a reg, interrupts or ranges property past its entry bound; \

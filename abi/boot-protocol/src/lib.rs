@@ -678,7 +678,7 @@ pub struct MmioAperture
 /// than this loses the highest, which the bootloader diagnoses.
 pub const MAX_APERTURES: usize = 256;
 
-// The aperture array fills exactly the one page the bootloader allocates for it.
+// The aperture array fits the one page the bootloader allocates for it.
 const _: () = assert!(MAX_APERTURES * core::mem::size_of::<MmioAperture>() <= 4096);
 
 /// A slice of [`MmioAperture`] values, passed by physical address.

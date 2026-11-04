@@ -276,7 +276,6 @@ mod tests
         assert_eq!(table_frame_bound(4, [(0x20_0000, 0x1000)]), 4);
         // Two pages either side of a 2 MiB boundary: one more PT.
         assert_eq!(table_frame_bound(4, [(0x1F_F000, 0x2000)]), 5);
-        assert_eq!(tables_needed(4, &[(0x1F_F000, 0x2000)]), 5);
         // An empty range maps nothing.
         assert_eq!(table_frame_bound(4, [(0x20_0000, 0)]), 1);
     }

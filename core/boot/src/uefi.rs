@@ -708,8 +708,9 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 /// `arch::current::allocate_ap_trampoline`, whose SIPI-vector constraint
 /// requires a frame below 1 MiB, x86-64's
 /// `arch::current::allocate_kernel_span`, which keeps the kernel image below
-/// 4 GiB, and the x86-64 boot page-table root, which the LA57 toggle
-/// trampoline loads with a 32-bit move; the helper is not gated on
+/// 4 GiB, and the x86-64 boot page-table frame pool, whose first frame is the
+/// root the LA57 toggle trampoline loads with a 32-bit move; the helper is not
+/// gated on
 /// architecture because `AllocateMaxAddress` is part of the UEFI spec on
 /// every supported platform.
 ///
@@ -802,54 +803,18 @@ pub unsafe fn free_pages(bs: *mut EfiBootServices, phys: u64, count: usize)
     Ok(())
 }
 
-/// Number of descriptors the firmware's memory map holds now, from the size
-/// query `GetMemoryMap` answers with a null buffer; nothing is allocated.
-///
-/// # Errors
-/// Returns `BootError::UefiError` when the query fails or reports a zero
-/// descriptor size.
+/// The `(map_size, descriptor_size)` the firmware's memory map needs now, from
+/// the size query `GetMemoryMap` answers with a null buffer; nothing is
+/// allocated.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<usize, BootError>
+unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usize), BootError>
 {
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
     let mut descriptor_size: usize = 0;
     let mut descriptor_version: u32 = 0;
-    // SAFETY: Null map pointer with zero size requests the required size.
-    let status = unsafe {
-        ((*bs).get_memory_map)(
-            core::ptr::addr_of_mut!(map_size),
-            core::ptr::null_mut(),
-            core::ptr::addr_of_mut!(map_key),
-            core::ptr::addr_of_mut!(descriptor_size),
-            core::ptr::addr_of_mut!(descriptor_version),
-        )
-    };
-    if (status != EFI_BUFFER_TOO_SMALL && status != EFI_SUCCESS) || descriptor_size == 0
-    {
-        return Err(BootError::UefiError(status));
-    }
-    Ok(map_size / descriptor_size)
-}
-
-/// Query the UEFI memory map into a freshly allocated buffer sized with 16
-/// descriptors of slack. Returns the buffer address and capacity, map size,
-/// map key, and descriptor size. The acquisition protocol (key invalidation,
-/// final-allocation ordering, slack sizing) is specified in
-/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
-///
-/// # Safety
-/// `bs` must be valid boot services.
-pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult, BootError>
-{
-    // First call: obtain required buffer size.
-    let mut map_size: usize = 0;
-    let mut map_key: usize = 0;
-    let mut descriptor_size: usize = 0;
-    let mut descriptor_version: u32 = 0;
-
     // SAFETY: Null map pointer with zero size requests the required size.
     let status = unsafe {
         ((*bs).get_memory_map)(
@@ -865,6 +830,44 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     {
         return Err(BootError::UefiError(status));
     }
+    Ok((map_size, descriptor_size))
+}
+
+/// Number of descriptors the firmware's memory map holds now
+/// ([`query_memory_map_size`]); nothing is allocated.
+///
+/// # Errors
+/// Returns `BootError::UefiError` when the query fails or reports a zero
+/// descriptor size.
+///
+/// # Safety
+/// `bs` must be valid boot services.
+pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<usize, BootError>
+{
+    // SAFETY: forwarded caller contract.
+    let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
+    if descriptor_size == 0
+    {
+        return Err(BootError::UefiError(EFI_SUCCESS));
+    }
+    Ok(map_size / descriptor_size)
+}
+
+/// Query the UEFI memory map into a freshly allocated buffer sized with 16
+/// descriptors of slack. Returns the buffer address and capacity, map size,
+/// map key, and descriptor size. The acquisition protocol (key invalidation,
+/// final-allocation ordering, slack sizing) is specified in
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
+///
+/// # Safety
+/// `bs` must be valid boot services.
+pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult, BootError>
+{
+    // First call: obtain required buffer size.
+    // SAFETY: bs is valid (caller contract).
+    let (mut map_size, mut descriptor_size) = unsafe { query_memory_map_size(bs)? };
+    let mut map_key: usize = 0;
+    let mut descriptor_version: u32 = 0;
 
     // Add slack for the buffer allocation itself (which creates one new entry).
     map_size += 16 * descriptor_size;

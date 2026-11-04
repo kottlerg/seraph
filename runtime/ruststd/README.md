@@ -315,6 +315,21 @@ upstream fixes its width at `u32` and the handle's generation sits above that.
 
 ---
 
+## argv and env
+
+`Command::spawn` packs the child's argv and env into a Memory cap the spawner funds and
+`CREATE_FROM_FILE` transfers with `CREATE_ARGV_ENV`
+([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
+§ Label 1, **argv and env**). `std::os::seraph::process::ArgvEnvCap` builds that cap and its
+header for any sender of a raw create request (svcmgr's launch and restart, svctest); dropping it
+after the call returns the run to memmgr. `spawn` refuses with `ArgumentListTooLong` only when argv
+and env together exceed `process_abi::ARGV_ENV_MAX_BYTES` or memmgr refuses the spawner the run
+they fill. In the child, `_start` reads both blobs from the argv/env region after the
+`ProcessInfo` page ([abi/process-abi/README.md](../../abi/process-abi/README.md) § argv / env
+region), confined to that region by `argv_env::blob_span`.
+
+---
+
 ## Implementation order
 
 ruststd is implemented before [`libc/`](../libc/README.md), which is design intent and not

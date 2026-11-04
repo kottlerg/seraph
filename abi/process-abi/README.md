@@ -50,7 +50,7 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 23 the groups are (every `*_cap` field a `u64` capability
+`PROCESS_ABI_VERSION` 24 the groups are (every `*_cap` field a `u64` capability
 handle):
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
@@ -66,8 +66,9 @@ handle):
 - **TLS template** — `tls_template_vaddr`, `tls_template_filesz`,
   `tls_template_memsz`, `tls_template_align`.
 - **argv / env blobs** — `args_offset`, `args_bytes`, `args_count`,
-  `env_offset`, `env_bytes`, `env_count` (blobs are written into the same page
-  after the fixed struct; their bounds are the create-request wire contract in
+  `env_offset`, `env_bytes`, `env_count`, each a `u64` (the blobs live in the
+  argv/env region after the page, below; the create request that delivers them
+  is specified in
   [procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
   § CREATE_PROCESS).
 - **Namespace** — `system_root_cap`, `current_dir_cap`.
@@ -89,6 +90,20 @@ handle):
 
 Every cap field names a `CSpace` slot (`0` = absent); `*_vaddr` / size / count
 fields are plain values.
+
+### argv / env region
+
+The struct fills the `ProcessInfo` page alone (`size_of::<ProcessInfo>()` is const-asserted to fit
+it). A creator that delivers argv or env maps their bytes read-only in the pages directly after
+it, at `ARGV_ENV_REGION_OFFSET` (one page) from the page base: the argv blob first, then the env
+blob, each a concatenation of NUL-terminated UTF-8 strings (env entries `KEY=VALUE`).
+`args_offset` and `env_offset` are byte offsets from the page base, so `args_offset` is
+`ARGV_ENV_REGION_OFFSET` and `env_offset` `ARGV_ENV_REGION_OFFSET + args_bytes`; an absent blob
+has offset, length and count zero. The region holds at most `ARGV_ENV_MAX_PAGES` pages
+(`(1 << 18) - 1`, argv and env together, `ARGV_ENV_MAX_BYTES` in bytes): the region tail
+`shared/process-layout` leaves after the `ProcessInfo` draw window less the page itself, which
+that crate pins with a const assert, so the bound costs VA only. The creator maps the pages the
+blobs fill; a reader treats fields that name bytes outside the region as no blob.
 
 ### Fixed CSpace slot conventions
 

@@ -168,7 +168,7 @@ token falls through to the normal run.
 | `sandbox-child`             | `namespace`    | `ns_sandbox` (namespace attenuation)        |
 | `programs-child`            | `namespace`    | `ns_programs_subtree` (`/programs` subtree) |
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
-| `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
+| `blobs-large-child`         | `procmgr`      | `command_blobs_large` (multi-page argv/env) |
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |

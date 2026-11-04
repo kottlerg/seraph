@@ -391,14 +391,14 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 
 ### Process layout and ruststd
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (the `ProcessInfo` page).
+Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `LAYOUT_VA_CEILING` | `shared/process-layout/src/lib.rs` | `1 << 38` | hardware spec (Sv39 user half), for the fixed tier only: the surfaces a creator places without knowing the paging mode; the heap and arena zones follow the user half | none | correct as is | None |
 | `IMAGE_MAX_SPAN` | `shared/process-layout/src/lib.rs` | 28 GiB, derived (`FIXED_IMAGE_ZONE_END` less the image window's end); procmgr's children get `image_max_span` of their user half's image zone (`H/8` less the window's end) | encoding artefact (fixed-tier zone map) | none | correct as is | None |
 | Window `slots_log2` values | `shared/process-layout/src/lib.rs` | 21, 23 | encoding artefact (ASLR budget under the ceiling) | none | correct as is | None |
-| `MAX_WINDOW_REGION_PAGES` | `shared/process-layout/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the 9 GiB stride less the 8 GiB draw span) | none | correct as is | None; const asserts pin the stack reservation and the main TLS block to it |
+| `MAX_WINDOW_REGION_PAGES` | `shared/process-layout/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the 9 GiB stride less the 8 GiB draw span) | none | correct as is | None; const asserts pin the stack reservation, the main TLS block, and the `ProcessInfo` page with its argv/env region to it |
 | Heap zone (`growth_zones`) | `shared/process-layout/src/lib.rs` | Sv39: base window `[1 GiB, 3 GiB)`, 60 GiB span; user half `H` above 2^38: `H/4` span (32 TiB at 2^47) | hardware spec (user half) | none (VA only) | correct as is | None |
 | Arena zone (`growth_zones`) | `shared/process-layout/src/lib.rs` | Sv39: base window `[64 GiB, 96 GiB)`, 32 GiB span; user half `H` above 2^38: `H/4` span | hardware spec (user half) | none (VA only) | correct as is | None |
 | Zone-map asserts | `shared/process-layout/src/lib.rs` | stride chain, defaults, fixed image zone, and the growth zones under every supported paging mode | encoding artefact | none | correct as is | Keep |
@@ -406,7 +406,9 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (the `ProcessIn
 | `DEFAULT_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 8 | default (per-binary override exists): the main-thread stack pages the loader commits; in a demand-paged process an `ET_DYN` image's stack grows on demand below them to `DEFAULT_DEMAND_STACK_PAGES` | 32 KiB per process | correct as is | None |
 | `MAX_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | `(1 << 18) - 1` (just under 1 GiB) | encoding artefact (the window region tail less the guard page) | none (VA only; loaders map the declared stack) | correct as is | None; loaders refuse a larger note |
 | `PROCESS_MAIN_TLS_MAX_PAGES` | `abi/process-abi/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the TLS window's region tail) | none (loaders map the `PT_TLS` size) | correct as is | None |
-| `ProcessInfo` page (argv and env blobs share it) | `abi/process-abi/src/lib.rs` | 4096 B less the struct | BSS budget (one page) | 4 KiB per process | needs a design | See the argv entries in the procmgr section (#672) |
+| `ARGV_ENV_MAX_PAGES`, `ARGV_ENV_MAX_BYTES` | `abi/process-abi/src/lib.rs` | `(1 << 18) - 1` pages (just under 1 GiB), argv and env together | encoding artefact (the `ProcessInfo` window's region tail less the `ProcessInfo` page) | none (VA only; the creator maps the pages the blobs fill, from the spawner's grant and the child's account) | correct as is | None; `std::process::Command::spawn` refuses past it, or past what memmgr funds, with `ArgumentListTooLong`, and procmgr with `INVALID_ARGUMENT` |
+| `ProcessInfo` page | `abi/process-abi/src/lib.rs` | one page, the struct alone (const-asserted) | ABI width (one page) | 4 KiB per process | correct as is | None; argv and env live in the region after it |
+| `ProcessInfo` argv and env fields | `abi/process-abi/src/lib.rs` | `u64` offsets, lengths and counts | ABI width | none | correct as is | None |
 | `ProcessInfo.initial_priority` | `abi/process-abi/src/lib.rs` | `u8` | ABI width (`PRIORITY_MAX` 30) | none | correct as is | None |
 | `ProcessInfo` cap fields | `abi/process-abi/src/lib.rs` | `u64` | ABI width (cap handle) | embedded | correct as is | None |
 | Growth-zone window `slots_log2` | `shared/process-layout/src/lib.rs` | Sv39: 19 (heap), 23 (arena); user half `H` above 2^38: `log2(H) - 18` | encoding artefact (ASLR window) | none | correct as is | None |
@@ -440,14 +442,11 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (the `ProcessIn
 
 ### Shared IPC and protocol crates
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
-[#645](https://github.com/kottlerg/seraph/issues/645) (log).
+Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `ARGS_BLOB_MAX` | `shared/ipc/src/lib.rs` | 256 B | current peak plus headroom; inline in one message | none | needs a design | argv and env through a Memory cap (#672) |
-| CREATE_FROM_FILE `args_bytes`, `env_bytes` | `shared/ipc/src/lib.rs` | `u16` | encoding artefact (label bit packing) | none | needs a design | Widen with the blob design (#672) |
-| CREATE_FROM_FILE `args_count`, `env_count` | `shared/ipc/src/lib.rs` | `u8` | encoding artefact (label bit packing) | none | needs a design | Unreachable at 256 B blobs; binds once blobs grow |
+| `ArgvEnvHeader` fields (`CREATE_ARGV_ENV`) | `shared/ipc/src/lib.rs` | `u64` byte lengths and counts, one data word each | ABI width (a count cannot exceed its bytes, which the caller's cap bounds) | none | correct as is | None; the binding bound is `ARGV_ENV_MAX_PAGES` |
 | `MAX_PATH_LEN` | `shared/ipc/src/lib.rs` | 4096 | provably unreachable (recipe paths in the tree are tens of bytes; no message carries a whole path, and svcmgr stores each at its length) | none | correct as is | None: svcmgr's one recipe path limit, the POSIX `PATH_MAX` value |
 | `svcmgr_labels::NAME_MAX`, `NAME_WORDS` | `shared/ipc/src/lib.rs` | 64 B / 8 words | encoding artefact (a name beside the label and round header fits one message; longest name in use 15 B) | none | correct as is | None: the one svcmgr name limit, which the registry, its client, svcmgr, its parser and init's endowment share with the `pack_name` codec |
 | `QUERY_LIVE_PROCESSES` page | `shared/ipc/src/lib.rs` (`LIVE_PROCESSES_PAGE`) | `MSG_DATA_WORDS_MAX - 1` = 63 badges | per-message bound (the caller pages on) | none | correct as is | None |
@@ -540,8 +539,7 @@ Every entry here is `correct as is`; none is tracked.
 
 ### procmgr
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
-[#666](https://github.com/kottlerg/seraph/issues/666) (address-space fault read-back).
+Tracked by [#666](https://github.com/kottlerg/seraph/issues/666) (address-space fault read-back).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -553,8 +551,8 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | `RECENT_EXIT_RETENTION_NS` (`RecentExits.ring`) | `services/procmgr/process-table/src/lib.rs` | 30 s, heap deque | tuning (a time bound; the ring is the death rate times the window) | none up front | correct as is | None |
 | death correlator | `services/procmgr/src/process.rs` (`finalize_creation`) | the full `u64` process badge | ABI width (`SYS_THREAD_BIND_NOTIFICATION`'s `u64` correlator) | none | correct as is | None |
 | `dispatch_death` exit reason | `services/procmgr/src/main.rs` | full `u64` (`DeathEvent.exit_reason`, kept whole by `RecentExits::record` and the forward to logd) | ABI width | none | correct as is | None |
-| `CreateBlobs.args_buf`, `env_buf` | `services/procmgr/process-table/src/create_blobs.rs` | 256 B each | encoding artefact (one message) | about 530 B stack | needs a design | argv and env through a Memory cap (#672) |
-| blob counts and lengths | `services/procmgr/process-table/src/create_blobs.rs` | `u8`, `u16` | encoding artefact | none | needs a design | Follows the blob design (#672) |
+| argv/env region (`map_child_argv_env`) | `services/procmgr/src/process.rs` | the pages the blobs fill, up to `ARGV_ENV_MAX_PAGES`, one contiguous grant on the child's account | per-instance (a create memmgr cannot fund fails with `OUT_OF_MEMORY`) | the blobs' pages per child that has argv or env | correct as is | None |
+| `checked_total` bound | `services/procmgr/process-table/src/create_blobs.rs` | the caller's cap size and `ARGV_ENV_MAX_BYTES` | see the process-layout section | none | correct as is | None |
 | `VFS_CHUNK_SIZE` | `services/procmgr/src/process.rs` | 504 | ABI width (`MSG_DATA_WORDS_MAX - 1` words) | none | correct as is | Derive from the ABI constant |
 | `RELA_CHUNK_RECORDS` | `services/procmgr/src/process.rs` | 128 | batch size (streaming chunk) | 3 KiB stack | correct as is | None |
 | `MAX_PROCESS_STACK_PAGES` check | `services/procmgr/src/process.rs` | notes outside `1..=MAX_PROCESS_STACK_PAGES` refused | see the process-layout section | none | correct as is | None |
@@ -568,7 +566,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 
 ### svcmgr and registry
 
-Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
+Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -581,8 +579,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv).
 | `RESTART_BURST`, `RESTART_WINDOW_NS` (`RestartBudget`) | `services/svcmgr/svc-defs/src/restart_budget.rs` | 3 restarts per 60 s window | tuning (stops a crash loop; a rarer crash always restarts) | 16 B per service | correct as is | None (#262 for clean cap-holder restart) |
 | `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
-| svc-defs argv and env limits | `services/svcmgr/svc-defs/src/parse.rs` | 255 / 256 B / 64 words | encoding artefact (procmgr wire) | none | needs a design | Follows the blob design (#672) |
-| restart create word check | `services/svcmgr/src/restart.rs` | `MSG_DATA_WORDS_MAX` | ABI width | none | correct as is | None |
+| svc-defs argv and env limit (`check_startup_blobs`) | `services/svcmgr/svc-defs/src/parse.rs` | argv and env together at most `ARGV_ENV_MAX_BYTES` | the process ABI's argv/env region | none | correct as is | None |
 | reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | table index, `u64` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its live thread state) | none | correct as is | None |
 | endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 6 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
 | bootstrap badge | `services/svcmgr/src/restart.rs` | random `u64` | ABI width | none | correct as is | None |

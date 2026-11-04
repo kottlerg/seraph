@@ -515,7 +515,7 @@ mod glue
                     // activate's fence.
                     core::sync::atomic::fence(Ordering::SeqCst);
                     // SAFETY: victim is a live AddressSpace (see above).
-                    let active_empty = unsafe { (*victim).active_cpu_mask().is_empty() };
+                    let active_empty = unsafe { (*victim).inactive_everywhere() };
                     if active_empty
                     {
                         // Safe to reuse: the victim is not running this tag. Other

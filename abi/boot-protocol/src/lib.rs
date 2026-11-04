@@ -336,12 +336,15 @@ pub struct InitSegment
 /// rather than truncating.
 pub const INIT_MAX_SEGMENTS: usize = 8;
 
-/// Maximum number of logical CPUs a `BootInfo` lists: the kernel's CPU-count
-/// width (its per-CPU masks hold `MAX_CPUS` bits).
+/// Maximum number of logical CPUs a `BootInfo` lists: a sanity ceiling, above
+/// any shipping part (a two-socket SMT system has 768 logical CPUs, an
+/// eight-socket 192-core SMT one 3072) with headroom. No structure is sized
+/// from it: the kernel sizes every per-CPU structure and CPU set from the boot's
+/// `cpu_count`.
 ///
 /// Producers MUST cap `cpu_count` at this value and diagnose truncation;
 /// consumers may assume `cpu_count <= MAX_CPUS`.
-pub const MAX_CPUS: usize = 512;
+pub const MAX_CPUS: usize = 8192;
 
 /// [`InitImage::flags`] bit 0: init is a position-independent executable
 /// (`ET_DYN`). The kernel chooses a load bias, applies the image's

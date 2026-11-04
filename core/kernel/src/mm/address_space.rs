@@ -58,7 +58,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use boot_protocol::{InitSegment, SegmentFlags};
 
-use crate::cpu_mask::{AtomicCpuMask, CpuMask};
+use crate::cpu_mask::{AtomicCpuMask, MaskSource};
 use crate::mm::PAGE_SIZE;
 use crate::mm::paging::phys_to_virt;
 
@@ -196,7 +196,9 @@ pub struct AddressSpace
     ///
     /// CPU N present = CPU N has this AS active, TLB may contain cached entries.
     /// Updated on every context switch by the scheduler; queried by TLB
-    /// shootdown to determine which CPUs need IPIs.
+    /// shootdown to determine which CPUs need IPIs. A view over the words
+    /// right after this struct in its wrapper page
+    /// ([`attach_active_cpus`](Self::attach_active_cpus)).
     active_cpus: AtomicCpuMask,
     /// Lock serializing page table modifications (map/unmap/protect).
     ///
@@ -366,10 +368,7 @@ impl AddressSpace
             core::sync::atomic::fence(Ordering::SeqCst);
         }
 
-        let mut remote_cpus = self.active_cpu_mask();
-        let current = crate::arch::current::cpu::current_cpu() as usize;
-        remote_cpus.clear(current);
-        if !remote_cpus.is_empty()
+        let remote_cpus = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
         {
             // `self.tag` is read without the pool lock, after the fence, and the
             // caller need not be running this space (cross-AS edits by procmgr /
@@ -381,8 +380,10 @@ impl AddressSpace
             // tagging disabled the tag is always 0.
             let tag = self.tag.load(Ordering::Acquire);
             // SAFETY: root_phys is a valid page table root; remote_cpus
-            // contains only online CPUs (enforced by scheduler); the caller
-            // holds preempt_disable() and no longer holds pt_lock.
+            // names only online CPUs (enforced by scheduler), and the
+            // shootdown leaves this CPU out of it; the caller holds
+            // preempt_disable() and no longer holds pt_lock. An empty target
+            // set returns at once.
             unsafe {
                 crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote_cpus, virt, tag);
             }
@@ -424,7 +425,7 @@ impl AddressSpace
         Self {
             root_phys,
             root_virt,
-            active_cpus: AtomicCpuMask::new(),
+            active_cpus: AtomicCpuMask::unattached(),
             pt_lock: AtomicBool::new(false),
             tag: AtomicU16::new(0),
             tag_gen: AtomicU64::new(0),
@@ -1001,13 +1002,9 @@ impl AddressSpace
                 }
             }
         }
-        let mut remote = self.active_cpu_mask();
-        remote.clear(current);
-        if remote.is_empty()
-        {
-            return;
-        }
-        // SAFETY: root_phys is a valid root; remote excludes current;
+        let remote = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
+        // SAFETY: root_phys is a valid root; the shootdown leaves current out
+        // of remote and returns at once when nothing else is active;
         // preemption is disabled (contract). Tag 0 is the untagged path, and
         // the full-flush sentinel ignores the tag, both correct cross-AS (see
         // the Dekker exclusion above).
@@ -1141,13 +1138,13 @@ impl AddressSpace
                 unsafe { flush_tlb_all() };
             }
         }
-        let mut remote = self.active_cpu_mask();
-        remote.clear(current);
-        if !remote.is_empty()
+        let remote = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
         {
             if ranged
             {
-                // SAFETY: root_phys is a valid root; remote excludes current;
+                // SAFETY: root_phys is a valid root; the shootdown leaves
+                // current out of remote and returns at once when nothing else
+                // is active;
                 // preempt is held and pt_lock no-pop invariant holds; tag 0 is
                 // the untagged path (see the Dekker exclusion comment above for
                 // why that is sufficient here).
@@ -1359,8 +1356,7 @@ impl AddressSpace
     /// # Memory Ordering
     /// Uses Release ordering: ensures all prior address space setup (page
     /// table modifications, mappings) is visible to other CPUs before marking
-    /// active, so TLB shootdown sees a consistent view when it queries
-    /// `active_cpu_mask`.
+    /// active, so TLB shootdown sees a consistent view when it reads the set.
     pub fn mark_active_on_cpu(&self, cpu: u32)
     {
         // SAFETY: Release ordering ensures prior address space setup (page
@@ -1386,20 +1382,69 @@ impl AddressSpace
         self.active_cpus.clear_cpu(cpu as usize, Ordering::Release);
     }
 
-    /// Get the bitmask of CPUs with this address space active.
-    ///
-    /// Used by TLB shootdown to determine which CPUs need IPIs.
-    /// Bit N set = CPU N is currently running threads in this address space.
+    /// Whether no CPU has this address space active.
     ///
     /// # Memory Ordering
-    /// Uses Acquire ordering: ensures we observe all prior `mark_active_on_cpu`
-    /// calls from other CPUs, giving an accurate snapshot of which CPUs have
-    /// cached TLB entries for this address space.
-    pub(crate) fn active_cpu_mask(&self) -> CpuMask
+    /// Uses Acquire ordering: ensures we observe all prior `mark_inactive_on_cpu`
+    /// calls from other CPUs, so an empty result means every CPU has switched
+    /// away.
+    pub(crate) fn inactive_everywhere(&self) -> bool
     {
-        // SAFETY: Acquire ordering ensures we see all mark_active calls from
-        // other CPUs. The snapshot is per-word atomic; no data race on the mask.
-        self.active_cpus.snapshot(Ordering::Acquire)
+        self.active_cpus.is_empty(Ordering::Acquire)
+    }
+
+    /// Point the active-CPU set at the [`crate::cpu_mask::mask_words`] words
+    /// right after this struct, and empty it.
+    ///
+    /// # Safety
+    /// `self` lies in its wrapper page with nothing after it, so the page holds
+    /// the words ([`ACTIVE_CPU_WORDS_FIT`]); called once, before any CPU marks
+    /// the space active.
+    pub(crate) unsafe fn attach_active_cpus(&mut self)
+    {
+        let after = core::ptr::from_mut::<Self>(self)
+            .wrapping_add(1)
+            .cast::<AtomicU64>();
+        // SAFETY: caller contract: the words after `self` in its wrapper page
+        // are reserved for this set; the struct's end is 8-byte aligned (its
+        // alignment is 8, asserted with ACTIVE_CPU_WORDS_FIT).
+        self.active_cpus = unsafe { AtomicCpuMask::attach(after, crate::cpu_mask::mask_words()) };
+    }
+}
+
+/// Whether an address space's wrapper page holds, after the `AddressSpaceObject`
+/// that starts it, the `AddressSpace` and its active-CPU set at the widest
+/// boot, `MAX_CPUS` CPUs.
+pub(crate) const ACTIVE_CPU_WORDS_FIT: bool = core::mem::size_of::<
+    crate::cap::object::AddressSpaceObject,
+>() + core::mem::size_of::<AddressSpace>()
+    + crate::cpu_mask::MAX_MASK_WORDS * core::mem::size_of::<AtomicU64>()
+    <= PAGE_SIZE
+    && core::mem::align_of::<AddressSpace>() >= core::mem::align_of::<AtomicU64>()
+    && core::mem::size_of::<AddressSpace>().is_multiple_of(core::mem::align_of::<AtomicU64>());
+
+const _: () = assert!(
+    ACTIVE_CPU_WORDS_FIT,
+    "the AddressSpace wrapper page cannot hold the active-CPU set at MAX_CPUS"
+);
+
+#[cfg(test)]
+mod active_cpu_words_tests
+{
+    use super::*;
+
+    // Defect caught: an AddressSpace or wrapper object that grows until the
+    // active-CPU set at the widest boot no longer fits the wrapper page, so
+    // the set's words overrun the page.
+    #[test]
+    fn the_wrapper_page_holds_the_address_space_and_its_set_at_max_cpus()
+    {
+        let used = core::mem::size_of::<crate::cap::object::AddressSpaceObject>()
+            + core::mem::size_of::<AddressSpace>()
+            + crate::cpu_mask::words_for(crate::sched::MAX_CPUS)
+                * core::mem::size_of::<AtomicU64>();
+        assert!(used <= PAGE_SIZE, "{used} bytes of the wrapper page");
+        assert!(ACTIVE_CPU_WORDS_FIT);
     }
 }
 

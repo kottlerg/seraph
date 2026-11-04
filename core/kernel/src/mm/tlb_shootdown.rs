@@ -52,7 +52,7 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering};
 
-use crate::cpu_mask::{AtomicCpuMask, CpuMask};
+use crate::cpu_mask::{AtomicCpuMask, MaskSource};
 
 /// Largest span (in 4 KiB pages) invalidated per-page rather than by full
 /// flush. Each per-VA invalidation walks the TLB's tags, while a full flush
@@ -111,7 +111,7 @@ impl TlbShootdownRequest
             flush_va: AtomicU64::new(u64::MAX),
             page_count: AtomicU64::new(1),
             tag: AtomicU16::new(0),
-            pending_cpus: AtomicCpuMask::new(),
+            pending_cpus: AtomicCpuMask::unattached(),
         }
     }
 }
@@ -121,8 +121,15 @@ impl TlbShootdownRequest
 /// before the APs start in Phase 8.
 static TLB_REQUESTS_PTR: AtomicPtr<TlbShootdownRequest> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Allocate the request slab for `cpu_count` CPUs and publish it. Called once
-/// from `percpu::init_storage` (Phase 4), on the BSP, before any AP starts.
+/// Allocate the request slab and its acknowledgement-set words for
+/// `cpu_count` CPUs and publish it. Called once from `percpu::init_storage`
+/// (Phase 4), on the BSP, before any AP starts, after the mask width is set
+/// (`cpu_mask::set_boot_cpu_count`).
+///
+/// Each request's `pending_cpus` is a view over its own run of
+/// [`crate::cpu_mask::mask_words`] words in a second slab, `cpu_count` runs in
+/// all, so the acknowledgement sets cost `cpu_count * cpu_count / 8` bytes,
+/// paid for the CPUs this boot has.
 pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
     let base = crate::sched::alloc_per_cpu_slab::<TlbShootdownRequest>(
@@ -130,11 +137,24 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
         cpu_count,
         allocator,
     );
+    let words_per_cpu = crate::cpu_mask::mask_words();
+    let words = crate::sched::alloc_per_cpu_slab::<AtomicU64>(
+        crate::sched::PerCpuSlab::of::<AtomicU64>("TLB_PENDING_CPUS")
+            .with_elems_per_cpu(words_per_cpu),
+        cpu_count,
+        allocator,
+    );
     for cpu in 0..cpu_count
     {
+        let mut req = TlbShootdownRequest::new();
+        // SAFETY: the words slab holds `words_per_cpu` words per CPU, so this
+        // CPU's run lies inside it and belongs to this request alone, for the
+        // kernel's life.
+        req.pending_cpus =
+            unsafe { AtomicCpuMask::attach(words.add(cpu * words_per_cpu), words_per_cpu) };
         // SAFETY: the slab covers cpu_count slots and nothing reads it before
         // the Release publication below.
-        unsafe { core::ptr::write(base.add(cpu), TlbShootdownRequest::new()) };
+        unsafe { core::ptr::write(base.add(cpu), req) };
     }
     TLB_REQUESTS_PTR.store(base, Ordering::Release);
 }
@@ -188,9 +208,11 @@ pub fn any_pending() -> bool
 pub unsafe fn service_shootdowns(my_cpu: usize)
 {
     let slots = requests();
-    // Slot indexes serviced this pass (slots are per-CPU, so a CpuMask
-    // indexes them; 64 bytes of stack, independent of request sizes).
-    let mut serviced = CpuMask::empty();
+    // Slot indexes serviced since the last acknowledgement, at most
+    // ACK_BATCH: a full batch closes the batch window and acknowledges
+    // them, so the stack holds a fixed list whatever the CPU count.
+    let mut serviced = [0u32; ACK_BATCH];
+    let mut serviced_len = 0usize;
     let mut batch_open = false;
     for (slot, req) in slots.iter().enumerate()
     {
@@ -250,18 +272,50 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
                 }
             }
         }
-        serviced.set(slot);
+        // cast_possible_truncation: slot < cpu_count <= MAX_CPUS, which fits u32.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            serviced[serviced_len] = slot as u32;
+        }
+        serviced_len += 1;
+        if serviced_len == ACK_BATCH
+        {
+            // SAFETY: IPI-handler context (caller contract).
+            unsafe { acknowledge(slots, &serviced, my_cpu, &mut batch_open) };
+            serviced_len = 0;
+        }
     }
-    if batch_open
+    // SAFETY: IPI-handler context (caller contract).
+    unsafe { acknowledge(slots, &serviced[..serviced_len], my_cpu, &mut batch_open) };
+}
+
+/// Slots [`service_shootdowns`] services before it acknowledges them.
+const ACK_BATCH: usize = 64;
+
+/// Close the batched-invalidation window if open, then clear `my_cpu`'s
+/// acknowledgement bit in each serviced slot.
+///
+/// # Safety
+/// IPI-handler context on `my_cpu`, as for [`service_shootdowns`].
+unsafe fn acknowledge(
+    slots: &[TlbShootdownRequest],
+    serviced: &[u32],
+    my_cpu: usize,
+    batch_open: &mut bool,
+)
+{
+    if *batch_open
     {
-        // SAFETY: paired with the inval_batch_begin above; IPI-handler context.
+        // SAFETY: paired with the inval_batch_begin in service_shootdowns;
+        // IPI-handler context.
         unsafe { crate::arch::current::paging::inval_batch_end() };
+        *batch_open = false;
     }
-    // Release: every flush above — including the just-closed batch window — is
-    // visible before any initiator observes its acknowledgement.
-    for slot in serviced.iter()
+    // Release: every flush before this call — including the just-closed batch
+    // window — is visible before any initiator observes its acknowledgement.
+    for &slot in serviced
     {
-        slots[slot]
+        slots[slot as usize]
             .pending_cpus
             .clear_cpu(my_cpu, Ordering::Release);
     }
@@ -272,10 +326,10 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
 ///
 /// # Contract / Safety
 /// As [`shootdown_range`].
-pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
+pub unsafe fn shootdown(root_phys: u64, targets: &MaskSource<'_>, virt: u64, tag: u16)
 {
     // SAFETY: contract propagates verbatim.
-    unsafe { shootdown_range(root_phys, cpus, virt, 1, tag) };
+    unsafe { shootdown_range(root_phys, targets, virt, 1, tag) };
 }
 
 /// Initiate a TLB shootdown of `pages` consecutive 4 KiB pages starting at
@@ -292,15 +346,29 @@ pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
 /// - `pages` must be at least 1 and small enough that the per-page handler
 ///   loop stays cheap — callers cap ranges at
 ///   [`RANGE_FLUSH_CEILING_PAGES`] and use the full-flush sentinel above it.
-/// - `cpus` must contain only online CPU indices and exclude the current CPU.
+/// - `targets` must name only online CPU indices; the current CPU is left out
+///   of them here.
 /// - `tag` is the hardware address-space tag (PCID / ASID) to invalidate, or `0`
 ///   for the untagged path. A non-zero `tag` must imply tagging is enabled.
 ///
 /// # Safety
-/// Caller must ensure `root_phys` and `cpus` are valid as described above.
-pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: u64, tag: u16)
+/// Caller must ensure `root_phys` and `targets` are valid as described above.
+pub unsafe fn shootdown_range(
+    root_phys: u64,
+    targets: &MaskSource<'_>,
+    virt: u64,
+    pages: u64,
+    tag: u16,
+)
 {
-    if cpus.is_empty()
+    let me = crate::arch::current::cpu::current_cpu() as usize;
+    // A target set beyond this CPU means the APs are up, so the slab exists.
+    let Some(req) = requests().get(me)
+    else
+    {
+        return; // Before the slab: no remote CPU is running yet.
+    };
+    if !req.pending_cpus.fill_would_be_nonempty(targets, me)
     {
         return; // No remote CPUs active
     }
@@ -325,15 +393,9 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     // / S-mode. Preemption is disabled by the caller.
     unsafe { crate::arch::current::interrupts::enable() };
 
-    // This CPU's own request slot. No lock: the slot is owned by this CPU and
-    // the previous shootdown drained it (pending_cpus empty) before we returned.
-    let me = crate::arch::current::cpu::current_cpu() as usize;
-    // A non-empty target set means the APs are up, so the slab exists.
-    let Some(req) = requests().get(me)
-    else
-    {
-        crate::fatal("tlb_shootdown: remote shootdown before the request slab exists");
-    };
+    // `req` is this CPU's own request slot. No lock: the slot is owned by
+    // this CPU and the previous shootdown drained it (pending_cpus empty)
+    // before we returned.
 
     // Publish the request. Release ordering pairs with the Acquire bit test in
     // service_shootdowns; the stores are globally visible before the IPI by
@@ -343,7 +405,7 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     req.flush_va.store(virt, Ordering::Release);
     req.page_count.store(pages.max(1), Ordering::Release);
     req.tag.store(tag, Ordering::Release);
-    req.pending_cpus.store(cpus, Ordering::Release);
+    req.pending_cpus.fill_from(targets, me, Ordering::Release);
 
     // Drain the store buffer so a remote handler cannot read a stale slot. On
     // RISC-V (RVWMO) the Release stores order this hart's writes but do not
@@ -354,11 +416,11 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     core::sync::atomic::fence(Ordering::SeqCst);
 
     // Helper: send IPIs to every CPU in `mask`.
-    let send_ipis = |mask: &CpuMask| {
-        for cpu in mask.iter()
+    let send_ipis = |mask: &AtomicCpuMask| {
+        for cpu in mask.iter(Ordering::Relaxed)
         {
             // Translate logical CPU → hardware ID (APIC ID / hart ID).
-            // SAFETY: cpu is an online CPU index from the caller's mask;
+            // SAFETY: cpu is an online CPU index from the target set;
             // apic_id_for returns the hardware ID for the logical CPU.
             let hw_id = unsafe { crate::percpu::apic_id_for(cpu) };
             // SAFETY: hw_id is a valid hardware ID for an online CPU.
@@ -368,8 +430,11 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
         }
     };
 
-    // Initial IPI volley.
-    send_ipis(cpus);
+    // The lowest-numbered target, read before any acknowledgement can clear it.
+    let target_cpu = req.pending_cpus.first(Ordering::Relaxed).unwrap_or(0);
+
+    // Initial IPI volley, to the target set just published.
+    send_ipis(&req.pending_cpus);
 
     // TSC-bounded ack wait with re-send + NMI-backtrace escalation. See
     // arch::current::interrupts::wait_for_ack and the IPI Watchdog Ladder
@@ -377,11 +442,10 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     // only to CPUs whose bit is still set in our slot, so a dropped IPI recovers
     // without retransmitting to acks-in-flight. target_cpu is the lowest-numbered
     // target; it drives the Phase-C NMI backtrace and Phase-D panic message only.
-    let target_cpu = cpus.first().unwrap_or(0);
     // Relaxed: a stale snapshot only causes a redundant IPI to a CPU that has
     // already acked, which is idempotent. The real synchronisation edge is the
     // Acquire poll in the cond closure below.
-    let resend = || send_ipis(&req.pending_cpus.snapshot(Ordering::Relaxed));
+    let resend = || send_ipis(&req.pending_cpus);
     // SAFETY: caller invariants (preempt-disabled, IF=1) are upheld by the
     // save_and_disable_interrupts + enable() sequence above.
     unsafe {

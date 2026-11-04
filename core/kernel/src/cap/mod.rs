@@ -1150,6 +1150,9 @@ pub(crate) unsafe fn boot_retype_aspace(
     let aspace = unsafe { AddressSpace::new_user_with_root(root_pt_phys) };
     // SAFETY: aspace_ptr lives in the wrapper page, exclusively owned.
     unsafe { core::ptr::write(aspace_ptr, aspace) };
+    // SAFETY: the AddressSpace is the last thing in its wrapper page, which
+    // holds its active-CPU words (ACTIVE_CPU_WORDS_FIT); no CPU has it active.
+    unsafe { (*aspace_ptr).attach_active_cpus() };
 
     // SAFETY: aso_ptr is page-aligned and exclusively owned.
     unsafe {

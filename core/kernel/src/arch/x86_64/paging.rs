@@ -1228,18 +1228,14 @@ pub unsafe fn unmap_identity_page(pa: u64)
     unsafe { flush_page(virt) };
 
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let current = crate::arch::current::cpu::current_cpu() as usize;
-    let mut remote = crate::cpu_mask::CpuMask::range(cpu_count);
-    remote.clear(current);
-    if !remote.is_empty()
-    {
-        crate::percpu::preempt_disable();
-        // SAFETY: root_pa is the active kernel root; remote covers only
-        // online CPUs; preemption disabled around the shootdown. Tag 0: this is
-        // a kernel identity mapping torn down at boot, not a tagged user space.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
-        crate::percpu::preempt_enable();
-    }
+    let remote = crate::cpu_mask::MaskSource::Below(cpu_count);
+    crate::percpu::preempt_disable();
+    // SAFETY: root_pa is the active kernel root; remote names only online CPUs
+    // (the shootdown leaves this one out, and returns at once when it is the
+    // only one); preemption disabled around the shootdown. Tag 0: this is a
+    // kernel identity mapping torn down at boot, not a tagged user space.
+    unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
+    crate::percpu::preempt_enable();
 }
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.

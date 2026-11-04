@@ -77,10 +77,12 @@ An entry an existing open Issue already names cites it in the recommendation.
   reports LA57 (5-level paging, negotiated at boot) or under Sv57 the half is 64 PiB; the
   stage-1 seed (`BOOT_TABLE_POOL_SIZE`) maps only the image and the carve's first two chunks,
   so it does not grow with RAM. The `u32` `CSpaceId` stops the registry at 16 TiB of DRAM.
-- **CPU ceiling.** The binding CPU ceiling is `MAX_CPUS` itself, the kernel's `CpuMask` width
-  (`BootInfo.cpu_ids` is an array in its own pages, so the page no longer bounds it); shipping
-  two-socket servers already exceed 512 logical CPUs. A per-CPU slab may span several buddy
-  blocks, so `MAX_ORDER` no longer caps the CPU count.
+- **CPU ceiling.** `MAX_CPUS` (8192) is a sanity ceiling above any shipping part (a two-socket
+  SMT system has 768 logical CPUs, an eight-socket 192-core SMT one 3072); no structure is sized
+  from it. Every per-CPU slab and CPU set takes the boot's `cpu_count`: a CPU set is
+  `cpu_count.div_ceil(64)` words held with its object, and `BootInfo.cpu_ids` is an array in its
+  own pages. A per-CPU slab may span several buddy blocks, so `MAX_ORDER` does not cap the CPU
+  count.
 - **Process ceiling.** No table caps live processes: procmgr's grows on its heap, memmgr's is
   RAM-bound, and the kernel's `CSpace` registry is sized from RAM and does not bind first. The
   death queues' observer pools grow too: procmgr and svcmgr each add a queue, funded from their
@@ -137,9 +139,11 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `acquire_tag_pool_lock` wait bound | `core/kernel/src/mm/tag_allocator.rs` | `DEADLOCK_BUDGET_US` (5 s elapsed), then fatal | tuning (bounds no capacity) | none | correct as is | None |
 | `claim` eviction retry bound | `core/kernel/src/mm/tag_allocator.rs` | `DEADLOCK_BUDGET_US` (5 s elapsed), then fatal | tuning (bounds no capacity) | none | correct as is | None |
 | `acquire_frame_alloc_lock` wait bound | `core/kernel/src/mm/mod.rs` | `DEADLOCK_BUDGET_US` (5 s elapsed), then fatal | tuning (bounds no capacity) | none | correct as is | None |
-| TLB-shootdown request slab (`TLB_REQUESTS_PTR`) | `core/kernel/src/mm/tlb_shootdown.rs` | `cpu_count`-sized | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x about 96 B | correct as is | Already pay-as-you-go |
+| TLB-shootdown request slab (`TLB_REQUESTS_PTR`) | `core/kernel/src/mm/tlb_shootdown.rs` | `cpu_count`-sized | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x about 48 B | correct as is | Already pay-as-you-go |
+| TLB-shootdown acknowledgement sets (`TLB_PENDING_CPUS`) | `core/kernel/src/mm/tlb_shootdown.rs` | one CPU set per request, `cpu_count` sets | derived from `cpu_count` | `cpu_count` x `cpu_count.div_ceil(64)` x 8 B: 4 KiB at 128 CPUs, 72 KiB at 768, 8 MiB at the 8192 ceiling | correct as is | Already pay-as-you-go; quadratic in the CPU count, as one initiator set per CPU is |
+| `service_shootdowns` acknowledgement batch (`ACK_BATCH`) | `core/kernel/src/mm/tlb_shootdown.rs` | 64 serviced slots per batch | static-footprint budget (a stack array on the IPI handler) | 256 B kernel stack | correct as is | None; a pass with more serviced slots acknowledges in batches |
 | `RANGE_FLUSH_CEILING_PAGES` | `core/kernel/src/mm/tlb_shootdown.rs` | 32 | tuning threshold (bounds no capacity) | none | correct as is | None |
-| `CPU_MASK_WORDS` (`CpuMask`) | `core/kernel/src/cpu_mask.rs` | `MAX_CPUS.div_ceil(64)` = 8 | ABI width (`MAX_CPUS`) | 64 B in every `AddressSpace` and TLB request | make pay-as-you-go | Decided: a per-boot width (`cpu_count.div_ceil(64)` words held with their object) once `MAX_CPUS` leaves `BootInfo` (#640); a hierarchical mask is rejected (reasons at the constant) |
+| CPU set width (`mask_words`, `AtomicCpuMask`) | `core/kernel/src/cpu_mask.rs` | `cpu_count.div_ceil(64)` words, set at Phase 4 | derived from `cpu_count` | 8 B per 64 CPUs, held with each set's object (an address space's wrapper page, a TLB request's slot, the reschedule-pending slab) | correct as is | None; no CPU set is held by value on a kernel stack |
 | `AddressSpace.death_observers` | `core/kernel/src/mm/address_space.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per `AddressSpace` | correct as is | None |
 | `DEFAULT_INIT_INFO_VA`, `DEFAULT_INIT_STACK_TOP` | `core/kernel/src/mm/address_space.rs` | fixed VAs under the Sv39 user top | encoding artefact (fallback layout) | none | correct as is | Not a count |
 | `INIT_MAX_SEGMENTS` RELRO split | `core/kernel/src/mm/init_reloc.rs` | 8 | ABI width (boot protocol) | none | correct as is | A split past 8 is a clean error |
@@ -235,9 +239,9 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |
 | `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning | none | correct as is | None |
 | `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget, measured (the bound at the constant; ktest after Tier S, both arches): debug at 4, 16 and 128 CPUs peaks at 3784 B (thread) and 1664 B (idle), and release at 4, 16 and 128 CPUs at 4304 B and 2080 B | 4 pages per thread, caller-funded | needs a design | Add a guard page below each kernel stack (a measured depth bounds no path the tests do not run, and an overflow now corrupts the page beneath) |
-| `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 512 (`boot_protocol::MAX_CPUS`) | ABI width (boot protocol) | see the per-CPU rows | needs a design | See the boot section |
+| `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 8192 (`boot_protocol::MAX_CPUS`) | current peak plus headroom (a sanity ceiling no structure is sized from) | none | correct as is | None; see the boot section |
 | Watchdog breadcrumbs (`CpuDiag`, `CPU_DIAG_PTR`) | `core/kernel/src/sched/mod.rs` | `cpu_count`-sized slab | ABI width (`MAX_CPUS` upper bound) | `cpu_count` x 32 B | correct as is | Already pay-as-you-go |
-| `stop_threads_bound_to` `prod` (`mark_bound_threads`) | `core/kernel/src/sched/mod.rs` | a `CpuMask` | ABI width (`CPU_MASK_WORDS`) | 64 B kernel stack | correct as is | None |
+| `stop_threads_bound_to` prod (`mark_bound_threads`) | `core/kernel/src/sched/mod.rs` | one prod per bound thread found running, inside the registry walk | design choice (no set is held) | none | correct as is | None |
 | `WATCHDOG_THRESHOLD_SECONDS`, `DETECTOR_SCAN_INTERVAL_MS` | `core/kernel/src/sched/mod.rs` | 3 s / 500 ms, converted at `ticks_per_second()` | tuning (a diagnostic threshold at any tick rate) | none | correct as is | None |
 | `WEDGE_GRACE_SECONDS` | `core/kernel/src/sched/mod.rs` | 8, scaled per 128 CPUs | tuning (scales with CPU count) | none | correct as is | None |
 | `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8, keyed by TCB pointer | diagnostic output cap | 128 B BSS | correct as is | None |
@@ -345,7 +349,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_CPUS` (`BootInfo.cpu_count`) | `abi/boot-protocol/src/lib.rs` | 512 | ABI width (the kernel's CPU-count width: `CpuMask` holds `MAX_CPUS` bits); `cpu_ids` is an array of `cpu_count` ids in its own pages, so `BootInfo` no longer bounds it | `MAX_CPUS`-wide kernel `CpuMask`s | needs a design | Shipping two-socket servers have 768 logical CPUs; the per-boot `CpuMask` width (#640) lifts it |
+| `MAX_CPUS` (`BootInfo.cpu_count`) | `abi/boot-protocol/src/lib.rs` | 8192 | current peak plus headroom, a sanity ceiling: above any shipping part (two-socket SMT 768, eight-socket 192-core SMT 3072) with headroom; no structure is sized from it, since the kernel sizes its per-CPU structures and CPU sets from `cpu_count` and `cpu_ids` is an array of `cpu_count` ids in its own pages | none | correct as is | None; a producer caps `cpu_count` at it and diagnoses the surplus |
 | `INIT_MAX_SEGMENTS` (`InitImage.segments`) | `abi/boot-protocol/src/lib.rs` | 8 | provably unreachable (the in-tree init has 4 LOAD segments on x86_64; overflow is an error) | 256 B in `BootInfo` | correct as is | None |
 | `BOOT_MODULE_NAME_LEN`, `ENTRY_NAME_LEN` | `abi/boot-protocol/src/lib.rs`, `bundle.rs` | 32 | ABI width (bundle wire format) | per module | correct as is | None: tied by a const assert in `core/boot/src/main.rs` |
 | `BundleHeader.entry_count` | `abi/boot-protocol/src/bundle.rs` | `u32` | ABI width | none | correct as is | The binding cap is `MAX_BOOT_MODULES` |

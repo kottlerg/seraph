@@ -1046,7 +1046,7 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
 **Why two notifications.** `non_empty` (per-CPU `AtomicU32`, "Ready thread at some
 priority") is updated by enqueue/dequeue and is the dispatcher's notification.
-`RESCHEDULE_PENDING` (global `AtomicCpuMask`, one bit per CPU) is set by
+`RESCHEDULE_PENDING` (a global CPU set, `AtomicCpuMask`, one bit per CPU) is set by
 every path that links or nudges work onto a CPU (`enqueue_and_wake`,
 `enqueue_ready_thread`, `relocate_ready_thread`, `schedule()`'s cross-affinity
 requeue, and `sys_thread_set_affinity`) and is consumed only by the idle loop
@@ -1364,10 +1364,12 @@ PR #167).
 | CPU0-owned `static mut` singleton | The path runs in exactly one non-reentrant context — a CPU0-gated ISR path behind an interrupt gate (IF=0). | The path is non-reentrant, so the single buffer needs no lock. | No ceiling-sized site today; `OWED_WAKE_LAST` (`core/kernel/src/sched/mod.rs`), the owed-wake detector's fixed eight-entry persistence set, uses the idiom. |
 | Per-CPU field on `PerCpuScheduler`, written under that CPU's own `scheduler.lock` | Several CPUs run the path serially and each needs its own slot. | Each slot is written only by the holder of that CPU's `scheduler.lock`; the all-CPU-locks region serialises every writer of a given slot, so the field needs no ordering beyond Relaxed (it is an `AtomicU64` only so the shared reference every CPU holds can reach it). | `saved_lock_flags` (`core/kernel/src/sched/run_queue.rs`) — per-CPU flag word for all three all-CPU-locks sites above (issue #168). |
 
-Outside the two contexts above, one `[bool; MAX_CPUS]` stack array remains:
-the prod set in `mark_bound_threads` (`core/kernel/src/sched/mod.rs`); other
-CPU-set state at the ceiling is carried as bitvectors
-(`core/kernel/src/cpu_mask.rs`), not per-CPU stack arrays.
+Outside the two contexts above, no ceiling-sized stack array remains either: CPU
+sets are `AtomicCpuMask` views over storage held with their object, as wide as
+the boot's CPU count (`core/kernel/src/cpu_mask.rs`), and none is held by value
+on a stack; `mark_bound_threads` (`core/kernel/src/sched/mod.rs`) prods each CPU
+it finds running a bound thread inside its registry walk instead of collecting
+a set.
 
 ---
 

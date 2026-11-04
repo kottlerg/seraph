@@ -57,9 +57,10 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
-/// ceiling ([`boot_protocol::MAX_CPUS`]). Per-CPU sets ([`crate::cpu_mask`])
-/// size their word counts from this, and the boot path drops any CPUs the
-/// firmware enumerates beyond it.
+/// sanity ceiling ([`boot_protocol::MAX_CPUS`], 8192). No structure is sized
+/// from it: per-CPU slabs and CPU sets ([`crate::cpu_mask`]) take the boot's
+/// `cpu_count`, and the boot path drops any CPUs the firmware enumerates beyond
+/// it.
 pub const MAX_CPUS: usize = boot_protocol::MAX_CPUS;
 
 /// Hard affinity sentinel: no hard CPU affinity.
@@ -179,8 +180,9 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 
 // ── Reschedule-pending flag ──────────────────────────────────────────────────
 
-/// Per-CPU reschedule-pending bitmask, sized to support up to `MAX_CPUS`
-/// CPUs as a vector of `AtomicU64` words.
+/// The reschedule-pending set's words: one bit per CPU, `mask_words` words
+/// (`crate::cpu_mask`), allocated at Phase 4 by [`init_storage`]. Null before;
+/// no producer runs before Phase 4.
 ///
 /// Set by producers before the wake IPI and consumed by the idle loop with
 /// interrupts masked; the protocol and its ordering are specified in
@@ -194,7 +196,22 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///
 /// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
 /// producer does. On x86-64 the same contract holds.
-static RESCHEDULE_PENDING: crate::cpu_mask::AtomicCpuMask = crate::cpu_mask::AtomicCpuMask::new();
+static RESCHEDULE_PENDING: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// The reschedule-pending set, a view over [`RESCHEDULE_PENDING`]'s words; the
+/// empty, unattached set before Phase 4.
+fn reschedule_pending() -> crate::cpu_mask::AtomicCpuMask
+{
+    let words = RESCHEDULE_PENDING.load(core::sync::atomic::Ordering::Acquire);
+    if words.is_null()
+    {
+        return crate::cpu_mask::AtomicCpuMask::unattached();
+    }
+    // SAFETY: the words were allocated zeroed for this set at Phase 4 and live
+    // for the kernel's life; every access is through such views.
+    unsafe { crate::cpu_mask::AtomicCpuMask::from_words(words, crate::cpu_mask::mask_words()) }
+}
 
 /// Set the reschedule-pending bit for `cpu` (producer side).
 ///
@@ -203,7 +220,7 @@ static RESCHEDULE_PENDING: crate::cpu_mask::AtomicCpuMask = crate::cpu_mask::Ato
 /// `take_reschedule_pending`.
 pub fn set_reschedule_pending_for(cpu: usize)
 {
-    RESCHEDULE_PENDING.set_cpu(cpu, core::sync::atomic::Ordering::Release);
+    reschedule_pending().set_cpu(cpu, core::sync::atomic::Ordering::Release);
 }
 
 /// Check and clear the reschedule-pending flag for a CPU.
@@ -212,7 +229,7 @@ pub fn set_reschedule_pending_for(cpu: usize)
 /// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
 pub fn take_reschedule_pending(cpu: usize) -> bool
 {
-    RESCHEDULE_PENDING.take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
+    reschedule_pending().take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
 }
 
 // ── Softlockup watchdog ──────────────────────────────────────────────────────
@@ -2556,6 +2573,15 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         "init_storage: must be called exactly once"
     );
     CPU_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
+    // Every CPU set is this boot's width from here on.
+    crate::cpu_mask::set_boot_cpu_count(cpu_count as usize);
+    let words = alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(
+        PerCpuSlab::of::<core::sync::atomic::AtomicU64>("RESCHEDULE_PENDING")
+            .with_elems_per_cpu(crate::cpu_mask::mask_words()),
+        1,
+        allocator,
+    );
+    RESCHEDULE_PENDING.store(words, core::sync::atomic::Ordering::Release);
     BOOT_TRANSIENT_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
     init_per_cpu_storage(cpu_count, allocator);
 }
@@ -2761,23 +2787,30 @@ impl PerCpuSlab
     }
 
     /// Whether the slab is sized ([`sized_at`](Self::sized_at)) at every CPU
-    /// count from one to [`MAX_CPUS`]. The compile-time assert beside each
+    /// count from one to [`MAX_CPUS`]. The byte count grows with the CPU count
+    /// and `sized_at` holds at a count whenever it holds at a larger one, so the
+    /// ceiling decides it; [`SLAB_CHECK_WIDTHS`] checks the word edges and a
+    /// shipping two-socket part besides. The compile-time assert beside each
     /// fixed-count descriptor calls it, so every build checks the target layout
     /// of its architecture.
     pub(crate) const fn sized_at_every_width(self) -> bool
     {
-        let mut cpus = 1;
-        while cpus <= MAX_CPUS
+        let mut i = 0;
+        while i < SLAB_CHECK_WIDTHS.len()
         {
-            if !self.sized_at(cpus)
+            if !self.sized_at(SLAB_CHECK_WIDTHS[i])
             {
                 return false;
             }
-            cpus += 1;
+            i += 1;
         }
         true
     }
 }
+
+/// CPU counts [`PerCpuSlab::sized_at_every_width`] checks: the partial-word
+/// edges, the old 512 ceiling, a two-socket SMT part (768), and [`MAX_CPUS`].
+pub(crate) const SLAB_CHECK_WIDTHS: [usize; 7] = [1, 63, 64, 65, 512, 768, MAX_CPUS];
 
 /// Allocate `slab`'s storage for `cpu_count` CPUs through
 /// [`alloc_zeroed_slab`] and return a typed pointer to its first element.
@@ -3721,7 +3754,6 @@ unsafe fn mark_bound_threads(
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let mut self_bound = false;
-    let mut prod = crate::cpu_mask::CpuMask::empty();
     // SAFETY: caller contract (no conflicting locks held); the walk body
     // takes only locks ordered after the registry lock and never waits
     // on another CPU.
@@ -3757,18 +3789,19 @@ unsafe fn mark_bound_threads(
             else if let StateCommit::Committed(Some(cpu)) = committed
                 && cpu != this_cpu
             {
-                prod.set(cpu);
+                // Prodded here, inside the walk: the prod sends an IPI and
+                // waits on no other CPU, which the registry walk allows, so
+                // no set of CPUs to prod is held. A CPU running several bound
+                // threads is prodded once per thread; the prod is idempotent.
+                debug_assert!(
+                    cpu < cpu_count,
+                    "mark_bound_threads: a thread runs past cpu_count"
+                );
+                // SAFETY: cpu < cpu_count: a thread is current only on a
+                // started CPU.
+                prod_remote_cpu(cpu);
             }
         });
-    }
-    for cpu in prod.iter()
-    {
-        debug_assert!(
-            cpu < cpu_count,
-            "mark_bound_threads: a thread runs past cpu_count"
-        );
-        // SAFETY: cpu < cpu_count: a thread is current only on a started CPU.
-        unsafe { prod_remote_cpu(cpu) };
     }
     self_bound
 }
@@ -3966,8 +3999,8 @@ pub unsafe fn wait_until_aspace_inactive(
     spin_site_enter(SPIN_SITE_DEALLOC_AS_ACTIVE);
     let mut warn = SpinWarnOnce::new();
     let mut completed = true;
-    // SAFETY: aspace valid per contract; active_cpu_mask is an Acquire snapshot.
-    while !unsafe { (*aspace).active_cpu_mask() }.is_empty()
+    // SAFETY: aspace valid per contract; inactive_everywhere reads the set with Acquire.
+    while !unsafe { (*aspace).inactive_everywhere() }
     {
         // SAFETY: we are the running thread on this_cpu with preemption
         // disabled; no scheduler lock held.

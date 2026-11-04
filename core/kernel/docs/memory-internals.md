@@ -415,13 +415,14 @@ page of the span inside one batched-invalidation window — for `tag` when the r
 a CPU that has since switched to another space still flushes the right translation; region
 teardown's and the Mmio withdrawal's range and full-flush requests carry `tag == 0` and rely on
 their `tlb_gen` bump for any CPU that switched away) and clears its bit. Range flushes from every
-slot matched in one service pass share a single window, and **every acknowledgement is deferred
-until the window closes**: a queued `sinval.vma` is architecturally complete only when the closing
-`sfence.inval.ir` retires, so acking earlier would let the initiator proceed against a translation
-the target can still use. A full-flush or single-page slot serviced after the window opens executes
-its `sfence.vma`-family instruction inside the open window — architecturally legal (the closing
-fence still completes the queued `sinval.vma`s), just not part of the batch. Preemption stays
-disabled across the whole edit-then-shootdown sequence.
+slot matched in one service pass share a single window, up to `ACK_BATCH` (64) serviced slots at a
+time, and **every acknowledgement is deferred until the window closes**: a queued `sinval.vma` is
+architecturally complete only when the closing `sfence.inval.ir` retires, so acking earlier would
+let the initiator proceed against a translation the target can still use. A full-flush or
+single-page slot serviced after the window opens executes its `sfence.vma`-family instruction
+inside the open window — architecturally legal (the closing fence still completes the queued
+`sinval.vma`s), just not part of the batch. Preemption stays disabled across the whole
+edit-then-shootdown sequence.
 
 The shootdown is **not** issued unconditionally. Each rewrite is classified as it
 commits (`MapOutcome`):

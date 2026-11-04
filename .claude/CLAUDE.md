@@ -122,7 +122,9 @@ truth for "how work is tracked and shipped" on this project.
   The surface findings of a `NON-BLOCKING ISSUES ONLY` run enter the ledger
   because the pass below records them after every such run, whatever its
   audit verdict and failed-agent list. The glob reads an auditor-only run's
-  `audit-<head>.json` too; its empty finding lists add no entry.
+  `audit-<head>.json` too: its `findings` are the surface findings of the
+  last run with the reviewer that the delta leaves unfixed, and they enter
+  the ledger when it states `NON-BLOCKING ISSUES ONLY`.
 
   Handle the run's findings as that section says, in one pass: fixes via
   commits; recorded findings via `gh issue edit` on the Issue the section

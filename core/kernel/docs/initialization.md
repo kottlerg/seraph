@@ -761,7 +761,9 @@ calls `sched::enter()`.
    zeroed last. Emit: "reclaim scrub: zeroed N pages over M ranges"
 7. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 8. Call sched::enter() — does not return:
-   a. Dequeue the highest-priority ready thread (init)
+   a. Dequeue the highest-priority ready thread (init), then, with interrupts disabled,
+      flush the BSP's whole TLB when init's guard epoch is newer than its record
+      (`mm::stack_guard::flush_before_run`, as a switch-in would)
    b. Build an initial user-mode TrapFrame on init's kernel stack:
       rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
       rflags=0x202 (IF=1)

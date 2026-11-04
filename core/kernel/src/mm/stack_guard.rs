@@ -304,7 +304,8 @@ mod live
     /// or `percpu::init_ap` installed the CPU's per-CPU pointer.
     pub unsafe fn flush_before_run(stamp: u64)
     {
-        // SAFETY: interrupts disabled (caller contract).
+        // SAFETY: interrupts disabled and this CPU's per-CPU pointer installed
+        // (caller contract).
         if stamp <= unsafe { crate::percpu::guard_epoch_flushed() }
         {
             return;

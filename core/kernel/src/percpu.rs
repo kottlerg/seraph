@@ -218,7 +218,7 @@ pub struct PerCpuData
     pub kernel_stack_floor: u64,
     /// The guard epoch at this CPU's last whole-TLB flush for the
     /// kernel-stack guards (`mm::stack_guard::flush_before_run`). Written
-    /// only by this CPU, at a switch-in.
+    /// only by this CPU, at a switch-in or in `sched::enter`.
     pub guard_epoch_flushed: u64,
 }
 

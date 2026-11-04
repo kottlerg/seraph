@@ -6500,9 +6500,11 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 /// Start executing the highest-priority ready thread and never return.
 ///
 /// Called once at the end of kernel boot after the init TCB has been enqueued.
-/// Dequeues the init thread, sets the kernel trap stack (`set_kernel_trap_stack`),
-/// builds an initial user-mode [`TrapFrame`] on its kernel stack, and calls
-/// `first_entry_to_user`, which loads init's address space and enters user mode.
+/// Dequeues the init thread, drops any stale translation of its guard page
+/// (`mm::stack_guard::flush_before_run`), sets the kernel trap stack
+/// (`set_kernel_trap_stack`), builds an initial user-mode [`TrapFrame`] on its
+/// kernel stack, and calls `first_entry_to_user`, which loads init's address
+/// space and enters user mode.
 ///
 /// # Panics
 /// Calls `crate::fatal` if the run queue is empty (init TCB not enqueued).
@@ -6556,18 +6558,18 @@ pub unsafe fn enter() -> !
         crate::arch::current::cpu::disable_interrupts();
     }
 
-    // Set the kernel trap stack pointer before entering user mode so the first
-    // ring-3 → ring-0 transition lands on the correct kernel stack.
-    // On x86-64: writes TSS RSP0 + PerCpuData::kernel_rsp.
-    // On RISC-V: writes PerCpuData::kernel_rsp (offset 8 from tp); trap_entry
-    //   loads this to locate the kernel stack on U-mode entry.  sscratch is set
-    //   to &PER_CPU by return_to_user just before sret.
     // Init's first run here is not a schedule() switch-in, so drop any stale
     // translation of its guard page as one would (`mm::stack_guard`).
     // SAFETY: interrupts disabled above, on the BSP with its per-CPU pointer
     // installed; guard_epoch is immutable after creation.
     unsafe { crate::mm::stack_guard::flush_before_run(init_tcb.guard_epoch) };
 
+    // Set the kernel trap stack pointer before entering user mode so the first
+    // ring-3 → ring-0 transition lands on the correct kernel stack.
+    // On x86-64: writes TSS RSP0 + PerCpuData::kernel_rsp.
+    // On RISC-V: writes PerCpuData::kernel_rsp (offset 8 from tp); trap_entry
+    //   loads this to locate the kernel stack on U-mode entry.  sscratch is set
+    //   to &PER_CPU by return_to_user just before sret.
     // SAFETY: single-boot-thread; kernel_stack_top is valid from init TCB.
     unsafe {
         crate::arch::current::cpu::set_kernel_trap_stack(kernel_stack_top);

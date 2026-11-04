@@ -1336,6 +1336,39 @@ impl HeldPage
     }
 }
 
+/// Path and name of the slot-reuse file: more pages than fatfs's cache holds,
+/// page `i` tagged [`page_tag`]`(i)`. Written once per boot and shared by the
+/// slot-reuse phase and the per-open eviction phase (`fs_opens`), the last to
+/// use it removing it, since writing it is most of either phase's time.
+pub(crate) const SLOT_REUSE_PATH: &str = "/data/svctest/slotreuse.bin";
+pub(crate) const SLOT_REUSE_NAME: &[u8] = b"slotreuse.bin";
+
+/// Write the slot-reuse file unless a file of its size is already there, and
+/// return its page count: fatfs's slots, its quarantine bound, and
+/// [`SLOT_REUSE_MARGIN`].
+pub(crate) fn slot_reuse_file(ipc_buf: *mut u64) -> usize
+{
+    use std::io::Write;
+
+    let pages = fatfs_slot_ceiling(ipc_buf) + FATFS_QUARANTINE_MAX + SLOT_REUSE_MARGIN;
+    let size = (pages * SLOT_REUSE_PAGE) as u64;
+    if std::fs::metadata(SLOT_REUSE_PATH).is_ok_and(|m| m.len() == size)
+    {
+        return pages;
+    }
+    let mut f = std::fs::File::create(SLOT_REUSE_PATH).expect("slot reuse: create");
+    let mut page = vec![0u8; SLOT_REUSE_PAGE];
+    for i in 0..pages
+    {
+        for chunk in page.chunks_exact_mut(8)
+        {
+            chunk.copy_from_slice(&page_tag(i));
+        }
+        f.write_all(&page).expect("slot reuse: write a page");
+    }
+    pages
+}
+
 /// Read every page of the slot-reuse file from page `skip` on, checking
 /// each page's tag, so the LRU reuses every unreferenced slot.
 fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
@@ -1379,25 +1412,11 @@ fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
 /// page of the file.
 pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
 {
-    use std::io::Write;
-
-    let path = "/data/svctest/slotreuse.bin";
-    let name: &[u8] = b"slotreuse.bin";
+    let path = SLOT_REUSE_PATH;
+    let name = SLOT_REUSE_NAME;
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let slots = fatfs_slot_ceiling(ipc_buf);
-    let file_pages = slots + FATFS_QUARANTINE_MAX + SLOT_REUSE_MARGIN;
-    {
-        let mut f = std::fs::File::create(path).expect("slot reuse: create");
-        let mut page = vec![0u8; SLOT_REUSE_PAGE];
-        for i in 0..file_pages
-        {
-            for chunk in page.chunks_exact_mut(8)
-            {
-                chunk.copy_from_slice(&page_tag(i));
-            }
-            f.write_all(&page).expect("slot reuse: write a page");
-        }
-    }
+    let file_pages = slot_reuse_file(ipc_buf);
 
     let svctest = svctest_dir_cap(ipc_buf);
     let (node_cap, _kind, _size) =
@@ -1446,10 +1465,11 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     }
     read_slot_reuse_file(path, 0, file_pages);
 
+    // The file stays for the per-open eviction phase (`fs_opens`), which
+    // reads it next and removes it.
     let _ = fs_close(node, ipc_buf);
     let _ = syscall::cap_delete(node);
     let _ = syscall::cap_delete(node_cap);
-    fs_remove(svctest, name, ipc_buf).expect("cleanup slotreuse");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_mapping_survives_slot_reuse phase passed (held {count})");
 }

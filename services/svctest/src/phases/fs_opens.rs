@@ -36,7 +36,7 @@ pub fn phases() -> &'static [Phase]
 const PAGE: usize = 4096;
 
 /// Write a file of `pages` pages at `/data/svctest/<name>` through `std::fs`
-/// and return its node cap.
+/// and return the `/data/svctest` directory cap and the file's node cap.
 fn scratch_file(name: &str, pages: usize, ipc_buf: *mut u64) -> (u32, u32)
 {
     use std::io::Write;
@@ -162,6 +162,8 @@ struct Opener
     endpoint: u32,
     stop: u32,
     pages: Vec<u32>,
+    /// The file page indices `pages` holds, in the same order.
+    held: Vec<usize>,
 }
 
 /// The releases a handler thread received: the tag of the endpoint each
@@ -194,6 +196,7 @@ impl Opener
             endpoint,
             stop,
             pages: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -207,6 +210,7 @@ impl Opener
             Ok((page, _)) =>
             {
                 self.pages.push(page);
+                self.held.push(index);
                 true
             }
             Err(ipc::fs_errors::IO_ERROR) => false,
@@ -293,10 +297,12 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
     const TAG_MASK: u64 = 0xFF << 56;
 
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let slots = crate::phases::fs_ipc::fatfs_slot_ceiling(ipc_buf);
-    let file_pages = slots + 64;
-    let name = "evict.bin";
-    let (svctest, node) = scratch_file(name, file_pages, ipc_buf);
+    // The slot-reuse phase's file, more pages than the cache has slots.
+    let file_pages = crate::phases::fs_ipc::slot_reuse_file(ipc_buf);
+    let name = crate::phases::fs_ipc::SLOT_REUSE_NAME;
+    let svctest = svctest_dir_cap(ipc_buf);
+    let (node, _kind, _size) =
+        ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("fs_eviction: lookup");
 
     let log: ReleaseLog = Arc::new(Mutex::new(Vec::new()));
     let mut x = Opener::new(node, TAG_X, &log, ipc_buf);
@@ -328,11 +334,13 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
         other.pages.iter().all(|&p| cap_live(p)),
         "fs_eviction: closing one open revoked a page of the other"
     );
-    while next < file_pages && other.hold(next, ipc_buf)
-    {
-        next += 1;
-    }
-    assert!(next < file_pages, "fs_eviction: cache never filled again");
+    // Pages the closed open held are cached but unreferenced, so reading
+    // them takes slots again; a page `other` holds itself takes none.
+    let own: Vec<usize> = other.held.clone();
+    let filled = (0..file_pages)
+        .filter(|i| !own.contains(i))
+        .any(|i| !other.hold(i, ipc_buf));
+    assert!(filled, "fs_eviction: cache never filled again");
     let releases = wait_for_releases(&log, 2);
     for &(tag, cookie) in &releases
     {
@@ -349,7 +357,7 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
 
     other.finish(ipc_buf);
     let _ = syscall::cap_delete(node);
-    fs_remove(svctest, name.as_bytes(), ipc_buf).expect("cleanup evict.bin");
+    fs_remove(svctest, name, ipc_buf).expect("cleanup slotreuse.bin");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!(
         "fs_eviction_routes_release_to_its_open phase passed ({} releases)",

@@ -39,6 +39,7 @@
 //! | `PERCPU_TSS_PTR_OFFSET` | 32 | `tss_ptr` |
 //! | `PERCPU_PREEMPT_COUNT_OFFSET` | 40 | `preempt_count` |
 //! | `PERCPU_FPU_OWNER_OFFSET` | 48 | `fpu_owner` |
+//! | `PERCPU_KERNEL_STACK_FLOOR_OFFSET` | 72 | `kernel_stack_floor` |
 //!
 //! ## Adding new fields
 //! Append fields at the end of the struct. If assembly reads the field, add
@@ -145,6 +146,12 @@ pub const PERCPU_PREEMPT_COUNT_OFFSET: usize = 40;
 // Not accessed from assembly; included for layout discipline.
 #[allow(dead_code)]
 pub const PERCPU_FPU_OWNER_OFFSET: usize = 48;
+/// Byte offset of `PerCpuData::kernel_stack_floor`, `tp`-relative: the riscv64
+/// `trap_entry` and `context::switch` naked asm take it as a `const` operand.
+// Unused on x86-64, which reads no stack floor.
+#[allow(dead_code)]
+pub const PERCPU_KERNEL_STACK_FLOOR_OFFSET: usize =
+    core::mem::offset_of!(PerCpuData, kernel_stack_floor);
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
 
@@ -199,6 +206,14 @@ pub struct PerCpuData
     /// (tag reissue or switched-away unmap catch-up; see
     /// `core/kernel/docs/memory-internals.md` § TLB Management).
     pub ctxsw_flush_performed: AtomicU64,
+    /// Lowest address of the kernel stack this CPU runs on (its guard page's
+    /// top), or 0 before one is set. The riscv64 S-mode trap entry compares
+    /// the trap frame it is about to push against it and reports an overflow
+    /// instead of pushing into the guard; `context::switch` writes the
+    /// incoming thread's floor at its stack-pointer swap, and the boot sets
+    /// the handoff stack's ([`set_kernel_stack_floor`]). x86-64 reads none: a
+    /// fault on its guard escalates to a double fault on IST1.
+    pub kernel_stack_floor: u64,
 }
 
 impl PerCpuData
@@ -217,6 +232,7 @@ impl PerCpuData
             fpu_owner: AtomicPtr::new(core::ptr::null_mut()),
             ctxsw_flush_elided: AtomicU64::new(0),
             ctxsw_flush_performed: AtomicU64::new(0),
+            kernel_stack_floor: 0,
         }
     }
 }
@@ -356,6 +372,24 @@ pub unsafe fn init_ap(cpu_id: u32)
     unsafe {
         crate::arch::current::cpu::install_percpu(ptr as u64);
     }
+}
+
+/// Set the current CPU's kernel stack floor
+/// ([`PerCpuData::kernel_stack_floor`]) for the stack it runs on outside a
+/// context switch: the BSP's handoff stack, an AP's idle stack before its
+/// first switch.
+///
+/// # Safety
+/// The current CPU's per-CPU pointer is installed ([`init_bsp`] or
+/// [`init_ap`]), and `floor` is the base of the stack this CPU runs on now,
+/// or 0.
+#[cfg(not(test))]
+pub unsafe fn set_kernel_stack_floor(floor: u64)
+{
+    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: the entry is this CPU's own, written only by it (caller
+    // contract).
+    unsafe { (*ptr).kernel_stack_floor = floor };
 }
 
 // ── Preemption control ───────────────────────────────────────────────────────
@@ -502,6 +536,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 72);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 80);
     }
 }

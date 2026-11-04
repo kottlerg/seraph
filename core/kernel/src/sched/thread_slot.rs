@@ -6,9 +6,13 @@
 //! Size of a Thread's retype slot, set at boot from the extended-state area
 //! the boot CPU needs.
 //!
-//! A Thread slot is the kernel stack ([`KERNEL_STACK_PAGES`]), one page
-//! holding the `ThreadObject` wrapper and the TCB, then the per-thread
-//! extended-state (FPU, SIMD, vector) save area, rounded up to whole pages.
+//! A Thread slot is one guard page ([`GUARD_PAGES`]), the kernel stack
+//! ([`KERNEL_STACK_PAGES`]), one page holding the `ThreadObject` wrapper and
+//! the TCB, then the per-thread extended-state (FPU, SIMD, vector) save area,
+//! rounded up to whole pages. The guard page is the caller's memory, debited
+//! like the rest of the slot, and unusable while the thread exists: thread
+//! creation removes it from the direct map (`mm::stack_guard`), so an
+//! overflow of the stack faults instead of writing below the slot.
 //! The area's size is a property of the hardware, so the boot CPU's
 //! architecture init reports it once, before any thread is created
 //! ([`set_extended_bytes`]): on x86-64 the XSAVE size of the components XCR0
@@ -26,6 +30,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::KERNEL_STACK_PAGES;
 use crate::mm::PAGE_SIZE;
 
+/// Pages below the kernel stack in a Thread slot: the guard, which the direct
+/// map leaves unmapped while the thread exists.
+pub const GUARD_PAGES: usize = 1;
+
+/// Offset of the kernel stack's base in a Thread slot: above the guard.
+pub const STACK_OFFSET: u64 = (GUARD_PAGES * PAGE_SIZE) as u64;
+
+/// Offset of the page holding the `ThreadObject` wrapper and the TCB: the
+/// kernel stack's top.
+pub const WRAPPER_OFFSET: u64 = ((GUARD_PAGES + KERNEL_STACK_PAGES) * PAGE_SIZE) as u64;
+
+/// Offset of the extended-state save area: the page after the wrapper's.
+pub const EXTENDED_OFFSET: u64 = WRAPPER_OFFSET + PAGE_SIZE as u64;
+
 /// Pages the save area of `extended_bytes` takes, at least one: an area the
 /// boot has not reported yet takes the one page every supported CPU needs at
 /// minimum.
@@ -35,11 +53,11 @@ pub const fn extended_pages(extended_bytes: u64) -> u64
     if pages == 0 { 1 } else { pages }
 }
 
-/// Bytes of a Thread slot whose save area is `extended_bytes`: the kernel
-/// stack, the wrapper and TCB page, and the save area's pages.
+/// Bytes of a Thread slot whose save area is `extended_bytes`: the guard,
+/// the kernel stack, the wrapper and TCB page, and the save area's pages.
 pub const fn slot_bytes(extended_bytes: u64) -> u64
 {
-    (KERNEL_STACK_PAGES as u64 + 1 + extended_pages(extended_bytes)) * PAGE_SIZE as u64
+    EXTENDED_OFFSET + extended_pages(extended_bytes) * PAGE_SIZE as u64
 }
 
 /// The save-area size the boot CPU reported, in bytes; zero before the
@@ -71,7 +89,7 @@ mod tests
     use super::*;
 
     const PAGE: u64 = PAGE_SIZE as u64;
-    const BASE: u64 = KERNEL_STACK_PAGES as u64 + 1;
+    const BASE: u64 = (GUARD_PAGES + KERNEL_STACK_PAGES) as u64 + 1;
 
     #[test]
     fn an_unreported_area_takes_one_page()

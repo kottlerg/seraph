@@ -17,6 +17,7 @@ pub mod init;
 pub mod init_reloc;
 pub mod kernel_pt_pool;
 pub mod paging;
+pub mod stack_guard;
 pub mod tag_allocator;
 #[cfg(not(test))]
 pub mod tlb_shootdown;

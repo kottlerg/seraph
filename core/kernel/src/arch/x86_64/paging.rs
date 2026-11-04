@@ -1242,6 +1242,162 @@ pub unsafe fn unmap_identity_page(pa: u64)
     }
 }
 
+// ── Direct-map holes ──────────────────────────────────────────────────────────
+// A guard page below a kernel stack (`crate::mm::stack_guard`) is a hole in
+// the direct map: one 4 KiB entry left not present. The 2 MiB leaf that maps
+// a guard's chunk is first split into a leaf table of the same translation.
+// `stack_guard` serialises every edit and flushes the TLB.
+
+/// Direct-map flags of a RAM page: read-write, never executable, write-back
+/// (`mm::paging::init_kernel_page_tables` maps RAM so).
+const DIRECT_RAM: PageFlags = PageFlags {
+    readable: true,
+    writable: true,
+    executable: false,
+    uncacheable: false,
+};
+
+/// Fill `table` with the 512 4 KiB direct-map entries of the 2 MiB chunk at
+/// `chunk`: the translation of the large leaf it replaces.
+fn split_chunk_entries(table: &mut [PageTableEntry; 512], chunk: u64)
+{
+    for (i, entry) in table.iter_mut().enumerate()
+    {
+        *entry = PageTableEntry::new_page(chunk + (i * 4096) as u64, DIRECT_RAM);
+    }
+}
+
+/// Leave the direct-map page at `virt` not present. When a 2 MiB leaf maps
+/// it, the leaf is first replaced by a leaf table with the same translation,
+/// built in the frame `take_table` returns.
+///
+/// # Errors
+/// - [`PagingError::NotMapped`] when the direct map does not map `virt`.
+/// - [`PagingError::OutOfFrames`] when a split is needed and `take_table`
+///   returns `None`.
+///
+/// # Safety
+/// `virt` is the direct-map address of a RAM page nothing reaches through the
+/// direct map until [`fill_direct_map_page`] restores it. The caller
+/// serialises every direct-map edit and flushes the TLB afterwards.
+#[cfg(not(test))]
+pub unsafe fn hole_direct_map_page(
+    virt: u64,
+    take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>
+{
+    use crate::mm::paging::{LARGE_PAGE_SIZE, kernel_root_table_pa, phys_to_virt};
+
+    let root_va = phys_to_virt(kernel_root_table_pa());
+    // SAFETY: the kernel root and the tables under it are live table frames
+    // reached through the direct map; the caller serialises their edits.
+    let pd = unsafe { descend_existing(root_va, virt, root_level(), 1, phys_to_virt) }
+        .ok_or(PagingError::NotMapped)?;
+    let pde = &mut pd[table_index(1, virt)];
+    if !pde.is_present()
+    {
+        return Err(PagingError::NotMapped);
+    }
+    if pde.0 & LARGE_PAGE != 0
+    {
+        let table_pa = take_table().ok_or(PagingError::OutOfFrames)?;
+        // SAFETY: the frame is the caller's alone, reached through the direct
+        // map, and no table names it yet.
+        let table = unsafe { table_at(phys_to_virt(table_pa)) };
+        split_chunk_entries(table, pde.phys_addr() & !(LARGE_PAGE_SIZE - 1));
+        // The entries are written before the directory names the table, so a
+        // walk through the new entry finds them.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        *pde = PageTableEntry::new_table(table_pa);
+    }
+    // SAFETY: the directory entry names a live leaf table (split above, or
+    // by an earlier hole or the Phase 3 build).
+    let pt = unsafe { table_at(phys_to_virt(pde.phys_addr())) };
+    pt[table_index(0, virt)] = PageTableEntry(0);
+    Ok(())
+}
+
+/// Map the direct-map page at `virt` to `phys` again, closing a hole
+/// [`hole_direct_map_page`] left.
+///
+/// # Safety
+/// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`];
+/// the caller serialises every direct-map edit. No flush is needed: x86-64
+/// caches no not-present entry.
+#[cfg(not(test))]
+pub unsafe fn fill_direct_map_page(virt: u64, phys: u64)
+{
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
+
+    let root_va = phys_to_virt(kernel_root_table_pa());
+    // SAFETY: as in hole_direct_map_page; the hole left a leaf table here.
+    if let Some(pt) = unsafe { descend_existing(root_va, virt, root_level(), 0, phys_to_virt) }
+    {
+        pt[table_index(0, virt)] = PageTableEntry::new_page(phys, DIRECT_RAM);
+    }
+}
+
+/// Whether the kernel's tables map the direct-map address `virt`.
+///
+/// # Safety
+/// The caller serialises the read against direct-map edits.
+#[cfg(not(test))]
+pub unsafe fn direct_map_page_present(virt: u64) -> bool
+{
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
+
+    let root_va = phys_to_virt(kernel_root_table_pa());
+    // SAFETY: as in hole_direct_map_page.
+    let Some(pd) = (unsafe { descend_existing(root_va, virt, root_level(), 1, phys_to_virt) })
+    else
+    {
+        return false;
+    };
+    let pde = pd[table_index(1, virt)];
+    if !pde.is_present() || pde.0 & LARGE_PAGE != 0
+    {
+        return pde.is_present();
+    }
+    // SAFETY: a present non-large directory entry names a live leaf table.
+    let pt = unsafe { table_at(phys_to_virt(pde.phys_addr())) };
+    pt[table_index(0, virt)].is_present()
+}
+
+/// INVPCID type 2: invalidate every translation, global ones included, of
+/// every PCID.
+const INVPCID_TYPE_ALL_GLOBAL: u64 = 2;
+
+/// Invalidate this CPU's cached translations of the kernel address `virt` in
+/// every address-space context.
+///
+/// The direct map's entries are not global, so with tagged TLBs a CPU caches
+/// them under each PCID it has run, and `invlpg` reaches only the loaded one;
+/// INVPCID type 2 drops every PCID's (the whole TLB). Without tagging every
+/// entry is cached under PCID 0, which `invlpg` reaches.
+///
+/// # Safety
+/// Must execute at ring 0.
+#[cfg(not(test))]
+pub unsafe fn flush_kernel_page(virt: u64)
+{
+    if crate::mm::tag_allocator::tagging_enabled()
+    {
+        let desc = InvpcidDescriptor {
+            pcid: 0,
+            linear_addr: 0,
+        };
+        // SAFETY: tagging enabled implies CR4.PCIDE on every CPU (each AP
+        // enables it before its first tagged activate); the type-2
+        // descriptor's fields are ignored and zero.
+        unsafe { invpcid(INVPCID_TYPE_ALL_GLOBAL, &desc) };
+    }
+    else
+    {
+        // SAFETY: ring 0 (caller contract).
+        unsafe { flush_page(virt) };
+    }
+}
+
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
 /// Walks from the root to the PT. Returns `Err(PagingError::NotMapped)` if
@@ -1524,6 +1680,25 @@ pub unsafe fn flush_tlb_all()
 mod tests
 {
     use super::*;
+
+    // ── Direct-map split ──────────────────────────────────────────────────────
+
+    // The defect caught: a split table that maps an entry to the wrong frame
+    // (an index or stride slip) or with other flags than the large leaf it
+    // replaces, which would corrupt every direct-map access in the chunk.
+    #[test]
+    fn a_split_chunk_maps_each_page_to_its_own_frame_read_write_no_execute()
+    {
+        let chunk = 0x4020_0000;
+        let mut table = [PageTableEntry(0); 512];
+        split_chunk_entries(&mut table, chunk);
+        for (i, e) in table.iter().enumerate()
+        {
+            assert_eq!(e.phys_addr(), chunk + (i as u64) * 4096);
+            assert!(e.is_present() && e.0 & WRITABLE != 0 && e.0 & NO_EXECUTE != 0);
+            assert_eq!(e.0 & (PCD | PWT | LARGE_PAGE), 0);
+        }
+    }
 
     // ── PTE construction ──────────────────────────────────────────────────────
 

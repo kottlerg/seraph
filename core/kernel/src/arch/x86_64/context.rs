@@ -93,6 +93,13 @@ pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64)
     saved.fs_base = tls_base;
 }
 
+/// Record the base of the thread's kernel stack. A no-op on x86-64: no code
+/// reads a stack floor, since a fault on a kernel stack's guard page
+/// escalates to a double fault on IST1 (riscv64 writes it to the per-CPU
+/// floor its trap entry checks).
+#[inline]
+pub fn set_stack_floor(_saved: &mut SavedState, _floor: u64) {}
+
 /// Round a user-supplied stack pointer to the ABI alignment expected at an
 /// `extern "C"` entry point. On x86-64 `SysV`, `rsp` ≡ 8 (mod 16) at function
 /// entry — the 8 accounts for the return address a normal `call` would have

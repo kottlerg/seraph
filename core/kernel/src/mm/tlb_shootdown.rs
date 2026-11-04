@@ -224,6 +224,12 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
                 {
                     crate::arch::current::paging::flush_page_tagged(va, tag);
                 }
+                else if root == crate::mm::paging::kernel_root_table_pa()
+                {
+                    // A kernel mapping: cached under every address space
+                    // this CPU has run.
+                    crate::arch::current::paging::flush_kernel_page(va);
+                }
                 else
                 {
                     crate::arch::current::paging::flush_page(va);
@@ -287,6 +293,9 @@ pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
 /// # Contract
 /// - Caller must have called `preempt_disable()` before this function.
 /// - `root_phys` must be a valid page table root physical address or 0 for full flush.
+///   The kernel root (`mm::paging::kernel_root_table_pa`) with `tag` 0 names a
+///   kernel mapping: each target drops its translation in every address space
+///   (`flush_kernel_page`).
 /// - `virt == u64::MAX` (or `root_phys == 0`) requests a full flush; `pages`
 ///   is ignored on that path.
 /// - `pages` must be at least 1 and small enough that the per-page handler

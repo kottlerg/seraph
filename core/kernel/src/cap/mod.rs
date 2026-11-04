@@ -455,7 +455,7 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
-/// That is 85 pages (340 KiB), and init's Thread slot adds six or more
+/// That is 85 pages (340 KiB), and init's Thread slot adds seven or more
 /// (`sched::thread_slot::thread_slot_bytes`). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
@@ -603,11 +603,16 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// named contributors:
 ///
 /// 1. `POOL_SEED_PAGES` — the kernel PT-frame pool seed.
-/// 2. Idle-thread kernel stacks — `cpu_count × KERNEL_STACK_PAGES`, one stack
-///    per online CPU (pre-allocated in Phase 4 from the pristine buddy).
-/// 3. The `InitInfo` block — worst-case `INIT_INFO_MAX_PAGES`.
-/// 4. Init's user stack — `INIT_STACK_PAGES`.
-/// 5. The SEED arena — `seed_reserve_bytes()`.
+/// 2. Idle-thread kernel stacks — `cpu_count × (KERNEL_STACK_PAGES + 1)`, one
+///    stack and the guard page below it per online CPU (pre-allocated in
+///    Phase 4 from the pristine buddy).
+/// 3. The guard-table reserve — `mm::stack_guard::seeded_frames()`, one leaf
+///    table per 2 MiB chunk of RAM (`mm::stack_guard::reserve_frames`),
+///    seeded in Phase 4, for the direct-map splits the kernel-stack guard
+///    pages make.
+/// 4. The `InitInfo` block — worst-case `INIT_INFO_MAX_PAGES`.
+/// 5. Init's user stack — `INIT_STACK_PAGES`.
+/// 6. The SEED arena — `seed_reserve_bytes()`.
 ///
 /// Every other page of RAM is drained for userspace and routes to memmgr's
 /// pool, leaving the post-handoff buddy fully empty. This value is a Phase-7
@@ -618,10 +623,11 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 pub(crate) fn kernel_reserve_pages() -> usize
 {
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let idle_stacks = cpu_count * crate::sched::KERNEL_STACK_PAGES;
+    let idle_stacks = cpu_count * (crate::sched::KERNEL_STACK_PAGES + 1);
+    let guard_tables = crate::mm::stack_guard::seeded_frames();
     let init_info = 1usize << INIT_INFO_RESERVE_ORDER;
     let seed = (seed_reserve_bytes() / crate::mm::PAGE_SIZE as u64) as usize;
-    POOL_SEED_PAGES + idle_stacks + init_info + INIT_STACK_PAGES + seed
+    POOL_SEED_PAGES + idle_stacks + guard_tables + init_info + INIT_STACK_PAGES + seed
 }
 
 /// Number of init user-stack pages reserved ahead of the drain.
@@ -774,12 +780,13 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
     }
 
     crate::kprintln!(
-        "Phase 7: kernel reserve {} pages = pool {} + idle {}×{} + initinfo {} + \
-         initstack {} + seed {} KiB; draining all remaining RAM to userspace",
+        "Phase 7: kernel reserve {} pages = pool {} + idle {}×{} + guard tables {} + \
+         initinfo {} + initstack {} + seed {} KiB; draining all remaining RAM to userspace",
         reserve_pages,
         POOL_SEED_PAGES,
         cpu_count,
-        crate::sched::KERNEL_STACK_PAGES,
+        crate::sched::KERNEL_STACK_PAGES + 1,
+        crate::mm::stack_guard::seeded_frames(),
         1usize << INIT_INFO_RESERVE_ORDER,
         INIT_STACK_PAGES,
         seed_reserve_bytes() / 1024,

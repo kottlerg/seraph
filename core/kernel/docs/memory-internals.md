@@ -461,7 +461,9 @@ still running it, and a CPU that switched away is covered by the `tlb_gen` bump 
 
 The direct physical map is set up during Phase 3 of initialization
 ([initialization.md](initialization.md) § Phase 3: Kernel Page Tables) and covers all
-usable physical memory. The kernel uses `phys_to_virt` and `virt_to_phys` helpers:
+usable physical memory, except the guard pages below the kernel stacks, which it leaves
+unmapped (§ Kernel Stack Guards). The kernel uses `phys_to_virt` and `virt_to_phys`
+helpers:
 
 ```rust
 /// Convert a physical address to its direct-map virtual address.
@@ -492,21 +494,74 @@ kernel image addresses.
 ## Kernel Stack Allocation
 
 Each kernel thread (the kernel-side execution context for syscall and interrupt
-handling) has a dedicated kernel stack of `KERNEL_STACK_PAGES` pages. Two sources
-exist:
+handling) has a dedicated kernel stack of `KERNEL_STACK_PAGES` pages, above one guard
+page (§ Kernel Stack Guards). Two sources exist:
 
-- The idle threads' stacks come from the buddy allocator in Phase 4, one
-  power-of-two block per CPU, while the buddy still holds large contiguous blocks
-  (before the Phase 7 drain); they live for the kernel's lifetime
-  ([initialization.md](initialization.md) § Phase 4: Typed-Memory Cap Surface).
-- Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of its
-  Thread slab — stack, then the page holding the `ThreadObject` and TCB, then
-  the per-thread FPU/SIMD save area, whose pages the boot CPU sizes
-  (`SystemInfoType::ThreadRetypeBytes`) — which `SYS_CAP_CREATE_THREAD` carves from
-  the caller's Memory capability, and boot code carves from the SEED reserve
-  for init's own thread; the slab returns to its source when the thread's
-  reference count reaches zero (see [capability-internals.md](capability-internals.md)
-  § Kernel Object Reference Counting).
+- The idle threads' stacks come from the buddy allocator in Phase 4, one order-3 block
+  per CPU, while the buddy still holds large contiguous blocks (before the Phase 7
+  drain): the stack is the block's top `KERNEL_STACK_PAGES` pages, the guard the page
+  below it, and the pages below the guard go back to the buddy. They live for the
+  kernel's lifetime ([initialization.md](initialization.md) § Phase 4: Typed-Memory Cap
+  Surface).
+- Every other thread's stack is the `KERNEL_STACK_PAGES` pages above the guard page that
+  starts its Thread slab — guard, stack, then the page holding the `ThreadObject` and
+  TCB, then the per-thread FPU/SIMD save area, whose pages the boot CPU sizes
+  (`sched::thread_slot`, `SystemInfoType::ThreadRetypeBytes`) — which
+  `SYS_CAP_CREATE_THREAD` carves from the caller's Memory capability, and boot code
+  carves from the SEED reserve for init's own thread; the slab returns to its source when
+  the thread's reference count reaches zero (see
+  [capability-internals.md](capability-internals.md) § Kernel Object Reference Counting).
+
+### Kernel Stack Guards
+
+Every kernel stack runs through the direct map, and the page below each is a hole in it:
+an overflow faults instead of writing the memory beneath the stack. The holes
+(`mm/stack_guard.rs`):
+
+- The handoff stack's guard, which the bootloader allocates below the stack
+  ([kernel-handoff.md](../../boot/docs/kernel-handoff.md)): Phase 3 builds the direct map
+  without it, mapping its 2 MiB chunk in 4 KiB pages, when the stack's base holds
+  `HANDOFF_STACK_BASE_MARK` (the reference layout; without the mark the page below may be
+  live, and no hole is made). The frame is never handed out, so the hole is permanent.
+- Each idle stack's guard, holed in Phase 4 while only the boot CPU runs (a local flush
+  suffices). Permanent.
+- Each Thread slab's guard page, holed when the thread is created and mapped again when
+  its slab is freed, before the page returns to its Memory capability. The page is the
+  caller's memory, debited with the rest of the slab, and unusable while the thread
+  exists.
+
+A hole in a chunk the direct map maps with one 2 MiB leaf first splits the chunk into a
+leaf table of the same translation. The leaf tables come from the guard-table reserve,
+one frame per 2 MiB chunk of RAM (`stack_guard::reserve_frames`), seeded from the
+pristine buddy in Phase 4 and counted in the kernel reserve, so a split never fails; a
+split chunk stays split and its table stays consumed, and the reserve's unused frames are
+never returned. One leaf lock serialises every hole, every fill and the reserve.
+
+Making a thread's hole drops every CPU's cached translation of the page: the creator
+flushes locally and broadcasts a single-VA shootdown on the kernel root (§ SMP TLB
+Shootdown), which each target serves with `flush_kernel_page`, since the direct map's
+entries are cached under every address space a CPU has run. On x86-64 with tagged TLBs
+that is INVPCID's all-context form, a whole-TLB flush, because no instruction drops one
+non-global address from every PCID; without tags, and on riscv64 (`sfence.vma va, zero`),
+it is the one address. Filling a hole needs no shootdown: x86-64 caches no not-present
+entry, and a riscv64 hart that cached the invalid one takes the S-mode spurious-fault
+retry (`paging::kernel_fault_is_spurious`), which flushes the address and re-executes.
+
+An overflow halts the boot with a diagnostic. On x86-64 the fault on the guard cannot
+push its frame on the overflowed stack and escalates to a double fault, which runs on
+IST1. On riscv64 an S-mode trap pushes its frame on the stack it interrupts, so the trap
+entry compares the frame's base with the hart's stack floor
+(`PerCpuData::kernel_stack_floor`, the base of the stack it runs on) and, below it,
+switches to a static overflow stack and halts (`interrupts::kernel_stack_overflow`)
+instead of nesting faults until the frames pass the guard. `context::switch` writes the
+incoming thread's floor (`SavedState::stack_floor`) at its stack-pointer swap, so no trap
+sees one stack with another's floor; the boot sets the handoff stack's and each AP's idle
+stack's before their first switch ([arch-interface.md](arch-interface.md) § `context`).
+
+A frame larger than a page below the stack pointer can step over a single guard page;
+the kernel's frames are far smaller ([limits.md](../../../docs/limits.md)
+`KERNEL_STACK_PAGES`). Phase 8 halts unless the handoff stack's guard (when Phase 3 found
+one) and every idle stack's guard are unmapped.
 
 ### Kernel Stack Depth
 

@@ -8,7 +8,10 @@
 //! Establishes two permanent kernel mappings:
 //! - **Direct physical map** at [`direct_map_base`]: every 2 MiB chunk of RAM
 //!   is mapped R/W- via 2 MiB large pages, so any physical address is
-//!   accessible as `direct_map_base() + phys`.
+//!   accessible as `direct_map_base() + phys`, except the guard page below the
+//!   handoff stack ([`handoff_guard_phys`]), which the build leaves unmapped
+//!   in a chunk of 4 KiB pages so an overflow of the stack faults (the other
+//!   kernel stacks' guards are holed later, `mm::stack_guard`).
 //! - **Kernel image** at `BootInfo::kernel_virtual_base`, a KASLR-randomized
 //!   base in the top 2 GiB (`0xFFFF_FFFF_8000_0000`, the link base, when the
 //!   slide is 0; see core/boot/docs/boot-flow.md § Step 5d: Apply the KASLR
@@ -244,7 +247,8 @@ impl MapOutcome
 /// not by RAM: the image's tables (one per 2 MiB of image plus its upper
 /// levels), about eight for the stack window, and for the two carve chunks at
 /// most two table chains (they can straddle a table boundary at their virtual
-/// address) and two leaf tables (a chunk holding a kernel MMIO page). 64
+/// address) and two leaf tables (a chunk holding a kernel MMIO page or the
+/// handoff stack's guard). 64
 /// frames leave room for a 64 MiB image at any paging depth (a fifth level
 /// adds one table to each chain). A seed too small fails the boot
 /// in Phase 3 by name.
@@ -512,9 +516,10 @@ pub fn span_table_bound(start: u64, end: u64, leaf_shift: u32) -> u64
 
 /// Upper bound on the frames stage 2 of [`init_kernel_page_tables`] draws from
 /// its carve: the direct map of `[0, direct_top)` in 2 MiB leaves, one leaf
-/// table per kernel-MMIO region below `direct_top` (its 2 MiB chunk is split),
-/// and 4 KiB mappings of every region above it, of the framebuffer span
-/// `fb` when it lies above, and of the AP trampoline page (identity-mapped).
+/// table per kernel-MMIO region below `direct_top` and one for the direct-map
+/// `hole` when it lies below it (each splits its 2 MiB chunk), and 4 KiB
+/// mappings of every region above it, of the framebuffer span `fb` when it
+/// lies above, and of the AP trampoline page (identity-mapped).
 ///
 /// The tables are indexed by virtual address, `dm_base + phys` in the direct
 /// map, and `dm_base` is only 1 GiB-aligned, so every span is counted at its
@@ -527,9 +532,14 @@ pub fn stage2_table_bound(
     mmio_regions: &[(u64, u64)],
     fb: Option<(u64, u64)>,
     trampoline: u64,
+    hole: Option<u64>,
 ) -> u64
 {
     let mut frames = span_table_bound(dm_base, dm_base.saturating_add(direct_top), 21);
+    if hole.is_some_and(|h| h < direct_top)
+    {
+        frames += 1;
+    }
     for &(base, size) in mmio_regions
     {
         frames += if base < direct_top
@@ -576,6 +586,76 @@ fn direct_map_page_flags(phys: u64, regions: &[(u64, u64)]) -> PageFlags
         writable: true,
         executable: false,
         uncacheable: span_overlaps_regions(phys, PAGE_SIZE as u64, regions),
+    }
+}
+
+/// What the direct map maps at a page other than plain RAM: the kernel's own
+/// MMIO `regions`, uncacheable, and the one `hole` page it leaves unmapped
+/// (the handoff stack's guard). A 2 MiB chunk holding either is mapped in
+/// 4 KiB pages.
+#[derive(Clone, Copy)]
+struct DirectMapLayout<'a>
+{
+    mmio: &'a [(u64, u64)],
+    hole: Option<u64>,
+}
+
+impl DirectMapLayout<'_>
+{
+    /// Whether the chunk at `chunk` is mapped in 4 KiB pages rather than one
+    /// large page.
+    fn splits_chunk(&self, chunk: u64) -> bool
+    {
+        span_overlaps_regions(chunk, LARGE_PAGE_SIZE, self.mmio)
+            || self
+                .hole
+                .is_some_and(|h| (chunk..chunk + LARGE_PAGE_SIZE).contains(&h))
+    }
+
+    /// Flags of the 4 KiB page at `page`, or `None` for the hole.
+    fn page_flags(&self, page: u64) -> Option<PageFlags>
+    {
+        (self.hole != Some(page)).then(|| direct_map_page_flags(page, self.mmio))
+    }
+}
+
+/// The handoff stack's guard page for the stack pointer `entry_sp` at
+/// `kernel_entry`'s first statement, when `base_mark` (the word at the stack
+/// base derived from it, `stack_depth::handoff_base`) confirms the reference
+/// bootloader's layout: the stack base holds
+/// [`HANDOFF_STACK_BASE_MARK`](boot_protocol::layout::HANDOFF_STACK_BASE_MARK)
+/// and the page below it is the allocation's guard
+/// (core/boot/docs/kernel-handoff.md). `None` when no pointer was recorded or
+/// the mark is absent: under another bootloader the page below may be live.
+fn handoff_guard_for(entry_sp: u64, base_mark: impl FnOnce(u64) -> u64) -> Option<u64>
+{
+    if entry_sp == 0
+    {
+        return None;
+    }
+    let base = crate::stack_depth::handoff_base(
+        entry_sp,
+        PAGE_SIZE as u64,
+        boot_protocol::layout::HANDOFF_STACK_BYTES as u64,
+    );
+    (base >= PAGE_SIZE as u64 && base_mark(base) == boot_protocol::layout::HANDOFF_STACK_BASE_MARK)
+        .then(|| base - PAGE_SIZE as u64)
+}
+
+/// Physical address of the handoff stack's guard page, which the direct map
+/// leaves unmapped, or 0 when Phase 3 found none (`handoff_guard_for`).
+#[cfg(not(test))]
+static HANDOFF_GUARD_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The handoff stack's guard page the direct map leaves unmapped, if Phase 3
+/// found one.
+#[cfg(not(test))]
+pub fn handoff_guard_phys() -> Option<u64>
+{
+    match HANDOFF_GUARD_PHYS.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        0 => None,
+        phys => Some(phys),
     }
 }
 
@@ -682,26 +762,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     let max_phys_rounded = (max_phys + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1);
 
     let dm_base = direct_map_base();
-    // Re-check, on the shared `boot_protocol::direct_map_ceiling`, that the
-    // direct map ends at or below the kernel image base; fail with a diagnostic
-    // rather than overlap the image mapping (core/kernel/docs/initialization.md
-    // § Phase 3: Kernel Page Tables; Sv39 margin: docs/memory-model.md § RISC-V
-    // (Sv39 / Sv48 / Sv57)).
-    {
-        // SAFETY: Phase 0 validated the memory map; identity-mapped at this
-        // point (pre-activate).
-        let entries = unsafe {
-            core::slice::from_raw_parts(info.memory_map.entries, info.memory_map.count as usize)
-        };
-        let ceiling =
-            boot_protocol::direct_map_ceiling(entries, &info.framebuffer, &info.kernel_mmio);
-        if dm_base
-            .checked_add(ceiling)
-            .is_none_or(|end| end > info.kernel_virtual_base)
-        {
-            crate::fatal("Phase 3: direct map would overlap the kernel image window");
-        }
-    }
+    check_direct_map_below_image(info, dm_base);
 
     // Kernel-internal MMIO regions (xAPIC + I/O APIC bases on x86-64; none on
     // RISC-V, whose PLIC and UART take their device memory type from the
@@ -713,12 +774,25 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
         &mut mmio_regions,
     );
     let mmio_regions = &mmio_regions[..mmio_count];
+    // The handoff stack's guard, left out of the direct map.
+    let hole = find_handoff_guard();
+    let layout = DirectMapLayout {
+        mmio: mmio_regions,
+        hole,
+    };
 
     // Everything stage 2 maps is read from `info` now: after the stage-1
     // switch the bootloader's identity map of `info` is gone.
     let fb = framebuffer_above(info, max_phys_rounded);
     let trampoline = info.ap_trampoline_page;
-    let carve_frames = stage2_table_bound(dm_base, max_phys_rounded, mmio_regions, fb, trampoline);
+    let carve_frames = stage2_table_bound(
+        dm_base,
+        max_phys_rounded,
+        mmio_regions,
+        fb,
+        trampoline,
+        hole,
+    );
     let carve = crate::mm::init::find_boot_table_carve(info, carve_frames)
         .ok_or(BootTableError::NoTableCarve)?;
     let carve_end = carve + carve_frames * PAGE_SIZE as u64;
@@ -737,7 +811,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
         root_va,
         dm_base,
         (carve_chunks.0, bootstrap_end),
-        mmio_regions,
+        layout,
         &mut pool,
     )?;
     // SAFETY: the tables map the kernel image (code, data, this stack's frame
@@ -755,7 +829,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
         (carve, carve_frames as usize, dm_base),
         (bootstrap_end, carve_chunks.1),
         |pool, phys| {
-            map_direct_chunk(root_va, dm_base, phys, mmio_regions, pool)?;
+            map_direct_chunk(root_va, dm_base, phys, layout, pool)?;
             // The next frames handed out lie in the chunk just mapped, and
             // stage 2 writes them through these entries at once: RISC-V may
             // cache an invalid entry, so the full fence (both operands zero,
@@ -769,14 +843,14 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     )?;
 
     // Direct physical map of [0, max_phys_rounded) in 2 MiB pages, except a
-    // chunk holding a kernel MMIO page (`map_direct_chunk`). The carve's own
-    // chunks are mapped already.
+    // chunk holding a kernel MMIO page or the hole (`map_direct_chunk`). The
+    // carve's own chunks are mapped already.
     let mut phys: u64 = 0;
     while phys < max_phys_rounded
     {
         if phys < carve_chunks.0 || phys >= carve_chunks.1
         {
-            map_direct_chunk(root_va, dm_base, phys, mmio_regions, &mut pool)?;
+            map_direct_chunk(root_va, dm_base, phys, layout, &mut pool)?;
         }
         phys += LARGE_PAGE_SIZE;
     }
@@ -784,7 +858,11 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     // Framebuffer, when it lies above the RAM ceiling.
     if let Some((fb_phys, fb_bytes)) = fb
     {
-        map_direct_pages(root_va, dm_base, fb_phys, fb_bytes, &[], &mut pool)?;
+        let plain = DirectMapLayout {
+            mmio: &[],
+            hole: None,
+        };
+        map_direct_pages(root_va, dm_base, (fb_phys, fb_bytes), plain, &mut pool)?;
     }
 
     // Kernel MMIO above the RAM ceiling: a region below it was mapped
@@ -794,37 +872,11 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     {
         if phys_base >= max_phys_rounded
         {
-            map_direct_pages(root_va, dm_base, phys_base, size, mmio_regions, &mut pool)?;
+            map_direct_pages(root_va, dm_base, (phys_base, size), layout, &mut pool)?;
         }
     }
 
-    // ── AP trampoline identity mapping (arch-neutral) ────────────────────────
-    // Map the AP trampoline page at its physical address as a 4 KiB identity
-    // page (VA = PA). Both arches need this: on x86-64 the AP enables paging
-    // (writes CR3 = kernel root) during the PM32 → LM64 transition and must
-    // keep fetching trampoline instructions at their PA through the LM64 relay
-    // stub until its `jmp rax` reaches the kernel-VA entry; on RISC-V the
-    // trampoline executes
-    // `csrw satp` and the next instructions (sfence.vma, mv sp, jr) likewise
-    // execute at the trampoline PA before the final `jr` lands at
-    // `kernel_entry_ap`'s kernel virtual address.
-    //
-    // The kernel's other mappings are at high virtual addresses
-    // (direct map, kernel image), so the low-VA identity mapping does
-    // not conflict. Once SMP bringup completes,
-    // `mm::paging::unmap_identity_page` (called in Phase 8) retires the
-    // mapping so the page can be reclaimed as a Memory cap.
-    if trampoline != 0
-    {
-        // R/W/X: the trampoline page contains startup code AND writable patch areas.
-        let rwx = PageFlags {
-            readable: true,
-            writable: true,
-            executable: true,
-            uncacheable: false,
-        };
-        arch_paging::map_page(root_va, trampoline, trampoline, rwx, &mut pool)?;
-    }
+    map_ap_trampoline(root_va, trampoline, &mut pool)?;
 
     // Reload the root: drops any translation cached while stage 2 filled
     // entries that stage 1 left not-present (RISC-V may cache invalid
@@ -838,21 +890,94 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     Ok(())
 }
 
+/// Re-check, on the shared `boot_protocol::direct_map_ceiling`, that the
+/// direct map at `dm_base` ends at or below the kernel image base; halt with a
+/// diagnostic rather than overlap the image mapping
+/// (core/kernel/docs/initialization.md § Phase 3: Kernel Page Tables; Sv39
+/// margin: docs/memory-model.md § RISC-V (Sv39 / Sv48 / Sv57)).
+#[cfg(not(test))]
+fn check_direct_map_below_image(info: &BootInfo, dm_base: u64)
+{
+    // SAFETY: Phase 0 validated the memory map; identity-mapped at this point
+    // (pre-activate).
+    let entries = unsafe {
+        core::slice::from_raw_parts(info.memory_map.entries, info.memory_map.count as usize)
+    };
+    let ceiling = boot_protocol::direct_map_ceiling(entries, &info.framebuffer, &info.kernel_mmio);
+    if dm_base
+        .checked_add(ceiling)
+        .is_none_or(|end| end > info.kernel_virtual_base)
+    {
+        crate::fatal("Phase 3: direct map would overlap the kernel image window");
+    }
+}
+
+/// Map the AP trampoline page at its physical address as a 4 KiB identity page
+/// (VA = PA), when there is one (`trampoline` nonzero).
+///
+/// Both arches need this: on x86-64 the AP enables paging (writes CR3 = kernel
+/// root) during the PM32 → LM64 transition and must keep fetching trampoline
+/// instructions at their PA through the LM64 relay stub until its `jmp rax`
+/// reaches the kernel-VA entry; on RISC-V the trampoline executes `csrw satp`
+/// and the next instructions (sfence.vma, mv sp, jr) likewise execute at the
+/// trampoline PA before the final `jr` lands at `kernel_entry_ap`'s kernel
+/// virtual address.
+///
+/// The kernel's other mappings are at high virtual addresses (direct map,
+/// kernel image), so the low-VA identity mapping does not conflict. Once SMP
+/// bringup completes, [`unmap_identity_page`] (called in Phase 8) retires the
+/// mapping so the page can be reclaimed as a Memory cap.
+#[cfg(not(test))]
+fn map_ap_trampoline(root_va: u64, trampoline: u64, pool: &mut PoolState)
+-> Result<(), PagingError>
+{
+    if trampoline == 0
+    {
+        return Ok(());
+    }
+    // R/W/X: the trampoline page contains startup code AND writable patch areas.
+    let rwx = PageFlags {
+        readable: true,
+        writable: true,
+        executable: true,
+        uncacheable: false,
+    };
+    arch_paging::map_page(root_va, trampoline, trampoline, rwx, pool)
+}
+
+/// Find the handoff stack's guard page (`handoff_guard_for`), reading the
+/// stack's base mark through the bootloader's tables, and record it for
+/// [`handoff_guard_phys`].
+#[cfg(not(test))]
+fn find_handoff_guard() -> Option<u64>
+{
+    // The derived base lies inside the `HANDOFF_STACK_BYTES` the boot protocol
+    // guarantees below the entry stack pointer.
+    let hole = handoff_guard_for(crate::stack_depth::boot_entry_sp(), |base| {
+        // SAFETY: `base` is page-aligned and inside the guaranteed stack,
+        // which the bootloader's tables (active until Phase 3's switch) map.
+        unsafe { core::ptr::read_volatile(base as *const u64) }
+    });
+    HANDOFF_GUARD_PHYS.store(hole.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+    hole
+}
+
 /// Map the 2 MiB direct-map chunk at `phys`: one large page, or, when the
-/// chunk holds a kernel MMIO page, 4 KiB pages so the MMIO pages can be
-/// uncacheable while the rest stay write-back (`direct_map_page_flags`).
+/// chunk holds a kernel MMIO page or the hole, 4 KiB pages so the MMIO pages
+/// can be uncacheable while the rest stay write-back
+/// (`direct_map_page_flags`) and the hole stays unmapped.
 #[cfg(not(test))]
 fn map_direct_chunk(
     root_va: u64,
     dm_base: u64,
     phys: u64,
-    mmio_regions: &[(u64, u64)],
+    layout: DirectMapLayout<'_>,
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    if span_overlaps_regions(phys, LARGE_PAGE_SIZE, mmio_regions)
+    if layout.splits_chunk(phys)
     {
-        return map_direct_pages(root_va, dm_base, phys, LARGE_PAGE_SIZE, mmio_regions, pool);
+        return map_direct_pages(root_va, dm_base, (phys, LARGE_PAGE_SIZE), layout, pool);
     }
     let rw = direct_map_page_flags(phys, &[]);
     arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, pool)
@@ -864,28 +989,28 @@ fn map_direct_chunks(
     root_va: u64,
     dm_base: u64,
     chunks: (u64, u64),
-    mmio_regions: &[(u64, u64)],
+    layout: DirectMapLayout<'_>,
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
     let mut phys = chunks.0;
     while phys < chunks.1
     {
-        map_direct_chunk(root_va, dm_base, phys, mmio_regions, pool)?;
+        map_direct_chunk(root_va, dm_base, phys, layout, pool)?;
         phys += LARGE_PAGE_SIZE;
     }
     Ok(())
 }
 
-/// Map every 4 KiB page `[phys, phys + len)` touches at `dm_base + phys`,
-/// uncacheable where a page overlaps one of `mmio_regions`.
+/// Map every 4 KiB page the span `(phys, len)` touches at `dm_base + phys`,
+/// uncacheable where a page overlaps one of the layout's MMIO regions and
+/// leaving its hole unmapped.
 #[cfg(not(test))]
 fn map_direct_pages(
     root_va: u64,
     dm_base: u64,
-    phys: u64,
-    len: u64,
-    mmio_regions: &[(u64, u64)],
+    (phys, len): (u64, u64),
+    layout: DirectMapLayout<'_>,
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
@@ -894,8 +1019,10 @@ fn map_direct_pages(
     let end = (phys + len + PAGE_SIZE as u64 - 1) & page_mask;
     while page < end
     {
-        let flags = direct_map_page_flags(page, mmio_regions);
-        arch_paging::map_page(root_va, dm_base + page, page, flags, pool)?;
+        if let Some(flags) = layout.page_flags(page)
+        {
+            arch_paging::map_page(root_va, dm_base + page, page, flags, pool)?;
+        }
         page += PAGE_SIZE as u64;
     }
     Ok(())
@@ -1303,6 +1430,49 @@ mod tests
         }
     }
 
+    // ── Direct-map hole ──────────────────────────────────────────────────────
+
+    // Defect caught: a hole that splits the wrong chunk, or a split chunk that
+    // leaves out a page other than the hole (or none), so the guard is mapped
+    // or a live page is not.
+    #[test]
+    fn only_the_hole_is_left_out_and_only_its_chunk_is_split()
+    {
+        let hole = 0x4060_3000;
+        let layout = DirectMapLayout {
+            mmio: &[],
+            hole: Some(hole),
+        };
+        let chunk = hole & !(LARGE_PAGE_SIZE - 1);
+        assert!(layout.splits_chunk(chunk));
+        assert!(!layout.splits_chunk(chunk + LARGE_PAGE_SIZE));
+        assert!(!layout.splits_chunk(chunk - LARGE_PAGE_SIZE));
+        let unmapped: Vec<u64> = (chunk..chunk + LARGE_PAGE_SIZE)
+            .step_by(0x1000)
+            .filter(|&p| layout.page_flags(p).is_none())
+            .collect();
+        assert_eq!(unmapped, [hole]);
+    }
+
+    // Defect caught: a guard derived without the base mark, which under a
+    // bootloader that puts live data below the stack would unmap that data,
+    // or a guard placed anywhere but the page below the derived base.
+    #[test]
+    fn the_handoff_guard_is_the_page_below_a_marked_stack_base()
+    {
+        let mark = boot_protocol::layout::HANDOFF_STACK_BASE_MARK;
+        let size = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
+        let top = 0x8053_0000u64;
+        let base = top - size;
+        let read = |want: u64| move |at: u64| if at == base { want } else { 0 };
+        assert_eq!(
+            handoff_guard_for(top - 0x40, read(mark)),
+            Some(base - 0x1000)
+        );
+        assert_eq!(handoff_guard_for(top - 0x40, read(mark ^ 1)), None);
+        assert_eq!(handoff_guard_for(0, read(mark)), None);
+    }
+
     // ── Stage-2 frame bound ──────────────────────────────────────────────────
 
     #[test]
@@ -1325,8 +1495,8 @@ mod tests
         let misaligned = aligned + (511 << 30);
         // [511 GiB, 1111 GiB) touches three 512 GiB blocks; [0, 600 GiB) two.
         assert_eq!(
-            stage2_table_bound(misaligned, top, &[], None, 0)
-                - stage2_table_bound(aligned, top, &[], None, 0),
+            stage2_table_bound(misaligned, top, &[], None, 0, None)
+                - stage2_table_bound(aligned, top, &[], None, 0, None),
             1
         );
     }
@@ -1342,10 +1512,16 @@ mod tests
         let fb = (top + (7 << 30), 8 << 20);
         let trampoline = 0x8000;
         let regions = [lapic, high_mmio];
+        // The handoff stack's guard, in a chunk of its own.
+        let hole = Some((3 << 30) + 0x5000);
+        let layout = DirectMapLayout {
+            mmio: &regions,
+            hole,
+        };
         // A KASLR base that is 1 GiB- but not 512 GiB-aligned, so the virtual
         // spans touch more 512 GiB blocks than the physical ones.
         let dm = 0xFFFF_8000_0000_0000 + (511 << 30);
-        let bound = stage2_table_bound(dm, top, &regions, Some(fb), trampoline);
+        let bound = stage2_table_bound(dm, top, &regions, Some(fb), trampoline, hole);
         let frames = bound as usize + 1; // plus the root
         let buf = make_test_pool_buf(frames);
         let mut pool = PoolState::new_for_test(aligned_start(&buf), frames);
@@ -1354,12 +1530,14 @@ mod tests
         let mut phys = 0;
         while phys < top
         {
-            if span_overlaps_regions(phys, LARGE_PAGE_SIZE, &regions)
+            if layout.splits_chunk(phys)
             {
                 for page in (phys..phys + LARGE_PAGE_SIZE).step_by(0x1000)
                 {
-                    let flags = direct_map_page_flags(page, &regions);
-                    map(root_va, dm + page, page, flags, &mut pool).unwrap();
+                    if let Some(flags) = layout.page_flags(page)
+                    {
+                        map(root_va, dm + page, page, flags, &mut pool).unwrap();
+                    }
                 }
             }
             else

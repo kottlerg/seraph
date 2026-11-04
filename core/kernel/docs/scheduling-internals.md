@@ -384,6 +384,15 @@ orderings (§ Atomic Ordering Invariants).
 live threads and bound threads × CPUs (rule 3); no page-table walks, buddy allocations, IPC
 syscalls, or other long-latency operations under any spinlock.
 
+**Kernel-stack guard lock.** `mm::stack_guard`'s lock, a `crate::sync::Spinlock`, serialises
+the direct-map holes under the kernel stacks and their leaf-table reserve
+([memory-internals.md](memory-internals.md) § Kernel Stack Guards). It is a leaf taken alone:
+thread creation, the Thread slab's reclaim, and the boot take it with no other lock held and
+acquire nothing under it. Its hold is one direct-map walk of the paging depth's levels plus, at
+a chunk's first hole, the 512 entries of the leaf table that splits it, a bounded walk the
+no-page-table-walk rule above excepts for this lock alone. The TLB shootdown a hole needs runs
+after its release.
+
 **Bare spin locks (MUST).** The derivation tree lock
 (`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
 lock, the per-`MemoryObject` retype-allocator lock, the `CSpace` and
@@ -877,6 +886,16 @@ swapped), and execute its own sp restore onto the same outgoing kstack. Any push
 then races this hart's continued use of the kstack until the `ld sp` retires. The symptom is less
 visible than the x86 iretq-frame case (no trap return address to corrupt) but the shared-kstack
 hazard is the same. Keeping the publication below the sp swap closes the window.
+
+**RISC-V stack floor at the sp swap.** The S-mode trap entry checks the frame it pushes against
+the hart's `PerCpuData::kernel_stack_floor`, the base of the stack it runs on
+([memory-internals.md](memory-internals.md) § Kernel Stack Guards), so the floor MUST name the
+stack `sp` is on whenever a trap can be taken. `switch()` loads `next.saved_state.stack_floor`
+before `ld sp, 0(a1)` and stores it to the per-CPU floor immediately after: the load can fault (a
+spurious S-mode fault on the TCB is retried) while sp and floor still name the outgoing stack, and
+the store, to the per-CPU slab, which is never a guard, cannot. A floor written earlier, in Rust
+before the call, would leave a window where a retried fault on the outgoing stack is compared
+against the incoming stack's floor and halts as an overflow. x86-64 checks no floor.
 
 Per-arch step ordering: both arches follow the textbook sequence above literally —
 `sched.lock.release_lock_only()` (step 3) runs in Rust before the lockless `next.context_saved`

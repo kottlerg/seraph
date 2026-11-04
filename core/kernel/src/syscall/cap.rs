@@ -951,6 +951,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::phys_to_virt;
     use crate::sched::alloc_thread_id;
     use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
+    use crate::sched::thread_slot::{EXTENDED_OFFSET, STACK_OFFSET, WRAPPER_OFFSET};
     use crate::sched::{AFFINITY_ANY, KERNEL_STACK_PAGES, TIME_SLICE_TICKS};
     use core::ptr::NonNull;
     use syscall::{PRIORITY_MAX, PRIORITY_MIN};
@@ -980,8 +981,8 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Memory cap; consumes the Thread slot (4 kstack pages
-    // + 1 wrapper/TCB page + the FPU/SIMD/V save-area pages,
+    // Resolve the source Memory cap; consumes the Thread slot (1 guard page +
+    // 4 kstack pages + 1 wrapper/TCB page + the FPU/SIMD/V save-area pages,
     // `sched::thread_slot::thread_slot_bytes`).
     // SAFETY: caller_cspace validated non-null above.
     let memory_slot_ref =
@@ -1072,27 +1073,37 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     };
 
     // Reserve the slot from the source Memory cap
-    // (`sched::thread_slot::thread_slot_bytes`). Layout:
-    //   pages 0..3 (16 KiB) — kstack
-    //   page 4              — ThreadObject followed by TCB (at size_of::<ThreadObject>())
-    //   pages 5..           — per-thread FPU/SIMD/V save area, one page or more
+    // (`sched::thread_slot::thread_slot_bytes`). Layout (`sched::thread_slot`):
+    //   page 0              — the guard, unmapped from the direct map below
+    //   pages 1..4 (16 KiB) — kstack
+    //   page 5              — ThreadObject followed by TCB (at size_of::<ThreadObject>())
+    //   pages 6..           — per-thread FPU/SIMD/V save area, one page or more
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
     let extended_bytes = crate::sched::thread_slot::extended_area_bytes();
-    debug_assert_eq!(
-        entry.raw_bytes,
-        (KERNEL_STACK_PAGES + 1) as u64 * PAGE_SIZE as u64 + extended_bytes
-    );
+    debug_assert_eq!(entry.raw_bytes, EXTENDED_OFFSET + extended_bytes);
     let offset = retype_allocate(memory, entry.raw_bytes)?;
     let block_phys = memory.base + offset;
     let block_virt = phys_to_virt(block_phys);
 
-    let kstack_virt = block_virt;
-    let kstack_top = block_virt + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+    // Unmap the guard page below the stack from the direct map, so an
+    // overflow faults instead of writing below the slot.
+    // SAFETY: after SMP bringup, with no lock held; the guard is this call's
+    // fresh slot page, which nothing reaches until the reclaim closes it.
+    if unsafe { crate::mm::stack_guard::hole(block_phys) }.is_err()
+    {
+        // SAFETY: this call's own `retype_allocate` return, holding no object.
+        unsafe { retype_free(memory, offset, entry.raw_bytes) };
+        return Err(SyscallError::OutOfMemory);
+    }
+
+    let kstack_virt = block_virt + STACK_OFFSET;
+    let kstack_top = block_virt + WRAPPER_OFFSET;
     // Paint the kernel stack for the depth report (crate::stack_depth): a full
     // overwrite of the stack pages, so their previous content never reaches
     // the thread.
-    // SAFETY: the retype slot's first KERNEL_STACK_PAGES pages are this new
-    // thread's stack, exclusively owned here; no thread runs on them yet.
+    // SAFETY: the retype slot's KERNEL_STACK_PAGES pages above the guard are
+    // this new thread's stack, exclusively owned here; no thread runs on them
+    // yet.
     unsafe { crate::stack_depth::paint(kstack_virt, KERNEL_STACK_PAGES * PAGE_SIZE) };
     let thread_obj_ptr = kstack_top as *mut ThreadObject;
     let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
@@ -1102,7 +1113,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // architected initial state. The area's lifecycle is the Thread retype
     // slot's; `retype_free` reclaims it wholesale, so no separate free
     // path is needed.
-    let extended_area = (kstack_top + PAGE_SIZE as u64) as *mut u8;
+    let extended_area = (block_virt + EXTENDED_OFFSET) as *mut u8;
     // SAFETY: extended_area points at the freshly-retyped save-area pages,
     // `extended_bytes` of them at the end of the slot, exclusively owned by
     // this TCB construction.
@@ -1120,17 +1131,18 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // so the trampoline's C stack frame cannot overwrite TrapFrame fields.
     let tf_size = core::mem::size_of::<ArchTF>() as u64;
     let trampoline_rsp = kstack_top - tf_size - TRAMPOLINE_FRAME_SIZE;
-    let saved = crate::arch::current::context::new_state(
+    let mut saved = crate::arch::current::context::new_state(
         crate::sched::user_thread_trampoline as *const () as u64,
         trampoline_rsp,
         0,
         crate::arch::ThreadKind::User,
     );
+    crate::arch::current::context::set_stack_floor(&mut saved, kstack_virt);
 
     let ancestor = memory_obj_nn;
 
     // SAFETY: pointers are inside the freshly-allocated retype slot.
-    // Both the wrapper and the TCB land on page 4 of the slot, so they
+    // Both the wrapper and the TCB land on page 5 of the slot, so they
     // are 8-byte aligned (page-aligned, in fact). The kstack pages are
     // painted above (`stack_depth::paint`), and `kstack_top` excludes the
     // wrapper page.
@@ -1276,10 +1288,14 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 core::ptr::drop_in_place(tcb_ptr);
                 core::ptr::drop_in_place(thread_obj_ptr);
             }
-            // SAFETY: this call's own `retype_allocate` return, holding no live
-            // object (dropped above) and no longer reachable: its registry
-            // entry is removed above.
-            unsafe { retype_free(memory, offset, entry.raw_bytes) };
+            // SAFETY: the guard was holed above and nothing runs on the
+            // stack; then this call's own `retype_allocate` return, holding
+            // no live object (dropped above) and no longer reachable: its
+            // registry entry is removed above.
+            unsafe {
+                crate::mm::stack_guard::close(block_phys);
+                retype_free(memory, offset, entry.raw_bytes);
+            }
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e)
@@ -2854,8 +2870,8 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Thread; header at offset 0 of ThreadObject.
-            // cast_ptr_alignment: the ThreadObject sits at the page-aligned start of page
-            // KERNEL_STACK_PAGES of the Thread retype slot; header at offset 0.
+            // cast_ptr_alignment: the ThreadObject sits at the page-aligned
+            // `thread_slot::WRAPPER_OFFSET` of the Thread retype slot; header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let thr_obj = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
             let target_tcb = thr_obj.tcb;

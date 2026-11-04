@@ -28,7 +28,8 @@ services/svctest/
     └── phases/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
-        ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding; identity
+        ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding;
+        │                      # object-slab release; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; death queues;

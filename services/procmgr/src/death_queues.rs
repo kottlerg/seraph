@@ -18,6 +18,7 @@
 //! and when either grows, is [`process_table::DeathQueues`]'s policy.
 
 use std::cell::{Cell, RefCell};
+use std::os::seraph::ObjectGrant;
 
 use process_table::DeathQueues;
 use process_table::death_queues::{FIRST_POOL_OBSERVERS, FIRST_WAIT_SET_MEMBERS};
@@ -42,6 +43,10 @@ pub struct DeathSet
 {
     /// The main wait set; replaced when the queues fill it.
     ws_cap: Cell<u32>,
+    /// The dedicated grant the main wait set was retyped from, returned to
+    /// memmgr when a replacement deletes the set; `None` while the set is a
+    /// sub-page retype the runtime reclaims itself.
+    ws_grant: Cell<Option<ObjectGrant>>,
     service_ep: u32,
     service_badge: u64,
     death_badge: u64,
@@ -55,14 +60,15 @@ impl DeathSet
     /// `None` if any of them cannot be funded, created, or added.
     pub fn new(service_ep: u32, service_badge: u64, death_badge: u64) -> Option<Self>
     {
-        let ws_cap = create_wait_set(FIRST_WAIT_SET_MEMBERS).ok()?;
+        let (ws_cap, ws_grant) = create_wait_set(FIRST_WAIT_SET_MEMBERS).ok()?;
         if syscall::wait_set_add(ws_cap, service_ep, service_badge).is_err()
         {
-            let _ = syscall::cap_delete(ws_cap);
+            delete_object(ws_cap, ws_grant);
             return None;
         }
         let set = Self {
             ws_cap: Cell::new(ws_cap),
+            ws_grant: Cell::new(ws_grant),
             service_ep,
             service_badge,
             death_badge,
@@ -95,9 +101,12 @@ impl DeathSet
     /// The `SYS_THREAD_BIND_NOTIFICATION` error; `OutOfMemory` when no
     /// further queue can be created, or when the main wait set must widen
     /// and cannot (it is already `WAIT_SET_MAX_MEMBERS` wide, or the wider
-    /// set cannot be funded); or the `SYS_WAIT_SET_REMOVE` /
-    /// `SYS_WAIT_SET_ADD` error that stopped the move into a wider set (every
-    /// member is back in the old one).
+    /// set cannot be funded); the `SYS_WAIT_SET_ADD` error that kept a new
+    /// queue out of the main wait set (`InvalidCapability`,
+    /// `InsufficientRights` or `InvalidArgument`; the queue is deleted and
+    /// its memory returned); or
+    /// the `SYS_WAIT_SET_REMOVE` / `SYS_WAIT_SET_ADD` error that stopped the
+    /// move into a wider set (every member is back in the old one).
     pub fn bind_thread(&self, thread_cap: u32, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::thread_bind_notification(thread_cap, q, correlator))
@@ -141,7 +150,7 @@ impl DeathSet
         moved
             .try_reserve_exact(queues.len() + 1)
             .map_err(|_| OUT_OF_MEMORY)?;
-        let new = create_wait_set(members)?;
+        let (new, new_grant) = create_wait_set(members)?;
         let sources = core::iter::once((self.service_ep, self.service_badge))
             .chain(queues.iter().map(|&q| (q, self.death_badge)));
         for (source, badge) in sources
@@ -161,21 +170,14 @@ impl DeathSet
                     let _ = syscall::wait_set_remove(new, m);
                     let _ = syscall::wait_set_add(old, m, b);
                 }
-                let _ = syscall::cap_delete(new);
+                delete_object(new, new_grant);
                 return Err(e);
             }
             moved.push((source, badge));
         }
         self.ws_cap.set(new);
-        // A wait set of 32 members or more is a page-sized retype whose grant
-        // `object_slab_retype` keeps no handle to return, so the old set's
-        // pages stay charged to this service: at most 14 over its life
-        // (docs/limits.md, `FIRST_WAIT_SET_MEMBERS`). A move the kernel
-        // refused would strand the new set the same way, but no path here
-        // makes it refuse: the new set has room for every member, and each
-        // source was just removed from the old one.
-        let _ = syscall::cap_delete(old);
-        std::os::seraph::log!("procmgr: main wait set widened to {members} members");
+        delete_object(old, self.ws_grant.replace(new_grant));
+        std::os::seraph::log!("main wait set widened to {members} members");
         Ok(())
     }
 
@@ -211,14 +213,29 @@ impl DeathSet
     }
 }
 
-/// Fund and create a wait set of `members` members from procmgr's memory.
-fn create_wait_set(members: u32) -> Result<u32, i64>
+/// Fund and create a wait set of `members` members from procmgr's memory,
+/// with the dedicated grant it was retyped from when it is page-sized (32
+/// members or more), for [`delete_object`] to return.
+fn create_wait_set(members: u32) -> Result<(u32, Option<ObjectGrant>), i64>
 {
-    std::os::seraph::object_slab_retype(
+    std::os::seraph::object_slab_retype_reclaimable(
         std::os::seraph::wait_set_retype_bytes(u64::from(members)),
         |slab| syscall::wait_set_create(slab, members).ok(),
     )
     .ok_or(OUT_OF_MEMORY)
+}
+
+/// Delete kernel object `cap` (a wait set or a death queue), then return
+/// the dedicated grant it was retyped from, if any, to memmgr's pool;
+/// deleting the object alone would leave the grant's pages charged to procmgr
+/// for its life.
+fn delete_object(cap: u32, grant: Option<ObjectGrant>)
+{
+    let _ = syscall::cap_delete(cap);
+    if let Some(grant) = grant
+    {
+        std::os::seraph::object_slab_release(grant);
+    }
 }
 
 /// Fund and create one death queue of [`DEATH_EQ_CAPACITY`] entries and
@@ -231,19 +248,21 @@ fn create_queue(ws_cap: u32, ws_badge: u64, observers: u32, made: usize) -> Resu
         u64::from(DEATH_EQ_CAPACITY),
         u64::from(observers),
     );
-    let queue = std::os::seraph::object_slab_retype(bytes, |slab| {
+    let (queue, grant) = std::os::seraph::object_slab_retype_reclaimable(bytes, |slab| {
         syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, observers).ok()
     })
     .ok_or(OUT_OF_MEMORY)?;
     if let Err(e) = syscall::wait_set_add(ws_cap, queue, ws_badge)
     {
-        let _ = syscall::cap_delete(queue);
+        // A queue outside the wait set is never drained: delete it, and
+        // return its dedicated grant, if it had one, to memmgr.
+        delete_object(queue, grant);
         return Err(e);
     }
     if made > 0
     {
         std::os::seraph::log!(
-            "procmgr: death queue {} created with {observers} observer nodes",
+            "death queue {} created with {observers} observer nodes",
             made + 1
         );
     }

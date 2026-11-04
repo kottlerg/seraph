@@ -266,7 +266,9 @@ chain).
 ### Lifecycle
 
 1. **Creation** (`SYS_CAP_CREATE_ASPACE`): carve a slab from the source
-   Memory cap; page 0 holds the wrapper object and the in-place `AddressSpace`,
+   Memory cap; page 0 holds the wrapper object, the in-place `AddressSpace`, and
+   right after it the address space's active-CPU set (`cpu_count.div_ceil(64)` words,
+   `attach_active_cpus`; `ACTIVE_CPU_WORDS_FIT` checks the page holds it at `MAX_CPUS`),
    page 1 the zeroed root page table with the kernel higher half mapped (root
    entries 256–511 copied from the active root, so every address space shares the
    kernel's lower-level tables), and the remaining

@@ -369,24 +369,22 @@ impl AddressSpace
         }
 
         let remote_cpus = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
-        {
-            // `self.tag` is read without the pool lock, after the fence, and the
-            // caller need not be running this space (cross-AS edits by procmgr /
-            // memmgr), so the read can race eviction. A revoked tag it carries is
-            // harmless: eviction needs the space inactive everywhere, so a CPU
-            // in the snapshot reactivated it under a fresh claim, which flushed
-            // that new tag and walks the PTE the fence published (proof:
-            // core/kernel/docs/memory-internals.md § SMP TLB Shootdown). With
-            // tagging disabled the tag is always 0.
-            let tag = self.tag.load(Ordering::Acquire);
-            // SAFETY: root_phys is a valid page table root; remote_cpus
-            // names only online CPUs (enforced by scheduler), and the
-            // shootdown leaves this CPU out of it; the caller holds
-            // preempt_disable() and no longer holds pt_lock. An empty target
-            // set returns at once.
-            unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote_cpus, virt, tag);
-            }
+        // `self.tag` is read without the pool lock, after the fence, and the
+        // caller need not be running this space (cross-AS edits by procmgr /
+        // memmgr), so the read can race eviction. A revoked tag it carries is
+        // harmless: eviction needs the space inactive everywhere, so a CPU
+        // in the snapshot reactivated it under a fresh claim, which flushed
+        // that new tag and walks the PTE the fence published (proof:
+        // core/kernel/docs/memory-internals.md § SMP TLB Shootdown). With
+        // tagging disabled the tag is always 0.
+        let tag = self.tag.load(Ordering::Acquire);
+        // SAFETY: root_phys is a valid page table root; remote_cpus
+        // names only online CPUs (enforced by scheduler), and the
+        // shootdown leaves this CPU out of it; the caller holds
+        // preempt_disable() and no longer holds pt_lock. An empty target
+        // set returns at once.
+        unsafe {
+            crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote_cpus, virt, tag);
         }
     }
 
@@ -1139,34 +1137,32 @@ impl AddressSpace
             }
         }
         let remote = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
+        if ranged
         {
-            if ranged
-            {
-                // SAFETY: root_phys is a valid root; the shootdown leaves
-                // current out of remote and returns at once when nothing else
-                // is active;
-                // preempt is held and pt_lock no-pop invariant holds; tag 0 is
-                // the untagged path (see the Dekker exclusion comment above for
-                // why that is sufficient here).
-                unsafe {
-                    crate::mm::tlb_shootdown::shootdown_range(
-                        self.root_phys,
-                        &remote,
-                        virt_base,
-                        page_count as u64,
-                        0,
-                    );
-                }
+            // SAFETY: root_phys is a valid root; the shootdown leaves
+            // current out of remote and returns at once when nothing else
+            // is active;
+            // preempt is held and pt_lock no-pop invariant holds; tag 0 is
+            // the untagged path (see the Dekker exclusion comment above for
+            // why that is sufficient here).
+            unsafe {
+                crate::mm::tlb_shootdown::shootdown_range(
+                    self.root_phys,
+                    &remote,
+                    virt_base,
+                    page_count as u64,
+                    0,
+                );
             }
-            else
-            {
-                // virt = u64::MAX routes the remote handler to flush_tlb_all()
-                // (ignores tag) — correct even cross-AS where this AS's tag is
-                // not stable on the current CPU.
-                // SAFETY: as the range branch; tag unused on this path.
-                unsafe {
-                    crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
-                }
+        }
+        else
+        {
+            // virt = u64::MAX routes the remote handler to flush_tlb_all()
+            // (ignores tag) — correct even cross-AS where this AS's tag is
+            // not stable on the current CPU.
+            // SAFETY: as the range branch; tag unused on this path.
+            unsafe {
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
             }
         }
 
@@ -1393,22 +1389,34 @@ impl AddressSpace
         self.active_cpus.is_empty(Ordering::Acquire)
     }
 
-    /// Point the active-CPU set at the [`crate::cpu_mask::mask_words`] words
-    /// right after this struct, and empty it.
+    /// Point the active-CPU set of the address space at `this` at the
+    /// [`crate::cpu_mask::mask_words`] words right after it, and empty it.
+    ///
+    /// It takes a raw pointer, not `&mut self`: the words lie past the struct,
+    /// so the pointer to them must carry the wrapper page's provenance, which a
+    /// reference to the struct alone does not.
     ///
     /// # Safety
-    /// `self` lies in its wrapper page with nothing after it, so the page holds
-    /// the words ([`ACTIVE_CPU_WORDS_FIT`]); called once, before any CPU marks
-    /// the space active.
-    pub(crate) unsafe fn attach_active_cpus(&mut self)
+    /// `this` points to an initialised `AddressSpace` that lies in its wrapper
+    /// page with nothing after it, so the page holds the words
+    /// ([`ACTIVE_CPU_WORDS_FIT`]); `this` is derived from the page's own
+    /// pointer, so its provenance covers the whole page; nothing else
+    /// references the address space; called once, before any CPU marks the
+    /// space active.
+    pub(crate) unsafe fn attach_active_cpus(this: *mut Self)
     {
-        let after = core::ptr::from_mut::<Self>(self)
-            .wrapping_add(1)
-            .cast::<AtomicU64>();
-        // SAFETY: caller contract: the words after `self` in its wrapper page
-        // are reserved for this set; the struct's end is 8-byte aligned (its
-        // alignment is 8, asserted with ACTIVE_CPU_WORDS_FIT).
-        self.active_cpus = unsafe { AtomicCpuMask::attach(after, crate::cpu_mask::mask_words()) };
+        // SAFETY: caller contract: one past the struct is still inside the
+        // wrapper page, whose provenance `this` carries, and is the first of
+        // the words reserved for this set; it is 8-byte aligned (the struct's
+        // alignment and size are multiples of 8, asserted with
+        // ACTIVE_CPU_WORDS_FIT).
+        let after = unsafe { this.add(1) }.cast::<AtomicU64>();
+        // SAFETY: caller contract: `this` is valid for writes and nothing else
+        // references it; the words at `after` belong to this set alone.
+        unsafe {
+            core::ptr::addr_of_mut!((*this).active_cpus)
+                .write(AtomicCpuMask::attach(after, crate::cpu_mask::mask_words()));
+        }
     }
 }
 

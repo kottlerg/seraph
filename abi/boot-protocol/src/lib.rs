@@ -144,7 +144,9 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     [`MAX_BOOT_MODULES`] (85) bounds `modules.count`. `MAX_APERTURES` is
 ///     gone: the aperture array is sized from the firmware's memory map, so
 ///     `mmio_apertures.count` has no protocol bound.
-pub const BOOT_PROTOCOL_VERSION: u32 = 18;
+/// v19: [`MAX_CPUS`] rose from 512 to 8192, a sanity ceiling no structure is
+///     sized from, so `cpu_count` may reach 8192. No layout change.
+pub const BOOT_PROTOCOL_VERSION: u32 = 19;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 

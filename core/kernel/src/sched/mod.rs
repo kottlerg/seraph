@@ -2548,12 +2548,13 @@ pub unsafe fn init(cpu_count: u32) -> u32
     cpu_count
 }
 
-/// Allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
-/// TCBs, idle kernel stacks and their tops, watchdog ticks and breadcrumbs
-/// (`CPU_DIAG`), per-CPU arch data, the TLB-shootdown request slots, and the x86
-/// AP GDT/TSS/IST tables and NMI-backtrace storage), publish `CPU_COUNT`, and
-/// arm the BSP
-/// boot transient. Must run before Phase 5 (timer arm) so that the timer
+/// Fix every CPU set's width at `cpu_count`'s (`cpu_mask::set_boot_cpu_count`),
+/// allocate the reschedule-pending CPU set (`RESCHEDULE_PENDING`) and the
+/// per-CPU storage slabs sized to `cpu_count` (schedulers, idle TCBs, idle
+/// kernel stacks and their tops, watchdog ticks and breadcrumbs (`CPU_DIAG`),
+/// per-CPU arch data, the TLB-shootdown request slots and their
+/// acknowledgement sets, and the x86 AP GDT/TSS/IST tables and NMI-backtrace
+/// storage), publish `CPU_COUNT`, and arm the BSP boot transient. Must run before Phase 5 (timer arm) so that the timer
 /// ISR's first read of `SCHEDULERS_PTR` is non-null.
 ///
 /// # Panics
@@ -2575,11 +2576,11 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     CPU_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
     // Every CPU set is this boot's width from here on.
     crate::cpu_mask::set_boot_cpu_count(cpu_count as usize);
-    let words = alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(
-        PerCpuSlab::of::<core::sync::atomic::AtomicU64>("RESCHEDULE_PENDING")
-            .with_elems_per_cpu(crate::cpu_mask::mask_words()),
-        1,
+    // One CPU set, not a per-CPU slab: at most MAX_MASK_WORDS words (1 KiB).
+    let words = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
+        crate::cpu_mask::mask_words() * core::mem::size_of::<core::sync::atomic::AtomicU64>(),
         allocator,
+        "RESCHEDULE_PENDING",
     );
     RESCHEDULE_PENDING.store(words, core::sync::atomic::Ordering::Release);
     BOOT_TRANSIENT_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
@@ -2721,8 +2722,8 @@ pub(crate) const fn slab_pages(bytes: usize) -> usize
 /// asks for at any CPU count is [`bytes`](Self::bytes) of that descriptor. The
 /// compile-time assert beside each descriptor of a fixed per-CPU element count
 /// checks it at every width up to [`MAX_CPUS`] against the target's own
-/// layout; the tag-state slab's count is set at boot, so a host test checks it
-/// instead.
+/// layout; the tag-state and TLB acknowledgement-set slabs' counts are set at
+/// boot, so host tests check them instead.
 #[derive(Clone, Copy)]
 pub(crate) struct PerCpuSlab
 {
@@ -2808,6 +2809,15 @@ impl PerCpuSlab
     }
 }
 
+/// The TLB acknowledgement-set slab (`mm::tlb_shootdown::init_storage`): each
+/// shootdown request's `AtomicCpuMask` words, [`crate::cpu_mask::mask_words`]
+/// per CPU. That count is set at Phase 4, so a host test (`slab_tests`) checks
+/// the sizing at every width instead of a compile-time assert. It is declared
+/// here, beside [`PerCpuSlab`], because the shootdown module is not built for
+/// host tests.
+pub(crate) const TLB_PENDING_CPUS_SLAB: PerCpuSlab =
+    PerCpuSlab::of::<core::sync::atomic::AtomicU64>("TLB_PENDING_CPUS");
+
 /// CPU counts [`PerCpuSlab::sized_at_every_width`] checks: the partial-word
 /// edges, the old 512 ceiling, a two-socket SMT part (768), and [`MAX_CPUS`].
 pub(crate) const SLAB_CHECK_WIDTHS: [usize; 7] = [1, 63, 64, 65, 512, 768, MAX_CPUS];
@@ -2815,8 +2825,8 @@ pub(crate) const SLAB_CHECK_WIDTHS: [usize; 7] = [1, 63, 64, 65, 512, 768, MAX_C
 /// Allocate `slab`'s storage for `cpu_count` CPUs through
 /// [`alloc_zeroed_slab`] and return a typed pointer to its first element.
 /// Halts when the byte count overflows (no fixed-count descriptor's
-/// compile-time assert, and for the tag-state slab no host test, admits one up
-/// to [`MAX_CPUS`]) or on buddy exhaustion.
+/// compile-time assert, and for the tag-state and TLB acknowledgement-set
+/// slabs no host test, admits one up to [`MAX_CPUS`]) or on buddy exhaustion.
 #[cfg(not(test))]
 pub(crate) fn alloc_per_cpu_slab<T>(
     slab: PerCpuSlab,
@@ -6626,7 +6636,7 @@ pub unsafe fn enter() -> !
 #[cfg(test)]
 mod slab_tests
 {
-    use super::{MAX_CPUS, PerCpuSlab, slab_pages};
+    use super::{MAX_CPUS, PerCpuSlab, TLB_PENDING_CPUS_SLAB, slab_pages};
     use crate::mm::PAGE_SIZE;
     use crate::mm::buddy::MAX_ORDER;
     use crate::mm::tag_allocator::{MAX_HW_TAGS, TAG_STATE_SLAB, tag_count};
@@ -6706,6 +6716,23 @@ mod slab_tests
             assert!(
                 TAG_STATE_SLAB.with_elems_per_cpu(n).sized_at(cpus),
                 "PER_CPU_TAG_STATE at {cpus} CPUs"
+            );
+        }
+    }
+
+    // The TLB acknowledgement-set slab's per-CPU count is the boot's CPU-set
+    // width (`cpu_mask::mask_words`), set at Phase 4, so it is checked here at
+    // every width from one CPU to `MAX_CPUS`.
+    #[test]
+    fn the_tlb_acknowledgement_set_slab_is_sized_at_every_width_up_to_max_cpus()
+    {
+        for cpus in 1..=MAX_CPUS
+        {
+            assert!(
+                TLB_PENDING_CPUS_SLAB
+                    .with_elems_per_cpu(crate::cpu_mask::words_for(cpus))
+                    .sized_at(cpus),
+                "TLB_PENDING_CPUS at {cpus} CPUs"
             );
         }
     }

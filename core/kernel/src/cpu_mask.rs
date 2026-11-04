@@ -423,6 +423,49 @@ mod tests
         }
     }
 
+    // Defect caught: a shootdown gate that disagrees with the fill it guards,
+    // so an initiator skips every remote shootdown, or one with no target.
+    #[test]
+    fn the_non_empty_check_agrees_with_the_fill_it_guards()
+    {
+        for cpus in WIDTHS
+        {
+            let dst = mask(cpus);
+            let empty = mask(cpus);
+            empty.fill_from(&MaskSource::Below(0), cpus, R);
+            let only_last = mask(cpus);
+            only_last.fill_from(&MaskSource::Below(0), cpus, R);
+            only_last.set_cpu(cpus - 1, R);
+            let ends = mask(cpus);
+            ends.fill_from(&MaskSource::Below(0), cpus, R);
+            ends.set_cpu(0, R);
+            ends.set_cpu(cpus - 1, R);
+            let sources = [
+                MaskSource::Below(cpus),
+                MaskSource::Below(1),
+                MaskSource::Below(0),
+                MaskSource::Mask(&empty, R),
+                MaskSource::Mask(&only_last, R),
+                MaskSource::Mask(&ends, R),
+            ];
+            for source in &sources
+            {
+                for except in [0, cpus - 1, cpus]
+                {
+                    let predicted = dst.fill_would_be_nonempty(source, except);
+                    assert_eq!(
+                        predicted,
+                        dst.fill_from(source, except, R),
+                        "{cpus} CPUs, except {except}"
+                    );
+                    assert_eq!(predicted, !dst.is_empty(R));
+                }
+            }
+            // Only the excepted CPU active: no target.
+            assert!(!dst.fill_would_be_nonempty(&MaskSource::Mask(&only_last, R), cpus - 1));
+        }
+    }
+
     // Defect caught: an unattached mask that reports a member or faults on a
     // read before its holder attaches storage.
     #[test]

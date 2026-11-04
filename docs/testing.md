@@ -449,7 +449,8 @@ changed line that names one of these items as a whole identifier or lies within 
   `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
   `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, and `TlbShootdownRequest` (`git grep -n -E
   'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the
-  slabs that are not per-CPU: the single-slot entropy pool, the tag pool, and the RAM-sized chunk
+  slabs that are not per-CPU: the single-slot entropy pool, the tag pool, the reschedule-pending CPU
+  set, and the RAM-sized chunk
   tables of `frame_map::init` and `init_cspace_registry`). A change that alters an element type's
   size is on the surface whether it edits the type's own fields or a type or constant the element
   holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or
@@ -809,8 +810,9 @@ list as the tracking Issues move):
   a count that does not overflow and `slab_pages` that cover it: by a
   compile-time assert beside each
   descriptor of a fixed per-CPU count, against the target's own layout on both
-  architectures, and for the tag-state slab, whose per-CPU count `tag_count`
-  sets at boot, by a host test (`sched::slab_tests`); and the 128-CPU boots
+  architectures, and for the tag-state and TLB acknowledgement-set slabs,
+  whose per-CPU counts `tag_count` and `cpu_mask::mask_words` set at boot, by
+  host tests (`sched::slab_tests`); and the 128-CPU boots
   for two full words.
 - Both arches, a partial second CPU-set word (residual): no local run boots
   a count past one 64-bit word that does not fill the next (65 to 127 CPUs).

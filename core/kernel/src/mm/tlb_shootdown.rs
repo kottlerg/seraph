@@ -139,8 +139,7 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
     );
     let words_per_cpu = crate::cpu_mask::mask_words();
     let words = crate::sched::alloc_per_cpu_slab::<AtomicU64>(
-        crate::sched::PerCpuSlab::of::<AtomicU64>("TLB_PENDING_CPUS")
-            .with_elems_per_cpu(words_per_cpu),
+        crate::sched::TLB_PENDING_CPUS_SLAB.with_elems_per_cpu(words_per_cpu),
         cpu_count,
         allocator,
     );
@@ -430,7 +429,9 @@ pub unsafe fn shootdown_range(
         }
     };
 
-    // The lowest-numbered target, read before any acknowledgement can clear it.
+    // The lowest-numbered target, for the watchdog's diagnostics only: a CPU
+    // already servicing another initiator's request may acknowledge this one
+    // before the read, which only moves the diagnostic to the next target.
     let target_cpu = req.pending_cpus.first(Ordering::Relaxed).unwrap_or(0);
 
     // Initial IPI volley, to the target set just published.

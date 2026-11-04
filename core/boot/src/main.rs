@@ -1098,8 +1098,8 @@ unsafe fn step6_allocate_and_build_page_tables(
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
     // The memory map's descriptor count, read before this step's first
-    // allocation; the entry array below adds MEM_MAP_SLACK_ENTRIES for the
-    // descriptors the allocations of steps 6 and 7 add.
+    // allocation; the entry array below adds MEM_MAP_SLACK_ENTRIES of headroom
+    // (its doc gives the budget).
     // SAFETY: bs is valid; the size query allocates nothing.
     let firmware_descriptors = unsafe { uefi::memory_map_descriptor_count(ctx.bs)? };
     let mem_entries_pages = ((firmware_descriptors + MEM_MAP_SLACK_ENTRIES)

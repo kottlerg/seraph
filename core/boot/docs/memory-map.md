@@ -143,7 +143,8 @@ allocation, and the array holds that count plus `MEM_MAP_SLACK_ENTRIES` (32).
 Each allocation after the query (the eight of steps 6 and 7) adds at most two
 descriptors, 16 in all, and the other 16 absorb the firmware's own housekeeping
 allocations in that window (§ ExitBootServices in
-[uefi-environment.md](uefi-environment.md)), which nothing bounds.
+[uefi-environment.md](uefi-environment.md)), which nothing bounds, so the
+headroom is a budget, not a proof.
 
 A final map that still holds more descriptors than the array does not boot
 silently short of memory: `translate_memory_map` counts the descriptors past the

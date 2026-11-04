@@ -63,6 +63,10 @@ pub enum BootError
     /// memory. The `usize` is the number of RAM descriptors left out.
     MemoryMapTruncated(usize),
 
+    /// The firmware's memory map violates the UEFI contract (a zero descriptor
+    /// size, say). The `&'static str` payload names the violation.
+    InvalidMemoryMap(&'static str),
+
     /// Step 9 had more entries to record than the reclaim array's page holds
     /// (`MAX_RECLAIM_RANGES`); the bootloader's compile-time count of the
     /// entries it records (`MAX_RECLAIM_ENTRIES`) is wrong.
@@ -107,7 +111,8 @@ impl BootError
             BootError::ProtocolNotFound(s)
             | BootError::FileNotFound(s)
             | BootError::InvalidElf(s)
-            | BootError::InvalidBundle(s) => Some(s),
+            | BootError::InvalidBundle(s)
+            | BootError::InvalidMemoryMap(s) => Some(s),
             _ => None,
         }
     }
@@ -136,6 +141,7 @@ impl BootError
             {
                 "memory map has RAM descriptors past the translated entry array"
             }
+            BootError::InvalidMemoryMap(_) => "UEFI memory map violates the UEFI contract",
             BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
         }
     }
@@ -186,6 +192,7 @@ mod tests
             BootError::InvalidBundle("b"),
             BootError::PagingModeUnsupported,
             BootError::MemoryMapTruncated(1),
+            BootError::InvalidMemoryMap("m"),
             BootError::ReclaimRangesOverflow,
         ];
         for v in variants

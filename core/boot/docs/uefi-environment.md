@@ -229,7 +229,8 @@ protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
 failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
 on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
-and, in step 9, RAM descriptors past the translated memory map (`MemoryMapTruncated`,
+a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), and, in
+step 9, RAM descriptors past the translated memory map (`MemoryMapTruncated`,
 [memory-map.md](memory-map.md) § Sizing the Entry Array) and a `reclaim_ranges` overflow
 (`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
 source is the authority on the variant list and payloads.

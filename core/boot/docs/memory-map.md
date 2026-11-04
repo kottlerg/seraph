@@ -141,17 +141,26 @@ The translated `MemoryMapEntry` array is allocated in step 6, before the final
 map exists, so it is sized from the firmware's map at that point: step 6 reads
 the descriptor count with a `GetMemoryMap` size query before its first
 allocation, and the array holds that count plus `MEM_MAP_SLACK_ENTRIES` (32).
-Each allocation after the query (the eight of steps 6 and 7) adds at most two
-descriptors, 16 in all, and the other 16 absorb the firmware's own housekeeping
-allocations in that window (§ ExitBootServices in
-[uefi-environment.md](uefi-environment.md)), which nothing bounds, so the
-headroom is a budget, not a proof.
+Each allocation after the query (the bootloader's own in steps 6 and 7) adds at
+most two descriptors, and the rest of the slack absorbs the firmware's own
+housekeeping allocations in that window (§ ExitBootServices in
+[uefi-environment.md](uefi-environment.md)), which nothing bounds, so the slack
+is a first guess, not a proof.
 
-A final map that still holds more descriptors than the array does not boot
-silently short of memory: `translate_memory_map` counts the descriptors past the
-array by class, and step 9 fails the boot with `BootError::MemoryMapTruncated` when
-one of them is RAM (`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`), and drops
-the others with a diagnostic.
+The guess is checked before `ExitBootServices`: when step 7's final map holds
+more descriptors than the array, the bootloader frees every allocation of steps 6
+and 7, the page-table frames included, and runs both again with twice the slack,
+so the next array is sized from a map that already holds the first attempt's
+allocations. After `MEM_MAP_ATTEMPTS` (3) attempts a map that still outgrows its
+array fails the boot with `BootError::MemoryMapKeptGrowing`; only firmware that
+keeps allocating on its own reaches a third.
+
+A map can still grow after step 7, when `ExitBootServices` refuses a stale key and
+step 8 re-queries it. Such a map does not boot silently short of memory:
+`translate_memory_map` counts the descriptors past the array by class, and step 9
+fails the boot with `BootError::MemoryMapTruncated` when one of them is RAM
+(`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`), and drops the others with
+a diagnostic.
 
 ---
 

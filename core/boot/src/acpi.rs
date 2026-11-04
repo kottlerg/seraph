@@ -619,6 +619,44 @@ fn madt_cpu_ids(table: &[u8]) -> impl Iterator<Item = u32> + '_
 /// `LocalApicAddress` in the MADT header with a 64-bit value).
 pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 
+/// The named and heuristic seeds a walk wrote, and those it found.
+struct SeedWalk
+{
+    written: (usize, usize),
+    found: (usize, usize),
+}
+
+/// Write the ACPI aperture seeds into `out` and `heuristic` (see
+/// [`walk_aperture_seed`] for what each holds); returns the number written to
+/// each. A seed past its buffer is dropped with a diagnostic, which a buffer
+/// sized by [`count_aperture_seed`] never needs.
+///
+/// # Safety
+/// As [`walk_aperture_seed`].
+pub unsafe fn parse_aperture_seed(
+    rsdp_addr: u64,
+    out: &mut [MmioAperture],
+    heuristic: &mut [MmioAperture],
+) -> (usize, usize)
+{
+    // SAFETY: caller contract.
+    unsafe { walk_aperture_seed(rsdp_addr, out, heuristic, false) }.written
+}
+
+/// The number of named and heuristic seeds [`parse_aperture_seed`] would
+/// write into buffers large enough for every one: the same walk, writing
+/// nothing. The bootloader sizes the seed buffers from it before
+/// `ExitBootServices`; the tables are firmware memory that does not change
+/// between the two walks.
+///
+/// # Safety
+/// As [`walk_aperture_seed`].
+pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
+{
+    // SAFETY: caller contract.
+    unsafe { walk_aperture_seed(rsdp_addr, &mut [], &mut [], true) }.found
+}
+
 /// Walk ACPI tables and collect MMIO extents for aperture seeding: the
 /// register windows tables name into `out`, and the heuristic PCI windows
 /// into `heuristic`.
@@ -644,34 +682,41 @@ pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 /// leave (`core/boot/docs/firmware-parsing.md` § Firmware exclusion).
 ///
 /// Callable unconditionally on every supported architecture; a zero
-/// `rsdp_addr` (no ACPI) is a fast no-op that returns `(0, 0)`. The caller
+/// `rsdp_addr` (no ACPI) is a fast no-op that finds nothing. The caller
 /// typically also calls [`super::dtb::parse_aperture_seed`] to cover
 /// DTB-only platforms, and merges both into
 /// [`super::memory_map::derive_mmio_apertures`].
 ///
-/// Returns the number of entries written to `out` and to `heuristic`.
+/// Returns the number of entries written to `out` and to `heuristic`, and the
+/// number found (written or dropped). `quiet` silences the dropped-seed
+/// diagnostic, for the count pass, whose buffers are empty.
 ///
 /// # Safety
 /// `rsdp_addr` must be the physical address of a valid, identity-mapped
-/// ACPI RSDP. A zero `rsdp_addr` returns `(0, 0)` without reading.
+/// ACPI RSDP. A zero `rsdp_addr` returns zero counts without reading.
 // too_many_lines: linear walk over MADT and MCFG with per-entry push dispatch;
 // the cases are flat and inline-local, splitting them loses the walk's shape.
 #[allow(clippy::too_many_lines)]
-pub unsafe fn parse_aperture_seed(
+unsafe fn walk_aperture_seed(
     rsdp_addr: u64,
     out: &mut [MmioAperture],
     heuristic: &mut [MmioAperture],
-) -> (usize, usize)
+    quiet: bool,
+) -> SeedWalk
 {
     let mut n: usize = 0;
     let mut h: usize = 0;
+    // Every seed found, written or not: the count pass sizes the buffers.
+    let mut found_n: usize = 0;
+    let mut found_h: usize = 0;
     // A seed past its buffer is dropped with a diagnostic, printed once.
-    let mut dropped = false;
+    let mut dropped = quiet;
 
     macro_rules! push {
         ($base:expr, $size:expr) => {
             if $size > 0
             {
+                found_n += 1;
                 if n < out.len()
                 {
                     out[n] = MmioAperture {
@@ -694,6 +739,7 @@ pub unsafe fn parse_aperture_seed(
         ($base:expr, $size:expr) => {
             if $size > 0
             {
+                found_h += 1;
                 if h < heuristic.len()
                 {
                     heuristic[h] = MmioAperture {
@@ -715,30 +761,45 @@ pub unsafe fn parse_aperture_seed(
 
     if rsdp_addr == 0
     {
-        return (n, h);
+        return SeedWalk {
+            written: (n, h),
+            found: (found_n, found_h),
+        };
     }
     // SAFETY: caller contract.
     let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
     if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
     {
-        return (n, h);
+        return SeedWalk {
+            written: (n, h),
+            found: (found_n, found_h),
+        };
     }
     let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
     if xsdt_addr == 0
     {
-        return (n, h);
+        return SeedWalk {
+            written: (n, h),
+            found: (found_n, found_h),
+        };
     }
 
     // SAFETY: validated RSDP.
     let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
     if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
     {
-        return (n, h);
+        return SeedWalk {
+            written: (n, h),
+            found: (found_n, found_h),
+        };
     }
     let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
     if xsdt_len < SDT_HDR_LEN
     {
-        return (n, h);
+        return SeedWalk {
+            written: (n, h),
+            found: (found_n, found_h),
+        };
     }
     // SAFETY: length validated.
     let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
@@ -897,7 +958,10 @@ pub unsafe fn parse_aperture_seed(
         push_heuristic!(base, size);
     }
 
-    (n, h)
+    SeedWalk {
+        written: (n, h),
+        found: (found_n, found_h),
+    }
 }
 
 /// ECAM window `(phys_base, size)` of one MCFG allocation entry: the MCFG

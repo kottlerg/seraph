@@ -263,24 +263,18 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
     )
 }
 
-/// Seeds of each class [`derive_mmio_apertures`] takes at most: the named
-/// seed buffer and the heuristic-window buffer each hold this many
-/// (core/boot/src/main.rs `MAX_APERTURE_SEEDS`, `MAX_HEURISTIC_SEEDS`).
-pub const MAX_SEEDS_PER_CLASS: usize = 256;
-
 /// Apertures [`derive_mmio_apertures`] can derive from a map of at most
-/// `descriptors` descriptors and full seed buffers, which sizes the aperture
-/// array at step 6.
+/// `descriptors` descriptors and `seeds` seeds of both classes, which sizes
+/// the aperture array at step 6.
 ///
 /// Every derived aperture is a maximal run of the merged pieces, so it starts
 /// where some piece starts: an MMIO descriptor's base, a seed's base, or the
 /// end of a descriptor clipped out of a seed. That is at most `descriptors`
-/// descriptor bases, two seed classes of [`MAX_SEEDS_PER_CLASS`] bases each,
-/// and `descriptors` descriptor ends.
+/// descriptor bases, `seeds` seed bases, and `descriptors` descriptor ends.
 #[must_use]
-pub const fn aperture_capacity(descriptors: usize) -> usize
+pub const fn aperture_capacity(descriptors: usize, seeds: usize) -> usize
 {
-    2 * descriptors + 2 * MAX_SEEDS_PER_CLASS
+    2 * descriptors + seeds
 }
 
 /// Derive the coarse MMIO aperture array from the raw UEFI memory map and
@@ -520,8 +514,8 @@ mod tests
     use core::mem::size_of;
 
     use super::{
-        MAX_SEEDS_PER_CLASS, MapTranslation, aperture_capacity, derive_mmio_apertures,
-        insertion_sort_memory_map, subtract_excluded, translate_memory_map, translate_memory_type,
+        MapTranslation, aperture_capacity, derive_mmio_apertures, insertion_sort_memory_map,
+        subtract_excluded, translate_memory_map, translate_memory_type,
     };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
@@ -533,6 +527,8 @@ mod tests
 
     /// Aperture array size the cap tests derive into.
     const MAX_APERTURES: usize = 256;
+    /// Seeds per class the capacity test fills.
+    const SEEDS_PER_CLASS: usize = 256;
 
     // ── translate_memory_type ─────────────────────────────────────────────────
 
@@ -1111,7 +1107,7 @@ mod tests
         }
         let mut seeds = Vec::new();
         let mut heuristic = Vec::new();
-        for i in 0..MAX_SEEDS_PER_CLASS as u64
+        for i in 0..SEEDS_PER_CLASS as u64
         {
             let named = 0x2_0000_0000 + i * 0x10_0000;
             seeds.push(ap(named, 0x3000));
@@ -1120,7 +1116,7 @@ mod tests
             heuristic.push(ap(window, 0x3000));
             descs.push(desc(EFI_CONVENTIONAL_MEMORY, window + 0x1000, 1));
         }
-        let capacity = aperture_capacity(descs.len());
+        let capacity = aperture_capacity(descs.len(), 2 * SEEDS_PER_CLASS);
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
             buffer_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
@@ -1131,7 +1127,7 @@ mod tests
         let mut out = vec![ap(0, 0); capacity];
         // SAFETY: `descs` is a live, aligned descriptor array covering `map_size`.
         let n = unsafe { derive_mmio_apertures(&uefi_map, &seeds, &heuristic, &mut out) };
-        assert_eq!(n, 40 + 4 * MAX_SEEDS_PER_CLASS);
+        assert_eq!(n, 40 + 4 * SEEDS_PER_CLASS);
         assert!(n <= capacity);
         let derived = pairs(&out[..n]);
         assert!(derived.contains(&(0x2_0000_0000, 0x1000)));

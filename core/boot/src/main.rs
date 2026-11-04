@@ -94,14 +94,21 @@ const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
 
 /// Entries of headroom the translated `MemoryMapEntry` array carries above the
 /// firmware's descriptor count, which step 6 reads before its first
-/// allocation. Each allocation after the count (the eight of steps 6 and 7:
-/// the `BootInfo`, module, entry, aperture and reclaim pages, the stack, the
-/// page-table pool, and the raw map buffer) adds at most two descriptors, 16
-/// in all; the other 16 absorb the firmware's own housekeeping allocations in
-/// that window, which no count bounds. A map still past the array fails the
-/// boot when a RAM descriptor would be dropped (step 9), so the margin is a
-/// budget backed by a loud failure, not a proof.
+/// allocation. Each allocation after the count (the ten of steps 6 and 7:
+/// the `BootInfo`, module, entry, aperture, two seed and reclaim pages, the
+/// stack, the page-table pool, and the raw map buffer) adds at most two
+/// descriptors, 20 in all; the other 12 absorb the firmware's own housekeeping allocations in
+/// that window, which no count bounds. A final map (step 7) past the array
+/// makes the bootloader free steps 6 and 7 and redo them with twice the slack,
+/// up to [`MEM_MAP_ATTEMPTS`] times, so the slack is a first guess, not a bound.
 const MEM_MAP_SLACK_ENTRIES: usize = 32;
+
+/// Times steps 6 and 7 run before the bootloader gives up on a memory map
+/// that keeps outgrowing the entry array sized for it, the slack doubling each
+/// time ([`BootError::MemoryMapKeptGrowing`]). The second attempt already
+/// sizes the array from a map that includes every allocation of the first,
+/// so a third is reached only by firmware still allocating on its own.
+const MEM_MAP_ATTEMPTS: usize = 3;
 
 /// Maximum number of physical regions tracked for identity mapping.
 /// Covers kernel segments, all fixed allocations, and the framebuffer.
@@ -110,23 +117,12 @@ const MEM_MAP_SLACK_ENTRIES: usize = 32;
 /// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 10` = 26 regions.
 const MAX_IDENTITY_REGIONS: usize = 64;
 
-/// Size of the aperture-seed buffer (firmware-advertised MMIO extents before
-/// merging with the UEFI memory map). The aperture array is sized to hold every
-/// aperture a full buffer can yield (`memory_map::aperture_capacity`). A seeder
-/// past it drops the surplus with a diagnostic.
-const MAX_APERTURE_SEEDS: usize = memory_map::MAX_SEEDS_PER_CLASS;
-
-/// Size of the heuristic-window seed buffer (two layout-heuristic PCI windows
-/// per MCFG allocation entry plus the arch's default PCI windows), sized as
-/// [`MAX_APERTURE_SEEDS`] is.
-const MAX_HEURISTIC_SEEDS: usize = memory_map::MAX_SEEDS_PER_CLASS;
-
 /// Most entries step 9 records in `BootInfo.reclaim_ranges`: the `BootInfo`,
-/// module, memory-map entry, aperture, CPU-id and reclaim-array pages, the raw
-/// map buffer, the page-table pool, the x86-64 LA57 toggle page and the AP
-/// trampoline page (ten), and one bundle gap before, between and after the at
-/// most [`MAX_MODULES`] module bodies.
-const MAX_RECLAIM_ENTRIES: usize = 10 + MAX_MODULES + 1;
+/// module, memory-map entry, aperture, named-seed, heuristic-seed, CPU-id and
+/// reclaim-array pages, the raw map buffer, the page-table pool, the x86-64
+/// LA57 toggle page and the AP trampoline page (twelve), and one bundle gap
+/// before, between and after the at most [`MAX_MODULES`] module bodies.
+const MAX_RECLAIM_ENTRIES: usize = 12 + MAX_MODULES + 1;
 
 // The reclaim array's page holds every entry step 9 can record, so the
 // overflow halt in step 9 is unreachable.
@@ -300,6 +296,20 @@ struct BootAllocations
     cpu_ids_phys: u64,
     /// Pages of the array at `cpu_ids_phys`.
     cpu_ids_pages: usize,
+    /// The named aperture-seed buffer (`MmioAperture`s), sized at step 6 from
+    /// the ACPI and DTB seeders' count pass and the framebuffer; filled at
+    /// step 9.
+    seeds_phys: u64,
+    /// Seeds the buffer at `seeds_phys` holds.
+    seeds_capacity: usize,
+    /// Pages of the buffer at `seeds_phys`.
+    seeds_pages: usize,
+    /// The heuristic-window seed buffer, sized as the named one is.
+    heuristic_phys: u64,
+    /// Seeds the buffer at `heuristic_phys` holds.
+    heuristic_capacity: usize,
+    /// Pages of the buffer at `heuristic_phys`.
+    heuristic_pages: usize,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -387,19 +397,47 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // live and identity-mapped; virtual addresses are still unbiased link VAs;
     // ctx.esp_root is valid until ExitBootServices.
     let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
-    // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
-    let (allocs, mut page_table) = unsafe {
-        step6_allocate_and_build_page_tables(
-            &ctx,
-            &bundle_load,
-            &kernel,
-            &init,
-            &cpus,
-            ap_trampoline_phys,
-        )?
+    // Steps 6 and 7, redone with twice the slack while the final map outgrows
+    // the entry array step 6 sized (MEM_MAP_ATTEMPTS bounds the retries).
+    let mut slack = MEM_MAP_SLACK_ENTRIES;
+    let mut attempt = 1;
+    let (allocs, mut page_table, mut uefi_map) = loop
+    {
+        // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
+        let (allocs, page_table) = unsafe {
+            step6_allocate_and_build_page_tables(
+                &ctx,
+                &bundle_load,
+                &kernel,
+                &init,
+                &cpus,
+                &firm,
+                ap_trampoline_phys,
+                slack,
+            )?
+        };
+        // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
+        let uefi_map = unsafe { step7_query_memory_map(&ctx)? };
+        let descriptors = uefi_map.map_size / uefi_map.descriptor_size.max(1);
+        let capacity = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
+        if descriptors <= capacity
+        {
+            break (allocs, page_table, uefi_map);
+        }
+        if attempt == MEM_MAP_ATTEMPTS
+        {
+            return Err(BootError::MemoryMapKeptGrowing(descriptors));
+        }
+        bprintln!(
+            "[--------] boot: memory map: {descriptors} descriptors past the {capacity}-entry \
+             array; redoing steps 6 and 7"
+        );
+        // SAFETY: bs is valid pre-exit; every range is an allocation steps 6
+        // and 7 just made and nothing else references.
+        unsafe { release_step6_and_7(&ctx, &allocs, &page_table, &uefi_map)? };
+        slack *= 2;
+        attempt += 1;
     };
-    // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
-    let mut uefi_map = unsafe { step7_query_memory_map(&ctx)? };
     // SAFETY: uefi_map produced by the immediately preceding get_memory_map;
     // no intervening allocations.
     unsafe { step8_exit_boot_services(&ctx, &mut uefi_map)? };
@@ -1138,23 +1176,28 @@ unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel` and `init` must
 /// come from their respective `step3`/`step4*` outputs.
+// too_many_arguments: step 6 sizes its allocations from every earlier step's
+// output (the bundle, kernel and init loads, the CPU topology, the firmware
+// tables for the seed counts), plus the retry's slack.
+#[allow(clippy::too_many_arguments)]
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
     bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
+    firm: &FirmwareInfo,
     ap_trampoline_phys: u64,
+    slack: usize,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
     // The memory map's descriptor count, read before this step's first
-    // allocation; the entry array below adds MEM_MAP_SLACK_ENTRIES of headroom
-    // (its doc gives the budget).
+    // allocation; the entry array below adds `slack` entries of headroom
+    // (MEM_MAP_SLACK_ENTRIES on the first attempt; its doc gives the budget).
     // SAFETY: bs is valid; the size query allocates nothing.
     let firmware_descriptors = unsafe { uefi::memory_map_descriptor_count(ctx.bs)? };
-    let mem_entries_pages = ((firmware_descriptors + MEM_MAP_SLACK_ENTRIES)
-        * core::mem::size_of::<MemoryMapEntry>())
-    .div_ceil(4096);
+    let mem_entries_pages =
+        ((firmware_descriptors + slack) * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096);
     // BootInfo: one page — holds the BootInfo struct populated in step 9.
     // SAFETY: bs is valid.
     let boot_info_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -1164,10 +1207,27 @@ unsafe fn step6_allocate_and_build_page_tables(
     // MemoryMapEntry output array.
     // SAFETY: bs is valid.
     let mem_entries_phys = unsafe { allocate_pages(ctx.bs, mem_entries_pages)? };
-    // MMIO aperture array, sized from the same descriptor count
-    // (memory_map::aperture_capacity).
-    let aperture_capacity =
-        memory_map::aperture_capacity(firmware_descriptors + MEM_MAP_SLACK_ENTRIES);
+    // Aperture seed buffers, sized by the seeders' count pass over the same
+    // firmware tables step 9 reads (one more named seed for the framebuffer).
+    // SAFETY: acpi_rsdp and device_tree are zero or identity-mapped firmware
+    // tables; the seeders validate them.
+    let (acpi_named, heuristic_capacity) = unsafe { acpi::count_aperture_seed(firm.acpi_rsdp) };
+    // SAFETY: as above.
+    let dtb_named = unsafe { dtb::count_aperture_seed(firm.device_tree) };
+    let seeds_capacity = acpi_named + dtb_named + usize::from(ctx.framebuffer.physical_base != 0);
+    let seed_bytes = core::mem::size_of::<MmioAperture>();
+    let seeds_pages = (seeds_capacity * seed_bytes).div_ceil(4096).max(1);
+    // SAFETY: bs is valid.
+    let seeds_phys = unsafe { allocate_pages(ctx.bs, seeds_pages)? };
+    let heuristic_pages = (heuristic_capacity * seed_bytes).div_ceil(4096).max(1);
+    // SAFETY: bs is valid.
+    let heuristic_phys = unsafe { allocate_pages(ctx.bs, heuristic_pages)? };
+    // MMIO aperture array, sized from the same descriptor count and the seed
+    // counts (memory_map::aperture_capacity).
+    let aperture_capacity = memory_map::aperture_capacity(
+        firmware_descriptors + slack,
+        seeds_capacity + heuristic_capacity,
+    );
     let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
@@ -1208,6 +1268,12 @@ unsafe fn step6_allocate_and_build_page_tables(
         reclaim_array_phys,
         cpu_ids_phys: cpus.ids_phys,
         cpu_ids_pages: cpus.ids_pages,
+        seeds_phys,
+        seeds_capacity,
+        seeds_pages,
+        heuristic_phys,
+        heuristic_capacity,
+        heuristic_pages,
     };
 
     let mut identity_regions: [(u64, u64); MAX_IDENTITY_REGIONS] =
@@ -1384,6 +1450,54 @@ unsafe fn step7_query_memory_map(ctx: &UefiContext) -> Result<uefi::MemoryMapRes
     unsafe { get_memory_map(ctx.bs) }
 }
 
+/// Free every allocation step 6 made and the map buffer step 7 made, for a
+/// retry of both with more slack: the fixed boot allocations, the seed
+/// buffers, the handoff stack with its guard page, the page-table frame pool
+/// (and the x86-64 LA57 toggle page), and the raw map buffer. The CPU-id pages
+/// and the AP trampoline page come from earlier steps and stay.
+///
+/// # Errors
+/// [`BootError`] from `FreePages`.
+///
+/// # Safety
+/// `ctx.bs` is valid pre-exit; every range named is an allocation of steps 6
+/// and 7 that nothing else references, and none is used after this call.
+unsafe fn release_step6_and_7(
+    ctx: &UefiContext,
+    allocs: &BootAllocations,
+    page_table: &arch::current::BootPageTable,
+    uefi_map: &uefi::MemoryMapResult,
+) -> Result<(), BootError>
+{
+    let ranges = [
+        (allocs.boot_info_phys, 1),
+        (allocs.modules_phys, 1),
+        (allocs.mem_entries_phys, allocs.mem_entries_pages),
+        (allocs.apertures_phys, allocs.apertures_pages),
+        (allocs.seeds_phys, allocs.seeds_pages),
+        (allocs.heuristic_phys, allocs.heuristic_pages),
+        (allocs.stack_phys - 4096, HANDOFF_STACK_ALLOC_PAGES),
+        (allocs.reclaim_array_phys, 1),
+        (uefi_map.buffer_phys, uefi_map.buffer_size.div_ceil(4096)),
+    ];
+    for (phys, pages) in ranges
+    {
+        // SAFETY: caller contract.
+        unsafe { free_pages(ctx.bs, phys, pages)? };
+    }
+    for &(phys, pages) in page_table.reclaim_spans()
+    {
+        // cast_possible_truncation: a table span is a few pages, far below
+        // usize::MAX on every target.
+        #[allow(clippy::cast_possible_truncation)]
+        // SAFETY: caller contract: the table frames step 6 allocated.
+        unsafe {
+            free_pages(ctx.bs, phys, pages as usize)?;
+        };
+    }
+    Ok(())
+}
+
 // ── Step 8: ExitBootServices ─────────────────────────────────────────────────
 
 /// Exit UEFI boot services. After this returns, no further UEFI calls may be
@@ -1471,21 +1585,35 @@ unsafe fn step9_populate_boot_info(
     // mmio_apertures: merge firmware-table seeds with the raw UEFI MMIO
     // descriptors. Both ACPI and DTB parsers are tried on every architecture;
     // derive_mmio_apertures merges duplicates.
-    let mut aperture_seed = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; MAX_APERTURE_SEEDS];
-    // The ACPI seeder's layout-heuristic PCI windows go to their own buffer:
+    // The buffers step 6 sized from the seeders' count pass. The ACPI
+    // seeder's layout-heuristic PCI windows go to their own buffer:
     // derive_mmio_apertures clips them harder than the named seeds
     // (core/boot/docs/firmware-parsing.md § Firmware exclusion).
-    let mut heuristic_seed = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; MAX_HEURISTIC_SEEDS];
-    // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
-    let (mut seed_count, heuristic_count) = unsafe {
-        acpi::parse_aperture_seed(firm.acpi_rsdp, &mut aperture_seed, &mut heuristic_seed)
+    // SAFETY: seeds_phys and heuristic_phys are step 6 allocations of
+    // seeds_pages and heuristic_pages pages, identity-mapped under the
+    // firmware's tables and owned by the bootloader, with room for their
+    // capacities; they are zeroed before the slices are formed.
+    let (aperture_seed, heuristic_seed): (&mut [MmioAperture], &mut [MmioAperture]) = unsafe {
+        core::ptr::write_bytes(allocs.seeds_phys as *mut u8, 0, allocs.seeds_pages * 4096);
+        core::ptr::write_bytes(
+            allocs.heuristic_phys as *mut u8,
+            0,
+            allocs.heuristic_pages * 4096,
+        );
+        (
+            core::slice::from_raw_parts_mut(
+                allocs.seeds_phys as *mut MmioAperture,
+                allocs.seeds_capacity,
+            ),
+            core::slice::from_raw_parts_mut(
+                allocs.heuristic_phys as *mut MmioAperture,
+                allocs.heuristic_capacity,
+            ),
+        )
     };
+    // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
+    let (mut seed_count, heuristic_count) =
+        unsafe { acpi::parse_aperture_seed(firm.acpi_rsdp, aperture_seed, heuristic_seed) };
     // SAFETY: device_tree is zero or identity-mapped; parse_aperture_seed validates.
     seed_count +=
         unsafe { dtb::parse_aperture_seed(firm.device_tree, &mut aperture_seed[seed_count..]) };
@@ -1498,7 +1626,7 @@ unsafe fn step9_populate_boot_info(
     // through to userspace.
     if framebuffer.physical_base != 0
     {
-        if seed_count < MAX_APERTURE_SEEDS
+        if seed_count < aperture_seed.len()
         {
             let base_aligned = framebuffer.physical_base & !0xFFF;
             let span = framebuffer.physical_base
@@ -1584,10 +1712,13 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0)?;
     }
-    // The aperture array is a few pages at most, far below u32::MAX pages.
+    // The aperture array and the seed buffers are a few pages at most, far
+    // below u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
     {
         push_reclaim(allocs.apertures_phys, allocs.apertures_pages as u32, 0)?;
+        push_reclaim(allocs.seeds_phys, allocs.seeds_pages as u32, 0)?;
+        push_reclaim(allocs.heuristic_phys, allocs.heuristic_pages as u32, 0)?;
     }
     // The map buffer is a whole-page allocation far below u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
@@ -1983,6 +2114,12 @@ mod tests
             reclaim_array_phys: 0x7_0000,
             cpu_ids_phys: 0x8_0000,
             cpu_ids_pages: 2,
+            seeds_phys: 0x9_0000,
+            seeds_capacity: 4,
+            seeds_pages: 1,
+            heuristic_phys: 0xA_0000,
+            heuristic_capacity: 2,
+            heuristic_pages: 1,
         };
         let regions = allocation_regions(&allocs);
         for region in [

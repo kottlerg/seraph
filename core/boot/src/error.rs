@@ -60,8 +60,15 @@ pub enum BootError
 
     /// The final memory map held RAM descriptors past the translated
     /// `MemoryMapEntry` array (step 9): the kernel would boot without that
-    /// memory. The `usize` is the number of RAM descriptors left out.
+    /// memory. Reached only when `ExitBootServices`' stale-key re-query (step
+    /// 8) returns a map larger than the one step 7 sized the array for. The
+    /// `usize` is the number of RAM descriptors left out.
     MemoryMapTruncated(usize),
+
+    /// The memory map outgrew the entry array step 6 sized for it on every one
+    /// of the `MEM_MAP_ATTEMPTS` runs of steps 6 and 7, the slack doubling each
+    /// time. The `usize` is the last attempt's descriptor count.
+    MemoryMapKeptGrowing(usize),
 
     /// The firmware's memory map violates the UEFI contract (a descriptor size
     /// below `EFI_MEMORY_DESCRIPTOR`'s). The `&'static str` payload names the
@@ -142,6 +149,10 @@ impl BootError
             {
                 "memory map has RAM descriptors past the translated entry array"
             }
+            BootError::MemoryMapKeptGrowing(_) =>
+            {
+                "memory map kept outgrowing the entry array across the step 6 and 7 retries"
+            }
             BootError::InvalidMemoryMap(_) => "UEFI memory map violates the UEFI contract",
             BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
         }
@@ -164,6 +175,10 @@ impl core::fmt::Display for BootError
         if let BootError::MemoryMapTruncated(ram) = self
         {
             write!(f, ": {ram} RAM descriptors left out")?;
+        }
+        if let BootError::MemoryMapKeptGrowing(descriptors) = self
+        {
+            write!(f, ": {descriptors} descriptors on the last attempt")?;
         }
         Ok(())
     }
@@ -193,6 +208,7 @@ mod tests
             BootError::InvalidBundle("b"),
             BootError::PagingModeUnsupported,
             BootError::MemoryMapTruncated(1),
+            BootError::MemoryMapKeptGrowing(1),
             BootError::InvalidMemoryMap("m"),
             BootError::ReclaimRangesOverflow,
         ];

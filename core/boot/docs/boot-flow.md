@@ -209,6 +209,11 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 
 W^X is verified during construction: no leaf PTE has both writable and executable permissions.
 
+Step 6 also sizes and allocates the arrays step 9 fills: the `MemoryMapEntry` array (the
+firmware's descriptor count plus slack, [memory-map.md](memory-map.md#sizing-the-entry-array)),
+the two aperture seed buffers (a count pass of the ACPI and DTB seeders,
+[firmware-parsing.md](firmware-parsing.md)), and the `MmioAperture` array from both.
+
 The handoff stack is `HANDOFF_STACK_BYTES` (`boot_protocol::layout`) of whole pages, so its
 top is page-aligned, and the kernel is entered with the stack pointer at that top
 (step 10). The bootloader fills the stack with `STACK_PAINT` and writes
@@ -236,6 +241,12 @@ query must be the last allocation-generating action before the exit call. The ra
 stays in its buffer; step 9 translates it from UEFI memory types to the `MemoryType`
 values defined in the boot protocol and sorts it by `physical_base`, per the policy in
 [memory-map.md](memory-map.md).
+
+When the final map holds more descriptors than the entry array step 6 sized, the
+bootloader frees every allocation of steps 6 and 7 (the page-table frames included) and
+runs both again with twice the slack, up to `MEM_MAP_ATTEMPTS` (3) times; a map that
+still outgrows the array fails the boot with `BootError::MemoryMapKeptGrowing`
+([memory-map.md](memory-map.md#sizing-the-entry-array)).
 
 Detail: [uefi-environment.md](uefi-environment.md)
 

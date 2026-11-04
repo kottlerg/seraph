@@ -176,6 +176,12 @@ pub struct PageCache
     /// nothing. Only the dispatch thread picks victims; the lock makes the
     /// sharing explicit.
     victim_skips: Mutex<Box<[bool]>>,
+    /// Set when a page acquisition found every slot held, for whichever
+    /// request it served: a memory-cap read's page, or a FAT, directory, or
+    /// inline-read sector. The dispatch loop takes it
+    /// ([`Self::take_pressure`]) and queues a held page for eviction, so
+    /// pressure met on any path relieves the cache.
+    pressure: AtomicBool,
 }
 
 /// Cache-init failure cause.
@@ -262,6 +268,7 @@ impl PageCache
                 spare: Vec::with_capacity(QUARANTINE_MAX),
             }),
             victim_skips: Mutex::new(skips.into_boxed_slice()),
+            pressure: AtomicBool::new(false),
         }));
 
         // Allocate and map the single-page scratch memory cap used for
@@ -324,6 +331,13 @@ impl PageCache
     pub fn slot_ceiling(&self) -> usize
     {
         self.slots.len()
+    }
+
+    /// Whether a page acquisition found every slot held since the last
+    /// call, clearing the mark (the `pressure` field).
+    pub fn take_pressure(&self) -> bool
+    {
+        self.pressure.swap(false, Ordering::AcqRel)
     }
 
     /// Top the fs process's `CSpace` (`cspace`) up so the general slots a
@@ -566,9 +580,14 @@ impl PageCache
         {
             return Some(i);
         }
-        let victim = self
+        let Some(victim) = self
             .free_or_new_slot(ipc_buf)
-            .or_else(|| self.pick_victim(ipc_buf))?;
+            .or_else(|| self.pick_victim(ipc_buf))
+        else
+        {
+            self.pressure.store(true, Ordering::Release);
+            return None;
+        };
         let slot = &self.slots[victim];
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.

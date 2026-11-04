@@ -281,6 +281,16 @@ fn service_loop(
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
+        // The last request may have met a full cache on a path that does
+        // not hold the open table's lock (relieve_pressure).
+        if cache.take_pressure()
+        {
+            let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(req) = pick_eviction_candidate(&mut files_g)
+            {
+                eviction.enqueue(req);
+            }
+        }
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let msg = match unsafe { ipc::ipc_recv(caps.service, ipc_buf) }
         {
@@ -716,6 +726,8 @@ fn read_memory_at_slot(
         }
         else
         {
+            // A FAT sector read that met a full cache fails the walk.
+            relieve_pressure(files, cache, eviction);
             let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
             // SAFETY: ipc_buf is the registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -734,15 +746,9 @@ fn read_memory_at_slot(
     let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
     else
     {
-        // Cache pressure: every slot is held by an outstanding
-        // page elsewhere. Pick one such page and submit it to
-        // the eviction worker; the client retries this read on
-        // IO_ERROR. Worker may take up to RELEASE_TIMEOUT_MS to
-        // free the slot.
-        if let Some(req) = pick_eviction_candidate(files)
-        {
-            eviction.enqueue(req);
-        }
+        // Cache pressure, when every slot is held by an outstanding page:
+        // the client retries this read on IO_ERROR.
+        relieve_pressure(files, cache, eviction);
         let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -822,6 +828,22 @@ fn read_memory_at_slot(
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// When a page acquisition found every cache slot held since the last check
+/// ([`PageCache::take_pressure`]), queue one held page for eviction
+/// ([`pick_eviction_candidate`]): the eviction worker frees its slot within
+/// `eviction::RELEASE_TIMEOUT_MS`, and the client retries the request it was
+/// answered `IO_ERROR`. Called before the reply on the memory-cap read path,
+/// and before each receive for every other path that reads through the
+/// cache (FAT walks, directory reads, inline reads).
+fn relieve_pressure(files: &mut OpenTable, cache: &PageCache, eviction: &EvictionState)
+{
+    if cache.take_pressure()
+        && let Some(req) = pick_eviction_candidate(files)
+    {
+        eviction.enqueue(req);
+    }
 }
 
 /// Scan the open table for an outstanding cache page not yet queued

@@ -5,10 +5,12 @@
 
 //! Eviction worker for the FAT page cache.
 //!
-//! When `read_memory_at_slot` cannot acquire a cache slot (every slot
-//! has `refcount > 0`), main scans the per-open outstanding-page
-//! tables for a page not already queued, marks it queued, enqueues an
-//! [`EvictReq`] for it, and replies `IO_ERROR`. The eviction worker
+//! When a request cannot acquire a cache slot (every slot has
+//! `refcount > 0`), whether for a memory-cap read's page or for a FAT,
+//! directory, or inline-read sector, main scans the per-open
+//! outstanding-page tables for a page not already queued, marks it
+//! queued, and enqueues an [`EvictReq`] for it (`relieve_pressure`); the
+//! request is answered `IO_ERROR` and the client retries. The eviction worker
 //! pops the request and first checks that the page is still
 //! outstanding, skipping it if the client's synchronous release or
 //! `FS_CLOSE` already cleaned it up. When the open that read the page

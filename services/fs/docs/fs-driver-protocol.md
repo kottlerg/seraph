@@ -196,7 +196,9 @@ A read at or past end of file succeeds with `data[0] = 0`.
 **Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
 (the badge lacks `READ`), `INVALID_BADGE` (the badge names no node, a
 directory, or a closed open), `IO_ERROR` (the file's cluster chain is
-corrupt or a block read failed).
+corrupt, a block read failed, or every cache page is held; the client MAY
+retry, since the driver queues a held page for eviction whenever a request
+finds the cache full).
 
 ---
 

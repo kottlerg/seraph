@@ -289,14 +289,14 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | `rdseed_u64`, `rdrand_u64` retry | `core/kernel/src/arch/x86_64/entropy.rs` | 32 | tolerance (above the Intel DRNG RDRAND guidance of 10; RDSEED has no fixed count) | none | correct as is | None |
 | `enable_tagged_tlb` | `core/kernel/src/arch/x86_64/paging.rs` | 4096 | hardware spec (12-bit PCID) | none | correct as is | None |
 | `TrapFrame::arg` | `core/kernel/src/arch/*/trap_frame.rs` | 6 arguments | ABI width (syscall register convention) | none | correct as is | None |
-| riscv64 `MAX_IRQ_ID`, `PLIC_MAX_SOURCES` | `core/kernel/src/arch/riscv64/mod.rs`, `interrupts.rs` | 1023 | hardware spec (PLIC) | none | correct as is | None |
+| riscv64 `MAX_IRQ_ID`, `PLIC_MAX_SOURCES` | `core/kernel/src/arch/riscv64/mod.rs`, `encoding.rs` | 1023 | hardware spec (PLIC) | none | correct as is | None |
 | riscv64 `plic_ndev` | `core/kernel/src/arch/riscv64/platform.rs` | the firmware's `riscv,ndev`, clamped to 1023; 1023 when unreported | hardware (discovered) | none | correct as is | None |
 | riscv64 `SOURCE_TARGET` | `core/kernel/src/arch/riscv64/interrupts.rs` | 1024 entries | hardware spec (PLIC id space) | 4 KiB BSS | correct as is | None |
 | riscv64 `ROOT_IRQ_COUNT` | `core/kernel/src/arch/riscv64/mod.rs` | 1024 | hardware spec (PLIC id space) | none | correct as is | None |
-| riscv64 `DEFAULT_PLIC_SIZE` | `core/kernel/src/arch/riscv64/platform.rs` | 64 MiB | hardware spec (PLIC register map, 15 872 contexts) | none | correct as is | None |
+| riscv64 `DEFAULT_PLIC_SIZE` | `core/kernel/src/arch/riscv64/encoding.rs` | 64 MiB | hardware spec (PLIC register map, 15 872 contexts) | none | correct as is | None |
 | device IRQ destination (`irq::next_target_cpu`) | `core/kernel/src/irq.rs` | one CPU per line, the CPUs in turn at route time; x86_64 only APIC ids below 255 | hardware spec (one PLIC context per source; the 8-bit physical destination of an I/O APIC entry without interrupt remapping, 255 being broadcast) | none | correct as is | None |
 | riscv64 ASID mask | `core/kernel/src/arch/riscv64/cpu.rs` | 16 bits | hardware spec (`satp`) | none | correct as is | None; the tag pool takes every probed ASID |
-| riscv64 `sbi_hart_mask` window | `core/kernel/src/arch/riscv64/interrupts.rs` | 64 harts per call | hardware spec (SBI `hart_mask`) | none | correct as is | None |
+| riscv64 `sbi_hart_mask` window | `core/kernel/src/arch/riscv64/encoding.rs` | 64 harts per call | hardware spec (SBI `hart_mask`) | none | correct as is | None |
 | riscv64 `NAPOT_64K_PAGES` | `core/kernel/src/arch/riscv64/paging.rs` | 16 | hardware spec (Svnapot) | none | correct as is | None |
 | riscv64 `VLENB_SPEC_MAX` | `core/kernel/src/arch/riscv64/fpu.rs` | 8192 (VLEN 65536) | hardware spec (the V extension's largest VLEN; a larger, or non-power-of-two, `vlenb` is refused at boot) | none | correct as is | None |
 | riscv64 `V_REGS_OFFSET` | `core/kernel/src/arch/riscv64/fpu.rs` | 304 | encoding artefact (the F/D registers, `fcsr` and the vector CSRs before `v0` in the save area; the save and restore asm and the area size read it) | none | correct as is | None |

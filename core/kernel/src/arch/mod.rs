@@ -6,7 +6,9 @@
 //! Architecture dispatch module: selects the active architecture's module as
 //! `current` (see `docs/coding-standards.md` § C. Architecture Invariants and
 //! `core/kernel/docs/arch-interface.md`), and defines [`ThreadKind`], the one
-//! type both architectures' `context::new_state` share.
+//! type both architectures' `context::new_state` share. Host test builds of
+//! other architectures also compile riscv64's `encoding` module, which
+//! depends on nothing else in its arch module, so its tests run on the host.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
@@ -15,6 +17,13 @@ pub mod current;
 #[cfg(target_arch = "riscv64")]
 #[path = "riscv64/mod.rs"]
 pub mod current;
+
+// The riscv64 module's pure register-map and encoding arithmetic, compiled
+// alone into the host test builds of the other architectures so that
+// `cargo xtask test`, which runs on an x86_64 host, runs its tests.
+#[cfg(all(test, not(target_arch = "riscv64")))]
+#[path = "riscv64/encoding.rs"]
+mod riscv64_encoding;
 
 /// Which privilege level a new thread runs at, selecting its first-dispatch
 /// interrupt state in `context::new_state` (the first-dispatch trampoline rule of

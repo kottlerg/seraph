@@ -33,10 +33,10 @@
 //         ledger?: string }
 //   mode 'full'  reviews every file in the PR diff.
 //   mode 'delta' reviews the files whose content changed between `since` (the
-//                head the last run with the reviewer reviewed) and the head, verifies the
-//                fixes claimed since then, and adds a whole-PR correctness-only
-//                regression lens that also verifies claimed fixes for files
-//                outside the delta. The call-sites and cross-boundary lenses
+//                head the last run with the reviewer reviewed) and the head,
+//                verifies the fixes claimed since then, and adds a whole-PR
+//                correctness-only regression lens that also verifies claimed
+//                fixes for files outside the delta. The call-sites and cross-boundary lenses
 //                cover the whole PR diff in both modes (the cross-boundary lens
 //                runs whenever the PR diff, not only the delta, touches a code
 //                file); the design-docs lenses read only the documents that
@@ -440,7 +440,7 @@ const DELTA_RANGE = DELTA ? SINCE + ' <head> -- <every file the PR diff touches>
 
 const SCOPE_PROMPT = [
     'Scope pull request #' + PR + ' for a sharded review.' +
-        (DELTA ? ' Re-review: the previous run reviewed head ' + SINCE + '.' : ''),
+        (DELTA ? ' Re-review: the last run with the reviewer reviewed head ' + SINCE + '.' : ''),
     '',
     'Run `gh pr view ' + PR + ' --json headRefOid,baseRefName,body,commits`, ' +
         '`git merge-base <head> origin/<baseRefName>` (the base), `git rev-parse ' +
@@ -644,7 +644,8 @@ const HEAD_LINE =
         : '') + '.'
 
 const DELTA_NOTE = DELTA
-    ? 'This is a re-review: the previous run reviewed head ' + SINCE + ', and the commits and ' +
+    ? 'This is a re-review: the last run with the reviewer reviewed head ' + SINCE +
+        ', and the commits and ' +
         'PR body since then claim fixes for its findings.'
     : null
 

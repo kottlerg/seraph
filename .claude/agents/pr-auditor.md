@@ -182,20 +182,21 @@ claims.
 
 11. Auditor-only run: when the parent names this run the auditor-only
     run `docs/conventions.md` § Branch and PR Workflow allows, it names
-    `since`, the head the last run with the reviewer reviewed, and that
-    run's record (`<mode>-<since>.json`). FAIL when the record lists a
-    failed agent (`stats.failed`), when `git diff <since> <head>` alters,
-    Markdown aside, anything but comment lines (judged as step 9 judges a
-    validation delta), or when a commit in
-    `git log --merges <since>..<head>` merges the base branch: each owes a
-    run with the reviewer. Compare every comment line and document
-    statement the range changes against the code it describes, citing
-    `path:line` on both sides, and FAIL each one the code contradicts.
-    Confirm that the range makes each fix the commits since `since` or the
-    PR body claim for a finding of that run, and FAIL a claimed fix the
-    range does not make. FAIL each finding in the record's `findings` that
-    the range does not fix and that no open Issue records as that section
-    says (an item stating it, citing this PR). End the section with the
+    `since`, the head the last run with the reviewer reviewed, and the path
+    of that run's record. FAIL when the record lists a failed agent
+    (`stats.failed`), when `git diff <since> <head>` alters, Markdown
+    aside, anything but comment lines (judged as step 9 judges a validation
+    delta), or when a commit in `git log --merges <since>..<head>` merges
+    the base branch: each owes a run with the reviewer. Compare every
+    comment line and document statement the range changes against the code
+    it describes, citing `path:line` on both sides, and FAIL each one the
+    code contradicts. Confirm that the range makes each fix the commits
+    since `since` or the PR body claim for a finding of that run, and FAIL
+    a claimed fix the range does not make. FAIL each finding in the
+    record's `findings` that the range does not fix, and each entry of its
+    `recorded`, that no open Issue records as that section says: an item
+    stating it, either the one this PR recorded or the one an open
+    follow-up Issue of its scope already held. End the section with the
     line `Reviewer verdict: <verdict>`, the verdict that section gives the
     run, derived from the record and the range.
 

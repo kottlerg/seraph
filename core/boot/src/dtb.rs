@@ -158,8 +158,8 @@ impl NodeState
     }
 }
 
-/// Whether a walk has reported nodes past [`MAX_DEPTH`]; every walk visits
-/// the whole tree, so the boot reports it once.
+/// Whether a walk has reported nodes past [`MAX_DEPTH`]; a later walk of the
+/// same tree would repeat the report, so the boot reports it once.
 static REPORTED_TOO_DEEP: AtomicBool = AtomicBool::new(false);
 /// Whether a walk has reported a property past its entry bound, once per boot
 /// for the reason [`REPORTED_TOO_DEEP`] gives.

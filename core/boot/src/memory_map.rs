@@ -1007,6 +1007,26 @@ mod tests
         );
     }
 
+    // Defect caught: a sweep that lets a later, shorter piece at the same base
+    // replace a longer one, or that does not extend the last aperture with a
+    // piece at a higher base reaching past its end.
+    #[test]
+    fn the_sweep_keeps_the_longest_piece_at_a_base_and_extends_across_pieces()
+    {
+        // Overflow the list so the sweep runs: MAX_APERTURES disjoint pieces
+        // 2 MiB apart, plus one more above them.
+        let mut descs: Vec<_> = (0..=MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x20_0000, 1))
+            .collect();
+        // At the first piece's base: a longer piece listed before the
+        // one-page one, and a piece at a higher base reaching past it.
+        descs.insert(0, mmio_desc(0x1000_0000, 4));
+        descs.push(mmio_desc(0x1000_2000, 4));
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+        assert_eq!(pairs(&out[..1]), vec![(0x1000_0000, 0x6000)]);
+    }
+
     #[test]
     fn zero_size_seed_is_ignored()
     {

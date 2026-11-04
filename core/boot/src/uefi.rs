@@ -710,9 +710,8 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 /// `arch::current::allocate_kernel_span`, which keeps the kernel image below
 /// 4 GiB, and the x86-64 boot page-table frame pool, whose first frame is the
 /// root the LA57 toggle trampoline loads with a 32-bit move; the helper is not
-/// gated on
-/// architecture because `AllocateMaxAddress` is part of the UEFI spec on
-/// every supported platform.
+/// gated on architecture because `AllocateMaxAddress` is part of the UEFI spec
+/// on every supported platform.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -803,13 +802,16 @@ pub unsafe fn free_pages(bs: *mut EfiBootServices, phys: u64, count: usize)
     Ok(())
 }
 
-/// The `(map_size, descriptor_size)` the firmware's memory map needs now, from
-/// the size query `GetMemoryMap` answers with a null buffer; nothing is
-/// allocated.
+/// The `(map_size, descriptor_size, status)` the firmware's memory map needs
+/// now, from the size query `GetMemoryMap` answers with a null buffer; nothing
+/// is allocated. `status` is the query's own, `EFI_BUFFER_TOO_SMALL` or
+/// `EFI_SUCCESS`.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usize), BootError>
+unsafe fn query_memory_map_size(
+    bs: *mut EfiBootServices,
+) -> Result<(usize, usize, usize), BootError>
 {
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
@@ -830,7 +832,7 @@ unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usiz
     {
         return Err(BootError::UefiError(status));
     }
-    Ok((map_size, descriptor_size))
+    Ok((map_size, descriptor_size, status))
 }
 
 /// Number of descriptors the firmware's memory map holds now
@@ -845,10 +847,10 @@ unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usiz
 pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<usize, BootError>
 {
     // SAFETY: forwarded caller contract.
-    let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
+    let (map_size, descriptor_size, status) = unsafe { query_memory_map_size(bs)? };
     if descriptor_size == 0
     {
-        return Err(BootError::UefiError(EFI_SUCCESS));
+        return Err(BootError::UefiError(status));
     }
     Ok(map_size / descriptor_size)
 }
@@ -865,7 +867,7 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
 {
     // First call: obtain required buffer size.
     // SAFETY: bs is valid (caller contract).
-    let (mut map_size, mut descriptor_size) = unsafe { query_memory_map_size(bs)? };
+    let (mut map_size, mut descriptor_size, _) = unsafe { query_memory_map_size(bs)? };
     let mut map_key: usize = 0;
     let mut descriptor_version: u32 = 0;
 

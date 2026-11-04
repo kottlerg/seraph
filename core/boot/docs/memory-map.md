@@ -141,7 +141,9 @@ map exists, so it is sized from the firmware's map at that point: step 6 reads
 the descriptor count with a `GetMemoryMap` size query before its first
 allocation, and the array holds that count plus `MEM_MAP_SLACK_ENTRIES` (32).
 Each allocation after the query (the eight of steps 6 and 7) adds at most two
-descriptors, so the slack covers them twice over.
+descriptors, 16 in all, and the other 16 absorb the firmware's own housekeeping
+allocations in that window (§ ExitBootServices in
+[uefi-environment.md](uefi-environment.md)), which nothing bounds.
 
 A final map that still holds more descriptors than the array does not boot
 silently short of memory: `translate_memory_map` counts the descriptors past the

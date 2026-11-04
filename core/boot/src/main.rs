@@ -97,9 +97,11 @@ const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
 /// firmware's descriptor count, which step 6 reads before its first
 /// allocation. Each allocation after the count (the eight of steps 6 and 7:
 /// the `BootInfo`, module, entry, aperture and reclaim pages, the stack, the
-/// page-table pool, and the raw map buffer) adds at most two descriptors, and
-/// the margin doubles that; a map still past it fails the boot when a RAM
-/// descriptor would be dropped (step 9).
+/// page-table pool, and the raw map buffer) adds at most two descriptors, 16
+/// in all; the other 16 absorb the firmware's own housekeeping allocations in
+/// that window, which no count bounds. A map still past the array fails the
+/// boot when a RAM descriptor would be dropped (step 9), so the margin is a
+/// budget backed by a loud failure, not a proof.
 const MEM_MAP_SLACK_ENTRIES: usize = 32;
 
 /// Maximum number of physical regions tracked for identity mapping.
@@ -1341,10 +1343,10 @@ unsafe fn step8_exit_boot_services(
 // BootInfo population is the fan-in point for every earlier step: bundle,
 // kernel, init, modules, firmware, cpu topology, boot entropy, KASLR
 // decision, framebuffer, boot allocations, the memory map, and the page-table
-// frame pool all contribute distinct fields. Bundling
-// them would only rename the argument list into an ad-hoc struct. The
-// too_many_lines allowance covers the inline reclaim-array build below,
-// which sits between aperture derivation and the BootInfo write.
+// frame pool all contribute distinct fields. Bundling them would only rename
+// the argument list into an ad-hoc struct. The too_many_lines allowance
+// covers the inline reclaim-array build below, which sits between aperture
+// derivation and the BootInfo write.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 unsafe fn step9_populate_boot_info(
     bundle: &BundleLoad,
@@ -1483,24 +1485,15 @@ unsafe fn step9_populate_boot_info(
     }; MAX_RECLAIM_RANGES];
     let mut reclaim_len: usize = 0;
     let mut push_reclaim = |phys_base: u64, page_count: u32, flags: u32| {
-        if page_count == 0
-        {
-            return Ok(());
-        }
-        // Unreachable: MAX_RECLAIM_ENTRIES bounds the pushes below at compile
-        // time. Reported rather than written past the page if that count is
-        // ever wrong.
-        if reclaim_len >= MAX_RECLAIM_RANGES
-        {
-            return Err(BootError::ReclaimRangesOverflow);
-        }
-        reclaim_ranges[reclaim_len] = ReclaimRange {
-            phys_base,
-            page_count,
-            flags,
-        };
-        reclaim_len += 1;
-        Ok(())
+        push_reclaim_range(
+            reclaim_ranges,
+            &mut reclaim_len,
+            ReclaimRange {
+                phys_base,
+                page_count,
+                flags,
+            },
+        )
     };
     push_reclaim(allocs.boot_info_phys, 1, 0)?;
     push_reclaim(allocs.modules_phys, 1, 0)?;
@@ -1700,6 +1693,31 @@ unsafe fn step9_populate_boot_info(
     Ok(())
 }
 
+/// Append `range` to `ranges[..*len]`, skipping an empty range.
+///
+/// # Errors
+/// [`BootError::ReclaimRangesOverflow`] when `ranges` is full. Unreachable from
+/// step 9 while `MAX_RECLAIM_ENTRIES` bounds its pushes at compile time; it is
+/// reported rather than written past the page if that count is ever wrong.
+fn push_reclaim_range(
+    ranges: &mut [ReclaimRange],
+    len: &mut usize,
+    range: ReclaimRange,
+) -> Result<(), BootError>
+{
+    if range.page_count == 0
+    {
+        return Ok(());
+    }
+    if *len >= ranges.len()
+    {
+        return Err(BootError::ReclaimRangesOverflow);
+    }
+    ranges[*len] = range;
+    *len += 1;
+    Ok(())
+}
+
 /// Report the descriptors the translated memory map had no room for. A RAM
 /// descriptor among them is [`BootError::MemoryMapTruncated`]: the kernel
 /// would boot without knowing that memory (core/boot/docs/memory-map.md
@@ -1759,8 +1777,9 @@ unsafe fn step10_handoff(
 mod tests
 {
     use super::{
-        BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES, KaslrOverride,
-        choose_kaslr_layout, handoff_stack_span, memory_map, report_map_truncation, scrub,
+        BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES, KaslrOverride, ReclaimRange,
+        choose_kaslr_layout, handoff_stack_span, memory_map, push_reclaim_range,
+        report_map_truncation, scrub,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -1872,6 +1891,34 @@ mod tests
             dropped_other: 3,
         };
         assert!(report_map_truncation(&lost_other).is_ok());
+    }
+
+    // Defect caught: a push past the reclaim array's page, or one that records
+    // an empty range.
+    #[test]
+    fn a_full_reclaim_array_refuses_a_push_and_an_empty_range_is_skipped()
+    {
+        let empty = ReclaimRange {
+            phys_base: 0,
+            page_count: 0,
+            flags: 0,
+        };
+        let one = ReclaimRange {
+            phys_base: 0x1000,
+            page_count: 1,
+            flags: 0,
+        };
+        let mut ranges = [empty; 2];
+        let mut len = 0;
+        assert!(push_reclaim_range(&mut ranges, &mut len, empty).is_ok());
+        assert_eq!(len, 0);
+        assert!(push_reclaim_range(&mut ranges, &mut len, one).is_ok());
+        assert!(push_reclaim_range(&mut ranges, &mut len, one).is_ok());
+        assert!(matches!(
+            push_reclaim_range(&mut ranges, &mut len, one),
+            Err(BootError::ReclaimRangesOverflow)
+        ));
+        assert_eq!(len, 2);
     }
 
     #[test]

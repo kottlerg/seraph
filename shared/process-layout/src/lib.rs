@@ -486,6 +486,31 @@ pub fn choose_process_layout(entropy: Option<&[u8; LAYOUT_ENTROPY_BYTES]>) -> Pr
     }
 }
 
+/// The demand-growth range of a main-thread stack: `(base, pages)` for the
+/// pages of a `usable_pages`-page stack ending at `stack_top` that lie below
+/// its `committed_pages` loader-mapped ones.
+///
+/// Every layout [`choose_process_layout`] returns leaves the
+/// `1 + MAX_PROCESS_STACK_PAGES` pages below `stack_top` to the stack, so a
+/// range of at most `MAX_PROCESS_STACK_PAGES` usable pages keeps at least one
+/// page below it free of every other surface, the guard. `None` when the
+/// committed pages already cover `usable_pages`, when `usable_pages` exceeds
+/// `MAX_PROCESS_STACK_PAGES`, or when `stack_top` is not page-aligned or lies
+/// below the stack.
+#[must_use]
+pub fn main_stack_growth(stack_top: u64, committed_pages: u64, usable_pages: u64)
+-> Option<(u64, u64)>
+{
+    if committed_pages >= usable_pages
+        || usable_pages > u64::from(MAX_PROCESS_STACK_PAGES)
+        || !stack_top.is_multiple_of(PAGE_SIZE)
+    {
+        return None;
+    }
+    let base = stack_top.checked_sub(usable_pages * PAGE_SIZE)?;
+    Some((base, usable_pages - committed_pages))
+}
+
 /// Pick an `ET_DYN` image load bias from [`IMAGE_WINDOW`].
 #[must_use]
 pub const fn choose_image_bias(r: u64) -> u64
@@ -743,5 +768,49 @@ mod tests
         // the zones valid in every mode.
         assert_eq!(growth_zones(0), SV39_ZONES);
         assert_eq!(growth_zones(u64::MAX), SV39_ZONES);
+    }
+
+    // Defect guarded: a growth range that overlaps the committed pages, leaves
+    // a hole below them, or reaches the page below the stack reservation, which
+    // would leave the stack no unregistered guard page.
+    #[test]
+    fn main_stack_growth_sits_below_the_commit_inside_the_reservation()
+    {
+        let stack_reserve = (1 + u64::from(MAX_PROCESS_STACK_PAGES)) * PAGE_SIZE;
+        let entropies = [
+            Some(&PATTERNS[0]),
+            Some(&PATTERNS[1]),
+            Some(&PATTERNS[2]),
+            Some(&PATTERNS[3]),
+            None,
+        ];
+        let max = u64::from(MAX_PROCESS_STACK_PAGES);
+        for entropy in entropies
+        {
+            let top = choose_process_layout(entropy).stack_top;
+            for (committed, usable) in [(8, 512), (1, 2), (12, 512), (1, max)]
+            {
+                let (base, pages) = main_stack_growth(top, committed, usable).unwrap();
+                assert_eq!(pages, usable - committed);
+                assert_eq!(base + pages * PAGE_SIZE, top - committed * PAGE_SIZE);
+                assert_eq!(base % PAGE_SIZE, 0);
+                // The guard page below the range stays inside the reservation.
+                assert!(base - PAGE_SIZE >= top - stack_reserve);
+            }
+        }
+    }
+
+    // Defect guarded: a range registered over pages the loader already maps,
+    // or past the reservation the layout leaves below the stack top.
+    #[test]
+    fn main_stack_growth_refuses_covered_oversized_and_misaligned_stacks()
+    {
+        let top = choose_process_layout(Some(&PATTERNS[2])).stack_top;
+        assert_eq!(main_stack_growth(top, 512, 512), None);
+        assert_eq!(main_stack_growth(top, 600, 512), None);
+        let max = u64::from(MAX_PROCESS_STACK_PAGES);
+        assert_eq!(main_stack_growth(top, 8, max + 1), None);
+        assert_eq!(main_stack_growth(top + 8, 8, 512), None);
+        assert_eq!(main_stack_growth(511 * PAGE_SIZE, 8, 512), None);
     }
 }

@@ -550,6 +550,13 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
         pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
     }
 
+    // In a demand-paged process, let the main-thread stack grow on demand below
+    // the pages the loader mapped. A failure leaves the stack at its committed
+    // size, an overflow of which faults as before; nothing else depends on it.
+    if info.pager_endpoint_cap != 0 {
+        let _ = register_main_stack_growth(info.stack_top_vaddr, info.stack_pages);
+    }
+
     unsafe extern "C" {
         fn main(argc: isize, argv: *const *const u8) -> i32;
     }
@@ -1040,6 +1047,46 @@ pub(crate) unsafe fn register_rw_region(
         unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
         Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
     )
+}
+
+/// Default usable pages of a demand-paged stack (2 MiB), for a spawned thread
+/// and for the main thread alike. Lazily backed — only touched pages cost RAM —
+/// so this floor is generous without eager allocation. A larger
+/// `Builder::stack_size` raises a spawned thread's, and a larger
+/// `stack_pages!` note the main thread's.
+pub(crate) const DEFAULT_DEMAND_STACK_PAGES: u64 = 512;
+
+/// Register the main thread's demand-growth range with the pager: the pages of
+/// a [`DEFAULT_DEMAND_STACK_PAGES`]-page stack ending at `stack_top` below the
+/// `committed_pages` the loader mapped (`process_layout::main_stack_growth`).
+/// The page below the range stays unregistered as the guard, inside the
+/// reservation the creator's layout leaves below every stack top, so an
+/// overflow past it faults on an address the pager declines. Returns whether
+/// the range was registered; on `false` the stack keeps only its committed
+/// pages, the next page below which the pager declines in the same way.
+///
+/// For a demand-paged process only: a pinned one has no pager to back the
+/// range.
+fn register_main_stack_growth(stack_top: u64, committed_pages: u32) -> bool {
+    let Some((base, pages)) = process_layout::main_stack_growth(
+        stack_top,
+        u64::from(committed_pages),
+        DEFAULT_DEMAND_STACK_PAGES,
+    ) else {
+        return false;
+    };
+    let ipc_buf = current_ipc_buf();
+    let info = startup_info();
+    if ipc_buf.is_null() || info.memmgr_endpoint == 0 {
+        return false;
+    }
+    // The pager maps the range's frames from this address space's page-table
+    // pool, which the loader's mappings did not fund for it.
+    if !fund_aspace_pt_budget(info.self_aspace, pages) {
+        return false;
+    }
+    // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+    unsafe { register_rw_region(info.memmgr_endpoint, ipc_buf, base, pages) }
 }
 
 /// A guarded demand-paged thread stack: a reserved VA window whose upper

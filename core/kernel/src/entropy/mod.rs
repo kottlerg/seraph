@@ -64,9 +64,8 @@ mod imp
     {
         let n = cpu_count as usize;
 
-        let rng_bytes = n * core::mem::size_of::<CpuRng>();
         let rng_ptr =
-            crate::sched::alloc_zeroed_slab::<CpuRng>(rng_bytes, allocator, "ENTROPY_CPURNG");
+            crate::sched::alloc_per_cpu_slab::<CpuRng>(super::cpurng::CPURNG_SLAB, n, allocator);
         // SAFETY: slab covers n slots; CpuRng::new() is const, overwriting the
         // (already valid) zero-fill in place.
         unsafe {

@@ -45,14 +45,20 @@ struct Acc
     count: AtomicU64,
 }
 
+/// The per-CPU jitter accumulator slab: one [`Acc`] per CPU.
+const JITTER_SLAB: crate::sched::PerCpuSlab = crate::sched::PerCpuSlab::of::<Acc>("ENTROPY_JITTER");
+const _: () = assert!(
+    JITTER_SLAB.sized_at_every_width(),
+    "ENTROPY_JITTER slab overflows"
+);
+
 static ACC_PTR: AtomicPtr<Acc> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU accumulator slab. Called once from
 /// `entropy::init_storage` (Phase 4).
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<Acc>();
-    let ptr = crate::sched::alloc_zeroed_slab::<Acc>(bytes, allocator, "ENTROPY_JITTER");
+    let ptr = crate::sched::alloc_per_cpu_slab::<Acc>(JITTER_SLAB, cpu_count, allocator);
     ACC_PTR.store(ptr, Ordering::Release);
 }
 

@@ -331,17 +331,24 @@ pub const IPI_VECTOR_WAKEUP: u8 = 251;
 static NMI_BACKTRACE_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU32> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// The NMI-backtrace request slab: one request count per CPU.
+pub(crate) const NMI_BACKTRACE_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<core::sync::atomic::AtomicU32>("NMI_BACKTRACE");
+const _: () = assert!(
+    NMI_BACKTRACE_SLAB.sized_at_every_width(),
+    "NMI_BACKTRACE slab overflows"
+);
+
 /// Allocate the per-CPU NMI-backtrace request slab sized to `cpu_count`,
 /// zero-filled (each count starts at 0). Called from [`super::init_ap_percpu_storage`]
 /// (reached from `sched::init_per_cpu_storage` in Phase 4), before AP bringup.
 #[cfg(not(test))]
 pub fn init_nmi_backtrace_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<core::sync::atomic::AtomicU32>();
-    let ptr = crate::sched::alloc_zeroed_slab::<core::sync::atomic::AtomicU32>(
-        bytes,
+    let ptr = crate::sched::alloc_per_cpu_slab::<core::sync::atomic::AtomicU32>(
+        NMI_BACKTRACE_SLAB,
+        cpu_count,
         allocator,
-        "NMI_BACKTRACE",
     );
     NMI_BACKTRACE_PTR.store(ptr, core::sync::atomic::Ordering::Release);
 }

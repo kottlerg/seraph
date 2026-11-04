@@ -33,6 +33,14 @@ pub struct CpuRng
     last_reseed_us: u64,
 }
 
+/// The per-CPU generator slab: one [`CpuRng`] per CPU.
+pub(crate) const CPURNG_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<CpuRng>("ENTROPY_CPURNG");
+const _: () = assert!(
+    CPURNG_SLAB.sized_at_every_width(),
+    "ENTROPY_CPURNG slab overflows"
+);
+
 impl CpuRng
 {
     /// A zero-initialized generator (matches a zeroed slab slot).

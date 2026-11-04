@@ -32,13 +32,20 @@ struct Sample
     captured: bool,
 }
 
+/// The per-CPU self-test slab: one [`Sample`] row per CPU.
+const SELFTEST_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<Sample>("ENTROPY_SELFTEST");
+const _: () = assert!(
+    SELFTEST_SLAB.sized_at_every_width(),
+    "ENTROPY_SELFTEST slab overflows"
+);
+
 static SAMPLES_PTR: AtomicPtr<Sample> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU sample slab. Called from `entropy::init_storage`.
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<Sample>();
-    let ptr = crate::sched::alloc_zeroed_slab::<Sample>(bytes, allocator, "ENTROPY_SELFTEST");
+    let ptr = crate::sched::alloc_per_cpu_slab::<Sample>(SELFTEST_SLAB, cpu_count, allocator);
     SAMPLES_PTR.store(ptr, Ordering::Release);
 }
 

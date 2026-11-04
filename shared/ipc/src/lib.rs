@@ -2146,8 +2146,9 @@ pub mod blk_labels
     /// least `count * block_size` bytes; the driver rejects with
     /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
-    /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
-    /// see [`BLK_READ_INTO_MEMORY`] for the userspace-IOMMU framing.
+    /// reserved IPC-shape slot, null today: the driver maps the source cap
+    /// for its device itself, for the request's duration
+    /// ([`crate::devmgr_dma_labels::DMA_MAP`]).
     /// Reply: empty body, label is the success or error code; the source
     /// Memory cap is moved back to the caller in `caps[0]` of the reply (same
     /// discipline as the read path).
@@ -2926,9 +2927,10 @@ pub mod blk_errors
     /// `length_lba` to `data[2]`); mismatch here means the caller was built
     /// against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 6;
-    /// The request got no usable completion: the device did not complete it
-    /// within the driver's timeout, published a malformed completion, wrote a
-    /// status byte outside `VirtIO`'s set, or the chain could not be queued.
+    /// The request got no usable completion: devmgr refused to map its
+    /// Memory cap for the device, the device did not complete it within the
+    /// driver's timeout, published a malformed completion, wrote a status
+    /// byte outside `VirtIO`'s set, or the chain could not be queued.
     /// After a lost request the driver resets the device, so the reply's
     /// Memory cap is free of device DMA, and answers every later
     /// `BLK_READ_INTO_MEMORY` / `BLK_WRITE_FROM_MEMORY` with this code

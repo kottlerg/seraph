@@ -8,7 +8,8 @@ error-code modules, the shared policy tables (`sched_policy`, `published_names`,
 the `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
 `procmgr_process_state` constants, the crate-level limits and masks (`VERB_BIT_MASK`,
 `MAX_PATH_LEN`, `ARGS_BLOB_MAX`), the svcmgr name limit and codec (`svcmgr_labels::NAME_MAX`,
-`pack_name`, `unpack_name`), and reply-shape decoders (today `memmgr_grant_layout`).
+`pack_name`, `unpack_name`), reply-shape decoders (today `memmgr_grant_layout`), and the
+driver-side `DMA_MAP` and `DMA_UNMAP` calls (`dma_map`, `dma_unmap`).
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 
@@ -30,21 +31,20 @@ shared/ipc/
 
 ## Wire Stability
 
-The per-service label modules (`procmgr_labels`, `vfsd_labels`, `ns_labels`, `fs_labels`, and
-the rest) define inter-process wire formats. Each module has a `*_LABELS_VERSION` constant that
-is bumped, per the version rule in docs/conventions.md §
-[ABI / wire-protocol versions](../../docs/conventions.md#abi--wire-protocol-versions), on any
-breaking change: a label added, removed, or repurposed, or a payload shape changed. The
-constants fall into four categories. Handshake-checked namespaces carry the version in their
-first-contact handshake, and the receiver rejects a mismatch; `devmgr_labels` instead carries it
-in `data[0]` of every request, which devmgr checks each time. Only `ns_labels` is implicitly
-covered: its caps descend from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT`
-handshakes, so the parent channel stands in for the version check. The remaining constants are
-markers that exist for the bump discipline. `STREAM_LABELS_VERSION` and `LOG_LABELS_VERSION` are
-in practice marker-only: no caller issues the `log_labels::GET_LOG_CAP` handshake. Every process
-that holds a stream cap has it pre-installed instead, in `ProcessInfo.log_send_cap` or, for
-init, derived by init itself. The block comment above the label modules in `src/lib.rs` lists
-which namespace falls in which category.
+The per-service label modules (`procmgr_labels`, `vfsd_labels`, `ns_labels`, `fs_labels`, and the
+rest) define inter-process wire formats. Each module has a `*_LABELS_VERSION` constant that is
+bumped, per the version rule in docs/conventions.md § [ABI / wire-protocol
+versions](../../docs/conventions.md#abi--wire-protocol-versions), on any breaking change: a label
+added, removed, or repurposed, or a payload shape changed. The constants fall into four categories.
+Handshake-checked namespaces carry the version in their first-contact handshake, and the receiver
+rejects a mismatch; `devmgr_labels` and `devmgr_dma_labels` instead carry it in `data[0]` of every
+request, which devmgr checks each time. Only `ns_labels` is implicitly covered: its caps descend
+from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT` handshakes, so the parent
+channel stands in for the version check. The remaining constants are markers that exist for the bump
+discipline. `STREAM_LABELS_VERSION` and `LOG_LABELS_VERSION` are in practice marker-only: no caller
+issues the `log_labels::GET_LOG_CAP` handshake. Every process that holds a stream cap has it
+pre-installed instead, in `ProcessInfo.log_send_cap` or, for init, derived by init itself. The block
+comment above the label modules in `src/lib.rs` lists which namespace falls in which category.
 
 ---
 

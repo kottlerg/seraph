@@ -52,21 +52,38 @@ devmgr's responsibilities are:
   (below). The `cmos-rtc` first round also carries one data word: the CMOS
   RAM index of the century register the FADT's `CENTURY` field names, or 0
   when it names none.
-  Drivers that need physical-base addresses for device DMA
-  programming obtain them from memmgr's `REQUEST_MEMORY_CAPS` reply alongside
-  the Memory caps. No IOMMU support exists, so every DMA-capable driver runs
-  DMA-unsafe today; DMA isolation programmed by devmgr through IOMMU hardware
-  it acquires via the `Mmio` cap flow is design intent; not yet implemented
-  (see
+  A DMA-capable driver programs its device only with the device addresses
+  devmgr returns from `DMA_MAP` on the driver's DMA capability, never with a
+  physical address (below, and
+  [docs/device-management.md § DMA Authorisation](../../../docs/device-management.md#dma-authorisation)).
+  devmgr programs no IOMMU, so it logs at startup that DMA runs unconfined and
+  every DMA-capable driver runs DMA-unsafe; DMA isolation programmed by
+  devmgr through IOMMU hardware it acquires via the `Mmio` cap flow is design
+  intent; not yet implemented (see
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
   devmgr spawns one driver for every virtio-input device and for every
   virtio-blk device it can give an IRQ cap, each with its own service
   endpoint, an `Mmio` cap for every BAR the device's VirtIO register regions
-  name, and its own derivation of its line's held `Interrupt` cap, so devices
-  that share an `INTx` line are all served (see
-  [docs/pci-enumeration.md](pci-enumeration.md) § Per-Device Capability
+  name, its own derivation of its line's held `Interrupt` cap, so devices
+  that share an `INTx` line are all served, and the device's DMA capability
+  (see [docs/pci-enumeration.md](pci-enumeration.md) § Per-Device Capability
   Creation).
+
+  The DMA capability is a SEND, badged with the device badge, on devmgr's DMA
+  endpoint, which devmgr creates before its first spawn and serves on a thread
+  of its own for the rest of the boot: `DMA_MAP` records a mapping of the
+  Memory cap a driver sends, which devmgr keeps while the mapping stands, and
+  replies its device address, and `DMA_UNMAP` removes one
+  (`ipc::devmgr_dma_labels`). The thread serves it apart from the registry
+  loop because that loop makes nested calls and settles batches during which
+  drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary
+  through virtio-blk, which maps the read's buffer, and every `VirtIO` driver
+  maps its rings before it reports ready. The two threads share the device
+  and mapping table (`devmgr_firmware::dma::DmaTable`) under one lock, taken
+  only around table operations and never across IPC. A device that cannot be
+  given a DMA capability is not spawned; devmgr halts when it cannot start the
+  DMA endpoint, since no DMA-capable driver could set its device up.
 
   devmgr serves a driver's endpoint only once the driver has set its device
   up. It spawns its drivers in two production settle batches: the boot batch
@@ -92,10 +109,16 @@ devmgr's responsibilities are:
 
   Withdrawing a `VirtIO` driver, live or dead, takes its device from it in
   this order, so the driver's memory returns to memmgr only once the device's
-  DMA is confirmed stopped
+  DMA is confirmed stopped or blocked
   ([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
   § DMA-Safe Teardown):
 
+  0. devmgr withdraws the device's DMA capability: it revokes every copy of
+     it, the driver's included, and drops the device's mappings with the
+     Memory caps it kept for them, so the driver maps nothing more. Where an
+     IOMMU confines the device, the withdrawal also blocks it there (design
+     intent; not yet implemented: no IOMMU is programmed, so no withdrawal
+     blocks a device today).
   1. devmgr clears the function's Bus Master Enable through the `Mmio` cap of
      the function's configuration page, which it carves at enumeration and
      delegates to no driver ([`docs/pci-enumeration.md`](pci-enumeration.md)
@@ -117,8 +140,9 @@ devmgr's responsibilities are:
      dead one it has reaped already is a no-op. Every `VirtIO` driver is
      created `CREATE_DMA_HOLD`, so procmgr holds the driver's memory on its
      memmgr record, out of the free pool, whether the driver died on its own
-     or was destroyed. Only when Bus Master Enable read back clear, every BAR
-     copy was revoked, and the reset confirmed does devmgr send `RELEASE_HOLD`
+     or was destroyed. Only when the IOMMU blocked the device at step 0, or Bus
+     Master Enable read back clear, every BAR copy was revoked, and the reset
+     confirmed, does devmgr send `RELEASE_HOLD`
      on the handle, on which procmgr sends memmgr `PROCESS_DIED` and the
      memory returns to the pool
      ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-3-release_hold)
@@ -145,7 +169,7 @@ devmgr's responsibilities are:
   it first, and holds its memory until devmgr's release. devmgr spawns no
   driver for a `VirtIO` device whose configuration page it holds no cap for,
   since it could not clear that function's Bus Master Enable. Then the
-  driver's service endpoint is revoked and deleted and its BAR,
+  driver's service endpoint is revoked and deleted and its BAR, DMA,
   configuration-page, and IRQ caps released. A withdrawn driver of any other
   class is destroyed through its process handle while devmgr still keeps it
   (until its batch settles); none of them drives a DMA-capable device, and none

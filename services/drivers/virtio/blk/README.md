@@ -29,8 +29,9 @@ virtio/blk/
 Devmgr spawns the driver, creates its service endpoint, and delivers an `Mmio`
 cap for every BAR the device's VirtIO register regions name in the first
 bootstrap round, each with its PCI BAR index, then the service endpoint, the
-IRQ with its line's `SYS_IRQ_REGISTER` mode, and a per-device badged devmgr
-query endpoint in the second (the rounds `virtio_core::bootstrap` specifies).
+IRQ with its line's `SYS_IRQ_REGISTER` mode, a per-device badged devmgr
+query endpoint, and the device's DMA capability in the second (the rounds
+`virtio_core::bootstrap` specifies).
 The driver maps the BARs into one
 register window and reaches each region through its own BAR's mapping. Once
 its device is set up, immediately before its service loop, the driver reports
@@ -102,7 +103,7 @@ supplied page, packed contiguously; the rest of the page is unspecified.
 | data[1] | Block count (`>= 1`; defaults to `1` if absent) |
 | caps[0] | Target Memory cap, `MAP | WRITE`, at least `count * block_size` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
-| caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
+| caps[2] | Reserved IPC-shape slot (null today) |
 
 **Reply:**
 
@@ -119,21 +120,17 @@ supplied page, packed contiguously; the rest of the page is unspecified.
 | 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OUT_OF_BOUNDS` | LBA outside the caller badge's partition range |
 | 5 | `INVALID_MEMORY_CAP` | Target Memory cap missing `MAP|WRITE`, smaller than `count * block_size`, or absent; or `count` is 0 or `count * block_size` exceeds the u32 descriptor length |
-| 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
+| 7 | `DEVICE_FAULT` | No usable completion: devmgr refused to map the Memory cap for the device, the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
-#### Reserved cap slots and the IOMMU forward-compat shape
+#### Reserved cap slots
 
-`caps[2]` holds the IPC-shape position for a future userspace-IOMMU grant
-capability. The kernel transports nothing for this slot today and has no
-awareness of any IOMMU semantics at any point in the IOMMU lifecycle —
-IOMMU drivers, enforcement, and policy live permanently in userspace. Once
-the userspace IOMMU driver lands, that driver and the block driver agree
-on a userspace cap shape to occupy this slot, and the block driver
-inspects, consumes, and releases the cap entirely in userspace before
-issuing the I/O. Reserving the slot now keeps the wire shape stable across
-that introduction. IOMMU ownership is defined in
-[docs/device-management.md](../../../../docs/device-management.md) § IOMMU Discovery and
-Programming.
+`caps[2]` is a reserved IPC-shape slot, null today. A client lends the
+driver only the Memory cap in `caps[0]`; the driver maps it for the device
+itself, through its DMA capability, for the request's duration (DMA
+Discipline below), so the client passes no grant of its own. DMA
+authorisation is defined in
+[docs/device-management.md](../../../../docs/device-management.md#dma-authorisation)
+§ DMA Authorisation.
 
 `caps[1]` is reserved for a per-request release handle if the cooperative
 release protocol grows a block-layer analogue; today the cap is null and
@@ -155,7 +152,7 @@ read.
 | data[1] | Block count (`>= 1`; defaults to `1` if absent) |
 | caps[0] | Source Memory cap, `MAP` rights, at least `count * block_size` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
-| caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
+| caps[2] | Reserved IPC-shape slot (null today) |
 
 **Reply:**
 
@@ -172,7 +169,7 @@ read.
 | 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OUT_OF_BOUNDS` | LBA outside the caller badge's partition range |
 | 5 | `INVALID_MEMORY_CAP` | Source Memory cap missing `MAP`, smaller than `count * block_size`, or absent; or `count` is 0 or `count * block_size` exceeds the u32 descriptor length |
-| 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
+| 7 | `DEVICE_FAULT` | No usable completion: devmgr refused to map the Memory cap for the device, the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
 ### Label 5: `BLK_GET_GEOMETRY`
 
@@ -201,13 +198,20 @@ is fixed for the device's life.
 
 ## DMA Discipline
 
-The driver owns a single 1-page DMA buffer for the request header and
-status byte (offsets 0 and 1024). The data segment of every read or
-write is the caller-supplied Memory cap: the driver queries `phys_base` via
-`cap_info` without mapping the memory cap into its own address space (the
-device DMAs to or from the physical address; the driver never touches
-the data), then programs the descriptor chain to point at `phys_base`.
-The Memory cap is moved back to the caller in every reply, so it never
+The driver programs the device only with device addresses devmgr returns
+from `DMA_MAP` on the driver's DMA capability, never with a physical address
+([docs/device-management.md](../../../../docs/device-management.md#dma-authorisation)
+§ DMA Authorisation). It maps its virtqueue rings and its single 1-page DMA
+buffer for the request header and status byte (offsets 0 and 1024) once at
+setup, for the device to read and write. The data segment of every read or
+write is the caller-supplied Memory cap: after checking its rights and size,
+the driver maps a derivation of it for the device (to write for a read, to
+read for a write) without mapping it into its own address space (the driver
+never touches the data), programs the descriptor chain with the device
+address devmgr returned, and unmaps it once the request completed or, for a
+lost request, once the device is quiesced, before it replies. Each transfer
+therefore makes two calls to devmgr's DMA thread besides the device's own
+work. The Memory cap is moved back to the caller in every reply, so it never
 accumulates in the driver's `CSpace`.
 
 The driver keeps one request in flight and waits for the completion of

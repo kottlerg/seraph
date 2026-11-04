@@ -26,8 +26,9 @@ virtio/input/
 ## Endpoint
 
 Devmgr enumerates the virtio-input PCI device, carves its per-device capabilities (an
-`Mmio` cap for every BAR its VirtIO register regions name, and its own derivation of its
-line's `Interrupt` cap, a line another device shares included), and spawns this driver from
+`Mmio` cap for every BAR its VirtIO register regions name, its own derivation of its
+line's `Interrupt` cap, a line another device shares included, and the device's DMA
+capability), and spawns this driver from
 the rootfs (`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads
 lazily through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers (see
 [docs/device-management.md](../../../../docs/device-management.md)). The driver
@@ -82,7 +83,11 @@ cook bytes or encode terminal/line-discipline policy. US layout only.
 ## DMA Discipline
 
 The driver owns one DMA page of 8-byte event buffers posted to the eventq
-(virtqueue 0) as device-writable descriptors. The device fills one event per
+(virtqueue 0) as device-writable descriptors. It maps that page and its virtqueue rings
+for the device once at setup, through its DMA capability, and programs the device only
+with the device addresses devmgr returns, never with a physical address
+([docs/device-management.md](../../../../docs/device-management.md#dma-authorisation)
+§ DMA Authorisation). The device fills one event per
 buffer as keys arrive and raises an interrupt; the driver drains the used ring,
 decodes, and re-posts each buffer. A descriptor-head → buffer-slot map locates
 the filled buffer on completion. With an IRQ cap, an interrupt-service thread

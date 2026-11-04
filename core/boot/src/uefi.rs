@@ -837,7 +837,8 @@ unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usiz
 ///
 /// # Errors
 /// Returns `BootError::UefiError` when the query fails, and
-/// `BootError::InvalidMemoryMap` when it reports a zero descriptor size.
+/// `BootError::InvalidMemoryMap` when it reports a descriptor size below
+/// `EFI_MEMORY_DESCRIPTOR`'s.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -845,9 +846,11 @@ pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<us
 {
     // SAFETY: forwarded caller contract.
     let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
-    if descriptor_size == 0
+    if descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
     {
-        return Err(BootError::InvalidMemoryMap("zero descriptor size"));
+        return Err(BootError::InvalidMemoryMap(
+            "descriptor size below EFI_MEMORY_DESCRIPTOR",
+        ));
     }
     Ok(map_size / descriptor_size)
 }
@@ -857,6 +860,12 @@ pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<us
 /// map key, and descriptor size. The acquisition protocol (key invalidation,
 /// final-allocation ordering, slack sizing) is specified in
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
+///
+/// # Errors
+/// Returns `BootError::UefiError` when the size query or the fill call fails,
+/// `BootError::OutOfMemory` when the buffer cannot be allocated, and
+/// `BootError::InvalidMemoryMap` when the fill call reports a descriptor size
+/// below `EFI_MEMORY_DESCRIPTOR`'s.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -895,9 +904,11 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     {
         return Err(BootError::UefiError(status));
     }
-    if descriptor_size == 0
+    if descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
     {
-        return Err(BootError::InvalidMemoryMap("zero descriptor size"));
+        return Err(BootError::InvalidMemoryMap(
+            "descriptor size below EFI_MEMORY_DESCRIPTOR",
+        ));
     }
 
     Ok(MemoryMapResult {

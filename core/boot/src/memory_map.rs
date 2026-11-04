@@ -60,23 +60,12 @@ pub unsafe fn translate_memory_map(
 {
     let mut result = MapTranslation::default();
     let mut count: usize = 0;
-    let mut offset: usize = 0;
 
-    // A zero stride would never advance; `get_memory_map` rejects one, and the
-    // guard keeps the loop finite whatever map it is given.
-    while uefi_map.descriptor_size != 0 && offset + uefi_map.descriptor_size <= uefi_map.map_size
+    // SAFETY: the caller's contract is `RawDescriptors::new`'s.
+    for desc in unsafe { RawDescriptors::new(uefi_map) }
     {
-        // SAFETY: uefi_map.buffer_phys is the UEFI raw map buffer; offset is
-        // within map_size; the descriptor at this offset is a valid EfiMemoryDescriptor.
-        // cast_possible_truncation: buffer_phys is a UEFI physical address; on all
-        // supported UEFI targets (x86_64, riscv64) usize == u64, so no truncation occurs.
-        #[allow(clippy::cast_possible_truncation)]
-        let desc =
-            unsafe { &*((uefi_map.buffer_phys as usize + offset) as *const EfiMemoryDescriptor) };
-
         let memory_type = translate_memory_type(desc.memory_type);
         let size_bytes = desc.number_of_pages * 4096;
-        offset += uefi_map.descriptor_size;
         if count >= max_entries
         {
             if is_ram(memory_type)
@@ -165,7 +154,10 @@ impl Iterator for RawDescriptors<'_>
 
     fn next(&mut self) -> Option<EfiMemoryDescriptor>
     {
-        if self.map.descriptor_size == 0
+        // A stride below the descriptor would read past it and, at the last
+        // stride, past `map_size`; `get_memory_map` rejects one, and the guard
+        // reads nothing from a map that carries one, a zero stride included.
+        if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
             || self.offset + self.map.descriptor_size > self.map.map_size
         {
             return None;
@@ -820,9 +812,10 @@ mod tests
     }
 
     // Defect caught: a translation loop that never advances on a zero
-    // descriptor stride and hangs the boot.
+    // descriptor stride and hangs the boot, or that reads a descriptor past
+    // the map at a stride shorter than the descriptor.
     #[test]
-    fn a_zero_descriptor_size_translates_nothing()
+    fn a_descriptor_size_below_the_descriptor_translates_nothing()
     {
         let descs = [EfiMemoryDescriptor {
             memory_type: EFI_CONVENTIONAL_MEMORY,
@@ -844,8 +837,15 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; 1];
-        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 1) };
-        assert_eq!(t, MapTranslation::default());
+        for stride in [0, 8, size_of::<EfiMemoryDescriptor>() - 1]
+        {
+            let map = MemoryMapResult {
+                descriptor_size: stride,
+                ..uefi_map
+            };
+            let t = unsafe { translate_memory_map(&map, out.as_mut_ptr(), 1) };
+            assert_eq!(t, MapTranslation::default(), "stride {stride}");
+        }
     }
 
     #[test]

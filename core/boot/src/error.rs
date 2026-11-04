@@ -63,8 +63,9 @@ pub enum BootError
     /// memory. The `usize` is the number of RAM descriptors left out.
     MemoryMapTruncated(usize),
 
-    /// The firmware's memory map violates the UEFI contract (a zero descriptor
-    /// size, say). The `&'static str` payload names the violation.
+    /// The firmware's memory map violates the UEFI contract (a descriptor size
+    /// below `EFI_MEMORY_DESCRIPTOR`'s). The `&'static str` payload names the
+    /// violation.
     InvalidMemoryMap(&'static str),
 
     /// Step 9 had more entries to record than the reclaim array's page holds
@@ -242,8 +243,8 @@ mod tests
     fn invalid_memory_map_detail_returns_payload()
     {
         assert_eq!(
-            BootError::InvalidMemoryMap("zero descriptor size").detail(),
-            Some("zero descriptor size")
+            BootError::InvalidMemoryMap("descriptor size below EFI_MEMORY_DESCRIPTOR").detail(),
+            Some("descriptor size below EFI_MEMORY_DESCRIPTOR")
         );
     }
 

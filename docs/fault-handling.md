@@ -328,6 +328,21 @@ holds the faulting [address-space](capability-model.md#address-space) capability
 to the mapping rights it needs) and a frame source, and reclaims frames through the existing
 process-death path of [Process Lifecycle](process-lifecycle.md#process-death).
 
+Stack growth is built on it: the runtime registers each spawned thread's stack, and the part of
+the main thread's stack below the pages the loader commits, as demand regions above an
+unregistered guard page, so a stack costs frames only as it grows and an overflow faults on an
+address the pager declines (see
+[Userspace Memory Model § Bootstrap Cross-Boundary VAs](userspace-memory-model.md#bootstrap-cross-boundary-vas)
+and [ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)).
+
+Only a userspace access takes the fault path. A kernel copy into or out of a caller-supplied
+user buffer (the `SYS_GETRANDOM` destination, the `SYS_THREAD_READ_REGS` and
+`SYS_THREAD_WRITE_REGS` buffers) that reaches a page of a demand region the pager has not yet
+backed fails the syscall with `InvalidAddress`; the fault is not delivered to the handler. A
+caller whose buffer may lie on such a page touches it first. On a stack this needs an
+uninitialised buffer in a chunk (the `DEMAND_CHUNK_PAGES` window memmgr backs per fault) that no
+store of the thread has yet reached.
+
 ### Default System Pager
 
 The broadly useful memory policies — lazy and guard-page stack growth, zero-fill-on-demand

@@ -80,8 +80,8 @@ disjoint surfaces:
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (`GlobalAlloc` for `System`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
-| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged per-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
-| Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack, main-thread IPC buffer, main-thread TLS block |
+| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged spawned-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
+| Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack (with the demand-growth range `std::sys::seraph` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
 overlap within a single address space.
@@ -233,7 +233,8 @@ quality caveat.
   register the same way.
 - **Main-thread stack.** The loader (procmgr or, for memmgr/procmgr,
   init) maps `ProcessInfo.stack_pages` pages ending at the chosen
-  `ProcessInfo.stack_top_vaddr` with a guard page below. The page
+  `ProcessInfo.stack_top_vaddr` and leaves the pages below them
+  unmapped, so a guard page lies below every stack. The page
   count comes from the binary's optional `.note.seraph.stack` ELF note
   (declared via the `process_abi::stack_pages!` /
   `std::os::seraph::stack_pages!` macro; see
@@ -243,7 +244,23 @@ quality caveat.
   declares zero pages or more than `MAX_PROCESS_STACK_PAGES`; the pool's
   available RAM is the remaining gate on the resulting
   `REQUEST_MEMORY_CAPS` calls (memmgr tracks per-process frames in a
-  RAM-bound arena, not a fixed quota).
+  RAM-bound arena, not a fixed quota). The creator leaves the
+  `1 + MAX_PROCESS_STACK_PAGES` pages below `stack_top_vaddr` to the
+  stack: it maps no other surface there, and the layout's draw windows
+  keep every other surface out of them for every draw. The process's
+  runtime may rely on this reservation.
+- **Main-thread stack growth.** The mapped pages are the stack's
+  committed part. In a demand-paged process `std::os::seraph::_start`
+  registers the pages below them, down to a 512-page
+  (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB) stack, as a read-write demand
+  region with the pager (`REGISTER_REGION`), so the stack grows on
+  first touch; the page below that range stays unregistered as the
+  guard, and an overflow past it faults on an address the pager
+  declines, killing the process. A binary whose note declares 512 pages
+  or more, a pinned process (no pager), and a process whose
+  registration fails keep the committed pages alone, the page below
+  which faults the same way. The growth range is the pager's demand
+  region like any other: its frames are reclaimed at process death.
 - **Main-thread IPC buffer.** The creator picks a per-process VA and
   writes it into `ProcessInfo.ipc_buffer_vaddr`.
 - **Main-thread TLS block.** The creator maps the pages the binary's
@@ -406,6 +423,11 @@ registers a range via `std::os::seraph::register_demand_paged`, and on each
 first-touch fault memmgr backs the chunk of the registered region that
 contains the faulting page (up to `DEMAND_CHUNK_PAGES` pages; see
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)).
+Stacks grow the same way: a spawned thread's stack is a demand region above
+an unregistered guard page
+([ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)),
+and the main thread's grows below its committed pages
+([Bootstrap Cross-Boundary VAs](#bootstrap-cross-boundary-vas)).
 
 ---
 

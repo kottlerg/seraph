@@ -396,7 +396,8 @@ range). See [entropy.md](entropy.md).
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
 gates only the SBI HSM extension; the boot hart's Vector extension, the ASID-tagged TLB, Sstc
 and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
-initialization sites (each secondary hart's Vector extension and `vlenb` in Phase 8). A boot
+initialization sites (each secondary hart's Vector extension, `vlenb` and ASID-tagged TLB in
+Phase 8). A boot
 hart without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
 message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
@@ -636,8 +637,9 @@ the BSP's wait then expires the same way. On riscv64 an AP whose PLIC S-mode con
 registers lie outside the PLIC window (a firmware hart id too large for the window
 `plic_size` reports) halts itself the same way, before announcing itself, as does an AP whose
 `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot hart's"),
-or one without the Vector extension, which takes a fatal illegal-instruction trap at its
-`vlenb` read.
+one without the Vector extension, which takes a fatal illegal-instruction trap at its
+`vlenb` read, or one without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported",
+from `paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -823,7 +825,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, or no Vector extension); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, no Vector extension, or no ASID-tagged TLB); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

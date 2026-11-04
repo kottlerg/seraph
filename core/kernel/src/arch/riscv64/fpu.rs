@@ -451,8 +451,9 @@ static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// Return the boot hart's cached `vlenb`, which every secondary hart shares
 /// ([`check_ap_vlenb`]). Returns 0 only before [`cache_vlenb`] runs at BSP
 /// init (docs/platform-requirements.md § Boot-Time Feature Gate).
-// dead_code fires only under `test`: `vlenb` is read only by the non-test `lazy_restore_fp_v`;
-// the `#[cfg(test)]` stub of `lazy_restore_fp_v` does not reference it.
+// dead_code fires only under `test`: `vlenb` is read only by non-test code
+// (`lazy_restore_fp_v`, `check_ap_vlenb`); their `#[cfg(test)]` stubs do not
+// reference it.
 #[cfg_attr(test, allow(dead_code))]
 pub fn vlenb() -> u64
 {

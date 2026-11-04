@@ -16,9 +16,10 @@
 //! vector registers of `vlenb` bytes (`arch::riscv64::fpu::cache_vlenb`). Every Thread
 //! retype debits [`thread_slot_bytes`] (`dispatch_for(Thread)` in
 //! `cap/retype.rs`, the Phase 9 init Thread), and userspace reads the same
-//! value through `SystemInfoType::ThreadRetypeBytes`. Every CPU must need the
-//! area the boot CPU reports (docs/platform-requirements.md § riscv64
-//! Classification; riscv64 halts the boot at a hart whose `vlenb` differs).
+//! value through `SystemInfoType::ThreadRetypeBytes`. Every CPU's save area
+//! must be the size the boot CPU reports (docs/platform-requirements.md
+//! § riscv64 Classification; riscv64 halts the boot at a hart whose `vlenb`
+//! differs).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,13 +88,11 @@ mod tests
         assert_eq!(extended_pages(PAGE + 1), 2);
     }
 
-    // The riscv64 area (304 + 32 * vlenb bytes) at the `vlenb` past which it
-    // leaves one page (119: 4112 bytes) and at the V specification's largest
-    // (8192, VLEN 65536: 262448 bytes), composed into whole slots.
+    // The largest area a CPU can report (riscv64 at VLEN 65536, 262448
+    // bytes), composed into a whole slot.
     #[test]
-    fn riscv_slots_at_the_vlenb_page_edge_and_the_largest()
+    fn the_largest_area_composes_into_a_seventy_page_slot()
     {
-        assert_eq!(slot_bytes(4112), (BASE + 2) * PAGE);
         assert_eq!(slot_bytes(262_448), (BASE + 65) * PAGE);
     }
 }

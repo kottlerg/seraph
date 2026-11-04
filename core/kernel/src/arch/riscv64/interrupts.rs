@@ -1242,8 +1242,10 @@ pub unsafe fn init()
 pub unsafe fn init_ap()
 {
     // SAFETY: caller (kernel_entry_ap) ensures execution in S-mode on the AP hart;
-    // all CSR operations (stvec, sscratch, sstatus, sie, scounteren) are S-mode
-    // privileged instructions; per-hart registers; no shared state.
+    // all CSR operations (stvec, sscratch, sstatus, vlenb, sie, scounteren) are
+    // S-mode privileged instructions on per-hart registers. The one shared state
+    // read is the boot hart's cached vlenb (`fpu::check_ap_vlenb`), written once
+    // at BSP init before any AP starts; that check may halt the boot.
     unsafe {
         // Clear SIE FIRST to prevent any stray interrupt from firing before
         // stvec and sscratch are configured. Firmware may leave SIE=1. The
@@ -1261,12 +1263,15 @@ pub unsafe fn init_ap()
         // Force sstatus.FS = sstatus.VS = 00 (Off) on this AP, mirroring
         // the BSP invariant. Per-hart CSR; must be re-established here.
         super::fpu::enable_fpu_vector();
-        // Every save area is sized from the boot hart's vlenb; halt the boot
-        // on a hart whose vector registers are a different width.
-        super::fpu::check_ap_vlenb();
 
         // Clear sscratch so trap_entry identifies S-mode traps correctly.
         core::arch::asm!("csrw sscratch, zero", options(nostack, nomem));
+
+        // Every save area is sized from the boot hart's vlenb; halt the boot
+        // on a hart whose vector registers are a different width. After the
+        // sscratch clear: on a hart without V the vlenb read traps, and the
+        // trap must take the S-mode path to the fatal handler.
+        super::fpu::check_ap_vlenb();
 
         // Enable SSIP, STIP, SEIP in sie (SIE is still 0; these only take
         // effect when SIE is re-enabled by the idle loop or sret).

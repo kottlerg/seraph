@@ -89,8 +89,9 @@ fn main() -> !
     // IRQ allocator state: single-line caps carved out of devmgr's
     // Interrupt range cap, every remainder kept; each PCI device's line held
     // once carved, every device on it given a derivation, and the UART line
-    // carved exclusive.
-    let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
+    // carved exclusive. The firmware's overrides give each PCI line's mode.
+    let mut irq_range =
+        IrqRangeAllocator::new(caps.irq_range_cap, arch::current::pci_line_overrides(&caps));
 
     // The UART line (`arch::current::UART_IRQ`), kept exclusive: the serial
     // driver acknowledges a delivery only when its client reads, so no other
@@ -944,6 +945,9 @@ struct IrqRangeAllocator
 {
     ranges: SpanTable<u32>,
     held: HeldLines<u32>,
+    /// The firmware's Interrupt Source Overrides, from which each PCI line's
+    /// `SYS_IRQ_REGISTER` mode is derived ([`Self::line_mode`]).
+    overrides: Vec<firmware::acpi::SourceOverride>,
 }
 
 impl IrqRangeAllocator
@@ -953,7 +957,7 @@ impl IrqRangeAllocator
     /// range, which [`SpanTable::carve`] reads as the cap ending there.
     const RANGE_END_BOUND: u64 = 1 << 32;
 
-    fn new(range_slot: u32) -> Self
+    fn new(range_slot: u32, overrides: Vec<firmware::acpi::SourceOverride>) -> Self
     {
         let mut ranges = SpanTable::new();
         // A range cap starts at line 0 (init derives it from the root range).
@@ -964,7 +968,15 @@ impl IrqRangeAllocator
         Self {
             ranges,
             held: HeldLines::new(),
+            overrides,
         }
+    }
+
+    /// The `SYS_IRQ_REGISTER` mode of PCI `INTx` line `gsi`, which every
+    /// driver bound on the line passes (`arch::current::pci_line_mode`).
+    fn line_mode(&self, gsi: u32) -> u64
+    {
+        arch::current::pci_line_mode(&self.overrides, gsi)
     }
 
     /// A device's own single-line cap on line `id`: a derivation of the
@@ -1153,12 +1165,120 @@ impl VirtioBars
 }
 
 /// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio` caps,
-/// its optional single-IRQ cap, and the badge of its catalog entry.
+/// its optional single-IRQ cap with the line's `SYS_IRQ_REGISTER` mode, the
+/// badge of its catalog entry, and where devmgr resets the device when it
+/// withdraws its driver.
 struct VirtioDeviceCaps
 {
     bars: VirtioBars,
     irq_cap: Option<u32>,
+    /// The mode the driver registers `irq_cap` with; 0 without one.
+    irq_mode: u64,
     device_badge: u64,
+    /// The device's `device_status` byte, through the BAR cap devmgr keeps;
+    /// `None` when the device's layout gives none ([`DeviceReset`]).
+    reset: Option<DeviceReset>,
+}
+
+/// Where devmgr writes a `VirtIO` device's `device_status` byte to reset it:
+/// the kept `Mmio` cap of the BAR holding it, the pages that cap spans, the
+/// byte's offset in the BAR, and devmgr's own address space to map it in.
+#[derive(Clone, Copy)]
+struct DeviceReset
+{
+    bar_cap: u32,
+    bar_pages: u64,
+    offset: u64,
+    aspace: u32,
+}
+
+impl DeviceReset
+{
+    /// The reset of the device `info` describes, through the cap in `bars`
+    /// of the BAR holding its `device_status` byte; `None` when the layout
+    /// gives no such byte, no delivered BAR holds it, or the byte lies past
+    /// the span that BAR's cap was carved to (a device whose common region
+    /// reaches past its BAR).
+    fn for_device(
+        info: &virtio_core::VirtioPciStartupInfo,
+        bars: &[spawn::BarSpec],
+        aspace: u32,
+    ) -> Option<Self>
+    {
+        let status = info.status_register()?;
+        let bar = bars.iter().find(|b| b.bar == status.bar)?;
+        if status.offset >= bar.bytes
+        {
+            return None;
+        }
+        Some(Self {
+            bar_cap: bar.cap,
+            bar_pages: bar.bytes.div_ceil(PAGE_SIZE),
+            offset: status.offset,
+            aspace,
+        })
+    }
+
+    /// Reset the device: map its status BAR into devmgr, store 0 to
+    /// `device_status`, wait for the status to read 0, which completes the
+    /// reset (`VirtIO` 1.2 §4.1.4.3.2), bounded by
+    /// `virtio_core::pci::RESET_TIMEOUT`, and unmap. A device whose reset
+    /// completed has stopped its DMA and dropped its pending interrupt, so a
+    /// driver that died while its device asserted a shared level-triggered
+    /// line leaves the line's other receivers no assertion to loop on
+    /// (docs/device-management.md § Interrupt Delivery). Returns whether the
+    /// reset completed; `false`, logged, when the mapping fails or the status
+    /// does not read 0 within the bound.
+    fn reset(&self) -> bool
+    {
+        let Ok(range) = reserve_pages(self.bar_pages)
+        else
+        {
+            std::os::seraph::log!("device reset: no VA for its status BAR; not reset");
+            return false;
+        };
+        let va = range.va_start();
+        if !std::os::seraph::fund_aspace_pt_budget(self.aspace, self.bar_pages)
+        {
+            std::os::seraph::log!("device reset: page-table budget not funded; not reset");
+            unreserve_pages(range);
+            return false;
+        }
+        // SAFETY: `va` starts `range`, a fresh reservation of the BAR cap's page
+        // count from the per-process arena, owned here: VA no Rust object or IPC
+        // page occupies. The mapping is reached only through the raw volatile
+        // write below, and `range` is unreserved only after the unmap
+        // (`mmio_map` § Safety).
+        if unsafe { syscall::mmio_map(self.aspace, self.bar_cap, va, 0) }.is_err()
+        {
+            std::os::seraph::log!("device reset: mapping its status BAR failed; not reset");
+            unreserve_pages(range);
+            return false;
+        }
+        let status = (va + self.offset) as *mut u8;
+        // SAFETY: `offset` is below the bytes the BAR's cap was carved to
+        // (`for_device`), all of which `mmio_map` mapped from `va`, and
+        // `device_status` is a byte register.
+        unsafe { core::ptr::write_volatile(status, 0) };
+        // The reset completes when the device reads back 0 (`VirtIO` 1.2
+        // §4.1.4.3.2); the status is device-written, so the wait is bounded.
+        let start = std::time::Instant::now();
+        let confirmed = virtio_core::pci::poll_until(
+            virtio_core::pci::RESET_TIMEOUT,
+            || start.elapsed(),
+            // SAFETY: as for the write above.
+            || unsafe { core::ptr::read_volatile(status) } == 0,
+        );
+        // SAFETY: the accesses above were the mapping's only use; the span is
+        // `range`, owned here.
+        let _ = unsafe { syscall::mem_unmap(self.aspace, va, self.bar_pages) };
+        unreserve_pages(range);
+        if !confirmed
+        {
+            std::os::seraph::log!("device reset: not confirmed within its bound");
+        }
+        confirmed
+    }
 }
 
 impl VirtioDeviceCaps
@@ -1219,10 +1339,19 @@ fn carve_virtio_device(
         bars.release();
         return None;
     };
+    let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
+    let irq_mode = match (irq_cap, device_gsi(pci_dev))
+    {
+        (Some(_), Some(gsi)) => irq_range.line_mode(gsi),
+        _ => 0,
+    };
+    let reset = DeviceReset::for_device(&pci_dev.virtio_info, bars.as_slice(), caps.self_aspace);
     Some(VirtioDeviceCaps {
         bars,
-        irq_cap: acquire_single_irq_cap(pci_dev, irq_range),
+        irq_cap,
+        irq_mode,
         device_badge,
+        reset,
     })
 }
 
@@ -1267,12 +1396,25 @@ struct ServedDriver
 
 impl ServedDriver
 {
-    /// Withdraw a driver the registry does not, or no longer, serves: revoke
-    /// its service endpoint (every copy derived from it: the driver's receive
-    /// copy and every client SEND) and delete it, so callers queued on it
-    /// return, and release the device's BAR and IRQ caps. The device's
-    /// catalog entry stays, so its badge is never recycled.
+    /// Withdraw a driver the registry does not, or no longer, serves (one
+    /// already dead): take a `VirtIO` device from it and reset the device
+    /// ([`Self::reset_device`]), so it neither DMAs nor holds its line asserted
+    /// with no driver to clear it, then [`Self::release`]. A reset the device
+    /// does not confirm is logged by [`DeviceReset::reset`]; nothing more can
+    /// be done for it here (the memory the device may still reach is the dead
+    /// driver's, which procmgr frees on its own).
     fn withdraw(&self)
+    {
+        let _ = self.reset_device();
+        self.release();
+    }
+
+    /// Release what the registry holds for the driver: revoke its service
+    /// endpoint (every copy derived from it: the driver's receive copy and
+    /// every client SEND) and delete it, so callers queued on it return, and
+    /// release the device's BAR and IRQ caps. The device's catalog entry
+    /// stays, so its badge is never recycled.
+    fn release(&self)
     {
         let _ = syscall::cap_revoke(self.ep);
         let _ = syscall::cap_delete(self.ep);
@@ -1281,6 +1423,70 @@ impl ServedDriver
             dev_caps.release();
         }
     }
+
+    /// Take a `VirtIO` device from its driver and reset it: revoke every cap
+    /// derived from the BAR caps devmgr keeps (the driver's copies, whose
+    /// mappings the revocation removes before it returns), so the driver
+    /// can no longer reach the device, then reset the device and wait for it
+    /// to confirm ([`DeviceReset::reset`]). Returns whether the device is
+    /// known to be quiet: `true` for a driver with no `VirtIO` device, and
+    /// for a device whose BAR copies were all revoked and that confirmed its
+    /// reset; `false`, logged, when a revocation failed, the device has no
+    /// reset target ([`DeviceReset::for_device`]), or the reset was not
+    /// confirmed, and the device may still be accessing the driver's memory.
+    fn reset_device(&self) -> bool
+    {
+        let Some(dev_caps) = &self.dev_caps
+        else
+        {
+            return true;
+        };
+        let mut revoked = true;
+        for bar in dev_caps.bars.as_slice()
+        {
+            if syscall::cap_revoke_all(bar.cap).is_err()
+            {
+                revoked = false;
+            }
+        }
+        if !revoked
+        {
+            std::os::seraph::log!("device reset: a BAR copy could not be revoked");
+        }
+        let Some(reset) = dev_caps.reset
+        else
+        {
+            std::os::seraph::log!("device reset: the device has no reset target; not reset");
+            return false;
+        };
+        reset.reset() && revoked
+    }
+}
+
+/// Withdraw a driver that is still running: take the device from it and reset
+/// the device ([`ServedDriver::reset_device`]), so the device's DMA has
+/// stopped and the driver can no longer re-arm it, then destroy the driver,
+/// which returns its memory to memmgr, and release what the registry holds
+/// for it (one reset per withdrawal).
+///
+/// The driver is destroyed whether or not the reset is confirmed.
+///
+/// TODO(#731): two windows remain until a driver can be frozen before its
+/// device is taken from it (services/devmgr/docs/responsibilities.md
+/// § Responsibilities): a device that does not confirm its reset may still be
+/// writing the driver's memory when it is freed, and the driver can fault on
+/// its revoked BARs and be reaped before the reset lands.
+fn destroy_live_driver(spawned: &SpawnedDriver, ipc_buf: *mut u64)
+{
+    if !spawned.driver.reset_device()
+    {
+        std::os::seraph::log!(
+            "{}: device not confirmed quiet; destroying the driver anyway",
+            spawned.class.name()
+        );
+    }
+    spawn::destroy_child(spawned.process_handle, ipc_buf);
+    spawned.driver.release();
 }
 
 /// A spawned driver its settle batch's roster records: its class, its device
@@ -1294,8 +1500,8 @@ struct SpawnedDriver
     driver: ServedDriver,
 }
 
-/// Record a spawned driver in its batch's roster, withdrawing and destroying
-/// it when the roster cannot hold it (its room is reserved before each
+/// Record a spawned driver in its batch's roster, withdrawing it as a live driver
+/// ([`destroy_live_driver`]) when the roster cannot hold it (its room is reserved before each
 /// spawn, so only a repeated device badge, which the catalog never issues,
 /// reaches that).
 fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ipc_buf: *mut u64)
@@ -1306,8 +1512,7 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
             "{}: driver not recorded; device not served",
             spawned.class.name()
         );
-        spawned.driver.withdraw();
-        spawn::destroy_child(spawned.process_handle, ipc_buf);
+        destroy_live_driver(&spawned, ipc_buf);
     }
 }
 
@@ -1358,8 +1563,7 @@ impl ServedDrivers
                     if class.try_reserve(1).is_err()
                     {
                         std::os::seraph::log!("{}: no memory to serve the driver; destroyed", name);
-                        spawned.driver.withdraw();
-                        spawn::destroy_child(spawned.process_handle, ipc_buf);
+                        destroy_live_driver(&spawned, ipc_buf);
                     }
                     else
                     {
@@ -1383,8 +1587,7 @@ impl ServedDrivers
                         "{}: driver reported neither ready nor death before the settle ended; destroyed",
                         name
                     );
-                    spawned.driver.withdraw();
-                    spawn::destroy_child(spawned.process_handle, ipc_buf);
+                    destroy_live_driver(&spawned, ipc_buf);
                 }
             }
         }
@@ -1640,6 +1843,7 @@ fn spawn_one_virtio_blk(
         source: spawn::CreateSource::Module(module_copy),
         bars: dev_caps.bars.as_slice(),
         irq_cap: Some(irq_cap),
+        irq_mode: dev_caps.irq_mode,
         service_ep: blk_ep,
         query_ep: batch.driver_ep(),
         death_eq,
@@ -1689,7 +1893,11 @@ fn acquire_single_irq_cap(
     {
         Ok(cap) =>
         {
-            std::os::seraph::log!("IRQ cap for GSI {:#x}", u64::from(gsi));
+            std::os::seraph::log!(
+                "IRQ cap for GSI {:#x}, mode {:#x}",
+                u64::from(gsi),
+                irq_range.line_mode(gsi)
+            );
             Some(cap)
         }
         Err(LineError::Hold(HoldError::Split(CarveError::NotCovered))) =>
@@ -1783,6 +1991,7 @@ fn carve_virtio_bars(
         bars.bars[bars.count] = spawn::BarSpec {
             bar: aperture.bar,
             cap,
+            bytes: size,
         };
         bars.count += 1;
     }
@@ -1949,6 +2158,7 @@ fn spawn_virtio_input_from_disk(
         },
         bars: pending.bars.as_slice(),
         irq_cap: pending.irq_cap,
+        irq_mode: pending.irq_mode,
         service_ep: input_ep,
         query_ep: batch.driver_ep(),
         death_eq,

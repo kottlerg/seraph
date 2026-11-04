@@ -1927,6 +1927,7 @@ bound to the line.
 |---|---|---|
 | 0 | `irq_cap` | Interrupt capability for the line to register |
 | 1 | `notification_cap` | Notification capability (Notify rights) to notify on interrupt |
+| 2 | `mode` | The line's trigger and polarity: `IRQ_MODE_LEVEL` (bit 0, level-triggered; clear, edge) and `IRQ_MODE_ACTIVE_LOW` (bit 1, asserts low; clear, high), from `abi/syscall`; 0 is edge-triggered, active-high |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -1936,16 +1937,16 @@ references a fresh object over the same line (see
 per bound object, up to `MAX_IRQ_BINDINGS` (64), and receivers sharing a wired line each bind
 through their own capability.
 
-- **Bind.** Through an object with no binding the call adds one. The line's first binding routes
-  the line at its controller, to one CPU, the next in turn
-  ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing is
-  kept while any binding remains, so every receiver on the line is signalled from that CPU. A
-  later binding masks the line. Every new binding owes an acknowledgement, so the line stays
-  masked until its receiver's first `SYS_IRQ_ACK`.
-- **Rebind.** Through an object already bound, the call rebinds that binding to
-  `notification_cap`'s notification, keeping whether it owes an acknowledgement and leaving the
-  line's mask as it is, and returns once no delivery to the replaced notification is still in
-  flight.
+- **Bind.** Through an object with no binding the call adds one. The line's first binding records
+  `mode` and routes the line at its controller in it, to one CPU, the next in turn
+  ([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked; the routing and
+  the mode are kept while any binding remains, so every receiver on the line is signalled from
+  that CPU. A later binding must pass the recorded mode, and masks the line. Every new binding
+  owes an acknowledgement, so the line stays masked until its receiver's first `SYS_IRQ_ACK`.
+- **Rebind.** Through an object already bound, the call, which must pass the line's recorded mode,
+  rebinds that binding to `notification_cap`'s notification, keeping whether it owes an
+  acknowledgement and leaving the line's mask as it is, and returns once no delivery to the
+  replaced notification is still in flight.
 - **Deliver.** Each interrupt masks the line, marks every binding on it as owing an
   acknowledgement, ORs bit 0 into each bound notification, and completes at the controller. A
   receiver whose device did not raise the interrupt finds nothing in its device's status and
@@ -1956,11 +1957,16 @@ through their own capability.
   deleted, consumed by a split, revoked through an ancestor, or torn down with its holder's
   CSpace) or when its Notification is freed; the removal waits out the deliveries in flight on
   the line. The line is then unmasked if bindings remain and none owes, so a receiver that goes
-  cannot hold a shared line masked, and released at its controller when no binding remains.
+  cannot hold a shared line masked, and released at its controller when no binding remains; the
+  release forgets the mode, so the line's next first binding records its own.
 
-On x86-64 the line is programmed edge-triggered, active-high (see
-[docs/device-management.md](../../../docs/device-management.md) § Interrupt Delivery for what that
-means on a shared level-triggered line); on RISC-V the PLIC gateway is level-sensitive.
+On x86-64 the line's I/O APIC redirection entry is programmed with the recorded mode: bit 15 set
+for level-triggered, bit 13 for active-low. A level-triggered entry whose device still asserts at
+the unmask delivers again, so an assertion while the line is masked is not lost (see
+[docs/device-management.md](../../../docs/device-management.md) § Interrupt Delivery for what an
+edge-triggered entry loses on a shared level-triggered line). On RISC-V the PLIC gateway is
+level-sensitive and has no trigger or polarity setting: the mode is validated and recorded, and
+programs nothing.
 
 **Capability requirements:** `irq_cap` (Notify rights; single-line), `notification_cap`
 (Notify rights).
@@ -1970,7 +1976,8 @@ means on a shared level-triggered line); on RISC-V the PLIC gateway is level-sen
 interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the root
 Interrupt cap spans 2048 GSIs; on RISC-V a source outside the PLIC's reported
 `1..=riscv,ndev`, where the root Interrupt cap spans the PLIC's 1024-id space; see
-[arch-interface.md](arch-interface.md) § Module-level constants and free functions),
+[arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
+sets a bit outside `IRQ_MODE_MASK`, or differs from the mode the line's bindings recorded),
 `QuotaExceeded` (the line already holds `MAX_IRQ_BINDINGS` bindings, through other objects; or,
 for the line's first binding on x86-64, every device IDT vector, 217 of them, is assigned to
 another routed GSI; a vector is freed when its line's last binding is removed). Nothing changes on

@@ -14,8 +14,13 @@
 //!   word per cap: `data[i]` is the PCI BAR index of `caps[i]`.
 //! - Round 2 (terminal) carries the positional slots [`SLOT_SERVICE`],
 //!   [`SLOT_IRQ`], and [`SLOT_DEVMGR_QUERY`], packed with
-//!   [`ipc::bootstrap::pack_slots`] and its presence word in `data[0]`. The
-//!   IRQ slot is absent when devmgr could give the device no IRQ cap.
+//!   [`ipc::bootstrap::pack_slots`] and its presence word in `data[0]`
+//!   ([`DATA_PRESENCE`]), and the IRQ line's mode in `data[1]`
+//!   ([`DATA_IRQ_MODE`]): the trigger and polarity word the driver passes to
+//!   `SYS_IRQ_REGISTER` (`IRQ_MODE_*` in `abi/syscall`), which devmgr derives
+//!   for the line (services/devmgr/docs/pci-enumeration.md). The IRQ slot is
+//!   absent when devmgr could give the device no IRQ cap, and the mode word is
+//!   then 0.
 //!
 //! The protocol carries no version constant; a round of another shape fails
 //! the checks here and the driver exits.
@@ -40,6 +45,12 @@ pub const SLOT_IRQ: usize = 1;
 pub const SLOT_DEVMGR_QUERY: usize = 2;
 /// Slots round 2 carries.
 pub const ROUND2_SLOTS: usize = 3;
+/// Round-2 data word holding the presence word of the slots.
+pub const DATA_PRESENCE: usize = 0;
+/// Round-2 data word holding the IRQ line's `SYS_IRQ_REGISTER` mode.
+pub const DATA_IRQ_MODE: usize = 1;
+/// Data words round 2 carries.
+pub const ROUND2_DATA_WORDS: usize = 2;
 
 // Round 2 is one positional-slot round.
 const _: () = assert!(ROUND2_SLOTS <= MSG_CAP_SLOTS_MAX);
@@ -99,6 +110,9 @@ pub struct DriverEndpoints
     pub service: u32,
     /// The device's IRQ cap ([`SLOT_IRQ`]), `0` when devmgr delivered none.
     pub irq: u32,
+    /// The mode the driver passes to `SYS_IRQ_REGISTER` for [`Self::irq`]
+    /// ([`DATA_IRQ_MODE`]).
+    pub irq_mode: u64,
     /// devmgr's per-device query and ready-report endpoint
     /// ([`SLOT_DEVMGR_QUERY`]).
     pub devmgr_query: u32,
@@ -106,25 +120,31 @@ pub struct DriverEndpoints
 
 impl DriverEndpoints
 {
-    /// Decode round 2. Returns `None` when the round is not terminal, its
-    /// presence word is missing or disagrees with its caps
-    /// ([`ipc::bootstrap::unpack_slots`]), or it fills a slot past
-    /// [`ROUND2_SLOTS`].
+    /// Decode round 2. Returns `None` when the round is not terminal, it
+    /// carries other than [`ROUND2_DATA_WORDS`] data words, its presence word
+    /// disagrees with its caps ([`ipc::bootstrap::spread_slots`]), it fills a
+    /// slot past [`ROUND2_SLOTS`], or its mode word sets a bit outside
+    /// `IRQ_MODE_MASK`.
     #[must_use]
     pub fn from_round(round: &BootstrapRound) -> Option<Self>
     {
-        if !round.done
+        if !round.done || round.data_words != ROUND2_DATA_WORDS
         {
             return None;
         }
-        let slots = ipc::bootstrap::unpack_slots(round).ok()?;
+        let slots =
+            ipc::bootstrap::spread_slots(&round.caps[..round.cap_count], round.data[DATA_PRESENCE])
+                .ok()?;
+        let irq_mode = round.data[DATA_IRQ_MODE];
         if slots[ROUND2_SLOTS..].iter().any(|&s| s != 0)
+            || irq_mode & !syscall_abi::IRQ_MODE_MASK != 0
         {
             return None;
         }
         Some(Self {
             service: slots[SLOT_SERVICE],
             irq: slots[SLOT_IRQ],
+            irq_mode,
             devmgr_query: slots[SLOT_DEVMGR_QUERY],
         })
     }
@@ -177,19 +197,35 @@ mod tests
     fn round_two_spreads_present_caps_over_their_slots()
     {
         // No IRQ: service and devmgr query present (slots 0 and 2).
-        let eps = DriverEndpoints::from_round(&round(true, &[20, 22], &[0b101]))
+        let eps = DriverEndpoints::from_round(&round(true, &[20, 22], &[0b101, 0]))
             .expect("well-formed round 2");
         assert_eq!((eps.service, eps.irq, eps.devmgr_query), (20, 0, 22));
+    }
+
+    #[test]
+    fn round_two_carries_the_irq_lines_mode()
+    {
+        let mode = syscall_abi::IRQ_MODE_LEVEL | syscall_abi::IRQ_MODE_ACTIVE_LOW;
+        let eps = DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111, mode]))
+            .expect("well-formed round 2");
+        assert_eq!((eps.irq, eps.irq_mode), (21, mode));
     }
 
     #[test]
     fn round_two_of_another_shape_is_refused()
     {
         // Not terminal.
-        assert!(DriverEndpoints::from_round(&round(false, &[20, 21, 22], &[0b111])).is_none());
+        assert!(DriverEndpoints::from_round(&round(false, &[20, 21, 22], &[0b111, 0])).is_none());
         // No presence word.
         assert!(DriverEndpoints::from_round(&round(true, &[20], &[])).is_none());
+        // No mode word: the shape before the mode word.
+        assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111])).is_none());
         // A slot past the three round 2 defines.
-        assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22, 23], &[0b1111])).is_none());
+        assert!(
+            DriverEndpoints::from_round(&round(true, &[20, 21, 22, 23], &[0b1111, 0])).is_none()
+        );
+        // A mode bit outside IRQ_MODE_MASK.
+        let bad = syscall_abi::IRQ_MODE_MASK + 1;
+        assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111, bad])).is_none());
     }
 }

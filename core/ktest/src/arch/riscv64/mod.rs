@@ -67,6 +67,11 @@ pub fn fresh_range_root(ctx: &TestContext) -> Option<u32>
     None
 }
 
+/// Whether the architecture has an I/O port space, so `IoPort` capabilities
+/// bind to threads (the kernel's `HAS_IO_PORTS`): none on RISC-V, so
+/// arch-neutral cells that exercise a port binding skip it.
+pub const HAS_IO_PORTS: bool = false;
+
 /// Exception cause a not-present user store faults with (store/AMO page
 /// fault), as recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills
 /// the thread.

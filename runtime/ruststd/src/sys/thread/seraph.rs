@@ -5,7 +5,7 @@
 
 //! Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
 //! A demand-paged process gives each thread a guarded demand-paged stack
-//! (`GUARD_PAGES` below at least `DEFAULT_DEMAND_STACK_PAGES`; see
+//! (`GUARD_PAGES` below at least `os::seraph::DEFAULT_DEMAND_STACK_PAGES`; see
 //! `alloc_stack`); a non-demand-paged process, or a failed reservation, falls
 //! back to an eager page-aligned heap stack without a guard. Per-thread IPC
 //! buffers are page-aligned heap allocations. Join synchronises on a
@@ -61,11 +61,6 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// address-space death-observer — is killed instead of silently corrupting
 /// adjacent memory.
 const GUARD_PAGES: u64 = 1;
-
-/// Default usable pages for a demand-paged thread stack (2 MiB). Lazily backed
-/// — only touched pages cost RAM — so this floor is generous without eager
-/// allocation. A larger `Builder::stack_size` raises it.
-const DEFAULT_DEMAND_STACK_PAGES: u64 = 512;
 
 /// Per-thread context the entry trampoline pulls off the `arg` slot of
 /// `thread_configure`. Owned by the spawning thread until the child takes
@@ -186,7 +181,8 @@ fn alloc_stack(
     if info.pager_endpoint_cap != 0 {
         let floor = crate::cmp::max(requested_bytes, DEFAULT_MIN_STACK_SIZE);
         let requested_pages = floor.div_ceil(PAGE_SIZE_USIZE) as u64;
-        let usable_pages = crate::cmp::max(requested_pages, DEFAULT_DEMAND_STACK_PAGES);
+        let usable_pages =
+            crate::cmp::max(requested_pages, crate::os::seraph::DEFAULT_DEMAND_STACK_PAGES);
         if let Ok(g) = crate::os::seraph::reserve_guarded_stack(usable_pages, GUARD_PAGES) {
             return Ok(StackAlloc::Demand(g));
         }

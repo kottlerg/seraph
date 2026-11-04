@@ -41,16 +41,16 @@
 //! as serial syscall issue allows, alternating their order by cycle parity to
 //! cover both interleavings.
 //!
-//! With four or more CPUs, the controller pins itself to CPU 0, the server,
-//! the client and a second stopper take three distinct other CPUs, and the
-//! second stopper stops the client too, released by the controller just
-//! before its own stop and delete and after a cycle-varying spin, so two
-//! cancels race one reply-blocked client while the server is freed. A cancel that wins the
+//! With four or more CPUs, the controller pins itself to CPU 0, the server, the
+//! client and a second stopper take three distinct other CPUs, and the second
+//! stopper stops the client too, released by the controller just before its own
+//! stop and delete and after a cycle-varying spin, so two cancels race one
+//! reply-blocked client while the server is freed. A cancel that wins the
 //! `reply_tcb` CAS leaves the server's slot null, so the server's dealloc no
-//! longer reaches the client; were the client's binding still naming the
-//! server once the winner dropped the client's `sched_lock`, the other
-//! cancel's `blocked_on == server` re-read would pass and its CAS would run
-//! on the freed server. The winner clears the binding inside that same hold
+//! longer reaches the client; were the client's binding still naming the server
+//! once the winner dropped the client's `sched_lock`, the other cancel's
+//! `blocked_on == server` re-read would pass and its CAS would run on the freed
+//! server. The winner clears the binding inside that same hold
 //! (core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 7).
 //!
 //! ## Anti-vacuous guard

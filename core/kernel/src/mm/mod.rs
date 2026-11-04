@@ -25,22 +25,6 @@ pub use buddy::{BuddyAllocator, PAGE_SIZE};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::sched::PerCpuSlab;
-
-/// Bytes of one TLB-shootdown request slot (`tlb_shootdown::TlbShootdownRequest`:
-/// three `u64` words, a `u16` tag and a CPU mask, padded to the mask's 8-byte
-/// alignment), for its slab's descriptor in builds that compile the type out;
-/// a compile-time assert beside the type ties the two.
-pub(crate) const TLB_REQUEST_BYTES: usize =
-    (3 * 8 + 2 + core::mem::size_of::<crate::cpu_mask::AtomicCpuMask>()).next_multiple_of(8);
-
-/// The TLB-shootdown request slab: one request slot per CPU.
-pub(crate) const TLB_REQUESTS_SLAB: PerCpuSlab = PerCpuSlab::new("TLB_REQUESTS", TLB_REQUEST_BYTES);
-const _: () = assert!(
-    TLB_REQUESTS_SLAB.sized_at_every_width(),
-    "TLB_REQUESTS slab overflows"
-);
-
 /// Exclusive upper bound of user-half virtual addresses.
 ///
 /// The single kernel-wide gate for "is this VA in the user half": on x86-64

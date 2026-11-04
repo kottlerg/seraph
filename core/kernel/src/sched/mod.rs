@@ -2692,11 +2692,11 @@ pub(crate) const fn slab_pages(bytes: usize) -> usize
 ///
 /// Every per-CPU storage initialiser allocates through
 /// [`alloc_per_cpu_slab`] with its slab's descriptor, so the byte count a boot
-/// asks for at any CPU count is [`bytes`](Self::bytes) of that descriptor: the
-/// value the host tests check at every width up to [`MAX_CPUS`], and the
+/// asks for at any CPU count is [`bytes`](Self::bytes) of that descriptor. The
 /// compile-time assert beside each descriptor of a fixed per-CPU element count
-/// checks against the target's own layout (the tag-state slab's count is set
-/// at boot, so the host tests alone check it).
+/// checks it at every width up to [`MAX_CPUS`] against the target's own
+/// layout; the tag-state slab's count is set at boot, so a host test checks it
+/// instead.
 #[derive(Clone, Copy)]
 pub(crate) struct PerCpuSlab
 {
@@ -6658,33 +6658,15 @@ mod slab_tests
         assert!(!slab.sized_at(1));
     }
 
-    // Every width from one CPU to `MAX_CPUS` is checked, which includes
-    // `MAX_CPUS` and each width where a slab's page count crosses into one
-    // more `2^MAX_ORDER` block; the tag-state slab's byte count does not grow
-    // monotonically with the width, so no subset of widths stands for the rest.
+    // The fixed-count descriptors are checked by the compile-time assert
+    // beside each; the tag-state slab's per-CPU count is `tag_count`'s at boot,
+    // so it is checked here, at every width from one CPU to `MAX_CPUS`, with
+    // the most hardware tags any architecture reports. Its byte count does not
+    // grow monotonically with the width, so no subset of widths stands for the
+    // rest.
     #[test]
-    fn every_per_cpu_slab_is_sized_at_every_width_up_to_max_cpus()
+    fn the_tag_state_slab_is_sized_at_every_width_up_to_max_cpus()
     {
-        let fixed = [
-            super::SCHEDULERS_SLAB,
-            super::IDLE_TCBS_SLAB,
-            super::IDLE_STACK_TOPS_SLAB,
-            super::LAST_NON_IDLE_TICK_SLAB,
-            super::CPU_DIAG_SLAB,
-            crate::percpu::PER_CPU_SLAB,
-            crate::percpu::CPU_APIC_IDS_SLAB,
-            crate::mm::TLB_REQUESTS_SLAB,
-            crate::entropy::CPURNG_SLAB,
-            crate::entropy::JITTER_SLAB,
-            crate::entropy::SELFTEST_SLAB,
-        ];
-        for slab in fixed.iter().chain(crate::arch::current::PER_CPU_SLABS)
-        {
-            assert!(slab.sized_at_every_width(), "{} is not sized", slab.label);
-        }
-
-        // The tag-state slab holds `tag_count` records per CPU, at its widest
-        // with the most hardware tags any architecture reports.
         for cpus in 1..=MAX_CPUS
         {
             let n = tag_count(MAX_HW_TAGS, cpus).expect("tagging is on at every width");

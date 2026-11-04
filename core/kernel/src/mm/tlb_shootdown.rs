@@ -94,11 +94,13 @@ struct TlbShootdownRequest
     pending_cpus: AtomicCpuMask,
 }
 
-// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
-// computes this slab's bytes from `TLB_REQUEST_BYTES`, in builds that compile
-// this type out; the assert keeps the constant equal to the layout the
-// kernel allocates.
-const _: () = assert!(core::mem::size_of::<TlbShootdownRequest>() == super::TLB_REQUEST_BYTES);
+/// The TLB-shootdown request slab: one [`TlbShootdownRequest`] per CPU.
+const TLB_REQUESTS_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<TlbShootdownRequest>("TLB_REQUESTS");
+const _: () = assert!(
+    TLB_REQUESTS_SLAB.sized_at_every_width(),
+    "TLB_REQUESTS slab overflows"
+);
 
 impl TlbShootdownRequest
 {
@@ -124,7 +126,7 @@ static TLB_REQUESTS_PTR: AtomicPtr<TlbShootdownRequest> = AtomicPtr::new(core::p
 pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
     let base = crate::sched::alloc_per_cpu_slab::<TlbShootdownRequest>(
-        super::TLB_REQUESTS_SLAB,
+        TLB_REQUESTS_SLAB,
         cpu_count,
         allocator,
     );

@@ -32,19 +32,20 @@ struct Sample
     captured: bool,
 }
 
-// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
-// computes this slab's bytes from `SELFTEST_SAMPLE_BYTES`, in builds that
-// compile this type out; the assert keeps the constant equal to the layout
-// the kernel allocates.
-const _: () = assert!(core::mem::size_of::<Sample>() == super::SELFTEST_SAMPLE_BYTES);
+/// The per-CPU self-test slab: one [`Sample`] row per CPU.
+const SELFTEST_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<Sample>("ENTROPY_SELFTEST");
+const _: () = assert!(
+    SELFTEST_SLAB.sized_at_every_width(),
+    "ENTROPY_SELFTEST slab overflows"
+);
 
 static SAMPLES_PTR: AtomicPtr<Sample> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU sample slab. Called from `entropy::init_storage`.
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
-    let ptr =
-        crate::sched::alloc_per_cpu_slab::<Sample>(super::SELFTEST_SLAB, cpu_count, allocator);
+    let ptr = crate::sched::alloc_per_cpu_slab::<Sample>(SELFTEST_SLAB, cpu_count, allocator);
     SAMPLES_PTR.store(ptr, Ordering::Release);
 }
 

@@ -45,43 +45,6 @@ pub mod selftest;
 #[cfg(not(test))]
 pub mod vmgenid;
 
-use crate::sched::PerCpuSlab;
-
-/// Bytes of one per-CPU generator (`cpurng::CpuRng`), for its slab's
-/// descriptor in builds that compile the type out; a compile-time assert
-/// beside the type ties the two.
-pub(crate) const CPURNG_BYTES: usize = 240;
-
-/// Bytes of one per-CPU jitter accumulator (`jitter::Acc`), tied to the type
-/// as [`CPURNG_BYTES`] is.
-pub(crate) const JITTER_ACC_BYTES: usize = 40;
-
-/// Bytes of one per-CPU self-test row (`selftest::Sample`), tied to the type
-/// as [`CPURNG_BYTES`] is.
-pub(crate) const SELFTEST_SAMPLE_BYTES: usize = 33;
-
-/// The per-CPU generator slab: one `CpuRng` per CPU.
-pub(crate) const CPURNG_SLAB: PerCpuSlab = PerCpuSlab::new("ENTROPY_CPURNG", CPURNG_BYTES);
-const _: () = assert!(
-    CPURNG_SLAB.sized_at_every_width(),
-    "ENTROPY_CPURNG slab overflows"
-);
-
-/// The per-CPU jitter accumulator slab: one `Acc` per CPU.
-pub(crate) const JITTER_SLAB: PerCpuSlab = PerCpuSlab::new("ENTROPY_JITTER", JITTER_ACC_BYTES);
-const _: () = assert!(
-    JITTER_SLAB.sized_at_every_width(),
-    "ENTROPY_JITTER slab overflows"
-);
-
-/// The per-CPU self-test slab: one `Sample` row per CPU.
-pub(crate) const SELFTEST_SLAB: PerCpuSlab =
-    PerCpuSlab::new("ENTROPY_SELFTEST", SELFTEST_SAMPLE_BYTES);
-const _: () = assert!(
-    SELFTEST_SLAB.sized_at_every_width(),
-    "ENTROPY_SELFTEST slab overflows"
-);
-
 #[cfg(not(test))]
 mod imp
 {
@@ -101,7 +64,8 @@ mod imp
     {
         let n = cpu_count as usize;
 
-        let rng_ptr = crate::sched::alloc_per_cpu_slab::<CpuRng>(super::CPURNG_SLAB, n, allocator);
+        let rng_ptr =
+            crate::sched::alloc_per_cpu_slab::<CpuRng>(super::cpurng::CPURNG_SLAB, n, allocator);
         // SAFETY: slab covers n slots; CpuRng::new() is const, overwriting the
         // (already valid) zero-fill in place.
         unsafe {

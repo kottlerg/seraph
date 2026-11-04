@@ -454,9 +454,8 @@ changed line that names one of these items as a whole identifier or lies within 
   size is on the surface whether it edits the type's own fields or a type or constant the element
   holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or
   `Prng` inside `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation
-  (`KERNEL_STACK_PAGES` for the idle stacks, and the element sizes the descriptors of the types
-  host builds compile out take: `CPURNG_BYTES`, `JITTER_ACC_BYTES`, `SELFTEST_SAMPLE_BYTES`,
-  `TLB_REQUEST_BYTES`, and `TAG_STATE_BYTES`);
+  (`KERNEL_STACK_PAGES` for the idle stacks, and `TAG_STATE_BYTES`, the tag-state slab's element
+  size);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
   and the MADT walk behind it (`madt_topology` and its per-CPU `record_cpu_id`),
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
@@ -795,13 +794,13 @@ list as the tracking Issues move):
   past one block, a run that cannot be found, and requests of one block or
   less) and of the byte-to-page rounding `alloc_zeroed_slab` applies
   (`sched::slab_pages`); the sizing of every per-CPU slab, whose byte count
-  each initialiser takes from its `sched::PerCpuSlab` descriptor: host tests
-  that every descriptor's count does not overflow and that its `slab_pages`
-  cover it at every width up to `MAX_CPUS`, each width where its page count
-  crosses a `2^MAX_ORDER` block among them (`sched::slab_tests`), and a
-  compile-time assert beside each descriptor of a fixed per-CPU count that
-  checks the same against the target's own layout on both architectures; and
-  the 128-CPU boots for two full words.
+  each initialiser takes from its `sched::PerCpuSlab` descriptor, checked at
+  every width from one CPU to `MAX_CPUS` for a count that does not overflow
+  and `slab_pages` that cover it: by a compile-time assert beside each
+  descriptor of a fixed per-CPU count, against the target's own layout on both
+  architectures, and for the tag-state slab, whose per-CPU count `tag_count`
+  sets at boot, by a host test (`sched::slab_tests`); and the 128-CPU boots
+  for two full words.
 - Both arches, a partial second `CpuMask` word (residual): no local run boots
   a count past one 64-bit word that does not fill the next (65 to 127 CPUs).
   The host tests of `CpuMask::range` cover those mask paths instead:

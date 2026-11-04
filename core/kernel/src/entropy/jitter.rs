@@ -45,11 +45,12 @@ struct Acc
     count: AtomicU64,
 }
 
-// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
-// computes this slab's bytes from `JITTER_ACC_BYTES`, in builds that compile
-// this type out; the assert keeps the constant equal to the layout the
-// kernel allocates.
-const _: () = assert!(core::mem::size_of::<Acc>() == super::JITTER_ACC_BYTES);
+/// The per-CPU jitter accumulator slab: one [`Acc`] per CPU.
+const JITTER_SLAB: crate::sched::PerCpuSlab = crate::sched::PerCpuSlab::of::<Acc>("ENTROPY_JITTER");
+const _: () = assert!(
+    JITTER_SLAB.sized_at_every_width(),
+    "ENTROPY_JITTER slab overflows"
+);
 
 static ACC_PTR: AtomicPtr<Acc> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -57,7 +58,7 @@ static ACC_PTR: AtomicPtr<Acc> = AtomicPtr::new(core::ptr::null_mut());
 /// `entropy::init_storage` (Phase 4).
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
-    let ptr = crate::sched::alloc_per_cpu_slab::<Acc>(super::JITTER_SLAB, cpu_count, allocator);
+    let ptr = crate::sched::alloc_per_cpu_slab::<Acc>(JITTER_SLAB, cpu_count, allocator);
     ACC_PTR.store(ptr, Ordering::Release);
 }
 

@@ -33,11 +33,13 @@ pub struct CpuRng
     last_reseed_us: u64,
 }
 
-// Size budget: the host-side per-CPU slab sweep (`sched::slab_tests`)
-// computes this slab's bytes from `CPURNG_BYTES`, in builds that compile
-// this type out; the assert keeps the constant equal to the layout the
-// kernel allocates.
-const _: () = assert!(core::mem::size_of::<CpuRng>() == super::CPURNG_BYTES);
+/// The per-CPU generator slab: one [`CpuRng`] per CPU.
+pub(crate) const CPURNG_SLAB: crate::sched::PerCpuSlab =
+    crate::sched::PerCpuSlab::of::<CpuRng>("ENTROPY_CPURNG");
+const _: () = assert!(
+    CPURNG_SLAB.sized_at_every_width(),
+    "ENTROPY_CPURNG slab overflows"
+);
 
 impl CpuRng
 {

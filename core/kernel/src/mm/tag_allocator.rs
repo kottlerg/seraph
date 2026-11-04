@@ -342,10 +342,11 @@ mod glue
         pub synced_tlb_gen: u64,
     }
 
-    // Size budget: `tag_count`'s `TAG_STATE_BUDGET_BYTES` trim and the
-    // host-side per-CPU slab sweep (`sched::slab_tests`) compute this slab's
-    // bytes from `TAG_STATE_BYTES`, in builds that compile this type out; the
-    // assert keeps the constant equal to the layout the kernel allocates.
+    // Size budget: `tag_count`'s `TAG_STATE_BUDGET_BYTES` trim, and the host
+    // test of the tag-state slab's sizing (`sched::slab_tests`), compute the
+    // records' bytes from `TAG_STATE_BYTES` in builds that compile this type
+    // out; the assert keeps the constant equal to the layout the kernel
+    // allocates.
     const _: () = assert!(core::mem::size_of::<TagState>() == super::TAG_STATE_BYTES);
 
     /// Base of the per-CPU tag-state slab (`cpu_count * NUM_TAGS` records,

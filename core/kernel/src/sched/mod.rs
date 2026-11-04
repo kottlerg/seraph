@@ -49,12 +49,11 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
-/// 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle stack
-/// (`riscv64`; 3296 B and 1328 B on `x86_64`), margins of about 77% and 90%;
-/// release builds at 4, 16 and 128 CPUs use at most 4304 B (thread) and 1616 B
-/// (idle), and debug builds at 4 CPUs at most 4200 B and 1752 B, so the deepest
-/// bounds leave margins of about 74% and 89%. The report gives the depth, not
-/// the path that reached it.
+/// 4, 16 and 128 CPUs peak at 3784 B on a thread stack and 1664 B on an idle
+/// stack (`riscv64`; 3296 B and 1328 B on `x86_64`), and release builds at 4, 16
+/// and 128 CPUs at 4304 B and 2080 B (`riscv64`; 3296 B and 1104 B on `x86_64`),
+/// so the deepest bounds leave margins of about 74% (thread) and 87% (idle). The
+/// report gives the depth, not the path that reached it.
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's

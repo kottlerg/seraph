@@ -739,13 +739,15 @@ static INIT_STACK_PHYS: [core::sync::atomic::AtomicU64; INIT_STACK_PAGES] =
 /// non-RAM descriptors ([`init_info_descriptor_bound`]).
 pub(crate) struct DescriptorCounts
 {
-    /// `AcpiReclaimable` memory-map entries, one ACPI region cap each.
+    /// `AcpiReclaimable` memory-map entries, at most one ACPI region cap each
+    /// (none for a zero-length entry).
     pub acpi_regions: usize,
     /// MMIO apertures, one `Mmio` cap each.
     pub apertures: usize,
     /// Boot modules, one `Memory` cap each.
     pub modules: usize,
-    /// Reclaim ranges, one reclaimable `Memory` cap each.
+    /// Reclaim ranges, at most one reclaimable `Memory` cap each (none for a
+    /// zero-length range).
     pub reclaim_ranges: usize,
 }
 
@@ -2900,8 +2902,9 @@ mod tests
     // Defect caught: a `populate_cspace` capability with a descriptor that
     // the `InitInfo` bound does not count (a new fixed cap, or ACPI regions
     // counted short by the counts Phase 7 sizes from), so a boot sized from the
-    // bound overruns the region it reserved. The aperture, module and reclaim
-    // descriptors are one per entry of the array each count reads.
+    // bound overruns the region it reserved. The aperture and module
+    // descriptors are one per entry of the array each count reads, the reclaim
+    // descriptors at most one.
     #[test]
     fn the_descriptor_bound_counts_every_fixed_and_acpi_descriptor_phase_7_mints()
     {

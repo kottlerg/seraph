@@ -308,13 +308,12 @@ impl VirtioPciStartupInfo
     #[must_use]
     pub fn status_register(&self) -> Option<StatusRegister>
     {
-        let layout = self.register_layout()?;
+        self.register_layout()?;
         if self.common_cfg.length <= COMMON_DEVICE_STATUS
         {
             return None;
         }
         let bar = self.common_cfg.bar;
-        layout.bars().iter().find(|b| b.bar == bar)?;
         Some(StatusRegister {
             bar,
             offset: u64::from(self.common_cfg.offset) + u64::from(COMMON_DEVICE_STATUS),

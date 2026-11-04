@@ -1388,13 +1388,22 @@ impl ServedDriver
     {
         let _ = syscall::cap_revoke(self.ep);
         let _ = syscall::cap_delete(self.ep);
+        self.reset_device();
         if let Some(dev_caps) = &self.dev_caps
         {
-            if let Some(reset) = dev_caps.reset
-            {
-                reset.reset();
-            }
             dev_caps.release();
+        }
+    }
+
+    /// Reset a `VirtIO` device ([`DeviceReset::reset`]); a no-op for a driver
+    /// with no `VirtIO` device. Called before a live driver is destroyed, so
+    /// the device's DMA stops before the driver's memory is freed, and by
+    /// [`Self::withdraw`].
+    fn reset_device(&self)
+    {
+        if let Some(reset) = self.dev_caps.as_ref().and_then(|d| d.reset)
+        {
+            reset.reset();
         }
     }
 }
@@ -1422,8 +1431,10 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
             "{}: driver not recorded; device not served",
             spawned.class.name()
         );
-        // Destroy the live driver first, so the reset in `withdraw`
-        // is the last write its device sees.
+        // Reset the device before destroying the live driver, so its
+        // DMA stops before the driver's memory returns to memmgr, and
+        // again in `withdraw`, so that reset is the last write it sees.
+        spawned.driver.reset_device();
         spawn::destroy_child(spawned.process_handle, ipc_buf);
         spawned.driver.withdraw();
     }
@@ -1476,8 +1487,10 @@ impl ServedDrivers
                     if class.try_reserve(1).is_err()
                     {
                         std::os::seraph::log!("{}: no memory to serve the driver; destroyed", name);
-                        // Destroy the live driver first, so the reset in `withdraw`
-                        // is the last write its device sees.
+                        // Reset the device before destroying the live driver, so its
+                        // DMA stops before the driver's memory returns to memmgr, and
+                        // again in `withdraw`, so that reset is the last write it sees.
+                        spawned.driver.reset_device();
                         spawn::destroy_child(spawned.process_handle, ipc_buf);
                         spawned.driver.withdraw();
                     }
@@ -1503,8 +1516,10 @@ impl ServedDrivers
                         "{}: driver reported neither ready nor death before the settle ended; destroyed",
                         name
                     );
-                    // Destroy the live driver first, so the reset in `withdraw`
-                    // is the last write its device sees.
+                    // Reset the device before destroying the live driver, so its
+                    // DMA stops before the driver's memory returns to memmgr, and
+                    // again in `withdraw`, so that reset is the last write it sees.
+                    spawned.driver.reset_device();
                     spawn::destroy_child(spawned.process_handle, ipc_buf);
                     spawned.driver.withdraw();
                 }

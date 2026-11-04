@@ -25,7 +25,7 @@ withdrawn.
    registry (`QUERY_*_DEVICE`). A driver MUST report `DRIVER_READY` on its devmgr query cap once
    its device is set up, immediately before its service loop (`ipc::report_driver_ready`), and
    exit when devmgr refuses the report: devmgr serves its endpoint only after that report, and
-   withdraws and destroys a driver that has not reported within its settle bound; see
+   destroys and withdraws a driver that has not reported within its settle bound; see
    [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities.
 5. A driver holding an IRQ binding on a line devmgr may share (a PCI `INTx` line) MUST
@@ -53,13 +53,14 @@ withdrawn.
 ## Withdrawal
 
 devmgr withdraws every driver it does not, or no longer, serves: one that dies, fails its device
-setup, overruns its settle bound, or that devmgr cannot record or serve. It destroys a driver still
-running first; for a `VirtIO` PCI driver it then resets the device through a BAR cap it keeps
-(`device_status` 0), which stops the device's DMA and drops its pending interrupt, before it
-releases the device's caps. A driver that dies while its device asserts a shared level-triggered
-line therefore leaves the line's other receivers no assertion to loop on once the reset lands;
-between the driver's death, which releases its binding, and the reset, they may see re-deliveries
-their own devices did not raise
+setup, overruns its settle bound, or that devmgr cannot record or serve. For a `VirtIO` PCI driver
+it resets the device through a BAR cap it keeps (`device_status` 0), which stops the device's DMA
+and drops its pending interrupt, before it releases the device's caps. A driver still running is
+reset, destroyed, and reset again: the device's DMA stops before the driver's memory is freed, and
+the last write the device sees is devmgr's. A driver that dies while its device asserts a shared
+level-triggered line therefore leaves the line's other receivers no assertion to loop on once the
+reset lands; between the driver's death, which releases its binding, and the reset, they may see
+re-deliveries their own devices did not raise
 ([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
 § Interrupt Delivery). The withdrawal, the reset among its steps, is specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)

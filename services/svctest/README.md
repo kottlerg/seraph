@@ -161,8 +161,7 @@ reply to `SHUTDOWN`.
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
 its child body and exits (`park-child` and `reclaim-child` park until their spawner tears them
-down), and an unmatched
-token falls through to the normal run.
+down), and an unmatched token falls through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
 |-----------------------------|----------------|---------------------------------------------|

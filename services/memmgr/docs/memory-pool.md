@@ -172,8 +172,8 @@ RAM is exhausted.
 
 ## Metadata Arena
 
-All of memmgr's bookkeeping — free runs, process records, and per-process
-frame and region descriptors — is nodes drawn from a self-hosted arena rather
+All of memmgr's bookkeeping — free runs, deferred runs, process records, and
+per-process frame and region descriptors — is nodes drawn from a self-hosted arena rather
 than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap a general
 heap against itself, but it *can* host fixed-size nodes in pages carved from
 its own pool:
@@ -231,8 +231,8 @@ bookkeeping is shaped so the SMP pager
 buffers ([#254](https://github.com/kottlerg/seraph/issues/254)), is a
 service-internal change rather than a rewrite of this layer:
 
-- The arena, the free pool, and the process index are plain values with no
-  global state, mutated only through exclusive references, and held together
+- The arena, the free pool, the deferred list, and the process index are
+  plain values with no global state, mutated only through exclusive references, and held together
   in one ledger; every growth path that needs a syscall sits outside them.
 - Several ledgers can coexist, each with its own arena and free pool, so a
   pool shard per CPU or NUMA node is one ledger per shard.
@@ -305,11 +305,16 @@ A query that fails answers no. A quiescent frame joins the free pool. Any other 
 **deferred list**: its descriptor node is rewritten into a run node in place, as a pooled frame's
 is, so reclamation still never allocates and cannot fail. A deferred run is owned by memmgr and
 counted in `pool_total`, lent to no process, and never granted. Before every `PROCESS_DIED`,
-`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before a `REQUEST_MEMORY_CAPS` answers
-`OUT_OF_MEMORY_CONTIGUOUS` or `OUT_OF_MEMORY_BEST_EFFORT`, memmgr rechecks the oldest
-`DEFERRED_RECHECK_BATCH` (64) deferred runs: each that has become quiescent joins the free pool
-(and a request that failed selects again), and each that has not goes to the back of the list,
-so successive rechecks visit every run. No timer drives it; a run that becomes quiescent while
+`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool
+fails (a `REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index,
+page-table, or `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run
+that has become quiescent joins the free pool (and the failed selection runs once more), and
+each that has not goes to the back of the list, so successive rechecks visit every run. One
+recheck takes at most `DEFERRED_RECHECK_BATCH` (64) runs from the list and spends at most
+`DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of
+the run that crosses that budget; the runs of the batch left once the budget is spent go to the
+back unqueried. Its kernel queries are therefore bounded by two per run taken plus 256, plus
+the windows of the largest deferred run. No timer drives it; a run that becomes quiescent while
 no message arrives waits for the next one. A run whose reaching object or mapping never goes,
 held by a process that never drops it, stays deferred for the rest of the boot, and
 `QUERY_POOL_STATUS` reports the deferred total (see
@@ -354,10 +359,11 @@ longer holds one — so it names each region by the `phys_base` memmgr reported
 at grant. memmgr matches that base against the entry's frame list
 (`FRAME_VA_UNMAPPED` grants only; demand-mapped chunks are reclaimed by
 `UNREGISTER_REGION`), takes the frame off the record, returns it to the pool
-when it is quiescent and to the deferred list otherwise, frees the node, and
-coalesces the freed runs with their physical neighbours, leaving the entry's
-other records untouched. Unmatched bases are ignored, so release is idempotent
-(a racing join-plus-reaper double-release is harmless). The caller must have
+when it is quiescent and to the deferred list otherwise (the node becomes
+the run's node in either case), and coalesces the freed runs with their
+physical neighbours, leaving the entry's other records untouched. Unmatched
+bases are ignored, so release is idempotent (a racing join-plus-reaper
+double-release is harmless). The caller must have
 deleted every object retyped from the region and unmapped it first; a region
 released with a live retype or a mapping waits on the deferred list until both
 are gone, so the next grantee of a pooled run can always split it, map it
@@ -370,9 +376,9 @@ whole region span from the delegated child `AddressSpace` in one
 address space's page-table budget (the process is still alive, so the mappings
 must be removed before the frames return to the pool). It then returns each
 backing frame's cap to the pool, or to the deferred list when the frame is not
-quiescent, frees the frame nodes, and coalesces the freed runs with their
-physical neighbours. Frames the caller mapped itself
-are left untouched. This is the reclamation path the ruststd guarded-stack
+quiescent (each frame node becoming its run's node), and coalesces the freed
+runs with their physical neighbours. Frames the caller mapped itself are left
+untouched. This is the reclamation path the ruststd guarded-stack
 consumer uses on `join()`.
 
 ---
@@ -464,8 +470,11 @@ terminal fault tears down the whole process (see
 ## Summarized By
 
 [abi/process-abi/README.md](../../../abi/process-abi/README.md),
+[Capability Model](../../../docs/capability-model.md),
 [Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[FS Driver Protocol](../../fs/docs/fs-driver-protocol.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

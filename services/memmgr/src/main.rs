@@ -245,11 +245,12 @@ const LAYOUT_DEFAULT: ArenaLayout = ArenaLayout {
     high_end: META_ARENA_HIGH_END,
 };
 
-// All bookkeeping (arena, free pool, process index) lives in one ledger so it
-// never lands on a syscall stack frame. memmgr is single-threaded: its only
-// thread runs the dispatch loop and owns the ledger exclusively, so the
-// `static mut` access is sound. Each handler takes the ledger once, through
-// `ledger_mut()`, and passes it down; nothing takes it twice at a time.
+// All bookkeeping (arena, free pool, deferred list, process index) lives in
+// one ledger so it never lands on a syscall stack frame. memmgr is
+// single-threaded: its only thread runs the dispatch loop and owns the
+// ledger exclusively, so the `static mut` access is sound. Each handler
+// takes the ledger once, through `ledger_mut()`, and passes it down; nothing
+// takes it twice at a time.
 static mut LEDGER: MemLedger = Ledger::new(
     MappedSlots {
         layout: LAYOUT_DEFAULT,
@@ -324,8 +325,25 @@ fn coalesce(l: &mut MemLedger)
 }
 
 /// Select runs for `want` pages (see `FreePool::select`), mapping a failure to
-/// its `memmgr_errors` code.
+/// its `memmgr_errors` code. Every pool draw comes through here (a grant, a
+/// demand fault, and memmgr's own arena, index, page-table and `CSpace`
+/// growth), so a failed selection first rechecks the deferred runs and, when
+/// one moved to the pool, selects once more
+/// (services/memmgr/docs/memory-pool.md § Reclamation).
 fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
+{
+    select_pooled(l, want, fit).or_else(|code| {
+        if recheck_deferred(l) == 0
+        {
+            return Err(code);
+        }
+        coalesce(l);
+        select_pooled(l, want, fit)
+    })
+}
+
+/// One selection from the free pool as it stands.
+fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 {
     l.pool
         .select(&mut l.arena, want, fit, split)
@@ -338,18 +356,28 @@ fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 
 // ── Deferred reclamation ─────────────────────────────────────────────────────
 
-/// Deferred runs one recheck examines ([`recheck_deferred`]): it bounds the
-/// work one request adds to the receive loop every process shares. A tuning
-/// value that bounds no capacity: a run the check refuses goes to the back
-/// of the list, so successive rechecks visit every run in turn.
+/// Deferred runs one recheck takes from the list ([`recheck_deferred`]). With
+/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work one message adds to the
+/// receive loop every process shares. A tuning value that bounds no
+/// capacity: a run not pooled goes to the back of the list, so successive
+/// rechecks visit every run in turn.
 const DEFERRED_RECHECK_BATCH: u64 = 64;
 
+/// Mapping-count windows (`CAP_INFO_MEMORY_MAPPINGS`, up to
+/// `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages each) one recheck spends
+/// ([`recheck_deferred`]). Once they are spent, the batch's remaining runs go
+/// to the back of the list unqueried; the run that spends the last of them is
+/// still read whole, so a run larger than the budget is checked when it
+/// reaches the head. A tuning value that bounds no capacity.
+const DEFERRED_RECHECK_WINDOWS: u64 = 256;
+
 /// Whether no process but memmgr can still reach the frame `run` names
-/// through a kernel object or a user mapping (`docs/memory-pool.md`
-/// § Reclamation): memmgr's retained cap still covers every page it granted,
-/// no byte of the region is retyped (`available_bytes == size`), and no
-/// address space maps any page of it. A query that fails answers no, so the
-/// run waits rather than joining the pool.
+/// through a kernel object or a user mapping
+/// (services/memmgr/docs/memory-pool.md § Reclamation): memmgr's retained
+/// cap still covers every page it granted, no byte of the region is retyped
+/// (`available_bytes == size`), and no address space maps any page of it. A
+/// query that fails answers no, so the run waits rather than joining the
+/// pool.
 fn quiescent(run: &FreeRun) -> bool
 {
     let Some(bytes) = run.page_count.checked_mul(PAGE_SIZE)
@@ -380,12 +408,24 @@ fn unmapped(cap: u64, pages: u64) -> bool
     true
 }
 
-/// Move up to [`DEFERRED_RECHECK_BATCH`] deferred runs that have become
-/// [`quiescent`] to the free pool. Returns the pages moved; the caller
-/// coalesces.
+/// Move the deferred runs that have become [`quiescent`] to the free pool,
+/// taking at most [`DEFERRED_RECHECK_BATCH`] runs from the list and spending
+/// at most [`DEFERRED_RECHECK_WINDOWS`] mapping windows (plus the rest of
+/// the run that crosses it). Returns the pages moved; the caller coalesces.
 fn recheck_deferred(l: &mut MemLedger) -> u64
 {
-    l.recheck_deferred(DEFERRED_RECHECK_BATCH, quiescent)
+    let mut windows = DEFERRED_RECHECK_WINDOWS;
+    l.recheck_deferred(DEFERRED_RECHECK_BATCH, |run| {
+        if windows == 0
+        {
+            return false;
+        }
+        windows = windows.saturating_sub(
+            run.page_count
+                .div_ceil(syscall::CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES),
+        );
+        quiescent(run)
+    })
 }
 
 /// Free arena slots held back from every allocation but the last-resort
@@ -892,17 +932,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     {
         Fit::Contiguous
     };
-    // A failed selection first rechecks the deferred runs: one that has become
-    // quiescent since its reclaim may cover the request.
-    let selected = select(l, want_pages, fit).or_else(|code| {
-        if recheck_deferred(l) == 0
-        {
-            return Err(code);
-        }
-        coalesce(l);
-        select(l, want_pages, fit)
-    });
-    let grant = match selected
+    let grant = match select(l, want_pages, fit)
     {
         Ok(g) => g,
         Err(code) =>
@@ -997,10 +1027,11 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     };
 
     // Each word names a previously-granted region by physical base (the value
-    // memmgr reported in the grant reply). Return every match to the pool;
-    // unmatched bases are ignored, so release is idempotent and a racing
-    // double-release (a joined thread plus the detached-thread reaper) is
-    // harmless. Clamp to the words actually present to stay in bounds.
+    // memmgr reported in the grant reply). Take every match back, into the
+    // pool or onto the deferred list as `quiescent` decides; unmatched bases
+    // are ignored, so release is idempotent and a racing double-release (a
+    // joined thread plus the detached-thread reaper) is harmless. Clamp to
+    // the words actually present to stay in bounds.
     let count = (req.word(0) as usize).min(req.word_count().saturating_sub(1));
     recheck_deferred(l);
     for i in 0..count
@@ -1092,7 +1123,7 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // mappings are gone. An object another process still references, or a
     // mapping another address space holds, outlives the child: `quiescent`
     // checks each frame, and `remove_process` pools the frames it accepts and
-    // parks the rest on the deferred list (docs/memory-pool.md
+    // parks the rest on the deferred list (services/memmgr/docs/memory-pool.md
     // § Reclamation). Each descriptor slot becomes the run's slot, so neither
     // move can fail. Reachability-only for the identity: these pages were
     // already counted in pool_total at acquisition. No unmap is performed.
@@ -1205,13 +1236,15 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
     })
 }
 
-/// Reply with the all-RAM-accounted identity terms plus the current free total
-/// (all in bytes): `system_ram`, `kernel_reserved`, `pool_total`, `free`.
-/// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
-/// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
-/// the subset currently in free runs (lent to no process), which falls on
-/// allocation and rises on reclamation. The identity facts arrive verbatim
-/// from the kernel.
+/// Reply with the all-RAM-accounted identity terms plus the current free and
+/// deferred totals (all in bytes): `system_ram`, `kernel_reserved`,
+/// `pool_total`, `free`, `deferred`. Read-only; the caller asserts
+/// `system_ram == kernel_reserved + pool_total`. `pool_total` is the monotonic
+/// owned-RAM counter scaled to bytes; `free` is the subset currently in free
+/// runs (lent to no process), which falls on allocation and rises on
+/// reclamation; `deferred` is the subset reclaimed but held on the deferred
+/// list while another process can still reach it. The identity facts arrive
+/// verbatim from the kernel.
 fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 {
     let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
@@ -1284,7 +1317,8 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
 /// Attributed by `req.badge`; words are `[va_base, len_bytes]`. The range must
 /// match a previously [`handle_register_region`]'d region exactly. memmgr
 /// unmaps the region span from the child `AddressSpace`, returns each backing
-/// frame to the pool, and frees the region. The reverse of registration plus
+/// frame to the pool (or to the deferred list when it is not quiescent), and
+/// frees the region. The reverse of registration plus
 /// the frames [`handle_fault`] mapped. Reply: [`memmgr_errors::SUCCESS`], or
 /// `INVALID_ARGUMENT` (unknown badge or no exact-match region).
 fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)

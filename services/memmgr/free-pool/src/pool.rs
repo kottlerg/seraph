@@ -92,7 +92,8 @@ impl Default for FreePool
     }
 }
 
-fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<FreeRun>
+/// The run slot `idx` holds, or `None` when it holds another node.
+pub(crate) fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<FreeRun>
 {
     match arena.get(idx).node
     {

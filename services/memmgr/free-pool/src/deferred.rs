@@ -14,8 +14,8 @@
 //! See `services/memmgr/docs/memory-pool.md` § Reclamation.
 
 use crate::FreeRun;
-use crate::arena::{Arena, NODE_NULL, Node, NodeIdx, SlotStore};
-use crate::pool::FreePool;
+use crate::arena::{Arena, NODE_NULL, NodeIdx, SlotStore};
+use crate::pool::{FreePool, run_of};
 
 /// Parked runs, oldest first, chained through each slot's `next` link, with
 /// running totals of their runs and pages.
@@ -35,17 +35,9 @@ impl Default for DeferredList
     }
 }
 
-fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<FreeRun>
-{
-    match arena.get(idx).node
-    {
-        Node::Run(run) => Some(run),
-        _ => None,
-    }
-}
-
 impl DeferredList
 {
+    /// An empty list: no run parked, no page counted.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -72,11 +64,14 @@ impl DeferredList
         self.pages
     }
 
-    /// Append the run slot `idx` already holds. A slot that does not hold a
-    /// run is ignored.
+    /// Append the run slot `idx` already holds. Every caller rewrites the slot
+    /// into a run first; a slot that does not hold one is a caller defect,
+    /// caught in debug builds and ignored otherwise.
     pub fn park<S: SlotStore>(&mut self, arena: &mut Arena<S>, idx: NodeIdx)
     {
-        let Some(run) = run_of(arena, idx)
+        let parked = run_of(arena, idx);
+        debug_assert!(parked.is_some(), "park: slot {idx} holds no run");
+        let Some(run) = parked
         else
         {
             return;
@@ -106,7 +101,7 @@ impl DeferredList
             self.tail = NODE_NULL;
         }
         self.runs -= 1;
-        self.pages -= run.page_count;
+        self.pages = self.pages.saturating_sub(run.page_count);
         Some((idx, run))
     }
 
@@ -148,6 +143,7 @@ impl DeferredList
 mod tests
 {
     use super::*;
+    use crate::arena::Node;
     use crate::arena::test_store::VecStore;
 
     fn arena() -> Arena<VecStore>

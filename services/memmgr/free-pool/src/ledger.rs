@@ -3,8 +3,9 @@
 
 // services/memmgr/free-pool/src/ledger.rs
 
-//! memmgr's whole bookkeeping state: the arena, the free pool over it, and
-//! the process index, with the per-process frame and region list operations.
+//! memmgr's whole bookkeeping state: the arena, the free pool over it, the
+//! deferred list beside it, and the process index, with the per-process frame
+//! and region list operations.
 //!
 //! A [`Ledger`] owns no global state and is mutated only through `&mut`, so
 //! the service holds one instance today and a sharded pager can hold one per
@@ -54,6 +55,8 @@ pub struct Ledger<S, W>
 {
     pub arena: Arena<S>,
     pub pool: FreePool,
+    /// Runs taken back from a process but held out of `pool` until the
+    /// caller's quiescence check accepts them.
     pub deferred: DeferredList,
     pub index: ProcessIndex<W>,
 }

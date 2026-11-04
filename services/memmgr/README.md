@@ -145,7 +145,8 @@ The remaining constants are tuning values that bound no capacity:
 | `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table self-funding step and retries per map |
 | `MAX_LOAD` | 2 | Mean index chain length before a bucket split |
 | `ARENA_RETURN_RESERVE` | 1 slot | Arena slot kept for last-resort returns of a run to the pool |
-| `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck examines; a refused run goes to the back |
+| `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck takes from the list; a run not pooled goes to the back |
+| `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count queries one recheck spends, past the run that crosses it |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)

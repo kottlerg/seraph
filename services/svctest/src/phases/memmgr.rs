@@ -667,6 +667,28 @@ fn recheck_deferred()
     );
 }
 
+/// memmgr's deferred total once rechecks stop lowering it: a run already
+/// deferred that has become quiescent is pooled now, not by a recheck inside
+/// the phase's own later messages, which would lower the total the phase
+/// compares against its baseline.
+fn settled_deferred_bytes() -> u64
+{
+    // A test wait bound: it limits only how many rechecks the settle takes.
+    const MAX_SETTLE: u32 = 64;
+    let mut last = deferred_bytes();
+    for _ in 0..MAX_SETTLE
+    {
+        recheck_deferred();
+        let now = deferred_bytes();
+        if now >= last
+        {
+            return now;
+        }
+        last = now;
+    }
+    last
+}
+
 /// Trigger rechecks until memmgr's deferred total falls to `target` bytes or
 /// below; panics with `what` when it does not within the poll bound.
 fn await_deferred_at_most(target: u64, what: &str)
@@ -804,7 +826,7 @@ pub fn frame_reclaim_live_object_phase(_: &Caps)
         .spawn(move || receive_handed_send(ep))
         .expect("frame_reclaim_live_object: server thread spawn failed");
 
-    let baseline = deferred_bytes();
+    let baseline = settled_deferred_bytes();
     let mut child = std::process::Command::new("/tests/svctest")
         .arg(RECLAIM_CHILD_ROLE)
         .namespace_cap(root)
@@ -897,7 +919,7 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     unsafe { syscall::mem_map(grant, info.self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }
         .expect("frame_reclaim_mapped_release: mem_map of the grant failed");
 
-    let baseline = deferred_bytes();
+    let baseline = settled_deferred_bytes();
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
         .word(0, 1)
         .word(1, phys_base)

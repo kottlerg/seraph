@@ -3070,12 +3070,24 @@ pub unsafe fn object_for_new_slot(
 {
     use crate::cap::slot::CapTag;
 
+    // Each typed arm reads `src` selected by its own tag as data, so an arm a
+    // mispredicted tag match reaches reads through null, never an object of
+    // another type (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening).
+    let typed = |arm: CapTag| {
+        crate::arch::nospec::select_ptr(
+            crate::arch::nospec::mask_if(tag == arm),
+            src.as_ptr(),
+            core::ptr::null_mut(),
+        )
+    };
+
     match tag
     {
         CapTag::Mmio =>
         {
-            // SAFETY: tag Mmio; src pinned (contract).
-            let mo = unsafe { &*src.as_ptr().cast::<MmioObject>() };
+            // SAFETY: tag Mmio; src pinned (contract); `typed` returns src for it.
+            let mo = unsafe { &*typed(CapTag::Mmio).cast::<MmioObject>() };
             let root = mo.lineage.root_of(src);
             // SAFETY: src is a pinned member of root's lineage, so root's live
             // count is above zero.
@@ -3095,8 +3107,8 @@ pub unsafe fn object_for_new_slot(
         }
         CapTag::IoPort =>
         {
-            // SAFETY: tag IoPort; src pinned (contract).
-            let po = unsafe { &*src.as_ptr().cast::<IoPortObject>() };
+            // SAFETY: tag IoPort; src pinned (contract); `typed` returns src for it.
+            let po = unsafe { &*typed(CapTag::IoPort).cast::<IoPortObject>() };
             let root = po.lineage.root_of(src);
             // SAFETY: as the Mmio arm.
             let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
@@ -3114,8 +3126,8 @@ pub unsafe fn object_for_new_slot(
         }
         CapTag::Interrupt =>
         {
-            // SAFETY: tag Interrupt; src pinned (contract).
-            let io = unsafe { &*src.as_ptr().cast::<InterruptObject>() };
+            // SAFETY: tag Interrupt; src pinned (contract); `typed` returns src for it.
+            let io = unsafe { &*typed(CapTag::Interrupt).cast::<InterruptObject>() };
             let root = io.lineage.root_of(src);
             // SAFETY: as the Mmio arm.
             let lineage = unsafe { RangeLineage::reserve_copy(root) }?;

@@ -27,6 +27,13 @@ The CSpace has the following properties:
 - **Pay-as-you-go** — capacity is whatever the owner-funded slot-page pool
   backs (see growth budgets below), bounded only by the directory's
   structural ceiling
+- **Bounded under speculation** — no user-supplied handle reaches a load that
+  depends on it before its index bound and its occupancy, generation, type, and
+  rights checks are enforced as data, not by a conditional branch alone: a
+  misspeculated resolution yields no capability, never another slot's, an
+  object of another type, or rights the slot does not hold (mechanism:
+  [core/kernel/docs/capability-internals.md](../core/kernel/docs/capability-internals.md)
+  § Speculative-Execution Hardening)
 
 Slot 0 is permanently null and cannot be written — using index 0 always means "no
 capability".

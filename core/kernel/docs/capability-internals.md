@@ -127,6 +127,47 @@ has grown, but the slot is permanently locked to the null capability,
 enforced at the lookup level (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces).
 
+### Speculative-Execution Hardening
+
+The rule is [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces:
+resolving a handle holds under speculative execution. A bound enforced only by a conditional
+branch does not hold on a mispredicted path, where the loads behind the branch execute with the
+out-of-bound value, so every bound between a user-supplied handle and the object it names is also
+enforced as data.
+
+The primitive is `arch::current::speculation::index_mask(index, bound)`: all-ones when
+`index < bound`, else zero, computed without a branch (x86-64 `cmp` then `sbb`; riscv64 `sltu`
+then `neg`, base RV64I, since the RVA23 floor defines no speculation barrier). It is inline
+assembly so the compiler cannot prove the mask redundant inside the arm of the guarding branch and
+delete it. `arch::nospec` builds the arch-neutral forms on it: `mask_index`, `mask_index_u64`,
+`mask_if` (all-ones when a condition holds), and `select_ptr` (one of two pointers chosen by a
+mask).
+
+| Site | User-controlled value | Load it would steer | Hardening |
+|---|---|---|---|
+| `CSpace::leaf_ptr`, direct arm | handle index | `direct[leaf]` past the inline root | the leaf index is masked against `L1_DIRECT`; a failed bound selects `SENTINEL_LEAF` |
+| `CSpace::leaf_ptr`, indirect arm | handle index | `indirect[..]` past the inline root, then the directory entry | the region-relative index is masked against `L1_INDIRECT × DIR_FANOUT`; a failed bound selects `SENTINEL_LEAF` |
+| Leaf and directory pointers | handle index | a null leaf or directory dereferenced at an offset below one page | no pointer is null: unallocated entries name `SENTINEL_LEAF` and `SENTINEL_DIR`, so the path has no null test |
+| `syscall::pin_checked` (`pin_slot`, `lookup_cap`) | handle | the handler's typed accesses of a slot's object | occupancy, generation, type, and rights are computed as values and folded into the object through `mask_if`: on a path past a failed check, the object is null |
+| `sys_cap_info`, `wait_set_source`, `object_for_new_slot` | the slot's tag | a cast to the wrong object type | each tag arm casts the object selected by its own tag as data (`PinnedCap::object_of`, or the same select) |
+| `syscall::dispatch` | syscall number | a jump-table entry past the table | a number at or past `SYSCALL_NR_BOUND` is refused, and the table reads the number through `mask_index_u64` |
+
+The sentinels are two statics in `cap/cspace.rs`. `SENTINEL_LEAF` is an all-`Null` `CSpacePage`
+(4032 bytes) with no interior mutability, so it is placed in read-only data. `SENTINEL_DIR` is one
+page of directory entries, each naming `SENTINEL_LEAF`. A `CSpace` starts with every inline entry
+naming a sentinel, and a grow fills a new directory page's entries with `SENTINEL_LEAF` before
+publishing it. `slot` and `slot_mut` refuse the sentinel after the loads, so architecturally an
+unallocated index still resolves nothing, and `slot_mut` never hands out the shared page. The
+masked fallback of either `leaf_ptr` arm is the sentinel, never leaf 0, so a mispredicted bound
+reads only `Null` slots and never aliases a live slot of the caller's `CSpace`. Every resolution
+of a handle passes through `slot` or `slot_mut`: `pin_slot`, `lookup_cap`, the capability-tree
+handlers, the IPC transfer pre-validation, and explicit placement.
+
+A misspeculated use of the null object that `pin_checked` folds a failed lookup into dereferences
+null at a small offset. Userspace can map virtual page 0 (#741), and the documents do not state
+whether SMAP or a clear `SUM` stop that transient load. The user-supplied indexes that select a
+kernel array entry outside the capability path are recorded on #270.
+
 ### Free Slot Tracking
 
 A free list of available slot indices is maintained intrusively, with its head in

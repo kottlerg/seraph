@@ -2754,7 +2754,13 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     let slot = unsafe { super::pin_slot(caller_cspace, slot_handle) }?;
     let tag = slot.tag;
     let rights = slot.rights;
-    let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
+    if slot.object.is_none()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // Each typed arm below casts `slot.object_of(<its tag>)`, the object
+    // selected by the tag as data, so an arm a mispredicted tag test reaches
+    // casts null, never an object of another type.
 
     match field
     {
@@ -2782,7 +2788,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: MemoryObject (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             Ok(memory.size)
         }
         CAP_INFO_MEMORY_AVAILABLE =>
@@ -2795,7 +2801,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             Ok(memory.available_bytes.load(Ordering::Acquire))
         }
         CAP_INFO_MEMORY_HAS_RETYPE =>
@@ -2816,7 +2822,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             Ok(memory.base)
         }
         CAP_INFO_MEMORY_MAPPINGS =>
@@ -2829,7 +2835,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             // Read-lock the region so a concurrent split cannot shrink it
             // between the window check and the walk.
             let _guard = crate::cap::object::MemoryReadGuard::acquire(memory);
@@ -2857,7 +2863,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the ThreadObject sits at the page-aligned start of page
             // KERNEL_STACK_PAGES of the Thread retype slot; header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let thr_obj = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
+            let thr_obj = unsafe { &*(slot.object_of(CapTag::Thread).cast::<ThreadObject>()) };
             let target_tcb = thr_obj.tcb;
             if target_tcb.is_null()
             {
@@ -2903,7 +2909,11 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
+            let as_obj = unsafe {
+                &*(slot
+                    .object_of(CapTag::AddressSpace)
+                    .cast::<AddressSpaceObject>())
+            };
             Ok(as_obj.pt_growth_budget_bytes.load(Ordering::Acquire))
         }
         CAP_INFO_CSPACE_CAPACITY =>
@@ -2916,7 +2926,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_obj = unsafe { &*(slot.object_of(CapTag::CSpace).cast::<CSpaceKernelObject>()) };
             let target = cs_obj.cspace;
             if target.is_null()
             {
@@ -2957,7 +2967,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_obj = unsafe { &*(slot.object_of(CapTag::CSpace).cast::<CSpaceKernelObject>()) };
             let target = cs_obj.cspace;
             if target.is_null()
             {
@@ -2984,7 +2994,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_obj = unsafe { &*(slot.object_of(CapTag::CSpace).cast::<CSpaceKernelObject>()) };
             Ok(cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire))
         }
         _ => Err(SyscallError::InvalidArgument),

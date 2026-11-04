@@ -37,18 +37,19 @@ build breaks. Items with no neutral caller are not checked this way: `interrupts
 core/kernel/src/arch/
 ├── mod.rs          # The only #[cfg(target_arch)] site; aliases the active arch as `current`;
 │                   # defines the shared `ThreadKind`; host-test-builds riscv64's `encoding`
+├── nospec.rs       # Arch-neutral speculation-safe bounds over `current::speculation`
 ├── x86_64/
 │   ├── mod.rs      # Module declarations and arch constants (ARCH_NAME, …)
 │   ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
 │   ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
 │   ├── gdt.rs      ├── idt.rs      ├── ioapic.rs     ├── fpu.rs
-│   ├── platform.rs ├── ap_trampoline.rs └── entropy.rs
+│   ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs └── speculation.rs
 └── riscv64/
     ├── mod.rs
     ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
-    ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs
+    ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
     └── encoding.rs # PLIC map, SBI hart mask, F/D/V opcode decode; no arch-module deps
 ```
 
@@ -668,6 +669,25 @@ pub fn hw_rng_u64() -> Option<u64>;
 /// Read a free-running cycle counter for jitter sampling; use deltas only
 /// (x86-64 TSC via `rdtsc`; RISC-V the `time` CSR).
 pub fn read_cycle_counter() -> u64;
+```
+
+---
+
+## `speculation` — `arch::current::speculation`
+
+The bound primitive the speculation-safe paths are built on (the rule is
+[docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces; its use is
+[capability-internals.md](capability-internals.md) § Speculative-Execution Hardening).
+Architecture-neutral code calls it through `arch::nospec`, which adds `mask_index`,
+`mask_index_u64`, `mask_if`, and `select_ptr` over it.
+
+```rust
+/// All-ones when `index < bound`, zero otherwise, computed without a branch, so
+/// the outcome holds on a mispredicted path. Inline assembly, so the compiler
+/// cannot delete the mask inside the arm of the branch that guards the access
+/// (x86-64 `cmp` + `sbb`; RISC-V `sltu` + `neg`, base RV64I: the RVA23 floor
+/// defines no speculation barrier).
+pub fn index_mask(index: usize, bound: usize) -> usize;
 ```
 
 ---

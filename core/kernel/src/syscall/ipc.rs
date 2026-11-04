@@ -1827,39 +1827,61 @@ unsafe fn wait_set_source(
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
 
-    let obj_ptr = src.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-    // SAFETY: src pins the object (contract) and its tag names the wrapper
-    // type, whose `state` field is read.
+    if src.object.is_none()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // Each arm reads `src.object_of(<its tag>)`, the object selected by the
+    // tag as data, so an arm a mispredicted tag match reaches reads through
+    // null, never an object of another type.
+    // SAFETY: src pins the object (contract) and the arm's tag names the
+    // wrapper type, whose `state` field is read; the arm's tag is the slot's,
+    // so `object_of` returns the pinned object.
     // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
     #[allow(clippy::cast_ptr_alignment)]
-    let (state, tag, right) = unsafe {
+    let (state, tag, header, right) = unsafe {
         match src.tag
         {
-            CapTag::Endpoint => (
-                (*obj_ptr.cast::<crate::cap::object::EndpointObject>())
-                    .state
-                    .cast::<u8>(),
-                WaitSetSourceTag::Endpoint,
-                EpRights::RECEIVE.erase(),
-            ),
-            CapTag::Notification => (
-                (*obj_ptr.cast::<crate::cap::object::NotificationObject>())
-                    .state
-                    .cast::<u8>(),
-                WaitSetSourceTag::Notification,
-                NtfRights::WAIT.erase(),
-            ),
-            CapTag::EventQueue => (
-                (*obj_ptr.cast::<crate::cap::object::EventQueueObject>())
-                    .state
-                    .cast::<u8>(),
-                WaitSetSourceTag::EventQueue,
-                EqRights::RECV.erase(),
-            ),
+            CapTag::Endpoint =>
+            {
+                let header = src.object_of(CapTag::Endpoint);
+                (
+                    (*header.cast::<crate::cap::object::EndpointObject>())
+                        .state
+                        .cast::<u8>(),
+                    WaitSetSourceTag::Endpoint,
+                    header,
+                    EpRights::RECEIVE.erase(),
+                )
+            }
+            CapTag::Notification =>
+            {
+                let header = src.object_of(CapTag::Notification);
+                (
+                    (*header.cast::<crate::cap::object::NotificationObject>())
+                        .state
+                        .cast::<u8>(),
+                    WaitSetSourceTag::Notification,
+                    header,
+                    NtfRights::WAIT.erase(),
+                )
+            }
+            CapTag::EventQueue =>
+            {
+                let header = src.object_of(CapTag::EventQueue);
+                (
+                    (*header.cast::<crate::cap::object::EventQueueObject>())
+                        .state
+                        .cast::<u8>(),
+                    WaitSetSourceTag::EventQueue,
+                    header,
+                    EqRights::RECV.erase(),
+                )
+            }
             _ => return Err(SyscallError::InvalidCapability),
         }
     };
-    Ok((state, tag, obj_ptr, right))
+    Ok((state, tag, header, right))
 }
 
 /// `SYS_WAIT_SET_REMOVE` (27): unregister a source from a wait set.

@@ -177,10 +177,21 @@ impl UserFrame
     }
 }
 
+/// One past the highest assigned syscall number: the dispatch table's bound.
+/// Every number from 0 up to it is assigned; a new syscall above it raises it.
+#[cfg(not(test))]
+const SYSCALL_NR_BOUND: u64 = SYS_GETRANDOM + 1;
+
 /// Syscall dispatcher: called from the arch-specific trap/syscall entry stub.
 ///
 /// Reads the syscall number from `tf`, invokes the handler, and writes the
 /// return value (or negative error code) back into `tf`.
+///
+/// A number at or past [`SYSCALL_NR_BOUND`] is refused before the match, and
+/// the match reads the number clamped as data (`nospec::mask_index_u64`), so
+/// a mispredicted refusal selects handler 0, never a jump-table entry past the
+/// table (core/kernel/docs/capability-internals.md § Speculative-Execution
+/// Hardening).
 ///
 /// # Safety
 /// `tf` must point to a valid, kernel-stack-resident [`TrapFrame`] for the
@@ -204,7 +215,61 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     // stack; `frame` is its live frame.
     unsafe { stamp_syscall_entry(nr, frame) };
 
-    let ret: Result<u64, SyscallError> = match nr
+    let ret: Result<u64, SyscallError> = if nr >= SYSCALL_NR_BOUND
+    {
+        Err(SyscallError::UnknownSyscall)
+    }
+    else
+    {
+        dispatch_in_range(
+            crate::arch::nospec::mask_index_u64(nr, SYSCALL_NR_BOUND),
+            tf,
+        )
+    };
+
+    let ret_val = match ret
+    {
+        Ok(v) => v.cast_signed(),
+        Err(e) => e as i64,
+    };
+
+    tf.set_return(ret_val);
+
+    // Self-teardown epilogue (#341): a live thread drains this CPU's
+    // deferred-reclaim stack; a thread found `Exited` (before or after the drain)
+    // reschedules away and never returns to userspace. Protocol and invariants:
+    // core/kernel/docs/thread-lifecycle-and-sleep.md § Self-teardown (the caller
+    // is the freed thread).
+    // SAFETY: syscall context on the caller's kernel stack with interrupts
+    // disabled (the drain re-enables them only with preemption disabled), so
+    // this CPU and its `current` are stable across both checks.
+    unsafe {
+        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+        if !crate::sched::running_thread_stopped(this_cpu)
+        {
+            crate::cap::object::drain_deferred_reclaim(this_cpu);
+        }
+        if crate::sched::running_thread_stopped(this_cpu)
+        {
+            crate::sched::schedule(crate::sched::Requeue::IfRunnable);
+            crate::arch::current::cpu::halt_loop();
+        }
+        let tcb = current_tcb();
+        if !tcb.is_null()
+        {
+            (*tcb)
+                .syscall_nr
+                .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// The syscall handler table: call the handler of `nr`, which
+/// [`dispatch`] has refused past [`SYSCALL_NR_BOUND`] and clamped as data.
+#[cfg(not(test))]
+fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, SyscallError>
+{
+    match nr
     {
         SYS_IPC_CALL => ipc::sys_ipc_call(tf),
         SYS_IPC_REPLY => ipc::sys_ipc_reply(tf),
@@ -263,42 +328,6 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
         SYS_CAP_DERIVE_BADGE => cap::sys_cap_derive_badge(tf),
         SYS_CAP_INFO => cap::sys_cap_info(tf),
         _ => Err(SyscallError::UnknownSyscall),
-    };
-
-    let ret_val = match ret
-    {
-        Ok(v) => v.cast_signed(),
-        Err(e) => e as i64,
-    };
-
-    tf.set_return(ret_val);
-
-    // Self-teardown epilogue (#341): a live thread drains this CPU's
-    // deferred-reclaim stack; a thread found `Exited` (before or after the drain)
-    // reschedules away and never returns to userspace. Protocol and invariants:
-    // core/kernel/docs/thread-lifecycle-and-sleep.md § Self-teardown (the caller
-    // is the freed thread).
-    // SAFETY: syscall context on the caller's kernel stack with interrupts
-    // disabled (the drain re-enables them only with preemption disabled), so
-    // this CPU and its `current` are stable across both checks.
-    unsafe {
-        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-        if !crate::sched::running_thread_stopped(this_cpu)
-        {
-            crate::cap::object::drain_deferred_reclaim(this_cpu);
-        }
-        if crate::sched::running_thread_stopped(this_cpu)
-        {
-            crate::sched::schedule(crate::sched::Requeue::IfRunnable);
-            crate::arch::current::cpu::halt_loop();
-        }
-        let tcb = current_tcb();
-        if !tcb.is_null()
-        {
-            (*tcb)
-                .syscall_nr
-                .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
-        }
     }
 }
 
@@ -858,6 +887,34 @@ pub(crate) struct PinnedCap
 }
 
 #[cfg(not(test))]
+impl PinnedCap
+{
+    /// The pinned object when the slot's tag is `tag`, else null, selected as
+    /// data (`nospec::mask_if`).
+    ///
+    /// For handlers that accept several tags and branch on [`Self::tag`]: the
+    /// typed cast in each arm reads this pointer, so an arm reached by a
+    /// mispredicted tag test casts null, never an object of another type
+    /// (core/kernel/docs/capability-internals.md § Speculative-Execution
+    /// Hardening).
+    #[must_use]
+    pub fn object_of(
+        &self,
+        tag: crate::cap::slot::CapTag,
+    ) -> *mut crate::cap::object::KernelObjectHeader
+    {
+        let raw = self
+            .object
+            .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
+        crate::arch::nospec::select_ptr(
+            crate::arch::nospec::mask_if(self.tag == tag),
+            raw,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+#[cfg(not(test))]
 impl Drop for PinnedCap
 {
     fn drop(&mut self)
@@ -879,9 +936,9 @@ impl Drop for PinnedCap
 /// `handle` is the encoded value userspace passes: slot index in the low
 /// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits.
 /// Handlers that accept several tags (`SYS_CAP_INFO`, `SYS_WAIT_SET_ADD`'s
-/// source) check the tag and rights themselves, as do copy, derive, and
-/// derive-badge for their source; every other handler resolves through
-/// [`lookup_cap`].
+/// source) check the tag and rights themselves and reach a typed object
+/// through [`PinnedCap::object_of`], as do copy, derive, and derive-badge for
+/// their source; every other handler resolves through [`lookup_cap`].
 ///
 /// # Errors
 /// [`SyscallError::InvalidCapability`] for a null `cspace`, a missing or
@@ -900,38 +957,8 @@ pub(crate) unsafe fn pin_slot(
     handle: u32,
 ) -> Result<PinnedCap, SyscallError>
 {
-    if cspace.is_null()
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
-    let index = syscall::cap_handle_index(handle);
-    // SAFETY: cspace is the running thread's bound CSpace (contract), live for
-    // the call. Its lock serialises slot occupancy, and every slot free clears
-    // the slot under it before releasing the slot's reference, so an occupied
-    // slot read here names an object whose count is at least one, and the
-    // inc_ref below lands before any release can reach zero. lock_raw and
-    // unlock_raw are paired.
-    let snapshot = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let snapshot = (*cspace).slot(index).and_then(|slot| {
-            (slot.tag != crate::cap::slot::CapTag::Null
-                && slot.generation() == syscall::cap_handle_gen(handle))
-            .then_some((slot.tag, slot.rights, slot.badge, slot.object))
-        });
-        if let Some((_, _, _, Some(obj))) = snapshot
-        {
-            obj.as_ref().inc_ref();
-        }
-        (*cspace).lock.unlock_raw(saved);
-        snapshot
-    };
-    let (tag, rights, badge, object) = snapshot.ok_or(SyscallError::InvalidCapability)?;
-    Ok(PinnedCap {
-        tag,
-        rights,
-        badge,
-        object,
-    })
+    // SAFETY: forwarded caller contract.
+    unsafe { pin_checked(cspace, handle, None, crate::cap::slot::Rights::NONE) }
 }
 
 /// Resolve `handle` to a capability of the type `required_rights` names,
@@ -956,7 +983,7 @@ pub(crate) unsafe fn pin_slot(
 /// - Tag mismatch → [`SyscallError::InvalidCapability`].
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
 ///
-/// Both checks read the snapshot taken under the `CSpace` lock, so a slot
+/// Every check reads the snapshot taken under the `CSpace` lock, so a slot
 /// being cleared concurrently answers `InvalidCapability`, never a rights
 /// refusal read from a half-cleared slot.
 ///
@@ -970,16 +997,89 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
 ) -> Result<PinnedCap, SyscallError>
 {
     // SAFETY: forwarded caller contract.
-    let pinned = unsafe { pin_slot(cspace, handle) }?;
-    if pinned.tag != K::TAG
+    unsafe { pin_checked(cspace, handle, Some(K::TAG), required_rights.erase()) }
+}
+
+/// The resolution [`pin_slot`] and [`lookup_cap`] share: read the slot of
+/// `handle` under the `CSpace` lock, check that it is occupied, of the
+/// handle's generation, of tag `tag` when one is given, and holding
+/// `required`, and pin its object when every check passes.
+///
+/// The checks are folded into the returned object as data: the object pointer
+/// is selected through `nospec::mask_if` over all of them, so on a path that
+/// a mispredicted check reaches, the object is null, never a slot's object of
+/// the wrong type, generation, or rights (core/kernel/docs/capability-internals.md
+/// § Speculative-Execution Hardening). The slot read itself is bounded by
+/// `CSpace::slot`.
+///
+/// # Errors
+/// As for [`lookup_cap`]; with `tag` `None` and `required` empty, as for
+/// [`pin_slot`].
+///
+/// # Safety
+/// As for [`pin_slot`].
+#[cfg(not(test))]
+unsafe fn pin_checked(
+    cspace: *mut crate::cap::cspace::CSpace,
+    handle: u32,
+    tag: Option<crate::cap::slot::CapTag>,
+    required: crate::cap::slot::Rights,
+) -> Result<PinnedCap, SyscallError>
+{
+    use crate::arch::nospec;
+    use crate::cap::slot::CapTag;
+
+    if cspace.is_null()
     {
         return Err(SyscallError::InvalidCapability);
     }
-    if !pinned.rights.contains(required_rights.erase())
+    let index = syscall::cap_handle_index(handle);
+    let generation = syscall::cap_handle_gen(handle);
+    // SAFETY: cspace is the running thread's bound CSpace (contract), live for
+    // the call. Its lock serialises slot occupancy, and every slot free clears
+    // the slot under it before releasing the slot's reference, so an occupied
+    // slot read here names an object whose count is at least one, and the
+    // inc_ref below lands before any release can reach zero. lock_raw and
+    // unlock_raw are paired.
+    let snapshot = unsafe {
+        let saved = (*cspace).lock.lock_raw();
+        let snapshot = (*cspace).slot(index).map(|slot| {
+            // `&`, not `&&`: each check is evaluated as a value, with no branch
+            // a misprediction could take past one of them.
+            let live = (slot.tag != CapTag::Null) & (slot.generation() == generation);
+            let typed = tag.is_none_or(|t| slot.tag == t);
+            let held = slot.rights.contains(required);
+            let usable = nospec::mask_if(live & typed & held);
+            let raw = slot
+                .object
+                .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
+            let object =
+                core::ptr::NonNull::new(nospec::select_ptr(usable, raw, core::ptr::null_mut()));
+            (live, typed, held, slot.tag, slot.rights, slot.badge, object)
+        });
+        if let Some((true, true, true, _, _, _, Some(obj))) = snapshot
+        {
+            obj.as_ref().inc_ref();
+        }
+        (*cspace).lock.unlock_raw(saved);
+        snapshot
+    };
+    let (live, typed, held, tag, rights, badge, object) =
+        snapshot.ok_or(SyscallError::InvalidCapability)?;
+    if !live || !typed
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    if !held
     {
         return Err(SyscallError::InsufficientRights);
     }
-    Ok(pinned)
+    Ok(PinnedCap {
+        tag,
+        rights,
+        badge,
+        object,
+    })
 }
 
 // ── IPC buffer ────────────────────────────────────────────────────────────────

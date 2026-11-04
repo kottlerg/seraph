@@ -42,9 +42,9 @@ the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
 The handoff is total. By the end of Phase 7 the kernel has taken its
-bounded reserves from the buddy (the Phase 4 per-CPU storage, frame map table, and
-`CSpace` registry, the Phase 5 per-CPU tag-state slab, and the Phase 7 contributors, in the order
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
+bounded reserves from the buddy (the Phase 4 guard-table reserve, per-CPU storage, frame map
+table, and `CSpace` registry, the Phase 5 per-CPU tag-state slab, and the Phase 7
+contributors, in the order [initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
 § Phase 5, and § Phase 7 give), drains **every** remaining page into userspace Memory
 caps — coalescing
 physically-adjacent drained blocks into the fewest contiguous caps so the

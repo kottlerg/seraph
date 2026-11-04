@@ -15,12 +15,11 @@
 //!
 //! Every supervised service binds death notification onto svcmgr's death
 //! queues with `correlator = service_index`; a further queue joins when
-//! every pool is out of nodes. The main wait set, which
-//! `death_set::DeathSet` owns and widens as the queues fill it, holds the
-//! service endpoint (badge 0) and every death queue (badge 1). On death
-//! wakeup svcmgr drains the queues and routes each payload to its
-//! `ServiceEntry` via the correlator. Multiplexing avoids consuming a
-//! wait-set slot per supervised process.
+//! every pool is out of nodes. The main wait set, which `death_set::DeathSet`
+//! owns and widens as the queues fill it, holds the service endpoint (badge
+//! 0) and every death queue (badge 1). On death wakeup svcmgr drains the
+//! queues and routes each payload to its `ServiceEntry` via the correlator.
+//! Multiplexing avoids consuming a wait-set slot per supervised process.
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 

@@ -94,11 +94,12 @@ one line: each branch and its head, the worktree's state, and what is left for y
   `Refs #N` for the Issues the commit touches. A closing keyword (`Fixes`, `Closes`, and
   their inflections) appears only in the PR body, never in a commit body, since a commit's
   keyword cannot be withdrawn without a history rewrite.
-- No assistant attribution in a commit message, the PR body, or a PR or Issue comment: no
-  attribution trailer and no assistant session link (docs/conventions.md § Style), whatever the
-  harness appends or asks to append. Write each without one, and after every `gh pr create`,
-  `gh pr edit`, or comment re-read what you wrote: `gh pr view <N> --json body --jq .body |
-  grep -c claude.ai` prints `0`.
+- No assistant attribution trailer or assistant session link in a commit message or the PR
+  body (docs/conventions.md § Style), and, as a worker rule, none in a PR or Issue comment either,
+  whatever the harness appends or asks to append. Write each without one, and after every
+  `gh pr create`, `gh pr edit`, or comment re-read what you wrote: `gh pr view <N> --json body
+  --jq .body`, `gh pr view <N> --json comments --jq '.comments[].body'`, and, for an Issue,
+  `gh issue view <N> --json body,comments` each show no `claude.ai`.
 - Never amend, rebase or otherwise rewrite a commit you have pushed on your own, although
   docs/conventions.md § Operations allows it on a feature branch: another worker or the
   orchestrator may have built on the remote branch. A pushed subject or body that needs
@@ -183,19 +184,21 @@ the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the 
 Before every review run, refresh the PR body to the head the run reviews: the validated head,
 the Validation report, the Acceptance ticks, and every claim the body makes.
 
-- After a fix round whose delta since the last run with the reviewer is documentation or
-  comments only and merges no `master` in, the next run may be the auditor-only run
-  docs/conventions.md § Branch and PR Workflow allows: `pr-auditor` alone, told it is that run
-  (its step 11), with the PR number, the `since` head (the head the last run with the reviewer
-  reviewed), the claimed fixes, and the open Issue list. Save its prose as `audit-<head>.md`
-  and its record as `audit-<head>.json` beside the `full-` and `delta-` records, in the
-  workflow's shape: `mode` `audit`; `verdict` the reviewer verdict that section gives the run,
-  exactly one of `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, `BLOCKING ISSUES`; `audit` the
-  audit verdict line; `findings`, `recorded` and `dropped` empty; `failed_agents`; and
-  `stats.head` and `stats.since`. The ledger command of `.claude/CLAUDE.md` § PR workflow
-  operations reads it with the other records and takes no entry from it. The next delta that
-  changes anything but documentation or comments, or merges `master` in, takes a run with the
-  reviewer, its `since` the head of the last run with the reviewer.
+- When docs/conventions.md § Branch and PR Workflow allows the auditor-only run (the last run
+  with the reviewer completed with no failed agent, and the fix round's delta since it is
+  documentation or comments only and merges no `master` in), the next run may be that run:
+  `pr-auditor` alone, told it is that run (its step 11), with the PR number, the `since` head
+  (the head the last run with the reviewer reviewed), the path of that run's record, the claimed
+  fixes, and the open Issue list. Save its prose as `audit-<head>.md` and its record as
+  `audit-<head>.json` beside the `full-` and `delta-` records, with the keys of the workflow's
+  return: `verdict`, the `Reviewer verdict:` line the audit states, exactly one of
+  `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, `BLOCKING ISSUES`; `audit_verdict`, the audit
+  verdict line; `audit` null; `findings`, `recorded`, `ledgered` and `dropped` empty; and
+  `stats` with `mode` `audit`, `head`, `since`, and `failed` (the agents that returned no
+  result). The ledger command of `.claude/CLAUDE.md` § PR workflow operations reads it with the
+  other records and takes no entry from it. Any later delta that changes anything but
+  documentation or comments, or merges `master` in, takes a run with the reviewer, its `since`
+  the head of the last run with the reviewer.
 
 - Orchestrated, after every review run copy the PR's whole `target/xtask/review/pr<N>/` directory
   into the orchestrator's checkout at the same relative path (the spawn prompt names that
@@ -207,10 +210,11 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
 - `NON-BLOCKING ISSUES ONLY`: record every surface finding on the follow-up Issue of its scope
   first (docs/conventions.md § Branch and PR Workflow requires it before the merge prompt),
   then report and wait; take no fix round on your own. The decision between the merge and one
-  more round is the maintainer's; a fix round that lands ticks the recorded items. The one
-  exception is the maintainer's standing ruling in `.claude/skills/orchestrate/SKILL.md`
-  § Rulings: a PR that drains a follow-up Issue of the scope fixes a nits-only run's findings,
-  recorded there, in the same PR.
+  more round is the maintainer's; a fix round that lands ticks the recorded items. The
+  exceptions are the standing default in `.claude/skills/orchestrate/SKILL.md` § Rulings: a
+  `should` finding takes one fix round; a comment-only nit is fixed in a round the PR owes
+  anyway; and a PR that drains a follow-up Issue of the scope fixes its nits in the same PR.
+  Each such finding is recorded first and ticked when the round fixes it.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `gh issue edit`, or a commit) and re-run the audit.
 - A contested finding is put to the maintainer (through the orchestrator when orchestrated); on
   the surface it resolves in this PR as that section says. A correctness, soundness, safety or

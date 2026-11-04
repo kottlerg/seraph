@@ -235,23 +235,26 @@ are forbidden; `master` MUST NOT receive force pushes.
   unresolved; the prompt offers the merge or one more fix round.
   `.claude/CLAUDE.md` § PR workflow operations gives the assistant's
   procedure.
-- A fix round whose delta (from the head the last run with the reviewer
-  reviewed to the new head) is documentation or comments only, as
-  [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, MAY
-  be followed by an auditor-only run: the closure audit alone, checking the
-  PR body's claims, the recording of findings, the validated head, and the
-  closing conditions at the new head. Since no code read covers a changed
-  comment or document in that run, the audit owes a contract-drift check:
-  every comment or document statement the delta changes is compared against
-  the code it describes, and one the code contradicts is a FAIL; the audit
-  also confirms that the delta delivers each fix the round claims. The
-  reviewer verdict of an auditor-only run is that of the last run with the
-  reviewer, read with the delta's fixes: `READY TO MERGE` when the delta
-  fixes every finding that run left on the surface, `NON-BLOCKING ISSUES
-  ONLY` when every finding it leaves there is non-blocking and recorded as
-  the next item says, and `BLOCKING ISSUES` otherwise. The reviewer returns
-  at the next delta that changes anything but documentation or comments, or
-  that merges `master` into the branch.
+- A fix round MAY be followed by an auditor-only run, the closure audit
+  alone, when the last run with the reviewer completed with no failed agent
+  and the round's delta (from the head that run reviewed to the new head)
+  is documentation or comments only, as
+  [testing.md](testing.md#coverage-tiers) § Coverage tiers defines it, and
+  merges no `master` into the branch. The audit checks the PR body's
+  claims, the recording of findings, the validated head, and the closing
+  conditions at the new head. Since no code read covers a changed comment
+  or document in that run, it owes a contract-drift check: every comment or
+  document statement the delta changes is compared against the code it
+  describes, and one the code contradicts is a FAIL. It reads that last
+  run's record, confirms that the delta delivers each fix the round claims,
+  fails a finding that run left on the surface that is neither fixed by
+  the delta nor recorded as the next item says, and states the reviewer
+  verdict: that of the last run with the reviewer, read with the delta's
+  fixes, `READY TO MERGE` when the delta fixes every finding that run left
+  on the surface, `NON-BLOCKING ISSUES ONLY` when every finding it leaves
+  there is non-blocking and recorded, and `BLOCKING ISSUES` otherwise. Any
+  later delta that changes anything but documentation or comments, or
+  that merges `master` into the branch, takes a run with the reviewer.
 - The review surface of a change is what it touches: the changed hunks and
   the items that contain them (a function, a paragraph, a section, a table
   row, a list; for a hunk inside a file header, the header block of license,

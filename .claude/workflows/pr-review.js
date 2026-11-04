@@ -33,7 +33,7 @@
 //         ledger?: string }
 //   mode 'full'  reviews every file in the PR diff.
 //   mode 'delta' reviews the files whose content changed between `since` (the
-//                head the previous run reviewed) and the head, verifies the
+//                head the last run with the reviewer reviewed) and the head, verifies the
 //                fixes claimed since then, and adds a whole-PR correctness-only
 //                regression lens that also verifies claimed fixes for files
 //                outside the delta. The call-sites and cross-boundary lenses
@@ -88,7 +88,11 @@ const LEDGER =
 if (!Number.isInteger(PR) || PR <= 0) return { error: 'args.pr must be a pull request number' }
 if (MODE === null) return { error: "args.mode must be 'full', 'delta', or 'scope'" }
 if (MODE === 'delta' && !DELTA) {
-    return { error: "args.since (the head the previous run reviewed) is required in 'delta' mode" }
+    return {
+        error:
+            "args.since (the head the last run with the reviewer reviewed) is required in " +
+            "'delta' mode",
+    }
 }
 if (MODE === 'full' && DELTA) {
     return { error: "args.since is only meaningful with mode 'delta' or 'scope'" }

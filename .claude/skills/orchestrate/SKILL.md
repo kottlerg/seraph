@@ -118,27 +118,27 @@ classifying; two canonical (4-CPU) boots side by side do not (the maintainer's r
 
 A PR is at its gate when: `gh pr view <N> --json mergeStateStatus,statusCheckRollup` shows
 `CLEAN` and every check green (docs/conventions.md § CI Gating, § Branch protection); the
-merge-prompt condition of its § Branch and PR Workflow holds, that is, the last run record
-under `target/xtask/review/pr<N>/` in your checkout, where the worker copied its records, is a
+merge-prompt condition of its § Branch and PR Workflow holds, that is, the last run record under
+`target/xtask/review/pr<N>/` in your checkout, where the worker copied its records, is a
 completed run with no failed agent whose verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES
 ONLY` with every surface finding recorded and no contested finding on the surface unresolved,
 and `AUDIT PASS` is on record for the head (an auditor-only run's `audit-<head>.json`, which
-`.claude/agents/worker.md` § Review describes, carries the reviewer verdict that section
-gives it); every Issue the body closes carries the current milestone (§ Milestones); a delta
-since the validated head is comment-only or Markdown-only (§ PR-body checklist discipline;
-`git diff <validated> <head> -- . ':!*.md'` shows only comment lines); and neither the PR body
-nor a commit message carries an assistant session link or attribution trailer
-(docs/conventions.md § Style; `gh pr view <N> --json body --jq .body | grep -c claude.ai` and
-`git log origin/master..<head> --format=%B | grep -c claude.ai` both print `0`). Strip a
-surviving link from the body with `gh pr edit` before the merge; one in a commit message is a
-history rewrite (§ Rulings). Verify each part yourself, since a worker's report is a claim; a
-gate whose records are not readable in your checkout is not verified, so ask the worker for
-the copy before merging rather than merging on the report. Then prompt the maintainer, or
-merge under their standing instruction, with `gh pr merge <N> --merge --delete-branch`;
-fast-forward your own checkout, record it, and tell every open PR's worker what moved. That
-message is information, and any sync guidance it carries (whether the move re-owes the
-worker's set) is advice for the worker's plan: `master quiet` (§ Host token) is the only
-instruction to sync.
+`.claude/agents/worker.md` § Review describes, carries the reviewer verdict docs/conventions.md
+§ Branch and PR Workflow gives it, as the audit states it); every Issue the body closes carries
+the current milestone (§ Milestones); a delta since the validated head is comment-only or
+Markdown-only (§ PR-body checklist discipline; `git diff <validated> <head> -- . ':!*.md'` shows
+only comment lines); and neither the PR body nor a commit message carries an assistant session
+link or attribution trailer (docs/conventions.md § Style; `gh pr view <N> --json body --jq .body
+| grep -c claude.ai` and `git log origin/master..<head> --format=%B | grep -c claude.ai` both
+print `0`). Strip a surviving link from the body with `gh pr edit` before the merge; one in a
+commit message is a history rewrite (§ Rulings). Verify each part yourself, since a worker's
+report is a claim; a gate whose records are not readable in your checkout is not verified, so
+ask the worker for the copy before merging rather than merging on the report. Then prompt the
+maintainer, or merge under their standing instruction, with `gh pr merge <N> --merge
+--delete-branch`; fast-forward your own checkout, record it, and tell every open PR's worker
+what moved. That message is information, and any sync guidance it carries (whether the move
+re-owes the worker's set) is advice for the worker's plan: `master quiet` (§ Host token) is the
+only instruction to sync.
 
 Order merges to minimize re-validation: a PR whose merge touches only Markdown or comments
 costs the others nothing; among code PRs, merge first the one whose later syncs the others have
@@ -174,9 +174,10 @@ decision, or a case with no clearly best option waits for the maintainer.
   scope's follow-up Issue (the Issue the PR drains in that scope, the lowest-numbered when it
   drains several, else the rolling Issue, as docs/conventions.md § Branch and PR Workflow
   defines it, from which the drain routing follows rather than from the ruling), with two
-  exceptions. A nit whose fix is comment-only, in a PR that owes a fix round anyway, is folded
-  into that round and recorded nowhere. A nit in a PR draining a follow-up Issue of its scope
-  is recorded there and fixed in the same PR, ticked `(fixed by PR #<M>)`.
+  exceptions. A nit whose fix is comment-only, in a PR that owes a fix round anyway, is fixed
+  in that round. A nit in a PR draining a follow-up Issue of its scope is fixed in the same
+  PR. Each is recorded first, as that section requires after a `NON-BLOCKING ISSUES ONLY`
+  run, and ticked `(fixed by PR #<M>)` when the round fixes it.
 - A finding a delta run reports as out of bound in a hunk the PR's own earlier commits
   introduced is on the surface (docs/conventions.md § Branch and PR Workflow): it is handled in
   the PR like any surface finding, on the track its class sets and under the default above,

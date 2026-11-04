@@ -749,9 +749,11 @@ and `column!()` record and assertion messages carry, which the CI gate's
 boots cover, so none of the local host runs in this section are required for
 it, whatever paths it touches. Source text a build embeds verbatim
 (`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input, not
-comment or Markdown. The CI gate and the
-[pre-merge review](conventions.md#branch-and-pr-workflow) apply unchanged;
-the PR body MUST carry what
+comment or Markdown. The CI gate applies unchanged, and the
+[pre-merge review](conventions.md#branch-and-pr-workflow) applies as
+conventions.md § Branch and PR Workflow defines it, its auditor-only run
+after a documentation- or comment-only fix round included; the PR body MUST
+carry what
 [conventions.md](conventions.md#pr-body-checklist-discipline) § PR-body checklist
 discipline requires (the validated head, that the delta is documentation or
 comments only, and the local host runs the PR as a whole owes, each with its

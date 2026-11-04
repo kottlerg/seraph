@@ -450,20 +450,12 @@ fn service_loop(
             }
             fs_labels::FS_WRITE =>
             {
-                handle_write_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                handle_write(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
                 continue;
             }
             fs_labels::FS_WRITE_MEMORY =>
             {
-                handle_write_memory_node_cap(
-                    node_id,
-                    &msg,
-                    state,
-                    nodes,
-                    cache,
-                    caps.block_dev,
-                    ipc_buf,
-                );
+                handle_write_memory(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
                 continue;
             }
             fs_labels::FS_CREATE =>
@@ -508,15 +500,7 @@ fn service_loop(
             }
             fs_labels::FS_TRUNCATE =>
             {
-                handle_truncate_node_cap(
-                    node_id,
-                    &msg,
-                    state,
-                    nodes,
-                    cache,
-                    caps.block_dev,
-                    ipc_buf,
-                );
+                handle_truncate(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
                 continue;
             }
             _ =>
@@ -559,9 +543,9 @@ fn service_loop(
     }
 }
 
-/// The kind of cap a badged request arrived on: a node cap (`NS_LOOKUP`,
-/// `FS_CREATE`, `FS_MKDIR`) or an open cap (`FS_OPEN`), told apart by the
-/// badge's `OPEN_INSTANCE` bit.
+/// The kind of cap a badged request arrived on, told apart by the badge's
+/// `OPEN_INSTANCE` bit: a node cap (minted by `NS_LOOKUP`, `FS_CREATE`, and
+/// `FS_MKDIR`) or an open cap (minted by `FS_OPEN`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CapKind
 {
@@ -1330,10 +1314,11 @@ fn write_file_bytes(
     Ok((chain_head, new_size))
 }
 
-/// `FS_WRITE` inline write. Badge = file cap (must carry `WRITE`).
+/// `FS_WRITE` inline write. Badge = file node cap or open cap (must carry
+/// `WRITE`), `node_id` the node either names.
 /// `label[16..32]` = byte length (≤504), `data[0]` = offset, payload
 /// bytes packed from word 1 onward.
-fn handle_write_node_cap(
+fn handle_write(
     node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,
@@ -1406,12 +1391,13 @@ fn handle_write_node_cap(
 /// memory cap. The Memory cap is mapped into fatfs's address space at a
 /// process-static scratch VA, copied into a heap buffer, and the
 /// scratch VA unmapped before the actual writes. The Memory cap is moved
-/// back to the caller in the reply.
+/// back to the caller in the reply. Badge = file node cap or open cap (must
+/// carry `WRITE`), `node_id` the node either names.
 // too_many_lines: the memory-cap write is one sequence (validate the request
 // and the carried cap, map it, copy, unmap, write, patch the entry, reply)
 // whose every exit returns the carried cap to the caller in its reply.
 #[allow(clippy::too_many_lines)]
-fn handle_write_memory_node_cap(
+fn handle_write_memory(
     node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,
@@ -2129,12 +2115,13 @@ fn handle_rename_node_cap(
 
 /// `FS_TRUNCATE`: shrink a file to a new length.
 ///
-/// Badge = file cap (must carry `WRITE`). `data[0]` = new length.
+/// Badge = file node cap or open cap (must carry `WRITE`), `node_id` the
+/// node either names. `data[0]` = new length.
 /// v1 supports only `new_len == 0`; non-zero replies `IO_ERROR` so
 /// the wire shape is forward-compatible with later extend-with-
 /// zero-fill semantics tracked by the `ruststd::fs` completeness-gaps
 /// Issue.
-fn handle_truncate_node_cap(
+fn handle_truncate(
     node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,

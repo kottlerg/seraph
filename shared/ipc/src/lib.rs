@@ -1461,8 +1461,8 @@ pub mod fs_labels
     /// such node, a directory, or an open cap), `PERMISSION_DENIED`,
     /// `TOO_MANY_OPEN` (the driver's open table is full, or its heap or
     /// `CSpace` cannot grow), `IO_ERROR` (the driver could not mint the open
-    /// cap). Every refusal deletes the carried SEND. Specified in `services/fs/docs/fs-driver-protocol.md` § Label 18:
-    /// `FS_OPEN`.
+    /// cap). Every refusal deletes the carried SEND. Specified in
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
     pub const FS_OPEN: u64 = 18;
 }
 

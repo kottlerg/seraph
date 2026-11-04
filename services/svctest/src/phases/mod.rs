@@ -77,8 +77,11 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());
-    out.extend_from_slice(fs_ipc::phases_pre_relative());
+    // fs_opens runs while /data's cache is still cold (its eviction phase's
+    // CSpace case needs slots not yet provisioned) and writes the file the
+    // slot-reuse phase of fs_ipc reads and removes.
     out.extend_from_slice(fs_opens::phases());
+    out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_faults::phases());
     out.extend_from_slice(layout::after_fs());

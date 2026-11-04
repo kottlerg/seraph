@@ -9,12 +9,13 @@
 //! eviction sends each page's cooperative release to the release endpoint of
 //! the open that read it.
 
+use std::os::seraph::startup_info;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
-    fs_close, fs_open, fs_read_memory, fs_release_memory, fs_remove, svctest_dir_cap,
+    fs_close, fs_create, fs_open, fs_read_memory, fs_release_memory, fs_remove, svctest_dir_cap,
 };
 use crate::ipc_util::ns::{ns_lookup, ns_stat};
 use crate::runner::Phase;
@@ -130,6 +131,26 @@ pub fn fs_close_isolates_opens_phase(_: &Caps)
         ns_stat(b, ipc_buf).err(),
         Some(namespace_protocol::NsError::NotSupported.as_label()),
         "NS_STAT on an open cap"
+    );
+    // The cap kind is checked before the rights: a wrong-kind request whose
+    // badge also lacks the label's right is still INVALID_BADGE.
+    let (stat_only, _kind, _size) = ns_lookup(
+        svctest,
+        name.as_bytes(),
+        u64::from(namespace_protocol::rights::STAT),
+        ipc_buf,
+    )
+    .expect("fs_close_isolates_opens: STAT-only lookup");
+    assert_eq!(
+        fs_read_memory(stat_only, 0, 5, ipc_buf).err(),
+        Some(ipc::fs_errors::INVALID_BADGE),
+        "FS_READ_MEMORY on a node cap without READ"
+    );
+    let _ = syscall::cap_delete(stat_only);
+    assert_eq!(
+        fs_create(b, b"x.bin", ipc_buf).err(),
+        Some(ipc::fs_errors::INVALID_BADGE),
+        "FS_CREATE on an open cap, which carries no MUTATE_DIR"
     );
 
     for cap in [page_a, page_b, page_c]
@@ -281,6 +302,12 @@ fn wait_for_releases(log: &ReleaseLog, count: usize) -> Vec<(u64, u64)>
     }
 }
 
+/// Opens of other files that each hold a release SEND, kept across the
+/// eviction phase's cache fill: more than the init funding's headroom beyond
+/// a full cache's own caps (the quarantine's 32 and 64 more), so the fill
+/// reaches the slots fatfs's `FS_OPEN` top-up keeps free.
+const HELD_FILES: usize = 200;
+
 /// Two opens of one file, each with its own release endpoint, read and hold
 /// pages until every cache slot is held, so fatfs queues a held page for
 /// eviction. Its cooperative `FS_RELEASE_MEMORY` must arrive on the release
@@ -290,6 +317,13 @@ fn wait_for_releases(log: &ReleaseLog, count: usize) -> Vec<(u64, u64)>
 /// next eviction must reach the other open's endpoint. fatfs once kept one
 /// release SEND per node, the first a read of the node carried, and sent
 /// every client's releases there.
+///
+/// The phase runs while fatfs's cache is still cold, and holds
+/// [`HELD_FILES`] `std::fs::File`s open across the fill: each `FS_OPEN` left
+/// a release SEND in fatfs's `CSpace`, so the fill's slot pages and per-read
+/// caps need the slots `FS_OPEN`'s top-up keeps free for every slot not yet
+/// provisioned. fatfs once kept only the per-read caps' worth free, and the
+/// fill exhausted its `CSpace` before the cache filled.
 pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
 {
     const TAG_X: u64 = 0x58 << 56;
@@ -297,7 +331,23 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
     const TAG_MASK: u64 = 0xFF << 56;
 
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    // The slot-reuse phase's file, more pages than the cache has slots.
+    // svctest holds an open cap per held File and a page cap per held page.
+    assert!(
+        std::os::seraph::fund_cspace_slot_budget(
+            startup_info().self_cspace,
+            (HELD_FILES + crate::phases::fs_ipc::fatfs_slot_ceiling(ipc_buf) + 64) as u64,
+        ),
+        "fs_eviction: funding svctest's CSpace failed"
+    );
+    let held_files: Vec<std::fs::File> = (0..HELD_FILES)
+        .map(|i| {
+            std::fs::File::open("/data/svctest/bench.bin")
+                .unwrap_or_else(|e| panic!("fs_eviction: holding open File {i}: {e}"))
+        })
+        .collect();
+    // The slot-reuse phase's file, more pages than the cache has slots,
+    // written here while the cache is cold; that phase reads it next and
+    // removes it.
     let file_pages = crate::phases::fs_ipc::slot_reuse_file(ipc_buf);
     let name = crate::phases::fs_ipc::SLOT_REUSE_NAME;
     let svctest = svctest_dir_cap(ipc_buf);
@@ -356,8 +406,8 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
     );
 
     other.finish(ipc_buf);
+    drop(held_files);
     let _ = syscall::cap_delete(node);
-    fs_remove(svctest, name, ipc_buf).expect("cleanup slotreuse.bin");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!(
         "fs_eviction_routes_release_to_its_open phase passed ({} releases)",

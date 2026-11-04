@@ -39,8 +39,8 @@ in [crash-safety.md](crash-safety.md).
   page holds one), the scratch page, and 64 more (`std::os::seraph::fund_cspace_slot_budget`), so
   growing the cache, or holding every slot outstanding, never meets an exhausted `CSpace`; a failed
   funding fails cache init. Before it records an open's release SEND, each `FS_OPEN` tops the
-  `CSpace` up so the same funding stays free, less the slot pages and scratch page it already
-  holds, so the opens' SENDs grow it rather than starve reads.
+  `CSpace` up so the same funding stays free, less the slot pages and scratch page the cache
+  already holds, so the opens' SENDs grow it rather than starve reads.
   Write-through: the cached page is updated in place before the on-disk write so any outstanding
   `FS_READ_MEMORY` cap aliasing the page observes new bytes immediately, and the sector is put back
   when the write fails. `reload_sector` reads one sector from the device past the cache and

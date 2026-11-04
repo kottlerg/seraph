@@ -1338,8 +1338,9 @@ impl HeldPage
 
 /// Path and name of the slot-reuse file: more pages than fatfs's cache holds,
 /// page `i` tagged [`page_tag`]`(i)`. Written once per boot and shared by the
-/// slot-reuse phase and the per-open eviction phase (`fs_opens`), the last to
-/// use it removing it, since writing it is most of either phase's time.
+/// per-open eviction phase (`fs_opens`), which runs first and writes it, and
+/// the slot-reuse phase, which removes it, since writing it is most of either
+/// phase's time.
 pub(crate) const SLOT_REUSE_PATH: &str = "/data/svctest/slotreuse.bin";
 pub(crate) const SLOT_REUSE_NAME: &[u8] = b"slotreuse.bin";
 
@@ -1465,11 +1466,10 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     }
     read_slot_reuse_file(path, 0, file_pages);
 
-    // The file stays for the per-open eviction phase (`fs_opens`), which
-    // reads it next and removes it.
     let _ = fs_close(open, ipc_buf);
     let _ = syscall::cap_delete(open);
     let _ = syscall::cap_delete(node_cap);
+    fs_remove(svctest, name, ipc_buf).expect("cleanup slotreuse");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_mapping_survives_slot_reuse phase passed (held {count})");
 }

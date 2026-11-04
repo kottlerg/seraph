@@ -35,8 +35,8 @@ pub struct OpenSlab<T>
     free: Vec<u32>,
     /// Live entries.
     len: usize,
-    /// Most slots the table grows to: [`MAX_ENTRIES`], every index the
-    /// identifier can name.
+    /// Most slots the table grows to, at most [`MAX_ENTRIES`] (every index
+    /// the identifier can name), which [`Self::new`] uses.
     max: usize,
 }
 
@@ -61,6 +61,10 @@ impl<T> OpenSlab<T>
     /// test reach the full table.
     const fn with_limit(max: usize) -> Self
     {
+        debug_assert!(
+            max <= MAX_ENTRIES,
+            "slab bound past the identifier's index field"
+        );
         Self {
             slots: Vec::new(),
             free: Vec::new(),
@@ -72,8 +76,8 @@ impl<T> OpenSlab<T>
     /// Insert `value` as a new entry and return its identifier, never 0.
     ///
     /// Returns `None`, leaving `value` dropped, when the slab already holds
-    /// [`MAX_ENTRIES`] entries with every freed index retired, or the heap
-    /// cannot grow the table.
+    /// its bound of slots ([`MAX_ENTRIES`] for [`Self::new`]) with every
+    /// freed index live or retired, or the heap cannot grow the table.
     pub fn insert(&mut self, value: T) -> Option<u64>
     {
         let idx = if let Some(idx) = self.free.pop()

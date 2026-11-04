@@ -211,14 +211,14 @@ handle with no data words or caps.
 | Field | Value |
 |---|---|
 | label | 0 (success) |
-| data[0] | State: 0 `ALIVE`, 1 `CREATED` (not yet started), 2 `UNKNOWN` (no entry; reaped or never valid), 3 `EXITED` |
+| data[0] | State: 0 `ALIVE`, 1 `CREATED` (not yet started), 2 `UNKNOWN` (no entry; reaped or destroyed more than `RECENT_EXIT_RETENTION_NS` ago, dropped early under heap exhaustion, or never valid), 3 `EXITED` |
 | data[1] | Kernel-encoded exit reason when `data[0]` is `EXITED`; 0 otherwise |
 
 A live entry whose thread the kernel reports as exited answers `EXITED` before
 procmgr reaps it. After the reap, or after a `DESTROY_PROCESS` teardown, the
 badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time,
-however many other processes die meanwhile while procmgr's heap can hold their
-records, and `UNKNOWN` after that. Retention is best-effort: when the heap
+however many other processes die in the window, while procmgr's heap can hold
+their records, and `UNKNOWN` after that. Retention is best-effort: when the heap
 cannot hold a new record, the oldest record makes room (or, with none held, the
 new one is dropped), so such a badge can answer `UNKNOWN` early. A destroyed
 process's reason is the one the kernel retained if its main thread had already

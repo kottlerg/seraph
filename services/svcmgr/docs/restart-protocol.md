@@ -32,16 +32,16 @@ twice the members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member
 across, and deletes the old one; the event loop waits on whichever is
 current, and every boot widens it once its queues pass the first. The kernel
 queues a member that is already ready when it is added, so the move loses no
-pending request or death post; a replaced wait set of 32 members or more
-stays charged to svcmgr, at most 14 pages over its life. Up to 1023 queues
-hold more nodes than svcmgr's `CSpace` has slots. On wakeup svcmgr drains
-every queue and routes each payload to its `ServiceEntry` via the
-correlator, then dispatches through
-[`restart::handle_death`](../src/restart.rs). The service table grows on the
-heap and never reuses a slot, so an index names one service for svcmgr's
-lifetime; a post whose service's current thread the kernel reports live
-(`CAP_INFO_THREAD_STATE`) is a dead instance's that a resync already
-handled, and is dropped.
+pending request or death post. A deleted wait set's memory returns to
+memmgr, a page-sized set's (32 members or more) dedicated grant through
+`std::os::seraph::object_slab_release`. Up to 1023 queues hold more nodes
+than svcmgr's `CSpace` has slots. On wakeup svcmgr drains every queue and
+routes each payload to its `ServiceEntry` via the correlator, then
+dispatches through [`restart::handle_death`](../src/restart.rs). The service
+table grows on the heap and never reuses a slot, so an index names one
+service for svcmgr's lifetime; a post whose service's current thread the
+kernel reports live (`CAP_INFO_THREAD_STATE`) is a dead instance's that a
+resync already handled, and is dropped.
 
 Each death queue has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64),
 not one sized from the service count. The kernel drops a post to a full

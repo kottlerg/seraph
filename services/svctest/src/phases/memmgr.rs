@@ -44,6 +44,10 @@ pub fn phases() -> &'static [Phase]
             name: "cspace_slot_budget",
             run: cspace_slot_budget_phase,
         },
+        Phase {
+            name: "object_slab_release",
+            run: object_slab_release_phase,
+        },
     ]
 }
 
@@ -256,6 +260,66 @@ pub fn donate_unauthorized_phase(_: &Caps)
 
     release_one_page(grant, phys_base);
     std::os::seraph::log!("non-procmgr donation refused with UNAUTHORIZED");
+}
+
+/// Page-sized wait sets [`object_slab_release_phase`] creates and deletes.
+const RELEASE_CHURN: u32 = 64;
+
+/// Members of each of those wait sets: a 512-member set is a five-page
+/// retype, well past the sub-page classes.
+const RELEASE_WS_MEMBERS: u32 = 512;
+
+/// The memmgr free-pool drop [`object_slab_release_phase`] tolerates, for
+/// other processes' allocations meanwhile: 32 pages, a tenth of the 320 the
+/// churn strands without the release.
+const RELEASE_POOL_SLACK_BYTES: u64 = 32 * 4096;
+
+/// `std::os::seraph::object_slab_retype_reclaimable` returns the dedicated
+/// grant of a page-sized retype and none for a sub-page one, and
+/// `object_slab_release` returns that grant's run to memmgr's pool:
+/// [`RELEASE_CHURN`] page-sized wait sets, each deleted and its grant
+/// released, leave memmgr's free pool within [`RELEASE_POOL_SLACK_BYTES`] of
+/// where it started. Without the release the churn would strand about
+/// 320 pages until svctest exits.
+pub fn object_slab_release_phase(_: &Caps)
+{
+    let small = std::os::seraph::object_slab_retype_reclaimable(
+        std::os::seraph::wait_set_retype_bytes(2),
+        |slab| syscall::wait_set_create(slab, 2).ok(),
+    )
+    .expect("object_slab_release: two-member wait set");
+    assert!(
+        small.1.is_none(),
+        "object_slab_release: a sub-page retype returned a grant"
+    );
+    let _ = syscall::cap_delete(small.0);
+
+    let before =
+        std::os::seraph::memmgr_pool_free_bytes().expect("object_slab_release: memmgr pool query");
+    for i in 0..RELEASE_CHURN
+    {
+        let (ws, grant) = std::os::seraph::object_slab_retype_reclaimable(
+            std::os::seraph::wait_set_retype_bytes(u64::from(RELEASE_WS_MEMBERS)),
+            |slab| syscall::wait_set_create(slab, RELEASE_WS_MEMBERS).ok(),
+        )
+        .unwrap_or_else(|| panic!("object_slab_release: wait set {i} not created"));
+        let grant =
+            grant.unwrap_or_else(|| panic!("object_slab_release: wait set {i} returned no grant"));
+        syscall::cap_delete(ws)
+            .unwrap_or_else(|e| panic!("object_slab_release: delete {i} failed ({e})"));
+        std::os::seraph::object_slab_release(grant);
+    }
+    let after =
+        std::os::seraph::memmgr_pool_free_bytes().expect("object_slab_release: memmgr pool query");
+    let drop = before.saturating_sub(after);
+    assert!(
+        drop <= RELEASE_POOL_SLACK_BYTES,
+        "object_slab_release: pool dropped {drop} bytes over {RELEASE_CHURN} released wait sets \
+         (before {before}, after {after})"
+    );
+    std::os::seraph::log!(
+        "object_slab_release: {RELEASE_CHURN} page-sized wait sets released, pool drop {drop}"
+    );
 }
 
 /// A process cannot map the slot pages it funded its own `CSpace` with. A

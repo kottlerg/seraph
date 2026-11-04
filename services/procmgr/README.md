@@ -215,13 +215,15 @@ endpoint and the first queue), and when the queues fill it, procmgr creates one 
 members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one;
 the main loop waits on whichever is current. The kernel queues a member that is already ready when
 it is added, so the move loses no pending request or death post. Up to 1023 queues then hold far
-more nodes than twice the children procmgr's `CSpace` can hold. Only RAM so fragmented that memmgr
-refuses every request above three pages keeps them small: the queues settle at 128 nodes, the
-largest pool a three-page request covers, and the wait set at 256 members (a 512-member set is a
-five-page request), so 255 queues hold about 16 K live processes. A replaced wait set of 32 members
-or more stays charged to procmgr, at most 14 pages over its life
-([docs/limits.md](../../docs/limits.md)). A bind that still fails (procmgr out of memory) fails the
-spawn, the address-space bind included.
+more nodes than twice the children procmgr's `CSpace` can hold. In RAM so fragmented that memmgr
+refuses every request above three pages, the queues settle at 128 nodes, the largest pool a
+three-page request covers, and the wait set at 256 members (a 512-member set is a five-page
+request), where 255 queues still hold about 16 K live processes. That is the death-queue set's own
+floor, not a cap a system meets: such RAM refuses each spawn's own contiguous grants (a 48-page
+`AddressSpace` among them, `memmgr_alloc_pages_contig` in `src/process.rs`) first. A deleted wait
+set's memory returns to memmgr, a page-sized set's (32 members or more) dedicated grant through
+`std::os::seraph::object_slab_release` ([docs/limits.md](../../docs/limits.md)). A bind that still
+fails (procmgr out of memory) fails the spawn, the address-space bind included.
 
 Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
 procmgr drains every queue on each death wakeup. The kernel drops a post to a

@@ -185,11 +185,14 @@ pub struct StartupInfo {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub env_count: usize,
     /// Virtual address of the top of the main-thread stack — the value
-    /// SP held at `_start`. The live mapping covers
-    /// `[stack_top_vaddr - stack_pages * PAGE_SIZE, stack_top_vaddr)`.
+    /// SP held at `_start`. The loader maps the stack's committed part,
+    /// `[stack_top_vaddr - stack_pages * PAGE_SIZE, stack_top_vaddr)`; in a
+    /// demand-paged process the stack grows on demand below it to
+    /// `DEFAULT_DEMAND_STACK_PAGES` (512) pages.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stack_top_vaddr: u64,
-    /// Number of 4 KiB pages mapped for the main-thread stack.
+    /// Number of 4 KiB pages the loader mapped for the main-thread stack, its
+    /// committed part.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stack_pages: u32,
     /// `Endpoint` cap on the process's demand-paging pager, or zero when
@@ -1056,37 +1059,66 @@ pub(crate) unsafe fn register_rw_region(
 /// `stack_pages!` note the main thread's.
 pub(crate) const DEFAULT_DEMAND_STACK_PAGES: u64 = 512;
 
+// lld synthesises `__ehdr_start` at the image's ELF header, which the
+// image's first load segment maps read-only for the process's lifetime.
+unsafe extern "C" {
+    static __ehdr_start: [u8; 18];
+}
+
+/// `e_type` of a position-independent (`ET_DYN`) ELF image.
+const ET_DYN: u16 = 3;
+
+/// Whether this process's own image is position-independent (`ET_DYN`). The
+/// loaders check only such an image's placement against the stack
+/// reservation; an `ET_EXEC` image sits at its link addresses unchecked, so
+/// it may lie in the reservation.
+fn own_image_is_position_independent() -> bool {
+    // SAFETY: `__ehdr_start` is this image's ELF header, mapped read-only for
+    // the process's lifetime; its first 18 bytes hold `e_ident` and the
+    // little-endian `e_type`, both architectures being little-endian.
+    let header = unsafe { &*core::ptr::addr_of!(__ehdr_start) };
+    u16::from_le_bytes([header[16], header[17]]) == ET_DYN
+}
+
 /// Register the main thread's demand-growth range with the pager: the pages of
 /// a [`DEFAULT_DEMAND_STACK_PAGES`]-page stack ending at `stack_top` below the
 /// `committed_pages` the loader mapped (`process_layout::main_stack_growth`).
 /// The page below the range stays unregistered as the guard, inside the
 /// reservation the creator's layout leaves below every stack top, so an
-/// overflow past it faults on an address the pager declines. Returns whether
-/// the range was registered; on `false` the stack keeps only its committed
-/// pages, the next page below which the pager declines in the same way.
+/// overflow past it faults on an address the pager declines. On an error the
+/// stack keeps only its committed pages, the next page below which the pager
+/// declines in the same way.
 ///
 /// For a demand-paged process only: a pinned one has no pager to back the
 /// range.
-fn register_main_stack_growth(stack_top: u64, committed_pages: u32) -> bool {
-    let Some((base, pages)) = process_layout::main_stack_growth(
+fn register_main_stack_growth(stack_top: u64, committed_pages: u32) -> crate::io::Result<()> {
+    if !own_image_is_position_independent() {
+        return Err(crate::io::Error::other("seraph: ET_EXEC image; no stack reservation"));
+    }
+    let (base, pages) = process_layout::main_stack_growth(
         stack_top,
         u64::from(committed_pages),
         DEFAULT_DEMAND_STACK_PAGES,
-    ) else {
-        return false;
-    };
+    )
+    .ok_or_else(|| crate::io::Error::other("seraph: committed stack leaves no growth range"))?;
     let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
+    }
     let info = startup_info();
-    if ipc_buf.is_null() || info.memmgr_endpoint == 0 {
-        return false;
+    if info.memmgr_endpoint == 0 {
+        return Err(crate::io::Error::other("seraph: no pager (memmgr unreachable)"));
     }
     // The pager maps the range's frames from this address space's page-table
     // pool, which the loader's mappings did not fund for it.
     if !fund_aspace_pt_budget(info.self_aspace, pages) {
-        return false;
+        return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
     }
     // SAFETY: current_ipc_buf returns the registered IPC buffer page.
-    unsafe { register_rw_region(info.memmgr_endpoint, ipc_buf, base, pages) }
+    if !unsafe { register_rw_region(info.memmgr_endpoint, ipc_buf, base, pages) } {
+        return Err(crate::io::Error::other("seraph: REGISTER_REGION rejected"));
+    }
+    Ok(())
 }
 
 /// A guarded demand-paged thread stack: a reserved VA window whose upper

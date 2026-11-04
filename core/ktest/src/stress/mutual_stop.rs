@@ -219,7 +219,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::mutual_stop: pin controller failed")?;
-    let result = with_children(ctx, CYCLES);
+    let result = with_children(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::mutual_stop: restore controller affinity failed");
     let tally = result?;
@@ -301,16 +301,16 @@ fn log_tallies(tally: &Tally)
     );
 }
 
-/// Create and start the children, run `cycles` rounds, end the children,
+/// Create and start the children, run [`CYCLES`] rounds, end the children,
 /// and delete both whatever the outcome (a deletion ends a thread wherever
 /// it is, so the stacks are free for the next test even after a failed
 /// round).
-fn with_children(ctx: &TestContext, cycles: u32) -> Result<Tally, &'static str>
+fn with_children(ctx: &TestContext) -> Result<Tally, &'static str>
 {
     let mut threads: [Option<u32>; CHILDREN] = [None, None];
     let result = start(ctx, &mut threads).and_then(|th| {
         let mut tally = Tally::default();
-        let ran = rounds(th, cycles, &mut tally);
+        let ran = rounds(th, &mut tally);
         let ended = finish(th, &mut tally);
         ran?;
         ended?;
@@ -379,12 +379,12 @@ fn start(
     Ok(th)
 }
 
-/// Run `cycles` rounds: restart both children, wait for both to count
+/// Run [`CYCLES`] rounds: restart both children, wait for both to count
 /// another loop, and spin a varying delay. Records the loops counted by
 /// the end.
-fn rounds(th: [u32; CHILDREN], cycles: u32, tally: &mut Tally) -> TestResult
+fn rounds(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
 {
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         let before = PROGRESS.each_ref().map(|p| p.load(Ordering::Acquire));
         let mut restarted = 0;

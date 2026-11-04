@@ -83,7 +83,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::stop_sleep_window: pin controller failed")?;
-    let result = with_sleeper(ctx, CYCLES);
+    let result = with_sleeper(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_sleep_window: restore controller affinity failed");
     result?;
@@ -108,9 +108,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Start the sleeper, run a storm of `cycles` stop/start pairs, and always
+/// Start the sleeper, run a storm of [`CYCLES`] stop/start pairs, and always
 /// reap the sleeper and its notification, whatever the storm's outcome.
-fn with_sleeper(ctx: &TestContext, cycles: u32) -> TestResult
+fn with_sleeper(ctx: &TestContext) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::stop_sleep_window: create done failed")?;
@@ -120,7 +120,7 @@ fn with_sleeper(ctx: &TestContext, cycles: u32) -> TestResult
         let _ = cap_delete(done);
         return Err("stress::stop_sleep_window: spawn sleeper failed");
     };
-    let result = start_and_storm(&child, done, cycles);
+    let result = start_and_storm(&child, done);
     // Deleting the thread stops it wherever it is, so the shared stack is
     // free for the next test even when the storm failed.
     let reaped = [
@@ -134,7 +134,7 @@ fn with_sleeper(ctx: &TestContext, cycles: u32) -> TestResult
     reaped.map_err(|_| "stress::stop_sleep_window: reap failed")
 }
 
-fn start_and_storm(child: &spawn::SpawnedChild, done: u32, cycles: u32) -> TestResult
+fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
 {
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "stress::stop_sleep_window: cap_copy done failed")?;
@@ -154,7 +154,7 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32, cycles: u32) -> TestR
         "stress::stop_sleep_window: the sleeper never reported running",
     )?;
 
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         // Vary the stop's phase against the sleep loop: 0 to 4095 spins
         // (a multiplicative hash of the cycle) before each pair.

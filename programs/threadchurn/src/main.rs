@@ -58,6 +58,11 @@ const DETACH_BATCH: u64 = 128;
 /// 99 observer nodes, so the burst grows the slot table and binds on a
 /// second queue, and every one of them is then reaped.
 const HELD_BURST: usize = 128;
+/// `CSpace` slots funded per held-burst thread before the burst. A live
+/// thread holds a few caps (its Thread cap, its done notification, its stack
+/// and slab caps); thread spawn does not grow the `CSpace` itself, so a known
+/// burst is funded first, as `fund_cspace_slot_budget` documents.
+const BURST_SLOTS_PER_THREAD: u64 = 8;
 /// Allowed slot growth across the held burst once it is reaped: the reaper's
 /// second death queue and its slab, and the byte heap's growth for the slot
 /// table. A burst that leaked its threads would keep about two slots each.
@@ -102,30 +107,37 @@ fn spawn_join(i: u64)
     std::hint::black_box(v);
 }
 
-fn main() -> ExitCode
+/// Held burst: `HELD_BURST` detached threads bound at once (each waits on
+/// the barrier until all are spawned), then released and reaped, with the
+/// slot count checked against the count before the burst. Returns whether
+/// the burst passed; a failure has printed its FAIL line.
+fn held_burst(cspace: u32) -> bool
 {
-    log::register_name(b"threadchurn");
-    let info = std::os::seraph::startup_info();
-    let cspace = info.self_cspace;
-
-    // Warm up so the reaper's first death queue, pooled object slabs, and PT
-    // budget reach steady state.
-    for i in 0..8
+    if !std::os::seraph::fund_cspace_slot_budget(cspace, HELD_BURST as u64 * BURST_SLOTS_PER_THREAD)
     {
-        spawn_join(i);
+        log!("FAIL could not fund the CSpace for the held burst");
+        println!("threadchurn: FAIL CSpace funding for the held burst");
+        return false;
     }
-
-    // Held burst: HELD_BURST detached threads bound at once (each waits on the
-    // barrier until all are spawned), then released, reaped, and the slot
-    // count checked against the count before the burst.
     let before_burst = used_slots(cspace);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(HELD_BURST + 1));
-    for _ in 0..HELD_BURST
+    for n in 0..HELD_BURST
     {
         let barrier = std::sync::Arc::clone(&barrier);
-        let _ = std::thread::spawn(move || {
+        if let Err(e) = std::thread::Builder::new().spawn(move || {
             barrier.wait();
-        });
+        })
+        {
+            // The threads already spawned wait on the barrier; the exit
+            // below ends them with the process.
+            let headroom = std::os::seraph::cspace_slot_headroom(cspace);
+            log!(
+                "FAIL held-burst spawn {n} refused: {e} (slots {}, headroom {headroom})",
+                used_slots(cspace)
+            );
+            println!("threadchurn: FAIL held-burst spawn {n} refused");
+            return false;
+        }
     }
     barrier.wait();
     drop(barrier);
@@ -141,6 +153,26 @@ fn main() -> ExitCode
     {
         log!("FAIL held-burst growth {burst_growth} > slack {BURST_SLACK}");
         println!("threadchurn: FAIL held-burst slot growth {burst_growth} exceeds {BURST_SLACK}");
+        return false;
+    }
+    true
+}
+
+fn main() -> ExitCode
+{
+    log::register_name(b"threadchurn");
+    let info = std::os::seraph::startup_info();
+    let cspace = info.self_cspace;
+
+    // Warm up so the reaper's first death queue, pooled object slabs, and PT
+    // budget reach steady state.
+    for i in 0..8
+    {
+        spawn_join(i);
+    }
+
+    if !held_burst(cspace)
+    {
         return ExitCode::FAILURE;
     }
 

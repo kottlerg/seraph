@@ -99,8 +99,8 @@ An entry an existing open Issue already names cites it in the recommendation.
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
   TLS block each reach 1 GiB of VA.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
-  copies: `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` (in `unit::cap_info`),
-  `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
+  copies: `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `MAX_IRQ_BINDINGS` and
+  `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
 - **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
   depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
   (`bounded_wait::DEADLOCK_BUDGET_US`) are the time-based model.

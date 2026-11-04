@@ -14,14 +14,14 @@
 
 /// Largest PLIC source id the RISC-V PLIC specification allows (sources 1..=1023;
 /// source 0 is reserved).
-pub const PLIC_MAX_SOURCES: u32 = 1023;
+pub(super) const PLIC_MAX_SOURCES: u32 = 1023;
 
 /// Default PLIC MMIO window size when the bootloader did not report one: the
 /// 64 MiB register map of the RISC-V PLIC specification, whose threshold and
 /// claim/complete blocks hold all 15 872 contexts. A hardware spec value, so a
 /// firmware hart id whose S-mode context the specification admits is never
 /// refused for want of a reported size.
-pub const DEFAULT_PLIC_SIZE: u64 = 0x0400_0000;
+pub(super) const DEFAULT_PLIC_SIZE: u64 = 0x0400_0000;
 
 /// PLIC S-mode context of the hart with hardware id `hart`.
 ///
@@ -35,20 +35,20 @@ const fn plic_s_context(hart: u32) -> u64
 
 /// PLIC S-mode enable-bits base for the hart with hardware id `hart`:
 /// 0x2000 + context * 0x80.
-pub const fn plic_enable_base_for(hart: u32) -> u64
+pub(super) const fn plic_enable_base_for(hart: u32) -> u64
 {
     0x2000 + plic_s_context(hart) * 0x80
 }
 
 /// PLIC S-mode threshold register offset for the hart with hardware id `hart`:
 /// `0x20_0000 + context * 0x1000`. The claim/complete register follows at +4.
-pub const fn plic_threshold_offset_for(hart: u32) -> u64
+pub(super) const fn plic_threshold_offset_for(hart: u32) -> u64
 {
     0x0020_0000 + plic_s_context(hart) * 0x1000
 }
 
 /// Number of 32-bit enable words a context needs for sources `0..=ndev`.
-pub const fn enable_words(ndev: u32) -> u32
+pub(super) const fn enable_words(ndev: u32) -> u32
 {
     (ndev + 1).div_ceil(32)
 }
@@ -60,7 +60,7 @@ pub const fn enable_words(ndev: u32) -> u32
 /// Hart ids come from firmware and can be sparse or large; a context past the
 /// window would turn a `plic_write` into a store to arbitrary physical memory
 /// through the direct map.
-pub const fn plic_context_in_window(hart: u32, window: u64) -> bool
+pub(super) const fn plic_context_in_window(hart: u32, window: u64) -> bool
 {
     // With the standard register map the claim register always ends past the
     // enable words, so the enable-word test is defensive: it keeps the bound
@@ -75,7 +75,7 @@ pub const fn plic_context_in_window(hart: u32, window: u64) -> bool
 /// An unreported count (0) programs every source the specification allows, which is
 /// harmless for the ones the PLIC lacks (their priority and enable bits read as zero); a
 /// report past the specification is clamped.
-pub fn ndev_for(reported: u64) -> u32
+pub(super) fn ndev_for(reported: u64) -> u32
 {
     match u32::try_from(reported)
     {
@@ -89,7 +89,7 @@ pub fn ndev_for(reported: u64) -> u32
 /// The SBI hart-mask convention addresses a 64-hart window: `hart_mask_base`
 /// is the first hart ID of the window and `hart_mask` is a bitmask relative
 /// to that base, so any hart ID up to the platform limit is reachable.
-pub fn sbi_hart_mask(target_hart_id: u32) -> (u64, u64)
+pub(super) fn sbi_hart_mask(target_hart_id: u32) -> (u64, u64)
 {
     let base = u64::from(target_hart_id) & !63;
     let mask = 1u64 << (u64::from(target_hart_id) & 63);
@@ -97,7 +97,7 @@ pub fn sbi_hart_mask(target_hart_id: u32) -> (u64, u64)
 }
 
 /// `n` rounded up to a whole 4 KiB page.
-pub const fn page_round_up(n: u64) -> u64
+pub(super) const fn page_round_up(n: u64) -> u64
 {
     (n + 0xFFF) & !0xFFF
 }
@@ -128,7 +128,7 @@ pub const fn page_round_up(n: u64) -> u64
 /// Returns `false` if `insn == 0`, which some implementations write to
 /// `stval` instead of the trapping encoding — the caller must then treat
 /// the trap as a non-FP/V illegal instruction.
-pub fn is_fp_or_v_opcode(insn: u64) -> bool
+pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
 {
     if insn == 0
     {

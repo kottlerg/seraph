@@ -2127,8 +2127,8 @@ pub(crate) fn mint_late_reclaim_memory_caps(
 /// init is enqueued, not here.
 // Linear sequence, run once in Phase 7 and once (the late pass) in Phase 8:
 // per-range overlap check, owned-range registration, MemoryObject mint,
-// descriptor push. The debug-only
-// overlap assertion adds ~25 lines without a natural extraction point.
+// descriptor push. The debug-only overlap assertion adds ~25 lines without a
+// natural extraction point.
 #[allow(clippy::too_many_lines)]
 fn mint_reclaim_pass(
     cspace: &mut CSpace,
@@ -2236,8 +2236,8 @@ fn mint_reclaim_pass(
         // SAFETY: range pages were not added via `add_region`
         // (bootloader-typed `Loaded`, filtered by
         // `mm::init::collect_usable_ranges`); single-threaded Phase 7, or for
-        // the late pass Phase 8's single-threaded boot path on the BSP, before
-        // `sched::enter`.
+        // the late pass the BSP's Phase 8 boot path, before `sched::enter`,
+        // with the APs idle.
         unsafe {
             crate::mm::with_frame_allocator(|alloc| {
                 alloc.register_owned_range(phys_base, size_bytes);

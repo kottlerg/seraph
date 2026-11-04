@@ -444,9 +444,9 @@ mod tests
     #[test]
     fn a_table_that_cannot_grow_refuses_a_reservation()
     {
-        // A slot larger than any host's user address space (2^57 bytes
-        // under 5-level paging) has no allocation under any overcommit
-        // policy: the table's growth fails.
+        // A slot larger than any host's user address space (at most 2^56
+        // bytes, under 5-level paging or Sv57) has no allocation under any
+        // overcommit policy: the table's growth fails.
         let mut reg = Registry::<[u8; 1 << 58]>::new();
         assert_eq!(reg.reserve(), Err(ReserveError::NoMemory));
         assert!(reg.is_empty());

@@ -36,15 +36,15 @@
 //                head the last run with the reviewer reviewed) and the head,
 //                verifies the fixes claimed since then, and adds a whole-PR
 //                correctness-only regression lens that also verifies claimed
-//                fixes for files outside the delta. The call-sites and cross-boundary lenses
-//                cover the whole PR diff in both modes (the cross-boundary lens
-//                runs whenever the PR diff, not only the delta, touches a code
-//                file); the design-docs lenses read only the documents that
-//                state facts the delta changed. `since` must resolve in this
-//                clone; it need not be an ancestor of the head, so an amended
-//                or rebased branch still works. Only files the PR diff also
-//                touches are reviewed, so files a merge or rebase of the base
-//                brought in are not.
+//                fixes for files outside the delta. The call-sites and
+//                cross-boundary lenses cover the whole PR diff in both modes
+//                (the cross-boundary lens runs whenever the PR diff, not only
+//                the delta, touches a code file); the design-docs lenses read
+//                only the documents that state facts the delta changed. `since`
+//                must resolve in this clone; it need not be an ancestor of the
+//                head, so an amended or rebased branch still works. Only files
+//                the PR diff also touches are reviewed, so files a merge or
+//                rebase of the base brought in are not.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
 //                every mode once one exists, so a full run after an earlier
@@ -644,9 +644,8 @@ const HEAD_LINE =
         : '') + '.'
 
 const DELTA_NOTE = DELTA
-    ? 'This is a re-review: the last run with the reviewer reviewed head ' + SINCE +
-        ', and the commits and ' +
-        'PR body since then claim fixes for its findings.'
+    ? 'This is a re-review: the last run with the reviewer reviewed head ' + SINCE + ', ' +
+        'and the commits and PR body since then claim fixes for its findings.'
     : null
 
 const SHARD_HEADER = [

@@ -196,9 +196,11 @@ claims.
     record's `findings` that the range does not fix, and each entry of its
     `recorded`, that no open Issue records as that section says: an item
     stating it, either the one this PR recorded or the one an open
-    follow-up Issue of its scope already held. End the section with the
-    line `Reviewer verdict: <verdict>`, the verdict that section gives the
-    run, derived from the record and the range.
+    follow-up Issue of its scope already held. List each finding of the
+    record's `findings` that the range leaves unfixed, as the record states
+    it, so the parent's record of this run carries it into the ledger. End
+    the section with the line `Reviewer verdict: <verdict>`, the verdict
+    that section gives the run, derived from the record and the range.
 
 ## Output
 

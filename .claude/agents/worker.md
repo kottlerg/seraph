@@ -193,12 +193,14 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
   `audit-<head>.json` beside the `full-` and `delta-` records, with the keys of the workflow's
   return: `verdict`, the `Reviewer verdict:` line the audit states, exactly one of
   `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, `BLOCKING ISSUES`; `audit_verdict`, the audit
-  verdict line; `audit` null; `findings`, `recorded`, `ledgered` and `dropped` empty; and
-  `stats` with `mode` `audit`, `head`, `since`, and `failed` (the agents that returned no
-  result). The ledger command of `.claude/CLAUDE.md` § PR workflow operations reads it with the
-  other records and takes no entry from it. Any later delta that changes anything but
-  documentation or comments, or merges `master` in, takes a run with the reviewer, its `since`
-  the head of the last run with the reviewer.
+  verdict line; `audit` null; `findings`, the surface findings of the last run with the reviewer
+  that the audit lists as unfixed, each as that run's record states it; `recorded`, `ledgered`
+  and `dropped` empty; and `stats` with `mode` `audit`, `head`, `since`, and `failed` (the
+  agents that returned no result). The ledger command of `.claude/CLAUDE.md` § PR workflow
+  operations reads it with the other records and takes its `findings` into the ledger when its
+  `verdict` is `NON-BLOCKING ISSUES ONLY`, as the pass that records them requires. Any later
+  delta that changes anything but documentation or comments, or merges `master` in, takes a run
+  with the reviewer, its `since` the head of the last run with the reviewer.
 
 - Orchestrated, after every review run copy the PR's whole `target/xtask/review/pr<N>/` directory
   into the orchestrator's checkout at the same relative path (the spawn prompt names that

@@ -475,9 +475,10 @@ Phase 7.
    holds what firmware and the bootloader left there, the UEFI stack among it, and the buddy's
    free-list headers. The "Phase 7: drained" line reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, `root_cspace_init_pages()`
-   pages: one wrapper page plus a slot-page pool holding at least every capability the boot can
-   mint, ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace, Thread and CSpace caps)
-   and ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap, and
+   pages: one wrapper page plus a slot-page pool holding at least every capability body the boot
+   mints (`boot_body_bound`), ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace,
+   Thread and CSpace caps), and ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap,
+   and
    ROOT_CSPACE_BODY_PAGES = 16 pages for the bodies of init's own splits) and register it as CSpace
    id 0:
    - Slot 0 is permanently null

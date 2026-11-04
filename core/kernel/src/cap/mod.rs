@@ -364,7 +364,7 @@ const ROOT_CSPACE_BODY_PAGES: u64 = 16;
 /// pages seed the slot-page pool. Sized so the pool holds at least
 /// [`root_cspace_init_slot_capacity`] slots regardless of `L2_SIZE`
 /// (slots-per-page), plus [`ROOT_CSPACE_BODY_PAGES`] for the bodies of init's
-/// splits. The slot-0 reservation on page 0 is one of the
+/// splits. The slot-0 reservation, on the pool's first slot page, is one of the
 /// [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`].
 #[cfg(not(test))]
 fn root_cspace_init_pages() -> u64
@@ -731,7 +731,6 @@ static INIT_STACK_PHYS: [core::sync::atomic::AtomicU64; INIT_STACK_PAGES] =
 
 /// The counts, read from `BootInfo` before the drain, that bound this boot's
 /// non-RAM descriptors ([`init_info_descriptor_bound`]).
-#[cfg(not(test))]
 pub(crate) struct DescriptorCounts
 {
     /// `AcpiReclaimable` memory-map entries, one ACPI region cap each.
@@ -742,6 +741,40 @@ pub(crate) struct DescriptorCounts
     pub modules: usize,
     /// Reclaim ranges, one reclaimable `Memory` cap each.
     pub reclaim_ranges: usize,
+}
+
+impl DescriptorCounts
+{
+    /// The counts of `mmap`, `apertures` and `info`'s module and reclaim
+    /// arrays, as Phases 7 and 8 mint one descriptor per entry of each.
+    fn of(
+        mmap: &[MemoryMapEntry],
+        apertures: &crate::platform::ValidatedApertures,
+        info: &BootInfo,
+    ) -> Self
+    {
+        Self {
+            acpi_regions: mmap
+                .iter()
+                .filter(|e| e.memory_type == MemoryType::AcpiReclaimable)
+                .count(),
+            apertures: apertures.iter().count(),
+            modules: info.modules.count as usize,
+            reclaim_ranges: info.reclaim_ranges.count as usize,
+        }
+    }
+
+    /// [`init_info_descriptor_bound`] over these counts and `ram_extents`.
+    const fn bound(&self, ram_extents: usize) -> usize
+    {
+        init_info_descriptor_bound(
+            ram_extents,
+            self.acpi_regions,
+            self.apertures,
+            self.modules,
+            self.reclaim_ranges,
+        )
+    }
 }
 
 /// Reserve, from the pristine buddy, every page Phase 9 consumes after the
@@ -771,14 +804,7 @@ fn reserve_init_backing(counts: &DescriptorCounts)
             slot.store(page, core::sync::atomic::Ordering::Relaxed);
         }
 
-        let ram_extents = alloc.coalesced_extent_count() + 2;
-        let bound = init_info_descriptor_bound(
-            ram_extents,
-            counts.acpi_regions,
-            counts.apertures,
-            counts.modules,
-            counts.reclaim_ranges,
-        );
+        let bound = counts.bound(alloc.coalesced_extent_count() + 2);
         if bound > INIT_INFO_DESCRIPTOR_CAPACITY
         {
             crate::kprintln!(
@@ -1488,15 +1514,7 @@ pub fn init_capability_system(
     // 6. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
     {
-        let counts = DescriptorCounts {
-            acpi_regions: mmap
-                .iter()
-                .filter(|e| e.memory_type == MemoryType::AcpiReclaimable)
-                .count(),
-            apertures: mmio_apertures.iter().count(),
-            modules: info.modules.count as usize,
-            reclaim_ranges: info.reclaim_ranges.count as usize,
-        };
+        let counts = DescriptorCounts::of(mmap, &mmio_apertures, info);
         // SAFETY: first call; single-threaded Phase 7.
         let ram_extents = unsafe { drain_and_install_seed(&counts) };
 
@@ -2861,12 +2879,13 @@ mod tests
         }
     }
 
-    // Defect caught: a Phase 7 capability with a descriptor that the
-    // `InitInfo` bound does not count (a new fixed cap past the spare slots, or
-    // ACPI regions counted short), so a boot sized from the bound overruns the
-    // region it reserved.
+    // Defect caught: a `populate_cspace` capability with a descriptor that
+    // the `InitInfo` bound does not count (a new fixed cap, or ACPI regions
+    // counted short by the counts Phase 7 sizes from), so a boot sized from the
+    // bound overruns the region it reserved. The aperture, module and reclaim
+    // descriptors are one per entry of the array each count reads.
     #[test]
-    fn the_descriptor_bound_counts_every_non_ram_phase_7_descriptor()
+    fn the_descriptor_bound_counts_populate_cspaces_fixed_and_acpi_descriptors()
     {
         let mut mmap = Vec::new();
         for i in 0..5u64
@@ -2895,16 +2914,33 @@ mod tests
             crate::platform::ValidatedApertures::empty(),
             &info,
         );
-        let acpi_regions = mmap
-            .iter()
-            .filter(|e| e.memory_type == MemoryType::AcpiReclaimable)
-            .count();
+        let counts =
+            DescriptorCounts::of(&mmap, &crate::platform::ValidatedApertures::empty(), &info);
         let non_ram = layout.descriptor_count - layout.memory_count as usize;
-        assert_eq!(layout.acpi_region_memory_count as usize, acpi_regions);
+        assert_eq!(
+            counts.acpi_regions,
+            layout.acpi_region_memory_count as usize
+        );
         assert!(
-            non_ram <= init_info_descriptor_bound(0, acpi_regions, 0, 0, 0),
+            non_ram <= counts.bound(0),
             "{non_ram} non-RAM descriptors past the bound"
         );
+        // The fixed caps this build mints, exactly: one more fails here until
+        // the list below and FIXED_BOOT_DESCRIPTORS count it.
+        let fixed = [
+            true, // SchedControl
+            true, // root Interrupt
+            info.acpi_rsdp != 0,
+            crate::mm::init::dtb_extent().is_some(),
+            crate::arch::current::platform::console_mmio().is_some(),
+            crate::arch::current::HAS_IO_PORTS,
+            crate::arch::current::HAS_SBI,
+        ];
+        let fixed_here = fixed.iter().filter(|&&f| f).count();
+        assert_eq!(non_ram - counts.acpi_regions, fixed_here);
+        // The most any build mints (IoPort and SbiControl are exclusive), with
+        // the two spare slots, is what the constant holds.
+        assert_eq!(fixed.len() - 1 + 2, FIXED_BOOT_DESCRIPTORS);
     }
 
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────

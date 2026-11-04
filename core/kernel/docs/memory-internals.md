@@ -102,7 +102,7 @@ without draining: it sorts the free blocks into the same chain, counts the maxim
 pushes every block back onto the free list of its order, so the same blocks stay free at the same
 orders and the free page count is unchanged. Phase 7 sizes the `InitInfo` region from this count
 before it reserves the region and drains the rest into it
-([initialization.md](initialization.md) § Phase 7).
+([initialization.md](initialization.md) § Phase 7: Capability System).
 
 ### Thread Safety
 

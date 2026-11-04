@@ -89,7 +89,10 @@ devmgr's responsibilities are:
   reported ready or died or the settle bound elapses, and then takes every
   death still queued. It then revokes the private endpoint, serves each driver
   that reported ready, and withdraws the rest: its service endpoint revoked
-  and deleted, its BAR and IRQ caps released, and a driver still pending
+  and deleted, a `VirtIO` device reset (devmgr maps the BAR cap it keeps
+  that holds the common configuration region and writes 0 to
+  `device_status`, which stops the device's DMA and drops its pending
+  interrupt), its BAR and IRQ caps released, and a driver still pending
   destroyed (`DESTROY_PROCESS` on the process handle devmgr keeps until the
   batch settles). The catalog entry of a withdrawn driver, or of one that
   failed to spawn, stays, so a badge is never reused. No `QUERY_*` reply hands

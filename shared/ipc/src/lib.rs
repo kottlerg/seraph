@@ -2023,8 +2023,9 @@ pub mod serial_labels
     /// that notification and arms it. The IRQ is masked on each fire and
     /// re-armed by the next [`SERIAL_READ_BYTES`], so a client loops: drain
     /// with `SERIAL_READ_BYTES`, then wait on its notification (with a bounded
-    /// timeout — the x86 IOAPIC is edge-triggered, so a byte racing the re-arm
-    /// is recovered by the timeout-driven re-drain). Reply: empty body, status
+    /// timeout — the driver registers the x86 UART line edge-triggered (mode
+    /// 0), so a byte racing the re-arm is recovered by the timeout-driven
+    /// re-drain). Reply: empty body, status
     /// in the reply label ([`super::serial_errors::REGISTER_FAILED`] if the
     /// driver holds no IRQ cap or the binding fails).
     pub const SERIAL_REGISTER_RX_NOTIFY: u64 = 3;

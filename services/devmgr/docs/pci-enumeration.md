@@ -153,8 +153,11 @@ For each matched device, devmgr:
    and takes the line's trigger and polarity from the override naming its
    GSI, field by field; a field the override leaves conforming to its bus,
    and a line no override names, take the PCI default, level-triggered and
-   active-low (`firmware::acpi::line_mode`). A missing or malformed MADT is
-   logged once and every line takes the PCI default. On riscv64 every line
+   active-low (`firmware::acpi::line_mode`). A missing MADT, or one whose
+   header is malformed, is logged once and every line takes the PCI default;
+   a structure malformed partway through ends the walk after the overrides
+   before it, logged once (`firmware::acpi::madt_well_formed`), and a line a
+   later override would have named takes the default. On riscv64 every line
    takes level-triggered, active-high, which the kernel validates and
    programs nothing from.
 4. Requests procmgr to create the driver process: `CREATE_PROCESS` for a

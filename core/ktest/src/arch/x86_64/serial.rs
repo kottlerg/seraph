@@ -78,8 +78,10 @@ const IER_THRI: u8 = 0x02;
 
 /// Raise one COM1 transmit-empty interrupt: clear IER, then set its THRI bit.
 /// The holding register is empty whenever ktest is not writing, so setting
-/// THRI asserts the line again (a rising edge, which the edge-triggered
-/// I/O APIC entry delivers once unmasked).
+/// THRI asserts the line again: a rising edge, which an I/O APIC entry
+/// programmed edge-triggered (mode 0) delivers once unmasked, and a held
+/// level, which a level-triggered entry delivers at every unmask until
+/// [`quiet_tx_interrupt`] lowers it.
 ///
 /// Called only on the main thread (the only one bound to COM1's ports) once
 /// [`init`] has returned `true`.

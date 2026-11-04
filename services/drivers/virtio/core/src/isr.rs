@@ -51,7 +51,8 @@ pub struct IsrStep
 /// A delivery is acknowledged and signalled whatever the ISR holds, since it
 /// may be another device's on the line and the binding owes either way. A
 /// timeout owes no acknowledgement; it signals only when the ISR was set,
-/// which is a lost edge.
+/// which is an interrupt no delivery reported: a lost edge on a line programmed
+/// edge-triggered, a lost wake on a level-triggered one.
 #[must_use]
 pub const fn isr_step(delivered: bool, isr: u8) -> IsrStep
 {

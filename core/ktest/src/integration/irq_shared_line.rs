@@ -38,11 +38,14 @@
 //!
 //! Last, the line's mode (`IRQ_MODE_*` in `abi/syscall`): a first binding
 //! records level-triggered, active-high; a second binding passing another mode
-//! is refused and binds nothing, as is a rebind of the first; a second passing
-//! the same mode binds, and a raise signals both; once both go, a new first
-//! binding records edge-triggered again; a mode with a bit outside
-//! `IRQ_MODE_MASK` is refused. Every mode used is active-high, the UART line's
-//! own polarity, so no binding inverts the line.
+//! is refused, as is a rebind of the first, and binds nothing (with the first
+//! acknowledged, a raise signals it alone); a second passing the same mode
+//! binds, a raise signals both, and with the line held asserted across both
+//! acknowledgements it signals both again at the unmask, which an
+//! edge-triggered entry would not; once both go, a new first binding records
+//! edge-triggered again; a mode with a bit outside `IRQ_MODE_MASK` is refused.
+//! Every mode used is active-high, the UART line's own polarity, so no binding
+//! inverts the line.
 
 use syscall::{
     IRQ_MODE_LEVEL, IRQ_MODE_MASK, RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive,
@@ -227,12 +230,29 @@ fn line_mode(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     {
         return Err("integration::irq_shared_line: a rebind to another mode was not refused");
     }
+    // The refusals bound nothing: with A acknowledged, a raise signals N1
+    // alone, where a B bound by a refused call would owe an acknowledgement
+    // and hold the line masked.
+    acknowledge(&[a])?;
+    raise_expect(&[n1], &[n2], "a refused registration bound the line")?;
     irq_register(b, n2, IRQ_MODE_LEVEL)
         .map_err(|_| "integration::irq_shared_line: a binding of the line's mode was refused")?;
-    // The refusals changed nothing: A still signals N1, and B, bound once,
-    // signals N2.
+    // Level-triggered: a raise signals both, and the assertion, held across
+    // both acknowledgements, is delivered again at the unmask; an
+    // edge-triggered entry raises no new edge for it.
     acknowledge(&[a, b])?;
-    raise_expect(&[n1, n2], &[], "a level line did not signal both bindings")?;
+    raise_tx_interrupt();
+    let redelivered = expect_signalled(&[n1, n2], &[], "a level line did not signal both bindings")
+        .and_then(|()| acknowledge(&[a, b]))
+        .and_then(|()| {
+            expect_signalled(
+                &[n1, n2],
+                &[],
+                "a level line did not deliver an assertion held at the unmask",
+            )
+        });
+    quiet_tx_interrupt();
+    redelivered?;
     cap_delete(a).map_err(|_| "integration::irq_shared_line: cap_delete(A) failed")?;
     cap_delete(b).map_err(|_| "integration::irq_shared_line: cap_delete(B) failed")?;
 
@@ -274,6 +294,15 @@ fn acknowledge(caps: &[u32]) -> TestResult
 fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
 {
     raise_tx_interrupt();
+    let result = expect_signalled(signalled, quiet, failure);
+    quiet_tx_interrupt();
+    result
+}
+
+/// Require every notification in `signalled` to see bit 0 and none in `quiet`
+/// to see anything, leaving the line as it is.
+fn expect_signalled(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
+{
     let mut result = Ok(());
     for &ntf in signalled
     {
@@ -291,6 +320,5 @@ fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> Test
             result = Err(failure);
         }
     }
-    quiet_tx_interrupt();
     result
 }

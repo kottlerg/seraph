@@ -59,9 +59,12 @@
 //! (bit 13, set for active-low) from the mode its line's first `SYS_IRQ_REGISTER` passed
 //! ([`redirection_low`]); the kernel reads no MADT interrupt-source override itself. A
 //! level-triggered entry's Remote IRR, set at delivery, is cleared by the local APIC's EOI,
-//! which the local APIC broadcasts to the I/O APICs (the kernel leaves the SVR's EOI-broadcast
-//! suppression bit clear). A device IRQ masks its entry before that EOI
-//! (`irq::dispatch_device_irq`), so an assertion still held at the unmask is delivered again.
+//! which the local APIC broadcasts to the I/O APICs (the kernel clears the SVR's EOI-broadcast
+//! suppression bit on every CPU, `interrupts::init` and `init_ap`). A device IRQ masks its entry
+//! before that EOI (`irq::dispatch_device_irq`), so an assertion still held at the unmask is
+//! delivered again. A delivery a CPU accepted while its line was being released leaves Remote
+//! IRR set with no entry left to carry its vector's EOI; [`route`] clears it before it programs
+//! the entry again ([`remote_irr_clear`]).
 //!
 //! # Limitations / deferred work
 //!
@@ -250,6 +253,32 @@ const REDIR_LEVEL: u32 = 1 << 15;
 /// Pin-polarity bit in the low dword of a redirection entry (bit 13): set for an
 /// active-low line.
 const REDIR_ACTIVE_LOW: u32 = 1 << 13;
+
+/// Remote IRR bit in the low dword of a redirection entry (bit 14, read-only):
+/// set while a level-triggered delivery awaits the EOI of the entry's vector.
+const REDIR_REMOTE_IRR: u32 = 1 << 14;
+
+/// The low dword [`route`] writes first, before the entry it programs, when the
+/// entry it replaces is `current`: a masked, edge-triggered entry when
+/// `current`'s Remote IRR is set, which clears it, and `None` otherwise.
+///
+/// A level delivery a CPU accepted while the line was being released leaves
+/// Remote IRR set, and its vector, released with the line, gets no EOI from an entry
+/// carrying it once the line is routed again on another vector; a level entry
+/// whose Remote IRR stays set delivers nothing more. Writing the trigger mode
+/// edge clears Remote IRR (the 82093AA, QEMU's and KVM's I/O APICs alike; Linux
+/// `clear_IO_APIC_pin` does the same).
+const fn remote_irr_clear(current: u32) -> Option<u32>
+{
+    if current & REDIR_REMOTE_IRR == 0
+    {
+        None
+    }
+    else
+    {
+        Some(REDIR_MASK | (current & 0xFF))
+    }
+}
 
 /// The low dword of a masked redirection entry delivering `vector` in fixed mode
 /// to a physical destination, with `mode`'s trigger and polarity
@@ -466,7 +495,9 @@ pub unsafe fn init()
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
 /// Uses fixed delivery, with the trigger mode and polarity `mode` names
-/// ([`redirection_low`]). A GSI no discovered I/O APIC owns is left alone
+/// ([`redirection_low`]). An entry whose Remote IRR a stale level delivery left
+/// set is first rewritten masked and edge-triggered, which clears it
+/// ([`remote_irr_clear`]). A GSI no discovered I/O APIC owns is left alone
 /// (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
@@ -488,6 +519,10 @@ pub unsafe fn route(gsi: u32, vector: u8, destination: u8, mode: u32)
     // until unmask(). IOAPIC_LOCK covers both select/window pairs.
     unsafe {
         let saved = IOAPIC_LOCK.lock_raw();
+        if let Some(clear) = remote_irr_clear(ioapic_read(base, 0x10 + 2 * pin))
+        {
+            ioapic_write(base, 0x10 + 2 * pin, clear);
+        }
         ioapic_write(base, 0x10 + 2 * pin, low);
         ioapic_write(base, 0x11 + 2 * pin, high);
         IOAPIC_LOCK.unlock_raw(saved);
@@ -639,6 +674,20 @@ mod tests
             redirection_low(0x43, level | active_low),
             REDIR_MASK | REDIR_LEVEL | REDIR_ACTIVE_LOW | 0x43
         );
+    }
+
+    #[test]
+    fn an_entry_with_remote_irr_set_is_first_rewritten_masked_and_edge()
+    {
+        let stale = REDIR_LEVEL | REDIR_REMOTE_IRR | 0x45;
+        assert_eq!(remote_irr_clear(stale), Some(REDIR_MASK | 0x45));
+    }
+
+    #[test]
+    fn an_entry_with_remote_irr_clear_is_programmed_directly()
+    {
+        assert_eq!(remote_irr_clear(REDIR_LEVEL | REDIR_MASK | 0x45), None);
+        assert_eq!(remote_irr_clear(REDIR_MASK), None);
     }
 
     #[test]

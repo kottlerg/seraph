@@ -283,6 +283,47 @@ impl RegisterLayout
     }
 }
 
+/// Offset of the `device_status` byte in the common configuration region
+/// (`VirtIO` 1.2 §4.1.4.3). Writing 0 to it resets the device, which stops its
+/// DMA and drops a pending interrupt (§2.4).
+pub const COMMON_DEVICE_STATUS: u64 = 0x14;
+
+/// Where a reset writes a device's `device_status` byte, for a holder of the
+/// BAR's `Mmio` cap that maps only that BAR: its PCI BAR index, the pages its
+/// cap spans ([`BarAperture::pages`]), and the byte's offset in the BAR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusRegister
+{
+    pub bar: u8,
+    pub bar_pages: u64,
+    pub offset: u64,
+}
+
+impl VirtioPciStartupInfo
+{
+    /// The device-status byte's place ([`StatusRegister`]): in the common
+    /// configuration region's BAR, at the region's offset plus
+    /// [`COMMON_DEVICE_STATUS`]. `None` when the device presents no complete
+    /// register layout ([`Self::register_layout`]) or the region is too short
+    /// to hold the byte.
+    #[must_use]
+    pub fn status_register(&self) -> Option<StatusRegister>
+    {
+        let layout = self.register_layout()?;
+        if u64::from(self.common_cfg.length) <= COMMON_DEVICE_STATUS
+        {
+            return None;
+        }
+        let bar = self.common_cfg.bar;
+        let bar_pages = layout.bars().iter().find(|b| b.bar == bar)?.pages;
+        Some(StatusRegister {
+            bar,
+            bar_pages,
+            offset: u64::from(self.common_cfg.offset) + COMMON_DEVICE_STATUS,
+        })
+    }
+}
+
 // ── VirtIO PCI capability types (VirtIO 1.2 §4.1.4) ────────────────────────
 
 /// Common configuration capability type.
@@ -319,6 +360,37 @@ mod tests
             notify_off_multiplier: 0x55,
             pad: 0,
         }
+    }
+
+    #[test]
+    fn the_status_register_is_in_the_common_regions_bar_past_its_offset()
+    {
+        // The common region of a VirtIO 1.x device: 0x38 bytes, holding `device_status`.
+        let mut info = populated();
+        info.common_cfg.length = 0x38;
+        let status = info.status_register().expect("complete layout");
+        assert_eq!(status.bar, 1);
+        assert_eq!(status.offset, 0x100 + COMMON_DEVICE_STATUS);
+        let pages = info
+            .register_layout()
+            .expect("complete layout")
+            .bars()
+            .iter()
+            .find(|b| b.bar == 1)
+            .expect("BAR 1")
+            .pages;
+        assert_eq!(status.bar_pages, pages);
+    }
+
+    #[test]
+    fn no_status_register_without_a_layout_or_room_for_the_byte()
+    {
+        let mut info = populated();
+        info.common_cfg.length = u32::try_from(COMMON_DEVICE_STATUS).expect("small");
+        assert_eq!(info.status_register(), None);
+        let mut info = populated();
+        info.isr_cfg.length = 0;
+        assert_eq!(info.status_register(), None);
     }
 
     #[test]

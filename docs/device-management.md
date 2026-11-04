@@ -180,9 +180,10 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
   devmgr may share MUST acknowledge each delivery promptly, whether or not it has a request in
   flight: the line stays masked until every binding has acknowledged, so a receiver that
   acknowledges only while it serves a request of its own holds the line masked for the others on
-  it while it is idle, and their devices' interrupts are lost (x86-64) or delayed (riscv64) until
-  it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges
-  every delivery ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
+  it while it is idle, and their devices' interrupts are lost (on a line programmed edge-triggered)
+  or delayed (on a level-triggered one) until it next does. The VirtIO drivers therefore run an
+  interrupt-service thread that acknowledges every delivery
+  ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
   rule 5) and also reads its device's interrupt status on a bounded timeout, which recovers an
   edge-triggered line's lost edge (below). A driver that does not acknowledge promptly needs its
   line kept exclusive: the serial driver acknowledges only when its client reads
@@ -195,7 +196,12 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
   or torn down with its holder's CSpace) or its Notification is; the line is unmasked when the
-  remaining bindings owe nothing, and released at its controller when none remains.
+  remaining bindings owe nothing, and released at its controller when none remains. A driver that
+  dies while its device asserts a level-triggered line leaves the device asserting with no
+  receiver to clear it, so the line's other receivers are signalled again on each unmask; devmgr
+  ends that by resetting a `VirtIO` device when it withdraws the device's driver
+  ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md#withdrawal)
+  § Withdrawal).
 
 The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
 § `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the PLIC gateway is level-sensitive, so an

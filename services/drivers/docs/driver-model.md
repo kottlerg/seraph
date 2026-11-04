@@ -3,10 +3,10 @@
 Driver lifecycle specification: device discovery, driver binding, per-device
 capability delegation, service-endpoint delivery, and driver teardown.
 
-Only § Adding a Driver is written here; devmgr's discovery, binding, and delegation are
-specified in
+§ Adding a Driver and § Withdrawal are written here; devmgr's discovery, binding, and delegation
+are specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md).
-TODO: specify driver teardown.
+TODO: specify the rest of driver teardown.
 
 ---
 
@@ -45,6 +45,23 @@ TODO: specify driver teardown.
    32 to 35), so the exclusivity costs no device a cap in practice.
 6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
+
+---
+
+## Withdrawal
+
+devmgr withdraws a driver that dies, fails its device setup, or overruns its settle bound. For a
+`VirtIO` PCI driver, devmgr resets the device as it withdraws the driver: it keeps the device's BAR
+caps for as long as it serves the device, maps the one holding the common configuration region,
+and writes 0 to `device_status`, which stops the device's DMA and drops its pending interrupt, and
+only then releases the device's caps. A driver that dies while its device asserts a shared
+level-triggered line therefore leaves the line's other receivers no assertion to loop on once the
+reset lands; between the driver's death, which releases its binding, and the reset, they may see
+re-deliveries their own devices did not raise
+([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
+§ Interrupt Delivery). The withdrawal itself is specified in
+[services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
+§ Responsibilities.
 
 ---
 

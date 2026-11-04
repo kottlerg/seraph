@@ -316,6 +316,40 @@ pub fn madt_source_overrides(madt_bytes: &[u8])
     }))
 }
 
+/// Whether the MADT's structures run, each of length 2 or more, exactly to the
+/// table's end (its reported length bounded by the slice), so
+/// [`madt_source_overrides`] read every override the table holds. `false` too
+/// for a table that is not a MADT.
+#[must_use]
+pub fn madt_well_formed(madt_bytes: &[u8]) -> bool
+{
+    if sdt_signature(madt_bytes) != *b"APIC"
+    {
+        return false;
+    }
+    let Some(len) = sdt_length(madt_bytes)
+    else
+    {
+        return false;
+    };
+    let end = (len as usize).min(madt_bytes.len());
+    if end < MADT_ENTRIES_OFF
+    {
+        return false;
+    }
+    let mut off = MADT_ENTRIES_OFF;
+    while off < end
+    {
+        let len = usize::from(read_u8(madt_bytes, off + 1));
+        if off + 2 > end || len < 2 || off + len > end
+        {
+            return false;
+        }
+        off += len;
+    }
+    true
+}
+
 /// The `SYS_IRQ_REGISTER` mode of a PCI `INTx` line: level-triggered,
 /// active-low, the PCI default, which a line no override names takes.
 pub const PCI_INTX_MODE: u64 = IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW;
@@ -827,6 +861,44 @@ mod tests
         let last = table.len() - LOCAL_APIC.len();
         table[last + 1] = 200;
         assert_eq!(madt_source_overrides(&table).expect("MADT").count(), 1);
+    }
+
+    #[test]
+    fn a_source_override_shorter_than_its_ten_bytes_is_skipped()
+    {
+        let short = [MADT_TYPE_SOURCE_OVERRIDE, 8, 0, 9, 9, 0, 0, 0];
+        let table = madt(&[&short, &source_override(10, 10, 0xd)]);
+        let found: Vec<_> = madt_source_overrides(&table).expect("MADT").collect();
+        assert_eq!(
+            found,
+            vec![SourceOverride {
+                source: 10,
+                gsi: 10,
+                flags: 0xd
+            }]
+        );
+    }
+
+    #[test]
+    fn a_walk_that_reaches_the_tables_end_is_well_formed()
+    {
+        assert!(madt_well_formed(&madt(&[
+            &LOCAL_APIC,
+            &source_override(10, 10, 0xd)
+        ])));
+        assert!(madt_well_formed(&madt(&[])));
+    }
+
+    #[test]
+    fn a_walk_cut_short_is_not_well_formed()
+    {
+        let iso = source_override(9, 9, 0xd);
+        assert!(!madt_well_formed(&madt(&[&iso, &[2, 0]])));
+        let mut table = madt(&[&iso, &LOCAL_APIC]);
+        let last = table.len() - LOCAL_APIC.len();
+        table[last + 1] = 200;
+        assert!(!madt_well_formed(&table));
+        assert!(!madt_well_formed(&sdt(b"FACP", 64)));
     }
 
     #[test]

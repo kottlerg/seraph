@@ -276,7 +276,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // direct physical map (VA == direct_map_base() + PA). The identity mapping
     // covers only the handoff stack's window (`HANDOFF_STACK_BYTES`) and
     // retires with it; the direct map covers all physical RAM with no size
-    // limit.
+    // limit but the kernel-stack guard pages (`mm::stack_guard`), the
+    // handoff stack's among them, below the stack.
     //
     // Call into the bulk of `kernel_entry` through an `#[inline(never)]`
     // boundary so LLVM cannot hoist sp-derived local-address
@@ -289,8 +290,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // riscv64 release ktest cell in CI — sepc=0xffffffff8000d972,
     // stval=0x9ddc0f58 from a stale `add s7, sp, 0x19E0`).
     //
-    // SAFETY: new page tables active with direct map covering all RAM.
-    // Adding the direct-map base to RSP/RBP switches to the same physical
+    // SAFETY: new page tables active with direct map covering all RAM but
+    // the guard page below the handoff stack. Adding the direct-map base to RSP/RBP switches to the same physical
     // frames through the direct map virtual range.
     unsafe {
         arch::current::paging::rebase_boot_stack(mm::paging::direct_map_base());
@@ -620,8 +621,10 @@ unsafe fn kernel_entry_post_rebase(
         // only copy and one scrub covers it. The length is clamped because
         // the Phase-0 validator does not check it.
         let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
-        // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
-        // was validated in Phase 0. Single-threaded boot, and no live BootInfo
+        // SAFETY: the direct map covers all RAM since Phase 3 but the
+        // kernel-stack guard pages (`mm::stack_guard`), and the `BootInfo`
+        // page is none of them; boot_info_phys was validated in Phase 0.
+        // Single-threaded boot, and no live BootInfo
         // reference aliases the page; the shared borrow taken here ends before
         // the scrub below writes through `bi`.
         unsafe {
@@ -795,7 +798,8 @@ unsafe fn kernel_entry_post_rebase(
         // Re-resolve `BootInfo` through the direct physical map; Phase 3 left
         // no identity mapping of it. (Phase 7's `cap::init_capability_system`
         // does the same translation from `boot_info_phys`.)
-        // SAFETY: direct map covers all RAM since Phase 3; boot_info
+        // SAFETY: direct map covers all RAM since Phase 3 but the kernel-stack
+        // guard pages, and the `BootInfo` page is none of them; boot_info
         // physical address validated in Phase 0.
         let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
         // SAFETY: ROOT_CSPACE installed in Phase 7; trampoline page no
@@ -985,8 +989,10 @@ unsafe fn kernel_entry_post_rebase(
             // init can forward the geometry to devmgr. The bootloader's
             // captured GOP framebuffer identity dies at `ExitBootServices`;
             // this is the only path from there to userspace.
-            // SAFETY: direct map covers all RAM since Phase 3; boot_info_phys
-            // validated in Phase 0; same pattern as `info_dm` above.
+            // SAFETY: direct map covers all RAM since Phase 3 but the
+            // kernel-stack guard pages, and the `BootInfo` page is none of
+            // them; boot_info_phys validated in Phase 0; same pattern as
+            // `info_dm` above.
             let boot_info_for_fb =
                 unsafe { &*(mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
             let fb_in = boot_info_for_fb.framebuffer;
@@ -1314,10 +1320,11 @@ unsafe fn kernel_entry_post_rebase(
             // SAFETY: after SMP bringup (Phase 8), with no lock held; the
             // guard is the fresh slab's first page, which nothing reaches
             // until the reclaim of init's Thread closes it.
-            if unsafe { mm::stack_guard::hole(block_phys) }.is_err()
+            let Ok(init_guard_epoch) = (unsafe { mm::stack_guard::hole(block_phys) })
+            else
             {
                 fatal("Phase 9: cannot unmap init's kernel stack guard page");
-            }
+            };
             let kstack_top = block_virt + sched::thread_slot::WRAPPER_OFFSET;
             // Paint init's kernel stack for the depth report (stack_depth).
             // SAFETY: the slab's KERNEL_STACK_PAGES pages above the guard are
@@ -1397,6 +1404,7 @@ unsafe fn kernel_entry_post_rebase(
                         is_user: true,
                         saved_state: init_saved,
                         kernel_stack_top: kstack_top,
+                        guard_epoch: init_guard_epoch,
                         trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                         syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                         address_space: init_as_ptr,

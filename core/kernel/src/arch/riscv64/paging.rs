@@ -1456,6 +1456,18 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     l0[vpn_index(0, virt)].is_present()
 }
 
+/// Invalidate every translation this hart caches, in every address space
+/// (`sfence.vma zero, zero`).
+///
+/// # Safety
+/// Must execute in S-mode.
+#[cfg(not(test))]
+pub unsafe fn flush_all_contexts()
+{
+    // SAFETY: S-mode (caller contract).
+    unsafe { flush_tlb_all() };
+}
+
 /// Whether a hart may cache an invalid entry, so that a page made valid again
 /// needs a flush on every hart before another one reaches it: true on RISC-V
 /// without Svvptc, which the kernel does not require.

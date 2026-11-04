@@ -216,6 +216,10 @@ pub struct PerCpuData
     /// the handoff stack's ([`set_kernel_stack_floor`]). x86-64 reads none: a
     /// fault on its guard escalates to a double fault on IST1.
     pub kernel_stack_floor: u64,
+    /// The guard epoch at this CPU's last whole-TLB flush for the
+    /// kernel-stack guards (`mm::stack_guard::flush_before_run`). Written
+    /// only by this CPU, at a switch-in.
+    pub guard_epoch_flushed: u64,
 }
 
 impl PerCpuData
@@ -235,6 +239,7 @@ impl PerCpuData
             ctxsw_flush_elided: AtomicU64::new(0),
             ctxsw_flush_performed: AtomicU64::new(0),
             kernel_stack_floor: 0,
+            guard_epoch_flushed: 0,
         }
     }
 }
@@ -394,6 +399,26 @@ pub unsafe fn set_kernel_stack_floor(floor: u64)
     unsafe { (*ptr).kernel_stack_floor = floor };
 }
 
+/// The guard epoch at this CPU's last whole-TLB flush
+/// ([`PerCpuData::guard_epoch_flushed`]).
+#[cfg(not(test))]
+pub fn guard_epoch_flushed() -> u64
+{
+    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: this CPU's own entry, written only by this CPU.
+    unsafe { (*ptr).guard_epoch_flushed }
+}
+
+/// Record `epoch` as the guard epoch of this CPU's last whole-TLB flush.
+/// Called with interrupts disabled, so the CPU does not change mid-call.
+#[cfg(not(test))]
+pub fn set_guard_epoch_flushed(epoch: u64)
+{
+    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: this CPU's own entry, written only by this CPU.
+    unsafe { (*ptr).guard_epoch_flushed = epoch };
+}
+
 // ── Preemption control ───────────────────────────────────────────────────────
 
 /// Increment the preemption-disable depth on the current CPU.
@@ -538,6 +563,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 80);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 88);
     }
 }

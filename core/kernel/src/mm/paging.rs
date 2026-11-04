@@ -892,7 +892,8 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
 
     // Reload the root: drops any translation cached while stage 2 filled
     // entries that stage 1 left not-present (RISC-V may cache invalid
-    // entries). After this point the direct map covers all RAM.
+    // entries). After this point the direct map covers all RAM but the
+    // handoff stack's guard page (`handoff_guard_phys`).
     // SAFETY: the same tables as above, now complete.
     unsafe {
         arch_paging::activate(root_pa);

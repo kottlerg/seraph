@@ -348,6 +348,12 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool;
 /// address from every PCID. A shootdown request on the kernel root makes each
 /// target run it (memory-internals.md § SMP TLB Shootdown).
 pub unsafe fn flush_kernel_page(virt: u64);
+
+/// Drop every translation this CPU caches, in every address space: x86-64
+/// INVPCID's all-context form with tagged TLBs and a CR3 reload without them;
+/// RISC-V `sfence.vma zero, zero`. The kernel-stack guards' switch-in flush
+/// (memory-internals.md § Kernel Stack Guards).
+pub unsafe fn flush_all_contexts();
 ```
 
 Which paging and TLB features each architecture requires, and which it uses opportunistically,

@@ -1366,6 +1366,32 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
 /// again needs a flush on every CPU: never on x86-64.
 pub const CACHES_NOT_PRESENT_ENTRIES: bool = false;
 
+/// Invalidate every translation this CPU caches, in every address space:
+/// INVPCID's all-context form with tagged TLBs; without them every entry
+/// sits under PCID 0 and is not global, so a CR3 reload drops it.
+///
+/// # Safety
+/// Must execute at ring 0.
+#[cfg(not(test))]
+pub unsafe fn flush_all_contexts()
+{
+    if crate::mm::tag_allocator::tagging_enabled()
+    {
+        let desc = InvpcidDescriptor {
+            pcid: 0,
+            linear_addr: 0,
+        };
+        // SAFETY: tagging enabled implies CR4.PCIDE on every CPU; the type-2
+        // descriptor's fields are ignored and zero.
+        unsafe { invpcid(INVPCID_TYPE_ALL_GLOBAL, &desc) };
+    }
+    else
+    {
+        // SAFETY: ring 0 (caller contract).
+        unsafe { flush_tlb_all() };
+    }
+}
+
 /// INVPCID type 2: invalidate every translation, global ones included, of
 /// every PCID.
 const INVPCID_TYPE_ALL_GLOBAL: u64 = 2;

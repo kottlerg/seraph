@@ -13,6 +13,14 @@
 //! idle stack's guard in Phase 4 ([`hole_on_boot_cpu`]) and each Thread slot's
 //! guard page while the thread exists ([`hole`], [`close`]).
 //!
+//! A Thread guard's hole sends no shootdown. [`hole`] advances the guard
+//! epoch and returns it for the new thread's TCB; every switch-in compares
+//! the incoming thread's stamp with the epoch the CPU last flushed at and
+//! flushes the CPU's whole TLB first when the stamp is newer
+//! ([`flush_before_run`]). A stale translation of a thread's guard lets an
+//! overflow through only while that thread runs on that CPU, and every run
+//! starts with a switch-in.
+//!
 //! A hole in a 2 MiB chunk mapped by one large leaf splits the chunk into a
 //! leaf table first. The leaf tables come from a reserve seeded in Phase 4
 //! from the pristine buddy, one frame for each 2 MiB chunk of RAM
@@ -58,7 +66,7 @@ pub fn reserve_frames(entries: &[MemoryMapEntry]) -> usize
 mod live
 {
     use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use crate::mm::paging::{PagingError, phys_to_virt};
     use crate::sync::Spinlock;
@@ -146,6 +154,12 @@ mod live
 
     /// Frames still in the reserve. Diagnostic only.
     static REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+    /// Thread-guard holes made so far: [`hole`] advances it after each edit
+    /// and stamps the new value in the thread's TCB. A CPU whose last flush
+    /// read an epoch at or past a thread's stamp holds no stale translation
+    /// of that thread's guard ([`flush_before_run`]).
+    static GUARD_EPOCH: AtomicU64 = AtomicU64::new(0);
 
     /// Seed the reserve with `frames` frames from the buddy.
     ///
@@ -247,8 +261,10 @@ mod live
         Ok(())
     }
 
-    /// Unmap the RAM page at `phys` from the direct map and drop every
-    /// CPU's cached translation of it, with every CPU online.
+    /// Unmap the RAM page at `phys`, a new thread's guard page, from the
+    /// direct map, and return the guard epoch to stamp in the thread's TCB.
+    /// No CPU's TLB is flushed here: each CPU flushes before it first runs
+    /// the thread ([`flush_before_run`]).
     ///
     /// # Errors
     /// As [`hole_on_boot_cpu`].
@@ -256,30 +272,41 @@ mod live
     /// # Safety
     /// After SMP bringup (Phase 8 on), with no lock held. `phys` is a
     /// page-aligned RAM page the caller owns, which nothing reaches through
-    /// the direct map until [`close`].
-    pub unsafe fn hole(phys: u64) -> Result<(), PagingError>
+    /// the direct map until [`close`]; the returned epoch is stamped in the
+    /// TCB of the thread whose stack lies above it before the thread first
+    /// runs.
+    pub unsafe fn hole(phys: u64) -> Result<u64, PagingError>
     {
-        let virt = phys_to_virt(phys);
-        // Pinned to this CPU from the edit to the end of the broadcast, so
-        // the local flush and the excluded CPU are the same.
-        crate::percpu::preempt_disable();
         // SAFETY: caller contract.
-        let r = unsafe { hole_locked(phys) };
-        if r.is_ok()
+        unsafe { hole_locked(phys) }?;
+        debug_assert!(!is_mapped(phys), "stack_guard: a holed guard is mapped");
+        // After the edit, which the reserve lock's release published: a CPU
+        // that reads this epoch or a later one sees the hole.
+        Ok(GUARD_EPOCH.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Flush this CPU's whole TLB, in every address space, when `stamp`, the
+    /// incoming thread's guard epoch, is newer than the epoch this CPU last
+    /// flushed at, so no stale translation of that thread's guard page
+    /// outlives the switch-in. Called by `schedule()` on every switch-in,
+    /// with interrupts disabled.
+    ///
+    /// The flush is `flush_all_contexts`: INVPCID's all-context form on
+    /// x86-64 with tagged TLBs, a CR3 reload without them, and
+    /// `sfence.vma zero, zero` on riscv64.
+    pub fn flush_before_run(stamp: u64)
+    {
+        if stamp <= crate::percpu::guard_epoch_flushed()
         {
-            // SAFETY: ring 0 / S-mode; after SMP bringup with no lock held
-            // and preemption disabled (above).
-            unsafe {
-                crate::arch::current::paging::flush_kernel_page(virt);
-                shoot_down_kernel_page(virt);
-            }
+            return;
         }
-        crate::percpu::preempt_enable();
-        debug_assert!(
-            r.is_err() || !is_mapped(phys),
-            "stack_guard: a holed guard is mapped"
-        );
-        r
+        // Read before the flush: every hole up to this epoch was published
+        // before it was advanced, so the flush drops each one's stale entry.
+        let epoch = GUARD_EPOCH.load(Ordering::Acquire);
+        // SAFETY: ring 0 / S-mode with interrupts disabled (caller
+        // contract); dropping every cached translation is always safe.
+        unsafe { crate::arch::current::paging::flush_all_contexts() };
+        crate::percpu::set_guard_epoch_flushed(epoch);
     }
 
     /// Map the page at `phys`, holed by [`hole`], into the direct map again,
@@ -324,7 +351,10 @@ mod live
 }
 
 #[cfg(not(test))]
-pub use live::{close, hole, hole_on_boot_cpu, is_mapped, remaining_frames, seed, seeded_frames};
+pub use live::{
+    close, flush_before_run, hole, hole_on_boot_cpu, is_mapped, remaining_frames, seed,
+    seeded_frames,
+};
 
 #[cfg(test)]
 mod tests

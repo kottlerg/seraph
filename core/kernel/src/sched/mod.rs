@@ -2504,6 +2504,8 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,
+                    // Phase 4 made the idle guard before any other CPU ran.
+                    guard_epoch: 0,
                     trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
@@ -5943,6 +5945,11 @@ pub unsafe fn schedule(requeue: Requeue)
     unsafe {
         crate::arch::current::cpu::set_kernel_trap_stack(trap_stack);
     }
+
+    // Drop any stale translation of the incoming thread's guard page before
+    // it runs on its stack here (`mm::stack_guard`: holes send no shootdown).
+    // SAFETY: next is a valid TCB; guard_epoch is immutable after creation.
+    crate::mm::stack_guard::flush_before_run(unsafe { (*next).guard_epoch });
 
     // Switch address space tracking and page tables.
     //

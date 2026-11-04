@@ -1089,12 +1089,13 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // overflow faults instead of writing below the slot.
     // SAFETY: after SMP bringup, with no lock held; the guard is this call's
     // fresh slot page, which nothing reaches until the reclaim closes it.
-    if unsafe { crate::mm::stack_guard::hole(block_phys) }.is_err()
+    let Ok(guard_epoch) = (unsafe { crate::mm::stack_guard::hole(block_phys) })
+    else
     {
         // SAFETY: this call's own `retype_allocate` return, holding no object.
         unsafe { retype_free(memory, offset, entry.raw_bytes) };
         return Err(SyscallError::OutOfMemory);
-    }
+    };
 
     let kstack_virt = block_virt + STACK_OFFSET;
     let kstack_top = block_virt + WRAPPER_OFFSET;
@@ -1184,6 +1185,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 is_user: true,
                 saved_state: saved,
                 kernel_stack_top: kstack_top,
+                guard_epoch,
                 trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                 address_space: as_ptr,

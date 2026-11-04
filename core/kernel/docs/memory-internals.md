@@ -544,18 +544,30 @@ pristine buddy in Phase 4 and counted in the kernel reserve, so a split never fa
 split chunk stays split and its table stays consumed, and the reserve's unused frames are
 never returned. One leaf lock serialises every hole, every fill and the reserve.
 
-Making a thread's hole drops every CPU's cached translation of the page: the creator
-flushes locally and broadcasts a single-VA shootdown on the kernel root (§ SMP TLB
-Shootdown), which each target serves with `flush_kernel_page`, since the direct map's
-entries are cached under every address space a CPU has run. On x86-64 with tagged TLBs
-that is INVPCID's all-context form, a whole-TLB flush, because no instruction drops one
-non-global address from every PCID; without tags, and on riscv64 (`sfence.vma va, zero`),
-it is the one address. Filling a hole, before the slab returns to its Memory capability,
-drops the not-present entry wherever a CPU may cache one (`CACHES_NOT_PRESENT_ENTRIES`):
-riscv64, without Svvptc, broadcasts the same shootdown, since a hart that kept the invalid
-entry would fault on the page's next use, and if that use is a kernel stack the fault's
-trap frame lands on the same page and faults again before the first trap has saved its
-state; x86-64 caches no not-present entry and needs none.
+Making a thread's hole sends no shootdown. A global guard epoch counts the holes: thread
+creation advances it after the edit and stamps the new value in the TCB (`guard_epoch`),
+and each CPU records the epoch of its last guard flush (`PerCpuData::guard_epoch_flushed`).
+At every switch-in `schedule()` compares the incoming thread's stamp with that record and,
+when the stamp is newer, reads the current epoch, flushes the CPU's whole TLB in every
+address space (`flush_all_contexts`), and records the epoch it read
+(`stack_guard::flush_before_run`). A stale translation of a thread's guard page lets an
+overflow through only while that thread runs on that CPU, and every run starts with a
+switch-in there, which flushes first whenever the CPU's last flush predates the hole; the
+epoch is advanced after the edit, so a CPU that reads an epoch at or past the stamp
+flushes after the edit is visible. The direct map's entries are not global and are cached
+under every address space a CPU has run, so on x86-64 with tagged TLBs the flush is
+INVPCID's all-context form (no instruction drops one non-global address from every PCID),
+a CR3 reload without tags, and `sfence.vma zero, zero` on riscv64. The cost is a compare
+per switch and at most one local flush per CPU per run of newer threads, with no IPI.
+
+Filling a hole, before the slab returns to its Memory capability, drops the not-present
+entry wherever a CPU may cache one (`CACHES_NOT_PRESENT_ENTRIES`): riscv64, without
+Svvptc, broadcasts a single-VA shootdown on the kernel root (§ SMP TLB Shootdown), which
+each target serves with `flush_kernel_page` (`sfence.vma va, zero`), since a hart that
+kept the invalid entry would fault on the page's next use, and if that use is a kernel
+stack the fault's trap frame lands on the same page and faults again before the first trap
+has saved its state, a use no switch-in bounds; x86-64 caches no not-present entry and
+needs none.
 
 An overflow halts the overflowing CPU with a diagnostic (`fatal`). On x86-64 the fault on
 the guard cannot push its frame on the overflowed stack and escalates to a double fault,

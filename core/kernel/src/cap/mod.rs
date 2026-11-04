@@ -706,7 +706,7 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// diagnostic; the authoritative `kernel_reserved` is the complement of the
 /// `owns_memory` ledger computed at Phase 9 (`core/kernel/src/main.rs`, from
 /// [`owns_memory_minted_bytes`]). Valid once Phase 7 has reserved the
-/// `InitInfo` block, which sizes terms 3 and 5.
+/// `InitInfo` block, which sizes terms 4 and 6.
 #[cfg(not(test))]
 pub(crate) fn kernel_reserve_pages() -> usize
 {
@@ -845,7 +845,8 @@ fn reserve_init_backing(counts: &DescriptorCounts)
         let block = phys_to_virt(info) as *mut u8;
         // SAFETY: the region's pages were just taken from the buddy, so
         // nothing else references them, and the direct map covers all RAM
-        // since Phase 3. Zeroed here, before the drain and the descriptors are
+        // since Phase 3 but the kernel-stack guard pages (`mm::stack_guard`), none of them
+        // a free buddy page. Zeroed here, before the drain and the descriptors are
         // written into it, so the header and every unused slot reach init as
         // zeroes.
         unsafe {
@@ -1017,7 +1018,8 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
     // leftover survives anywhere in the drained RAM.
     // SAFETY: the reserve is the front of an extent just drained from the
     // buddy, and nothing has been retyped from the seed yet; the direct map
-    // covers all RAM since Phase 3; single-threaded Phase 7.
+    // covers all RAM since Phase 3 but the kernel-stack guard pages (`mm::stack_guard`), none of
+    // them a drained page; single-threaded Phase 7.
     unsafe {
         core::ptr::write_bytes(
             phys_to_virt(seed_base) as *mut u8,
@@ -1039,7 +1041,8 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
         // § Kernel state in donated memory).
         // SAFETY: the extent is free RAM just drained from the buddy (or the
         // seed extent's tail), so nothing references it; the direct map
-        // covers all RAM since Phase 3; single-threaded Phase 7.
+        // covers all RAM since Phase 3 but the kernel-stack guard pages (`mm::stack_guard`), none of
+        // them a drained page; single-threaded Phase 7.
         unsafe { core::ptr::write_bytes(phys_to_virt(base) as *mut u8, 0, size as usize) };
     }
     let zero_us = crate::arch::current::timer::elapsed_us()
@@ -2516,7 +2519,8 @@ const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = (boot_protocol::MAX_RECLAIM_RANGES
 /// page and of every recorded range, and before init is enqueued: nothing
 /// reads a recorded range after this call, and no userspace thread can yet
 /// reach the caps minted over them. `boot_info_phys` was validated in
-/// Phase 0; the direct map covers all RAM since Phase 3.
+/// Phase 0; the direct map covers all RAM since Phase 3 but the kernel-stack
+/// guard pages (`mm::stack_guard`), none of them in a reclaim range.
 #[cfg(not(test))]
 pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
 {

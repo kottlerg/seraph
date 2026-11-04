@@ -318,6 +318,12 @@ context_switch(current_tcb, next_tcb):
     //    user stack). A kernel/idle thread passes 0.
     arch::current::cpu::set_kernel_trap_stack(next_tcb.kernel_stack_top)
 
+    // 1b. Flush this CPU's whole TLB when next_tcb's kernel-stack guard was
+    //     holed after this CPU's last guard flush, so no stale translation of
+    //     the guard page outlives the switch (memory-internals.md § Kernel
+    //     Stack Guards).
+    mm::stack_guard::flush_before_run(next_tcb.guard_epoch)
+
     // 2. Switch address space if different.
     if current_tcb.address_space != next_tcb.address_space:
         arch::current::paging::activate(next_tcb.address_space.root_phys)

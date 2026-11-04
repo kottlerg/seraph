@@ -7,15 +7,12 @@
 //!
 //! The fs driver evicts cached pages by sending `FS_RELEASE_MEMORY` on
 //! a badged SEND derived from the per-process release endpoint owned
-//! by this module. Copies of each opened file's SEND travel to the driver
-//! in `caps[0]` of its [`fs_labels::FS_READ_MEMORY`] requests until one
-//! is confirmed delivered (see [`super::File::read_frame`]); from the
-//! request that allocates the node's driver slot on, the driver's
-//! eviction worker can route cooperative releases here. The
-//! handler finds the cookie among every registered `File`, not only the one
-//! whose badge the release carries: the driver records one release SEND per
-//! node, so a release for one `File`'s page can arrive on another `File`'s
-//! badge (services/fs/docs/fs-driver-protocol.md § Label 8). It waits out a
+//! by this module. Each opened file's SEND travels to the driver in
+//! `caps[0]` of the file's [`fs_labels::FS_OPEN`] (see
+//! [`super::File::open`]), and the driver's eviction worker sends each
+//! page's release on the SEND of the open that read it
+//! (services/fs/docs/fs-driver-protocol.md § Label 8), so the handler
+//! looks the cookie up in the `File` the release's badge names. It waits out a
 //! local copy still reading the cookie's page, for at most [`READ_WAIT`]
 //! once per cookie, removes the matching outstanding mapping (race-safe
 //! against the local read path's immediate-release cleanup), unmaps the
@@ -77,6 +74,9 @@ pub(super) struct OutstandingMapping
 /// and the local read/drop paths.
 pub(super) struct FileEntry
 {
+    /// The `File`'s open cap, for the process-exit `FS_CLOSE`
+    /// ([`open_caps`]).
+    open_cap: u32,
     outstanding: Mutex<Outstanding>,
     /// Signalled whenever a cookie leaves [`Outstanding::reading`].
     read_done: Condvar,
@@ -198,10 +198,12 @@ pub(super) fn allocate_badge() -> Option<u64>
     }
 }
 
-/// Register a `File` with the handler, returning its `FileEntry`.
-pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
+/// Register a `File` and its open cap with the handler, returning its
+/// `FileEntry`.
+pub(super) fn register(state: &ReleaseState, badge: u64, open_cap: u32) -> Arc<FileEntry>
 {
     let entry = Arc::new(FileEntry {
+        open_cap,
         outstanding: Mutex::new(Outstanding {
             idle: Vec::new(),
             reading: Vec::new(),
@@ -215,6 +217,18 @@ pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
         .unwrap_or_else(PoisonError::into_inner);
     reg.insert(badge, entry.clone());
     entry
+}
+
+/// The open caps of every registered `File`: those not yet dropped. Read
+/// under the registry lock and returned, so the caller's IPC runs with the
+/// lock free.
+pub(super) fn open_caps(state: &ReleaseState) -> Vec<u32>
+{
+    let reg = state
+        .registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    reg.values().map(|e| e.open_cap).collect()
 }
 
 /// Remove a `File`'s registration. After this call the handler cannot
@@ -289,17 +303,18 @@ enum Taken
     Busy,
 }
 
-/// The registered entry holding `cookie`, reading or idle, whichever `File`
-/// it belongs to. Cookies are random per read, so at most one entry holds
-/// one. Lock order: the registry, then an entry.
-fn find_entry(state: &ReleaseState, cookie: u64) -> Option<Arc<FileEntry>>
+/// The entry registered under `badge`, the badge of the release SEND a
+/// driver release arrived on, when it holds `cookie`, reading or idle. A
+/// release whose badge names no registered `File`, or a `File` that holds
+/// no such cookie, finds none. Lock order: the registry, then an entry.
+fn find_entry(state: &ReleaseState, badge: u64, cookie: u64) -> Option<Arc<FileEntry>>
 {
     let reg = state
         .registry
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    reg.values()
-        .find(|e| {
+    reg.get(&badge)
+        .filter(|e| {
             let out = e.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
             out.reading.contains(&cookie) || out.idle.iter().any(|m| m.cookie == cookie)
         })
@@ -432,7 +447,7 @@ fn handler_main(state: &ReleaseState)
 
         // The registry lock is dropped before the wait and the unmap, so
         // local reads keep registering mappings meanwhile.
-        let taken = find_entry(state, cookie)
+        let taken = find_entry(state, msg.badge, cookie)
             .map_or(Taken::Absent, |e| take_mapping_after_read(e.as_ref(), cookie));
 
         // A page this process cannot unmap, or one a copy is still reading,

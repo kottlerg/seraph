@@ -538,7 +538,10 @@ fn try_forward_lookup_fallthrough(
     let parent = match gate(recv.label, recv.badge)
     {
         Ok((node, _)) => node,
-        Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
+        Err(GateError::PermissionDenied | GateError::UnknownLabel | GateError::WrongKind) =>
+        {
+            return false;
+        }
     };
     // Cast is range-safe: name_len lives in bits 16..32 of the label.
     let name_len = ((recv.label >> 16) & 0xFFFF) as usize;
@@ -633,7 +636,10 @@ fn try_forward_readdir_fallthrough(
     let dir = match gate(recv.label, recv.badge)
     {
         Ok((node, _)) => node,
-        Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
+        Err(GateError::PermissionDenied | GateError::UnknownLabel | GateError::WrongKind) =>
+        {
+            return false;
+        }
     };
     // An index beyond u32 cannot name an entry; answer `END_OF_DIR` as
     // namespace-protocol's `handle_readdir` does for the local children,

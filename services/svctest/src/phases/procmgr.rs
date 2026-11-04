@@ -139,8 +139,8 @@ pub fn init_cspace_released_phase(_: &Caps)
     panic!("init_cspace_released: init's reap did not run within the poll budget");
 }
 
-/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, and
-/// `death_queue_growth` run after the namespace cluster has established
+/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`,
+/// `procmgr_dma_hold`, and `death_queue_growth` run after the namespace cluster has established
 /// attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
 {
@@ -180,6 +180,10 @@ pub fn command_phases() -> &'static [Phase]
         Phase {
             name: "procmgr_refusals",
             run: procmgr_refusals_phase,
+        },
+        Phase {
+            name: "procmgr_dma_hold",
+            run: procmgr_dma_hold_phase,
         },
         Phase {
             name: "death_queue_growth",
@@ -844,9 +848,9 @@ pub fn procmgr_refusals_phase(_: &Caps)
         );
         expect_reply(
             procmgr,
-            &IpcMessage::builder(3).cap(spare_cap()).build(),
+            &IpcMessage::builder(4).cap(spare_cap()).build(),
             procmgr_errors::UNKNOWN_OPCODE,
-            "unassigned label 3",
+            "unassigned label 4",
         );
         let (file, size) = hello_file();
         expect_reply(
@@ -887,6 +891,182 @@ pub fn procmgr_refusals_phase(_: &Caps)
          {UNDELIVERABLE_GRANT_FAILED}=a reserve-spending grant failed"
     );
     std::os::seraph::log!("procmgr_refusals phase passed");
+}
+
+/// Sample windows [`procmgr_dma_hold_phase`] retries: memmgr's free-pool size
+/// is system-wide, and other processes (crasher shares the boot) can move it
+/// inside one.
+const DMA_HOLD_WINDOWS: u32 = 8;
+/// Pool queries per window: while the held child's pages must stay out of
+/// the pool, and after the release until they are back. A test wait bound: it
+/// limits only how long a window polls.
+const DMA_HOLD_POLLS: u32 = 256;
+/// `QUERY_PROCESS` polls for the held child's exit. A test wait bound.
+const DMA_HOLD_EXIT_POLLS: u32 = 100_000;
+
+/// Create `/programs/hello` through raw `CREATE_FROM_FILE` with
+/// `CREATE_DMA_HOLD` and return its `(process_handle, thread)`.
+fn create_held_hello() -> (u32, u32)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let (file, size) = hello_file();
+    let create =
+        IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DMA_HOLD)
+            .word(0, size)
+            .cap(file)
+            .build();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().procmgr_endpoint,
+            &create,
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .expect("CREATE_FROM_FILE with CREATE_DMA_HOLD call failed");
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "CREATE_FROM_FILE with CREATE_DMA_HOLD refused"
+    );
+    match reply.caps()
+    {
+        &[handle, thread] => (handle, thread),
+        other => panic!("CREATE_FROM_FILE replied {} caps", other.len()),
+    }
+}
+
+/// memmgr's free-pool size, asserting the query succeeds.
+fn pool_free() -> u64
+{
+    std::os::seraph::memmgr_pool_free_bytes().expect("memmgr QUERY_POOL_STATUS failed")
+}
+
+/// Whether memmgr's free pool reads `level` within [`DMA_HOLD_POLLS`] polls.
+fn pool_returns_to(level: u64) -> bool
+{
+    for _ in 0..DMA_HOLD_POLLS
+    {
+        if pool_free() == level
+        {
+            return true;
+        }
+        std::thread::yield_now();
+    }
+    false
+}
+
+/// Start the held child behind `handle`, wait for it to exit, and destroy it,
+/// so procmgr has torn it down before the call returns.
+fn run_held_child_to_teardown(handle: u32)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels, procmgr_process_state};
+
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::START_PROCESS),
+        procmgr_errors::SUCCESS,
+        "START_PROCESS of the held child",
+    );
+    let exited = (0..DMA_HOLD_EXIT_POLLS).any(|_| {
+        let exited = process_state_and_reason(handle).0 == procmgr_process_state::EXITED;
+        if !exited
+        {
+            std::thread::yield_now();
+        }
+        exited
+    });
+    assert!(exited, "the held child did not exit");
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+        procmgr_errors::SUCCESS,
+        "DESTROY_PROCESS of the exited held child",
+    );
+}
+
+/// procmgr's held reclaim (`CREATE_DMA_HOLD`, `RELEASE_HOLD`;
+/// `services/procmgr/docs/ipc-interface.md` § Label 3): a held child that was
+/// started keeps its pages out of memmgr's free pool after its teardown,
+/// until its creator's `RELEASE_HOLD`, which returns them, and a second
+/// release finds nothing; `RELEASE_HOLD` on a live child, or on one never
+/// started, finds nothing to release; and a held child destroyed before its
+/// start is reclaimed at once. This is the procmgr side of devmgr's order for
+/// a DMA-capable driver (docs/process-lifecycle.md § Process Death); no boot
+/// can kill a `VirtIO` driver with a request in flight and observe its frames
+/// reused (services/devmgr/docs/responsibilities.md § Responsibilities).
+pub fn procmgr_dma_hold_phase(_: &Caps)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let release = IpcMessage::new(procmgr_labels::RELEASE_HOLD);
+
+    // Never started: no hold, reclaimed at its destroy.
+    let unstarted = (0..DMA_HOLD_WINDOWS).any(|_| {
+        let before = pool_free();
+        let (handle, thread) = create_held_hello();
+        expect_reply(
+            handle,
+            &release,
+            procmgr_errors::INVALID_BADGE,
+            "RELEASE_HOLD on a live held child",
+        );
+        expect_reply(
+            handle,
+            &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+            procmgr_errors::SUCCESS,
+            "DESTROY_PROCESS of the never-started held child",
+        );
+        expect_reply(
+            handle,
+            &release,
+            procmgr_errors::INVALID_BADGE,
+            "RELEASE_HOLD on a never-started held child",
+        );
+        let _ = syscall::cap_delete(thread);
+        let _ = syscall::cap_delete(handle);
+        pool_returns_to(before)
+    });
+    assert!(
+        unstarted,
+        "a held child destroyed before its start was not reclaimed in {DMA_HOLD_WINDOWS} windows"
+    );
+
+    // Started: held across the teardown until the release.
+    let mut held_seen = false;
+    let started = (0..DMA_HOLD_WINDOWS).any(|_| {
+        let before = pool_free();
+        let (handle, thread) = create_held_hello();
+        run_held_child_to_teardown(handle);
+        let held = !pool_returns_to(before);
+        expect_reply(
+            handle,
+            &release,
+            procmgr_errors::SUCCESS,
+            "RELEASE_HOLD on the torn-down held child",
+        );
+        expect_reply(
+            handle,
+            &release,
+            procmgr_errors::INVALID_BADGE,
+            "second RELEASE_HOLD on the released child",
+        );
+        let _ = syscall::cap_delete(thread);
+        let _ = syscall::cap_delete(handle);
+        held_seen |= held;
+        held && pool_returns_to(before)
+    });
+    assert!(
+        held_seen,
+        "a started held child's pages returned to the pool before RELEASE_HOLD in every window"
+    );
+    assert!(
+        started,
+        "a held child's pages were not back in the pool after RELEASE_HOLD in any of \
+         {DMA_HOLD_WINDOWS} windows"
+    );
+    std::os::seraph::log!("procmgr_dma_hold phase passed");
 }
 
 /// `CONFIGURE_PIPE` cells on a child created (and never started) through raw

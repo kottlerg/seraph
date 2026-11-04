@@ -112,6 +112,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     ipc::bench_ipc_round_trip(ctx, iters);
     notification::bench_notification_roundtrip(ctx, iters);
     cap::bench_cap_create_delete(ctx, iters);
+    cap::bench_cap_info_lookup(ctx, iters);
     mm::bench_mem_map_unmap(ctx, iters);
     mm::bench_mem_protect(ctx, iters);
     thread::bench_thread_lifecycle(ctx, iters);

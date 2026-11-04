@@ -92,16 +92,29 @@ const KERNEL_STACK_PAGES: usize = boot_protocol::layout::HANDOFF_STACK_BYTES / 4
 /// overwriting another allocation ([`handoff_stack_span`]).
 const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
 
-/// Entries of headroom the translated `MemoryMapEntry` array carries above the
-/// firmware's descriptor count, which step 6 reads before its first
-/// allocation. Each allocation after the count (the eight of steps 6 and 7:
-/// the `BootInfo`, module, entry, aperture and reclaim pages, the stack, the
-/// page-table pool, and the raw map buffer) adds at most two descriptors, 16
-/// in all; the other 16 absorb the firmware's own housekeeping allocations in
-/// that window, which no count bounds. A map still past the array fails the
-/// boot when a RAM descriptor would be dropped (step 9), so the margin is a
-/// budget backed by a loud failure, not a proof.
+/// Descriptors of growth the translated `MemoryMapEntry` array allows for
+/// above the firmware's descriptor count, which step 6 reads before its first
+/// allocation; the array then holds every descriptor the buffer step 7
+/// allocates for a map that large could ever hold
+/// ([`uefi::map_buffer_descriptor_reach`]). Each allocation after the count
+/// (the ten of steps 6 and 7: the `BootInfo`, module, entry, aperture, two
+/// seed and reclaim pages, the stack, the page-table pool, and the raw map
+/// buffer) adds at most two descriptors, 20 in all; the other 12 absorb the
+/// firmware's own housekeeping allocations in that window, which no count
+/// bounds. Its overflow costs only another round: a final map (step 7) whose
+/// buffer reaches past the array makes the bootloader free steps 6 and 7 and
+/// redo them with twice the slack, up to [`MEM_MAP_ATTEMPTS`] times.
 const MEM_MAP_SLACK_ENTRIES: usize = 32;
+
+/// Times steps 6 and 7 run before the bootloader gives up on a memory map
+/// that keeps outgrowing the entry array sized for it, the slack doubling each
+/// time ([`BootError::MemoryMapKeptGrowing`]). It bounds no capacity: it is a
+/// retry guard against firmware that never stops allocating, as
+/// `uefi::EXIT_BOOT_SERVICES_MAX_ATTEMPTS` is. A redo frees the first
+/// attempt's allocations before it counts again, so its count includes what
+/// the firmware itself allocated during the first window; a third attempt is
+/// reached only by firmware that outgrows twice that slack in the second.
+const MEM_MAP_ATTEMPTS: usize = 3;
 
 /// Maximum number of physical regions tracked for identity mapping.
 /// Covers kernel segments, all fixed allocations, and the framebuffer.
@@ -110,23 +123,12 @@ const MEM_MAP_SLACK_ENTRIES: usize = 32;
 /// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 10` = 26 regions.
 const MAX_IDENTITY_REGIONS: usize = 64;
 
-/// Size of the aperture-seed buffer (firmware-advertised MMIO extents before
-/// merging with the UEFI memory map). The aperture array is sized to hold every
-/// aperture a full buffer can yield (`memory_map::aperture_capacity`). A seeder
-/// past it drops the surplus with a diagnostic.
-const MAX_APERTURE_SEEDS: usize = memory_map::MAX_SEEDS_PER_CLASS;
-
-/// Size of the heuristic-window seed buffer (two layout-heuristic PCI windows
-/// per MCFG allocation entry plus the arch's default PCI windows), sized as
-/// [`MAX_APERTURE_SEEDS`] is.
-const MAX_HEURISTIC_SEEDS: usize = memory_map::MAX_SEEDS_PER_CLASS;
-
 /// Most entries step 9 records in `BootInfo.reclaim_ranges`: the `BootInfo`,
-/// module, memory-map entry, aperture, CPU-id and reclaim-array pages, the raw
-/// map buffer, the page-table pool, the x86-64 LA57 toggle page and the AP
-/// trampoline page (ten), and one bundle gap before, between and after the at
-/// most [`MAX_MODULES`] module bodies.
-const MAX_RECLAIM_ENTRIES: usize = 10 + MAX_MODULES + 1;
+/// module, memory-map entry, aperture, named-seed, heuristic-seed, CPU-id and
+/// reclaim-array pages, the raw map buffer, the page-table pool, the x86-64
+/// LA57 toggle page and the AP trampoline page (twelve), and one bundle gap
+/// before, between and after the at most [`MAX_MODULES`] module bodies.
+const MAX_RECLAIM_ENTRIES: usize = 12 + MAX_MODULES + 1;
 
 // The reclaim array's page holds every entry step 9 can record, so the
 // overflow halt in step 9 is unreachable.
@@ -278,8 +280,9 @@ struct BootAllocations
     modules_phys: u64,
     mem_entries_phys: u64,
     /// Pages of the `MemoryMapEntry` array at `mem_entries_phys`, sized at
-    /// step 6 from the firmware's descriptor count plus
-    /// [`MEM_MAP_SLACK_ENTRIES`].
+    /// step 6 to the reach of the map buffer for the firmware's descriptor
+    /// count plus the attempt's slack ([`MEM_MAP_SLACK_ENTRIES`], doubled on
+    /// each redo).
     mem_entries_pages: usize,
     apertures_phys: u64,
     /// Apertures the array at `apertures_phys` holds
@@ -300,6 +303,20 @@ struct BootAllocations
     cpu_ids_phys: u64,
     /// Pages of the array at `cpu_ids_phys`.
     cpu_ids_pages: usize,
+    /// The named aperture-seed buffer (`MmioAperture`s), sized at step 6 from
+    /// the ACPI and DTB seeders' count pass and the framebuffer; filled at
+    /// step 9.
+    seeds_phys: u64,
+    /// Seeds the buffer at `seeds_phys` holds.
+    seeds_capacity: usize,
+    /// Pages of the buffer at `seeds_phys`.
+    seeds_pages: usize,
+    /// The heuristic-window seed buffer, sized as the named one is.
+    heuristic_phys: u64,
+    /// Seeds the buffer at `heuristic_phys` holds.
+    heuristic_capacity: usize,
+    /// Pages of the buffer at `heuristic_phys`.
+    heuristic_pages: usize,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -387,19 +404,19 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // live and identity-mapped; virtual addresses are still unbiased link VAs;
     // ctx.esp_root is valid until ExitBootServices.
     let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
-    // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
-    let (allocs, mut page_table) = unsafe {
-        step6_allocate_and_build_page_tables(
+    // SAFETY: all prior unsafe outputs remain valid; steps 6 and 7 allocate
+    // via bs, and step 7 is the last pre-exit allocation.
+    let (allocs, mut page_table, mut uefi_map) = unsafe {
+        steps6_and_7_sized_to_the_map(
             &ctx,
             &bundle_load,
             &kernel,
             &init,
             &cpus,
+            &firm,
             ap_trampoline_phys,
         )?
     };
-    // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
-    let mut uefi_map = unsafe { step7_query_memory_map(&ctx)? };
     // SAFETY: uefi_map produced by the immediately preceding get_memory_map;
     // no intervening allocations.
     unsafe { step8_exit_boot_services(&ctx, &mut uefi_map)? };
@@ -1130,31 +1147,37 @@ unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
 
 /// Allocate the fixed pre-exit scratch pages (`BootInfo` page, modules
-/// descriptor page, memory-map entry pages, aperture pages, stack,
-/// reclaim-ranges page), accumulate the identity-map region list (those pages
+/// descriptor page, memory-map entry pages, the named and heuristic
+/// aperture-seed buffers, aperture pages, stack, reclaim-ranges page),
+/// accumulate the identity-map region list (those pages
 /// and step 5's CPU-id pages, `cpus`, among others), build initial page
 /// tables, and install the handoff-trampoline mapping.
 ///
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel` and `init` must
 /// come from their respective `step3`/`step4*` outputs.
+// too_many_arguments: step 6 sizes its allocations from every earlier step's
+// output (the bundle, kernel and init loads, the CPU topology, the firmware
+// tables for the seed counts), plus the retry's slack.
+#[allow(clippy::too_many_arguments)]
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
     bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
+    firm: &FirmwareInfo,
     ap_trampoline_phys: u64,
+    slack: usize,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
-    // The memory map's descriptor count, read before this step's first
-    // allocation; the entry array below adds MEM_MAP_SLACK_ENTRIES of headroom
-    // (its doc gives the budget).
+    // The memory map's descriptor count and stride, read before this step's
+    // first allocation. The entry array holds every descriptor the buffer
+    // step 7 allocates could hold, for a map `slack` descriptors larger
+    // (MEM_MAP_SLACK_ENTRIES on the first attempt; its doc gives the budget).
     // SAFETY: bs is valid; the size query allocates nothing.
-    let firmware_descriptors = unsafe { uefi::memory_map_descriptor_count(ctx.bs)? };
-    let mem_entries_pages = ((firmware_descriptors + MEM_MAP_SLACK_ENTRIES)
-        * core::mem::size_of::<MemoryMapEntry>())
-    .div_ceil(4096);
+    let (firmware_descriptors, stride) = unsafe { uefi::memory_map_shape(ctx.bs)? };
+    let mem_entries_pages = entry_array_pages(firmware_descriptors, slack, stride);
     // BootInfo: one page — holds the BootInfo struct populated in step 9.
     // SAFETY: bs is valid.
     let boot_info_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -1164,10 +1187,26 @@ unsafe fn step6_allocate_and_build_page_tables(
     // MemoryMapEntry output array.
     // SAFETY: bs is valid.
     let mem_entries_phys = unsafe { allocate_pages(ctx.bs, mem_entries_pages)? };
-    // MMIO aperture array, sized from the same descriptor count
+    // Aperture seed buffers, sized by the seeders' count pass over the same
+    // firmware tables step 9 reads (one more named seed for the framebuffer).
+    // SAFETY: acpi_rsdp and device_tree are zero or identity-mapped firmware
+    // tables; the seeders validate them.
+    let (acpi_named, heuristic_capacity) = unsafe { acpi::count_aperture_seed(firm.acpi_rsdp) };
+    // SAFETY: as above.
+    let dtb_named = unsafe { dtb::count_aperture_seed(firm.device_tree) };
+    let seeds_capacity = acpi_named + dtb_named + usize::from(ctx.framebuffer.physical_base != 0);
+    let seed_bytes = core::mem::size_of::<MmioAperture>();
+    let seeds_pages = (seeds_capacity * seed_bytes).div_ceil(4096).max(1);
+    // SAFETY: bs is valid.
+    let seeds_phys = unsafe { allocate_pages(ctx.bs, seeds_pages)? };
+    let heuristic_pages = (heuristic_capacity * seed_bytes).div_ceil(4096).max(1);
+    // SAFETY: bs is valid.
+    let heuristic_phys = unsafe { allocate_pages(ctx.bs, heuristic_pages)? };
+    // MMIO aperture array, sized from the entry array's capacity (the bound
+    // step 7 checks the map buffer against) and the seed counts
     // (memory_map::aperture_capacity).
     let aperture_capacity =
-        memory_map::aperture_capacity(firmware_descriptors + MEM_MAP_SLACK_ENTRIES);
+        aperture_array_capacity(mem_entries_pages, seeds_capacity + heuristic_capacity);
     let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
@@ -1208,6 +1247,12 @@ unsafe fn step6_allocate_and_build_page_tables(
         reclaim_array_phys,
         cpu_ids_phys: cpus.ids_phys,
         cpu_ids_pages: cpus.ids_pages,
+        seeds_phys,
+        seeds_capacity,
+        seeds_pages,
+        heuristic_phys,
+        heuristic_capacity,
+        heuristic_pages,
     };
 
     let mut identity_regions: [(u64, u64); MAX_IDENTITY_REGIONS] =
@@ -1384,6 +1429,176 @@ unsafe fn step7_query_memory_map(ctx: &UefiContext) -> Result<uefi::MemoryMapRes
     unsafe { get_memory_map(ctx.bs) }
 }
 
+/// Entries the `MemoryMapEntry` array of `pages` pages holds: the one capacity
+/// step 6 sizes the aperture array from, step 7 checks the map buffer against
+/// ([`map_buffer_fits`]), and step 9 translates into.
+const fn entry_array_capacity(pages: usize) -> usize
+{
+    pages * 4096 / core::mem::size_of::<MemoryMapEntry>()
+}
+
+/// Pages of the `MemoryMapEntry` array for a map of `descriptors` descriptors
+/// at `stride` bytes, with `slack` descriptors of growth: enough for the reach
+/// of the buffer step 7 would allocate for a map that large
+/// ([`uefi::map_buffer_descriptor_reach`] of [`uefi::map_buffer_bytes`]).
+fn entry_array_pages(descriptors: usize, slack: usize, stride: usize) -> usize
+{
+    let reach = uefi::map_buffer_descriptor_reach(uefi::map_buffer_bytes(
+        (descriptors + slack) * stride,
+        stride,
+    ));
+    (reach * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096)
+}
+
+/// Apertures the `MmioAperture` array step 6 allocates holds, for an entry
+/// array of `mem_entries_pages` pages and `seeds` seeds of both classes: the
+/// [`memory_map::aperture_capacity`] of the entry array's capacity, so a map
+/// any buffer [`map_buffer_fits`] accepts derives no more apertures than it
+/// holds.
+fn aperture_array_capacity(mem_entries_pages: usize, seeds: usize) -> usize
+{
+    memory_map::aperture_capacity(entry_array_capacity(mem_entries_pages), seeds)
+}
+
+/// Whether step 7's map buffer of `buffer_bytes` fits the entry array of
+/// `pages` pages: every map read into that buffer, step 8's re-query
+/// included, then has an entry for each descriptor, and its apertures a slot.
+fn map_buffer_fits(buffer_bytes: usize, pages: usize) -> bool
+{
+    uefi::map_buffer_descriptor_reach(buffer_bytes) <= entry_array_capacity(pages)
+}
+
+/// Run steps 6 and 7 until the final memory map's buffer holds no more
+/// descriptors than the entry array step 6 sized
+/// ([`uefi::map_buffer_descriptor_reach`], which bounds step 8's re-query
+/// into the same buffer too): a buffer past the array frees both steps' allocations
+/// ([`release_step6_and_7`]) and redoes them with twice the slack, from
+/// [`MEM_MAP_SLACK_ENTRIES`], up to [`MEM_MAP_ATTEMPTS`] times
+/// (`core/boot/docs/memory-map.md` § Sizing the Entry Array).
+///
+/// # Errors
+/// [`BootError::MemoryMapKeptGrowing`] when the last attempt's buffer still
+/// reaches past its array, and any error of steps 6 and 7 or of the frees.
+///
+/// # Safety
+/// As [`step6_allocate_and_build_page_tables`]; nothing between the returned
+/// map and `ExitBootServices` may allocate.
+unsafe fn steps6_and_7_sized_to_the_map(
+    ctx: &UefiContext,
+    bundle: &BundleLoad,
+    kernel: &KernelLoad,
+    init: &InitLoad,
+    cpus: &CpuTopology,
+    firm: &FirmwareInfo,
+    ap_trampoline_phys: u64,
+) -> Result<
+    (
+        BootAllocations,
+        arch::current::BootPageTable,
+        uefi::MemoryMapResult,
+    ),
+    BootError,
+>
+{
+    let mut slack = MEM_MAP_SLACK_ENTRIES;
+    let mut attempt = 1;
+    loop
+    {
+        // SAFETY: caller contract; step 6 allocates via bs.
+        let (allocs, page_table) = unsafe {
+            step6_allocate_and_build_page_tables(
+                ctx,
+                bundle,
+                kernel,
+                init,
+                cpus,
+                firm,
+                ap_trampoline_phys,
+                slack,
+            )?
+        };
+        // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
+        let uefi_map = unsafe { step7_query_memory_map(ctx)? };
+        if map_buffer_fits(uefi_map.buffer_size, allocs.mem_entries_pages)
+        {
+            return Ok((allocs, page_table, uefi_map));
+        }
+        let reach = uefi::map_buffer_descriptor_reach(uefi_map.buffer_size);
+        let capacity = entry_array_capacity(allocs.mem_entries_pages);
+        if attempt == MEM_MAP_ATTEMPTS
+        {
+            return Err(BootError::MemoryMapKeptGrowing(reach));
+        }
+        bprintln!(
+            "[--------] boot: memory map: a buffer of {reach} descriptors past the \
+             {capacity}-entry array; redoing steps 6 and 7"
+        );
+        // SAFETY: bs is valid pre-exit; the spans are the allocations steps 6
+        // and 7 just made, which nothing else references.
+        unsafe { release_step6_and_7(ctx, &allocs, &page_table, &uefi_map)? };
+        slack *= 2;
+        attempt += 1;
+    }
+}
+
+/// The `(physical base, page count)` spans of every allocation steps 6 and 7
+/// make: the `BootInfo`, module, entry and aperture pages, the two seed
+/// buffers, the handoff stack with its guard page, the reclaim-array page,
+/// the page-table frame pool (`pool`, [`paging::PageTableBuilder::pool_span`]),
+/// and the raw map buffer (`map_buffer`, its base and size in bytes). The
+/// CPU-id pages and the AP trampoline page (step 5 and 5b) and the x86-64
+/// LA57 toggle page (paging negotiation) are earlier steps' allocations, which
+/// the handoff still uses, and are not among them.
+fn step6_and_7_spans(
+    allocs: &BootAllocations,
+    pool: (u64, u64),
+    map_buffer: (u64, usize),
+) -> [(u64, usize); 10]
+{
+    // cast_possible_truncation: the pool is sized by table_frame_bound, a few
+    // hundred frames, far below usize::MAX on every target.
+    #[allow(clippy::cast_possible_truncation)]
+    let pool_pages = pool.1 as usize;
+    [
+        (allocs.boot_info_phys, 1),
+        (allocs.modules_phys, 1),
+        (allocs.mem_entries_phys, allocs.mem_entries_pages),
+        (allocs.apertures_phys, allocs.apertures_pages),
+        (allocs.seeds_phys, allocs.seeds_pages),
+        (allocs.heuristic_phys, allocs.heuristic_pages),
+        (allocs.stack_phys - 4096, HANDOFF_STACK_ALLOC_PAGES),
+        (allocs.reclaim_array_phys, 1),
+        (pool.0, pool_pages),
+        (map_buffer.0, map_buffer.1.div_ceil(4096)),
+    ]
+}
+
+/// Free every allocation steps 6 and 7 made ([`step6_and_7_spans`]), for a
+/// redo of both with more slack.
+///
+/// # Errors
+/// [`BootError`] from `FreePages`.
+///
+/// # Safety
+/// `ctx.bs` is valid pre-exit; `allocs`, `page_table` and `uefi_map` are the
+/// outputs of the steps 6 and 7 just run, and none of their memory is used
+/// after this call.
+unsafe fn release_step6_and_7(
+    ctx: &UefiContext,
+    allocs: &BootAllocations,
+    page_table: &arch::current::BootPageTable,
+    uefi_map: &uefi::MemoryMapResult,
+) -> Result<(), BootError>
+{
+    let map_buffer = (uefi_map.buffer_phys, uefi_map.buffer_size);
+    for (phys, pages) in step6_and_7_spans(allocs, page_table.pool_span(), map_buffer)
+    {
+        // SAFETY: caller contract.
+        unsafe { free_pages(ctx.bs, phys, pages)? };
+    }
+    Ok(())
+}
+
 // ── Step 8: ExitBootServices ─────────────────────────────────────────────────
 
 /// Exit UEFI boot services. After this returns, no further UEFI calls may be
@@ -1409,9 +1624,8 @@ unsafe fn step8_exit_boot_services(
 /// aperture list.
 ///
 /// # Errors
-/// [`BootError::MemoryMapTruncated`] when the final map holds RAM descriptors
-/// past the translated entry array, and [`BootError::ReclaimRangesOverflow`]
-/// when step 9 has more reclaim entries than `MAX_RECLAIM_ENTRIES` allows for.
+/// [`BootError::ReclaimRangesOverflow`] when step 9 has more reclaim entries
+/// than `MAX_RECLAIM_ENTRIES` allows for.
 ///
 /// # Safety
 /// All physical allocations named in `allocs` must remain identity-mapped and
@@ -1452,12 +1666,13 @@ unsafe fn step9_populate_boot_info(
 
     // Translate + sort the UEFI memory map.
     let entry_out = allocs.mem_entries_phys as *mut MemoryMapEntry;
-    let max_entries = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
+    let max_entries = entry_array_capacity(allocs.mem_entries_pages);
+    // Step 6 sized the array and step 7 checked the map buffer's reach, which
+    // bounds the step 8 re-query too, against it, so every descriptor has an
+    // entry.
     // SAFETY: entry_out is a valid allocated buffer of max_entries entries;
     // uefi_map is a valid map buffer populated by UEFI GetMemoryMap.
-    let translation = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
-    report_map_truncation(&translation)?;
-    let entry_count = translation.count;
+    let entry_count = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
     // SAFETY: elements [0..entry_count] were written by the call above.
     unsafe { memory_map::insertion_sort_memory_map(entry_out, entry_count) };
 
@@ -1471,21 +1686,35 @@ unsafe fn step9_populate_boot_info(
     // mmio_apertures: merge firmware-table seeds with the raw UEFI MMIO
     // descriptors. Both ACPI and DTB parsers are tried on every architecture;
     // derive_mmio_apertures merges duplicates.
-    let mut aperture_seed = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; MAX_APERTURE_SEEDS];
-    // The ACPI seeder's layout-heuristic PCI windows go to their own buffer:
+    // The buffers step 6 sized from the seeders' count pass. The ACPI
+    // seeder's layout-heuristic PCI windows go to their own buffer:
     // derive_mmio_apertures clips them harder than the named seeds
     // (core/boot/docs/firmware-parsing.md § Firmware exclusion).
-    let mut heuristic_seed = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; MAX_HEURISTIC_SEEDS];
-    // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
-    let (mut seed_count, heuristic_count) = unsafe {
-        acpi::parse_aperture_seed(firm.acpi_rsdp, &mut aperture_seed, &mut heuristic_seed)
+    // SAFETY: seeds_phys and heuristic_phys are step 6 allocations of
+    // seeds_pages and heuristic_pages pages, identity-mapped under the
+    // firmware's tables and owned by the bootloader, with room for their
+    // capacities; they are zeroed before the slices are formed.
+    let (aperture_seed, heuristic_seed): (&mut [MmioAperture], &mut [MmioAperture]) = unsafe {
+        core::ptr::write_bytes(allocs.seeds_phys as *mut u8, 0, allocs.seeds_pages * 4096);
+        core::ptr::write_bytes(
+            allocs.heuristic_phys as *mut u8,
+            0,
+            allocs.heuristic_pages * 4096,
+        );
+        (
+            core::slice::from_raw_parts_mut(
+                allocs.seeds_phys as *mut MmioAperture,
+                allocs.seeds_capacity,
+            ),
+            core::slice::from_raw_parts_mut(
+                allocs.heuristic_phys as *mut MmioAperture,
+                allocs.heuristic_capacity,
+            ),
+        )
     };
+    // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
+    let (mut seed_count, heuristic_count) =
+        unsafe { acpi::parse_aperture_seed(firm.acpi_rsdp, aperture_seed, heuristic_seed) };
     // SAFETY: device_tree is zero or identity-mapped; parse_aperture_seed validates.
     seed_count +=
         unsafe { dtb::parse_aperture_seed(firm.device_tree, &mut aperture_seed[seed_count..]) };
@@ -1498,7 +1727,7 @@ unsafe fn step9_populate_boot_info(
     // through to userspace.
     if framebuffer.physical_base != 0
     {
-        if seed_count < MAX_APERTURE_SEEDS
+        if seed_count < aperture_seed.len()
         {
             let base_aligned = framebuffer.physical_base & !0xFFF;
             let span = framebuffer.physical_base
@@ -1584,10 +1813,13 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0)?;
     }
-    // The aperture array is a few pages at most, far below u32::MAX pages.
+    // The aperture array and the seed buffers are a few pages at most, far
+    // below u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
     {
         push_reclaim(allocs.apertures_phys, allocs.apertures_pages as u32, 0)?;
+        push_reclaim(allocs.seeds_phys, allocs.seeds_pages as u32, 0)?;
+        push_reclaim(allocs.heuristic_phys, allocs.heuristic_pages as u32, 0)?;
     }
     // The map buffer is a whole-page allocation far below u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
@@ -1810,30 +2042,6 @@ fn push_reclaim_range(
     Ok(())
 }
 
-/// Report the descriptors the translated memory map had no room for. A RAM
-/// descriptor among them is [`BootError::MemoryMapTruncated`]: the kernel
-/// would boot without knowing that memory (core/boot/docs/memory-map.md
-/// § Sizing the Entry Array). Descriptors of other types are dropped with a
-/// diagnostic and the boot goes on.
-///
-/// # Errors
-/// [`BootError::MemoryMapTruncated`] when `t.dropped_ram` is non-zero.
-fn report_map_truncation(t: &memory_map::MapTranslation) -> Result<(), BootError>
-{
-    if t.dropped_other != 0
-    {
-        bprintln!(
-            "[--------] boot: memory map: {} non-RAM descriptors past the entry array dropped",
-            t.dropped_other
-        );
-    }
-    if t.dropped_ram != 0
-    {
-        return Err(BootError::MemoryMapTruncated(t.dropped_ram));
-    }
-    Ok(())
-}
-
 // ── Step 10: Kernel handoff ──────────────────────────────────────────────────
 
 /// Transfer control to the kernel. Installs new page tables, sets the stack,
@@ -1870,8 +2078,9 @@ mod tests
 {
     use super::{
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
-        KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions, choose_kaslr_layout,
-        handoff_stack_span, memory_map, push_reclaim_range, report_map_truncation, scrub,
+        KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions,
+        aperture_array_capacity, choose_kaslr_layout, entry_array_pages, handoff_stack_span,
+        map_buffer_fits, memory_map, push_reclaim_range, scrub, step6_and_7_spans, uefi,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -1963,13 +2172,10 @@ mod tests
         assert_eq!(top, alloc + (HANDOFF_STACK_ALLOC_PAGES as u64) * 4096);
     }
 
-    // Defect caught: one of the fixed boot allocations (the CPU-id pages, for
-    // one) dropped from the identity map at kernel entry or mapped short, which
-    // no boot exposes while the kernel reads it only through its direct map.
-    #[test]
-    fn fixed_boot_allocations_are_identity_mapped_whole()
+    /// Boot allocations at distinct, non-overlapping addresses.
+    fn sample_allocations() -> BootAllocations
     {
-        let allocs = BootAllocations {
+        BootAllocations {
             boot_info_phys: 0x1_0000,
             modules_phys: 0x2_0000,
             mem_entries_phys: 0x3_0000,
@@ -1983,7 +2189,99 @@ mod tests
             reclaim_array_phys: 0x7_0000,
             cpu_ids_phys: 0x8_0000,
             cpu_ids_pages: 2,
-        };
+            seeds_phys: 0x9_0000,
+            seeds_capacity: 4,
+            seeds_pages: 1,
+            heuristic_phys: 0xA_0000,
+            heuristic_capacity: 2,
+            heuristic_pages: 1,
+        }
+    }
+
+    // Defect caught: a redo of steps 6 and 7 that frees an allocation of an
+    // earlier step the handoff still uses (the AP trampoline or the CPU-id
+    // pages), or that leaks one of its own.
+    #[test]
+    fn a_redo_of_steps_6_and_7_frees_exactly_their_allocations()
+    {
+        let allocs = sample_allocations();
+        let pool = (0xB_0000, 7);
+        let map_buffer = (0xC_0000, 3 * 4096 + 1);
+        let spans = step6_and_7_spans(&allocs, pool, map_buffer);
+        let expected = [
+            (0x1_0000, 1),
+            (0x2_0000, 1),
+            (0x3_0000, 3),
+            (0x4_0000, 3),
+            (0x9_0000, 1),
+            (0xA_0000, 1),
+            (0x5_0000, HANDOFF_STACK_ALLOC_PAGES),
+            (0x7_0000, 1),
+            (0xB_0000, 7),
+            (0xC_0000, 4),
+        ];
+        assert_eq!(spans, expected);
+        for kept in [allocs.ap_trampoline_phys, allocs.cpu_ids_phys]
+        {
+            assert!(
+                spans
+                    .iter()
+                    .all(|&(base, pages)| kept < base || kept >= base + pages as u64 * 4096),
+                "{kept:#x} is an earlier step's allocation"
+            );
+        }
+    }
+
+    // Defect caught: step 6 sizing the aperture array from a smaller capacity
+    // than the one step 7 accepts a map buffer against (the entry array's
+    // reach before page rounding, for one), so a map that passes the check
+    // derives more apertures than the array holds; or a buffer for a map no
+    // larger than step 6 allowed for that fails the check.
+    #[test]
+    fn every_map_buffer_step_7_accepts_fits_the_arrays_step_6_sized()
+    {
+        let seeds = 7;
+        for stride in [40usize, 48, 56, 80]
+        {
+            for descriptors in [0usize, 1, 50, 100, 160, 400]
+            {
+                for slack in [32usize, 64, 128]
+                {
+                    let pages = entry_array_pages(descriptors, slack, stride);
+                    let apertures = aperture_array_capacity(pages, seeds);
+                    for grown in 0..=descriptors + slack
+                    {
+                        let buffer = uefi::map_buffer_bytes(grown * stride, stride);
+                        assert!(
+                            map_buffer_fits(buffer, pages),
+                            "{stride} {descriptors} {grown}"
+                        );
+                    }
+                    // Every buffer step 7 accepts, up to the largest: a map read
+                    // into one derives at most `aperture_capacity` of its
+                    // reach, which the array step 6 sizes must hold.
+                    let mut buffer = 4096;
+                    while map_buffer_fits(buffer, pages)
+                    {
+                        let reach = uefi::map_buffer_descriptor_reach(buffer);
+                        assert!(
+                            memory_map::aperture_capacity(reach, seeds) <= apertures,
+                            "{stride} {descriptors} {slack}: reach {reach}"
+                        );
+                        buffer += 4096;
+                    }
+                }
+            }
+        }
+    }
+
+    // Defect caught: one of the fixed boot allocations (the CPU-id pages, for
+    // one) dropped from the identity map at kernel entry or mapped short, which
+    // no boot exposes while the kernel reads it only through its direct map.
+    #[test]
+    fn fixed_boot_allocations_are_identity_mapped_whole()
+    {
+        let allocs = sample_allocations();
         let regions = allocation_regions(&allocs);
         for region in [
             (0x1_0000, 4096),
@@ -2000,28 +2298,6 @@ mod tests
                 "{region:x?} is not identity-mapped"
             );
         }
-    }
-
-    // Defect caught: a truncated map that drops RAM yet boots, or one that
-    // drops only non-RAM descriptors and fails the boot.
-    #[test]
-    fn only_lost_ram_fails_the_boot()
-    {
-        let lost_ram = memory_map::MapTranslation {
-            count: 4,
-            dropped_ram: 2,
-            dropped_other: 1,
-        };
-        assert!(matches!(
-            report_map_truncation(&lost_ram),
-            Err(BootError::MemoryMapTruncated(2))
-        ));
-        let lost_other = memory_map::MapTranslation {
-            count: 4,
-            dropped_ram: 0,
-            dropped_other: 3,
-        };
-        assert!(report_map_truncation(&lost_other).is_ok());
     }
 
     // Defect caught: a push past the reclaim array's page, or one that records

@@ -75,8 +75,9 @@ fault from `crate::arch::ILLEGAL_INSTRUCTION_VECTOR`, raise the latter through
 `crate::arch::illegal_instruction`, and take the register file's size and
 instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
 `crate::arch::IP_OFFSET` (the `abi/syscall` `REGS_<ARCH>_SIZE` and
-`REGS_<ARCH>_IP_OFFSET` constants). The register-file probes of the FPU and
-callee-saved-register tests are `crate::arch::fpu` and
+`REGS_<ARCH>_IP_OFFSET` constants). A cell that binds an I/O port runs only
+where `crate::arch::HAS_IO_PORTS` holds. The register-file probes of the FPU
+and callee-saved-register tests are `crate::arch::fpu` and
 `crate::arch::callee_saved`, the machine-code stubs of `unit::retype`
 `crate::arch::code_stub`, and the harness's UART, I/O port seed, shutdown, and
 cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
@@ -95,7 +96,7 @@ mirroring the kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
-| `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE` |
+| `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, and the bounds of handle resolution (`lookup_bounds`) |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps |
 | `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY` |
@@ -349,6 +350,7 @@ thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
 | `ipc_round_trip` | Synchronous IPC call + reply, per-iteration |
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
+| `cap_info_lookup` | `cap_info(CAP_INFO_TAG_RIGHTS)` on a held cap: one handle resolution and pin, against the `null_syscall_roundtrip` baseline |
 | `mem_map_unmap` | `mem_map` + `mem_unmap` cycle |
 | `mem_protect_pair` | `mem_protect(READ)` + `mem_protect(WRITABLE)` round trip |
 | `thread_lifecycle` | Full thread create → start → exit → cleanup |

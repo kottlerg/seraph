@@ -6,9 +6,10 @@
 //! `CSpace`-slot and memmgr-pool reclaim fixture for the usertest
 //! `threadchurn` tester (#240, #274).
 //!
-//! Spawns and joins, then spawns and detaches, batches of threads, sampling two
-//! quantities before and after: the process's populated `CSpace`-slot count
-//! (`CAP_INFO_CSPACE_USED`) and memmgr's free-pool size (`QUERY_POOL_STATUS`).
+//! Holds a burst of detached threads bound at once, then spawns and joins, then
+//! spawns and detaches, batches of threads, sampling two quantities before and
+//! after: the process's populated `CSpace`-slot count (`CAP_INFO_CSPACE_USED`)
+//! and memmgr's free-pool size (`QUERY_POOL_STATUS`).
 //!
 //! Reclaim runs at three sites — `thread_slab` freed on the `Thread::new`
 //! success path, the Thread cap deleted on `join`, and the detached-thread
@@ -17,14 +18,16 @@
 //! demand-stack VA are reused. So across the churn both the slot count and the
 //! pool footprint stay flat.
 //!
-//! The fixture asserts that flatness: slot growth within `SLACK`, free-pool
-//! drop within `POOL_SLACK_BYTES`. A per-spawn slot leak would grow the slot
-//! count ~2-3 slots per spawn; a per-spawn slab leak would drop the free pool
-//! by `JOIN_CHURN * ~6` pages — either trips its bound. The high `JOIN_CHURN`
-//! also runs past the count at which an unbounded memmgr tracking-anchor
-//! footprint live-locks the service, so completing the run at all proves that
-//! footprint stays bounded (#274); a regression there surfaces as a HANG, which
-//! the periodic heartbeat keeps visible against slow progress.
+//! The fixture asserts that flatness: slot growth across the held burst once
+//! it is reaped within `BURST_SLACK` (the burst runs past 64 slots and the
+//! reaper's first death queue), slot growth across the churn within `SLACK`,
+//! free-pool drop within `POOL_SLACK_BYTES`. A per-spawn slot leak would grow
+//! the slot count ~2-3 slots per spawn; a per-spawn slab leak would drop the
+//! free pool by `JOIN_CHURN * ~6` pages — either trips its bound. The high
+//! `JOIN_CHURN` also runs past the count at which an unbounded memmgr
+//! tracking-anchor footprint live-locks the service, so completing the run at
+//! all proves that footprint stays bounded (#274); a regression there surfaces
+//! as a HANG, which the periodic heartbeat keeps visible against slow progress.
 //!
 //! Idiomatic `std` for the threading; only the sampling reaches the Seraph
 //! `cap_info` / memmgr surfaces.
@@ -49,11 +52,28 @@ const JOIN_CHURN: u64 = 600;
 /// Threads per reaping churn (detach-burst cleanup). Kept small: its job is to
 /// drive reaper sweeps, not to stress the pool.
 const REAP_CHURN: u64 = 50;
-/// Detached threads spawned in one burst, then reaped by later sweeps.
-const DETACH_BATCH: u64 = 48;
+/// Detached threads spawned in one burst, then reaped by later sweeps: as
+/// many as the held burst, past the first death queue's 99 observer nodes and
+/// 64 slots, on the queues and slot table the held burst already grew.
+const DETACH_BATCH: u64 = 128;
+/// Detached threads held bound at once in the warm-up's held burst: past 64
+/// slots and past the reaper's first death queue's 99 observer nodes, so the
+/// burst grows the slot table and binds on a second queue, and every one of
+/// them is then reaped.
+const HELD_BURST: usize = 128;
+/// `CSpace` slots funded per held-burst thread before the burst. A live
+/// thread holds a few caps (its Thread cap, its done notification, its stack
+/// and slab caps); thread spawn does not grow the `CSpace` itself, so a known
+/// burst is funded first, as `fund_cspace_slot_budget` documents.
+const BURST_SLOTS_PER_THREAD: u64 = 8;
+/// Allowed slot growth across the held burst once it is reaped: the reaper's
+/// second death queue and its slab, and the byte heap's growth for the slot
+/// table. A burst that leaked its threads would keep about two slots each.
+const BURST_SLACK: u64 = 8;
 /// Allowed slot growth between the baseline and the final sample. Absorbs
-/// lazily-created one-time caps (the reaper death `EventQueue`, pooled object
-/// slabs and their shelf entries) that may not have settled at the baseline.
+/// lazily-created one-time caps (pooled object slabs and their shelf entries,
+/// a reaper death queue the detach burst may add) that may not have settled at
+/// the baseline.
 /// Steady-state growth is 0: the pooled object slab recycles auto-reclaimed
 /// done-notification bytes in place (#364), so the ~700 spawn-churned
 /// `BIN_128` chunks in this run trigger no steady-state refills. A pool that
@@ -90,18 +110,75 @@ fn spawn_join(i: u64)
     std::hint::black_box(v);
 }
 
+/// Held burst: `HELD_BURST` detached threads bound at once (each waits on
+/// the barrier until all are spawned), then released and reaped, with the
+/// slot count checked against the count before the burst. Returns whether
+/// the burst passed; a failure has printed its FAIL line.
+fn held_burst(cspace: u32) -> bool
+{
+    if !std::os::seraph::fund_cspace_slot_budget(cspace, HELD_BURST as u64 * BURST_SLOTS_PER_THREAD)
+    {
+        log!("FAIL could not fund the CSpace for the held burst");
+        println!("threadchurn: FAIL CSpace funding for the held burst");
+        return false;
+    }
+    let before_burst = used_slots(cspace);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(HELD_BURST + 1));
+    for n in 0..HELD_BURST
+    {
+        let barrier = std::sync::Arc::clone(&barrier);
+        if let Err(e) = std::thread::Builder::new().spawn(move || {
+            barrier.wait();
+        })
+        {
+            // The threads already spawned wait on the barrier; the exit
+            // below ends them with the process.
+            let headroom = std::os::seraph::cspace_slot_headroom(cspace);
+            log!(
+                "FAIL held-burst spawn {n} refused: {e} (slots {}, headroom {headroom})",
+                used_slots(cspace)
+            );
+            println!("threadchurn: FAIL held-burst spawn {n} refused");
+            return false;
+        }
+    }
+    barrier.wait();
+    drop(barrier);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    for i in 0..16
+    {
+        spawn_join(i);
+    }
+    let after_burst = used_slots(cspace);
+    log!("held burst of {HELD_BURST}: slots {before_burst} -> {after_burst}");
+    let burst_growth = after_burst.saturating_sub(before_burst);
+    if burst_growth > BURST_SLACK
+    {
+        log!("FAIL held-burst growth {burst_growth} > slack {BURST_SLACK}");
+        println!("threadchurn: FAIL held-burst slot growth {burst_growth} exceeds {BURST_SLACK}");
+        return false;
+    }
+    true
+}
+
 fn main() -> ExitCode
 {
     log::register_name(b"threadchurn");
     let info = std::os::seraph::startup_info();
     let cspace = info.self_cspace;
 
-    // Warm up so the reaper death EventQueue, pooled object slabs, and PT budget
-    // reach steady state before the baseline sample.
+    // Warm up so the reaper's first death queue, pooled object slabs, and PT
+    // budget reach steady state.
     for i in 0..8
     {
         spawn_join(i);
     }
+
+    if !held_burst(cspace)
+    {
+        return ExitCode::FAILURE;
+    }
+
     let baseline = used_slots(cspace);
     let baseline_free = std::os::seraph::memmgr_pool_free_bytes();
     log!("baseline slots {baseline} free {baseline_free:?}");

@@ -3,13 +3,11 @@
 
 // programs/stackoverflow/src/main.rs
 
-//! Stack-overflow fixture for the `PROCESS_STACK_GUARD_VA` regression test.
-//!
-//! Recurses with a page-sized local in every frame until the stack pointer
-//! descends past `PROCESS_STACK_BOTTOM` and writes into
-//! `PROCESS_STACK_GUARD_VA`, which is unmapped by construction. The first
-//! write hits an unmapped page and the kernel terminates the thread with
-//! the architecture's page-fault exit reason.
+//! Stack-overflow fixture for the main-thread stack guard page: recursion
+//! without bound until the main thread's stack overflows onto its guard page
+//! and the thread is killed with a page-fault exit reason. The stack it
+//! overflows is described in `programs/stackoverflow/README.md` and
+//! docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs.
 //!
 //! Driven by `services/svctest`'s `stack_overflow_phase`, which spawns this
 //! binary, waits for exit, and asserts the non-zero fault reason.
@@ -27,9 +25,10 @@ fn main()
 fn overflow(depth: usize)
 {
     // One full page of stack per frame guarantees that overflow reaches
-    // the guard page in a bounded number of recursions (one per
-    // `stack_pages`, plus one for the guard). `black_box` prevents the
-    // optimiser from eliding the buffer or the tail call.
+    // the guard page in a bounded number of recursions: about one per page
+    // of the `std::os::seraph::DEFAULT_DEMAND_STACK_PAGES` stack, plus one
+    // for the guard. `black_box` prevents the optimiser from eliding the
+    // buffer or the tail call.
     let buf = [depth as u8; 4096];
     std::hint::black_box(&buf);
     overflow(depth + 1);

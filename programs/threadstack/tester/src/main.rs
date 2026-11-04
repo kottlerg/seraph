@@ -3,7 +3,7 @@
 
 // programs/threadstack/tester/src/main.rs
 
-//! Per-program tester for `/programs/threadstack`. Spawns it in three modes
+//! Per-program tester for `/programs/threadstack`. Spawns it in five modes
 //! (demand-paged by the system default) and asserts, capability-natively
 //! (stdout marker is the verdict;
 //! the kernel's fault-class exit reason is corroborating mechanism only):
@@ -17,6 +17,10 @@
 //!   * `bigframe` — a worker calls a function whose one frame is larger than
 //!     its usable stack and writes only the frame's lowest byte, past the
 //!     guard page; same verdict as `guard`, which only stack probes deliver.
+//!   * `main-grow` — the main thread recurses far past the stack pages the
+//!     loader mapped for it; same verdict as `grow`.
+//!   * `main-guard` — the main thread overflows past its demand growth range
+//!     into the guard page; same verdict as `guard`.
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 
@@ -56,26 +60,28 @@ fn run(mode: &str) -> (String, std::process::ExitStatus)
     (String::from_utf8_lossy(&bytes).into_owned(), status)
 }
 
-fn check_grow()
+/// Run a growth `mode` (`grow` or `main-grow`), whose fixture must recurse
+/// deep into a demand stack and exit cleanly.
+fn check_grow(mode: &str)
 {
-    let (out, status) = run("grow");
+    let (out, status) = run(mode);
     if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
     {
-        fail("grow unexpectedly reported SURVIVED");
+        fail(&format!("{mode} unexpectedly reported SURVIVED"));
     }
     if !out.lines().any(|l| l.trim() == "PASS")
     {
-        println!("[threadstack-tester] grow stdout: {out:?}");
-        fail("grow PASS marker missing");
+        println!("[threadstack-tester] {mode} stdout: {out:?}");
+        fail(&format!("{mode} PASS marker missing"));
     }
     if !status.success()
     {
-        fail(&format!("grow exited non-clean: {:?}", status.code()));
+        fail(&format!("{mode} exited non-clean: {:?}", status.code()));
     }
 }
 
-/// Run an overflow `mode` (`guard` or `bigframe`), whose fixture must reach the
-/// overflow point and then be killed by the guard-page fault.
+/// Run an overflow `mode` (`guard`, `bigframe`, or `main-guard`), whose fixture
+/// must reach the overflow point and then be killed by the guard-page fault.
 // cast_sign_loss: ExitStatus::code() is i32, but exit reasons are non-negative
 // (clean 0, fault 0x1000+vector); the u64 cast preserves the value.
 #[allow(clippy::cast_sign_loss)]
@@ -113,8 +119,10 @@ fn check_overflow(mode: &str)
 
 fn main()
 {
-    check_grow();
+    check_grow("grow");
     check_overflow("guard");
     check_overflow("bigframe");
+    check_grow("main-grow");
+    check_overflow("main-guard");
     println!("[threadstack-tester] PASS");
 }

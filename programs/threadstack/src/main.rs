@@ -7,7 +7,9 @@
 //!
 //! Spawned demand-paged (the system default; no opt-in needed), so threads this
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
-//! usable region with an unregistered guard page below it. Three modes, by argv:
+//! usable region with an unregistered guard page below it, and its main thread's
+//! stack grows on demand below the pages the loader mapped, above a guard page
+//! of its own. Five modes, by argv:
 //!
 //!   * `grow` — spawn a worker that recurses deep enough to fault in many
 //!     demand-paged stack pages (but stays inside the usable region), `join`
@@ -28,6 +30,11 @@
 //!     registered stack, so only the target's stack probes, touching each
 //!     page of the frame in turn, fault on the guard. Same verdict as
 //!     `guard`: the process must be killed.
+//!   * `main-grow` — the main thread itself recurses as deep as `grow`'s
+//!     worker, far past the pages the loader mapped for it, and prints `PASS`.
+//!     Exits `SUCCESS`.
+//!   * `main-guard` — the main thread recurses unbounded, past its demand
+//!     growth range into the guard page below it. Same verdict as `guard`.
 //!
 //! Idiomatic `std` only — no direct Seraph cap awareness. The demand-paged
 //! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
@@ -36,12 +43,13 @@ use std::io::Write;
 use std::process::ExitCode;
 
 /// Bytes of stack each recursion frame consumes, forcing demand faults as the
-/// worker descends. One page per frame keeps the fault count proportional to
+/// recursing thread descends. One page per frame keeps the fault count proportional to
 /// depth.
 const FRAME_BYTES: usize = 4096;
 
-/// `grow` recursion depth. 200 frames ≈ 820 KiB — many demand faults, well
-/// inside the default 2 MiB usable demand stack.
+/// `grow` and `main-grow` recursion depth. 200 frames ≈ 820 KiB — many demand
+/// faults, well inside the default 2 MiB usable demand stack, and 25 times the
+/// main thread's default 8 committed pages.
 const GROW_DEPTH: u64 = 200;
 
 /// `bigframe` frame size: the default 2 MiB (512-page) usable demand stack plus
@@ -51,7 +59,15 @@ const BIG_FRAME_BYTES: usize = (512 + 4) * 4096;
 
 fn main() -> ExitCode
 {
-    if std::env::args().any(|a| a == "guard")
+    if std::env::args().any(|a| a == "main-guard")
+    {
+        main_guard()
+    }
+    else if std::env::args().any(|a| a == "main-grow")
+    {
+        main_grow()
+    }
+    else if std::env::args().any(|a| a == "guard")
     {
         guard()
     }
@@ -79,10 +95,11 @@ fn touch(buf: &[u8; FRAME_BYTES]) -> u64
 #[derive(Clone, Copy)]
 enum Direction
 {
-    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`).
+    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`
+    /// and `main-grow`).
     Down,
     /// Count `depth` up, never reaching the base case at runtime (used by
-    /// `guard` to overflow into the guard page).
+    /// `guard` and `main-guard` to overflow into the guard page).
     Up,
 }
 
@@ -147,6 +164,27 @@ fn guard() -> ExitCode
     // and procmgr tears this process down, so `join` never returns. Reaching
     // past it means the guard failed to fault — report it loudly.
     let _ = worker.join();
+    println!("SURVIVED (BUG)");
+    ExitCode::SUCCESS
+}
+
+fn main_grow() -> ExitCode
+{
+    let checksum = recurse(GROW_DEPTH, Direction::Down);
+    println!("main-grow checksum {}", std::hint::black_box(checksum));
+    println!("PASS");
+    ExitCode::SUCCESS
+}
+
+fn main_guard() -> ExitCode
+{
+    println!("about to overflow");
+    let _ = std::io::stdout().flush();
+
+    // The guard fault kills the main thread and procmgr tears this process
+    // down, so `recurse` never returns. Reaching past it means the guard failed
+    // to fault — report it loudly.
+    let _ = std::hint::black_box(recurse(1, Direction::Up));
     println!("SURVIVED (BUG)");
     ExitCode::SUCCESS
 }

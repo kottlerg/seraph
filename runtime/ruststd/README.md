@@ -167,9 +167,10 @@ process after the kernel posts that thread's death (or at once by that detach or
 death post has already landed), or leaks until process exit when the reaper could not register
 the thread at spawn (its slot table could not grow, or no death queue could take the observer
 bind). The slot table and the death queues grow on demand, each further queue with twice the last
-one's entries and observer nodes (the `ruststd-death-queues` crate). Every queue is drained before
-each bind, so the posts pending on a queue never outnumber the threads bound to it, which never
-exceed its entries, and no death post is dropped.
+one's observer nodes (the `ruststd-death-queues` crate), and each queue with one entry more than its
+nodes. Every queue is drained before each bind, in the same lock hold, so a queue's pending posts
+never exceed its nodes plus the one thread that hold binds, its entries, and no death post is
+dropped.
 
 ### CSpace slot headroom
 

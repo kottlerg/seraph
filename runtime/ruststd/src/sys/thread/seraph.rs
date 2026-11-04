@@ -527,8 +527,9 @@ impl Drop for Thread {
         // Instead, hand ownership to the reaper registry: a kernel death
         // observer (bound in `new`) posts to one of the process's death
         // queues when the child exits or faults, and `reaper::sweep` (run on
-        // every spawn, join, and detach) reclaims the resources then. If the child has already
-        // died, `detach` returns the resources to reclaim now.
+        // every spawn, join, and detach) reclaims the resources then. If the
+        // child has already died, `detach` returns the resources to reclaim
+        // now.
         //
         // SAFETY: `res` is a valid initialised field; `ThreadResources` has no
         // `Drop` glue, so the field's automatic drop after this returns is a
@@ -566,36 +567,39 @@ impl Drop for Thread {
 ///
 /// Every spawned thread binds a death observer (before `thread_start`) to one
 /// of the process's death `EventQueue`s, with a generation-tagged correlator
-/// that names a registry slot (`death_queues::slots`, the `ruststd-death-queues`
-/// crate). The
-/// registry grows a slot at a time and the queues a queue at a time, each
-/// with twice the last one's nodes (`death_queues::DeathQueues`), so the
-/// threads a process can have bound at once are bounded by memory, not by a
-/// fixed table. A joined thread reclaims its own resources directly and frees
-/// its slot, unless its join wait failed, in which case it is handed to the
-/// registry like a detached one; a detached thread leaves its resources in
-/// the slot. `sweep` drains every queue on every spawn, join, and detach, and
-/// reclaims any
-/// thread left in a slot whose death-post has landed. The generation tag
-/// makes a stale post for an already-joined or reused slot a no-op.
+/// that names a registry slot (`death_queues::slots`, the
+/// `ruststd-death-queues` crate). The registry grows a slot at a time and the
+/// queues a queue at a time, each with twice the last one's nodes
+/// (`death_queues::DeathQueues`), so the threads a process can have bound at
+/// once are bounded by memory, not by a fixed table. A joined thread reclaims
+/// its own resources directly and frees its slot, unless its join wait
+/// failed, in which case it is handed to the registry like a detached one; a
+/// detached thread leaves its resources in the slot. `sweep` drains every
+/// queue on every spawn, join, and detach, and reclaims any thread left in a
+/// slot whose death-post has landed. The generation tag makes a stale post
+/// for an already-joined or reused slot a no-op.
 mod reaper {
     use super::ThreadResources;
     use crate::cell::UnsafeCell;
     use crate::sync::atomic::{AtomicBool, Ordering};
     use crate::vec::Vec;
     use death_queues::DeathQueues;
-    use death_queues::slots::{Detached, Registry, ReserveError, correlator};
-    use syscall_abi::{PAGE_SIZE, SyscallError, WAIT_SET_MAX_MEMBERS, event_queue_retype_bytes};
+    use death_queues::slots::{Detached, Registry, correlator};
+    use syscall_abi::{
+        EVENT_QUEUE_MAX_CAPACITY, PAGE_SIZE, SyscallError, WAIT_SET_MAX_MEMBERS,
+        event_queue_retype_bytes,
+    };
 
-    /// Observer nodes, and entries, of the process's first death
-    /// `EventQueue`: the most whose queue still fits one 4 KiB retype class
-    /// (`event_queue_retype_bytes`), since `object_slab_retype` grants that
-    /// class for any queue past the sub-page classes, so a smaller first pool
-    /// would cost the same two-page grant. Each further queue has twice the
-    /// last one's nodes, up to `EVENT_QUEUE_MAX_CAPACITY` ([`DeathQueues`]).
+    /// Observer nodes of the process's first death `EventQueue`: the most
+    /// whose queue, with one entry more than its nodes ([`create_queue`]),
+    /// still fits one 4 KiB retype class (`event_queue_retype_bytes`), since
+    /// `object_slab_retype` grants that class for any queue past the
+    /// sub-page classes, so a smaller first pool would cost the same two-page
+    /// grant. Each further queue has twice the last one's nodes, up to
+    /// `EVENT_QUEUE_MAX_CAPACITY` ([`DeathQueues`]).
     const FIRST_POOL_OBSERVERS: u32 = {
         let mut n: u64 = 1;
-        while event_queue_retype_bytes(n + 1, n + 1) <= PAGE_SIZE {
+        while event_queue_retype_bytes(n + 2, n + 1) <= PAGE_SIZE {
             n += 1;
         }
         // `n` is below the page size in nodes, so it fits a u32.
@@ -603,10 +607,12 @@ mod reaper {
         let nodes = n as u32;
         nodes
     };
-    const _: () = assert!(event_queue_retype_bytes(
-        FIRST_POOL_OBSERVERS as u64,
-        FIRST_POOL_OBSERVERS as u64
-    ) <= PAGE_SIZE);
+    // The loop above starts at one node without checking it; this pins that
+    // the first queue fits the class.
+    const _: () = assert!(
+        event_queue_retype_bytes(FIRST_POOL_OBSERVERS as u64 + 1, FIRST_POOL_OBSERVERS as u64)
+            <= PAGE_SIZE
+    );
 
     /// A value its spin lock serialises; the only access is [`SpinMutex::with`].
     struct SpinMutex<T> {
@@ -639,10 +645,12 @@ mod reaper {
     // `SLOTS` per post; nothing takes `QUEUES` while holding `SLOTS`. The
     // byte heap's and the object slabs' locks are taken inside either (a
     // `Vec` growth, a queue's slab), and the allocator takes neither.
-    // Reclaims, which make memmgr calls, run after both are released. A queue
-    // is created under `QUEUES`, with the bind that needs it, so two binds
-    // racing for a full set cannot both create a queue; that happens only
-    // when the set grows, each further queue twice the last.
+    // Reclaims, which make memmgr calls, run after both are released, except
+    // that a drain whose list cannot grow (the byte heap is exhausted)
+    // reclaims that thread in place, under `QUEUES`. A queue is created under
+    // `QUEUES`, with the bind that needs it, so two binds racing for a full
+    // set cannot both create a queue; that happens only when the set grows,
+    // each further queue twice the last.
 
     /// The reaper's slot registry.
     static SLOTS: SpinMutex<Registry<ThreadResources>> = SpinMutex::new(Registry::new());
@@ -657,18 +665,22 @@ mod reaper {
     /// Why [`register`] gave no slot.
     #[derive(Debug)]
     pub(super) enum RegisterError {
-        /// The registry could not reserve a slot.
-        Registry(ReserveError),
-        /// No death queue took the observer bind (the error the last bind or
-        /// queue create returned).
-        Bind(i64),
+        /// The registry could not reserve a slot (no memory for the table,
+        /// or every index taken).
+        Registry,
+        /// No death queue took the observer bind.
+        Bind,
     }
 
-    /// Create one death queue of `observers` entries and observer nodes.
+    /// Create one death queue of `observers` observer nodes, at most
+    /// `EVENT_QUEUE_MAX_CAPACITY - 1`, and one entry more than its nodes: a
+    /// queue's pending posts can reach its nodes plus one ([`register`]).
     fn create_queue(observers: u32) -> Result<u32, i64> {
-        let bytes = event_queue_retype_bytes(u64::from(observers), u64::from(observers));
+        let nodes = observers.min(EVENT_QUEUE_MAX_CAPACITY - 1);
+        let entries = nodes + 1;
+        let bytes = event_queue_retype_bytes(u64::from(entries), u64::from(nodes));
         crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-            syscall::event_queue_create_observed(slab, observers, observers).ok()
+            syscall::event_queue_create_observed(slab, entries, nodes).ok()
         })
         .ok_or(SyscallError::OutOfMemory as i64)
     }
@@ -709,17 +721,21 @@ mod reaper {
     /// every queue is out of nodes ([`DeathQueues::bind`]). Every queue is
     /// drained first, in the same hold: a node returns when its thread is
     /// destroyed, which may precede the drain of that thread's post, so a bind
-    /// on a node freed that way could otherwise stack a post past the queue's
-    /// entries. With the drain, the posts pending on a queue never outnumber
-    /// the threads bound to it, which never exceed its entries. Returns the
-    /// slot and generation. Call before `thread_start`.
+    /// on a node freed that way could otherwise stack posts past the queue's
+    /// entries. After a queue's drain, its new posts come from the threads
+    /// that held its nodes then, at most its nodes, and from the one thread
+    /// this hold binds on it, which may take a node returned since the drain;
+    /// every later bind drains it again first. Its pending posts therefore
+    /// never exceed its nodes plus one, its entries ([`create_queue`]).
+    /// Returns the slot and generation. Call before `thread_start`.
     ///
     /// # Errors
     /// [`RegisterError::Registry`] when no slot can be reserved;
     /// [`RegisterError::Bind`] when no queue takes the bind. The caller then
     /// leaks the thread's resources on detach, the fallback without a reaper.
     pub(super) fn register(thread_cap: u32) -> Result<(u32, u32), RegisterError> {
-        let (slot, generation) = SLOTS.with(Registry::reserve).map_err(RegisterError::Registry)?;
+        let (slot, generation) =
+            SLOTS.with(Registry::reserve).map_err(|_| RegisterError::Registry)?;
         let tag = correlator(slot, generation);
         let mut drained = Vec::new();
         let bound = QUEUES.with(|queues| {
@@ -733,9 +749,9 @@ mod reaper {
             )
         });
         reclaim_all(drained);
-        if let Err(e) = bound {
+        if bound.is_err() {
             release(slot, generation);
-            return Err(RegisterError::Bind(e));
+            return Err(RegisterError::Bind);
         }
         Ok((slot, generation))
     }

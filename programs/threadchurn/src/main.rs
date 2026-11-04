@@ -6,9 +6,10 @@
 //! `CSpace`-slot and memmgr-pool reclaim fixture for the usertest
 //! `threadchurn` tester (#240, #274).
 //!
-//! Spawns and joins, then spawns and detaches, batches of threads, sampling two
-//! quantities before and after: the process's populated `CSpace`-slot count
-//! (`CAP_INFO_CSPACE_USED`) and memmgr's free-pool size (`QUERY_POOL_STATUS`).
+//! Holds a burst of detached threads bound at once, then spawns and joins, then
+//! spawns and detaches, batches of threads, sampling two quantities before and
+//! after: the process's populated `CSpace`-slot count (`CAP_INFO_CSPACE_USED`)
+//! and memmgr's free-pool size (`QUERY_POOL_STATUS`).
 //!
 //! Reclaim runs at three sites — `thread_slab` freed on the `Thread::new`
 //! success path, the Thread cap deleted on `join`, and the detached-thread
@@ -17,14 +18,16 @@
 //! demand-stack VA are reused. So across the churn both the slot count and the
 //! pool footprint stay flat.
 //!
-//! The fixture asserts that flatness: slot growth within `SLACK`, free-pool
-//! drop within `POOL_SLACK_BYTES`. A per-spawn slot leak would grow the slot
-//! count ~2-3 slots per spawn; a per-spawn slab leak would drop the free pool
-//! by `JOIN_CHURN * ~6` pages — either trips its bound. The high `JOIN_CHURN`
-//! also runs past the count at which an unbounded memmgr tracking-anchor
-//! footprint live-locks the service, so completing the run at all proves that
-//! footprint stays bounded (#274); a regression there surfaces as a HANG, which
-//! the periodic heartbeat keeps visible against slow progress.
+//! The fixture asserts that flatness: slot growth across the held burst once
+//! it is reaped within `BURST_SLACK` (the burst runs past 64 slots and the
+//! reaper's first death queue), slot growth across the churn within `SLACK`,
+//! free-pool drop within `POOL_SLACK_BYTES`. A per-spawn slot leak would grow
+//! the slot count ~2-3 slots per spawn; a per-spawn slab leak would drop the
+//! free pool by `JOIN_CHURN * ~6` pages — either trips its bound. The high
+//! `JOIN_CHURN` also runs past the count at which an unbounded memmgr
+//! tracking-anchor footprint live-locks the service, so completing the run at
+//! all proves that footprint stays bounded (#274); a regression there surfaces
+//! as a HANG, which the periodic heartbeat keeps visible against slow progress.
 //!
 //! Idiomatic `std` for the threading; only the sampling reaches the Seraph
 //! `cap_info` / memmgr surfaces.
@@ -53,10 +56,10 @@ const REAP_CHURN: u64 = 50;
 /// many as the held burst, past the first death queue's 99 observer nodes and
 /// 64 slots, on the queues and slot table the held burst already grew.
 const DETACH_BATCH: u64 = 128;
-/// Detached threads held bound at once in the warm-up's held burst: past the
-/// 64 slots the reaper's table once had, and past its first death queue's
-/// 99 observer nodes, so the burst grows the slot table and binds on a
-/// second queue, and every one of them is then reaped.
+/// Detached threads held bound at once in the warm-up's held burst: past 64
+/// slots and past the reaper's first death queue's 99 observer nodes, so the
+/// burst grows the slot table and binds on a second queue, and every one of
+/// them is then reaped.
 const HELD_BURST: usize = 128;
 /// `CSpace` slots funded per held-burst thread before the burst. A live
 /// thread holds a few caps (its Thread cap, its done notification, its stack

@@ -102,7 +102,8 @@ pub enum ReserveError
 {
     /// Every slot is occupied and the table's allocation could not grow.
     NoMemory,
-    /// Every slot is occupied and the next index would not fit 32 bits.
+    /// Every slot is occupied and the table already holds its most slots
+    /// (`u32::MAX`, unless [`Registry::with_max_slots`] set fewer).
     IndexExhausted,
 }
 
@@ -111,6 +112,8 @@ pub enum ReserveError
 pub struct Registry<T>
 {
     next_gen: u32,
+    /// The most slots the table grows to.
+    max_slots: u32,
     slots: Vec<Slot<T>>,
     /// Indices of vacant slots, popped by [`Registry::reserve`] before the
     /// table grows. Its capacity is kept at least the table's length, so a
@@ -121,12 +124,21 @@ pub struct Registry<T>
 
 impl<T> Registry<T>
 {
-    /// An empty registry: no slot until the first [`Self::reserve`].
+    /// An empty registry: no slot until the first [`Self::reserve`], and
+    /// at most `u32::MAX` slots.
     #[must_use]
     pub const fn new() -> Self
     {
+        Self::with_max_slots(u32::MAX)
+    }
+
+    /// An empty registry that grows to at most `max_slots` slots.
+    #[must_use]
+    pub const fn with_max_slots(max_slots: u32) -> Self
+    {
         Self {
             next_gen: 1,
+            max_slots,
             slots: Vec::new(),
             free: Vec::new(),
         }
@@ -152,8 +164,9 @@ impl<T> Registry<T>
     ///
     /// # Errors
     /// [`ReserveError::NoMemory`] when every slot is occupied and the table
-    /// cannot grow; [`ReserveError::IndexExhausted`] when the next index does
-    /// not fit 32 bits. The registry is unchanged on an error.
+    /// cannot grow; [`ReserveError::IndexExhausted`] when every slot is
+    /// occupied and the table already holds its most slots. The registry is
+    /// unchanged on an error.
     pub fn reserve(&mut self) -> Result<(u32, u32), ReserveError>
     {
         let slot = match self.free.pop()
@@ -161,8 +174,10 @@ impl<T> Registry<T>
             Some(slot) => slot,
             None =>
             {
-                let slot =
-                    u32::try_from(self.slots.len()).map_err(|_| ReserveError::IndexExhausted)?;
+                let slot = u32::try_from(self.slots.len())
+                    .ok()
+                    .filter(|&slot| slot < self.max_slots)
+                    .ok_or(ReserveError::IndexExhausted)?;
                 self.slots
                     .try_reserve(1)
                     .map_err(|_| ReserveError::NoMemory)?;
@@ -393,19 +408,46 @@ mod tests
     }
 
     #[test]
-    fn freed_slots_are_reused_without_scanning_the_table()
+    fn slots_freed_by_a_post_or_a_reclaiming_detach_are_reused_before_growth()
     {
         let mut reg = Registry::<u32>::new();
-        let held: Vec<_> = (0..8).map(|_| reg.reserve().expect("room")).collect();
-        for &(slot, generation) in &held[2..5]
-        {
-            reg.release(slot, generation);
-        }
-        let mut reused: Vec<u32> = (0..3).map(|_| reg.reserve().expect("room").0).collect();
+        // Slot a: detached, then freed by its death post.
+        let (a, ga) = reg.reserve().expect("room");
+        // Slot b: dead first, then freed by its detach (Reclaim).
+        let (b, gb) = reg.reserve().expect("room");
+        assert_eq!(reg.detach(a, ga, 1), Detached::Held);
+        assert_eq!(reg.death(correlator(a, ga)), Some(1));
+        assert_eq!(reg.death(correlator(b, gb)), None);
+        assert_eq!(reg.detach(b, gb, 2), Detached::Reclaim(2));
+        let mut reused = [
+            reg.reserve().expect("room").0,
+            reg.reserve().expect("room").0,
+        ];
         reused.sort_unstable();
-        assert_eq!(reused, [2, 3, 4]);
-        assert_eq!(reg.len(), 8);
-        assert_eq!(reg.reserve().expect("room").0, 8);
+        assert_eq!(reused, [a, b]);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn a_full_table_at_its_most_slots_refuses_a_reservation()
+    {
+        let mut reg = Registry::<u32>::with_max_slots(2);
+        let (a, ga) = reg.reserve().expect("room");
+        reg.reserve().expect("room");
+        assert_eq!(reg.reserve(), Err(ReserveError::IndexExhausted));
+        assert_eq!(reg.len(), 2);
+        // A freed slot is still handed out.
+        reg.release(a, ga);
+        assert_eq!(reg.reserve().map(|(slot, _)| slot), Ok(a));
+    }
+
+    #[test]
+    fn a_table_that_cannot_grow_refuses_a_reservation()
+    {
+        // A slot this large has no allocation: the table's growth fails.
+        let mut reg = Registry::<[u8; 1 << 46]>::new();
+        assert_eq!(reg.reserve(), Err(ReserveError::NoMemory));
+        assert!(reg.is_empty());
     }
 
     #[test]

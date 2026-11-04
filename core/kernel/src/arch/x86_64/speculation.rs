@@ -9,7 +9,7 @@
 //! original. [`index_mask`] turns a bounds comparison into data, so a load that a
 //! user-controlled index addresses stays inside its array on every execution
 //! path, a transiently executed one included. The arch-neutral helpers built
-//! on it are in `crate::arch::nospec`; the rule they serve is
+//! on the two are in `crate::arch::nospec`; the rule they serve is
 //! docs/capability-model.md § Capability Spaces, and the mechanism is
 //! core/kernel/docs/capability-internals.md § Speculative-Execution Hardening.
 

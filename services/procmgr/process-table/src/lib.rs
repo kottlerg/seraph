@@ -797,17 +797,37 @@ mod tests
     }
 
     #[test]
-    fn arm_dma_hold_marks_a_live_entry_once_and_refuses_an_unknown_badge()
+    fn arm_dma_hold_refuses_a_badge_no_live_entry_holds()
     {
         let mut table = ProcessTable::new();
         table.insert(entry_with_badge(16)).unwrap();
         assert_eq!(table.arm_dma_hold(17), Err(ArmError::NotFound));
+        assert!(!table.take_by_badge(16).unwrap().dma_hold);
+    }
+
+    #[test]
+    fn arm_dma_hold_marks_the_live_entry()
+    {
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(16)).unwrap();
         assert_eq!(table.arm_dma_hold(16), Ok(()));
-        assert_eq!(table.arm_dma_hold(16), Ok(()));
+        assert!(table.take_by_badge(16).unwrap().dma_hold);
+    }
+
+    #[test]
+    fn arming_an_armed_entry_again_reserves_no_second_record()
+    {
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(16)).unwrap();
+        table.arm_dma_hold(16).unwrap();
+        table.arm_dma_hold(16).unwrap();
         let mut taken = table.take_by_badge(16).unwrap();
-        assert!(taken.dma_hold);
         taken.started = true;
+        // The one parked record leaves no armed child behind: a second
+        // record would need a second armed entry.
         assert!(table.holds_mut().park(&taken));
+        assert_eq!(table.holds_mut().len(), 1);
+        assert_eq!(table.holds_mut().armed(), 0);
     }
 
     #[test]

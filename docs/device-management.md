@@ -129,6 +129,13 @@ its own or devmgr withdrew it:
    Base Specification r4.0 § 7.5.1.1.3). The driver holds no configuration-space capability, so
    it cannot set the bit again, and devmgr needs neither the driver's cooperation nor a way to
    stop its threads.
+   The read-back is also what confirms the DMA already issued has landed. A Configuration
+   Request carries no Relaxed Ordering attribute, nor does its Completion, and on PCI Express a
+   Completion without it does not pass a Posted Request in the same direction (PCI Express Base
+   Specification r4.0 § 2.2.7 and § 2.4.1), so the read-back's Completion reaches the processor
+   only after every memory write the function posted before it. Conventional PCI orders a read's
+   completion behind earlier posted writes the same way (PCI Local Bus Specification r3.0
+   Appendix E).
 2. **Device taken and reset.** devmgr then revokes the driver's BAR capabilities and resets the
    device, waiting for the reset to be confirmed for at most `RESET_TIMEOUT` (5 s).
 3. **Memory freed.** procmgr holds back the `PROCESS_DIED` of a driver devmgr created with
@@ -138,6 +145,11 @@ its own or devmgr withdrew it:
    leaves the frames quarantined on that record, counted and never handed out again, for the
    rest of the boot.
 
+The hold covers the driver's own frames only. A frame a client lends a driver for one transfer
+(the memory capability a virtio-blk caller supplies) is on the client's memmgr record, which no
+hold covers, so it returns to the pool when the client releases it or dies, whatever the device's
+state.
+
 The steps, their owners, and their bounds are specified in
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities (the withdrawal),
@@ -146,6 +158,14 @@ reclaim), and
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#label-4-process_died)
 § Label 4 (`PROCESS_DIED`). As an observation, not a guarantee the order relies on, QEMU's
 virtio-pci devices also stop processing their queues when Bus Master Enable is cleared.
+
+No boot runs this withdrawal of a `VirtIO` driver: a production boot serves every `VirtIO` driver
+that reports ready and withdraws one only on its death or a failed settle, neither of which a test
+boot can cause without a test-only label to kill a `VirtIO` driver, and the enumeration redesign
+removes those labels ([#165](https://github.com/kottlerg/seraph/issues/165)). What a boot
+does run is the rest of the path: devmgr maps a configuration page through the same helper that
+maps each ECAM window for the scan, the scan's BAR probe reads and writes the same 16-bit Command
+register, and the Command arithmetic is host-tested in the devmgr firmware crate.
 
 ---
 

@@ -125,7 +125,11 @@ devmgr's responsibilities are:
      § Label 3). Otherwise the device may still be writing that memory:
      devmgr logs the device and never releases the hold, so the memory stays
      quarantined on the dead driver's memmgr record, counted and never handed
-     out again, for the rest of the boot. A status byte past the span its BAR
+     out again, for the rest of the boot. The hold covers the driver's own
+     memory only: the frames a client lends a virtio-blk driver for a transfer
+     are on the client's memmgr record, which no hold covers, so they return to
+     the pool when the client releases them or dies, whatever the device's
+     state. A status byte past the span its BAR
      cap was carved to is not written, and a BAR copy whose revocation fails
      leaves the driver its mapping; either counts as an unconfirmed reset.
 

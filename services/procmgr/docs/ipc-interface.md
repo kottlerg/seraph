@@ -221,10 +221,12 @@ procmgr serves its requests in order, so a `DESTROY_PROCESS` the creator sends
 first has torn the child down, and parked its record, before the release is
 served, whether or not procmgr had reaped the child already. A release that
 finds no held record changes nothing: the child is live, was never started or
-never held, or was released already. The child's own procmgr cap carries the
-badge its process handle does, but a record is held only once the child is torn
-down, so only the creator can release it, and procmgr never hands a held
-record's badge to a new child.
+never held, or was released already. procmgr cannot tell the creator's
+handle from any other SEND carrying the child's badge: the child's own procmgr
+cap carries it too, and the child may have granted a copy onward before it
+died, so any holder of such a copy can release the hold once the child is torn
+down. A dead child itself cannot. procmgr never hands a held record's badge to a
+new child.
 
 **Reply:**
 

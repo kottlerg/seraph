@@ -4,9 +4,10 @@
 // services/devmgr/firmware/src/pci.rs
 
 //! PCI configuration-space arithmetic for devmgr: ECAM register offsets, the
-//! physical page of a function's configuration space, BAR sizes from their sizing read-backs (PCI Local Bus Specification r3.0
-//! § 6.2.5.1), and the Command register's Bus Master Enable (§ 6.2.2).
-//! devmgr performs the volatile accesses; these functions only compute.
+//! physical page of a function's configuration space, BAR sizes from their
+//! sizing read-backs (PCI Local Bus Specification r3.0 § 6.2.5.1), and the
+//! Command register's Bus Master Enable (§ 6.2.2). devmgr performs the
+//! volatile accesses; these functions only compute.
 
 /// Bytes of one function's configuration space in an ECAM window (PCI
 /// Express Base Specification r4.0 § 7.2.2): one page.

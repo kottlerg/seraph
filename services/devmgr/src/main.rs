@@ -835,40 +835,27 @@ fn enumerate_ecam(
         return false;
     };
     let ecam_pages = loc.size.div_ceil(PAGE_SIZE);
-    let Ok(ecam_range) = reserve_pages(ecam_pages)
+    let found_before = devices.len();
+    let scanned = with_mmio_mapped(
+        caps.self_aspace,
+        ecam_cap,
+        ecam_pages,
+        "ECAM window",
+        |va| {
+            // SAFETY: `va` maps `loc.size` = (end_bus - start_bus + 1) MiB from
+            // `loc.phys_base`, the configuration space of `start_bus`, until this
+            // closure returns, and the scan reaches it only through `pci::Ecam`'s
+            // raw volatile accessors ([`with_mmio_mapped`]).
+            let ecam = unsafe { pci::Ecam::new(va, loc.start_bus, loc.end_bus) };
+            firmware::scan::scan(&ecam, loc.segment, loc.start_bus, loc.end_bus, devices)
+        },
+    );
+    let Some(scanned) = scanned
     else
     {
-        std::os::seraph::log!("no VA for ECAM segment {}; not scanned", loc.segment);
+        std::os::seraph::log!("ECAM segment {} not scanned", loc.segment);
         return false;
     };
-    let ecam_va = ecam_range.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, ecam_pages)
-    {
-        std::os::seraph::log!("failed to fund PT budget for ECAM segment {}", loc.segment);
-        unreserve_pages(ecam_range);
-        return false;
-    }
-    // SAFETY: ecam_va starts `ecam_range`, a fresh reservation of the ECAM
-    // window's page count from the per-process arena, owned here: VA no Rust
-    // object or IPC page occupies. The scan reaches the mapping only through
-    // `pci::Ecam`'s raw volatile accessors, never a reference, and
-    // `ecam_range` is unreserved only after it returns (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0) }.is_err()
-    {
-        std::os::seraph::log!("failed to map ECAM segment {}", loc.segment);
-        unreserve_pages(ecam_range);
-        return false;
-    }
-    // SAFETY: ecam_va maps `loc.size` = (end_bus - start_bus + 1) MiB from
-    // `loc.phys_base`, the configuration space of `start_bus`, and stays
-    // mapped until after the scan below.
-    let ecam = unsafe { pci::Ecam::new(ecam_va, loc.start_bus, loc.end_bus) };
-    let found_before = devices.len();
-    let scanned = firmware::scan::scan(&ecam, loc.segment, loc.start_bus, loc.end_bus, devices);
-    // SAFETY: the scan has returned and reached ECAM only through raw
-    // pointers; the span is `ecam_range`, owned here.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages) };
-    unreserve_pages(ecam_range);
     keep_ecam(caps, loc, ecam_cap);
     if let Err(stop) = scanned
     {
@@ -883,6 +870,56 @@ fn enumerate_ecam(
         return devices.len() > found_before;
     }
     true
+}
+
+/// Map the `Mmio` cap `cap`, `pages` pages, into devmgr's own address space
+/// `aspace` at fresh VA, run `access` on the mapping's base address, then
+/// unmap it and return what `access` returned. Returns `None`, logged under
+/// `what`, when the VA reservation, the page-table funding, or the mapping
+/// fails; `access` then does not run.
+///
+/// The VA is a fresh reservation from the per-process arena that no Rust
+/// object or IPC page occupies, mapped for exactly the call to `access`:
+/// `access` may reach the `pages` pages from its base only through raw
+/// volatile accesses, never a reference, and must not keep the address.
+fn with_mmio_mapped<R>(
+    aspace: u32,
+    cap: u32,
+    pages: u64,
+    what: &str,
+    access: impl FnOnce(u64) -> R,
+) -> Option<R>
+{
+    let Ok(range) = reserve_pages(pages)
+    else
+    {
+        std::os::seraph::log!("{}: no VA to map it", what);
+        return None;
+    };
+    let va = range.va_start();
+    if !std::os::seraph::fund_aspace_pt_budget(aspace, pages)
+    {
+        std::os::seraph::log!("{}: page-table budget not funded", what);
+        unreserve_pages(range);
+        return None;
+    }
+    // SAFETY: `va` starts `range`, a fresh reservation of `pages` pages from
+    // the per-process arena, owned here: VA no Rust object or IPC page
+    // occupies. `access` reaches the mapping only through raw volatile
+    // accesses, never a reference, and `range` is unreserved only after the
+    // unmap below (`mmio_map` § Safety).
+    if unsafe { syscall::mmio_map(aspace, cap, va, 0) }.is_err()
+    {
+        std::os::seraph::log!("{}: mapping failed", what);
+        unreserve_pages(range);
+        return None;
+    }
+    let result = access(va);
+    // SAFETY: `access` has returned, and was the mapping's only use; the span
+    // is `range`, owned here.
+    let _ = unsafe { syscall::mem_unmap(aspace, va, pages) };
+    unreserve_pages(range);
+    Some(result)
 }
 
 /// Keep a scanned ECAM window's cap and location in `caps.config_space` and
@@ -1304,48 +1341,37 @@ impl DeviceReset
     /// does not read 0 within the bound.
     fn reset(&self) -> bool
     {
-        let Ok(range) = reserve_pages(self.bar_pages)
+        let offset = self.offset;
+        let confirmed = with_mmio_mapped(
+            self.aspace,
+            self.bar_cap,
+            self.bar_pages,
+            "device reset",
+            |va| {
+                let status = (va + offset) as *mut u8;
+                // SAFETY: `offset` is below the bytes the BAR's cap was carved
+                // to (`for_device`), all of which are mapped from `va` for this
+                // closure ([`with_mmio_mapped`]), and `device_status` is a byte
+                // register.
+                unsafe { core::ptr::write_volatile(status, 0) };
+                // The reset completes when the device reads back 0 (`VirtIO`
+                // 1.2 §4.1.4.3.2); the status is device-written, so the wait is
+                // bounded.
+                let start = std::time::Instant::now();
+                virtio_core::pci::poll_until(
+                    virtio_core::pci::RESET_TIMEOUT,
+                    || start.elapsed(),
+                    // SAFETY: as for the write above.
+                    || unsafe { core::ptr::read_volatile(status) } == 0,
+                )
+            },
+        );
+        let Some(confirmed) = confirmed
         else
         {
-            std::os::seraph::log!("device reset: no VA for its status BAR; not reset");
+            std::os::seraph::log!("device reset: its status BAR not mapped; not reset");
             return false;
         };
-        let va = range.va_start();
-        if !std::os::seraph::fund_aspace_pt_budget(self.aspace, self.bar_pages)
-        {
-            std::os::seraph::log!("device reset: page-table budget not funded; not reset");
-            unreserve_pages(range);
-            return false;
-        }
-        // SAFETY: `va` starts `range`, a fresh reservation of the BAR cap's page
-        // count from the per-process arena, owned here: VA no Rust object or IPC
-        // page occupies. The mapping is reached only through the raw volatile
-        // write below, and `range` is unreserved only after the unmap
-        // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(self.aspace, self.bar_cap, va, 0) }.is_err()
-        {
-            std::os::seraph::log!("device reset: mapping its status BAR failed; not reset");
-            unreserve_pages(range);
-            return false;
-        }
-        let status = (va + self.offset) as *mut u8;
-        // SAFETY: `offset` is below the bytes the BAR's cap was carved to
-        // (`for_device`), all of which `mmio_map` mapped from `va`, and
-        // `device_status` is a byte register.
-        unsafe { core::ptr::write_volatile(status, 0) };
-        // The reset completes when the device reads back 0 (`VirtIO` 1.2
-        // §4.1.4.3.2); the status is device-written, so the wait is bounded.
-        let start = std::time::Instant::now();
-        let confirmed = virtio_core::pci::poll_until(
-            virtio_core::pci::RESET_TIMEOUT,
-            || start.elapsed(),
-            // SAFETY: as for the write above.
-            || unsafe { core::ptr::read_volatile(status) } == 0,
-        );
-        // SAFETY: the accesses above were the mapping's only use; the span is
-        // `range`, owned here.
-        let _ = unsafe { syscall::mem_unmap(self.aspace, va, self.bar_pages) };
-        unreserve_pages(range);
         if !confirmed
         {
             std::os::seraph::log!("device reset: not confirmed within its bound");
@@ -1368,50 +1394,35 @@ impl FunctionConfig
 {
     /// Clear the function's Bus Master Enable and read the Command register
     /// back: once the bit is clear the function issues no memory request of
-    /// its own, so it performs no DMA, and the read's completion follows every
-    /// write the function posted before it (docs/device-management.md § DMA
-    /// Safety Model). Returns whether the read-back confirms the bit clear;
-    /// `false`, logged, when the mapping fails or it does not.
+    /// its own, so it performs no DMA, and the read-back's completion arrives
+    /// only after every write the function posted before it
+    /// (docs/device-management.md § DMA-Safe Teardown). Returns whether the
+    /// read-back confirms the bit clear; `false`, logged, when the mapping
+    /// fails or it does not.
     fn clear_bus_master(&self) -> bool
     {
-        let Ok(range) = reserve_pages(1)
+        let read_back = with_mmio_mapped(self.aspace, self.cap, 1, "bus master", |va| {
+            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
+            // SAFETY: the Command register lies in the configuration page
+            // mapped from `va` for this closure ([`with_mmio_mapped`]), and is a
+            // 16-bit register.
+            let current = unsafe { core::ptr::read_volatile(command) };
+            // SAFETY: as for the read above.
+            unsafe {
+                core::ptr::write_volatile(
+                    command,
+                    firmware::pci::command_without_bus_master(current),
+                );
+            }
+            // SAFETY: as for the read above.
+            unsafe { core::ptr::read_volatile(command) }
+        });
+        let Some(read_back) = read_back
         else
         {
-            std::os::seraph::log!("bus master: no VA for the configuration page; not cleared");
+            std::os::seraph::log!("bus master: configuration page not mapped; not cleared");
             return false;
         };
-        let va = range.va_start();
-        if !std::os::seraph::fund_aspace_pt_budget(self.aspace, 1)
-        {
-            std::os::seraph::log!("bus master: page-table budget not funded; not cleared");
-            unreserve_pages(range);
-            return false;
-        }
-        // SAFETY: `va` starts `range`, a fresh one-page reservation from the
-        // per-process arena, owned here: VA no Rust object or IPC page
-        // occupies. The mapping is reached only through the raw volatile
-        // accesses below, and `range` is unreserved only after the unmap
-        // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(self.aspace, self.cap, va, 0) }.is_err()
-        {
-            std::os::seraph::log!("bus master: mapping the configuration page failed; not cleared");
-            unreserve_pages(range);
-            return false;
-        }
-        let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
-        // SAFETY: the Command register lies in the configuration page
-        // `mmio_map` mapped at `va`, and is a 16-bit register.
-        let current = unsafe { core::ptr::read_volatile(command) };
-        // SAFETY: as for the read above.
-        unsafe {
-            core::ptr::write_volatile(command, firmware::pci::command_without_bus_master(current));
-        }
-        // SAFETY: as for the read above.
-        let read_back = unsafe { core::ptr::read_volatile(command) };
-        // SAFETY: the accesses above were the mapping's only use; the span is
-        // `range`, owned here.
-        let _ = unsafe { syscall::mem_unmap(self.aspace, va, 1) };
-        unreserve_pages(range);
         let cleared = firmware::pci::bus_master_confirmed_clear(read_back);
         if !cleared
         {
@@ -1477,11 +1488,13 @@ impl VirtioDeviceCaps
     }
 }
 
-/// Carve a `VirtIO` device's BAR and IRQ caps and add its catalog entry.
-/// Returns `None`, logging why and releasing what it carved, when the
-/// device presents no complete set of register regions, a BAR they name is
-/// not an MMIO BAR or no aperture covers it, or the catalog entry cannot be
-/// added. The IRQ is optional here; a driver that requires one checks.
+/// Carve a `VirtIO` device's BAR caps, its configuration-page cap, and its
+/// IRQ cap, and add its catalog entry. Returns `None`, logging why and
+/// releasing what it carved, when the device presents no complete set of
+/// register regions, a BAR they name is not an MMIO BAR or no aperture covers
+/// it, no kept ECAM window yields its configuration page
+/// ([`carve_function_config`]), or the catalog entry cannot be added. The IRQ
+/// is optional here; a driver that requires one checks.
 fn carve_virtio_device(
     name: &str,
     pci_dev: &pci::PciDevice,

@@ -989,14 +989,32 @@ fn resolve_create_sched(
     Some(process::ChildSched { priority, band_max })
 }
 
+/// Arm the held reclaim of a child created with `CREATE_DMA_HOLD`, reserving
+/// its record's room, so its teardown never has to free its frames for want
+/// of a record. Returns `false` when the heap cannot reserve the room: the
+/// child, which has not run, is then destroyed with both reply caps deleted,
+/// and the create is answered `OUT_OF_MEMORY`.
+fn arm_dma_hold(
+    result: &process::CreateResult,
+    ipc_buf: *mut u64,
+    memmgr_ep: u32,
+    table: &mut process::ProcessTable,
+) -> bool
+{
+    if table.arm_dma_hold(result.badge).is_ok()
+    {
+        return true;
+    }
+    std::os::seraph::log!("no room for a held reclaim; destroying the child");
+    let _ = syscall::cap_delete(result.thread_for_caller);
+    let _ = syscall::cap_delete(result.process_handle);
+    let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
+    reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+    false
+}
+
 /// Reply with a successful process creation result, or destroy the child
 /// when the reply cannot deliver it.
-///
-/// A create with `CREATE_DMA_HOLD` (`dma_hold`) first arms the child's held
-/// reclaim, reserving its record's room; when the heap cannot reserve it the
-/// child, which has not run, is destroyed and the create replies
-/// `OUT_OF_MEMORY`, so a held child's teardown never has to free its frames
-/// for want of a record.
 ///
 /// Reply caps: `[process_handle, thread]`. The reply's cap transfer is
 /// all-or-nothing: when the caller's `CSpace` cannot take both caps (or the
@@ -1006,21 +1024,11 @@ fn resolve_create_sched(
 /// both caps and tears the child down as `DESTROY_PROCESS` does.
 fn reply_create_result(
     result: &process::CreateResult,
-    dma_hold: bool,
     ipc_buf: *mut u64,
     memmgr_ep: u32,
     table: &mut process::ProcessTable,
 )
 {
-    if dma_hold && table.arm_dma_hold(result.badge).is_err()
-    {
-        std::os::seraph::log!("no room for a held reclaim; destroying the child");
-        let _ = syscall::cap_delete(result.thread_for_caller);
-        let _ = syscall::cap_delete(result.process_handle);
-        let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
-        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        return;
-    }
     let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
         .cap(result.process_handle)
         .cap(result.thread_for_caller)
@@ -1176,13 +1184,11 @@ fn handle_create(
         Some(result) =>
         {
             log_spawn_sched(sched);
-            reply_create_result(
-                &result,
-                label & procmgr_labels::CREATE_DMA_HOLD != 0,
-                ipc_buf,
-                ctx.memmgr_ep,
-                table,
-            );
+            if label & procmgr_labels::CREATE_DMA_HOLD == 0
+                || arm_dma_hold(&result, ipc_buf, ctx.memmgr_ep, table)
+            {
+                reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
+            }
         }
         None =>
         {
@@ -1333,13 +1339,11 @@ fn handle_create_from_file(
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            reply_create_result(
-                &result,
-                label & procmgr_labels::CREATE_DMA_HOLD != 0,
-                ipc_buf,
-                ctx.memmgr_ep,
-                table,
-            );
+            if label & procmgr_labels::CREATE_DMA_HOLD == 0
+                || arm_dma_hold(&result, ipc_buf, ctx.memmgr_ep, table)
+            {
+                reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
+            }
         }
         Err(code) =>
         {

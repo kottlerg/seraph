@@ -49,6 +49,7 @@ pub struct DmaHolds
 
 impl DmaHolds
 {
+    /// No held record and no armed child.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -125,6 +126,13 @@ impl DmaHolds
     pub fn is_empty(&self) -> bool
     {
         self.held.is_empty()
+    }
+
+    /// Number of armed children, for the table's tests.
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> usize
+    {
+        self.armed
     }
 }
 
@@ -221,11 +229,22 @@ mod tests
         }
         assert_eq!(holds.held.capacity(), capacity);
         assert_eq!(holds.len(), 5);
-        // A release keeps the other records, in any order.
-        assert!(holds.release(2).is_some());
+    }
+
+    #[test]
+    fn a_release_takes_only_its_own_record()
+    {
+        let mut holds = DmaHolds::new();
+        for badge in 1..=5
+        {
+            holds.arm().unwrap();
+            assert!(holds.park(&entry(badge, true, true)));
+        }
+        assert_eq!(holds.release(2).map(|r| r.badge), Some(2));
         for badge in [1, 3, 4, 5]
         {
             assert!(holds.holds(badge));
         }
+        assert_eq!(holds.len(), 4);
     }
 }

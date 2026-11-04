@@ -1063,7 +1063,8 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
     );
     assert!(
         started,
-        "a started held child's pages did not return to the pool after RELEASE_HOLD          in {DMA_HOLD_WINDOWS} windows"
+        "a held child's pages were not back in the pool after RELEASE_HOLD in any of \
+         {DMA_HOLD_WINDOWS} windows"
     );
     std::os::seraph::log!("procmgr_dma_hold phase passed");
 }

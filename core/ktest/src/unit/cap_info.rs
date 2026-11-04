@@ -511,16 +511,16 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
 /// `CSpace` fields report the currently-backed capacity, and the cap's tag
 /// is `CSpace`.
 ///
-/// A fresh `init_pages = 4` cspace (3 pool pages, none consumed) reports
-/// `capacity == 3 × 56`, `used == 0`, and `budget == 3` pages. Inserting
-/// one cap draws the first slot page from the pool, so capacity settles at
-/// `3 × 56 − 1` (slot 0 reserved) with `used == 1`. An augment-mode
-/// donation of 2 pages raises capacity by `2 × 56`. The page and slot
+/// With `S` the slots per leaf page (`CSPACE_SLOTS_PER_PAGE`, the kernel's
+/// `L2_SIZE`), a fresh `init_pages = 4` cspace (3 pool pages, none consumed)
+/// reports `capacity == 3 × S`, `used == 0`, and `budget == 3` pages.
+/// Inserting one cap draws the first slot page from the pool, so capacity
+/// settles at `3 × S − 1` (slot 0 reserved) with `used == 1`. An
+/// augment-mode donation of 2 pages raises capacity by `2 × S`. The page and slot
 /// arithmetic follows core/kernel/docs/capability-internals.md § Page Pools,
 /// § Representation, and § Storage: Hybrid Two-Level Radix.
 pub fn cspace_fields(ctx: &TestContext) -> TestResult
 {
-    const PAGE_SIZE: u64 = 4096;
     // Slots per leaf page: the kernel's `L2_SIZE`, published in the ABI.
     const L2_SIZE: u64 = CSPACE_SLOTS_PER_PAGE;
     let cs = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace failed")?;
@@ -564,19 +564,19 @@ pub fn cspace_fields(ctx: &TestContext) -> TestResult
 
     if fresh_capacity != 3 * L2_SIZE
     {
-        return Err("fresh cspace capacity != pool-backed 3 x 56");
+        return Err("fresh cspace capacity != 3 pool pages of CSPACE_SLOTS_PER_PAGE slots");
     }
     if fresh_used != 0
     {
         return Err("freshly-created cspace reported non-zero CSPACE_USED");
     }
-    if fresh_budget != 3 * PAGE_SIZE
+    if fresh_budget != 3 * syscall_abi::PAGE_SIZE
     {
         return Err("fresh cspace budget != 3 pool pages");
     }
     if after_capacity != 3 * L2_SIZE - 1
     {
-        return Err("capacity after first insert != 3 x 56 - 1 (slot 0 reserved)");
+        return Err("capacity after first insert != 3 pages of slots less slot 0");
     }
     if after_used != 1
     {
@@ -588,7 +588,7 @@ pub fn cspace_fields(ctx: &TestContext) -> TestResult
     }
     if aug_capacity != after_capacity + 2 * L2_SIZE
     {
-        return Err("capacity did not grow by 2 x 56 after 2-page augment");
+        return Err("capacity did not grow by 2 pages of slots after a 2-page augment");
     }
     Ok(())
 }

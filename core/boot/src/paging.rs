@@ -34,9 +34,10 @@ pub enum MapError
 
 /// Architecture-specific page table builder.
 ///
-/// Implementors allocate page table frames via UEFI `AllocatePages` and construct
-/// the minimal initial mapping needed for kernel handoff. All allocation must occur
-/// before `ExitBootServices`.
+/// Implementors take their page table frames from one pool allocated via UEFI
+/// `AllocatePages` at construction, sized by [`table_frame_bound`], and
+/// construct the minimal initial mapping needed for kernel handoff. All
+/// allocation must occur before `ExitBootServices`.
 ///
 /// # Safety
 /// All implementations must enforce W^X: any call to [`map`] with
@@ -46,20 +47,26 @@ pub enum MapError
 /// [`map`]: PageTableBuilder::map
 pub trait PageTableBuilder: Sized
 {
-    /// Allocate a new, empty root page table.
-    ///
-    /// Frames are allocated from UEFI `AllocatePages`. Returns `None` if the
-    /// allocation fails.
+    /// Translation levels of the paging mode the builder builds for (the root
+    /// included), which [`table_frame_bound`] sizes the frame pool from.
+    fn translation_levels() -> usize;
+
+    /// Allocate a pool of `table_frames` contiguous frames from UEFI
+    /// `AllocatePages` and take a new, empty root page table from it. Every
+    /// intermediate table [`map`][Self::map] needs comes from the same pool.
+    /// Returns `None` if the allocation fails.
     ///
     /// # Safety
     /// `bs` must be a valid pointer to UEFI boot services (before `ExitBootServices`).
-    fn new(bs: *mut crate::uefi::EfiBootServices) -> Option<Self>;
+    fn new(bs: *mut crate::uefi::EfiBootServices, table_frames: u64) -> Option<Self>;
 
     /// Map the virtual range `[virt, virt+size)` to `[phys, phys+size)`.
     ///
     /// `size` must be page-aligned. Returns [`MapError::WxViolation`] if both
     /// `flags.writable` and `flags.executable` are set, without modifying any table.
-    /// Returns [`MapError::OutOfMemory`] if an intermediate frame allocation fails.
+    /// Returns [`MapError::OutOfMemory`] if the frame pool holds no frame for an
+    /// intermediate table, which a pool sized by [`table_frame_bound`] over
+    /// every mapped range never meets.
     fn map(&mut self, virt: u64, phys: u64, size: u64, flags: PageFlags) -> Result<(), MapError>;
 
     /// Return the physical address of the root page table frame.
@@ -68,13 +75,42 @@ pub trait PageTableBuilder: Sized
     /// on RISC-V.
     fn root_physical(&self) -> u64;
 
-    /// Physical addresses of every frame this builder allocated for its own page
-    /// tables (the root frame and every intermediate frame allocated during
-    /// [`map`][Self::map]).
+    /// The `(physical base, page count)` spans this builder allocated that are
+    /// dead once the kernel runs: the whole frame pool, used or not, and on
+    /// x86-64 the LA57 toggle page when one is installed.
     ///
-    /// Step 9 records these in `BootInfo.reclaim_ranges`; see
+    /// Step 9 records each span as one entry of `BootInfo.reclaim_ranges`; see
     /// `core/boot/docs/page-tables.md` § Page Table Frame Tracking.
-    fn allocated_frames(&self) -> &[u64];
+    fn reclaim_spans(&self) -> &[(u64, u64)];
+}
+
+/// Most page-table frames a builder of `levels` translation levels takes to map
+/// every `(virt, size)` range of `ranges` with 4 KiB leaves, the root included.
+///
+/// A table one level above the leaves (a PT) covers 2 MiB of virtual space and
+/// each level above multiplies that by 512, so the tables a range needs at a
+/// level are the blocks of that level's span the range touches. The bound sums
+/// that count over the ranges and the levels below the root, so tables two
+/// ranges share are counted twice: it is an upper bound, never below what the
+/// builder allocates for the same ranges.
+pub fn table_frame_bound(levels: usize, ranges: impl IntoIterator<Item = (u64, u64)>) -> u64
+{
+    let mut frames: u64 = 1;
+    for (virt, size) in ranges
+    {
+        if size == 0
+        {
+            continue;
+        }
+        let (base, span) = page_span(virt, size);
+        let last = base + (span - 1);
+        for level in 0..levels.saturating_sub(1)
+        {
+            let shift = 21 + 9 * level;
+            frames += (last >> shift) - (base >> shift) + 1;
+        }
+    }
+    frames
 }
 
 /// Convert a [`MapError`] to a [`BootError`].
@@ -104,7 +140,23 @@ pub fn build_initial_tables(
     identity_regions: &[(u64, u64)],
 ) -> Result<arch::current::BootPageTable, BootError>
 {
-    let mut table = arch::current::BootPageTable::new(bs).ok_or(BootError::OutOfMemory)?;
+    // Size the frame pool over every range the tables will map: the kernel
+    // segments, the identity regions, and the handoff trampoline's page or
+    // pages, which `install_handoff_trampoline_mapping` maps afterwards.
+    let (tramp_first, tramp_last) = arch::current::trampoline_page_range();
+    let trampoline = [(tramp_first, 4096), (tramp_last, 4096)]
+        .into_iter()
+        .filter(|&(page, _)| page != 0);
+    let segments = kernel.segments[0..kernel.segment_count]
+        .iter()
+        .map(|seg| (seg.virt_base, seg.size));
+    let frames = table_frame_bound(
+        arch::current::BootPageTable::translation_levels(),
+        segments
+            .chain(identity_regions.iter().copied())
+            .chain(trampoline),
+    );
+    let mut table = arch::current::BootPageTable::new(bs, frames).ok_or(BootError::OutOfMemory)?;
 
     // Map each kernel ELF segment at its ELF virtual address with segment permissions.
     for seg in &kernel.segments[0..kernel.segment_count]
@@ -158,6 +210,75 @@ fn page_span(phys: u64, size: u64) -> (u64, u64)
 mod tests
 {
     use super::*;
+    use std::collections::HashSet;
+
+    /// The tables a builder of `levels` levels allocates for `ranges`: the
+    /// root and one table per distinct block of each lower level's span that
+    /// a mapped page falls in.
+    fn tables_needed(levels: usize, ranges: &[(u64, u64)]) -> u64
+    {
+        let mut tables = HashSet::new();
+        for &(virt, size) in ranges
+        {
+            if size == 0
+            {
+                continue;
+            }
+            let (base, span) = page_span(virt, size);
+            for page in (base..base + span).step_by(4096)
+            {
+                for level in 0..levels - 1
+                {
+                    tables.insert((level, page >> (21 + 9 * level)));
+                }
+            }
+        }
+        1 + tables.len() as u64
+    }
+
+    /// Defect caught: a pool bound below the frames the builder takes, which
+    /// exhausts the pool and fails the boot with `OutOfMemory`.
+    #[test]
+    fn the_frame_bound_covers_every_table_the_mappings_need()
+    {
+        let kernel = [
+            (0xFFFF_FFFF_8000_0000, 0x21_0000),
+            (0xFFFF_FFFF_8021_0000, 0x8_1000),
+            (0xFFFF_FFFF_8029_2000, 0x3_0010),
+        ];
+        let identity = [
+            (0x7E00_0000, 0x1000),
+            (0x7E00_1000, 0x1000),
+            (0x7DF0_0000, 0x4000),
+            (0x7DE0_0000, 0x1_1000),
+            (0x1F_FFFF_F000, 0x2000), // straddles a 1 GiB and a 2 MiB boundary
+            (0x8000_0000, 7680 * 4320 * 4), // an 8K framebuffer
+            (0x1000_0000, 0x1F00),
+        ];
+        let all: Vec<(u64, u64)> = kernel.iter().chain(identity.iter()).copied().collect();
+        for levels in [3, 4, 5]
+        {
+            let bound = table_frame_bound(levels, all.iter().copied());
+            let needed = tables_needed(levels, &all);
+            assert!(
+                bound >= needed,
+                "levels {levels}: bound {bound} < needed {needed}"
+            );
+        }
+    }
+
+    /// Defect caught: a bound that drops the root, or counts one table per
+    /// range at the PT level where a range crosses a 2 MiB boundary.
+    #[test]
+    fn a_range_crossing_a_pt_boundary_needs_a_second_pt()
+    {
+        // One page: a table per level below the root, plus the root.
+        assert_eq!(table_frame_bound(4, [(0x20_0000, 0x1000)]), 4);
+        // Two pages either side of a 2 MiB boundary: one more PT.
+        assert_eq!(table_frame_bound(4, [(0x1F_F000, 0x2000)]), 5);
+        // An empty range maps nothing.
+        assert_eq!(table_frame_bound(4, [(0x20_0000, 0)]), 1);
+    }
 
     /// A region whose in-page offset pushes its end across one more page
     /// boundary than its size alone keeps that last page.

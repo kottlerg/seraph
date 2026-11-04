@@ -94,21 +94,23 @@ after `ExitBootServices` by
    [`core/boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
    firmware source that is present, and with the GOP framebuffer, which
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
-   carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS` (64)
-   seed buffer, the framebuffer seed included, are dropped without a diagnostic.
-   The ACPI seeder's heuristic PCI windows go to a separate buffer
-   (`MAX_HEURISTIC_SEEDS`, 16); windows beyond it are dropped without a
+   carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS`
+   (`MAX_APERTURES`, 256) seed buffer, the framebuffer seed included, are dropped
+   with a diagnostic. The ACPI seeder's heuristic PCI windows go to a separate
+   buffer (`MAX_HEURISTIC_SEEDS`, also 256); windows beyond it are dropped with a
    diagnostic. Each seed is first clipped to the memory map as
    [§ Firmware exclusion](#firmware-exclusion) defines, so it contributes only
    the gaps the subtracted ranges leave, and a seed wholly inside one contributes
    nothing.
-3. Sort by `phys_base`.
-4. Merge adjacent and overlapping entries into a minimal non-overlapping
-   list.
-5. Cap at `MAX_APERTURES` (16, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs));
-   surplus, and any entry collected in steps 1–2 beyond the
-   `derive_mmio_apertures` scratch buffer (`MAX_APERTURES` × 4), is dropped with a
-   diagnostic.
+3. Merge every piece, as it is collected, into the output list kept sorted by
+   `phys_base`, joining adjacent and overlapping entries, so the list is minimal
+   and non-overlapping at every step and no scratch buffer bounds the input.
+4. Cap at `MAX_APERTURES` (256, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs),
+   the capacity of the array's page). When more pieces than that are disjoint at
+   once, a later piece could still bridge them, so the list is rebuilt by taking
+   the pieces in ascending `phys_base` order, which keeps exactly the lowest
+   `MAX_APERTURES` apertures of the full merge; when the full merge holds more, the
+   highest are dropped with a diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often

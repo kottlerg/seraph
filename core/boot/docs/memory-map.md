@@ -47,10 +47,9 @@ re-validation.
 
 Contiguous same-type UEFI entries are **not** coalesced by the
 bootloader. The translated array mirrors the UEFI descriptor sequence
-1:1 (after sorting) up to the capacity of the `MemoryMapEntry` array
-(`MEM_MAP_ENTRY_PAGES` pages, about 680 entries); `translate_memory_map` drops
-descriptors beyond it without a diagnostic; any consolidation of adjacent
-regions into a single larger entry is left to the kernel if it wants a denser
+1:1 (after sorting); its capacity follows the firmware's map
+(§ Sizing the Entry Array). Any consolidation of adjacent regions into a
+single larger entry is left to the kernel if it wants a denser
 representation.
 
 The bootloader makes no allocation after the final memory-map query; a
@@ -132,6 +131,26 @@ The `Loaded` allocations are:
 The acquisition sequence that sizes and fills the map buffer, including
 its slack margin, is owned by
 [uefi-environment.md](uefi-environment.md) §"Memory Map Acquisition".
+
+---
+
+## Sizing the Entry Array
+
+The translated `MemoryMapEntry` array is allocated in step 6, before the final
+map exists, so it is sized from the firmware's map at that point: step 6 reads
+the descriptor count with a `GetMemoryMap` size query before its first
+allocation, and the array holds that count plus `MEM_MAP_SLACK_ENTRIES` (32).
+Each allocation after the query (the eight of steps 6 and 7) adds at most two
+descriptors, 16 in all, and the other 16 absorb the firmware's own housekeeping
+allocations in that window (§ ExitBootServices in
+[uefi-environment.md](uefi-environment.md)), which nothing bounds, so the
+headroom is a budget, not a proof.
+
+A final map that still holds more descriptors than the array does not boot
+silently short of memory: `translate_memory_map` counts the descriptors past the
+array by class, and step 9 fails the boot with `BootError::MemoryMapTruncated` when
+one of them is RAM (`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`), and drops
+the others with a diagnostic.
 
 ---
 

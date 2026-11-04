@@ -30,6 +30,7 @@ use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::{
     HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT, MAX_CPUS, MmioAperture,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// ISA-extension names the CPU-node walker recognizes, with the
 /// `hart_caps` bit each one confirms. Shared by the DTB stringlist /
@@ -55,15 +56,25 @@ const FDT_NOP: u32 = 4;
 #[cfg_attr(not(test), allow(dead_code))]
 const FDT_END: u32 = 9;
 
-/// Maximum FDT node nesting depth supported by the walker.
-const MAX_DEPTH: usize = 8;
+/// Maximum FDT node nesting depth the walkers track. Device trees in the wild
+/// nest well under it (buses inside buses inside `/soc`); the cost is stack
+/// only, one per-depth state per level, about 12 KiB for `walk_compatible`'s,
+/// and a deeper node's properties are skipped with a diagnostic.
+const MAX_DEPTH: usize = 32;
 
-/// Maximum `reg` entries (address+size pairs) extracted per node.
+/// Maximum `reg` entries (address+size pairs) extracted per node. Only the
+/// first is consumed (aperture seeds, kernel MMIO bases); surplus entries are
+/// dropped with a diagnostic.
 const MAX_REG_ENTRIES: usize = 8;
-/// Maximum number of `interrupts` values collected per node.
+/// Maximum number of `interrupts` values collected per node. No consumer reads
+/// them; surplus values are dropped with a diagnostic.
 const MAX_IRQ_ENTRIES: usize = 4;
-/// Maximum number of `ranges` entries collected per node.
-const MAX_RANGES_ENTRIES: usize = 4;
+/// Maximum number of `ranges` entries collected per node. A PCI host bridge
+/// carries one per window, each an aperture seed; the QEMU virt bridge has
+/// three, and the PCI binding sets no limit. Surplus entries are dropped with a
+/// diagnostic. Eight keeps `walk_compatible`'s per-depth state, `MAX_DEPTH` of
+/// them, under clippy's 16 KiB `large_stack_arrays` limit.
+const MAX_RANGES_ENTRIES: usize = 8;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -144,6 +155,32 @@ impl NodeState
             ranges_count: 0,
             riscv_ndev: 0,
         }
+    }
+}
+
+/// Whether a walk has reported nodes past [`MAX_DEPTH`]; a later walk of the
+/// same tree would repeat the report, so the boot reports it once.
+static REPORTED_TOO_DEEP: AtomicBool = AtomicBool::new(false);
+/// Whether a walk has reported a property past its entry bound, once per boot
+/// for the reason [`REPORTED_TOO_DEEP`] gives.
+static REPORTED_TRUNCATED: AtomicBool = AtomicBool::new(false);
+
+/// Report, after a walk, that it skipped the properties of nodes past
+/// [`MAX_DEPTH`] (`too_deep`) or dropped entries past a property's
+/// `MAX_*_ENTRIES` bound (`truncated`), each the first time a walk of this
+/// boot meets it.
+fn report_walk_limits(too_deep: bool, truncated: bool)
+{
+    if too_deep && !REPORTED_TOO_DEEP.swap(true, Ordering::Relaxed)
+    {
+        bprintln!("[--------] boot: DTB: nodes nested past MAX_DEPTH; their properties skipped");
+    }
+    if truncated && !REPORTED_TRUNCATED.swap(true, Ordering::Relaxed)
+    {
+        bprintln!(
+            "[--------] boot: DTB: a reg, interrupts or ranges property past its entry bound; \
+             surplus entries dropped"
+        );
     }
 }
 
@@ -273,6 +310,10 @@ impl Fdt
         let mut states = [NodeState::new(); MAX_DEPTH];
         let mut depth: usize = 0;
         let mut off: u32 = 0; // byte offset within struct block
+        // Whether a node lay past MAX_DEPTH, and whether a property held more
+        // entries than its MAX_*_ENTRIES bound; reported once, after the walk.
+        let mut too_deep = false;
+        let mut truncated = false;
 
         while let Some(token) = self.read_struct_u32(off)
         {
@@ -285,6 +326,10 @@ impl Fdt
                     if depth < MAX_DEPTH
                     {
                         states[depth] = NodeState::new();
+                    }
+                    else
+                    {
+                        too_deep = true;
                     }
                     depth += 1;
                     // Skip null-terminated, 4-byte-aligned node name.
@@ -373,6 +418,7 @@ impl Fdt
                             state.reg_count += 1;
                             i += 16;
                         }
+                        truncated |= i + 16 <= data.len();
                     }
                     else if name == b"interrupts"
                     {
@@ -385,6 +431,7 @@ impl Fdt
                             state.irq_count += 1;
                             i += 4;
                         }
+                        truncated |= i + 4 <= data.len();
                     }
                     else if name == b"riscv,ndev"
                     {
@@ -414,6 +461,7 @@ impl Fdt
                             state.ranges_count += 1;
                             i += 28;
                         }
+                        truncated |= i + 28 <= data.len();
                     }
                 }
                 FDT_NOP =>
@@ -422,6 +470,7 @@ impl Fdt
                 _ => break,
             }
         }
+        report_walk_limits(too_deep, truncated);
     }
 
     /// Call `f` for each node whose `compatible` property contains `compat`.
@@ -480,6 +529,8 @@ impl Fdt
 
         let mut depth: usize = 0;
         let mut off: u32 = 0;
+        // Whether a node lay past MAX_DEPTH; reported once, after the walk.
+        let mut too_deep = false;
 
         while let Some(token) = self.read_struct_u32(off)
         {
@@ -499,6 +550,10 @@ impl Fdt
                             caps: 0,
                             mmu: None,
                         };
+                    }
+                    else
+                    {
+                        too_deep = true;
                     }
                     depth += 1;
                     let Some(next) = skip_node_name(self, off)
@@ -648,6 +703,7 @@ impl Fdt
                 _ => break,
             }
         }
+        report_walk_limits(too_deep, false);
     }
 
     /// Return the first `timebase-frequency` property value in the tree, or
@@ -1023,19 +1079,23 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     };
 
     let mut n: usize = 0;
+    let mut dropped = false;
 
     // Push a node's first `reg` entry as an aperture seed when its size is
     // non-zero; shared by every compatible string below.
-    let push_first_reg = |out: &mut [MmioAperture], n: &mut usize, node: &FdtNode| {
-        if *n < out.len() && node.reg_count > 0 && node.reg_entries[0].1 > 0
-        {
-            out[*n] = MmioAperture {
-                phys_base: node.reg_entries[0].0,
-                size: node.reg_entries[0].1,
-            };
-            *n += 1;
-        }
-    };
+    let push_first_reg =
+        |out: &mut [MmioAperture], n: &mut usize, dropped: &mut bool, node: &FdtNode| {
+            if node.reg_count > 0 && node.reg_entries[0].1 > 0
+            {
+                push_seed(
+                    out,
+                    n,
+                    dropped,
+                    node.reg_entries[0].0,
+                    node.reg_entries[0].1,
+                );
+            }
+        };
 
     for compat in [
         &b"sifive,plic-1.0.0"[..],
@@ -1046,7 +1106,7 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     ]
     {
         fdt.walk_compatible(compat, |node| {
-            push_first_reg(out, &mut n, &node);
+            push_first_reg(out, &mut n, &mut dropped, &node);
             true
         });
     }
@@ -1054,18 +1114,14 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     // PCI host bridge — reg is the ECAM window; ranges entries with
     // child-space 2 (32-bit MMIO) or 3 (64-bit MMIO) are BAR windows.
     fdt.walk_compatible(b"pci-host-ecam-generic", |node| {
-        push_first_reg(out, &mut n, &node);
+        push_first_reg(out, &mut n, &mut dropped, &node);
         for i in 0..node.ranges_count
         {
             let (flags, cpu_addr, size) = node.ranges_entries[i];
             let space = (flags >> 24) & 0x3;
-            if (space == 2 || space == 3) && n < out.len() && size > 0
+            if (space == 2 || space == 3) && size > 0
             {
-                out[n] = MmioAperture {
-                    phys_base: cpu_addr,
-                    size,
-                };
-                n += 1;
+                push_seed(out, &mut n, &mut dropped, cpu_addr, size);
             }
         }
         true
@@ -1073,11 +1129,30 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 
     // Each VirtIO MMIO transport advertises its own register window.
     fdt.walk_compatible(b"virtio,mmio", |node| {
-        push_first_reg(out, &mut n, &node);
+        push_first_reg(out, &mut n, &mut dropped, &node);
         true
     });
 
+    if dropped
+    {
+        bprintln!("[--------] boot: DTB: aperture seeds past the seed buffer dropped");
+    }
     n
+}
+
+/// Append the seed `(phys_base, size)` to `out[..*n]`, or set `dropped` when
+/// `out` is full.
+fn push_seed(out: &mut [MmioAperture], n: &mut usize, dropped: &mut bool, phys_base: u64, size: u64)
+{
+    if *n < out.len()
+    {
+        out[*n] = MmioAperture { phys_base, size };
+        *n += 1;
+    }
+    else
+    {
+        *dropped = true;
+    }
 }
 
 /// Extract the `/chosen/rng-seed` property into `out`, scrub it from the
@@ -1265,6 +1340,73 @@ mod tests
     {
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
         unsafe { parse_hart_caps(blob.as_ptr() as u64) }
+    }
+
+    // Defect caught: a depth bound that skips the properties of a node a SoC
+    // tree nests deep under buses, losing its aperture seed.
+    #[test]
+    fn a_node_nested_twenty_deep_is_found()
+    {
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        for _ in 0..19
+        {
+            b.begin_node(b"bus");
+        }
+        b.begin_node(b"uart@10000000");
+        b.prop(b"compatible", b"ns16550a\0");
+        b.prop(
+            b"reg",
+            &[0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0],
+        );
+        b.end_node();
+        for _ in 0..19
+        {
+            b.end_node();
+        }
+        b.end_node();
+        let blob = b.finish();
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let fdt = unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.expect("valid FDT");
+        let mut reg = None;
+        fdt.walk_compatible(b"ns16550a", |node| {
+            reg = Some(node.reg_entries[0]);
+            false
+        });
+        assert_eq!(reg, Some((0x1000_0000, 0x1000)));
+    }
+
+    // Defect caught: a ranges bound below a PCIe host bridge's window count,
+    // dropping BAR windows the aperture seeds need.
+    #[test]
+    fn a_host_bridge_with_eight_ranges_keeps_them_all()
+    {
+        let mut ranges = Vec::new();
+        for i in 0..8u32
+        {
+            // child_hi (64-bit MMIO), child_mid, child_lo, parent (u64), size (u64)
+            ranges.extend_from_slice(&0x0300_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&[0; 8]);
+            ranges
+                .extend_from_slice(&(0x4_0000_0000u64 + u64::from(i) * 0x1000_0000).to_be_bytes());
+            ranges.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+        }
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        b.begin_node(b"pcie@30000000");
+        b.prop(b"compatible", b"pci-host-ecam-generic\0");
+        b.prop(b"ranges", &ranges);
+        b.end_node();
+        b.end_node();
+        let blob = b.finish();
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let fdt = unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.expect("valid FDT");
+        let mut count = None;
+        fdt.walk_compatible(b"pci-host-ecam-generic", |node| {
+            count = Some(node.ranges_count);
+            false
+        });
+        assert_eq!(count, Some(8));
     }
 
     // Defect caught: a PLIC's `riscv,ndev` not reaching the walker's node, so the

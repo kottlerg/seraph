@@ -292,7 +292,8 @@ impl CSpaceRegistry
 
     /// Store `new_epoch` as `id`'s epoch and return the id to the free list.
     ///
-    /// Pre-condition: `id` is backed, unregistered, and not on the free list;
+    /// Pre-condition: `id` is backed and unregistered, and was handed out by
+    /// [`Self::alloc`] and not retired since (so it is not on the free list);
     /// `new_epoch` is non-zero and differs from the current epoch (the
     /// caller draws it, `cap::free_cspace_id` from the kernel CSPRNG). An
     /// unbacked `id` is ignored.
@@ -509,8 +510,8 @@ mod tests
         assert_eq!(reg.live(), 0);
     }
 
-    // Defect caught: a retire with no id live wrapping the count silently
-    // (the assert dropped, or the decrement made saturating again).
+    // Defect caught: a retire with no id live passing silently (the count
+    // assert dropped or weakened), leaving the count wrapped or pinned at zero.
     #[test]
     #[should_panic(expected = "retire with no CSpace id live")]
     fn a_retire_with_no_id_live_trips_the_count_assert()

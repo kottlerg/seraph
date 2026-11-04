@@ -113,7 +113,8 @@ impl DeathSet
     /// and cannot (it is already `WAIT_SET_MAX_MEMBERS` wide, or the wider
     /// set cannot be funded); the `SYS_WAIT_SET_ADD` error that kept a new
     /// queue out of the main wait set (`InvalidCapability`,
-    /// `InsufficientRights` or `InvalidArgument`; the queue is deleted); or
+    /// `InsufficientRights` or `InvalidArgument`; the queue is deleted and
+    /// its memory returned); or
     /// the `SYS_WAIT_SET_REMOVE` / `SYS_WAIT_SET_ADD` error that stopped the
     /// move into a wider set (every member is back in the old one).
     pub fn bind_thread(&self, thread_cap: u32, correlator: u64) -> Result<(), i64>
@@ -245,13 +246,19 @@ fn create_queue(ws_cap: u32, ws_badge: u64, observers: u32, made: usize) -> Resu
         u64::from(DEATHS_EQ_CAPACITY),
         u64::from(observers),
     );
-    let queue = std::os::seraph::object_slab_retype(bytes, |slab| {
+    let (queue, grant) = std::os::seraph::object_slab_retype_reclaimable(bytes, |slab| {
         syscall::event_queue_create_observed(slab, DEATHS_EQ_CAPACITY, observers).ok()
     })
     .ok_or(OUT_OF_MEMORY)?;
     if let Err(e) = syscall::wait_set_add(ws_cap, queue, ws_badge)
     {
+        // A queue outside the wait set is never drained: delete it, and
+        // return its dedicated grant, if it had one, to memmgr.
         let _ = syscall::cap_delete(queue);
+        if let Some(grant) = grant
+        {
+            std::os::seraph::object_slab_release(grant);
+        }
         return Err(e);
     }
     if made > 0

@@ -851,8 +851,11 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
 /// [`object_slab_retype_reclaimable`] returns it: what [`object_slab_release`]
 /// needs to return the grant's run to memmgr's pool once the object is
 /// deleted.
+///
+/// Neither `Clone` nor `Copy`: [`object_slab_release`] consumes it, so one
+/// grant is released once.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ObjectGrant {
     phys: u64,
 }
@@ -879,10 +882,12 @@ pub fn object_slab_retype_reclaimable<T>(
 }
 
 /// Return `grant`'s run to memmgr's pool. The caller MUST have deleted the
-/// object retyped from it first; a release while the object is live is safe
-/// (the kernel does not hand out live bytes) but leaves the run charged
-/// until the object is deleted. Best-effort: a failed call leaves the run
-/// charged to the process until it dies.
+/// object retyped from it first. A release while the object is live is
+/// memory-safe (the kernel does not hand out live bytes) but strands the run
+/// in memmgr's pool until the object is deleted: memmgr takes it off the
+/// process's ledger at once, and no process can use it meanwhile.
+/// Best-effort: a failed call leaves the run charged to the process until it
+/// dies.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn object_slab_release(grant: ObjectGrant) {
     pal_alloc::slab_release_fresh(grant.phys);

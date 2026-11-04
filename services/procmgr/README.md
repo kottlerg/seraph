@@ -220,8 +220,9 @@ refuses every request above three pages, the queues settle at 128 nodes, the lar
 three-page request covers, and the wait set at 256 members (a 512-member set is a five-page
 request), where 255 queues still hold about 16 K live processes. That is the death-queue set's own
 floor, not a cap a system meets: such RAM refuses each spawn's own contiguous grants (a 48-page
-`AddressSpace` among them, `memmgr_alloc_pages_contig` in `src/process.rs`) first. A deleted wait
-set's memory returns to memmgr, a page-sized set's (32 members or more) dedicated grant through
+`AddressSpace` among them, requested by `create_child_kernel_objects` in `src/process.rs`) first. A
+deleted sub-page wait set's bytes return to the runtime's pooled object-slab page; a page-sized
+set's (32 members or more) dedicated grant returns to memmgr through
 `std::os::seraph::object_slab_release` ([docs/limits.md](../../docs/limits.md)). A bind that still
 fails (procmgr out of memory) fails the spawn, the address-space bind included.
 

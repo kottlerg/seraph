@@ -265,14 +265,14 @@ pub fn donate_unauthorized_phase(_: &Caps)
 /// Page-sized wait sets [`object_slab_release_phase`] creates and deletes.
 const RELEASE_CHURN: u32 = 64;
 
-/// Members of each of those wait sets: a 512-member set is a five-page
-/// retype, well past the sub-page classes.
+/// Members of each of those wait sets: a 512-member set is a four-page
+/// retype class in a five-page grant, well past the sub-page classes.
 const RELEASE_WS_MEMBERS: u32 = 512;
 
 /// The memmgr free-pool drop [`object_slab_release_phase`] tolerates, for
 /// other processes' allocations meanwhile: 32 pages, a tenth of the 320 the
 /// churn strands without the release.
-const RELEASE_POOL_SLACK_BYTES: u64 = 32 * 4096;
+const RELEASE_POOL_SLACK_BYTES: u64 = 32 * syscall_abi::PAGE_SIZE;
 
 /// `std::os::seraph::object_slab_retype_reclaimable` returns the dedicated
 /// grant of a page-sized retype and none for a sub-page one, and

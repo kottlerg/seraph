@@ -210,7 +210,8 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 W^X is verified during construction: no leaf PTE has both writable and executable permissions.
 
 Step 6 also sizes and allocates the arrays step 9 fills: the `MemoryMapEntry` array (the
-firmware's descriptor count plus slack, [memory-map.md](memory-map.md#sizing-the-entry-array)),
+reach of the step 7 map buffer for the firmware's descriptor count plus slack,
+[memory-map.md](memory-map.md#sizing-the-entry-array)),
 the two aperture seed buffers (a count pass of the ACPI and DTB seeders,
 [firmware-parsing.md](firmware-parsing.md)), and the `MmioAperture` array from both.
 

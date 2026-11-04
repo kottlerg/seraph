@@ -918,7 +918,8 @@ pub unsafe fn memory_map_shape(bs: *mut EfiBootServices) -> Result<(usize, usize
 }
 
 /// Query the UEFI memory map into a freshly allocated buffer sized with
-/// [`MAP_BUFFER_SLACK_DESCRIPTORS`] descriptors of slack ([`map_buffer_bytes`]). Returns the buffer address and capacity, map size,
+/// [`MAP_BUFFER_SLACK_DESCRIPTORS`] descriptors of slack
+/// ([`map_buffer_bytes`]). Returns the buffer address and capacity, map size,
 /// map key, and descriptor size. The acquisition protocol (key invalidation,
 /// final-allocation ordering, slack sizing) is specified in
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.

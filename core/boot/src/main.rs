@@ -1177,12 +1177,7 @@ unsafe fn step6_allocate_and_build_page_tables(
     // (MEM_MAP_SLACK_ENTRIES on the first attempt; its doc gives the budget).
     // SAFETY: bs is valid; the size query allocates nothing.
     let (firmware_descriptors, stride) = unsafe { uefi::memory_map_shape(ctx.bs)? };
-    let entry_capacity = uefi::map_buffer_descriptor_reach(uefi::map_buffer_bytes(
-        (firmware_descriptors + slack) * stride,
-        stride,
-    ));
-    let mem_entries_pages =
-        (entry_capacity * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096);
+    let mem_entries_pages = entry_array_pages(firmware_descriptors, slack, stride);
     // BootInfo: one page — holds the BootInfo struct populated in step 9.
     // SAFETY: bs is valid.
     let boot_info_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -1207,10 +1202,13 @@ unsafe fn step6_allocate_and_build_page_tables(
     let heuristic_pages = (heuristic_capacity * seed_bytes).div_ceil(4096).max(1);
     // SAFETY: bs is valid.
     let heuristic_phys = unsafe { allocate_pages(ctx.bs, heuristic_pages)? };
-    // MMIO aperture array, sized from the entry array's capacity and the
-    // seed counts (memory_map::aperture_capacity).
-    let aperture_capacity =
-        memory_map::aperture_capacity(entry_capacity, seeds_capacity + heuristic_capacity);
+    // MMIO aperture array, sized from the entry array's capacity (the bound
+    // step 7 checks the map buffer against) and the seed counts
+    // (memory_map::aperture_capacity).
+    let aperture_capacity = memory_map::aperture_capacity(
+        entry_array_capacity(mem_entries_pages),
+        seeds_capacity + heuristic_capacity,
+    );
     let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
@@ -1433,6 +1431,35 @@ unsafe fn step7_query_memory_map(ctx: &UefiContext) -> Result<uefi::MemoryMapRes
     unsafe { get_memory_map(ctx.bs) }
 }
 
+/// Entries the `MemoryMapEntry` array of `pages` pages holds: the one capacity
+/// step 6 sizes the aperture array from, step 7 checks the map buffer against
+/// ([`map_buffer_fits`]), and step 9 translates into.
+const fn entry_array_capacity(pages: usize) -> usize
+{
+    pages * 4096 / core::mem::size_of::<MemoryMapEntry>()
+}
+
+/// Pages of the `MemoryMapEntry` array for a map of `descriptors` descriptors
+/// at `stride` bytes, with `slack` descriptors of growth: enough for the reach
+/// of the buffer step 7 would allocate for a map that large
+/// ([`uefi::map_buffer_descriptor_reach`] of [`uefi::map_buffer_bytes`]).
+fn entry_array_pages(descriptors: usize, slack: usize, stride: usize) -> usize
+{
+    let reach = uefi::map_buffer_descriptor_reach(uefi::map_buffer_bytes(
+        (descriptors + slack) * stride,
+        stride,
+    ));
+    (reach * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096)
+}
+
+/// Whether step 7's map buffer of `buffer_bytes` fits the entry array of
+/// `pages` pages: every map read into that buffer, step 8's re-query
+/// included, then has an entry for each descriptor, and its apertures a slot.
+fn map_buffer_fits(buffer_bytes: usize, pages: usize) -> bool
+{
+    uefi::map_buffer_descriptor_reach(buffer_bytes) <= entry_array_capacity(pages)
+}
+
 /// Run steps 6 and 7 until the final memory map's buffer holds no more
 /// descriptors than the entry array step 6 sized
 /// ([`uefi::map_buffer_descriptor_reach`], which bounds step 8's re-query
@@ -1484,12 +1511,12 @@ unsafe fn steps6_and_7_sized_to_the_map(
         };
         // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
         let uefi_map = unsafe { step7_query_memory_map(ctx)? };
-        let reach = uefi::map_buffer_descriptor_reach(uefi_map.buffer_size);
-        let capacity = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
-        if reach <= capacity
+        if map_buffer_fits(uefi_map.buffer_size, allocs.mem_entries_pages)
         {
             return Ok((allocs, page_table, uefi_map));
         }
+        let reach = uefi::map_buffer_descriptor_reach(uefi_map.buffer_size);
+        let capacity = entry_array_capacity(allocs.mem_entries_pages);
         if attempt == MEM_MAP_ATTEMPTS
         {
             return Err(BootError::MemoryMapKeptGrowing(reach));
@@ -1631,9 +1658,10 @@ unsafe fn step9_populate_boot_info(
 
     // Translate + sort the UEFI memory map.
     let entry_out = allocs.mem_entries_phys as *mut MemoryMapEntry;
-    let max_entries = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
-    // Step 7 sized the array to the map buffer's reach, which bounds the
-    // step 8 re-query too, so every descriptor has an entry.
+    let max_entries = entry_array_capacity(allocs.mem_entries_pages);
+    // Step 6 sized the array and step 7 checked the map buffer's reach, which
+    // bounds the step 8 re-query too, against it, so every descriptor has an
+    // entry.
     // SAFETY: entry_out is a valid allocated buffer of max_entries entries;
     // uefi_map is a valid map buffer populated by UEFI GetMemoryMap.
     let entry_count = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
@@ -2043,7 +2071,8 @@ mod tests
     use super::{
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
         KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions, choose_kaslr_layout,
-        handoff_stack_span, push_reclaim_range, scrub, step6_and_7_spans,
+        entry_array_capacity, entry_array_pages, handoff_stack_span, map_buffer_fits, memory_map,
+        push_reclaim_range, scrub, step6_and_7_spans, uefi,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -2162,8 +2191,8 @@ mod tests
     }
 
     // Defect caught: a redo of steps 6 and 7 that frees an allocation of an
-    // earlier step the handoff still uses (the AP trampoline, the CPU-id
-    // pages, or the x86-64 LA57 toggle page), or that leaks one of its own.
+    // earlier step the handoff still uses (the AP trampoline or the CPU-id
+    // pages), or that leaks one of its own.
     #[test]
     fn a_redo_of_steps_6_and_7_frees_exactly_their_allocations()
     {
@@ -2192,6 +2221,44 @@ mod tests
                     .all(|&(base, pages)| kept < base || kept >= base + pages as u64 * 4096),
                 "{kept:#x} is an earlier step's allocation"
             );
+        }
+    }
+
+    // Defect caught: an aperture array sized from a smaller capacity than the
+    // one step 7 accepts a map buffer against, so a map that passes the check
+    // derives more apertures than the array holds; or a buffer for a map no
+    // larger than step 6 allowed for that fails the check.
+    #[test]
+    fn every_map_buffer_step_7_accepts_fits_the_arrays_step_6_sized()
+    {
+        let seeds = 7;
+        for stride in [40usize, 48, 56, 80]
+        {
+            for descriptors in [0usize, 1, 50, 100, 160, 400]
+            {
+                for slack in [32usize, 64, 128]
+                {
+                    let pages = entry_array_pages(descriptors, slack, stride);
+                    let capacity = entry_array_capacity(pages);
+                    let apertures = memory_map::aperture_capacity(capacity, seeds);
+                    for grown in 0..=descriptors + slack
+                    {
+                        let buffer = uefi::map_buffer_bytes(grown * stride, stride);
+                        assert!(
+                            map_buffer_fits(buffer, pages),
+                            "{stride} {descriptors} {grown}"
+                        );
+                    }
+                    let mut buffer = 4096;
+                    while map_buffer_fits(buffer, pages)
+                    {
+                        let reach = uefi::map_buffer_descriptor_reach(buffer);
+                        assert!(reach <= capacity);
+                        assert!(memory_map::aperture_capacity(reach, seeds) <= apertures);
+                        buffer += 4096;
+                    }
+                }
+            }
         }
     }
 

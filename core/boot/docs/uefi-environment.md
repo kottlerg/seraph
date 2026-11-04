@@ -140,6 +140,8 @@ The acquisition sequence:
    Note: this allocation itself invalidates any prior map key.
 3. Call GetMemoryMap(buf_size, buf_addr, &map_key, &desc_size, &desc_version)
    to fill the buffer. The map_key from this call is the correct one to use.
+   A desc_size below EFI_MEMORY_DESCRIPTOR's fails the boot
+   (BootError::InvalidMemoryMap): every reader steps through the map at it.
 ```
 
 Translation into `MemoryType` and the ascending sort by `physical_base` run after

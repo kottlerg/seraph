@@ -50,8 +50,10 @@ impl Iterator for RawDescriptors<'_>
     fn next(&mut self) -> Option<EfiMemoryDescriptor>
     {
         // A stride below the descriptor would read past it and, at the last
-        // stride, past `map_size`; `get_memory_map` rejects one, and the guard
-        // reads nothing from a map that carries one, a zero stride included.
+        // stride, past `map_size`. `uefi::check_descriptor_size` rejects one at
+        // every read of the firmware's map (the step 6 count query, the step 7
+        // fill, and the `ExitBootServices` retry), and the guard reads nothing
+        // from a map that carries one, a zero stride included.
         if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
             || self.offset + self.map.descriptor_size > self.map.map_size
         {

@@ -487,6 +487,10 @@ const EFI_FILE_MODE_READ: u64 = 0x0000_0000_0000_0001;
 
 /// Locate `EFI_LOADED_IMAGE_PROTOCOL` for the given image handle.
 ///
+/// # Errors
+/// `BootError::ProtocolNotFound` when `OpenProtocol` fails for
+/// `EFI_LOADED_IMAGE_PROTOCOL`.
+///
 /// # Safety
 /// `bs` must be a valid pointer to UEFI boot services, `image` must be a valid
 /// loaded-image handle.
@@ -515,6 +519,11 @@ pub unsafe fn get_loaded_image(
 }
 
 /// Open the ESP root volume via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`.
+///
+/// # Errors
+/// `BootError::ProtocolNotFound` when the device has no
+/// `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`, and `BootError::UefiError` carrying the
+/// status when `OpenVolume` fails.
 ///
 /// # Safety
 /// `bs` must be valid boot services, `device` must be the device handle from
@@ -554,6 +563,9 @@ pub unsafe fn open_esp_volume(
 ///
 /// `path` must be a UEFI-style path with backslash separators, encoded as a
 /// null-terminated UTF-16 slice.
+///
+/// # Errors
+/// `BootError::FileNotFound` carrying `name` when `Open` fails.
 ///
 /// # Safety
 /// `root` must be a valid `EFI_FILE_PROTOCOL` handle pointing to the ESP root.
@@ -597,6 +609,9 @@ struct FileInfoBuf([u8; FILE_INFO_BUF_LEN]);
 const _: () = assert!(core::mem::align_of::<FileInfoBuf>() >= core::mem::align_of::<EfiFileInfo>());
 
 /// Query the file size in bytes using `EFI_FILE_INFO`.
+///
+/// # Errors
+/// `BootError::UefiError` carrying the status when `GetInfo` fails.
 ///
 /// # Safety
 /// `file` must be a valid open `EFI_FILE_PROTOCOL` handle.
@@ -649,6 +664,9 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
 ///
 /// Reads exactly `buffer.len()` bytes starting from the current file position.
 ///
+/// # Errors
+/// `BootError::UefiError` carrying the status when `Read` fails.
+///
 /// # Safety
 /// `file` must be a valid open `EFI_FILE_PROTOCOL` handle. The file's current
 /// position must be set appropriately before calling.
@@ -674,6 +692,9 @@ pub unsafe fn file_read(file: *mut EfiFileProtocol, buffer: &mut [u8]) -> Result
 ///
 /// Returns the physical address of the allocated region. Uses `EfiLoaderData`
 /// memory type so the region appears as `Loaded` in the boot protocol memory map.
+///
+/// # Errors
+/// `BootError::OutOfMemory` when `AllocatePages` fails.
 ///
 /// # Safety
 /// `bs` must be a valid pointer to UEFI boot services (before `ExitBootServices`).
@@ -713,6 +734,9 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 /// gated on architecture because `AllocateMaxAddress` is part of the UEFI spec
 /// on every supported platform.
 ///
+/// # Errors
+/// `BootError::OutOfMemory` when `AllocatePages` fails.
+///
 /// # Safety
 /// `bs` must be valid boot services.
 // Used only by the x86-64 `arch::current` allocation hooks; dead on riscv64.
@@ -735,6 +759,9 @@ pub unsafe fn allocate_pages_max_addr(
 /// `EfiLoaderCode` ones, so code the bootloader runs under those tables
 /// from an allocated page (the x86-64 LA57 toggle trampoline) needs this type.
 /// The region appears as `Loaded` in the boot protocol memory map.
+///
+/// # Errors
+/// `BootError::OutOfMemory` when `AllocatePages` fails.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -948,6 +975,12 @@ const EXIT_BOOT_SERVICES_MAX_ATTEMPTS: u32 = 16;
 /// The retry protocol (re-query into the existing buffer at its full
 /// capacity, then retry) is specified in
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § `ExitBootServices`.
+///
+/// # Errors
+/// `BootError::ExitBootServicesFailed` for a status other than a stale key,
+/// a failed re-query, or a stale key on every attempt; and
+/// `BootError::InvalidMemoryMap` when a re-query reports a descriptor size
+/// below `EFI_MEMORY_DESCRIPTOR`'s.
 ///
 /// # Safety
 /// `bs` must be valid boot services. `image` must be a valid image handle.

@@ -269,7 +269,7 @@ struct KaslrDecision
 }
 
 /// All pre-`ExitBootServices` physical allocations the boot sequence
-/// produces, gathered by [`step6_allocate_boot_structures`].
+/// produces, gathered by [`step6_allocate_and_build_page_tables`].
 struct BootAllocations
 {
     boot_info_phys: u64,

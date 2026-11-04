@@ -62,7 +62,9 @@ pub unsafe fn translate_memory_map(
     let mut count: usize = 0;
     let mut offset: usize = 0;
 
-    while offset + uefi_map.descriptor_size <= uefi_map.map_size
+    // A zero stride would never advance; `get_memory_map` rejects one, and the
+    // guard keeps the loop finite whatever map it is given.
+    while uefi_map.descriptor_size != 0 && offset + uefi_map.descriptor_size <= uefi_map.map_size
     {
         // SAFETY: uefi_map.buffer_phys is the UEFI raw map buffer; offset is
         // within map_size; the descriptor at this offset is a valid EfiMemoryDescriptor.
@@ -815,6 +817,35 @@ mod tests
                 dropped_other: 1,
             }
         );
+    }
+
+    // Defect caught: a translation loop that never advances on a zero
+    // descriptor stride and hangs the boot.
+    #[test]
+    fn a_zero_descriptor_size_translates_nothing()
+    {
+        let descs = [EfiMemoryDescriptor {
+            memory_type: EFI_CONVENTIONAL_MEMORY,
+            physical_start: 0,
+            virtual_start: 0,
+            number_of_pages: 1,
+            attribute: 0,
+        }];
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: size_of::<EfiMemoryDescriptor>(),
+            map_size: size_of::<EfiMemoryDescriptor>(),
+            map_key: 0,
+            descriptor_size: 0,
+        };
+        let dummy = MemoryMapEntry {
+            physical_base: 0,
+            size: 0,
+            memory_type: MemoryType::Reserved,
+        };
+        let mut out = vec![dummy; 1];
+        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 1) };
+        assert_eq!(t, MapTranslation::default());
     }
 
     #[test]

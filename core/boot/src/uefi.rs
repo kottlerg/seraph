@@ -895,6 +895,10 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     {
         return Err(BootError::UefiError(status));
     }
+    if descriptor_size == 0
+    {
+        return Err(BootError::InvalidMemoryMap("zero descriptor size"));
+    }
 
     Ok(MemoryMapResult {
         buffer_phys,

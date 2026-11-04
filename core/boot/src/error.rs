@@ -236,6 +236,17 @@ mod tests
         );
     }
 
+    // Defect caught: an InvalidMemoryMap whose payload, which names the UEFI
+    // contract violation, does not reach the fatal handler's message.
+    #[test]
+    fn invalid_memory_map_detail_returns_payload()
+    {
+        assert_eq!(
+            BootError::InvalidMemoryMap("zero descriptor size").detail(),
+            Some("zero descriptor size")
+        );
+    }
+
     // ── detail() — variants without string payloads return None ──────────────
 
     #[test]

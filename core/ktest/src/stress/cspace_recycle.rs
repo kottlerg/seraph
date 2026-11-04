@@ -6,19 +6,21 @@
 //! Stress test: repeated `CSpace` create + delete.
 //!
 //! Creates and immediately destroys 10000 `CSpace`s in a tight loop and
-//! checks that `memory_base` ends with exactly the retypable bytes it began
-//! with, so every destruction ran the teardown that returns a `CSpace`'s
-//! pages (core/kernel/docs/capability-internals.md § Teardown). Under the
-//! former fixed 4096-entry registry the same loop also exhausted the ids had
-//! a destruction failed to return one; the RAM-sized arena
-//! (§ `CSpace` Registry) holds far more ids than this loop takes, and cycling
-//! past its capacity would overrun CI's ktest budget under TCG, so id return
-//! through the kernel's teardown is not checked here. The registry's
-//! retire-then-reuse logic is covered by the kernel's `cap::registry` host
-//! tests, and the arena's capacity by `stress::cspace_registry_arena`.
+//! checks two things the teardown returns
+//! (core/kernel/docs/capability-internals.md § Teardown):
+//! - `memory_base` ends with exactly the retypable bytes it began with, so
+//!   every destruction returned the `CSpace`'s pages;
+//! - `SYS_SYSTEM_INFO(LiveCSpaceCount)` ends where it began, so every
+//!   destruction returned its id to the registry (§ `CSpace` Registry).
+//!
+//! The RAM-sized registry holds far more ids than the loop takes, so a leaked
+//! id would not exhaust it; the count catches the leak instead. The
+//! registry's retire-then-reuse logic is covered by the kernel's
+//! `cap::registry` host tests, and the arena's capacity by
+//! `stress::cspace_registry_arena`.
 
-use syscall::{cap_create_cspace, cap_delete, cap_info};
-use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
+use syscall::{cap_create_cspace, cap_delete, cap_info, system_info};
+use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, SystemInfoType};
 
 use crate::{TestContext, TestResult};
 
@@ -29,6 +31,7 @@ const ITERATIONS: usize = 10_000;
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let before = available(ctx)?;
+    let ids_before = live_cspaces()?;
     for _ in 0..ITERATIONS
     {
         // 4 init_pages (wrapper page + 3 pool pages), matching
@@ -41,7 +44,18 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("cspace_recycle: memory_base did not get every CSpace page back");
     }
+    if live_cspaces()? != ids_before
+    {
+        return Err("cspace_recycle: a CSpace teardown did not return its id to the registry");
+    }
     Ok(())
+}
+
+/// `CSpace` ids in use system-wide (`SYS_SYSTEM_INFO(LiveCSpaceCount)`).
+fn live_cspaces() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::LiveCSpaceCount as u64)
+        .map_err(|_| "cspace_recycle: system_info(LiveCSpaceCount) failed")
 }
 
 /// `memory_base`'s retypable bytes.

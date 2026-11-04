@@ -107,7 +107,7 @@ mirroring the kernel's own source layout.
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT` (`SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` and `SYS_SBI_CALL` are under `src/arch/<arch>/`) |
-| `sysinfo.rs` | `SYS_SYSTEM_INFO`, including each `StackHighWater` class |
+| `sysinfo.rs` | `SYS_SYSTEM_INFO`, including each `StackHighWater` class and the `LiveCSpaceCount` id count across a `CSpace` create and delete |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
 | `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
@@ -291,7 +291,7 @@ wait), where a lost wake is the defect the watchdog reports.
 | File | Scenario | Knobs |
 |---|---|---|
 | `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation | `CHAIN_DEPTH=8`, `PASSES=500` |
-| `cspace_recycle.rs` | Repeated `CSpace` create+delete; `memory_base` ends with the retypable bytes it began with (every teardown returns its pages) | `ITERATIONS=10_000` |
+| `cspace_recycle.rs` | Repeated `CSpace` create+delete; `memory_base` ends with the retypable bytes it began with and `SYS_SYSTEM_INFO(LiveCSpaceCount)` with the id count (every teardown returns its pages and its id) | `ITERATIONS=10_000` |
 | `cspace_registry_arena.rs` | More than 4096 one-page `CSpace`s live at once (the RAM-sized registry arena), then all deleted, with every page back in `memory_base`; logs the bytes needed and available, and skip-passes when `memory_base` cannot cover them | `LIVE=4097` |
 | `copy_source_delete.rs` | Free an endpoint through its last capability — a delete of its original cap, then a revoke of the original that removes the caller's derived copy followed by the original's delete — while a caller on another CPU loops `SYS_CAP_COPY` (into its own `CSpace`), `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` through that handle, deleting each new capability at once, each free aimed in turn at one of the three calls; every call returns `Ok` (its new capability then deletes cleanly, as a no-op when the revoke already cleared it) or `InvalidCapability` once the handle is gone, the caller sees every round's handle go, each call returns `Ok` in some round, and some free is issued while the caller is inside a call (the call's source pin keeps the object live for its reference increment; the kernel's debug assertions are the tripwires for an increment landing on a freed object) (≥ 2 CPUs) | `CYCLES=300` per phase, `ROUND_WAIT_US=200_000` |
 | `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) | `CAPACITY=8`, `CYCLES=2000` |

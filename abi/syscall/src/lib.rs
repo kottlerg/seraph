@@ -459,6 +459,11 @@ pub const SYS_PROCESS_EXIT: u64 = 54;
 /// `core/kernel/docs/entropy.md`.
 pub const SYS_GETRANDOM: u64 = 55;
 
+/// One past the highest syscall number. Every number below it is assigned,
+/// and the kernel bounds its dispatch table by it, so a syscall numbered at or
+/// above it raises it.
+pub const SYSCALL_NR_BOUND: u64 = SYS_GETRANDOM + 1;
+
 // ── getrandom constants ───────────────────────────────────────────────────────
 
 /// Maximum bytes a single `SYS_GETRANDOM` call may request.

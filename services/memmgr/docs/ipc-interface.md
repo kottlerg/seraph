@@ -285,6 +285,26 @@ IPC. Idempotent on stale badges (already-reaped or never-registered).
 `PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
 
+**When procmgr sends it.** procmgr sends `PROCESS_DIED` after its teardown of
+the process, except for a started process created with
+`procmgr_labels::CREATE_DMA_HOLD`, whose `PROCESS_DIED` procmgr sends only when
+the creator releases the hold (`procmgr_labels::RELEASE_HOLD`,
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-3-release_hold)
+§ Label 3). Until then memmgr keeps the process's record, and every frame on it
+stays out of the free pool and counted, as for a live process; a hold that is
+never released keeps them so for the rest of the boot. devmgr creates every
+DMA-capable driver so and releases the hold only once the driver's device is
+confirmed to have stopped its DMA, so memmgr never hands out a frame of the
+driver's own record that such a device may still write, unless the driver
+handed a copy of its procmgr capability onward, through which its hold can be
+released early
+([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
+§ DMA-Safe Teardown). The hold covers that record only: a frame a client lends
+the driver for a transfer is on the client's record, which returns it to the
+pool when the client releases it or dies, whatever the device's state
+([#749](https://github.com/kottlerg/seraph/issues/749)). memmgr itself treats a
+held-back `PROCESS_DIED` like any other.
+
 ### Label 5: `DONATE_MEMORY_CAPS`
 
 Permanently transfer Memory caps into memmgr's pool. Privilege: procmgr-only.

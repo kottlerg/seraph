@@ -666,7 +666,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 /// The workspace crates std depends on when built for seraph: the dependency
 /// name, its path under the project root, and any extra key placed between
 /// `path` and `features` in its `library/std/Cargo.toml` line.
-const STD_WORKSPACE_DEPS: [(&str, &str, &str); 10] = [
+const STD_WORKSPACE_DEPS: [(&str, &str, &str); 11] = [
     ("syscall-abi", "abi/syscall", ""),
     ("syscall", "shared/syscall", ""),
     ("ipc", "shared/ipc", ""),
@@ -680,6 +680,11 @@ const STD_WORKSPACE_DEPS: [(&str, &str, &str); 10] = [
         "argv-env",
         "runtime/ruststd/argv-env",
         ", package = \"ruststd-argv-env\"",
+    ),
+    (
+        "death-queues",
+        "runtime/ruststd/death-queues",
+        ", package = \"ruststd-death-queues\"",
     ),
 ];
 

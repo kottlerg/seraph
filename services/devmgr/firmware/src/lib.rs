@@ -9,13 +9,14 @@
 //! Narrow subset lifted from `core/boot/src/{acpi,dtb}.rs`. Walks ACPI tables
 //! (RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK` for the shutdown
 //! broker's check) and flattened device trees for the PCI ECAM windows,
-//! computes ECAM register offsets and BAR sizes, walks PCI configuration
-//! space through a caller-supplied accessor, keeps the table of MMIO and
-//! interrupt range caps devmgr carves per-device caps from, holds the
+//! computes ECAM register offsets, a function's configuration-space page,
+//! BAR sizes, and the Command register's Bus Master Enable, walks PCI
+//! configuration space through a caller-supplied accessor, keeps the table of
+//! MMIO and interrupt range caps devmgr carves per-device caps from, holds the
 //! interrupt lines it has carved so every device on a line gets its own
-//! derivation, tracks which
-//! spawned drivers reported their device ready, and keeps each class's served
-//! drivers by instance ordinal, a withdrawn one's ordinal held by a tombstone.
+//! derivation, tracks which spawned drivers reported their device ready, and
+//! keeps each class's served drivers by instance ordinal, a withdrawn one's
+//! ordinal held by a tombstone.
 //! The functions read caller-mapped byte slices or values, or reach the
 //! platform only through a caller-supplied accessor or split operation, and
 //! touch no syscall, IPC, or `std::os::seraph` surface, so the crate is

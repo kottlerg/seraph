@@ -47,6 +47,41 @@ use crate::{TestContext, TestResult};
 
 const TEST_VA_BASE: u64 = 0x0000_0001_4000_0000;
 
+/// Leaf pages the `CSpace` root addresses directly: mirrors the kernel's
+/// `L1_DIRECT` (core/kernel/src/cap/cspace.rs).
+const DIRECT_LEAVES: u64 = 128;
+/// Leaves per pool-paid directory page: mirrors the kernel's `DIR_FANOUT`,
+/// one page of leaf pointers.
+const DIR_FANOUT: u64 = syscall_abi::PAGE_SIZE / core::mem::size_of::<*const ()>() as u64;
+/// The slot index of [`INDIRECT_SLOT`] as a `u64`, before its narrowing to `u32`.
+const INDIRECT_SLOT_INDEX: u64 = (DIRECT_LEAVES + 2) * syscall_abi::CSPACE_SLOTS_PER_PAGE + 20;
+const _: () = assert!(INDIRECT_SLOT_INDEX >> 32 == 0);
+/// A slot past the direct region's `DIRECT_LEAVES` × `CSPACE_SLOTS_PER_PAGE`
+/// slots, under the first directory page: 20 slots into the third leaf past
+/// the direct region.
+// cast_possible_truncation: the assert above keeps INDIRECT_SLOT_INDEX
+// within u32.
+#[allow(clippy::cast_possible_truncation)]
+const INDIRECT_SLOT: u32 = INDIRECT_SLOT_INDEX as u32;
+
+/// Pool pages a `CSpace` with no grown leaf spends to cover slot `index`:
+/// every leaf through the covering one (`CSPACE_SLOTS_PER_PAGE` slots each,
+/// the kernel's `L2_SIZE`), plus the directory pages above the direct
+/// region. Mirrors the kernel's `CSpace::pages_to_cover` from leaf 0.
+fn pages_to_cover(index: u32) -> u64
+{
+    let leaf = u64::from(index) / syscall_abi::CSPACE_SLOTS_PER_PAGE;
+    let dirs = if leaf >= DIRECT_LEAVES
+    {
+        (leaf - DIRECT_LEAVES) / DIR_FANOUT + 1
+    }
+    else
+    {
+        0
+    };
+    leaf + 1 + dirs
+}
+
 /// VA of the machine-code stub inside each dedicated child address space.
 /// Canonical in every paging mode (below the 2^38 Sv39 user half) and
 /// distinct from other tests' VAs.
@@ -641,20 +676,34 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
 
-    // init_pages = 3 → wrapper page + 2 pool pages = 111 usable slots.
+    // init_pages = 3 → wrapper page + 2 pool pages: two leaves of
+    // `CSPACE_SLOTS_PER_PAGE` slots, less reserved slot 0.
     let cspace = cap_create_cspace(memory, 0, 3)
         .map_err(|_| "retype::cspace_grow: cap_create_cspace failed")?;
-    let used_before = cap_info(cspace, CAP_INFO_CSPACE_USED)
-        .map_err(|_| "retype::cspace_grow: cap_info(used before) failed")?;
-    let budget_before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
-        .map_err(|_| "retype::cspace_grow: cap_info(budget before) failed")?;
+    let Ok(used_before) = cap_info(cspace, CAP_INFO_CSPACE_USED)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::cspace_grow: cap_info(used before) failed");
+    };
+    let Ok(budget_before) = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::cspace_grow: cap_info(budget before) failed");
+    };
 
-    let probe = cap_create_endpoint(memory)
-        .map_err(|_| "retype::cspace_grow: cap_create_endpoint failed")?;
+    let Ok(probe) = cap_create_endpoint(memory)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::cspace_grow: cap_create_endpoint failed");
+    };
 
-    // Copy enough times to spill past the first slot page. ~70 copies
-    // forces at least one grow on an `L2_SIZE`-slot page (currently 56).
-    let copies = 70usize;
+    // Copy a quarter page past the first slot page's
+    // `CSPACE_SLOTS_PER_PAGE` slots (the kernel's `L2_SIZE`), forcing at
+    // least one grow.
+    let copies = syscall_abi::CSPACE_SLOTS_PER_PAGE + syscall_abi::CSPACE_SLOTS_PER_PAGE / 4;
     for _ in 0..copies
     {
         match cap_copy(probe, cspace, 1)
@@ -779,22 +828,20 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
 }
 
 /// The indirect directory region works end to end: explicit-destination
-/// placement past the direct region (slot 7300, leaf 130) and — memory
-/// permitting — at index 1,000,000 (leaf 17,857), growing every
-/// intermediate leaf and the covering pool-paid directory pages. The
-/// wholesale delete reclaims the entire slab.
+/// placement past the direct region (`INDIRECT_SLOT`) and — memory
+/// permitting — at index 1,000,000, growing every intermediate leaf and the
+/// covering pool-paid directory pages. The wholesale delete reclaims the
+/// entire slab.
 pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
 {
-    const PAGE: u64 = 4096;
-    const SMALL_SLOT: u32 = 7300;
+    const PAGE: u64 = syscall_abi::PAGE_SIZE;
     const DEEP_SLOT: u32 = 1_000_000;
-    // Pages to back DEEP_SLOT: leaves 0..=17,857 plus 35 directory pages.
-    const DEEP_POOL_PAGES: u64 = 17_893;
-    // SMALL_SLOT one leaf on: slots per leaf page are the kernel's `L2_SIZE`,
-    // published in the ABI. Taken before any capability exists, so the
-    // refusal needs no cleanup.
+    let deep_pool_pages = pages_to_cover(DEEP_SLOT);
+    // INDIRECT_SLOT one leaf on: slots per leaf page are the kernel's
+    // `L2_SIZE`, published in the ABI. Taken before any capability exists,
+    // so the refusal needs no cleanup.
     let next_leaf_slot = u32::try_from(syscall_abi::CSPACE_SLOTS_PER_PAGE)
-        .map(|leaf| SMALL_SLOT + leaf)
+        .map(|leaf| INDIRECT_SLOT + leaf)
         .map_err(|_| "retype::indirect: CSPACE_SLOTS_PER_PAGE exceeds a slot index")?;
 
     let memory = ctx.memory_base;
@@ -803,16 +850,20 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     let probe = cap_create_notification(memory)
         .map_err(|_| "retype::indirect: cap_create_notification failed")?;
 
-    let cspace = cap_create_cspace(memory, 0, 4)
-        .map_err(|_| "retype::indirect: cap_create_cspace failed")?;
+    let Ok(cspace) = cap_create_cspace(memory, 0, 4)
+    else
+    {
+        cap_delete(probe).ok();
+        return Err("retype::indirect: cap_create_cspace failed");
+    };
 
     // Deep placement first (while the pool is coldest): fund it only if the
     // source cap has comfortable headroom, otherwise skip-pass the deep
     // half — CI guests with small RAM still exercise the small crossing.
-    let deep = baseline > (DEEP_POOL_PAGES + 4096) * PAGE;
+    let deep = baseline > (deep_pool_pages + 4096) * PAGE;
     if deep
     {
-        if cap_create_cspace(memory, cspace, DEEP_POOL_PAGES).is_err()
+        if cap_create_cspace(memory, cspace, deep_pool_pages).is_err()
         {
             cap_delete(cspace).ok();
             cap_delete(probe).ok();
@@ -822,14 +873,14 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
         {
             cap_delete(cspace).ok();
             cap_delete(probe).ok();
-            return Err("retype::indirect: cap_insert(1_000_000) failed");
+            return Err("retype::indirect: cap_insert(DEEP_SLOT) failed");
         }
     }
     else
     {
         crate::log("ktest: retype::cspace_indirect_region deep half SKIP (low memory)");
-        // Small augment instead: enough pool for 131 leaves + 1 dir page.
-        if cap_create_cspace(memory, cspace, 132).is_err()
+        // Small augment instead: enough pool to cover INDIRECT_SLOT.
+        if cap_create_cspace(memory, cspace, pages_to_cover(INDIRECT_SLOT)).is_err()
         {
             cap_delete(cspace).ok();
             cap_delete(probe).ok();
@@ -837,19 +888,24 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
         }
     }
 
-    // Small crossing: leaf 130, three-level lookup path.
-    if cap_insert(probe, cspace, SMALL_SLOT, RIGHTS_NTF_NOTIFY).is_err()
+    // Small crossing: the first indirect leaves, three-level lookup path.
+    if cap_insert(probe, cspace, INDIRECT_SLOT, RIGHTS_NTF_NOTIFY).is_err()
     {
         cap_delete(cspace).ok();
         cap_delete(probe).ok();
-        return Err("retype::indirect: cap_insert(7300) failed");
+        return Err("retype::indirect: cap_insert(INDIRECT_SLOT) failed");
     }
 
     // Explicit high-slot MOVE: same growth contract on the path that also
     // holds the derivation lock. The moved cap is consumed from this
     // CSpace and lands in the target.
-    let mover = cap_create_notification(memory)
-        .map_err(|_| "retype::indirect: cap_create_notification(mover) failed")?;
+    let Ok(mover) = cap_create_notification(memory)
+    else
+    {
+        cap_delete(cspace).ok();
+        cap_delete(probe).ok();
+        return Err("retype::indirect: cap_create_notification(mover) failed");
+    };
     if syscall::cap_move(mover, cspace, next_leaf_slot).is_err()
     {
         cap_delete(mover).ok();
@@ -858,15 +914,22 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
         return Err("retype::indirect: cap_move to a high explicit slot failed");
     }
 
-    let used = cap_info(cspace, CAP_INFO_CSPACE_USED)
-        .map_err(|_| "retype::indirect: cap_info(used) failed")?;
+    let Ok(used) = cap_info(cspace, CAP_INFO_CSPACE_USED)
+    else
+    {
+        cap_delete(cspace).ok();
+        cap_delete(probe).ok();
+        return Err("retype::indirect: cap_info(used) failed");
+    };
     let expected_used = if deep { 3 } else { 2 };
     // An occupied high slot must also reject a second explicit placement.
-    let occupied = cap_insert(probe, cspace, SMALL_SLOT, RIGHTS_NTF_NOTIFY).is_err();
+    let occupied = cap_insert(probe, cspace, INDIRECT_SLOT, RIGHTS_NTF_NOTIFY).is_err();
 
     // Wholesale reclaim.
-    cap_delete(cspace).map_err(|_| "retype::indirect: cap_delete(cspace) failed")?;
-    cap_delete(probe).map_err(|_| "retype::indirect: cap_delete(probe) failed")?;
+    let cspace_deleted = cap_delete(cspace);
+    let probe_deleted = cap_delete(probe);
+    cspace_deleted.map_err(|_| "retype::indirect: cap_delete(cspace) failed")?;
+    probe_deleted.map_err(|_| "retype::indirect: cap_delete(probe) failed")?;
 
     if used != expected_used
     {
@@ -886,12 +949,12 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
 }
 
 /// A doomed explicit placement fails fast without consuming any pool
-/// page: covering slot 7300 needs 132 pages (131 leaves plus the first
-/// directory page) against a 1-page pool, and the budget is untouched
-/// after the rejection.
+/// page: covering `INDIRECT_SLOT` needs `pages_to_cover(INDIRECT_SLOT)` pages
+/// (every leaf through its own plus the first directory page) against a
+/// 1-page pool, and the budget is untouched after the rejection.
 pub fn cspace_explicit_placement_fast_fail(ctx: &TestContext) -> TestResult
 {
-    const PAGE: u64 = 4096;
+    const PAGE: u64 = syscall_abi::PAGE_SIZE;
     let memory = ctx.memory_base;
     let cspace = cap_create_cspace(memory, 0, 2)
         .map_err(|_| "retype::fast_fail: cap_create_cspace failed")?;
@@ -902,13 +965,13 @@ pub fn cspace_explicit_placement_fast_fail(ctx: &TestContext) -> TestResult
         return Err("retype::fast_fail: cap_create_endpoint failed");
     };
 
-    let before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
-        .map_err(|_| "retype::fast_fail: cap_info(budget) failed")?;
-    let doomed = cap_insert(probe, cspace, 7300, syscall::RIGHTS_ALL);
-    let after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
-        .map_err(|_| "retype::fast_fail: cap_info(budget after) failed")?;
+    let before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET);
+    let doomed = cap_insert(probe, cspace, INDIRECT_SLOT, syscall::RIGHTS_ALL);
+    let after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET);
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
+    let before = before.map_err(|_| "retype::fast_fail: cap_info(budget) failed")?;
+    let after = after.map_err(|_| "retype::fast_fail: cap_info(budget after) failed")?;
     if doomed != Err(SYS_OUT_OF_MEMORY) || before != after || before != PAGE
     {
         return Err("retype::fast_fail: doomed placement consumed budget");
@@ -924,9 +987,9 @@ pub fn cspace_explicit_placement_fast_fail(ctx: &TestContext) -> TestResult
 /// again.
 pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 {
-    // 128 direct leaves of `CSPACE_SLOTS_PER_PAGE` slots (the kernel's
+    // The direct leaves of `CSPACE_SLOTS_PER_PAGE` slots (the kernel's
     // `L2_SIZE`), minus reserved slot 0.
-    const DIRECT_SLOTS: u64 = 128 * syscall_abi::CSPACE_SLOTS_PER_PAGE - 1;
+    const DIRECT_SLOTS: u64 = DIRECT_LEAVES * syscall_abi::CSPACE_SLOTS_PER_PAGE - 1;
 
     let memory = ctx.memory_base;
     let cspace = cap_create_cspace(memory, 0, 2)
@@ -939,9 +1002,9 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     };
 
     // Fill the whole direct region, all but the IPC receive reserve, so
-    // general allocations stop exactly at the direct/indirect boundary. 128
-    // leaf pages total; 127 more than seeded.
-    if cap_create_cspace(memory, cspace, 127).is_err()
+    // general allocations stop exactly at the direct/indirect boundary: the
+    // direct leaves less the one seeded.
+    if cap_create_cspace(memory, cspace, DIRECT_LEAVES - 1).is_err()
     {
         cap_delete(probe).ok();
         cap_delete(cspace).ok();
@@ -981,9 +1044,10 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     }
 
     // One more page: the surviving directory page is not re-charged, so a
-    // single page now buys leaf 128. Its `CSPACE_SLOTS_PER_PAGE` slots join
-    // the 4 the IPC receive reserve kept free, so exactly that many more
-    // general inserts succeed before the reserve is reached again.
+    // single page now buys the first indirect leaf. Its
+    // `CSPACE_SLOTS_PER_PAGE` slots join the `CSPACE_IPC_RECV_RESERVE` slots
+    // the reserve kept free, so exactly that many more general inserts
+    // succeed before the reserve is reached again.
     if cap_create_cspace(memory, cspace, 1).is_err()
     {
         cap_delete(probe).ok();
@@ -1019,7 +1083,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 /// the source Memory cap.
 pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 {
-    const PAGE: u64 = 4096;
+    const PAGE: u64 = syscall_abi::PAGE_SIZE;
     const DONATIONS: u64 = 200;
     // Donations 16 and 143 open the two record pages: the inline records
     // hold the create-time slab plus fifteen donations, and a record page
@@ -1028,11 +1092,6 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     // own donation.
     const RECORD_PAGES: u64 = 2;
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
-    // Mirrors the kernel's `L1_DIRECT`: leaves the inline root addresses
-    // directly.
-    const DIRECT_LEAVES: u64 = 128;
-    // Mirrors the kernel's `DIR_FANOUT`: leaves per pool-paid directory page.
-    const DIR_FANOUT: u64 = 512;
     // Directory pages the pool pays for leaves past the direct region; each
     // costs a page that would otherwise be a leaf. For the 198 seeded pages
     // here: one directory page, leaving 197 leaves.
@@ -1138,7 +1197,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 /// post-donation value, and the delete returns every donation.
 pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 {
-    const PAGE: u64 = 4096;
+    const PAGE: u64 = syscall_abi::PAGE_SIZE;
     // Donations 16 and 143 open the two record pages (127 records each, as
     // above), so the newest describes the last fourteen donations.
     const DONATIONS: u64 = 157;

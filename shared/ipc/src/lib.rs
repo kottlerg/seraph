@@ -79,7 +79,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 5;
+pub const PROCMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -105,7 +105,8 @@ pub mod procmgr_labels
     /// * bits `[16..18]` — flags ([`CREATE_PINNED`], [`CREATE_DEATH_RELAY`])
     /// * bits `[18..23]` — `CREATE_PRIORITY` (see [`CREATE_PRIORITY_SHIFT`])
     /// * bits `[23..28]` — `CREATE_BAND_MAX` (see [`CREATE_BAND_MAX_SHIFT`])
-    /// * bits `[28..32]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `28` — [`CREATE_DMA_HOLD`]
+    /// * bits `[29..32]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     /// * bits `[32..48]` — `args_bytes` (total byte length of the argv blob; u16)
     /// * bits `[48..56]` — `args_count` (number of NUL-terminated argv strings; u8)
     /// * bits `[56..64]` — `env_count` (number of NUL-terminated `KEY=VALUE` strings; u8)
@@ -175,11 +176,24 @@ pub mod procmgr_labels
     /// bits hold every level of the kernel's 32-level priority space
     /// (`syscall_abi::PRIORITY_MAX` is 30), so the width bounds nothing.
     pub const CREATE_SCHED_FIELD_MASK: u64 = 0x1F;
-    /// Still-reserved bits `[28..32]` of the create-label window. Procmgr
+    /// Label flag (bit 28) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// once the child has been started, hold back its memory reclaim at its
+    /// teardown. procmgr tears the child down as any other, but sends memmgr
+    /// its `memmgr_labels::PROCESS_DIED` only when the creator sends
+    /// [`RELEASE_HOLD`] on the child's process handle; until then memmgr
+    /// keeps the child's frames on its record, out of the free pool. Set it
+    /// for a driver whose device may DMA into its frames: the creator
+    /// releases the hold once it has confirmed the device's DMA stopped,
+    /// and never when it cannot. A child destroyed before
+    /// [`START_PROCESS`] never ran and is reclaimed at once. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+    /// (**DMA hold flag**). Occupies bit 28 of the `[16..32]` label window.
+    pub const CREATE_DMA_HOLD: u64 = 1 << 28;
+    /// Still-reserved bits `[29..32]` of the create-label window. Procmgr
     /// rejects labels with any of these set (`INVALID_ARGUMENT`), so a
     /// future field addition is provably additive: existing senders are
     /// known to send zeros.
-    pub const CREATE_RESERVED_MASK: u64 = 0xF << 28;
+    pub const CREATE_RESERVED_MASK: u64 = 0x7 << 29;
 
     /// Pack the scheduling fields of a [`CREATE_PROCESS`] /
     /// [`CREATE_FROM_FILE`] label. `0` in either field means
@@ -192,8 +206,18 @@ pub mod procmgr_labels
             | ((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT
     }
 
+    /// Release the held memory reclaim of a child created with
+    /// [`CREATE_DMA_HOLD`], sent on its badged `process_handle` once the
+    /// child is torn down: procmgr sends memmgr `PROCESS_DIED` for it. Replies
+    /// `SUCCESS`, or `INVALID_BADGE` when procmgr holds no reclaim for the
+    /// handle (the child is live, was never held, or was released already).
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 3:
+    /// `RELEASE_HOLD`.
+    pub const RELEASE_HOLD: u64 = 3;
+
     /// Destroy a process, sent on its badged `process_handle`; procmgr
-    /// deletes its kernel objects and sends memmgr `PROCESS_DIED` for it.
+    /// deletes its kernel objects and sends memmgr `PROCESS_DIED` for it,
+    /// unless [`CREATE_DMA_HOLD`] holds the reclaim back.
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 8:
     /// `DESTROY_PROCESS`.
     pub const DESTROY_PROCESS: u64 = 8;

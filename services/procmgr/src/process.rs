@@ -185,8 +185,8 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 // `process::split_create_from_file_caps` call sites in the create handlers,
 // resolve through this module.
 pub use process_table::{
-    ChildArgs, ChildEnv, CreateBlobs, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
-    resolve_spawn_sched, split_create_from_file_caps,
+    ChildArgs, ChildEnv, CreateBlobs, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
+    badge_is_acceptable, resolve_spawn_sched, split_create_from_file_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -1382,6 +1382,7 @@ fn finalize_creation(
             stack_top_vaddr: layout.stack_top,
             process_info_va: layout.process_info_va,
             started: false,
+            dma_hold: false,
         })
         .is_err()
     {
@@ -2775,7 +2776,8 @@ pub fn create_process_from_file(
 /// page tables. The child's heap / stack / IPC / `ProcessInfo` pages are
 /// `owns_memory = false` derivations of memmgr's pool, so dropping them
 /// frees nothing to the sealed buddy; memmgr reclaims those pages into its
-/// pool via the process-death notification.
+/// pool via the process-death notification, which a started
+/// `CREATE_DMA_HOLD` child's teardown holds back ([`teardown_entry`]).
 ///
 /// Returns the exit reason the process is torn down with, for the caller to
 /// record in the recent-exits ring so `QUERY_PROCESS` answers `EXITED` for
@@ -2801,8 +2803,27 @@ pub fn destroy_process(
         }
         _ => EXIT_KILLED,
     };
-    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf);
+    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, table.holds_mut());
     Some(exit_reason)
+}
+
+/// Send memmgr the held-back `PROCESS_DIED` of the torn-down
+/// `CREATE_DMA_HOLD` child `badge` (`RELEASE_HOLD`), then drop procmgr's
+/// badged memmgr SEND for it. Returns `false` when `holds` keeps no reclaim
+/// for the badge.
+pub fn release_hold(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, holds: &mut DmaHolds) -> bool
+{
+    let Some(held) = holds.release(badge)
+    else
+    {
+        return false;
+    };
+    notify_memmgr_died(memmgr_ep, held.memmgr_badge, ipc_buf);
+    if held.memmgr_send_cap != 0
+    {
+        let _ = syscall::cap_delete(held.memmgr_send_cap);
+    }
+    true
 }
 
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed
@@ -2826,13 +2847,25 @@ fn notify_memmgr_died(memmgr_ep: u32, memmgr_badge: u64, ipc_buf: *mut u64)
 /// behalf of the child, then forwards the death, with `exit_reason`, to
 /// logd ([`forward_death_to_logd`]).
 ///
+/// The memmgr reclaim of a started child created with `CREATE_DMA_HOLD` is
+/// parked in `holds` instead of sent: a device the child drove may still be
+/// writing its frames, so they return to memmgr only on the creator's
+/// `RELEASE_HOLD` ([`release_hold`]; docs/process-lifecycle.md § Process
+/// Death).
+///
 /// Note: the bound death-notification observers in the child thread's TCB
 /// and address space are released automatically when the objects are torn
 /// down by the cap-revokes below — no explicit unbind syscall is required.
 // needless_pass_by_value: consumes the entry's cap slots; passing by
 // reference would invite accidental double-free on subsequent reuse.
 #[allow(clippy::needless_pass_by_value)]
-pub fn teardown_entry(entry: ProcessEntry, exit_reason: u64, memmgr_ep: u32, ipc_buf: *mut u64)
+pub fn teardown_entry(
+    entry: ProcessEntry,
+    exit_reason: u64,
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    holds: &mut DmaHolds,
+)
 {
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
@@ -2867,11 +2900,15 @@ pub fn teardown_entry(entry: ProcessEntry, exit_reason: u64, memmgr_ep: u32, ipc
     }
 
     // Notify memmgr to reclaim every memory cap attributed to this child's
-    // memmgr badge, then drop procmgr's badged SEND copy.
-    notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
-    if entry.memmgr_send_cap != 0
+    // memmgr badge, then drop procmgr's badged SEND copy, unless the reclaim
+    // is held for the creator's `RELEASE_HOLD`.
+    if !holds.park(&entry)
     {
-        let _ = syscall::cap_delete(entry.memmgr_send_cap);
+        notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
+        if entry.memmgr_send_cap != 0
+        {
+            let _ = syscall::cap_delete(entry.memmgr_send_cap);
+        }
     }
 
     forward_death_to_logd(entry.badge, exit_reason);

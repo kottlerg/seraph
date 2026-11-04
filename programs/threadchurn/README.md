@@ -35,12 +35,16 @@ The fixture samples two quantities: its populated slot count, read with
 [`QUERY_POOL_STATUS`](../../services/memmgr/docs/ipc-interface.md#label-6-query_pool_status)
 free-bytes word and returns `None` when memmgr is unreachable. It runs in three phases:
 
-1. **Warm-up.** Eight spawn-and-join iterations bring the reaper's death `EventQueue`, the
-   pooled object slabs, and the page-table budget to steady state, then the baseline slot
-   count and free pool are sampled.
+1. **Warm-up.** Eight spawn-and-join iterations bring the reaper's first death queue, the
+   pooled object slabs, and the page-table budget to steady state. A held burst follows:
+   `HELD_BURST` (128) detached threads each wait on one barrier until all are spawned, so all
+   are bound at once, past the reaper's first 99-node death queue and past 64 slots; once
+   released, a 100 ms sleep and 16 spawn-and-join iterations reap them, and the slot count must
+   be within `BURST_SLACK` (8) of its value before the burst. Then the baseline slot count and
+   free pool are sampled.
 2. **Join churn.** `JOIN_CHURN` (600) spawn-and-join iterations, logging a progress line every
    25, then a slot sample.
-3. **Detach churn.** `DETACH_BATCH` (48) threads are spawned and their handles dropped at once,
+3. **Detach churn.** `DETACH_BATCH` (128) threads are spawned and their handles dropped at once,
    a 100 ms sleep lets them die, and `REAP_CHURN` (50) spawn-and-join iterations drive the
    reaper sweeps that reclaim them. A 50 ms sleep and 16 more iterations drain stragglers, then
    the slot count and free pool are sampled again.
@@ -53,6 +57,7 @@ The fixture then checks two bounds:
 
 | Bound | Constant | Fails when |
 |---|---|---|
+| Held-burst growth | `BURST_SLACK` (8) | The slot count after the held burst is reaped exceeds its value before the burst by more than 8 (the second death queue and its slab, and the heap's growth for the slot table) |
 | Slot growth | `SLACK` (4) | The larger of the two post-churn slot samples exceeds the baseline by more than 4 |
 | Pool drop | `POOL_SLACK_BYTES` (1 MiB) | The final free pool is more than 1 MiB below the baseline; skipped when either sample is `None` |
 

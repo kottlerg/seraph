@@ -49,11 +49,23 @@ const JOIN_CHURN: u64 = 600;
 /// Threads per reaping churn (detach-burst cleanup). Kept small: its job is to
 /// drive reaper sweeps, not to stress the pool.
 const REAP_CHURN: u64 = 50;
-/// Detached threads spawned in one burst, then reaped by later sweeps.
-const DETACH_BATCH: u64 = 48;
+/// Detached threads spawned in one burst, then reaped by later sweeps: as
+/// many as the held burst, past the first death queue's 99 observer nodes and
+/// 64 slots, on the queues and slot table the held burst already grew.
+const DETACH_BATCH: u64 = 128;
+/// Detached threads held bound at once in the warm-up's held burst: past the
+/// 64 slots the reaper's table once had, and past its first death queue's
+/// 99 observer nodes, so the burst grows the slot table and binds on a
+/// second queue, and every one of them is then reaped.
+const HELD_BURST: usize = 128;
+/// Allowed slot growth across the held burst once it is reaped: the reaper's
+/// second death queue and its slab, and the byte heap's growth for the slot
+/// table. A burst that leaked its threads would keep about two slots each.
+const BURST_SLACK: u64 = 8;
 /// Allowed slot growth between the baseline and the final sample. Absorbs
-/// lazily-created one-time caps (the reaper death `EventQueue`, pooled object
-/// slabs and their shelf entries) that may not have settled at the baseline.
+/// lazily-created one-time caps (pooled object slabs and their shelf entries,
+/// a reaper death queue the detach burst may add) that may not have settled at
+/// the baseline.
 /// Steady-state growth is 0: the pooled object slab recycles auto-reclaimed
 /// done-notification bytes in place (#364), so the ~700 spawn-churned
 /// `BIN_128` chunks in this run trigger no steady-state refills. A pool that
@@ -96,12 +108,42 @@ fn main() -> ExitCode
     let info = std::os::seraph::startup_info();
     let cspace = info.self_cspace;
 
-    // Warm up so the reaper death EventQueue, pooled object slabs, and PT budget
-    // reach steady state before the baseline sample.
+    // Warm up so the reaper's first death queue, pooled object slabs, and PT
+    // budget reach steady state.
     for i in 0..8
     {
         spawn_join(i);
     }
+
+    // Held burst: HELD_BURST detached threads bound at once (each waits on the
+    // barrier until all are spawned), then released, reaped, and the slot
+    // count checked against the count before the burst.
+    let before_burst = used_slots(cspace);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(HELD_BURST + 1));
+    for _ in 0..HELD_BURST
+    {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let _ = std::thread::spawn(move || {
+            barrier.wait();
+        });
+    }
+    barrier.wait();
+    drop(barrier);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    for i in 0..16
+    {
+        spawn_join(i);
+    }
+    let after_burst = used_slots(cspace);
+    log!("held burst of {HELD_BURST}: slots {before_burst} -> {after_burst}");
+    let burst_growth = after_burst.saturating_sub(before_burst);
+    if burst_growth > BURST_SLACK
+    {
+        log!("FAIL held-burst growth {burst_growth} > slack {BURST_SLACK}");
+        println!("threadchurn: FAIL held-burst slot growth {burst_growth} exceeds {BURST_SLACK}");
+        return ExitCode::FAILURE;
+    }
+
     let baseline = used_slots(cspace);
     let baseline_free = std::os::seraph::memmgr_pool_free_bytes();
     log!("baseline slots {baseline} free {baseline_free:?}");

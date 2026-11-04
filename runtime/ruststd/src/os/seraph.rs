@@ -43,14 +43,6 @@ use process_abi::{PROCESS_ABI_VERSION, process_info_ref};
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use process_abi::StackNote;
 
-/// Death-observer bookkeeping, the `ruststd-death-queues` crate: the growth
-/// policy of a set of death `EventQueue`s (`death_queues::DeathQueues`),
-/// which the thread reaper builds on, and the reaper's slot registry
-/// (`death_queues::slots`). Re-exported so a service that binds death
-/// observers uses the same policy without a direct dependency.
-#[stable(feature = "seraph_ext", since = "1.0.0")]
-pub use death_queues;
-
 /// Startup information the kernel+procmgr hand to a process at spawn time,
 /// materialised by `_start` from the read-only `ProcessInfo` page and made
 /// available through [`startup_info`]. A std-local copy of the shape defined in
@@ -798,7 +790,9 @@ pub fn namespace_lookup_dir(
 // real object sizes, and a size change is an ABI-visible change by design.
 // They are defined here rather than re-exported because an item reached
 // through the sysroot-private ABI crate is unstable (`rustc_private`) to
-// std's users.
+// std's users: build-std compiles std's dependencies with
+// `-Zforce-unstable-if-unmarked`. The same holds for `ruststd-death-queues`,
+// which std uses internally and services take as a path dependency instead.
 
 /// Raw retype debit of one `Endpoint`, in bytes (`syscall_abi`'s
 /// `ENDPOINT_RETYPE_BYTES`).

@@ -11,10 +11,12 @@
 //! ([`queues`]). [`slots::Registry`] is the slot table ruststd's thread
 //! reaper names in its observers' correlators ([`slots`]). Neither makes a
 //! syscall: the binds, the queue creates and the reclaims are the caller's.
-//! The crate is a host-tested workspace member and, under the
-//! `rustc-dep-of-std` feature, a dependency of the seraph std overlay, which
-//! re-exports it as `std::os::seraph::death_queues` — see
-//! [coding-standards.md](../../../docs/coding-standards.md#d-testing-invariants).
+//! The crate is a host-tested workspace member, a path dependency of the
+//! services that bind death observers, and, under the `rustc-dep-of-std`
+//! feature, a dependency of the seraph std overlay's thread reaper. std does
+//! not re-export it: the items of std's dependencies are unstable
+//! (`rustc_private`) to std's users. See
+//! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 // Under `rustc-dep-of-std` (build-std), use the core and alloc facades and
 // no_core so this crate can sit inside std's dep graph. Mirrors

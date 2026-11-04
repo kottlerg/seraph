@@ -30,8 +30,7 @@ ruststd/
 │   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
 ├── death-queues/               # `ruststd-death-queues` crate: pure, host-tested death-queue
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
-│                               #   rustc-dep-of-std dep, re-exported as
-│                               #   std::os::seraph::death_queues
+│                               #   rustc-dep-of-std dep of overlaid std (not re-exported)
 ├── patches/                    # upstream library/std patches applied during overlay assembly
 └── src/                        # std PAL overlay, copied into vendored library/std at build time
     ├── os/
@@ -168,8 +167,9 @@ process after the kernel posts that thread's death (or at once by that detach or
 death post has already landed), or leaks until process exit when the reaper could not register
 the thread at spawn (its slot table could not grow, or no death queue could take the observer
 bind). The slot table and the death queues grow on demand, each further queue with twice the last
-one's entries and observer nodes (`std::os::seraph::death_queues`); a queue's entries equal its
-nodes, so no death post is dropped.
+one's entries and observer nodes (the `ruststd-death-queues` crate). Every queue is drained before
+each bind, so the posts pending on a queue never outnumber the threads bound to it, which never
+exceed its entries, and no death post is dropped.
 
 ### CSpace slot headroom
 

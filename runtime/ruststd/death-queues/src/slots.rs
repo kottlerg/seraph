@@ -96,11 +96,27 @@ pub enum Detached<T>
     Leak(T),
 }
 
-/// The reaper's slots, and the generation the next reserved slot takes.
+/// Why [`Registry::reserve`] gave no slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveError
+{
+    /// Every slot is occupied and the table's allocation could not grow.
+    NoMemory,
+    /// Every slot is occupied and the next index would not fit 32 bits.
+    IndexExhausted,
+}
+
+/// The reaper's slots, the indices of the vacant ones, and the generation
+/// the next reserved slot takes.
 pub struct Registry<T>
 {
     next_gen: u32,
     slots: Vec<Slot<T>>,
+    /// Indices of vacant slots, popped by [`Registry::reserve`] before the
+    /// table grows. Its capacity is kept at least the table's length, so a
+    /// slot freed by [`Registry::release`] or [`Registry::death`] is
+    /// recorded without allocating.
+    free: Vec<u32>,
 }
 
 impl<T> Registry<T>
@@ -112,6 +128,7 @@ impl<T> Registry<T>
         Self {
             next_gen: 1,
             slots: Vec::new(),
+            free: Vec::new(),
         }
     }
 
@@ -129,24 +146,36 @@ impl<T> Registry<T>
         self.slots.is_empty()
     }
 
-    /// Reserve a slot for a thread being bound: the first vacant one, or a new
-    /// one appended when every slot is occupied. Returns its index and
-    /// generation, or `None` when the table cannot grow (the allocation is
-    /// refused, or the next index does not fit 32 bits).
-    pub fn reserve(&mut self) -> Option<(u32, u32)>
+    /// Reserve a slot for a thread being bound: a vacant one (the most
+    /// recently freed), or a new one appended when every slot is occupied.
+    /// Returns its index and generation.
+    ///
+    /// # Errors
+    /// [`ReserveError::NoMemory`] when every slot is occupied and the table
+    /// cannot grow; [`ReserveError::IndexExhausted`] when the next index does
+    /// not fit 32 bits. The registry is unchanged on an error.
+    pub fn reserve(&mut self) -> Result<(u32, u32), ReserveError>
     {
-        let index = match self.slots.iter().position(|s| s.state == State::Vacant)
+        let slot = match self.free.pop()
         {
-            Some(index) => index,
+            Some(slot) => slot,
             None =>
             {
-                u32::try_from(self.slots.len()).ok()?;
-                self.slots.try_reserve(1).ok()?;
+                let slot =
+                    u32::try_from(self.slots.len()).map_err(|_| ReserveError::IndexExhausted)?;
+                self.slots
+                    .try_reserve(1)
+                    .map_err(|_| ReserveError::NoMemory)?;
+                // Room for this slot's index in `free`, so freeing it never
+                // allocates.
+                self.free
+                    .try_reserve(self.slots.len() + 1 - self.free.len())
+                    .map_err(|_| ReserveError::NoMemory)?;
                 self.slots.push(Slot::vacant());
-                self.slots.len() - 1
+                slot
             }
         };
-        let slot = u32::try_from(index).ok()?;
+        let index = slot as usize;
         let generation = self.next_gen;
         self.next_gen = self.next_gen.wrapping_add(1);
         self.slots[index] = Slot {
@@ -155,7 +184,16 @@ impl<T> Registry<T>
             died: false,
             res: None,
         };
-        Some((slot, generation))
+        Ok((slot, generation))
+    }
+
+    /// Make slot `slot` vacant and record it as free.
+    fn vacate(&mut self, slot: u32)
+    {
+        self.slots[slot as usize] = Slot::vacant();
+        // `free`'s capacity covers every slot (`reserve`), so this does not
+        // allocate.
+        self.free.push(slot);
     }
 
     /// Free `slot` for a joined thread (or one never started), whose
@@ -163,10 +201,11 @@ impl<T> Registry<T>
     /// ignored. A slot of another generation, or vacant, is left alone.
     pub fn release(&mut self, slot: u32, generation: u32)
     {
-        if let Some(s) = self.slot_mut(slot, generation)
-            && s.state != State::Vacant
+        if self
+            .slot_mut(slot, generation)
+            .is_some_and(|s| s.state != State::Vacant)
         {
-            *s = Slot::vacant();
+            self.vacate(slot);
         }
     }
 
@@ -185,7 +224,7 @@ impl<T> Registry<T>
         }
         if s.died
         {
-            *s = Slot::vacant();
+            self.vacate(slot);
             return Detached::Reclaim(res);
         }
         s.state = State::Detached;
@@ -207,7 +246,7 @@ impl<T> Registry<T>
             State::Detached =>
             {
                 let res = s.res.take();
-                *s = Slot::vacant();
+                self.vacate(slot);
                 res
             }
             State::Reserved =>
@@ -254,8 +293,7 @@ mod tests
     {
         let mut reg = Registry::<u32>::new();
         let reserved: Vec<_> = (0..200).map(|_| reg.reserve().expect("room")).collect();
-        let mut slots: Vec<u32> = reserved.iter().map(|&(s, _)| s).collect();
-        slots.dedup();
+        let slots: Vec<u32> = reserved.iter().map(|&(s, _)| s).collect();
         assert_eq!(slots, (0..200).collect::<Vec<_>>());
         assert_eq!(reg.len(), 200);
     }
@@ -323,6 +361,51 @@ mod tests
         let (slot, generation) = reg.reserve().expect("room");
         reg.release(slot, generation.wrapping_add(1));
         assert_eq!(reg.detach(slot, generation, 8), Detached::Held);
+    }
+
+    #[test]
+    fn a_generation_zero_post_does_nothing_to_a_vacant_slot()
+    {
+        // A vacant slot carries generation 0; a post naming it must not
+        // reclaim or mark anything.
+        let mut reg = Registry::<u32>::new();
+        let (slot, generation) = reg.reserve().expect("room");
+        reg.release(slot, generation);
+        assert_eq!(reg.death(correlator(slot, 0)), None);
+        let (again, fresh) = reg.reserve().expect("room");
+        assert_eq!(again, slot);
+        assert_eq!(reg.detach(again, fresh, 6), Detached::Held);
+    }
+
+    #[test]
+    fn a_post_after_a_died_thread_is_released_does_nothing()
+    {
+        // The thread died while its handle was held, then was joined (its
+        // slot released): a repeated post for it must be stale.
+        let mut reg = Registry::<u32>::new();
+        let (slot, generation) = reg.reserve().expect("room");
+        assert_eq!(reg.death(correlator(slot, generation)), None);
+        reg.release(slot, generation);
+        assert_eq!(reg.death(correlator(slot, generation)), None);
+        let (again, fresh) = reg.reserve().expect("room");
+        assert_eq!(again, slot);
+        assert_eq!(reg.detach(again, fresh, 9), Detached::Held);
+    }
+
+    #[test]
+    fn freed_slots_are_reused_without_scanning_the_table()
+    {
+        let mut reg = Registry::<u32>::new();
+        let held: Vec<_> = (0..8).map(|_| reg.reserve().expect("room")).collect();
+        for &(slot, generation) in &held[2..5]
+        {
+            reg.release(slot, generation);
+        }
+        let mut reused: Vec<u32> = (0..3).map(|_| reg.reserve().expect("room").0).collect();
+        reused.sort_unstable();
+        assert_eq!(reused, [2, 3, 4]);
+        assert_eq!(reg.len(), 8);
+        assert_eq!(reg.reserve().expect("room").0, 8);
     }
 
     #[test]

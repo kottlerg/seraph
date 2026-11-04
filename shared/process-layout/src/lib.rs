@@ -498,8 +498,11 @@ pub fn choose_process_layout(entropy: Option<&[u8; LAYOUT_ENTROPY_BYTES]>) -> Pr
 /// `MAX_PROCESS_STACK_PAGES`, or when `stack_top` is not page-aligned or lies
 /// below the stack.
 #[must_use]
-pub fn main_stack_growth(stack_top: u64, committed_pages: u64, usable_pages: u64)
--> Option<(u64, u64)>
+pub fn main_stack_growth(
+    stack_top: u64,
+    committed_pages: u64,
+    usable_pages: u64,
+) -> Option<(u64, u64)>
 {
     if committed_pages >= usable_pages
         || usable_pages > u64::from(MAX_PROCESS_STACK_PAGES)

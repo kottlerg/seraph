@@ -933,7 +933,9 @@ pub fn platform::uart_base_for_boot_info(km: &KernelMmio) -> u64;
 /// on x86-64; 0 on RISC-V (PLIC and UART lie inside the RAM direct map).
 pub fn platform::collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) -> usize;
 /// The most regions `collect_mmio_direct_map_regions` writes, which sizes the
-/// Phase 3 buffer: `1 + MAX_IOAPICS` on x86-64, 0 on RISC-V.
+/// Phase 3 buffer: the producer's own bound,
+/// `boot_protocol::layout::MAX_MMIO_DIRECT_MAP_REGIONS`, re-exported
+/// (`1 + MAX_IOAPICS` on x86-64, 0 on RISC-V).
 pub const platform::MMIO_DIRECT_MAP_REGIONS: usize;
 
 /// Copy the AP trampoline into the page at `trampoline_pa`; call once before

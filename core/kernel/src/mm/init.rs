@@ -480,8 +480,9 @@ pub fn record_boot_table_carve(base: u64, frames: u64)
 /// # Safety
 ///
 /// Called once, on the single boot thread, after [`init_physical_memory`] and
-/// after the kernel page tables (with the direct map over all RAM) are
-/// active; `alloc` is empty and nothing has allocated from it.
+/// after the kernel page tables (with the direct map over all RAM but the
+/// handoff stack's guard page, which is no free range) are active; `alloc` is
+/// empty and nothing has allocated from it.
 pub unsafe fn populate_buddy(alloc: &mut BuddyAllocator)
 {
     let info_phys = BOOT_INFO_PHYS.load(Ordering::Relaxed);

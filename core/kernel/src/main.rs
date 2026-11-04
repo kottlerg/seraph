@@ -403,7 +403,8 @@ unsafe fn kernel_entry_post_rebase(
     // On RISC-V the UART is MMIO and must be accessed via the direct map after
     // the page table switch; on x86-64 the UART is I/O-mapped (no-op).
     // SAFETY: kernel page tables active with direct physical map covering all
-    // RAM and UART MMIO region; framebuffer physical base from validated BootInfo.
+    // RAM but the handoff stack's guard page, and the UART MMIO region;
+    // framebuffer physical base from validated BootInfo.
     unsafe {
         let uart_phys = arch::current::console::uart_phys_base();
         if uart_phys != 0
@@ -422,7 +423,8 @@ unsafe fn kernel_entry_post_rebase(
     // device tree blob; nothing allocates before this
     // (core/kernel/docs/initialization.md § Phase 3).
     // SAFETY: the single boot thread, once, after Phase 2 and with the direct
-    // map over all RAM active; `allocator` is empty.
+    // map over all RAM but the handoff stack's guard page, which is no free
+    // range, active; `allocator` is empty.
     unsafe { mm::init::populate_buddy(allocator) };
     kprintln!(
         "buddy allocator: {} free pages",

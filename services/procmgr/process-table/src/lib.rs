@@ -17,13 +17,15 @@
 //! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
 //! init-reap handoff state machine ([`InitReap`]), and the size of procmgr's
 //! first death queue ([`death_queues::FIRST_POOL_OBSERVERS`]). None of these
-//! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are slot *indices* (plain
-//! integers), never live capabilities, and the decoder reads a stack
-//! [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
-//! host-tested. The syscall/IPC-bearing operations (pipe/namespace
-//! configuration, the death-queue binds and creates, the logd death forward,
-//! random process-badge minting, ELF load, the init-reap teardown, and process
-//! teardown) stay in `procmgr` and drive this logic across the crate boundary.
+//! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are
+//! slot *indices* (plain integers), never live capabilities, and the decoder
+//! reads a stack [`ipc::IpcMessage`] snapshot — so the whole crate is
+//! host-reachable and host-tested. The syscall/IPC-bearing operations
+//! (pipe/namespace configuration, the logd death forward, random
+//! process-badge minting, ELF load, the init-reap teardown, and process
+//! teardown) stay in `procmgr` and drive this logic across the crate
+//! boundary; the death-queue binds and creates are made by the `death-set`
+//! crate's `DeathSet`, which procmgr calls.
 //! See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 

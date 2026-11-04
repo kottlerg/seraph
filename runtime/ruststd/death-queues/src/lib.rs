@@ -15,8 +15,8 @@
 //! `rustc-dep-of-std` feature, a dependency of the seraph std overlay's
 //! thread reaper. Services reach the policy through the `death-set` crate
 //! (shared/death-set), whose `DeathSet` makes the syscalls for procmgr and
-//! svcmgr; std does not re-export it, since the items of std's dependencies
-//! are unstable (`rustc_private`) to std's users. See
+//! svcmgr; std does not re-export this crate, since the items of std's
+//! dependencies are unstable (`rustc_private`) to std's users. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 // Under `rustc-dep-of-std` (build-std), use the core and alloc facades and

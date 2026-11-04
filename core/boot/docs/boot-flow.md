@@ -216,6 +216,14 @@ bottom by the mark, and measures the deepest use as the lowest word no longer pa
 ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth) § Kernel
 Stack Depth).
 
+The stack is allocated with one more page below it, its guard, which no identity-map region
+covers, so an overflow of the stack faults instead of overwriting the allocation beneath it.
+The kernel's Phase 3 identity window over the stack leaves the guard out as well
+([initialization.md](../../kernel/docs/initialization.md#phase-3-kernel-page-tables)
+§ Phase 3). The kernel's direct map, which the stack is reached through from the end of
+Phase 3, maps the guard frame like any other RAM, so from there an overflow of up to a page
+lands in the guard frame without a fault, and the overwritten base mark reports it.
+
 Detail: [page-tables.md](page-tables.md)
 
 ### Step 7: Query Final Memory Map

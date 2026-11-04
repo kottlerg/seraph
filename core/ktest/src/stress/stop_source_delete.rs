@@ -14,8 +14,9 @@
 //! it. Two paths reach the source through the binding alone: a stop's
 //! `cancel_ipc_block`, which unlinks the waiter so the stopped thread's
 //! blocked syscall returns `Interrupted` on restart, and the drain of
-//! `dealloc_object(Thread)` (step 11 of core/kernel/docs/thread-lifecycle-and-sleep.md
-//! § `dealloc_object(Thread)` Drain Protocol), which unlinks a dying waiter.
+//! `dealloc_object(Thread)` (step 11 of
+//! core/kernel/docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+//! Drain Protocol), which unlinks a dying waiter.
 //! Each once read the binding under the waiter's `sched_lock`, released it,
 //! and then locked the source through the pointer it read. The source's
 //! last-capability delete could claim the waiter and free the source in
@@ -39,25 +40,24 @@
 //!
 //! ## How this exercises it
 //!
-//! Twelve phases: for each source kind — a notification, an event queue, a
-//! wait set with a notification member, an endpoint receive (`ipc_recv`, the
-//! waiter queued as a receiver), an endpoint call (`ipc_call` with no
-//! receiver, the waiter queued as a sender), and a served endpoint call (the
-//! same, with a server receiving on the endpoint) — one phase racing a stop
-//! and one racing a Thread delete. A long-lived racer, pinned to CPU 2, takes the
-//! phase's action (stop the waiter, or delete its Thread capability) in each
-//! round it is armed for. The controller, pinned to CPU 0, runs [`CYCLES`]
-//! rounds per phase.
-//! Each round creates a fresh source and a waiter pinned to CPU 1 that loops
-//! waiting on it, counting each wait it enters and classifying each result;
-//! the controller waits until the waiter has entered a wait (bounded by
+//! Twelve phases: for each source kind — a notification, an event queue, a wait
+//! set with a notification member, an endpoint receive (`ipc_recv`, the waiter
+//! queued as a receiver), an endpoint call (`ipc_call` with no receiver, the
+//! waiter queued as a sender), and a served endpoint call (the same, with a
+//! server receiving on the endpoint) — one phase racing a stop and one racing a
+//! Thread delete. A long-lived racer, pinned to CPU 2, takes the phase's action
+//! (stop the waiter, or delete its Thread capability) in each round it is armed
+//! for. The controller, pinned to CPU 0, runs [`CYCLES`] rounds per phase. Each
+//! round creates a fresh source and a waiter pinned to CPU 1 that loops waiting
+//! on it, counting each wait it enters and classifying each result; the
+//! controller waits until the waiter has entered a wait (bounded by
 //! [`ENTRY_WAIT_US`]; a round that times out is tallied), spins a varying
-//! settle so the race lands before, during, or after the park, arms the
-//! racer, spins a short varying delay of its own, and deletes the source's
-//! capability, so the racer's action and the source's teardown overlap in
-//! both orders. The source, the waiter, and the racer all use ktest's own
-//! `CSpace` and the controller's handles, so the source's delete and the
-//! racer's Thread delete each drop the object's last capability.
+//! settle so the race lands before, during, or after the park, arms the racer,
+//! spins a short varying delay of its own, and deletes the source's capability,
+//! so the racer's action and the source's teardown overlap in both orders. The
+//! source, the waiter, and the racer all use ktest's own `CSpace` and the
+//! controller's handles, so the source's delete and the racer's Thread delete
+//! each drop the object's last capability.
 //!
 //! In a stop phase the controller then restarts the waiter (a waiter the
 //! stop found already exited — the teardown woke it first and its next wait
@@ -89,11 +89,11 @@
 //! Required, per phase: every wait returned `Interrupted` or
 //! `InvalidCapability` (nothing is ever delivered); every racer action
 //! returned an accepted result (a stop `Ok` or `InvalidState`, a Thread
-//! delete `Ok`), and every restart after an `Ok` stop returned `Ok`, or `InvalidArgument`
-//! on a waiter the stop caught inside its exit syscall, whose exit then
-//! committed `Exited` over the stop; in a
-//! stop phase some stop landed on a waiter inside a wait (the waiter's counts,
-//! read once it is stopped, show the wait entered and not finished) and some
+//! delete `Ok`), and every restart after an `Ok` stop returned `Ok`, or
+//! `InvalidArgument` on a waiter the stop caught inside its exit syscall,
+//! whose exit then committed `Exited` over the stop; in a stop phase some
+//! stop landed on a waiter inside a wait (the waiter's counts, read once it
+//! is stopped, show the wait entered and not finished) and some
 //! wait returned `Interrupted`; in a Thread-delete phase some delete ended a
 //! waiter inside a wait. Which of the racer's action and the source's
 //! teardown claimed a park is reached statistically across the rounds; the

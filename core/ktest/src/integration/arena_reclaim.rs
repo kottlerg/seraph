@@ -29,12 +29,13 @@
 //!    out to ktest's `CSpace`. When the `CSpace` dies, P comes back but for
 //!    the arena pages the moved bodies sit on, at least two, so P's span is
 //!    cut into several runs; P is whole again once the moved capabilities go.
-//! 5. Kept pages on freed table pages (x86-64): a `CSpace` made from one
-//!    8-page piece binds an `IoPort` to a thread of its own and deletes the
-//!    thread, whose port-binding table's pages go back to the top of its pool
-//!    with their record cell; two of the three arena pages of case 4's bodies
-//!    are carved from them (a slot page takes the third), and the piece comes
-//!    back cut around the kept pages as in case 4.
+//! 5. Kept pages on freed table pages, where the architecture has I/O ports
+//!    (`crate::arch::HAS_IO_PORTS`): a `CSpace` made from one 8-page piece
+//!    binds an `IoPort` to a thread of its own and deletes the thread, whose
+//!    port-binding table's pages go back to the top of its pool with their
+//!    record cell; two of the three arena pages of case 4's bodies are carved
+//!    from them (a slot page takes the third), and the piece comes back cut
+//!    around the kept pages as in case 4.
 //!
 //! A RAM tail cannot be deleted in ktest (its destruction would free into the
 //! sealed buddy), so each tail is moved out to ktest's own `CSpace` before its
@@ -79,7 +80,6 @@ const MANY: usize = 70;
 /// Pages of case 4's Memory piece P, donated in one augment.
 const P_PAGES: u64 = 16;
 /// Pages of case 5's Memory piece, the funding `CSpace`'s whole slab.
-#[cfg(target_arch = "x86_64")]
 const T_PAGES: u64 = 8;
 /// The copier's inputs, handles in its `CSpace`: the `Mmio` capability to
 /// derive from, ktest's `CSpace`, and the notification it signals when done.
@@ -218,8 +218,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     mutually_funded(ctx)?;
     budget_floor(ctx)?;
     kept_in_spilled_record(ctx)?;
-    #[cfg(target_arch = "x86_64")]
-    kept_on_freed_table_pages(ctx)?;
+    if crate::arch::HAS_IO_PORTS
+    {
+        kept_on_freed_table_pages(ctx)?;
+    }
     Ok(())
 }
 
@@ -399,10 +401,9 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
     finish_kept(ctx, a, piece, P_PAGES, base_before, placed)
 }
 
-/// Case 5 (x86-64): kept pages, two of them carved from pool pages a
-/// port-binding table gave back, which carry their donation record's cell
-/// from the table.
-#[cfg(target_arch = "x86_64")]
+/// Case 5, on an architecture with I/O ports (`crate::arch::HAS_IO_PORTS`):
+/// kept pages, two of them carved from pool pages a port-binding table gave
+/// back, which carry their donation record's cell from the table.
 fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
 {
     let Some(probe) = probe_mmio(ctx)

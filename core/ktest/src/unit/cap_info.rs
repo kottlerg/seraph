@@ -30,7 +30,8 @@ use syscall::{
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
-    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, SyscallError,
+    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CSPACE_SLOTS_PER_PAGE,
+    SyscallError,
 };
 
 use crate::{TestContext, TestResult};
@@ -520,7 +521,8 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
 pub fn cspace_fields(ctx: &TestContext) -> TestResult
 {
     const PAGE_SIZE: u64 = 4096;
-    const L2_SIZE: u64 = 56;
+    // Slots per leaf page: the kernel's `L2_SIZE`, published in the ABI.
+    const L2_SIZE: u64 = CSPACE_SLOTS_PER_PAGE;
     let cs = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace failed")?;
 
     let fresh_capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY)

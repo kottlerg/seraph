@@ -170,9 +170,9 @@ narrowed with `SYS_IRQ_SPLIT`). Rights:
 - **Notify** — may register, acknowledge, and split (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`,
   `SYS_IRQ_SPLIT`); register and acknowledge require a single-line cap
 
-The holder binds a Notification to the line with `SYS_IRQ_REGISTER`; each interrupt
-ORs bit 0 into that Notification, and the holder re-enables the line with
-`SYS_IRQ_ACK`.
+The holder binds a Notification to the line with `SYS_IRQ_REGISTER`, passing the line's
+trigger and polarity mode, which every binding on the line shares; each interrupt ORs bit 0
+into that Notification, and the holder re-enables the line with `SYS_IRQ_ACK`.
 
 Every Interrupt capability references an object of its own, as for [Mmio](#mmio): a copy or
 derivation references a fresh object over the same range, bounded the same way, and that object

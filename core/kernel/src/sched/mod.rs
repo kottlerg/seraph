@@ -19,6 +19,7 @@ pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
 pub mod thread_registry;
+pub mod thread_slot;
 
 #[cfg(not(test))]
 use core::mem::MaybeUninit;

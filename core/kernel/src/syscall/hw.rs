@@ -105,6 +105,10 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 /// arg1 = Notification cap index (must have NOTIFY right).
+/// arg2 = the line's mode (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW`; 0 is
+///        edge-triggered, active-high). The line's first binding records it and
+///        routes the line in it; every later binding must pass the same mode
+///        (`irq` module doc § Mode).
 ///
 /// Binds the cap's own object (each copy of an Interrupt cap is an object of
 /// its own) to the Notification; a line holds one binding per bound object, up
@@ -119,15 +123,17 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// 4. Each driver calls `SYS_IRQ_ACK`; the line is unmasked once none owes.
 ///
 /// The line's first binding routes it: on `x86_64` it assigns the GSI a device
-/// IDT vector and programs its IOAPIC redirection entry, on RISC-V it assigns
-/// the PLIC source a target hart, masked until the first ACK in both cases. A
-/// later binding masks the line, which stays masked until that binding's
-/// first ACK.
+/// IDT vector and programs its IOAPIC redirection entry with the mode's trigger
+/// and polarity, on RISC-V it assigns the PLIC source a target hart (the mode is
+/// validated and recorded, and the level-sensitive PLIC gateway needs nothing
+/// from it), masked until the first ACK in both cases. A later binding masks the
+/// line, which stays masked until that binding's first ACK.
 ///
 /// Returns 0 on success; `InvalidArgument` for an id no discovered controller
-/// implements, `QuotaExceeded` when the controller has no delivery resource left
-/// (x86-64: every device vector assigned) or the line already holds
-/// `MAX_IRQ_BINDINGS` bindings.
+/// implements, a mode with a bit outside `IRQ_MODE_MASK`, or a mode other than
+/// the one the line's bindings recorded; `QuotaExceeded` when the controller has
+/// no delivery resource left (x86-64: every device vector assigned) or the line
+/// already holds `MAX_IRQ_BINDINGS` bindings.
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -137,6 +143,14 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 
     let irq_cap_idx = tf.arg(0) as u32;
     let sig_cap_idx = tf.arg(1) as u32;
+    let mode = tf.arg(2);
+    if mode & !syscall::IRQ_MODE_MASK != 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // IRQ_MODE_MASK is two bits, so a mode that passed the check fits a u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let mode = mode as u32;
 
     // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
     // CPU's current thread.
@@ -194,9 +208,12 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     // sig_state is the live state of the Notification cap resolved above; `io`
     // is live, its line is `irq_id`, and its dealloc arm unbinds it
     // (`irq::unregister`) before it is freed.
-    unsafe { crate::irq::register(irq_id, &io.binding, sig_state) }.map_err(|e| match e
+    unsafe { crate::irq::register(irq_id, &io.binding, sig_state, mode) }.map_err(|e| match e
     {
-        crate::irq::RouteError::NoSuchLine => SyscallError::InvalidArgument,
+        crate::irq::RouteError::NoSuchLine | crate::irq::RouteError::ModeMismatch =>
+        {
+            SyscallError::InvalidArgument
+        }
         crate::irq::RouteError::Exhausted | crate::irq::RouteError::TooManyBindings =>
         {
             SyscallError::QuotaExceeded

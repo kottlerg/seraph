@@ -53,20 +53,28 @@
 //! `interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider x2APIC id
 //! without interrupt remapping, which the kernel does not program.
 //!
+//! # Trigger and polarity
+//!
+//! A redirection entry takes its trigger mode (bit 15, set for level) and pin polarity
+//! (bit 13, set for active-low) from the mode its line's first `SYS_IRQ_REGISTER` passed
+//! ([`redirection_low`]); the kernel reads no MADT interrupt-source override itself. A
+//! level-triggered entry's Remote IRR, set at delivery, is cleared by the local APIC's EOI,
+//! which the local APIC broadcasts to the I/O APICs (the kernel clears the SVR's EOI-broadcast
+//! suppression bit on every CPU, `interrupts::init` and `init_ap`). A device IRQ masks its entry
+//! before that EOI (`irq::dispatch_device_irq`), so an assertion still held at the unmask is
+//! delivered again. A delivery a CPU accepted while its line was being released leaves Remote
+//! IRR set, which stays set when the line is routed again, on another vector, before that
+//! delivery's EOI; [`route`] clears it before it programs the entry again
+//! ([`remote_irr_clear`]).
+//!
 //! # Limitations / deferred work
 //!
 //! - **No MSI/MSI-X support.** Required for modern `PCIe` devices (#325).
-//!
-//! - **Edge-triggered, active-high only.** Level-triggered and active-low sources (PCI `INTx`
-//!   lines, MADT interrupt-source overrides) are not handled; no trigger/polarity information
-//!   reaches the kernel (`InterruptObject` carries only `start` and `count`).
 //!
 //! # Modification notes
 //! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`, through
 //!   `irq::register`), released by `interrupts::unroute_device_irq`, and unmasked by
 //!   `interrupts::unmask` (from `SYS_IRQ_ACK`).
-//! - To support level-triggered IRQs: set bit 15 (level-sensitive) and
-//!   bit 13 (active-low polarity) in the redirection entry low dword.
 
 // cast_possible_truncation: u64→usize APIC MMIO address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector widening casts.
@@ -238,6 +246,60 @@ const REDIR_MASK: u32 = 1 << 16;
 /// Fixed delivery mode (000), physical destination, vector in [7:0].
 /// Logical destination mode would be bit 11; we leave it clear (physical).
 const REDIR_FIXED: u32 = 0x0000_0000;
+
+/// Trigger-mode bit in the low dword of a redirection entry (bit 15): set for a
+/// level-triggered line.
+const REDIR_LEVEL: u32 = 1 << 15;
+
+/// Pin-polarity bit in the low dword of a redirection entry (bit 13): set for an
+/// active-low line.
+const REDIR_ACTIVE_LOW: u32 = 1 << 13;
+
+/// Remote IRR bit in the low dword of a redirection entry (bit 14, read-only):
+/// set while a level-triggered delivery awaits the EOI of the entry's vector.
+const REDIR_REMOTE_IRR: u32 = 1 << 14;
+
+/// The low dword [`route`] writes first, before the entry it programs, when the
+/// entry it replaces is `current`: when `current`'s Remote IRR is set, the same
+/// entry masked and edge-triggered, which clears Remote IRR, and `None`
+/// otherwise.
+///
+/// A level delivery a CPU accepted while the line was being released leaves
+/// Remote IRR set. When the line is routed again, on another vector, before
+/// that delivery's EOI, the EOI of the old vector matches the entry no more,
+/// and a level entry whose Remote IRR stays set delivers nothing more. Writing
+/// the trigger mode edge clears Remote IRR (the 82093AA, QEMU's and KVM's I/O
+/// APICs alike); only the mask and trigger bits change, as Linux's
+/// `__eoi_ioapic_pin` does.
+const fn remote_irr_clear(current: u32) -> Option<u32>
+{
+    if current & REDIR_REMOTE_IRR == 0
+    {
+        None
+    }
+    else
+    {
+        Some((current | REDIR_MASK) & !REDIR_LEVEL & !REDIR_REMOTE_IRR)
+    }
+}
+
+/// The low dword of a masked redirection entry delivering `vector` in fixed mode
+/// to a physical destination, with `mode`'s trigger and polarity
+/// (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW` in `abi/syscall`; bits outside them are
+/// ignored, since the syscall refuses them).
+const fn redirection_low(vector: u8, mode: u32) -> u32
+{
+    let mut low = REDIR_MASK | REDIR_FIXED | (vector as u32);
+    if mode as u64 & syscall::IRQ_MODE_LEVEL != 0
+    {
+        low |= REDIR_LEVEL;
+    }
+    if mode as u64 & syscall::IRQ_MODE_ACTIVE_LOW != 0
+    {
+        low |= REDIR_ACTIVE_LOW;
+    }
+    low
+}
 
 // ── Per-IOAPIC state ──────────────────────────────────────────────────────────
 
@@ -435,28 +497,35 @@ pub unsafe fn init()
 /// with id `destination` (physical destination mode, so at most `0xFF`).
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
-/// Uses edge-triggered, active-high, fixed delivery. A GSI no discovered I/O
-/// APIC owns is left alone (`interrupts::route_device_irq` checks [`owns`] first).
+/// Uses fixed delivery, with the trigger mode and polarity `mode` names
+/// ([`redirection_low`]). An entry whose Remote IRR a stale level delivery left
+/// set is first rewritten masked and edge-triggered, which clears it
+/// ([`remote_irr_clear`]). A GSI no discovered I/O APIC owns is left alone
+/// (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
-pub unsafe fn route(gsi: u32, vector: u8, destination: u8)
+pub unsafe fn route(gsi: u32, vector: u8, destination: u8, mode: u32)
 {
     let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
     else
     {
         return;
     };
-    // Low dword: vector | fixed delivery | masked.
+    // Low dword: vector | fixed delivery | trigger and polarity | masked.
     // High dword: destination APIC id in bits [31:24] (entry bits [63:56]).
-    let low = REDIR_MASK | REDIR_FIXED | (vector as u32);
+    let low = redirection_low(vector, mode);
     let high = u32::from(destination) << 24;
 
     // SAFETY: caller ensures init() has completed; entry remains masked
-    // until unmask(). IOAPIC_LOCK covers both select/window pairs.
+    // until unmask(). IOAPIC_LOCK covers every select/window pair below.
     unsafe {
         let saved = IOAPIC_LOCK.lock_raw();
+        if let Some(clear) = remote_irr_clear(ioapic_read(base, 0x10 + 2 * pin))
+        {
+            ioapic_write(base, 0x10 + 2 * pin, clear);
+        }
         ioapic_write(base, 0x10 + 2 * pin, low);
         ioapic_write(base, 0x11 + 2 * pin, high);
         IOAPIC_LOCK.unlock_raw(saved);
@@ -582,6 +651,52 @@ mod tests
         release_vector_in(&t, 1, 100);
         let (vector, _) = assign_vector_in(&t, 5000, 100).expect("vector");
         assert_eq!(vector, DEVICE_VECTOR_BASE + 1);
+    }
+
+    #[test]
+    fn mode_zero_programs_an_edge_triggered_active_high_masked_entry()
+    {
+        let low = redirection_low(0x40, 0);
+        assert_eq!(low, REDIR_MASK | 0x40);
+    }
+
+    #[test]
+    fn the_mode_bits_set_the_trigger_and_polarity_bits()
+    {
+        let level = syscall::IRQ_MODE_LEVEL as u32;
+        let active_low = syscall::IRQ_MODE_ACTIVE_LOW as u32;
+        assert_eq!(
+            redirection_low(0x41, level),
+            REDIR_MASK | REDIR_LEVEL | 0x41
+        );
+        assert_eq!(
+            redirection_low(0x42, active_low),
+            REDIR_MASK | REDIR_ACTIVE_LOW | 0x42
+        );
+        assert_eq!(
+            redirection_low(0x43, level | active_low),
+            REDIR_MASK | REDIR_LEVEL | REDIR_ACTIVE_LOW | 0x43
+        );
+    }
+
+    #[test]
+    fn an_entry_with_remote_irr_set_is_first_rewritten_masked_and_edge()
+    {
+        let stale = REDIR_LEVEL | REDIR_REMOTE_IRR | 0x45;
+        assert_eq!(remote_irr_clear(stale), Some(REDIR_MASK | 0x45));
+        // The polarity bit is kept.
+        let stale = REDIR_LEVEL | REDIR_ACTIVE_LOW | REDIR_REMOTE_IRR | 0x45;
+        assert_eq!(
+            remote_irr_clear(stale),
+            Some(REDIR_MASK | REDIR_ACTIVE_LOW | 0x45)
+        );
+    }
+
+    #[test]
+    fn an_entry_with_remote_irr_clear_is_programmed_directly()
+    {
+        assert_eq!(remote_irr_clear(REDIR_LEVEL | REDIR_MASK | 0x45), None);
+        assert_eq!(remote_irr_clear(REDIR_MASK), None);
     }
 
     #[test]

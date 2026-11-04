@@ -5,7 +5,10 @@ modern PCI transport register access, split-virtqueue management, device-status 
 the `VirtioPciStartupInfo` payload (versioned by `VIRTIO_PCI_INFO_VERSION`) that carries PCI
 capability locations, which devmgr serialises into its `QUERY_DEVICE_INFO` reply to a VirtIO
 driver, and the register layout derived from it (the distinct BARs the four register regions name,
-up to `MAX_VIRTIO_BARS`, and each region's place in the driver's register window). It also
+up to `MAX_VIRTIO_BARS`, and each region's place in the driver's register window), and where a
+reset writes the device's `device_status` byte (`VirtioPciStartupInfo::status_register`), which
+devmgr uses when it withdraws a driver
+([driver-model.md](../../docs/driver-model.md#withdrawal) § Withdrawal). It also
 specifies the two bootstrap rounds devmgr serves a VirtIO PCI driver and decodes them on the driver
 side, and provides the interrupt-service loop (`isr::serve_interrupts`) each VirtIO driver runs on
 a thread of its own, so it acknowledges every delivery on its line, a request in flight or not
@@ -22,8 +25,9 @@ virtio/core/
 ├── README.md
 └── src/
     ├── lib.rs            # Device status bits, VirtioPciStartupInfo QUERY_DEVICE_INFO payload,
-    │                     #   RegisterLayout (per-BAR register window)
-    ├── bootstrap.rs      # devmgr-to-driver bootstrap rounds (BAR caps, endpoint slots)
+    │                     #   RegisterLayout (per-BAR register window), StatusRegister (where a
+    │                     #   reset writes `device_status`)
+    ├── bootstrap.rs      # devmgr-to-driver bootstrap rounds (BAR caps, endpoint slots, IRQ mode)
     ├── isr.rs            # Interrupt-service loop (bounded wait, ISR read, acknowledge, signal)
     ├── pci.rs            # Modern PCI transport register access
     └── virtqueue.rs      # Split virtqueue rings and descriptors

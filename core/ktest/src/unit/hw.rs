@@ -113,7 +113,7 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
     {
         // Any error (a slot of another type, most often) leaves the cap
         // intact; keep scanning.
-        if irq_register(slot, irq_sig).is_ok()
+        if irq_register(slot, irq_sig, 0).is_ok()
         {
             irq_ack(slot).map_err(|_| "irq_ack failed")?;
             syscall::cap_delete(irq_sig).map_err(|_| "cap_delete irq_sig after irq test failed")?;
@@ -218,7 +218,7 @@ fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 {
     let single =
         isolate_irq_id(ctx, id).ok_or("hw::irq_register_high_id: cannot isolate the id")?;
-    let registered = irq_register(single, irq_sig);
+    let registered = irq_register(single, irq_sig, 0);
     let acked = registered.and_then(|()| irq_ack(single));
     let deleted = syscall::cap_delete(single);
     registered.map_err(|_| "hw::irq_register_high_id: routable id refused")?;
@@ -232,7 +232,7 @@ fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 {
     let single = isolate_irq_id(ctx, id)
         .ok_or("hw::irq_register_unroutable_id_err: cannot isolate the id")?;
-    let err = irq_register(single, irq_sig);
+    let err = irq_register(single, irq_sig, 0);
     // Deleting the cap must not touch the routing table for an id it cannot
     // index (the kernel panicked here before the teardown guard).
     let deleted = syscall::cap_delete(single);

@@ -101,6 +101,12 @@ unsafe fn serial_hw_init()
 /// The UART's PLIC source on QEMU's virt machine (`UART0_IRQ`).
 pub const UART_IRQ: u32 = 10;
 
+/// Whether the UART line, bound level-triggered (`IRQ_MODE_LEVEL`), delivers again an
+/// assertion held across its receivers' acknowledgements: no. The kernel programs nothing
+/// from the mode, and QEMU's PLIC model does not pend a source again that stays asserted
+/// across its claim and completion.
+pub const UART_HELD_LEVEL_REDELIVERED: bool = false;
+
 /// UART interrupt-enable register offset, and its THRI bit
 /// (transmit-holding-register-empty interrupt enable).
 const IER: usize = 1;

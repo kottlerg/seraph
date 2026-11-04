@@ -147,25 +147,11 @@ const TABLE_ENTRIES: usize = 512;
 /// with a 32-bit move.
 const ROOT_MAX_PHYS: u64 = 0xFFFF_FFFF;
 
-/// Capacity of the page-table frame log used for post-handoff reclamation.
-///
-/// Covers the root plus every intermediate frame `map` allocates for the
-/// mappings `core/boot/docs/page-tables.md` § Contract at Kernel Entry lists,
-/// and the LA57 toggle page when one is installed. Five-level paging adds
-/// one intermediate level (one extra frame per distinct top-level chain), so
-/// the cap matches the riscv64 builder's, which covers Sv57. The reclaim
-/// array's backing page in `BootInfo` holds up to
-/// `boot_protocol::MAX_RECLAIM_RANGES` (256) entries, so this cap is the
-/// binding limit; `alloc_table` returns `None` once exhausted, propagating as
-/// `BootError::OutOfMemory` — diagnose by bumping this constant rather than
-/// silently truncating.
-const FRAME_LOG_CAP: usize = 160;
-
 /// x86-64 page table builder for the negotiated paging depth.
 ///
-/// Holds the physical address of the root table (PML4 or PML5) and the UEFI
-/// boot services pointer used to allocate intermediate table frames on
-/// demand.
+/// Holds the physical address of the root table (PML4 or PML5) and the
+/// contiguous frame pool, allocated once at construction, that the root and
+/// every intermediate table come from.
 pub struct BootPageTable
 {
     /// Physical address of the root table, below 4 GiB.
@@ -173,49 +159,54 @@ pub struct BootPageTable
     /// Translation levels of the negotiated depth (4 / 5), captured from
     /// [`negotiated_depth`] at construction.
     levels: usize,
-    /// UEFI boot services pointer for frame allocation.
-    bs: *mut crate::uefi::EfiBootServices,
-    /// Physical addresses of every frame allocated for this builder's tables
-    /// (root + every intermediate frame), and of the LA57 toggle page when
-    /// one is installed, which is dead once the kernel runs. Appended to
-    /// `BootInfo.reclaim_ranges` for kernel reclamation per
-    /// `core/boot/docs/page-tables.md` § Page Table Frame Tracking.
-    frame_log: [u64; FRAME_LOG_CAP],
-    /// Number of valid entries in [`Self::frame_log`].
-    frame_log_len: usize,
+    /// Physical base of the contiguous frame pool every table comes from, the
+    /// root its first frame; wholly below 4 GiB ([`ROOT_MAX_PHYS`]).
+    pool_phys: u64,
+    /// Frames in the pool, sized by `paging::table_frame_bound`.
+    pool_frames: u64,
+    /// Frames of the pool already taken as tables, the root included.
+    pool_used: u64,
+    /// The `(base, pages)` spans dead once the kernel runs, appended to
+    /// `BootInfo.reclaim_ranges` per `core/boot/docs/page-tables.md` § Page
+    /// Table Frame Tracking: the whole pool, and the LA57 toggle page when one
+    /// is installed.
+    reclaim: [(u64, u64); 2],
+    /// Number of valid entries in [`Self::reclaim`].
+    reclaim_len: usize,
 }
 
 impl PageTableBuilder for BootPageTable
 {
-    fn new(bs: *mut crate::uefi::EfiBootServices) -> Option<Self>
+    fn translation_levels() -> usize
     {
+        negotiated_depth().levels()
+    }
+
+    fn new(bs: *mut crate::uefi::EfiBootServices, table_frames: u64) -> Option<Self>
+    {
+        let frames = usize::try_from(table_frames).ok()?.max(1);
         // SAFETY: bs is valid pre-ExitBootServices; the allocation returns the
-        // physical address of a fresh EfiLoaderData page below 4 GiB.
-        let root_phys = unsafe { crate::uefi::allocate_pages_max_addr(bs, ROOT_MAX_PHYS, 1).ok()? };
-        // SAFETY: root_phys points to one PAGE_SIZE region of allocated memory.
-        // Zeroing ensures all entries have P=0 (not present); absent entries
-        // are never walked by the hardware regardless of other bits.
-        // cast_possible_truncation: PAGE_SIZE is 4096, fits in usize on all targets.
-        #[allow(clippy::cast_possible_truncation)]
-        unsafe {
-            core::ptr::write_bytes(root_phys as *mut u8, 0, PAGE_SIZE as usize);
-        }
-        let mut frame_log = [0u64; FRAME_LOG_CAP];
-        frame_log[0] = root_phys;
-        let mut frame_log_len = 1;
+        // physical base of `frames` fresh EfiLoaderData pages ending below
+        // 4 GiB, so the root (the first frame) is below ROOT_MAX_PHYS.
+        let pool_phys =
+            unsafe { crate::uefi::allocate_pages_max_addr(bs, ROOT_MAX_PHYS, frames).ok()? };
+        let mut table = Self {
+            root_phys: 0,
+            levels: negotiated_depth().levels(),
+            pool_phys,
+            pool_frames: frames as u64,
+            pool_used: 0,
+            reclaim: [(pool_phys, frames as u64), (0, 0)],
+            reclaim_len: 1,
+        };
+        table.root_phys = table.alloc_table()?;
         let toggle = super::handoff::la57_toggle_page();
         if toggle != 0
         {
-            frame_log[1] = toggle;
-            frame_log_len = 2;
+            table.reclaim[1] = (toggle, 1);
+            table.reclaim_len = 2;
         }
-        Some(Self {
-            root_phys,
-            levels: negotiated_depth().levels(),
-            bs,
-            frame_log,
-            frame_log_len,
-        })
+        Some(table)
     }
 
     fn map(&mut self, virt: u64, phys: u64, size: u64, flags: PageFlags) -> Result<(), MapError>
@@ -245,9 +236,9 @@ impl PageTableBuilder for BootPageTable
         self.root_phys
     }
 
-    fn allocated_frames(&self) -> &[u64]
+    fn reclaim_spans(&self) -> &[(u64, u64)]
     {
-        &self.frame_log[..self.frame_log_len]
+        &self.reclaim[..self.reclaim_len]
     }
 }
 
@@ -315,28 +306,28 @@ impl BootPageTable
         Ok(frame)
     }
 
-    /// Allocate and zero one 4 KiB frame for use as an intermediate page table.
+    /// Take and zero the pool's next 4 KiB frame for use as a page table.
     ///
-    /// Returns the physical address of the frame, or `None` on allocation failure
-    /// (UEFI out-of-memory or [`FRAME_LOG_CAP`] exhausted).
+    /// Returns the physical address of the frame, or `None` when the pool is
+    /// exhausted, which a pool sized by `paging::table_frame_bound` over every
+    /// mapped range never is.
     fn alloc_table(&mut self) -> Option<u64>
     {
-        if self.frame_log_len >= FRAME_LOG_CAP
+        if self.pool_used >= self.pool_frames
         {
             return None;
         }
-        // SAFETY: self.bs is valid pre-ExitBootServices; allocate_pages returns a
-        // physical address of a freshly allocated EfiLoaderData region.
-        let frame = unsafe { crate::uefi::allocate_pages(self.bs, 1).ok()? };
-        // SAFETY: frame points to one PAGE_SIZE region of allocated memory.
-        // Zeroing ensures all entries have P=0 (not present).
+        let frame = self.pool_phys + self.pool_used * PAGE_SIZE;
+        self.pool_used += 1;
+        // SAFETY: frame is a page of the pool `new` allocated, below its end,
+        // identity-mapped under UEFI and not yet handed out. Zeroing ensures
+        // all entries have P=0 (not present); absent entries are never walked
+        // by the hardware regardless of other bits.
         // cast_possible_truncation: PAGE_SIZE is 4096, fits in usize on all targets.
         #[allow(clippy::cast_possible_truncation)]
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
         }
-        self.frame_log[self.frame_log_len] = frame;
-        self.frame_log_len += 1;
         Some(frame)
     }
 }

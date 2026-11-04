@@ -219,7 +219,7 @@ impl ExtendedState
     }
 
     /// Construct a populated `ExtendedState` from the per-thread save-area
-    /// page that thread creation carves from the Thread retype slot
+    /// pages that thread creation carves from the Thread retype slot
     /// (`sys_cap_create_thread`; init's thread in `kernel_entry_post_rebase`).
     pub const fn from_raw(area: *mut u8) -> Self
     {

@@ -390,10 +390,10 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 /// trapping instruction would re-trap forever).
 ///
 /// The V restore is skipped when [`vlenb`] is zero, which holds only before
-/// [`cache_vlenb`] runs at BSP init. Only the boot hart is probed: it halts
-/// there when it lacks V. A secondary hart is never probed, so one without V is
-/// not refused at boot; harts are assumed uniform, and on such a hart the first
-/// V restore here takes a supervisor illegal-instruction trap, which is fatal
+/// [`cache_vlenb`] runs in Phase 5. Every hart is probed at boot: the boot
+/// hart in [`cache_vlenb`], each secondary hart in [`check_ap_vlenb`], whose
+/// `vlenb` read takes a fatal supervisor illegal-instruction trap on a hart
+/// without V and which halts on a `vlenb` other than the boot hart's
 /// (docs/platform-requirements.md § Boot-Time Feature Gate).
 ///
 /// # Safety
@@ -448,38 +448,43 @@ pub unsafe fn lazy_restore_fp_v(_area: *const u8, _frame: &mut super::trap_frame
 /// the lazy-trap path then skips V save/restore.
 static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Cap on supported `vlenb`. With 304 bytes of F/D + V-header prefix and
-/// 32 V registers, the per-thread 4 KiB save area accommodates
-/// `vlenb <= 118`; 64 (VLEN = 512) leaves comfortable headroom and covers
-/// every realistic RVA23-class implementation as of writing.
-const MAX_VLENB: u64 = 64;
-
-/// Return the cached `vlenb`. Returns 0 only before [`cache_vlenb`] runs at
-/// BSP init. Only the boot hart is probed: it halts in [`cache_vlenb`] when it
-/// lacks V, and a secondary hart is never probed, so one without V is not
-/// refused at boot (docs/platform-requirements.md § Boot-Time Feature Gate).
-// dead_code fires only under `test`: `vlenb` is read only by the non-test `lazy_restore_fp_v`;
-// the `#[cfg(test)]` stub of `lazy_restore_fp_v` does not reference it.
+/// Return the boot hart's cached `vlenb`, which every secondary hart shares
+/// ([`check_ap_vlenb`]). Returns 0 only before [`cache_vlenb`] runs in Phase
+/// 5 ([`report_save_area`]; docs/platform-requirements.md § Boot-Time Feature
+/// Gate).
+// dead_code fires only under `test`: `vlenb` is read only by non-test code
+// (`lazy_restore_fp_v`, `check_ap_vlenb`); their `#[cfg(test)]` stubs do not
+// reference it.
 #[cfg_attr(test, allow(dead_code))]
 pub fn vlenb() -> u64
 {
     VLENB.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Read CSR `vlenb` on the running hart and cache it for later
-/// save-restore sizing. Must be called once at boot, before any user code
-/// runs. The CSR access requires `sstatus.VS != Off`; this function
-/// temporarily promotes VS to Initial, reads `vlenb`, then restores
-/// VS = Off.
-///
-/// Halts via [`crate::fatal`] if `vlenb` is zero or exceeds [`MAX_VLENB`]
-/// (the Vector requirement and `vlenb` ceiling are defined in
-/// `docs/platform-requirements.md` § riscv64 Classification).
+/// Offset of `v0` in the save area: the 32 F/D registers and `fcsr` (264
+/// bytes), then `vstart`, `vl`, `vtype` and `vcsr`, padded to 304. The save
+/// and restore asm ([`save_v_to`], [`restore_v_from`]) takes it as a `const`
+/// operand, and the area's size is computed from it ([`cache_vlenb`]), so the
+/// layout is stated once.
+const V_REGS_OFFSET: u64 = 304;
+
+/// Largest `vlenb` the V specification allows (VLEN 65536). A hart reporting
+/// more is not conforming; refusing it keeps the save-area arithmetic in range.
+const VLENB_SPEC_MAX: u64 = 8192;
+
+/// Read CSR `vlenb` on the running hart. The CSR access requires
+/// `sstatus.VS != Off`; this function temporarily promotes VS to Initial,
+/// reads `vlenb`, then restores VS = Off. On a hart without the V extension
+/// the read takes an S-mode illegal-instruction trap, which the trap handler
+/// treats as a fatal kernel exception: that is how such a hart is refused.
 ///
 /// # Safety
-/// Must execute in supervisor mode.
+/// Must execute in supervisor mode, with this hart's trap vector installed,
+/// `sscratch` zero and its per-CPU pointer (`tp`) installed
+/// (`percpu::init_bsp` / `percpu::init_ap`), so a trap on a hart without V
+/// takes the S-mode path to the fatal handler, which reads `current_cpu()`.
 #[cfg(not(test))]
-pub unsafe fn cache_vlenb()
+unsafe fn read_vlenb() -> u64
 {
     // Promote VS to Initial so the vlenb CSR read does not trap.
     // SAFETY: csrs sstatus is privileged S-mode.
@@ -511,16 +516,81 @@ pub unsafe fn cache_vlenb()
             options(nostack, nomem),
         );
     }
-    if v == 0 || v > MAX_VLENB
+    v
+}
+
+/// Read the boot hart's `vlenb`, cache it for the save-restore paths, and
+/// report the per-thread save area it needs (the [`V_REGS_OFFSET`] prefix
+/// and 32 vector registers, `crate::sched::thread_slot`), which sizes every
+/// Thread retype slot. Must be called once at boot, before any Thread is
+/// created.
+///
+/// Halts via [`crate::fatal`] if `vlenb` is zero, above [`VLENB_SPEC_MAX`],
+/// or not a power of two (the Vector requirement is defined in
+/// `docs/platform-requirements.md` § riscv64 Classification). Any other
+/// `vlenb` is accepted: the save area grows with it.
+///
+/// # Safety
+/// [`read_vlenb`]'s contract, on the boot hart.
+#[cfg(not(test))]
+unsafe fn cache_vlenb()
+{
+    // SAFETY: the caller's contract is `read_vlenb`'s, so a boot hart without
+    // V halts in the trap handler at the read.
+    let v = unsafe { read_vlenb() };
+    if v == 0 || v > VLENB_SPEC_MAX || !v.is_power_of_two()
     {
-        crate::fatal("RISC-V vlenb out of range (0 or > MAX_VLENB) for this kernel build");
+        crate::fatal(
+            "RISC-V vlenb is zero, above 8192, or not a power of two: the boot hart's Vector \
+             extension is unusable",
+        );
     }
     VLENB.store(v, core::sync::atomic::Ordering::Relaxed);
+    // At most 304 + 32 * 8192 bytes: the bound above keeps it in range.
+    crate::sched::thread_slot::set_extended_bytes(V_REGS_OFFSET + 32 * v);
+}
+
+/// Read the boot hart's `vlenb` and report the per-thread save area it
+/// needs ([`cache_vlenb`]). The arch contract's `fpu::report_save_area`,
+/// called by Phase 5 after `percpu::init_bsp`.
+///
+/// # Safety
+/// Must execute in supervisor mode on the boot hart, once, after
+/// `interrupts::init` installed the trap vector and cleared `sscratch` and
+/// `percpu::init_bsp` installed `tp` ([`read_vlenb`]), and before any Thread
+/// is created.
+#[cfg(not(test))]
+pub unsafe fn report_save_area()
+{
+    // SAFETY: the caller's contract is `cache_vlenb`'s.
+    unsafe { cache_vlenb() };
+}
+
+/// Halt the boot when this secondary hart's `vlenb` differs from the boot
+/// hart's. Every Thread's save area is sized from the boot hart's `vlenb`,
+/// while [`save_v_to`] and [`restore_v_from`] stride by the running hart's,
+/// so a wider hart would write past the area (docs/platform-requirements.md
+/// § riscv64 Classification requires uniform harts). Called once per AP
+/// during its early init, after [`cache_vlenb`] ran on the boot hart.
+///
+/// # Safety
+/// Must execute in supervisor mode, after this hart installed its trap
+/// vector, cleared `sscratch` and installed `tp` ([`read_vlenb`]).
+#[cfg(not(test))]
+pub unsafe fn check_ap_vlenb()
+{
+    // SAFETY: the caller's contract, which `read_vlenb` needs: a hart without
+    // V halts in the trap handler at the read.
+    let v = unsafe { read_vlenb() };
+    if v != vlenb()
+    {
+        crate::fatal("RISC-V: a secondary hart's vlenb differs from the boot hart's");
+    }
 }
 
 /// No-op test stub.
 #[cfg(test)]
-pub unsafe fn cache_vlenb() {}
+pub unsafe fn check_ap_vlenb() {}
 
 /// Save V state (vstart, vl, vtype, vcsr and v0..v31) to `area`.
 ///
@@ -533,7 +603,7 @@ pub unsafe fn cache_vlenb() {}
 ///
 /// # Safety
 /// Must execute in supervisor mode. `sstatus.VS` must be non-Off. `area`
-/// must be the per-thread save area page (4 KiB).
+/// must be the per-thread save area (`thread_slot::extended_area_bytes`).
 #[cfg(not(test))]
 #[inline]
 unsafe fn save_v_to(area: *mut u8)
@@ -551,7 +621,7 @@ unsafe fn save_v_to(area: *mut u8)
             "sd {tmp}, 280({a})",
             "csrr {tmp}, vcsr",
             "sd {tmp}, 288({a})",
-            "addi {p}, {a}, 304",
+            "addi {p}, {a}, {off}",
             "csrr {stride}, vlenb",
             "slli {stride}, {stride}, 3",
             "vs8r.v v0, ({p})",
@@ -563,6 +633,7 @@ unsafe fn save_v_to(area: *mut u8)
             "vs8r.v v24, ({p})",
             ".option pop",
             a = in(reg) area,
+            off = const V_REGS_OFFSET,
             tmp = out(reg) _,
             p = out(reg) _,
             stride = out(reg) _,
@@ -600,7 +671,7 @@ unsafe fn restore_v_from(area: *const u8)
         core::arch::asm!(
             ".option push",
             ".option arch, +v",
-            "addi {p}, {a}, 304",
+            "addi {p}, {a}, {off}",
             "csrr {stride}, vlenb",
             "slli {stride}, {stride}, 3",
             "vl8re8.v v0, ({p})",
@@ -621,6 +692,7 @@ unsafe fn restore_v_from(area: *const u8)
             "csrw vstart, {tmp}",
             ".option pop",
             a = in(reg) area,
+            off = const V_REGS_OFFSET,
             tmp = out(reg) _,
             vl = out(reg) _,
             vtype = out(reg) _,

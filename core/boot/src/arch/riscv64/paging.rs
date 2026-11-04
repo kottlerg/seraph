@@ -225,24 +225,11 @@ const PAGE_SIZE_USIZE: usize = 4096;
 /// Number of entries in a single page table (all levels).
 const TABLE_ENTRIES: usize = 512;
 
-/// Capacity of the page-table frame log used for post-handoff reclamation.
-///
-/// Sized to cover the root plus every intermediate frame allocated
-/// during identity mapping of kernel, init, modules, framebuffer, and
-/// file-read buffers. Empirically a six-module seraph boot uses ~95
-/// frames at four levels; Sv57 adds one intermediate level (roughly one
-/// extra frame per distinct top-level chain), so this cap keeps >=25%
-/// headroom above that. The reclaim array's backing page in `BootInfo`
-/// holds up to `MAX_RECLAIM_RANGES` (256) entries, so this cap is the
-/// binding limit; `alloc_table` returns `None` once exhausted,
-/// propagating as `BootError::OutOfMemory` — diagnose by bumping this
-/// constant rather than silently truncating.
-const FRAME_LOG_CAP: usize = 160;
-
 /// RISC-V page table builder for the negotiated paging mode.
 ///
-/// Holds the physical address of the root table and the UEFI boot services
-/// pointer used to allocate intermediate table frames on demand.
+/// Holds the physical address of the root table and the contiguous frame
+/// pool, allocated once at construction, that the root and every intermediate
+/// table come from.
 pub struct BootPageTable
 {
     /// Physical address of the root table.
@@ -250,40 +237,43 @@ pub struct BootPageTable
     /// Translation levels of the negotiated mode (3 / 4 / 5), captured from
     /// [`negotiated_mode`] at construction.
     levels: usize,
-    /// UEFI boot services pointer for frame allocation.
-    bs: *mut crate::uefi::EfiBootServices,
-    /// Physical addresses of every frame allocated for this builder's tables
-    /// (root + every intermediate frame). Recorded in `BootInfo.reclaim_ranges`;
-    /// their reclamation is described in
+    /// Physical base of the contiguous frame pool every table comes from, the
+    /// root its first frame.
+    pool_phys: u64,
+    /// Frames in the pool, sized by `paging::table_frame_bound`.
+    pool_frames: u64,
+    /// Frames of the pool already taken as tables, the root included.
+    pool_used: u64,
+    /// The pool as one `(base, pages)` span, recorded in
+    /// `BootInfo.reclaim_ranges`; its reclamation is described in
     /// [`core/boot/docs/page-tables.md`](../../../docs/page-tables.md)
     /// § Page Table Frame Tracking.
-    frame_log: [u64; FRAME_LOG_CAP],
-    /// Number of valid entries in [`Self::frame_log`].
-    frame_log_len: usize,
+    reclaim: [(u64, u64); 1],
 }
 
 impl PageTableBuilder for BootPageTable
 {
-    fn new(bs: *mut crate::uefi::EfiBootServices) -> Option<Self>
+    fn translation_levels() -> usize
     {
-        // SAFETY: bs is valid pre-ExitBootServices; allocate_pages returns a
-        // physical address of a freshly allocated EfiLoaderData region.
-        let root_phys = unsafe { crate::uefi::allocate_pages(bs, 1).ok()? };
-        // SAFETY: root_phys points to one PAGE_SIZE region of allocated memory.
-        // Zeroing ensures all entries have V=0 (invalid), which is the correct
-        // initial state for a page table at any level.
-        unsafe {
-            core::ptr::write_bytes(root_phys as *mut u8, 0, PAGE_SIZE_USIZE);
-        }
-        let mut frame_log = [0u64; FRAME_LOG_CAP];
-        frame_log[0] = root_phys;
-        Some(Self {
-            root_phys,
+        negotiated_mode().levels()
+    }
+
+    fn new(bs: *mut crate::uefi::EfiBootServices, table_frames: u64) -> Option<Self>
+    {
+        let frames = usize::try_from(table_frames).ok()?.max(1);
+        // SAFETY: bs is valid pre-ExitBootServices; allocate_pages returns the
+        // physical base of `frames` freshly allocated EfiLoaderData pages.
+        let pool_phys = unsafe { crate::uefi::allocate_pages(bs, frames).ok()? };
+        let mut table = Self {
+            root_phys: 0,
             levels: negotiated_mode().levels(),
-            bs,
-            frame_log,
-            frame_log_len: 1,
-        })
+            pool_phys,
+            pool_frames: frames as u64,
+            pool_used: 0,
+            reclaim: [(pool_phys, frames as u64)],
+        };
+        table.root_phys = table.alloc_table()?;
+        Some(table)
     }
 
     fn map(&mut self, virt: u64, phys: u64, size: u64, flags: PageFlags) -> Result<(), MapError>
@@ -313,9 +303,9 @@ impl PageTableBuilder for BootPageTable
         self.root_phys
     }
 
-    fn allocated_frames(&self) -> &[u64]
+    fn reclaim_spans(&self) -> &[(u64, u64)]
     {
-        &self.frame_log[..self.frame_log_len]
+        &self.reclaim
     }
 }
 
@@ -398,26 +388,25 @@ impl BootPageTable
         Ok(frame)
     }
 
-    /// Allocate and zero one 4 KiB frame for use as an intermediate page table.
+    /// Take and zero the pool's next 4 KiB frame for use as a page table.
     ///
-    /// Returns the physical address of the frame, or `None` on allocation failure
-    /// (UEFI out-of-memory or [`FRAME_LOG_CAP`] exhausted).
+    /// Returns the physical address of the frame, or `None` when the pool is
+    /// exhausted, which a pool sized by `paging::table_frame_bound` over every
+    /// mapped range never is.
     fn alloc_table(&mut self) -> Option<u64>
     {
-        if self.frame_log_len >= FRAME_LOG_CAP
+        if self.pool_used >= self.pool_frames
         {
             return None;
         }
-        // SAFETY: self.bs is valid pre-ExitBootServices; allocate_pages returns a
-        // physical address of a freshly allocated EfiLoaderData region.
-        let frame = unsafe { crate::uefi::allocate_pages(self.bs, 1).ok()? };
-        // SAFETY: frame points to one PAGE_SIZE region of allocated memory.
-        // Zeroing ensures all entries have V=0 (invalid).
+        let frame = self.pool_phys + self.pool_used * PAGE_SIZE;
+        self.pool_used += 1;
+        // SAFETY: frame is a page of the pool `new` allocated, below its end,
+        // identity-mapped under UEFI and not yet handed out. Zeroing ensures
+        // all entries have V=0 (invalid), the initial state at any level.
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE_USIZE);
         }
-        self.frame_log[self.frame_log_len] = frame;
-        self.frame_log_len += 1;
         Some(frame)
     }
 }

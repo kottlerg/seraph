@@ -152,9 +152,9 @@ that cap's address.
 
 ## Interrupt Delivery
 
-Implementation status: the kernel's binding mechanism below and devmgr's sharing of a line among
-the devices on it are implemented; the x86-64 trigger and polarity word is design intent, not yet
-implemented ([#664](https://github.com/kottlerg/seraph/issues/664)).
+Implementation status: the kernel's binding mechanism below, its trigger and polarity mode, and
+devmgr's sharing of a line among the devices on it are implemented; message-signaled interrupts
+are design intent (below).
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap and binds it to a
 Notification with `SYS_IRQ_REGISTER`. The kernel models each wired line as a source with up to
@@ -169,22 +169,24 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
 [responsibilities.md § Responsibilities](../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 - **Bind.** `SYS_IRQ_REGISTER` through an unbound object adds a binding; the line's first binding
-  routes it at its controller, and every new binding masks the line and owes an acknowledgement,
-  so the line stays masked until the new receiver's first `SYS_IRQ_ACK`. Through a bound object
-  it rebinds that binding to the new notification. A binding past the bound is refused with
-  `QuotaExceeded`.
+  records the call's trigger and polarity mode and routes the line at its controller in it, and
+  every new binding masks the line and owes an acknowledgement, so the line stays masked until
+  the new receiver's first `SYS_IRQ_ACK`. Every later binding passes the same mode, or is refused
+  with `InvalidArgument`. Through a bound object it rebinds that binding to the new notification.
+  A binding past the bound is refused with `QuotaExceeded`.
 - **Deliver.** Each assertion masks the line, marks every binding as owing an acknowledgement,
   signals every bound notification, and completes at the controller. A receiver whose device did
   not assert reads its device's interrupt status and finds nothing. Every receiver on a line
   devmgr may share MUST acknowledge each delivery promptly, whether or not it has a request in
   flight: the line stays masked until every binding has acknowledged, so a receiver that
   acknowledges only while it serves a request of its own holds the line masked for the others on
-  it while it is idle, and their devices' interrupts are lost (x86-64) or delayed (riscv64) until
-  it next does. The VirtIO drivers therefore run an interrupt-service thread that acknowledges
-  every delivery ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
-  rule 5) and also reads its device's interrupt status on a bounded timeout, which the x86-64
-  limit below needs. A driver that does not acknowledge promptly needs its line kept exclusive:
-  the serial driver acknowledges only when its client reads
+  it while it is idle, and their devices' interrupts are lost (on a line programmed edge-triggered)
+  or delayed (on a level-triggered one) until it next does. The VirtIO drivers therefore run an
+  interrupt-service thread that acknowledges every delivery
+  ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
+  rule 5) and also reads its device's interrupt status on a bounded timeout, which recovers an
+  edge-triggered line's lost edge (below). A driver that does not acknowledge promptly needs its
+  line kept exclusive: the serial driver acknowledges only when its client reads
   ([services/drivers/serial/README.md](../services/drivers/serial/README.md#interrupts)
   § Interrupts), so devmgr keeps the UART line exclusive and shares no other device onto it. The
   UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA IRQ 4; the riscv64
@@ -194,27 +196,38 @@ holds nothing, and moves the cap itself to the serial driver (devmgr's
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,
   or torn down with its holder's CSpace) or its Notification is; the line is unmasked when the
-  remaining bindings owe nothing, and released at its controller when none remains.
+  remaining bindings owe nothing, and released at its controller when none remains. A driver that
+  dies while its device asserts a level-triggered line leaves the device asserting with no
+  receiver to clear it, so the line's other receivers are signalled again on each unmask; devmgr
+  ends that by resetting a `VirtIO` device when it withdraws the device's driver
+  ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md#withdrawal)
+  § Withdrawal).
 
 The contract is specified in [core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
 § `SYS_IRQ_REGISTER` and § `SYS_IRQ_ACK`. On riscv64 the PLIC gateway is level-sensitive, so an
-assertion that persists while the line is masked is delivered at the unmask. On x86-64 the I/O
-APIC entries are programmed edge-triggered, active-high (core/kernel/src/arch/x86_64/ioapic.rs),
-and on a shared level-triggered line an assertion while the line is masked or another device holds
-it high raises no new edge, and the device stays asserted until its interrupt status is read, so
-no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed read
-(`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
+assertion that arrives while the line is masked is delivered at the unmask (QEMU's PLIC model,
+though, does not pend a source again that stays asserted across its claim and completion, which the
+drivers' timed polls cover); the mode is validated and programs nothing. On x86-64 the line's I/O
+APIC entry is programmed with the mode's trigger and polarity
+(core/kernel/src/arch/x86_64/ioapic.rs), and a level-triggered entry likewise delivers at the unmask
+an assertion still held. devmgr gives each PCI driver the mode of its `INTx` line, which every
+driver on the line then passes: on x86-64 the trigger and polarity of the MADT Interrupt Source
+Override that names the line's GSI, field by field, with the PCI default (level-triggered,
+active-low) for a field the override leaves conforming to its bus and for a line no override names;
+on riscv64 level-triggered, active-high
+([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 3). On a
+line programmed edge-triggered and shared, an assertion while the line is masked or another device
+holds it high raises no new edge, and the device stays asserted until its interrupt status is read,
+so no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed
+read (`ISR_POLL_MS`) clears that assertion and signals the waiting path, and the driver's timed poll
 finds its completion meanwhile (virtio-blk's `IRQ_WAIT_TIMEOUT_MS`, virtio-input's
-`POLL_INTERVAL_MS`), so the loss is latency, not a hang. That is the x86-64 limit until
-`SYS_IRQ_REGISTER` takes a trigger and polarity word, which devmgr sets to level, active-low for
-PCI `INTx` (design intent, not yet implemented). Devices that need several interrupts are to get
-message-signaled ones (design intent, not yet implemented;
+`POLL_INTERVAL_MS`), so the loss is latency, not a hang. Devices that need several interrupts are to
+get message-signaled ones (design intent, not yet implemented;
 [#325](https://github.com/kottlerg/seraph/issues/325)), as further sources beside the wired ones.
 The kernel delivers each routed line to one CPU, chosen when the line is first bound by taking the
 CPUs in turn, so the interrupts of several devices spread over the CPUs. On x86-64 only CPUs whose
-APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. The mechanism is
-specified in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md)
-§ `interrupts`.
+APIC id an I/O APIC can name (below `0xFF`, the broadcast id) take part. The mechanism is specified
+in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
 
 ---
 

@@ -46,7 +46,7 @@ use crate::DeviceCatalog;
 
 /// How long a batch's settle waits for its drivers to report ready or die,
 /// from the start of the settle (after the batch's last spawn), before the
-/// drivers still pending are withdrawn and destroyed.
+/// drivers still pending are destroyed and withdrawn.
 ///
 /// Derived from the longest bounded wait a driver's setup makes before its
 /// ready report: the `VirtIO` reset, which a virtio-blk or virtio-input

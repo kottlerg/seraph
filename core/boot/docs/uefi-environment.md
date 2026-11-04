@@ -81,8 +81,8 @@ allocation modes are used:
 **`AllocateAnyPages`** — the firmware selects a free physical page range. Used for
 everything whose absolute address does not matter: the bundle buffer (boot modules are
 referenced in place inside it), the kernel file buffer, the kernel image span on RISC-V,
-init image segments, page-table frames other than the x86-64 root (and, on RISC-V, the
-paging-mode probe root and the AP trampoline page), the `BootInfo` page, the module
+init image segments, the page-table frame pool on RISC-V (and the paging-mode probe root
+and the AP trampoline page), the `BootInfo` page, the module
 descriptor array, the `MemoryMapEntry` array, the `MmioAperture` array, the kernel stack,
 the reclaim-range array, and the memory map buffer. The kernel image is placed as one
 contiguous span and its base recorded in `BootInfo.kernel_physical_base`, so kernel
@@ -96,8 +96,9 @@ the kernel image span, which must lie wholly below 4 GiB because the kernel's ro
 table sits in the image's BSS and the AP trampoline loads it into CR3 with a 32-bit move
 (`BootInfo.kernel_physical_base` in
 [abi/boot-protocol](../../../abi/boot-protocol/src/lib.rs)); and, below 4 GiB, for the
-initial root page table and the LA57 toggle page, since the toggle trampoline runs with
-32-bit addresses and loads that root with a 32-bit move
+page-table frame pool, whose first frame is the initial root page table, and the LA57
+toggle page, since the toggle trampoline runs with 32-bit addresses and loads that root
+with a 32-bit move
 ([page-tables.md](page-tables.md) § x86-64: Negotiated Paging Depth).
 
 Every allocation uses memory type `EfiLoaderData` except the x86-64 LA57 toggle page, which
@@ -139,6 +140,8 @@ The acquisition sequence:
    Note: this allocation itself invalidates any prior map key.
 3. Call GetMemoryMap(buf_size, buf_addr, &map_key, &desc_size, &desc_version)
    to fill the buffer. The map_key from this call is the correct one to use.
+   A desc_size below EFI_MEMORY_DESCRIPTOR's fails the boot
+   (BootError::InvalidMemoryMap): every reader steps through the map at it.
 ```
 
 Translation into `MemoryType` and the ascending sort by `physical_base` run after
@@ -169,7 +172,9 @@ The call sequence:
 3. If the call returns EFI_INVALID_PARAMETER (stale map key):
    a. Call GetMemoryMap again with the existing buffer (no new allocation),
       passing the full allocated buffer capacity as the size in-param.
-   b. Update map_key from the new call.
+   b. Update map_key, the map size and the descriptor size from the new call,
+      rejecting a descriptor size below EFI_MEMORY_DESCRIPTOR's (the body it
+      rewrote is read at that stride).
    c. Retry ExitBootServices.
    d. Repeat from step 3 up to EXIT_BOOT_SERVICES_MAX_ATTEMPTS times total.
    e. If still failing after the bound: halt — the environment is unrecoverable.
@@ -227,14 +232,17 @@ defined in [`core/boot/src/error.rs`](../src/error.rs). The variant set covers
 protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
 failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
-and, on RISC-V, no supported paging mode passing the satp probe (`PagingModeUnsupported`);
-the source is the authority on the variant list and payloads.
+on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
+a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), and, in
+step 9, RAM descriptors past the translated memory map (`MemoryMapTruncated`,
+[memory-map.md](memory-map.md) § Sizing the Entry Array) and a `reclaim_ranges` overflow
+(`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
+source is the authority on the variant list and payloads.
 
 The top-level `efi_main` propagates every `BootError` to a single fatal handler
-(`error::fatal_error`) that reports the error and halts. Two halts bypass it: a
-`reclaim_ranges` overflow in step 9 prints
-`[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)` and spins in
-place, and a panic prints `SERAPH BOOT PANIC: <panic info>` from the panic handler.
+(`error::fatal_error`) that reports the error and halts; it needs no boot service, so
+the step 9 failures, after `ExitBootServices`, reach it too. Only a panic bypasses it,
+printing `SERAPH BOOT PANIC: <panic info>` from the panic handler.
 
 ### Error Reporting
 

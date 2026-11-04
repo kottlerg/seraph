@@ -22,7 +22,9 @@
 
 // cast_possible_truncation: all u64→u32 casts in this file extract cap slot indices
 // from 64-bit trap frame registers. Seraph runs on 64-bit only; slot indices are
-// defined as u32 and always fit. No truncation occurs in practice.
+// defined as u32 and always fit. The u64→usize cast of the Thread save-area byte
+// count (`sys_cap_create_thread`) is lossless for the same reason: usize is 64
+// bits on every target. No truncation occurs in practice.
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
@@ -919,7 +921,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
 ///
 /// arg0 = Memory capability handle (generation-checked; must have RETYPE);
-///        supplies the 6-page Thread slot.
+///        supplies the Thread slot (`sched::thread_slot::thread_slot_bytes`,
+///        `SystemInfoType::ThreadRetypeBytes`).
 /// arg1 = `AddressSpace` capability handle (generation-checked; must have MAP).
 /// arg2 = `CSpace` capability handle (generation-checked; must have INSERT).
 /// arg3 = `SchedControl` capability handle (generation-checked), or 0.
@@ -977,8 +980,9 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Memory cap; consumes 6 retype-pages (4 kstack +
-    // 1 wrapper/TCB + 1 FPU/SIMD save area).
+    // Resolve the source Memory cap; consumes the Thread slot (4 kstack pages
+    // + 1 wrapper/TCB page + the FPU/SIMD/V save-area pages,
+    // `sched::thread_slot::thread_slot_bytes`).
     // SAFETY: caller_cspace validated non-null above.
     let memory_slot_ref =
         unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::RETYPE)? };
@@ -1067,14 +1071,16 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Reserve the 6-page slot from the source Memory cap. Layout:
+    // Reserve the slot from the source Memory cap
+    // (`sched::thread_slot::thread_slot_bytes`). Layout:
     //   pages 0..3 (16 KiB) — kstack
     //   page 4              — ThreadObject followed by TCB (at size_of::<ThreadObject>())
-    //   page 5              — per-thread FPU/SIMD/V save area
+    //   pages 5..           — per-thread FPU/SIMD/V save area, one page or more
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
+    let extended_bytes = crate::sched::thread_slot::extended_area_bytes();
     debug_assert_eq!(
         entry.raw_bytes,
-        (KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64
+        (KERNEL_STACK_PAGES + 1) as u64 * PAGE_SIZE as u64 + extended_bytes
     );
     let offset = retype_allocate(memory, entry.raw_bytes)?;
     let block_phys = memory.base + offset;
@@ -1091,16 +1097,17 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     let thread_obj_ptr = kstack_top as *mut ThreadObject;
     let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
     let tcb_ptr = (kstack_top + tcb_offset) as *mut ThreadControlBlock;
-    // Per-thread FPU/SIMD/V save area: one page directly after the wrapper
+    // Per-thread FPU/SIMD/V save area: its pages directly after the wrapper
     // page. Zero-initialised so the first XRSTOR / F-D restore sees the
     // architected initial state. The area's lifecycle is the Thread retype
     // slot's; `retype_free` reclaims it wholesale, so no separate free
     // path is needed.
     let extended_area = (kstack_top + PAGE_SIZE as u64) as *mut u8;
-    // SAFETY: extended_area points at a freshly-retyped page exclusively
-    // owned by this TCB construction.
+    // SAFETY: extended_area points at the freshly-retyped save-area pages,
+    // `extended_bytes` of them at the end of the slot, exclusively owned by
+    // this TCB construction.
     unsafe {
-        core::ptr::write_bytes(extended_area, 0u8, PAGE_SIZE);
+        core::ptr::write_bytes(extended_area, 0u8, extended_bytes as usize);
     }
 
     // Build the initial SavedState. The "entry point" is the user_thread_trampoline

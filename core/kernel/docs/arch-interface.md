@@ -428,14 +428,16 @@ pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
 
-/// Route a device IRQ to a destination CPU and leave it masked at the
-/// controller; the driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a
-/// device IDT vector and installs its IOAPIC redirection entry; RISC-V records
-/// the source's target hart. Fails with `irq::RouteError::NoSuchLine` for a line
-/// no discovered controller implements, `Exhausted` when the controller has no
-/// delivery resource left (x86-64: every device vector assigned). Called by
+/// Route a device IRQ to a destination CPU in `mode` (the `SYS_IRQ_REGISTER`
+/// trigger and polarity word) and leave it masked at the controller; the
+/// driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a device IDT vector
+/// and installs its IOAPIC redirection entry with `mode`'s trigger and polarity
+/// bits; RISC-V records the source's target hart and programs nothing from
+/// `mode`. Fails with `irq::RouteError::NoSuchLine` for a line no discovered
+/// controller implements, `Exhausted` when the controller has no delivery
+/// resource left (x86-64: every device vector assigned). Called by
 /// `irq::register` for a line's first binding, under its routing lock.
-pub unsafe fn route_device_irq(irq: u32) -> Result<(), irq::RouteError>;
+pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), irq::RouteError>;
 /// Release a routed line: mask it and free what `route_device_irq` assigned (the
 /// x86-64 device vector; the RISC-V target hart). Called by `irq` when a line's
 /// last binding is removed, under its routing lock.
@@ -798,7 +800,7 @@ architecture-neutral code calls them:
 `gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, init_ap, bsp_tss_ptr}`,
 `platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions,
 MMIO_DIRECT_MAP_REGIONS}`,
-`fpu::{switch_out_save, switch_in_restore}`, `idt::load`, and
+`fpu::{switch_out_save, switch_in_restore, report_save_area}`, `idt::load`, and
 `ap_trampoline::{setup_trampoline, start_ap}` (the `gdt` items are stubs on RISC-V); the rest
 of those modules is arch-private:
 
@@ -830,6 +832,13 @@ pub unsafe fn idt::load();
 /// sets `CR0.TS`; a no-op on RISC-V, where the trap path restores lazily).
 pub unsafe fn fpu::switch_out_save(tcb: *mut ThreadControlBlock);
 pub unsafe fn fpu::switch_in_restore(tcb: *mut ThreadControlBlock);
+/// Report the BSP's per-thread extended-state save-area size to
+/// `sched::thread_slot`, which sizes every Thread retype slot: x86-64 the
+/// XSAVE size of the enabled XCR0 components (CPUID leaf 0xD); RISC-V
+/// `304 + 32 * vlenb` from the boot hart's `vlenb`, halting the boot on a
+/// `vlenb` of 0, above 8192, or not a power of two. Called once in Phase 5,
+/// after the per-CPU install, before any Thread exists.
+pub unsafe fn fpu::report_save_area();
 
 /// Physical (base, size) of a boot console UART needing a dedicated `Mmio`
 /// capability at Phase 7: `Some` on RISC-V (ns16550, which may also lie inside an aperture);

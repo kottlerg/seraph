@@ -17,82 +17,7 @@ use crate::uefi::{
 };
 use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
-/// Translate a UEFI memory map into the boot protocol's `MemoryMapEntry` format.
-///
-/// Iterates `uefi_map.map_size / uefi_map.descriptor_size` descriptors and
-/// converts each UEFI memory type to a [`MemoryType`]. Writes at most
-/// `max_entries` entries to `out`. Returns the number of entries written.
-///
-/// # Safety
-/// `out` must point to an allocation of at least `max_entries * size_of::<MemoryMapEntry>()`
-/// bytes. `uefi_map.buffer_phys` must be the UEFI raw map buffer from the most
-/// recent `GetMemoryMap` call, with valid descriptors.
-pub unsafe fn translate_memory_map(
-    uefi_map: &crate::uefi::MemoryMapResult,
-    out: *mut MemoryMapEntry,
-    max_entries: usize,
-) -> usize
-{
-    let mut count: usize = 0;
-    let mut offset: usize = 0;
-
-    while offset + uefi_map.descriptor_size <= uefi_map.map_size && count < max_entries
-    {
-        // SAFETY: uefi_map.buffer_phys is the UEFI raw map buffer; offset is
-        // within map_size; the descriptor at this offset is a valid EfiMemoryDescriptor.
-        // cast_possible_truncation: buffer_phys is a UEFI physical address; on all
-        // supported UEFI targets (x86_64, riscv64) usize == u64, so no truncation occurs.
-        #[allow(clippy::cast_possible_truncation)]
-        let desc =
-            unsafe { &*((uefi_map.buffer_phys as usize + offset) as *const EfiMemoryDescriptor) };
-
-        let memory_type = translate_memory_type(desc.memory_type);
-        let size_bytes = desc.number_of_pages * 4096;
-
-        // SAFETY: count < max_entries; out[count] is within the allocated array.
-        unsafe {
-            core::ptr::write(
-                out.add(count),
-                MemoryMapEntry {
-                    physical_base: desc.physical_start,
-                    size: size_bytes,
-                    memory_type,
-                },
-            );
-        }
-        count += 1;
-        offset += uefi_map.descriptor_size;
-    }
-
-    count
-}
-
-/// Translate a UEFI `EFI_MEMORY_TYPE` value to the boot protocol's [`MemoryType`].
-///
-/// The mapping is defined in `core/boot/docs/memory-map.md`
-/// § UEFI Memory Type → `MemoryType`.
-fn translate_memory_type(uefi_type: u32) -> MemoryType
-{
-    match uefi_type
-    {
-        EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA =>
-        {
-            MemoryType::Usable
-        }
-
-        EFI_LOADER_CODE | EFI_LOADER_DATA => MemoryType::Loaded,
-
-        EFI_ACPI_RECLAIM_MEMORY => MemoryType::AcpiReclaimable,
-
-        EFI_PERSISTENT_MEMORY => MemoryType::Persistent,
-
-        // Every other type is Reserved, per core/boot/docs/memory-map.md
-        // § UEFI Memory Type → `MemoryType`.
-        _ => MemoryType::Reserved,
-    }
-}
-
-// ── MMIO aperture derivation ─────────────────────────────────────────────────
+// ── Raw descriptor iteration ─────────────────────────────────────────────────
 
 /// Iterator over the descriptors of a raw UEFI memory map, yielding each
 /// descriptor by value.
@@ -124,7 +49,12 @@ impl Iterator for RawDescriptors<'_>
 
     fn next(&mut self) -> Option<EfiMemoryDescriptor>
     {
-        if self.map.descriptor_size == 0
+        // A stride below the descriptor would read past it and, at the last
+        // stride, past `map_size`. `uefi::check_descriptor_size` rejects one at
+        // every read of the firmware's map (the step 6 count query, the step 7
+        // fill, and the `ExitBootServices` retry), and the guard reads nothing
+        // from a map that carries one, a zero stride included.
+        if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
             || self.offset + self.map.descriptor_size > self.map.map_size
         {
             return None;
@@ -140,6 +70,118 @@ impl Iterator for RawDescriptors<'_>
         Some(unsafe { core::ptr::read_unaligned(ptr) })
     }
 }
+
+// ── Memory map translation ───────────────────────────────────────────────────
+
+/// Outcome of [`translate_memory_map`]: the entries written, and the
+/// descriptors past the output's capacity that were not, split by whether
+/// they translate to RAM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MapTranslation
+{
+    /// Entries written to the output.
+    pub count: usize,
+    /// Descriptors not written that translate to a RAM type (`Usable`,
+    /// `Loaded`, `AcpiReclaimable` or `Persistent`): memory the kernel would
+    /// never learn of.
+    pub dropped_ram: usize,
+    /// Descriptors not written that translate to `Reserved`.
+    pub dropped_other: usize,
+}
+
+/// Whether `t` names RAM: the types the boot protocol's
+/// `mmio_apertures` contract (abi/boot-protocol/README.md) classifies as RAM.
+fn is_ram(t: MemoryType) -> bool
+{
+    !matches!(t, MemoryType::Reserved)
+}
+
+/// Translate a UEFI memory map into the boot protocol's `MemoryMapEntry` format.
+///
+/// Iterates `uefi_map.map_size / uefi_map.descriptor_size` descriptors (none
+/// when the descriptor size is below `EFI_MEMORY_DESCRIPTOR`'s) and
+/// converts each UEFI memory type to a [`MemoryType`]. Writes at most
+/// `max_entries` entries to `out` and counts the descriptors past that
+/// capacity, by class, in the returned [`MapTranslation`], so the caller can
+/// refuse to boot on lost RAM.
+///
+/// # Safety
+/// `out` must point to an allocation of at least `max_entries * size_of::<MemoryMapEntry>()`
+/// bytes. `uefi_map.buffer_phys` must be the UEFI raw map buffer from the most
+/// recent `GetMemoryMap` call, holding valid descriptors covering
+/// `uefi_map.map_size` bytes at `uefi_map.descriptor_size` strides (the contract
+/// of `RawDescriptors::new`).
+pub unsafe fn translate_memory_map(
+    uefi_map: &crate::uefi::MemoryMapResult,
+    out: *mut MemoryMapEntry,
+    max_entries: usize,
+) -> MapTranslation
+{
+    let mut result = MapTranslation::default();
+    let mut count: usize = 0;
+
+    // SAFETY: this function's `# Safety` contract is `RawDescriptors::new`'s.
+    for desc in unsafe { RawDescriptors::new(uefi_map) }
+    {
+        let memory_type = translate_memory_type(desc.memory_type);
+        let size_bytes = desc.number_of_pages * 4096;
+        if count >= max_entries
+        {
+            if is_ram(memory_type)
+            {
+                result.dropped_ram += 1;
+            }
+            else
+            {
+                result.dropped_other += 1;
+            }
+            continue;
+        }
+
+        // SAFETY: count < max_entries; out[count] is within the allocated array.
+        unsafe {
+            core::ptr::write(
+                out.add(count),
+                MemoryMapEntry {
+                    physical_base: desc.physical_start,
+                    size: size_bytes,
+                    memory_type,
+                },
+            );
+        }
+        count += 1;
+    }
+
+    result.count = count;
+    result
+}
+
+/// Translate a UEFI `EFI_MEMORY_TYPE` value to the boot protocol's [`MemoryType`].
+///
+/// The mapping is defined in `core/boot/docs/memory-map.md`
+/// § UEFI Memory Type → `MemoryType`.
+fn translate_memory_type(uefi_type: u32) -> MemoryType
+{
+    match uefi_type
+    {
+        EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA =>
+        {
+            MemoryType::Usable
+        }
+
+        EFI_LOADER_CODE | EFI_LOADER_DATA => MemoryType::Loaded,
+
+        EFI_ACPI_RECLAIM_MEMORY => MemoryType::AcpiReclaimable,
+
+        EFI_PERSISTENT_MEMORY => MemoryType::Persistent,
+
+        // Every other type is Reserved, per core/boot/docs/memory-map.md
+        // § UEFI Memory Type → `MemoryType`.
+        _ => MemoryType::Reserved,
+    }
+}
+
+// ── MMIO aperture derivation ─────────────────────────────────────────────────
 
 /// Whether a UEFI memory type is subtracted from every named aperture seed: RAM
 /// (`EfiConventionalMemory`, `EfiBootServices*`, `EfiLoader*`,
@@ -238,9 +280,15 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
 ///   map's holes and MMIO descriptors remain and firmware-reserved DRAM
 ///   inside such a window is left out.
 ///
-/// No aperture therefore covers RAM. Writes at most `MAX_APERTURES` entries
-/// to `out` and returns the number written; surplus is dropped with a
-/// diagnostic.
+/// No aperture therefore covers RAM. Each piece is merged into `out` as it
+/// arrives ([`insert_merged`]), so `out` holds the sorted, merged apertures at
+/// every step and no scratch buffer bounds the input. When more than
+/// `MAX_APERTURES` pieces are disjoint at once, which a later piece bridging
+/// them could still undo, `out` is rebuilt by [`sweep_merged`], which takes the
+/// pieces in ascending order and so keeps exactly the lowest `MAX_APERTURES`
+/// apertures of the full merge. Returns the number of apertures in `out`; when
+/// the full merge holds more than `MAX_APERTURES`, the highest are dropped with
+/// a diagnostic.
 ///
 /// Apertures are coarse by design; see `docs/device-management.md`
 /// § Raw Firmware Passthrough for where device-level discovery happens.
@@ -257,45 +305,56 @@ pub unsafe fn derive_mmio_apertures(
     out: &mut [MmioAperture; MAX_APERTURES],
 ) -> usize
 {
-    // Scratch buffer: MAX_APERTURES * 4 gives headroom for fragmented UEFI
-    // maps plus seed pieces before the merge pass. 16 apertures × 4 × 16
-    // bytes = 1 KiB, stack-safe.
-    const SCRATCH: usize = MAX_APERTURES * 4;
-    let mut buf: [MmioAperture; SCRATCH] = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; SCRATCH];
-    let mut n: usize = 0;
-    let mut dropped = false;
-    let mut push = |ap: MmioAperture| {
-        if n < SCRATCH
-        {
-            buf[n] = ap;
-            n += 1;
-        }
-        else
-        {
-            dropped = true;
-        }
-    };
-
     // SAFETY: the caller's contract is `RawDescriptors::new`'s.
     let descriptors = unsafe { RawDescriptors::new(uefi_map) };
 
-    // Collect MMIO-class descriptors from the UEFI map.
+    let mut n: usize = 0;
+    let mut full = false;
+    for_each_piece(&descriptors, seed, heuristic, &mut |ap| {
+        if !full && !insert_merged(out, &mut n, ap)
+        {
+            full = true;
+        }
+    });
+    if !full
+    {
+        return n;
+    }
+    let (n, dropped) = sweep_merged(out, |emit| {
+        for_each_piece(&descriptors, seed, heuristic, emit);
+    });
+    if dropped
+    {
+        bprintln!(
+            "[--------] boot: MMIO apertures: more than MAX_APERTURES disjoint; the highest dropped"
+        );
+    }
+    n
+}
+
+/// Emit every aperture piece `derive_mmio_apertures` merges: the map's MMIO
+/// descriptors, then each named seed clipped to the gaps the map's RAM-class
+/// and firmware-exclusive ranges leave, then each heuristic window clipped to
+/// the map's holes and MMIO descriptors. Empty pieces are emitted too; the
+/// mergers skip them.
+fn for_each_piece(
+    descriptors: &RawDescriptors<'_>,
+    seed: &[MmioAperture],
+    heuristic: &[MmioAperture],
+    emit: &mut dyn FnMut(MmioAperture),
+)
+{
     for desc in descriptors.clone()
     {
         if is_mmio(desc.memory_type)
         {
-            push(MmioAperture {
+            emit(MmioAperture {
                 phys_base: desc.physical_start,
                 size: desc.number_of_pages.saturating_mul(4096),
             });
         }
     }
 
-    // Fold in the named seeds, each clipped to the gaps the map's RAM-class
-    // and firmware-exclusive ranges leave.
     let excluded = descriptors
         .clone()
         .filter(|d| excluded_from_apertures(d.memory_type))
@@ -304,79 +363,132 @@ pub unsafe fn derive_mmio_apertures(
     {
         if s.size != 0
         {
-            subtract_excluded(*s, &excluded, &mut push);
+            subtract_excluded(*s, &excluded, &mut *emit);
         }
     }
 
-    // Fold in the heuristic windows, each clipped to the map's holes and
-    // MMIO descriptors.
     let described = descriptors
+        .clone()
         .filter(|d| !is_mmio(d.memory_type))
         .map(|d| descriptor_range(&d));
     for s in heuristic
     {
         if s.size != 0
         {
-            subtract_excluded(*s, &described, &mut push);
+            subtract_excluded(*s, &described, &mut *emit);
         }
     }
+}
 
-    if n == 0
+/// Merge the pieces `pieces` emits into `out` by taking them in ascending
+/// `phys_base` order: each pass over the pieces finds the lowest base above
+/// the last one taken and the furthest end among the pieces at that base,
+/// which either extends the last aperture (it overlaps or abuts it) or starts
+/// the next. Taken in order, a piece can never bridge apertures already
+/// written, so the result is the lowest `out.len()` apertures of the full
+/// merge. Returns their number and whether a further aperture was dropped.
+///
+/// One pass per distinct base: quadratic in the piece count, and only run when
+/// the incremental merge filled `out`.
+fn sweep_merged(
+    out: &mut [MmioAperture],
+    pieces: impl Fn(&mut dyn FnMut(MmioAperture)),
+) -> (usize, bool)
+{
+    let mut n: usize = 0;
+    let mut last_base: Option<u64> = None;
+    loop
     {
-        return 0;
-    }
-
-    // Insertion sort by phys_base; O(n²) is fine with n ≤ 64.
-    for i in 1..n
-    {
-        let mut j = i;
-        while j > 0 && buf[j - 1].phys_base > buf[j].phys_base
-        {
-            buf.swap(j - 1, j);
-            j -= 1;
-        }
-    }
-
-    // Merge adjacent / overlapping entries in one pass.
-    let mut out_count: usize = 0;
-    let mut i: usize = 0;
-    while i < n
-    {
-        let base = buf[i].phys_base;
-        let mut end = base.saturating_add(buf[i].size);
-        let mut j = i + 1;
-        while j < n && buf[j].phys_base <= end
-        {
-            let j_end = buf[j].phys_base.saturating_add(buf[j].size);
-            if j_end > end
+        let mut next: Option<(u64, u64)> = None;
+        pieces(&mut |ap| {
+            if ap.size == 0 || last_base.is_some_and(|b| ap.phys_base <= b)
             {
-                end = j_end;
+                return;
             }
-            j += 1;
-        }
-        if out_count < out.len()
+            let end = ap.phys_base.saturating_add(ap.size);
+            next = match next
+            {
+                Some((b, e)) if b < ap.phys_base || (b == ap.phys_base && e >= end) => Some((b, e)),
+                _ => Some((ap.phys_base, end)),
+            };
+        });
+        let Some((base, end)) = next
+        else
         {
-            out[out_count] = MmioAperture {
+            return (n, false);
+        };
+        last_base = Some(base);
+        if n > 0 && base <= out[n - 1].phys_base.saturating_add(out[n - 1].size)
+        {
+            let top = out[n - 1].phys_base.saturating_add(out[n - 1].size);
+            if end > top
+            {
+                out[n - 1].size = end - out[n - 1].phys_base;
+            }
+        }
+        else if n < out.len()
+        {
+            out[n] = MmioAperture {
                 phys_base: base,
                 size: end - base,
             };
-            out_count += 1;
+            n += 1;
         }
         else
         {
-            dropped = true;
+            // Every piece still to come starts above this one, so none can
+            // join the apertures already written.
+            return (n, true);
         }
-        i = j;
     }
+}
 
-    if dropped
+/// Merge `ap` into the sorted, disjoint, non-adjacent apertures `set[..*len]`,
+/// keeping them so: `ap` joins every entry it overlaps or abuts.
+///
+/// Returns `false`, changing nothing, when `ap` stays disjoint from every entry
+/// and `set` is full. An empty `ap` changes nothing.
+fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) -> bool
+{
+    if ap.size == 0
     {
-        bprintln!(
-            "[--------] boot: MMIO apertures: entries dropped (scratch buffer or MAX_APERTURES cap)"
-        );
+        return true;
     }
-
-    out_count
+    let mut base = ap.phys_base;
+    let mut end = base.saturating_add(ap.size);
+    // Entries wholly below `ap`, not even abutting it, stay as they are.
+    let mut i = 0;
+    while i < *len && set[i].phys_base.saturating_add(set[i].size) < base
+    {
+        i += 1;
+    }
+    // Entries from `i` that start at or before `ap`'s end merge into it.
+    let mut j = i;
+    while j < *len && set[j].phys_base <= end
+    {
+        base = base.min(set[j].phys_base);
+        end = end.max(set[j].phys_base.saturating_add(set[j].size));
+        j += 1;
+    }
+    if j == i
+    {
+        if *len == set.len()
+        {
+            return false;
+        }
+        set.copy_within(i..*len, i + 1);
+        *len += 1;
+    }
+    else
+    {
+        set.copy_within(j..*len, i + 1);
+        *len -= j - i - 1;
+    }
+    set[i] = MmioAperture {
+        phys_base: base,
+        size: end - base,
+    };
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -387,8 +499,8 @@ mod tests
     use core::mem::size_of;
 
     use super::{
-        derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded, translate_memory_map,
-        translate_memory_type,
+        MapTranslation, derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded,
+        translate_memory_map, translate_memory_type,
     };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
@@ -593,8 +705,8 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; max_entries];
-        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
-        out.truncate(count);
+        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
+        out.truncate(t.count);
         out
     }
 
@@ -665,6 +777,86 @@ mod tests
         assert_eq!(entries.len(), 1);
     }
 
+    // Defect caught: a truncation that drops descriptors past the capacity
+    // without reporting them, so lost RAM boots unnoticed.
+    #[test]
+    fn descriptors_past_the_capacity_are_counted_by_class()
+    {
+        let d = |memory_type, physical_start| EfiMemoryDescriptor {
+            memory_type,
+            physical_start,
+            virtual_start: 0,
+            number_of_pages: 1,
+            attribute: 0,
+        };
+        let descs = [
+            d(EFI_CONVENTIONAL_MEMORY, 0x0000),
+            d(EFI_CONVENTIONAL_MEMORY, 0x1000),
+            d(EFI_MEMORY_MAPPED_IO, 0x2000),
+            d(EFI_LOADER_DATA, 0x3000),
+        ];
+        let stride = size_of::<EfiMemoryDescriptor>();
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: descs.len() * stride,
+            map_size: descs.len() * stride,
+            map_key: 0,
+            descriptor_size: stride,
+        };
+        let dummy = MemoryMapEntry {
+            physical_base: 0,
+            size: 0,
+            memory_type: MemoryType::Reserved,
+        };
+        let mut out = vec![dummy; 1];
+        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 1) };
+        assert_eq!(
+            t,
+            MapTranslation {
+                count: 1,
+                dropped_ram: 2,
+                dropped_other: 1,
+            }
+        );
+    }
+
+    // Defect caught: a translation loop that never advances on a zero
+    // descriptor stride and hangs the boot, or that reads a descriptor past
+    // the map at a stride shorter than the descriptor.
+    #[test]
+    fn a_descriptor_size_below_the_descriptor_translates_nothing()
+    {
+        let descs = [EfiMemoryDescriptor {
+            memory_type: EFI_CONVENTIONAL_MEMORY,
+            physical_start: 0,
+            virtual_start: 0,
+            number_of_pages: 1,
+            attribute: 0,
+        }];
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: size_of::<EfiMemoryDescriptor>(),
+            map_size: size_of::<EfiMemoryDescriptor>(),
+            map_key: 0,
+            descriptor_size: 0,
+        };
+        let dummy = MemoryMapEntry {
+            physical_base: 0,
+            size: 0,
+            memory_type: MemoryType::Reserved,
+        };
+        let mut out = vec![dummy; 1];
+        for stride in [0, 8, size_of::<EfiMemoryDescriptor>() - 1]
+        {
+            let map = MemoryMapResult {
+                descriptor_size: stride,
+                ..uefi_map
+            };
+            let t = unsafe { translate_memory_map(&map, out.as_mut_ptr(), 1) };
+            assert_eq!(t, MapTranslation::default(), "stride {stride}");
+        }
+    }
+
     #[test]
     fn zero_length_map_returns_zero_entries()
     {
@@ -706,7 +898,7 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; 4];
-        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) };
+        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) }.count;
         assert_eq!(count, 1);
         assert_eq!(out[0].memory_type, MemoryType::Persistent);
         assert_eq!(out[0].physical_base, 0x4000);
@@ -770,6 +962,109 @@ mod tests
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].phys_base, 0x1000_0000);
         assert_eq!(out[0].size, 0x2000);
+    }
+
+    // Defect caught: a bounded scratch buffer that drops pieces before the
+    // merge, losing apertures a fragmented map describes in many pieces.
+    #[test]
+    fn many_abutting_pieces_merge_into_one_aperture_without_a_drop()
+    {
+        // Far more pieces than MAX_APERTURES, out of order, all abutting.
+        let descs: Vec<_> = (0..(MAX_APERTURES as u64 * 8))
+            .rev()
+            .map(|i| mmio_desc(0x4000_0000 + i * 0x1000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(
+            pairs(&out),
+            vec![(0x4000_0000, MAX_APERTURES as u64 * 8 * 0x1000)]
+        );
+    }
+
+    // Defect caught: an insertion that merges only its first neighbour,
+    // leaving overlapping apertures when one piece bridges several.
+    #[test]
+    fn a_piece_bridging_several_apertures_merges_them_all()
+    {
+        let descs = [
+            mmio_desc(0x1000_0000, 1),
+            mmio_desc(0x1000_2000, 1),
+            mmio_desc(0x1000_4000, 1),
+            mmio_desc(0x2000_0000, 1),
+        ];
+        let seed = [MmioAperture {
+            phys_base: 0x1000_0800,
+            size: 0x4000,
+        }];
+        let out = run_derive(&descs, &seed);
+        assert_eq!(
+            pairs(&out),
+            vec![(0x1000_0000, 0x5000), (0x2000_0000, 0x1000)]
+        );
+    }
+
+    // Defect caught: a full list that drops a piece arriving above every
+    // aperture, or keeps it past the cap.
+    #[test]
+    fn surplus_arriving_highest_last_is_the_one_dropped()
+    {
+        let descs: Vec<_> = (0..=MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x10_0000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(
+            out[MAX_APERTURES - 1].phys_base,
+            0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x10_0000
+        );
+    }
+
+    // Defect caught: a cap applied while pieces arrive, which loses an
+    // aperture once a later piece bridges several and the full merge fits.
+    #[test]
+    fn a_full_list_a_later_seed_bridges_keeps_every_aperture()
+    {
+        // MAX_APERTURES disjoint pieces 2 MiB apart, plus one between the
+        // first two: the list overflows while pieces arrive.
+        let mut descs: Vec<_> = (0..MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x20_0000, 1))
+            .collect();
+        descs.push(mmio_desc(0x1010_0000, 1));
+        // A seed over the first eleven pieces and the extra one merges twelve
+        // pieces into one aperture.
+        let seed = [MmioAperture {
+            phys_base: 0x1000_0000,
+            size: 10 * 0x20_0000 + 0x1000,
+        }];
+        let out = run_derive(&descs, &seed);
+        assert_eq!(out.len(), MAX_APERTURES - 10);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(out[0].size, 10 * 0x20_0000 + 0x1000);
+        assert_eq!(
+            out[MAX_APERTURES - 11].phys_base,
+            0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x20_0000
+        );
+    }
+
+    // Defect caught: a sweep that lets a later, shorter piece at the same base
+    // replace a longer one, or that does not extend the last aperture with a
+    // piece at a higher base reaching past its end.
+    #[test]
+    fn the_sweep_keeps_the_longest_piece_at_a_base_and_extends_across_pieces()
+    {
+        // Overflow the list so the sweep runs: MAX_APERTURES disjoint pieces
+        // 2 MiB apart, plus one more above them.
+        let mut descs: Vec<_> = (0..=MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x20_0000, 1))
+            .collect();
+        // At the first piece's base: a longer piece listed before the
+        // one-page one, and a piece at a higher base reaching past it.
+        descs.insert(0, mmio_desc(0x1000_0000, 4));
+        descs.push(mmio_desc(0x1000_2000, 4));
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+        assert_eq!(pairs(&out[..1]), vec![(0x1000_0000, 0x6000)]);
     }
 
     #[test]

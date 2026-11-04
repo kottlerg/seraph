@@ -487,6 +487,10 @@ const EFI_FILE_MODE_READ: u64 = 0x0000_0000_0000_0001;
 
 /// Locate `EFI_LOADED_IMAGE_PROTOCOL` for the given image handle.
 ///
+/// # Errors
+/// `BootError::ProtocolNotFound` when `OpenProtocol` fails for
+/// `EFI_LOADED_IMAGE_PROTOCOL`.
+///
 /// # Safety
 /// `bs` must be a valid pointer to UEFI boot services, `image` must be a valid
 /// loaded-image handle.
@@ -515,6 +519,11 @@ pub unsafe fn get_loaded_image(
 }
 
 /// Open the ESP root volume via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`.
+///
+/// # Errors
+/// `BootError::ProtocolNotFound` when the device has no
+/// `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`, and `BootError::UefiError` carrying the
+/// status when `OpenVolume` fails.
 ///
 /// # Safety
 /// `bs` must be valid boot services, `device` must be the device handle from
@@ -554,6 +563,9 @@ pub unsafe fn open_esp_volume(
 ///
 /// `path` must be a UEFI-style path with backslash separators, encoded as a
 /// null-terminated UTF-16 slice.
+///
+/// # Errors
+/// `BootError::FileNotFound` carrying `name` when `Open` fails.
 ///
 /// # Safety
 /// `root` must be a valid `EFI_FILE_PROTOCOL` handle pointing to the ESP root.
@@ -597,6 +609,9 @@ struct FileInfoBuf([u8; FILE_INFO_BUF_LEN]);
 const _: () = assert!(core::mem::align_of::<FileInfoBuf>() >= core::mem::align_of::<EfiFileInfo>());
 
 /// Query the file size in bytes using `EFI_FILE_INFO`.
+///
+/// # Errors
+/// `BootError::UefiError` carrying the status when `GetInfo` fails.
 ///
 /// # Safety
 /// `file` must be a valid open `EFI_FILE_PROTOCOL` handle.
@@ -649,6 +664,9 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
 ///
 /// Reads exactly `buffer.len()` bytes starting from the current file position.
 ///
+/// # Errors
+/// `BootError::UefiError` carrying the status when `Read` fails.
+///
 /// # Safety
 /// `file` must be a valid open `EFI_FILE_PROTOCOL` handle. The file's current
 /// position must be set appropriately before calling.
@@ -674,6 +692,9 @@ pub unsafe fn file_read(file: *mut EfiFileProtocol, buffer: &mut [u8]) -> Result
 ///
 /// Returns the physical address of the allocated region. Uses `EfiLoaderData`
 /// memory type so the region appears as `Loaded` in the boot protocol memory map.
+///
+/// # Errors
+/// `BootError::OutOfMemory` when `AllocatePages` fails.
 ///
 /// # Safety
 /// `bs` must be a valid pointer to UEFI boot services (before `ExitBootServices`).
@@ -708,10 +729,13 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 /// `arch::current::allocate_ap_trampoline`, whose SIPI-vector constraint
 /// requires a frame below 1 MiB, x86-64's
 /// `arch::current::allocate_kernel_span`, which keeps the kernel image below
-/// 4 GiB, and the x86-64 boot page-table root, which the LA57 toggle
-/// trampoline loads with a 32-bit move; the helper is not gated on
-/// architecture because `AllocateMaxAddress` is part of the UEFI spec on
-/// every supported platform.
+/// 4 GiB, and the x86-64 boot page-table frame pool, whose first frame is the
+/// root the LA57 toggle trampoline loads with a 32-bit move; the helper is not
+/// gated on architecture because `AllocateMaxAddress` is part of the UEFI spec
+/// on every supported platform.
+///
+/// # Errors
+/// `BootError::OutOfMemory` when `AllocatePages` fails.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -735,6 +759,9 @@ pub unsafe fn allocate_pages_max_addr(
 /// `EfiLoaderCode` ones, so code the bootloader runs under those tables
 /// from an allocated page (the x86-64 LA57 toggle trampoline) needs this type.
 /// The region appears as `Loaded` in the boot protocol memory map.
+///
+/// # Errors
+/// `BootError::OutOfMemory` when `AllocatePages` fails.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -802,22 +829,35 @@ pub unsafe fn free_pages(bs: *mut EfiBootServices, phys: u64, count: usize)
     Ok(())
 }
 
-/// Query the UEFI memory map into a freshly allocated buffer sized with 16
-/// descriptors of slack. Returns the buffer address and capacity, map size,
-/// map key, and descriptor size. The acquisition protocol (key invalidation,
-/// final-allocation ordering, slack sizing) is specified in
-/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
+/// Check a descriptor size the firmware reported: a stride below
+/// `EFI_MEMORY_DESCRIPTOR`'s would make every reader of the map read past each
+/// descriptor and, at the last stride, past the map.
+///
+/// # Errors
+/// [`BootError::InvalidMemoryMap`] for a size below the descriptor's.
+pub fn check_descriptor_size(descriptor_size: usize) -> Result<(), BootError>
+{
+    if descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
+    {
+        return Err(BootError::InvalidMemoryMap(
+            "descriptor size below EFI_MEMORY_DESCRIPTOR",
+        ));
+    }
+    Ok(())
+}
+
+/// The `(map_size, descriptor_size)` the firmware's memory map needs now, from
+/// the size query `GetMemoryMap` answers with a null buffer; nothing is
+/// allocated.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult, BootError>
+unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usize), BootError>
 {
-    // First call: obtain required buffer size.
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
     let mut descriptor_size: usize = 0;
     let mut descriptor_version: u32 = 0;
-
     // SAFETY: Null map pointer with zero size requests the required size.
     let status = unsafe {
         ((*bs).get_memory_map)(
@@ -833,6 +873,48 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     {
         return Err(BootError::UefiError(status));
     }
+    Ok((map_size, descriptor_size))
+}
+
+/// Number of descriptors the firmware's memory map holds now
+/// ([`query_memory_map_size`]); nothing is allocated.
+///
+/// # Errors
+/// Returns `BootError::UefiError` when the query fails, and
+/// `BootError::InvalidMemoryMap` when it reports a descriptor size below
+/// `EFI_MEMORY_DESCRIPTOR`'s.
+///
+/// # Safety
+/// `bs` must be valid boot services.
+pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<usize, BootError>
+{
+    // SAFETY: forwarded caller contract.
+    let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
+    check_descriptor_size(descriptor_size)?;
+    Ok(map_size / descriptor_size)
+}
+
+/// Query the UEFI memory map into a freshly allocated buffer sized with 16
+/// descriptors of slack. Returns the buffer address and capacity, map size,
+/// map key, and descriptor size. The acquisition protocol (key invalidation,
+/// final-allocation ordering, slack sizing) is specified in
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
+///
+/// # Errors
+/// Returns `BootError::UefiError` when the size query or the fill call fails,
+/// `BootError::OutOfMemory` when the buffer cannot be allocated, and
+/// `BootError::InvalidMemoryMap` when the fill call reports a descriptor size
+/// below `EFI_MEMORY_DESCRIPTOR`'s.
+///
+/// # Safety
+/// `bs` must be valid boot services.
+pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult, BootError>
+{
+    // First call: obtain required buffer size.
+    // SAFETY: bs is valid (caller contract).
+    let (mut map_size, mut descriptor_size) = unsafe { query_memory_map_size(bs)? };
+    let mut map_key: usize = 0;
+    let mut descriptor_version: u32 = 0;
 
     // Add slack for the buffer allocation itself (which creates one new entry).
     map_size += 16 * descriptor_size;
@@ -861,6 +943,7 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     {
         return Err(BootError::UefiError(status));
     }
+    check_descriptor_size(descriptor_size)?;
 
     Ok(MemoryMapResult {
         buffer_phys,
@@ -892,6 +975,12 @@ const EXIT_BOOT_SERVICES_MAX_ATTEMPTS: u32 = 16;
 /// The retry protocol (re-query into the existing buffer at its full
 /// capacity, then retry) is specified in
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § `ExitBootServices`.
+///
+/// # Errors
+/// `BootError::ExitBootServicesFailed` for a status other than a stale key,
+/// a failed re-query, or a stale key on every attempt; and
+/// `BootError::InvalidMemoryMap` when a re-query reports a descriptor size
+/// below `EFI_MEMORY_DESCRIPTOR`'s.
 ///
 /// # Safety
 /// `bs` must be valid boot services. `image` must be a valid image handle.
@@ -946,7 +1035,11 @@ pub unsafe fn exit_boot_services(
         {
             return Err(BootError::ExitBootServicesFailed);
         }
+        // The re-query rewrote the map body at the stride it reports, which is
+        // the one the body must be read at.
+        check_descriptor_size(descriptor_size)?;
         map.map_size = map_size;
+        map.descriptor_size = descriptor_size;
     }
 }
 
@@ -1237,4 +1330,29 @@ pub unsafe fn find_config_table(
         }
     }
     None
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::{BootError, EfiMemoryDescriptor, check_descriptor_size};
+
+    // Defect caught: a stride below the descriptor accepted, so the map
+    // readers read past each descriptor; or a conforming stride refused.
+    #[test]
+    fn only_a_stride_below_the_descriptor_is_refused()
+    {
+        let full = core::mem::size_of::<EfiMemoryDescriptor>();
+        for short in [0, 8, full - 1]
+        {
+            assert!(matches!(
+                check_descriptor_size(short),
+                Err(BootError::InvalidMemoryMap(_))
+            ));
+        }
+        assert!(check_descriptor_size(full).is_ok());
+        assert!(check_descriptor_size(full + 8).is_ok());
+    }
 }

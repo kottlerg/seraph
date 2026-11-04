@@ -102,6 +102,21 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
     carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
+/// The overrides the PCI `INTx` lines' modes come from: none on riscv64,
+/// where every line takes [`pci_line_mode`]'s fixed mode.
+pub fn pci_line_overrides(_caps: &DevmgrCaps) -> Vec<firmware::acpi::SourceOverride>
+{
+    Vec::new()
+}
+
+/// The `SYS_IRQ_REGISTER` mode of a PCI `INTx` line: level-triggered,
+/// active-high, the PLIC's own sense of the swizzled `INTx` sources. The
+/// kernel validates and records it, and programs nothing from it.
+pub fn pci_line_mode(_overrides: &[firmware::acpi::SourceOverride], _gsi: u32) -> u64
+{
+    syscall::IRQ_MODE_LEVEL
+}
+
 /// The data word the RTC driver's bootstrap round carries: none. No-op on
 /// riscv64: the goldfish RTC counts nanoseconds since the epoch, so it has
 /// no century register for firmware to name.

@@ -19,10 +19,11 @@ use ipc::{IpcMessage, input_errors, input_labels, keysym, serial_errors, serial_
 
 use crate::Msg;
 
-/// Bounded wait between serial RX drains. Backstops the x86 IOAPIC's
-/// edge-triggered delivery (a byte racing the driver's interrupt re-arm is
-/// recovered on the next tick) and degrades to plain polling when the serial
-/// driver holds no IRQ cap. Matches the virtio-input driver's poll interval.
+/// Bounded wait between serial RX drains. Backstops the edge-triggered
+/// delivery the serial driver registers the x86 UART line with (mode 0; a
+/// byte racing the driver's interrupt re-arm is recovered on the next tick)
+/// and degrades to plain polling when the serial driver holds no IRQ cap.
+/// Matches the virtio-input driver's poll interval.
 const SERIAL_RX_POLL_MS: u64 = 20;
 
 /// Block reading the keysym stream and forward decoded bytes as [`Msg::Input`].

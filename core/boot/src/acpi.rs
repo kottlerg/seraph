@@ -683,28 +683,50 @@ pub unsafe fn parse_aperture_seed(
 {
     let mut n: usize = 0;
     let mut h: usize = 0;
+    // A seed past its buffer is dropped with a diagnostic, printed once.
+    let mut dropped = false;
 
     macro_rules! push {
         ($base:expr, $size:expr) => {
-            if n < out.len() && $size > 0
+            if $size > 0
             {
-                out[n] = MmioAperture {
-                    phys_base: $base,
-                    size: $size,
-                };
-                n += 1;
+                if n < out.len()
+                {
+                    out[n] = MmioAperture {
+                        phys_base: $base,
+                        size: $size,
+                    };
+                    n += 1;
+                }
+                else if !dropped
+                {
+                    dropped = true;
+                    bprintln!(
+                        "[--------] boot: ACPI: aperture seeds past the seed buffers dropped"
+                    );
+                }
             }
         };
     }
     macro_rules! push_heuristic {
         ($base:expr, $size:expr) => {
-            if h < heuristic.len() && $size > 0
+            if $size > 0
             {
-                heuristic[h] = MmioAperture {
-                    phys_base: $base,
-                    size: $size,
-                };
-                h += 1;
+                if h < heuristic.len()
+                {
+                    heuristic[h] = MmioAperture {
+                        phys_base: $base,
+                        size: $size,
+                    };
+                    h += 1;
+                }
+                else if !dropped
+                {
+                    dropped = true;
+                    bprintln!(
+                        "[--------] boot: ACPI: aperture seeds past the seed buffers dropped"
+                    );
+                }
             }
         };
     }

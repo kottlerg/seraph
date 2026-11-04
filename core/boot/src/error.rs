@@ -57,6 +57,21 @@ pub enum BootError
     /// the riscv64 negotiation path; x86-64 builds never produce it.
     #[allow(dead_code)]
     PagingModeUnsupported,
+
+    /// The final memory map held RAM descriptors past the translated
+    /// `MemoryMapEntry` array (step 9): the kernel would boot without that
+    /// memory. The `usize` is the number of RAM descriptors left out.
+    MemoryMapTruncated(usize),
+
+    /// The firmware's memory map violates the UEFI contract (a descriptor size
+    /// below `EFI_MEMORY_DESCRIPTOR`'s). The `&'static str` payload names the
+    /// violation.
+    InvalidMemoryMap(&'static str),
+
+    /// Step 9 had more entries to record than the reclaim array's page holds
+    /// (`MAX_RECLAIM_RANGES`); the bootloader's compile-time count of the
+    /// entries it records (`MAX_RECLAIM_ENTRIES`) is wrong.
+    ReclaimRangesOverflow,
 }
 
 impl From<elf::ElfError> for BootError
@@ -97,7 +112,8 @@ impl BootError
             BootError::ProtocolNotFound(s)
             | BootError::FileNotFound(s)
             | BootError::InvalidElf(s)
-            | BootError::InvalidBundle(s) => Some(s),
+            | BootError::InvalidBundle(s)
+            | BootError::InvalidMemoryMap(s) => Some(s),
             _ => None,
         }
     }
@@ -122,6 +138,12 @@ impl BootError
             {
                 "no supported RISC-V paging mode (Sv39 is the platform minimum)"
             }
+            BootError::MemoryMapTruncated(_) =>
+            {
+                "memory map has RAM descriptors past the translated entry array"
+            }
+            BootError::InvalidMemoryMap(_) => "UEFI memory map violates the UEFI contract",
+            BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
         }
     }
 }
@@ -138,6 +160,10 @@ impl core::fmt::Display for BootError
         if let BootError::UefiError(code) = self
         {
             write!(f, ": status={code:#018x}")?;
+        }
+        if let BootError::MemoryMapTruncated(ram) = self
+        {
+            write!(f, ": {ram} RAM descriptors left out")?;
         }
         Ok(())
     }
@@ -166,6 +192,9 @@ mod tests
             BootError::ExitBootServicesFailed,
             BootError::InvalidBundle("b"),
             BootError::PagingModeUnsupported,
+            BootError::MemoryMapTruncated(1),
+            BootError::InvalidMemoryMap("m"),
+            BootError::ReclaimRangesOverflow,
         ];
         for v in variants
         {
@@ -205,6 +234,17 @@ mod tests
         assert_eq!(
             BootError::InvalidBundle("missing init").detail(),
             Some("missing init")
+        );
+    }
+
+    // Defect caught: an InvalidMemoryMap whose payload, which names the UEFI
+    // contract violation, does not reach the fatal handler's message.
+    #[test]
+    fn invalid_memory_map_detail_returns_payload()
+    {
+        assert_eq!(
+            BootError::InvalidMemoryMap("descriptor size below EFI_MEMORY_DESCRIPTOR").detail(),
+            Some("descriptor size below EFI_MEMORY_DESCRIPTOR")
         );
     }
 

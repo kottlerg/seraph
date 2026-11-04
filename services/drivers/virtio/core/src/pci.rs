@@ -12,12 +12,15 @@ use core::time::Duration;
 
 use crate::{RegisterLayout, STATUS_FEATURES_OK};
 
-/// How long [`PciTransport::try_reset`] waits, on the caller's clock, for a
-/// reset to complete. QEMU completes a reset within the status write; the
-/// bound only keeps a wedged device from parking the driver in the poll. A
-/// wall-clock bound, so the time it spans does not depend on the platform's
-/// MMIO-read cost. A tuning value that bounds no capacity: it decides only
-/// when an unacknowledged reset is given up on.
+/// How long a reset is waited for, on the caller's clock: by
+/// [`PciTransport::try_reset`] in a driver, and by devmgr when it resets a
+/// withdrawn driver's device (services/devmgr/docs/responsibilities.md),
+/// which holds devmgr's thread that long for a device that does not confirm.
+/// QEMU completes a reset within the status write; the bound only keeps a
+/// wedged device from parking the waiter in the poll. A wall-clock bound, so
+/// the time it spans does not depend on the platform's MMIO-read cost. A
+/// tuning value that bounds no capacity: it decides only when an
+/// unacknowledged reset is given up on.
 pub const RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Poll `done` until it holds or `elapsed` reaches `timeout`, returning

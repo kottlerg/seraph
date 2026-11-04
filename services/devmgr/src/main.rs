@@ -1396,18 +1396,28 @@ struct ServedDriver
 
 impl ServedDriver
 {
-    /// Withdraw a driver the registry does not, or no longer, serves: revoke
-    /// its service endpoint (every copy derived from it: the driver's receive
-    /// copy and every client SEND) and delete it, so callers queued on it
-    /// return; reset a `VirtIO` device ([`DeviceReset::reset`]), so it neither
-    /// DMAs nor holds its line asserted with no driver to clear it; and
+    /// Withdraw a driver the registry does not, or no longer, serves (one
+    /// already dead): take a `VirtIO` device from it and reset the device
+    /// ([`Self::reset_device`]), so it neither DMAs nor holds its line asserted
+    /// with no driver to clear it, then [`Self::release`]. A reset the device
+    /// does not confirm is logged by [`DeviceReset::reset`]; nothing more can
+    /// be done for it here (the memory the device may still reach is the dead
+    /// driver's, which procmgr frees on its own).
+    fn withdraw(&self)
+    {
+        let _ = self.reset_device();
+        self.release();
+    }
+
+    /// Release what the registry holds for the driver: revoke its service
+    /// endpoint (every copy derived from it: the driver's receive copy and
+    /// every client SEND) and delete it, so callers queued on it return, and
     /// release the device's BAR and IRQ caps. The device's catalog entry
     /// stays, so its badge is never recycled.
-    fn withdraw(&self)
+    fn release(&self)
     {
         let _ = syscall::cap_revoke(self.ep);
         let _ = syscall::cap_delete(self.ep);
-        let _ = self.reset_device();
         if let Some(dev_caps) = &self.dev_caps
         {
             dev_caps.release();
@@ -1420,7 +1430,9 @@ impl ServedDriver
     /// can no longer reach the device, then reset the device and wait for it
     /// to confirm ([`DeviceReset::reset`]). Returns whether the device is
     /// known to be quiet: `true` for a driver with no `VirtIO` device, and
-    /// for a device that confirmed its reset; `false` when the reset was not
+    /// for a device whose BAR copies were all revoked and that confirmed its
+    /// reset; `false`, logged, when a revocation failed, the device has no
+    /// reset target ([`DeviceReset::for_device`]), or the reset was not
     /// confirmed, and the device may still be accessing the driver's memory.
     fn reset_device(&self) -> bool
     {
@@ -1429,37 +1441,51 @@ impl ServedDriver
         {
             return true;
         };
+        let mut revoked = true;
         for bar in dev_caps.bars.as_slice()
         {
-            let _ = syscall::cap_revoke_all(bar.cap);
+            if syscall::cap_revoke_all(bar.cap).is_err()
+            {
+                revoked = false;
+            }
         }
-        dev_caps.reset.is_none_or(|reset| reset.reset())
+        if !revoked
+        {
+            std::os::seraph::log!("device reset: a BAR copy could not be revoked");
+        }
+        let Some(reset) = dev_caps.reset
+        else
+        {
+            std::os::seraph::log!("device reset: the device has no reset target; not reset");
+            return false;
+        };
+        reset.reset() && revoked
     }
 }
 
-/// Withdraw a driver that is still running. devmgr first takes the device
-/// from it and resets the device ([`ServedDriver::reset_device`]), so the
-/// device's DMA has stopped and the driver can no longer re-arm it, then
-/// destroys the driver, which returns its memory to memmgr, and withdraws it.
-/// A device that does not confirm its reset may still be writing the
-/// driver's memory, so that driver is not destroyed: devmgr releases its
-/// process handle, and the driver, which can no longer reach its device,
-/// keeps its memory out of reuse.
+/// Withdraw a driver that is still running: take the device from it and reset
+/// the device ([`ServedDriver::reset_device`]), so the device's DMA has
+/// stopped and the driver can no longer re-arm it, then destroy the driver,
+/// which returns its memory to memmgr, and release what the registry holds
+/// for it (one reset per withdrawal).
+///
+/// Two windows remain until a driver can be frozen before its device is taken
+/// from it (#731; services/devmgr/docs/responsibilities.md § Responsibilities): a
+/// device that does not confirm its reset may still be writing the driver's
+/// memory when it is freed, and the driver can fault on its revoked BARs and
+/// be reaped before the reset lands. The driver is destroyed either way, as
+/// it would be with no reset.
 fn destroy_live_driver(spawned: &SpawnedDriver, ipc_buf: *mut u64)
 {
-    if spawned.driver.reset_device()
-    {
-        spawn::destroy_child(spawned.process_handle, ipc_buf);
-    }
-    else
+    if !spawned.driver.reset_device()
     {
         std::os::seraph::log!(
-            "{}: device did not confirm its reset; driver kept so its memory stays out of reuse",
+            "{}: device not confirmed quiet; destroying the driver anyway",
             spawned.class.name()
         );
-        let _ = syscall::cap_delete(spawned.process_handle);
     }
-    spawned.driver.withdraw();
+    spawn::destroy_child(spawned.process_handle, ipc_buf);
+    spawned.driver.release();
 }
 
 /// A spawned driver its settle batch's roster records: its class, its device

@@ -57,13 +57,15 @@ setup, overruns its settle bound, or that devmgr cannot record or serve. For a `
 it takes the device from the driver, revoking the driver's mappings of its BARs, then resets the
 device through a BAR cap it keeps (`device_status` 0, complete once the status reads back 0), which
 stops the device's DMA and drops its pending interrupt, before it releases the device's caps. A
-driver still running is taken from its device and reset before it is destroyed, so the device can no
-longer reach the driver's memory when that memory is freed; a driver whose device does not confirm
-the reset is not destroyed, and keeps its memory out of reuse. A driver that dies while its device
-asserts a shared level-triggered line therefore leaves the line's other receivers no assertion to
-loop on once the reset lands; between the driver's death, which releases its binding, and the reset,
-they may see re-deliveries their own devices did not raise
-([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
+driver still running is taken from its device and reset before it is destroyed, so a device that
+confirms its reset can no longer reach the driver's memory when that memory is freed. Two windows
+remain until a driver can be frozen before its device is taken from it
+([#731](https://github.com/kottlerg/seraph/issues/731)): a device that does not confirm its reset,
+whose driver is destroyed anyway, and a driver that faults on its revoked BARs and is reaped before
+the reset lands. A driver that dies while its device asserts a shared level-triggered line therefore
+leaves the line's other receivers no assertion to loop on once the reset lands; between the driver's
+death, which releases its binding, and the reset, they may see re-deliveries their own devices did
+not raise ([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
 § Interrupt Delivery). The withdrawal, the reset among its steps, is specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities.

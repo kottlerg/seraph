@@ -38,6 +38,7 @@ pub mod drivers;
 pub mod exit_code;
 pub mod fs_faults;
 pub mod fs_ipc;
+pub mod fs_opens;
 pub mod fs_std;
 pub mod layout;
 pub mod memmgr;
@@ -77,6 +78,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());
     out.extend_from_slice(fs_ipc::phases_pre_relative());
+    out.extend_from_slice(fs_opens::phases());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_faults::phases());
     out.extend_from_slice(layout::after_fs());

@@ -45,6 +45,7 @@ services/svctest/
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
+        ├── fs_opens.rs        # Per-open fatfs state: close isolation, eviction routing
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
@@ -171,7 +172,7 @@ token falls through to the normal run.
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
-| `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
+| `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

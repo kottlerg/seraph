@@ -25,7 +25,7 @@ use crate::definitions::launch::{
 use crate::definitions::{build_blob, cwd_rights};
 use crate::service::{POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
-use syscall_abi::MSG_DATA_WORDS_MAX;
+use std::os::seraph::process::ArgvEnvCap;
 
 /// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
 /// in `main.rs`) to either continue, log degradation, or initiate a
@@ -74,28 +74,27 @@ pub fn mint_child_creator(bootstrap_ep: u64) -> Option<(u64, u64)>
 
 /// Argv and env blobs seeded into a child at `CREATE_FROM_FILE` time.
 ///
-/// Each blob is NUL-separated and NUL-terminated (the wire shape
-/// procmgr's stack-envelope writer expects); `count` is the number of
-/// entries in the blob. An empty blob with `count = 0` skips that
-/// surface entirely — the child inherits no argv / no env from svcmgr.
+/// Each blob is NUL-separated and NUL-terminated (the shape procmgr's
+/// `CREATE_ARGV_ENV` checks); `count` is the number of entries in the blob.
+/// An empty blob with `count = 0` skips that surface entirely — the child
+/// inherits no argv / no env from svcmgr.
 #[derive(Default, Clone, Copy)]
 pub struct StartupBlobs<'a>
 {
     pub argv: &'a [u8],
-    pub argv_count: u32,
+    pub argv_count: u64,
     pub env: &'a [u8],
-    pub env_count: u32,
+    pub env_count: u64,
 }
 
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
 /// Returns the freshly created (suspended) process, or `None` (each arm
-/// logged) when `blobs` would not fit the `CREATE_FROM_FILE` message
-/// (`MSG_DATA_WORDS_MAX` words), the bootstrap-badge mint fails, svcmgr has
-/// no root cap, the walk fails, or the create call fails in transport, in
-/// procmgr, or with a reply short of its two caps. The size check is a
-/// backstop: the `.svc` parser already rejects such a recipe, and the check
-/// keeps an oversize blob from reaching the message builder's bound
-/// assertion. Every `None` arm releases the file and badged-creator caps it
+/// logged) when the argv/env cap cannot be built
+/// (`std::os::seraph::process::ArgvEnvCap`: blobs past the argv/env region,
+/// which the `.svc` parser already refuses, or a run memmgr will not fund),
+/// the bootstrap-badge mint fails, svcmgr has no root cap, the walk fails,
+/// or the create call fails in transport, in procmgr, or with a reply short
+/// of its two caps. Every `None` arm releases the file and badged-creator caps it
 /// still holds, and the short-reply arm destroys the child procmgr created.
 /// An error reply carries no handle to destroy and needs none: when procmgr
 /// created the child but the reply's cap transfer into svcmgr's `CSpace`
@@ -128,23 +127,18 @@ pub fn walk_and_create_from_file(
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
-    // word layout matches the procmgr `CREATE_FROM_FILE` wire layout:
-    //   word 0:           file_size
-    //   words 1..1+argv_w: argv blob (NUL-separated, NUL-terminated)
-    //   word  1+argv_w:   env_bytes
-    //   words ...:        env blob
-    let argv_bytes = blobs.argv.len();
-    let argv_words = argv_bytes.div_ceil(8);
-    let env_bytes = blobs.env.len();
-    let env_words = env_bytes.div_ceil(8);
-    let data_count = 1 + argv_words + 1 + env_words;
-    if data_count > MSG_DATA_WORDS_MAX
+    // The argv/env cap holds both blobs; dropping it once the create call
+    // returns gives its run back to memmgr (procmgr has copied the blobs by
+    // then, or refused the request).
+    let argv_env = match ArgvEnvCap::new(blobs.argv, blobs.argv_count, blobs.env, blobs.env_count)
     {
-        std::os::seraph::log!(
-            "create: {path:?} argv/env need {data_count} words, limit {MSG_DATA_WORDS_MAX}"
-        );
-        return None;
-    }
+        Ok(cap) => cap,
+        Err(e) =>
+        {
+            std::os::seraph::log!("create: {path:?} argv/env cap failed: {e}");
+            return None;
+        }
+    };
 
     let Some((child_badge, badged_creator)) = mint_child_creator(bootstrap_ep)
     else
@@ -171,36 +165,38 @@ pub fn walk_and_create_from_file(
         }
     };
 
+    let argv_env_flag = if argv_env.is_some()
+    {
+        procmgr_labels::CREATE_ARGV_ENV
+    }
+    else
+    {
+        0
+    };
     let label = procmgr_labels::CREATE_FROM_FILE
         | procmgr_labels::create_sched_bits(priority, sched_max)
-        | ((argv_bytes as u64) << 32)
-        | (u64::from(blobs.argv_count) << 48)
-        | (u64::from(blobs.env_count) << 56);
+        | argv_env_flag;
 
-    let argv_word_offset: usize = 1;
-    let env_len_word_offset = argv_word_offset + argv_words;
-    let env_blob_word_offset = env_len_word_offset + 1;
-
-    let mut builder = IpcMessage::builder(label).word(0, file_size);
-    if argv_bytes > 0
+    // Caps: [file_cap, badged_creator, argv_env?]; the header rides in data
+    // words 1..5, after `file_size`.
+    let mut builder = IpcMessage::builder(label)
+        .word(0, file_size)
+        .cap(file_cap)
+        .cap(badged_creator);
+    if let Some(cap) = &argv_env
     {
-        builder = builder.bytes(argv_word_offset, blobs.argv);
+        builder = builder.words(1, &cap.header_words()).cap(cap.cap());
     }
-    builder = builder
-        .word(env_len_word_offset, env_bytes as u64)
-        .word_count(data_count);
-    if env_bytes > 0
-    {
-        builder = builder.bytes(env_blob_word_offset, blobs.env);
-    }
-    let create_msg = builder.cap(file_cap).cap(badged_creator).build();
+    let create_msg = builder.build();
 
     // A failed call may leave `file_cap` and `badged_creator` in svcmgr's
     // CSpace: a transport error, or a post-block refusal that delivers the
     // request with zero caps and draws an error reply. Deleting a slot the
     // kernel already transferred is a generation-checked no-op.
     // SAFETY: `ipc_buf` is the registered IPC buffer.
-    let reply = match unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }
+    let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
+    drop(argv_env);
+    let reply = match reply
     {
         Ok(r) => r,
         Err(e) =>

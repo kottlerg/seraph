@@ -82,7 +82,12 @@ use core::prelude::rust_2024::*;
 /// v23: Capability handles are 64-bit (#637). Every `ProcessInfo` cap field
 ///      widens from `u32` to `u64`, so every field after
 ///      [`ProcessInfo::version`] moves.
-pub const PROCESS_ABI_VERSION: u32 = 23;
+/// v24: argv and env live in their own pages after the `ProcessInfo` page
+///      (#672), up to [`ARGV_ENV_MAX_PAGES`], instead of in the page's
+///      remainder. [`ProcessInfo::args_offset`], `args_bytes`, `args_count`,
+///      `env_offset`, `env_bytes` and `env_count` widen from `u32` to `u64`,
+///      so every field after them moves.
+pub const PROCESS_ABI_VERSION: u32 = 24;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -231,6 +236,27 @@ macro_rules! stack_pages {
 /// it costs VA only. Spawned threads allocate their own blocks from the heap
 /// and are unconstrained by this limit.
 pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 1 << 18;
+
+/// Byte offset, from the `ProcessInfo` page base, of the argv/env region: the
+/// pages a creator maps directly after the `ProcessInfo` page, holding the
+/// argv blob and then the env blob (see [`ProcessInfo::args_offset`]).
+pub const ARGV_ENV_REGION_OFFSET: u64 = 4096;
+
+/// Maximum number of 4 KiB pages in the argv/env region, argv and env
+/// combined.
+///
+/// The value is the region tail `process-layout` leaves after the
+/// `ProcessInfo` draw window (`MAX_WINDOW_REGION_PAGES`, 1 GiB) less the
+/// `ProcessInfo` page itself, which that crate pins with a const assert, so
+/// the ceiling costs VA only: a creator maps the pages the spawner's blobs
+/// fill, funded by the spawner's request and the child's account. A spawner
+/// whose blobs exceed it is refused (`ArgumentListTooLong` from
+/// `std::process::Command::spawn`, `INVALID_ARGUMENT` from procmgr).
+pub const ARGV_ENV_MAX_PAGES: u64 = (1 << 18) - 1;
+
+/// [`ARGV_ENV_MAX_PAGES`] in bytes: the largest argv blob plus env blob a
+/// process can be created with.
+pub const ARGV_ENV_MAX_BYTES: u64 = ARGV_ENV_MAX_PAGES * 4096;
 
 // ── ProcessInfo ──────────────────────────────────────────────────────────────
 
@@ -408,42 +434,40 @@ pub struct ProcessInfo
 
     // ── Program arguments (argv) ─────────────────────────────────────
     //
-    // Procmgr writes the argv blob into this same `ProcessInfo` page
-    // after the struct fields, between `args_offset` and `args_offset +
-    // args_bytes`. The blob is a concatenation of `args_count`
-    // NUL-terminated UTF-8 strings. `args_offset == 0` OR `args_count ==
-    // 0` means "no argv delivered".
-    //
-    // The page remainder after the fixed struct is where the blob lives,
-    // not its limit; the bound is the create-request wire contract in
-    // `services/procmgr/docs/ipc-interface.md` § CREATE_PROCESS.
+    // Procmgr writes the argv blob into the argv/env region, the read-only
+    // pages it maps directly after this `ProcessInfo` page (at
+    // [`ARGV_ENV_REGION_OFFSET`] from the page base, at most
+    // [`ARGV_ENV_MAX_PAGES`] pages), between `args_offset` and
+    // `args_offset + args_bytes`. The blob is a concatenation of
+    // `args_count` NUL-terminated UTF-8 strings. `args_offset == 0` OR
+    // `args_count == 0` means "no argv delivered".
     /// Byte offset from the `ProcessInfo` page base where the argv blob
-    /// begins. 0 when no argv was provided.
-    pub args_offset: u32,
+    /// begins ([`ARGV_ENV_REGION_OFFSET`]). 0 when no argv was provided.
+    pub args_offset: u64,
 
     /// Total byte length of the argv blob.
-    pub args_bytes: u32,
+    pub args_bytes: u64,
 
     /// Number of argv entries (NUL-terminated strings) in the blob.
-    pub args_count: u32,
+    pub args_count: u64,
 
     // ── Environment variables (env) ──────────────────────────────────
     //
-    // Procmgr writes the env blob into this `ProcessInfo` page after the
-    // argv blob, between `env_offset` and `env_offset + env_bytes`. The
+    // Procmgr writes the env blob into the argv/env region directly after
+    // the argv blob, between `env_offset` and `env_offset + env_bytes`. The
     // blob is a concatenation of `env_count` NUL-terminated UTF-8 strings,
     // each of shape `KEY=VALUE`. `env_offset == 0` OR `env_count == 0`
-    // means "no env delivered". The bound is the same wire contract as
-    // argv's.
+    // means "no env delivered".
     /// Byte offset from the `ProcessInfo` page base where the env blob
-    /// begins. 0 when no env was provided.
-    pub env_offset: u32,
+    /// begins (`ARGV_ENV_REGION_OFFSET + args_bytes`). 0 when no env was
+    /// provided.
+    pub env_offset: u64,
 
     /// Total byte length of the env blob.
-    pub env_bytes: u32,
+    pub env_bytes: u64,
 
     /// Number of env entries (NUL-terminated `KEY=VALUE` strings) in the blob.
-    pub env_count: u32,
+    pub env_count: u64,
 
     /// `CSpace` slot of a badged SEND cap on a namespace endpoint
     /// addressing the directory the process should treat as its
@@ -566,6 +590,10 @@ pub struct ProcessInfo
     /// reads this only for introspection.
     pub main_tls_vaddr: u64,
 }
+
+// Hard size budget: creators write `ProcessInfo` into the one page below
+// `ARGV_ENV_REGION_OFFSET`, and the process reads it there.
+const _: () = assert!(core::mem::size_of::<ProcessInfo>() as u64 <= ARGV_ENV_REGION_OFFSET);
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
 

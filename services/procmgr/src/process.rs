@@ -176,17 +176,16 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
     }
 }
 
-// Pure process-table, badge, recent-exit, and create-request blob logic
-// (`ChildArgs`, `ChildEnv`, `CreateBlobs`) lives in the host-testable
-// `procmgr-process-table` crate; the syscall/IPC-bearing operations below
-// stay in the service and drive its lookups. Re-exported so the
-// `process::{ProcessTable, ProcessEntry, RecentExits}` paths
-// `main.rs` uses, and its `process::CreateBlobs::extract` and
-// `process::split_create_from_file_caps` call sites in the create handlers,
-// resolve through this module.
+// Pure process-table, badge, recent-exit, and create-request argv/env logic
+// (`ChildArgvEnv`, `decode_header`, `checked_total`) lives in the
+// host-testable `procmgr-process-table` crate; the syscall/IPC-bearing
+// operations below stay in the service and drive its lookups. Re-exported so
+// the `process::{ProcessTable, ProcessEntry, RecentExits}` paths `main.rs`
+// uses, and its `process::split_create_caps` call sites in the create
+// handlers, resolve through this module.
 pub use process_table::{
-    ChildArgs, ChildEnv, CreateBlobs, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
-    badge_is_acceptable, resolve_spawn_sched, split_create_from_file_caps,
+    ArgvEnvRefusal, ChildArgvEnv, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
+    badge_is_acceptable, resolve_spawn_sched, split_create_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -558,7 +557,194 @@ pub struct MainTls
     pub base_va: u64,
 }
 
-/// Populate a `ProcessInfo` page for a child process and map it read-only.
+/// The argv and env a create request carried, mapped read-only from the
+/// caller's Memory cap for the length of the create.
+///
+/// Built by [`map_argv_env`] before any resource is acquired for the child;
+/// dropping it unmaps the caller's pages, after which the handler deletes
+/// procmgr's copy of the cap, before it replies.
+pub struct ArgvEnvSource
+{
+    /// The caller's pages, mapped read-only; `None` when both blobs are
+    /// empty.
+    mapping: Option<ScratchMapping>,
+    header: ipc::procmgr_labels::ArgvEnvHeader,
+}
+
+impl ArgvEnvSource
+{
+    /// The source of a request that carries no argv and no env.
+    pub fn empty() -> Self
+    {
+        Self {
+            mapping: None,
+            header: ipc::procmgr_labels::ArgvEnvHeader::default(),
+        }
+    }
+
+    /// The blobs as the caller's pages hold them.
+    pub fn blobs(&self) -> ChildArgvEnv<'_>
+    {
+        let Some(mapping) = &self.mapping
+        else
+        {
+            return ChildArgvEnv::default();
+        };
+        let Ok(len) = usize::try_from(self.header.total_bytes().unwrap_or(0))
+        else
+        {
+            return ChildArgvEnv::default();
+        };
+        // SAFETY: `map_argv_env` mapped `len.div_ceil(PAGE_SIZE)` pages of the
+        // caller's cap read-only at the mapping's base, and the mapping lives
+        // as long as `self`, which the returned borrow cannot outlive. The
+        // bytes are plain data; the caller may rewrite them concurrently, so
+        // the child's copy is checked again after it is taken.
+        let region = unsafe { core::slice::from_raw_parts(mapping.va() as *const u8, len) };
+        ChildArgvEnv::split(region, self.header).unwrap_or_default()
+    }
+}
+
+/// Map and check the argv and env of a create request that sets
+/// `CREATE_ARGV_ENV`: decode the [`ipc::procmgr_labels::ArgvEnvHeader`] at
+/// data word `first_word`, bound the blobs by `argv_env_cap`'s size and by
+/// `process_abi::ARGV_ENV_MAX_BYTES`, map the bytes they occupy read-only,
+/// and check each blob's strings.
+///
+/// Acquires nothing for the child, so the handler calls it before any other
+/// resource and replies `INVALID_ARGUMENT` on `Err`. Does not take
+/// `argv_env_cap`: the handler deletes it after the create, refused or not.
+///
+/// # Errors
+/// The [`ArgvEnvRefusal`] the header or blobs earn, or
+/// [`ArgvEnvRefusal::PastCap`] when the cap's size cannot be read or its
+/// pages cannot be mapped (not a Memory cap procmgr can map).
+pub fn map_argv_env(
+    req: &IpcMessage,
+    first_word: usize,
+    argv_env_cap: u64,
+    self_aspace: u64,
+) -> Result<ArgvEnvSource, ArgvEnvRefusal>
+{
+    let header = process_table::decode_header(req, first_word)?;
+    let cap_bytes = syscall::cap_info(argv_env_cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| ArgvEnvRefusal::PastCap)?;
+    let total = process_table::checked_total(header, cap_bytes, process_abi::ARGV_ENV_MAX_BYTES)?;
+    if total == 0
+    {
+        return Ok(ArgvEnvSource {
+            mapping: None,
+            header,
+        });
+    }
+    let mapping =
+        loader::map_memory_read_only(argv_env_cap, self_aspace, total.div_ceil(PAGE_SIZE))
+            .ok_or(ArgvEnvRefusal::PastCap)?;
+    let source = ArgvEnvSource {
+        mapping: Some(mapping),
+        header,
+    };
+    source.blobs().check()?;
+    Ok(source)
+}
+
+/// Copy `blobs` into fresh pages on the child's memmgr account, check the
+/// copy, and map it read-only into `child_aspace` directly after the
+/// `ProcessInfo` page (`process_abi::ARGV_ENV_REGION_OFFSET`). Returns the
+/// guarded Memory cap behind the region, which the child's table entry keeps
+/// for teardown.
+///
+/// `None` when memmgr cannot supply the pages, a mapping fails, or the copy
+/// fails its check (the caller rewrote its pages while procmgr copied them).
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at the VA the child's layout leaves after
+/// its `ProcessInfo` page, without checking what procmgr holds there.
+unsafe fn map_child_argv_env(
+    self_aspace: u64,
+    child_aspace: u64,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    blobs: &ChildArgvEnv<'_>,
+    layout: &ProcessLayout,
+) -> Option<CapGuard>
+{
+    let total = blobs.total_bytes();
+    let pages = (total as u64).div_ceil(PAGE_SIZE);
+    let memory = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        child_memmgr_send,
+        pages,
+        ipc_buf,
+    )?);
+    let scratch = ScratchMapping::map(self_aspace, memory.cap(), pages, syscall::MAP_WRITABLE)?;
+    let args_len = blobs.args.len();
+    {
+        // SAFETY: `scratch` maps the `pages` pages of `memory` writable at its
+        // base, for procmgr alone (the child is not running and has no mapping
+        // of them yet), and outlives this block, the slice's only use.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(scratch.va() as *mut u8, (pages * PAGE_SIZE) as usize)
+        };
+        dst[..args_len].copy_from_slice(blobs.args);
+        dst[args_len..total].copy_from_slice(blobs.env);
+        // The page tail past the blobs carries no earlier owner's bytes.
+        dst[total..].fill(0);
+        let copy = ChildArgvEnv {
+            args: &dst[..args_len],
+            args_count: blobs.args_count,
+            env: &dst[args_len..total],
+            env_count: blobs.env_count,
+        };
+        if copy.check().is_err()
+        {
+            std::os::seraph::log!("argv/env changed while procmgr copied it; spawn refused");
+            return None;
+        }
+    }
+    drop(scratch);
+
+    let ro = CapGuard::new(syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
+    // SAFETY: the caller's contract: `child_aspace` is a child's address
+    // space, never procmgr's own, so the map changes nothing procmgr runs on.
+    // The region lies inside the tail every layout leaves after the
+    // `ProcessInfo` page (`process-layout` pins `1 + ARGV_ENV_MAX_PAGES` to it,
+    // and `map_argv_env` bounded `pages` by `ARGV_ENV_MAX_BYTES`).
+    unsafe {
+        syscall::mem_map(
+            ro.cap(),
+            child_aspace,
+            layout.process_info_va + process_abi::ARGV_ENV_REGION_OFFSET,
+            0,
+            pages,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .ok()?;
+    Some(memory)
+}
+
+/// The Memory caps [`populate_child_info`] leaves the child's table entry:
+/// the `ProcessInfo` page's and the argv/env region's (zero without one).
+/// Both guarded, so a later failure of the create releases them.
+struct ChildInfoCaps
+{
+    pi_memory: CapGuard,
+    argv_env_memory: CapGuard,
+}
+
+impl ChildInfoCaps
+{
+    /// Hand both caps to the child's table entry, which now owns them.
+    fn disarm(self)
+    {
+        let _ = self.pi_memory.disarm();
+        let _ = self.argv_env_memory.disarm();
+    }
+}
+
+/// Populate a `ProcessInfo` page for a child process and map it read-only,
+/// with the argv/env region after it when `argv_env` carries any bytes.
 ///
 /// Installs the creator endpoint cap (if any) and the procmgr service
 /// endpoint into the child `CSpace` and records their slots in the child's
@@ -594,14 +780,13 @@ unsafe fn populate_child_info(
     creator_endpoint: u64,
     universals: &UniversalCaps,
     tls: &ChildTlsTemplate,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: &ChildArgvEnv<'_>,
     ipc_buf: *mut u64,
     stack_pages: u32,
     process_badge: u64,
     sched: ChildSched,
     layout: &ProcessLayout,
-) -> Option<u64>
+) -> Option<ChildInfoCaps>
 {
     // Guarded from allocation: every early `None` below deletes the slot.
     let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
@@ -822,66 +1007,54 @@ unsafe fn populate_child_info(
     // The pager fields stay zero here: `finalize_creation` writes them only
     // once the pager binding has taken effect (`advertise_pager`).
 
-    // Write the argv blob, then the env blob, into the page region
-    // following the struct. Each blob begins at a u64-aligned offset so
-    // std can read whole words safely; both must fit inside the remaining
-    // page bytes — caller validates size before reaching here.
-    let pi_size = core::mem::size_of::<process_abi::ProcessInfo>() as u64;
-    let args_offset = (pi_size + 7) & !7;
-    let args_end = if args.count > 0 && !args.blob.is_empty()
+    // The argv blob, then the env blob, live in the argv/env region directly
+    // after this page; the offsets locate them from the page base. An empty
+    // blob is recorded as absent (offset, length and count zero).
+    let argv_env_memory = if argv_env.total_bytes() == 0
     {
-        let blob_len = args.blob.len() as u64;
-        if args_offset + blob_len > PAGE_SIZE
-        {
-            return None;
-        }
-        // SAFETY: range within the mapped page; source is plain bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                args.blob.as_ptr(),
-                (scratch_va + args_offset) as *mut u8,
-                args.blob.len(),
-            );
-        }
-        pi.args_offset = args_offset as u32;
-        pi.args_bytes = args.blob.len() as u32;
-        pi.args_count = args.count;
-        args_offset + blob_len
+        CapGuard::new(0)
     }
     else
     {
-        pi.args_offset = 0;
-        pi.args_bytes = 0;
-        pi.args_count = 0;
-        args_offset
+        // SAFETY: the caller's contract: `child_aspace` is a child's address
+        // space, never procmgr's own.
+        unsafe {
+            map_child_argv_env(
+                self_aspace,
+                child_aspace,
+                universals.memmgr_endpoint,
+                ipc_buf,
+                argv_env,
+                layout,
+            )
+        }?
     };
-
-    let env_offset = (args_end + 7) & !7;
-    if env.count > 0 && !env.blob.is_empty()
+    let args_bytes = argv_env.args.len() as u64;
+    let env_bytes = argv_env.env.len() as u64;
+    (pi.args_offset, pi.args_bytes, pi.args_count) = if args_bytes == 0
     {
-        let blob_len = env.blob.len() as u64;
-        if env_offset + blob_len > PAGE_SIZE
-        {
-            return None;
-        }
-        // SAFETY: range within the mapped page; source is plain bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                env.blob.as_ptr(),
-                (scratch_va + env_offset) as *mut u8,
-                env.blob.len(),
-            );
-        }
-        pi.env_offset = env_offset as u32;
-        pi.env_bytes = env.blob.len() as u32;
-        pi.env_count = env.count;
+        (0, 0, 0)
     }
     else
     {
-        pi.env_offset = 0;
-        pi.env_bytes = 0;
-        pi.env_count = 0;
+        (
+            process_abi::ARGV_ENV_REGION_OFFSET,
+            args_bytes,
+            argv_env.args_count,
+        )
+    };
+    (pi.env_offset, pi.env_bytes, pi.env_count) = if env_bytes == 0
+    {
+        (0, 0, 0)
     }
+    else
+    {
+        (
+            process_abi::ARGV_ENV_REGION_OFFSET + args_bytes,
+            env_bytes,
+            argv_env.env_count,
+        )
+    };
 
     drop(scratch);
 
@@ -899,10 +1072,14 @@ unsafe fn populate_child_info(
         )
     }
     .ok()?;
-    // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
-    // cascades to any descendants); the mapping doesn't need pi_ro to
-    // outlive this call, so its guard deletes it on return.
-    Some(pi_memory.disarm())
+    // pi_memory and argv_env_memory stay in procmgr's CSpace as the teardown
+    // handles (revoke cascades to any descendants); the mappings don't need
+    // the map-only derivations to outlive this call, so their guards delete
+    // them on return.
+    Some(ChildInfoCaps {
+        pi_memory,
+        argv_env_memory,
+    })
 }
 
 /// Intermediate state returned by [`alloc_main_tls_memory`] — a memory cap
@@ -1308,7 +1485,7 @@ fn finalize_creation(
     child_aspace: u64,
     child_cspace: u64,
     child_thread: u64,
-    pi_memory_cap: u64,
+    info_caps: &ChildInfoCaps,
     entry_point: u64,
     main_tls: MainTls,
     table: &mut ProcessTable,
@@ -1327,6 +1504,7 @@ fn finalize_creation(
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
+    let pi_memory_cap = info_caps.pi_memory.cap();
 
     // Bind a death observer from procmgr's death queues on the child's main
     // thread. Correlator = the table badge; on death, dispatch_death recovers
@@ -1372,6 +1550,7 @@ fn finalize_creation(
             thread_cap: child_thread,
             pi_memory_cap,
             tls_memory_cap: main_tls.memory_cap,
+            argv_env_memory_cap: info_caps.argv_env_memory.cap(),
             memmgr_send_cap,
             memmgr_badge,
             namespace_override: 0,
@@ -1531,8 +1710,7 @@ fn create_process_from_bytes(
     self_endpoint: u64,
     creator_endpoint: u64,
     universals: &UniversalCaps,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: &ChildArgvEnv<'_>,
     deaths: &DeathSet,
     sched: ChildSched,
     ipc_buf: *mut u64,
@@ -1724,7 +1902,7 @@ fn create_process_from_bytes(
     let process_badge = next_process_badge(table)?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
-    let pi_memory = CapGuard::new(unsafe {
+    let info_caps = unsafe {
         populate_child_info(
             self_aspace,
             child_aspace,
@@ -1733,15 +1911,14 @@ fn create_process_from_bytes(
             creator_endpoint,
             universals,
             &tls_template,
-            args,
-            env,
+            argv_env,
             ipc_buf,
             stack_pages,
             process_badge,
             sched,
             &layout,
         )
-    }?);
+    }?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     unsafe {
@@ -1760,7 +1937,7 @@ fn create_process_from_bytes(
         child_aspace,
         child_cspace,
         child_thread,
-        pi_memory.cap(),
+        &info_caps,
         entry,
         main_tls,
         table,
@@ -1780,7 +1957,7 @@ fn create_process_from_bytes(
         self_aspace,
     )?;
     let _ = child_objs.disarm();
-    let _ = pi_memory.disarm();
+    info_caps.disarm();
     let _ = main_tls_memory.disarm();
     Some(result)
 }
@@ -1798,8 +1975,7 @@ pub fn create_process(
     self_endpoint: u64,
     creator_endpoint: u64,
     universals: &UniversalCaps,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: &ChildArgvEnv<'_>,
     deaths: &DeathSet,
     sched: ChildSched,
 ) -> Option<CreateResult>
@@ -1821,8 +1997,7 @@ pub fn create_process(
         self_endpoint,
         creator_endpoint,
         universals,
-        args,
-        env,
+        argv_env,
         deaths,
         sched,
         ipc_buf,
@@ -2374,8 +2549,7 @@ pub fn create_process_from_file(
     table: &mut ProcessTable,
     ipc_buf: *mut u64,
     creator_endpoint: u64,
-    args: &ChildArgs<'_>,
-    env: &ChildEnv<'_>,
+    argv_env: &ChildArgvEnv<'_>,
     deaths: &DeathSet,
     demand_paged: bool,
     parent_relay_cap: u64,
@@ -2679,7 +2853,7 @@ pub fn create_process_from_file(
     let process_badge = next_process_badge(table).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
-    let pi_memory_cap = unsafe {
+    let info_caps = unsafe {
         populate_child_info(
             self_aspace,
             child_objs.aspace(),
@@ -2688,8 +2862,7 @@ pub fn create_process_from_file(
             creator_endpoint,
             &universals,
             &tls_template,
-            args,
-            env,
+            argv_env,
             ipc_buf,
             stack_pages,
             process_badge,
@@ -2698,7 +2871,6 @@ pub fn create_process_from_file(
         )
     }
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    let pi_memory_guard = CapGuard::new(pi_memory_cap);
 
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
@@ -2728,7 +2900,7 @@ pub fn create_process_from_file(
         child_objs.aspace(),
         child_objs.cspace(),
         child_objs.thread(),
-        pi_memory_guard.cap(),
+        &info_caps,
         entry,
         main_tls_for_finalize,
         table,
@@ -2750,7 +2922,7 @@ pub fn create_process_from_file(
     {
         let _ = child_objs.disarm();
         let _ = mms.disarm();
-        let _ = pi_memory_guard.disarm();
+        info_caps.disarm();
         let _ = main_tls_memory_guard.disarm();
     }
     result
@@ -2870,8 +3042,8 @@ pub fn teardown_entry(
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
     // owns every cap the child held) before aspace (whose dealloc walks the
-    // page tables). pi_memory last — it was a leaf resource the child used
-    // read-only; no other object references it.
+    // page tables). pi_memory and the argv/env region last — leaf resources
+    // the child used read-only; no other object references them.
     let _ = syscall::cap_revoke_all(entry.thread_cap);
     let _ = syscall::cap_delete(entry.thread_cap);
     let _ = syscall::cap_revoke_all(entry.cspace_cap);
@@ -2880,6 +3052,11 @@ pub fn teardown_entry(
     let _ = syscall::cap_delete(entry.aspace_cap);
     let _ = syscall::cap_revoke_all(entry.pi_memory_cap);
     let _ = syscall::cap_delete(entry.pi_memory_cap);
+    if entry.argv_env_memory_cap != 0
+    {
+        let _ = syscall::cap_revoke_all(entry.argv_env_memory_cap);
+        let _ = syscall::cap_delete(entry.argv_env_memory_cap);
+    }
     if entry.tls_memory_cap != 0
     {
         let _ = syscall::cap_revoke_all(entry.tls_memory_cap);

@@ -164,8 +164,8 @@ pub struct StartupInfo {
     /// Required alignment of per-thread TLS blocks.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub tls_template_align: u64,
-    /// Raw argv blob written into the read-only `ProcessInfo` page by the
-    /// spawner. Concatenation of `args_count` NUL-terminated UTF-8
+    /// Raw argv blob the spawner delivered, in the read-only argv/env
+    /// region after the `ProcessInfo` page. Concatenation of `args_count` NUL-terminated UTF-8
     /// strings; total byte length `args_blob.len()`. Empty slice when no
     /// argv was provided. Application code should not read this
     /// directly — use `std::env::args()`.
@@ -174,8 +174,8 @@ pub struct StartupInfo {
     /// Number of NUL-terminated entries in [`Self::args_blob`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub args_count: usize,
-    /// Raw env blob written into the read-only `ProcessInfo` page by the
-    /// spawner. Concatenation of `env_count` NUL-terminated UTF-8 strings
+    /// Raw env blob the spawner delivered, in the read-only argv/env
+    /// region after the `ProcessInfo` page. Concatenation of `env_count` NUL-terminated UTF-8 strings
     /// of shape `KEY=VALUE`. Empty slice when no env was provided.
     /// Application code should not read this directly — use
     /// `std::env::{var, vars}`.
@@ -405,39 +405,33 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
         unsafe { set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64) };
     }
 
-    // Build the argv slice from the ProcessInfo-page region procmgr wrote.
-    // `args_offset` is a byte offset within the mapped ProcessInfo page;
-    // bounds-check it against the 4 KiB page size. Any inconsistency
-    // (bogus ABI version, truncated page) falls through to an empty
-    // slice rather than an out-of-bounds read.
-    let args_blob: &'static [u8] = if info.args_count > 0
-        && info.args_bytes > 0
-        && (info.args_offset as u64) < 4096
-        && (info.args_offset as u64) + (info.args_bytes as u64) <= 4096
-    {
-        let base = info_ptr + info.args_offset as u64;
-        // SAFETY: the ProcessInfo page is mapped read-only for the
-        // process's lifetime and the bounds check above confines the
-        // slice to the same page. Bytes are plain data.
-        unsafe { core::slice::from_raw_parts(base as *const u8, info.args_bytes as usize) }
-    } else {
-        &[]
+    // Build the argv and env slices from the argv/env region procmgr mapped
+    // after the ProcessInfo page. Each offset is a byte offset from the page
+    // base; `blob_span` confines the slice to the region's largest extent.
+    // Any inconsistency (bogus ABI version, a span outside the region) falls
+    // through to an empty slice rather than an out-of-bounds read.
+    let region_end = process_abi::ARGV_ENV_REGION_OFFSET + process_abi::ARGV_ENV_MAX_BYTES;
+    let blob = |offset: u64, bytes: u64, count: u64| -> &'static [u8] {
+        match argv_env::blob_span(
+            offset,
+            bytes,
+            count,
+            process_abi::ARGV_ENV_REGION_OFFSET,
+            region_end,
+        ) {
+            Some((offset, len)) => {
+                // SAFETY: the creator maps the region's pages read-only for
+                // the process's lifetime, covering every byte of each blob
+                // it records, and `blob_span` keeps the slice inside the
+                // region, clear of every other surface the layout places.
+                // Bytes are plain data.
+                unsafe { core::slice::from_raw_parts((info_ptr as usize + offset) as *const u8, len) }
+            }
+            None => &[],
+        }
     };
-
-    // Build the env slice the same way as argv. Same page, same bounds
-    // check, same empty-slice fallback on any inconsistency.
-    let env_blob: &'static [u8] = if info.env_count > 0
-        && info.env_bytes > 0
-        && (info.env_offset as u64) < 4096
-        && (info.env_offset as u64) + (info.env_bytes as u64) <= 4096
-    {
-        let base = info_ptr + info.env_offset as u64;
-        // SAFETY: ProcessInfo page is mapped read-only for the process's
-        // lifetime; bounds check above confines the slice to the same page.
-        unsafe { core::slice::from_raw_parts(base as *const u8, info.env_bytes as usize) }
-    } else {
-        &[]
-    };
+    let args_blob = blob(info.args_offset, info.args_bytes, info.args_count);
+    let env_blob = blob(info.env_offset, info.env_bytes, info.env_count);
 
     let startup = StartupInfo {
         ipc_buffer: info.ipc_buffer_vaddr as *mut u8,
@@ -1492,6 +1486,200 @@ pub mod process {
         fn process_handle(&self) -> u64 {
             self.as_inner().process_handle()
         }
+    }
+
+    /// A spawner's argv and env, packed into a Memory cap for a procmgr create
+    /// request (`procmgr_labels::CREATE_ARGV_ENV`): one contiguous run of the
+    /// pages both blobs fill, granted to this process by memmgr, holding the argv
+    /// blob at byte 0 and the env blob directly after it.
+    ///
+    /// [`Self::cap`] is a map-only derivation the request moves into
+    /// procmgr, which deletes its copy before it replies. Dropping the value,
+    /// once the create call has returned, deletes the derivation if the call
+    /// did not move it, deletes this process's cap on the run, and returns the
+    /// run to memmgr (`RELEASE_MEMORY_CAPS`).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub struct ArgvEnvCap {
+        original: u64,
+        transfer: u64,
+        phys: u64,
+        header: ipc::procmgr_labels::ArgvEnvHeader,
+    }
+
+    impl ArgvEnvCap {
+        /// Pack `args` (`args_count` NUL-terminated strings) and `env`
+        /// (`env_count` NUL-terminated `KEY=VALUE` strings) into a fresh Memory
+        /// cap. `Ok(None)` when both blobs are empty: the request then carries no
+        /// argv/env cap.
+        ///
+        /// # Errors
+        /// `ArgumentListTooLong` when the blobs together exceed
+        /// `process_abi::ARGV_ENV_MAX_BYTES` or memmgr refuses this process the
+        /// contiguous run they fill; `Unsupported` when the process has no memmgr
+        /// endpoint or IPC buffer; `Other` when the run cannot be mapped to be
+        /// written.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn new(
+            args: &[u8],
+            args_count: u64,
+            env: &[u8],
+            env_count: u64,
+        ) -> crate::io::Result<Option<Self>> {
+            let total = args.len() + env.len();
+            if total == 0 {
+                return Ok(None);
+            }
+            if total as u64 > process_abi::ARGV_ENV_MAX_BYTES {
+                return Err(crate::io::Error::new(
+                    crate::io::ErrorKind::ArgumentListTooLong,
+                    "argv and env exceed the process ABI's argv/env region",
+                ));
+            }
+            let info = super::try_startup_info().ok_or_else(|| {
+                crate::io::Error::new(
+                    crate::io::ErrorKind::Unsupported,
+                    "argv/env: startup info not installed",
+                )
+            })?;
+            if info.memmgr_endpoint == 0 || super::current_ipc_buf().is_null() {
+                return Err(crate::io::Error::new(
+                    crate::io::ErrorKind::Unsupported,
+                    "argv/env: spawning process has no memmgr endpoint or IPC buffer",
+                ));
+            }
+            let pages = (total as u64).div_ceil(syscall_abi::PAGE_SIZE);
+            let Some((original, _, phys)) =
+                crate::sys::alloc::seraph::slab_request_pages(info.memmgr_endpoint, pages)
+            else {
+                return Err(crate::io::Error::new(
+                    crate::io::ErrorKind::ArgumentListTooLong,
+                    "argv and env exceed what the spawner can fund",
+                ));
+            };
+            let release = |original: u64| {
+                let _ = syscall::cap_delete(original);
+                crate::sys::alloc::seraph::slab_release_fresh(phys);
+            };
+            if let Err(still_mapped) =
+                write_argv_env(info.self_aspace, original, pages, args, env)
+            {
+                // A run this process may still have mapped stays charged to it
+                // until it exits, rather than going back to memmgr's pool.
+                if still_mapped {
+                    let _ = syscall::cap_delete(original);
+                } else {
+                    release(original);
+                }
+                return Err(crate::io::Error::other("argv/env: mapping the blob pages failed"));
+            }
+            let Ok(transfer) = syscall::cap_derive(original, syscall::RIGHTS_MEM_MAP) else {
+                release(original);
+                return Err(crate::io::Error::other("argv/env: deriving the transfer cap failed"));
+            };
+            Ok(Some(Self {
+                original,
+                transfer,
+                phys,
+                header: ipc::procmgr_labels::ArgvEnvHeader {
+                    args_bytes: args.len() as u64,
+                    args_count,
+                    env_bytes: env.len() as u64,
+                    env_count,
+                },
+            }))
+        }
+
+        /// The `ipc::procmgr_labels::ArgvEnvHeader` the request carries, as its
+        /// four data words in wire order (from word 0 for `CREATE_PROCESS`,
+        /// from word 1 for `CREATE_FROM_FILE`).
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn header_words(&self) -> [u64; 4] {
+            self.header.to_words()
+        }
+
+        /// The map-only cap the request transfers to procmgr, the last cap
+        /// before a death relay.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn cap(&self) -> u64 {
+            self.transfer
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl crate::fmt::Debug for ArgvEnvCap {
+        fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+            f.debug_struct("ArgvEnvCap")
+                .field("header", &self.header)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl Drop for ArgvEnvCap {
+        fn drop(&mut self) {
+            // A call that moved the derivation left a stale handle here, whose
+            // delete the per-slot generation refuses; one that did not leaves it
+            // to delete.
+            let _ = syscall::cap_delete(self.transfer);
+            let _ = syscall::cap_delete(self.original);
+            crate::sys::alloc::seraph::slab_release_fresh(self.phys);
+        }
+    }
+
+    /// Map `pages` pages of `memory` writable at a fresh reservation of
+    /// `aspace`, write `args` then `env` from byte 0 and zero the tail, and
+    /// unmap them. `Err(still_mapped)` when the reservation or the map fails
+    /// (`false`) or the unmap does (`true`: the pages may still be mapped here).
+    fn write_argv_env(
+        aspace: u64,
+        memory: u64,
+        pages: u64,
+        args: &[u8],
+        env: &[u8],
+    ) -> Result<(), bool> {
+        use crate::sys::reserve::{reserve_pages, unreserve_pages};
+
+        let reserved = reserve_pages(pages).map_err(|_| false)?;
+        let va = reserved.va_start();
+        let mapped = syscall::cap_derive(memory, syscall::RIGHTS_MEM_MAP_RW).and_then(|rw| {
+            // SAFETY: `va` is the base of a `pages`-page reservation just taken
+            // from the per-process reservation arena (`sys::reserve`), which
+            // hands out VA no Rust object or IPC page occupies, and this call
+            // owns it exclusively.
+            let r = unsafe { syscall::mem_map(rw, aspace, va, 0, pages, syscall::MAP_WRITABLE) };
+            let _ = syscall::cap_delete(rw);
+            r
+        });
+        if mapped.is_err() {
+            unreserve_pages(reserved);
+            return Err(false);
+        }
+        {
+            // SAFETY: the `pages` pages at `va` are mapped writable just above,
+            // for this process alone (no other mapping of the fresh run exists),
+            // and stay mapped until the unmap below, after the slice's last use.
+            let dst = unsafe {
+                crate::slice::from_raw_parts_mut(
+                    va as *mut u8,
+                    (pages * syscall_abi::PAGE_SIZE) as usize,
+                )
+            };
+            let (dst_args, rest) = dst.split_at_mut(args.len());
+            dst_args.copy_from_slice(args);
+            let (dst_env, tail) = rest.split_at_mut(env.len());
+            dst_env.copy_from_slice(env);
+            tail.fill(0);
+        }
+        // SAFETY: the span is this function's own reservation, mapped above; no
+        // slice over it outlives the block above.
+        let unmapped = unsafe { syscall::mem_unmap(aspace, va, pages) }.is_ok();
+        if !unmapped {
+            // The span stays reserved, so no later reservation lands on the
+            // still-mapped pages.
+            return Err(true);
+        }
+        unreserve_pages(reserved);
+        Ok(())
     }
 }
 

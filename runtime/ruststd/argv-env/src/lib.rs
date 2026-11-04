@@ -5,14 +5,16 @@
 
 //! Pure argv / env blob parsers for the seraph std overlay.
 //!
-//! procmgr writes the argv and env blobs into a process's read-only
-//! `ProcessInfo` page at spawn time: each is a concatenation of
-//! NUL-terminated UTF-8 strings (env entries are additionally `KEY=VALUE`).
-//! `std::sys::{args,env}::seraph` walk those blobs. This crate owns the
-//! pure byte-slice walks they use — [`next_field`] and [`prev_field`] (one
-//! NUL-terminated field, from the front or the back), [`bounded_fields`]
-//! (the span of a declared field count), and [`split_key_value`] (a
-//! `KEY=VALUE` split on the first `=`) — so the
+//! procmgr writes the argv and env blobs into a process's read-only argv/env
+//! region, the pages after its `ProcessInfo` page, at spawn time: each is a
+//! concatenation of NUL-terminated UTF-8 strings (env entries are
+//! additionally `KEY=VALUE`). `std::sys::{args,env}::seraph` walk those
+//! blobs. This crate owns the pure byte-slice work they use —
+//! [`blob_span`] (where a blob lies, from its `ProcessInfo` fields),
+//! [`next_field`] and [`prev_field`] (one NUL-terminated field, from the
+//! front or the back), [`bounded_fields`] (the span of a declared field
+//! count), and [`split_key_value`] (a `KEY=VALUE` split on the first `=`) —
+//! so the
 //! parse of spawner-supplied bytes is host-testable rather than entangled
 //! with the overlay's `OsString` glue. The crate performs no I/O and
 //! touches only `core` slice operations — see
@@ -29,6 +31,35 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
+
+/// Where a blob lies, from its `ProcessInfo` offset, length and count:
+/// `(offset, len)` in bytes from the `ProcessInfo` page base, or `None` when
+/// the fields describe no blob or one the argv/env region cannot hold.
+///
+/// `region_offset` is where the region begins (the page after `ProcessInfo`)
+/// and `region_end` its largest end, both from the page base. A zero count,
+/// zero length or zero offset is "none delivered"; an offset below the
+/// region, a span past its end, or one that overflows is a bogus page, and
+/// the caller reads no bytes for it rather than any outside the region.
+#[must_use]
+pub fn blob_span(
+    offset: u64,
+    bytes: u64,
+    count: u64,
+    region_offset: u64,
+    region_end: u64,
+) -> Option<(usize, usize)>
+{
+    if count == 0 || bytes == 0 || offset < region_offset
+    {
+        return None;
+    }
+    if offset.checked_add(bytes)? > region_end
+    {
+        return None;
+    }
+    Some((usize::try_from(offset).ok()?, usize::try_from(bytes).ok()?))
+}
 
 /// Walk one NUL-terminated field of a blob starting at `cursor`. Returns the
 /// field slice (exclusive of the NUL) and the cursor for the next field, or
@@ -116,6 +147,31 @@ pub fn split_key_value(entry: &[u8]) -> Option<(&[u8], &[u8])>
 mod tests
 {
     use super::*;
+
+    const REGION: u64 = 4096;
+    const REGION_END: u64 = 1 << 30;
+
+    // Defect guarded: a reader that slices a blob from fields that point
+    // into the `ProcessInfo` struct, past the region, or around an
+    // overflowing end, instead of reading it as absent.
+    #[test]
+    fn blob_span_accepts_only_spans_inside_the_region()
+    {
+        assert_eq!(
+            blob_span(REGION, 9000, 3, REGION, REGION_END),
+            Some((4096, 9000))
+        );
+        assert_eq!(
+            blob_span(REGION_END - 8, 8, 1, REGION, REGION_END),
+            Some(((REGION_END - 8) as usize, 8))
+        );
+        assert_eq!(blob_span(REGION_END - 8, 9, 1, REGION, REGION_END), None);
+        assert_eq!(blob_span(REGION - 8, 8, 1, REGION, REGION_END), None);
+        assert_eq!(blob_span(u64::MAX, 2, 1, REGION, REGION_END), None);
+        assert_eq!(blob_span(REGION, 8, 0, REGION, REGION_END), None);
+        assert_eq!(blob_span(REGION, 0, 1, REGION, REGION_END), None);
+        assert_eq!(blob_span(0, 8, 1, REGION, REGION_END), None);
+    }
 
     #[test]
     fn next_field_returns_none_on_empty_blob()

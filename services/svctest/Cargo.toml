@@ -21,9 +21,8 @@ process-layout = { path = "../../shared/process-layout" }
 # from procmgr's first death-queue pool.
 process_table = { path = "../procmgr/process-table", package = "procmgr-process-table" }
 syscall = { path = "../../shared/syscall" }
-# `MSG_DATA_WORDS_MAX`: the blob-size cells size argv/env against the
-# `CREATE_FROM_FILE` data area, the `fs_std` rename cell sizes its long
-# leaf names so two of them overflow the `FS_RENAME` data area, and the
+# `MSG_DATA_WORDS_MAX`: the `fs_std` rename cell sizes its long leaf names
+# so two of them overflow the `FS_RENAME` data area, and the
 # `fs_ipc` request-bounds phase sizes the inline FS_READ reply ceiling.
 # `SyscallError`: the svcmgr published-send phase matches the code a
 # re-badge of the already-badged published cap returns, and the memmgr
@@ -33,6 +32,8 @@ syscall = { path = "../../shared/syscall" }
 # `FAULT_REPLY_KILL`: its forged-fault case sends a fault-shaped request
 # and expects the KILL reply. `SYS_THREAD_SET_FAULT_HANDLER` and
 # `FAULT_CLASS_ALL`: the pager forged-badge phase issues the raw bind.
+# `PAGE_SIZE`: the argv/env refusal cell declares a header one byte past its
+# one-page cap.
 syscall-abi = { path = "../../abi/syscall" }
 shmem = { path = "../../shared/shmem" }
 

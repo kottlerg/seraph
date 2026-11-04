@@ -154,10 +154,16 @@ wrap), so an open cap kept past its open's end is answered
 2^24 - 1 live opens and answers `TOO_MANY_OPEN` past that. No per-client
 bound is enforceable: the driver has no client identity, and an open cap
 can be delegated. The driver cannot observe a client's death or a
-`cap_delete` of an open cap, so an open whose client exits without
-`FS_CLOSE` keeps its record and release SEND until its node is freed; its
-pages are still reclaimed by eviction. Reclaiming such opens is tracked in
-[#742](https://github.com/kottlerg/seraph/issues/742).
+`cap_delete` of an open cap. The std client sends `FS_CLOSE` for every open
+`File` when its process exits normally, through `main` returning or
+`std::process::exit` ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md)
+§ Process Entry and `StartupInfo`); a crash or a kill sends none. An open
+whose client dies without `FS_CLOSE` keeps its record and release SEND until
+its node is freed; its pages are still reclaimed by eviction. Reclaiming
+such opens is tracked in [#742](https://github.com/kottlerg/seraph/issues/742).
+The SEND keeps the client's release endpoint alive past the client's death,
+which leaves a live kernel object in a frame memmgr returns to its pool,
+tracked in [#750](https://github.com/kottlerg/seraph/issues/750).
 
 ---
 

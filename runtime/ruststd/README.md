@@ -61,8 +61,16 @@ It then reads the top of its user half once (`SystemInfoType::UserVaTop`, expose
 from the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the
 page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
 if that fails). Last it runs the rustc-synthesised `main`, which drives `std::rt::lang_start` and
-the binary's idiomatic `fn main()`; when `main` returns, `_start` closes the stdio pipes and exits
-the process with its return code.
+the binary's idiomatic `fn main()`; when `main` returns, `_start` sends `FS_CLOSE` for every
+`std::fs::File` still open, closes the stdio pipes, and exits the process with its return code.
+`std::process::exit` runs the same two steps before its exit syscall, so the fs driver drops the
+opens, and the release SENDs they hold, of `File`s the process never drops
+([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md)
+§ Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`: the driver keeps such an
+open until its node is freed (reclaim tracked in
+[#742](https://github.com/kottlerg/seraph/issues/742)), and the endpoint its release SEND names
+outlives the process, a hazard to the frame it lives in tracked in
+[#750](https://github.com/kottlerg/seraph/issues/750).
 
 `std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
 (which only memmgr's bespoke runtime constructs); a binary reads it through

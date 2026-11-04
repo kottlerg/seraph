@@ -1157,6 +1157,33 @@ fn write_frame_chunk(
     Ok(n)
 }
 
+/// Send `FS_CLOSE` on the open cap of every `File` not yet dropped: the
+/// process-exit hook, run by `std::os::seraph::_start` once `main` returns
+/// and by `std::process::exit`, before the exit syscall. A `File` the
+/// process never drops would otherwise leave its open, and the release
+/// SEND it handed the driver, in the fs driver past the process's death
+/// (fs-driver-protocol.md § Label 18). The caps are left for the exit to
+/// free. A crash or a kill runs no exit hook and sends no `FS_CLOSE`.
+pub(crate) fn close_open_files()
+{
+    let Some(state) = release_handler::state()
+    else
+    {
+        return;
+    };
+    let ipc_buf = crate::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        return;
+    }
+    let close = IpcMessage::new(fs_labels::FS_CLOSE);
+    for cap in release_handler::open_caps(state)
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_call(cap, &close, ipc_buf) };
+    }
+}
+
 /// Send `FS_OPEN` on the file node cap `node_cap`, moving `release_send`
 /// (this `File`'s badged SEND on the release endpoint) to the driver in
 /// `caps[0]`, and return the open cap the reply carries
@@ -1411,8 +1438,7 @@ impl File
         // `FS_OPEN` moves a badged SEND on the release endpoint to the
         // driver, which keeps it on this `File`'s open so its eviction
         // worker can route cooperative `FS_RELEASE_MEMORY` back here.
-        // Failure paths below roll the setup back so a refused open never
-        // leaks an entry into the release handler.
+        // A refused open registers nothing with the release handler.
         let state = match release_handler::ensure_started()
         {
             Ok(s) => s,
@@ -1428,7 +1454,6 @@ impl File
             let _ = syscall::cap_delete(file_cap);
             return Err(io::Error::other("seraph fs: release-badge entropy draw failed"));
         };
-        let entry = release_handler::register(state, badge);
 
         let release_ep = release_handler::release_endpoint(state);
         let release_send =
@@ -1437,7 +1462,6 @@ impl File
                 Ok(c) => c,
                 Err(_) =>
                 {
-                    let _ = release_handler::unregister(state, badge);
                     let _ = syscall::cap_delete(file_cap);
                     return Err(io::Error::other(
                         "seraph fs: cap_derive_badge (release send) failed",
@@ -1451,15 +1475,11 @@ impl File
         // request goes to the open cap, so the node cap goes too.
         let _ = syscall::cap_delete(release_send);
         let _ = syscall::cap_delete(file_cap);
-        let file_cap = match opened
-        {
-            Ok(cap) => cap,
-            Err(e) =>
-            {
-                let _ = release_handler::unregister(state, badge);
-                return Err(e);
-            }
-        };
+        let file_cap = opened?;
+        // Registered once the open exists, so the exit hook
+        // (`close_open_files`) closes it; no driver release can name one of
+        // its pages before its first read.
+        let entry = release_handler::register(state, badge, file_cap);
 
         // ── Initial position: EOF for append, 0 otherwise ────────────
         let initial_pos = if opts.append { size } else { 0 };

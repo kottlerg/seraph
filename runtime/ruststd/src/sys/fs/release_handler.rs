@@ -74,6 +74,9 @@ pub(super) struct OutstandingMapping
 /// and the local read/drop paths.
 pub(super) struct FileEntry
 {
+    /// The `File`'s open cap, for the process-exit `FS_CLOSE`
+    /// ([`open_caps`]).
+    open_cap: u32,
     outstanding: Mutex<Outstanding>,
     /// Signalled whenever a cookie leaves [`Outstanding::reading`].
     read_done: Condvar,
@@ -195,10 +198,12 @@ pub(super) fn allocate_badge() -> Option<u64>
     }
 }
 
-/// Register a `File` with the handler, returning its `FileEntry`.
-pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
+/// Register a `File` and its open cap with the handler, returning its
+/// `FileEntry`.
+pub(super) fn register(state: &ReleaseState, badge: u64, open_cap: u32) -> Arc<FileEntry>
 {
     let entry = Arc::new(FileEntry {
+        open_cap,
         outstanding: Mutex::new(Outstanding {
             idle: Vec::new(),
             reading: Vec::new(),
@@ -212,6 +217,18 @@ pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
         .unwrap_or_else(PoisonError::into_inner);
     reg.insert(badge, entry.clone());
     entry
+}
+
+/// The open caps of every registered `File`: those not yet dropped. Read
+/// under the registry lock and returned, so the caller's IPC runs with the
+/// lock free.
+pub(super) fn open_caps(state: &ReleaseState) -> Vec<u32>
+{
+    let reg = state
+        .registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    reg.values().map(|e| e.open_cap).collect()
 }
 
 /// Remove a `File`'s registration. After this call the handler cannot

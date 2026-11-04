@@ -15,7 +15,8 @@ use crate::{RegisterLayout, STATUS_FEATURES_OK};
 /// How long a reset is waited for, on the caller's clock: by
 /// [`PciTransport::try_reset`] in a driver, and by devmgr when it resets a
 /// withdrawn driver's device (services/devmgr/docs/responsibilities.md),
-/// which holds devmgr's thread that long for a device that does not confirm.
+/// which holds devmgr's thread up to that long per withdrawn device, all of it
+/// for a device that does not confirm.
 /// QEMU completes a reset within the status write; the bound only keeps a
 /// wedged device from parking the waiter in the poll. A wall-clock bound, so
 /// the time it spans does not depend on the platform's MMIO-read cost. A

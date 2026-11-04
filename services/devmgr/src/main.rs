@@ -1469,12 +1469,13 @@ impl ServedDriver
 /// which returns its memory to memmgr, and release what the registry holds
 /// for it (one reset per withdrawal).
 ///
-/// Two windows remain until a driver can be frozen before its device is taken
-/// from it (#731; services/devmgr/docs/responsibilities.md § Responsibilities): a
-/// device that does not confirm its reset may still be writing the driver's
-/// memory when it is freed, and the driver can fault on its revoked BARs and
-/// be reaped before the reset lands. The driver is destroyed either way, as
-/// it would be with no reset.
+/// The driver is destroyed whether or not the reset is confirmed.
+///
+/// TODO(#731): two windows remain until a driver can be frozen before its
+/// device is taken from it (services/devmgr/docs/responsibilities.md
+/// § Responsibilities): a device that does not confirm its reset may still be
+/// writing the driver's memory when it is freed, and the driver can fault on
+/// its revoked BARs and be reaped before the reset lands.
 fn destroy_live_driver(spawned: &SpawnedDriver, ipc_buf: *mut u64)
 {
     if !spawned.driver.reset_device()

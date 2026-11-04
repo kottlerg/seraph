@@ -1042,7 +1042,8 @@ fn apply_stdio_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 /// `syscall::process_exit(code)` on seraph, so `std::process::exit` terminates
 /// the process and carries the code (via the kernel exit-reason encoding)
 /// instead of trapping via `intrinsics::abort()` (the unsupported-fallback
-/// behaviour). Closes stdio pipes first so any parent blocked on a
+/// behaviour). Sends `FS_CLOSE` for every open `File` first, so the fs driver
+/// drops their opens, then closes stdio pipes so any parent blocked on a
 /// `read_to_end` / `write` observes EOF / `BrokenPipe` instead of hanging.
 fn apply_exit_overlay(rust_src: &Path) -> Result<()>
 {
@@ -1054,6 +1055,7 @@ fn apply_exit_overlay(rust_src: &Path) -> Result<()>
         "        target_os = \"xous\" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n        \
          // seraph-overlay: exit the process via SYS_PROCESS_EXIT, forwarding the code\n        \
          target_os = \"seraph\" => {\n            \
+         crate::sys::fs::close_open_files();\n            \
          crate::sys::stdio::seraph::close_all();\n            \
          syscall::process_exit(code as u32)\n        }\n",
     )
@@ -1302,7 +1304,7 @@ fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: std::fs::File via vfsd OPEN + fs-driver FS_READ/FS_READ_FRAME\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          use seraph as imp;\n        \
-         pub(crate) use seraph::{walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
+         pub(crate) use seraph::{close_open_files, walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
     )
 }
 

@@ -26,7 +26,8 @@ use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Sub};
 
 /// Width of the namespace-rights field within a node-cap badge, in bits.
 ///
-/// 24 bits packed at badge[40..64]. Eight defined; sixteen reserved.
+/// 24 bits packed at badge[40..64]. Eight defined; bit 8 is the
+/// [`crate::badge::OPEN_INSTANCE`] kind flag; fifteen reserved.
 pub const RIGHTS_BITS: u32 = 24;
 
 /// Mask of the whole rights field (defined and reserved bits) within a
@@ -54,8 +55,9 @@ pub const MUTATE_DIR: u32 = 1 << 6;
 /// rule in `docs/namespace-model.md`).
 pub const ADMIN: u32 = 1 << 7;
 
-/// Mask of the defined rights bits (bits 0..8). The reserved bits of the
-/// field (8..24) MUST be zero on derive and are ignored on read, so no
+/// Mask of the defined rights bits (bits 0..8). The other bits of the
+/// field (8..24: the `OPEN_INSTANCE` kind flag and the reserved bits, which
+/// are zero on derive and ignored on read) are never part of a rights mask, so no
 /// [`NamespaceRights`] value carries a bit outside this mask.
 pub const DEFINED_MASK: u32 = LOOKUP | READDIR | STAT | READ | WRITE | EXEC | MUTATE_DIR | ADMIN;
 

@@ -33,33 +33,39 @@ in [crash-safety.md](crash-safety.md).
   of the device, whose size `FS_MOUNT` reads with `BLK_GET_GEOMETRY` before the BPB; a page holds
   `PAGE_SIZE` over it. A slot takes its page from memmgr the first time a miss finds no free slot,
   and the cache evicts only once every slot holds a page or memmgr refuses one, so an idle mount
-  pays only for the pages it fills. A file holds at most the slot ceiling of outstanding
+  pays only for the pages it fills. An open holds at most the slot ceiling of outstanding
   `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with general headroom for every
-  slot page, the quarantine's replacements, the scratch page, and 64 more
-  (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache never meets an exhausted
-  `CSpace`; a failed funding fails cache init. Write-through: the cached page is updated in place
-  before the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the page observes new
-  bytes immediately, and the sector is put back when the write fails. `reload_sector` reads one
-  sector from the device past the cache and refreshes the cached copy; a failed `FS_REMOVE` or
-  `FS_RENAME` whose 8.3 slot write failed uses it to learn whether that slot was deleted. A slot
-  whose page went to a client through `FS_READ_MEMORY` is reused only once `SYS_CAP_INFO`'s mappings
-  count shows the cache's own mapping alone. A page a client still maps is quarantined, and the slot
-  gets a replacement page. The cache takes at most 32 pages beyond its slots for replacements, past
-  which a still-mapped slot stays out of service (`src/cache.rs` module docs; [fs-driver-protocol.md
-  § Label 8](../../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
+  slot page, the quarantine's replacements, a per-read ancestor cap for every slot (each outstanding
+  page holds one), the scratch page, and 64 more (`std::os::seraph::fund_cspace_slot_budget`), so
+  growing the cache, or holding every slot outstanding, never meets an exhausted `CSpace`; a failed
+  funding fails cache init. Before it records an open's release SEND, each `FS_OPEN` tops the
+  `CSpace` up so the same funding stays free, less the slot pages and scratch page the cache
+  already holds, so the opens' SENDs grow it rather than starve reads.
+  Write-through: the cached page is updated in place before the on-disk write so any outstanding
+  `FS_READ_MEMORY` cap aliasing the page observes new bytes immediately, and the sector is put back
+  when the write fails. `reload_sector` reads one sector from the device past the cache and
+  refreshes the cached copy; a failed `FS_REMOVE` or `FS_RENAME` whose 8.3 slot write failed uses it
+  to learn whether that slot was deleted. A slot whose page went to a client through
+  `FS_READ_MEMORY` is reused only once `SYS_CAP_INFO`'s mappings count shows the cache's own mapping
+  alone. A page a client still maps is quarantined, and the slot gets a replacement page. The cache
+  takes at most 32 pages beyond its slots for replacements, past which a still-mapped slot stays out
+  of service (`src/cache.rs` module docs; [fs-driver-protocol.md § Label
+  8](../../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files
   at cluster 0. The table is a heap-grown `fat_parse::node_slab::NodeSlab`:
   a `NodeId` packs a 24-bit index and a 16-bit generation, and every holder
-  of an entry shares its one node. `FS_CLOSE` frees no node, since the
-  driver cannot tell which holder a close comes from; `FS_REMOVE` and
-  `FS_RENAME` free the unlinked slot's node, and its open-file slot with
-  it. A freed index is reused under the next generation and retired when
-  the generation would wrap, so a stale cap names no node.
-* **Open-file table** (`src/file.rs`): one slot per node read through
-  `FS_READ_MEMORY`, grown on demand and reused once closed; each slot's
-  outstanding-page table grows up to the cache's slot count.
+  of an entry shares its one node. `FS_CLOSE` frees an open, never a
+  node; `FS_REMOVE` and `FS_RENAME` free the unlinked slot's node, and
+  every open of it with it. A freed index is reused under the next
+  generation and retired when the generation would wrap, so a stale cap
+  names no node.
+* **Open table** (`src/file.rs`): one `OpenFile` per `FS_OPEN`, in a
+  heap-grown `fat_parse::open_slab::OpenSlab` whose generation-checked id
+  is the open cap's badge; at most 2^24 - 1 live opens, with no
+  per-client bound. Each open holds its own release SEND and an
+  outstanding-page table that grows up to the cache's slot count.
 * **Eviction worker** (`src/eviction.rs`): the read-side cooperative release. It sends
   `FS_RELEASE_MEMORY`, waits up to 100 ms for the ack, then revokes the page's caps and drops the
   slot. The send runs on a watchdog thread, which a client that never replies leaves blocked; with

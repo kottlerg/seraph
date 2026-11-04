@@ -333,8 +333,8 @@ any cap past cap[1].
 
 Create a suspended process from an ELF binary the caller has already resolved:
 the caller walks its own namespace cap to the binary node and transfers the
-resulting file cap. procmgr streams the ELF with `FS_READ` / `FS_READ_MEMORY`
-against that cap and never holds a namespace cap of its own. Loading, the
+resulting file cap. procmgr opens it (`FS_OPEN`), streams the ELF with `FS_READ` /
+`FS_READ_MEMORY` against its own open, and never holds a namespace cap of its own. Loading, the
 **Pinned flag**, and the **Scheduling fields** are as for `CREATE_PROCESS`.
 
 **Request:**
@@ -350,9 +350,11 @@ against that cap and never holds a namespace cap of its own. Loading, the
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap |
 
-procmgr `FS_CLOSE`s and deletes the file cap after the load, whether it succeeds or fails, and
-deletes its copy of the creator endpoint and any cap the layout does not name. When present, the
-death-relay cap is the last cap in the message, so the creator-endpoint slot stays at cap[1]; it is
+procmgr deletes the file cap once it has opened it, `FS_CLOSE`s and deletes its open after the
+load, whether it succeeds or fails, and deletes its copy of the creator endpoint and any cap the
+layout does not name; a request refused before the open deletes the file cap unopened. When
+present, the death-relay cap is the last cap in the message, so the creator-endpoint slot stays at
+cap[1]; it is
 a cap of its own, so a request that sets `CREATE_DEATH_RELAY` carries at least two caps, and one
 whose only cap is the file cap is refused with `INVALID_ARGUMENT`. Once the child is recorded,
 procmgr binds the relay as an `AddressSpace` death observer (correlator 0) on the child, using one
@@ -372,7 +374,7 @@ child, its memmgr record included, as for `CREATE_PROCESS`.
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` set with only the file cap, reserved label bits `[29..32]` set, or the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band) |
-| 10 | `IO_ERROR` | An `FS_READ` of the ELF header against the file cap failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
+| 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 

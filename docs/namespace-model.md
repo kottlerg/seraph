@@ -44,10 +44,14 @@ addressed node:
   `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`, and the `MUTATE_DIR`-gated
   `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`.
 - **File capability** — references a file node. Operations: `NS_STAT`,
-  plus the file labels `FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
-  `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`, and `FS_CLOSE`;
-  `namespace_protocol::gate` checks each request label against the
-  caller's namespace rights.
+  `FS_OPEN`, and the stateless file labels `FS_READ`, `FS_WRITE`,
+  `FS_WRITE_MEMORY`, and `FS_TRUNCATE`; `namespace_protocol::gate` checks
+  each request label against the caller's namespace rights. `FS_OPEN`
+  mints an **open capability**, a cap of its own kind on the same server
+  that names one open of the file and carries the file cap's rights; the
+  open's `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE` go to it
+  ([services/fs/docs/fs-driver-protocol.md](../services/fs/docs/fs-driver-protocol.md)
+  § Label 18).
 
 The kernel layer holds no notion of "directory" or "file." Type
 distinctions are server-private and surface to clients via the

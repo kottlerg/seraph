@@ -10,7 +10,8 @@
 //! any badged message; it looks up the operation's rights requirement
 //! in [`RIGHTS_TABLE`], unpacks the badge, and returns
 //! `Ok((node_id, rights))` only when the badge's rights mask satisfies
-//! the requirement.
+//! the requirement. [`gate_open`] is its counterpart for open-instance
+//! badges, which [`gate`] refuses (`README.md` § Badge shape).
 //!
 //! Adding a new badged label requires one row in [`RIGHTS_TABLE`]
 //! next to the wire-protocol definition; an unmatched opcode replies
@@ -22,7 +23,7 @@ use core::prelude::rust_2024::*;
 
 use core::num::NonZeroU32;
 
-use crate::badge::{NodeId, unpack};
+use crate::badge::{NodeId, is_open_instance, unpack};
 use crate::rights::{self, NamespaceRights};
 
 /// Failure modes for [`gate`]. Callers map to their wire layer's
@@ -35,6 +36,11 @@ pub enum GateError
     /// Badge's rights mask is missing a required bit (or is empty for
     /// [`RightsRequirement::AnyNonEmpty`] operations).
     PermissionDenied,
+    /// The badge is of the other kind: an open-instance badge
+    /// ([`crate::badge::OPEN_INSTANCE`] set) passed to [`gate`], or a node
+    /// badge passed to [`gate_open`]. Callers map it to their wire layer's
+    /// invalid-badge code.
+    WrongKind,
 }
 
 /// Decode a badged request and enforce its rights requirement.
@@ -46,13 +52,48 @@ pub enum GateError
 /// # Errors
 ///
 /// [`GateError::UnknownLabel`] when the opcode is absent from
-/// [`RIGHTS_TABLE`]; [`GateError::PermissionDenied`] when the badge's
-/// rights mask does not satisfy the entry.
+/// [`RIGHTS_TABLE`]; [`GateError::WrongKind`] when the badge is an
+/// open-instance badge, whose low bits are an open id and not a
+/// [`NodeId`]; [`GateError::PermissionDenied`] when the badge's rights
+/// mask does not satisfy the entry.
 pub fn gate(label: u64, badge: u64) -> Result<(NodeId, NamespaceRights), GateError>
+{
+    if is_open_instance(badge)
+    {
+        return Err(GateError::WrongKind);
+    }
+    let (node, rights) = unpack(badge);
+    check_rights(label, rights)?;
+    Ok((node, rights))
+}
+
+/// Decode an open-instance cap's badged request and enforce its rights
+/// requirement: [`gate`] for the badges [`crate::badge::pack_open`]
+/// builds. Returns the server-private open id (the badge's low
+/// [`crate::badge::NODE_ID_BITS`]) and the rights the open cap carries.
+///
+/// # Errors
+///
+/// [`GateError::UnknownLabel`] as for [`gate`]; [`GateError::WrongKind`]
+/// when the badge is a node badge; [`GateError::PermissionDenied`] when the
+/// rights mask does not satisfy the entry.
+pub fn gate_open(label: u64, badge: u64) -> Result<(u64, NamespaceRights), GateError>
+{
+    if !is_open_instance(badge)
+    {
+        return Err(GateError::WrongKind);
+    }
+    let (id, rights) = unpack(badge);
+    check_rights(label, rights)?;
+    Ok((id.raw(), rights))
+}
+
+/// Apply the rights requirement [`RIGHTS_TABLE`] lists for `label`'s
+/// opcode to `rights`.
+fn check_rights(label: u64, rights: NamespaceRights) -> Result<(), GateError>
 {
     let opcode = label & 0xFFFF;
     let req = required_rights_for(opcode).ok_or(GateError::UnknownLabel)?;
-    let (node, rights) = unpack(badge);
     let ok = match req
     {
         RightsRequirement::Bits(bits) => rights.contains(bits.get()),
@@ -60,7 +101,7 @@ pub fn gate(label: u64, badge: u64) -> Result<(NodeId, NamespaceRights), GateErr
     };
     if ok
     {
-        Ok((node, rights))
+        Ok(())
     }
     else
     {
@@ -157,6 +198,7 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         RightsRequirement::AnyNonEmpty,
     ),
     (ipc::fs_labels::FS_CLOSE, RightsRequirement::AnyNonEmpty),
+    (ipc::fs_labels::FS_OPEN, RightsRequirement::AnyNonEmpty),
     (
         ipc::fs_labels::FS_WRITE,
         RightsRequirement::Bits(nz(rights::WRITE)),
@@ -222,6 +264,44 @@ mod tests
         assert_eq!(
             gate(0x9999, badge_with(0xFFFF)),
             Err(GateError::UnknownLabel)
+        );
+    }
+
+    #[test]
+    fn gate_refuses_an_open_instance_badge_and_gate_open_a_node_badge()
+    {
+        let rights = NamespaceRights::from_raw(rights::READ | rights::STAT);
+        let open = crate::badge::pack_open(0x42, rights).unwrap();
+        assert_eq!(
+            gate(ipc::fs_labels::FS_READ, open),
+            Err(GateError::WrongKind)
+        );
+        assert_eq!(
+            gate_open(ipc::fs_labels::FS_READ, badge_with(rights.raw())),
+            Err(GateError::WrongKind)
+        );
+        assert_eq!(gate_open(ipc::fs_labels::FS_READ, open), Ok((0x42, rights)));
+    }
+
+    #[test]
+    fn gate_open_applies_the_same_rights_table()
+    {
+        let open = crate::badge::pack_open(7, NamespaceRights::from_raw(rights::READ)).unwrap();
+        assert_eq!(
+            gate_open(ipc::fs_labels::FS_WRITE, open),
+            Err(GateError::PermissionDenied)
+        );
+        assert!(gate_open(ipc::fs_labels::FS_CLOSE, open).is_ok());
+        assert_eq!(gate_open(0x9999, open), Err(GateError::UnknownLabel));
+    }
+
+    #[test]
+    fn fs_open_accepts_any_non_empty_rights_mask()
+    {
+        assert!(gate(ipc::fs_labels::FS_OPEN, badge_with(rights::STAT)).is_ok());
+        assert_eq!(
+            gate(ipc::fs_labels::FS_OPEN, badge_with(0)),
+            Err(GateError::PermissionDenied)
         );
     }
 

@@ -38,11 +38,12 @@ Each label's wire shape and error set are specified in
 |---|---|---|
 | `FS_MOUNT` | yes | vfsd's BPB-validation probe at mount time |
 | `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` | no | namespace dispatch |
-| `FS_READ` | no | inline read on a file cap |
-| `FS_READ_MEMORY` | no | zero-copy read via a returned `Memory` cap |
+| `FS_OPEN` | no | mint a per-open cap on a file cap |
+| `FS_READ` | no | inline read on a file cap or open cap |
+| `FS_READ_MEMORY` | no | zero-copy read via a returned `Memory` cap, on an open cap |
 | `FS_RELEASE_MEMORY` | no | synchronous client release of an `FS_READ_MEMORY` page (the eviction worker sends the cooperative release; fatfs does not receive it) |
-| `FS_CLOSE` | no | release per-file driver-side bookkeeping |
-| `FS_WRITE` | no | inline write on a file cap |
+| `FS_CLOSE` | no | end one open, releasing its pages and release SEND |
+| `FS_WRITE` | no | inline write on a file cap or open cap |
 | `FS_WRITE_MEMORY` | no | caller-supplied source `Memory` cap |
 | `FS_CREATE` | no | new file in a directory |
 | `FS_REMOVE` | no | unlink a file or empty directory |

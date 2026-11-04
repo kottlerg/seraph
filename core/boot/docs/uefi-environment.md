@@ -223,7 +223,9 @@ resources degrade instead of failing: an absent GOP leaves the system headless, 
 failing entropy source falls back as
 [boot-flow.md § Step 5c](boot-flow.md#step-5c-boot-entropy-seed) describes. There is no recovery
 path for a `BootError` that reaches `efi_main`, no retry beyond the bounded `ExitBootServices`
-retry loop described above, and no fallback configuration.
+retry loop described above and the bounded redo of steps 6 and 7 on a memory map that outgrew
+its entry array ([memory-map.md](memory-map.md) § Sizing the Entry Array), and no fallback
+configuration.
 
 ### BootError Type
 
@@ -233,9 +235,11 @@ protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
 failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
 on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
-a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), and, in
-step 9, RAM descriptors past the translated memory map (`MemoryMapTruncated`,
-[memory-map.md](memory-map.md) § Sizing the Entry Array) and a `reclaim_ranges` overflow
+a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), a memory map
+that outgrows its entry array on every run of steps 6 and 7 (`MemoryMapKeptGrowing`), and, in
+step 9, RAM descriptors past the translated memory map after step 8's stale-key re-query
+(`MemoryMapTruncated`, [memory-map.md](memory-map.md) § Sizing the Entry Array) and a
+`reclaim_ranges` overflow
 (`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
 source is the authority on the variant list and payloads.
 

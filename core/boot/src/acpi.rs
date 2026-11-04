@@ -20,6 +20,8 @@
 //!   sizes the CPU-id pages.
 //! - [`parse_cpu_topology`]: MADT walk producing `BootInfo.cpu_count` and
 //!   the hardware IDs `BootInfo.cpu_ids` names.
+//! - [`count_aperture_seed`]: the aperture-seed walk counting the register
+//!   and heuristic-window seeds, which sizes the seed buffers.
 //! - [`parse_aperture_seed`]: MADT + MCFG walk, plus the arch's
 //!   platform-default MMIO apertures and PCI windows
 //!   (`core/boot/docs/acpi.md` § Tables Consumed), producing the register
@@ -640,7 +642,12 @@ pub unsafe fn parse_aperture_seed(
 ) -> (usize, usize)
 {
     // SAFETY: caller contract.
-    unsafe { walk_aperture_seed(rsdp_addr, out, heuristic, false) }.written
+    let walk = unsafe { walk_aperture_seed(rsdp_addr, out, heuristic) };
+    if walk.found != walk.written
+    {
+        bprintln!("[--------] boot: ACPI: aperture seeds past the seed buffers dropped");
+    }
+    walk.written
 }
 
 /// The number of named and heuristic seeds [`parse_aperture_seed`] would
@@ -654,7 +661,7 @@ pub unsafe fn parse_aperture_seed(
 pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 {
     // SAFETY: caller contract.
-    unsafe { walk_aperture_seed(rsdp_addr, &mut [], &mut [], true) }.found
+    unsafe { walk_aperture_seed(rsdp_addr, &mut [], &mut []) }.found
 }
 
 /// Walk ACPI tables and collect MMIO extents for aperture seeding: the
@@ -688,8 +695,7 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// [`super::memory_map::derive_mmio_apertures`].
 ///
 /// Returns the number of entries written to `out` and to `heuristic`, and the
-/// number found (written or dropped). `quiet` silences the dropped-seed
-/// diagnostic, for the count pass, whose buffers are empty.
+/// number found (written, or past a full buffer and not written).
 ///
 /// # Safety
 /// `rsdp_addr` must be the physical address of a valid, identity-mapped
@@ -701,7 +707,6 @@ unsafe fn walk_aperture_seed(
     rsdp_addr: u64,
     out: &mut [MmioAperture],
     heuristic: &mut [MmioAperture],
-    quiet: bool,
 ) -> SeedWalk
 {
     let mut n: usize = 0;
@@ -709,8 +714,6 @@ unsafe fn walk_aperture_seed(
     // Every seed found, written or not: the count pass sizes the buffers.
     let mut found_n: usize = 0;
     let mut found_h: usize = 0;
-    // A seed past its buffer is dropped with a diagnostic, printed once.
-    let mut dropped = quiet;
 
     macro_rules! push {
         ($base:expr, $size:expr) => {
@@ -724,13 +727,6 @@ unsafe fn walk_aperture_seed(
                         size: $size,
                     };
                     n += 1;
-                }
-                else if !dropped
-                {
-                    dropped = true;
-                    bprintln!(
-                        "[--------] boot: ACPI: aperture seeds past the seed buffers dropped"
-                    );
                 }
             }
         };
@@ -747,13 +743,6 @@ unsafe fn walk_aperture_seed(
                         size: $size,
                     };
                     h += 1;
-                }
-                else if !dropped
-                {
-                    dropped = true;
-                    bprintln!(
-                        "[--------] boot: ACPI: aperture seeds past the seed buffers dropped"
-                    );
                 }
             }
         };
@@ -1065,6 +1054,86 @@ mod tests
         let len = t.len() as u32;
         t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
         t
+    }
+
+    /// A synthetic SDT: `signature`, the length field over `body`, then
+    /// `body` after the 36-byte header.
+    fn sdt(signature: &[u8; 4], body: &[u8]) -> Vec<u8>
+    {
+        let mut t = vec![0u8; SDT_HDR_LEN];
+        t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(signature);
+        t.extend_from_slice(body);
+        let len = t.len() as u32;
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    // Defect caught: an ACPI count pass that finds a different number of
+    // named or heuristic seeds than the fill pass writes, so a buffer sized
+    // from it drops seeds the kernel needs as apertures.
+    #[test]
+    fn the_acpi_seed_count_pass_finds_every_seed_the_fill_pass_writes()
+    {
+        // MADT: a LAPIC base the override replaces, one I/O APIC, and the
+        // `LocalApicAddressOverride`.
+        let mut madt_body = Vec::new();
+        madt_body.extend_from_slice(&0xFEE0_0000u32.to_le_bytes());
+        madt_body.extend_from_slice(&0u32.to_le_bytes());
+        madt_body.extend_from_slice(&[MADT_TYPE_IOAPIC, 12, 0, 0]);
+        madt_body.extend_from_slice(&0xFEC0_0000u32.to_le_bytes());
+        madt_body.extend_from_slice(&0u32.to_le_bytes());
+        madt_body.extend_from_slice(&[MADT_TYPE_LAPIC_OVERRIDE, 12, 0, 0]);
+        madt_body.extend_from_slice(&0xFEE0_1000u64.to_le_bytes());
+        let madt = sdt(b"APIC", &madt_body);
+        // MCFG: one ECAM above 2 GiB (the q35 branch) and one below (virt),
+        // each with its two heuristic PCI windows.
+        let mut mcfg_body = vec![0u8; MCFG_ENTRIES_OFF - SDT_HDR_LEN];
+        for base in [0xB000_0000u64, 0x3000_0000u64]
+        {
+            mcfg_body.extend_from_slice(&base.to_le_bytes());
+            mcfg_body.extend_from_slice(&[0, 0, 0, 0xFF, 0, 0, 0, 0]);
+        }
+        let mcfg = sdt(b"MCFG", &mcfg_body);
+        let mut xsdt_body = Vec::new();
+        xsdt_body.extend_from_slice(&(madt.as_ptr() as u64).to_le_bytes());
+        xsdt_body.extend_from_slice(&(mcfg.as_ptr() as u64).to_le_bytes());
+        let xsdt = sdt(b"XSDT", &xsdt_body);
+        let mut rsdp = vec![0u8; 36];
+        rsdp[..8].copy_from_slice(RSDP_SIG);
+        rsdp[RSDP_OFF_REVISION] = 2;
+        rsdp[RSDP_OFF_XSDT..RSDP_OFF_XSDT + 8]
+            .copy_from_slice(&(xsdt.as_ptr() as u64).to_le_bytes());
+        let addr = rsdp.as_ptr() as u64;
+
+        // SAFETY: rsdp, xsdt, madt and mcfg are live, well-formed tables at
+        // the addresses they name.
+        let (named, heuristic) = unsafe { count_aperture_seed(addr) };
+        let defaults = crate::arch::current::default_mmio_apertures().len();
+        let pci_defaults = crate::arch::current::default_pci_windows().len();
+        assert_eq!(named, 4 + defaults, "LAPIC, I/O APIC and two ECAM windows");
+        assert_eq!(heuristic, 4 + pci_defaults, "two PCI windows per ECAM");
+
+        let empty = MmioAperture {
+            phys_base: 0,
+            size: 0,
+        };
+        let mut out = vec![empty; named + 4];
+        let mut out_h = vec![empty; heuristic + 4];
+        // SAFETY: as above.
+        let written = unsafe { parse_aperture_seed(addr, &mut out, &mut out_h) };
+        assert_eq!(written, (named, heuristic));
+        assert!(out[..named].iter().any(|a| a.phys_base == 0xFEE0_1000));
+
+        // Buffers of exactly the counted sizes drop nothing.
+        let mut exact = vec![empty; named];
+        let mut exact_h = vec![empty; heuristic];
+        // SAFETY: as above.
+        let exact_written = unsafe { parse_aperture_seed(addr, &mut exact, &mut exact_h) };
+        assert_eq!(exact_written, (named, heuristic));
+        let spans =
+            |a: &[MmioAperture]| a.iter().map(|a| (a.phys_base, a.size)).collect::<Vec<_>>();
+        assert_eq!(spans(&exact), spans(&out[..named]));
+        assert_eq!(spans(&exact_h), spans(&out_h[..heuristic]));
     }
 
     /// Run `madt_topology` over a synthetic MADT; returns the count, the

@@ -18,6 +18,8 @@
 //!   the `HART_CAP_*` bits every enabled hart advertises.
 //! - [`parse_boot_cpu_mmu_type`]: read the boot hart's `mmu-type` paging
 //!   claim for mode negotiation.
+//! - [`count_aperture_seed`]: count the seeds [`parse_aperture_seed`]
+//!   writes, which sizes the seed buffer.
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports) as seeds for
 //!   [`super::memory_map::derive_mmio_apertures`].
@@ -1076,7 +1078,12 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
 pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> usize
 {
     // SAFETY: caller contract.
-    unsafe { walk_aperture_seed(dtb_addr, out, false) }.0
+    let (written, found) = unsafe { walk_aperture_seed(dtb_addr, out) };
+    if found != written
+    {
+        bprintln!("[--------] boot: DTB: aperture seeds past the seed buffer dropped");
+    }
+    written
 }
 
 /// The number of seeds [`parse_aperture_seed`] would write into a buffer
@@ -1089,17 +1096,15 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 pub unsafe fn count_aperture_seed(dtb_addr: u64) -> usize
 {
     // SAFETY: caller contract.
-    unsafe { walk_aperture_seed(dtb_addr, &mut [], true) }.1
+    unsafe { walk_aperture_seed(dtb_addr, &mut []) }.1
 }
 
 /// The walk behind [`parse_aperture_seed`] and [`count_aperture_seed`]:
 /// returns the seeds written to `out` and the seeds found, written or not.
-/// `quiet` silences the dropped-seed diagnostic, for the count pass.
 ///
 /// # Safety
 /// As [`parse_aperture_seed`].
-unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture], quiet: bool)
--> (usize, usize)
+unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> (usize, usize)
 {
     if dtb_addr == 0
     {
@@ -1160,10 +1165,6 @@ unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture], quiet: boo
         true
     });
 
-    if found > n && !quiet
-    {
-        bprintln!("[--------] boot: DTB: aperture seeds past the seed buffer dropped");
-    }
     (n, found)
 }
 
@@ -1482,7 +1483,7 @@ mod tests
         // SAFETY: as above.
         let written = unsafe { parse_aperture_seed(addr, &mut out) };
         assert_eq!(counted, written);
-        assert!(counted >= 4, "ECAM, three windows and a virtio transport");
+        assert_eq!(counted, 5, "ECAM, three windows and a virtio transport");
         // A buffer of exactly the counted size drops nothing.
         let mut exact = vec![
             MmioAperture {

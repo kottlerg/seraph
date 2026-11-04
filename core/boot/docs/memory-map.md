@@ -149,11 +149,13 @@ is a first guess, not a proof.
 
 The guess is checked before `ExitBootServices`: when step 7's final map holds
 more descriptors than the array, the bootloader frees every allocation of steps 6
-and 7, the page-table frames included, and runs both again with twice the slack,
-so the next array is sized from a map that already holds the first attempt's
-allocations. After `MEM_MAP_ATTEMPTS` (3) attempts a map that still outgrows its
-array fails the boot with `BootError::MemoryMapKeptGrowing`; only firmware that
-keeps allocating on its own reaches a third.
+and 7, the page-table frame pool included (the AP trampoline page, the CPU-id
+pages and the x86-64 LA57 toggle page are earlier steps' and stay), and runs both
+again with twice the slack. The redo counts the map after those frees, so its count
+includes what the firmware itself allocated during the first window. After
+`MEM_MAP_ATTEMPTS` (3) attempts a map that still outgrows its array fails the boot
+with `BootError::MemoryMapKeptGrowing`; only firmware that outgrows twice the slack
+in the second window reaches a third.
 
 A map can still grow after step 7, when `ExitBootServices` refuses a stale key and
 step 8 re-queries it. Such a map does not boot silently short of memory:

@@ -86,7 +86,11 @@
 /// v14: [`INIT_MAX_NAMED_MODULES`] rose from 12 to 85, one per boot module a
 ///     `BootInfo` can list; [`InitInfo::module_names`] grows with it, so every
 ///     field after it moves.
-pub const INIT_PROTOCOL_VERSION: u32 = 14;
+/// v15: the kernel sizes the [`InitInfo`] region from the boot's own
+///     descriptor counts and maps all of it; [`InitInfo::init_info_memory_count`]
+///     is its page count, which init reads to bound the descriptor slice.
+///     [`INIT_INFO_MAX_PAGES`] rose from 4 to 64 and is now only the ceiling.
+pub const INIT_PROTOCOL_VERSION: u32 = 15;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle
@@ -115,14 +119,24 @@ pub const INIT_MAX_NAMED_MODULES: usize = 85;
 /// and no hardware count grows.
 pub const INIT_STACK_PAGES: usize = 4;
 
-/// Maximum number of 4 KiB pages the kernel may allocate for the
-/// [`InitInfo`] region (header — which now includes the boot-module
-/// name table — followed by the [`CapDescriptor`] array).
+/// Ceiling on the 4 KiB pages of the [`InitInfo`] region (the header, which
+/// includes the boot-module name table, followed by the [`CapDescriptor`]
+/// array): 64 pages hold 10,775 descriptors past the header.
 ///
-/// The kernel enforces this ceiling when assembling the region; init uses it
-/// to bound descriptor-slice reads. Both sides must agree: changing this
-/// constant is a protocol change — bump [`INIT_PROTOCOL_VERSION`].
-pub const INIT_INFO_MAX_PAGES: usize = 4;
+/// The kernel sizes each boot's region from that boot's own counts, one
+/// descriptor per coalesced RAM extent, ACPI region, MMIO aperture, boot module
+/// and reclaim range plus a few fixed caps, and reports the page count in
+/// [`InitInfo::init_info_memory_count`]. Each of those counts is bounded by the
+/// platform: coalesced RAM extents and ACPI regions by the firmware memory map,
+/// apertures by the map and the firmware tables, modules by
+/// `boot_protocol::MAX_BOOT_MODULES` (85), reclaim ranges by
+/// `boot_protocol::MAX_RECLAIM_RANGES` (256). Real maps yield tens of
+/// descriptors, so no platform comes near the ceiling; a boot that would pass
+/// it halts by name. The ceiling sizes what must be fixed before init can
+/// allocate: the virtual-address room the kernel leaves for the region and
+/// init's orphan-cap table. Both sides must agree: changing this constant is a
+/// protocol change — bump [`INIT_PROTOCOL_VERSION`].
+pub const INIT_INFO_MAX_PAGES: usize = 64;
 
 // ── InitInfo ─────────────────────────────────────────────────────────────────
 
@@ -246,7 +260,9 @@ pub struct InitInfo
     /// struct itself — once init has read `InitInfo` at `_start`, the
     /// pages can be reclaimed safely.
     pub init_info_memory_base: u32,
-    /// Number of `InitInfo` `Memory` caps (1..=[`INIT_INFO_MAX_PAGES`]).
+    /// Number of `InitInfo` `Memory` caps (1..=[`INIT_INFO_MAX_PAGES`]),
+    /// one per page of the region: the region's page count, which bounds the
+    /// descriptor slice.
     pub init_info_memory_count: u32,
 
     // ── Boot-module name table (added in protocol version 7) ────────────

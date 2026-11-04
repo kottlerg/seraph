@@ -114,6 +114,39 @@ The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
 DMA-safety verdict.
 
+### DMA-Safe Teardown
+
+A device can keep writing the frames its driver posted to it after the driver is gone, until the
+device is stopped, and with no IOMMU confining the device to those frames the writes land on
+whatever owns them next. A DMA-capable driver's frames therefore return to
+memmgr's free pool only after its device's DMA is confirmed stopped, whether the driver died on
+its own or devmgr withdrew it:
+
+1. **Bus mastering off.** devmgr clears the function's Bus Master Enable (bit 2 of the Command
+   register) through a configuration-page capability it keeps and never delegates, and reads the
+   register back. While the bit is clear the function issues no memory or I/O request of its own,
+   so it performs no DMA and signals no MSI (PCI Local Bus Specification r3.0 § 6.2.2; PCI Express
+   Base Specification r4.0 § 7.5.1.1.3). The driver holds no configuration-space capability, so
+   it cannot set the bit again, and devmgr needs neither the driver's cooperation nor a way to
+   stop its threads.
+2. **Device taken and reset.** devmgr then revokes the driver's BAR capabilities and resets the
+   device, waiting for the reset to be confirmed for at most `RESET_TIMEOUT` (5 s).
+3. **Memory freed.** procmgr holds back the `PROCESS_DIED` of a driver devmgr created with
+   `CREATE_DMA_HOLD`, however the driver died, so memmgr keeps its frames on the driver's record,
+   out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only once the Bus Master Enable
+   read-back and the reset both confirm the device stopped; a device that does not confirm both
+   leaves the frames quarantined on that record, counted and never handed out again, for the
+   rest of the boot.
+
+The steps, their owners, and their bounds are specified in
+[services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
+§ Responsibilities (the withdrawal),
+[docs/process-lifecycle.md](process-lifecycle.md#process-death) § Process Death (the held
+reclaim), and
+[services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#label-4-process_died)
+§ Label 4 (`PROCESS_DIED`). As an observation, not a guarantee the order relies on, QEMU's
+virtio-pci devices also stop processing their queues when Bus Master Enable is cleared.
+
 ---
 
 ## IOMMU Discovery and Programming
@@ -215,7 +248,7 @@ driver on the line then passes: on x86-64 the trigger and polarity of the MADT I
 Override that names the line's GSI, field by field, with the PCI default (level-triggered,
 active-low) for a field the override leaves conforming to its bus and for a line no override names;
 on riscv64 level-triggered, active-high
-([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 3). On a
+([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) step 4). On a
 line programmed edge-triggered and shared, an assertion while the line is masked or another device
 holds it high raises no new edge, and the device stays asserted until its interrupt status is read,
 so no later assertion on the line raises one either. The VirtIO interrupt-service thread's timed

@@ -47,7 +47,7 @@ devmgr's responsibilities are:
   ([services/drivers/serial/README.md](../../drivers/serial/README.md#interrupts)
   § Interrupts), so no other device may share its line; every PCI device's
   line is instead held and shared,
-  [docs/pci-enumeration.md](pci-enumeration.md) step 3),
+  [docs/pci-enumeration.md](pci-enumeration.md) step 4),
   and whose second, terminal round delivers the driver's devmgr query cap
   (below). The `cmos-rtc` first round also carries one data word: the CMOS
   RAM index of the century register the FADT's `CENTURY` field names, or 0
@@ -88,36 +88,75 @@ devmgr's responsibilities are:
   and taking deaths from the queue, until every driver of the batch has
   reported ready or died or the settle bound elapses, and then takes every
   death still queued. It then revokes the private endpoint, serves each driver
-  that reported ready, and withdraws the rest. Withdrawing a `VirtIO` driver
-  takes its device from it and resets the device: devmgr revokes every cap
-  derived from the BAR caps it keeps, which removes the driver's mappings of
-  the device before the revocation returns, then maps the BAR cap holding the
-  common configuration region, writes 0 to `device_status`, and waits, bounded
-  by `RESET_TIMEOUT`, for the status to read 0, which completes the reset: the
-  device has then stopped its DMA and dropped its pending interrupt (a status
-  byte past the span the cap was carved to is not written, and a BAR copy
-  whose revocation fails leaves the driver its mapping; either counts as an
-  unconfirmed reset). A driver still running (one pending, or one devmgr has
-  no memory to serve) is taken from its device and reset first, and only then
-  destroyed (`DESTROY_PROCESS` on the process handle devmgr keeps until the
-  batch settles, which returns once procmgr has torn it down and handed its
-  memory back to memmgr), so a device that confirmed its reset can no longer
-  reach that memory when it is freed. Each withdrawal resets once, and the
-  wait for the confirmation holds devmgr's thread (the settle, or the registry
-  loop) for up to `RESET_TIMEOUT` (5 s) per withdrawn device, all of it for
-  one whose status does not read 0 within the bound. Two windows remain until
-  a driver can be frozen before its device is taken from it
-  ([#731](https://github.com/kottlerg/seraph/issues/731)): a device that does
-  not confirm its reset is logged and its driver destroyed anyway, so the
-  device may still be writing that memory when it is freed; and the driver can
-  fault on its revoked BARs and be reaped before the reset lands. A driver
-  that dies on its own has its memory freed by procmgr before devmgr hears of
-  the death and resets its device, which #731 tracks too. Then the driver's
-  service endpoint is revoked and deleted and its BAR and IRQ caps released. A
-  driver devmgr's batch cannot record at its spawn is withdrawn the same way
-  there. The catalog entry of a withdrawn driver, or of one that failed to
-  spawn, stays, so a badge is never reused. No `QUERY_*` reply hands out the
-  endpoint of a driver that has not reported its device ready.
+  that reported ready, and withdraws the rest.
+
+  Withdrawing a `VirtIO` driver, live or dead, takes its device from it in
+  this order, so the driver's memory returns to memmgr only once the device's
+  DMA is confirmed stopped
+  ([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
+  § DMA-Safe Teardown):
+
+  1. devmgr clears the function's Bus Master Enable through the `Mmio` cap of
+     the function's configuration page, which it carves at enumeration and
+     delegates to no driver ([`docs/pci-enumeration.md`](pci-enumeration.md)
+     § Per-Device Capability Creation), and reads the Command register back.
+     While the bit is clear the function issues no memory request of its own,
+     so it performs no DMA, whatever its driver does; the driver holds only
+     BAR caps, so it cannot set the bit again.
+  2. devmgr revokes every cap derived from the BAR caps it keeps, which
+     removes the driver's mappings of the device before the revocation
+     returns. A live driver's next register access faults; its death is held
+     at step 4 like any other.
+  3. devmgr maps the BAR cap holding the common configuration region, writes
+     0 to `device_status`, and waits, bounded by `RESET_TIMEOUT`
+     (`virtio_core::pci::RESET_TIMEOUT`, 5 s), for the status to read 0, which
+     completes the reset: the device has then dropped its pending interrupt,
+     so a line it shares is left no assertion to loop on.
+  4. devmgr sends `DESTROY_PROCESS` on the driver's process handle, which it
+     keeps for the rest of the boot; procmgr tears a live driver down, and a
+     dead one it has reaped already is a no-op. Every `VirtIO` driver is
+     created `CREATE_DMA_HOLD`, so procmgr holds the driver's memory on its
+     memmgr record, out of the free pool, whether the driver died on its own
+     or was destroyed. Only when Bus Master Enable read back clear, every BAR
+     copy was revoked, and the reset confirmed does devmgr send `RELEASE_HOLD`
+     on the handle, on which procmgr sends memmgr `PROCESS_DIED` and the
+     memory returns to the pool
+     ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-3-release_hold)
+     § Label 3). Otherwise the device may still be writing that memory:
+     devmgr logs the device and never releases the hold, so the memory stays
+     quarantined on the dead driver's memmgr record, counted and never handed
+     out again, for the rest of the boot. A status byte past the span its BAR
+     cap was carved to is not written, and a BAR copy whose revocation fails
+     leaves the driver its mapping; either counts as an unconfirmed reset.
+
+  Each withdrawal resets once, and the wait for the confirmation holds
+  devmgr's thread (the settle, or the registry loop) for up to `RESET_TIMEOUT`
+  per withdrawn device, all of it for one whose status does not read 0 within
+  the bound. A driver still running (one pending, one devmgr has no memory to
+  serve, one devmgr's batch cannot record at its spawn, or one whose bootstrap
+  failed after its start) is withdrawn the same way, its Bus Master Enable
+  cleared before its BAR caps are taken. A driver that dies on its own is
+  withdrawn when devmgr takes its death from the death queue; procmgr may reap
+  it first, and holds its memory until devmgr's release. devmgr spawns no
+  driver for a `VirtIO` device whose configuration page it holds no cap for,
+  since it could not clear that function's Bus Master Enable. Then the
+  driver's service endpoint is revoked and deleted and its BAR,
+  configuration-page, and IRQ caps released. A withdrawn driver of any other
+  class is destroyed through its process handle while devmgr still keeps it
+  (until its batch settles); none of them drives a DMA-capable device, and none
+  is created `CREATE_DMA_HOLD`. No boot kills a `VirtIO` driver with a request
+  in flight to observe whether its frames are reused before the reset: only
+  devmgr holds a `VirtIO` driver's process handle, the only virtio-blk driver
+  of a test boot serves its root filesystem, and the emulated devices complete
+  a request on their own event loop, with nothing a guest can hold in flight,
+  so a late device write cannot be placed after a free. svctest's
+  `procmgr_dma_hold` phase checks the held reclaim the order rests on instead:
+  a started held child's pages stay out of memmgr's pool after its teardown
+  until its creator releases them.
+
+  The catalog entry of a withdrawn driver, or of one that failed to spawn,
+  stays, so a badge is never reused. No `QUERY_*` reply hands out the endpoint
+  of a driver that has not reported its device ready.
 
   The settle bound, `SETTLE_TIMEOUT` (`services/devmgr/src/settle.rs`), is
   twice `virtio_core::pci::RESET_TIMEOUT` (5 s), so 10 s, counted from the
@@ -271,7 +310,7 @@ how devmgr uses them.
 | Capability | Rights | Purpose |
 |---|---|---|
 | Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_*_DEVICE`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` / `TEST_QUERY_DENY_DEVICE` / `TEST_SPAWN_FAULT_DRIVERS` / `TEST_QUERY_FAULT_DEVICE` labels the enumeration redesign removes (#165) on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). The test labels are gated on `TEST_LABEL_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds. `TEST_QUERY_DENY_DEVICE` mints a SEND on the serial, input, or framebuffer driver's endpoint badged `TEST_DENY_BADGE`, which carries none of the driver's verb bits, so svctest can assert each driver's `UNAUTHORIZED` reply; every other SEND devmgr mints on those endpoints carries the bits |
-| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers |
+| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers; the ECAM windows carved from them stay devmgr's, split into the configuration page of each `VirtIO` function, which devmgr keeps to clear its Bus Master Enable (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |

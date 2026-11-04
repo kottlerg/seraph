@@ -3,10 +3,36 @@
 
 // services/devmgr/firmware/src/pci.rs
 
-//! PCI configuration-space arithmetic for devmgr: ECAM register offsets,
-//! BAR sizes from their sizing read-backs (PCI Local Bus Specification r3.0
+//! PCI configuration-space arithmetic for devmgr: ECAM register offsets, the
+//! physical page of a function's configuration space, BAR sizes from their sizing read-backs (PCI Local Bus Specification r3.0
 //! § 6.2.5.1), and the Command register's Bus Master Enable (§ 6.2.2).
 //! devmgr performs the volatile accesses; these functions only compute.
+
+/// Bytes of one function's configuration space in an ECAM window (PCI
+/// Express Base Specification r4.0 § 7.2.2): one page.
+pub const FUNCTION_CONFIG_BYTES: u64 = 0x1000;
+
+/// Physical address of the configuration space of function `func` of device
+/// `dev` on `bus` in PCI segment `segment`: the page of it the ECAM window
+/// among `windows` that decodes that segment and bus holds. Returns `None`
+/// when no window decodes them or a field is out of range
+/// ([`config_offset`]).
+#[must_use]
+pub fn function_config_phys(
+    windows: &[crate::EcamLocation],
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Option<u64>
+{
+    let window = windows
+        .iter()
+        .find(|w| w.segment == segment && w.start_bus <= bus && bus <= w.end_bus)?;
+    window
+        .phys_base
+        .checked_add(config_offset(window.start_bus, bus, dev, func, 0)?)
+}
 
 /// Offset of the Command register in a function's configuration header.
 pub const COMMAND: u16 = 0x04;
@@ -112,6 +138,50 @@ mod tests
         assert_eq!(config_offset(0, 0, 32, 0, 0), None);
         assert_eq!(config_offset(0, 0, 0, 8, 0), None);
         assert_eq!(config_offset(0, 0, 0, 0, 0x1000), None);
+    }
+
+    fn window(segment: u16, phys_base: u64, start_bus: u8, end_bus: u8) -> crate::EcamLocation
+    {
+        crate::EcamLocation {
+            phys_base,
+            size: (u64::from(end_bus - start_bus) + 1) << 20,
+            segment,
+            start_bus,
+            end_bus,
+        }
+    }
+
+    #[test]
+    fn function_config_phys_is_its_page_in_the_window_decoding_its_bus()
+    {
+        let windows = [
+            window(0, 0xB000_0000, 0, 0x3F),
+            window(0, 0xC000_0000, 0x40, 0x7F),
+            window(1, 0xD000_0000, 0, 0xFF),
+        ];
+        assert_eq!(
+            function_config_phys(&windows, 0, 0, 3, 1),
+            Some(0xB000_0000 | (3 << 15) | (1 << 12))
+        );
+        assert_eq!(
+            function_config_phys(&windows, 0, 0x41, 0, 0),
+            Some(0xC000_0000 | (1 << 20))
+        );
+        assert_eq!(
+            function_config_phys(&windows, 1, 2, 0, 0),
+            Some(0xD000_0000 | (2 << 20))
+        );
+    }
+
+    #[test]
+    fn function_config_phys_misses_an_undecoded_segment_or_bus_and_bad_fields()
+    {
+        let windows = [window(0, 0xB000_0000, 1, 0x3F)];
+        assert_eq!(function_config_phys(&windows, 1, 1, 0, 0), None);
+        assert_eq!(function_config_phys(&windows, 0, 0, 0, 0), None);
+        assert_eq!(function_config_phys(&windows, 0, 0x40, 0, 0), None);
+        assert_eq!(function_config_phys(&windows, 0, 1, 32, 0), None);
+        assert_eq!(function_config_phys(&windows, 0, 1, 0, 8), None);
     }
 
     #[test]

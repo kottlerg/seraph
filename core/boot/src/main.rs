@@ -1272,13 +1272,10 @@ fn collect_identity_regions(
         push(seg.phys_base, (seg.size + 4095) & !4095);
     }
     // Fixed boot allocations.
-    push(allocs.boot_info_phys, 4096);
-    push(allocs.modules_phys, 4096);
-    push(
-        allocs.mem_entries_phys,
-        (allocs.mem_entries_pages as u64) * 4096,
-    );
-    push(allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096);
+    for (phys, size) in allocation_regions(allocs)
+    {
+        push(phys, size);
+    }
     // Init segments — segment bodies live in their own UEFI allocations,
     // produced by `load_init` against the bundle slice for the `init` entry.
     // `phys_addr` carries the `p_vaddr` in-page offset; `build_initial_tables`
@@ -1302,16 +1299,32 @@ fn collect_identity_regions(
     {
         push(uart_base, 4096);
     }
-    // MMIO aperture array pages.
-    push(
-        allocs.apertures_phys,
-        (allocs.apertures_pages as u64) * 4096,
-    );
-    // Reclaim-array page: backs BootInfo.reclaim_ranges.
-    push(allocs.reclaim_array_phys, 4096);
-    // CPU-id pages: back BootInfo.cpu_ids.
-    push(allocs.cpu_ids_phys, (allocs.cpu_ids_pages as u64) * 4096);
     n
+}
+
+/// The identity-map regions of the fixed boot allocations: the `BootInfo`
+/// page, the boot-module array page, the memory-map entry pages, the handoff
+/// stack above its guard page, the MMIO aperture array pages, the
+/// reclaim-array page (`BootInfo.reclaim_ranges`), and the CPU-id pages
+/// (`BootInfo.cpu_ids`). The AP trampoline page is mapped by the kernel, not
+/// here.
+fn allocation_regions(allocs: &BootAllocations) -> [(u64, u64); 7]
+{
+    [
+        (allocs.boot_info_phys, 4096),
+        (allocs.modules_phys, 4096),
+        (
+            allocs.mem_entries_phys,
+            (allocs.mem_entries_pages as u64) * 4096,
+        ),
+        (allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096),
+        (
+            allocs.apertures_phys,
+            (allocs.apertures_pages as u64) * 4096,
+        ),
+        (allocs.reclaim_array_phys, 4096),
+        (allocs.cpu_ids_phys, (allocs.cpu_ids_pages as u64) * 4096),
+    ]
 }
 
 /// Identity-map the handoff trampoline page(s) as RX in the new tables.
@@ -1856,9 +1869,9 @@ unsafe fn step10_handoff(
 mod tests
 {
     use super::{
-        BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES, KaslrOverride, ReclaimRange,
-        choose_kaslr_layout, handoff_stack_span, memory_map, push_reclaim_range,
-        report_map_truncation, scrub,
+        BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
+        KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions, choose_kaslr_layout,
+        handoff_stack_span, memory_map, push_reclaim_range, report_map_truncation, scrub,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -1948,6 +1961,45 @@ mod tests
             boot_protocol::layout::HANDOFF_STACK_BYTES as u64
         );
         assert_eq!(top, alloc + (HANDOFF_STACK_ALLOC_PAGES as u64) * 4096);
+    }
+
+    // Defect caught: an array `BootInfo` references left out of the identity
+    // map at kernel entry, which no boot exposes while the kernel reads that
+    // array only through its direct map (the CPU-id pages, for one).
+    #[test]
+    fn every_boot_array_is_identity_mapped_whole()
+    {
+        let allocs = BootAllocations {
+            boot_info_phys: 0x1_0000,
+            modules_phys: 0x2_0000,
+            mem_entries_phys: 0x3_0000,
+            mem_entries_pages: 3,
+            apertures_phys: 0x4_0000,
+            aperture_capacity: 600,
+            apertures_pages: 3,
+            stack_phys: 0x5_1000,
+            stack_top: 0x6_1000,
+            ap_trampoline_phys: 0x8000,
+            reclaim_array_phys: 0x7_0000,
+            cpu_ids_phys: 0x8_0000,
+            cpu_ids_pages: 2,
+        };
+        let regions = allocation_regions(&allocs);
+        for region in [
+            (0x1_0000, 4096),
+            (0x2_0000, 4096),
+            (0x3_0000, 3 * 4096),
+            (0x4_0000, 3 * 4096),
+            (0x5_1000, (KERNEL_STACK_PAGES as u64) * 4096),
+            (0x7_0000, 4096),
+            (0x8_0000, 2 * 4096),
+        ]
+        {
+            assert!(
+                regions.contains(&region),
+                "{region:x?} is not identity-mapped"
+            );
+        }
     }
 
     // Defect caught: a truncated map that drops RAM yet boots, or one that

@@ -1102,8 +1102,8 @@ mod tests
     {
         // Disjoint MMIO descriptors, each one aperture, and full seed buffers of
         // disjoint three-page windows, each cut in two by a one-page RAM
-        // descriptor in its middle, so half the apertures start at the end of
-        // a clipped descriptor.
+        // descriptor in its middle, so half the seed-derived apertures start at
+        // the end of a clipped descriptor.
         let mut descs = Vec::new();
         for i in 0..40u64
         {

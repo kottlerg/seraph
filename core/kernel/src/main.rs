@@ -323,10 +323,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// Phase 3 has completed (the direct map is active), `boot_info_phys` is the
 /// `BootInfo` Phase 0 validated, neither its page nor the CPU-id pages its
 /// `cpu_ids` names (a reclaim range of their own) are yet scrubbed by Phase 9's
-/// `cap::scrub_reclaim_ranges`, and nothing writes the ids while the slice lives. `count` is the producer's
-/// `cpu_count`, at most `MAX_CPUS` by the boot protocol's contract; the slice
-/// is clamped to `MAX_CPUS` in any case. Phase 0 confirmed the array lies below
-/// the RAM ceiling, so the direct map reaches it.
+/// `cap::scrub_reclaim_ranges`, and nothing writes the ids while the slice
+/// lives. `count` is the producer's `cpu_count`, at most `MAX_CPUS` by the
+/// boot protocol's contract; the slice is clamped to `MAX_CPUS` in any case.
+/// Phase 0 confirmed the array lies below the RAM ceiling, so the direct map
+/// reaches it.
 #[cfg(not(test))]
 unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 {

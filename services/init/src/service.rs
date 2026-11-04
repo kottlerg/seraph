@@ -192,16 +192,12 @@ fn serve_checked(
 
 // ── Hardware cap partitioning for devmgr ────────────────────────────────────
 
-/// Maximum number of MMIO apertures init forwards to devmgr in one go.
-/// Kernel's `MmioApertureSlice` is sized at `MAX_APERTURES = 16` today; 32
-/// is a comfortable upper bound.
-const MAX_APERTURE_CAPS: usize = 32;
-
 /// Collected hardware caps: init forwards raw firmware + MMIO surfaces
 /// to devmgr. Parsing (MCFG / DTB → ECAM, FADT → `PM1a`) lives in devmgr.
-/// The ACPI reclaimable-region caps are not collected here: they are
-/// streamed to devmgr straight from the `InitInfo` descriptors
-/// ([`acpi_region_caps`]), however many the kernel minted.
+/// The MMIO aperture caps and the ACPI reclaimable-region caps are not
+/// collected here: they are streamed to devmgr straight from the `InitInfo`
+/// descriptors ([`aperture_caps`], [`acpi_region_caps`]), however many the
+/// kernel minted.
 struct HwCaps
 {
     /// Root `Interrupt` range cap. Zero if the kernel did not mint one.
@@ -213,9 +209,6 @@ struct HwCaps
     dtb_slot: u32,
     dtb_page_base: u64,
     dtb_size: u64,
-    /// All MMIO aperture caps (slot, base, size).
-    apertures: [(u32, u64, u64); MAX_APERTURE_CAPS],
-    aperture_count: usize,
 }
 
 impl HwCaps
@@ -229,8 +222,6 @@ impl HwCaps
             dtb_slot: 0,
             dtb_page_base: 0,
             dtb_size: 0,
-            apertures: [(0, 0, 0); MAX_APERTURE_CAPS],
-            aperture_count: 0,
         }
     }
 }
@@ -244,17 +235,12 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
     hw.rsdp_slot = info.acpi_rsdp_memory_cap;
     hw.dtb_slot = info.dtb_memory_cap;
 
-    // Walk the descriptor array once to capture aperture metadata. RSDP /
-    // DTB base + size come from their descriptors too.
+    // Walk the descriptor array once: RSDP / DTB base + size come from their
+    // descriptors.
     for d in crate::descriptors(info)
     {
         match d.cap_type
         {
-            CapType::Mmio if hw.aperture_count < MAX_APERTURE_CAPS =>
-            {
-                hw.apertures[hw.aperture_count] = (d.slot, d.aux0, d.aux1);
-                hw.aperture_count += 1;
-            }
             CapType::Memory if d.slot == hw.rsdp_slot && hw.rsdp_slot != 0 =>
             {
                 hw.rsdp_page_base = d.aux0;
@@ -270,6 +256,17 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
     }
 
     hw
+}
+
+/// The MMIO aperture caps the kernel minted, as `(slot, base, size)`: one per
+/// `Mmio` descriptor, whose aux0/aux1 carry the aperture, with no bound of
+/// init's own.
+fn aperture_caps(info: &InitInfo) -> impl Iterator<Item = (u32, u64, u64)> + '_
+{
+    crate::descriptors(info)
+        .iter()
+        .filter(|d| d.cap_type == CapType::Mmio)
+        .map(|d| (d.slot, d.aux0, d.aux1))
 }
 
 /// The ACPI reclaimable-region Memory caps the kernel minted, as
@@ -548,7 +545,7 @@ pub fn create_devmgr_with_caps(
         child_badge,
         ipc_buf,
         kind::APERTURE,
-        hw.apertures[..hw.aperture_count].iter().copied(),
+        aperture_caps(info),
         "devmgr: bootstrap aperture round failed",
     ) || !serve_region_rounds(
         bootstrap_ep,

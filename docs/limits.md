@@ -97,9 +97,8 @@ An entry an existing open Issue already names cites it in the recommendation.
   Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
   TLS block each reach 1 GiB of VA.
-- **Silent truncation.** Many tables drop entries past their bound with no diagnostic: boot
-  memory-map entries, DTB nodes and ranges, named modules. Each needs a diagnostic
-  as well as a better bound.
+- **Silent truncation.** Some tables drop entries past their bound with no diagnostic: named
+  modules. Each needs a diagnostic as well as a better bound.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_MODULES` and `INIT_MAX_NAMED_MODULES` (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS`
   and `MAX_IOAPICS`, `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` (in
@@ -348,37 +347,36 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 |---|---|---|---|---|---|---|
 | `MAX_CPUS` (`BootInfo.cpu_ids`) | `abi/boot-protocol/src/lib.rs` | 512 | BSS budget (`BootInfo` fits one page) | 2 KiB of the `BootInfo` page plus kernel `[_; MAX_CPUS]` statics | needs a design | Shipping two-socket servers have 768 logical CPUs; a slice in its own pages |
 | `INIT_MAX_SEGMENTS` (`InitImage.segments`) | `abi/boot-protocol/src/lib.rs` | 8 | provably unreachable (the in-tree init has 4 LOAD segments on x86_64; overflow is an error) | 256 B in `BootInfo` | correct as is | None |
-| `BOOT_MODULE_NAME_LEN`, `ENTRY_NAME_LEN` | `abi/boot-protocol/src/lib.rs`, `bundle.rs` | 32 | ABI width (bundle wire format) | per module | correct as is | Tie the copies with a const assert |
+| `BOOT_MODULE_NAME_LEN`, `ENTRY_NAME_LEN` | `abi/boot-protocol/src/lib.rs`, `bundle.rs` | 32 | ABI width (bundle wire format) | per module | correct as is | None: tied by a const assert in `core/boot/src/main.rs` |
 | `BundleHeader.entry_count` | `abi/boot-protocol/src/bundle.rs` | `u32` | ABI width | none | correct as is | The binding cap is core/boot `MAX_MODULES` |
 | `MAX_IOAPICS` (`KernelMmio.ioapics`) | `abi/boot-protocol/src/lib.rs` | 8 | unknown | 192 B in `BootInfo` | raise | Truncation loses GSIs on multi-socket servers |
 | `MAX_MMIO_DIRECT_MAP_REGIONS` | `abi/boot-protocol/src/layout.rs` | 16 | provably unreachable today (`1 + MAX_IOAPICS` = 9), unasserted | 256 B stack | correct as is | Pin with a const assert |
-| `MAX_APERTURES` | `abi/boot-protocol/src/lib.rs` | 16 | unknown | 256 B of a dedicated page | raise | The page holds 256; the surplus is dropped today |
-| `MAX_RECLAIM_RANGES` | `abi/boot-protocol/src/lib.rs` | 256 | BSS budget (one page) | one page, reclaimed | needs a design | The bootloader spin-halts on overflow; tie to `FRAME_LOG_CAP` |
+| `MAX_APERTURES` | `abi/boot-protocol/src/lib.rs` | 256 | ABI width (the aperture array's one page, 256 x 16 B; const-asserted) | one dedicated page, reclaimed | correct as is | None: past it the highest apertures are dropped with a diagnostic |
+| `MAX_RECLAIM_RANGES` | `abi/boot-protocol/src/lib.rs` | 256 | provably unreachable (the bootloader records at most `MAX_RECLAIM_ENTRIES`, 26: its fixed scratch, one page-table pool and the bundle gaps; const-asserted in `core/boot/src/main.rs`) | one page, reclaimed | correct as is | None |
 | `ReclaimRange.page_count` | `abi/boot-protocol/src/lib.rs` | `u32` pages | ABI width (16 B entry) | embedded | correct as is | 16 TiB per range |
 | `BootInfo.boot_entropy_seed` | `abi/boot-protocol/src/lib.rs` | 32 B | hardware spec (256-bit seed) | 32 B | correct as is | None |
 | `IMAGE_WINDOW_SIZE` | `abi/boot-protocol/src/layout.rs` | 2 GiB | hardware spec (small and medany code-model reach) | none | correct as is | None |
 | `INIT_MAX_NAMED_MODULES` (`InitInfo.module_names`) | `abi/init-protocol/src/lib.rs` | 12 | current peak plus headroom (8 in use) | 480 B | raise | The bootloader accepts 16; unify with `MAX_MODULES` and fail loudly |
-| `INIT_MODULE_NAME_LEN` | `abi/init-protocol/src/lib.rs` | 32 | ABI width (equals `BOOT_MODULE_NAME_LEN`) | per name | correct as is | Const-assert equality at the kernel boundary |
+| `INIT_MODULE_NAME_LEN` | `abi/init-protocol/src/lib.rs` | 32 | ABI width (equals `BOOT_MODULE_NAME_LEN`) | per name | correct as is | None: tied by a const assert in `core/kernel/src/cap/mod.rs` |
 | `INIT_INFO_MAX_PAGES` | `abi/init-protocol/src/lib.rs` | 4 | unknown | none (allocated at actual size) | raise | Phases 7 and 8 halt past its descriptor capacity, about 655 (`INIT_INFO_DESCRIPTOR_CAPACITY`); size from the count |
 | `INIT_STACK_PAGES` | `abi/init-protocol/src/lib.rs` | 4 | provably unreachable (init's own stack, whose depth the in-tree init fixes) | 16 KiB | correct as is | None |
 | `InitInfo` count and slot fields | `abi/init-protocol/src/lib.rs` | `u32` | ABI width (cap handle) | embedded | correct as is | None |
 | `InitInfo` size assert | `abi/init-protocol/src/lib.rs` | at most `INIT_INFO_MAX_PAGES` pages | ABI width | none | correct as is | Also assert the header fits page 1 |
 | `MAX_MODULES` (`ModulesLoad.modules`) | `core/boot/src/main.rs` | 16 | current peak plus headroom (8 in use) | 768 B stack | raise | The output page holds 85; unify with `INIT_MAX_NAMED_MODULES` (#183) |
-| `MEM_MAP_ENTRY_PAGES` | `core/boot/src/main.rs` | 4 (about 682 entries) | unknown | 16 KiB, reclaimed | raise | `translate_memory_map` truncates silently; size from the firmware count |
+| `MEM_MAP_SLACK_ENTRIES` (`MemoryMapEntry` array) | `core/boot/src/main.rs` | the firmware's descriptor count at step 6 plus 32 | sized from the machine (the count is read before step 6's first allocation; the slack is twice the at most 16 descriptors the eight later allocations add) | 24 B per descriptor, reclaimed | correct as is | None: a RAM descriptor past the array halts the boot by name, any other is dropped with a diagnostic |
 | `KERNEL_STACK_PAGES` (bootloader) | `core/boot/src/main.rs` | 16 (64 KiB) | stack budget, measured (the bound at `HANDOFF_STACK_BYTES`; ktest, both arches): the kernel's boot phases peak at 6880 B in debug at 16 and 128 CPUs, and use at most 7240 B in release at 4, 16 and 128 CPUs and 9008 B in debug at 4 CPUs | 64 KiB plus a 4 KiB guard page | needs a design | Its size is the shared `HANDOFF_STACK_BYTES`; the unmapped guard page below it faults an overflow until Phase 3 rebases the stack into the direct map, which maps the guard frame (#666) |
 | `MAX_IDENTITY_REGIONS` | `core/boot/src/main.rs` | 64 | provably unreachable (`MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 at most) | 1 KiB stack | correct as is | Pin the sum with a const assert |
-| `MAX_APERTURE_SEEDS` | `core/boot/src/main.rs` | 64 | unknown | 1 KiB stack | raise | Silent drop past `out.len()` |
-| `MAX_HEURISTIC_SEEDS` | `core/boot/src/main.rs` | 16 | current peak plus headroom | 256 B stack | raise | More than about 7 MCFG segments drop windows |
-| `derive_mmio_apertures` `SCRATCH` | `core/boot/src/memory_map.rs` | `MAX_APERTURES * 4` = 64 | current peak plus headroom | 1 KiB stack | raise | Raise with `MAX_APERTURES` |
+| `MAX_APERTURE_SEEDS` | `core/boot/src/main.rs` | `MAX_APERTURES` (256) | ABI width (derived from the aperture array's bound) | 4 KiB stack | correct as is | None: drops are diagnosed |
+| `MAX_HEURISTIC_SEEDS` | `core/boot/src/main.rs` | `MAX_APERTURES` (256) | ABI width (derived from the aperture array's bound; two windows per MCFG segment) | 4 KiB stack | correct as is | None: drops are diagnosed |
 | `get_memory_map` slack | `core/boot/src/uefi.rs` | 16 descriptors | provably unreachable (only the buffer's own allocation lands between the size query and the fill; overflow fails the boot loudly) | a few hundred bytes | correct as is | None |
 | `EXIT_BOOT_SERVICES_MAX_ATTEMPTS` | `core/boot/src/uefi.rs` | 16 | provably unreachable (residual failure odds below 1e-14) | none | correct as is | None |
 | `FILE_INFO_BUF_LEN` | `core/boot/src/uefi.rs` | `size_of::<EfiFileInfo>() + 256` | provably unreachable (fixed short ESP file names) | about 350 B stack | correct as is | None |
 | `TARGET_FB_WIDTH`, `TARGET_FB_HEIGHT` | `core/boot/src/uefi.rs` | 1280 x 720 | policy (bounds no capacity) | none | correct as is | None |
 | `MAX_LOAD_SEGMENTS` (`KernelInfo.segments`) | `core/boot/src/elf.rs` | 8 | provably unreachable (the in-tree kernel has 5 LOAD segments on x86_64; overflow is an error) | embedded | correct as is | None |
-| `FRAME_LOG_CAP` | `core/boot/src/arch/x86_64/paging.rs`, `arch/riscv64/paging.rs` | 160 / 160 (the x86-64 log also holds the LA57 toggle page) | current peak plus headroom | about 1 KiB embedded | raise | Grows with framebuffer and bundle size; 2 MiB leaves or coalescing |
-| dtb `MAX_DEPTH` | `core/boot/src/dtb.rs` | 8 | unknown | stack | raise | Deeper nodes are skipped silently |
-| dtb `MAX_REG_ENTRIES`, `MAX_IRQ_ENTRIES` | `core/boot/src/dtb.rs` | 8 / 4 | unknown | embedded per node | needs a design | Truncation is silent; diagnose |
-| dtb `MAX_RANGES_ENTRIES` | `core/boot/src/dtb.rs` | 4 | unknown | 96 B per node | raise | Host-bridge `ranges` can carry more windows |
+| Boot page-table pool (`table_frame_bound`) | `core/boot/src/paging.rs`, `arch/x86_64/paging.rs`, `arch/riscv64/paging.rs` | an upper bound on the boot tables, from the kernel segments, identity regions and trampoline pages they map | provably unreachable (sized from the mappings; a host test checks the bound against the tables the ranges need) | about one frame per 2 MiB of mapped span, reclaimed as one range | correct as is | None |
+| dtb `MAX_DEPTH` | `core/boot/src/dtb.rs` | 32 | provably unreachable on real trees (under 8 deep); deeper nodes' properties are skipped with a diagnostic | about 12 KiB stack per walk | correct as is | None |
+| dtb `MAX_REG_ENTRIES`, `MAX_IRQ_ENTRIES` | `core/boot/src/dtb.rs` | 8 / 4 | provably unreachable (only a node's first `reg` entry is consumed and no `interrupts` value is; surplus entries are dropped with a diagnostic) | embedded per node | correct as is | None |
+| dtb `MAX_RANGES_ENTRIES` | `core/boot/src/dtb.rs` | 8 | provably unreachable (a PCI host bridge carries one entry per window type, I/O and 32- and 64-bit memory, prefetchable or not); surplus entries are dropped with a diagnostic | 192 B per node | correct as is | None |
 | `cpu_ids` truncation arrays | `core/boot/src/acpi.rs`, `dtb.rs`, `firmware.rs` | `[u32; MAX_CPUS]` | ABI width (`MAX_CPUS`) | 2 KiB stack each | needs a design | Follows the `MAX_CPUS` design |
 
 ### Process layout and ruststd
@@ -616,7 +614,6 @@ The entries left open are tracked by the Issue each recommendation names.
 | `INIT_RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 8 | provably unreachable (asserted against the fixed endpoint count) | 8 pages | correct as is | None |
 | `RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 203 | encoding artefact (sum) | per tier-1 service | correct as is | None |
 | `MODULE_SCRATCH_MAX_PAGES` | `services/init/src/bootstrap.rs` | 65536 (256 MiB) | encoding artefact (init VA layout) | none | correct as is | Caps one boot module at 256 MiB |
-| `MAX_APERTURE_CAPS` (`HwCaps.apertures`) | `services/init/src/service.rs` | 32 | hardware spec mirror (boot `MAX_APERTURES` = 16) | 768 B | correct as is | Pin against the boot constant with a const assert |
 | ACPI region rounds (`acpi_region_caps`) | `services/init/src/service.rs` | every cap `InitInfo` reports (`acpi_region_memory_count`), streamed four per round | provable unreachability (nothing is stored) | none | correct as is | None |
 | substrate name packing | `services/init/src/service.rs` | `svcmgr_labels::NAME_MAX` (64), `pack_name` | the shared svcmgr name limit | 64 B stack | correct as is | None |
 | `mm_boot_data` | `services/init/src/main.rs` | literal 64 | ABI width (`MSG_DATA_WORDS_MAX`) | 512 B stack | correct as is | Use the constant |

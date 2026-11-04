@@ -93,10 +93,14 @@ const KERNEL_STACK_PAGES: usize = boot_protocol::layout::HANDOFF_STACK_BYTES / 4
 /// overwriting another allocation ([`handoff_stack_span`]).
 const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
 
-/// Number of 4 KiB pages allocated for the translated `MemoryMapEntry` output
-/// array. At 24 bytes per entry this accommodates roughly 680 entries, which
-/// comfortably exceeds any real UEFI memory map.
-const MEM_MAP_ENTRY_PAGES: usize = 4;
+/// Entries of headroom the translated `MemoryMapEntry` array carries above the
+/// firmware's descriptor count, which step 6 reads before its first
+/// allocation. Each allocation after the count (the eight of steps 6 and 7:
+/// the `BootInfo`, module, entry, aperture and reclaim pages, the stack, the
+/// page-table pool, and the raw map buffer) adds at most two descriptors, and
+/// the margin doubles that; a map still past it fails the boot when a RAM
+/// descriptor would be dropped (step 9).
+const MEM_MAP_SLACK_ENTRIES: usize = 32;
 
 /// Maximum number of physical regions tracked for identity mapping.
 /// Covers kernel segments, all fixed allocations, and the framebuffer.
@@ -105,13 +109,31 @@ const MEM_MAP_ENTRY_PAGES: usize = 4;
 /// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 regions.
 const MAX_IDENTITY_REGIONS: usize = 64;
 
-/// Size of the aperture-seed scratch buffer (firmware-advertised MMIO extents
-/// before merging with the UEFI memory map).
-const MAX_APERTURE_SEEDS: usize = 64;
+/// Size of the aperture-seed buffer (firmware-advertised MMIO extents before
+/// merging with the UEFI memory map): one per aperture the output can hold,
+/// since every seed that survives the merge as its own window is an aperture.
+/// A seeder past it drops the surplus with a diagnostic.
+const MAX_APERTURE_SEEDS: usize = MAX_APERTURES;
 
-/// Size of the heuristic-window seed buffer: two layout-heuristic PCI windows
-/// per MCFG allocation entry plus the arch's default PCI windows.
-const MAX_HEURISTIC_SEEDS: usize = 16;
+/// Size of the heuristic-window seed buffer (two layout-heuristic PCI windows
+/// per MCFG allocation entry plus the arch's default PCI windows): one per
+/// aperture the output can hold, for the reason [`MAX_APERTURE_SEEDS`] gives.
+const MAX_HEURISTIC_SEEDS: usize = MAX_APERTURES;
+
+/// Most entries step 9 records in `BootInfo.reclaim_ranges`: the `BootInfo`,
+/// module, memory-map entry, aperture and reclaim-array pages, the raw map
+/// buffer, the page-table pool, the x86-64 LA57 toggle page and the AP
+/// trampoline page (nine), and one bundle gap before, between and after the
+/// at most [`MAX_MODULES`] module bodies.
+const MAX_RECLAIM_ENTRIES: usize = 9 + MAX_MODULES + 1;
+
+// The reclaim array's page holds every entry step 9 can record, so the
+// overflow halt in step 9 is unreachable.
+const _: () = assert!(MAX_RECLAIM_ENTRIES <= MAX_RECLAIM_RANGES);
+
+// The bundle entry name is copied straight into `BootModule.name` (step 4), so
+// the two widths are one ABI fact.
+const _: () = assert!(bundle::ENTRY_NAME_LEN == BOOT_MODULE_NAME_LEN);
 
 // ── Forward-state groupings ───────────────────────────────────────────────────
 
@@ -251,6 +273,10 @@ struct BootAllocations
     boot_info_phys: u64,
     modules_phys: u64,
     mem_entries_phys: u64,
+    /// Pages of the `MemoryMapEntry` array at `mem_entries_phys`, sized at
+    /// step 6 from the firmware's descriptor count plus
+    /// [`MEM_MAP_SLACK_ENTRIES`].
+    mem_entries_pages: usize,
     apertures_phys: u64,
     stack_phys: u64,
     stack_top: u64,
@@ -1069,6 +1095,14 @@ unsafe fn step6_allocate_and_build_page_tables(
     ap_trampoline_phys: u64,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
+    // The memory map's descriptor count, read before this step's first
+    // allocation; the entry array below adds MEM_MAP_SLACK_ENTRIES for the
+    // descriptors the allocations of steps 6 and 7 add.
+    // SAFETY: bs is valid; the size query allocates nothing.
+    let firmware_descriptors = unsafe { uefi::memory_map_descriptor_count(ctx.bs)? };
+    let mem_entries_pages = ((firmware_descriptors + MEM_MAP_SLACK_ENTRIES)
+        * core::mem::size_of::<MemoryMapEntry>())
+    .div_ceil(4096);
     // BootInfo: one page — holds the BootInfo struct populated in step 9.
     // SAFETY: bs is valid.
     let boot_info_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -1077,8 +1111,8 @@ unsafe fn step6_allocate_and_build_page_tables(
     let modules_phys = unsafe { allocate_pages(ctx.bs, 1)? };
     // MemoryMapEntry output array.
     // SAFETY: bs is valid.
-    let mem_entries_phys = unsafe { allocate_pages(ctx.bs, MEM_MAP_ENTRY_PAGES)? };
-    // MMIO aperture array: one page easily covers MAX_APERTURES × 16 bytes.
+    let mem_entries_phys = unsafe { allocate_pages(ctx.bs, mem_entries_pages)? };
+    // MMIO aperture array: one page holds exactly MAX_APERTURES × 16 bytes.
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, 1)? };
     // Kernel handoff stack, above its guard page.
@@ -1108,6 +1142,7 @@ unsafe fn step6_allocate_and_build_page_tables(
         boot_info_phys,
         modules_phys,
         mem_entries_phys,
+        mem_entries_pages,
         apertures_phys,
         stack_phys,
         stack_top,
@@ -1179,7 +1214,10 @@ fn collect_identity_regions(
     // Fixed boot allocations.
     push(allocs.boot_info_phys, 4096);
     push(allocs.modules_phys, 4096);
-    push(allocs.mem_entries_phys, (MEM_MAP_ENTRY_PAGES as u64) * 4096);
+    push(
+        allocs.mem_entries_phys,
+        (allocs.mem_entries_pages as u64) * 4096,
+    );
     push(allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096);
     // Init segments — segment bodies live in their own UEFI allocations,
     // produced by `load_init` against the bundle slice for the `init` entry.
@@ -1331,10 +1369,12 @@ unsafe fn step9_populate_boot_info(
 
     // Translate + sort the UEFI memory map.
     let entry_out = allocs.mem_entries_phys as *mut MemoryMapEntry;
-    let max_entries = (MEM_MAP_ENTRY_PAGES * 4096) / core::mem::size_of::<MemoryMapEntry>();
+    let max_entries = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
     // SAFETY: entry_out is a valid allocated buffer of max_entries entries;
     // uefi_map is a valid map buffer populated by UEFI GetMemoryMap.
-    let entry_count = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
+    let translation = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
+    report_map_truncation(&translation);
+    let entry_count = translation.count;
     // SAFETY: elements [0..entry_count] were written by the call above.
     unsafe { memory_map::insertion_sort_memory_map(entry_out, entry_count) };
 
@@ -1373,22 +1413,31 @@ unsafe fn step9_populate_boot_info(
     // at `ExitBootServices` (only GOP knows it pre-exit), so the
     // bootloader is the only entity that can carry this aperture
     // through to userspace.
-    if framebuffer.physical_base != 0 && seed_count < MAX_APERTURE_SEEDS
+    if framebuffer.physical_base != 0
     {
-        let base_aligned = framebuffer.physical_base & !0xFFF;
-        let span = framebuffer.physical_base
-            + u64::from(framebuffer.stride) * u64::from(framebuffer.height);
-        let end_aligned = (span + 0xFFF) & !0xFFF;
-        aperture_seed[seed_count] = MmioAperture {
-            phys_base: base_aligned,
-            size: end_aligned - base_aligned,
-        };
-        seed_count += 1;
+        if seed_count < MAX_APERTURE_SEEDS
+        {
+            let base_aligned = framebuffer.physical_base & !0xFFF;
+            let span = framebuffer.physical_base
+                + u64::from(framebuffer.stride) * u64::from(framebuffer.height);
+            let end_aligned = (span + 0xFFF) & !0xFFF;
+            aperture_seed[seed_count] = MmioAperture {
+                phys_base: base_aligned,
+                size: end_aligned - base_aligned,
+            };
+            seed_count += 1;
+        }
+        else
+        {
+            bprintln!(
+                "[--------] boot: MMIO apertures: seed buffer full; framebuffer seed dropped"
+            );
+        }
     }
 
     let apertures_out = allocs.apertures_phys as *mut MmioAperture;
     // SAFETY: apertures_phys is a valid 4 KiB allocation with room for
-    // MAX_APERTURES × sizeof(MmioAperture) = 256 bytes.
+    // MAX_APERTURES × sizeof(MmioAperture) = 4096 bytes.
     let apertures_buf: &mut [MmioAperture; MAX_APERTURES] =
         unsafe { &mut *(apertures_out.cast::<[MmioAperture; MAX_APERTURES]>()) };
     *apertures_buf = [MmioAperture {
@@ -1452,10 +1501,11 @@ unsafe fn step9_populate_boot_info(
     };
     push_reclaim(allocs.boot_info_phys, 1, 0);
     push_reclaim(allocs.modules_phys, 1, 0);
-    // MEM_MAP_ENTRY_PAGES is a small compile-time constant well within u32 range.
+    // The entry array is a few pages per thousand descriptors, far below
+    // u32::MAX pages.
     #[allow(clippy::cast_possible_truncation)]
     {
-        push_reclaim(allocs.mem_entries_phys, MEM_MAP_ENTRY_PAGES as u32, 0);
+        push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0);
     }
     push_reclaim(allocs.apertures_phys, 1, 0);
     // The map buffer is a whole-page allocation far below u32::MAX pages.
@@ -1467,9 +1517,14 @@ unsafe fn step9_populate_boot_info(
             0,
         );
     }
-    for &frame in page_table.allocated_frames()
+    for &(base, pages) in page_table.reclaim_spans()
     {
-        push_reclaim(frame, 1, 0);
+        // The page-table pool is a few hundred pages at most, far below
+        // u32::MAX pages, and the LA57 toggle span is one page.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            push_reclaim(base, pages as u32, 0);
+        }
     }
     // Bundle blob: emit reclaim ranges over every bundle page NOT
     // covered by a module Memory cap. Module bodies are 4 KiB-aligned
@@ -1638,6 +1693,33 @@ unsafe fn step9_populate_boot_info(
             boot_entropy.seed.len(),
         );
         core::ptr::addr_of_mut!((*bi).boot_entropy_len).write(boot_entropy.len);
+    }
+}
+
+/// Report the descriptors the translated memory map had no room for, and halt
+/// when one of them is RAM: the kernel would boot without knowing that memory
+/// (core/boot/docs/memory-map.md § Sizing the Entry Array). Descriptors of
+/// other types are dropped with a diagnostic and the boot goes on.
+fn report_map_truncation(t: &memory_map::MapTranslation)
+{
+    if t.dropped_other != 0
+    {
+        bprintln!(
+            "[--------] boot: memory map: {} non-RAM descriptors past the entry array dropped",
+            t.dropped_other
+        );
+    }
+    if t.dropped_ram != 0
+    {
+        bprintln!(
+            "[--------] boot: FATAL: memory map: {} RAM descriptors past the entry array",
+            t.dropped_ram
+        );
+        // Post-exit, pre-handoff: a BootInfo missing RAM is not handed over.
+        loop
+        {
+            core::hint::spin_loop();
+        }
     }
 }
 

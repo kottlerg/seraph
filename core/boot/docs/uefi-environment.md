@@ -81,8 +81,8 @@ allocation modes are used:
 **`AllocateAnyPages`** — the firmware selects a free physical page range. Used for
 everything whose absolute address does not matter: the bundle buffer (boot modules are
 referenced in place inside it), the kernel file buffer, the kernel image span on RISC-V,
-init image segments, page-table frames other than the x86-64 root (and, on RISC-V, the
-paging-mode probe root and the AP trampoline page), the `BootInfo` page, the module
+init image segments, the page-table frame pool on RISC-V (and the paging-mode probe root
+and the AP trampoline page), the `BootInfo` page, the module
 descriptor array, the `MemoryMapEntry` array, the `MmioAperture` array, the kernel stack,
 the reclaim-range array, and the memory map buffer. The kernel image is placed as one
 contiguous span and its base recorded in `BootInfo.kernel_physical_base`, so kernel
@@ -96,8 +96,9 @@ the kernel image span, which must lie wholly below 4 GiB because the kernel's ro
 table sits in the image's BSS and the AP trampoline loads it into CR3 with a 32-bit move
 (`BootInfo.kernel_physical_base` in
 [abi/boot-protocol](../../../abi/boot-protocol/src/lib.rs)); and, below 4 GiB, for the
-initial root page table and the LA57 toggle page, since the toggle trampoline runs with
-32-bit addresses and loads that root with a 32-bit move
+page-table frame pool, whose first frame is the initial root page table, and the LA57
+toggle page, since the toggle trampoline runs with 32-bit addresses and loads that root
+with a 32-bit move
 ([page-tables.md](page-tables.md) § x86-64: Negotiated Paging Depth).
 
 Every allocation uses memory type `EfiLoaderData` except the x86-64 LA57 toggle page, which

@@ -388,6 +388,10 @@ pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = (init_protocol::INIT_INFO_MAX_P
     - core::mem::size_of::<init_protocol::InitInfo>())
     / core::mem::size_of::<CapDescriptor>();
 
+// `mint_module_memory_caps` copies each boot module's `BootModule.name`
+// straight into its `InitModuleName.name`, so the two widths are one ABI fact.
+const _: () = assert!(init_protocol::INIT_MODULE_NAME_LEN == boot_protocol::BOOT_MODULE_NAME_LEN);
+
 // The descriptor array starts right after the header, at an offset its
 // element alignment divides.
 const _: () = assert!(

@@ -85,12 +85,13 @@ and the permission-flags record are defined in
 [`core/boot/src/paging.rs`](../src/paging.rs) and re-used by each arch implementation
 without duplication.
 
-The trait exposes four operations: allocate a fresh root table, map a
+The trait exposes five operations: report the paging mode's translation
+levels, allocate a frame pool and take a fresh root table from it, map a
 virtual range onto a physical range with requested permissions, return
 the root's physical address (the value written to `CR3` on x86-64 or
-encoded into the `satp` PPN on RISC-V), and list every frame the builder
-allocated (`allocated_frames`, § Page Table Frame Tracking). All page table frames are
-obtained from UEFI `AllocatePages`; no allocation occurs after
+encoded into the `satp` PPN on RISC-V), and list the spans the builder
+allocated (`reclaim_spans`, § Page Table Frame Tracking). All page table frames come
+from the one pool obtained from UEFI `AllocatePages`; no allocation occurs after
 `ExitBootServices`.
 
 Permissions carry only *writable* and *executable* booleans. Every
@@ -329,15 +330,20 @@ policy violation.
 
 ## Page Table Frame Tracking
 
-Each arch-specific `BootPageTable` records the physical address of every
-frame it allocates from `AllocatePages` — the root table and every
-intermediate table allocated during `map` — in an inline `frame_log`; the
-x86-64 builder also records the LA57 toggle page when one is installed,
-which is dead once the kernel has replaced the boot GDT and tables.
-After [step 8](boot-flow.md#step-8-exitbootservices),
-[step 9](boot-flow.md#step-9-populate-bootinfo) reads this log via the trait method
-`PageTableBuilder::allocated_frames` and appends one
-`boot_protocol::ReclaimRange` per frame to `BootInfo.reclaim_ranges`.
+Each arch-specific `BootPageTable` takes every frame it uses, the root table
+and every intermediate table allocated during `map`, from one contiguous pool
+it allocates from `AllocatePages` at construction (below 4 GiB on x86-64, where
+the LA57 toggle loads the root with a 32-bit move). `build_initial_tables`
+sizes the pool with `paging::table_frame_bound`, an upper bound on the tables
+the kernel segments, the identity regions, and the handoff trampoline's pages
+need at the negotiated paging depth, so the pool never runs out and no frame
+count is capped. The x86-64 builder also records the LA57 toggle page when one
+is installed, which is dead once the kernel has replaced the boot GDT and
+tables. After [step 8](boot-flow.md#step-8-exitbootservices),
+[step 9](boot-flow.md#step-9-populate-bootinfo) reads these spans via the trait
+method `PageTableBuilder::reclaim_spans` and appends one
+`boot_protocol::ReclaimRange` per span, the whole pool as one, to
+`BootInfo.reclaim_ranges`.
 The kernel mints reclaimable Memory caps over the recorded frames during
 [Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)
 (`cap::mint_reclaim_memory_caps`), so they flow into userspace

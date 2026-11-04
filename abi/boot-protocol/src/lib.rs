@@ -134,7 +134,10 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     kernel takes its paging depth from `CR4.LA57` at entry
 ///     ([`x86_paging`]), and `direct_map_base` lies at or above that
 ///     depth's kernel-half floor. No layout change.
-pub const BOOT_PROTOCOL_VERSION: u32 = 16;
+/// v17: [`MAX_APERTURES`] rose from 16 to 256, the capacity of the
+///     aperture array's page, so `mmio_apertures.count` may reach 256. No
+///     layout change.
+pub const BOOT_PROTOCOL_VERSION: u32 = 17;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -664,14 +667,19 @@ pub struct MmioAperture
     pub size: u64,
 }
 
-/// Maximum number of MMIO apertures the bootloader records.
+/// Maximum number of MMIO apertures the bootloader records: the capacity of
+/// the 4 KiB page the array lives in (256 × 16 B).
 ///
 /// Derived from `EfiMemoryMappedIO` / `EfiMemoryMappedIOPortSpace`
 /// regions of the UEFI memory map, unioned with firmware-advertised PCI
 /// apertures (MCFG on x86-64, `/soc ranges` on RISC-V), then
-/// sorted-and-merged. Platforms with more than sixteen disjoint
-/// non-RAM regions are out of the targeted envelope.
-pub const MAX_APERTURES: usize = 16;
+/// sorted-and-merged. A server with many PCI Express segments has a few disjoint
+/// windows per segment; a platform with more disjoint non-RAM regions
+/// than this loses the highest, which the bootloader diagnoses.
+pub const MAX_APERTURES: usize = 256;
+
+// The aperture array fills exactly the one page the bootloader allocates for it.
+const _: () = assert!(MAX_APERTURES * core::mem::size_of::<MmioAperture>() <= 4096);
 
 /// A slice of [`MmioAperture`] values, passed by physical address.
 ///
@@ -735,10 +743,11 @@ pub const RECLAIM_FLAG_LATE: u32 = 1;
 /// can hold. The bootloader allocates a dedicated 4 KiB page for the array
 /// and indexes into it; 256 × 16 B = 4 KiB exactly.
 ///
-/// A typical seraph boot produces between fifteen and fifty entries (one
-/// per fixed scratch allocation plus one per bootloader transient
-/// page-table frame). The bootloader diagnoses overflow as a sizing bug
-/// rather than truncating.
+/// The reference bootloader records one entry per fixed scratch allocation,
+/// one for its whole page-table frame pool, and one per bundle gap around the
+/// boot modules, a count it bounds below this capacity at compile time
+/// (core/boot/src/main.rs `MAX_RECLAIM_ENTRIES`); it halts on overflow rather
+/// than truncating.
 pub const MAX_RECLAIM_RANGES: usize = 256;
 
 /// A slice of [`ReclaimRange`] values, passed by physical address.

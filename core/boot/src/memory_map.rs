@@ -17,11 +17,36 @@ use crate::uefi::{
 };
 use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
+/// Outcome of [`translate_memory_map`]: the entries written, and the
+/// descriptors past the output's capacity that were not, split by whether
+/// they translate to RAM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MapTranslation
+{
+    /// Entries written to the output.
+    pub count: usize,
+    /// Descriptors not written that translate to a RAM type (`Usable`,
+    /// `Loaded`, `AcpiReclaimable` or `Persistent`): memory the kernel would
+    /// never learn of.
+    pub dropped_ram: usize,
+    /// Descriptors not written that translate to `Reserved`.
+    pub dropped_other: usize,
+}
+
+/// Whether `t` names RAM: the types the boot protocol's
+/// `mmio_apertures` contract (abi/boot-protocol/README.md) classifies as RAM.
+fn is_ram(t: MemoryType) -> bool
+{
+    !matches!(t, MemoryType::Reserved)
+}
+
 /// Translate a UEFI memory map into the boot protocol's `MemoryMapEntry` format.
 ///
 /// Iterates `uefi_map.map_size / uefi_map.descriptor_size` descriptors and
 /// converts each UEFI memory type to a [`MemoryType`]. Writes at most
-/// `max_entries` entries to `out`. Returns the number of entries written.
+/// `max_entries` entries to `out` and counts the descriptors past that
+/// capacity, by class, in the returned [`MapTranslation`], so the caller can
+/// refuse to boot on lost RAM.
 ///
 /// # Safety
 /// `out` must point to an allocation of at least `max_entries * size_of::<MemoryMapEntry>()`
@@ -31,12 +56,13 @@ pub unsafe fn translate_memory_map(
     uefi_map: &crate::uefi::MemoryMapResult,
     out: *mut MemoryMapEntry,
     max_entries: usize,
-) -> usize
+) -> MapTranslation
 {
+    let mut result = MapTranslation::default();
     let mut count: usize = 0;
     let mut offset: usize = 0;
 
-    while offset + uefi_map.descriptor_size <= uefi_map.map_size && count < max_entries
+    while offset + uefi_map.descriptor_size <= uefi_map.map_size
     {
         // SAFETY: uefi_map.buffer_phys is the UEFI raw map buffer; offset is
         // within map_size; the descriptor at this offset is a valid EfiMemoryDescriptor.
@@ -48,6 +74,19 @@ pub unsafe fn translate_memory_map(
 
         let memory_type = translate_memory_type(desc.memory_type);
         let size_bytes = desc.number_of_pages * 4096;
+        offset += uefi_map.descriptor_size;
+        if count >= max_entries
+        {
+            if is_ram(memory_type)
+            {
+                result.dropped_ram += 1;
+            }
+            else
+            {
+                result.dropped_other += 1;
+            }
+            continue;
+        }
 
         // SAFETY: count < max_entries; out[count] is within the allocated array.
         unsafe {
@@ -61,10 +100,10 @@ pub unsafe fn translate_memory_map(
             );
         }
         count += 1;
-        offset += uefi_map.descriptor_size;
     }
 
-    count
+    result.count = count;
+    result
 }
 
 /// Translate a UEFI `EFI_MEMORY_TYPE` value to the boot protocol's [`MemoryType`].
@@ -238,9 +277,11 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
 ///   map's holes and MMIO descriptors remain and firmware-reserved DRAM
 ///   inside such a window is left out.
 ///
-/// No aperture therefore covers RAM. Writes at most `MAX_APERTURES` entries
-/// to `out` and returns the number written; surplus is dropped with a
-/// diagnostic.
+/// No aperture therefore covers RAM. Each piece is merged into `out` as it
+/// arrives ([`insert_merged`]), so `out` holds the sorted, merged apertures at
+/// every step and no scratch buffer bounds the input. Returns the number of
+/// apertures in `out`; when more than `MAX_APERTURES` stay disjoint, the
+/// highest are dropped with a diagnostic.
 ///
 /// Apertures are coarse by design; see `docs/device-management.md`
 /// § Raw Firmware Passthrough for where device-level discovery happens.
@@ -257,23 +298,10 @@ pub unsafe fn derive_mmio_apertures(
     out: &mut [MmioAperture; MAX_APERTURES],
 ) -> usize
 {
-    // Scratch buffer: MAX_APERTURES * 4 gives headroom for fragmented UEFI
-    // maps plus seed pieces before the merge pass. 16 apertures × 4 × 16
-    // bytes = 1 KiB, stack-safe.
-    const SCRATCH: usize = MAX_APERTURES * 4;
-    let mut buf: [MmioAperture; SCRATCH] = [MmioAperture {
-        phys_base: 0,
-        size: 0,
-    }; SCRATCH];
     let mut n: usize = 0;
     let mut dropped = false;
     let mut push = |ap: MmioAperture| {
-        if n < SCRATCH
-        {
-            buf[n] = ap;
-            n += 1;
-        }
-        else
+        if !insert_merged(out, &mut n, ap)
         {
             dropped = true;
         }
@@ -321,62 +349,71 @@ pub unsafe fn derive_mmio_apertures(
         }
     }
 
-    if n == 0
-    {
-        return 0;
-    }
-
-    // Insertion sort by phys_base; O(n²) is fine with n ≤ 64.
-    for i in 1..n
-    {
-        let mut j = i;
-        while j > 0 && buf[j - 1].phys_base > buf[j].phys_base
-        {
-            buf.swap(j - 1, j);
-            j -= 1;
-        }
-    }
-
-    // Merge adjacent / overlapping entries in one pass.
-    let mut out_count: usize = 0;
-    let mut i: usize = 0;
-    while i < n
-    {
-        let base = buf[i].phys_base;
-        let mut end = base.saturating_add(buf[i].size);
-        let mut j = i + 1;
-        while j < n && buf[j].phys_base <= end
-        {
-            let j_end = buf[j].phys_base.saturating_add(buf[j].size);
-            if j_end > end
-            {
-                end = j_end;
-            }
-            j += 1;
-        }
-        if out_count < out.len()
-        {
-            out[out_count] = MmioAperture {
-                phys_base: base,
-                size: end - base,
-            };
-            out_count += 1;
-        }
-        else
-        {
-            dropped = true;
-        }
-        i = j;
-    }
-
     if dropped
     {
         bprintln!(
-            "[--------] boot: MMIO apertures: entries dropped (scratch buffer or MAX_APERTURES cap)"
+            "[--------] boot: MMIO apertures: more than MAX_APERTURES disjoint; the highest dropped"
         );
     }
 
-    out_count
+    n
+}
+
+/// Merge `ap` into the sorted, disjoint, non-adjacent apertures `set[..*len]`,
+/// keeping them so: `ap` joins every entry it overlaps or abuts.
+///
+/// Returns `false` when an aperture was dropped: `ap` stays disjoint from every
+/// entry and `set` is full, in which case the highest of the `set.len() + 1`
+/// apertures is the one dropped (`ap` itself when it is the highest), so the
+/// lowest bases are kept. An empty `ap` changes nothing.
+fn insert_merged(set: &mut [MmioAperture], len: &mut usize, ap: MmioAperture) -> bool
+{
+    if ap.size == 0
+    {
+        return true;
+    }
+    let mut base = ap.phys_base;
+    let mut end = base.saturating_add(ap.size);
+    // Entries wholly below `ap`, not even abutting it, stay as they are.
+    let mut i = 0;
+    while i < *len && set[i].phys_base.saturating_add(set[i].size) < base
+    {
+        i += 1;
+    }
+    // Entries from `i` that start at or before `ap`'s end merge into it.
+    let mut j = i;
+    while j < *len && set[j].phys_base <= end
+    {
+        base = base.min(set[j].phys_base);
+        end = end.max(set[j].phys_base.saturating_add(set[j].size));
+        j += 1;
+    }
+    let mut kept = true;
+    if j == i
+    {
+        if *len == set.len()
+        {
+            kept = false;
+            if i == *len
+            {
+                return false;
+            }
+            // Drop the highest entry to make room below it.
+            *len -= 1;
+        }
+        set.copy_within(i..*len, i + 1);
+        *len += 1;
+    }
+    else
+    {
+        set.copy_within(j..*len, i + 1);
+        *len -= j - i - 1;
+    }
+    set[i] = MmioAperture {
+        phys_base: base,
+        size: end - base,
+    };
+    kept
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -387,8 +424,8 @@ mod tests
     use core::mem::size_of;
 
     use super::{
-        derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded, translate_memory_map,
-        translate_memory_type,
+        MapTranslation, derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded,
+        translate_memory_map, translate_memory_type,
     };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
@@ -593,8 +630,8 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; max_entries];
-        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
-        out.truncate(count);
+        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
+        out.truncate(t.count);
         out
     }
 
@@ -665,6 +702,49 @@ mod tests
         assert_eq!(entries.len(), 1);
     }
 
+    // Defect caught: a truncation that drops descriptors past the capacity
+    // without reporting them, so lost RAM boots unnoticed.
+    #[test]
+    fn descriptors_past_the_capacity_are_counted_by_class()
+    {
+        let d = |memory_type, physical_start| EfiMemoryDescriptor {
+            memory_type,
+            physical_start,
+            virtual_start: 0,
+            number_of_pages: 1,
+            attribute: 0,
+        };
+        let descs = [
+            d(EFI_CONVENTIONAL_MEMORY, 0x0000),
+            d(EFI_CONVENTIONAL_MEMORY, 0x1000),
+            d(EFI_MEMORY_MAPPED_IO, 0x2000),
+            d(EFI_LOADER_DATA, 0x3000),
+        ];
+        let stride = size_of::<EfiMemoryDescriptor>();
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: descs.len() * stride,
+            map_size: descs.len() * stride,
+            map_key: 0,
+            descriptor_size: stride,
+        };
+        let dummy = MemoryMapEntry {
+            physical_base: 0,
+            size: 0,
+            memory_type: MemoryType::Reserved,
+        };
+        let mut out = vec![dummy; 1];
+        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 1) };
+        assert_eq!(
+            t,
+            MapTranslation {
+                count: 1,
+                dropped_ram: 2,
+                dropped_other: 1,
+            }
+        );
+    }
+
     #[test]
     fn zero_length_map_returns_zero_entries()
     {
@@ -706,7 +786,7 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; 4];
-        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) };
+        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) }.count;
         assert_eq!(count, 1);
         assert_eq!(out[0].memory_type, MemoryType::Persistent);
         assert_eq!(out[0].physical_base, 0x4000);
@@ -770,6 +850,45 @@ mod tests
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].phys_base, 0x1000_0000);
         assert_eq!(out[0].size, 0x2000);
+    }
+
+    // Defect caught: a bounded scratch buffer that drops pieces before the
+    // merge, losing apertures a fragmented map describes in many pieces.
+    #[test]
+    fn many_abutting_pieces_merge_into_one_aperture_without_a_drop()
+    {
+        // Far more pieces than MAX_APERTURES, out of order, all abutting.
+        let descs: Vec<_> = (0..(MAX_APERTURES as u64 * 8))
+            .rev()
+            .map(|i| mmio_desc(0x4000_0000 + i * 0x1000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(
+            pairs(&out),
+            vec![(0x4000_0000, MAX_APERTURES as u64 * 8 * 0x1000)]
+        );
+    }
+
+    // Defect caught: an insertion that merges only its first neighbour,
+    // leaving overlapping apertures when one piece bridges several.
+    #[test]
+    fn a_piece_bridging_several_apertures_merges_them_all()
+    {
+        let descs = [
+            mmio_desc(0x1000_0000, 1),
+            mmio_desc(0x1000_2000, 1),
+            mmio_desc(0x1000_4000, 1),
+            mmio_desc(0x2000_0000, 1),
+        ];
+        let seed = [MmioAperture {
+            phys_base: 0x1000_0800,
+            size: 0x4000,
+        }];
+        let out = run_derive(&descs, &seed);
+        assert_eq!(
+            pairs(&out),
+            vec![(0x1000_0000, 0x5000), (0x2000_0000, 0x1000)]
+        );
     }
 
     #[test]

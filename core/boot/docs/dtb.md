@@ -83,12 +83,13 @@ corresponding `kernel_mmio` base). Full cell-inheritance support belongs
 to `devmgr` (design intent, not yet implemented: devmgr's DTB reader
 likewise assumes `#address-cells = 2` and `#size-cells = 2`).
 
-Walker limits: `MAX_DEPTH = 8` for node nesting, `MAX_REG_ENTRIES = 8`
+Walker limits: `MAX_DEPTH = 32` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`
-values, `MAX_RANGES_ENTRIES = 4` for PCI `ranges`. Nodes exceeding
-these bounds truncate silently — the bootloader does not need
-exhaustive coverage, because device-level discovery is a userspace
-concern (see Responsibilities in
+values, `MAX_RANGES_ENTRIES = 8` for PCI `ranges`. A walk skips the
+properties of nodes nested past `MAX_DEPTH` and drops the entries past a
+property's bound, and reports either with one console line — the
+bootloader does not need exhaustive coverage, because device-level
+discovery is a userspace concern (see Responsibilities in
 [`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 ---

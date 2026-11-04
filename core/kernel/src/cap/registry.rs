@@ -320,11 +320,10 @@ impl CSpaceRegistry
             .store(self.free_head.load(Ordering::Relaxed), Ordering::Relaxed);
         self.free_head.store(id, Ordering::Relaxed);
         // Every retired id was handed out by `alloc` (the pre-condition), so
-        // the count is at least one here.
-        self.live.store(
-            self.live.load(Ordering::Relaxed).saturating_sub(1),
-            Ordering::Relaxed,
-        );
+        // the count is at least one here; a double retire trips the assert.
+        let live = self.live.load(Ordering::Relaxed);
+        debug_assert!(live > 0, "retire of an id alloc did not hand out");
+        self.live.store(live.wrapping_sub(1), Ordering::Relaxed);
         // SAFETY: paired with lock_raw above.
         unsafe { self.free_lock.unlock_raw(saved) };
     }
@@ -509,6 +508,8 @@ mod tests
         assert_eq!(reg.live(), 0);
     }
 
+    // Defect caught: a failed `alloc` (the `None` arm) that still raises the
+    // count.
     #[test]
     fn exhausted_registry_counts_every_backed_id_live()
     {

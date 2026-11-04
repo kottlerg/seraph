@@ -14,7 +14,7 @@
 //! (`BLK_GET_GEOMETRY`) over IPC.
 
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
+// are lossless. Narrower casts extract the fields a packed `u64` word carries.
 #![allow(clippy::cast_possible_truncation)]
 
 mod io;
@@ -59,13 +59,13 @@ const QUEUE_SIZE: u16 = 4;
 struct DriverCaps
 {
     bars: DeliveredBars,
-    irq_slot: u32,
+    irq_slot: u64,
     /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
     irq_mode: u64,
-    memmgr_ep: u32,
-    service_ep: u32,
-    devmgr_ep: u32,
-    self_aspace: u32,
+    memmgr_ep: u64,
+    service_ep: u64,
+    devmgr_ep: u64,
+    self_aspace: u64,
 }
 
 fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
@@ -153,7 +153,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
 /// `word[0]` = kind, `word[1]` = version, `word[2]` = `byte_len`,
 /// payload bytes packed into the subsequent data words. The driver
 /// verifies kind/version before deserialising.
-fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
+fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 {
     let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_INFO)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -216,7 +216,7 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 /// this driver's service endpoint only after the report. Logs the
 /// `ReadyError` and exits when the call fails or devmgr refuses the report,
 /// since devmgr then serves no client this driver.
-fn report_ready(devmgr_ep: u32, ipc_buf: *mut u64)
+fn report_ready(devmgr_ep: u64, ipc_buf: *mut u64)
 {
     // SAFETY: ipc_buf is the registered IPC buffer.
     if let Err(e) = unsafe { ipc::report_driver_ready(devmgr_ep, ipc_buf) }
@@ -232,7 +232,7 @@ fn report_ready(devmgr_ep: u32, ipc_buf: *mut u64)
 /// memmgr. Returns `(cap_slot, phys_base)` on success — the physical base
 /// address is needed for DMA programming on no-IOMMU systems and is
 /// supplied by memmgr in the `REQUEST_MEMORY_CAPS` reply alongside the cap.
-fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
+fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Option<(u64, u64)>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -504,14 +504,14 @@ pub struct BlkRuntime<'a>
     /// Notification the interrupt-service thread signals after each
     /// delivery it acknowledged and each interrupt its timed ISR read finds
     /// ([`start_isr_thread`]); the request path waits on it.
-    pub completion: u32,
+    pub completion: u64,
     /// Un-badged `SEND_GRANT` cap on this driver's service endpoint;
     /// kept so `handle_register_partition` can `cap_derive_badge` per-
     /// partition badged caps from it. The kernel rejects re-badging
     /// of a badged source, so partition cap derivation must happen
     /// here (server-side) and not at the caller (which holds a
     /// MOUNT_AUTHORITY-badged cap).
-    pub service_ep: u32,
+    pub service_ep: u64,
     partitions: PartitionTable,
     /// Logical block size and capacity; every wire LBA and count is in
     /// these blocks.
@@ -528,9 +528,9 @@ pub struct BlkRuntime<'a>
 /// request path. Returns whether the thread started.
 fn start_isr_thread(
     transport: PciTransport,
-    irq_notification: u32,
-    irq_cap: u32,
-    completion: u32,
+    irq_notification: u64,
+    irq_cap: u64,
+    completion: u64,
 ) -> bool
 {
     std::thread::Builder::new()
@@ -581,7 +581,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 }
 
 /// Handle incoming IPC requests on the service endpoint.
-fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
+fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 {
     std::os::seraph::log!("ready, entering service loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
@@ -631,7 +631,7 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 /// Delete every cap in `caps` from the driver's `CSpace`: caps a request
 /// carried that its handler neither uses nor returns, which would otherwise
 /// accumulate there for the driver's lifetime.
-fn drop_caps(caps: &[u32])
+fn drop_caps(caps: &[u64])
 {
     for &cap in caps
     {
@@ -750,7 +750,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
 /// The cap must be a Memory cap of at least `data_len` bytes carrying
 /// `MAP|WRITE` for a read (the device writes into it) or `MAP` for a write
 /// (the device only reads it).
-fn validate_memory_cap(mem_cap: u32, dir: io::IoDirection, data_len: u32) -> Result<u64, u64>
+fn validate_memory_cap(mem_cap: u64, dir: io::IoDirection, data_len: u32) -> Result<u64, u64>
 {
     let invalid = ipc::blk_errors::INVALID_MEMORY_CAP;
     let tag_rights =

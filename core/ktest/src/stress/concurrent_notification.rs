@@ -39,8 +39,8 @@ const ALL_BITS: u64 = u64::MAX;
 #[derive(Clone, Copy)]
 struct SenderArgs
 {
-    target: u32,
-    done: u32,
+    target: u64,
+    done: u64,
     bit_index: usize,
 }
 

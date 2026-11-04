@@ -26,7 +26,7 @@ use crate::worker_pool::{
 
 /// Bootstrap worker entry. Runs for the process lifetime; spawned by
 /// `WorkerPool::new`.
-pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
+pub fn bootstrap_loop(bootstrap_ep: u64, state: &Mutex<BootstrapState>) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()

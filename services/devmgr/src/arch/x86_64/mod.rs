@@ -21,7 +21,7 @@ pub struct ArchCaps
     // per-driver narrow copies for ISA peripherals (CMOS RTC at ports
     // 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and, on
     // `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
-    ioport_cap: u32,
+    ioport_cap: u64,
 }
 
 impl ArchCaps
@@ -34,7 +34,7 @@ impl ArchCaps
 
     /// Store the `SVCMGR_BUNDLE` round's shutdown-authority cap: on x86-64,
     /// the full-rights `IoPort` derivation.
-    pub fn absorb_shutdown_authority(&mut self, cap: u32)
+    pub fn absorb_shutdown_authority(&mut self, cap: u64)
     {
         self.ioport_cap = cap;
     }
@@ -75,7 +75,7 @@ pub fn intx_fallback_gsi(_pin: u8, _dev: u8) -> Option<u32>
 /// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of devmgr's
 /// full-rights `IoPort` cap. Returns `None` when devmgr holds no `IoPort`
 /// cap or a derive or split fails.
-pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
+pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u64>
 {
     ioport_carve(caps.arch.ioport_cap, 0x3F8, 8)
 }
@@ -85,7 +85,7 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 /// pending #165, which replaces all such hardcoded per-driver knowledge
 /// with ACPI `_HID` (`PNP0B00`) driven discovery. Returns `None` when
 /// devmgr holds no `IoPort` cap or a derive or split fails.
-pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
+pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u64>
 {
     ioport_carve(caps.arch.ioport_cap, 0x70, 2)
 }
@@ -210,7 +210,7 @@ pub fn reply_shutdown_device(caps: &DevmgrCaps, msg: &IpcMessage, ipc_buf: *mut 
 /// `base + count` overflows, or a derive or split fails; every unused slab
 /// is deleted. `cap_derive`-copies the source so it stays intact for
 /// further carves.
-fn ioport_carve(source_cap: u32, base: u16, count: u16) -> Option<u32>
+fn ioport_carve(source_cap: u64, base: u16, count: u16) -> Option<u64>
 {
     if source_cap == 0
     {

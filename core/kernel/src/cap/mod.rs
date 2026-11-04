@@ -956,7 +956,7 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
             out[i] = CapDescriptor {
                 slot: 0,
                 cap_type: init_protocol::CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: base,
                 aux1: size,
             };
@@ -1370,7 +1370,7 @@ static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
 static mut TEST_DESCRIPTOR_ARRAY: [CapDescriptor; TEST_DESCRIPTOR_CAPACITY] = [CapDescriptor {
     slot: 0,
     cap_type: init_protocol::CapType::Memory,
-    pad: [0; 3],
+    pad: [0; 7],
     aux0: 0,
     aux1: 0,
 };
@@ -1615,9 +1615,9 @@ fn mint_acpi_region_caps(
             "Phase 7: ACPI region Memory caps are not in consecutive slots",
         );
         record(CapDescriptor {
-            slot,
+            slot: u64::from(slot),
             cap_type: init_protocol::CapType::Memory,
-            pad: [0; 3],
+            pad: [0; 7],
             aux0: aligned_base,
             aux1: size,
         });
@@ -1768,9 +1768,9 @@ fn populate_cspace(
             note_owns_memory_minted(cap_size);
             memory_count += 1;
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: cap_base,
                 aux1: cap_size,
             }
@@ -1825,9 +1825,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: aligned_base,
                 aux1: aligned_size,
             },
@@ -1869,9 +1869,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Mmio,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: uart_base,
                 aux1: uart_size,
             },
@@ -1896,9 +1896,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Mmio,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: ap.phys_base,
                 aux1: ap.size,
             },
@@ -1924,9 +1924,9 @@ fn populate_cspace(
     push_descriptor(
         &mut desc_count,
         CapDescriptor {
-            slot: sched_control_slot,
+            slot: u64::from(sched_control_slot),
             cap_type: CapType::SchedControl,
-            pad: [0; 3],
+            pad: [0; 7],
             aux0: u64::from(syscall::PRIORITY_MIN),
             aux1: u64::from(syscall::PRIORITY_MAX),
         },
@@ -1953,9 +1953,9 @@ fn populate_cspace(
     push_descriptor(
         &mut desc_count,
         CapDescriptor {
-            slot: irq_range_slot,
+            slot: u64::from(irq_range_slot),
             cap_type: CapType::Interrupt,
-            pad: [0; 3],
+            pad: [0; 7],
             aux0: 0,
             aux1: u64::from(ROOT_IRQ_COUNT),
         },
@@ -1984,9 +1984,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: info.acpi_rsdp,
                 aux1: 0x1000,
             },
@@ -2013,9 +2013,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: dtb_base,
                 aux1: dtb_size,
             },
@@ -2043,9 +2043,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot: ioport_root_slot,
+                slot: u64::from(ioport_root_slot),
                 cap_type: CapType::IoPort,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: 0,
                 aux1: 0x10000, // full 64K range
             },
@@ -2074,9 +2074,9 @@ fn populate_cspace(
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::SbiControl,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: 0,
                 aux1: 0,
             },
@@ -2202,9 +2202,9 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: module.physical_base,
                 aux1: module.size,
             },
@@ -2217,8 +2217,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
             crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
         }
         layout.module_names[name_slot] = init_protocol::InitModuleName {
-            slot,
-            _pad: 0,
+            slot: u64::from(slot),
             name: module.name,
         };
         layout.module_name_count += 1;
@@ -2450,9 +2449,9 @@ fn mint_reclaim_pass(
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
-                slot,
+                slot: u64::from(slot),
                 cap_type: CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: phys_base,
                 aux1: size_bytes,
             },
@@ -2874,10 +2873,14 @@ mod tests
         assert_eq!(descs.len(), 20);
         for (i, d) in descs.iter().enumerate()
         {
-            assert_eq!(d.slot, base + i as u32);
+            assert_eq!(d.slot, u64::from(base + i as u32));
             assert_eq!(d.aux0, 0x1000_0000 + i as u64 * 0x10_0000);
             assert_eq!(d.aux1, 0x2000);
-            assert!(cspace.slot(d.slot).is_some_and(|s| s.tag == CapTag::Memory));
+            assert!(
+                cspace
+                    .slot(syscall::cap_handle_index(d.slot))
+                    .is_some_and(|s| s.tag == CapTag::Memory)
+            );
         }
     }
 
@@ -3023,7 +3026,7 @@ mod tests
         let extent = |i: usize| CapDescriptor {
             slot: 0,
             cap_type: init_protocol::CapType::Memory,
-            pad: [0; 3],
+            pad: [0; 7],
             aux0: 0x1_0000_0000 + (i as u64) * 0x20_0000,
             aux1: 0x1000 * (i as u64 + 1),
         };
@@ -3033,9 +3036,9 @@ mod tests
         complete_extent_descriptors(&mut slots, |base, size| {
             seen.push((base, size));
             CapDescriptor {
-                slot: seen.len() as u32,
+                slot: seen.len() as u64,
                 cap_type: init_protocol::CapType::Memory,
-                pad: [0; 3],
+                pad: [0; 7],
                 aux0: base,
                 aux1: size,
             }
@@ -3046,7 +3049,7 @@ mod tests
             assert_eq!(seen[i], (want.aux0, want.aux1), "extent {i} read intact");
             assert_eq!(
                 (d.slot, d.aux0, d.aux1),
-                (i as u32 + 1, want.aux0, want.aux1)
+                (i as u64 + 1, want.aux0, want.aux1)
             );
         }
     }

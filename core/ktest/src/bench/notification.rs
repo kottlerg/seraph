@@ -22,9 +22,9 @@ static mut BENCH_SIGNAL_STACK: ChildStack = ChildStack::ZERO;
 #[derive(Clone, Copy)]
 struct PongArgs
 {
-    ping: u32,
-    pong: u32,
-    done: u32,
+    ping: u64,
+    pong: u64,
+    done: u64,
     n: u64,
 }
 

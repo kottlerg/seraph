@@ -55,9 +55,9 @@ static mut FOUR_CAPS_STACK: ChildStack = ChildStack::ZERO;
 #[derive(Clone, Copy)]
 struct XferArgs
 {
-    ep: u32,
-    done: u32,
-    memory: u32,
+    ep: u64,
+    done: u64,
+    memory: u64,
 }
 
 static CAP_XFER_ARGS: ArgBlock<XferArgs, 1> = ArgBlock::new(XferArgs {
@@ -80,10 +80,10 @@ static RECV_RESERVE_ARGS: ArgBlock<XferArgs, 2> = ArgBlock::new(XferArgs {
 #[derive(Clone, Copy)]
 struct ReplyOomArgs
 {
-    ep: u32,
-    ready: u32,
-    done: u32,
-    memory: u32,
+    ep: u64,
+    ready: u64,
+    done: u64,
+    memory: u64,
 }
 
 static REPLY_OOM_ARGS: ArgBlock<ReplyOomArgs, 1> = ArgBlock::new(ReplyOomArgs {
@@ -92,6 +92,31 @@ static REPLY_OOM_ARGS: ArgBlock<ReplyOomArgs, 1> = ArgBlock::new(ReplyOomArgs {
     done: 0,
     memory: 0,
 });
+
+/// Arguments of the children that take an endpoint and a report
+/// notification, handed to their entries by address: each handle fills a
+/// whole `u64`, so the pair does not fit the one argument word.
+#[derive(Clone, Copy)]
+struct EpDoneArgs
+{
+    ep: u64,
+    done: u64,
+}
+
+/// An [`EpDoneArgs`] block holding no caps.
+const fn ep_done_block() -> ArgBlock<EpDoneArgs, 1>
+{
+    ArgBlock::new(EpDoneArgs { ep: 0, done: 0 })
+}
+
+static CALL_REPLY_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static QUEUED_CALLER_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static DATA_WORDS_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static BADGE_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static UNBADGED_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static SNAPSHOT_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static DUP_REPLY_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+static STALE_REPLY_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
 
 // ── SYS_IPC_CALL / SYS_IPC_RECV / SYS_IPC_REPLY ─────────────────────────────
 
@@ -119,8 +144,16 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
     let child_notify = cap_copy(notify, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy notify into child CSpace failed")?;
 
-    // Pack child ep and notify slots into the arg u64.
-    let child_arg = u64::from(child_ep) | (u64::from(child_notify) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        CALL_REPLY_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_notify,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
@@ -182,7 +215,16 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for recv_finds_queued_caller failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_finds_queued_caller failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        QUEUED_CALLER_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
     // SAFETY: the stack is `RECV_BLOCKS_STACK`, this test's own `ChildStack`,
@@ -284,7 +326,16 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for data_words test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for data_words test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        DATA_WORDS_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK));
     // SAFETY: the stack is `DATA_WORDS_STACK`, this test's own `ChildStack`,
@@ -434,7 +485,16 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy badged ep for recv_delivers_badge failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_delivers_badge failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        BADGE_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(BADGE_STACK));
     // SAFETY: the stack is `BADGE_STACK`, this test's own `ChildStack`,
@@ -486,7 +546,16 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for recv_unbadged failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_unbadged failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        UNBADGED_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
     let stack_top = ChildStack::top(core::ptr::addr_of!(UNBADGED_STACK));
@@ -558,11 +627,14 @@ static mut RECV_RESERVE_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
 
 /// Child: calls the endpoint with label 0xCAFE, waits for reply, then signals.
 ///
-/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `notify_slot` (in child's `CSpace`).
+/// `arg`: address of the child's [`EpDoneArgs`] (slots in the child's `CSpace`).
 extern "C" fn caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let notify_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs {
+        ep: ep_slot,
+        done: notify_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CALLER_IPC_PAGE));
     // SAFETY: `CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -601,11 +673,14 @@ extern "C" fn caller_entry(arg: u64) -> !
 /// Child for `recv_finds_queued_caller`: calls endpoint immediately (no server
 /// yet), then signals the result after the server replies.
 ///
-/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot` (in child's `CSpace`).
+/// `arg`: address of the child's [`EpDoneArgs`] (slots in the child's `CSpace`).
 extern "C" fn queued_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs {
+        ep: ep_slot,
+        done: done_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(QUEUED_CALLER_IPC_PAGE));
     // SAFETY: `QUEUED_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -638,11 +713,14 @@ extern "C" fn queued_caller_entry(arg: u64) -> !
 /// Child for `call_with_data_words`: registers its IPC buffer, builds a two-word
 /// message, then calls.
 ///
-/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot`.
+/// `arg`: address of the child's [`EpDoneArgs`].
 extern "C" fn data_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs {
+        ep: ep_slot,
+        done: done_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(DATA_CALLER_IPC_PAGE));
     // SAFETY: `DATA_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -711,11 +789,14 @@ extern "C" fn cap_xfer_caller_entry(arg: u64) -> !
 
 /// Child for `recv_delivers_badge`: calls endpoint with label 0xD00D.
 ///
-/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot`.
+/// `arg`: address of the child's [`EpDoneArgs`].
 extern "C" fn badge_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs {
+        ep: ep_slot,
+        done: done_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(BADGE_CALLER_IPC_PAGE));
     // SAFETY: `BADGE_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -763,7 +844,16 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for snapshot test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for snapshot test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        SNAPSHOT_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
     // SAFETY: the stack is `SNAPSHOT_STACK`, this test's own `ChildStack`,
@@ -828,8 +918,11 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 /// data words and exits.
 extern "C" fn snapshot_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs {
+        ep: ep_slot,
+        done: done_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(SNAPSHOT_CALLER_IPC_PAGE));
     // SAFETY: `SNAPSHOT_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -1011,9 +1104,9 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
 
 /// Mint `MSG_CAP_SLOTS_MAX` (4) notifications from `memory` for a
 /// cap-bearing message.
-fn mint_notifications(memory: u32) -> Result<[u32; 4], &'static str>
+fn mint_notifications(memory: u64) -> Result<[u64; 4], &'static str>
 {
-    let mut caps = [0u32; 4];
+    let mut caps = [0u64; 4];
     for c in &mut caps
     {
         *c = cap_create_notification(memory)
@@ -1023,7 +1116,7 @@ fn mint_notifications(memory: u32) -> Result<[u32; 4], &'static str>
 }
 
 /// A message labelled `label` carrying the four `caps`.
-fn four_cap_message(label: u64, caps: [u32; 4]) -> IpcMessage
+fn four_cap_message(label: u64, caps: [u64; 4]) -> IpcMessage
 {
     IpcMessage::builder(label)
         .cap(caps[0])
@@ -1155,7 +1248,7 @@ pub fn call_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
     outcome
 }
 
-/// `sys_ipc_call` rejects a message that packs the same cap slot twice,
+/// `sys_ipc_call` rejects a message that names the same cap slot twice,
 /// before the caller blocks.
 ///
 /// A repeated index would make the transfer's second move observe the Null
@@ -1186,7 +1279,7 @@ pub fn call_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// A reply that packs the same cap slot twice is refused with
+/// A reply that names the same cap slot twice is refused with
 /// `InvalidArgument` at the server, and the waiting caller un-parks with
 /// the synthetic `IPC_REPLY_TRANSFER_FAILED` label instead of being
 /// stranded.
@@ -1205,7 +1298,16 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for reply_dup test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for reply_dup test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        DUP_REPLY_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(DUP_REPLY_STACK));
     // SAFETY: the stack is `DUP_REPLY_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
@@ -1257,8 +1359,11 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
 extern "C" fn dup_reply_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs {
+        ep: ep_slot,
+        done: done_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(DUP_REPLY_CALLER_IPC_PAGE));
     // SAFETY: `DUP_REPLY_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -1319,7 +1424,16 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for reply_stale test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for reply_stale test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        STALE_REPLY_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_REPLY_STACK));
     // SAFETY: the stack is `STALE_REPLY_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
@@ -1366,14 +1480,15 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── full-width cap transfer (both packed words) ──────────────────────────────
+// ── full-width cap transfer (every handle word) ──────────────────────────────
 
 /// An IPC call transferring `MSG_CAP_SLOTS_MAX` (4) capabilities delivers
 /// all four intact.
 ///
-/// Exercises both packed cap-handle words (layout: core/kernel/docs/syscalls.md
-/// § `SYS_IPC_CALL`); the lo/hi boundary is the one place sender and kernel
-/// could disagree.
+/// Exercises every cap-handle word of the sender's IPC buffer, the
+/// `MSG_CAP_SLOTS_MAX` words from `MSG_CAP_HANDLES_WORD` on (layout:
+/// core/kernel/docs/syscalls.md § `SYS_IPC_CALL`), so a sender and kernel
+/// that disagreed on where a handle word sits would fail it.
 pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1472,7 +1587,7 @@ extern "C" fn four_caps_caller_entry(arg: u64) -> !
         thread_exit()
     }
 
-    let mut caps = [0u32; 4];
+    let mut caps = [0u64; 4];
     for c in &mut caps
     {
         let Ok(h) = cap_create_notification(memory_slot)
@@ -1590,7 +1705,7 @@ pub fn recv_succeeds_on_exhausted_general_slots(ctx: &TestContext) -> TestResult
 /// Start the victim and the caller of `recv_succeeds_on_exhausted_general_slots`
 /// (`threads` and their published `args`, in that order) and check their
 /// reports on `reports`: the caller's result, then the victim's done.
-fn recv_reserve_drive(threads: [u32; 2], args: [u64; 2], reports: [u32; 2]) -> TestResult
+fn recv_reserve_drive(threads: [u64; 2], args: [u64; 2], reports: [u64; 2]) -> TestResult
 {
     let [victim_th, caller_th] = threads;
     let [victim_arg, caller_arg] = args;
@@ -1725,7 +1840,7 @@ extern "C" fn recv_reserve_caller_entry(arg: u64) -> !
         thread_exit()
     }
 
-    let mut caps = [0u32; 4];
+    let mut caps = [0u64; 4];
     for c in &mut caps
     {
         let Ok(h) = cap_create_notification(memory_slot)

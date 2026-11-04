@@ -92,8 +92,9 @@ An entry an existing open Issue already names cites it in the recommendation.
   set at 256 members, where the queues still hold about 16 K live processes: the death-queue
   set's floor, not a cap a system meets, since such RAM refuses each spawn's own contiguous
   grants (a 48-page `AddressSpace`, a `Thread` slot of six pages or more) first. The
-  first bound past RAM is procmgr's `CSpace` (about 1 M children, `MAX_SLOTS_STRUCTURAL`), and
-  behind it sits the cap handle's 8-bit wrapping generation.
+  first bound past RAM is procmgr's `CSpace` (about 1 M children, `MAX_SLOTS_STRUCTURAL`), a
+  directory-geometry bound: the cap handle's 32-bit index field leaves room for a deeper
+  directory with no ABI change.
 - **Per-process address space.** The surfaces a creator places stay in one static map below
   Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
@@ -173,11 +174,12 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `REGISTRY_CHUNK_ORDER` | `core/kernel/src/cap/registry.rs` | 8 (1 MiB chunks) | encoding artefact (chunk granularity of the two-level arena) | none | correct as is | None |
 | `CSpaceRegistry` chunk table (`chunks_for_ram`, `MAX_ID_CHUNKS`) | `core/kernel/src/cap/registry.rs` | one slot per 256 MiB of DRAM, at most `MAX_ID_CHUNKS` (the `u32` id space, 16 TiB of DRAM) | encoding artefact (`CSpaceId` width) | 8 B per 256 MiB of DRAM | correct as is | None |
 | `RegistryEntry.epoch`, `SlotId.epoch` | `core/kernel/src/cap/registry.rs`, `slot.rs` | `u32`, redrawn on recycle | encoding artefact (12 B `SlotId`, 72 B slot) | 4 B per `SlotId` | correct as is | Freshness-only; the residual per recycle is documented |
-| `CapabilitySlot.pad[1]` (handle generation) | `core/kernel/src/cap/slot.rs` | `u8`, wrapping | ABI width (`u32` handle: 8 generation + 24 index bits) | 1 B per slot | raise | Wraps after 256 recycles of one index. Retiring the index at wrap instead leaks one 72 B slot per 256 frees, which cap-churning workloads exhaust their `CSpace` pools with in seconds, so widen handles; decide with `CAP_INDEX_BITS` |
-| `CAP_INDEX_BITS` | `abi/syscall/src/lib.rs` | 24 | ABI width (`u32` handle) | none | needs a design | About 16.7 M slots per CSpace; decide with the generation (#41) |
+| `CapabilitySlot.generation` (handle generation, `CAP_GEN_BITS`) | `core/kernel/src/cap/slot.rs` | `u32`, wrapping at 2^31 | ABI width (`u64` handle: 31 generation + 32 index bits, bit 63 clear for the negative-error return convention) | 4 B per slot | correct as is | A stale handle aliases a later occupant only when held across exactly a multiple of 2^31 recycles of its index. The index stays in service at wrap: retiring it would leak one 72 B slot per 2^31 recycles of every hot index on the LIFO free list for the `CSpace`'s life; the same retirement at 256 recycles exhausted cap-churning workloads' pools (#637) |
+| `CAP_INDEX_BITS` | `abi/syscall/src/lib.rs` | 32 | ABI width (`u64` handle) | none | correct as is | The field outsizes the directory: `MAX_SLOTS_STRUCTURAL`, not the handle, bounds a CSpace |
+| `Rights`, `TypedRights` (slot rights word) | `core/kernel/src/cap/slot.rs` | `u16`, 16 rights per capability type | encoding artefact (the 72 B slot's first word holds tag, pin, rights and generation) | 2 B per slot | correct as is | The highest right today is bit 5; deriving a seventeenth fails the build (`TypedRights::from_abi`) |
 | `L2_SIZE` | `core/kernel/src/cap/cspace.rs` | 56 | encoding artefact (56 x 72 B in one page, asserted; published as `CSPACE_SLOTS_PER_PAGE`) | none | correct as is | None |
 | `L1_DIRECT`, `L1_INDIRECT` | `core/kernel/src/cap/cspace.rs` | 128 / 128 | encoding artefact (two-level directory inline in the CSpace) | 2 KiB per CSpace | correct as is | Add a level, not inline pointers, if `MAX_SLOTS_STRUCTURAL` ever binds (#41) |
-| `MAX_LEAVES`, `MAX_SLOTS_STRUCTURAL` | `core/kernel/src/cap/cspace.rs` | 65 664 leaves, 3 677 184 slots per CSpace | encoding artefact (directory geometry) | none (growth is pool-funded) | needs a design | procmgr's CSpace bounds its children near 1 M; decide with `CAP_INDEX_BITS` |
+| `MAX_LEAVES`, `MAX_SLOTS_STRUCTURAL` | `core/kernel/src/cap/cspace.rs` | 65 664 leaves, 3 677 184 slots per CSpace | encoding artefact (directory geometry) | none (growth is pool-funded) | raise | procmgr's CSpace bounds its children near 1 M. Add a directory level: the 32-bit handle index field holds about 1 168 times this ceiling, so the raise needs no ABI change |
 | CSpace geometry asserts | `core/kernel/src/cap/cspace.rs` | `MAX_SLOTS_STRUCTURAL <= 1 << CAP_INDEX_BITS`, page fits | encoding artefact | none | correct as is | Keep |
 | `CSpace.next_leaf`, `pool_exhaustions` | `core/kernel/src/cap/cspace.rs` | `u32` | encoding artefact (`next_leaf` asserted against `MAX_LEAVES`); `pool_exhaustions` is a wrapping diagnostic counter | embedded | correct as is | None |
 | `root_cspace_init_slot_capacity` | `core/kernel/src/cap/mod.rs` | the boot's capability bodies (`boot_body_bound`) plus `ROOT_CSPACE_BOOT_EXTRA_SLOTS` and `ROOT_CSPACE_INIT_HEADROOM_SLOTS` | derived from the boot's own `InitInfo` descriptor capacity, sized at Phase 7 | the slot pages it rounds up to, in SEED | correct as is | None |
@@ -223,7 +225,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `Message.data` | `core/kernel/src/ipc/message.rs` | 64 words (`MSG_DATA_WORDS_MAX`) | ABI width (IPC buffer layout) | 512 B per TCB | correct as is | Bulk data moves through Memory caps |
-| `Message.cap_slots` | `core/kernel/src/ipc/message.rs` | 4 (`MSG_CAP_SLOTS_MAX`) | encoding artefact (two registers of two `u32` handles) | 16 B per TCB | correct as is | See the Syscall ABI entry |
+| `Message.cap_slots` | `core/kernel/src/ipc/message.rs` | 4 (`MSG_CAP_SLOTS_MAX`) | ABI width (the IPC buffer cap block) | 32 B per TCB | correct as is | See the Syscall ABI entry |
 | `EventQueueState` counters | `core/kernel/src/ipc/event_queue.rs` | `u32` | encoding artefact (capacity at most `EVENT_QUEUE_MAX_CAPACITY`) | embedded | correct as is | None |
 | `NotificationState.bits` | `core/kernel/src/ipc/notification.rs` | `u64` | ABI width (64 signal bits) | embedded | correct as is | None |
 | Endpoint, Notification, EventQueue state size asserts | `core/kernel/src/ipc/*.rs` | 128 B bin | encoding artefact | none | correct as is | Keep |
@@ -322,18 +324,18 @@ Every entry here is `correct as is`; none is tracked.
 
 ### Syscall ABI
 
-Tracked by [#638](https://github.com/kottlerg/seraph/issues/638); `CAP_INDEX_BITS` and the handle
-generation by [#637](https://github.com/kottlerg/seraph/issues/637).
+Tracked by [#638](https://github.com/kottlerg/seraph/issues/638); the handle width (`CAP_INDEX_BITS`
+and the generation) was decided on [#637](https://github.com/kottlerg/seraph/issues/637).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MSG_CAP_SLOTS_MAX` | `abi/syscall/src/lib.rs` | 4 | encoding artefact (two transfer registers of two `u32` handles each) | 16 B per TCB message | correct as is | Bounds caps per message, not per transfer: every protocol that moves more iterates (`shared/ipc` bootstrap rounds, DONATE rounds); the protocols that do not are tracked in their own sections |
-| `MSG_CAP_SLOTS_MAX <= 4` assert | `abi/syscall/src/lib.rs` | compile time | encoding artefact | none | correct as is | Keep |
+| `MSG_CAP_SLOTS_MAX` | `abi/syscall/src/lib.rs` | 4 | ABI width (the IPC buffer cap block, one `u64` handle per word from `MSG_CAP_HANDLES_WORD`) | 32 B per TCB message | correct as is | Bounds caps per message, not per transfer: every protocol that moves more iterates (`shared/ipc` bootstrap rounds, DONATE rounds); the protocols that do not are tracked in their own sections |
+| Cap block fits the IPC buffer page assert | `abi/syscall/src/lib.rs` | compile time | ABI width | none | correct as is | Keep |
 | `CSPACE_IPC_RECV_RESERVE` | `abi/syscall/src/lib.rs` | `MSG_CAP_SLOTS_MAX` (4) free slots per CSpace | ABI width (one message's caps) | 4 slots per CSpace | correct as is | None: general allocations fail first, receives keep landing caps (#41) |
 | `CSPACE_SLOTS_PER_PAGE` | `abi/syscall/src/lib.rs` | 56 | encoding artefact (kernel `L2_SIZE`, asserted equal) | none | correct as is | None |
 | `MSG_DATA_WORDS_MAX` | `abi/syscall/src/lib.rs` | 64 | ABI width (IPC buffer layout) | about 550 B per TCB | correct as is | Bulk data moves through Memory caps (#36, #40) |
-| IPC buffer layout | `abi/syscall/src/lib.rs` | data words 0..64, count at 64, handles 65..69, in one page | ABI width | 4 KiB per thread | correct as is | None |
-| `CAP_INDEX_BITS + 8 <= 32` assert | `abi/syscall/src/lib.rs` | compile time | ABI width | none | correct as is | Keep |
+| IPC buffer layout | `abi/syscall/src/lib.rs` | data words 0..64, delivered cap count at 64, sent and delivered handles 65..69, in one page | ABI width | 4 KiB per thread | correct as is | None |
+| `CAP_INDEX_BITS + CAP_GEN_BITS == 63` assert | `abi/syscall/src/lib.rs` | compile time | ABI width (bit 63 of a handle stays clear) | none | correct as is | Keep |
 | `EVENT_QUEUE_MAX_CAPACITY` | `abi/syscall/src/lib.rs` | 2^20 entries and observer nodes | per-call bound (one create zeroes the ring and links the nodes in the kernel; the queue is caller-funded) | none | correct as is | More is had with more queues |
 | `PRIORITY_MIN`, `PRIORITY_MAX` | `abi/syscall/src/lib.rs` | 1 / 30 | ABI width (32-level mask: 0 idle, 31 reserved) | none | correct as is | None (#215) |
 | `MAX_GETRANDOM_LEN` | `abi/syscall/src/lib.rs` | 256 B | per-call bound (callers loop; it bounds the interrupts-off window) | 256 B stack | correct as is | None |
@@ -362,7 +364,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 | `INIT_MODULE_NAME_LEN` | `abi/init-protocol/src/lib.rs` | 32 | ABI width (equals `BOOT_MODULE_NAME_LEN`) | per name | correct as is | None: tied by a const assert in `core/kernel/src/cap/mod.rs` |
 | `INIT_INFO_MAX_PAGES` | `abi/init-protocol/src/lib.rs` | 64 (10,775 descriptors past the header) | ABI width (the virtual-address room the kernel leaves for the `InitInfo` region, and init's orphan-cap table, both fixed before init can allocate); no platform reaches it, since each count the region is sized from is the platform's own and bounded: coalesced RAM extents and ACPI regions by the firmware memory map, apertures by the map and firmware tables, modules by `MAX_BOOT_MODULES` (85), reclaim ranges by `MAX_RECLAIM_RANGES` (256), and real maps give tens | none (the region is allocated at the boot's size, two pages on the QEMU boots) | correct as is | None; Phase 7 halts by name past it |
 | `INIT_STACK_PAGES` | `abi/init-protocol/src/lib.rs` | 4 | provably unreachable (init's own stack, whose depth the in-tree init fixes) | 16 KiB | correct as is | None |
-| `InitInfo` count and slot fields | `abi/init-protocol/src/lib.rs` | `u32` | ABI width (cap handle) | embedded | correct as is | None |
+| `InitInfo` count and slot fields | `abi/init-protocol/src/lib.rs` | `u64` slot handles, bases and slot counts; `u32` descriptor and module-name counts | ABI width (cap handle) | embedded | correct as is | None |
 | `InitInfo` size assert | `abi/init-protocol/src/lib.rs` | the header fits the region's first page | ABI width | none | correct as is | None |
 | `MAX_BOOT_MODULES` (`BootInfo.modules`; core/boot `MAX_MODULES`) | `abi/boot-protocol/src/lib.rs` | 85 | static-footprint budget (the `BootModule` entries the one-page module array holds) | 4 KiB stack in core/boot, one page reclaimed | correct as is | None: a larger bundle is refused by name by the bootloader, and the kernel halts by name |
 | `MEM_MAP_SLACK_ENTRIES` (`MemoryMapEntry` array) | `core/boot/src/main.rs` | the firmware's descriptor count at step 6 plus 32 | current peak plus headroom (the eight later bootloader allocations add at most 16 descriptors; the other 16 absorb firmware housekeeping, which nothing bounds) | 24 B per descriptor, reclaimed | needs a design | Check the final map's count against the array before `ExitBootServices` and regrow it, which needs the regrown array identity-mapped after step 6; until then a RAM descriptor past the array fails the boot by name, any other is dropped with a diagnostic |
@@ -400,7 +402,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (the `ProcessIn
 | `PROCESS_MAIN_TLS_MAX_PAGES` | `abi/process-abi/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the TLS window's region tail) | none (loaders map the `PT_TLS` size) | correct as is | None |
 | `ProcessInfo` page (argv and env blobs share it) | `abi/process-abi/src/lib.rs` | 4096 B less the struct | BSS budget (one page) | 4 KiB per process | needs a design | See the argv entries in the procmgr section (#672) |
 | `ProcessInfo.initial_priority` | `abi/process-abi/src/lib.rs` | `u8` | ABI width (`PRIORITY_MAX` 30) | none | correct as is | None |
-| `ProcessInfo` cap fields | `abi/process-abi/src/lib.rs` | `u32` | ABI width (cap handle) | embedded | correct as is | Follows the handle-width decision (#637) |
+| `ProcessInfo` cap fields | `abi/process-abi/src/lib.rs` | `u64` | ABI width (cap handle) | embedded | correct as is | None |
 | Growth-zone window `slots_log2` | `shared/process-layout/src/lib.rs` | Sv39: 19 (heap), 23 (arena); user half `H` above 2^38: `log2(H) - 18` | encoding artefact (ASLR window) | none | correct as is | None |
 | `HEAP_INITIAL_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 512 (2 MiB) | default (a floor that avoids early grows) | demand-paged process: VA, and frames as the allocator hands them out; pinned process: 2 MiB eager | correct as is | None |
 | `GROW_MIN_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | tuning | none | correct as is | None |
@@ -448,7 +450,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | `INIT_REAP_CORRELATOR`, per-child correlator | `shared/ipc/src/lib.rs` | `u64::MAX`; the full process badge | ABI width (the kernel correlator is `u64`; the sentinel carries every verb bit, so no minted badge equals it) | none | correct as is | None |
 | `memmgr_grant_layout` caps per reply | `shared/ipc/src/lib.rs` | `MSG_CAP_SLOTS_MAX` | ABI width (4 caps per reply); a request spread over more runs gets a partial grant the caller requests again | none | correct as is | None |
 | phys-table index constants (`FACTS_*`, `IN_USE_*`) | `shared/ipc/src/lib.rs` | 0 to 3 | encoding artefact (one-page layout) | none | correct as is | None |
-| `MAX_IN_USE`, `IN_USE_WORDS` | `shared/ipc/src/lib.rs` | 4 / 3 | provably unreachable (three tier-1 producers; the page fit is const-asserted) | none | correct as is | None |
+| `MAX_IN_USE`, `IN_USE_WORDS` | `shared/ipc/src/lib.rs` | 4 / 4 | provably unreachable (three tier-1 producers; the page fit is const-asserted) | none | correct as is | None |
 | svcmgr and namespace label name lengths | `shared/ipc/src/lib.rs` | 16-bit fields | encoding artefact | none | correct as is | The binding limits are the name constants |
 | FS_WRITE, FS_READ inline payloads | `shared/ipc/src/lib.rs` | 504 B per call | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | Large transfers use the memory verbs (#87) |
 | FS_READ_MEMORY, FS_WRITE_MEMORY | `shared/ipc/src/lib.rs` | one page per call | encoding artefact (one slot cap per reply) | none | correct as is | Callers iterate; batching is a throughput question (#229) |
@@ -472,9 +474,9 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | `RECV_FAILURE_FATAL_STREAK`, `RECV_FAILURE_BACKOFF_CAP_MS`, `RecvGuard.streak` | `shared/ipc/src/recv_guard.rs` | 32 / 128 ms / `u32` | tuning (bounds no capacity) | 4 B | correct as is | None |
 | `registry::NAME_MAX` | `shared/registry/src/lib.rs` | `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | per entry | correct as is | None |
 | `Registry.entries` | `shared/registry/src/lib.rs` | heap `Vec`, one entry per published name | per-instance (a publish fails only when the heap cannot grow it) | none | correct as is | None |
-| `Entry.name_len`, `Entry.cap` | `shared/registry/src/lib.rs` | `u8`, `u32` | ABI width (cap handle); length unreachable | 5 B per entry | correct as is | None |
+| `Entry.name_len`, `Entry.cap` | `shared/registry/src/lib.rs` | `u8`, `u64` | ABI width (cap handle); length unreachable | 9 B per entry | correct as is | None |
 | `registry-client` `NAME_MAX`, `NAME_WORDS` | `shared/registry-client/src/lib.rs` | re-export of `svcmgr_labels::NAME_MAX` / `NAME_WORDS` | the shared svcmgr name limit | 64 B stack | correct as is | None |
-| `REGISTRY_CAP`, `BADGEED_CAP` | `shared/registry-client`, `shared/log` | `AtomicU32` | ABI width (cap handle) | 4 B | correct as is | None (#74) |
+| `REGISTRY_CAP`, `BADGEED_CAP` | `shared/registry-client`, `shared/log` | `AtomicU64` | ABI width (cap handle) | 8 B | correct as is | None (#74) |
 | log `CHUNK_SIZE` | `shared/log/src/lib.rs` | 512 | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | None |
 | log `STACK_BUF_LEN` | `shared/log/src/lib.rs` | 512 | ABI width (one `STREAM_BYTES` payload; a longer message is sent in chunks as the buffer fills) | 512 B stack per call | correct as is | None |
 | `SharedBuffer.page_count` | `shared/shmem/src/lib.rs` | `u64` | ABI width (`mem_map` page count) | 8 B | correct as is | None |

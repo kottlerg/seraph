@@ -37,20 +37,20 @@ use std::os::seraph::startup_info;
 
 struct BootCaps
 {
-    service_ep: u32,
-    hw_cap: u32,
+    service_ep: u64,
+    hw_cap: u64,
     /// UART interrupt cap (x86 ISA IRQ4, riscv NS16550 PLIC source). Zero when
     /// devmgr delivered no IRQ: RX then degrades to timeout polling on the
     /// client side, and `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
-    irq_cap: u32,
+    irq_cap: u64,
     /// devmgr query cap: a SEND badged with this device's badge on its spawn
     /// batch's private endpoint, for `DRIVER_READY`.
-    devmgr_query_ep: u32,
+    devmgr_query_ep: u64,
 }
 
 /// Request the two bootstrap rounds: round 1 (not terminal)
 /// `[service_ep, hw_cap, irq_cap?]`, round 2 (terminal) `[devmgr_query_ep]`.
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -83,7 +83,7 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
 /// one reply carries. A caller drains more input with further reads.
 const MAX_READ_BYTES: usize = 512;
 
-fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
+fn handle_request(msg: &IpcMessage, irq_cap: u64, ipc_buf: *mut u64)
 {
     // Label encoding mirrors `stream_labels::STREAM_BYTES`: opcode in bits
     // 0-15, payload byte length in bits 16-31.
@@ -169,7 +169,7 @@ fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-fn service_loop(service_ep: u32, irq_cap: u32, ipc_buf: *mut u64) -> !
+fn service_loop(service_ep: u64, irq_cap: u64, ipc_buf: *mut u64) -> !
 {
     // No diagnostic hook: a `log!` here is a blocking call into logd, which
     // may itself be blocked calling this driver (see the module doc). The

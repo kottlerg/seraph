@@ -399,7 +399,7 @@ fn lfn_slots(name: &[u8]) -> usize
 }
 
 /// Create `name` in `dir` and write [`CONTENT`] to it; returns its cap.
-fn create_with_content(dir: u32, name: &[u8]) -> u32
+fn create_with_content(dir: u64, name: &[u8]) -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let (cap, _) = fs_create(dir, name, ipc_buf).expect("fs_block_faults: FS_CREATE failed");
@@ -411,7 +411,7 @@ fn create_with_content(dir: u32, name: &[u8]) -> u32
 /// entries, with one entry whose LFN run takes every remaining slot, so a
 /// rename's destination lands in another sector and the faults armed on
 /// this one count only the source's writes.
-fn fill_rest_of_sector(dir: u32, used: usize)
+fn fill_rest_of_sector(dir: u64, used: usize)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let lfn = SLOTS_PER_SECTOR - used - 1;
@@ -453,7 +453,7 @@ fn assert_only_read_unfired(disk: &SharedDisk, case: &str)
     disk.disarm();
 }
 
-fn expect_present(dir: u32, name: &[u8], what: &str)
+fn expect_present(dir: u64, name: &[u8], what: &str)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let (cap, _, _) =
@@ -461,7 +461,7 @@ fn expect_present(dir: u32, name: &[u8], what: &str)
     let _ = syscall::cap_delete(cap);
 }
 
-fn expect_missing(dir: u32, name: &[u8], what: &str)
+fn expect_missing(dir: u64, name: &[u8], what: &str)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let got = ns_lookup(dir, name, 0xFFFF, ipc_buf).map(|(cap, _, _)| {
@@ -476,7 +476,7 @@ fn expect_missing(dir: u32, name: &[u8], what: &str)
 
 /// A cap whose node fatfs dropped names nothing: `FS_READ` replies
 /// `INVALID_BADGE`.
-fn expect_dropped(cap: u32, what: &str)
+fn expect_dropped(cap: u64, what: &str)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     assert_eq!(
@@ -494,13 +494,13 @@ fn expect_dropped(cap: u32, what: &str)
 struct OwnFatfs
 {
     /// procmgr process handle.
-    process: u32,
+    process: u64,
     /// The driver's service endpoint; every node cap derives from it.
-    service: u32,
+    service: u64,
     /// Full-rights cap on the volume's root directory.
-    root: u32,
-    block_ep: u32,
-    block_stop: u32,
+    root: u64,
+    block_ep: u64,
+    block_stop: u64,
     server: std::thread::JoinHandle<()>,
 }
 
@@ -574,7 +574,7 @@ impl OwnFatfs
 
     /// `FS_MKDIR` `name` in the root; returns the directory's cap and the
     /// sector of its single cluster.
-    fn case_dir(&self, disk: &SharedDisk, name: &[u8]) -> (u32, usize)
+    fn case_dir(&self, disk: &SharedDisk, name: &[u8]) -> (u64, usize)
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
         let (cap, _) =
@@ -625,7 +625,7 @@ impl OwnFatfs
     }
 }
 
-fn new_endpoint() -> u32
+fn new_endpoint() -> u64
 {
     std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
         syscall::cap_create_endpoint(slab).ok()
@@ -636,7 +636,7 @@ fn new_endpoint() -> u32
 /// Create and start a fatfs process with `creator` as its creator endpoint
 /// (`CREATE_FROM_FILE`, services/procmgr/docs/ipc-interface.md); returns
 /// its process handle.
-fn spawn_fatfs(creator: u32) -> u32
+fn spawn_fatfs(creator: u64) -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let (file, size) = std::os::seraph::namespace_lookup_file(

@@ -63,7 +63,7 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Slot of the child's c2p notification in the child's cspace, written by the
 /// parent before `thread_start`.
-static mut CHILD_C2P_SLOT: u32 = 0;
+static mut CHILD_C2P_SLOT: u64 = 0;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -96,13 +96,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
-        crate::spawn::configure_and_start_pinned(
-            &child,
-            worker_entry,
-            stack_top,
-            u64::from(child_p2c),
-            1,
-        )
+        crate::spawn::configure_and_start_pinned(&child, worker_entry, stack_top, child_p2c, 1)
     }
     .map_err(|_| "stress::idle_wake_race: configure_and_start_pinned failed")?;
 
@@ -198,14 +192,10 @@ fn elapsed_us() -> u64
 /// The `notification_wait` on `p2c` is the per-iteration park: the kernel records
 /// this TCB as the notification's waiter, commits it `Blocked`, and calls
 /// `schedule()`, so the hosting CPU switches to its idle thread immediately.
-// cast_possible_truncation: the argument is the child's p2c cap slot, which
-// `run` widened from a u32.
-#[allow(clippy::cast_possible_truncation)]
-extern "C" fn worker_entry(p2c_slot: u64) -> !
+extern "C" fn worker_entry(p2c: u64) -> !
 {
     // SAFETY: CHILD_C2P_SLOT written by parent before thread_start.
     let c2p = unsafe { CHILD_C2P_SLOT };
-    let p2c = p2c_slot as u32;
 
     // Signal readiness.
     notification_send(c2p, BIT_ACK).ok();

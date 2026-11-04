@@ -34,6 +34,10 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 // children on every path, so a failed run leaves no thread on either stack.
 static mut OCCUPIED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
 
+/// `(ws, done)` for each of `occupied_wait_refused`'s two waiters, indexed like
+/// [`OCCUPIED_STACKS`]: each handle fills a word, so the pair goes by address.
+static OCCUPIED_ARGS: crate::spawn::ArgBlock<(u64, u64), 2> = crate::spawn::ArgBlock::new((0, 0));
+
 /// `occupied_wait_refused`'s `done` bits for waiter 0; waiter 1 reports the
 /// same verdicts shifted by [`WAITER_SHIFT`]. Each waiter waits once on the
 /// set and reports one verdict: refused with `InvalidState`, returned with the
@@ -80,7 +84,7 @@ pub fn capacity_is_caller_sized(ctx: &TestContext) -> TestResult
     #[allow(clippy::cast_possible_truncation)]
     let ws = wait_set_create(ctx.memory_base, WIDE_MEMBERS as u32)
         .map_err(|_| "wait_set::capacity: wait_set_create(wide) failed")?;
-    let mut sigs = [0u32; WIDE_MEMBERS + 1];
+    let mut sigs = [0u64; WIDE_MEMBERS + 1];
     let result = fill_and_wake(ctx, ws, &mut sigs);
     for &sig in sigs.iter().filter(|&&s| s != 0)
     {
@@ -92,7 +96,7 @@ pub fn capacity_is_caller_sized(ctx: &TestContext) -> TestResult
 
 /// Body of [`capacity_is_caller_sized`]: fill `ws` with `sigs.len() - 1`
 /// notifications, refuse one more, and wake on the last member.
-fn fill_and_wake(ctx: &TestContext, ws: u32, sigs: &mut [u32]) -> TestResult
+fn fill_and_wake(ctx: &TestContext, ws: u64, sigs: &mut [u64]) -> TestResult
 {
     let last = sigs.len() - 1;
     for (i, sig) in sigs.iter_mut().enumerate()
@@ -209,10 +213,8 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-    }
-    .map_err(|_| "configure_and_start for blocking test failed")?;
+    unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
+        .map_err(|_| "configure_and_start for blocking test failed")?;
 
     // Block until the child fires the notification.
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait (blocking) failed")?;
@@ -247,9 +249,9 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
 #[derive(Default)]
 struct Occupied
 {
-    ws: Option<u32>,
-    sig: Option<u32>,
-    done: Option<u32>,
+    ws: Option<u64>,
+    sig: Option<u64>,
+    done: Option<u64>,
     waiters: [Option<crate::spawn::SpawnedChild>; 2],
 }
 
@@ -337,13 +339,13 @@ fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
 }
 
 /// Start `child` at `entry` on occupied stack `stack`, passing it copies of
-/// `ws` and `done`.
+/// `ws` and `done` through entry `stack` of [`OCCUPIED_ARGS`].
 fn start_occupied_child(
     child: &crate::spawn::SpawnedChild,
     stack: usize,
     entry: extern "C" fn(u64) -> !,
-    ws: u32,
-    done: u32,
+    ws: u64,
+    done: u64,
 ) -> TestResult
 {
     let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL).map_err(|_| "cap_copy ws for occupied failed")?;
@@ -352,22 +354,19 @@ fn start_occupied_child(
     // SAFETY: each occupied stack belongs to one of this test's two children,
     // which the test deletes before returning; unit tests run sequentially.
     let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(OCCUPIED_STACKS[stack]) });
+    // SAFETY: `stack` < 2; the entry's previous child (one of an earlier
+    // run's waiters, deleted before that run returned) has exited, and this
+    // one has not started.
+    let arg = unsafe { OCCUPIED_ARGS.publish(stack, (c_ws, c_done)) };
     // SAFETY: the stack is `OCCUPIED_STACKS[stack]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(
-            child,
-            entry,
-            stack_top,
-            u64::from(c_ws) | (u64::from(c_done) << 32),
-        )
-    }
-    .map_err(|_| "configure_and_start for occupied failed")
+    unsafe { crate::spawn::configure_and_start(child, entry, stack_top, arg) }
+        .map_err(|_| "configure_and_start for occupied failed")
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
 /// failing when a scaled [`REPORT_MS`] wait passes with nothing new.
-fn collect(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
+fn collect(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {
@@ -501,20 +500,19 @@ pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 
 // ── Child thread entry ────────────────────────────────────────────────────────
 
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn sender_entry(sig_slot: u64) -> !
 {
-    notification_send(sig_slot as u32, 0xBEEF).ok();
+    notification_send(sig_slot, 0xBEEF).ok();
     thread_exit()
 }
 
-/// Wait once on the occupied set and report waiter `k`'s verdict.
-// cast_possible_truncation: packed fields are 32-bit cap handles.
-#[allow(clippy::cast_possible_truncation)]
+/// Wait once on the occupied set and report waiter `k`'s verdict; `arg` is
+/// the waiter's [`OCCUPIED_ARGS`] entry.
 fn occupied_waiter(arg: u64, k: u32) -> !
 {
-    let (ws, done) = ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32);
+    // SAFETY: `arg` is the `OCCUPIED_ARGS` entry `start_occupied_child`
+    // published for this waiter.
+    let (ws, done): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
     let bit = match wait_set_wait(ws)
     {
         Err(e) if e == SyscallError::InvalidState as i64 => BIT_REFUSED,

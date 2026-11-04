@@ -20,11 +20,9 @@
 //!    the carve back (`retype_free`) on failure.
 //! 4. Return the handle as `u64`.
 
-// cast_possible_truncation: all u64→u32 casts in this file extract cap slot indices
-// from 64-bit trap frame registers. Seraph runs on 64-bit only; slot indices are
-// defined as u32 and always fit. The u64→usize cast of the Thread save-area byte
-// count (`sys_cap_create_thread`) is lossless for the same reason: usize is 64
-// bits on every target. No truncation occurs in practice.
+// cast_possible_truncation: the u64→usize cast of the Thread save-area byte
+// count (`sys_cap_create_thread`) is lossless: usize is 64 bits on every
+// target.
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
@@ -56,7 +54,7 @@ use super::current_tcb;
 #[cfg(not(test))]
 unsafe fn resolve_src_cap(
     cspace: *mut crate::cap::cspace::CSpace,
-    handle: u32,
+    handle: u64,
 ) -> Result<super::PinnedCap, SyscallError>
 {
     // SAFETY: forwarded caller contract.
@@ -86,7 +84,7 @@ unsafe fn resolve_src_cap(
 #[cfg(not(test))]
 pub(super) unsafe fn revalidate_src_under_lock(
     cspace: *mut crate::cap::cspace::CSpace,
-    handle: u32,
+    handle: u64,
     object: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
 ) -> Result<(), SyscallError>
 {
@@ -145,7 +143,7 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::ipc::endpoint::EndpointState;
     use core::ptr::NonNull;
 
-    let memory_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0);
 
     // SAFETY: syscall entry ensures current_tcb() returns the active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -229,7 +227,7 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
 
     match idx_res
     {
-        Ok(idx) => Ok(u64::from(idx)),
+        Ok(idx) => Ok(idx),
         Err(e) =>
         {
             // CSpace slot allocation failed; roll back. Drop in place,
@@ -272,7 +270,7 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::ipc::notification::NotificationState;
     use core::ptr::NonNull;
 
-    let memory_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -340,7 +338,7 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     match idx_res
     {
-        Ok(idx) => Ok(u64::from(idx)),
+        Ok(idx) => Ok(idx),
         Err(e) =>
         {
             // CSpace slot allocation failed: roll back the in-place
@@ -411,8 +409,8 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     use core::ptr::NonNull;
     use core::sync::atomic::AtomicU64;
 
-    let memory_idx = tf.arg(0) as u32;
-    let augment_idx = tf.arg(1) as u32;
+    let memory_idx = tf.arg(0);
+    let augment_idx = tf.arg(1);
     let init_pages = tf.arg(2);
 
     if init_pages == 0
@@ -628,7 +626,7 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    Ok(u64::from(idx))
+    Ok(idx)
 }
 
 /// `SYS_CAP_CREATE_CSPACE` (12): retype a Memory cap into a new `CSpace`,
@@ -674,8 +672,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::phys_to_virt;
     use core::ptr::NonNull;
 
-    let memory_idx = tf.arg(0) as u32;
-    let augment_idx = tf.arg(1) as u32;
+    let memory_idx = tf.arg(0);
+    let augment_idx = tf.arg(1);
     let init_pages = tf.arg(2);
 
     if init_pages == 0 || tf.arg(3) != 0
@@ -915,7 +913,7 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    Ok(u64::from(idx))
+    Ok(idx)
 }
 
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
@@ -959,10 +957,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // TrapFrame base. 512 bytes is sufficient for the minimal C frame.
     const TRAMPOLINE_FRAME_SIZE: u64 = 512;
 
-    let memory_idx = tf.arg(0) as u32;
-    let as_idx = tf.arg(1) as u32;
-    let cs_idx = tf.arg(2) as u32;
-    let sched_idx = tf.arg(3) as u32;
+    let memory_idx = tf.arg(0);
+    let as_idx = tf.arg(1);
+    let cs_idx = tf.arg(2);
+    let sched_idx = tf.arg(3);
     // Kept as u64 until range-checked: an `as u8` here would wrap 256 to 0
     // and silently select the band floor.
     let priority_arg = tf.arg(4);
@@ -1236,7 +1234,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
             && super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT)
                 .is_ok_and(|s| s.object == cs_object)
     };
-    let idx_res: Result<u32, SyscallError> = if bound
+    let idx_res: Result<u64, SyscallError> = if bound
     {
         // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
         unsafe {
@@ -1258,7 +1256,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         Ok(idx) =>
         {
             let _ = kstack_virt;
-            Ok(u64::from(idx))
+            Ok(idx)
         }
         Err(e) =>
         {
@@ -1383,18 +1381,18 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::object::CSpaceKernelObject;
     use crate::cap::slot::Rights;
 
-    let src_handle = tf.arg(0) as u32;
+    let src_handle = tf.arg(0);
     let src_idx = syscall::cap_handle_index(src_handle);
-    let dest_cs_idx = tf.arg(1) as u32;
+    let dest_cs_idx = tf.arg(1);
     // Destination is a placement index (slot may be empty), not a live handle,
     // so it is not generation-checked; a value outside the handle's index
     // field is out of range rather than truncated to a different slot.
-    let dest_slot_idx = match u32::try_from(tf.arg(2))
+    let Ok(dest_slot_idx) = u32::try_from(tf.arg(2))
+    else
     {
-        Ok(idx) if idx <= syscall::CAP_INDEX_MASK => idx,
-        _ => return Err(SyscallError::InvalidArgument),
+        return Err(SyscallError::InvalidArgument);
     };
-    let rights_mask = Rights(tf.arg(3) as u32);
+    let rights_mask = Rights::from_mask(tf.arg(3));
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1555,7 +1553,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
     debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
     crate::cap::DERIVATION_LOCK.write_unlock();
-    Ok(u64::from(new_handle))
+    Ok(new_handle)
 }
 
 /// `SYS_CAP_DERIVE` (14): attenuate a capability within the caller's own `CSpace.`
@@ -1573,9 +1571,9 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
-    let src_handle = tf.arg(0) as u32;
+    let src_handle = tf.arg(0);
     let src_idx = syscall::cap_handle_index(src_handle);
-    let rights_mask = Rights(tf.arg(1) as u32);
+    let rights_mask = Rights::from_mask(tf.arg(1));
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1678,7 +1676,7 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
     debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
     crate::cap::DERIVATION_LOCK.write_unlock();
-    Ok(u64::from(new_handle))
+    Ok(new_handle)
 }
 
 /// `SYS_CAP_DERIVE_BADGE` (48): derive a capability with a badge attached.
@@ -1698,9 +1696,9 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
-    let src_handle = tf.arg(0) as u32;
+    let src_handle = tf.arg(0);
     let src_idx = syscall::cap_handle_index(src_handle);
-    let rights_mask = Rights(tf.arg(1) as u32);
+    let rights_mask = Rights::from_mask(tf.arg(1));
     let badge_value = tf.arg(2);
 
     if badge_value == 0
@@ -1814,7 +1812,7 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
     debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
     crate::cap::DERIVATION_LOCK.write_unlock();
-    Ok(u64::from(new_handle))
+    Ok(new_handle)
 }
 
 /// One-shot guard for [`log_self_cap_delete_refused`].
@@ -1879,7 +1877,7 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
 unsafe fn resolve_delete_target(
     caller_cspace: *mut crate::cap::cspace::CSpace,
     slot_idx: u32,
-    slot_handle: u32,
+    slot_handle: u64,
     expected: Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>,
 ) -> Result<
     (
@@ -1957,7 +1955,7 @@ unsafe fn resolve_delete_target(
 #[cfg(not(test))]
 pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    let slot_handle = tf.arg(0) as u32;
+    let slot_handle = tf.arg(0);
     let slot_idx = syscall::cap_handle_index(slot_handle);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -2099,7 +2097,7 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    let slot_handle = tf.arg(0) as u32;
+    let slot_handle = tf.arg(0);
     let slot_idx = syscall::cap_handle_index(slot_handle);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -2332,17 +2330,17 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
         DestRef, MoveStep, Placement, move_cap_begin, move_cap_drive, release_moved_object,
     };
 
-    let src_handle = tf.arg(0) as u32;
+    let src_handle = tf.arg(0);
     let src_idx = syscall::cap_handle_index(src_handle);
-    let dest_cs_idx = tf.arg(1) as u32;
+    let dest_cs_idx = tf.arg(1);
     // Destination is a placement index (slot may be empty), not a live handle,
     // so it is not generation-checked; a value outside the handle's index
     // field is out of range rather than truncated to a different slot.
     // 0 = auto-allocate.
-    let dest_idx = match u32::try_from(tf.arg(2))
+    let Ok(dest_idx) = u32::try_from(tf.arg(2))
+    else
     {
-        Ok(idx) if idx <= syscall::CAP_INDEX_MASK => idx,
-        _ => return Err(SyscallError::InvalidArgument),
+        return Err(SyscallError::InvalidArgument);
     };
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -2445,7 +2443,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
                 // were released above).
                 unsafe { release_moved_object(obj) };
             }
-            Ok(u64::from(handle))
+            Ok(handle)
         }
         MoveStep::Lost(e) => Err(e),
         MoveStep::Abandoned { .. } => Err(SyscallError::Interrupted),
@@ -2481,7 +2479,7 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::ipc::event_queue::EventQueueState;
     use core::ptr::NonNull;
 
-    let memory_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0);
     // Range-check the full register before narrowing: a 64-bit capacity whose
     // low 32 bits are in range (0x1_0000_0001) must be refused, not truncated.
     let Some(capacity) = event_queue_capacity(tf.arg(1))
@@ -2572,7 +2570,7 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
 
     match idx_res
     {
-        Ok(idx) => Ok(u64::from(idx)),
+        Ok(idx) => Ok(idx),
         Err(e) =>
         {
             // The cap never reached visibility, so no waiter or `wait_set`
@@ -2614,7 +2612,7 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::ipc::wait_set::{WaitSetMember, WaitSetState};
     use core::ptr::NonNull;
 
-    let memory_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0);
     let Some(capacity) = wait_set_capacity(tf.arg(1))
     else
     {
@@ -2692,7 +2690,7 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 
     match idx_res
     {
-        Ok(idx) => Ok(u64::from(idx)),
+        Ok(idx) => Ok(idx),
         Err(e) =>
         {
             // Roll back: nothing else has observed these constructed objects.
@@ -2748,7 +2746,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{CapTag, MemRights};
     use crate::sched::thread::ThreadState;
 
-    let slot_handle = tf.arg(0) as u32;
+    let slot_handle = tf.arg(0);
     let field = tf.arg(1);
 
     // Resolve the caller's CSpace via its TCB.

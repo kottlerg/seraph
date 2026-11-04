@@ -11,6 +11,8 @@
 //! `code()` carries the value. Hosts the child-mode entries spawned by
 //! `exit_code_phase`.
 
+use std::os::seraph::process::ChildExt;
+
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -51,7 +53,7 @@ pub fn exit_code_phase(_: &Caps)
         .arg("exit-code-nonzero")
         .spawn()
         .expect("spawn /tests/svctest exit-code-nonzero failed");
-    let id = child.id();
+    let id = child.process_handle();
     let status = child.wait().expect("exit-code-nonzero wait failed");
     std::os::seraph::log!("exit-code-nonzero exited: {status}");
     assert!(

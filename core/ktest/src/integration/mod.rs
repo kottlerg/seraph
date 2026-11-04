@@ -15,6 +15,7 @@ pub mod arena_reclaim;
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
+pub mod cap_generation_wide;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
 pub mod cap_transfer_large;
@@ -164,6 +165,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::cap_generation_stale_handle",
         cap_generation_stale_handle::run(ctx)
+    );
+    run_integration_test!(
+        "integration::cap_generation_wide",
+        cap_generation_wide::run(ctx)
     );
     run_integration_test!(
         "integration::fpu_survives_ipc_call",

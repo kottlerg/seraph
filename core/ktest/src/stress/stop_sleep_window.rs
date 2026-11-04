@@ -134,7 +134,7 @@ fn with_sleeper(ctx: &TestContext) -> TestResult
     reaped.map_err(|_| "stress::stop_sleep_window: reap failed")
 }
 
-fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
+fn start_and_storm(child: &spawn::SpawnedChild, done: u64) -> TestResult
 {
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "stress::stop_sleep_window: cap_copy done failed")?;
@@ -143,7 +143,7 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe { spawn::configure_and_start_pinned(child, sleeper_entry, stack, u64::from(c_done), 0) }
+    unsafe { spawn::configure_and_start_pinned(child, sleeper_entry, stack, c_done, 0) }
         .map_err(|_| "stress::stop_sleep_window: start sleeper failed")?;
 
     let mut acc = 0u64;
@@ -176,11 +176,9 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
 }
 
 /// Sleeper: `thread_sleep(1)` until told to quit, tallying each result.
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn sleeper_entry(arg: u64) -> !
 {
-    let done = arg as u32;
+    let done = arg;
     // A child has no other channel to report on; a failed send fails the
     // controller's bounded wait for the bit.
     notification_send(done, BIT_RUNNING).ok();

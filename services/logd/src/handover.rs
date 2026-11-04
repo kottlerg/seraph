@@ -44,7 +44,7 @@ enum Release
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
-pub unsafe fn transfer(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTable)
+pub unsafe fn transfer(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTable)
 {
     for _ in 0..=wire::MAX_RELEASE_DEFERRALS
     {
@@ -69,7 +69,7 @@ pub unsafe fn transfer(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
-unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTable)
+unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTable)
 {
     // Bound on chunks per drain. A first drain sends 1 header + up to
     // init-logd's MAX_SENDERS (32) slots + its history ring's lines + 1
@@ -133,7 +133,7 @@ unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTa
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
-unsafe fn send_release(handover_send_cap: u32, ipc_buf: *mut u64) -> Release
+unsafe fn send_release(handover_send_cap: u64, ipc_buf: *mut u64) -> Release
 {
     let req = IpcMessage::new(HANDOVER_RELEASE);
     let attempt = || {

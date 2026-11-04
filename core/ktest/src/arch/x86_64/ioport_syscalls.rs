@@ -45,10 +45,10 @@ pub fn bind(ctx: &TestContext) -> TestResult
 /// or `None` when there is none. A slot of another type refuses the bind and
 /// is skipped; `OutOfMemory`, the table's three pages missing from `th`'s
 /// `CSpace` pool, fails the test instead of passing for a missing cap.
-fn bind_first_ioport(ctx: &TestContext, th: u32) -> Result<Option<u32>, &'static str>
+fn bind_first_ioport(ctx: &TestContext, th: u64) -> Result<Option<u64>, &'static str>
 {
     let bound = crate::unit::hw::scan_bound(ctx);
-    for slot in 1u32..=bound
+    for slot in 1..=u64::from(bound)
     {
         match syscall::ioport_bind(th, slot)
         {
@@ -150,7 +150,7 @@ pub fn split(ctx: &TestContext) -> TestResult
     // slot indices above `aspace_cap` — are always reachable, regardless of
     // how the cspace has grown.
     let bound = crate::unit::hw::scan_bound(ctx);
-    for slot in 1u32..=bound
+    for slot in 1..=u64::from(bound)
     {
         // Try splitting at 0x80. If the slot is not an IoPort we
         // get InvalidCapability and keep scanning. If it is an

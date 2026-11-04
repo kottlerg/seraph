@@ -248,8 +248,8 @@ unregistered; memmgr reclaims its frames at process death.
   resolve from this cap.
 
 ```rust
-let root: u32 = std::os::seraph::root_dir_cap();    // 0 if no root attached
-let cwd:  u32 = std::os::seraph::current_dir_cap(); // 0 if no cwd attached
+let root: u64 = std::os::seraph::root_dir_cap();    // 0 if no root attached
+let cwd:  u64 = std::os::seraph::current_dir_cap(); // 0 if no cwd attached
 
 // Walk the root cap to a path and install the resolved directory cap
 // as the process's cwd. The walk fails iff the path is unreachable
@@ -294,6 +294,15 @@ protocol is in
 entry's name from the entry. `DirEntry::file_name` and `DirEntry::path`
 allocate a copy, so a caller that must handle out-of-memory reads a
 listing's names through the extension (svcmgr's recipe scan does).
+
+---
+
+## Child process handles
+
+`std::os::seraph::process::ChildExt::process_handle` returns a spawned child's
+procmgr process-handle cap as the full `u64` capability handle, for the procmgr
+labels that take one. `Child::id` returns only the handle's slot index, since
+upstream fixes its width at `u32` and the handle's generation sits above that.
 
 ---
 

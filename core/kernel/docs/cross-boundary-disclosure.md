@@ -78,8 +78,9 @@ Notes on the non-obvious entries:
 
 - **IPC `cap_slots[]`** carry cap *handles* (CSpace-local index + per-slot
   generation), never pointers: the sender's own full handles inbound
-  (`syscall_abi::unpack_cap_handles`, generation-validated by
-  `ipc::prevalidate_transfer_slots` before any move), and freshly
+  (copied from its IPC buffer's cap block by `ipc::read_cap_handles`,
+  generation-validated by `ipc::prevalidate_transfer_slots` before any
+  move), and freshly
   re-derived destination handles outbound. Both directions expose only
   values the owning process already holds or is being granted; see
   [syscalls.md](syscalls.md) § Capability Handles.

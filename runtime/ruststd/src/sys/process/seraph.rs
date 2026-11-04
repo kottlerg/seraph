@@ -142,12 +142,12 @@ pub struct Command {
     /// `CONFIGURE_NAMESPACE` between `CREATE_FROM_FILE` and
     /// `START_PROCESS`; the wire transfers ownership, so the slot is
     /// consumed by the spawn call (success or wire-level error).
-    namespace_cap: u32,
+    namespace_cap: u64,
     /// Per-spawn override for the child's `ProcessInfo.current_dir_cap`.
     /// Zero defers to the cwd source chain (`self.cwd` path walk,
     /// then `current_dir_cap()` parent inherit, then zero). Same
     /// ownership contract as `namespace_cap`.
-    cwd_dir_cap: u32,
+    cwd_dir_cap: u64,
     /// When set, spawn ORs `procmgr_labels::CREATE_PINNED` into the
     /// `CREATE_FROM_FILE` label so procmgr leaves the child eager-mapped with
     /// no system pager. Set via `CommandExt::pinned`. Defaults to off — the
@@ -185,13 +185,13 @@ impl Command {
     /// `ProcessInfo.system_root_cap`. Called by the seraph-specific
     /// `CommandExt::namespace_cap` trait method; transfers ownership of
     /// the cap to this `Command` (consumed by the next `spawn`).
-    pub fn set_namespace_cap(&mut self, cap: u32) {
+    pub fn set_namespace_cap(&mut self, cap: u64) {
         self.namespace_cap = cap;
     }
 
     /// Install a per-spawn override for the child's
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
-    pub fn set_cwd_dir_cap(&mut self, cap: u32) {
+    pub fn set_cwd_dir_cap(&mut self, cap: u64) {
         self.cwd_dir_cap = cap;
     }
 
@@ -559,7 +559,7 @@ impl Command {
         // load-bearing for the thread-before-aspace teardown order, and the
         // kernel-side refuse-self-delete guard remains as further defense.
         let _ = syscall::cap_delete(thread_cap);
-        let thread_cap = 0u32;
+        let thread_cap = 0u64;
 
         // For each piped direction, allocate a parent-side `Pipe` end
         // (memory cap + 2 notification caps) and install the corresponding triple
@@ -717,7 +717,7 @@ impl Command {
         //   4. Zero (child has no cwd cap).
         //
         // procmgr consumes both caps on the IPC regardless of reply label.
-        let ns_cap_to_send: u32 = if self.namespace_cap != 0 {
+        let ns_cap_to_send: u64 = if self.namespace_cap != 0 {
             let cap = self.namespace_cap;
             self.namespace_cap = 0;
             cap
@@ -727,7 +727,7 @@ impl Command {
                 Err(_) => 0,
             }
         };
-        let cwd_resolution: io::Result<u32> = if self.cwd_dir_cap != 0 {
+        let cwd_resolution: io::Result<u64> = if self.cwd_dir_cap != 0 {
             let cap = self.cwd_dir_cap;
             self.cwd_dir_cap = 0;
             Ok(cap)
@@ -759,7 +759,7 @@ impl Command {
                 Ok(0)
             }
         };
-        let cwd_cap_to_send: u32 = match cwd_resolution {
+        let cwd_cap_to_send: u64 = match cwd_resolution {
             Ok(c) => c,
             Err(e) => {
                 if ns_cap_to_send != 0 {
@@ -923,7 +923,7 @@ fn mark_spawn_failure_pipes(
 /// originals (the IPC transfers `cap_derive`'d handoff slots), so the
 /// returned `Pipe` is valid for read/write through its full lifetime.
 fn install_pipe(
-    process_handle: u32,
+    process_handle: u64,
     ipc_ptr: *mut u64,
     direction: u64,
     parent_role: crate::sys::pipe::seraph::Role,
@@ -1005,7 +1005,7 @@ impl fmt::Debug for Stdio {
 struct Bridge {
     /// Bridge → `wait` rendezvous. Bridge `notification_send`s once after
     /// publishing `exit_reason`; `wait` `notification_wait`s.
-    completion_notification: u32,
+    completion_notification: u64,
     /// Bridge thread handle. Taken by `wait` (after completion fires), by
     /// `try_wait` (after seeing `peer_dead`), or by `Drop` (after sentinel
     /// post).
@@ -1020,12 +1020,12 @@ struct Bridge {
 }
 
 pub struct Process {
-    process_handle: u32,
-    thread_cap: u32,
+    process_handle: u64,
+    thread_cap: u64,
     /// Death-notification queue bound to the child thread. Owned by
     /// `Process` regardless of stdio mode. With `bridge` present the
     /// bridge thread consumes the EQ; otherwise `wait` does so directly.
-    death_eq: u32,
+    death_eq: u64,
     /// Per-spawn bridge state — only allocated for piped spawns. The
     /// bridge translates a child death into the parent-side `peer_dead`
     /// atomic + pipe-notification wakes that unblock any blocked
@@ -1038,9 +1038,15 @@ pub struct Process {
 
 impl Process {
     pub fn id(&self) -> u32 {
-        // No POSIX pid on Seraph; the process-handle cap's handle uniquely
-        // identifies the process within this caller's CSpace. The `u32` is
-        // upstream's `Child::id` width and matches the cap-handle width.
+        // No POSIX pid on Seraph; the slot index of the process-handle cap
+        // identifies the process among this caller's live children, and fits
+        // upstream's `u32` `Child::id` width (the handle's generation bits
+        // above it do not).
+        syscall_abi::cap_handle_index(self.process_handle)
+    }
+
+    /// The full process-handle cap (`std::os::seraph::process::ChildExt`).
+    pub fn process_handle(&self) -> u64 {
         self.process_handle
     }
 
@@ -1204,8 +1210,8 @@ impl Drop for Process {
 // at all.
 
 struct PipeBridgeNotifications {
-    data_notification: u32,
-    space_notification: u32,
+    data_notification: u64,
+    space_notification: u64,
     /// Shared ring-grant release state for this direction's parent end;
     /// the bridge reports the child's death and sends the release when
     /// the parent end is already dropped.
@@ -1216,9 +1222,9 @@ struct BridgeHandles {
     /// Process handle the bridge sends `DESTROY_PROCESS` on before any ring
     /// release. `Process` deletes it only after the bridge has finished:
     /// `wait` and `try_wait` join the bridge, and `Drop` joins it first.
-    process_handle: u32,
-    death_eq: u32,
-    completion_notification: u32,
+    process_handle: u64,
+    death_eq: u64,
+    completion_notification: u64,
     pipe_notifications: [Option<PipeBridgeNotifications>; 3],
     exit_reason: Arc<AtomicU64>,
     peer_dead: Arc<AtomicBool>,
@@ -1277,7 +1283,7 @@ fn bridge_main(h: BridgeHandles) {
 
 /// Send `DESTROY_PROCESS` on `process_handle`, retrying a call this thread's
 /// stop and restart interrupted, and report whether procmgr replied.
-fn destroy_child(process_handle: u32) -> bool {
+fn destroy_child(process_handle: u64) -> bool {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {
         return false;

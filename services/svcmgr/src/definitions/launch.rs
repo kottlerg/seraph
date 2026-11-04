@@ -27,18 +27,18 @@ use crate::restart::{
 /// nothing and deletes the handles.
 pub struct Launched
 {
-    pub thread_cap: u32,
-    pub process_handle: u32,
+    pub thread_cap: u64,
+    pub process_handle: u64,
     /// Persistent service-endpoint source for a `provides = ...` service,
     /// stored on the `ServiceEntry` so restarts re-serve a fresh RECV on
     /// the same object. Zero for pure-consumer services.
-    pub provided_endpoint: u32,
+    pub provided_endpoint: u64,
 }
 
 /// Delete a set of cap slots, skipping the zero sentinel. Used on the
 /// launch/restart cleanup paths where a partially-assembled cap set must
 /// be released; deleting an already-transferred slot is a kernel no-op.
-pub(crate) fn delete_caps(caps: &[u32])
+pub(crate) fn delete_caps(caps: &[u64])
 {
     for &c in caps
     {
@@ -54,9 +54,9 @@ pub(crate) fn delete_caps(caps: &[u32])
 /// `seeds`. A `provided_recv` of `0` (pure consumer) is skipped. Any number
 /// of slots is served, over as many rounds as they need (see
 /// [`serve_boot_slots`]). Consumes `seeds`.
-pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32>
+pub(crate) fn assemble_boot_caps(provided_recv: u64, seeds: Vec<u64>) -> Vec<u64>
 {
-    let mut caps: Vec<u32> = Vec::with_capacity(seeds.len() + 1);
+    let mut caps: Vec<u64> = Vec::with_capacity(seeds.len() + 1);
     if provided_recv != 0
     {
         caps.push(provided_recv);
@@ -78,7 +78,7 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
 /// # Errors
 /// The [`ipc::bootstrap::serve_round`] error code of the first round that
 /// fails; the caps of the rounds after it are still the caller's.
-pub(crate) fn serve_boot_slots(ctx: &RestartCtx, child_badge: u64, slots: &[u32])
+pub(crate) fn serve_boot_slots(ctx: &RestartCtx, child_badge: u64, slots: &[u64])
 -> Result<(), u64>
 {
     let rounds = ipc::bootstrap::slot_round_count(slots.len());
@@ -130,7 +130,7 @@ pub(crate) enum LaunchKind
 /// only the present caps and names the slot each fills in the round's
 /// presence word, so a round with an absent slot, such as every
 /// [`LaunchKind::Restart`] round, still reaches logd.
-pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32>
+pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u64>
 {
     let recv = if ctx.master_log_source != 0
     {
@@ -187,7 +187,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32
 /// the `ServiceEntry`, so the SENDs stay valid across restarts. No-op for
 /// a pure consumer (`provided_endpoint == 0`) or an empty list.
 fn publish_provided(
-    provided_endpoint: u32,
+    provided_endpoint: u64,
     provides: &[ProvidedName],
     registry: &mut registry::Registry,
     svc_name: &str,
@@ -248,7 +248,7 @@ fn assemble_provided_boot_caps(
     created: &CreatedProcess,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-) -> Option<(u32, Vec<u32>)>
+) -> Option<(u64, Vec<u64>)>
 {
     let provided_endpoint = if def.provides.is_empty()
     {
@@ -429,9 +429,9 @@ pub(crate) fn resolve_seeds(
     seed: &[String],
     svc_name: &str,
     registry: &mut registry::Registry,
-) -> Vec<u32>
+) -> Vec<u64>
 {
-    let mut caps: Vec<u32> = Vec::with_capacity(seed.len());
+    let mut caps: Vec<u64> = Vec::with_capacity(seed.len());
     for name in seed
     {
         match registry_lookup_derived(registry, name.as_bytes(), Resolver::Seed)

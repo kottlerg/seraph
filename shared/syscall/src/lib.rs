@@ -15,7 +15,7 @@
 //! # ABI
 //! Register assignment follows `core/kernel/docs/syscalls.md` § Calling
 //! Convention; `arch::current` implements it per architecture. A wrapper's
-//! argument widths (`u32` cap handles, narrower `u16` and `u8` fields) are
+//! argument widths (`u64` cap handles, narrower `u16` and `u8` fields) are
 //! the syscall ABI's, not limits of this crate.
 
 // When pulled into std's dep graph via build-std (feature
@@ -136,10 +136,6 @@ pub unsafe fn raw_syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     unsafe { syscall4_any(nr, a0, a1, a2, a3) }
 }
 
-// ── IPC capability handle helpers ─────────────────────────────────────────────
-
-pub use syscall_abi::pack_cap_handles;
-
 // ── Public syscall wrappers ───────────────────────────────────────────────────
 
 /// Voluntarily yield the CPU to the next runnable thread.
@@ -192,10 +188,10 @@ pub fn process_exit(code: u32) -> !
 /// `virt` must be 4 KiB-aligned (or 0 to deregister). The kernel checks only
 /// the alignment and that `virt` lies in the user half; it does not check that
 /// the page is mapped (`core/kernel/docs/syscalls.md` § `SYS_IPC_BUFFER_SET`).
-/// Once registered, the kernel reads the page for every data-carrying
-/// `SYS_IPC_CALL` request and `SYS_IPC_REPLY`, and writes it on every
-/// `SYS_IPC_RECV` delivery and `SYS_IPC_CALL` reply, until the thread registers
-/// another page or 0.
+/// Once registered, the kernel reads the page for every `SYS_IPC_CALL`
+/// request and `SYS_IPC_REPLY` that carries data words or caps, and writes it
+/// on every `SYS_IPC_RECV` delivery and `SYS_IPC_CALL` reply, until the thread
+/// registers another page or 0.
 ///
 /// # Safety
 /// A call that registers a page (a non-zero, page-aligned, user-half `virt`;
@@ -226,16 +222,19 @@ pub unsafe fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///
-/// Returns `(reply_label, reply_word_count)` on success.
+/// The `cap_count` cap handles travel in the IPC buffer's cap block (word
+/// `syscall_abi::MSG_CAP_HANDLES_WORD` on), which the caller fills before
+/// the call, as it fills the data words. Returns
+/// `(reply_label, reply_word_count)` on success.
 ///
 /// # Errors
 /// Returns a negative `i64` error code, per `SYS_IPC_CALL` in
 /// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
 /// Endpoint cap, or a cap slot is stale or Null), `InsufficientRights` (`ep`
 /// lacks Send, or Grant on a cap-bearing call), `InvalidArgument` (a cap
-/// slot repeated in one message, or `data_count > 0` with no IPC buffer page
-/// registered), `InvalidAddress` (the registered IPC buffer page is
-/// unmapped), `InvalidState` (a cap slot is pinned by an in-flight
+/// slot repeated in one message, or `data_count > 0` or `cap_count > 0` with
+/// no IPC buffer page registered), `InvalidAddress` (the registered IPC
+/// buffer page is unmapped), `InvalidState` (a cap slot is pinned by an in-flight
 /// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer), or
 /// `Interrupted` (the call was cancelled while blocked, including by the
 /// receiver receiving again before it replied). A `data_count` above
@@ -246,12 +245,10 @@ pub unsafe fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_call(
-    ep: u32,
+    ep: u64,
     label: u64,
     data_count: usize,
     cap_count: usize,
-    cap_packed_lo: u64,
-    cap_packed_hi: u64,
 ) -> Result<(u64, usize), i64>
 {
     // cast_possible_truncation: word count fits in 16 bits by invariant.
@@ -260,22 +257,14 @@ pub fn raw_ipc_call(
     #[allow(clippy::cast_possible_truncation)]
     let cap_count_u64 = cap_count as u64;
     // SAFETY: syscall6_ret3 issues the raw syscall; every argument is a scalar
-    // the kernel validates. The kernel reads the request words from, and writes
-    // the reply into, this thread's registered IPC buffer page; registering it
+    // the kernel validates, and the two unused argument registers are zero. The
+    // kernel reads the request words and cap handles from, and writes the reply
+    // into, this thread's registered IPC buffer page; registering it
     // required `ipc_buffer_set`'s contract, under which no Rust reference into
     // the page is live across this call, which is the raw-wrapper contract's
     // IPC-buffer clause.
-    let (ret, reply_label, reply_word_count) = unsafe {
-        syscall6_ret3(
-            SYS_IPC_CALL,
-            u64::from(ep),
-            label,
-            data_count_u64,
-            cap_count_u64,
-            cap_packed_lo,
-            cap_packed_hi,
-        )
-    };
+    let (ret, reply_label, reply_word_count) =
+        unsafe { syscall6_ret3(SYS_IPC_CALL, ep, label, data_count_u64, cap_count_u64, 0, 0) };
     if ret < 0
     {
         Err(ret)
@@ -307,14 +296,14 @@ pub fn raw_ipc_call(
 /// any pending reply is released.
 #[doc(hidden)]
 #[inline]
-pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
+pub fn raw_ipc_recv(ep: u64) -> Result<(u64, u64, usize), i64>
 {
     // SAFETY: syscall1_ret4 issues the raw syscall; `ep` is a scalar the kernel
     // validates. The kernel writes the delivered message into this thread's
     // registered IPC buffer page; registering it required `ipc_buffer_set`'s
     // contract, under which no Rust reference into the page is live across this
     // call, which is the raw-wrapper contract's IPC-buffer clause.
-    let (ret, label, badge, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, u64::from(ep)) };
+    let (ret, label, badge, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, ep) };
     if ret < 0
     {
         Err(ret)
@@ -330,14 +319,16 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 }
 
 /// Raw `SYS_IPC_REPLY`. Intended for `shared/ipc`'s `IpcMessage`-snapshot
-/// wrapper; other callers should use that higher-level entry point.
+/// wrapper; other callers should use that higher-level entry point. The
+/// `cap_count` cap handles travel in the IPC buffer's cap block, as for
+/// [`raw_ipc_call`].
 ///
 /// # Errors
 /// Returns a negative `i64` error code, per `SYS_IPC_REPLY` in
 /// `core/kernel/docs/syscalls.md`: `InvalidCapability` (no pending reply, or
 /// a reply cap slot is stale or Null), `InvalidArgument` (a cap slot
-/// repeated in the reply, or `data_count > 0` with no IPC buffer page
-/// registered), `InvalidAddress` (the registered IPC buffer page is
+/// repeated in the reply, or `data_count > 0` or `cap_count > 0` with no IPC
+/// buffer page registered), `InvalidAddress` (the registered IPC buffer page is
 /// unmapped), `InvalidState` (a reply cap slot is pinned by an in-flight
 /// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer), or
 /// `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace` cannot accept the
@@ -349,13 +340,7 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 /// retried.
 #[doc(hidden)]
 #[inline]
-pub fn raw_ipc_reply(
-    label: u64,
-    data_count: usize,
-    cap_count: usize,
-    cap_packed_lo: u64,
-    cap_packed_hi: u64,
-) -> Result<(), i64>
+pub fn raw_ipc_reply(label: u64, data_count: usize, cap_count: usize) -> Result<(), i64>
 {
     // cast_possible_truncation: Seraph targets 64-bit only (usize == u64).
     #[allow(clippy::cast_possible_truncation)]
@@ -363,20 +348,12 @@ pub fn raw_ipc_reply(
     #[allow(clippy::cast_possible_truncation)]
     let cap_count_u64 = cap_count as u64;
     // SAFETY: syscall5 issues the raw syscall; every argument is a scalar the
-    // kernel validates. The kernel reads the reply words from this thread's
+    // kernel validates, and the two unused argument registers are zero. The
+    // kernel reads the reply words and cap handles from this thread's
     // registered IPC buffer page; registering it required `ipc_buffer_set`'s
     // contract, under which no Rust reference into the page is live across this
     // call, which is the raw-wrapper contract's IPC-buffer clause.
-    let ret = unsafe {
-        syscall5(
-            SYS_IPC_REPLY,
-            label,
-            data_count_u64,
-            cap_count_u64,
-            cap_packed_lo,
-            cap_packed_hi,
-        )
-    };
+    let ret = unsafe { syscall5(SYS_IPC_REPLY, label, data_count_u64, cap_count_u64, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -387,11 +364,11 @@ pub fn raw_ipc_reply(
 /// `InsufficientRights` (cap lacks Notify), or `InvalidArgument` (`bits` is
 /// zero).
 #[inline]
-pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
+pub fn notification_send(sig: u64, bits: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; sig is cap index as u64, bits is bitmask;
     // kernel validates cap and updates notification state.
-    let ret = unsafe { syscall2(SYS_NOTIFICATION_SEND, u64::from(sig), bits) };
+    let ret = unsafe { syscall2(SYS_NOTIFICATION_SEND, sig, bits) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -407,12 +384,12 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 /// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
 /// waiting or the notification is destroyed under it.
 #[inline]
-pub fn notification_wait(sig: u32) -> Result<u64, i64>
+pub fn notification_wait(sig: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; sig is cap
     // index as u64, arg1 = 0 selects indefinite blocking; kernel validates
     // cap and writes the bitmask into the secondary return register.
-    let (ret, bits) = unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, u64::from(sig), 0, 0, 0, 0) };
+    let (ret, bits) = unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, sig, 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
@@ -431,12 +408,11 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 /// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
 /// waiting or the notification is destroyed under it.
 #[inline]
-pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
+pub fn notification_wait_timeout(sig: u64, timeout_ms: u64) -> Result<u64, i64>
 {
     // SAFETY: same as `notification_wait`; arg1 carries the timeout sentinel
     // (0 = infinite, matching the single-arg behaviour).
-    let (ret, bits) =
-        unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, u64::from(sig), timeout_ms, 0, 0, 0) };
+    let (ret, bits) = unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, sig, timeout_ms, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
@@ -454,18 +430,17 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `QuotaExceeded` also means the Memory object's reference
 /// count is at its 2^31 ceiling.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
+pub fn cap_create_endpoint(memory_cap: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
     // kernel retypes the Memory-cap region and returns the new capability handle (slot index
     // plus generation).
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_ENDPOINT, u64::from(memory_cap), 0) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_ENDPOINT, memory_cap, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Retype a Memory cap into a new Notification. Returns the new capability
@@ -481,18 +456,17 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `QuotaExceeded` also means the Memory object's reference
 /// count is at its 2^31 ceiling.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
+pub fn cap_create_notification(memory_cap: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
     // kernel retypes the Memory-cap region and returns the new capability handle (slot index
     // plus generation).
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_NOTIFICATION, u64::from(memory_cap), 0) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_NOTIFICATION, memory_cap, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Retype a Memory cap into a new `AddressSpace`, or augment an existing
@@ -525,24 +499,23 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 /// caller's `CSpace` slot-page pool is exhausted; `QuotaExceeded` if the
 /// caller's `CSpace` directory is structurally full or `memory_cap`'s object has
 /// its reference count at its 2^31 ceiling.
-// cast_possible_truncation, cast_sign_loss: ret is 0 (augment mode) or a
-// non-negative cap handle — a 24-bit slot index plus an 8-bit generation
-// (`CAP_INDEX_BITS + 8 <= 32`) — so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is 0 (augment mode) or a non-negative cap handle (the
+// kernel keeps bit 63 of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
--> Result<u32, i64>
+pub fn cap_create_aspace(memory_cap: u64, augment_target: u64, init_pages: u64)
+-> Result<u64, i64>
 {
     // SAFETY: syscall3 issues a raw syscall; arguments are scalar.
     let ret = unsafe {
         syscall3(
             SYS_CAP_CREATE_ASPACE,
-            u64::from(memory_cap),
-            u64::from(augment_target),
+            memory_cap,
+            augment_target,
             init_pages,
         )
     };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Retype a Memory cap into a new `CSpace`, or augment an existing one's
@@ -581,17 +554,16 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// 2^31 ceiling. A later cap insert into the new `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
 /// mode) and `QuotaExceeded` (-17) at the structural ceiling.
-// cast_possible_truncation, cast_sign_loss: ret is 0 (augment mode) or a
-// non-negative cap handle — a 24-bit slot index plus an 8-bit generation
-// (`CAP_INDEX_BITS + 8 <= 32`) — so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is 0 (augment mode) or a non-negative cap handle (the
+// kernel keeps bit 63 of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)
--> Result<u32, i64>
+pub fn cap_create_cspace(memory_cap: u64, augment_target: u64, init_pages: u64)
+-> Result<u64, i64>
 {
     // arg3 is reserved (the removed `max_slots` quota) and must be 0.
     let ret = raw_cap_create_cspace(memory_cap, augment_target, init_pages, 0);
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Raw `SYS_CAP_CREATE_CSPACE` with a caller-controlled reserved arg 3.
@@ -606,8 +578,8 @@ pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 #[must_use]
 #[inline]
 pub fn raw_cap_create_cspace(
-    memory_cap: u32,
-    augment_target: u32,
+    memory_cap: u64,
+    augment_target: u64,
     init_pages: u64,
     reserved: u64,
 ) -> i64
@@ -616,8 +588,8 @@ pub fn raw_cap_create_cspace(
     unsafe {
         syscall4(
             SYS_CAP_CREATE_CSPACE,
-            u64::from(memory_cap),
-            u64::from(augment_target),
+            memory_cap,
+            augment_target,
             init_pages,
             reserved,
         )
@@ -648,32 +620,31 @@ pub fn raw_cap_create_cspace(
 /// caller's `CSpace` slot pool is exhausted), or `QuotaExceeded` (the `CSpace`
 /// directory is structurally full, or the Memory object's reference count is at
 /// its 2^31 ceiling).
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_thread(
-    memory_cap: u32,
-    aspace_cap: u32,
-    cspace_cap: u32,
-    sched_cap: u32,
+    memory_cap: u64,
+    aspace_cap: u64,
+    cspace_cap: u64,
+    sched_cap: u64,
     priority: u8,
-) -> Result<u32, i64>
+) -> Result<u64, i64>
 {
     // SAFETY: syscall5 issues a raw syscall instruction; all arguments are
     // scalar cap indices / a priority level; the kernel validates them.
     let ret = unsafe {
         syscall5(
             SYS_CAP_CREATE_THREAD,
-            u64::from(memory_cap),
-            u64::from(aspace_cap),
-            u64::from(cspace_cap),
-            u64::from(sched_cap),
+            memory_cap,
+            aspace_cap,
+            cspace_cap,
+            sched_cap,
             u64::from(priority),
         )
     };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Map `page_count` pages of a Memory cap into an address space.
@@ -717,8 +688,8 @@ pub fn cap_create_thread(
 /// allocation, or a frame already named by `u32::MAX` user mappings).
 #[inline]
 pub unsafe fn mem_map(
-    memory_cap: u32,
-    aspace_cap: u32,
+    memory_cap: u64,
+    aspace_cap: u64,
     virt: u64,
     offset_pages: u64,
     page_count: u64,
@@ -732,8 +703,8 @@ pub unsafe fn mem_map(
     let ret = unsafe {
         syscall6(
             SYS_MEM_MAP,
-            u64::from(memory_cap),
-            u64::from(aspace_cap),
+            memory_cap,
+            aspace_cap,
             virt,
             offset_pages,
             page_count,
@@ -763,14 +734,14 @@ pub unsafe fn mem_map(
 /// or the range leaves the user half), `InvalidArgument` (zero page count or
 /// overflow), `InvalidCapability`, or `InsufficientRights` (cap lacks Map).
 #[inline]
-pub unsafe fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
+pub unsafe fn mem_unmap(aspace_cap: u64, virt: u64, page_count: u64) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues the raw syscall; every argument is a scalar the
     // kernel validates (cap index, virtual address, page count, flags = 0;
     // arg3 is passed explicitly so it is never an uninitialised register, as
     // the flag path keys on it). The caller's contract keeps the span off live
     // Rust objects and the registered IPC page, the raw-wrapper mapping clause.
-    let ret = unsafe { syscall4(SYS_MEM_UNMAP, u64::from(aspace_cap), virt, page_count, 0) };
+    let ret = unsafe { syscall4(SYS_MEM_UNMAP, aspace_cap, virt, page_count, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -790,7 +761,7 @@ pub unsafe fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(
 /// # Errors
 /// The same codes as [`mem_unmap`].
 #[inline]
-pub unsafe fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
+pub unsafe fn mem_unmap_reclaim(aspace_cap: u64, virt: u64, page_count: u64) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues the raw syscall; every argument is a scalar the
     // kernel validates (cap index, virtual address, page count, reclaim flag).
@@ -799,7 +770,7 @@ pub unsafe fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> 
     let ret = unsafe {
         syscall4(
             SYS_MEM_UNMAP,
-            u64::from(aspace_cap),
+            aspace_cap,
             virt,
             page_count,
             MEM_UNMAP_RECLAIM_PTS,
@@ -829,8 +800,8 @@ pub unsafe fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> 
 /// `InsufficientRights` (requested permissions exceed the cap's rights).
 #[inline]
 pub unsafe fn mem_protect(
-    memory_cap: u32,
-    aspace_cap: u32,
+    memory_cap: u64,
+    aspace_cap: u64,
     virt: u64,
     page_count: u64,
     prot: u64,
@@ -843,8 +814,8 @@ pub unsafe fn mem_protect(
     let ret = unsafe {
         syscall5(
             SYS_MEM_PROTECT,
-            u64::from(memory_cap),
-            u64::from(aspace_cap),
+            memory_cap,
+            aspace_cap,
             virt,
             page_count,
             prot,
@@ -877,17 +848,16 @@ pub unsafe fn mem_protect(
 /// `CSpace` pool cannot back the tail's slot or its body, which comes from
 /// the pool's body arena; `syscall_abi::cspace_topup_pages`), or
 /// `QuotaExceeded` (`CSpace` directory structurally full).
-// cast_sign_loss: proven non-negative in Ok branch.
-// cast_possible_truncation: returned value is a cap handle — a 24-bit slot index plus an
-// 8-bit generation — so it fits u32.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
+pub fn memory_split(memory_cap: u64, split_offset: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; memory_cap is cap index as u64, split_offset
     // is byte offset; kernel validates cap and offset, returns the tail's cap handle.
-    let ret = unsafe { syscall3(SYS_MEMORY_SPLIT, u64::from(memory_cap), split_offset, 0) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall3(SYS_MEMORY_SPLIT, memory_cap, split_offset, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Absorb a virgin tail Memory cap back into its parent.
@@ -915,18 +885,11 @@ pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 /// `InvalidState` (a `cap_revoke`, `cap_move`, or IPC capability transfer is
 /// in flight on either cap), or `InsufficientRights` (either cap lacks Map).
 #[inline]
-pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
+pub fn memory_merge(parent_cap: u64, tail_cap: u64) -> Result<(), i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; both caps are u32 cap indices;
+    // SAFETY: syscall3 issues raw syscall instruction; both caps are cap handles;
     // kernel validates contiguity, rights, and derivation invariants.
-    let ret = unsafe {
-        syscall3(
-            SYS_MEMORY_MERGE,
-            u64::from(parent_cap),
-            u64::from(tail_cap),
-            0,
-        )
-    };
+    let ret = unsafe { syscall3(SYS_MEMORY_MERGE, parent_cap, tail_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -960,25 +923,23 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss: proven non-negative in Ok branch.
-// cast_possible_truncation: each returned handle is 32 bits (a 24-bit slot index
-// plus an 8-bit generation).
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// cast_sign_loss: both returned handles are non-negative (the kernel keeps
+// bit 63 of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
+pub fn mmio_split(mmio_cap: u64, split_offset: u64) -> Result<(u64, u64), i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; mmio_cap is cap index as
     // u64, split_offset is byte offset; kernel validates cap and offset and returns
     // the first child handle in the primary register, the second in the secondary.
-    let (ret, handle2) =
-        unsafe { syscall5_ret2(SYS_MMIO_SPLIT, u64::from(mmio_cap), split_offset, 0, 0, 0) };
+    let (ret, handle2) = unsafe { syscall5_ret2(SYS_MMIO_SPLIT, mmio_cap, split_offset, 0, 0, 0) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        Ok((ret as u32, handle2 as u32))
+        Ok((ret as u64, handle2))
     }
 }
 
@@ -1003,30 +964,22 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// cast_sign_loss: identical to `mmio_split`.
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
+pub fn irq_split(irq_cap: u64, split_at: u32) -> Result<(u64, u64), i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; kernel validates cap and
     // split point, returning the two child handles in the primary/secondary registers.
-    let (ret, handle2) = unsafe {
-        syscall5_ret2(
-            SYS_IRQ_SPLIT,
-            u64::from(irq_cap),
-            u64::from(split_at),
-            0,
-            0,
-            0,
-        )
-    };
+    let (ret, handle2) =
+        unsafe { syscall5_ret2(SYS_IRQ_SPLIT, irq_cap, u64::from(split_at), 0, 0, 0) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        Ok((ret as u32, handle2 as u32))
+        Ok((ret as u64, handle2))
     }
 }
 
@@ -1061,30 +1014,22 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// cast_sign_loss: identical to `mmio_split`.
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
+pub fn ioport_split(ioport_cap: u64, split_at: u16) -> Result<(u64, u64), i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; kernel validates cap and
     // split point, returning the two child handles in the primary/secondary registers.
-    let (ret, handle2) = unsafe {
-        syscall5_ret2(
-            SYS_IOPORT_SPLIT,
-            u64::from(ioport_cap),
-            u64::from(split_at),
-            0,
-            0,
-            0,
-        )
-    };
+    let (ret, handle2) =
+        unsafe { syscall5_ret2(SYS_IOPORT_SPLIT, ioport_cap, u64::from(split_at), 0, 0, 0) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        Ok((ret as u32, handle2 as u32))
+        Ok((ret as u64, handle2))
     }
 }
 
@@ -1109,30 +1054,22 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
 /// come from its body arena (`syscall_abi::cspace_topup_pages`;
 /// `QuotaExceeded` at the structural ceiling).
-// cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// cast_sign_loss: identical to `mmio_split`.
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
+pub fn sched_split(sched_cap: u64, split_at: u8) -> Result<(u64, u64), i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; kernel validates cap and
     // split point, returning the two child handles in the primary/secondary registers.
-    let (ret, handle2) = unsafe {
-        syscall5_ret2(
-            SYS_SCHED_SPLIT,
-            u64::from(sched_cap),
-            u64::from(split_at),
-            0,
-            0,
-            0,
-        )
-    };
+    let (ret, handle2) =
+        unsafe { syscall5_ret2(SYS_SCHED_SPLIT, sched_cap, u64::from(split_at), 0, 0, 0) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        Ok((ret as u32, handle2 as u32))
+        Ok((ret as u64, handle2))
     }
 }
 
@@ -1155,7 +1092,7 @@ pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
 /// § `context` gives each architecture's `align_initial_stack`).
 #[inline]
 pub unsafe fn thread_configure(
-    thread_cap: u32,
+    thread_cap: u64,
     entry: u64,
     stack_ptr: u64,
     arg: u64,
@@ -1196,7 +1133,7 @@ pub unsafe fn thread_configure(
 /// [`thread_configure`]).
 #[inline]
 pub unsafe fn thread_configure_with_tls(
-    thread_cap: u32,
+    thread_cap: u64,
     entry: u64,
     stack_ptr: u64,
     arg: u64,
@@ -1210,7 +1147,7 @@ pub unsafe fn thread_configure_with_tls(
     let ret = unsafe {
         syscall5(
             SYS_THREAD_CONFIGURE,
-            u64::from(thread_cap),
+            thread_cap,
             entry,
             stack_ptr,
             arg,
@@ -1243,11 +1180,11 @@ pub unsafe fn thread_configure_with_tls(
 /// in place and sees `Interrupted` once restarted; nothing was started and a
 /// retry is safe.
 #[inline]
-pub fn thread_start(thread_cap: u32) -> Result<(), i64>
+pub fn thread_start(thread_cap: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; thread_cap is cap index as u64;
     // kernel validates cap and enqueues thread.
-    let ret = unsafe { syscall2(SYS_THREAD_START, u64::from(thread_cap), 0) };
+    let ret = unsafe { syscall2(SYS_THREAD_START, thread_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -1280,26 +1217,17 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
 /// capability transfer is in flight on the source.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result<u32, i64>
+pub fn cap_copy(src_slot: u64, dest_cspace_cap: u64, rights_mask: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
     // (source handle, dest CSpace cap, dest slot, rights mask); a dest slot of 0 asks the
     // kernel to allocate a free slot, whose handle it returns.
-    let ret = unsafe {
-        syscall4(
-            SYS_CAP_COPY,
-            u64::from(src_slot),
-            u64::from(dest_cspace_cap),
-            0,
-            rights_mask,
-        )
-    };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall4(SYS_CAP_COPY, src_slot, dest_cspace_cap, 0, rights_mask) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Attenuate a capability within the caller's own `CSpace` (`SYS_CAP_DERIVE`).
@@ -1323,16 +1251,15 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
+pub fn cap_derive(src_slot: u64, rights_mask: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; src_slot is cap index as u64, rights_mask
     // is bitmask; kernel validates cap, creates attenuated derivative, returns its cap handle.
-    let ret = unsafe { syscall2(SYS_CAP_DERIVE, u64::from(src_slot), rights_mask) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall2(SYS_CAP_DERIVE, src_slot, rights_mask) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Derive a capability with a badge attached (`SYS_CAP_DERIVE_BADGE`).
@@ -1354,23 +1281,15 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// revoke freed before the new slot was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// source.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u32, i64>
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
+pub fn cap_derive_badge(src_slot: u64, rights_mask: u64, badge: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; src_slot is cap index, rights_mask
     // is bitmask, badge is the badge value; kernel validates and creates badged derivative.
-    let ret = unsafe {
-        syscall3(
-            SYS_CAP_DERIVE_BADGE,
-            u64::from(src_slot),
-            rights_mask,
-            badge,
-        )
-    };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall3(SYS_CAP_DERIVE_BADGE, src_slot, rights_mask, badge) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Delete a capability slot in the caller's `CSpace` (`SYS_CAP_DELETE`).
@@ -1399,11 +1318,11 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 /// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer on it is in
 /// flight; `Interrupted` if a concurrent deriver extended the slot's child
 /// list faster than the batched reparent could move it (retry).
-pub fn cap_delete(slot: u32) -> Result<(), i64>
+pub fn cap_delete(slot: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64;
     // kernel validates slot, unlinks from derivation tree, dec-refs object.
-    let ret = unsafe { syscall2(SYS_CAP_DELETE, u64::from(slot), 0) };
+    let ret = unsafe { syscall2(SYS_CAP_DELETE, slot, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -1424,11 +1343,11 @@ pub fn cap_delete(slot: u32) -> Result<(), i64>
 ///   subtree was larger than one call covers (about 1.3 × 10^8 nodes), or
 ///   concurrent derivation kept extending it; everything revoked so far stays
 ///   revoked, and a retry continues (see [`cap_revoke_all`]).
-pub fn cap_revoke(slot: u32) -> Result<(), i64>
+pub fn cap_revoke(slot: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64;
     // kernel validates slot and revokes entire descendant subtree.
-    let ret = unsafe { syscall2(SYS_CAP_REVOKE, u64::from(slot), 0) };
+    let ret = unsafe { syscall2(SYS_CAP_REVOKE, slot, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -1446,7 +1365,7 @@ pub fn cap_revoke(slot: u32) -> Result<(), i64>
 ///
 /// # Errors
 /// As for [`cap_revoke`]; `Interrupted` only after the retry bound.
-pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
+pub fn cap_revoke_all(slot: u64) -> Result<(), i64>
 {
     const MAX_RETRIES: u32 = 4096;
     let mut last = Ok(());
@@ -1495,11 +1414,10 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// the kernel's batch backstop — the capability then lives in both slots,
 /// the destination a derived child of the source, and a `cap_revoke` on the
 /// source reclaims it.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
+pub fn cap_move(src_cap: u64, dest_cspace_cap: u64, dest_index: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
     // (source handle, dest CSpace cap, dest index); kernel validates and moves cap, returns
@@ -1507,12 +1425,12 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
     let ret = unsafe {
         syscall3(
             SYS_CAP_MOVE,
-            u64::from(src_cap),
-            u64::from(dest_cspace_cap),
+            src_cap,
+            dest_cspace_cap,
             u64::from(dest_index),
         )
     };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Insert a capability at a specific slot index in another `CSpace`.
@@ -1543,16 +1461,15 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 /// concurrent delete, move, or revoke freed before the copy was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// source.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 pub fn cap_insert(
-    src_slot: u32,
-    dest_cspace_cap: u32,
+    src_slot: u64,
+    dest_cspace_cap: u64,
     dest_index: u32,
     rights_mask: u64,
-) -> Result<u32, i64>
+) -> Result<u64, i64>
 {
     // The kernel reads a destination of 0 as "allocate a slot", which would
     // place the copy elsewhere.
@@ -1566,13 +1483,13 @@ pub fn cap_insert(
     let ret = unsafe {
         syscall4(
             SYS_CAP_COPY,
-            u64::from(src_slot),
-            u64::from(dest_cspace_cap),
+            src_slot,
+            dest_cspace_cap,
             u64::from(dest_index),
             rights_mask,
         )
     };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Query system information by `SystemInfoType` discriminant.
@@ -1677,7 +1594,7 @@ pub fn user_va_top() -> Result<u64, i64>
 // cast_sign_loss: ret is proven non-negative in the Ok branch.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
+pub fn cap_info(slot: u64, field: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; slot is a cap handle as u64,
     // field is one of the CAP_INFO_* selectors, and the two window registers are
@@ -1686,7 +1603,7 @@ pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
     // The kernel performs all validation (slot bounds and generation, tag match
     // for tag-specific fields, selector recognition) and returns the requested
     // field value.
-    let ret = unsafe { syscall4(SYS_CAP_INFO, u64::from(slot), field, 0, 0) };
+    let ret = unsafe { syscall4(SYS_CAP_INFO, slot, field, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
@@ -1702,14 +1619,14 @@ pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
 // cast_sign_loss: ret is checked non-negative before the cast.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_info_memory_mappings(memory_cap: u32, first_page: u64, pages: u64) -> Result<u64, i64>
+pub fn cap_info_memory_mappings(memory_cap: u64, first_page: u64, pages: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; the arguments are a cap
     // handle, the selector, and the window; the kernel validates all of them.
     let ret = unsafe {
         syscall4(
             SYS_CAP_INFO,
-            u64::from(memory_cap),
+            memory_cap,
             CAP_INFO_MEMORY_MAPPINGS,
             first_page,
             pages,
@@ -1734,11 +1651,11 @@ pub fn cap_info_memory_mappings(memory_cap: u32, first_page: u64, pages: u64) ->
 // cast_sign_loss: ret is proven non-negative in the Ok branch.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
+pub fn aspace_query(aspace_cap: u64, virt: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; aspace_cap is cap index as u64, virt is
     // virtual address; kernel validates cap and mapping, returns physical address.
-    let ret = unsafe { syscall2(SYS_ASPACE_QUERY, u64::from(aspace_cap), virt) };
+    let ret = unsafe { syscall2(SYS_ASPACE_QUERY, aspace_cap, virt) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
@@ -1759,12 +1676,11 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 /// of range, or the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
 /// also means the Memory object's reference count is at its 2^31 ceiling.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
+pub fn event_queue_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 {
     event_queue_create_observed(memory_cap, capacity, 0)
 }
@@ -1781,16 +1697,15 @@ pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 /// # Errors
 /// As [`event_queue_create`], and `InvalidArgument` if `observers` is out of
 /// range.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn event_queue_create_observed(
-    memory_cap: u32,
+    memory_cap: u64,
     capacity: u32,
     observers: u32,
-) -> Result<u32, i64>
+) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; arg0 = source Memory
     // cap slot, arg1 = capacity, arg2 = observer-node count. Kernel retypes
@@ -1798,12 +1713,12 @@ pub fn event_queue_create_observed(
     let ret = unsafe {
         syscall3(
             SYS_CAP_CREATE_EVENT_Q,
-            u64::from(memory_cap),
+            memory_cap,
             u64::from(capacity),
             u64::from(observers),
         )
     };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// One event-queue entry: the two words `SYS_EVENT_POST` appends and
@@ -1851,7 +1766,7 @@ impl DeathEvent
 /// Returns a negative `i64` error code: `InvalidCapability`,
 /// `InsufficientRights` (cap lacks Post), or `QueueFull`.
 #[inline]
-pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
+pub fn event_post(queue_cap: u64, payload: u64) -> Result<(), i64>
 {
     event_post_entry(queue_cap, EventEntry { payload, tag: 0 })
 }
@@ -1863,18 +1778,11 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// `InsufficientRights` (cap lacks Post), or `QueueFull` (the queue is at
 /// capacity).
 #[inline]
-pub fn event_post_entry(queue_cap: u32, entry: EventEntry) -> Result<(), i64>
+pub fn event_post_entry(queue_cap: u64, entry: EventEntry) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; queue_cap is cap index as u64, the
     // two words are opaque data; kernel validates cap and enqueues the entry (non-blocking).
-    let ret = unsafe {
-        syscall3(
-            SYS_EVENT_POST,
-            u64::from(queue_cap),
-            entry.payload,
-            entry.tag,
-        )
-    };
+    let ret = unsafe { syscall3(SYS_EVENT_POST, queue_cap, entry.payload, entry.tag) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -1888,13 +1796,12 @@ pub fn event_post_entry(queue_cap: u32, entry: EventEntry) -> Result<(), i64>
 /// destroyed under it; or another negative `i64` error code if the queue cap
 /// is invalid or lacks Recv rights.
 #[inline]
-pub fn event_recv_entry(queue_cap: u32, timeout_ms: u64) -> Result<EventEntry, i64>
+pub fn event_recv_entry(queue_cap: u64, timeout_ms: u64) -> Result<EventEntry, i64>
 {
     // SAFETY: syscall2_ret3 issues raw syscall instruction; arg1 carries the
     // timeout sentinel directly to the kernel, which returns the payload word
     // in the secondary register and the tag word in the tertiary one.
-    let (ret, payload, tag) =
-        unsafe { syscall2_ret3(SYS_EVENT_RECV, u64::from(queue_cap), timeout_ms) };
+    let (ret, payload, tag) = unsafe { syscall2_ret3(SYS_EVENT_RECV, queue_cap, timeout_ms) };
     if ret < 0
     {
         Err(ret)
@@ -1914,7 +1821,7 @@ pub fn event_recv_entry(queue_cap: u32, timeout_ms: u64) -> Result<EventEntry, i
 /// Recv rights; `-16` (`Interrupted`) if the caller is stopped while waiting
 /// or the queue is destroyed under it.
 #[inline]
-pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
+pub fn event_recv(queue_cap: u64) -> Result<u64, i64>
 {
     event_recv_entry(queue_cap, 0).map(|e| e.payload)
 }
@@ -1926,7 +1833,7 @@ pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 /// Returns `-6` (`WouldBlock`) if the queue is empty, or `InvalidCapability`
 /// or `InsufficientRights` (cap lacks Recv).
 #[inline]
-pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
+pub fn event_try_recv(queue_cap: u64) -> Result<u64, i64>
 {
     event_recv_entry(queue_cap, u64::MAX).map(|e| e.payload)
 }
@@ -1936,7 +1843,7 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// # Errors
 /// As [`event_try_recv`].
 #[inline]
-pub fn event_try_recv_death(queue_cap: u32) -> Result<DeathEvent, i64>
+pub fn event_try_recv_death(queue_cap: u64) -> Result<DeathEvent, i64>
 {
     event_recv_entry(queue_cap, u64::MAX).map(DeathEvent::from_entry)
 }
@@ -1953,7 +1860,7 @@ pub fn event_try_recv_death(queue_cap: u32) -> Result<DeathEvent, i64>
 /// destroyed under it; or another negative `i64` error code if the queue cap
 /// is invalid or lacks Recv rights.
 #[inline]
-pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
+pub fn event_recv_timeout(queue_cap: u64, timeout_ms: u64) -> Result<u64, i64>
 {
     event_recv_entry(queue_cap, timeout_ms).map(|e| e.payload)
 }
@@ -1973,23 +1880,16 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 /// the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
 /// also means the Memory object's reference count is at its 2^31 ceiling.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
-// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
-// so it fits u32.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// cast_sign_loss: ret is a non-negative cap handle (the kernel keeps bit 63
+// of every handle clear; `syscall_abi::CAP_GEN_BITS`).
+#[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn wait_set_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
+pub fn wait_set_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Memory
     // cap slot, arg1 = member capacity. Kernel retypes the region.
-    let ret = unsafe {
-        syscall2(
-            SYS_CAP_CREATE_WAIT_SET,
-            u64::from(memory_cap),
-            u64::from(capacity),
-        )
-    };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_WAIT_SET, memory_cap, u64::from(capacity)) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Register `source_cap` (Endpoint/Notification/EventQueue) in `ws_cap` with a
@@ -2005,18 +1905,11 @@ pub fn wait_set_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 /// receive right), or `InvalidArgument` (the wait set is full, or the source
 /// is already in a wait set).
 #[inline]
-pub fn wait_set_add(ws_cap: u32, source_cap: u32, badge: u64) -> Result<(), i64>
+pub fn wait_set_add(ws_cap: u64, source_cap: u64, badge: u64) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
     // (wait set cap, source cap, opaque badge); kernel validates caps and registers source.
-    let ret = unsafe {
-        syscall3(
-            SYS_WAIT_SET_ADD,
-            u64::from(ws_cap),
-            u64::from(source_cap),
-            badge,
-        )
-    };
+    let ret = unsafe { syscall3(SYS_WAIT_SET_ADD, ws_cap, source_cap, badge) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2026,17 +1919,11 @@ pub fn wait_set_add(ws_cap: u32, source_cap: u32, badge: u64) -> Result<(), i64>
 /// Returns a negative `i64` error code if either cap is invalid or
 /// `source_cap` is not in the wait set.
 #[inline]
-pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
+pub fn wait_set_remove(ws_cap: u64, source_cap: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; ws_cap and source_cap are cap indices as u64;
     // kernel validates caps and unregisters source from wait set.
-    let ret = unsafe {
-        syscall2(
-            SYS_WAIT_SET_REMOVE,
-            u64::from(ws_cap),
-            u64::from(source_cap),
-        )
-    };
+    let ret = unsafe { syscall2(SYS_WAIT_SET_REMOVE, ws_cap, source_cap) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2052,11 +1939,11 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 /// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is
 /// stopped while waiting or the wait set is destroyed under it.
 #[inline]
-pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
+pub fn wait_set_wait(ws_cap: u64) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; ws_cap is cap index as u64;
     // kernel validates cap, blocks until source ready, returns badge in secondary register.
-    let (ret, badge) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, u64::from(ws_cap), 0, 0, 0, 0) };
+    let (ret, badge) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, ws_cap, 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(badge) }
 }
 
@@ -2084,19 +1971,12 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// 64 bindings or, for its first binding, the controller has no delivery
 /// resource left (x86-64: every device vector is assigned).
 #[inline]
-pub fn irq_register(irq_cap: u32, notification_cap: u32, mode: u64) -> Result<(), i64>
+pub fn irq_register(irq_cap: u64, notification_cap: u64, mode: u64) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; irq_cap and notification_cap are cap
     // indices as u64 and mode a plain word; the kernel validates the caps and the mode and
     // binds the IRQ to the notification for interrupt delivery.
-    let ret = unsafe {
-        syscall3(
-            SYS_IRQ_REGISTER,
-            u64::from(irq_cap),
-            u64::from(notification_cap),
-            mode,
-        )
-    };
+    let ret = unsafe { syscall3(SYS_IRQ_REGISTER, irq_cap, notification_cap, mode) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2112,11 +1992,11 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32, mode: u64) -> Result<()
 /// `InsufficientRights` (cap lacks Notify), or `InvalidArgument` (the cap
 /// covers more than one line).
 #[inline]
-pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
+pub fn irq_ack(irq_cap: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; irq_cap is cap index as u64;
     // kernel validates cap and acknowledges its binding, unmasking once none owes.
-    let ret = unsafe { syscall2(SYS_IRQ_ACK, u64::from(irq_cap), 0) };
+    let ret = unsafe { syscall2(SYS_IRQ_ACK, irq_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2154,21 +2034,13 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// `OutOfMemory` failure keeps the mapping's record and the pages already
 /// mapped; a retry at the same `virt` reuses the record.
 #[inline]
-pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) -> Result<(), i64>
+pub unsafe fn mmio_map(aspace_cap: u64, mmio_cap: u64, virt: u64, flags: u64) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues the raw syscall; every argument is a scalar the
     // kernel validates (cap indices, virtual address, flags). The caller's
     // contract (`mem_map`'s) keeps the span off live Rust objects and the
     // registered IPC page, the raw-wrapper mapping clause.
-    let ret = unsafe {
-        syscall4(
-            SYS_MMIO_MAP,
-            u64::from(aspace_cap),
-            u64::from(mmio_cap),
-            virt,
-            flags,
-        )
-    };
+    let ret = unsafe { syscall4(SYS_MMIO_MAP, aspace_cap, mmio_cap, virt, flags) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2187,17 +2059,11 @@ pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) ->
 /// caps), or `OutOfMemory` (the first bind's binding table cannot be taken
 /// from the target thread's `CSpace` pool).
 #[inline]
-pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
+pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; thread_cap and ioport_cap are cap indices as u64;
     // kernel validates caps and grants I/O port access (x86-64 only; returns NotSupported on RISC-V).
-    let ret = unsafe {
-        syscall2(
-            SYS_IOPORT_BIND,
-            u64::from(thread_cap),
-            u64::from(ioport_cap),
-        )
-    };
+    let ret = unsafe { syscall2(SYS_IOPORT_BIND, thread_cap, ioport_cap) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2235,11 +2101,11 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// Control rights, or `-15` (`InvalidState`) if the thread is not yet
 /// started, already stopped, or exited.
 #[inline]
-pub fn thread_stop(thread_cap: u32) -> Result<(), i64>
+pub fn thread_stop(thread_cap: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; thread_cap is cap index as u64;
     // kernel validates cap and transitions thread to Stopped state.
-    let ret = unsafe { syscall2(SYS_THREAD_STOP, u64::from(thread_cap), 0) };
+    let ret = unsafe { syscall2(SYS_THREAD_STOP, thread_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2256,16 +2122,16 @@ pub fn thread_stop(thread_cap: u32) -> Result<(), i64>
 /// `priority` is out of range, `sched_cap` is not a `SchedControl`, or its band
 /// does not cover `priority`.
 #[inline]
-pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Result<(), i64>
+pub fn thread_set_priority(thread_cap: u64, priority: u8, sched_cap: u64) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
     // (thread cap, priority level, sched cap); kernel validates caps and priority range.
     let ret = unsafe {
         syscall3(
             SYS_THREAD_SET_PRIORITY,
-            u64::from(thread_cap),
+            thread_cap,
             u64::from(priority),
-            u64::from(sched_cap),
+            sched_cap,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
@@ -2289,17 +2155,11 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// is invalid, `InsufficientRights` if it lacks Control rights, or
 /// `InvalidArgument` if `cpu_id` names an offline or out-of-range CPU.
 #[inline]
-pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
+pub fn thread_set_affinity(thread_cap: u64, cpu_id: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; thread_cap and cpu_id are scalar u64 values;
     // kernel validates cap and CPU ID, sets thread affinity.
-    let ret = unsafe {
-        syscall2(
-            SYS_THREAD_SET_AFFINITY,
-            u64::from(thread_cap),
-            u64::from(cpu_id),
-        )
-    };
+    let ret = unsafe { syscall2(SYS_THREAD_SET_AFFINITY, thread_cap, u64::from(cpu_id)) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2321,8 +2181,8 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 /// other than `FAULT_CLASS_ALL`).
 #[inline]
 pub fn thread_set_fault_handler(
-    thread_cap: u32,
-    endpoint_cap: u32,
+    thread_cap: u64,
+    endpoint_cap: u64,
     fault_class_mask: u64,
 ) -> Result<(), i64>
 {
@@ -2332,8 +2192,8 @@ pub fn thread_set_fault_handler(
     let ret = unsafe {
         syscall4(
             SYS_THREAD_SET_FAULT_HANDLER,
-            u64::from(thread_cap),
-            u64::from(endpoint_cap),
+            thread_cap,
+            endpoint_cap,
             0,
             fault_class_mask,
         )
@@ -2360,7 +2220,7 @@ pub fn thread_set_fault_handler(
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
-pub fn thread_read_regs(thread_cap: u32, buf: &mut [u8]) -> Result<u64, i64>
+pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues the raw syscall; `buf` is a live, exclusively
     // borrowed slice, so the kernel's writes of at most `buf.len()` bytes land
@@ -2369,7 +2229,7 @@ pub fn thread_read_regs(thread_cap: u32, buf: &mut [u8]) -> Result<u64, i64>
     let ret = unsafe {
         syscall3(
             SYS_THREAD_READ_REGS,
-            u64::from(thread_cap),
+            thread_cap,
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )
@@ -2411,7 +2271,7 @@ pub fn thread_read_regs(thread_cap: u32, buf: &mut [u8]) -> Result<u64, i64>
 /// pointer, is not a user address), or `InvalidAddress` (`buf` is not wholly
 /// in the user half or not mapped readable).
 #[inline]
-pub unsafe fn thread_write_regs(thread_cap: u32, buf: &[u8]) -> Result<(), i64>
+pub unsafe fn thread_write_regs(thread_cap: u64, buf: &[u8]) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues the raw syscall; `buf` is a live slice the
     // kernel only reads, for at most `buf.len()` bytes. The caller's contract
@@ -2420,7 +2280,7 @@ pub unsafe fn thread_write_regs(thread_cap: u32, buf: &[u8]) -> Result<(), i64>
     let ret = unsafe {
         syscall3(
             SYS_THREAD_WRITE_REGS,
-            u64::from(thread_cap),
+            thread_cap,
             buf.as_ptr() as u64,
             buf.len() as u64,
         )
@@ -2533,7 +2393,7 @@ pub fn random_u64() -> Result<u64, i64>
 /// `NotSupported` on x86-64 or if SBI firmware itself returns an error.
 #[inline]
 pub fn sbi_call(
-    sbi_cap: u32,
+    sbi_cap: u64,
     extension: u64,
     function: u64,
     a0: u64,
@@ -2542,17 +2402,7 @@ pub fn sbi_call(
 ) -> Result<u64, i64>
 {
     // SAFETY: syscall6 issues raw syscall instruction; all arguments are plain u64 values.
-    let ret = unsafe {
-        syscall6(
-            SYS_SBI_CALL,
-            u64::from(sbi_cap),
-            extension,
-            function,
-            a0,
-            a1,
-            a2,
-        )
-    };
+    let ret = unsafe { syscall6(SYS_SBI_CALL, sbi_cap, extension, function, a0, a1, a2) };
     if ret < 0
     {
         Err(ret)
@@ -2612,8 +2462,8 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// Post), or `OutOfMemory` (the event queue has no free observer node).
 #[inline]
 pub fn thread_bind_notification(
-    thread_cap: u32,
-    event_queue_cap: u32,
+    thread_cap: u64,
+    event_queue_cap: u64,
     correlator: u64,
 ) -> Result<(), i64>
 {
@@ -2622,8 +2472,8 @@ pub fn thread_bind_notification(
     let ret = unsafe {
         syscall3(
             SYS_THREAD_BIND_NOTIFICATION,
-            u64::from(thread_cap),
-            u64::from(event_queue_cap),
+            thread_cap,
+            event_queue_cap,
             correlator,
         )
     };
@@ -2675,8 +2525,8 @@ pub fn thread_bind_notification(
 /// node).
 #[inline]
 pub fn aspace_bind_notification(
-    aspace_cap: u32,
-    event_queue_cap: u32,
+    aspace_cap: u64,
+    event_queue_cap: u64,
     correlator: u64,
 ) -> Result<(), i64>
 {
@@ -2685,8 +2535,8 @@ pub fn aspace_bind_notification(
     let ret = unsafe {
         syscall3(
             SYS_ASPACE_BIND_NOTIFICATION,
-            u64::from(aspace_cap),
-            u64::from(event_queue_cap),
+            aspace_cap,
+            event_queue_cap,
             correlator,
         )
     };

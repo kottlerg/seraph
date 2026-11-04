@@ -196,7 +196,7 @@ impl Access
 
 /// Receive the child's next fault on `ep`, check it is `access` at `va`, then
 /// resume the child (`child_th`) past the faulting instruction.
-fn expect_fault(ctx: &TestContext, ep: u32, child_th: u32, va: u64, access: Access) -> TestResult
+fn expect_fault(ctx: &TestContext, ep: u64, child_th: u64, va: u64, access: Access) -> TestResult
 {
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }

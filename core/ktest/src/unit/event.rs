@@ -23,6 +23,10 @@ use crate::{ChildStack, TestContext, TestResult};
 
 // Child stack for the recv_blocks_until_post test.
 static mut RECV_BLOCKS_STACK: ChildStack = ChildStack::ZERO;
+/// `(eq_slot, sync_slot)` for the [`recv_blocks_until_post`] child: each
+/// handle fills a word, so the pair goes by address.
+static RECV_BLOCKS_ARGS: crate::spawn::ArgBlock<(u64, u64), 1> =
+    crate::spawn::ArgBlock::new((0, 0));
 // Child stacks for the timeout tests (each test owns its own stack).
 static mut TIMEOUT_ZERO_PAYLOAD_STACK: ChildStack = ChildStack::ZERO;
 static mut TIMEOUT_NONZERO_PAYLOAD_STACK: ChildStack = ChildStack::ZERO;
@@ -147,7 +151,9 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_sync = cap_copy(sync, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy sync failed")?;
-    let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 32);
+    // SAFETY: index 0 < 1; this test's previous child on the entry has
+    // exited, and this one has not started.
+    let child_arg = unsafe { RECV_BLOCKS_ARGS.publish(0, (child_eq, child_sync)) };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
     // SAFETY: the stack is `RECV_BLOCKS_STACK`, this test's own `ChildStack`,
@@ -301,7 +307,7 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     // The child's entry sleeps ~10 ms, then posts payload 0; arg carries only
     // its queue slot.
-    let child_arg = u64::from(child_eq);
+    let child_arg = child_eq;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));
     // SAFETY: the stack is `TIMEOUT_ZERO_PAYLOAD_STACK`, this test's own `ChildStack`,
@@ -333,7 +339,7 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
         .map_err(|_| "event_queue_create for nonzero-payload test failed")?;
     let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
-    let child_arg = u64::from(child_eq);
+    let child_arg = child_eq;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK));
     // SAFETY: the stack is `TIMEOUT_NONZERO_PAYLOAD_STACK`, this test's own `ChildStack`,
@@ -364,7 +370,7 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
         .map_err(|_| "event_queue_create for forever-block test failed")?;
     let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
-    let child_arg = u64::from(child_eq);
+    let child_arg = child_eq;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK));
     // SAFETY: the stack is `TIMEOUT_FOREVER_STACK`, this test's own `ChildStack`,
@@ -391,11 +397,12 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 
 /// Child: blocks on `event_recv` then signals the received payload back.
 ///
-/// `arg`: bits[31:0] = `eq_slot`, bits[63:32] = `sync_slot` (in child's `CSpace`).
+/// `arg`: the `RECV_BLOCKS_ARGS` entry holding `(eq_slot, sync_slot)` (in
+/// the child's `CSpace`).
 extern "C" fn recv_and_report_entry(arg: u64) -> !
 {
-    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
-    let sync_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `RECV_BLOCKS_ARGS` entry the test published.
+    let (eq_slot, sync_slot): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
 
     match event_recv(eq_slot)
     {
@@ -413,18 +420,16 @@ extern "C" fn recv_and_report_entry(arg: u64) -> !
 
 /// Child: sleeps ~10 ms then posts payload `0` (the legitimate-zero
 /// disambiguation case).
-extern "C" fn post_zero_after_sleep_entry(arg: u64) -> !
+extern "C" fn post_zero_after_sleep_entry(eq_slot: u64) -> !
 {
-    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let _ = thread_sleep(10);
     let _ = event_post(eq_slot, 0);
     thread_exit()
 }
 
 /// Child: sleeps ~10 ms then posts payload `0xCAFE`.
-extern "C" fn post_cafe_after_sleep_entry(arg: u64) -> !
+extern "C" fn post_cafe_after_sleep_entry(eq_slot: u64) -> !
 {
-    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let _ = thread_sleep(10);
     let _ = event_post(eq_slot, 0xCAFE);
     thread_exit()
@@ -432,9 +437,8 @@ extern "C" fn post_cafe_after_sleep_entry(arg: u64) -> !
 
 /// Child: sleeps ~10 ms then posts payload `0xBEEF` (used by the
 /// `arg1=0` "block forever" sentinel test).
-extern "C" fn post_beef_after_sleep_entry(arg: u64) -> !
+extern "C" fn post_beef_after_sleep_entry(eq_slot: u64) -> !
 {
-    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let _ = thread_sleep(10);
     let _ = event_post(eq_slot, 0xBEEF);
     thread_exit()

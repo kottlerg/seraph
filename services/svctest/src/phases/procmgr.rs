@@ -12,6 +12,7 @@
 //! (spawned by `procmgr_refusals_phase`), and `logd_reclaim_child_main`
 //! (spawned by `logd_death_forward_phase`).
 
+use std::os::seraph::process::ChildExt;
 use std::os::seraph::startup_info;
 
 use syscall_abi::MSG_DATA_WORDS_MAX;
@@ -289,9 +290,14 @@ pub fn death_queue_growth_phase(_: &Caps)
         );
         let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
         // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-        let reply =
-            unsafe { ipc::ipc_call(child.id(), &query, std::os::seraph::current_ipc_buf()) }
-                .expect("death_queue_growth: QUERY_PROCESS call failed");
+        let reply = unsafe {
+            ipc::ipc_call(
+                child.process_handle(),
+                &query,
+                std::os::seraph::current_ipc_buf(),
+            )
+        }
+        .expect("death_queue_growth: QUERY_PROCESS call failed");
         assert_eq!(
             (reply.label, reply.word(0), reply.word(1)),
             (
@@ -341,12 +347,12 @@ pub fn spawn_phase(_: &Caps)
         .spawn()
         .expect("spawn /programs/hello failed");
 
-    let id = child.id();
+    let id = child.process_handle();
     std::os::seraph::log!("spawned /programs/hello handle={id:#x}");
 
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
-        let id = child.id();
+        let id = child.process_handle();
         let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
         // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
         let reply =
@@ -654,7 +660,7 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
             );
             // `Child::kill` sends `DESTROY_PROCESS`, which records the exit:
             // the parked child answers `EXITED` with `EXIT_KILLED`.
-            let (state, reason) = process_state_and_reason(child.id());
+            let (state, reason) = process_state_and_reason(child.process_handle());
             assert_eq!(
                 (state, reason),
                 (EXITED, syscall_abi::EXIT_KILLED),
@@ -665,7 +671,7 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
                 .arg(PARK_ROLE)
                 .spawn()
                 .expect("spawning the park child to drop failed");
-            let handle = syscall::cap_derive(unwaited.id(), syscall::RIGHTS_ALL)
+            let handle = syscall::cap_derive(unwaited.process_handle(), syscall::RIGHTS_ALL)
                 .expect("copying the unwaited child's process handle failed");
             // Dropping an unwaited `Child` destroys it (`DESTROY_PROCESS`),
             // which records the exit as the kill cell's does.
@@ -691,7 +697,7 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
 /// `EXITED` while it holds the exit record (the recent-exit window, best
 /// effort) and `UNKNOWN` after, so a failed call or a refusal is a test
 /// failure, not a sign the process is gone.
-fn process_state_and_reason(handle: u32) -> (u64, u64)
+fn process_state_and_reason(handle: u64) -> (u64, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
@@ -751,14 +757,14 @@ const REFUSAL_ROUNDS: usize = 16;
 
 /// A cap to attach to a request: a SEND copy of svctest's own procmgr cap,
 /// which the call moves into procmgr's `CSpace`.
-fn spare_cap() -> u32
+fn spare_cap() -> u64
 {
     syscall::cap_derive(startup_info().procmgr_endpoint, syscall::RIGHTS_EP_SEND)
         .expect("deriving a spare cap to attach failed")
 }
 
 /// Call `target` with `msg` and assert procmgr replies `want`.
-fn expect_reply(target: u32, msg: &ipc::IpcMessage, want: u64, what: &str)
+fn expect_reply(target: u64, msg: &ipc::IpcMessage, want: u64, what: &str)
 {
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(target, msg, std::os::seraph::current_ipc_buf()) }
@@ -767,7 +773,7 @@ fn expect_reply(target: u32, msg: &ipc::IpcMessage, want: u64, what: &str)
 }
 
 /// Look up `/programs/hello` and return `(file_cap, size)`.
-fn hello_file() -> (u32, u64)
+fn hello_file() -> (u64, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let root = std::os::seraph::root_dir_cap();
@@ -906,7 +912,7 @@ const DMA_HOLD_EXIT_POLLS: u32 = 100_000;
 
 /// Create `/programs/hello` through raw `CREATE_FROM_FILE` with
 /// `CREATE_DMA_HOLD` and return its `(process_handle, thread)`.
-fn create_held_hello() -> (u32, u32)
+fn create_held_hello() -> (u64, u64)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
@@ -959,7 +965,7 @@ fn pool_returns_to(level: u64) -> bool
 
 /// Start the held child behind `handle`, wait for it to exit, and destroy it,
 /// so procmgr has torn it down before the call returns.
-fn run_held_child_to_teardown(handle: u32)
+fn run_held_child_to_teardown(handle: u64)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels, procmgr_process_state};
 
@@ -1177,7 +1183,7 @@ fn undeliverable_reply_child_main() -> !
 
     let info = startup_info();
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let lookup = |dir: u32, name: &[u8]| {
+    let lookup = |dir: u64, name: &[u8]| {
         crate::ipc_util::ns::ns_lookup(dir, name, 0xFFFF, ipc_buf)
             .unwrap_or_else(|_| std::process::exit(UNDELIVERABLE_LOOKUP_FAILED))
     };

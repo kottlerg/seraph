@@ -176,12 +176,26 @@ pub enum CapTag
 /// `define_typed_rights!` table below.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rights(pub u32);
+pub struct Rights(pub u16);
 
 impl Rights
 {
     /// No rights.
     pub const NONE: Rights = Rights(0);
+
+    /// Decode a rights mask passed in a syscall argument register.
+    ///
+    /// Every ABI right is below bit 16 (`TypedRights::from_abi` asserts it),
+    /// so the bits above the 16-bit word name no right of any type and
+    /// dropping them leaves the mask's attenuation unchanged: `RIGHTS_ALL`
+    /// still keeps every right.
+    pub fn from_mask(mask: u64) -> Rights
+    {
+        // cast_possible_truncation: the mask keeps the 16 low bits only.
+        #[allow(clippy::cast_possible_truncation)]
+        let word = (mask & u64::from(u16::MAX)) as u16;
+        Rights(word)
+    }
 
     /// Return `true` if all bits in `mask` are present in `self`.
     pub fn contains(self, mask: Rights) -> bool
@@ -234,11 +248,11 @@ pub trait CapKind
 
 /// A rights word statically scoped to one capability type.
 ///
-/// Same 32-bit representation as the erased [`Rights`] stored in a slot; the
+/// Same 16-bit representation as the erased [`Rights`] stored in a slot; the
 /// type parameter exists purely at compile time to pair a rights constant
 /// with its `CapTag`.
 #[repr(transparent)]
-pub struct TypedRights<K: CapKind>(u32, PhantomData<K>);
+pub struct TypedRights<K: CapKind>(u16, PhantomData<K>);
 
 impl<K: CapKind> TypedRights<K>
 {
@@ -247,12 +261,12 @@ impl<K: CapKind> TypedRights<K>
     pub const NONE: Self = Self(0, PhantomData);
 
     // Bridge from the ABI's u64 rights constants. The assert makes an ABI bit
-    // outside the 32-bit slot word a compile error, so the cast is exact.
+    // outside the 16-bit slot word a compile error, so the cast is exact.
     #[allow(clippy::cast_possible_truncation)]
     const fn from_abi(bits: u64) -> Self
     {
-        assert!(bits <= u32::MAX as u64);
-        Self(bits as u32, PhantomData)
+        assert!(bits <= u16::MAX as u64);
+        Self(bits as u16, PhantomData)
     }
 
     /// Erase the compile-time type scope, e.g. for storage in a
@@ -525,9 +539,11 @@ define_typed_rights! {
 /// ```text
 ///  offset  size  field
 ///       0     1  tag
-///       1     3  pad   (aligns rights to offset 4; pad[0] = free-list marker)
-///       4     4  rights
-///       8     8  badge  (caller-identifying label; 0 = unbadged)
+///       1     1  pin    (in-flight pin; see `pinned`)
+///       2     2  rights
+///       4     4  generation (per-slot generation; see `generation`)
+///       8     8  badge  (caller-identifying label; 0 = unbadged; the
+///                        free-list marker when tag == Null)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
 ///      24    12  deriv_parent   (next_free index when tag == Null)
 ///      36    12  deriv_first_child (prev_free index when tag == Null)
@@ -537,31 +553,28 @@ define_typed_rights! {
 /// ```
 ///
 /// Each `Option<SlotId>` derivation pointer is 12 bytes (3 × u32, niche on
-/// `index: NonZeroU32`). `#[repr(C)]` would insert 3 bytes of implicit
-/// padding after `tag` to align `rights` to offset 4; the explicit `pad`
-/// names those bytes so they can carry the free-list marker, the per-slot
-/// generation, and the in-flight pin. The struct alignment is 8 (from
-/// `badge` and `object`); 72 is already a multiple of 8, so no trailing pad
-/// is required.
+/// `index: NonZeroU32`). The first word packs the tag, the in-flight pin, the
+/// 16-bit rights word, and the 32-bit per-slot generation with no implicit
+/// padding. The struct alignment is 8 (from `badge` and `object`); 72 is
+/// already a multiple of 8, so no trailing pad is required.
 #[repr(C)]
 pub struct CapabilitySlot
 {
     /// Capability type; `Null` means the slot is empty.
     pub tag: CapTag,
-    /// Explicit padding: aligns `rights` to offset 4 and `badge` to offset 8.
-    /// `pad[0]` doubles as the intrusive free-list membership marker
-    /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
-    /// list); `pad[1]` holds the per-slot generation counter (see
-    /// [`CapabilitySlot::generation`]); `pad[2]` holds the in-flight pin
-    /// (see [`CapabilitySlot::pinned`]).
-    pad: [u8; 3],
+    /// In-flight pin (see [`CapabilitySlot::pinned`]); non-zero while pinned.
+    pin: u8,
     /// Rights bitmask (type-specific).
     pub rights: Rights,
+    /// Per-slot generation counter (see [`CapabilitySlot::generation`]).
+    generation: u32,
     /// Caller-identifying badge, set via `SYS_CAP_DERIVE_BADGE`. Zero means
     /// unbadged. Immutable once set — re-badging a capability that already
     /// has a non-zero badge returns an error. Inherited by derivation and copy.
     /// For endpoint caps, the kernel delivers the badge to the receiver on
-    /// `ipc_recv`.
+    /// `ipc_recv`. On a Null slot it holds the intrusive free-list membership
+    /// marker instead ([`FREE_LIST_MARKER`] while the slot is linked on a
+    /// `CSpace` free list, see [`CapabilitySlot::is_on_free_list`]).
     pub badge: u64,
     /// Pointer to the kernel object (None when tag == Null).
     pub object: Option<NonNull<KernelObjectHeader>>,
@@ -592,15 +605,17 @@ unsafe impl Sync for CapabilitySlot {}
 
 // The 72-byte size is what lets `L2_SIZE` (56) slots fit a 4 KiB `CSpacePage`
 // (see core/kernel/docs/capability-internals.md § Representation). The
-// per-slot generation lives in the spare `pad[1]` and must not grow the slot.
+// per-slot generation shares the first word with the tag, pin, and rights and
+// must not grow the slot.
 const _: () = assert!(core::mem::size_of::<CapabilitySlot>() == 72);
 
-/// Value stamped into `CapabilitySlot::pad[0]` while a Null slot is linked on a
+/// Value stamped into `CapabilitySlot::badge` while a Null slot is linked on a
 /// `CSpace` intrusive free list. A free-list **tail** slot has `deriv_parent ==
-/// None`, identical to a freshly-allocated-but-unpopulated Null slot; this
-/// marker is the O(1) discriminator that lets `free_slot` reject a double-free
-/// of any slot, not just the current free-list head.
-const FREE_LIST_MARKER: u8 = 1;
+/// None`, identical to a freshly-allocated-but-unpopulated Null slot (whose
+/// badge is 0); this marker is the O(1) discriminator that lets `free_slot`
+/// reject a double-free of any slot, not just the current free-list head. A
+/// Null slot carries no badge, so the word is free to hold it.
+const FREE_LIST_MARKER: u64 = 1;
 
 impl CapabilitySlot
 {
@@ -609,8 +624,9 @@ impl CapabilitySlot
     {
         Self {
             tag: CapTag::Null,
-            pad: [0; 3],
+            pin: 0,
             rights: Rights::NONE,
+            generation: 0,
             badge: 0,
             object: None,
             deriv_parent: None,
@@ -632,7 +648,7 @@ impl CapabilitySlot
         *self = Self::null();
     }
 
-    /// Reset the slot to null but preserve the per-slot generation in `pad[1]`.
+    /// Reset the slot to null but preserve the per-slot generation.
     ///
     /// Used on the allocation path: `CSpace::allocate_slot` pops a free slot and
     /// must hand out the generation the previous `free_slot` left behind, so the
@@ -642,38 +658,40 @@ impl CapabilitySlot
     /// live cap.
     pub fn clear_keep_generation(&mut self)
     {
-        let generation = self.pad[1];
+        let generation = self.generation;
         *self = Self::null();
-        self.pad[1] = generation;
+        self.generation = generation;
     }
 
-    /// Read this slot's per-slot generation counter (stored in `pad[1]`).
+    /// Read this slot's per-slot generation counter.
     ///
     /// `CSpace::free_slot` bumps the generation each time the slot is recycled.
     /// It is encoded into the cap handle ([`syscall::cap_handle_encode`]), so a
     /// stale handle to a recycled slot fails `lookup_cap` with `InvalidCapability`
     /// instead of aliasing the new occupant (#349). Distinct from
     /// [`SlotId::epoch`], which is the `CSpace`-registry generation.
-    pub fn generation(&self) -> u8
+    pub fn generation(&self) -> u32
     {
-        self.pad[1]
+        self.generation
     }
 
-    /// Increment the per-slot generation, wrapping at 256.
+    /// Increment the per-slot generation, wrapping at
+    /// `1 << syscall::CAP_GEN_BITS` (2^31), so it always fits the handle's
+    /// generation field and leaves the handle's bit 63 clear.
     ///
     /// Called by `CSpace::free_slot` when a slot is recycled, so every handle to
-    /// the prior occupant becomes stale. Wraparound is a bounded ABA window
-    /// (256 reuses of the same index); acceptable for a fail-closed backstop
-    /// (#349). See [`generation`](Self::generation).
+    /// the prior occupant becomes stale. A handle aliases a later occupant only
+    /// when it is held across exactly a multiple of 2^31 recycles of its index
+    /// (see core/kernel/docs/capability-internals.md § Per-Slot Generation).
     pub fn bump_generation(&mut self)
     {
-        self.pad[1] = self.pad[1].wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1) & syscall::CAP_GEN_MASK;
     }
 
-    // ── In-flight pin (`pad[2]`) ──────────────────────────────────────────────
+    // ── In-flight pin ─────────────────────────────────────────────────────────
 
     /// Return `true` if a multi-batch operation is in flight on this slot
-    /// (marker stored in `pad[2]`): a `SYS_CAP_REVOKE` on its root, or a
+    /// (the `pin` byte): a `SYS_CAP_REVOKE` on its root, or a
     /// `SYS_CAP_MOVE` / IPC capability transfer on its source and
     /// destination.
     ///
@@ -682,23 +700,23 @@ impl CapabilitySlot
     /// § Move. Written only under `DERIVATION_LOCK` and read under it by every
     /// path that acts on it; the advisory IPC and capability-tree pre-checks
     /// read it without that lock, and their locked path re-decides.
-    /// [`set_next_free`](Self::set_next_free) zeroes `pad[2]`, so a slot freed
+    /// [`set_next_free`](Self::set_next_free) zeroes the pin, so a slot freed
     /// while pinned does not carry the pin to its next occupant.
     pub fn pinned(&self) -> bool
     {
-        self.pad[2] != 0
+        self.pin != 0
     }
 
     /// Set the in-flight pin (see [`pinned`](Self::pinned)).
     pub fn pin(&mut self)
     {
-        self.pad[2] = 1;
+        self.pin = 1;
     }
 
     /// Clear the in-flight pin (see [`pinned`](Self::pinned)).
     pub fn unpin(&mut self)
     {
-        self.pad[2] = 0;
+        self.pin = 0;
     }
 
     // ── Intrusive free-list helpers ───────────────────────────────────────────
@@ -716,11 +734,11 @@ impl CapabilitySlot
     /// the free-list reader only consults `index` (see
     /// core/kernel/docs/capability-internals.md § Free Slot Tracking).
     ///
-    /// Stamps the [`FREE_LIST_MARKER`] into `pad[0]` so [`is_on_free_list`]
+    /// Stamps the [`FREE_LIST_MARKER`] into `badge` so [`is_on_free_list`]
     /// can recognise this slot as a free-list member regardless of whether it
-    /// is the list tail. Leaves `pad[1]` (the per-slot generation) untouched —
+    /// is the list tail. Leaves the per-slot generation untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
-    /// allocation must observe the incremented value. Zeroes `pad[2]` — a
+    /// allocation must observe the incremented value. Zeroes the pin — a
     /// slot freed while a revoke, move, or IPC capability transfer had it
     /// pinned must not carry the pin into its next occupant (see
     /// [`pinned`](Self::pinned)).
@@ -729,13 +747,12 @@ impl CapabilitySlot
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
     {
         self.tag = CapTag::Null;
-        self.pad[0] = FREE_LIST_MARKER;
-        self.pad[2] = 0;
-        // pad[1] holds the per-slot generation, bumped by `CSpace::free_slot`
-        // just before this call. Preserve it across the free so the next
+        self.pin = 0;
+        // The per-slot generation, bumped by `CSpace::free_slot` just before
+        // this call, is preserved across the free so the next
         // `allocate_slot` hands out the incremented generation.
         self.rights = Rights::NONE;
-        self.badge = 0;
+        self.badge = FREE_LIST_MARKER;
         self.object = None;
         // deriv_first_child doubles as the free-list predecessor link;
         // a fresh push always enters at the head, so it starts None.
@@ -813,7 +830,7 @@ impl CapabilitySlot
     /// [`set_next_free`]: Self::set_next_free
     pub fn is_on_free_list(&self) -> bool
     {
-        self.tag == CapTag::Null && self.pad[0] == FREE_LIST_MARKER
+        self.tag == CapTag::Null && self.badge == FREE_LIST_MARKER
     }
 }
 
@@ -995,38 +1012,21 @@ mod tests
         assert_eq!(s.generation(), 0, "clear() must zero the generation");
     }
 
-    // 8-bit generation wraps after 256 recycles — bounded ABA, documented (#349).
+    // The generation passes 255 without wrapping (an 8-bit store would wrap
+    // there and reopen the 256-recycle alias window) and wraps at 2^31, never
+    // reaching the handle's bit 63.
     #[test]
-    fn bump_generation_wraps_at_256()
+    fn bump_generation_passes_255_and_wraps_at_the_handle_field()
     {
         let mut s = CapabilitySlot::null();
         for _ in 0..256
         {
             s.bump_generation();
         }
+        assert_eq!(s.generation(), 256);
+        s.generation = syscall::CAP_GEN_MASK;
+        s.bump_generation();
         assert_eq!(s.generation(), 0);
-    }
-
-    // Cap-handle encoding round-trips index and generation, and a gen-0 handle is
-    // numerically identical to the bare index (the backward-compat hinge, #349).
-    #[test]
-    fn cap_handle_round_trip_and_gen_zero_identity()
-    {
-        use syscall::{cap_handle_encode, cap_handle_gen, cap_handle_index};
-        for &index in &[1u32, 2, 42, 14_335, syscall::CAP_INDEX_MASK]
-        {
-            for &generation in &[0u8, 1, 127, 128, 255]
-            {
-                let h = cap_handle_encode(index, generation);
-                assert_eq!(cap_handle_index(h), index);
-                assert_eq!(cap_handle_gen(h), generation);
-            }
-        }
-        assert_eq!(
-            cap_handle_encode(7, 0),
-            7,
-            "gen-0 handle equals the bare index"
-        );
     }
 
     #[test]

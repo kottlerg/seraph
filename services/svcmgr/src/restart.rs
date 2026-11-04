@@ -47,8 +47,8 @@ pub enum DeathOutcome
 /// restart path and the post-handover launch path.
 pub struct CreatedProcess
 {
-    pub process_handle: u32,
-    pub thread_cap: u32,
+    pub process_handle: u64,
+    pub thread_cap: u64,
     pub child_badge: u64,
 }
 
@@ -61,7 +61,7 @@ pub struct CreatedProcess
 /// leak stays unguessable; svcmgr matches each round by exact badge value, never
 /// by index. The `u64` width is the kernel badge word, so the space never runs
 /// out. Returns `None` if the entropy draw or cap derivation fails.
-pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
+pub fn mint_child_creator(bootstrap_ep: u64) -> Option<(u64, u64)>
 {
     let mut badge = syscall::random_u64().ok()?;
     while badge == 0
@@ -123,8 +123,8 @@ pub fn walk_and_create_from_file(
     blobs: StartupBlobs<'_>,
     priority: u8,
     sched_max: u8,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
+    procmgr_ep: u64,
+    bootstrap_ep: u64,
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
@@ -239,7 +239,7 @@ pub fn walk_and_create_from_file(
 
 /// Send `START_PROCESS` via the badged process handle. Shared by the
 /// restart path and the post-handover launch path.
-pub fn start_process(process_handle: u32, ipc_buf: *mut u64) -> bool
+pub fn start_process(process_handle: u64, ipc_buf: *mut u64) -> bool
 {
     let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
     // SAFETY: `ipc_buf` is the registered IPC buffer.
@@ -256,8 +256,8 @@ pub fn start_process(process_handle: u32, ipc_buf: *mut u64) -> bool
 /// so the same instance is reused across all death events.
 pub struct RestartCtx
 {
-    pub procmgr_ep: u32,
-    pub bootstrap_ep: u32,
+    pub procmgr_ep: u64,
+    pub bootstrap_ep: u64,
     pub ipc_buf: *mut u64,
     /// The death-notification queues. Restarted services are rebound
     /// here with the same correlator they used pre-crash, so the routing
@@ -266,13 +266,13 @@ pub struct RestartCtx
     pub deaths: crate::death_queues::DeathSet,
     /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
-    pub master_log_source: u32,
+    pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it.
-    pub procmgr_death_auth_source: u32,
+    pub procmgr_death_auth_source: u64,
     /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
     /// real-logd's `REGISTRY_QUERY_AUTHORITY` query cap from it.
-    pub devmgr_registry: u32,
+    pub devmgr_registry: u64,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -493,14 +493,14 @@ fn restart_boot_caps(
     ctx: &RestartCtx,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
-) -> Option<Vec<u32>>
+) -> Option<Vec<u64>>
 {
     if matches!(recipe, Some(r) if r.log_sink)
     {
         return Some(mint_logd_boot_caps(ctx, LaunchKind::Restart));
     }
 
-    let restart_caps: Vec<u32> = match recipe
+    let restart_caps: Vec<u64> = match recipe
     {
         Some(r) => resolve_seeds(&r.seed, svc.name_str(), registry),
         None => Vec::new(),
@@ -532,7 +532,7 @@ fn create_process(
     svc: &ServiceEntry,
     recipe: Option<&RestartRecipe>,
     ctx: &RestartCtx,
-) -> Option<(u32, u32, u64)>
+) -> Option<(u64, u64, u64)>
 {
     if svc.vfs_path.is_empty()
     {
@@ -600,8 +600,8 @@ fn create_process(
 pub fn apply_namespace_policy(
     svc: &ServiceEntry,
     cwd: Option<&str>,
-    process_handle: u32,
-    thread_cap: u32,
+    process_handle: u64,
+    thread_cap: u64,
     ctx: &RestartCtx,
 ) -> bool
 {
@@ -687,12 +687,12 @@ pub fn apply_namespace_policy(
 /// of outcome — the kernel transfers it on the IPC. On any failure the
 /// partial child is destroyed and `false` is returned.
 pub(crate) fn configure_namespace_caps(
-    ns_cap: u32,
+    ns_cap: u64,
     cwd: Option<&str>,
     cwd_rights: u32,
-    root_cap: u32,
-    process_handle: u32,
-    thread_cap: u32,
+    root_cap: u64,
+    process_handle: u64,
+    thread_cap: u64,
     ctx: &RestartCtx,
 ) -> bool
 {
@@ -755,7 +755,7 @@ pub(crate) fn configure_namespace_caps(
 /// badged handle and release procmgr-side cap slots. Called when a step
 /// between procmgr's CREATE and START fails and the partial child must
 /// be reaped before the supervision loop retries.
-pub(crate) fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64)
+pub(crate) fn destroy_partial_child(process_handle: u64, thread_cap: u64, ipc_buf: *mut u64)
 {
     let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -771,7 +771,7 @@ pub(crate) fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_bu
 fn rebind_death_notification(
     svc: &mut ServiceEntry,
     deaths: &crate::death_queues::DeathSet,
-    new_thread_cap: u32,
+    new_thread_cap: u64,
     correlator: u64,
 ) -> bool
 {

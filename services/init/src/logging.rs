@@ -85,7 +85,7 @@ const HISTORY_RING_BYTES: usize = 16 * 1024;
 /// Badged SEND cap on the log endpoint that init's own `log()` writes to.
 /// Set after the log thread is up. Zero before then; falls back to direct
 /// serial output.
-static mut INIT_LOG_SEND: u32 = 0;
+static mut INIT_LOG_SEND: u64 = 0;
 
 /// IPC buffer pointer for the main thread (set after IPC buffer is mapped).
 static mut MAIN_IPC_BUF: *mut u64 = core::ptr::null_mut();
@@ -119,7 +119,7 @@ pub fn log(s: &str)
 /// Must be called exactly once after the log thread has started. `cap` must
 /// be a badged SEND cap on the log endpoint with the badge identifying the
 /// sender (badge `1` — init's self-identity — for init's own diagnostics).
-pub fn set_ipc_logging(cap: u32, ipc_buf: *mut u64)
+pub fn set_ipc_logging(cap: u64, ipc_buf: *mut u64)
 {
     // SAFETY: single main thread; log thread only reads its own argument.
     unsafe {
@@ -175,7 +175,7 @@ pub(crate) fn serial_log(s: &str)
 /// Send up to `STREAM_CHUNK_SIZE` bytes per IPC call on `cap` using the
 /// `STREAM_BYTES` label. Sends multiple calls if `bytes` exceeds the chunk
 /// size; the receiver concatenates each call's payload in order.
-fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
+fn ipc_log(cap: u64, ipc_buf: *mut u64, bytes: &[u8])
 {
     if bytes.is_empty()
     {
@@ -216,9 +216,9 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 pub unsafe fn spawn_log_thread(
     info: &InitInfo,
     arena: &mut BootArena,
-    log_ep: u32,
-    ioport_cap: u32,
-) -> u32
+    log_ep: u64,
+    ioport_cap: u64,
+) -> u64
 {
     // Offset-map the log thread's stack pages from init's arena into init's
     // address space, writable (W^X: not executable). `place_page` maps the
@@ -289,8 +289,8 @@ pub unsafe fn spawn_log_thread(
 
     let stack_top = LOG_THREAD_STACK_VA + LOG_THREAD_STACK_PAGES * PAGE_SIZE;
 
-    // Pack log_ep (u32) into the arg passed to the thread.
-    let arg = u64::from(log_ep);
+    // The thread's one argument word is log_ep's full handle.
+    let arg = log_ep;
 
     // SAFETY: `log_thread_entry` is an `extern "C" fn(u64) -> !`; `stack_top`
     // tops the stack pages placed above for this thread alone, which nothing
@@ -332,7 +332,7 @@ extern "C" fn log_thread_entry(arg: u64) -> !
         syscall::thread_exit();
     }
 
-    let log_ep = arg as u32;
+    let log_ep = arg;
 
     // SAFETY: LOG_THREAD_IPC_BUF_VA is the registered IPC buffer, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
@@ -395,7 +395,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, _err: i64)
 /// `HANDOVER_PULL` data drain and its terminal `HANDOVER_RELEASE`; an
 /// acknowledged release sets `HANDOVER_COMPLETE`, and the next loop
 /// iteration self-terminates the thread.
-fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
+fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
 {
     // SAFETY: the log thread runs this loop once and never returns from it,
     // and nothing else names SENDERS, so this is the only reference to it.

@@ -30,7 +30,7 @@ pub struct OutstandingPage
     /// Revoking it kills only this caller's child cap; the cache slot's
     /// parent cap stays untouched. Lives in the fs's `CSpace` until the
     /// outstanding entry is dropped.
-    pub ancestor_cap: u32,
+    pub ancestor_cap: u64,
     /// Set when the page has been queued for the eviction worker, so a
     /// later cache miss picks another page instead of queueing this one
     /// again. It is never cleared: the entry leaves the table when the
@@ -61,7 +61,7 @@ pub struct OpenFile
     /// carried one; eviction then skips the cooperative round-trip and goes
     /// straight to the revoke. Deleted from the fs's `CSpace` at
     /// `FS_CLOSE` time.
-    pub release_endpoint_cap: u32,
+    pub release_endpoint_cap: u64,
 }
 
 impl OpenFile

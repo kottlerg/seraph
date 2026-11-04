@@ -30,15 +30,15 @@ use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 #[derive(Default, Clone, Copy)]
 pub struct ServiceThreadCaps
 {
-    pub memmgr: u32,
-    pub procmgr: u32,
-    pub devmgr: u32,
-    pub vfsd: u32,
+    pub memmgr: u64,
+    pub procmgr: u64,
+    pub devmgr: u64,
+    pub vfsd: u64,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn derive_badged_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
+fn derive_badged_creator(bootstrap_ep: u64) -> Option<(u64, u64)>
 {
     let badge = crate::bootstrap::mint_bootstrap_badge()?;
     let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_EP_SEND, badge).ok()?;
@@ -63,9 +63,9 @@ fn derive_badged_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 /// caps from the same CREATE reply (e.g. a separate thread cap)
 /// remain responsible for releasing those.
 fn configure_child_namespace(
-    process_handle: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
+    process_handle: u64,
+    system_root_cap: u64,
+    init_self_cspace: u64,
     cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
 ) -> bool
@@ -127,7 +127,7 @@ fn configure_child_namespace(
 /// Tear down a partially-created child: send `DESTROY_PROCESS` over its
 /// badged handle and release init's procmgr-side slot. Used by every
 /// helper that reaches a failure between procmgr's CREATE and START.
-fn destroy_partial_child(process_handle: u32, ipc_buf: *mut u64)
+fn destroy_partial_child(process_handle: u64, ipc_buf: *mut u64)
 {
     let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -136,7 +136,7 @@ fn destroy_partial_child(process_handle: u32, ipc_buf: *mut u64)
 }
 
 /// Start a process by calling `START_PROCESS` on its badged process handle.
-fn start_process(process_handle: u32, ipc_buf: *mut u64, ok_msg: &str, fail_msg: &str) -> bool
+fn start_process(process_handle: u64, ipc_buf: *mut u64, ok_msg: &str, fail_msg: &str) -> bool
 {
     let msg = IpcMessage::new(procmgr_labels::START_PROCESS);
     // SAFETY: ipc_buf is caller's registered IPC buffer.
@@ -158,11 +158,11 @@ fn start_process(process_handle: u32, ipc_buf: *mut u64, ok_msg: &str, fail_msg:
 /// Serve one bootstrap round from init to the named child. Logs `context`
 /// and returns `false` on failure; [`serve_checked`] keeps the error code.
 fn serve(
-    bootstrap_ep: u32,
+    bootstrap_ep: u64,
     badge: u64,
     ipc_buf: *mut u64,
     done: bool,
-    caps: &[u32],
+    caps: &[u64],
     data: &[u64],
     context: &str,
 ) -> bool
@@ -176,11 +176,11 @@ fn serve(
 /// `bootstrap_errors::INVALID` otherwise, including a failed reply that has
 /// already woken the child with an error).
 fn serve_checked(
-    bootstrap_ep: u32,
+    bootstrap_ep: u64,
     badge: u64,
     ipc_buf: *mut u64,
     done: bool,
-    caps: &[u32],
+    caps: &[u64],
     data: &[u64],
     context: &str,
 ) -> Result<(), u64>
@@ -201,12 +201,12 @@ fn serve_checked(
 struct HwCaps
 {
     /// Root `Interrupt` range cap. Zero if the kernel did not mint one.
-    irq_range_slot: u32,
+    irq_range_slot: u64,
     /// RO Memory cap covering the ACPI RSDP page. Zero if none.
-    rsdp_slot: u32,
+    rsdp_slot: u64,
     rsdp_page_base: u64,
     /// RO Memory cap covering the DTB blob. Zero if none.
-    dtb_slot: u32,
+    dtb_slot: u64,
     dtb_page_base: u64,
     dtb_size: u64,
 }
@@ -261,7 +261,7 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
 /// The MMIO aperture caps the kernel minted, as `(slot, base, size)`: one per
 /// `Mmio` descriptor, whose aux0/aux1 carry the aperture, with no bound of
 /// init's own.
-fn aperture_caps(info: &InitInfo) -> impl Iterator<Item = (u32, u64, u64)> + '_
+fn aperture_caps(info: &InitInfo) -> impl Iterator<Item = (u64, u64, u64)> + '_
 {
     crate::descriptors(info)
         .iter()
@@ -274,7 +274,7 @@ fn aperture_caps(info: &InitInfo) -> impl Iterator<Item = (u32, u64, u64)> + '_
 /// `[acpi_region_memory_base, + acpi_region_memory_count)`, and their
 /// descriptors' aux0/aux1 carry the region. One per region the boot memory
 /// map reports, with no bound of init's own.
-fn acpi_region_caps(info: &InitInfo) -> impl Iterator<Item = (u32, u64, u64)> + '_
+fn acpi_region_caps(info: &InitInfo) -> impl Iterator<Item = (u64, u64, u64)> + '_
 {
     let start = info.acpi_region_memory_base;
     let end = start.saturating_add(info.acpi_region_memory_count);
@@ -328,18 +328,18 @@ mod present
 /// fail the whole round. Returns `false`, after logging `context`, when a
 /// round fails.
 fn serve_region_rounds(
-    bootstrap_ep: u32,
+    bootstrap_ep: u64,
     child_badge: u64,
     ipc_buf: *mut u64,
     round_kind: u64,
-    regions: impl IntoIterator<Item = (u32, u64, u64)>,
+    regions: impl IntoIterator<Item = (u64, u64, u64)>,
     context: &str,
 ) -> bool
 {
     let mut regions = regions.into_iter().peekable();
     while regions.peek().is_some()
     {
-        let mut caps = [0u32; 4];
+        let mut caps = [0u64; 4];
         let mut data = [0u64; 2 + 4 * 2];
         let mut n = 0usize;
         for (slot, base, size) in regions.by_ref().take(4)
@@ -396,12 +396,12 @@ fn serve_region_rounds(
 #[allow(clippy::too_many_lines)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    registry_ep: u32,
-    svcmgr_service_ep: u32,
+    procmgr_ep: u64,
+    bootstrap_ep: u64,
+    registry_ep: u64,
+    svcmgr_service_ep: u64,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<u64>
 {
     let devmgr_memory_cap = crate::find_module_by_name(info, b"devmgr")?;
     let devmgr_module_copy = module_spawn_copy(devmgr_memory_cap)?;
@@ -500,7 +500,7 @@ pub fn create_devmgr_with_caps(
     // Round 1: [registry, ...present(irq,rsdp,dtb)].
     // data[0] = presence bitmap; data[1]=rsdp_base, data[2]=dtb_base,
     // data[3]=dtb_size (always written; bitmap indicates validity).
-    let mut r1_caps = [0u32; 4];
+    let mut r1_caps = [0u64; 4];
     let mut r1_cap_count: usize = 1;
     r1_caps[0] = registry_copy;
     let mut presence: u64 = 0;
@@ -569,7 +569,7 @@ pub fn create_devmgr_with_caps(
     let serial_module = crate::find_module_by_name(info, b"serial");
     let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
     {
-        let mut module_caps = [0u32; 3];
+        let mut module_caps = [0u64; 3];
         let mut module_data = [0u64; 2 + 3];
         module_data[0] = kind::MODULE;
         let mut n = 0usize;
@@ -735,7 +735,7 @@ pub fn create_devmgr_with_caps(
         0
     };
 
-    let bundle_caps: [u32; 2] = [svcmgr_publish, arch_shutdown_cap];
+    let bundle_caps: [u64; 2] = [svcmgr_publish, arch_shutdown_cap];
     let bundle_cap_count = if arch_shutdown_cap != 0 { 2 } else { 1 };
 
     let _ = serve(
@@ -755,18 +755,18 @@ pub fn create_devmgr_with_caps(
 /// Endpoint set passed to vfsd via its bootstrap round.
 pub struct VfsdSpawnCaps
 {
-    pub registry_ep: u32,
-    pub vfsd_service_ep: u32,
+    pub registry_ep: u64,
+    pub vfsd_service_ep: u64,
 }
 
 /// Create vfsd via procmgr and serve its bootstrap.
 pub fn create_vfsd_with_caps(
     info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
+    procmgr_ep: u64,
+    bootstrap_ep: u64,
     spawn: &VfsdSpawnCaps,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<u64>
 {
     let vfsd_memory_cap = crate::find_module_by_name(info, b"vfsd")?;
     let vfsd_module_copy = module_spawn_copy(vfsd_memory_cap)?;
@@ -890,12 +890,12 @@ pub fn create_vfsd_with_caps(
 ///
 /// Returns `(process_handle, child_badge)` on success.
 pub fn create_svcmgr_from_file(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
+    procmgr_ep: u64,
+    bootstrap_ep: u64,
+    system_root_cap: u64,
+    init_self_cspace: u64,
     ipc_buf: *mut u64,
-) -> Option<(u32, u64)>
+) -> Option<(u64, u64)>
 {
     // SAFETY: `ipc_buf` is init's main-thread IPC buffer (`INIT_IPC_BUF_VA`,
     // registered in `run`), passed down unchanged.
@@ -971,26 +971,26 @@ pub fn create_svcmgr_from_file(
 /// so it can (re)launch real-logd any number of times.
 pub struct SvcmgrEndowment
 {
-    pub svcmgr_service_ep: u32,
-    pub svcmgr_bootstrap_ep: u32,
+    pub svcmgr_service_ep: u64,
+    pub svcmgr_bootstrap_ep: u64,
     /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). svcmgr
     /// derives the published `rootfs.root` SEND from it.
-    pub rootfs_root_cap: u32,
-    pub devmgr_registry_ep: u32,
+    pub rootfs_root_cap: u64,
+    pub devmgr_registry_ep: u64,
     /// vfsd's un-badged service endpoint. init mints the endowed
     /// `MOUNT_AUTHORITY` SEND (published as `vfsd.mount`) and the
     /// `DENY_BADGE` SEND (published as `vfsd.deny`) from it.
-    pub vfsd_service_ep: u32,
+    pub vfsd_service_ep: u64,
     /// Reserved master-log endpoint source (`cap_derive(log_ep, RIGHTS_ALL)`).
     /// svcmgr mints real-logd's master-log RECV from it on every (re)launch,
     /// plus the one-shot `HANDOVER_PULL` SEND on the first launch. Holding it
     /// keeps the endpoint object alive across a logd crash so log senders are
     /// agnostic to which process holds the RECV.
-    pub master_log_source: u32,
+    pub master_log_source: u64,
     /// Reserved badge-0 `SEND|GRANT` source on procmgr's service endpoint.
     /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch
     /// (used by logd to register sender death-notifications for slot reclaim).
-    pub procmgr_death_auth_source: u32,
+    pub procmgr_death_auth_source: u64,
 }
 
 /// Start svcmgr, then serve the handover endowment over the bootstrap
@@ -1033,8 +1033,8 @@ pub struct SvcmgrEndowment
 /// round, so it is serving its service endpoint: only then can it receive
 /// `HANDOVER_COMPLETE`, and phase 3 sends that only on `true`.
 fn endow_svcmgr(
-    bootstrap_ep: u32,
-    process_handle: u32,
+    bootstrap_ep: u64,
+    process_handle: u64,
     child_badge: u64,
     endow: &SvcmgrEndowment,
     thread_caps: ServiceThreadCaps,
@@ -1175,13 +1175,13 @@ fn endow_svcmgr(
 /// definition` orphan in svcmgr. logd is absent: it is a svcmgr-launched
 /// service (the `LOGD_SOURCES` round), not a parked substrate.
 fn serve_substrate_rounds(
-    bootstrap_ep: u32,
+    bootstrap_ep: u64,
     child_badge: u64,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
 ) -> Result<(), u64>
 {
-    let registrations: &[(&[u8], u32)] = &[
+    let registrations: &[(&[u8], u64)] = &[
         (b"memmgr", thread_caps.memmgr),
         (b"procmgr", thread_caps.procmgr),
         (b"devmgr", thread_caps.devmgr),
@@ -1221,7 +1221,7 @@ fn serve_substrate_rounds(
 /// svcmgr leaves its round loop (`request_round`) rather than block in it.
 /// Called only after a `NO_CHILD` failure, which leaves svcmgr's request
 /// pending, so the receive is answered. A further failure is logged.
-fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
+fn end_endowment(bootstrap_ep: u64, child_badge: u64, ipc_buf: *mut u64)
 {
     let empty = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
         master_log_source: 0,
@@ -1258,18 +1258,18 @@ fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    svcmgr_service_ep: u32,
-    devmgr_registry_ep: u32,
-    vfsd_service_ep: u32,
-    system_root_cap: u32,
-    log_ep: u32,
+    procmgr_ep: u64,
+    bootstrap_ep: u64,
+    svcmgr_service_ep: u64,
+    devmgr_registry_ep: u64,
+    vfsd_service_ep: u64,
+    system_root_cap: u64,
+    log_ep: u64,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
-    init_logd_thread_cap: u32,
-    mem_reap_floor: u32,
-    orphan_memory_caps: &[u32],
+    init_logd_thread_cap: u64,
+    mem_reap_floor: u64,
+    orphan_memory_caps: &[u64],
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1385,7 +1385,7 @@ pub fn phase3_svcmgr_handover(
 /// Send svcmgr `HANDOVER_COMPLETE` on its service endpoint through a SEND
 /// carrying the `HANDOVER_AUTHORITY` verb-bit, derived for the call and
 /// deleted after it. Logs the outcome; a failure is not fatal to init.
-fn send_handover_complete(svcmgr_service_ep: u32, ipc_buf: *mut u64)
+fn send_handover_complete(svcmgr_service_ep: u64, ipc_buf: *mut u64)
 {
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     match syscall::cap_derive_badge(
@@ -1420,7 +1420,7 @@ fn send_handover_complete(svcmgr_service_ep: u32, ipc_buf: *mut u64)
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
 /// SEND|GRANT.
-unsafe fn send_teardown_round(procmgr_ep: u32, slots: &[u32], ipc_buf: *mut u64)
+unsafe fn send_teardown_round(procmgr_ep: u64, slots: &[u64], ipc_buf: *mut u64)
 {
     if slots.is_empty()
     {
@@ -1447,7 +1447,7 @@ unsafe fn send_teardown_round(procmgr_ep: u32, slots: &[u32], ipc_buf: *mut u64)
 /// of the module-source `MemoryObject` and donates it to memmgr at reap. The
 /// loader borrows this copy (deriving a read-only child for the load-time
 /// mapping) and deletes it once the ELF is loaded.
-fn module_spawn_copy(module_memory_cap: u32) -> Option<u32>
+fn module_spawn_copy(module_memory_cap: u64) -> Option<u64>
 {
     syscall::cap_derive(module_memory_cap, syscall::RIGHTS_ALL).ok()
 }
@@ -1467,9 +1467,9 @@ fn module_spawn_copy(module_memory_cap: u32) -> Option<u32>
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
 /// `SEND|GRANT`.
 fn register_init_reap_objects(
-    procmgr_ep: u32,
+    procmgr_ep: u64,
     info: &InitInfo,
-    init_logd_thread_cap: u32,
+    init_logd_thread_cap: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -1511,10 +1511,10 @@ fn register_init_reap_objects(
 /// build (`docs/process-lifecycle.md` § Init reap).
 fn finish_init_reap_handoff(
     info: &InitInfo,
-    procmgr_ep: u32,
+    procmgr_ep: u64,
     ipc_buf: *mut u64,
-    mem_reap_floor: u32,
-    orphan_memory_caps: &[u32],
+    mem_reap_floor: u64,
+    orphan_memory_caps: &[u64],
 )
 {
     // Donate every `owns_memory` Memory cap init solely holds, streamed in
@@ -1548,10 +1548,10 @@ fn finish_init_reap_handoff(
         .acpi_region_memory_base
         .saturating_add(info.acpi_region_memory_count);
 
-    let mut chunk = [0u32; syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut chunk = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
     let mut cn = 0usize;
     {
-        let mut push = |slot: u32| {
+        let mut push = |slot: u64| {
             chunk[cn] = slot;
             cn += 1;
             if cn == chunk.len()

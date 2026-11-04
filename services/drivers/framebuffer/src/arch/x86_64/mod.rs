@@ -22,7 +22,7 @@ use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
 /// region `mmio_cap` names must span at most `total_pages` pages, so the
 /// whole-region mapping stays inside the reservation (`syscall::mmio_map`'s
 /// contract).
-pub unsafe fn fb_mmio_init(self_aspace: u32, mmio_cap: u32, total_pages: u64) -> Option<*mut u8>
+pub unsafe fn fb_mmio_init(self_aspace: u64, mmio_cap: u64, total_pages: u64) -> Option<*mut u8>
 {
     let range = reserve_pages(total_pages).ok()?;
     let base_va = range.va_start();

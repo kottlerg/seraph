@@ -14,7 +14,7 @@ use crate::ipc_util::ns::ns_lookup;
 
 /// Walk the per-test `/data/svctest` directory from the std-overlay
 /// root-dir cap and return the dir cap.
-pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u32
+pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u64
 {
     let root = std::os::seraph::root_dir_cap();
     let (data_cap, _kind, _) =
@@ -27,7 +27,7 @@ pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u32
 
 /// `FS_CREATE` returns `(node_cap, kind)` on success. Returns the wire
 /// error code on failure.
-pub fn fs_create(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
+pub fn fs_create(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(u64, u64), u64>
 {
     let label = ipc::fs_labels::FS_CREATE | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
@@ -42,7 +42,7 @@ pub fn fs_create(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32
 }
 
 /// `FS_MKDIR`. Same shape as `FS_CREATE`.
-pub fn fs_mkdir(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
+pub fn fs_mkdir(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(u64, u64), u64>
 {
     let label = ipc::fs_labels::FS_MKDIR | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
@@ -57,7 +57,7 @@ pub fn fs_mkdir(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32,
 }
 
 /// `FS_REMOVE`. Returns `Ok(())` on success.
-pub fn fs_remove(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
+pub fn fs_remove(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
 {
     let label = ipc::fs_labels::FS_REMOVE | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
@@ -71,7 +71,7 @@ pub fn fs_remove(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(), 
 }
 
 /// `FS_RENAME` within a single directory. Returns `Ok(())` on success.
-pub fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
+pub fn fs_rename(dir_cap: u64, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
 {
     let mut combined = Vec::with_capacity(src.len() + dst.len());
     combined.extend_from_slice(src);
@@ -92,7 +92,7 @@ pub fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Res
 
 /// `FS_WRITE` inline: returns `bytes_written`.
 pub fn fs_write_inline(
-    file_cap: u32,
+    file_cap: u64,
     offset: u64,
     payload: &[u8],
     ipc_buf: *mut u64,
@@ -114,7 +114,7 @@ pub fn fs_write_inline(
 
 /// Round-trip `FS_READ`: returns the bytes the driver reports.
 pub fn fs_read_bytes(
-    file_cap: u32,
+    file_cap: u64,
     offset: u64,
     max_len: u64,
     ipc_buf: *mut u64,

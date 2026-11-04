@@ -42,11 +42,10 @@ pub struct Message
     /// Actual number of valid entries in `data` (`0..=MSG_DATA_WORDS_MAX`).
     pub data_count: usize,
     /// Capability handles in transfer: on the send side, the sender's full
-    /// cap handles (index + generation) as unpacked from the syscall's two
-    /// packed words; after a completed transfer, rewritten to the
-    /// destination-side handles delivered to the recipient. Four because each
-    /// of the two packed words carries two `u32` handles (`MSG_CAP_SLOTS_MAX`).
-    pub cap_slots: [u32; MSG_CAP_SLOTS_MAX],
+    /// cap handles (index + generation) as copied from its IPC buffer's cap
+    /// block (`syscall::MSG_CAP_HANDLES_WORD`); after a completed transfer,
+    /// rewritten to the destination-side handles delivered to the recipient.
+    pub cap_slots: [u64; MSG_CAP_SLOTS_MAX],
     /// Actual number of valid entries in `cap_slots`.
     pub cap_count: usize,
 }
@@ -60,7 +59,7 @@ impl Default for Message
             badge: 0,
             data: [0u64; MSG_DATA_WORDS_MAX],
             data_count: 0,
-            cap_slots: [0u32; MSG_CAP_SLOTS_MAX],
+            cap_slots: [0u64; MSG_CAP_SLOTS_MAX],
             cap_count: 0,
         }
     }

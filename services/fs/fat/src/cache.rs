@@ -90,7 +90,7 @@ static SCRATCH_MEMORY: OnceLock<ScratchMemory> = OnceLock::new();
 /// only through [`PageCache::release_slot`].
 struct ScratchMemory
 {
-    cap: AtomicU32,
+    cap: AtomicU64,
     va: u64,
 }
 
@@ -126,7 +126,7 @@ struct CacheSlot
     /// different `CSpace` index, so the field is rewritten on every fill.
     /// Synchronisation is via the slot `refcount` `AcqRel` pair — readers
     /// load `memory_cap` only after a successful refcount bump.
-    memory_cap: AtomicU32,
+    memory_cap: AtomicU64,
     va: u64,
     refcount: AtomicU32,
     lru_seq: AtomicU64,
@@ -141,9 +141,9 @@ struct CacheSlot
 struct Quarantine
 {
     /// Caps of pages taken out of a slot while a client still mapped them.
-    held: Vec<u32>,
+    held: Vec<u64>,
     /// Caps of pages no address space maps, ready to replace a slot's page.
-    spare: Vec<u32>,
+    spare: Vec<u64>,
 }
 
 /// Process-wide page cache.
@@ -160,9 +160,9 @@ pub struct PageCache
     sector_size: AtomicU32,
     next_seq: AtomicU64,
     /// memmgr endpoint replacement pages are requested from.
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     /// The fs process's own address space, which maps every slot.
-    self_aspace: u32,
+    self_aspace: u64,
     quarantine: Mutex<Quarantine>,
     /// [`Self::pick_victim`]'s per-slot skip marks, one per slot, allocated
     /// at init so an eviction, which runs when memory is short, allocates
@@ -197,9 +197,9 @@ impl PageCache
     /// slots, allocate and map the scratch page, and return the
     /// process-static cache. Slot pages come later, one per slot on first use.
     pub fn init(
-        memmgr_ep: u32,
-        self_aspace: u32,
-        cspace: u32,
+        memmgr_ep: u64,
+        self_aspace: u64,
+        cspace: u64,
         ipc_buf: *mut u64,
     ) -> Result<&'static Self, InitError>
     {
@@ -231,7 +231,7 @@ impl PageCache
             .map_err(|_| InitError::Heap)?;
         slots.extend((0..slot_count).map(|i| CacheSlot {
             page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
-            memory_cap: AtomicU32::new(0),
+            memory_cap: AtomicU64::new(0),
             va: base_va + (i as u64) * PAGE_SIZE,
             refcount: AtomicU32::new(0),
             lru_seq: AtomicU64::new(0),
@@ -271,7 +271,7 @@ impl PageCache
             .map_err(|_| InitError::Map)?;
         SCRATCH_MEMORY
             .set(ScratchMemory {
-                cap: AtomicU32::new(scratch_cap),
+                cap: AtomicU64::new(scratch_cap),
                 va: scratch_va,
             })
             .ok();
@@ -367,7 +367,7 @@ impl PageCache
     /// Returns `false` when `data` is shorter than a sector, when no memory
     /// holds the sector's prior bytes, on cache acquire failure, missing
     /// scratch memory cap (cache init never ran), or block-driver error.
-    pub fn write_sector(&self, lba: u64, block_dev: u32, data: &[u8], ipc_buf: *mut u64) -> bool
+    pub fn write_sector(&self, lba: u64, block_dev: u64, data: &[u8], ipc_buf: *mut u64) -> bool
     {
         let len = self.sector_bytes();
         let Some(scratch) = SCRATCH_MEMORY.get()
@@ -432,7 +432,7 @@ impl PageCache
     /// Returns `false` when `buf` is shorter than a sector, the scratch
     /// memory cap is missing, or the read fails; `buf` and the cache are then
     /// unchanged.
-    pub fn reload_sector(&self, lba: u64, block_dev: u32, buf: &mut [u8], ipc_buf: *mut u64)
+    pub fn reload_sector(&self, lba: u64, block_dev: u64, buf: &mut [u8], ipc_buf: *mut u64)
     -> bool
     {
         let len = self.sector_bytes();
@@ -470,7 +470,7 @@ impl PageCache
     /// `buf`. Single-call helper for callers that don't need the underlying
     /// memory cap: handles page-fill-on-miss, hit refcounting, and release.
     /// Returns `false` when `buf` is shorter than a sector or the fill fails.
-    pub fn read_sector(&self, lba: u64, block_dev: u32, buf: &mut [u8], ipc_buf: *mut u64) -> bool
+    pub fn read_sector(&self, lba: u64, block_dev: u64, buf: &mut [u8], ipc_buf: *mut u64) -> bool
     {
         let len = self.sector_bytes();
         if buf.len() < len
@@ -507,7 +507,7 @@ impl PageCache
     pub fn acquire_page(
         &self,
         page_lba_base: u64,
-        block_dev: u32,
+        block_dev: u64,
         ipc_buf: *mut u64,
     ) -> Option<usize>
     {
@@ -520,7 +520,7 @@ impl PageCache
     /// Returns `0` if the slot is in a degraded state (cap lost on a
     /// previous fill failure). Callers must hold a refcount on the slot
     /// before observing the cap.
-    pub fn slot_memory_cap(&self, idx: usize) -> u32
+    pub fn slot_memory_cap(&self, idx: usize) -> u64
     {
         self.slots[idx].memory_cap.load(Ordering::Acquire)
     }
@@ -539,7 +539,7 @@ impl PageCache
         self.slots[idx].exposed.store(true, Ordering::Release);
     }
 
-    fn get_or_fill(&self, page_lba_base: u64, block_dev: u32, ipc_buf: *mut u64) -> Option<usize>
+    fn get_or_fill(&self, page_lba_base: u64, block_dev: u64, ipc_buf: *mut u64) -> Option<usize>
     {
         if let Some(i) = self.lookup_cached(page_lba_base)
         {
@@ -714,7 +714,7 @@ impl PageCache
     /// failure `old` is mapped back; when that fails too, the slot is left
     /// with no page ([`Swap::Lost`]). The slot is unreferenced, so no reader is
     /// inside its page.
-    fn swap_page(&self, slot: &CacheSlot, old: u32, fresh: u32) -> Swap
+    fn swap_page(&self, slot: &CacheSlot, old: u64, fresh: u64) -> Swap
     {
         // SAFETY: slot.va is this slot's page of the cache's reserved window,
         // which only the cache maps; the slot is unreferenced, so no read or
@@ -840,7 +840,7 @@ fn fill_via_block_dev(
     slot: &CacheSlot,
     page_lba_base: u64,
     sectors_per_page: u64,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -877,7 +877,7 @@ fn fill_via_block_dev(
 fn writeback_via_block_dev(
     scratch: &ScratchMemory,
     lba: u64,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -908,7 +908,7 @@ fn writeback_via_block_dev(
 fn read_one_via_block_dev(
     scratch: &ScratchMemory,
     lba: u64,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -936,7 +936,7 @@ fn read_one_via_block_dev(
 
 /// The pages of system RAM memmgr reports (`QUERY_POOL_STATUS` `data[0]`), or
 /// `None` when the query fails.
-fn query_system_ram_pages(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u64>
+fn query_system_ram_pages(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let req = IpcMessage::builder(memmgr_labels::QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
@@ -945,7 +945,7 @@ fn query_system_ram_pages(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u64>
 }
 
 /// Acquire one single-page Memory cap from memmgr.
-fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
+fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)

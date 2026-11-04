@@ -30,9 +30,9 @@ const _: () = assert!(NUM_CHILDREN <= 32);
 #[derive(Clone, Copy)]
 struct MapperArgs
 {
-    done: u32,
-    memory: u32,
-    aspace: u32,
+    done: u64,
+    memory: u64,
+    aspace: u64,
     done_bit: u64,
 }
 
@@ -52,7 +52,7 @@ const VA_STRIDE: u64 = 0x1_0000;
 /// frames and the first `spawned` children are live.
 struct Mappers
 {
-    frames: [u32; NUM_CHILDREN],
+    frames: [u64; NUM_CHILDREN],
     allocated: usize,
     children: [spawn::SpawnedChild; NUM_CHILDREN],
     spawned: usize,
@@ -85,7 +85,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Allocate one pool frame per child, then start each child on its own
 /// frame and VA, recording each frame and child in `mappers` as soon as it
 /// exists.
-fn start_mappers(ctx: &TestContext, done: u32, mappers: &mut Mappers) -> TestResult
+fn start_mappers(ctx: &TestContext, done: u64, mappers: &mut Mappers) -> TestResult
 {
     for i in 0..NUM_CHILDREN
     {
@@ -139,7 +139,7 @@ fn start_mappers(ctx: &TestContext, done: u32, mappers: &mut Mappers) -> TestRes
 }
 
 /// Wait for every child's done bit; fail if any child reported failure.
-fn await_mappers(done: u32) -> TestResult
+fn await_mappers(done: u64) -> TestResult
 {
     let all_done = (1u64 << NUM_CHILDREN) - 1;
     let mut done_bits: u64 = 0;

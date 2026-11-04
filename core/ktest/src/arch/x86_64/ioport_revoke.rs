@@ -50,7 +50,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     result
 }
 
-fn check(ctx: &TestContext, held: u32) -> TestResult
+fn check(ctx: &TestContext, held: u64) -> TestResult
 {
     let granted = cap_derive(held, syscall::RIGHTS_ALL)
         .map_err(|_| "integration::ioport_revoke: cap_derive(granted) failed")?;

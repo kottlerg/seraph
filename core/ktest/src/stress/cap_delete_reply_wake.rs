@@ -114,6 +114,25 @@ static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 // own IPC syscalls (kernel-synchronous), never aliased across cycles.
 static mut CLIENT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
+/// The two cap handles both child entries take, in the child's own `CSpace`;
+/// handed to each child by address. Each child reads its dedicated IPC buffer
+/// from its module static.
+#[derive(Clone, Copy)]
+struct ChildArgs
+{
+    ep: u64,
+    done: u64,
+}
+
+/// [`ChildArgs`] entry of the server.
+const SERVER_ARGS: usize = 0;
+
+/// [`ChildArgs`] entry of the client.
+const CLIENT_ARGS: usize = 1;
+
+static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 2> =
+    spawn::ArgBlock::new(ChildArgs { ep: 0, done: 0 });
+
 // too_many_lines: one stress cell's setup, cycle loop, and teardown; the two
 // child starts' `unsafe` wrappers push it past the limit, and splitting would
 // thread each cycle's caps and stacks through helpers.
@@ -154,9 +173,17 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client ep failed")?;
         let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client done failed")?;
-        // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
-        // dedicated IPC buffer address from the static directly.
-        let client_arg = u64::from(client_ep) | (u64::from(client_done) << 32);
+        // SAFETY: CLIENT_ARGS < 2; the previous cycle's client, the entry's
+        // only reader, has been reaped.
+        let client_arg = unsafe {
+            CHILD_ARGS.publish(
+                CLIENT_ARGS,
+                ChildArgs {
+                    ep: client_ep,
+                    done: client_done,
+                },
+            )
+        };
         // SAFETY: stack index 1 is the client's; sequential cycles never alias.
         let client_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
         // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
@@ -191,7 +218,17 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server ep failed")?;
         let server_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server done failed")?;
-        let server_arg = u64::from(server_ep) | (u64::from(server_done) << 32);
+        // SAFETY: SERVER_ARGS < 2; the previous cycle's server, the entry's
+        // only reader, has been reaped.
+        let server_arg = unsafe {
+            CHILD_ARGS.publish(
+                SERVER_ARGS,
+                ChildArgs {
+                    ep: server_ep,
+                    done: server_done,
+                },
+            )
+        };
         // SAFETY: stack index 0 is the server's; sequential cycles never alias.
         let server_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
         // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
@@ -280,16 +317,13 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child entries ───────────────────────────────────────────────────────────
 
-/// Decode the two packed fields shared by both child entries:
-/// `ep_slot[31:0]`, `done_slot[63:32]` (cap handles in the child's own
-/// `CSpace`). Each child reads its dedicated IPC buffer from its module static.
-// cast_possible_truncation: ep/done are kernel cap slot indices < 2^32.
-#[allow(clippy::cast_possible_truncation)]
-fn decode(arg: u64) -> (u32, u32)
+/// Decode the [`ChildArgs`] entry `run` published for this child at `arg`.
+fn decode(arg: u64) -> (u64, u64)
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
-    (ep_slot, done_slot)
+    // SAFETY: `arg` is the entry `run` published for this child, which the
+    // parent does not rewrite until the child is reaped.
+    let ChildArgs { ep, done } = unsafe { spawn::child_args(arg) };
+    (ep, done)
 }
 
 /// Server: receive one caller (making it `BlockedOnReply`), announce the reply

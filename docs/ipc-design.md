@@ -88,9 +88,12 @@ The kernel reads from the sender's page and writes to the receiver's page
 directly — no arbitrary user pointer dereference, no heap allocation. The error
 surface of a missing or unmapped page, on the sending and the delivery side, is
 specified in [syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IPC_BUFFER_SET`.
-Capability handles always travel in registers on the send side, regardless
-of payload size; the delivered destination handles reach the receiver
-through the cap-transfer result block in its IPC buffer page. Message labels,
+The IPC buffer page also carries the capability handles, in a cap block after the
+data words: the sender writes the full handles of the caps it transfers there
+(one `u64` handle per word from `MSG_CAP_HANDLES_WORD`), and the kernel writes the
+delivered destination handles to the same words of the receiver's page, after the
+delivered count at word `MSG_DATA_WORDS_MAX`. A message that transfers caps therefore
+needs a registered page, as one that carries data words does. Message labels,
 counts, and badges travel in registers.
 
 For bulk data, pass a shared memory capability instead.

@@ -185,10 +185,10 @@ static QUIT: AtomicU32 = AtomicU32::new(0);
 static RACER_EXITED: AtomicU32 = AtomicU32::new(0);
 /// The round's source, a handle in ktest's `CSpace`, published before the
 /// round's waiter starts.
-static SOURCE: AtomicU32 = AtomicU32::new(0);
+static SOURCE: AtomicU64 = AtomicU64::new(0);
 /// The round's waiter, a handle in ktest's `CSpace`, published before the
 /// racer is armed.
-static WAITER: AtomicU32 = AtomicU32::new(0);
+static WAITER: AtomicU64 = AtomicU64::new(0);
 /// Controller → racer: the round, counted from 1, whose waiter it is to act
 /// on, published after [`WAITER`]; racer → controller: the round whose
 /// action it has finished, after [`RACER_RESULT`].
@@ -318,9 +318,9 @@ impl Race
 #[derive(Default)]
 struct RoundParts
 {
-    source: Option<u32>,
-    member: Option<u32>,
-    waiter: Option<u32>,
+    source: Option<u64>,
+    member: Option<u64>,
+    waiter: Option<u64>,
 }
 
 /// What a phase saw.
@@ -523,8 +523,6 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
     for counter in [
         &QUIT,
         &RACER_EXITED,
-        &SOURCE,
-        &WAITER,
         &ARMED,
         &RACER_DONE,
         &WAITS_ENTERED,
@@ -540,6 +538,8 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
     {
         counter.store(0, Ordering::Release);
     }
+    SOURCE.store(0, Ordering::Release);
+    WAITER.store(0, Ordering::Release);
     RACER_RESULT.store(RESULT_OK, Ordering::Release);
     for tally in [&BAD_WAITS, &BAD_ACTIONS]
     {
@@ -589,7 +589,7 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
 }
 
 /// Start the served-call phases' server (none for any other kind).
-fn start_server(ctx: &TestContext, kind: Kind, server: &mut Option<u32>) -> TestResult
+fn start_server(ctx: &TestContext, kind: Kind, server: &mut Option<u64>) -> TestResult
 {
     if kind != Kind::CallServed
     {
@@ -699,7 +699,7 @@ fn start_waiter(
     entered_before: u32,
     parts: &mut RoundParts,
     seen: &mut Seen,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let waiter = create_thread(
         ctx,
@@ -772,7 +772,7 @@ fn settle_round(
 /// to exit on the deleted handle. A stop that found the waiter already
 /// exited answers `InvalidState`, and its restart `InvalidArgument`.
 fn settle_stopped(
-    waiter: u32,
+    waiter: u64,
     action: u64,
     entered_before: u32,
     done_before: u32,
@@ -910,7 +910,7 @@ fn release_round(parts: &RoundParts) -> TestResult
 /// else can fail, and return the handle the waiter parks on. A wait set gets
 /// a notification member, which nothing ever signals.
 fn create_source(ctx: &TestContext, kind: Kind, parts: &mut RoundParts)
--> Result<u32, &'static str>
+-> Result<u64, &'static str>
 {
     let created = match kind
     {
@@ -940,12 +940,12 @@ fn create_source(ctx: &TestContext, kind: Kind, parts: &mut RoundParts)
 /// returned.
 fn create_thread(
     ctx: &TestContext,
-    slot: &mut Option<u32>,
+    slot: &mut Option<u64>,
     entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
     cpu: u32,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let th = *slot.insert(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
@@ -1013,7 +1013,7 @@ fn error_word(error: SyscallError) -> u64
 
 /// Block on `source` of `kind`; returns the value delivered (for an endpoint,
 /// the message label), which nothing in this cell ever produces.
-fn wait(kind: Kind, source: u32, buf: *mut u64) -> Result<u64, i64>
+fn wait(kind: Kind, source: u64, buf: *mut u64) -> Result<u64, i64>
 {
     match kind
     {

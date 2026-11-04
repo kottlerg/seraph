@@ -36,13 +36,13 @@ use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
 
 use crate::{TestContext, TestResult};
 
-fn read_available(memory_cap: u32) -> Result<u64, &'static str>
+fn read_available(memory_cap: u64) -> Result<u64, &'static str>
 {
     cap_info(memory_cap, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "integration::retype_reclaim: cap_info(MEMORY_AVAILABLE) failed")
 }
 
-fn assert_baseline(label: &'static str, memory_cap: u32, baseline: u64) -> TestResult
+fn assert_baseline(label: &'static str, memory_cap: u64, baseline: u64) -> TestResult
 {
     let now = read_available(memory_cap)?;
     if now != baseline

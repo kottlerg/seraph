@@ -154,7 +154,7 @@ pub enum EntryTarget
     {
         /// Unbadged SEND on the peer server's namespace endpoint, held
         /// by this server and never handed out directly.
-        endpoint: u32,
+        endpoint: u64,
         /// Peer-side node the mount resolves to (`NodeId::ROOT` for a
         /// whole-filesystem mount).
         node: NodeId,
@@ -196,7 +196,7 @@ pub struct EntryView
 pub struct MemoryReply
 {
     /// Single-page Memory cap (`MAP` rights) covering the cached page.
-    pub memory_cap: u32,
+    pub memory_cap: u64,
     /// Bytes of valid file content starting at `memory_data_offset`.
     pub bytes_valid: u32,
     /// Byte offset within the returned page at which valid content
@@ -327,7 +327,7 @@ pub trait NamespaceBackend
 pub unsafe fn dispatch_request<B: NamespaceBackend>(
     backend: &mut B,
     received: &ipc::IpcMessage,
-    namespace_endpoint: u32,
+    namespace_endpoint: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -372,7 +372,7 @@ pub(crate) fn decode_caller_requested(raw_req: u64) -> NamespaceRights
 fn handle_lookup<B: NamespaceBackend>(
     backend: &mut B,
     msg: &ipc::IpcMessage,
-    namespace_endpoint: u32,
+    namespace_endpoint: u64,
 ) -> ipc::IpcMessage
 {
     let (parent, parent_rights) = badge::unpack(msg.badge);

@@ -57,7 +57,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-fn map_all(ctx: &TestContext, granted: u32) -> TestResult
+fn map_all(ctx: &TestContext, granted: u64) -> TestResult
 {
     for i in (0..PLACES).chain(core::iter::once(PLACES - 1))
     {

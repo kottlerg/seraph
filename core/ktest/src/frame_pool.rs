@@ -66,7 +66,7 @@ const PAGE_SIZE: u64 = 0x1000;
 
 /// Return the byte size of the Memory cap occupying `slot`, or `None` if no
 /// Memory descriptor matches.
-fn find_frame_size(info: &InitInfo, slot: u32) -> Option<u64>
+fn find_frame_size(info: &InitInfo, slot: u64) -> Option<u64>
 {
     for d in crate::init_info::descriptors(info)
     {
@@ -87,7 +87,7 @@ static POOL_AVAILABLE: AtomicU64 = AtomicU64::new(0);
 ///
 /// Initialized once at startup by splitting the tail carved off the first RAM
 /// Memory cap into single-page caps.
-static mut POOL_SLOTS: [u32; POOL_SIZE] = [0; POOL_SIZE];
+static mut POOL_SLOTS: [u64; POOL_SIZE] = [0; POOL_SIZE];
 
 /// Number of frames in the pool (set during init).
 static POOL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -101,7 +101,7 @@ static POOL_COUNT: AtomicU32 = AtomicU32::new(0);
 /// # Safety
 ///
 /// Must be called only during `init()`, before any concurrent access.
-unsafe fn split_frame_recursive(memory_cap: u32, count: &mut usize)
+unsafe fn split_frame_recursive(memory_cap: u64, count: &mut usize)
 {
     if *count >= POOL_SIZE
     {
@@ -276,7 +276,7 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
 /// Returns the memory capability slot, or `None` if the pool is exhausted.
 /// Caller must call `free()` when done to return the frame to the pool.
 #[must_use]
-pub fn alloc() -> Option<u32>
+pub fn alloc() -> Option<u64>
 {
     loop
     {
@@ -311,7 +311,7 @@ pub fn alloc() -> Option<u32>
 ///
 /// - `memory_cap` must be a cap previously returned by `alloc()`
 /// - Caller must have unmapped all pages using this frame
-pub unsafe fn free(memory_cap: u32)
+pub unsafe fn free(memory_cap: u64)
 {
     // Find the slot index
     let count = POOL_COUNT.load(Ordering::Acquire) as usize;
@@ -341,8 +341,8 @@ pub unsafe fn free(memory_cap: u32)
 /// fails is logged and not returned to the pool.
 pub struct FrameGuard
 {
-    memory_cap: u32,
-    aspace_cap: u32,
+    memory_cap: u64,
+    aspace_cap: u64,
     mapped_va: Option<u64>,
 }
 
@@ -350,7 +350,7 @@ impl FrameGuard
 {
     /// Allocate a frame from the pool.
     #[must_use]
-    pub fn new(aspace_cap: u32) -> Option<Self>
+    pub fn new(aspace_cap: u64) -> Option<Self>
     {
         alloc().map(|memory_cap| FrameGuard {
             memory_cap,
@@ -361,7 +361,7 @@ impl FrameGuard
 
     /// Get the memory capability slot.
     #[must_use]
-    pub fn cap(&self) -> u32
+    pub fn cap(&self) -> u64
     {
         self.memory_cap
     }

@@ -23,7 +23,7 @@ pub fn next_cluster(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
@@ -45,7 +45,7 @@ pub fn chain_next(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<Option<u32>, FatError>
 {
@@ -179,7 +179,7 @@ pub fn read_file_data(
     req: &FileRead,
     state: &mut FatState,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     out: &mut [u8],
 ) -> Result<usize, FatError>

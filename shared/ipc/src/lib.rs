@@ -31,7 +31,7 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
-use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
+use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 // ── IPC label constants ─────────────────────────────────────────────────────
 //
@@ -446,7 +446,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 6;
+pub const MEMMGR_LABELS_VERSION: u32 = 7;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -684,10 +684,12 @@ pub mod memmgr_bootstrap
     /// Phys-table `u64` index of the first in-use arena descriptor.
     pub const IN_USE_BASE_IDX: usize = 3;
     /// `u64` words per in-use arena descriptor:
-    /// * word 0 — `cap_slot` (low 32 bits) | `page_count` (high 32 bits).
-    /// * word 1 — `phys_base`.
-    /// * word 2 — `kind` (see `IN_USE_KIND_*`).
-    pub const IN_USE_WORDS: usize = 3;
+    /// * word 0 — `cap_slot`, the arena Memory cap's handle in memmgr's
+    ///   `CSpace`.
+    /// * word 1 — `page_count`.
+    /// * word 2 — `phys_base`.
+    /// * word 3 — `kind` (see `IN_USE_KIND_*`).
+    pub const IN_USE_WORDS: usize = 4;
     /// Maximum in-use arenas init forwards (memmgr-self, procmgr, init, slack).
     /// `IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS` must stay within the
     /// 512-slot page.
@@ -1893,7 +1895,7 @@ pub enum ReadyError
 /// [`ReadyError::Call`] when the call fails, and [`ReadyError::Refused`]
 /// with devmgr's reply label when devmgr does not accept the report. Either
 /// way devmgr serves no client the driver, which then exits.
-pub unsafe fn report_driver_ready(devmgr_ep: u32, ipc_buf: *mut u64) -> Result<(), ReadyError>
+pub unsafe fn report_driver_ready(devmgr_ep: u64, ipc_buf: *mut u64) -> Result<(), ReadyError>
 {
     let request = IpcMessage::builder(devmgr_labels::DRIVER_READY)
         .word(0, u64::from(DEVMGR_LABELS_VERSION))
@@ -2817,7 +2819,7 @@ pub struct IpcMessage
     /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX` (4), far
     /// below `u8::MAX`.
     cap_count: u8,
-    cap_slots: [u32; MSG_CAP_SLOTS_MAX],
+    cap_slots: [u64; MSG_CAP_SLOTS_MAX],
 }
 
 impl IpcMessage
@@ -2897,7 +2899,7 @@ impl IpcMessage
     /// delivered destination handles; on a message being built, the full
     /// handles to transfer (see [`IpcMessageBuilder::cap`]).
     #[must_use]
-    pub fn caps(&self) -> &[u32]
+    pub fn caps(&self) -> &[u64]
     {
         &self.cap_slots[..self.cap_count as usize]
     }
@@ -2936,12 +2938,11 @@ impl IpcMessage
         // = 64 + 1 + 4 = 69 < 512 (4 KiB / 8 B).
         let cap_count_raw = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX)) };
         let cap_count = (cap_count_raw as usize).min(MSG_CAP_SLOTS_MAX);
-        let mut cap_slots = [0u32; MSG_CAP_SLOTS_MAX];
+        let mut cap_slots = [0u64; MSG_CAP_SLOTS_MAX];
         for (i, slot) in cap_slots.iter_mut().take(cap_count).enumerate()
         {
             // SAFETY: offset bounded as above.
-            *slot =
-                unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX + 1 + i)) } as u32;
+            *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD + i)) };
         }
         Self {
             label,
@@ -2953,13 +2954,15 @@ impl IpcMessage
         }
     }
 
-    /// Write the populated data words into the IPC buffer.
+    /// Write the populated data words and the cap handles to transfer into
+    /// the IPC buffer.
     ///
     /// Used by the `ipc_call` / `ipc_reply` wrappers before issuing the
-    /// syscall. Cap handles are passed as syscall arguments; the sender
-    /// does not write cap metadata into the buffer (the kernel installs
-    /// caps in the receiver and writes the receiver-side handles into
-    /// the receiver's buffer).
+    /// syscall. The handles go to the cap block (word
+    /// `MSG_CAP_HANDLES_WORD` on), where the kernel reads the `cap_count`
+    /// the syscall names; the count itself travels in a register. The
+    /// kernel installs the caps in the receiver and writes the
+    /// receiver-side handles into the receiver's buffer.
     ///
     /// # Safety
     /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
@@ -2973,6 +2976,13 @@ impl IpcMessage
             // `i < MSG_DATA_WORDS_MAX` and the offset is within the
             // 4 KiB buffer. Caller guarantees pointer validity.
             unsafe { core::ptr::write_volatile(ipc_buf.add(i), val) };
+        }
+        for (i, &handle) in self.caps().iter().enumerate()
+        {
+            // SAFETY: `caps()` holds at most MSG_CAP_SLOTS_MAX handles, and
+            // `syscall_abi` asserts the cap block ends inside the 4 KiB
+            // buffer. Caller guarantees pointer validity.
+            unsafe { core::ptr::write_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD + i), handle) };
         }
     }
 }
@@ -3102,7 +3112,7 @@ impl IpcMessageBuilder
     /// appended (the slot array bounds check); a message's cap count is a
     /// protocol constant, so an overrun is a programmer error.
     #[must_use]
-    pub fn cap(mut self, handle: u32) -> Self
+    pub fn cap(mut self, handle: u64) -> Self
     {
         let i = self.msg.cap_count as usize;
         self.msg.cap_slots[i] = handle;
@@ -3174,16 +3184,14 @@ impl IpcMessageBuilder
 /// rejected before blocking; a refusal arising only afterwards delivers the
 /// message with zero caps (the caller keeps its capabilities).
 #[inline]
-pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
     unsafe {
         msg.write_to_ipc_buf(ipc_buf);
     }
-    let caps = msg.caps();
-    let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
     let (reply_label, reply_word_count) =
-        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)?;
+        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), msg.caps().len())?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
     // reply (data + cap metadata) into it before return. `reply_word_count`
     // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
@@ -3221,7 +3229,7 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 /// The first four refuse the receive before any pending reply is released,
 /// so a pending caller stays bound.
 #[inline]
-pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+pub unsafe fn ipc_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
     let (label, badge, word_count) = syscall::raw_ipc_recv(ep)?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote data +
@@ -3265,9 +3273,7 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
     unsafe {
         msg.write_to_ipc_buf(ipc_buf);
     }
-    let caps = msg.caps();
-    let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
-    syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)
+    syscall::raw_ipc_reply(msg.label, msg.word_count(), msg.caps().len())
 }
 
 #[cfg(test)]
@@ -3277,7 +3283,7 @@ mod tests
 
     /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one
     /// transferred cap per entry of `caps`.
-    fn grant_reply(label: u64, words: &[u64], caps: &[u32]) -> IpcMessage
+    fn grant_reply(label: u64, words: &[u64], caps: &[u64]) -> IpcMessage
     {
         let mut b = IpcMessage::builder(label).words(0, words);
         for &c in caps

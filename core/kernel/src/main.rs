@@ -1012,23 +1012,23 @@ unsafe fn kernel_entry_post_rebase(
             let info = InitInfo {
                 version: INIT_PROTOCOL_VERSION,
                 cap_descriptor_count: desc_count as u32,
-                aspace_cap: init_aspace_cap_slot,
-                sched_control_cap: cspace_layout.sched_control_slot,
-                memory_base: cspace_layout.memory_base,
-                memory_count: cspace_layout.memory_count,
-                segment_memory_base,
-                segment_memory_count,
-                hw_cap_base: cspace_layout.hw_cap_base,
-                hw_cap_count: cspace_layout.hw_cap_count,
+                aspace_cap: u64::from(init_aspace_cap_slot),
+                sched_control_cap: u64::from(cspace_layout.sched_control_slot),
+                memory_base: u64::from(cspace_layout.memory_base),
+                memory_count: u64::from(cspace_layout.memory_count),
+                segment_memory_base: u64::from(segment_memory_base),
+                segment_memory_count: u64::from(segment_memory_count),
+                hw_cap_base: u64::from(cspace_layout.hw_cap_base),
+                hw_cap_count: u64::from(cspace_layout.hw_cap_count),
                 cap_descriptors_offset: descriptors_offset,
                 thread_cap: 0, // patched below after Thread cap is minted
-                sbi_control_cap: cspace_layout.sbi_control_slot,
+                sbi_control_cap: u64::from(cspace_layout.sbi_control_slot),
                 cspace_cap: 0, // patched below after CSpace cap is minted
-                irq_range_cap: cspace_layout.irq_range_slot,
-                acpi_rsdp_memory_cap: cspace_layout.acpi_rsdp_memory_slot,
-                acpi_region_memory_base: cspace_layout.acpi_region_memory_base,
-                acpi_region_memory_count: cspace_layout.acpi_region_memory_count,
-                dtb_memory_cap: cspace_layout.dtb_memory_slot,
+                irq_range_cap: u64::from(cspace_layout.irq_range_slot),
+                acpi_rsdp_memory_cap: u64::from(cspace_layout.acpi_rsdp_memory_slot),
+                acpi_region_memory_base: u64::from(cspace_layout.acpi_region_memory_base),
+                acpi_region_memory_count: u64::from(cspace_layout.acpi_region_memory_count),
+                dtb_memory_cap: u64::from(cspace_layout.dtb_memory_slot),
                 init_stack_memory_base: 0,  // patched after stack mint
                 init_stack_memory_count: 0, // patched after stack mint
                 init_info_memory_base: 0,   // patched after self-mint below
@@ -1109,8 +1109,8 @@ unsafe fn kernel_entry_post_rebase(
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let info_ptr = info_base.cast::<InitInfo>();
-                (*info_ptr).init_info_memory_base = info_memory_base_slot;
-                (*info_ptr).init_info_memory_count = info_pages as u32;
+                (*info_ptr).init_info_memory_base = u64::from(info_memory_base_slot);
+                (*info_ptr).init_info_memory_count = info_pages as u64;
             }
 
             kprintln!(
@@ -1219,8 +1219,8 @@ unsafe fn kernel_entry_post_rebase(
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
-            (*info_ptr).init_stack_memory_base = init_stack_memory_base;
-            (*info_ptr).init_stack_memory_count = init_stack_memory_count;
+            (*info_ptr).init_stack_memory_base = u64::from(init_stack_memory_base);
+            (*info_ptr).init_stack_memory_count = u64::from(init_stack_memory_count);
         }
 
         // Patch the immutable memory-accounting facts. All `owns_memory` Memory
@@ -1460,8 +1460,8 @@ unsafe fn kernel_entry_post_rebase(
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
-            (*info_ptr).thread_cap = init_thread_cap_slot;
-            (*info_ptr).cspace_cap = init_cspace_cap_slot;
+            (*info_ptr).thread_cap = u64::from(init_thread_cap_slot);
+            (*info_ptr).cspace_cap = u64::from(init_cspace_cap_slot);
         }
 
         // Bind init's TCB to the root CSpace. The CSpace lives inside a SEED

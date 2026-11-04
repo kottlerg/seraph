@@ -14,7 +14,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::pin::Pin;
-use crate::sync::atomic::AtomicU32;
+use crate::sync::atomic::{AtomicU32, AtomicU64};
 use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use crate::time::Duration;
 
@@ -24,7 +24,7 @@ const PARKED: u32 = 2;
 
 pub struct Parker {
     state: AtomicU32,
-    notification: AtomicU32,
+    notification: AtomicU64,
 }
 
 impl Parker {
@@ -32,7 +32,7 @@ impl Parker {
     /// `parker` must be a properly-aligned, writable `*mut Parker`.
     pub unsafe fn new_in_place(parker: *mut Parker) {
         unsafe {
-            parker.write(Self { state: AtomicU32::new(EMPTY), notification: AtomicU32::new(0) });
+            parker.write(Self { state: AtomicU32::new(EMPTY), notification: AtomicU64::new(0) });
         }
     }
 
@@ -122,7 +122,7 @@ impl Drop for Parker {
     }
 }
 
-fn ensure_notification(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU64) -> u64 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;

@@ -61,7 +61,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     result
 }
 
-fn check(ctx: &TestContext, held: u32) -> TestResult
+fn check(ctx: &TestContext, held: u64) -> TestResult
 {
     // Every early return below leaves `granted` derived from `held`, so the
     // caller's delete of `held` hands it to the boot capability, and its own

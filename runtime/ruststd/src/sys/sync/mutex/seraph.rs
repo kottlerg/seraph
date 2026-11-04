@@ -27,7 +27,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::sync::atomic::AtomicU32;
+use crate::sync::atomic::{AtomicU32, AtomicU64};
 use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 
 const UNLOCKED: u32 = 0;
@@ -36,13 +36,13 @@ const CONTENDED: u32 = 2;
 
 pub struct Mutex {
     state: AtomicU32,
-    notification: AtomicU32,
+    notification: AtomicU64,
 }
 
 impl Mutex {
     #[inline]
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(UNLOCKED), notification: AtomicU32::new(0) }
+        Self { state: AtomicU32::new(UNLOCKED), notification: AtomicU64::new(0) }
     }
 
     #[inline]
@@ -121,7 +121,7 @@ impl Drop for Mutex {
 
 /// Lazily allocate a Notification cap on first contention. Returns 0 if allocation
 /// fails; callers fall back to busy-spinning.
-fn ensure_notification(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU64) -> u64 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;

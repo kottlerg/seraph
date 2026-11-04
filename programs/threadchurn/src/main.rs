@@ -88,7 +88,7 @@ const SLACK: u64 = 4;
 /// of pages other services churn during the run.
 const POOL_SLACK_BYTES: u64 = 1024 * 1024;
 
-fn used_slots(cspace: u32) -> u64
+fn used_slots(cspace: u64) -> u64
 {
     syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_USED)
         .expect("cap_info(CSPACE_USED) on self_cspace")
@@ -114,7 +114,7 @@ fn spawn_join(i: u64)
 /// the barrier until all are spawned), then released and reaped, with the
 /// slot count checked against the count before the burst. Returns whether
 /// the burst passed; a failure has printed its FAIL line.
-fn held_burst(cspace: u32) -> bool
+fn held_burst(cspace: u64) -> bool
 {
     if !std::os::seraph::fund_cspace_slot_budget(cspace, HELD_BURST as u64 * BURST_SLOTS_PER_THREAD)
     {

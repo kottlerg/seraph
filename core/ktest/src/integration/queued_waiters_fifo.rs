@@ -135,8 +135,8 @@ enum Expect
 #[derive(Clone, Copy)]
 struct ChildArgs
 {
-    obj_cap: u32,
-    done: u32,
+    obj_cap: u64,
+    done: u64,
     kind: Kind,
     waiter: Waiter,
     timeout_ms: u64,
@@ -267,8 +267,8 @@ fn tail_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 struct Phase
 {
     kind: Kind,
-    obj_cap: u32,
-    done: u32,
+    obj_cap: u64,
+    done: u64,
     children: [Option<spawn::SpawnedChild>; 2],
     acc: u64,
 }

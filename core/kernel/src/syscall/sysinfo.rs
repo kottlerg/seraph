@@ -108,15 +108,12 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
 /// Returns `InvalidAddress` if the virtual address is not mapped or
 /// fails the alignment/range checks.
 #[cfg(not(test))]
-// cast_possible_truncation: capability handles are u32 by ABI contract; the
-// truncation discards any upper 32 bits a caller sets.
-#[allow(clippy::cast_possible_truncation)]
 pub fn sys_aspace_query(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
     use crate::cap::slot::AsRights;
 
-    let aspace_idx = tf.arg(0) as u32;
+    let aspace_idx = tf.arg(0);
     let virt = tf.arg(1);
 
     // Virtual address must be page-aligned.

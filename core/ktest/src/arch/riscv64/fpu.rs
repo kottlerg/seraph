@@ -238,8 +238,8 @@ pub fn preempt_capture(pattern: u64, iters: u64) -> u64
 pub fn notification_rendezvous_capture(
     pattern: u64,
     spin: u64,
-    sig_ready: u32,
-    sig_resume: u32,
+    sig_ready: u64,
+    sig_resume: u64,
 ) -> u64
 {
     let mut buf = [0u64; 32];
@@ -342,8 +342,8 @@ pub fn notification_rendezvous_capture(
             p = in(reg) pattern,
             b = in(reg) buf.as_mut_ptr(),
             it = inout(reg) spin => _,
-            sig_ready = in(reg) u64::from(sig_ready),
-            sig_resume = in(reg) u64::from(sig_resume),
+            sig_ready = in(reg) sig_ready,
+            sig_resume = in(reg) sig_resume,
             out("a0") _, out("a1") _, out("a7") _,
             options(nostack),
         );
@@ -366,7 +366,7 @@ pub fn notification_rendezvous_capture(
 /// mismatched-lane count. The caller has registered its IPC buffer.
 // too_many_lines: 32 FP loads, the ecall, and 32 FP stores dominate the body.
 #[allow(clippy::too_many_lines)]
-pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u32, msg_label: u64) -> u64
+pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
 {
     let mut buf = [0u64; 32];
 
@@ -417,8 +417,8 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u32, msg_label: u64) -> u64
             "2:",
             "addi {it}, {it}, -1",
             "bnez {it}, 2b",
-            // SYS_IPC_CALL(ep, msg_label, data=0, caps=0,
-            // cap_handles_lo=0, cap_handles_hi=0).
+            // SYS_IPC_CALL(ep, msg_label, data=0, caps=0); args 4-5 are
+            // unused and passed as zero.
             "li a7, 0",
             "mv a0, {ep}",
             "mv a1, {label}",
@@ -467,7 +467,7 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u32, msg_label: u64) -> u64
             p = in(reg) pattern,
             b = in(reg) buf.as_mut_ptr(),
             it = inout(reg) spin => _,
-            ep = in(reg) u64::from(ep),
+            ep = in(reg) ep,
             label = in(reg) msg_label,
             out("a0") _, out("a1") _, out("a2") _, out("a3") _, out("a4") _,
             out("a5") _, out("a7") _,

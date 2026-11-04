@@ -100,7 +100,7 @@ fn check_cwd()
 
 /// Assert the bootstrap seeds survived the (re)spawn: the recipe declares
 /// `seed = svcmgr pwrmgr.deny`, so both slots must be present and non-zero.
-fn check_seeds(svcmgr_cap: u32, second_cap: u32, cap_count: usize)
+fn check_seeds(svcmgr_cap: u64, second_cap: u64, cap_count: usize)
 {
     if cap_count == 2 && svcmgr_cap != 0 && second_cap != 0
     {
@@ -118,7 +118,7 @@ fn check_seeds(svcmgr_cap: u32, second_cap: u32, cap_count: usize)
 /// Request the generic bootstrap rounds, returning `(svcmgr_cap, second_cap,
 /// cap_count)`, `cap_count` being the caps delivered in the first four
 /// slots. Missing caps are zero.
-fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
+fn bootstrap_caps(creator_ep: u64, ipc_buffer: *mut u8) -> (u64, u64, usize)
 {
     if creator_ep == 0
     {
@@ -150,7 +150,7 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
 /// was not re-injected live after restart. TODO(#438): log the failed
 /// round-trip as `FATAL:`; deferred by maintainer decision to the work #438
 /// tracks.
-fn probe_svcmgr(svcmgr_cap: u32, ipc_buffer: *mut u8)
+fn probe_svcmgr(svcmgr_cap: u64, ipc_buffer: *mut u8)
 {
     // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
     #[allow(clippy::cast_ptr_alignment)]

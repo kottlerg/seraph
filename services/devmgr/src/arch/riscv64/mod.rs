@@ -19,7 +19,7 @@ pub struct ArchCaps
     // serves pwrmgr a Reset-only derivation on `QUERY_SHUTDOWN_DEVICE`;
     // Suspend is held against a future path. devmgr itself never forwards
     // an SBI call — it only holds and brokers the cap.
-    sbi_control_cap: u32,
+    sbi_control_cap: u64,
 }
 
 impl ArchCaps
@@ -32,7 +32,7 @@ impl ArchCaps
 
     /// Store the `SVCMGR_BUNDLE` round's shutdown-authority cap: on RISC-V,
     /// the Reset + Suspend `SbiControl` derivation.
-    pub fn absorb_shutdown_authority(&mut self, cap: u32)
+    pub fn absorb_shutdown_authority(&mut self, cap: u64)
     {
         self.sbi_control_cap = cap;
     }
@@ -97,7 +97,7 @@ pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
 /// SPCR for its early console; replacing this constant with forwarded
 /// SPCR/`_CRS` discovery is #165. Returns `None` when no aperture covers
 /// the window or the split fails.
-pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
+pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u64>
 {
     carve_subrange(caps, 0x1000_0000, 0x1000)
 }
@@ -131,7 +131,7 @@ pub fn rtc_bootstrap_word(_caps: &DevmgrCaps) -> Option<u64>
 /// knowledge with DTB `compatible = "google,goldfish-rtc"` driven
 /// discovery. Returns `None` when no aperture covers the page or the split
 /// fails.
-pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
+pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u64>
 {
     carve_subrange(caps, 0x0010_1000, 0x1000)
 }

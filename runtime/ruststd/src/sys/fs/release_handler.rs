@@ -69,7 +69,7 @@ pub(super) struct OutstandingMapping
 {
     pub cookie: u64,
     pub range: ReservedRange,
-    pub memory_cap: u32,
+    pub memory_cap: u64,
 }
 
 /// Per-`File` registration entry held by the release handler under its
@@ -106,11 +106,11 @@ pub(super) struct ReleaseState
     /// derived from it would live in fs's CSpace once a delivery
     /// channel exists. Revoking this cap (which we never do) would
     /// tear down every fs-side derived child atomically.
-    release_ep: u32,
+    release_ep: u64,
     registry: Mutex<BTreeMap<u64, Arc<FileEntry>>>,
     /// Process aspace cap, captured at init for the handler's
     /// `mem_unmap` calls. Equal to `StartupInfo::self_aspace`.
-    aspace: u32,
+    aspace: u64,
 }
 
 /// Published only after the handler thread serving it has spawned.
@@ -174,7 +174,7 @@ pub(super) fn state() -> Option<&'static ReleaseState>
 }
 
 /// Unbadged endpoint cap the per-`File` SEND derivation hangs off.
-pub(super) fn release_endpoint(state: &ReleaseState) -> u32
+pub(super) fn release_endpoint(state: &ReleaseState) -> u64
 {
     state.release_ep
 }
@@ -345,7 +345,7 @@ pub(super) fn drain_mappings(entry: &FileEntry) -> Vec<OutstandingMapping>
 /// `File::read` to release the resources the read held briefly. If the
 /// handler thread already cleaned up this cookie (rare but possible
 /// during a contended eviction), this is a no-op.
-pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
+pub(super) fn release_one_local(entry: &FileEntry, aspace: u64, cookie: u64)
 {
     if let Some(m) = take_mapping(entry, cookie)
     {
@@ -357,7 +357,7 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
 /// reservation arena only once the unmap succeeds; a range still mapped
 /// stays reserved until this process exits, so no later reservation can
 /// land on the driver's page. Returns whether the unmap succeeded.
-pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32) -> bool
+pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u64) -> bool
 {
     // SAFETY: `m` owns its `ReservedRange`, arena VA that holds no Rust
     // object; the read path reads the page only through raw volatile reads,

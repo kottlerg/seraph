@@ -109,13 +109,15 @@ one set of links suffices). No separate allocation. Threads are served in arriva
       return through the disposition
 ```
 
-**Message copy:** The label, counts, badge, and packed cap handles travel in
-saved register state (message format per
+**Message copy:** The label, counts, and badge travel in saved register state
+(message format per
 [docs/ipc-design.md § Message Format](../../../docs/ipc-design.md#message-format)).
-Data words travel through the per-thread IPC buffer pages: when `data_count` > 0
-the kernel reads the words from the sender's registered page and writes them
-into the receiver's registered page; the delivered cap-transfer result block is
-likewise written into the receiver's page. The error surface is read-side only,
+Data words and the sender's cap handles travel through the per-thread IPC buffer
+pages: when `data_count` > 0 the kernel reads the words from the sender's
+registered page and writes them into the receiver's registered page, and when
+`cap_count` > 0 it reads the handles from the sender's cap block; the delivered
+cap-transfer result block is likewise written into the receiver's page. The error
+surface is read-side only,
 per [syscalls.md § `SYS_IPC_BUFFER_SET`](syscalls.md#sys_ipc_buffer_set-42): a
 sender (or replier) with no registered page fails with `InvalidArgument`, and a
 sender page unmapped at copy time surfaces the copy fault (`InvalidAddress`),

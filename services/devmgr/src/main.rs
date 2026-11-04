@@ -54,9 +54,9 @@ fn main() -> !
         "got {} apertures, {} ACPI regions, irq_range={:#x}, rsdp={:#x}, dtb={:#x}",
         caps.apertures.spans().len() as u64,
         caps.acpi_regions.len() as u64,
-        u64::from(caps.irq_range_cap),
-        u64::from(caps.rsdp_memory_cap),
-        u64::from(caps.dtb_memory_cap)
+        caps.irq_range_cap,
+        caps.rsdp_memory_cap,
+        caps.dtb_memory_cap
     );
 
     // Parse firmware to locate every PCI ECAM window. ACPI wins when RSDP is
@@ -174,7 +174,7 @@ fn main() -> !
     // reply and recv). `on_disk_spawn_attempted` is sticky: a single attempt
     // per boot, with `NO_DEVICE` returned thereafter for a driver not served,
     // so timed degrades gracefully to its no-RTC path.
-    let mut drivers_dir_cap: u32 = 0;
+    let mut drivers_dir_cap: u64 = 0;
     let mut on_disk_spawn_attempted: bool = false;
     // TODO(#165): remove with the test labels. Whether the test-only fault
     // batch has been spawned: at most once per boot, so the death queue's
@@ -701,7 +701,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// `driver_ep` badged `TEST_DENY_BADGE`, which carries none of the driver's
 /// verb bits; `NO_DEVICE` when the driver is not running (`driver_ep == 0`)
 /// and `INVALID_REQUEST` when the derive fails.
-fn reply_deny_send(driver_ep: u32, ipc_buf: *mut u64)
+fn reply_deny_send(driver_ep: u64, ipc_buf: *mut u64)
 {
     if driver_ep == 0
     {
@@ -883,8 +883,8 @@ fn enumerate_ecam(
 /// `access` may reach the `pages` pages from its base only through raw
 /// volatile accesses, never a reference, and must not keep the address.
 fn with_mmio_mapped<R>(
-    aspace: u32,
-    cap: u32,
+    aspace: u64,
+    cap: u64,
     pages: u64,
     what: &str,
     access: impl FnOnce(u64) -> R,
@@ -927,7 +927,7 @@ fn with_mmio_mapped<R>(
 /// page is carved ([`carve_function_config`]). A window the tables cannot
 /// hold is logged; its cap stays held, and its `VirtIO` functions get no
 /// driver, since devmgr could not clear their Bus Master Enable.
-fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap: u32)
+fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap: u64)
 {
     let kept = caps.ecam_windows.try_reserve(1).is_ok()
         && matches!(
@@ -969,7 +969,7 @@ fn carve_function_config(
                 phys,
                 firmware::pci::FUNCTION_CONFIG_BYTES,
                 PAGE_SIZE,
-                |span: &Span<u32>, at| {
+                |span: &Span<u64>, at| {
                     syscall::mmio_split(span.slot, at - span.base).map_err(|_| SplitError::Failed)
                 },
             )
@@ -999,11 +999,11 @@ fn carve_function_config(
 /// (e.g. the framebuffer lives below the ECAM in the same parent aperture on
 /// x86-64 QEMU+OVMF). Returns `None` when no aperture covers the range, the
 /// table cannot grow, or a split fails.
-pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u32>
+pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u64>
 {
     let carved = caps
         .apertures
-        .carve(phys, size, PAGE_SIZE, |span: &Span<u32>, at| {
+        .carve(phys, size, PAGE_SIZE, |span: &Span<u64>, at| {
             // `mmio_split` takes the split point as an offset into the cap; the
             // table records each aperture's exact range, so no split it asks for
             // falls outside its cap.
@@ -1050,8 +1050,8 @@ const IRQ_SPLIT_OUT_OF_RANGE: i64 = syscall_abi::SyscallError::InvalidArgument a
 /// held, and its cap itself goes to the serial driver.
 struct IrqRangeAllocator
 {
-    ranges: SpanTable<u32>,
-    held: HeldLines<u32>,
+    ranges: SpanTable<u64>,
+    held: HeldLines<u64>,
     /// The firmware's Interrupt Source Overrides, from which each PCI line's
     /// `SYS_IRQ_REGISTER` mode is derived ([`Self::line_mode`]).
     overrides: Vec<firmware::acpi::SourceOverride>,
@@ -1064,7 +1064,7 @@ impl IrqRangeAllocator
     /// range, which [`SpanTable::carve`] reads as the cap ending there.
     const RANGE_END_BOUND: u64 = 1 << 32;
 
-    fn new(range_slot: u32, overrides: Vec<firmware::acpi::SourceOverride>) -> Self
+    fn new(range_slot: u64, overrides: Vec<firmware::acpi::SourceOverride>) -> Self
     {
         let mut ranges = SpanTable::new();
         // A range cap starts at line 0 (init derives it from the root range).
@@ -1097,7 +1097,7 @@ impl IrqRangeAllocator
     /// or devmgr holds no range), another carve error when the split fails,
     /// or [`HoldError::NoMemory`]; [`LineError::Derive`] with the
     /// `SYS_CAP_DERIVE` error, the line staying held.
-    fn line_cap(&mut self, id: u32) -> Result<u32, LineError<i64>>
+    fn line_cap(&mut self, id: u32) -> Result<u64, LineError<i64>>
     {
         let ranges = &mut self.ranges;
         self.held.derive(
@@ -1115,16 +1115,16 @@ impl IrqRangeAllocator
     /// # Errors
     /// [`CarveError::NotCovered`] when no held range contains the line, any
     /// other carve error when the split fails.
-    fn exclusive_line(&mut self, id: u32) -> Result<u32, CarveError>
+    fn exclusive_line(&mut self, id: u32) -> Result<u64, CarveError>
     {
         Self::isolate_one(&mut self.ranges, id)
     }
 
     /// Carve the single-line cap for line `id` off the range table;
     /// [`CarveError::NotCovered`] when no held range contains it.
-    fn isolate_one(ranges: &mut SpanTable<u32>, id: u32) -> Result<u32, CarveError>
+    fn isolate_one(ranges: &mut SpanTable<u64>, id: u32) -> Result<u64, CarveError>
     {
-        ranges.carve(u64::from(id), 1, 1, |span: &Span<u32>, at| {
+        ranges.carve(u64::from(id), 1, 1, |span: &Span<u64>, at| {
             let at = u32::try_from(at).map_err(|_| SplitError::OutOfRange)?;
             syscall::irq_split(span.slot, at).map_err(|e| {
                 if e == IRQ_SPLIT_OUT_OF_RANGE
@@ -1281,7 +1281,7 @@ struct VirtioDeviceCaps
     /// The function's configuration page, kept by devmgr alone, through
     /// which it clears Bus Master Enable before it takes the device.
     config: FunctionConfig,
-    irq_cap: Option<u32>,
+    irq_cap: Option<u64>,
     /// The mode the driver registers `irq_cap` with; 0 without one.
     irq_mode: u64,
     device_badge: u64,
@@ -1296,10 +1296,10 @@ struct VirtioDeviceCaps
 #[derive(Clone, Copy)]
 struct DeviceReset
 {
-    bar_cap: u32,
+    bar_cap: u64,
     bar_pages: u64,
     offset: u64,
-    aspace: u32,
+    aspace: u64,
 }
 
 impl DeviceReset
@@ -1312,7 +1312,7 @@ impl DeviceReset
     fn for_device(
         info: &virtio_core::VirtioPciStartupInfo,
         bars: &[spawn::BarSpec],
-        aspace: u32,
+        aspace: u64,
     ) -> Option<Self>
     {
         let status = info.status_register()?;
@@ -1386,8 +1386,8 @@ impl DeviceReset
 #[derive(Clone, Copy)]
 struct FunctionConfig
 {
-    cap: u32,
-    aspace: u32,
+    cap: u64,
+    aspace: u64,
 }
 
 impl FunctionConfig
@@ -1595,13 +1595,13 @@ impl DriverClass
 /// driver's process handle while devmgr keeps it.
 struct ServedDriver
 {
-    ep: u32,
+    ep: u64,
     dev_caps: Option<VirtioDeviceCaps>,
     /// The driver's badged procmgr process handle: kept until its batch
     /// settles, and for the rest of the boot for a driver with a `VirtIO`
     /// device, whose memory procmgr holds after its death until devmgr
     /// releases it (`CREATE_DMA_HOLD`); 0 once released.
-    process_handle: u32,
+    process_handle: u64,
 }
 
 impl ServedDriver
@@ -1649,7 +1649,7 @@ impl ServedDriver
 /// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves that
 /// memory on the driver's memmgr record for the rest of the boot, since the
 /// device may still be writing it. One reset per withdrawal.
-fn withdraw_device(dev_caps: &VirtioDeviceCaps, process_handle: u32, ipc_buf: *mut u64)
+fn withdraw_device(dev_caps: &VirtioDeviceCaps, process_handle: u64, ipc_buf: *mut u64)
 {
     let quiet = dev_caps.take_from_driver();
     if process_handle == 0
@@ -1861,7 +1861,7 @@ fn spawn_boot_drivers(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
-    uart_irq: u32,
+    uart_irq: u64,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     served: &mut ServedDrivers,
@@ -1929,7 +1929,7 @@ fn spawn_virtio_blk_all(
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
     batch: &settle::SettleBatch,
-    death_eq: u32,
+    death_eq: u64,
     roster: &mut Roster<SpawnedDriver>,
     catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
@@ -1991,12 +1991,12 @@ fn spawn_virtio_blk_all(
 /// completed its bootstrap; on `None` the caller releases `dev_caps`.
 fn spawn_one_virtio_blk(
     caps: &caps::DevmgrCaps,
-    module_cap: u32,
+    module_cap: u64,
     dev_caps: &VirtioDeviceCaps,
     batch: &settle::SettleBatch,
-    death_eq: u32,
+    death_eq: u64,
     ipc_buf: *mut u64,
-) -> Option<(u32, u32)>
+) -> Option<(u64, u64)>
 {
     // virtio-blk requires an IRQ: delivered an absent IRQ slot, it exits
     // after its bootstrap, which would leave the device registered with no
@@ -2065,7 +2065,7 @@ fn spawn_one_virtio_blk(
 
 /// Create a driver service endpoint devmgr owns; `None` when it cannot be
 /// created.
-fn create_service_endpoint() -> Option<u32>
+fn create_service_endpoint() -> Option<u64>
 {
     std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
         syscall::cap_create_endpoint(slab).ok()
@@ -2079,7 +2079,7 @@ fn create_service_endpoint() -> Option<u32>
 fn acquire_single_irq_cap(
     pci_dev: &pci::PciDevice,
     irq_range: &mut IrqRangeAllocator,
-) -> Option<u32>
+) -> Option<u64>
 {
     let gsi = device_gsi(pci_dev)?;
     match irq_range.line_cap(gsi)
@@ -2233,7 +2233,7 @@ fn enumerate_virtio_input(
 /// never served, and its device's carved caps are released.
 fn spawn_on_disk_drivers(
     caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u32,
+    drivers_dir_cap: u64,
     pending_inputs: Vec<VirtioDeviceCaps>,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
@@ -2314,10 +2314,10 @@ fn spawn_virtio_input_from_disk(
     caps: &mut caps::DevmgrCaps,
     pending: &VirtioDeviceCaps,
     batch: &settle::SettleBatch,
-    death_eq: u32,
-    drivers_dir_cap: u32,
+    death_eq: u64,
+    drivers_dir_cap: u64,
     ipc_buf: *mut u64,
-) -> Option<(u32, u32)>
+) -> Option<(u64, u64)>
 {
     let requested_rights = u64::from(namespace_protocol::rights::READ);
     // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
@@ -2393,8 +2393,8 @@ fn spawn_virtio_input_from_disk(
 struct SimpleDeviceSlots
 {
     device_badge: u64,
-    service_ep: u32,
-    query_ep: u32,
+    service_ep: u64,
+    query_ep: u64,
 }
 
 impl SimpleDeviceSlots
@@ -2474,9 +2474,9 @@ fn spawn_simple_into(
 /// moved to the driver.
 fn spawn_serial(
     caps: &mut caps::DevmgrCaps,
-    uart_irq: u32,
+    uart_irq: u64,
     batch: &settle::SettleBatch,
-    death_eq: u32,
+    death_eq: u64,
     roster: &mut Roster<SpawnedDriver>,
     catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
@@ -2546,7 +2546,7 @@ fn spawn_serial(
 fn spawn_framebuffer(
     caps: &mut caps::DevmgrCaps,
     batch: &settle::SettleBatch,
-    death_eq: u32,
+    death_eq: u64,
     roster: &mut Roster<SpawnedDriver>,
     catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
@@ -2657,9 +2657,9 @@ fn spawn_framebuffer(
 /// `CREATE_FROM_FILE` and closed by procmgr after the ELF load.
 fn spawn_rtc_from_disk(
     caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u32,
+    drivers_dir_cap: u64,
     batch: &settle::SettleBatch,
-    death_eq: u32,
+    death_eq: u64,
     roster: &mut Roster<SpawnedDriver>,
     catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
@@ -2744,7 +2744,7 @@ fn spawn_rtc_from_disk(
 /// withdrawal and tombstone.
 fn spawn_test_fault_drivers(
     caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u32,
+    drivers_dir_cap: u64,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     served: &mut ServedDrivers,
@@ -2787,10 +2787,10 @@ fn spawn_test_fault_drivers(
 #[allow(clippy::too_many_arguments)]
 fn spawn_one_test_fault(
     caps: &caps::DevmgrCaps,
-    drivers_dir_cap: u32,
+    drivers_dir_cap: u64,
     mode: u64,
     batch: &settle::SettleBatch,
-    death_eq: u32,
+    death_eq: u64,
     roster: &mut Roster<SpawnedDriver>,
     catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
@@ -2864,7 +2864,7 @@ fn spawn_one_test_fault(
 /// be set up (driver binary absent, or endpoint/cap minting failed).
 fn test_spawn_orphan(
     caps: &mut caps::DevmgrCaps,
-    drivers_dir_cap: u32,
+    drivers_dir_cap: u64,
     ipc_buf: *mut u64,
 ) -> Option<bool>
 {

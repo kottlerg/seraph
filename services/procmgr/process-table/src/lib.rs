@@ -76,16 +76,16 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 pub struct ProcessEntry
 {
     pub badge: u64,
-    pub aspace_cap: u32,
-    pub cspace_cap: u32,
-    pub thread_cap: u32,
-    pub pi_memory_cap: u32,
-    pub tls_memory_cap: u32,
+    pub aspace_cap: u64,
+    pub cspace_cap: u64,
+    pub thread_cap: u64,
+    pub pi_memory_cap: u64,
+    pub tls_memory_cap: u64,
     /// Slot in procmgr's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that procmgr minted via `REGISTER_PROCESS` for this child.
     /// Held until `PROCESS_DIED`. Zero when memmgr was unwired at create
     /// time (early-boot regression path).
-    pub memmgr_send_cap: u32,
+    pub memmgr_send_cap: u64,
     /// Memmgr-side process badge for this child. Sent in the
     /// `PROCESS_DIED` payload so memmgr can reclaim the right record.
     pub memmgr_badge: u64,
@@ -97,12 +97,12 @@ pub struct ProcessEntry
     /// (`cap_copy` into the child, then `cap_delete` of the procmgr-side
     /// slot) or the entry is torn down (`teardown_entry` deletes the
     /// slot if still present).
-    pub namespace_override: u32,
+    pub namespace_override: u64,
     /// Per-process cwd cap installed by `configure_namespace`. Zero means
     /// the child has no cwd cap (`ProcessInfo.current_dir_cap` stays zero;
     /// relative paths return `Unsupported` until installed). Same lifetime
     /// rules as `namespace_override`.
-    pub cwd_override: u32,
+    pub cwd_override: u64,
     /// Upper bound of the baseline `SchedControl` band minted into this
     /// child (`[1, band_max]`). This is the child's spawn ceiling: when it
     /// calls `CREATE_PROCESS` / `CREATE_FROM_FILE`, procmgr resolves the
@@ -399,7 +399,7 @@ impl ProcessTable
     /// suitable for `cap_info`'s `CAP_INFO_THREAD_STATE` selector to
     /// fetch the kernel-authoritative lifecycle snapshot.
     #[must_use]
-    pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u32)>
+    pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u64)>
     {
         let idx = self.index_of_badge(badge)?;
         let e = &self.entries[idx];

@@ -72,9 +72,9 @@ pub const fn isr_step(delivered: bool, isr: u8) -> IsrStep
 /// driver rather than spinning or leaving the line masked.
 pub fn serve_interrupts(
     transport: &PciTransport,
-    irq_notification: u32,
-    irq_cap: u32,
-    signal: u32,
+    irq_notification: u64,
+    irq_cap: u64,
+    signal: u64,
     diag: fn(RecvFailureStage, i64),
 ) -> !
 {

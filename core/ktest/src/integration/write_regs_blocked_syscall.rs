@@ -119,9 +119,9 @@ const TOKEN_TAG: u64 = 0x5140_0000_0000_0000;
 
 /// The child's capability handles, in its own `CSpace`, published before
 /// its start.
-static CHILD_SIG: AtomicU32 = AtomicU32::new(0);
-static CHILD_EP: AtomicU32 = AtomicU32::new(0);
-static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
+static CHILD_SIG: AtomicU64 = AtomicU64::new(0);
+static CHILD_EP: AtomicU64 = AtomicU64::new(0);
+static CHILD_DONE: AtomicU64 = AtomicU64::new(0);
 /// The blocking syscall the child enters next ([`KIND_NOTIFICATION`],
 /// [`KIND_RECV`], or [`KIND_SLEEP`]).
 static KIND: AtomicU32 = AtomicU32::new(KIND_NOTIFICATION);
@@ -197,9 +197,9 @@ fn syscall_nr_of(kind: u32) -> u64
 /// The objects the child blocks on and reports through.
 struct Parts
 {
-    sig: u32,
-    ep: u32,
-    done: u32,
+    sig: u64,
+    ep: u64,
+    done: u64,
 }
 
 /// Create the objects, spawn the child, run the rounds, and release
@@ -271,7 +271,7 @@ fn publish_handles(child: &SpawnedChild, parts: &Parts) -> TestResult
 }
 
 /// Run [`ROUNDS`] rounds, stopping at the first that fails.
-fn rounds(child: &SpawnedChild, done: u32) -> TestResult
+fn rounds(child: &SpawnedChild, done: u64) -> TestResult
 {
     for round in 1..=ROUNDS
     {

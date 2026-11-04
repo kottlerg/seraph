@@ -28,9 +28,9 @@ const UART_LSR: u16 = 5;
 /// mapped. The function is `unsafe` for the arch-dispatch surface, whose
 /// riscv64 implementation maps the cap it is handed.
 pub unsafe fn serial_init(
-    self_thread: u32,
-    _self_aspace: u32,
-    ioport_cap: u32,
+    self_thread: u64,
+    _self_aspace: u64,
+    ioport_cap: u64,
     enable_rx_irq: bool,
 ) -> bool
 {

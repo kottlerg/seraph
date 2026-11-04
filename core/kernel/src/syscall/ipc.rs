@@ -108,13 +108,49 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
     }
 }
 
+/// Read the `count` capability handles a sender placed in its IPC buffer's cap
+/// block (word [`syscall::MSG_CAP_HANDLES_WORD`] on, one full handle per word).
+///
+/// The handles are copied once into kernel memory, so every later check and
+/// the transfer itself act on this copy, never on a re-read of the page.
+///
+/// Returns `Err(InvalidArgument)` if the buffer is not registered, or
+/// `Err(InvalidAddress)` if it is unmapped at copy time.
+///
+/// # Safety
+/// `buf` must be a user-mode IPC buffer VA or 0, as for [`read_ipc_buf`].
+#[cfg(not(test))]
+unsafe fn read_cap_handles(buf: u64, count: usize)
+-> Result<[u64; MSG_CAP_SLOTS_MAX], SyscallError>
+{
+    if buf == 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    let n = count.min(MSG_CAP_SLOTS_MAX);
+    let mut handles = [0u64; MSG_CAP_SLOTS_MAX];
+    let src = buf + (syscall::MSG_CAP_HANDLES_WORD * core::mem::size_of::<u64>()) as u64;
+    // SAFETY: handles holds MSG_CAP_SLOTS_MAX words, valid for n*8 bytes; src
+    //         is the user span inside the registered IPC buffer page (non-zero
+    //         per the check above; the abi const assert keeps the cap block
+    //         inside the page), read with fault recovery.
+    unsafe {
+        crate::uaccess::copy_from_user(
+            handles.as_mut_ptr().cast::<u8>(),
+            src,
+            n * core::mem::size_of::<u64>(),
+        )?;
+    }
+    Ok(handles)
+}
+
 /// Write cap transfer results to the receiver's IPC buffer.
 ///
 /// Layout starting at word `MSG_DATA_WORDS_MAX`:
 /// ```text
 /// word[MSG_DATA_WORDS_MAX + 0] = cap_count as u64
-/// word[MSG_DATA_WORDS_MAX + 1] = handle[0] as u64
-/// word[MSG_DATA_WORDS_MAX + 2] = handle[1] as u64
+/// word[MSG_DATA_WORDS_MAX + 1] = handle[0]
+/// word[MSG_DATA_WORDS_MAX + 2] = handle[1]
 /// ...
 /// ```
 ///
@@ -124,7 +160,7 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
 /// # Safety
 /// `buf` must be a valid, mapped IPC buffer page VA, or 0.
 #[cfg(not(test))]
-unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_SLOTS_MAX])
+unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u64; MSG_CAP_SLOTS_MAX])
 {
     if buf == 0
     {
@@ -136,15 +172,12 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_
     // `req.caps()`, and trip `shared/ipc`'s bootstrap `debug_assert_eq!`
     // against the label-declared cap count.
     let n = cap_count.min(MSG_CAP_SLOTS_MAX);
-    // Assemble the result block [cap_count, handle0, handle1, ...] (handles
-    // widened u32 -> u64) in a kernel buffer, then copy it to the user IPC
-    // buffer at word offset MSG_DATA_WORDS_MAX.
+    // Assemble the result block [cap_count, handle0, handle1, ...] in a
+    // kernel buffer, then copy it to the user IPC buffer at word offset
+    // MSG_DATA_WORDS_MAX.
     let mut block = [0u64; MSG_CAP_SLOTS_MAX + 1];
     block[0] = cap_count as u64;
-    for (slot, &handle) in block[1..].iter_mut().zip(handles.iter()).take(n)
-    {
-        *slot = u64::from(handle);
-    }
+    block[1..=n].copy_from_slice(&handles[..n]);
     let dst = buf + (MSG_DATA_WORDS_MAX * core::mem::size_of::<u64>()) as u64;
     // SAFETY: block is valid for (n+1)*8 bytes; the IPC buffer is page-sized, far
     //         larger than MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX words. A fault
@@ -171,7 +204,7 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_
 /// degrades to zero-cap delivery without notifying the sender, which is why
 /// the call path must run both before parking.
 #[cfg(not(test))]
-fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), SyscallError>
+fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u64]) -> Result<(), SyscallError>
 {
     for (i, &handle) in handles.iter().enumerate()
     {
@@ -217,7 +250,7 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// `cs` must be the running thread's bound, live `CSpace`; no `CSpace` lock
 /// may be held by the caller.
 #[cfg(not(test))]
-unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u32]) -> Result<(), SyscallError>
+unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u64]) -> Result<(), SyscallError>
 {
     // SAFETY: caller contract; the lock is released below.
     let saved = unsafe { (*cs).lock.lock_raw() };
@@ -265,9 +298,9 @@ unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u32]) -> Result<()
 #[cfg(not(test))]
 unsafe fn transfer_caps(
     src_tcb: *mut crate::sched::thread::ThreadControlBlock,
-    src_handles: &[u32],
+    src_handles: &[u64],
     dst_tcb: *mut crate::sched::thread::ThreadControlBlock,
-    dst_handles_out: &mut [u32; MSG_CAP_SLOTS_MAX],
+    dst_handles_out: &mut [u64; MSG_CAP_SLOTS_MAX],
 ) -> Result<usize, SyscallError>
 {
     use crate::cap::transfer::{
@@ -436,7 +469,7 @@ unsafe fn deliver_call_caps(
     {
         return;
     }
-    let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
+    let mut dst_handles = [0u64; MSG_CAP_SLOTS_MAX];
     // SAFETY: caller_tcb is the running caller; server_tcb a valid TCB
     // pinned by wake_in_flight; this function's caller holds no lock.
     let transferred = unsafe {
@@ -539,9 +572,9 @@ unsafe fn consume_call_disposition(
 
 /// `SYS_IPC_CALL` (0): synchronous call on an endpoint.
 ///
-/// arg0 = endpoint cap index, arg1 = label, arg2 = `data_count`,
-/// arg3 = `cap_count` (0-4), arg4/arg5 = packed cap handles (two 32-bit
-/// full handles per word; handles 0/1 in arg4, 2/3 in arg5).
+/// arg0 = endpoint cap handle, arg1 = label, arg2 = `data_count`,
+/// arg3 = `cap_count` (0-4); the `cap_count` cap handles are read from the
+/// caller's IPC buffer at word `MSG_CAP_HANDLES_WORD`.
 ///
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
@@ -557,9 +590,7 @@ unsafe fn consume_call_disposition(
 #[cfg(not(test))]
 pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let ep_idx = tf.arg(0) as u32;
+    let ep_idx = tf.arg(0);
     let label = tf.arg(1);
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
@@ -567,8 +598,6 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
     let cap_count = (tf.arg(3) as usize).min(MSG_CAP_SLOTS_MAX);
-    let cap_packed_lo = tf.arg(4);
-    let cap_packed_hi = tf.arg(5);
 
     // SAFETY: current_tcb() valid from syscall context.
     let tcb = unsafe { current_tcb() };
@@ -616,13 +645,18 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
     }
 
-    // Populate cap_slots in the message (the caller's full cap handles).
-    // The cap move runs after rendezvous: in `deliver_call_caps` below when a
-    // server was already waiting, or in `sys_ipc_recv`'s immediate-delivery
-    // path when this caller queues on the send queue.
+    // Populate cap_slots in the message (the caller's full cap handles, copied
+    // once from its IPC buffer's cap block). The cap move runs after
+    // rendezvous: in `deliver_call_caps` below when a server was already
+    // waiting, or in `sys_ipc_recv`'s immediate-delivery path when this caller
+    // queues on the send queue.
     if cap_count > 0
     {
-        let handles = syscall::unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
+        // SAFETY: tcb is valid; ipc_buffer is written only by this thread's
+        // own SYS_IPC_BUFFER_SET.
+        let buf = unsafe { (*tcb).ipc_buffer };
+        // SAFETY: buf validated by read_cap_handles.
+        let handles = unsafe { read_cap_handles(buf, cap_count) }?;
         // Fail-fast reject before blocking (see prevalidate_sender_caps).
         // SAFETY: cspace_ptr validated above; no CSpace lock is held.
         unsafe { prevalidate_sender_caps(cspace_ptr, &handles[..cap_count]) }?;
@@ -778,9 +812,7 @@ fn log_recv_preallocate_failure(
 #[cfg(not(test))]
 pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let ep_idx = tf.arg(0) as u32;
+    let ep_idx = tf.arg(0);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -856,7 +888,7 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         // caps) rather than losing the consumed message and stranding the
         // sender, mirroring `deliver_call_caps`.
         let mut transferred: usize = 0;
-        let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
+        let mut dst_handles = [0u64; MSG_CAP_SLOTS_MAX];
         if msg.cap_count > 0
         {
             // SAFETY: caller returned by endpoint_recv is a valid TCB parked
@@ -986,8 +1018,8 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// `SYS_IPC_REPLY` (1): reply to a blocked caller.
 ///
 /// arg0 = label, arg1 = `data_count`,
-/// arg2 = `cap_count` (0-4), arg3/arg4 = packed cap handles (two 32-bit
-/// full handles per word; handles 0/1 in arg3, 2/3 in arg4).
+/// arg2 = `cap_count` (0-4); the `cap_count` cap handles are read from the
+/// server's IPC buffer at word `MSG_CAP_HANDLES_WORD`.
 ///
 /// Capabilities move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply; a transfer refused after the caller was
@@ -1018,8 +1050,6 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
     let cap_count = (tf.arg(2) as usize).min(MSG_CAP_SLOTS_MAX);
-    let cap_packed_lo = tf.arg(3);
-    let cap_packed_hi = tf.arg(4);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1027,12 +1057,6 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidCapability);
     }
-    let caps = ReplyCaps {
-        count: cap_count,
-        packed_lo: cap_packed_lo,
-        packed_hi: cap_packed_hi,
-    };
-
     // Claim the binding first. `endpoint_reply` CASes `reply_tcb` from the
     // bound caller to null; a canceller or a dealloc of either thread that
     // loses to it leaves the caller to this reply, and the caller's
@@ -1049,7 +1073,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         // (the documented precedence); otherwise the missing reply capability.
         let mut scratch = Message::new(label);
         // SAFETY: tcb is the calling thread's valid TCB.
-        unsafe { stage_reply_payload(tcb, data_count, &caps, &mut scratch) }?;
+        unsafe { stage_reply_payload(tcb, data_count, cap_count, &mut scratch) }?;
         return Err(SyscallError::InvalidCapability);
     };
 
@@ -1098,37 +1122,38 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // the server.
     let mut msg = Message::new(label);
     // SAFETY: tcb is the calling thread's valid TCB.
-    let staged = unsafe { stage_reply_payload(tcb, data_count, &caps, &mut msg) }.and_then(|()| {
-        if cap_count == 0
-        {
-            return Ok(());
-        }
-        // Pre-allocating here keeps OOM out of the transfer below;
-        // `transfer_caps` pre-allocates again under the locks it moves
-        // under, so a slot consumed meanwhile is still caught. The caller's
-        // CSpace is resolved through the registry
-        // (core/kernel/docs/capability-internals.md § Move).
-        // SAFETY: caller is pinned by the won claim, so its `cspace_id` and
-        // `cspace_epoch` are read from a live TCB; the CSpace pointer is
-        // registry-resolved under the derivation lock; lock_raw/unlock_raw
-        // paired.
-        unsafe {
-            crate::cap::DERIVATION_LOCK.write_lock();
-            let r = match crate::cap::lookup_cspace((*caller).cspace_id, (*caller).cspace_epoch)
+    let staged =
+        unsafe { stage_reply_payload(tcb, data_count, cap_count, &mut msg) }.and_then(|()| {
+            if cap_count == 0
             {
-                Some(cs) =>
+                return Ok(());
+            }
+            // Pre-allocating here keeps OOM out of the transfer below;
+            // `transfer_caps` pre-allocates again under the locks it moves
+            // under, so a slot consumed meanwhile is still caught. The caller's
+            // CSpace is resolved through the registry
+            // (core/kernel/docs/capability-internals.md § Move).
+            // SAFETY: caller is pinned by the won claim, so its `cspace_id` and
+            // `cspace_epoch` are read from a live TCB; the CSpace pointer is
+            // registry-resolved under the derivation lock; lock_raw/unlock_raw
+            // paired.
+            unsafe {
+                crate::cap::DERIVATION_LOCK.write_lock();
+                let r = match crate::cap::lookup_cspace((*caller).cspace_id, (*caller).cspace_epoch)
                 {
-                    let saved = (*cs).lock.lock_raw();
-                    let r = (*cs).pre_allocate(cap_count);
-                    (*cs).lock.unlock_raw(saved);
-                    r.map_err(SyscallError::from)
-                }
-                None => Err(SyscallError::InvalidCapability),
-            };
-            crate::cap::DERIVATION_LOCK.write_unlock();
-            r
-        }
-    });
+                    Some(cs) =>
+                    {
+                        let saved = (*cs).lock.lock_raw();
+                        let r = (*cs).pre_allocate(cap_count);
+                        (*cs).lock.unlock_raw(saved);
+                        r.map_err(SyscallError::from)
+                    }
+                    None => Err(SyscallError::InvalidCapability),
+                };
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                r
+            }
+        });
     if let Err(e) = staged
     {
         // SAFETY: caller is the parked TCB whose episode the claim won.
@@ -1140,7 +1165,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // stored in the caller's ipc_msg so that sys_ipc_call can write them to
     // the caller's IPC buffer when the caller resumes in its own address
     // space.
-    let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
+    let mut dst_handles = [0u64; MSG_CAP_SLOTS_MAX];
     let mut transferred = 0;
     if cap_count > 0
     {
@@ -1188,23 +1213,16 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// The reply capability arguments of `SYS_IPC_REPLY`: how many caps, and the
-/// two packed handle words.
-#[cfg(not(test))]
-struct ReplyCaps
-{
-    count: usize,
-    packed_lo: u64,
-    packed_hi: u64,
-}
-
-/// Read a reply's data words into `msg` and pre-validate its capability
-/// slots in the server's own `CSpace`, staging the handles in `msg`.
+/// Read a reply's data words and its `cap_count` capability handles from the
+/// server's IPC buffer into `msg`, and pre-validate the capability slots in
+/// the server's own `CSpace`.
 ///
 /// # Errors
-/// `read_ipc_buf`'s errors for the data words, and `prevalidate_sender_caps`'
-/// for the capability slots: `prevalidate_transfer_slots`' errors, or
-/// `QuotaExceeded` when a cap's object is at the reference ceiling.
+/// `read_ipc_buf`'s errors for the data words, `read_cap_handles`' for the
+/// handles (`InvalidArgument` with no IPC buffer registered, `InvalidAddress`
+/// when it is unmapped), and `prevalidate_sender_caps`' for the capability
+/// slots: `prevalidate_transfer_slots`' errors, or `QuotaExceeded` when a
+/// cap's object is at the reference ceiling.
 ///
 /// # Safety
 /// `server` must be the calling thread's valid TCB.
@@ -1212,27 +1230,28 @@ struct ReplyCaps
 unsafe fn stage_reply_payload(
     server: *mut crate::sched::thread::ThreadControlBlock,
     data_count: usize,
-    caps: &ReplyCaps,
+    cap_count: usize,
     msg: &mut Message,
 ) -> Result<(), SyscallError>
 {
+    // SAFETY: server is the running thread; ipc_buffer is written only by
+    // its own SYS_IPC_BUFFER_SET.
+    let buf = unsafe { (*server).ipc_buffer };
     msg.data_count = data_count;
     if data_count > 0
     {
-        // SAFETY: server is the running thread; ipc_buffer is written only
-        // by its own SYS_IPC_BUFFER_SET.
-        let buf = unsafe { (*server).ipc_buffer };
         // SAFETY: buf validated by read_ipc_buf.
         unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
     }
-    if caps.count > 0
+    if cap_count > 0
     {
-        let handles = syscall::unpack_cap_handles(caps.packed_lo, caps.packed_hi, caps.count);
+        // SAFETY: buf validated by read_cap_handles.
+        let handles = unsafe { read_cap_handles(buf, cap_count) }?;
         // SAFETY: server is the running thread; its bound CSpace outlives the
         // syscall, and no CSpace lock is held.
-        unsafe { prevalidate_sender_caps((*server).cspace, &handles[..caps.count]) }?;
+        unsafe { prevalidate_sender_caps((*server).cspace, &handles[..cap_count]) }?;
         msg.cap_slots = handles;
-        msg.cap_count = caps.count;
+        msg.cap_count = cap_count;
     }
     Ok(())
 }
@@ -1243,9 +1262,7 @@ unsafe fn stage_reply_payload(
 #[cfg(not(test))]
 pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let sig_idx = tf.arg(0) as u32;
+    let sig_idx = tf.arg(0);
     let bits = tf.arg(1);
 
     if bits == 0
@@ -1318,9 +1335,7 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let sig_idx = tf.arg(0) as u32;
+    let sig_idx = tf.arg(0);
     let timeout_ms = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1420,9 +1435,7 @@ pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let eq_idx = tf.arg(0) as u32;
+    let eq_idx = tf.arg(0);
     let entry = crate::ipc::event_queue::EventEntry {
         payload: tf.arg(1),
         tag: tf.arg(2),
@@ -1498,9 +1511,7 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let eq_idx = tf.arg(0) as u32;
+    let eq_idx = tf.arg(0);
     let timeout_ms = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1649,12 +1660,8 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
 
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let ws_idx = tf.arg(0) as u32;
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let src_handle = tf.arg(1) as u32;
+    let ws_idx = tf.arg(0);
+    let src_handle = tf.arg(1);
     let badge = tf.arg(2);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1925,12 +1932,8 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
 
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let ws_idx = tf.arg(0) as u32;
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let src_handle = tf.arg(1) as u32;
+    let ws_idx = tf.arg(0);
+    let src_handle = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -2076,9 +2079,7 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
-    #[allow(clippy::cast_possible_truncation)]
-    let ws_idx = tf.arg(0) as u32;
+    let ws_idx = tf.arg(0);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };

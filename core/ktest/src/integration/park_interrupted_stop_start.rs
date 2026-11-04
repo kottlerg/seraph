@@ -95,6 +95,20 @@ const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
+/// A phase child's arguments (handles in its own `CSpace`): its copy of the
+/// phase's source (0 when the phase has none) and of `done`, handed to the
+/// child entry by address. The phases run sequentially and each child is
+/// reaped before the next is spawned, so one entry serves every phase.
+#[derive(Clone, Copy)]
+struct ChildArgs
+{
+    source: u64,
+    done: u64,
+}
+
+static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 1> =
+    spawn::ArgBlock::new(ChildArgs { source: 0, done: 0 });
+
 /// A page-aligned 4 KiB IPC buffer page for the `ipc_recv` phase's child.
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
@@ -234,11 +248,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Spawn one phase's child: copy the phase's source cap (skipped when
 /// `source == 0`) and the `done` notification into its `CSpace`, then start it
-/// on the shared stack with `source[31:0] | done[63:32]` as its argument.
+/// on the shared stack with the address of its [`ChildArgs`] as its argument.
 fn spawn_phase(
     ctx: &TestContext,
-    done: u32,
-    source: u32,
+    done: u64,
+    source: u64,
     source_rights: u64,
     entry: extern "C" fn(u64) -> !,
 ) -> Result<spawn::SpawnedChild, &'static str>
@@ -256,9 +270,18 @@ fn spawn_phase(
     };
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::park_interrupted_stop_start: cap_copy done failed")?;
-    let arg = u64::from(c_source) | (u64::from(c_done) << 32);
     // Phases run sequentially and each child is reaped before the next spawn,
-    // so the shared stack has exactly one live user.
+    // so the shared stack and argument entry have exactly one live user.
+    // SAFETY: the previous phase's child, the entry's last reader, is reaped.
+    let arg = unsafe {
+        CHILD_ARGS.publish(
+            0,
+            ChildArgs {
+                source: c_source,
+                done: c_done,
+            },
+        )
+    };
     let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
@@ -270,8 +293,8 @@ fn spawn_phase(
 /// One phase's stop/restart sequence: wait for the child's READY signal, let
 /// it settle into its park, stop + restart it, then take its verdict.
 fn drive(
-    th: u32,
-    done: u32,
+    th: u64,
+    done: u64,
     acc: &mut u64,
     ready: u64,
     ok: u64,
@@ -293,7 +316,7 @@ fn drive(
 /// Wait until any bit of `mask` arrives; fail with `msg` if `bad` is among
 /// the accumulated bits.
 fn verdict(
-    done: u32,
+    done: u64,
     acc: &mut u64,
     mask: u64,
     bad: u64,
@@ -321,7 +344,7 @@ fn reap(mut child: spawn::SpawnedChild) -> Result<(), &'static str>
 }
 
 /// Accumulate `done` bits into `acc` until any bit of `mask` is present.
-fn wait_for(done: u32, acc: &mut u64, mask: u64) -> Result<(), &'static str>
+fn wait_for(done: u64, acc: &mut u64, mask: u64) -> Result<(), &'static str>
 {
     while *acc & mask == 0
     {
@@ -338,12 +361,14 @@ fn is_interrupted(e: i64) -> bool
     e == SyscallError::Interrupted as i64
 }
 
-// cast_possible_truncation: each half is masked or shifted to 32 bits before
-// its cast, so neither cast drops set bits.
-#[allow(clippy::cast_possible_truncation)]
-fn unpack(arg: u64) -> (u32, u32)
+/// A phase child's `(source, done)` handles, from the [`ChildArgs`] entry
+/// `spawn_phase` published at `arg`.
+fn unpack(arg: u64) -> (u64, u64)
 {
-    ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32)
+    // SAFETY: every phase entry receives the address `spawn_phase` published,
+    // and the entry is not rewritten until this child is reaped.
+    let ChildArgs { source, done } = unsafe { spawn::child_args(arg) };
+    (source, done)
 }
 
 /// Phase 1 child: cancelled wait must return `Interrupted`; then a second,

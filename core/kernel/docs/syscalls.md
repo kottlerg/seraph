@@ -274,17 +274,18 @@ Send a message to an endpoint and block until a reply is received.
 | 1 | `label` | Message label (opaque word; passed to server as-is) |
 | 2 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
 | 3 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
-| 4 | `cap_handles_lo` | Packed cap handles 0 and 1 (two 32-bit fields) |
-| 5 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
+| 4, 5 | (unused) | Ignored |
 
-Each 32-bit field of the two packed words carries a **full** cap handle —
-slot index plus per-slot generation — so the kernel generation-validates the
-sender's named slots: a stale handle to a recycled slot is rejected
-(`InvalidCapability`) instead of transmitting the slot's current occupant
-(see [capability-model.md](../../../docs/capability-model.md) § Capability Handle Format).
-Capability handles always travel in these registers on the send side; the
-delivered destination handles are reported through the result block in the
-receiver's IPC buffer page (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
+**Capability handles:** When `cap_count` > 0, the kernel reads the `cap_count`
+**full** cap handles (slot index plus per-slot generation, one `u64` per word) from
+the caller's registered IPC buffer page, handle `i` at word
+`MSG_CAP_HANDLES_WORD + i` (`MSG_DATA_WORDS_MAX + 1`), and copies them once before
+validating them. The kernel generation-validates the sender's named slots: a stale
+handle to a recycled slot is rejected (`InvalidCapability`) instead of transmitting
+the slot's current occupant (see [capability-model.md](../../../docs/capability-model.md)
+§ Capability Handle Format). The delivered destination handles are reported through
+the result block in the receiver's IPC buffer page, at the same word offsets (see
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 **Data words:** When `data_count` > 0, the kernel reads the data words from
 the caller's registered IPC buffer page (`SYS_IPC_BUFFER_SET`); the syscall
@@ -303,8 +304,8 @@ when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
 `InsufficientRights`, `InvalidArgument` (a cap slot repeated in one message, or
-`data_count` > 0 with no IPC buffer page registered; a `data_count` or `cap_count` above
-its maximum is clamped, not refused),
+`data_count` > 0 or `cap_count` > 0 with no IPC buffer page registered; a `data_count`
+or `cap_count` above its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
 transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^31 ceiling),
@@ -335,11 +336,11 @@ Send a reply to the caller bound to this thread by its most recent `SYS_IPC_RECV
 | 0 | `label` | Reply label |
 | 1 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
 | 2 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
-| 3 | `cap_handles_lo` | Packed cap handles 0 and 1 (two 32-bit fields) |
-| 4 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
+| 3, 4 | (unused) | Ignored |
 
-The packed-handle encoding matches `SYS_IPC_CALL`: full 32-bit handles, so a
-stale reply slot is rejected rather than resolved to its current occupant (see
+The reply's cap handles travel as for `SYS_IPC_CALL`: full handles in the server's
+IPC buffer page from word `MSG_CAP_HANDLES_WORD`, so a stale reply slot is rejected
+rather than resolved to its current occupant (see
 [capability-model.md](../../../docs/capability-model.md) § Capability Handle Format).
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
@@ -350,20 +351,21 @@ time; see [capability-internals.md](capability-internals.md) § Capability Trans
 in IPC). It is consumed by this syscall whether it succeeds or fails. If no reply
 capability is present (this thread holds no pending caller: it received none, or the
 caller was cancelled), the syscall returns `InvalidCapability`, unless a payload or cap
-check fails first: `data_count` > 0 with no IPC buffer page registered returns
-`InvalidArgument`, an unmapped IPC buffer page `InvalidAddress`, and an invalid reply
-cap slot its own error.
+check fails first: `data_count` > 0 or `cap_count` > 0 with no IPC buffer page
+registered returns `InvalidArgument`, an unmapped IPC buffer page `InvalidAddress`, and
+an invalid reply cap slot its own error.
 
 Data words follow the same rules as `SYS_IPC_CALL`: when `data_count` > 0
 they are read from this thread's registered IPC buffer page and written to
-the original caller's IPC buffer page.
+the original caller's IPC buffer page; when `cap_count` > 0 the handles are read
+from the same page's cap block.
 
 **Capability requirement:** Implicit reply capability bound in the calling thread
 (`reply_tcb`).
 
 **Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
 stale), `InvalidArgument` (a cap slot repeated in one reply, or
-`data_count` > 0 with no IPC buffer page registered), `InvalidAddress`
+`data_count` > 0 or `cap_count` > 0 with no IPC buffer page registered), `InvalidAddress`
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
 `QuotaExceeded` (caller's CSpace
@@ -560,18 +562,22 @@ means the wait's timeout elapsed.
 
 ## Capability Handles
 
-A capability handle — the value passed in and returned through the cap-index
-argument and return registers — packs a per-slot generation with the slot index:
-`handle = (generation << 24) | index`. The low 24 bits are the `CSpace` slot
-index; the high 8 bits are the slot's generation, which the kernel bumps each
-time the slot is freed and recycled. Every cap-bearing syscall checks the
-handle's generation against the slot's current generation and returns
-`InvalidCapability` on mismatch — a handle held across a free/reallocate of its
-slot fails closed rather than aliasing the unrelated capability now at that index
-(#349). A never-recycled slot has generation 0, so its handle equals the bare
-index; long-lived boot/spawn caps keep their historical values, and a `0` handle
-still means "no capability". Range-split syscalls return their two child handles
-in the primary and secondary return registers (never packed into one word). See
+A capability handle — the `u64` value passed in and returned through the cap
+argument and return registers, the full width of each — packs a per-slot
+generation with the slot index: `handle = (generation << 32) | index`. The low 32
+bits are the `CSpace` slot index; bits 32 to 62 are the slot's generation, which
+the kernel bumps each time the slot is freed and recycled, wrapping at 2^31, so
+bit 63 is always clear and a handle in the primary return register never reads as
+a negative error code. Every cap-bearing syscall checks the handle's generation
+against the slot's current generation and returns `InvalidCapability` on mismatch
+(a handle with bit 63 set never matches) — a handle held across a free/reallocate
+of its slot fails closed rather than aliasing the unrelated capability now at that
+index (#349), unless it is held across exactly a multiple of 2^31 recycles of the
+index. A never-recycled slot has generation 0, so its handle equals the bare index,
+and a `0` handle means "no capability". An explicit destination index
+(`SYS_CAP_COPY` and `SYS_CAP_MOVE`) is a bare slot index, not a handle: a value that
+does not fit 32 bits returns `InvalidArgument`. Range-split syscalls return their two
+child handles in the primary and secondary return registers. See
 [capability-model.md](../../../docs/capability-model.md) § Capability Handle
 Format.
 
@@ -2323,7 +2329,9 @@ event queue lacks Post), `OutOfMemory` (the event queue has no free observer nod
 
 Register the per-thread IPC buffer page. This is the page the kernel uses for
 IPC data words (`SYS_IPC_CALL`, `SYS_IPC_REPLY`, and `SYS_IPC_RECV` delivery,
-whenever `data_count` > 0) and for the cap-transfer result block.
+whenever `data_count` > 0), for the cap handles a `SYS_IPC_CALL` or
+`SYS_IPC_REPLY` transfers (whenever `cap_count` > 0), and for the cap-transfer
+result block.
 
 **Arguments:**
 
@@ -2336,17 +2344,17 @@ whenever `data_count` > 0) and for the cap-transfer result block.
 The page at `virt` must already be mapped in the calling thread's address space with
 at least read+write permissions. The kernel records the address in the calling
 thread's TCB. The page must remain mapped for the duration of any IPC that uses it.
-The error surface is read-side only: a *sending* data-carrying IPC fails with
-`InvalidArgument` when no page is registered and `InvalidAddress` when the
-registered page is unmapped, while delivery-side writes are best-effort — a
+The error surface is read-side only: a *sending* IPC that carries data words or
+caps fails with `InvalidArgument` when no page is registered and `InvalidAddress`
+when the registered page is unmapped, while delivery-side writes are best-effort — a
 receiver with no usable page silently misses the data words and the
 cap-result block. Transferred capabilities are still moved into that receiver's
 CSpace; without the result block it cannot learn their handles, so the slots
 stay consumed until the CSpace is torn down.
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
-deregisters the IPC buffer page (sending data-carrying IPC then fails with
-`InvalidArgument`).
+deregisters the IPC buffer page (sending IPC that carries data words or caps then
+fails with `InvalidArgument`).
 
 **Capability requirement:** None — acts on the calling thread implicitly.
 

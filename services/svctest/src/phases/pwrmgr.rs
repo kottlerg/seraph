@@ -57,7 +57,7 @@ pub fn pwrmgr_shutdown_phase(caps: &Caps)
 /// When the cap is zero, pwrmgr replies, or the call fails, it logs the
 /// outcome and returns. It never panics or allocates, because the failure
 /// hooks call it too.
-pub fn request_shutdown(pwrmgr_auth_cap: u32)
+pub fn request_shutdown(pwrmgr_auth_cap: u64)
 {
     if pwrmgr_auth_cap == 0
     {

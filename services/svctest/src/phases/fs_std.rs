@@ -581,7 +581,7 @@ fn release_child_main() -> !
 /// from memmgr). Anything else is refused. Returns the two releases'
 /// replies, and whether node 1's second read carried a release SEND (`None`
 /// when there was no second read).
-fn fake_fs_serve(ep: u32) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>)
+fn fake_fs_serve(ep: u64) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut next_badge = 1;
@@ -669,7 +669,7 @@ fn fake_fs_serve(ep: u32) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>
 const FAKE_FS_FRAME_BYTES: u64 = 64;
 
 /// One page from memmgr for the fake fs's frame.
-fn fake_fs_page() -> u32
+fn fake_fs_page() -> u64
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
@@ -693,7 +693,7 @@ fn fake_fs_page() -> u32
 /// Send `FS_RELEASE_MEMORY` for `cookie` on `release` twice, from a helper
 /// thread so the caller's unanswered `FS_READ_MEMORY` stays pending, and
 /// return each reply's label and round-trip time.
-fn release_twice(release: u32, cookie: u64) -> (ReleaseReply, ReleaseReply)
+fn release_twice(release: u64, cookie: u64) -> (ReleaseReply, ReleaseReply)
 {
     std::thread::spawn(move || {
         let ipc_buf = std::os::seraph::current_ipc_buf();

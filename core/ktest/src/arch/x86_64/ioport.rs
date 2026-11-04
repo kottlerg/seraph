@@ -25,7 +25,7 @@ use init_protocol::{CapType, InitInfo};
 struct WideCap
 {
     /// `CSpace` slot of the cap. 0 means uninitialised or exhausted.
-    slot: u32,
+    slot: u64,
     /// First port covered by the cap.
     base: u32,
     /// One past the last port covered by the cap.
@@ -62,7 +62,7 @@ pub fn init(info: &InitInfo)
 ///
 /// Carves exactly the requested sub-range ([`carve_port_range`]) and binds
 /// the carved cap, which stays in ktest's `CSpace` so the binding lasts.
-pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
+pub fn bind_port_range(thread_cap: u64, port: u16, count: u16) -> bool
 {
     carve_port_range(port, count).is_some_and(|cap| syscall::ioport_bind(thread_cap, cap).is_ok())
 }
@@ -77,7 +77,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
 /// after the first has consumed the old wide cap: the prefix cap for
 /// `[base, port)` stays in the `CSpace` and the wide cap is left narrowed to
 /// `[port, end)`.
-pub fn carve_port_range(port: u16, count: u16) -> Option<u32>
+pub fn carve_port_range(port: u16, count: u16) -> Option<u64>
 {
     if count == 0
     {
@@ -152,7 +152,7 @@ pub fn carve_port_range(port: u16, count: u16) -> Option<u32>
 }
 
 /// Locate the root `IoPort` descriptor in `InitInfo`.
-fn find_root(info: &InitInfo) -> Option<(u32, u32, u32)>
+fn find_root(info: &InitInfo) -> Option<(u64, u32, u32)>
 {
     for d in crate::init_info::descriptors(info)
     {

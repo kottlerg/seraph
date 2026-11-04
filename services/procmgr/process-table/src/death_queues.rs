@@ -45,7 +45,7 @@ const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
 pub struct DeathQueues
 {
     /// Queue caps, oldest first.
-    queues: Vec<u32>,
+    queues: Vec<u64>,
     /// Observer nodes in the first queue: the smallest pool a refused grant
     /// falls back to.
     first_observers: u32,
@@ -73,7 +73,7 @@ impl DeathQueues
 
     /// The queue caps, oldest first.
     #[must_use]
-    pub fn queues(&self) -> &[u32]
+    pub fn queues(&self) -> &[u64]
     {
         &self.queues
     }
@@ -102,10 +102,10 @@ impl DeathQueues
     /// the first error `create` returns other than `OutOfMemory`. The set is
     /// unchanged on every error, except that a wait set `grow_ws` replaced
     /// stays replaced.
-    pub fn grow<C, W>(&mut self, mut create: C, grow_ws: W) -> Result<u32, i64>
+    pub fn grow<C, W>(&mut self, mut create: C, grow_ws: W) -> Result<u64, i64>
     where
-        C: FnMut(u32) -> Result<u32, i64>,
-        W: FnOnce(&[u32], u32) -> Result<(), i64>,
+        C: FnMut(u32) -> Result<u64, i64>,
+        W: FnOnce(&[u64], u32) -> Result<(), i64>,
     {
         // The service endpoint holds one member.
         let members_used = u32::try_from(self.queues.len())
@@ -156,9 +156,9 @@ impl DeathQueues
     /// error of the bind on the new queue.
     pub fn bind<B, C, W>(&mut self, mut bind: B, create: C, grow_ws: W) -> Result<(), i64>
     where
-        B: FnMut(u32) -> Result<(), i64>,
-        C: FnMut(u32) -> Result<u32, i64>,
-        W: FnOnce(&[u32], u32) -> Result<(), i64>,
+        B: FnMut(u64) -> Result<(), i64>,
+        C: FnMut(u32) -> Result<u64, i64>,
+        W: FnOnce(&[u64], u32) -> Result<(), i64>,
     {
         for &queue in self.queues.iter().rev()
         {
@@ -182,7 +182,7 @@ mod tests
     const INVALID: i64 = SyscallError::InvalidCapability as i64;
 
     /// A `grow_ws` a test does not expect to be called.
-    fn no_ws(_: &[u32], _: u32) -> Result<(), i64>
+    fn no_ws(_: &[u64], _: u32) -> Result<(), i64>
     {
         panic!("the wait set had room; it must not grow")
     }
@@ -194,7 +194,10 @@ mod tests
         let mut set = DeathQueues::new(4, 64);
         for i in 1..=count
         {
-            assert_eq!(set.grow(|_| Ok(i * 10), no_ws), Ok(i * 10));
+            assert_eq!(
+                set.grow(|_| Ok(u64::from(i) * 10), no_ws),
+                Ok(u64::from(i) * 10)
+            );
         }
         set
     }
@@ -417,7 +420,7 @@ mod tests
         // Fill the half-width set: the service endpoint and its queues.
         for q in 1..WAIT_SET_MAX_MEMBERS / 2
         {
-            assert_eq!(set.grow(|_| Ok(q), no_ws), Ok(q));
+            assert_eq!(set.grow(|_| Ok(u64::from(q)), no_ws), Ok(u64::from(q)));
         }
         let mut widths = Vec::new();
         let _ = set.grow(
@@ -431,7 +434,7 @@ mod tests
         // Fill the full-width set; a further queue has no room.
         for q in WAIT_SET_MAX_MEMBERS / 2 + 1..WAIT_SET_MAX_MEMBERS
         {
-            assert_eq!(set.grow(|_| Ok(q), no_ws), Ok(q));
+            assert_eq!(set.grow(|_| Ok(u64::from(q)), no_ws), Ok(u64::from(q)));
         }
         assert_eq!(
             set.grow(|_| panic!("no room for another queue"), no_ws),

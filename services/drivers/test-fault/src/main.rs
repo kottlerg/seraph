@@ -24,12 +24,12 @@ use std::os::seraph::startup_info;
 /// The caps and mode word the two bootstrap rounds deliver.
 struct BootCaps
 {
-    service_ep: u32,
-    devmgr_query_ep: u32,
+    service_ep: u64,
+    devmgr_query_ep: u64,
     mode: u64,
 }
 
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -105,7 +105,7 @@ fn hang() -> !
 
 /// Serve `FAULT_PING` until a `FAULT_EXIT`, then exit after its delay
 /// without receiving again.
-fn serve(service_ep: u32, ipc_buf: *mut u64) -> !
+fn serve(service_ep: u64, ipc_buf: *mut u64) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop

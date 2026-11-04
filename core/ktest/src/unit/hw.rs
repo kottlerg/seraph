@@ -35,7 +35,7 @@ pub fn scan_bound(ctx: &TestContext) -> u32
     syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
         .ok()
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(ctx.aspace_cap)
+        .unwrap_or(syscall_abi::cap_handle_index(ctx.aspace_cap))
 }
 
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
     // The scan bound is the cspace's backed capacity (queried at runtime)
     // so the test stays robust against cap mint order.
     let bound = scan_bound(ctx);
-    for slot in 1..=bound
+    for slot in 1..=u64::from(bound)
     {
         let Ok((lo, _hi)) = mmio_split(slot, 0x1000)
         else
@@ -109,7 +109,7 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
     // The scan bound is the cspace's backed capacity (queried at runtime)
     // so the test stays robust against cap mint order.
     let bound = scan_bound(ctx);
-    for slot in 1..=bound
+    for slot in 1..=u64::from(bound)
     {
         // Any error (a slot of another type, most often) leaves the cap
         // intact; keep scanning.
@@ -134,7 +134,7 @@ pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
 {
     let bound = scan_bound(ctx);
 
-    for slot in 1u32..=bound
+    for slot in 1..=u64::from(bound)
     {
         // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
         // InvalidArgument ⇒ Mmio exists but too small.
@@ -214,7 +214,7 @@ pub fn irq_register_high_id(ctx: &TestContext) -> TestResult
 
 /// Isolate `id`, register `irq_sig` on it, acknowledge it, and delete the cap,
 /// which clears the route.
-fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
+fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u64) -> TestResult
 {
     let single =
         isolate_irq_id(ctx, id).ok_or("hw::irq_register_high_id: cannot isolate the id")?;
@@ -228,7 +228,7 @@ fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 
 /// Isolate `id` and check `irq_register` refuses it with `InvalidArgument`
 /// and that deleting its cap succeeds.
-fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
+fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u64) -> TestResult
 {
     let single = isolate_irq_id(ctx, id)
         .ok_or("hw::irq_register_unroutable_id_err: cannot isolate the id")?;
@@ -246,10 +246,10 @@ fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 /// A single-id Interrupt cap for `id`, split off a derived copy of the first
 /// cap in the test's `CSpace` whose range contains it; `None` when no cap does
 /// or the split that cuts the id off from the ids above it is refused.
-pub fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u32>
+pub fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u64>
 {
     let bound = scan_bound(ctx);
-    for slot in 1u32..=bound
+    for slot in 1..=u64::from(bound)
     {
         // A slot that cannot be derived is empty; keep scanning.
         let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
@@ -297,7 +297,7 @@ pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
     let bound = scan_bound(ctx);
 
-    for slot in 1u32..=bound
+    for slot in 1..=u64::from(bound)
     {
         // A slot that cannot be derived is empty; keep scanning.
         let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)

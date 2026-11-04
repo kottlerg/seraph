@@ -68,7 +68,7 @@ const GUARD_PAGES: u64 = 1;
 struct SpawnArgs {
     ipc_buffer_vaddr: u64,
     init: *mut ThreadInit,
-    done_notification: u32,
+    done_notification: u64,
 }
 
 /// The reclaimable resources a spawned thread owns. Moved as a unit between the
@@ -78,13 +78,13 @@ struct SpawnArgs {
 /// a plain `u64` — so it is freed only via the explicit
 /// [`ThreadResources::reclaim`].
 struct ThreadResources {
-    thread_cap: u32,
+    thread_cap: u64,
     /// Physical base of the Thread-retype slab's backing run, as reported by
     /// memmgr at grant. Returned to memmgr's pool in `reclaim`, after the
     /// Thread cap is deleted, so a thread-churn loop holds a bounded
     /// memmgr-pool footprint (#274).
     slab_phys: u64,
-    done_notification: u32,
+    done_notification: u64,
     stack: StackAlloc,
     ipc_buf_base: *mut u8,
     ipc_buf_layout: Layout,
@@ -672,7 +672,7 @@ mod reaper {
     /// Create one death queue of `observers` observer nodes, at most
     /// `EVENT_QUEUE_MAX_CAPACITY - 1`, and one entry more than its nodes: a
     /// queue's pending posts can reach its nodes plus one ([`register`]).
-    fn create_queue(observers: u32) -> Result<u32, i64> {
+    fn create_queue(observers: u32) -> Result<u64, i64> {
         let nodes = observers.min(EVENT_QUEUE_MAX_CAPACITY - 1);
         let entries = nodes + 1;
         let bytes = event_queue_retype_bytes(u64::from(entries), u64::from(nodes));
@@ -730,7 +730,7 @@ mod reaper {
     /// [`RegisterError::Registry`] when no slot can be reserved;
     /// [`RegisterError::Bind`] when no queue takes the bind. The caller then
     /// leaks the thread's resources on detach, the fallback without a reaper.
-    pub(super) fn register(thread_cap: u32) -> Result<(u32, u32), RegisterError> {
+    pub(super) fn register(thread_cap: u64) -> Result<(u32, u32), RegisterError> {
         let (slot, generation) =
             SLOTS.with(Registry::reserve).map_err(|_| RegisterError::Registry)?;
         let tag = correlator(slot, generation);

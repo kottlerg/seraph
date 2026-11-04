@@ -69,7 +69,7 @@ const QUIET_WAIT_MS: u64 = 20;
 /// Capability handles a scenario made, deleted when it ends.
 struct Held
 {
-    handles: [u32; MAX_IRQ_BINDINGS + 4],
+    handles: [u64; MAX_IRQ_BINDINGS + 4],
     len: usize,
 }
 
@@ -83,7 +83,7 @@ impl Held
         }
     }
 
-    fn push(&mut self, handle: u32) -> u32
+    fn push(&mut self, handle: u64) -> u64
     {
         self.handles[self.len] = handle;
         self.len += 1;
@@ -124,7 +124,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// The five steps of the module doc.
-fn shared_line(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
+fn shared_line(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     let a = held.push(derive(line)?);
     let b = held.push(derive(line)?);
@@ -168,7 +168,7 @@ fn shared_line(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
 /// refused, and a freed binding makes room; then the teardown of the one
 /// notification every binding names removes them all, and the line binds and
 /// delivers again.
-fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
+fn binding_bound(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     let ntf = held.push(notification(ctx)?);
     // `bound[0]` is the line's own cap; the rest are its copies.
@@ -217,7 +217,7 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
 
 /// The line's mode: the last scenario of the module doc. Runs once no binding
 /// remains on the line, so its first registration records the mode.
-fn line_mode(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
+fn line_mode(ctx: &TestContext, line: u64, held: &mut Held) -> TestResult
 {
     let a = held.push(derive(line)?);
     let b = held.push(derive(line)?);
@@ -282,18 +282,18 @@ fn line_mode(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     Ok(())
 }
 
-fn derive(line: u32) -> Result<u32, &'static str>
+fn derive(line: u64) -> Result<u64, &'static str>
 {
     cap_derive(line, RIGHTS_ALL).map_err(|_| "integration::irq_shared_line: cap_derive failed")
 }
 
-fn notification(ctx: &TestContext) -> Result<u32, &'static str>
+fn notification(ctx: &TestContext) -> Result<u64, &'static str>
 {
     cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::irq_shared_line: cap_create_notification failed")
 }
 
-fn acknowledge(caps: &[u32]) -> TestResult
+fn acknowledge(caps: &[u64]) -> TestResult
 {
     caps.iter()
         .try_for_each(|&cap| irq_ack(cap))
@@ -302,7 +302,7 @@ fn acknowledge(caps: &[u32]) -> TestResult
 
 /// Raise the line once and require every notification in `signalled` to see
 /// bit 0 and none in `quiet` to see anything, then lower the line.
-fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
+fn raise_expect(signalled: &[u64], quiet: &[u64], failure: &'static str) -> TestResult
 {
     raise_tx_interrupt();
     let result = expect_signalled(signalled, quiet, failure);
@@ -312,7 +312,7 @@ fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> Test
 
 /// Require every notification in `signalled` to see bit 0 and none in `quiet`
 /// to see anything, leaving the line as it is.
-fn expect_signalled(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
+fn expect_signalled(signalled: &[u64], quiet: &[u64], failure: &'static str) -> TestResult
 {
     let mut result = Ok(());
     for &ntf in signalled

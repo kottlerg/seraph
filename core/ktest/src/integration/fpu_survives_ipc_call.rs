@@ -55,8 +55,8 @@ static mut STACK: ChildStack = ChildStack::ZERO;
 // argument so the inline-asm block can load them without depending on any
 // register the kernel-side entry-frame setup may not preserve. Matches the
 // publishing scheme in `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu`.
-static CHILD_EP: AtomicU32 = AtomicU32::new(0);
-static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
+static CHILD_EP: AtomicU64 = AtomicU64::new(0);
+static CHILD_DONE: AtomicU64 = AtomicU64::new(0);
 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 

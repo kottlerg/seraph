@@ -30,11 +30,11 @@ use std::os::seraph::StartupInfo;
 pub struct Bootstrap
 {
     /// pwrmgr's service endpoint (RECV). Zero if the round was empty.
-    pub service_ep: u32,
+    pub service_ep: u64,
     /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`-badged SEND
     /// on devmgr's registry endpoint (the `devmgr.shutdown` seed). Zero if
     /// absent — the arch module then degrades to its no-actuator path.
-    pub devmgr_registry: u32,
+    pub devmgr_registry: u64,
 }
 
 /// Drain the provider bootstrap rounds from `creator_endpoint`.
@@ -62,7 +62,7 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
 /// always the compiled `DEVMGR_LABELS_VERSION` so devmgr can version-gate.
 /// Returns `None` on a transport error or any non-success reply.
 pub(crate) fn devmgr_call(
-    registry: u32,
+    registry: u64,
     label: u64,
     word1: u64,
     word2: u64,

@@ -41,8 +41,8 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 #[derive(Clone, Copy)]
 struct ProducerArgs
 {
-    queue: u32,
-    done: u32,
+    queue: u64,
+    done: u64,
     producer_id: u64,
 }
 

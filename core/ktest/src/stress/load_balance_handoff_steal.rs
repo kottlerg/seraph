@@ -138,8 +138,8 @@ static MIGRATIONS: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Copy)]
 struct ClientArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     /// Client index: its IPC buffer and its `done` bit.
     idx: usize,
 }
@@ -154,9 +154,9 @@ static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, NUM_PAIRS> = spawn::ArgBlock::ne
 #[derive(Clone, Copy)]
 struct ServerArgs
 {
-    ep: u32,
+    ep: u64,
     /// Signal copy of the controller's `ready` notification.
-    ready: u32,
+    ready: u64,
     /// Server index: its `ready` bit; its IPC buffer is `NUM_PAIRS + idx`.
     idx: usize,
 }
@@ -193,7 +193,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let mut servers = [const { spawn::SpawnedChild::EMPTY }; NUM_PAIRS];
     let mut clients = [const { spawn::SpawnedChild::EMPTY }; NUM_PAIRS];
-    let mut eps = [0u32; NUM_PAIRS];
+    let mut eps = [0u64; NUM_PAIRS];
 
     // ── Servers first: pinned round-robin, RECEIVE on a private endpoint. ────
     // Started, and reported entering `ipc_recv`, before the clients, so they

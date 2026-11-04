@@ -75,11 +75,11 @@ fn pipe_for(idx: usize) -> Option<&'static Pipe> {
 /// Install one direction's pipe if a memory cap was provided, reserving
 /// its ring VA from the arena. Helper for `stdio_init`.
 fn try_attach(
-    memory: u32,
-    data_notification: u32,
-    space_notification: u32,
+    memory: u64,
+    data_notification: u64,
+    space_notification: u64,
     role: Role,
-    aspace: u32,
+    aspace: u64,
 ) -> Option<Pipe> {
     if memory == 0 {
         return None;
@@ -95,16 +95,16 @@ fn try_attach(
 /// tolerated.
 #[allow(clippy::too_many_arguments)]
 pub fn stdio_init(
-    stdin_memory: u32,
-    stdin_data_sig: u32,
-    stdin_space_sig: u32,
-    stdout_memory: u32,
-    stdout_data_sig: u32,
-    stdout_space_sig: u32,
-    stderr_memory: u32,
-    stderr_data_sig: u32,
-    stderr_space_sig: u32,
-    aspace: u32,
+    stdin_memory: u64,
+    stdin_data_sig: u64,
+    stdin_space_sig: u64,
+    stdout_memory: u64,
+    stdout_data_sig: u64,
+    stdout_space_sig: u64,
+    stderr_memory: u64,
+    stderr_data_sig: u64,
+    stderr_space_sig: u64,
+    aspace: u64,
 ) {
     // SAFETY: single writer; runs before `STDIO_READY` is observed by
     // any other code path.

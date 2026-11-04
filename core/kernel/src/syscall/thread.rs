@@ -11,11 +11,10 @@
 //! 3. Add a dispatch arm to `core/kernel/src/syscall/mod.rs`.
 //! 4. Add a userspace wrapper to `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: u64→u32 casts keep the low 32 bits of 64-bit
-// trap-frame cap-handle args, whose ABI width is 32 bits. Value args with a
-// range contract (priority levels, split points, CPU IDs) are narrowed with
-// `try_from` and rejected when out of range. u64→usize casts are lossless
-// (Seraph is 64-bit only).
+// cast_possible_truncation: the u64→usize casts of trap-frame byte counts
+// are lossless (Seraph is 64-bit only). Value args with a range contract
+// (priority levels, split points, CPU IDs) are narrowed with `try_from` and
+// rejected when out of range.
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
@@ -53,7 +52,7 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use core::mem::size_of;
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
     let entry = tf.arg(1);
     // Round the user stack pointer to the entry point's `extern "C"` ABI
     // alignment (arch-specific; see `context::align_initial_stack`).
@@ -186,7 +185,7 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
 
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let caller_tcb = unsafe { current_tcb() };
@@ -338,7 +337,7 @@ pub fn sys_thread_stop(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
 
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let caller_tcb = unsafe { current_tcb() };
@@ -484,7 +483,7 @@ unsafe fn drain_remote_stopped(
     target_tcb: *mut crate::sched::thread::ThreadControlBlock,
     caller_tcb: *mut crate::sched::thread::ThreadControlBlock,
     caller_cspace: *mut crate::cap::cspace::CSpace,
-    thread_idx: u32,
+    thread_idx: u64,
     run_cpu: usize,
     mut target_pin: super::PinnedCap,
 )
@@ -690,7 +689,7 @@ unsafe fn stopper_stopped(caller_tcb: *mut crate::sched::thread::ThreadControlBl
 #[cfg(not(test))]
 unsafe fn slot_names_thread(
     cspace: *mut crate::cap::cspace::CSpace,
-    thread_idx: u32,
+    thread_idx: u64,
     target_tcb: *mut crate::sched::thread::ThreadControlBlock,
 ) -> Option<super::PinnedCap>
 {
@@ -1200,8 +1199,8 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use core::sync::atomic::Ordering;
 
-    let thread_idx = tf.arg(0) as u32;
-    let endpoint_idx = tf.arg(1) as u32;
+    let thread_idx = tf.arg(0);
+    let endpoint_idx = tf.arg(1);
     let reserved = tf.arg(2);
     let fault_class_mask = tf.arg(3);
 
@@ -1328,11 +1327,11 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use syscall::PRIORITY_MAX;
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
     // Validate the full 64-bit argument: a value above u8 is out of range, not
     // its low byte.
     let priority = u8::try_from(tf.arg(1)).map_err(|_| SyscallError::InvalidArgument)?;
-    let sched_idx = tf.arg(2) as u32;
+    let sched_idx = tf.arg(2);
 
     // Validate priority range: 0 (idle) and 31 (reserved) are rejected.
     if priority == 0 || priority > PRIORITY_MAX
@@ -1457,7 +1456,7 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
-    let sched_handle = tf.arg(0) as u32;
+    let sched_handle = tf.arg(0);
     // A value above u8 cannot name a level; reject it rather than its low byte.
     let split_at = u8::try_from(tf.arg(1)).map_err(|_| SyscallError::InvalidArgument)?;
     // arg2 reserved.
@@ -1550,8 +1549,8 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
     }?;
     // Deliver both child handles: first in the primary return register, second
     // in the secondary (rdx / a1). Never packed into one word (#349).
-    tf.set_ipc_return(u64::from(handle1), u64::from(handle2));
-    Ok(u64::from(handle1))
+    tf.set_ipc_return(handle1, handle2);
+    Ok(handle1)
 }
 
 /// `SYS_THREAD_SET_AFFINITY` (38): set a thread's CPU affinity.
@@ -1595,7 +1594,7 @@ pub fn sys_thread_set_affinity(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use core::sync::atomic::Ordering;
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
     // A value above u32 names no CPU and is not AFFINITY_ANY; reject it rather
     // than its low word.
     let cpu_id = u32::try_from(tf.arg(1)).map_err(|_| SyscallError::InvalidArgument)?;
@@ -1762,7 +1761,7 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use core::mem::{MaybeUninit, size_of};
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
     let buf_ptr = tf.arg(1);
     let buf_size = tf.arg(2) as usize;
 
@@ -1886,7 +1885,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use core::mem::{MaybeUninit, size_of};
 
-    let thread_idx = tf.arg(0) as u32;
+    let thread_idx = tf.arg(0);
     let buf_ptr = tf.arg(1);
     let buf_size = tf.arg(2) as usize;
 

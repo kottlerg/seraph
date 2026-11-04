@@ -54,9 +54,9 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 struct WorkerArgs
 {
     /// The notification the worker parks on (notify + wait).
-    notif: u32,
+    notif: u64,
     /// Signal copy of the controller's `ready` notification.
-    ready: u32,
+    ready: u64,
     /// Worker index: its `ready` bit.
     idx: usize,
 }
@@ -94,7 +94,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_WORKERS];
     // Parent-side notification caps used to wake each worker.
-    let mut p2c = [0u32; NUM_WORKERS];
+    let mut p2c = [0u64; NUM_WORKERS];
 
     for i in 0..NUM_WORKERS
     {

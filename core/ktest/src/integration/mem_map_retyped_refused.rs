@@ -51,7 +51,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Retype the grant's first two pages into a `CSpace` and probe `mem_map`
 /// against them and the page after. Leaves the grant virgin again.
-fn check_boundary(ctx: &TestContext, grant: u32) -> TestResult
+fn check_boundary(ctx: &TestContext, grant: u64) -> TestResult
 {
     let cs = cap_create_cspace(grant, 0, 1)
         .map_err(|_| "integration::mem_map_retyped_refused: cap_create_cspace failed")?;
@@ -62,7 +62,7 @@ fn check_boundary(ctx: &TestContext, grant: u32) -> TestResult
     result
 }
 
-fn probe(ctx: &TestContext, grant: u32, cs: u32) -> TestResult
+fn probe(ctx: &TestContext, grant: u64, cs: u64) -> TestResult
 {
     cap_create_cspace(grant, cs, 1)
         .map_err(|_| "integration::mem_map_retyped_refused: augment cap_create_cspace failed")?;

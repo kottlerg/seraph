@@ -33,7 +33,7 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{
     IpcMessage,
@@ -56,14 +56,14 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 /// Badged SEND cap on the log endpoint, pre-installed at process
 /// startup via [`install_badged_cap`]. Zero when no logger is
 /// reachable (a process spawned before the log endpoint exists);
-/// [`emit`] drops in that case. `AtomicU32` because a cap handle is `u32` in
+/// [`emit`] drops in that case. `AtomicU64` because a cap handle is `u64` in
 /// the syscall ABI.
-static BADGEED_CAP: AtomicU32 = AtomicU32::new(0);
+static BADGEED_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Pre-install a badged SEND cap on the log endpoint. Called by
 /// std's `_start` with the cap procmgr seeded in
 /// `ProcessInfo.log_send_cap`. Idempotent — last writer wins.
-pub fn install_badged_cap(cap: u32)
+pub fn install_badged_cap(cap: u64)
 {
     BADGEED_CAP.store(cap, Ordering::Release);
 }
@@ -71,7 +71,7 @@ pub fn install_badged_cap(cap: u32)
 /// Return the pre-installed badged SEND cap, or zero. Caller is
 /// expected to have set it via [`install_badged_cap`] before the
 /// first log call. `_ipc_buf` is unused.
-pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u32
+pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u64
 {
     BADGEED_CAP.load(Ordering::Acquire)
 }
@@ -87,7 +87,7 @@ pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u32
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
+pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, bytes: &[u8])
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
     let _ = unsafe { send_bytes(cap, ipc_buf, bytes) };
@@ -99,7 +99,7 @@ pub unsafe fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 ///
 /// # Safety
 /// As for [`write_bytes`].
-unsafe fn send_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8]) -> bool
+unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, bytes: &[u8]) -> bool
 {
     if cap == 0 || ipc_buf.is_null()
     {
@@ -133,7 +133,7 @@ unsafe fn send_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8]) -> bool
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
+pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
 {
     if cap == 0 || ipc_buf.is_null() || name.is_empty()
     {
@@ -158,7 +158,7 @@ pub unsafe fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
 /// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
 /// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`).
-pub unsafe fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
+pub unsafe fn write_args(cap: u64, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
     let send = |chunk: &[u8]| unsafe { send_bytes(cap, ipc_buf, chunk) };

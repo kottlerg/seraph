@@ -90,7 +90,13 @@
 ///     descriptor counts and maps all of it; [`InitInfo::init_info_memory_count`]
 ///     is its page count, which init reads to bound the descriptor slice.
 ///     [`INIT_INFO_MAX_PAGES`] rose from 4 to 64 and is now only the ceiling.
-pub const INIT_PROTOCOL_VERSION: u32 = 15;
+/// v16: Capability handles are 64-bit (#637). Every slot field of
+///     [`InitInfo`] (each cap handle, range base, and slot count),
+///     [`CapDescriptor::slot`], and [`InitModuleName::slot`] widen to `u64`;
+///     [`InitInfo::cap_descriptors_offset`] and [`InitInfo::module_name_count`]
+///     move up beside the other `u32` header fields so the header has no
+///     implicit padding. Every field moves.
+pub const INIT_PROTOCOL_VERSION: u32 = 16;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle
@@ -147,9 +153,13 @@ pub const INIT_INFO_MAX_PAGES: usize = 64;
 /// a variable-length [`CapDescriptor`] array; the array starts at byte offset
 /// [`InitInfo::cap_descriptors_offset`] from the start of this struct.
 ///
-/// All slot indices refer to init's root `CSpace` (`CSpace` ID 0). The slot
-/// and count fields are `u32`, the width of a capability handle, so each
-/// holds any slot index or slot count the `CSpace` can produce.
+/// All slot fields refer to init's root `CSpace` (`CSpace` ID 0). Each slot
+/// field holds a capability handle and each slot-count field a count of
+/// consecutive slots; both are `u64`, the width of a capability handle. Every
+/// handover cap sits in a never-recycled slot, so its handle is its bare slot
+/// index and the caps of a range are `base..base + count`. The fields are laid
+/// out with no implicit padding: the kernel writes the struct by value, so a
+/// padding byte would carry kernel stack contents into init's page.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InitInfo
@@ -160,29 +170,6 @@ pub struct InitInfo
     /// Number of [`CapDescriptor`] entries in the descriptor array.
     pub cap_descriptor_count: u32,
 
-    // ── Init's own resources ─────────────────────────────────────────────
-    /// Slot index of init's own `AddressSpace` capability.
-    pub aspace_cap: u32,
-
-    /// Slot index of the `SchedControl` capability.
-    pub sched_control_cap: u32,
-
-    // ── CSpace slot ranges (contiguous) ──────────────────────────────────
-    /// First slot index of usable physical memory `Memory` capabilities.
-    pub memory_base: u32,
-    /// Number of usable memory `Memory` capabilities.
-    pub memory_count: u32,
-
-    /// First slot index of init's ELF segment `Memory` capabilities.
-    pub segment_memory_base: u32,
-    /// Number of segment `Memory` capabilities.
-    pub segment_memory_count: u32,
-
-    /// First slot index of hardware resource capabilities (MMIO, IRQ, I/O port).
-    pub hw_cap_base: u32,
-    /// Number of hardware resource capabilities.
-    pub hw_cap_count: u32,
-
     /// Byte offset from the start of this struct to the first [`CapDescriptor`].
     ///
     /// The descriptor array contains `cap_descriptor_count` entries, one per
@@ -191,66 +178,94 @@ pub struct InitInfo
     /// identify what each capability slot represents without probing.
     pub cap_descriptors_offset: u32,
 
-    /// Slot index of init's own `Thread` capability (CONTROL right).
+    /// Number of valid [`InitModuleName`] entries in [`Self::module_names`].
+    /// Indices `0..module_name_count` are populated; the rest are
+    /// [`INIT_MODULE_NAME_EMPTY`].
+    pub module_name_count: u32,
+
+    // ── Init's own resources ─────────────────────────────────────────────
+    /// Handle of init's own `AddressSpace` capability.
+    pub aspace_cap: u64,
+
+    /// Handle of the `SchedControl` capability.
+    pub sched_control_cap: u64,
+
+    // ── CSpace slot ranges (contiguous) ──────────────────────────────────
+    /// First slot of usable physical memory `Memory` capabilities.
+    pub memory_base: u64,
+    /// Number of usable memory `Memory` capabilities.
+    pub memory_count: u64,
+
+    /// First slot of init's ELF segment `Memory` capabilities.
+    pub segment_memory_base: u64,
+    /// Number of segment `Memory` capabilities.
+    pub segment_memory_count: u64,
+
+    /// First slot of hardware resource capabilities (MMIO, IRQ, I/O port).
+    pub hw_cap_base: u64,
+    /// Number of hardware resource capabilities.
+    pub hw_cap_count: u64,
+
+    /// Handle of init's own `Thread` capability (CONTROL right).
     ///
     /// Allows init to bind I/O port ranges to itself (`ioport_bind`), set its
     /// own priority and affinity, and delegate thread authority to child services.
-    pub thread_cap: u32,
+    pub thread_cap: u64,
 
     // ── RISC-V SBI forwarding (added in protocol version 3) ─────────────
-    /// Slot index of the `SbiControl` capability (RISC-V only).
+    /// Handle of the `SbiControl` capability (RISC-V only).
     ///
     /// Grants authority to forward SBI calls from userspace through the kernel.
     /// Zero on x86-64 (no SBI concept).
-    pub sbi_control_cap: u32,
+    pub sbi_control_cap: u64,
 
-    /// Slot index of init's own `CSpace` capability.
+    /// Handle of init's own `CSpace` capability.
     ///
     /// Init needs this to create threads bound to its own `CSpace` (e.g. a log
     /// thread that shares init's capability namespace). Added in protocol v4.
-    pub cspace_cap: u32,
+    pub cspace_cap: u64,
 
     // ── Root IRQ range + firmware-table caps (added in protocol v5) ─────
-    /// Slot index of the root `Interrupt` range capability.
+    /// Handle of the root `Interrupt` range capability.
     ///
     /// Covers the full valid IRQ range for the target arch (x86-64: GSI
     /// 0..256; RISC-V: PLIC sources 0..N). Userspace splits this cap
     /// with `SYS_IRQ_SPLIT` to produce single-IRQ sub-caps for device
     /// drivers.
-    pub irq_range_cap: u32,
+    pub irq_range_cap: u64,
 
-    /// Slot index of the read-only `Memory` cap covering the 4 KiB page
+    /// Handle of the read-only `Memory` cap covering the 4 KiB page
     /// that contains the ACPI RSDP.
     ///
     /// RSDP commonly lives in firmware-reserved memory outside
     /// `AcpiReclaimable`, so it gets its own slot. Zero if no RSDP
     /// address was reported (pure-DTB platforms).
-    pub acpi_rsdp_memory_cap: u32,
+    pub acpi_rsdp_memory_cap: u64,
 
-    /// First slot index of the read-only `Memory` caps covering each
+    /// First slot of the read-only `Memory` caps covering each
     /// `MemoryType::AcpiReclaimable` region in the boot memory map.
-    pub acpi_region_memory_base: u32,
+    pub acpi_region_memory_base: u64,
 
     /// Number of ACPI reclaimable-region `Memory` caps.
-    pub acpi_region_memory_count: u32,
+    pub acpi_region_memory_count: u64,
 
-    /// Slot index of the read-only `Memory` cap covering the DTB blob,
+    /// Handle of the read-only `Memory` cap covering the DTB blob,
     /// or zero if no DTB was supplied (pure-ACPI platforms).
-    pub dtb_memory_cap: u32,
+    pub dtb_memory_cap: u64,
 
     // ── Init self-reclaim cap surfaces (added in protocol v6) ───────────
-    /// First slot index of init's user stack `Memory` caps.
+    /// First slot of init's user stack `Memory` caps.
     ///
     /// Each cap covers one 4 KiB stack page; init holds
     /// `init_stack_memory_count` consecutive caps starting at this slot.
     /// Used by init's reap-handoff (`procmgr.REGISTER_INIT_TEARDOWN`) to
     /// donate the stack pages back to memmgr's pool after init's
     /// `AddressSpace` is torn down.
-    pub init_stack_memory_base: u32,
+    pub init_stack_memory_base: u64,
     /// Number of stack `Memory` caps (typically `INIT_STACK_PAGES = 4`).
-    pub init_stack_memory_count: u32,
+    pub init_stack_memory_count: u64,
 
-    /// First slot index of init's `InitInfo`-region `Memory` caps.
+    /// First slot of init's `InitInfo`-region `Memory` caps.
     ///
     /// Each cap covers one 4 KiB page of the kernel-allocated
     /// `InitInfo` region (header — which includes the boot-module name
@@ -259,18 +274,13 @@ pub struct InitInfo
     /// The cap range includes the page that contains this `InitInfo`
     /// struct itself — once init has read `InitInfo` at `_start`, the
     /// pages can be reclaimed safely.
-    pub init_info_memory_base: u32,
+    pub init_info_memory_base: u64,
     /// Number of `InitInfo` `Memory` caps (1..=[`INIT_INFO_MAX_PAGES`]),
     /// one per page of the region: the region's page count, which bounds the
     /// descriptor slice.
-    pub init_info_memory_count: u32,
+    pub init_info_memory_count: u64,
 
     // ── Boot-module name table (added in protocol version 7) ────────────
-    /// Number of valid [`InitModuleName`] entries in [`Self::module_names`].
-    /// Indices `0..module_name_count` are populated; the rest are
-    /// [`INIT_MODULE_NAME_EMPTY`].
-    pub module_name_count: u32,
-
     /// Bundle-entry-name → `CSpace`-slot mapping for boot-module `Memory`
     /// caps. Lives inside the `InitInfo` header so it sits entirely on
     /// the first `InitInfo` page (the [`CapDescriptor`] array that
@@ -333,15 +343,15 @@ const _: () = assert!(
 #[derive(Clone, Copy)]
 pub struct CapDescriptor
 {
-    /// `CSpace` slot index.
-    pub slot: u32,
+    /// Capability handle of the slot.
+    pub slot: u64,
 
     /// Capability type discriminant. See [`CapType`].
     pub cap_type: CapType,
 
     /// Padding for alignment; must be zero.
     #[doc(hidden)]
-    pub pad: [u8; 3],
+    pub pad: [u8; 7],
 
     /// Type-specific primary metadata:
     /// - `Memory`: physical base address
@@ -372,12 +382,8 @@ pub struct CapDescriptor
 #[derive(Clone, Copy)]
 pub struct InitModuleName
 {
-    /// `CSpace` slot index of the module's `Memory` cap.
-    pub slot: u32,
-    /// Explicit padding so `name` starts 8-byte aligned within the
-    /// surrounding `[InitModuleName; N]` array.
-    #[doc(hidden)]
-    pub _pad: u32,
+    /// Capability handle of the module's `Memory` cap.
+    pub slot: u64,
     /// Bundle entry name, NUL-padded to [`INIT_MODULE_NAME_LEN`] bytes.
     pub name: [u8; INIT_MODULE_NAME_LEN],
 }
@@ -385,7 +391,6 @@ pub struct InitModuleName
 /// Empty / NUL-padded slot for an unused [`InitModuleName`] entry.
 pub const INIT_MODULE_NAME_EMPTY: InitModuleName = InitModuleName {
     slot: 0,
-    _pad: 0,
     name: [0u8; INIT_MODULE_NAME_LEN],
 };
 
@@ -476,11 +481,11 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 
 /// Locate a boot-module `Memory` cap by its bundle-entry name.
 ///
-/// Returns the `CSpace` slot index from the first matching
+/// Returns the capability handle from the first matching
 /// [`InitModuleName`] in [`InitInfo::module_names`], or `None` if no
 /// entry carries the requested name.
 #[must_use]
-pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u32>
+pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u64>
 {
     let count = (info.module_name_count as usize).min(INIT_MAX_NAMED_MODULES);
     for entry in &info.module_names[..count]

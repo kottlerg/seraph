@@ -69,10 +69,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-    }
-    .map_err(|_| "integration::wait_concurrency: configure_and_start failed")?;
+    unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
+        .map_err(|_| "integration::wait_concurrency: configure_and_start failed")?;
 
     // Block until the child fires the notification.
     let tok_b = wait_set_wait(ws)
@@ -120,10 +118,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn sender_entry(sig_slot: u64) -> !
 {
-    notification_send(sig_slot as u32, 0xBEEF).ok();
+    notification_send(sig_slot, 0xBEEF).ok();
     thread_exit()
 }

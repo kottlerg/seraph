@@ -198,7 +198,8 @@ claims.
     stating it, either the one this PR recorded or the one an open
     follow-up Issue of its scope already held. List each finding of the
     record's `findings` that the range leaves unfixed, as the record states
-    it, so the parent's record of this run carries it into the ledger. End
+    it, so the parent's record of this run carries it, and the ledger takes
+    it when the run's reviewer verdict is `NON-BLOCKING ISSUES ONLY`. End
     the section with the line `Reviewer verdict: <verdict>`, the verdict
     that section gives the run, derived from the record and the range.
 

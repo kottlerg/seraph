@@ -349,6 +349,7 @@ thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
 | `ipc_round_trip` | Synchronous IPC call + reply, per-iteration |
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
+| `cap_info_lookup` | `cap_info(CAP_INFO_TAG_RIGHTS)` on a held cap: one handle resolution and pin, against the `null_syscall_roundtrip` baseline |
 | `mem_map_unmap` | `mem_map` + `mem_unmap` cycle |
 | `mem_protect_pair` | `mem_protect(READ)` + `mem_protect(WRITABLE)` round trip |
 | `thread_lifecycle` | Full thread create → start → exit → cleanup |

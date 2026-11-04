@@ -96,9 +96,9 @@ pub mod procmgr_labels
     /// Create a new process from a caller-supplied file cap (ELF binary).
     ///
     /// The caller already walked its own namespace cap to the binary node
-    /// and attaches the resulting badged file cap. Procmgr issues
-    /// `FS_READ` / `FS_READ_MEMORY` against that cap to stream the ELF —
-    /// it never holds a namespace cap of its own.
+    /// and attaches the resulting badged file cap. Procmgr opens it
+    /// (`FS_OPEN`) and streams the ELF with `FS_READ` / `FS_READ_MEMORY`
+    /// against its own open — it never holds a namespace cap of its own.
     ///
     /// Label layout:
     /// * bits `[0..16]` — opcode (`CREATE_FROM_FILE`)
@@ -2563,8 +2563,9 @@ pub mod procmgr_errors
     /// Reserved for callers that want a structured error before issuing
     /// `CREATE_FROM_FILE`.
     pub const FILE_NOT_FOUND: u64 = 9;
-    /// I/O error reading file via the supplied file cap during
-    /// `CREATE_FROM_FILE`.
+    /// I/O error during `CREATE_FROM_FILE`: the `FS_OPEN` of the supplied
+    /// file cap failed, or a read through procmgr's open of it did
+    /// (services/procmgr/docs/ipc-interface.md § Label 13).
     pub const IO_ERROR: u64 = 10;
     /// `mem_map` or scratch mapping failed during ELF page load.
     pub const MAP_FAILED: u64 = 11;

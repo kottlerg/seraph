@@ -498,6 +498,7 @@ fn service_loop(
                     nodes,
                     &mut files_g,
                     caps,
+                    cache,
                     ipc_buf,
                 );
             }
@@ -856,7 +857,11 @@ fn pick_eviction_candidate(files: &mut OpenTable) -> Option<EvictReq>
 /// deleted), and reply with an open cap whose badge names it
 /// (services/fs/docs/fs-driver-protocol.md § Label 18). The open cap
 /// carries the node cap's rights and `SEND_GRANT`, as a node cap does, so
-/// `FS_WRITE_MEMORY` can carry its source page on it.
+/// `FS_WRITE_MEMORY` can carry its source page on it. Before recording the
+/// SEND it tops the `CSpace` up ([`PageCache::fund_run_time_headroom`]).
+// too_many_arguments: the request, its node and rights, and the driver state
+// an open touches (node table, open table, endpoint caps, cache, IPC buffer).
+#[allow(clippy::too_many_arguments)]
 fn handle_open_node_cap(
     node_id: NodeId,
     rights: NamespaceRights,
@@ -864,6 +869,7 @@ fn handle_open_node_cap(
     nodes: &NodeTable,
     files: &mut OpenTable,
     caps: &FatCaps,
+    cache: &PageCache,
     ipc_buf: *mut u64,
 )
 {
@@ -886,6 +892,14 @@ fn handle_open_node_cap(
         }
         reply_err(code, ipc_buf);
     };
+    // The SEND holds a slot for the open's lifetime, so the CSpace grows
+    // with the opens rather than leaving a later read no slot for its
+    // page's caps.
+    if !cache.fund_run_time_headroom(startup_info().self_cspace)
+    {
+        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        return;
+    }
     let Some(open_id) = files.insert(OpenFile::new(node_id, release_send))
     else
     {

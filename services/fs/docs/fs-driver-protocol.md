@@ -141,9 +141,9 @@ open cap, with the rights its badge carries.
 
 **Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (the badge
 names no node, or a directory, or is an open cap), `PERMISSION_DENIED` (the
-badge carries no rights), `TOO_MANY_OPEN` (the open table is full or the
-heap cannot grow it), `IO_ERROR` (the driver could not mint the cap). Every
-refusal deletes the carried SEND.
+badge carries no rights), `TOO_MANY_OPEN` (the open table is full, or the
+heap or the driver's `CSpace` cannot grow), `IO_ERROR` (the driver could not
+mint the cap). Every refusal deletes the carried SEND.
 
 **Lifetime and bounds.** An open lives until its `FS_CLOSE`, or until an
 [`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)

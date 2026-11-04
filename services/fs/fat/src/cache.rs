@@ -94,14 +94,21 @@ struct ScratchMemory
     va: u64,
 }
 
+/// General capability slots the fs keeps free for the caps it takes at run
+/// time beyond the cache's own: a read's transient child derivation,
+/// block-device replies, the eviction worker's release-SEND copies, and the
+/// release SENDs `FS_OPEN` records until [`PageCache::fund_run_time_headroom`]
+/// next tops the `CSpace` up.
+const RUN_TIME_CSPACE_HEADROOM: usize = 64;
+
 /// General capability slots [`PageCache::init`] funds in the fs process's
 /// own `CSpace` before filling a cache of `slots` slots: one per slot page,
-/// one per page the quarantine may add, the scratch page, and headroom for
-/// the caps the fs takes at run time (per-read derivations, block-device
-/// replies).
+/// one per page the quarantine may add, one per-read ancestor per slot (each
+/// outstanding `FS_READ_MEMORY` page holds one, and every slot can be
+/// outstanding at once), the scratch page, and [`RUN_TIME_CSPACE_HEADROOM`].
 fn cache_cspace_funding(slots: usize) -> u64
 {
-    (slots + QUARANTINE_MAX) as u64 + 1 + 64
+    (2 * slots + QUARANTINE_MAX + 1 + RUN_TIME_CSPACE_HEADROOM) as u64
 }
 
 /// Sector size before mount sets the device's ([`PageCache::set_sector_size`]).
@@ -317,6 +324,20 @@ impl PageCache
     pub fn slot_ceiling(&self) -> usize
     {
         self.slots.len()
+    }
+
+    /// Top the fs process's `CSpace` (`cspace`) up so the general slots a
+    /// full cache can still take stay free: a per-read ancestor for every
+    /// slot, the quarantine's replacements, and
+    /// [`RUN_TIME_CSPACE_HEADROOM`]. Called before `FS_OPEN` records a
+    /// release SEND, which holds a slot for the open's lifetime, so the
+    /// `CSpace` grows with the opens instead of starving reads. A no-op
+    /// beyond reading the `CSpace`'s headroom while it suffices; `false`
+    /// when memmgr cannot fund it.
+    pub fn fund_run_time_headroom(&self, cspace: u32) -> bool
+    {
+        let slots = self.slot_ceiling() + QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM;
+        std::os::seraph::fund_cspace_slot_budget(cspace, slots as u64)
     }
 
     /// The slots that hold a page: the provisioned prefix of `slots`.

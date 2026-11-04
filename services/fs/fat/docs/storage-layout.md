@@ -35,9 +35,12 @@ in [crash-safety.md](crash-safety.md).
   and the cache evicts only once every slot holds a page or memmgr refuses one, so an idle mount
   pays only for the pages it fills. A file holds at most the slot ceiling of outstanding
   `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with general headroom for every
-  slot page, the quarantine's replacements, the scratch page, and 64 more
-  (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache never meets an exhausted
-  `CSpace`; a failed funding fails cache init. Write-through: the cached page is updated in place
+  slot page, the quarantine's replacements, a per-read ancestor cap for every slot (each
+  outstanding page holds one), the scratch page, and 64 more
+  (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache, or holding every slot
+  outstanding, never meets an exhausted `CSpace`; a failed funding fails cache init. Each
+  `FS_OPEN` tops the `CSpace` up to the same run-time headroom before it records the open's
+  release SEND, so the opens' SENDs grow it rather than starve reads. Write-through: the cached page is updated in place
   before the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the page observes new
   bytes immediately, and the sector is put back when the write fails. `reload_sector` reads one
   sector from the device past the cache and refreshes the cached copy; a failed `FS_REMOVE` or

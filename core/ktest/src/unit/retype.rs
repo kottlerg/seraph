@@ -790,6 +790,12 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     const DEEP_SLOT: u32 = 1_000_000;
     // Pages to back DEEP_SLOT: leaves 0..=17,857 plus 35 directory pages.
     const DEEP_POOL_PAGES: u64 = 17_893;
+    // SMALL_SLOT one leaf on: slots per leaf page are the kernel's `L2_SIZE`,
+    // published in the ABI. Taken before any capability exists, so the
+    // refusal needs no cleanup.
+    let next_leaf_slot = u32::try_from(syscall_abi::CSPACE_SLOTS_PER_PAGE)
+        .map(|leaf| SMALL_SLOT + leaf)
+        .map_err(|_| "retype::indirect: CSPACE_SLOTS_PER_PAGE exceeds a slot index")?;
 
     let memory = ctx.memory_base;
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -844,11 +850,6 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     // CSpace and lands in the target.
     let mover = cap_create_notification(memory)
         .map_err(|_| "retype::indirect: cap_create_notification(mover) failed")?;
-    // The same slot one leaf on: slots per leaf page are the kernel's
-    // `L2_SIZE`, published in the ABI.
-    let next_leaf_slot = u32::try_from(syscall_abi::CSPACE_SLOTS_PER_PAGE)
-        .map(|leaf| SMALL_SLOT + leaf)
-        .map_err(|_| "retype::indirect: CSPACE_SLOTS_PER_PAGE exceeds a slot index")?;
     if syscall::cap_move(mover, cspace, next_leaf_slot).is_err()
     {
         cap_delete(mover).ok();

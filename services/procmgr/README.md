@@ -166,7 +166,8 @@ The full procmgr IPC specification is in
 - `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child `Thread` cap
 - `CREATE_FROM_FILE(file_cap, file_size, …)` → suspended process handle,
   child `Thread` cap. Caller has already walked its own namespace cap to the
-  binary; procmgr issues `FS_READ` against the supplied file cap.
+  binary; procmgr opens the supplied file cap (`FS_OPEN`) and reads the ELF
+  through its own open.
 - `START_PROCESS(process_handle)` — start a previously created process
 - `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)
   cwd caps on the child before start; the sole path that writes

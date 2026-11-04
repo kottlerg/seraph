@@ -9,7 +9,8 @@ use std::os::seraph::startup_info;
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
-    fs_create, fs_mkdir, fs_read_bytes, fs_remove, fs_rename, fs_write_inline, svctest_dir_cap,
+    fs_close, fs_create, fs_mkdir, fs_open, fs_read_bytes, fs_read_memory, fs_release_memory,
+    fs_remove, fs_rename, fs_write_inline, svctest_dir_cap,
 };
 use crate::ipc_util::ns::ns_lookup;
 use crate::runner::Phase;
@@ -200,9 +201,10 @@ pub fn fs_release_on_close_phase(_: &Caps)
 /// generation: file A's cap, used once file B has taken A's index (the free
 /// list hands back the most recently freed index first), must be refused
 /// rather than read B. Without the generation, A's badge would name B's node
-/// and the read would return B's bytes. A's `FS_CLOSE` before the removal
-/// covers the close-then-use order: a close frees no node, and the removal
-/// still invalidates the cap.
+/// and the read would return B's bytes. An open of A closed before the
+/// removal covers the close-then-use order: a close frees an open, never the
+/// node, and the removal still invalidates the node cap. An open of A still
+/// live at the removal is released with the node, so its cap is refused too.
 pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -213,14 +215,17 @@ pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
 
     let (cap_a, _) = fs_create(svctest, name_a, ipc_buf).expect("FS_CREATE epocha failed");
     fs_write_inline(cap_a, 0, b"AAAA", ipc_buf).expect("FS_WRITE epocha failed");
-    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(cap_a, &close, ipc_buf) }.expect("FS_CLOSE ipc_call");
-    assert_eq!(reply.label, ipc::fs_errors::SUCCESS, "FS_CLOSE epocha");
+    let closed = fs_open(cap_a, 0, ipc_buf).expect("FS_OPEN epocha");
+    let live = fs_open(cap_a, 0, ipc_buf).expect("FS_OPEN epocha again");
+    assert_eq!(
+        fs_close(closed, ipc_buf),
+        ipc::fs_errors::SUCCESS,
+        "FS_CLOSE epocha"
+    );
     assert_eq!(
         fs_read_bytes(cap_a, 0, 4, ipc_buf).expect("FS_READ epocha after close"),
         b"AAAA",
-        "a closed cap still reaches its own file"
+        "the node cap of a closed open still reaches its own file"
     );
     fs_remove(svctest, name_a, ipc_buf).expect("FS_REMOVE epocha");
 
@@ -232,6 +237,13 @@ pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
         Err(ipc::fs_errors::INVALID_BADGE),
         "a removed node's cap read another node's content"
     );
+    assert_eq!(
+        fs_read_bytes(live, 0, 4, ipc_buf),
+        Err(ipc::fs_errors::INVALID_BADGE),
+        "an open of a removed node outlived it"
+    );
+    let _ = syscall::cap_delete(closed);
+    let _ = syscall::cap_delete(live);
     assert_eq!(
         fs_read_bytes(cap_b, 0, 4, ipc_buf).expect("FS_READ epochb"),
         b"BBBB",
@@ -298,21 +310,19 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
     );
     std::os::seraph::log!("fs_rights_attenuation: FS_READ rejected on STAT-only cap");
 
-    let memory_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
-        .word(0, 0)
-        .word(1, 1)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let memory_reply = unsafe { ipc::ipc_call(stat_cap, &memory_msg, ipc_buf) }
-        .expect("fs_rights_attenuation: FS_READ_MEMORY ipc_call failed");
+    // An open of the STAT-only cap carries its rights and no more.
+    let stat_open = fs_open(stat_cap, 0, ipc_buf)
+        .expect("fs_rights_attenuation: FS_OPEN of the STAT-only cap failed");
+    let memory = fs_read_memory(stat_open, 0, 1, ipc_buf);
     assert_eq!(
-        memory_reply.label,
-        ipc::fs_errors::PERMISSION_DENIED,
-        "fs_rights_attenuation: FS_READ_MEMORY on STAT-only cap returned {} (expected PERMISSION_DENIED={})",
-        memory_reply.label,
-        ipc::fs_errors::PERMISSION_DENIED,
+        memory.err(),
+        Some(ipc::fs_errors::PERMISSION_DENIED),
+        "fs_rights_attenuation: FS_READ_MEMORY on an open of a STAT-only cap must be \
+         PERMISSION_DENIED",
     );
-    std::os::seraph::log!("fs_rights_attenuation: FS_READ_MEMORY rejected on STAT-only cap");
+    let _ = fs_close(stat_open, ipc_buf);
+    let _ = syscall::cap_delete(stat_open);
+    std::os::seraph::log!("fs_rights_attenuation: FS_READ_MEMORY rejected on STAT-only open");
 
     let unknown_msg = ipc::IpcMessage::new(0x9999);
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -1018,39 +1028,30 @@ pub fn fs_long_name_insert_phase(_: &Caps)
     std::os::seraph::log!("fs_long_name_insert phase passed");
 }
 
-/// `FS_READ_MEMORY` on `cap` at `offset` with `cookie`, opting out of
-/// cooperative release. Returns `bytes_valid` after releasing the page it
-/// returned, if any.
+/// `FS_READ_MEMORY` at `offset` with `cookie` through a fresh open of file
+/// node cap `cap`, opting out of cooperative release. Returns `bytes_valid`
+/// after releasing the page it returned, if any, and closing the open.
 fn read_memory_bytes_valid(cap: u32, offset: u64, cookie: u64, ipc_buf: *mut u64) -> u64
 {
-    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
-        .word(0, offset)
-        .word(1, cookie)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }.expect("FS_READ_MEMORY ipc_call");
-    assert_eq!(
-        reply.label,
-        ipc::fs_errors::SUCCESS,
-        "FS_READ_MEMORY at {offset} status"
-    );
-    if let Some(&page) = reply.caps().first()
+    let open = fs_open(cap, 0, ipc_buf).expect("FS_OPEN for FS_READ_MEMORY");
+    let (page, bytes_valid) = fs_read_memory(open, offset, cookie, ipc_buf)
+        .unwrap_or_else(|e| panic!("FS_READ_MEMORY at {offset} status {e}"));
+    if page != 0
     {
         let _ = syscall::cap_delete(page);
-        let release = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
-            .word(0, cookie)
-            .build();
-        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_call(cap, &release, ipc_buf) };
+        let _ = fs_release_memory(open, cookie, ipc_buf);
     }
-    reply.word(0)
+    assert_eq!(fs_close(open, ipc_buf), ipc::fs_errors::SUCCESS, "FS_CLOSE");
+    let _ = syscall::cap_delete(open);
+    bytes_valid
 }
 
 /// A memory-cap read sees the node's current size and chain: after an
 /// append it returns the appended bytes, and after a truncate to zero it
 /// reports end of file. fatfs once answered from the size and first cluster
 /// it recorded when the node's first `FS_READ_MEMORY` allocated its open-file
-/// slot, missing appends and reading the freed chain after a truncate.
+/// slot, missing appends and reading the freed chain after a truncate; each
+/// read here goes through a fresh open, and the writes through the node cap.
 pub fn fs_memory_read_tracks_size_phase(_: &Caps)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -1082,9 +1083,6 @@ pub fn fs_memory_read_tracks_size_phase(_: &Caps)
         "FS_READ_MEMORY after a truncate to zero must report end of file"
     );
 
-    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(cap, &close, ipc_buf) };
     let _ = syscall::cap_delete(cap);
     fs_remove(svctest, name, ipc_buf).expect("cleanup mrsize");
     let _ = syscall::cap_delete(svctest);
@@ -1180,9 +1178,6 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
         "FS_READ_MEMORY after carried caps"
     );
 
-    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(cap, &close, ipc_buf) };
     let _ = syscall::cap_delete(cap);
     fs_remove(svctest, name, ipc_buf).expect("cleanup capdrop");
     let _ = syscall::cap_delete(svctest);
@@ -1198,7 +1193,7 @@ const SLOT_REUSE_MARGIN: usize = 40;
 
 /// fatfs's cache slot ceiling on this machine: [`fat_parse::slot_ceiling`] of
 /// the RAM memmgr reports, the one rule fatfs itself sizes its cache by.
-fn fatfs_slot_ceiling(ipc_buf: *mut u64) -> usize
+pub(crate) fn fatfs_slot_ceiling(ipc_buf: *mut u64) -> usize
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -1241,12 +1236,12 @@ struct HeldPage
 
 impl HeldPage
 {
-    /// `FS_READ_MEMORY` page `index` of the open `node` without a release
-    /// endpoint, map the returned cap read-only, then send `FS_RELEASE_MEMORY`
-    /// without unmapping. fatfs revokes the cap and drops its slot while the
-    /// mapping stays. `None` when fatfs answers `IO_ERROR`, finding no slot it
-    /// may reuse.
-    fn take(node: u32, index: usize, ipc_buf: *mut u64) -> Option<Self>
+    /// `FS_READ_MEMORY` page `index` through the open cap `open`, opened
+    /// without a release endpoint, map the returned cap read-only, then send
+    /// `FS_RELEASE_MEMORY` without unmapping. fatfs revokes the cap and drops
+    /// its slot while the mapping stays. `None` when fatfs answers `IO_ERROR`,
+    /// finding no slot it may reuse.
+    fn take(open: u32, index: usize, ipc_buf: *mut u64) -> Option<Self>
     {
         let cookie = 0x5107_0000 + index as u64;
         let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
@@ -1254,7 +1249,7 @@ impl HeldPage
             .word(1, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(node, &read, ipc_buf) }
+        let reply = unsafe { ipc::ipc_call(open, &read, ipc_buf) }
             .expect("slot reuse: FS_READ_MEMORY ipc_call");
         if reply.label == ipc::fs_errors::IO_ERROR
         {
@@ -1289,7 +1284,7 @@ impl HeldPage
             .word(0, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let released = unsafe { ipc::ipc_call(node, &release, ipc_buf) }
+        let released = unsafe { ipc::ipc_call(open, &release, ipc_buf) }
             .expect("slot reuse: FS_RELEASE_MEMORY ipc_call");
         // A failed release would leave the slot in use, so the reuse the
         // cases check would never happen.
@@ -1341,6 +1336,40 @@ impl HeldPage
     }
 }
 
+/// Path and name of the slot-reuse file: more pages than fatfs's cache holds,
+/// page `i` tagged [`page_tag`]`(i)`. Written once per boot and shared by the
+/// per-open eviction phase (`fs_opens`), which runs first and writes it, and
+/// the slot-reuse phase, which removes it, since writing it is most of either
+/// phase's time.
+pub(crate) const SLOT_REUSE_PATH: &str = "/data/svctest/slotreuse.bin";
+pub(crate) const SLOT_REUSE_NAME: &[u8] = b"slotreuse.bin";
+
+/// Write the slot-reuse file unless a file of its size is already there, and
+/// return its page count: fatfs's slots, its quarantine bound, and
+/// [`SLOT_REUSE_MARGIN`].
+pub(crate) fn slot_reuse_file(ipc_buf: *mut u64) -> usize
+{
+    use std::io::Write;
+
+    let pages = fatfs_slot_ceiling(ipc_buf) + FATFS_QUARANTINE_MAX + SLOT_REUSE_MARGIN;
+    let size = (pages * SLOT_REUSE_PAGE) as u64;
+    if std::fs::metadata(SLOT_REUSE_PATH).is_ok_and(|m| m.len() == size)
+    {
+        return pages;
+    }
+    let mut f = std::fs::File::create(SLOT_REUSE_PATH).expect("slot reuse: create");
+    let mut page = vec![0u8; SLOT_REUSE_PAGE];
+    for i in 0..pages
+    {
+        for chunk in page.chunks_exact_mut(8)
+        {
+            chunk.copy_from_slice(&page_tag(i));
+        }
+        f.write_all(&page).expect("slot reuse: write a page");
+    }
+    pages
+}
+
 /// Read every page of the slot-reuse file from page `skip` on, checking
 /// each page's tag, so the LRU reuses every unreferenced slot.
 fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
@@ -1384,32 +1413,19 @@ fn read_slot_reuse_file(path: &str, skip: usize, pages: usize)
 /// page of the file.
 pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
 {
-    use std::io::Write;
-
-    let path = "/data/svctest/slotreuse.bin";
-    let name: &[u8] = b"slotreuse.bin";
+    let path = SLOT_REUSE_PATH;
+    let name = SLOT_REUSE_NAME;
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let slots = fatfs_slot_ceiling(ipc_buf);
-    let file_pages = slots + FATFS_QUARANTINE_MAX + SLOT_REUSE_MARGIN;
-    {
-        let mut f = std::fs::File::create(path).expect("slot reuse: create");
-        let mut page = vec![0u8; SLOT_REUSE_PAGE];
-        for i in 0..file_pages
-        {
-            for chunk in page.chunks_exact_mut(8)
-            {
-                chunk.copy_from_slice(&page_tag(i));
-            }
-            f.write_all(&page).expect("slot reuse: write a page");
-        }
-    }
+    let file_pages = slot_reuse_file(ipc_buf);
 
     let svctest = svctest_dir_cap(ipc_buf);
-    let (node, _kind, _size) =
+    let (node_cap, _kind, _size) =
         ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("slot reuse: lookup");
+    let open = fs_open(node_cap, 0, ipc_buf).expect("slot reuse: FS_OPEN");
 
     let held: Vec<HeldPage> = (0..SLOT_REUSE_HELD)
-        .map(|i| HeldPage::take(node, i, ipc_buf).expect("slot reuse: a read past the bound"))
+        .map(|i| HeldPage::take(open, i, ipc_buf).expect("slot reuse: a read past the bound"))
         .collect();
     read_slot_reuse_file(path, SLOT_REUSE_HELD, file_pages);
     read_slot_reuse_file(path, 0, file_pages);
@@ -1425,7 +1441,7 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     let mut held = Vec::new();
     while held.len() < file_pages
     {
-        match HeldPage::take(node, held.len(), ipc_buf)
+        match HeldPage::take(open, held.len(), ipc_buf)
         {
             Some(page) => held.push(page),
             None => break,
@@ -1450,10 +1466,9 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     }
     read_slot_reuse_file(path, 0, file_pages);
 
-    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(node, &close, ipc_buf) };
-    let _ = syscall::cap_delete(node);
+    let _ = fs_close(open, ipc_buf);
+    let _ = syscall::cap_delete(open);
+    let _ = syscall::cap_delete(node_cap);
     fs_remove(svctest, name, ipc_buf).expect("cleanup slotreuse");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_mapping_survives_slot_reuse phase passed (held {count})");

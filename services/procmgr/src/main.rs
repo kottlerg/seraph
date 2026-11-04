@@ -1263,7 +1263,8 @@ pub struct ProcmgrCtx
 /// Wire layout: see [`procmgr_labels::CREATE_FROM_FILE`]. The caller has
 /// already walked its own namespace cap to the binary node; procmgr never
 /// touches the namespace tree on this path. procmgr owns every transferred
-/// cap: the file cap is `FS_CLOSE`d and deleted after the load, the creator
+/// cap: the file cap is opened (`FS_OPEN`) and deleted, and procmgr's open
+/// `FS_CLOSE`d and deleted after the load, the creator
 /// endpoint is deleted once the child holds its own copy, the relay is
 /// consumed by `finalize_creation` on success, and every other cap, and every
 /// cap of a rejected request, is deleted here.
@@ -1288,29 +1289,19 @@ fn handle_create_from_file(
     )
     else
     {
-        match all_caps.split_first()
-        {
-            Some((&file_cap, rest)) if file_cap != 0 =>
-            {
-                process::vfs_close(file_cap, ipc_buf);
-                release_caps(rest);
-            }
-            _ => release_caps(all_caps),
-        }
+        release_caps(all_caps);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     release_caps(caps.extra);
 
     // Resolve the scheduling fields before any resource acquisition. The
-    // transferred caps are procmgr's to release on the reject path — the
-    // file cap needs a real FS_CLOSE so the fs driver drops its open-file
-    // state, not just a slot delete.
+    // transferred caps are procmgr's to release on the reject path; the
+    // file cap is not opened yet, so the fs driver holds no state for it.
     let Some(sched) = resolve_create_sched(label, req.badge, table)
     else
     {
-        process::vfs_close(caps.file, ipc_buf);
-        release_caps(&[caps.creator, caps.relay]);
+        release_caps(&[caps.file, caps.creator, caps.relay]);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };

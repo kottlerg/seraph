@@ -58,10 +58,11 @@ pub enum BootError
     #[allow(dead_code)]
     PagingModeUnsupported,
 
-    /// The final memory map held RAM descriptors past the translated
-    /// `MemoryMapEntry` array (step 9): the kernel would boot without that
-    /// memory. The `usize` is the number of RAM descriptors left out.
-    MemoryMapTruncated(usize),
+    /// The final map's buffer could hold more descriptors than the entry array
+    /// step 6 sized, on every one of the `MEM_MAP_ATTEMPTS` runs of steps 6
+    /// and 7, the slack doubling each time. The `usize` is the last attempt's
+    /// buffer reach (`uefi::map_buffer_descriptor_reach`).
+    MemoryMapKeptGrowing(usize),
 
     /// The firmware's memory map violates the UEFI contract (a descriptor size
     /// below `EFI_MEMORY_DESCRIPTOR`'s). The `&'static str` payload names the
@@ -138,9 +139,9 @@ impl BootError
             {
                 "no supported RISC-V paging mode (Sv39 is the platform minimum)"
             }
-            BootError::MemoryMapTruncated(_) =>
+            BootError::MemoryMapKeptGrowing(_) =>
             {
-                "memory map has RAM descriptors past the translated entry array"
+                "memory map kept outgrowing the entry array across the step 6 and 7 retries"
             }
             BootError::InvalidMemoryMap(_) => "UEFI memory map violates the UEFI contract",
             BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
@@ -161,9 +162,9 @@ impl core::fmt::Display for BootError
         {
             write!(f, ": status={code:#018x}")?;
         }
-        if let BootError::MemoryMapTruncated(ram) = self
+        if let BootError::MemoryMapKeptGrowing(reach) = self
         {
-            write!(f, ": {ram} RAM descriptors left out")?;
+            write!(f, ": a buffer of {reach} descriptors on the last attempt")?;
         }
         Ok(())
     }
@@ -192,7 +193,7 @@ mod tests
             BootError::ExitBootServicesFailed,
             BootError::InvalidBundle("b"),
             BootError::PagingModeUnsupported,
-            BootError::MemoryMapTruncated(1),
+            BootError::MemoryMapKeptGrowing(1),
             BootError::InvalidMemoryMap("m"),
             BootError::ReclaimRangesOverflow,
         ];

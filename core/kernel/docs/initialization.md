@@ -555,7 +555,8 @@ consecutive slots also halts, naming the run and the first slot out of place (fo
 **Completion criterion:** Root CSpace exists and contains capabilities for all
 boot-provided hardware resources, including the reclaimable Memory caps
 covering bootloader scratch pages (`BootInfo` page, descriptor arrays,
-MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames)
+MMIO aperture array, aperture-seed buffers, reclaim-array page, CPU-id pages, transient
+page-table frames)
 and the bundle's non-module pages (header + entry table + 4 KiB pad,
 init ELF source body, inter-module and trailing slack — module bodies
 are excluded because `mint_module_memory_caps` already covers them).

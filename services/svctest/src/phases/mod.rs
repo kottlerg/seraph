@@ -12,9 +12,12 @@
 //!
 //! 1. [`startup`] first — argv/env/stack/TLS bring-up before anything
 //!    else touches them.
-//! 2. [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end (but before
-//!    [`pwrmgr`]), and [`layout::after_fs`] after them: it writes a fixture
-//!    under `/data/svctest`.
+//! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end
+//!    (but before [`pwrmgr`]), and [`layout::after_fs`] after them: it
+//!    writes a fixture under `/data/svctest`. [`fs_opens`] comes before
+//!    [`fs_ipc`]: its eviction phase needs `/data`'s page cache cold (slots
+//!    not yet provisioned), and it writes the slot-reuse file that
+//!    `fs_ipc`'s slot-reuse phase reads and removes.
 //! 3. `fs_open_relative_phase` last inside [`fs_ipc`]: it installs a
 //!    process-global `current_dir_cap` whose cap-derivation pressure
 //!    on TCG-emulated arches affects subsequent phases.
@@ -38,6 +41,7 @@ pub mod drivers;
 pub mod exit_code;
 pub mod fs_faults;
 pub mod fs_ipc;
+pub mod fs_opens;
 pub mod fs_std;
 pub mod layout;
 pub mod memmgr;
@@ -76,6 +80,10 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());
+    // fs_opens runs while /data's cache is still cold (its eviction phase's
+    // CSpace case needs slots not yet provisioned) and writes the file the
+    // slot-reuse phase of fs_ipc reads and removes.
+    out.extend_from_slice(fs_opens::phases());
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_faults::phases());

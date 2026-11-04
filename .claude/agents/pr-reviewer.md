@@ -41,15 +41,17 @@ discipline below has been applied end-to-end.
     the head, which the parent names (when it does not, compute each as
     `git merge-base <sha> origin/<base branch>`); with equal merge bases
     every changed hunk is the PR's. A standards, doc-drift, coverage, or
-    style finding in a base hunk is not one the delta introduced; a
+    style finding in a base hunk is not one the PR introduced; a
     correctness, safety, or contract defect in one stays in bound. Verify
     each claimed fix for your files against the code, and report: every
     claimed fix not actually made; every finding in the changed hunks; any
     correctness, soundness, safety, or contract defect anywhere in the
     file. Per `docs/conventions.md` § Branch and PR Workflow, a standards,
-    doc-drift, coverage, or style finding the delta did not introduce is out
-    of bound; a statement the delta made stale, or a test the delta's new
-    code lacks, is one the delta introduced wherever it anchors.
+    doc-drift, coverage, or style finding that neither the delta nor the
+    PR's own earlier commits introduced is out of bound; a statement the
+    delta made stale, a test the delta's new code lacks, or a finding in a
+    hunk an earlier commit of the PR introduced is one the PR introduced
+    wherever it anchors.
 
     Per `docs/conventions.md` § Branch and PR Workflow, when the parent
     names a ledger file, read its entries for the files you report on
@@ -166,9 +168,9 @@ per the tracks and the contract-versus-drift criterion `docs/conventions.md`
   for hiding distinct findings. In schema mode there is no collapsing:
   one entry per site.
 
-When invoked with a structured-output schema, fill it instead of the prose
-buckets: one entry per finding with `file` (repository-relative) and
-`line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
+When invoked with a structured-output schema, fill it instead of the
+prose buckets: one entry per finding with `file` (repository-relative)
+and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
 `safety`: memory, concurrency, or soundness, including a document's
 statement of a safety invariant that the code contradicts; `contract`: a
 caller, ABI, or documented promise broken, including a document's
@@ -178,24 +180,25 @@ other disagreement between a document and the code (a stale name, count,
 path, or cross-reference, or a summary out of step with its owner), per
 `docs/conventions.md` § Branch and PR Workflow; `coverage`: a missing
 test; `style`: readability and naming), whether the diff `introduced` it
-(in `delta` mode, whether the delta did), whether it is a `must_violation`
-of a binding standard, whether a `ledger` entry the parent supplied
-already states it at a hunk unchanged since the run the entry names (its
-`run` field; false when that run does not resolve), whether it is
-`in_bound` (on the review surface `docs/conventions.md` § Branch and PR
-Workflow defines, judged as if no open Issue named the work; a
-correctness, soundness, safety, or contract defect in a touched file is;
-in a delta run, a standards, doc-drift, coverage, or style finding only
-when the delta introduced it), the `issue` that names it when one does
-(the parent lists the open Issues; per `docs/conventions.md` § Branch and
-PR Workflow an Issue whose title is `<scope>: defects found by review`, or
-begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
-follow-up Issue, which names findings, not work: it takes nothing off the
-surface, so `issue` is never set to it, and a finding it already holds is
-flagged `ledger` only as step 2a says, and otherwise reported where the
-surface puts it), the `authority`, the `claim`, the `evidence`, and the
-`fix`. There is no final line in schema mode; the workflow computes the
-verdict from the entries.
+(in `delta` mode, whether the delta or the PR's own earlier commits
+did), whether it is a `must_violation` of a binding standard, whether a
+`ledger` entry the parent supplied already states it at a hunk unchanged
+since the run the entry names (its `run` field; false when that run does
+not resolve), whether it is `in_bound` (on the review surface
+`docs/conventions.md` § Branch and PR Workflow defines, judged as if no
+open Issue named the work; a correctness, soundness, safety, or contract
+defect in a touched file is; in a delta run, a standards, doc-drift,
+coverage, or style finding only when the delta or the PR's own earlier
+commits introduced it), the `issue` that names it when one does (the
+parent lists the open Issues; per `docs/conventions.md` § Branch and PR
+Workflow an Issue whose title is `<scope>: defects found by review`, or
+begins with the earlier `<scope>: defects found by PR #<N>'s review`, is
+a follow-up Issue, which names findings, not work: it takes nothing off
+the surface, so `issue` is never set to it, and a finding it already
+holds is flagged `ledger` only as step 2a says, and otherwise reported
+where the surface puts it), the `authority`, the `claim`, the
+`evidence`, and the `fix`. There is no final line in schema mode; the
+workflow computes the verdict from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,

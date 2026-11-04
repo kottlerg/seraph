@@ -1927,10 +1927,32 @@ fn vfs_read(
     Some(bytes_read)
 }
 
-/// Close an open file via its per-file capability and delete the cap.
-/// `pub(crate)` so `main.rs` request handlers can release a transferred
-/// file cap on pre-create validation failures.
-pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
+/// Open the file a caller-transferred file node cap names (`FS_OPEN`, with
+/// no release SEND: procmgr releases each page itself right after its copy,
+/// so it opts out of cooperative release), and delete the node cap. Returns
+/// the open cap every later read and the closing `FS_CLOSE` go to, so
+/// procmgr's pages and close touch no other opener's state
+/// (`fs/docs/fs-driver-protocol.md` § Label 18). `None` when the call fails
+/// or the reply carries no open cap; every other reply cap is deleted.
+fn vfs_open(node_cap: u32, ipc_buf: *mut u64) -> Option<u32>
+{
+    let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) };
+    let _ = syscall::cap_delete(node_cap);
+    let reply = reply.ok()?;
+    let (open_cap, surplus) = match reply.caps().split_first()
+    {
+        Some((&cap, rest)) if reply.label == 0 => (Some(cap), rest),
+        _ => (None, reply.caps()),
+    };
+    // The file cap is client-supplied, so its server is untrusted.
+    crate::release_caps(surplus);
+    open_cap
+}
+
+/// Close an open file via its open cap and delete the cap.
+fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1951,7 +1973,8 @@ pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 // the success path via `disarm()`. Constructed at the point of acquisition;
 // disarmed only after the caps have been moved into the final destination.
 
-/// Holds the caller-transferred file cap until the success path consumes it.
+/// Holds procmgr's open of the caller-transferred file until the success
+/// path consumes it.
 struct FileCapGuard
 {
     cap: u32,
@@ -2328,8 +2351,9 @@ fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
 ///
 /// Reads only the ELF header page, then loads each segment page-by-page
 /// directly from the file cap into target memory caps. No intermediate file
-/// buffer. Procmgr `FS_CLOSE`s and `cap_delete`s `file_cap` before
-/// return regardless of outcome — ownership transfers in. `creator_endpoint`
+/// buffer. Procmgr opens `file_cap` (`FS_OPEN`) and deletes it, then
+/// `FS_CLOSE`s and deletes its open before return regardless of outcome —
+/// ownership transfers in. `creator_endpoint`
 /// is only copied into the child, so the caller still owns and releases it;
 /// `parent_relay_cap` is consumed only on `Ok`, so on `Err` the caller
 /// releases it. Every resource acquired for the child, including memmgr's
@@ -2360,10 +2384,14 @@ pub fn create_process_from_file(
     let self_aspace = ctx.self_aspace;
     let self_endpoint = ctx.self_endpoint;
 
-    // Caller-transferred file cap: wrapped immediately so every early
-    // return between here and the success-path disarm closes the file
-    // (FS_CLOSE on the fs driver) and frees procmgr's CSpace slot.
-    let file_cap = FileCapGuard::new(file_cap, ipc_buf);
+    // Caller-transferred file node cap: opened at once, and the open
+    // wrapped, so every early return between here and the success-path
+    // disarm closes the open (FS_CLOSE on the fs driver) and frees
+    // procmgr's CSpace slot.
+    let file_cap = FileCapGuard::new(
+        vfs_open(file_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?,
+        ipc_buf,
+    );
 
     if file_size == 0
     {

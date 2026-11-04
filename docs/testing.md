@@ -636,6 +636,7 @@ these items: the boot memory map and the direct map (`translate_memory_map`, `ma
 `BOOT_TABLE_POOL_SIZE`, and the stage-2 table carve, `stage2_table_bound`, `find_boot_table_carve`,
 and its bootstrap, `carve_bootstrap_end`, `carve_frames_below`, `map_carve_rest`, `switch_to_carve`,
 and `extend_carve_mapped`), and the drain of RAM into Memory caps (`drain_and_install_seed`,
+`reserve_init_backing`, `coalesced_extent_count`, `init_info_descriptor_bound`,
 `INIT_INFO_DESCRIPTOR_CAPACITY`, `populate_cspace`, `complete_extent_descriptors`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
 `frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
@@ -647,7 +648,8 @@ git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/in
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
 M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|stage2_table_bound|find_boot_table_carve"
 M="$M|carve_bootstrap_end|carve_frames_below|map_carve_rest|switch_to_carve|extend_carve_mapped"
-M="$M|drain_and_install_seed|complete_extent_descriptors"
+M="$M|drain_and_install_seed|reserve_init_backing|coalesced_extent_count"
+M="$M|init_info_descriptor_bound|complete_extent_descriptors"
 M="$M|INIT_INFO_DESCRIPTOR_CAPACITY|populate_cspace|INIT_INFO_MAX_PAGES"
 M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
@@ -830,8 +832,8 @@ list as the tracking Issues move):
   [process-lifecycle.md § Kernel → init](process-lifecycle.md#kernel--init)), so the descriptor
   count tracks memory-map fragmentation (a small fixed number of usable extents
   plus reservation holes), not total RAM. The capacity check now runs at Phase 7,
-  where the drain and `push_descriptor` log the count against
-  `INIT_INFO_DESCRIPTOR_CAPACITY` before fatal-ing, so any residual overflow on a
+  where the drain and `push_descriptor` log the count against the reserved
+  region's descriptor capacity before fatal-ing, so any residual overflow on a
   pathologically fragmented map is diagnosable rather than bare. Verified booting
   clean to the ktest pass marker on both arches at `--mem 4096`.
 

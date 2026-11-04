@@ -255,11 +255,12 @@ pub fn thread_retype_bytes_funds_one_thread(ctx: &TestContext) -> TestResult
 {
     let bytes = system_info(SystemInfoType::ThreadRetypeBytes as u64)
         .map_err(|_| "system_info(ThreadRetypeBytes) failed")?;
-    // The kernel stack (four pages), the wrapper and TCB page, and a save
-    // area of at least one page, all whole pages.
-    if bytes % PAGE_SIZE != 0 || bytes < 6 * PAGE_SIZE
+    // The guard page below the kernel stack, the kernel stack (four pages),
+    // the wrapper and TCB page, and a save area of at least one page, all
+    // whole pages: a slot without its guard reads six.
+    if bytes % PAGE_SIZE != 0 || bytes < 7 * PAGE_SIZE
     {
-        return Err("system_info(ThreadRetypeBytes) is not a slot of six or more whole pages");
+        return Err("system_info(ThreadRetypeBytes) is not a slot of seven or more whole pages");
     }
     crate::log_u64("ktest: ThreadRetypeBytes=", bytes);
     let pages = bytes / PAGE_SIZE;

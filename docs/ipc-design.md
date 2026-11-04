@@ -220,14 +220,14 @@ Two mechanisms make the condition diagnosable:
   `OutOfMemory` error split in [capability-model.md](capability-model.md). This is the only
   signal a process with no log channel (memmgr) can produce before it dies.
 - **Userspace policy.** Blocking receive loops MUST route every receive outcome through
-  `ipc::recv_guard::RecvGuard` (a blocking notification-wait loop may route its waits through
-  it too, as the VirtIO drivers' interrupt-service loop, `virtio_core::isr::serve_interrupts`,
-  does, so `EXIT_RECV_WEDGE` also ends a driver whose interrupt wait wedged): bounded
-  exponential backoff between failed receives, a
-  diagnostic hook at the first failure of a streak, and voluntary process death with
-  `EXIT_RECV_WEDGE` once a streak of identical failures proves the condition persistent.
-  `Interrupted` receives are exempt — expected during thread stop/start, they neither extend
-  nor reset the streak. Non-blocking drain loops (`event_try_recv`) do not use the guard.
+  `ipc::recv_guard::RecvGuard`: bounded exponential backoff between failed receives, a diagnostic
+  hook at the first failure of a streak, and voluntary process death with `EXIT_RECV_WEDGE` once a
+  streak of identical failures proves the condition persistent. A blocking notification-wait loop
+  may route its waits through it too, as the VirtIO drivers' interrupt-service loop,
+  `virtio_core::isr::serve_interrupts`, does, so `EXIT_RECV_WEDGE` also ends a driver whose
+  interrupt wait wedged. `Interrupted` receives are exempt — expected during thread stop/start, they
+  neither extend nor reset the streak. Non-blocking drain loops (`event_try_recv`) do not use the
+  guard.
 
 A wedged service supervised by svcmgr under `restart = always` is relaunched with a fresh
 CSpace — bounded self-recovery. Unsupervised processes die loudly instead of spinning.

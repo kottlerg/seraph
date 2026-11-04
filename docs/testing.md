@@ -699,7 +699,7 @@ Delivery), and [xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the o
 staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is
 the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
 boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
-follow; a change to that boot re-derives it.
+follow; a change to these boots' times re-derives it.
 
 ```sh
 # Disk variations, per architecture (clean between architectures):

@@ -83,7 +83,7 @@ const CONTROLLER_CPU: u32 = 0;
 const DELETER_CPU: u32 = 1;
 /// Raises per round at most; a round ends sooner once the delete landed.
 const MAX_RAISES: u32 = 20_000;
-/// Raises after the delete was seen, so deliveries also meet a cleared route.
+/// Raises after the delete was seen, so deliveries also meet a removed binding.
 const TRAILING_RAISES: u32 = 16;
 /// Wait for the delivery probe's signal, in ms, through [`crate::scaled_bound`].
 const PROBE_TIMEOUT_MS: u64 = 1000;
@@ -98,14 +98,14 @@ static SIG: AtomicU32 = AtomicU32::new(0);
 /// Whether the deleter rebinds the line to the spare before this round's
 /// delete; published before the round.
 static REBIND: AtomicU32 = AtomicU32::new(0);
-/// The carved line and the spare notification the deleter reroutes it to.
+/// The carved line and the spare notification the deleter rebinds it to.
 static LINE: AtomicU32 = AtomicU32::new(0);
 static SPARE: AtomicU32 = AtomicU32::new(0);
-/// Round whose delete (with its reroute, on a rerouted round) the deleter has
+/// Round whose delete (with its rebind, on a rebound round) the deleter has
 /// begun.
 static DELETING: AtomicU32 = AtomicU32::new(0);
 /// Rebinds the deleter's `SYS_IRQ_REGISTER` refused.
-static REROUTE_FAILED: AtomicU32 = AtomicU32::new(0);
+static REBIND_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Last round whose delete the deleter finished.
 static DELETED: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller to end the deleter.
@@ -130,7 +130,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::irq_route_delete_race: pin controller failed")?;
     let line = carve_line(ctx);
     let result = line.and_then(|line| {
-        let raced = race(ctx, line, [CYCLES, BINDING_CYCLES]);
+        let raced = race(ctx, line);
         quiet_tx_interrupt();
         cap_delete(line).ok();
         raced
@@ -170,9 +170,9 @@ fn carve_line(ctx: &TestContext) -> Result<u32, &'static str>
     }
 }
 
-/// Prove the stand-in delivers, then run `cycles[0]` notification rounds and
-/// `cycles[1]` binding rounds.
-fn race(ctx: &TestContext, line: u32, cycles: [u32; 2]) -> TestResult
+/// Prove the stand-in delivers, then run [`CYCLES`] notification rounds and
+/// [`BINDING_CYCLES`] binding rounds.
+fn race(ctx: &TestContext, line: u32) -> TestResult
 {
     probe_delivery(ctx, line)?;
 
@@ -181,7 +181,7 @@ fn race(ctx: &TestContext, line: u32, cycles: [u32; 2]) -> TestResult
     ROUND.store(0, Ordering::Release);
     DELETED.store(0, Ordering::Release);
     DELETING.store(0, Ordering::Release);
-    REROUTE_FAILED.store(0, Ordering::Release);
+    REBIND_FAILED.store(0, Ordering::Release);
     QUIT.store(0, Ordering::Release);
     LINE.store(line, Ordering::Release);
     SPARE.store(spare, Ordering::Release);
@@ -196,7 +196,7 @@ fn race(ctx: &TestContext, line: u32, cycles: [u32; 2]) -> TestResult
         .map_err(|_| "stress::irq_route_delete_race: start deleter failed");
     let raced = match started
     {
-        Ok(()) => phases(ctx, line, cycles, spare),
+        Ok(()) => phases(ctx, line, spare),
         Err(e) =>
         {
             cap_delete(spare).ok();
@@ -207,17 +207,17 @@ fn race(ctx: &TestContext, line: u32, cycles: [u32; 2]) -> TestResult
     let exited = spawn::wait_until_exited(deleter, crate::scaled_polls(EXIT_POLLS));
     cap_delete(deleter).ok();
     let armed = raced?;
-    if REROUTE_FAILED.load(Ordering::Acquire) != 0
+    if REBIND_FAILED.load(Ordering::Acquire) != 0
     {
-        return Err("stress::irq_route_delete_race: a reroute to the spare notification failed");
+        return Err("stress::irq_route_delete_race: a rebind to the spare notification failed");
     }
     exited?;
     crate::log_u64(
-        "stress::irq_route_delete_race: armed_routed=",
+        "stress::irq_route_delete_race: armed_direct=",
         u64::from(armed[0]),
     );
     crate::log_u64(
-        "stress::irq_route_delete_race: armed_rerouted=",
+        "stress::irq_route_delete_race: armed_rebound=",
         u64::from(armed[1]),
     );
     crate::log_u64(
@@ -235,52 +235,47 @@ fn race(ctx: &TestContext, line: u32, cycles: [u32; 2]) -> TestResult
 /// last binding) is deleted so each binding round routes the line afresh, the
 /// binding rounds; returns how many rounds of each kind armed the race. The
 /// spare is deleted whatever the outcome.
-fn phases(
-    ctx: &TestContext,
-    line: u32,
-    cycles: [u32; 2],
-    spare: u32,
-) -> Result<[u32; 3], &'static str>
+fn phases(ctx: &TestContext, line: u32, spare: u32) -> Result<[u32; 3], &'static str>
 {
-    let notified = rounds(ctx, line, cycles[0]);
+    let notified = rounds(ctx, line);
     cap_delete(spare).ok();
     let notified = notified?;
-    let bound = binding_rounds(ctx, line, cycles[0] + 1, cycles[1])?;
+    let bound = binding_rounds(ctx, line, CYCLES + 1)?;
     Ok([notified[0], notified[1], bound])
 }
 
-/// Route the line to a fresh notification and require one raise to signal
+/// Bind the line to a fresh notification and require one raise to signal
 /// it, so the rounds below are not vacuous.
 fn probe_delivery(ctx: &TestContext, line: u32) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create probe notification failed")?;
-    let routed = irq_register(line, sig, 0).and_then(|()| irq_ack(line));
+    let bound = irq_register(line, sig, 0).and_then(|()| irq_ack(line));
     raise_tx_interrupt();
     let bits =
-        routed.and_then(|()| notification_wait_timeout(sig, crate::scaled_bound(PROBE_TIMEOUT_MS)));
+        bound.and_then(|()| notification_wait_timeout(sig, crate::scaled_bound(PROBE_TIMEOUT_MS)));
     quiet_tx_interrupt();
     cap_delete(sig).ok();
     match bits
     {
         Ok(bits) if bits & 1 != 0 => Ok(()),
         Ok(_) => Err("stress::irq_route_delete_race: UART interrupt never delivered"),
-        Err(_) => Err("stress::irq_route_delete_race: route or wait on the UART line failed"),
+        Err(_) => Err("stress::irq_route_delete_race: bind or wait on the UART line failed"),
     }
 }
 
-/// Whether the deleter reroutes the line to the spare before `round`'s delete.
-fn rerouted(round: u32) -> bool
+/// Whether the deleter rebinds the line to the spare before `round`'s delete.
+fn rebound(round: u32) -> bool
 {
     round.is_multiple_of(2)
 }
 
-/// The rounds; returns, for direct and rerouted deletes, how many began a
-/// raise while the delete was running.
-fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'static str>
+/// The rounds; returns, for direct deletes and deletes after a rebind, how
+/// many began a raise while the delete was running.
+fn rounds(ctx: &TestContext, line: u32) -> Result<[u32; 2], &'static str>
 {
     let mut armed = [0u32; 2];
-    for round in 1..=cycles
+    for round in 1..=CYCLES
     {
         let sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "stress::irq_route_delete_race: create notification failed")?;
@@ -289,10 +284,10 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'stati
             .is_err()
         {
             cap_delete(sig).ok();
-            return Err("stress::irq_route_delete_race: route the UART line failed");
+            return Err("stress::irq_route_delete_race: bind the UART line failed");
         }
         SIG.store(sig, Ordering::Release);
-        REBIND.store(u32::from(rerouted(round)), Ordering::Release);
+        REBIND.store(u32::from(rebound(round)), Ordering::Release);
         ROUND.store(round, Ordering::Release);
         let mut raises = 0u32;
         let mut overlapped = false;
@@ -303,7 +298,7 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'stati
             let during = DELETING.load(Ordering::Acquire) == round
                 && DELETED.load(Ordering::Acquire) != round;
             // Unmask before each raise, since each delivery masks the line;
-            // after the delete the ack may fail or find the line unrouted.
+            // after the delete the ack may fail or find the line unbound.
             irq_ack(line).ok();
             raise_tx_interrupt();
             raises += 1;
@@ -311,7 +306,7 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'stati
         }
         if overlapped
         {
-            armed[usize::from(rerouted(round))] += 1;
+            armed[usize::from(rebound(round))] += 1;
         }
         if DELETED.load(Ordering::Acquire) == round
         {
@@ -344,14 +339,9 @@ fn await_delete(round: u32) -> TestResult
     Ok(())
 }
 
-/// `cycles` binding rounds numbered from `first`; returns how many armed the
-/// race.
-fn binding_rounds(
-    ctx: &TestContext,
-    line: u32,
-    first: u32,
-    cycles: u32,
-) -> Result<u32, &'static str>
+/// [`BINDING_CYCLES`] binding rounds numbered from `first`; returns how many
+/// armed the race.
+fn binding_rounds(ctx: &TestContext, line: u32, first: u32) -> Result<u32, &'static str>
 {
     let keeper = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create keeper notification failed")?;
@@ -359,7 +349,7 @@ fn binding_rounds(
     let result = victim
         .map_err(|_| "stress::irq_route_delete_race: create victim notification failed")
         .and_then(|victim| {
-            (first..first + cycles).try_fold(0u32, |armed, round| {
+            (first..first + BINDING_CYCLES).try_fold(0u32, |armed, round| {
                 binding_round(line, round, [keeper, victim]).map(|hit| armed + u32::from(hit))
             })
         });
@@ -488,7 +478,7 @@ extern "C" fn deleter_entry(_arg: u64) -> !
             )
             .is_err()
         {
-            REROUTE_FAILED.fetch_add(1, Ordering::AcqRel);
+            REBIND_FAILED.fetch_add(1, Ordering::AcqRel);
         }
         cap_delete(SIG.load(Ordering::Acquire)).ok();
         DELETED.store(round, Ordering::Release);

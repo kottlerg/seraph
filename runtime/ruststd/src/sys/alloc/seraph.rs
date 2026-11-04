@@ -1081,14 +1081,26 @@ pub fn slab_release_fresh(phys: u64) {
 /// Returns `None` if memmgr is unreachable, refuses the request, returns
 /// a cap too small for the class, or `retype` itself fails.
 pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
+    object_slab_retype_reclaimable(min_bytes, retype).map(|(out, _)| out)
+}
+
+/// [`object_slab_retype`], also returning the `phys` base of the dedicated
+/// grant a page-aligned class draws, so the caller can return that grant's
+/// run to memmgr's pool with [`slab_release_fresh`] once the object is
+/// deleted. `None` in its place for a sub-page class, whose pooled page the
+/// runtime reclaims itself.
+pub fn object_slab_retype_reclaimable<T>(
+    min_bytes: u64,
+    retype: impl FnOnce(u32) -> Option<T>,
+) -> Option<(T, Option<u64>)> {
     let need = slab_round_to_class(min_bytes);
     // Sized so `need` still fits after the ledger withholds
     // `ALLOCATOR_METADATA_RESERVE` from the grant.
     let want_pages = slab_want_pages(need);
     if need <= 128 {
-        slab_retype_pooled(&SLAB_BIN_128, need, want_pages, retype)
+        slab_retype_pooled(&SLAB_BIN_128, need, want_pages, retype).map(|out| (out, None))
     } else if need <= 512 {
-        slab_retype_pooled(&SLAB_BIN_512, need, want_pages, retype)
+        slab_retype_pooled(&SLAB_BIN_512, need, want_pages, retype).map(|out| (out, None))
     } else {
         let grant = slab_acquire_fresh(need, want_pages, ALLOCATOR_METADATA_RESERVE)?;
         match retype(grant.cap) {
@@ -1096,7 +1108,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
                 // The retyped object holds its own ancestor ref on the
                 // grant's MemoryObject; the source slot is dead weight.
                 let _ = syscall::cap_delete(grant.cap);
-                Some(out)
+                Some((out, Some(grant.phys)))
             }
             None => {
                 // Retype failed without consuming the grant — the slab is

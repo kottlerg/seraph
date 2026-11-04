@@ -22,7 +22,7 @@
 //! `memory_base` has before it starts, and skip-passes when they fall short.
 
 use syscall::{cap_create_cspace, cap_delete, cap_info};
-use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
+use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CSPACE_SLOTS_PER_PAGE};
 
 use crate::{TestContext, TestResult};
 
@@ -30,15 +30,11 @@ use crate::{TestContext, TestResult};
 /// entries, the least count that registry could not hold.
 const LIVE: usize = 4097;
 
-/// Slots per kernel `CSpace` leaf page (`cap::cspace::L2_SIZE`). An
-/// underestimate here shows as a slot-pool failure of a creation, which the
-/// test reports, not as a false pass.
-const SLOTS_PER_PAGE: usize = 56;
-
 /// Pages donated to ktest's `CSpace` for the [`LIVE`] caps: one leaf per
-/// [`SLOTS_PER_PAGE`] slots, plus headroom for a directory page and the
-/// harness's own later inserts.
-const FUND_PAGES: u64 = LIVE.div_ceil(SLOTS_PER_PAGE) as u64 + 4;
+/// [`CSPACE_SLOTS_PER_PAGE`] slots (the kernel's `L2_SIZE`, published in the
+/// ABI), plus headroom for a directory page and the harness's own later
+/// inserts.
+const FUND_PAGES: u64 = (LIVE as u64).div_ceil(CSPACE_SLOTS_PER_PAGE) + 4;
 
 const PAGE: u64 = 4096;
 

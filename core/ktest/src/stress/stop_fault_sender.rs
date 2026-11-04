@@ -267,7 +267,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_fault_sender: pin controller failed")?;
-    let result = with_parts(ctx, CYCLES);
+    let result = with_parts(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_fault_sender: restore controller affinity failed");
     let tally = result?;
@@ -344,14 +344,14 @@ fn report(tally: &Tally) -> TestResult
     Ok(())
 }
 
-/// Create the endpoint, the page, and the children, run `cycles` rounds, end
-/// the children, and release everything whatever the outcome.
-fn with_parts(ctx: &TestContext, cycles: u32) -> Result<Tally, &'static str>
+/// Create the endpoint, the page, and the children, run [`CYCLES`] rounds,
+/// end the children, and release everything whatever the outcome.
+fn with_parts(ctx: &TestContext) -> Result<Tally, &'static str>
 {
     let mut parts = Parts::default();
     let result = setup(ctx, &mut parts).and_then(|()| {
         let mut tally = Tally::default();
-        let ran = rounds(ctx, &mut parts, &mut tally, cycles);
+        let ran = rounds(ctx, &mut parts, &mut tally);
         let ended = finish(&mut parts, &mut tally);
         ran?;
         ended?;
@@ -490,10 +490,10 @@ fn await_handler_ready(handler: u32) -> TestResult
     Err("stress::stop_fault_sender: the handler never registered its IPC buffer")
 }
 
-/// Run `cycles` rounds, respawning the faulter after each death.
-fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, cycles: u32) -> TestResult
+/// Run [`CYCLES`] rounds, respawning the faulter after each death.
+fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
 {
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         if parts.faulter.is_none()
         {

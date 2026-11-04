@@ -35,6 +35,11 @@ libc = "0.2"
 # "No such file or directory" from Command::spawn.
 which = "8"
 
+[dev-dependencies]
+# logd's reclaim-line formatter (`logd_codec::reclaim`): test-logd-reclaim's
+# parser is tested against the line logd formats, not a copy of its shape.
+logd-codec = { path = "../services/logd/codec" }
+
 # Windows console-mode bindings for TerminalGuard. Only pulled in for
 # Windows builds; Linux/macOS/BSD builds skip this crate entirely.
 [target.'cfg(windows)'.dependencies]

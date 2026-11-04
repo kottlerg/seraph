@@ -210,7 +210,6 @@ pub fn run(ctx: &TestContext) -> TestResult
                 span: cpu_count,
             },
             Stops::Single,
-            CYCLES,
         );
     }
     // The controller takes CPU 0 so a floor-priority child never shares its
@@ -224,7 +223,6 @@ pub fn run(ctx: &TestContext) -> TestResult
             span: cpu_count - 1,
         },
         Stops::Double,
-        CYCLES,
     );
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_reply_race: restore controller affinity failed");
@@ -260,17 +258,17 @@ enum Stops
     Double,
 }
 
-/// Run `count` races with the children placed per `place` and stopped by
+/// Run [`CYCLES`] races with the children placed per `place` and stopped by
 /// `stops`. Every cycle must arm its race ([`one_cycle`] fails one that does
 /// not).
-fn cycles(ctx: &TestContext, place: Placement, stops: Stops, count: u32) -> TestResult
+fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 {
     STOPPER_GO.store(0, Ordering::Release);
     SECOND_STOPS_OK.store(0, Ordering::Release);
 
-    for cycle in 0..count
+    for cycle in 0..CYCLES
     {
-        let slot = super::rotation_slot(cycle, count, place.span);
+        let slot = super::rotation_slot(cycle, CYCLES, place.span);
         one_cycle(ctx, place, stops, cycle, slot)?;
     }
     if stops == Stops::Double

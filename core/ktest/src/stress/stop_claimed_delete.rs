@@ -216,15 +216,14 @@ enum Stops
 
 static PHASE_ARGS: spawn::ArgBlock<Kind, 1> = spawn::ArgBlock::new(Kind::Notification);
 
-/// A phase's parameters: its source kind, its stoppers, the argument its
-/// children receive, and its rounds.
+/// A phase's parameters: its source kind, its stoppers, and the argument its
+/// children receive.
 #[derive(Clone, Copy)]
 struct Phase
 {
     kind: Kind,
     stops: Stops,
     arg: u64,
-    cycles: u32,
 }
 
 /// A phase's long-lived helpers; each is deleted on every path.
@@ -278,16 +277,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_claimed_delete: pin controller failed")?;
-    let result = phases(ctx, CYCLES);
+    let result = phases(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_claimed_delete: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run one phase of `cycles` rounds per source kind and stopper set, and
+/// Run one phase of [`CYCLES`] rounds per source kind and stopper set, and
 /// check each.
-fn phases(ctx: &TestContext, cycles: u32) -> TestResult
+fn phases(ctx: &TestContext) -> TestResult
 {
     for (kind, stops, name) in [
         (
@@ -313,7 +312,7 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
     ]
     {
         crate::log(name);
-        let seen = phase(ctx, kind, stops, cycles)?;
+        let seen = phase(ctx, kind, stops)?;
         log_seen(&seen);
         check(&seen, stops)?;
     }
@@ -374,9 +373,9 @@ fn check(seen: &Seen, stops: Stops) -> TestResult
     Ok(())
 }
 
-/// One phase: start the helpers, run `cycles` rounds, end the helpers, and
+/// One phase: start the helpers, run [`CYCLES`] rounds, end the helpers, and
 /// delete them whatever the outcome. Returns what the phase saw.
-fn phase(ctx: &TestContext, kind: Kind, stops: Stops, cycles: u32) -> Result<Seen, &'static str>
+fn phase(ctx: &TestContext, kind: Kind, stops: Stops) -> Result<Seen, &'static str>
 {
     for counter in [
         &QUIT,
@@ -406,12 +405,7 @@ fn phase(ctx: &TestContext, kind: Kind, stops: Stops, cycles: u32) -> Result<See
     // phase's children start; the previous phase's helpers have exited and
     // its waiters were deleted while stopped, so none reads it.
     let arg = unsafe { PHASE_ARGS.publish(0, kind) };
-    let params = Phase {
-        kind,
-        stops,
-        arg,
-        cycles,
-    };
+    let params = Phase { kind, stops, arg };
 
     let mut helpers = Helpers::default();
     let result = start_helpers(ctx, &mut helpers, arg).and_then(|()| rounds(ctx, params));
@@ -497,12 +491,12 @@ fn release_helpers(helpers: &Helpers) -> TestResult
     }
 }
 
-/// Run the phase's rounds, stopping at the first that fails. Returns the
-/// controller-side tallies.
+/// Run the phase's [`CYCLES`] rounds, stopping at the first that fails.
+/// Returns the controller-side tallies.
 fn rounds(ctx: &TestContext, phase: Phase) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
-    for cycle in 0..phase.cycles
+    for cycle in 0..CYCLES
     {
         round(ctx, phase, cycle, &mut seen)?;
     }

@@ -77,7 +77,7 @@ fn choose_child_layout() -> ProcessLayout
     let entropy = draw_layout_entropy();
     if entropy.is_none()
     {
-        std::os::seraph::log!("procmgr: layout entropy draw failed; using default layout");
+        std::os::seraph::log!("layout entropy draw failed; using default layout");
     }
     choose_process_layout(entropy.as_ref())
 }
@@ -100,7 +100,7 @@ fn choose_image_bias_or_default() -> u64
     {
         return process_layout::choose_image_bias(r);
     }
-    std::os::seraph::log!("procmgr: image-bias entropy draw failed; using window base");
+    std::os::seraph::log!("image-bias entropy draw failed; using window base");
     process_layout::IMAGE_WINDOW.base
 }
 
@@ -171,7 +171,7 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
         Ok(()) | Err(QUEUE_FULL) => (),
         Err(e) =>
         {
-            std::os::seraph::log!("procmgr: death forward to logd failed (badge={badge}, err={e})");
+            std::os::seraph::log!("death forward to logd failed (badge={badge}, err={e})");
         }
     }
 }
@@ -1334,7 +1334,7 @@ fn finalize_creation(
     // further queue, so a failure here is procmgr's memory running out.
     if let Err(e) = deaths.bind_thread(child_thread, badge)
     {
-        std::os::seraph::log!("procmgr: main-thread death bind failed (err={e}); spawn refused");
+        std::os::seraph::log!("main-thread death bind failed (err={e}); spawn refused");
         return None;
     }
 
@@ -1349,7 +1349,7 @@ fn finalize_creation(
     // main-thread observer's node.
     if let Err(e) = deaths.bind_aspace(child_aspace, badge)
     {
-        std::os::seraph::log!("procmgr: address-space death bind failed (err={e}); spawn refused");
+        std::os::seraph::log!("address-space death bind failed (err={e}); spawn refused");
         return None;
     }
 
@@ -1409,7 +1409,7 @@ fn finalize_creation(
             // The creation is complete; the spawner's own main-thread
             // observer still reports the child's exit.
             std::os::seraph::log!(
-                "procmgr: death-relay bind failed (err={e}); a worker-thread fault will not reach the spawner"
+                "death-relay bind failed (err={e}); a worker-thread fault will not reach the spawner"
             );
         }
         let _ = syscall::cap_delete(parent_relay_cap);
@@ -1556,7 +1556,7 @@ fn create_process_from_bytes(
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
-        std::os::seraph::log!("procmgr: spawn image bias=0x{bias:x}");
+        std::os::seraph::log!("spawn image bias=0x{bias:x}");
     }
     let entry = elf::entry_point(ehdr).checked_add(bias)?;
 
@@ -1663,7 +1663,7 @@ fn create_process_from_bytes(
     if applied_relocs != total_relocs
     {
         std::os::seraph::log!(
-            "procmgr: reloc application mismatch applied={applied_relocs} expected={total_relocs}"
+            "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
         );
         return None;
     }
@@ -2430,7 +2430,7 @@ pub fn create_process_from_file(
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
-        std::os::seraph::log!("procmgr: spawn image bias=0x{bias:x}");
+        std::os::seraph::log!("spawn image bias=0x{bias:x}");
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)
@@ -2568,7 +2568,7 @@ pub fn create_process_from_file(
     if applied_relocs != total_relocs
     {
         std::os::seraph::log!(
-            "procmgr: reloc application mismatch applied={applied_relocs} expected={total_relocs}"
+            "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
         );
         return Err(procmgr_errors::INVALID_ELF);
     }

@@ -279,7 +279,7 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
 {
     if memmgr_send == 0
     {
-        std::os::seraph::log!("procmgr: alloc_page: memmgr_send=0");
+        std::os::seraph::log!("alloc_page: memmgr_send=0");
         return None;
     }
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -291,14 +291,14 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
         Ok(r) => r,
         Err(e) =>
         {
-            std::os::seraph::log!("procmgr: alloc_page: ipc_call err={}", e);
+            std::os::seraph::log!("alloc_page: ipc_call err={}", e);
             return None;
         }
     };
     if reply.label != memmgr_errors::SUCCESS
     {
         std::os::seraph::log!(
-            "procmgr: alloc_page: memmgr label={} pool: total={} runs={} max={}",
+            "alloc_page: memmgr label={} pool: total={} runs={} max={}",
             reply.label,
             reply.word(0),
             reply.word(1),
@@ -309,7 +309,7 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
     if reply.word(0) != 1
     {
         std::os::seraph::log!(
-            "procmgr: alloc_page: count={} caps={}",
+            "alloc_page: count={} caps={}",
             reply.word(0),
             reply.caps().len()
         );
@@ -752,7 +752,7 @@ fn dispatch_death(
     });
     if full
     {
-        std::os::seraph::log!("procmgr: a death queue drained full; resyncing the process table");
+        std::os::seraph::log!("a death queue drained full; resyncing the process table");
         resync_deaths(memmgr_ep, ipc_buf, table, recent);
     }
 }
@@ -802,7 +802,7 @@ fn resync_deaths(
     });
     if short
     {
-        std::os::seraph::log!("procmgr: death resync could not list every exited process");
+        std::os::seraph::log!("death resync could not list every exited process");
     }
     for (badge, exit_reason) in exited
     {
@@ -976,7 +976,7 @@ fn reply_create_result(
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
     {
-        std::os::seraph::log!("procmgr: create reply undeliverable; destroying the child");
+        std::os::seraph::log!("create reply undeliverable; destroying the child");
         let _ = syscall::cap_delete(result.thread_for_caller);
         let _ = syscall::cap_delete(result.process_handle);
         // No handle to this child survives, so nothing can query its exit.
@@ -1138,7 +1138,7 @@ fn handle_create(
 fn log_spawn_sched(sched: process::ChildSched)
 {
     std::os::seraph::log!(
-        "procmgr: spawn priority={} band=[1,{}]",
+        "spawn priority={} band=[1,{}]",
         sched.priority,
         sched.band_max
     );

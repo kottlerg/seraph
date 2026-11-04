@@ -30,7 +30,8 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # One module per subcommand (build, run, run_parallel,
 │   │                           #   ktest_timing, mkdisk, compose_bundle, clean, test,
-│   │                           #   test_kaslr, test_terminal, test_vmgenid, lint_docs)
+│   │                           #   test_kaslr, test_logd_reclaim, test_terminal,
+│   │                           #   test_vmgenid, lint_docs)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -567,6 +568,38 @@ whose floor the `nokaslr` boot expects.
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
 [docs/memory-model.md](../docs/memory-model.md) for the randomized layout.
+
+---
+
+### `cargo xtask test-logd-reclaim`
+
+Check that a child's death reaches logd and evicts its slot, on either arch. Reads a svctest
+boot's serial log and passes when the log holds svctest's pass marker and exactly one logd line
+`reclaim: badge=<b> exit_reason=0x17 name=svctest-logd-reclaim`: the slot of the child svctest's
+`logd_death_forward` phase spawns, evicted on its exit with code `0x17`. The line's shape is
+stated in [services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md)
+§ Death-notification cascade.
+
+```sh
+# Check a saved svctest log; boots nothing (what CI's svctest cell runs):
+cargo xtask test-logd-reclaim --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+
+# Boot the current sysroot once, svctest staged, and check its log:
+cargo xtask test-logd-reclaim [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
+    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
+```
+
+With no `--log`, the boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass
+and fail markers, `--timeout` defaulting to 900 s) with `--save-logs` into
+`target/xtask/test-logd-reclaim/`, and the check reads the log saved there (a log an earlier
+boot left there is removed first). A boot that ends `FAIL`, `HANG`, `OK` or `ERR` fails the command
+before the check, as it fails `run-parallel`. A `QEMU-CRASH` boot, a host-emulator crash that
+`run-parallel` does not count as a failure, leaves a log without the pass marker: the check reads
+the outcome from the log's `[run-parallel]` trailer, its last line, and reports itself skipped,
+which passes the command, for a saved log given with `--log` as well. Stage svctest first, as
+[docs/testing.md](../docs/testing.md) § Gating describes.
+
+See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ---
 

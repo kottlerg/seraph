@@ -8,8 +8,9 @@
 //! Hosts the child-mode entries `cwd_child_main` (spawned by
 //! `command_cwd_inherit_phase`), `blobs_fill_child_main` (spawned by
 //! `command_blobs_fill_message_phase`), `park_child_main` (spawned by
-//! `command_from_spawned_thread_phase`), and `undeliverable_reply_child_main`
-//! (spawned by `procmgr_refusals_phase`).
+//! `command_from_spawned_thread_phase`), `undeliverable_reply_child_main`
+//! (spawned by `procmgr_refusals_phase`), and `logd_reclaim_child_main`
+//! (spawned by `logd_death_forward_phase`).
 
 use std::os::seraph::startup_info;
 
@@ -25,6 +26,61 @@ pub fn spawn_only() -> &'static [Phase]
         name: "spawn",
         run: spawn_phase,
     }]
+}
+
+/// The logd death-forward fixture, run just after [`spawn_only`]: early, so
+/// logd has drained the child's death long before the run shuts down.
+pub fn logd_forward() -> &'static [Phase]
+{
+    &[Phase {
+        name: "logd_death_forward",
+        run: logd_death_forward_phase,
+    }]
+}
+
+/// The log name [`logd_death_forward_phase`]'s child registers, which
+/// `cargo xtask test-logd-reclaim` finds in logd's `reclaim:` line. No other
+/// process registers it.
+const LOGD_RECLAIM_NAME: &[u8] = b"svctest-logd-reclaim";
+
+/// The code [`logd_death_forward_phase`]'s child exits with, which logd's
+/// `reclaim:` line carries as `exit_reason=0x17`. Nonzero, so the check also
+/// sees that the forward carries the exit reason, not only the badge.
+const LOGD_RECLAIM_EXIT_CODE: i32 = 0x17;
+
+/// Role token of [`logd_death_forward_phase`]'s child.
+const LOGD_RECLAIM_ROLE: &str = "logd-reclaim-child";
+
+/// Register [`LOGD_RECLAIM_NAME`], log one line under it, and exit with
+/// [`LOGD_RECLAIM_EXIT_CODE`]. The registration is a synchronous call, so
+/// logd holds the named slot before the child can exit.
+fn logd_reclaim_child_main() -> !
+{
+    std::os::seraph::log::register_name(LOGD_RECLAIM_NAME);
+    std::os::seraph::log!("logd-reclaim child exiting");
+    std::process::exit(LOGD_RECLAIM_EXIT_CODE)
+}
+
+/// Spawn a child that registers [`LOGD_RECLAIM_NAME`] with logd and exits
+/// with [`LOGD_RECLAIM_EXIT_CODE`], and assert that code. procmgr's teardown
+/// forwards the death to logd's death queue (`forward_death_to_logd`), and
+/// logd evicts the child's slot and logs
+/// `reclaim: badge=<b> exit_reason=0x17 name=svctest-logd-reclaim`. logd has
+/// no read surface, so svctest cannot observe the eviction:
+/// `cargo xtask test-logd-reclaim` checks the line in the boot's serial log
+/// (docs/testing.md § Death forward to logd).
+pub fn logd_death_forward_phase(_: &Caps)
+{
+    let status = std::process::Command::new("/tests/svctest")
+        .arg(LOGD_RECLAIM_ROLE)
+        .status()
+        .expect("logd_death_forward: spawn failed");
+    assert_eq!(
+        status.code(),
+        Some(LOGD_RECLAIM_EXIT_CODE),
+        "logd_death_forward: child exit code not propagated: {status}"
+    );
+    std::os::seraph::log!("logd_death_forward: named child exited: {status}");
 }
 
 /// The init-reap release check. Registered late (see [`super::all`]) so
@@ -153,6 +209,10 @@ pub fn reentry_main(role: &str)
     if role == UNDELIVERABLE_ROLE
     {
         undeliverable_reply_child_main();
+    }
+    if role == LOGD_RECLAIM_ROLE
+    {
+        logd_reclaim_child_main();
     }
 }
 

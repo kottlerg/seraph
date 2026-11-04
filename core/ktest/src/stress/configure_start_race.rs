@@ -33,15 +33,15 @@
 //! stack with argument [`tag`]`(round, A)`, pins it to CPU 2 (with 3+ CPUs,
 //! an idle CPU that dispatches it at once) or else to CPU 0 (dispatched at
 //! the controller's yield right after its start, or at its next sleep),
-//! publishes its handle and arms the round. Once the helper reports itself ready, the controller
-//! releases it through [`GO`]; each side then spins a delay (one of the two
-//! spins 0 to 8191 spins, the side alternating by round, so the relative
-//! offset sweeps both orders) and the helper calls `thread_configure` to
-//! [`entry_b`] on a second stress stack with argument `tag(round, B)` while
-//! the controller calls `thread_start`. Each entry checks that it runs on its
-//! own stack, records its argument, and exits. The controller waits, bounded,
-//! for the helper's result and for the thread to reach `Exited`, then deletes
-//! it.
+//! publishes its handle and arms the round. Once the helper reports itself
+//! ready, the controller releases it through [`GO`]; each side then spins a
+//! delay (one of the two spins 0 to 8191 spins, the side alternating by
+//! round, so the relative offset sweeps both orders) and the helper calls
+//! `thread_configure` to [`entry_b`] on a second stress stack with argument
+//! `tag(round, B)` while the controller calls `thread_start`. Each entry
+//! checks that it runs on its own stack, records its argument, and exits. The
+//! controller waits, bounded, for the helper's result and for the thread to
+//! reach `Exited`, then deletes it.
 //!
 //! Required, per round: the start returned `Ok`; the configure returned `Ok`
 //! or `InvalidArgument`; the thread exited voluntarily; exactly one entry ran,
@@ -175,7 +175,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::configure_start_race: pin controller failed")?;
-    let result = with_helper(ctx, target_cpu, CYCLES);
+    let result = with_helper(ctx, target_cpu);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::configure_start_race: restore controller affinity failed");
     let tally = result?;
@@ -212,10 +212,10 @@ fn report(tally: &Tally) -> TestResult
 }
 
 /// Reset the cell's state, publish the entries' stacks, start the helper,
-/// run `cycles` rounds, end the helper, and delete it whatever the outcome
+/// run [`CYCLES`] rounds, end the helper, and delete it whatever the outcome
 /// (a deletion ends a thread wherever it is, so its stack is free for the
 /// next test even after a failed round).
-fn with_helper(ctx: &TestContext, target_cpu: u32, cycles: u32) -> Result<Tally, &'static str>
+fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str>
 {
     for counter in [
         &QUIT,
@@ -239,7 +239,7 @@ fn with_helper(ctx: &TestContext, target_cpu: u32, cycles: u32) -> Result<Tally,
     let mut helper = None;
     let result = start_helper(ctx, &mut helper).and_then(|th| {
         let mut tally = Tally::default();
-        let ran = rounds(ctx, target_cpu, cycles, &mut tally);
+        let ran = rounds(ctx, target_cpu, &mut tally);
         let ended = finish(th);
         ran?;
         ended?;
@@ -297,11 +297,11 @@ fn start_helper(ctx: &TestContext, slot: &mut Option<u32>) -> Result<u32, &'stat
     Ok(th)
 }
 
-/// Run `cycles` rounds, stopping at the first that fails, and count each
+/// Run [`CYCLES`] rounds, stopping at the first that fails, and count each
 /// outcome.
-fn rounds(ctx: &TestContext, target_cpu: u32, cycles: u32, tally: &mut Tally) -> TestResult
+fn rounds(ctx: &TestContext, target_cpu: u32, tally: &mut Tally) -> TestResult
 {
-    for seq in 1..=cycles
+    for seq in 1..=CYCLES
     {
         if round(ctx, seq, target_cpu)? == OUTCOME_CONFIGURED
         {

@@ -173,15 +173,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::copy_source_delete: pin controller failed")?;
-    let result = phases(ctx, CYCLES);
+    let result = phases(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::copy_source_delete: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run one phase of `cycles` rounds per way of freeing, and check each.
-fn phases(ctx: &TestContext, cycles: u32) -> TestResult
+/// Run one phase of [`CYCLES`] rounds per way of freeing, and check each.
+fn phases(ctx: &TestContext) -> TestResult
 {
     for (free, name) in [
         (
@@ -195,8 +195,8 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
     ]
     {
         crate::log(name);
-        let landed = phase(ctx, free, cycles)?;
-        report(&landed, cycles)?;
+        let landed = phase(ctx, free)?;
+        report(&landed)?;
     }
     Ok(())
 }
@@ -204,7 +204,7 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
 /// Log a phase's tallies, then check them: no bad result, every round's
 /// handle seen gone, every call returned `Ok` in some round, and some free
 /// landed inside a call.
-fn report(landed: &[u32; 4], cycles: u32) -> TestResult
+fn report(landed: &[u32; 4]) -> TestResult
 {
     for call in (0..CALLS).map(|offset| FIRST + offset)
     {
@@ -226,7 +226,7 @@ fn report(landed: &[u32; 4], cycles: u32) -> TestResult
         "stress::copy_source_delete: a call through the handle, or the delete of its result, \
          returned a result outside its accepted set",
     )?;
-    if vanished != cycles
+    if vanished != CYCLES
     {
         return Err("stress::copy_source_delete: the caller missed a round's free");
     }
@@ -248,7 +248,7 @@ fn report(landed: &[u32; 4], cycles: u32) -> TestResult
 /// end the caller, and delete everything whatever the outcome. Returns, per
 /// call flag, the frees issued while the caller was inside that call
 /// (`NONE`: outside any).
-fn phase(ctx: &TestContext, free: Free, cycles: u32) -> Result<[u32; 4], &'static str>
+fn phase(ctx: &TestContext, free: Free) -> Result<[u32; 4], &'static str>
 {
     for counter in [
         &QUIT,
@@ -273,7 +273,7 @@ fn phase(ctx: &TestContext, free: Free, cycles: u32) -> Result<[u32; 4], &'stati
     let mut caller = None;
     let mut landed = [0u32; 4];
     let ran = start_caller(ctx, done, &mut caller).and_then(|()| {
-        (0..cycles).try_for_each(|cycle| round(ctx, free, cycle, done, &mut landed))
+        (0..CYCLES).try_for_each(|cycle| round(ctx, free, cycle, done, &mut landed))
     });
     let ended = caller.map_or(Ok(()), finish);
     // Every delete runs, whatever an earlier one returned.

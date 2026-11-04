@@ -847,6 +847,54 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
     pal_alloc::object_slab_retype(min_bytes, retype)
 }
 
+/// The dedicated memmgr grant behind one page-granular object retype, as
+/// [`object_slab_retype_reclaimable`] returns it: what [`object_slab_release`]
+/// needs to return the grant's run to memmgr's pool once the object is
+/// deleted.
+///
+/// Neither `Clone` nor `Copy`: [`object_slab_release`] consumes it, so one
+/// grant is released once.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ObjectGrant {
+    phys: u64,
+}
+
+/// [`object_slab_retype`] for an object the caller deletes mid-life: also
+/// returns the [`ObjectGrant`] of the dedicated grant a page-granular class
+/// draws, so [`object_slab_release`] can return its run to memmgr's pool once
+/// the object is deleted. Deleting the object alone leaves that run charged
+/// to the process until it dies. `None` in the grant's place for a sub-page
+/// class: its pooled page is the runtime's to reclaim.
+///
+/// `min_bytes` and `retype` are [`object_slab_retype`]'s, under the same
+/// closure contract.
+///
+/// Returns `None` if memmgr is unreachable, refuses the request, or
+/// `retype` itself fails.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn object_slab_retype_reclaimable<T>(
+    min_bytes: u64,
+    retype: impl FnOnce(u32) -> Option<T>,
+) -> Option<(T, Option<ObjectGrant>)> {
+    pal_alloc::object_slab_retype_reclaimable(min_bytes, retype)
+        .map(|(out, phys)| (out, phys.map(|phys| ObjectGrant { phys })))
+}
+
+/// Return `grant`'s run to memmgr's pool. The caller MUST have deleted the
+/// object retyped from it first. A release while the object is live is
+/// memory-safe (the kernel does not hand out live bytes) but strands the run
+/// until the object is deleted: memmgr takes it off the process's ledger at
+/// once and returns it to its free pool, where it is re-grantable only whole
+/// and its next grantee cannot map it below its retype bump cursor, over the
+/// live object (`services/memmgr/docs/memory-pool.md` § Reclamation).
+/// Best-effort: a failed call leaves the run charged to the process until it
+/// dies.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn object_slab_release(grant: ObjectGrant) {
+    pal_alloc::slab_release_fresh(grant.phys);
+}
+
 /// memmgr's current free-pool size in bytes, or `None` if memmgr is
 /// unreachable. Thin wrapper over the `QUERY_POOL_STATUS` aggregate query;
 /// used by tests asserting that a churn loop holds a bounded memmgr-pool

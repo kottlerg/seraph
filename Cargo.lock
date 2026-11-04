@@ -1622,6 +1622,7 @@ dependencies = [
  "fatfs 0.3.6",
  "gpt",
  "libc",
+ "logd-codec",
  "regex",
  "uuid",
  "which",

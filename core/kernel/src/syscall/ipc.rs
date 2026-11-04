@@ -25,6 +25,8 @@ use syscall::SyscallError;
 #[cfg(not(test))]
 use super::{current_tcb, lookup_cap};
 #[cfg(not(test))]
+use crate::arch::nospec;
+#[cfg(not(test))]
 use crate::cap::CSpace;
 #[cfg(not(test))]
 use crate::cap::slot::{CapTag, EpRights, EqRights, NtfRights, WsRights};
@@ -1688,6 +1690,11 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
     let src = unsafe { super::pin_slot(cspace_ptr, src_handle) }?;
     // SAFETY: src pins the object it names.
     let (source_ptr, source_tag, source_header, member_right) = unsafe { wait_set_source(&src) }?;
+    // The member right is folded into the source pointers as data before it
+    // is tested, so a path past a mispredicted refusal reaches null.
+    let held = nospec::mask_if(src.rights.contains(member_right));
+    let source_ptr = nospec::select_ptr(held, source_ptr, core::ptr::null_mut());
+    let source_header = nospec::select_ptr(held, source_header, core::ptr::null_mut());
     if !src.rights.contains(member_right)
     {
         return Err(SyscallError::InsufficientRights);
@@ -1705,7 +1712,10 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: source_ptr extracted from validated cap; member_idx returned
     // from waitset_add. Lock acquired and released for each branch; a shared
     // helper is not used because the source types differ and the field
-    // accesses do not share a trait.
+    // accesses do not share a trait. Each arm casts `source_ptr` selected by
+    // its own tag (`PinnedCap::tag_mask`), so an arm a mispredicted match
+    // reaches casts null, never a state of another type; the arm's tag is the
+    // slot's, so the select returns `source_ptr` itself.
     let member_idx_result = unsafe {
         match source_tag
         {
@@ -1713,7 +1723,12 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
+                let ep = nospec::select_ptr(
+                    src.tag_mask(CapTag::Endpoint),
+                    source_ptr,
+                    core::ptr::null_mut(),
+                )
+                .cast::<crate::ipc::endpoint::EndpointState>();
                 let saved = (*ep).lock.lock_raw();
                 let res = if (*ep).wait_set.is_null()
                 {
@@ -1742,7 +1757,12 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
+                let sig = nospec::select_ptr(
+                    src.tag_mask(CapTag::Notification),
+                    source_ptr,
+                    core::ptr::null_mut(),
+                )
+                .cast::<crate::ipc::notification::NotificationState>();
                 let saved = (*sig).lock.lock_raw();
                 let res = if (*sig).wait_set.is_null()
                 {
@@ -1772,7 +1792,12 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
+                let eq = nospec::select_ptr(
+                    src.tag_mask(CapTag::EventQueue),
+                    source_ptr,
+                    core::ptr::null_mut(),
+                )
+                .cast::<crate::ipc::event_queue::EventQueueState>();
                 let saved = (*eq).lock.lock_raw();
                 let res = if (*eq).wait_set.is_null()
                 {
@@ -1947,7 +1972,8 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
     // for the call, so the membership's reference is never the last one here:
     // the source is freed, if at all, when the pin drops after the unlock.
     //
-    // SAFETY: source_ptr extracted from validated cap.
+    // SAFETY: source_ptr extracted from validated cap. Each arm casts
+    // `source_ptr` selected by its own tag, as in `sys_wait_set_add`.
     let remove_result = unsafe {
         match source_tag
         {
@@ -1955,7 +1981,12 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
+                let ep = nospec::select_ptr(
+                    src.tag_mask(CapTag::Endpoint),
+                    source_ptr,
+                    core::ptr::null_mut(),
+                )
+                .cast::<crate::ipc::endpoint::EndpointState>();
                 let saved = (*ep).lock.lock_raw();
                 let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
                 if res.is_ok()
@@ -1975,7 +2006,12 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
+                let sig = nospec::select_ptr(
+                    src.tag_mask(CapTag::Notification),
+                    source_ptr,
+                    core::ptr::null_mut(),
+                )
+                .cast::<crate::ipc::notification::NotificationState>();
                 let saved = (*sig).lock.lock_raw();
                 let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
                 if res.is_ok()
@@ -1997,7 +2033,12 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
+                let eq = nospec::select_ptr(
+                    src.tag_mask(CapTag::EventQueue),
+                    source_ptr,
+                    core::ptr::null_mut(),
+                )
+                .cast::<crate::ipc::event_queue::EventQueueState>();
                 let saved = (*eq).lock.lock_raw();
                 let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
                 if res.is_ok()

@@ -139,18 +139,27 @@ The primitive is `arch::current::speculation::index_mask(index, bound)`: all-one
 `index < bound`, else zero, computed without a branch (x86-64 `cmp` then `sbb`; riscv64 `sltu`
 then `neg`, base RV64I, since the RVA23 floor defines no speculation barrier). It is inline
 assembly so the compiler cannot prove the mask redundant inside the arm of the guarding branch and
-delete it. `arch::nospec` builds the arch-neutral forms on it: `mask_index`, `mask_index_u64`,
-`mask_if` (all-ones when a condition holds), and `select_ptr` (one of two pointers chosen by a
-mask).
+delete it, and it is not `pure`, so it is not moved into such an arm either.
+`arch::current::speculation::hide` passes a value through an empty, non-`pure` assembly block,
+giving a copy the compiler cannot relate to the original. `arch::nospec` builds the arch-neutral
+forms on the two: `mask_index`, `mask_index_u64`, `mask_if` (all-ones when a condition holds),
+`hide`, and `select_ptr` (one of two pointers chosen by a mask).
+
+A mask's output is opaque but its input is not. A condition that a dominating branch has already
+tested is a constant inside that branch's arm, so a mask taken there on the same condition is
+all-ones whatever the data. Every mask is therefore computed either ahead of the branch it backs,
+or, inside an arm of a dispatch on a slot's tag, from the tag `pin_checked` passed through `hide`
+at resolution (`PinnedCap::tag_mask`), which no later branch on the tag lets the compiler fold.
 
 | Site | User-controlled value | Load it would steer | Hardening |
 |---|---|---|---|
 | `CSpace::leaf_ptr`, direct arm | handle index | `direct[leaf]` past the inline root | the leaf index is masked against `L1_DIRECT`; a failed bound selects `SENTINEL_LEAF` |
 | `CSpace::leaf_ptr`, indirect arm | handle index | `indirect[..]` past the inline root, then the directory entry | the region-relative index is masked against `L1_INDIRECT × DIR_FANOUT`; a failed bound selects `SENTINEL_LEAF` |
 | Leaf and directory pointers | handle index | a null leaf or directory dereferenced at an offset below one page | no pointer is null: unallocated entries name `SENTINEL_LEAF` and `SENTINEL_DIR`, so the path has no null test |
-| `syscall::pin_checked` (`pin_slot`, `lookup_cap`) | handle | the handler's typed accesses of a slot's object | occupancy, generation, type, and rights are computed as values and folded into the object through `mask_if`: on a path past a failed check, the object is null |
-| `sys_cap_info`, `wait_set_source`, `object_for_new_slot` | the slot's tag | a cast to the wrong object type | each tag arm casts the object selected by its own tag as data (`PinnedCap::object_of`, or the same select) |
-| `syscall::dispatch` | syscall number | a jump-table entry past the table | a number at or past `SYSCALL_NR_BOUND` is refused, and the table reads the number through `mask_index_u64` |
+| `syscall::pin_checked` (`pin_slot`, `lookup_cap`) | handle | the handler's typed accesses of a slot's object | occupancy, generation, type, and the rights the lookup requires are computed as values and folded into the object through `mask_if`, ahead of the branches that refuse them: on a path past a failed check, the object is null |
+| `sys_cap_info`, `wait_set_source`, the `sys_wait_set_add` and `sys_wait_set_remove` source dispatch, `object_for_new_slot` | the slot's tag | a cast to the wrong object or state type | each tag arm casts the pointer selected by its own tag against the hidden tag (`PinnedCap::object_of`, `PinnedCap::tag_mask`, or `object_for_new_slot`'s `hidden_tag`) |
+| `sys_wait_set_add` member right | the source's rights | the source's state and header, locked and written | the member right is folded into the source pointers through `mask_if` ahead of the refusal |
+| `syscall::dispatch` | syscall number | a jump-table entry past the table | a number at or past `SYSCALL_NR_BOUND` (abi/syscall) is refused, and the table reads the number through `mask_index_u64` |
 
 The sentinels are two statics in `cap/cspace.rs`. `SENTINEL_LEAF` is an all-`Null` `CSpacePage`
 (4032 bytes) with no interior mutability, so it is placed in read-only data. `SENTINEL_DIR` is one
@@ -165,8 +174,9 @@ handlers, the IPC transfer pre-validation, and explicit placement.
 
 A misspeculated use of the null object that `pin_checked` folds a failed lookup into dereferences
 null at a small offset. Userspace can map virtual page 0 (#741), and the documents do not state
-whether SMAP or a clear `SUM` stop that transient load. The user-supplied indexes that select a
-kernel array entry outside the capability path are recorded on #270.
+whether SMAP or a clear `SUM` stop that transient load. A rights bit a handler tests after
+resolution, beyond those its lookup requires, is a branch only; those sites, and the user-supplied
+indexes that select a kernel array entry outside the capability path, are recorded on #270.
 
 ### Free Slot Tracking
 

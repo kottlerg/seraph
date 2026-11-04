@@ -3055,28 +3055,35 @@ unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut 
 /// `dest`'s arena cannot back the copy. For every other type: `QuotaExceeded`
 /// when `src`'s reference count is at [`REF_COUNT_LIMIT`].
 ///
+/// `hidden_tag` is `tag` as the source's `PinnedCap::hidden_tag` holds it,
+/// the value each tag arm masks `src` by.
+///
 /// # Safety
-/// `src` is the live object of a slot tagged `tag`, pinned by the caller, and
-/// `dest` is a live `CSpace` the caller pins.
+/// `src` is the live object of a slot tagged `tag`, pinned by the caller,
+/// `hidden_tag` equals `tag as usize`, and `dest` is a live `CSpace` the
+/// caller pins.
 // cast_ptr_alignment: each object is constructed in place at a
 // size-class-aligned retype offset; the header sits at offset 0.
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
 pub unsafe fn object_for_new_slot(
     tag: crate::cap::slot::CapTag,
+    hidden_tag: usize,
     src: NonNull<KernelObjectHeader>,
     dest: *mut crate::cap::cspace::CSpace,
 ) -> Result<NonNull<KernelObjectHeader>, syscall::SyscallError>
 {
     use crate::cap::slot::CapTag;
 
-    // Each typed arm reads `src` selected by its own tag as data, so an arm a
-    // mispredicted tag match reaches reads through null, never an object of
-    // another type (core/kernel/docs/capability-internals.md
-    // § Speculative-Execution Hardening).
+    // Each typed arm reads `src` selected by its own tag as data, compared
+    // against `hidden_tag`, which the match on `tag` tells the compiler
+    // nothing about, so an arm a mispredicted tag match reaches reads through
+    // null, never an object of another type
+    // (core/kernel/docs/capability-internals.md § Speculative-Execution
+    // Hardening).
     let typed = |arm: CapTag| {
         crate::arch::nospec::select_ptr(
-            crate::arch::nospec::mask_if(tag == arm),
+            crate::arch::nospec::mask_if(hidden_tag == arm as usize),
             src.as_ptr(),
             core::ptr::null_mut(),
         )

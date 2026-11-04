@@ -675,19 +675,25 @@ pub fn read_cycle_counter() -> u64;
 
 ## `speculation` — `arch::current::speculation`
 
-The bound primitive the speculation-safe paths are built on (the rule is
+The bound primitives the speculation-safe paths are built on (the rule is
 [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces; its use is
 [capability-internals.md](capability-internals.md) § Speculative-Execution Hardening).
-Architecture-neutral code calls it through `arch::nospec`, which adds `mask_index`,
-`mask_index_u64`, `mask_if`, and `select_ptr` over it.
+Architecture-neutral code calls them through `arch::nospec`, which adds `mask_index`,
+`mask_index_u64`, `mask_if`, and `select_ptr` over them.
 
 ```rust
 /// All-ones when `index < bound`, zero otherwise, computed without a branch, so
 /// the outcome holds on a mispredicted path. Inline assembly, so the compiler
-/// cannot delete the mask inside the arm of the branch that guards the access
-/// (x86-64 `cmp` + `sbb`; RISC-V `sltu` + `neg`, base RV64I: the RVA23 floor
-/// defines no speculation barrier).
+/// cannot delete the mask inside the arm of the branch that guards the access,
+/// and not `pure`, so it is not moved into such an arm either (x86-64 `cmp` +
+/// `sbb`; RISC-V `sltu` + `neg`, base RV64I: the RVA23 floor defines no
+/// speculation barrier).
 pub fn index_mask(index: usize, bound: usize) -> usize;
+
+/// `value` through an empty, non-`pure` assembly block: a copy the compiler
+/// cannot relate to `value`, taken where it is written, so a later branch on
+/// `value` does not let it fold a comparison of the copy.
+pub fn hide(value: usize) -> usize;
 ```
 
 ---
@@ -917,7 +923,8 @@ pub unsafe fn ap_trampoline::start_ap(
 - SMP bringup (INIT/SIPI on x86-64; SBI HSM on RISC-V)
 
 **Architecture-neutral** (lives outside `arch/`, for example in `mm/`, `cap/`, `ipc/`, `sched/`,
-and `syscall/`):
+and `syscall/`; the one neutral module under `arch/` is `arch::nospec`, the arch-neutral forms of
+§ `speculation`, kept beside the primitive they wrap):
 
 - Buddy allocator algorithm
 - Retype allocator and the page pools behind address spaces and CSpaces

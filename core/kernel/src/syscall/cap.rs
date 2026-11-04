@@ -1475,8 +1475,9 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`;
     // `dest_cs_slot` pins the destination CSpace, which funds a fresh object.
-    let new_object =
-        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, dest_cs_ptr) }?;
+    let new_object = unsafe {
+        crate::cap::object::object_for_new_slot(src_tag, src.hidden_tag(), src_object, dest_cs_ptr)
+    }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (the destination's cspace.lock nested per the documented order).
@@ -1612,8 +1613,14 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
     // caller's own CSpace receives the new slot and funds a fresh object.
-    let new_object =
-        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, caller_cspace) }?;
+    let new_object = unsafe {
+        crate::cap::object::object_for_new_slot(
+            src_tag,
+            src.hidden_tag(),
+            src_object,
+            caller_cspace,
+        )
+    }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -1741,8 +1748,14 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
     // caller's own CSpace receives the new slot and funds a fresh object.
-    let new_object =
-        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, caller_cspace) }?;
+    let new_object = unsafe {
+        crate::cap::object::object_for_new_slot(
+            src_tag,
+            src.hidden_tag(),
+            src_object,
+            caller_cspace,
+        )
+    }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -2759,8 +2772,10 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
     // Each typed arm below casts `slot.object_of(<its tag>)`, the object
-    // selected by the tag as data, so an arm a mispredicted tag test reaches
-    // casts null, never an object of another type.
+    // selected as data by the tag hidden at resolution, so an arm a
+    // mispredicted tag test reaches casts null, never an object of another
+    // type. Architecturally the arm's tag check has passed, so `object_of`
+    // returns the pinned object, which the arms' SAFETY comments rely on.
 
     match field
     {

@@ -45,7 +45,7 @@ use syscall::{
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
 };
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
@@ -176,11 +176,6 @@ impl UserFrame
         };
     }
 }
-
-/// One past the highest assigned syscall number: the dispatch table's bound.
-/// Every number from 0 up to it is assigned; a new syscall above it raises it.
-#[cfg(not(test))]
-const SYSCALL_NR_BOUND: u64 = SYS_GETRANDOM + 1;
 
 /// Syscall dispatcher: called from the arch-specific trap/syscall entry stub.
 ///
@@ -884,6 +879,10 @@ pub(crate) struct PinnedCap
     pub badge: u64,
     /// The object the slot named at resolution, pinned while `self` lives.
     pub object: Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>,
+    /// `tag` as a `usize`, passed through `nospec::hide` at resolution, ahead
+    /// of every handler branch on `tag`: the value [`Self::tag_mask`] compares,
+    /// which no such branch lets the compiler fold.
+    hidden_tag: usize,
 }
 
 #[cfg(not(test))]
@@ -906,11 +905,24 @@ impl PinnedCap
         let raw = self
             .object
             .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
-        crate::arch::nospec::select_ptr(
-            crate::arch::nospec::mask_if(self.tag == tag),
-            raw,
-            core::ptr::null_mut(),
-        )
+        crate::arch::nospec::select_ptr(self.tag_mask(tag), raw, core::ptr::null_mut())
+    }
+
+    /// All-ones when the slot's tag is `tag`, else zero, computed from the tag
+    /// hidden at resolution, so the comparison stays data inside an arm of a
+    /// branch on [`Self::tag`] (`nospec::mask_if`'s input rule).
+    #[must_use]
+    pub fn tag_mask(&self, tag: crate::cap::slot::CapTag) -> usize
+    {
+        crate::arch::nospec::mask_if(self.hidden_tag == tag as usize)
+    }
+
+    /// The slot's tag as hidden at resolution, for a callee that masks per
+    /// tag arm itself (`cap::object::object_for_new_slot`).
+    #[must_use]
+    pub fn hidden_tag(&self) -> usize
+    {
+        self.hidden_tag
     }
 }
 
@@ -921,7 +933,7 @@ impl Drop for PinnedCap
     {
         if let Some(obj) = self.object
         {
-            // SAFETY: `pin_slot` took this reference and nothing else
+            // SAFETY: `pin_checked` took this reference and nothing else
             // releases it; the type's contract has its holder drop it in
             // syscall context with interrupts disabled and no lock held, the
             // preconditions `release_ref` states.
@@ -935,10 +947,12 @@ impl Drop for PinnedCap
 ///
 /// `handle` is the encoded value userspace passes: slot index in the low
 /// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits.
-/// Handlers that accept several tags (`SYS_CAP_INFO`, `SYS_WAIT_SET_ADD`'s
-/// source) check the tag and rights themselves and reach a typed object
-/// through [`PinnedCap::object_of`], as do copy, derive, and derive-badge for
-/// their source; every other handler resolves through [`lookup_cap`].
+/// Handlers that accept several tags (`SYS_CAP_INFO`, the wait-set source)
+/// check the tag and rights themselves and reach a typed object through
+/// [`PinnedCap::object_of`] or [`PinnedCap::tag_mask`]; copy, derive, and
+/// derive-badge pass their source's hidden tag to
+/// `cap::object::object_for_new_slot`, which masks per tag arm. Every other
+/// handler resolves through [`lookup_cap`].
 ///
 /// # Errors
 /// [`SyscallError::InvalidCapability`] for a null `cspace`, a missing or
@@ -1010,7 +1024,8 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
 /// a mispredicted check reaches, the object is null, never a slot's object of
 /// the wrong type, generation, or rights (core/kernel/docs/capability-internals.md
 /// § Speculative-Execution Hardening). The slot read itself is bounded by
-/// `CSpace::slot`.
+/// `CSpace::slot`. The tag is also passed through `nospec::hide` here, ahead
+/// of every handler branch on it, for [`PinnedCap::tag_mask`].
 ///
 /// # Errors
 /// As for [`lookup_cap`]; with `tag` `None` and `required` empty, as for
@@ -1019,6 +1034,10 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
 /// # Safety
 /// As for [`pin_slot`].
 #[cfg(not(test))]
+// needless_bitwise_bool: the checks combine with `&` and `|`, not `&&` and
+// `||`, so each is evaluated as a value with no branch a misprediction could
+// take past it.
+#[allow(clippy::needless_bitwise_bool)]
 unsafe fn pin_checked(
     cspace: *mut crate::cap::cspace::CSpace,
     handle: u32,
@@ -1044,27 +1063,37 @@ unsafe fn pin_checked(
     let snapshot = unsafe {
         let saved = (*cspace).lock.lock_raw();
         let snapshot = (*cspace).slot(index).map(|slot| {
-            // `&`, not `&&`: each check is evaluated as a value, with no branch
-            // a misprediction could take past one of them.
+            // `&` and `|`, not `&&` and `||`: each check is evaluated as a
+            // value, with no branch a misprediction could take past one of them.
             let live = (slot.tag != CapTag::Null) & (slot.generation() == generation);
-            let typed = tag.is_none_or(|t| slot.tag == t);
+            let typed = tag.is_none() | (tag == Some(slot.tag));
             let held = slot.rights.contains(required);
             let usable = nospec::mask_if(live & typed & held);
+            let hidden_tag = nospec::hide(slot.tag as usize);
             let raw = slot
                 .object
                 .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
             let object =
                 core::ptr::NonNull::new(nospec::select_ptr(usable, raw, core::ptr::null_mut()));
-            (live, typed, held, slot.tag, slot.rights, slot.badge, object)
+            (
+                live,
+                typed,
+                held,
+                slot.tag,
+                slot.rights,
+                slot.badge,
+                object,
+                hidden_tag,
+            )
         });
-        if let Some((true, true, true, _, _, _, Some(obj))) = snapshot
+        if let Some((true, true, true, _, _, _, Some(obj), _)) = snapshot
         {
             obj.as_ref().inc_ref();
         }
         (*cspace).lock.unlock_raw(saved);
         snapshot
     };
-    let (live, typed, held, tag, rights, badge, object) =
+    let (live, typed, held, tag, rights, badge, object, hidden_tag) =
         snapshot.ok_or(SyscallError::InvalidCapability)?;
     if !live || !typed
     {
@@ -1079,6 +1108,7 @@ unsafe fn pin_checked(
         rights,
         badge,
         object,
+        hidden_tag,
     })
 }
 

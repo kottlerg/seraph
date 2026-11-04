@@ -54,11 +54,27 @@ pub fn mask_index_u64(index: u64, bound: u64) -> u64
 
 /// All-ones when `cond` holds, zero otherwise, as an opaque value the compiler
 /// cannot turn back into a branch.
+///
+/// The output is opaque, the input is not: `cond` MUST NOT be a condition a
+/// dominating branch has already tested, or the compiler folds it to a
+/// constant inside that branch's arm and the mask no longer depends on the
+/// data. A mask taken inside such an arm compares a value passed through
+/// [`hide`] ahead of the branch instead.
 #[inline]
 #[must_use]
 pub fn mask_if(cond: bool) -> usize
 {
     speculation::index_mask(0, usize::from(cond))
+}
+
+/// `value`, passed through the active architecture's `speculation::hide`: an
+/// opaque copy the compiler cannot relate to `value`, taken where it is
+/// written. A later branch on `value` tells the compiler nothing about it.
+#[inline]
+#[must_use]
+pub fn hide(value: usize) -> usize
+{
+    speculation::hide(value)
 }
 
 /// `if_set` when `mask` is all-ones, `otherwise` when it is zero, selected
@@ -117,6 +133,15 @@ mod tests
     {
         assert_eq!(mask_if(true), usize::MAX);
         assert_eq!(mask_if(false), 0);
+    }
+
+    #[test]
+    fn hide_is_the_identity()
+    {
+        for v in [0, 1, 0xE, usize::MAX]
+        {
+            assert_eq!(hide(v), v);
+        }
     }
 
     #[test]

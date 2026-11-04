@@ -769,8 +769,9 @@ bound on every `BLK_READ_INTO_MEMORY`. See
 
 ## Summarized By
 
-[Storage](../../../docs/storage.md),
+[Storage](../../../docs/storage.md), [Namespace Model](../../../docs/namespace-model.md),
 [programs/fsbench/README.md](../../../programs/fsbench/README.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md),
 [services/vfsd/README.md](../../vfsd/README.md),
 [vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

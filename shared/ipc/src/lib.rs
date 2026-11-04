@@ -1241,7 +1241,7 @@ pub const NS_LABELS_VERSION: u32 = 1;
 /// IPC labels for the namespace protocol (cap-as-namespace surface).
 ///
 /// Numbered in a reserved range above the [`fs_labels`] codes (2 through
-/// 17) so node-cap and per-file requests share one fs-driver endpoint with
+/// 18) so node-cap and per-file requests share one fs-driver endpoint with
 /// no opcode collisions.
 /// [`fs_labels::END_OF_DIR`] is reused unchanged as the readdir
 /// terminator.
@@ -1459,8 +1459,9 @@ pub mod fs_labels
     /// [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the open cap; the
     /// stateless file labels accept either cap. Errors: `INVALID_BADGE` (no
     /// such node, a directory, or an open cap), `PERMISSION_DENIED`,
-    /// `TOO_MANY_OPEN` (the driver's open table is full or cannot grow).
-    /// Specified in `services/fs/docs/fs-driver-protocol.md` § Label 18:
+    /// `TOO_MANY_OPEN` (the driver's open table is full, or its heap or
+    /// `CSpace` cannot grow), `IO_ERROR` (the driver could not mint the open
+    /// cap). Every refusal deletes the carried SEND. Specified in `services/fs/docs/fs-driver-protocol.md` § Label 18:
     /// `FS_OPEN`.
     pub const FS_OPEN: u64 = 18;
 }

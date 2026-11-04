@@ -1236,12 +1236,12 @@ struct HeldPage
 
 impl HeldPage
 {
-    /// `FS_READ_MEMORY` page `index` through the open cap `node`, opened
+    /// `FS_READ_MEMORY` page `index` through the open cap `open`, opened
     /// without a release endpoint, map the returned cap read-only, then send
     /// `FS_RELEASE_MEMORY` without unmapping. fatfs revokes the cap and drops
     /// its slot while the mapping stays. `None` when fatfs answers `IO_ERROR`,
     /// finding no slot it may reuse.
-    fn take(node: u32, index: usize, ipc_buf: *mut u64) -> Option<Self>
+    fn take(open: u32, index: usize, ipc_buf: *mut u64) -> Option<Self>
     {
         let cookie = 0x5107_0000 + index as u64;
         let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
@@ -1249,7 +1249,7 @@ impl HeldPage
             .word(1, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(node, &read, ipc_buf) }
+        let reply = unsafe { ipc::ipc_call(open, &read, ipc_buf) }
             .expect("slot reuse: FS_READ_MEMORY ipc_call");
         if reply.label == ipc::fs_errors::IO_ERROR
         {
@@ -1284,7 +1284,7 @@ impl HeldPage
             .word(0, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let released = unsafe { ipc::ipc_call(node, &release, ipc_buf) }
+        let released = unsafe { ipc::ipc_call(open, &release, ipc_buf) }
             .expect("slot reuse: FS_RELEASE_MEMORY ipc_call");
         // A failed release would leave the slot in use, so the reuse the
         // cases check would never happen.
@@ -1421,10 +1421,10 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     let svctest = svctest_dir_cap(ipc_buf);
     let (node_cap, _kind, _size) =
         ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("slot reuse: lookup");
-    let node = fs_open(node_cap, 0, ipc_buf).expect("slot reuse: FS_OPEN");
+    let open = fs_open(node_cap, 0, ipc_buf).expect("slot reuse: FS_OPEN");
 
     let held: Vec<HeldPage> = (0..SLOT_REUSE_HELD)
-        .map(|i| HeldPage::take(node, i, ipc_buf).expect("slot reuse: a read past the bound"))
+        .map(|i| HeldPage::take(open, i, ipc_buf).expect("slot reuse: a read past the bound"))
         .collect();
     read_slot_reuse_file(path, SLOT_REUSE_HELD, file_pages);
     read_slot_reuse_file(path, 0, file_pages);
@@ -1440,7 +1440,7 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
     let mut held = Vec::new();
     while held.len() < file_pages
     {
-        match HeldPage::take(node, held.len(), ipc_buf)
+        match HeldPage::take(open, held.len(), ipc_buf)
         {
             Some(page) => held.push(page),
             None => break,
@@ -1467,8 +1467,8 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
 
     // The file stays for the per-open eviction phase (`fs_opens`), which
     // reads it next and removes it.
-    let _ = fs_close(node, ipc_buf);
-    let _ = syscall::cap_delete(node);
+    let _ = fs_close(open, ipc_buf);
+    let _ = syscall::cap_delete(open);
     let _ = syscall::cap_delete(node_cap);
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_mapping_survives_slot_reuse phase passed (held {count})");

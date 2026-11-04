@@ -474,6 +474,9 @@ struct FakeFsReport
     cross: Option<ReleaseReply>,
     /// Two releases of it on `/b`'s own release SEND.
     own: Option<(ReleaseReply, ReleaseReply)>,
+    /// `FS_CLOSE`s each open received, by node: the child's exit hook sends
+    /// one for each `File` it never drops.
+    closes: [usize; 2],
 }
 
 /// The std client hands each `File`'s release SEND to the driver on its
@@ -486,7 +489,8 @@ struct FakeFsReport
 /// While that `FS_READ_MEMORY` is still unanswered, so its cookie is
 /// mid-read, the fake sends a release of the cookie on `/a`'s SEND, which
 /// names a `File` that holds no such page and is acked at once, and then
-/// two on `/b`'s.
+/// two on `/b`'s. The child exits through `std::process::exit` holding both
+/// `File`s, so its exit hook must send one `FS_CLOSE` on each open.
 pub fn std_release_matched_by_open_phase(_: &Caps)
 {
     use std::os::seraph::process::CommandExt;
@@ -547,6 +551,11 @@ pub fn std_release_matched_by_open_phase(_: &Caps)
         cross_rtt < RELEASE_WINDOW,
         "a release on another File's SEND waited ({cross_rtt:?}) for /b's read"
     );
+    assert_eq!(
+        report.closes,
+        [1, 1],
+        "the exit hook must send one FS_CLOSE on each open File (counts for /a, /b)"
+    );
     let ((first, first_rtt), (repeat, repeat_rtt)) = report
         .own
         .expect("std_release_matched_by_open: the fake fs sent no release on /b's SEND");
@@ -578,7 +587,8 @@ pub fn std_release_matched_by_open_phase(_: &Caps)
 /// delivered, then read a page of `/b`. The fake answers the read with a
 /// frame only after a release of its cookie on `/b`'s SEND has waited out the
 /// window, so the copy is stalled and must be discarded: the read returns
-/// `Interrupted` and the position stays at 0. Exits before the `File`s drop.
+/// `Interrupted` and the position stays at 0. Exits through
+/// `std::process::exit` before the `File`s drop, so the exit hook closes them.
 /// Exit codes: 0 as expected, 2 an open failed, 3 `/b`'s read did not return
 /// `Interrupted`, 4 `/b`'s position moved.
 fn release_child_main() -> !
@@ -606,7 +616,8 @@ fn release_child_main() -> !
 /// keeping the release SEND it carries. `/b`'s `FS_READ_MEMORY` is answered,
 /// after one release of its cookie on `/a`'s release SEND and two on
 /// `/b`'s, with a one-page frame (a read-only derivation of a page from
-/// memmgr). Anything else is refused.
+/// memmgr). Each open's `FS_CLOSE` is counted and answered. Anything else is
+/// refused.
 fn fake_fs_serve(ep: u32) -> FakeFsReport
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -659,6 +670,15 @@ fn fake_fs_serve(ep: u32) -> FakeFsReport
             ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
                 .cap(open)
                 .build()
+        }
+        else if opcode == ipc::fs_labels::FS_CLOSE
+            && (msg.badge == FAKE_FS_OPEN_BASE + 1 || msg.badge == FAKE_FS_OPEN_BASE + 2)
+        {
+            // Cast is range-safe: the badge is one of the two open badges.
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = (msg.badge - FAKE_FS_OPEN_BASE - 1) as usize;
+            report.closes[idx] += 1;
+            ipc::IpcMessage::new(ipc::fs_errors::SUCCESS)
         }
         else if opcode == ipc::fs_labels::FS_READ_MEMORY && msg.badge == FAKE_FS_OPEN_BASE + 2
         {

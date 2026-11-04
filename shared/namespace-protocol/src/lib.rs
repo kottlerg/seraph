@@ -435,9 +435,9 @@ fn handle_lookup<B: NamespaceBackend>(
         {
             let badge = pack(node, returned_rights);
             // SEND_GRANT lets the holder attach caps to IPC requests
-            // through this node cap (e.g. the per-process release-
-            // endpoint SEND that travels in `caps[0]` of the first
-            // `FS_READ_MEMORY`). It does not widen authority — the
+            // through this node cap (e.g. the release-endpoint SEND that
+            // travels in `caps[0]` of `FS_OPEN`, or `FS_WRITE_MEMORY`'s
+            // source page). It does not widen authority — the
             // recipient still validates every received cap. SEND-only
             // would force the kernel to reject any cap-bearing IPC.
             match syscall::cap_derive_badge(
@@ -462,8 +462,8 @@ fn handle_lookup<B: NamespaceBackend>(
             // stored badged cap could only ever be copied at its original
             // full rights. GRANT is carried for the same reason as in the
             // `Local` arm: a node cap across a mount must still be able to
-            // attach caps (the release-endpoint SEND of `FS_READ_MEMORY`)
-            // to its requests.
+            // attach caps (the release-endpoint SEND of `FS_OPEN`) to its
+            // requests.
             let badge = pack(node, returned_rights);
             match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_EP_SEND_GRANT, badge)
             {

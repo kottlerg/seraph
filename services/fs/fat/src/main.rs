@@ -8,9 +8,11 @@
 //! Implements read-write FAT16/FAT32 filesystem support. Serves the
 //! cap-native namespace protocol (`NS_LOOKUP` / `NS_STAT` /
 //! `NS_READDIR`) for directory walks; per-node badged caps carry
-//! the read side (`FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
-//! `FS_CLOSE`) and the write side (`FS_WRITE`, `FS_WRITE_MEMORY`,
-//! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`, `FS_TRUNCATE`).
+//! `FS_OPEN`, the stateless file labels (`FS_READ`, `FS_WRITE`,
+//! `FS_WRITE_MEMORY`, `FS_TRUNCATE`), and directory mutation (`FS_CREATE`,
+//! `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`); per-open caps carry the open's
+//! `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`, and the stateless
+//! file labels.
 //! `FS_MOUNT` is the one unbadged service-level request, used by vfsd
 //! as a BPB-validation probe at mount time. All disk I/O is performed via
 //! the block device IPC endpoint received at creation time.
@@ -260,9 +262,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   `FS_CLOSE`, and the stateless file ops on the open's node.
 ///
 /// The open table is shared with the eviction worker via a `Mutex`. Main
-/// takes the lock to resolve an open cap, and for `FS_OPEN`,
-/// `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE` holds it for the
-/// whole dispatch. Lock contention with the worker is only material during
+/// takes the lock to resolve an open cap, `FS_OPEN` takes it only around its
+/// table update, and `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
+/// hold it for the whole dispatch. Lock contention with the worker is only material during
 /// cache-pressure releases.
 // too_many_lines: the loop is one dispatch over every label the driver serves,
 // each arm a call into its handler; splitting it would scatter the dispatch
@@ -358,8 +360,22 @@ fn service_loop(
         // a `MUTATE_DIR`-only parent would silently gain `READ` /
         // `WRITE` / `EXEC` on every child they create. An open cap
         // resolves to its open and the open's node; `open_id` is `None`
-        // for a node cap.
-        let gated = if is_open_instance(msg.badge)
+        // for a node cap. A label sent on the wrong kind of cap is refused
+        // before its rights are checked (fs-driver-protocol.md § Label 18).
+        let kind = if is_open_instance(msg.badge)
+        {
+            CapKind::Open
+        }
+        else
+        {
+            CapKind::Node
+        };
+        if !label_accepts(opcode, kind)
+        {
+            reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+            continue;
+        }
+        let gated = if kind == CapKind::Open
         {
             gate_open(msg.label, msg.badge).map(|(id, rights)| (None, rights, Some(id)))
         }
@@ -375,18 +391,13 @@ fn service_loop(
                     let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
                     open.and_then(|id| files_g.get(id)).map(|f| f.node_id)
                 });
-                match node
+                let Some(node) = node
+                else
                 {
-                    Some(node) if label_fits_cap_kind(opcode, open.is_some()) =>
-                    {
-                        (node, rights, open)
-                    }
-                    _ =>
-                    {
-                        reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
-                        continue;
-                    }
-                }
+                    reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+                    continue;
+                };
+                (node, rights, open)
             }
             Err(err) =>
             {
@@ -412,7 +423,7 @@ fn service_loop(
 
         if opcode == fs_labels::FS_READ
         {
-            handle_read_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+            handle_read(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
             continue;
         }
 
@@ -421,6 +432,22 @@ fn service_loop(
         // + cache write-through.
         match opcode
         {
+            fs_labels::FS_OPEN =>
+            {
+                // Takes the open table's lock itself, only around the
+                // table update: its CSpace top-up may call memmgr.
+                handle_open_node_cap(
+                    node_id,
+                    parent_rights,
+                    &msg,
+                    nodes,
+                    files,
+                    caps,
+                    cache,
+                    ipc_buf,
+                );
+                continue;
+            }
             fs_labels::FS_WRITE =>
             {
                 handle_write_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
@@ -499,19 +526,6 @@ fn service_loop(
         let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
         match (opcode, open_id)
         {
-            (fs_labels::FS_OPEN, None) =>
-            {
-                handle_open_node_cap(
-                    node_id,
-                    parent_rights,
-                    &msg,
-                    nodes,
-                    &mut files_g,
-                    caps,
-                    cache,
-                    ipc_buf,
-                );
-            }
             (fs_labels::FS_READ_MEMORY, Some(open)) =>
             {
                 handle_read_memory_open_cap(
@@ -545,25 +559,36 @@ fn service_loop(
     }
 }
 
-/// Whether a gated `opcode` may be sent on a cap of this kind (an open cap
-/// when `on_open_cap`, else a node cap), per
+/// The kind of cap a badged request arrived on: a node cap (`NS_LOOKUP`,
+/// `FS_CREATE`, `FS_MKDIR`) or an open cap (`FS_OPEN`), told apart by the
+/// badge's `OPEN_INSTANCE` bit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapKind
+{
+    Node,
+    Open,
+}
+
+/// Whether `opcode` may be sent on a cap of `kind`, per
 /// services/fs/docs/fs-driver-protocol.md § Label 18. An open's own labels
-/// (`FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) need an open cap; the
-/// stateless file labels take either; `FS_OPEN` and directory mutation need
-/// a node cap. A misdirected label is answered `INVALID_BADGE`.
-fn label_fits_cap_kind(opcode: u64, on_open_cap: bool) -> bool
+/// (`FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) need an open cap;
+/// `FS_OPEN` and directory mutation need a node cap; the stateless file
+/// labels take either. Any other opcode passes, so the rights gate answers
+/// it `UNKNOWN_OPCODE`. A misdirected label is answered `INVALID_BADGE`.
+fn label_accepts(opcode: u64, kind: CapKind) -> bool
 {
     match opcode
     {
         fs_labels::FS_READ_MEMORY | fs_labels::FS_RELEASE_MEMORY | fs_labels::FS_CLOSE =>
         {
-            on_open_cap
+            kind == CapKind::Open
         }
-        fs_labels::FS_READ
-        | fs_labels::FS_WRITE
-        | fs_labels::FS_WRITE_MEMORY
-        | fs_labels::FS_TRUNCATE => true,
-        _ => !on_open_cap,
+        fs_labels::FS_OPEN
+        | fs_labels::FS_CREATE
+        | fs_labels::FS_REMOVE
+        | fs_labels::FS_MKDIR
+        | fs_labels::FS_RENAME => kind == CapKind::Node,
+        _ => true,
     }
 }
 
@@ -579,11 +604,11 @@ fn drop_caps(caps: &[u32])
 
 // ── Operation handlers ─────────────────────────────────────────────────────
 
-/// `FS_READ` against a node cap. Resolves `node_id` against the
-/// `NodeTable` and reads from the FAT cluster chain. Inline reads
-/// allocate no `OpenFile` slot — no outstanding pages, no release
-/// bookkeeping.
-fn handle_read_node_cap(
+/// `FS_READ` against a node cap or an open cap, `node_id` being the node
+/// either names. Resolves `node_id` against the `NodeTable` and reads from
+/// the FAT cluster chain. Inline reads touch no open: no outstanding pages,
+/// no release bookkeeping.
+fn handle_read(
     node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,
@@ -657,7 +682,7 @@ fn handle_read_node_cap(
 // sequence (validate, resolve the sector, pin a cache page, mint and record
 // the cap, reply) whose steps share the slot state.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn read_memory_at_slot(
+fn read_memory_for_open(
     msg: &IpcMessage,
     node: &backend::FatNode,
     open_id: u64,
@@ -880,7 +905,9 @@ fn pick_eviction_candidate(files: &mut OpenTable) -> Option<EvictReq>
 /// (services/fs/docs/fs-driver-protocol.md § Label 18). The open cap
 /// carries the node cap's rights and `SEND_GRANT`, as a node cap does, so
 /// `FS_WRITE_MEMORY` can carry its source page on it. Before recording the
-/// SEND it tops the `CSpace` up ([`PageCache::fund_run_time_headroom`]).
+/// SEND it tops the `CSpace` up ([`PageCache::fund_run_time_headroom`]),
+/// with the open table unlocked, since the top-up may call memmgr; the lock
+/// is held only to insert the open, and to remove it if the mint fails.
 // too_many_arguments: the request, its node and rights, and the driver state
 // an open touches (node table, open table, endpoint caps, cache, IPC buffer).
 #[allow(clippy::too_many_arguments)]
@@ -889,7 +916,7 @@ fn handle_open_node_cap(
     rights: NamespaceRights,
     msg: &IpcMessage,
     nodes: &NodeTable,
-    files: &mut OpenTable,
+    files: &Mutex<OpenTable>,
     caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
@@ -922,7 +949,11 @@ fn handle_open_node_cap(
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
         return;
     }
-    let Some(open_id) = files.insert(OpenFile::new(node_id, release_send))
+    let inserted = files
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(OpenFile::new(node_id, release_send));
+    let Some(open_id) = inserted
     else
     {
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
@@ -934,7 +965,10 @@ fn handle_open_node_cap(
     let Some(open_cap) = minted
     else
     {
-        files.remove(open_id);
+        files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(open_id);
         refuse(ipc::fs_errors::IO_ERROR);
         return;
     };
@@ -947,9 +981,9 @@ fn handle_open_node_cap(
 
 /// `FS_READ_MEMORY` against an open cap: the page is tracked on that open
 /// and its cooperative release goes to that open's release SEND. Delegates
-/// to [`read_memory_at_slot`].
+/// to [`read_memory_for_open`].
 // too_many_arguments: the request, its node and open, plus the driver state
-// `read_memory_at_slot` needs, which this handler forwards.
+// `read_memory_for_open` needs, which this handler forwards.
 #[allow(clippy::too_many_arguments)]
 fn handle_read_memory_open_cap(
     node_id: NodeId,
@@ -975,7 +1009,7 @@ fn handle_read_memory_open_cap(
         reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     }
-    read_memory_at_slot(
+    read_memory_for_open(
         msg,
         &node,
         open_id,
@@ -990,7 +1024,7 @@ fn handle_read_memory_open_cap(
 
 /// Reply `code` holding none of the caps the request carried: an
 /// `FS_WRITE_MEMORY` source page goes back in the reply, as § Label 12
-/// promises in every outcome, and any other cap (an `FS_READ_MEMORY`
+/// promises in every outcome, and any other cap (an `FS_OPEN`
 /// release SEND) is deleted. Used for requests refused before any cap they
 /// carry is recorded or consumed (the dispatch loop's rights-gate and
 /// unknown or unbadged label refusals, the cap-kind refusal, and the

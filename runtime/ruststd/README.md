@@ -302,6 +302,7 @@ primitives.
 
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
 [Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
 [`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

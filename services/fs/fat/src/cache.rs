@@ -340,17 +340,21 @@ impl PageCache
         self.pressure.swap(false, Ordering::AcqRel)
     }
 
-    /// Top the fs process's `CSpace` (`cspace`) up so the general slots a
-    /// full cache can still take stay free: a per-read ancestor for every
-    /// slot, the quarantine's replacements, and
-    /// [`RUN_TIME_CSPACE_HEADROOM`]. Called before `FS_OPEN` records a
-    /// release SEND, which holds a slot for the open's lifetime, so the
-    /// `CSpace` grows with the opens instead of starving reads. A no-op
+    /// Top the fs process's `CSpace` (`cspace`) up so every general slot the
+    /// cache can still take stays free: a page cap for each slot not yet
+    /// provisioned, a per-read ancestor for every slot, the quarantine's
+    /// replacements, and [`RUN_TIME_CSPACE_HEADROOM`] (the init funding,
+    /// less the slot pages and the scratch page already held). Called before
+    /// `FS_OPEN` records a release SEND, which holds a slot for the open's
+    /// lifetime, so the `CSpace` grows with the opens instead of starving
+    /// reads. A no-op
     /// beyond reading the `CSpace`'s headroom while it suffices; `false`
     /// when memmgr cannot fund it.
     pub fn fund_run_time_headroom(&self, cspace: u32) -> bool
     {
-        let slots = self.slot_ceiling() + QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM;
+        let ceiling = self.slot_ceiling();
+        let unprovisioned = ceiling - self.provisioned.load(Ordering::Acquire);
+        let slots = unprovisioned + ceiling + QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM;
         std::os::seraph::fund_cspace_slot_budget(cspace, slots as u64)
     }
 

@@ -189,7 +189,8 @@ byte is rejected) and shares this resolution path.
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving
 `FS_*` labels against per-node badged SEND caps on its own
-endpoint. The block endpoint it receives is partition-scoped at
+endpoint, and the labels of an open against the per-open caps its
+`FS_OPEN` mints. The block endpoint it receives is partition-scoped at
 delivery time; the fs driver reads and writes by partition-relative
 LBA. See
 [`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).

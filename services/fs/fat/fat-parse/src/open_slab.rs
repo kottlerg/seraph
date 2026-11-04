@@ -35,6 +35,9 @@ pub struct OpenSlab<T>
     free: Vec<u32>,
     /// Live entries.
     len: usize,
+    /// Most slots the table grows to: [`MAX_ENTRIES`], every index the
+    /// identifier can name.
+    max: usize,
 }
 
 impl<T> Default for OpenSlab<T>
@@ -50,10 +53,19 @@ impl<T> OpenSlab<T>
     #[must_use]
     pub const fn new() -> Self
     {
+        Self::with_limit(MAX_ENTRIES)
+    }
+
+    /// A slab that grows to at most `max` slots, `max` at most
+    /// [`MAX_ENTRIES`]; [`Self::new`]'s bound is the identifier's. Lets a
+    /// test reach the full table.
+    const fn with_limit(max: usize) -> Self
+    {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
             len: 0,
+            max,
         }
     }
 
@@ -70,7 +82,7 @@ impl<T> OpenSlab<T>
         }
         else
         {
-            if self.slots.len() >= MAX_ENTRIES
+            if self.slots.len() >= self.max
             {
                 return None;
             }
@@ -229,6 +241,26 @@ mod tests
         let next = slab.insert(1).expect("room");
         assert_ne!(next & INDEX_MASK, first & INDEX_MASK);
         assert_eq!(slab.get(first), None);
+    }
+
+    #[test]
+    fn a_full_table_refuses_until_a_removal_frees_a_reusable_index()
+    {
+        let mut slab: OpenSlab<u8> = OpenSlab::with_limit(2);
+        let a = slab.insert(1).expect("room");
+        let b = slab.insert(2).expect("room");
+        assert_eq!(slab.insert(3), None, "every slot live");
+        assert_eq!(slab.remove(a), Some(1));
+        let c = slab.insert(3).expect("a freed index is reused");
+        assert_eq!(c & INDEX_MASK, a & INDEX_MASK);
+
+        // Retire b's index: its generation would wrap, so it is not reissued,
+        // and the table stays full though one slot is empty.
+        slab.slots[(b & INDEX_MASK) as usize - 1].generation = u16::MAX;
+        let b_last = (b & INDEX_MASK) | (u64::from(u16::MAX) << INDEX_BITS);
+        assert_eq!(slab.remove(b_last), Some(2));
+        assert_eq!(slab.len(), 1);
+        assert_eq!(slab.insert(4), None, "every free index retired");
     }
 
     #[test]

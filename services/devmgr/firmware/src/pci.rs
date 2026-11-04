@@ -3,10 +3,35 @@
 
 // services/devmgr/firmware/src/pci.rs
 
-//! PCI configuration-space arithmetic for devmgr: ECAM register offsets and
+//! PCI configuration-space arithmetic for devmgr: ECAM register offsets,
 //! BAR sizes from their sizing read-backs (PCI Local Bus Specification r3.0
-//! § 6.2.5.1). devmgr performs the volatile accesses; these functions only
-//! compute.
+//! § 6.2.5.1), and the Command register's Bus Master Enable (§ 6.2.2).
+//! devmgr performs the volatile accesses; these functions only compute.
+
+/// Offset of the Command register in a function's configuration header.
+pub const COMMAND: u16 = 0x04;
+
+/// Bus Master Enable, bit 2 of the Command register: while it is clear the
+/// function issues no memory or I/O request of its own, so it performs no
+/// DMA and signals no MSI.
+pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
+
+/// The Command register value that clears Bus Master Enable and keeps every
+/// other bit of `command`, so the function still decodes its BARs.
+#[must_use]
+pub const fn command_without_bus_master(command: u16) -> u16
+{
+    command & !COMMAND_BUS_MASTER
+}
+
+/// Whether a Command register read back after clearing Bus Master Enable
+/// confirms it clear. An all-ones read-back is what a function that does
+/// not answer returns, so it confirms nothing.
+#[must_use]
+pub const fn bus_master_confirmed_clear(read_back: u16) -> bool
+{
+    read_back != u16::MAX && read_back & COMMAND_BUS_MASTER == 0
+}
 
 /// Byte offset of a BDF + register within an ECAM window whose first bus is
 /// `start_bus` (1 MiB per bus, 32 KiB per device, 4 KiB per function).
@@ -87,6 +112,24 @@ mod tests
         assert_eq!(config_offset(0, 0, 32, 0, 0), None);
         assert_eq!(config_offset(0, 0, 0, 8, 0), None);
         assert_eq!(config_offset(0, 0, 0, 0, 0x1000), None);
+    }
+
+    #[test]
+    fn clearing_bus_master_keeps_every_other_command_bit()
+    {
+        assert_eq!(command_without_bus_master(0x0007), 0x0003);
+        assert_eq!(command_without_bus_master(0x0406), 0x0402);
+        assert_eq!(command_without_bus_master(0x0003), 0x0003);
+    }
+
+    #[test]
+    fn only_a_read_back_with_bus_master_clear_confirms_it()
+    {
+        assert!(bus_master_confirmed_clear(0x0003));
+        assert!(bus_master_confirmed_clear(0x0000));
+        assert!(!bus_master_confirmed_clear(0x0007));
+        // A function that does not answer reads all ones.
+        assert!(!bus_master_confirmed_clear(0xFFFF));
     }
 
     #[test]

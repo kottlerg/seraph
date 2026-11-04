@@ -33,18 +33,18 @@
 //         ledger?: string }
 //   mode 'full'  reviews every file in the PR diff.
 //   mode 'delta' reviews the files whose content changed between `since` (the
-//                head the previous run reviewed) and the head, verifies the
-//                fixes claimed since then, and adds a whole-PR correctness-only
-//                regression lens that also verifies claimed fixes for files
-//                outside the delta. The call-sites and cross-boundary lenses
-//                cover the whole PR diff in both modes (the cross-boundary lens
-//                runs whenever the PR diff, not only the delta, touches a code
-//                file); the design-docs lenses read only the documents that
-//                state facts the delta changed. `since` must resolve in this
-//                clone; it need not be an ancestor of the head, so an amended
-//                or rebased branch still works. Only files the PR diff also
-//                touches are reviewed, so files a merge or rebase of the base
-//                brought in are not.
+//                head the last run with the reviewer reviewed) and the head,
+//                verifies the fixes claimed since then, and adds a whole-PR
+//                correctness-only regression lens that also verifies claimed
+//                fixes for files outside the delta. The call-sites and
+//                cross-boundary lenses cover the whole PR diff in both modes
+//                (the cross-boundary lens runs whenever the PR diff, not only
+//                the delta, touches a code file); the design-docs lenses read
+//                only the documents that state facts the delta changed. `since`
+//                must resolve in this clone; it need not be an ancestor of the
+//                head, so an amended or rebased branch still works. Only files
+//                the PR diff also touches are reviewed, so files a merge or
+//                rebase of the base brought in are not.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
 //                every mode once one exists, so a full run after an earlier
@@ -88,7 +88,11 @@ const LEDGER =
 if (!Number.isInteger(PR) || PR <= 0) return { error: 'args.pr must be a pull request number' }
 if (MODE === null) return { error: "args.mode must be 'full', 'delta', or 'scope'" }
 if (MODE === 'delta' && !DELTA) {
-    return { error: "args.since (the head the previous run reviewed) is required in 'delta' mode" }
+    return {
+        error:
+            "args.since (the head the last run with the reviewer reviewed) is required in " +
+            "'delta' mode",
+    }
 }
 if (MODE === 'full' && DELTA) {
     return { error: "args.since is only meaningful with mode 'delta' or 'scope'" }
@@ -108,7 +112,8 @@ const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and
 const VERIFY_LENSES = ['reality', 'authority']
 // The finding classes: a defect of the first set in a touched file is on the
 // review surface; one of the second set is on it in a delta run only when the
-// delta introduced it. The schema's class enum is their union.
+// delta or the PR's own earlier commits introduced it. The schema's class enum
+// is their union.
 const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
 const SOFT_CLASSES = ['standards', 'doc-drift', 'coverage', 'style']
 // The blocking track (docs/conventions.md § Branch and PR Workflow): a finding
@@ -120,7 +125,8 @@ const blocks = (f) =>
 // even when the narrowed design-document list omits them; never a design-docs
 // lens document in that mode.
 const STANDARDS_DOCS = ['docs/coding-standards.md', 'docs/documentation-standards.md']
-// The sections pr-auditor's Output lists; the audit must return each of them.
+// The sections pr-auditor's Output lists for a run with the reviewer (every run
+// of this workflow); the audit must return each of them.
 const AUDIT_SECTION_NAMES = [
     'PR-body checklist', 'per-issue closure', 'silent-deferral scan', 'test-plan honesty',
     'commit-message compliance', 'validation claim', 'PR-body claims',
@@ -261,7 +267,8 @@ const FINDING_SCHEMA = {
         introduced: {
             type: 'boolean',
             description:
-                'The diff introduced it (in delta mode, the delta did); else pre-existing.',
+                'The diff introduced it (in delta mode, the delta or the PR\'s own ' +
+                'earlier commits did); else pre-existing.',
         },
         must_violation: {
             type: 'boolean',
@@ -282,7 +289,8 @@ const FINDING_SCHEMA = {
                 'item, something the change introduces, a caller or reverse dependency of a ' +
                 'changed item, or any correctness, safety, or contract defect in a touched ' +
                 'file; in a delta run, a standards, doc-drift, coverage, or style finding only ' +
-                'when the delta introduced it. Name the Issue in `issue`; the workflow takes ' +
+                'when the delta or the PR\'s own earlier commits introduced it. Name the ' +
+                'Issue in `issue`; the workflow takes ' +
                 'the finding off the surface.',
         },
         issue: {
@@ -432,7 +440,7 @@ const DELTA_RANGE = DELTA ? SINCE + ' <head> -- <every file the PR diff touches>
 
 const SCOPE_PROMPT = [
     'Scope pull request #' + PR + ' for a sharded review.' +
-        (DELTA ? ' Re-review: the previous run reviewed head ' + SINCE + '.' : ''),
+        (DELTA ? ' Re-review: the last run with the reviewer reviewed head ' + SINCE + '.' : ''),
     '',
     'Run `gh pr view ' + PR + ' --json headRefOid,baseRefName,body,commits`, ' +
         '`git merge-base <head> origin/<baseRefName>` (the base), `git rev-parse ' +
@@ -629,13 +637,15 @@ const HEAD_LINE =
                 ? '; here they are equal, so every delta hunk is the PR\'s'
                 : '') +
             '. A standards, doc-drift, coverage, or style finding in a base hunk is not one ' +
-            'the delta introduced; a correctness, safety, or contract defect in one stays on ' +
+            'the PR introduced; a finding in a hunk an earlier commit of the PR introduced ' +
+            'is one it introduced; a correctness, safety, or contract defect in a base ' +
+            'hunk stays on ' +
             'the surface, as in any touched file'
         : '') + '.'
 
 const DELTA_NOTE = DELTA
-    ? 'This is a re-review: the previous run reviewed head ' + SINCE + ', and the commits and ' +
-        'PR body since then claim fixes for its findings.'
+    ? 'This is a re-review: the last run with the reviewer reviewed head ' + SINCE + ', ' +
+        'and the commits and PR body since then claim fixes for its findings.'
     : null
 
 const SHARD_HEADER = [
@@ -1094,7 +1104,7 @@ function dedup(findings, source) {
             f.issue = 0
         }
         // In a delta run a soft-class finding is on the surface only when the
-        // delta introduced it.
+        // delta or the PR's own earlier commits introduced it.
         const soft_preexisting = DELTA && SOFT_CLASSES.includes(f.class) && !f.introduced
         const surface =
             !soft_preexisting &&

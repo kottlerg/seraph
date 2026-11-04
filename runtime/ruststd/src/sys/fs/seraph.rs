@@ -49,23 +49,18 @@
 //! timestamp work in issue #85 lands a clock source;
 //! `FileAttr::modified()` surfaces `Unsupported` in that case.
 //!
-//! ## Per-`File` release-endpoint plumbing
-//! A badged derivation off the per-process release endpoint owned
-//! by [`release_handler`] is allocated on every open and kept by the
-//! `File`. Each [`fs_labels::FS_READ_MEMORY`] request carries a fresh
-//! copy of it in `caps[0]` until one request that carried a copy the
-//! kernel moved gets a `SUCCESS` reply, so a request refused before the
-//! driver allocates its `OpenFile` slot, or a concurrent read that
-//! reaches the driver first, cannot leave the `File` without a recorded
-//! SEND. The driver records the copy on the file's `OpenFile` slot when
-//! that request allocates the slot and deletes any other; its eviction
-//! worker uses it to issue a cooperative
-//! [`fs_labels::FS_RELEASE_MEMORY`] back to us, then revokes the page's
-//! caps whether or not the reply is an ack. A slot another opener
-//! allocated or freed is outside the `File`'s view (#530). Files that
-//! never trigger a frame-read (only inline `FS_READ` / `FS_WRITE`) never
-//! deliver a copy and get the revoke without the cooperative step; the
-//! kept SEND is deleted in `Drop`.
+//! ## Per-`File` open and release endpoint
+//! Every open ends with [`fs_labels::FS_OPEN`] on the file node cap the
+//! walk returned: the driver mints an open cap for this `File` alone, and
+//! the node cap is deleted. Every file-scoped request goes to the open
+//! cap, so the driver keeps this `File`'s outstanding pages apart from
+//! every other opener's, and the `FS_CLOSE` in `Drop` releases only them.
+//! The `FS_OPEN` carries, in `caps[0]`, a badged SEND on the per-process
+//! release endpoint owned by [`release_handler`], with a badge drawn for
+//! this `File`; the driver keeps it on the open, and its eviction worker
+//! sends each cooperative [`fs_labels::FS_RELEASE_MEMORY`] for this
+//! `File`'s pages on it, then revokes the page's caps whether or not the
+//! reply is an ack.
 //!
 //! ## Path anchoring
 //! Absolute paths walk from `root_dir_cap()`; relative paths walk
@@ -82,7 +77,7 @@ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::vec::Vec;
 use crate::sys::time::SystemTime;
 use crate::sys::{unsupported, unsupported_err};
@@ -1162,6 +1157,61 @@ fn write_frame_chunk(
     Ok(n)
 }
 
+/// Send `FS_CLOSE` on the open cap of every `File` not yet dropped: the
+/// process-exit hook, run by `std::os::seraph::_start` once `main` returns
+/// and by `std::process::exit`, before the exit syscall. A `File` the
+/// process never drops would otherwise leave its open, and the release
+/// SEND it handed the driver, in the fs driver past the process's death
+/// (fs-driver-protocol.md § Label 18). The caps are left for the exit to
+/// free. A crash or a kill runs no exit hook and sends no `FS_CLOSE`.
+pub(crate) fn close_open_files()
+{
+    let Some(state) = release_handler::state()
+    else
+    {
+        return;
+    };
+    let ipc_buf = crate::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        return;
+    }
+    let close = IpcMessage::new(fs_labels::FS_CLOSE);
+    for cap in release_handler::open_caps(state)
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_call(cap, &close, ipc_buf) };
+    }
+}
+
+/// Send `FS_OPEN` on the file node cap `node_cap`, moving `release_send`
+/// (this `File`'s badged SEND on the release endpoint) to the driver in
+/// `caps[0]`, and return the open cap the reply carries
+/// (fs-driver-protocol.md § Label 18). Every other reply cap is deleted.
+fn file_open(node_cap: u32, release_send: u32, ipc_buf: *mut u64) -> io::Result<u32>
+{
+    let msg = IpcMessage::builder(fs_labels::FS_OPEN)
+        .cap(release_send)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }
+        .map_err(|_| io::Error::other("seraph fs: FS_OPEN ipc_call failed"))?;
+    let (open_cap, surplus) = match reply.caps().split_first()
+    {
+        Some((&cap, rest)) if reply.label == fs_errors::SUCCESS => (Some(cap), rest),
+        _ => (None, reply.caps()),
+    };
+    for &cap in surplus
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    if reply.label != fs_errors::SUCCESS
+    {
+        return Err(map_fs_error(reply.label));
+    }
+    open_cap.ok_or_else(|| io::Error::other("seraph fs: FS_OPEN reply carries no open cap"))
+}
+
 /// Send `FS_TRUNCATE(0)` against `file_cap`. v1 only supports the
 /// truncate-to-zero shrink; the server replies `IO_ERROR` for any
 /// non-zero `new_len` and the client pre-rejects with `Unsupported`.
@@ -1246,28 +1296,17 @@ fn create_file_at(
 
 pub struct File
 {
-    /// Per-file node capability returned by the final `NS_LOOKUP` of
-    /// the open walk. Receives every file-scoped op (FS_READ,
-    /// FS_READ_MEMORY, FS_WRITE, FS_WRITE_MEMORY, FS_TRUNCATE,
-    /// FS_CLOSE, synchronous client-initiated FS_RELEASE_MEMORY).
+    /// The open cap [`fs_labels::FS_OPEN`] minted for this `File`.
+    /// Receives every file-scoped op (FS_READ, FS_READ_MEMORY, FS_WRITE,
+    /// FS_WRITE_MEMORY, FS_TRUNCATE, FS_CLOSE, synchronous
+    /// client-initiated FS_RELEASE_MEMORY).
     file_cap: u32,
     /// Badge keying this `File`'s entry in the release-handler registry,
-    /// so `Drop` can unregister it; also the badge of `release_send`. A
-    /// driver `FS_RELEASE_MEMORY` is matched by cookie across every
-    /// registered `File`, not by the badge it arrives on: the driver keeps
-    /// one release SEND per node (fs-driver-protocol.md § Label 8).
+    /// so `Drop` can unregister it. It is also the badge of the release
+    /// SEND the `FS_OPEN` handed the driver, so a driver
+    /// `FS_RELEASE_MEMORY` for one of this `File`'s pages arrives with it
+    /// (fs-driver-protocol.md § Label 8).
     badge: u64,
-    /// Badged SEND on the per-process release endpoint. It never leaves
-    /// this `File`: each delivery attempt moves a `cap_derive`d copy
-    /// (which inherits the badge) to the driver, and `Drop` deletes it.
-    release_send: u32,
-    /// True once an `FS_READ_MEMORY` request whose release-SEND copy the
-    /// kernel moved to the driver got a `SUCCESS` reply, which means the
-    /// driver's `OpenFile` slot for the node was allocated by then. Until
-    /// then every frame read carries a fresh copy, so neither a request
-    /// refused before slot allocation nor a concurrent cap-less read can
-    /// leave the slot without one; afterwards reads carry none.
-    release_confirmed: AtomicBool,
     /// Process aspace cap, captured at open for `mem_map` / `mem_unmap`.
     aspace: u32,
     /// memmgr endpoint cap captured at open; used by the write-frame
@@ -1394,14 +1433,12 @@ impl File
             size = 0;
         }
 
-        // ── Release-handler plumbing ─────────────────────────────────
+        // ── Release-handler plumbing and FS_OPEN ─────────────────────
         //
-        // The `release_send` cap is unused on the inline `FS_READ`/
-        // `FS_WRITE` paths; `FS_READ_MEMORY` transfers copies of it to
-        // the driver in `caps[0]` (see `release_copy`) so the driver's
-        // eviction worker can route cooperative `FS_RELEASE_MEMORY`
-        // back here. Failure paths below roll the setup back so a
-        // refused open never leaks an entry into the release handler.
+        // `FS_OPEN` moves a badged SEND on the release endpoint to the
+        // driver, which keeps it on this `File`'s open so its eviction
+        // worker can route cooperative `FS_RELEASE_MEMORY` back here.
+        // A refused open registers nothing with the release handler.
         let state = match release_handler::ensure_started()
         {
             Ok(s) => s,
@@ -1417,7 +1454,6 @@ impl File
             let _ = syscall::cap_delete(file_cap);
             return Err(io::Error::other("seraph fs: release-badge entropy draw failed"));
         };
-        let entry = release_handler::register(state, badge);
 
         let release_ep = release_handler::release_endpoint(state);
         let release_send =
@@ -1426,13 +1462,24 @@ impl File
                 Ok(c) => c,
                 Err(_) =>
                 {
-                    let _ = release_handler::unregister(state, badge);
                     let _ = syscall::cap_delete(file_cap);
                     return Err(io::Error::other(
                         "seraph fs: cap_derive_badge (release send) failed",
                     ));
                 }
             };
+        let opened = file_open(file_cap, release_send, ipc_buf);
+        // A SEND the kernel did not move (a refused call) is still ours and
+        // is deleted here; a moved one's handle is stale, and the kernel's
+        // generation check refuses the delete. Every later file-scoped
+        // request goes to the open cap, so the node cap goes too.
+        let _ = syscall::cap_delete(release_send);
+        let _ = syscall::cap_delete(file_cap);
+        let file_cap = opened?;
+        // Registered once the open exists, so the exit hook
+        // (`close_open_files`) closes it; no driver release can name one of
+        // its pages before its first read.
+        let entry = release_handler::register(state, badge, file_cap);
 
         // ── Initial position: EOF for append, 0 otherwise ────────────
         let initial_pos = if opts.append { size } else { 0 };
@@ -1440,8 +1487,6 @@ impl File
         Ok(File {
             file_cap,
             badge,
-            release_send,
-            release_confirmed: AtomicBool::new(false),
             aspace: info.self_aspace,
             memmgr_ep: info.memmgr_endpoint,
             entry,
@@ -1571,41 +1616,20 @@ impl File
         {
             return Err(io::Error::other("seraph fs: read cookie entropy draw failed"));
         };
+        // Registered before the request, so a driver release that arrives
+        // on our release SEND before the reply waits for the copy
+        // (release_handler) instead of finding no such cookie.
         let mark = ReadMark::begin(self.entry.as_ref(), cookie);
-        // Until the driver's slot is known to hold a release SEND, the
-        // request carries a fresh copy of ours in caps[0]: the driver
-        // records it if this request allocates the node's OpenFile slot,
-        // so its eviction worker can route a cooperative FS_RELEASE_MEMORY
-        // back to us, letting us unmap the page, or finish a copy from it,
-        // before its revoke, within the driver's cooperative-release window
-        // (release_handler); it deletes the copy otherwise.
-        let release_copy = self.release_copy();
-        let mut builder = IpcMessage::builder(fs_labels::FS_READ_MEMORY)
+        let msg = IpcMessage::builder(fs_labels::FS_READ_MEMORY)
             .word(0, pos)
-            .word(1, cookie);
-        if let Some(copy) = release_copy
-        {
-            builder = builder.cap(copy);
-        }
-        let msg = builder.build();
+            .word(1, cookie)
+            .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let result = unsafe { ipc::ipc_call(self.file_cap, &msg, ipc_buf) };
-        // A copy the kernel did not move (a refused call, or a delivery
-        // degraded to zero caps) is still ours and is deleted here. A moved
-        // copy's handle is stale, and the kernel's generation check refuses
-        // the delete, so a refusal is what shows the driver received it.
-        let copy_moved = release_copy.is_some_and(|copy| syscall::cap_delete(copy).is_err());
-        let reply =
-            result.map_err(|_| io::Error::other("seraph fs: FS_READ_MEMORY ipc_call failed"))?;
+        let reply = unsafe { ipc::ipc_call(self.file_cap, &msg, ipc_buf) }
+            .map_err(|_| io::Error::other("seraph fs: FS_READ_MEMORY ipc_call failed"))?;
         if reply.label != fs_errors::SUCCESS
         {
             return Err(map_fs_error(reply.label));
-        }
-        if copy_moved
-        {
-            // The driver answered a request that carried a SEND, so the
-            // node's slot existed by then and later reads need not carry one.
-            self.release_confirmed.store(true, Ordering::Relaxed);
         }
         let Some((memory_cap, memory_data_offset, bytes_valid)) =
             self.checked_frame_reply(&reply, cookie)?
@@ -1668,18 +1692,6 @@ impl File
         }
         self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
         Ok(copy_len)
-    }
-
-    /// A fresh copy of `release_send` for an `FS_READ_MEMORY` request to
-    /// carry, or `None` once a delivery is confirmed or when the derive
-    /// fails (the read then goes without one, as an opted-out client's does).
-    fn release_copy(&self) -> Option<u32>
-    {
-        if self.release_confirmed.load(Ordering::Relaxed)
-        {
-            return None;
-        }
-        syscall::cap_derive(self.release_send, syscall::RIGHTS_EP_SEND).ok()
     }
 
     /// Reserve a page, fund this address space's page tables for it, and map
@@ -1774,7 +1786,7 @@ impl File
             .word(0, cookie)
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer. Failure is
-        // non-fatal — the fs will reclaim the slot at FS_CLOSE time.
+        // non-fatal — the fs reclaims the page at this open's FS_CLOSE.
         let _ = unsafe { ipc::ipc_call(self.file_cap, &msg, ipc_buf) };
     }
 
@@ -1916,9 +1928,11 @@ impl Drop for File
     fn drop(&mut self)
     {
         let ipc_buf = crate::os::seraph::current_ipc_buf();
-        // FS_CLOSE: fs walks its outstanding-page table and revokes
-        // every per-cookie ancestor cap, decrementing each cache-slot
-        // refcount. The revoke invalidates our derived caps but leaves
+        // FS_CLOSE: fs walks this open's outstanding-page table and
+        // revokes every per-cookie ancestor cap, decrementing each
+        // cache-slot refcount, and deletes the release SEND the open
+        // kept; other opens of the file keep theirs. The revoke
+        // invalidates our derived caps but leaves
         // their mappings in place; fs refills none of those pages while we
         // map it, but each held page shrinks its cache, so each VA must
         // still be unmapped, its reservation freed, and its cap deleted.
@@ -1946,11 +1960,6 @@ impl Drop for File
                 }
             }
         }
-
-        // Drop the per-File badged SEND, which never left this CSpace. The
-        // driver's copy of it, if the driver recorded one, is deleted by its
-        // FS_CLOSE handler.
-        let _ = syscall::cap_delete(self.release_send);
     }
 }
 

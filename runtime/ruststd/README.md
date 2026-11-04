@@ -28,6 +28,9 @@ ruststd/
 ├── README.md
 ├── argv-env/                   # `ruststd-argv-env` crate: pure, host-tested argv/env
 │   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
+├── death-queues/               # `ruststd-death-queues` crate: pure, host-tested death-queue
+│   └── src/                    #   growth policy and thread-reaper slot registry; a
+│                               #   rustc-dep-of-std dep of overlaid std (not re-exported)
 ├── patches/                    # upstream library/std patches applied during overlay assembly
 └── src/                        # std PAL overlay, copied into vendored library/std at build time
     ├── os/
@@ -64,8 +67,16 @@ if that fails), and, when the page carries a pager and the image is `ET_DYN`, re
 main-thread stack's demand-growth range
 ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
 rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
-`fn main()`; when `main` returns, `_start` closes the stdio pipes and exits the process with its
-return code.
+`fn main()`; when `main` returns, `_start` sends `FS_CLOSE` for every `std::fs::File` still open,
+closes the stdio pipes, and exits the process with its return code. `std::process::exit` runs
+the same two steps before its exit syscall, so the fs driver drops the opens, and the release
+SENDs they hold, of `File`s the process never drops
+([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md)
+§ Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`: the driver keeps such an
+open until its node is freed (reclaim tracked in
+[#742](https://github.com/kottlerg/seraph/issues/742)), and the endpoint its release SEND names
+outlives the process, a hazard to the frame it lives in tracked in
+[#750](https://github.com/kottlerg/seraph/issues/750).
 
 `std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
 (which only memmgr's bespoke runtime constructs); a binary reads it through
@@ -167,8 +178,12 @@ of a joined thread whose join wait failed with an error other than `Interrupted`
 completion notification gone), is freed the same way by the next spawn, join, or detach in the
 process after the kernel posts that thread's death (or at once by that detach or join, when the
 death post has already landed), or leaks until process exit when the reaper could not register
-the thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
-dropped the death post because the process's death queue (128 entries) was full.
+the thread at spawn (its slot table could not grow, or no death queue could take the observer
+bind). The slot table and the death queues grow on demand, each further queue with twice the last
+one's observer nodes (the `ruststd-death-queues` crate), and each queue with one entry more than its
+nodes. Every queue is drained before each bind, in the same lock hold, so a queue's pending posts
+never exceed its nodes plus the one thread bound in that same hold, which is its entries, and no
+death post is dropped.
 
 ### CSpace slot headroom
 
@@ -321,4 +336,5 @@ primitives.
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
+[Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

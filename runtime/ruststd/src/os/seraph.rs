@@ -570,6 +570,9 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // user's `fn main`, returning the `ExitCode`/`lang_start` value as `i32`.
     let code = unsafe { main(0, core::ptr::null()) };
 
+    // Close every File main left open, so the fs driver drops its opens.
+    crate::sys::fs::close_open_files();
+
     // Close stdio pipes before exit so the close protocol fires
     // (header `closed` flag + notification kick) and any parent blocked on
     // a read/write returns cleanly.
@@ -801,7 +804,9 @@ pub fn namespace_lookup_dir(
 // real object sizes, and a size change is an ABI-visible change by design.
 // They are defined here rather than re-exported because an item reached
 // through the sysroot-private ABI crate is unstable (`rustc_private`) to
-// std's users.
+// std's users: build-std compiles std's dependencies with
+// `-Zforce-unstable-if-unmarked`. The same holds for `ruststd-death-queues`,
+// which std uses internally and services take as a path dependency instead.
 
 /// Raw retype debit of one `Endpoint`, in bytes (`syscall_abi`'s
 /// `ENDPOINT_RETYPE_BYTES`).

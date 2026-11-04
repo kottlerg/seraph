@@ -114,10 +114,11 @@ impl ChildGuard
         }
     }
 
-    /// Bootstrap completed: keep the child alive and hand its process handle
-    /// to the caller, which keeps it until the driver's settle batch settles
-    /// (to destroy a driver that never reports ready). `Drop` still frees the
-    /// thread cap.
+    /// The child was started: keep it alive and hand its process handle to
+    /// the caller, which keeps it at least until the driver's settle batch
+    /// settles (to destroy a driver that never reports ready) or withdraws
+    /// the started driver at once when its bootstrap failed. `Drop` still
+    /// frees the thread cap.
     fn keep_handle(mut self) -> u32
     {
         self.destroy = false;
@@ -145,15 +146,42 @@ impl Drop for ChildGuard
 }
 
 /// Destroy a child through its badged `process_handle` (`DESTROY_PROCESS`:
-/// procmgr tears down its thread, `CSpace`, and address space, which returns
-/// its pages and drops every capability it holds) and release the handle. A
-/// child that has already died is a no-op for procmgr.
+/// procmgr tears down its thread, `CSpace`, and address space, which drops
+/// every capability it holds and returns its pages, unless the child was
+/// created with `CREATE_DMA_HOLD` and started, whose pages procmgr then holds
+/// until a `RELEASE_HOLD` this function never sends) and release the handle.
+/// A child that has already died is a no-op for procmgr.
 pub fn destroy_child(process_handle: u32, ipc_buf: *mut u64)
+{
+    send_destroy(process_handle, ipc_buf);
+    let _ = syscall::cap_delete(process_handle);
+}
+
+/// Destroy a `CREATE_DMA_HOLD` child as [`destroy_child`] does, then release
+/// its held pages to memmgr (`RELEASE_HOLD`), and release the handle. Called
+/// only once the child's device is confirmed quiet; procmgr's teardown of the
+/// child, by this destroy or by its own reap of a dead child, precedes the
+/// release, since procmgr serves both calls in order.
+pub fn destroy_and_release(process_handle: u32, ipc_buf: *mut u64)
+{
+    send_destroy(process_handle, ipc_buf);
+    let release_msg = IpcMessage::new(procmgr_labels::RELEASE_HOLD);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let released = unsafe { ipc::ipc_call(process_handle, &release_msg, ipc_buf) };
+    if !matches!(released, Ok(r) if r.label == 0)
+    {
+        std::os::seraph::log!("driver memory hold not released");
+    }
+    let _ = syscall::cap_delete(process_handle);
+}
+
+/// Send `DESTROY_PROCESS` on `process_handle`; procmgr replies success
+/// whatever the child's state.
+fn send_destroy(process_handle: u32, ipc_buf: *mut u64)
 {
     let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
     let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) };
-    let _ = syscall::cap_delete(process_handle);
 }
 
 /// Draw a fresh non-zero driver-child bootstrap badge: a random `u64` from the
@@ -194,8 +222,10 @@ pub struct DriverSpawnConfig<'a>
     /// ELF source for the child: a boot-module Memory cap
     /// ([`CreateSource::Module`], the bootstrap-essential PCI drivers) or a
     /// rootfs file cap ([`CreateSource::File`], for on-disk PCI drivers loaded
-    /// after vfsd-mount, e.g. virtio-input). Both spawn `CREATE_PINNED` — a PCI
-    /// device with a BAR/IRQ is DMA-capable and must be eager-mapped.
+    /// after vfsd-mount, e.g. virtio-input). Both spawn `CREATE_PINNED` and
+    /// `CREATE_DMA_HOLD` — a PCI device with a BAR/IRQ is DMA-capable, so its
+    /// driver must be eager-mapped and its pages held after its death until
+    /// devmgr has confirmed the device quiet.
     pub source: CreateSource,
     /// The device's BAR caps, one per distinct BAR its `VirtIO` register
     /// regions name, in ascending BAR index
@@ -223,6 +253,20 @@ pub struct DriverSpawnConfig<'a>
     pub priority: u8,
 }
 
+/// How [`spawn_driver`] ended.
+pub enum DriverSpawn
+{
+    /// The driver completed its bootstrap: its badged process handle.
+    Bootstrapped(u32),
+    /// The driver was started but its bootstrap failed after it, so it may
+    /// hold the device's BAR caps: its process handle, through which the
+    /// caller withdraws it from the device and destroys it as a live driver.
+    Unbootstrapped(u32),
+    /// The spawn failed before the driver started; the child, if created,
+    /// is torn down and its pages returned.
+    Failed,
+}
+
 /// Spawn a driver process with per-device capabilities.
 ///
 /// Creates the process via procmgr, starts it, and serves its bootstrap over
@@ -242,12 +286,16 @@ pub struct DriverSpawnConfig<'a>
 ///     the presence word, then `irq_mode`; the IRQ slot is absent when
 ///     `irq_cap` is `None`.
 ///
-/// log + procmgr endpoints arrive via `ProcessInfo`. Returns the child's
-/// badged process handle, which the caller keeps until the driver's settle
-/// batch settles and then releases, or destroys the driver through
-/// ([`destroy_child`]) when it never reported ready. Returns `None`, the
-/// child torn down, on any failure, including a service endpoint that cannot
-/// be copied (a driver delivered none would never report ready).
+/// log + procmgr endpoints arrive via `ProcessInfo`. The child is created
+/// `CREATE_DMA_HOLD`, so procmgr holds its pages after it is torn down until
+/// devmgr releases them ([`destroy_and_release`]). Returns
+/// [`DriverSpawn::Bootstrapped`] with the child's badged process handle, which
+/// the caller keeps for the rest of the boot, to withdraw the driver through;
+/// [`DriverSpawn::Unbootstrapped`] with it when a bootstrap round or the death
+/// observer's bind failed after the start; and [`DriverSpawn::Failed`], the
+/// child torn down, on any failure before the start, including a service
+/// endpoint that cannot be copied (a driver delivered none would never report
+/// ready).
 // clippy::too_many_lines: driver spawn is a single transaction — derive the
 // per-child caps, install them into the suspended child, and serve two
 // bootstrap rounds against one shared `ipc` buffer. Each derive owns a slot
@@ -255,7 +303,7 @@ pub struct DriverSpawnConfig<'a>
 // requires passing the same `DriverSpawnConfig` to each. The linear
 // presentation matches the bootstrap protocol one-to-one.
 #[allow(clippy::too_many_lines)]
-pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32>
+pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
 {
     // Release the source ELF cap on every exit before the create call consumes
     // it (missing BAR/IRQ, badge-derive failure, ipc_call failure). Disarmed
@@ -270,7 +318,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     if config.bars.is_empty() || config.bars.len() > MAX_VIRTIO_BARS
     {
         std::os::seraph::log!("driver spawn: BAR count outside 1..={}", MAX_VIRTIO_BARS);
-        return None;
+        return DriverSpawn::Failed;
     }
     let procmgr_ep = config.procmgr_ep;
     let bootstrap_ep = config.bootstrap_ep;
@@ -283,14 +331,14 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     else
     {
         std::os::seraph::log!("driver spawn: entropy draw failed");
-        return None;
+        return DriverSpawn::Failed;
     };
     let Ok(badged_creator) =
         syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
     else
     {
         std::os::seraph::log!("driver spawn: badged creator derivation failed");
-        return None;
+        return DriverSpawn::Failed;
     };
 
     // Create the process via procmgr. Caps [source, creator]. The child has no
@@ -300,32 +348,38 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     // CREATE_PINNED: drivers reached through `spawn_driver` are PCI devices with
     // BAR + IRQ — the DMA-capable class. A device may write driver memory before
     // a demand fault could back it (the kernel never pins), so these must be
-    // eager-mapped, not demand-paged. Applies to both the boot-module and the
-    // on-disk (`CREATE_FROM_FILE`) source. #165 replaces the spawn-path keying
-    // with an explicit per-driver DMA attribute.
+    // eager-mapped, not demand-paged. CREATE_DMA_HOLD: for the same reason the
+    // device may write the driver's memory after the driver dies, until devmgr
+    // has stopped its DMA, so procmgr holds the memory until devmgr releases it.
+    // Applies to both the boot-module and the on-disk (`CREATE_FROM_FILE`)
+    // source. #165 replaces the spawn-path keying with an explicit per-driver
+    // DMA attribute.
+    let flags = procmgr_labels::CREATE_PINNED | procmgr_labels::CREATE_DMA_HOLD;
     let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
     let create_msg = match config.source
     {
-        CreateSource::Module(module_cap) => IpcMessage::builder(
-            procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED | sched_bits,
-        )
-        .cap(module_cap)
-        .cap(badged_creator)
-        .build(),
-        CreateSource::File { file_cap, size } => IpcMessage::builder(
-            procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PINNED | sched_bits,
-        )
-        .word(0, size)
-        .cap(file_cap)
-        .cap(badged_creator)
-        .build(),
+        CreateSource::Module(module_cap) =>
+        {
+            IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | sched_bits)
+                .cap(module_cap)
+                .cap(badged_creator)
+                .build()
+        }
+        CreateSource::File { file_cap, size } =>
+        {
+            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | flags | sched_bits)
+                .word(0, size)
+                .cap(file_cap)
+                .cap(badged_creator)
+                .build()
+        }
     };
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
         std::os::seraph::log!("driver create ipc_call failed");
-        return None;
+        return DriverSpawn::Failed;
     };
     // ipc_call returned: the source cap was transferred to procmgr regardless of
     // the reply label (procmgr owns its teardown on its own failure). Disarm so
@@ -334,14 +388,14 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     if reply.label != 0
     {
         std::os::seraph::log!("driver create failed");
-        return None;
+        return DriverSpawn::Failed;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
         std::os::seraph::log!("driver CREATE_PROCESS reply missing caps");
-        return None;
+        return DriverSpawn::Failed;
     }
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
@@ -368,7 +422,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
         {
             std::os::seraph::log!("driver bar cap derivation failed");
             drop_bars(&bar_copies[..i]);
-            return None;
+            return DriverSpawn::Failed;
         };
         bar_copies[i] = copy;
         bar_indices[i] = u64::from(bar.bar);
@@ -388,7 +442,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
             {
                 std::os::seraph::log!("driver irq cap derivation failed");
                 drop_bars(bar_copies);
-                return None;
+                return DriverSpawn::Failed;
             };
             c
         }
@@ -400,7 +454,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
         std::os::seraph::log!("driver service endpoint derivation failed");
         drop_bars(bar_copies);
         let _ = syscall::cap_delete(irq_copy);
-        return None;
+        return DriverSpawn::Failed;
     };
     let Ok(devmgr_copy) =
         syscall::cap_derive_badge(query_ep, syscall::RIGHTS_EP_SEND, device_badge)
@@ -410,7 +464,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
         drop_bars(bar_copies);
         let _ = syscall::cap_delete(irq_copy);
         let _ = syscall::cap_delete(service_copy);
-        return None;
+        return DriverSpawn::Failed;
     };
 
     // Best-effort release of every derived per-child cap. Deleting a slot a
@@ -434,7 +488,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     {
         std::os::seraph::log!("driver START_PROCESS failed");
         drop_derived();
-        return None;
+        return DriverSpawn::Failed;
     }
 
     // Round 1: the BAR caps, each with its BAR index.
@@ -453,7 +507,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     {
         std::os::seraph::log!("driver bootstrap round 1 failed");
         drop_derived();
-        return None;
+        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
 
     // Round 2: [service, irq, devmgr_query] as positional slots, then the
@@ -480,7 +534,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     {
         std::os::seraph::log!("driver bootstrap round 2 failed");
         drop_derived();
-        return None;
+        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
 
     // Observe the driver's death from here on. Bound only once every round
@@ -489,12 +543,12 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
     if syscall::thread_bind_notification(thread_cap, config.death_eq, device_badge).is_err()
     {
         std::os::seraph::log!("driver death observer bind failed");
-        return None;
+        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
 
     // Child owns its full cap set: keep it alive, and its process handle.
     std::os::seraph::log!("driver started");
-    Some(child_guard.keep_handle())
+    DriverSpawn::Bootstrapped(child_guard.keep_handle())
 }
 
 /// Capabilities and identifiers for one non-PCI platform device driver

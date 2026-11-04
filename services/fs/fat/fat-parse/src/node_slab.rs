@@ -33,7 +33,7 @@ pub const GENERATION_BITS: u32 = 16;
 /// can name, about 16.7 million nodes.
 pub const MAX_ENTRIES: usize = (1 << INDEX_BITS) - 1;
 
-const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
+pub(crate) const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
 
 struct Slot<K, T>
 {
@@ -129,6 +129,14 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
         self.place(&key, idx);
         self.len += 1;
         Some(identifier(idx, generation))
+    }
+
+    /// The identifier of `key`'s live entry, without inserting one.
+    #[must_use]
+    pub fn id_of(&self, key: &K) -> Option<u64>
+    {
+        let idx = self.buckets[self.find(key)?];
+        Some(identifier(idx, self.slots[idx as usize].generation))
     }
 
     /// The value `id` names, while the entry it was issued for is live.
@@ -323,7 +331,8 @@ impl Hasher for Fnv1a
 }
 
 /// The identifier of slab index `idx` at `generation`: never 0, the root's.
-fn identifier(idx: u32, generation: u16) -> u64
+/// [`crate::open_slab::OpenSlab`] issues its identifiers in the same shape.
+pub(crate) fn identifier(idx: u32, generation: u16) -> u64
 {
     (u64::from(generation) << INDEX_BITS) | (u64::from(idx) + 1)
 }
@@ -419,6 +428,19 @@ mod tests
             assert_eq!(slab.get(*id), Some(v), "key {key:?}");
             assert_eq!(slab.acquire(*key, || u32::MAX), Some(*id));
         }
+    }
+
+    #[test]
+    fn id_of_names_a_live_key_without_inserting_one()
+    {
+        let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
+        assert_eq!(slab.id_of(&4), None);
+        let id = slab.acquire(4, || 1).expect("room");
+        assert_eq!(slab.id_of(&4), Some(id));
+        assert_eq!(slab.id_of(&5), None);
+        assert_eq!(slab.len(), 1);
+        slab.remove_key(&4);
+        assert_eq!(slab.id_of(&4), None);
     }
 
     #[test]

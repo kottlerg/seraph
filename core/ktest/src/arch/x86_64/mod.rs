@@ -51,6 +51,11 @@ use init_protocol::InitInfo;
 
 use crate::TestContext;
 
+/// Whether the architecture has an I/O port space, so `IoPort` capabilities
+/// bind to threads (the kernel's `HAS_IO_PORTS`): arch-neutral cells that
+/// exercise a port binding run only where it is true.
+pub const HAS_IO_PORTS: bool = true;
+
 /// Exception vector a not-present user store faults with (`#PF`), as recorded
 /// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const PAGE_FAULT_STORE_VECTOR: u64 = 14;

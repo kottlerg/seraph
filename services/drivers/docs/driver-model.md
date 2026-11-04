@@ -34,7 +34,9 @@ TODO: specify driver teardown.
    § Interrupt Delivery). The VirtIO drivers run an interrupt-service thread, the only waiter on
    the line's notification, which reads the device's interrupt status and acknowledges every
    delivery, and reads the status on a bounded timeout too, so an interrupt whose edge was lost on
-   x86-64 is still seen (`virtio_core::isr::serve_interrupts`, at most `ISR_POLL_MS` late). A
+   an x86-64 line programmed edge-triggered is still seen (`virtio_core::isr::serve_interrupts`,
+   at most `ISR_POLL_MS` late). Every driver on a line passes `SYS_IRQ_REGISTER` the line's mode
+   devmgr delivers with the IRQ (docs/device-management.md § Interrupt Delivery). A
    driver that does not acknowledge promptly needs its line kept exclusive: the serial driver
    acknowledges only when its client reads
    ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr

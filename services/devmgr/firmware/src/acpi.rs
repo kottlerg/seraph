@@ -3,14 +3,18 @@
 
 // services/devmgr/firmware/src/acpi.rs
 
-//! Narrow ACPI walk: RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK`.
+//! Narrow ACPI walk: RSDP → XSDT → MCFG, FADT (`PM1a_CNT_BLK`, `CENTURY`),
+//! and MADT (its Interrupt Source Overrides).
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
 //! for mapping the tables into its address space first, and
 //! [`table_window`] computes which pages of a region hold one. No alloc.
-//! MADT-driven IRQ routing is not needed at this stage: devmgr derives
-//! per-device GSIs from the PCI config IRQ line (x86-64) or PCI `INTx`
-//! swizzling (RISC-V). When that changes, extend this module.
+//! devmgr derives per-device GSIs from the PCI config IRQ line (x86-64) or
+//! PCI `INTx` swizzling (RISC-V); the MADT's overrides give each line's
+//! trigger and polarity ([`line_mode`]), the `SYS_IRQ_REGISTER` mode word
+//! (services/devmgr/docs/pci-enumeration.md).
+
+use syscall_abi::{IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL};
 
 use super::EcamLocation;
 
@@ -34,6 +38,16 @@ const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 /// FADT `CENTURY` (ACPI 6.x section 5.2.9): the CMOS RAM index of the RTC's
 /// century-of-year register, a byte; 0 means the RTC has none.
 const FADT_OFF_CENTURY: usize = 108;
+
+/// First MADT interrupt-controller structure (ACPI 6.x section 5.2.12): after
+/// the header, the local interrupt controller address (u32) and the flags
+/// (u32).
+const MADT_ENTRIES_OFF: usize = SDT_HDR_LEN + 8;
+/// MADT structure type of an Interrupt Source Override (section 5.2.12.5).
+const MADT_TYPE_SOURCE_OVERRIDE: u8 = 2;
+/// Length of an Interrupt Source Override: type, length, bus, source (u8
+/// each), GSI (u32), MPS INTI flags (u16).
+const MADT_SOURCE_OVERRIDE_LEN: usize = 10;
 
 // ── Byte-read helpers ─────────────────────────────────────────────────
 
@@ -237,6 +251,104 @@ fn mcfg_entry_ecam(mcfg_bytes: &[u8], off: usize) -> Option<EcamLocation>
         start_bus,
         end_bus,
     })
+}
+
+// ── MADT → interrupt source overrides ──────────────────────────────────
+
+/// One MADT Interrupt Source Override (ACPI 6.x section 5.2.12.5): ISA IRQ
+/// `source` is delivered on `gsi`, with the trigger and polarity its MPS INTI
+/// `flags` give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceOverride
+{
+    pub source: u8,
+    pub gsi: u32,
+    pub flags: u16,
+}
+
+/// Iterate the MADT's Interrupt Source Overrides.
+///
+/// Returns `None` if the signature isn't `APIC` or the header's length is
+/// unreadable or does not reach the first structure. The structures are
+/// bounded by the table's reported length and the slice; the walk ends at a
+/// structure whose length is under 2 or runs past that bound, so a truncated
+/// or malformed table yields the overrides before the bad structure. A source
+/// override shorter than its 10 bytes is skipped.
+#[must_use]
+pub fn madt_source_overrides(madt_bytes: &[u8])
+-> Option<impl Iterator<Item = SourceOverride> + '_>
+{
+    if sdt_signature(madt_bytes) != *b"APIC"
+    {
+        return None;
+    }
+    let end = (sdt_length(madt_bytes)? as usize).min(madt_bytes.len());
+    if end < MADT_ENTRIES_OFF
+    {
+        return None;
+    }
+    let mut off = MADT_ENTRIES_OFF;
+    Some(core::iter::from_fn(move || {
+        while off + 2 <= end
+        {
+            let kind = read_u8(madt_bytes, off);
+            let len = usize::from(read_u8(madt_bytes, off + 1));
+            if len < 2 || off + len > end
+            {
+                off = end;
+                return None;
+            }
+            let at = off;
+            off += len;
+            if kind == MADT_TYPE_SOURCE_OVERRIDE && len >= MADT_SOURCE_OVERRIDE_LEN
+            {
+                return Some(SourceOverride {
+                    source: read_u8(madt_bytes, at + 3),
+                    gsi: read_u32(madt_bytes, at + 4),
+                    flags: u16::from_le_bytes([
+                        read_u8(madt_bytes, at + 8),
+                        read_u8(madt_bytes, at + 9),
+                    ]),
+                });
+            }
+        }
+        None
+    }))
+}
+
+/// The `SYS_IRQ_REGISTER` mode of a PCI `INTx` line: level-triggered,
+/// active-low, the PCI default, which a line no override names takes.
+pub const PCI_INTX_MODE: u64 = IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW;
+
+/// The `SYS_IRQ_REGISTER` mode of PCI `INTx` line `gsi`: the trigger and
+/// polarity of the first override in `overrides` that names it, field by
+/// field, with [`PCI_INTX_MODE`]'s for a field the override leaves
+/// "conforms to bus" (0) or reserved (2), and [`PCI_INTX_MODE`] when no
+/// override names it.
+///
+/// MPS INTI flags: bits 1:0 are the polarity (1 active-high, 3 active-low),
+/// bits 3:2 the trigger mode (1 edge, 3 level).
+#[must_use]
+pub fn line_mode(overrides: impl IntoIterator<Item = SourceOverride>, gsi: u32) -> u64
+{
+    let Some(found) = overrides.into_iter().find(|o| o.gsi == gsi)
+    else
+    {
+        return PCI_INTX_MODE;
+    };
+    let polarity = match found.flags & 0b11
+    {
+        1 => 0,
+        3 => IRQ_MODE_ACTIVE_LOW,
+        _ => PCI_INTX_MODE & IRQ_MODE_ACTIVE_LOW,
+    };
+    let trigger = match (found.flags >> 2) & 0b11
+    {
+        1 => 0,
+        3 => IRQ_MODE_LEVEL,
+        _ => PCI_INTX_MODE & IRQ_MODE_LEVEL,
+    };
+    polarity | trigger
 }
 
 // ── Table mapping window ─────────────────────────────────────────────
@@ -630,5 +742,148 @@ mod tests
     fn mcfg_entry_whose_window_end_overflows_yields_no_ecam()
     {
         assert!(first(&mcfg(u64::MAX - (1 << 20) + 2, 0, 0)).is_none());
+    }
+
+    /// A MADT holding `structures` (each a type, then its body), with its
+    /// reported length covering them all.
+    fn madt(structures: &[&[u8]]) -> Vec<u8>
+    {
+        let body: usize = structures.iter().map(|s| s.len()).sum();
+        let len = u32::try_from(MADT_ENTRIES_OFF + body).unwrap();
+        let mut b = sdt(b"APIC", len);
+        let mut off = MADT_ENTRIES_OFF;
+        for s in structures
+        {
+            b[off..off + s.len()].copy_from_slice(s);
+            off += s.len();
+        }
+        b
+    }
+
+    fn source_override(source: u8, gsi: u32, flags: u16) -> [u8; MADT_SOURCE_OVERRIDE_LEN]
+    {
+        let mut s = [0u8; MADT_SOURCE_OVERRIDE_LEN];
+        s[0] = MADT_TYPE_SOURCE_OVERRIDE;
+        s[1] = MADT_SOURCE_OVERRIDE_LEN as u8;
+        s[3] = source;
+        s[4..8].copy_from_slice(&gsi.to_le_bytes());
+        s[8..10].copy_from_slice(&flags.to_le_bytes());
+        s
+    }
+
+    /// A local APIC structure (type 0, 8 bytes): not an override.
+    const LOCAL_APIC: [u8; 8] = [0, 8, 0, 0, 1, 0, 0, 0];
+
+    #[test]
+    fn madt_overrides_are_read_past_other_structures()
+    {
+        let iso0 = source_override(0, 2, 0);
+        let iso10 = source_override(10, 10, 0xd);
+        let table = madt(&[&LOCAL_APIC, &iso0, &LOCAL_APIC, &iso10]);
+        let found: Vec<_> = madt_source_overrides(&table).expect("MADT").collect();
+        assert_eq!(
+            found,
+            vec![
+                SourceOverride {
+                    source: 0,
+                    gsi: 2,
+                    flags: 0
+                },
+                SourceOverride {
+                    source: 10,
+                    gsi: 10,
+                    flags: 0xd
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_that_is_not_a_madt_is_refused()
+    {
+        assert!(madt_source_overrides(&sdt(b"FACP", 64)).is_none());
+        // Reported length short of the first structure.
+        assert!(madt_source_overrides(&sdt(b"APIC", 40)).is_none());
+        assert!(madt_source_overrides(&[]).is_none());
+    }
+
+    #[test]
+    fn a_malformed_structure_ends_the_walk_after_the_overrides_before_it()
+    {
+        let iso = source_override(9, 9, 0xd);
+        // A zero-length structure, then an override the walk must not reach.
+        let table = madt(&[&iso, &[2, 0], &source_override(11, 11, 0xd)]);
+        let found: Vec<_> = madt_source_overrides(&table).expect("MADT").collect();
+        assert_eq!(
+            found,
+            vec![SourceOverride {
+                source: 9,
+                gsi: 9,
+                flags: 0xd
+            }]
+        );
+        // A structure running past the reported length.
+        let mut table = madt(&[&iso, &LOCAL_APIC]);
+        let last = table.len() - LOCAL_APIC.len();
+        table[last + 1] = 200;
+        assert_eq!(madt_source_overrides(&table).expect("MADT").count(), 1);
+    }
+
+    #[test]
+    fn a_line_no_override_names_takes_the_pci_default()
+    {
+        assert_eq!(
+            line_mode(
+                [SourceOverride {
+                    source: 10,
+                    gsi: 10,
+                    flags: 0xd
+                }],
+                16
+            ),
+            PCI_INTX_MODE
+        );
+        assert_eq!(line_mode([], 11), IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW);
+    }
+
+    #[test]
+    fn an_override_gives_the_lines_trigger_and_polarity()
+    {
+        // QEMU's PCI lines: level, active-high (flags 0xd).
+        let iso = |flags| {
+            [SourceOverride {
+                source: 10,
+                gsi: 10,
+                flags,
+            }]
+        };
+        assert_eq!(line_mode(iso(0xd), 10), IRQ_MODE_LEVEL);
+        // Edge, active-high.
+        assert_eq!(line_mode(iso(0b0101), 10), 0);
+        // Level, active-low.
+        assert_eq!(
+            line_mode(iso(0b1111), 10),
+            IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW
+        );
+        // Edge, active-low.
+        assert_eq!(line_mode(iso(0b0111), 10), IRQ_MODE_ACTIVE_LOW);
+    }
+
+    #[test]
+    fn a_conforming_or_reserved_field_takes_the_pci_default_for_that_field()
+    {
+        let iso = |flags| {
+            [SourceOverride {
+                source: 10,
+                gsi: 10,
+                flags,
+            }]
+        };
+        // Both fields conform: the PCI default.
+        assert_eq!(line_mode(iso(0), 10), PCI_INTX_MODE);
+        // Polarity active-high, trigger conforms: level from the default.
+        assert_eq!(line_mode(iso(0b0001), 10), IRQ_MODE_LEVEL);
+        // Polarity reserved, trigger edge: active-low from the default.
+        assert_eq!(line_mode(iso(0b0110), 10), IRQ_MODE_ACTIVE_LOW);
     }
 }

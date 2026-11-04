@@ -255,7 +255,7 @@ fn probe_delivery(ctx: &TestContext, line: u32) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create probe notification failed")?;
-    let routed = irq_register(line, sig).and_then(|()| irq_ack(line));
+    let routed = irq_register(line, sig, 0).and_then(|()| irq_ack(line));
     raise_tx_interrupt();
     let bits =
         routed.and_then(|()| notification_wait_timeout(sig, crate::scaled_bound(PROBE_TIMEOUT_MS)));
@@ -284,7 +284,7 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'stati
     {
         let sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "stress::irq_route_delete_race: create notification failed")?;
-        if irq_register(line, sig)
+        if irq_register(line, sig, 0)
             .and_then(|()| irq_ack(line))
             .is_err()
         {
@@ -398,8 +398,8 @@ fn race_binding_delete(
     ntfs: [u32; 2],
 ) -> Result<bool, &'static str>
 {
-    if irq_register(kept, ntfs[0])
-        .and_then(|()| irq_register(doomed, ntfs[1]))
+    if irq_register(kept, ntfs[0], 0)
+        .and_then(|()| irq_register(doomed, ntfs[1], 0))
         .and_then(|()| irq_ack(kept))
         .and_then(|()| irq_ack(doomed))
         .is_err()
@@ -481,7 +481,12 @@ extern "C" fn deleter_entry(_arg: u64) -> !
         // notification already replaced. A failed rebind is counted and fails
         // the cell.
         if REBIND.load(Ordering::Acquire) != 0
-            && irq_register(LINE.load(Ordering::Acquire), SPARE.load(Ordering::Acquire)).is_err()
+            && irq_register(
+                LINE.load(Ordering::Acquire),
+                SPARE.load(Ordering::Acquire),
+                0,
+            )
+            .is_err()
         {
             REROUTE_FAILED.fetch_add(1, Ordering::AcqRel);
         }

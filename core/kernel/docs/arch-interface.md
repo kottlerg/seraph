@@ -428,14 +428,16 @@ pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
 
-/// Route a device IRQ to a destination CPU and leave it masked at the
-/// controller; the driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a
-/// device IDT vector and installs its IOAPIC redirection entry; RISC-V records
-/// the source's target hart. Fails with `irq::RouteError::NoSuchLine` for a line
-/// no discovered controller implements, `Exhausted` when the controller has no
-/// delivery resource left (x86-64: every device vector assigned). Called by
+/// Route a device IRQ to a destination CPU in `mode` (the `SYS_IRQ_REGISTER`
+/// trigger and polarity word) and leave it masked at the controller; the
+/// driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a device IDT vector
+/// and installs its IOAPIC redirection entry with `mode`'s trigger and polarity
+/// bits; RISC-V records the source's target hart and programs nothing from
+/// `mode`. Fails with `irq::RouteError::NoSuchLine` for a line no discovered
+/// controller implements, `Exhausted` when the controller has no delivery
+/// resource left (x86-64: every device vector assigned). Called by
 /// `irq::register` for a line's first binding, under its routing lock.
-pub unsafe fn route_device_irq(irq: u32) -> Result<(), irq::RouteError>;
+pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), irq::RouteError>;
 /// Release a routed line: mask it and free what `route_device_irq` assigned (the
 /// x86-64 device vector; the RISC-V target hart). Called by `irq` when a line's
 /// last binding is removed, under its routing lock.

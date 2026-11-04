@@ -146,7 +146,17 @@ For each matched device, devmgr:
    gets another derivation of the same cap, so devices on a shared `INTx`
    line each bind their own receiver (docs/device-management.md
    § Interrupt Delivery). Releasing a device's caps deletes only its own
-   derivation; the line stays held for the others.
+   derivation; the line stays held for the others. The device's IRQ comes
+   with its line's `SYS_IRQ_REGISTER` mode, the same for every device on
+   the line. On x86-64 devmgr reads the MADT's Interrupt Source Overrides
+   once at startup (`firmware::acpi::madt_source_overrides`), logging each,
+   and takes the line's trigger and polarity from the override naming its
+   GSI, field by field; a field the override leaves conforming to its bus,
+   and a line no override names, take the PCI default, level-triggered and
+   active-low (`firmware::acpi::line_mode`). A missing or malformed MADT is
+   logged once and every line takes the PCI default. On riscv64 every line
+   takes level-triggered, active-high, which the kernel validates and
+   programs nothing from.
 4. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (virtio-blk, at enumeration, from a derived copy of the
    module cap per device; the original is released once every device is
@@ -160,7 +170,9 @@ For each matched device, devmgr:
    word; round 2 carries the positional slots service endpoint, IRQ, and a
    SEND badged with the device's badge on the private driver endpoint of the
    driver's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
-   word in `data[0]`), and ends the bootstrap. The IRQ slot is absent when the
+   word in `data[0]`), with the IRQ line's mode of step 3 in `data[1]` (0 with
+   no IRQ), which the driver passes to `SYS_IRQ_REGISTER`, and ends the
+   bootstrap. The IRQ slot is absent when the
    device got no IRQ cap in step 3; virtio-input then polls, and virtio-blk,
    which requires the IRQ, is not spawned. A driver checks the delivered BAR indices
    against the layout it computes from its `QUERY_DEVICE_INFO` reply and exits
@@ -185,4 +197,5 @@ For each matched device, devmgr:
 
 ## Summarized By
 
+[Device Management](../../../docs/device-management.md),
 [devmgr Responsibilities and Capabilities](responsibilities.md)

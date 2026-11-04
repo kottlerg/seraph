@@ -1001,13 +1001,17 @@ pub fn unmask(irq: u32)
 /// remains, and released (`unroute_device_irq`) when the last goes, so the source is not
 /// routed when this runs; the leading disable is defensive.
 ///
+/// `_mode` (the `SYS_IRQ_REGISTER` trigger and polarity word, which `irq::register`
+/// validated and recorded) programs nothing: the PLIC gateway is level-sensitive and has
+/// no trigger or polarity setting.
+///
 /// # Errors
 /// `NoSuchLine` for a source outside `1..=plic_ndev()`.
 ///
 /// # Safety
 /// Must be called after PLIC init, under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
 {
     if irq == 0 || irq > super::platform::plic_ndev()
     {
@@ -1030,7 +1034,7 @@ pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
 {
     Ok(())
 }

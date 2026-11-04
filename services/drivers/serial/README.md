@@ -141,8 +141,10 @@ UART's IER (every earlier boot stage left `IER = 0`), and the driver routes the
 UART interrupt to a client notification via `SERIAL_REGISTER_RX_NOTIFY`. The
 kernel masks the line on each fire; the next `SERIAL_READ_BYTES` re-arms it
 after draining, via
-[`SYS_IRQ_ACK`](../../../core/kernel/docs/syscalls.md#sys_irq_ack-29). Because
-the x86 IOAPIC delivers edge-triggered, a client must wait with a bounded
+[`SYS_IRQ_ACK`](../../../core/kernel/docs/syscalls.md#sys_irq_ack-29). The
+driver registers the line with mode 0, edge-triggered and active-high (x86-64
+COM1 is ISA IRQ 4, which no MADT override reroutes). Because the x86 IOAPIC
+then delivers edge-triggered, a client must wait with a bounded
 timeout (the terminal uses 20 ms) so a byte racing the re-arm is recovered on
 the next drain; this also degrades gracefully to polling when no IRQ cap was
 delivered. The riscv PLIC is level-sensitive and re-asserts

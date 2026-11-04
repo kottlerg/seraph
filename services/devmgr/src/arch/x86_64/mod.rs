@@ -11,6 +11,7 @@ use crate::caps::DevmgrCaps;
 use crate::reply_status;
 use crate::tables::{locate_table_by_sig, with_acpi_table};
 use firmware::EcamLocation;
+use firmware::acpi::SourceOverride;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
 pub struct ArchCaps
@@ -87,6 +88,43 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
     ioport_carve(caps.arch.ioport_cap, 0x70, 2)
+}
+
+/// The MADT's Interrupt Source Overrides, which give the PCI `INTx` lines'
+/// trigger and polarity ([`pci_line_mode`]); each is logged. Empty, logged
+/// once, when the MADT is missing or malformed: every PCI line then takes
+/// the PCI default, level-triggered, active-low.
+pub fn pci_line_overrides(caps: &DevmgrCaps) -> Vec<SourceOverride>
+{
+    let read = locate_table_by_sig(caps, *b"APIC").and_then(|madt| {
+        with_acpi_table(caps, madt, |bytes| {
+            firmware::acpi::madt_source_overrides(bytes).map(Iterator::collect::<Vec<_>>)
+        })
+    });
+    let Some(overrides) = read
+    else
+    {
+        std::os::seraph::log!("MADT missing or malformed; PCI INTx lines take level, active-low");
+        return Vec::new();
+    };
+    for o in &overrides
+    {
+        std::os::seraph::log!(
+            "MADT override: IRQ {} -> GSI {:#x}, flags {:#x}",
+            o.source,
+            u64::from(o.gsi),
+            o.flags
+        );
+    }
+    overrides
+}
+
+/// The `SYS_IRQ_REGISTER` mode of PCI `INTx` line `gsi`: the trigger and
+/// polarity of the override in `overrides` that names it, else the PCI
+/// default ([`firmware::acpi::line_mode`]).
+pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
+{
+    firmware::acpi::line_mode(overrides.iter().copied(), gsi)
 }
 
 /// The data word the RTC driver's bootstrap round carries: the CMOS RAM

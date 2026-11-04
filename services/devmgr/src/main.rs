@@ -89,8 +89,9 @@ fn main() -> !
     // IRQ allocator state: single-line caps carved out of devmgr's
     // Interrupt range cap, every remainder kept; each PCI device's line held
     // once carved, every device on it given a derivation, and the UART line
-    // carved exclusive.
-    let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
+    // carved exclusive. The firmware's overrides give each PCI line's mode.
+    let mut irq_range =
+        IrqRangeAllocator::new(caps.irq_range_cap, arch::current::pci_line_overrides(&caps));
 
     // The UART line (`arch::current::UART_IRQ`), kept exclusive: the serial
     // driver acknowledges a delivery only when its client reads, so no other
@@ -944,6 +945,9 @@ struct IrqRangeAllocator
 {
     ranges: SpanTable<u32>,
     held: HeldLines<u32>,
+    /// The firmware's Interrupt Source Overrides, from which each PCI line's
+    /// `SYS_IRQ_REGISTER` mode is derived ([`Self::line_mode`]).
+    overrides: Vec<firmware::acpi::SourceOverride>,
 }
 
 impl IrqRangeAllocator
@@ -953,7 +957,7 @@ impl IrqRangeAllocator
     /// range, which [`SpanTable::carve`] reads as the cap ending there.
     const RANGE_END_BOUND: u64 = 1 << 32;
 
-    fn new(range_slot: u32) -> Self
+    fn new(range_slot: u32, overrides: Vec<firmware::acpi::SourceOverride>) -> Self
     {
         let mut ranges = SpanTable::new();
         // A range cap starts at line 0 (init derives it from the root range).
@@ -964,7 +968,15 @@ impl IrqRangeAllocator
         Self {
             ranges,
             held: HeldLines::new(),
+            overrides,
         }
+    }
+
+    /// The `SYS_IRQ_REGISTER` mode of PCI `INTx` line `gsi`, which every
+    /// driver bound on the line passes (`arch::current::pci_line_mode`).
+    fn line_mode(&self, gsi: u32) -> u64
+    {
+        arch::current::pci_line_mode(&self.overrides, gsi)
     }
 
     /// A device's own single-line cap on line `id`: a derivation of the
@@ -1153,11 +1165,14 @@ impl VirtioBars
 }
 
 /// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio` caps,
-/// its optional single-IRQ cap, and the badge of its catalog entry.
+/// its optional single-IRQ cap with the line's `SYS_IRQ_REGISTER` mode, and
+/// the badge of its catalog entry.
 struct VirtioDeviceCaps
 {
     bars: VirtioBars,
     irq_cap: Option<u32>,
+    /// The mode the driver registers `irq_cap` with; 0 without one.
+    irq_mode: u64,
     device_badge: u64,
 }
 
@@ -1219,9 +1234,16 @@ fn carve_virtio_device(
         bars.release();
         return None;
     };
+    let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
+    let irq_mode = match (irq_cap, device_gsi(pci_dev))
+    {
+        (Some(_), Some(gsi)) => irq_range.line_mode(gsi),
+        _ => 0,
+    };
     Some(VirtioDeviceCaps {
         bars,
-        irq_cap: acquire_single_irq_cap(pci_dev, irq_range),
+        irq_cap,
+        irq_mode,
         device_badge,
     })
 }
@@ -1640,6 +1662,7 @@ fn spawn_one_virtio_blk(
         source: spawn::CreateSource::Module(module_copy),
         bars: dev_caps.bars.as_slice(),
         irq_cap: Some(irq_cap),
+        irq_mode: dev_caps.irq_mode,
         service_ep: blk_ep,
         query_ep: batch.driver_ep(),
         death_eq,
@@ -1689,7 +1712,11 @@ fn acquire_single_irq_cap(
     {
         Ok(cap) =>
         {
-            std::os::seraph::log!("IRQ cap for GSI {:#x}", u64::from(gsi));
+            std::os::seraph::log!(
+                "IRQ cap for GSI {:#x}, mode {:#x}",
+                u64::from(gsi),
+                irq_range.line_mode(gsi)
+            );
             Some(cap)
         }
         Err(LineError::Hold(HoldError::Split(CarveError::NotCovered))) =>
@@ -1949,6 +1976,7 @@ fn spawn_virtio_input_from_disk(
         },
         bars: pending.bars.as_slice(),
         irq_cap: pending.irq_cap,
+        irq_mode: pending.irq_mode,
         service_ep: input_ep,
         query_ep: batch.driver_ep(),
         death_eq,

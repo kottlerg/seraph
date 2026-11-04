@@ -23,13 +23,15 @@ use crate::pci::PciTransport;
 /// How long, in milliseconds, [`serve_interrupts`] waits for a delivery
 /// before it reads the device's interrupt status anyway.
 ///
-/// On x86-64 the I/O APIC entries are edge-triggered, so a device that
-/// asserts its shared level-triggered line while the line is masked raises
-/// no edge, and stays asserted until its ISR is read. The timed read clears
-/// that assertion, so the device's next one raises an edge again, and a lost
-/// interrupt costs the waiter at most this long. A tuning value that bounds
-/// no capacity: it decides only how soon a lost edge is recovered, against
-/// one ISR read per period while the device is idle.
+/// On a line whose x86-64 I/O APIC entry is programmed edge-triggered (a
+/// line the firmware describes as edge), a device that asserts the shared
+/// line while it is masked raises no edge, and stays asserted until its ISR
+/// is read. The timed read clears that assertion, so the device's next one
+/// raises an edge again, and a lost interrupt costs the waiter at most this
+/// long. A level-triggered entry delivers such an assertion at the unmask,
+/// so there the read only bounds a lost wake. A tuning value that bounds no
+/// capacity: it decides only how soon a lost edge is recovered, against one
+/// ISR read per period while the device is idle.
 pub const ISR_POLL_MS: u64 = 50;
 
 /// What [`serve_interrupts`] does after one bounded wait.

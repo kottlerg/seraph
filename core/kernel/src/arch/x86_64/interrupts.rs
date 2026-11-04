@@ -757,8 +757,9 @@ pub fn unmask(_irq: u32) {}
 
 /// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: assign it a
 /// device vector ([`super::ioapic::assign_vector`]) and a destination CPU, and program its
-/// redirection entry. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
-/// handler. Called by `irq::register` for the GSI's first binding; the route is kept
+/// redirection entry with `mode`'s trigger and polarity (the `SYS_IRQ_REGISTER` word,
+/// validated by the syscall). The driver unmasks via `SYS_IRQ_ACK` once it has registered
+/// a handler. Called by `irq::register` for the GSI's first binding; the route is kept
 /// while any binding remains.
 ///
 /// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id the
@@ -772,7 +773,7 @@ pub fn unmask(_irq: u32) {}
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised), under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), crate::irq::RouteError>
 {
     if !super::ioapic::owns(irq)
     {
@@ -791,7 +792,7 @@ pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
     // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
     // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
     unsafe {
-        super::ioapic::route(irq, vector, apic_id);
+        super::ioapic::route(irq, vector, apic_id, mode);
     }
     Ok(())
 }
@@ -801,7 +802,7 @@ pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
 {
     Ok(())
 }

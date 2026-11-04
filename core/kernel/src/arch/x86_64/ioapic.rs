@@ -53,20 +53,24 @@
 //! `interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider x2APIC id
 //! without interrupt remapping, which the kernel does not program.
 //!
+//! # Trigger and polarity
+//!
+//! A redirection entry takes its trigger mode (bit 15, set for level) and pin polarity
+//! (bit 13, set for active-low) from the mode its line's first `SYS_IRQ_REGISTER` passed
+//! ([`redirection_low`]); the kernel reads no MADT interrupt-source override itself. A
+//! level-triggered entry's Remote IRR, set at delivery, is cleared by the local APIC's EOI,
+//! which the local APIC broadcasts to the I/O APICs (the kernel leaves the SVR's EOI-broadcast
+//! suppression bit clear). A device IRQ masks its entry before that EOI
+//! (`irq::dispatch_device_irq`), so an assertion still held at the unmask is delivered again.
+//!
 //! # Limitations / deferred work
 //!
 //! - **No MSI/MSI-X support.** Required for modern `PCIe` devices (#325).
-//!
-//! - **Edge-triggered, active-high only.** Level-triggered and active-low sources (PCI `INTx`
-//!   lines, MADT interrupt-source overrides) are not handled; no trigger/polarity information
-//!   reaches the kernel (`InterruptObject` carries only `start` and `count`).
 //!
 //! # Modification notes
 //! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`, through
 //!   `irq::register`), released by `interrupts::unroute_device_irq`, and unmasked by
 //!   `interrupts::unmask` (from `SYS_IRQ_ACK`).
-//! - To support level-triggered IRQs: set bit 15 (level-sensitive) and
-//!   bit 13 (active-low polarity) in the redirection entry low dword.
 
 // cast_possible_truncation: u64→usize APIC MMIO address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector widening casts.
@@ -238,6 +242,32 @@ const REDIR_MASK: u32 = 1 << 16;
 /// Fixed delivery mode (000), physical destination, vector in [7:0].
 /// Logical destination mode would be bit 11; we leave it clear (physical).
 const REDIR_FIXED: u32 = 0x0000_0000;
+
+/// Trigger-mode bit in the low dword of a redirection entry (bit 15): set for a
+/// level-triggered line.
+const REDIR_LEVEL: u32 = 1 << 15;
+
+/// Pin-polarity bit in the low dword of a redirection entry (bit 13): set for an
+/// active-low line.
+const REDIR_ACTIVE_LOW: u32 = 1 << 13;
+
+/// The low dword of a masked redirection entry delivering `vector` in fixed mode
+/// to a physical destination, with `mode`'s trigger and polarity
+/// (`IRQ_MODE_LEVEL`, `IRQ_MODE_ACTIVE_LOW` in `abi/syscall`; bits outside them are
+/// ignored, since the syscall refuses them).
+const fn redirection_low(vector: u8, mode: u32) -> u32
+{
+    let mut low = REDIR_MASK | REDIR_FIXED | (vector as u32);
+    if mode as u64 & syscall::IRQ_MODE_LEVEL != 0
+    {
+        low |= REDIR_LEVEL;
+    }
+    if mode as u64 & syscall::IRQ_MODE_ACTIVE_LOW != 0
+    {
+        low |= REDIR_ACTIVE_LOW;
+    }
+    low
+}
 
 // ── Per-IOAPIC state ──────────────────────────────────────────────────────────
 
@@ -435,22 +465,23 @@ pub unsafe fn init()
 /// with id `destination` (physical destination mode, so at most `0xFF`).
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
-/// Uses edge-triggered, active-high, fixed delivery. A GSI no discovered I/O
-/// APIC owns is left alone (`interrupts::route_device_irq` checks [`owns`] first).
+/// Uses fixed delivery, with the trigger mode and polarity `mode` names
+/// ([`redirection_low`]). A GSI no discovered I/O APIC owns is left alone
+/// (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
-pub unsafe fn route(gsi: u32, vector: u8, destination: u8)
+pub unsafe fn route(gsi: u32, vector: u8, destination: u8, mode: u32)
 {
     let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
     else
     {
         return;
     };
-    // Low dword: vector | fixed delivery | masked.
+    // Low dword: vector | fixed delivery | trigger and polarity | masked.
     // High dword: destination APIC id in bits [31:24] (entry bits [63:56]).
-    let low = REDIR_MASK | REDIR_FIXED | (vector as u32);
+    let low = redirection_low(vector, mode);
     let high = u32::from(destination) << 24;
 
     // SAFETY: caller ensures init() has completed; entry remains masked
@@ -582,6 +613,32 @@ mod tests
         release_vector_in(&t, 1, 100);
         let (vector, _) = assign_vector_in(&t, 5000, 100).expect("vector");
         assert_eq!(vector, DEVICE_VECTOR_BASE + 1);
+    }
+
+    #[test]
+    fn mode_zero_programs_an_edge_triggered_active_high_masked_entry()
+    {
+        let low = redirection_low(0x40, 0);
+        assert_eq!(low, REDIR_MASK | 0x40);
+    }
+
+    #[test]
+    fn the_mode_bits_set_the_trigger_and_polarity_bits()
+    {
+        let level = syscall::IRQ_MODE_LEVEL as u32;
+        let active_low = syscall::IRQ_MODE_ACTIVE_LOW as u32;
+        assert_eq!(
+            redirection_low(0x41, level),
+            REDIR_MASK | REDIR_LEVEL | 0x41
+        );
+        assert_eq!(
+            redirection_low(0x42, active_low),
+            REDIR_MASK | REDIR_ACTIVE_LOW | 0x42
+        );
+        assert_eq!(
+            redirection_low(0x43, level | active_low),
+            REDIR_MASK | REDIR_LEVEL | REDIR_ACTIVE_LOW | 0x43
+        );
     }
 
     #[test]

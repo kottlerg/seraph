@@ -42,25 +42,27 @@ use crate::decode::ModifierState;
 use crate::input::EventRing;
 
 /// Per-iteration timeout on the read-path wait, in milliseconds. When an IRQ is
-/// bound the wait wakes on the device interrupt; the bounded timeout also
-/// re-drains the used ring every tick, so the driver works whether or not an
-/// IRQ is available (virtio-input may share an `INTx` line, leaving it with
-/// none) and tolerates a lost PLIC interrupt on QEMU virt RISC-V. At 20 ms the
-/// poll-only fallback stays well above human typing rates.
+/// bound the wait wakes when the interrupt-service thread signals `wake`; the
+/// bounded timeout also re-drains the used ring every tick, so the driver works
+/// whether or not an IRQ is available (devmgr delivers none when it can give
+/// the device no IRQ cap) and tolerates a lost PLIC interrupt on QEMU virt
+/// RISC-V. At 20 ms the poll-only fallback stays well above human typing rates.
 const POLL_INTERVAL_MS: u64 = 20;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
 // devmgr serves the two rounds `virtio_core::bootstrap` specifies, as for
 // virtio-blk: the BAR caps with their BAR indices, then the service
-// endpoint, the IRQ (absent when the device shares an INTx line), and the
-// per-device devmgr query endpoint. log_ep and procmgr_ep arrive via
-// `ProcessInfo`/`StartupInfo`.
+// endpoint, the IRQ (absent when devmgr could give the device no IRQ cap)
+// with its line's mode word, and the per-device devmgr query endpoint.
+// log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`.
 
 struct DriverCaps
 {
     bars: DeliveredBars,
     irq_slot: u32,
+    /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
+    irq_mode: u64,
     memmgr_ep: u32,
     service_ep: u32,
     devmgr_ep: u32,
@@ -86,6 +88,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     Some(DriverCaps {
         bars,
         irq_slot: endpoints.irq,
+        irq_mode: endpoints.irq_mode,
         service_ep: endpoints.service,
         memmgr_ep: info.memmgr_endpoint,
         devmgr_ep: endpoints.devmgr_query,
@@ -681,7 +684,7 @@ fn main() -> !
             std::os::seraph::log!("failed to create IRQ notification");
             syscall::thread_exit();
         };
-        if syscall::irq_register(irq_cap, irq_notification).is_err()
+        if syscall::irq_register(irq_cap, irq_notification, caps.irq_mode).is_err()
         {
             std::os::seraph::log!("irq_register failed");
             syscall::thread_exit();

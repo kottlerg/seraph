@@ -201,15 +201,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_repark: pin controller failed")?;
-    let result = phases(ctx, CYCLES);
+    let result = phases(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_repark: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run one phase of `cycles` rounds per source kind and check each.
-fn phases(ctx: &TestContext, cycles: u32) -> TestResult
+/// Run one phase of [`CYCLES`] rounds per source kind and check each.
+fn phases(ctx: &TestContext) -> TestResult
 {
     for (kind, name) in [
         (
@@ -223,7 +223,7 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
     ]
     {
         crate::log(name);
-        let seen = phase(ctx, kind, cycles)?;
+        let seen = phase(ctx, kind)?;
         report(&seen)?;
     }
     Ok(())
@@ -271,7 +271,7 @@ fn report(seen: &Seen) -> TestResult
 /// One phase: create the sources and the children, run the rounds, pause
 /// the sender, run the final check, end the children, and release
 /// everything whatever the outcome. Returns what the rounds saw.
-fn phase(ctx: &TestContext, kind: Kind, cycles: u32) -> Result<Seen, &'static str>
+fn phase(ctx: &TestContext, kind: Kind) -> Result<Seen, &'static str>
 {
     for counter in [&QUIT, &SENDER_BUSY, &EXITED, &WAITS_ENTERED]
         .into_iter()
@@ -290,7 +290,7 @@ fn phase(ctx: &TestContext, kind: Kind, cycles: u32) -> Result<Seen, &'static st
     let result = setup(ctx, kind, &mut parts).and_then(|()| {
         let waiter = parts.waiter.ok_or("stress::stop_repark: no waiter")?;
         let sources = sources_of(&parts)?;
-        let ran = rounds(waiter, cycles);
+        let ran = rounds(waiter);
         let seen = Seen {
             delivered: DELIVERED.each_ref().map(|d| d.load(Ordering::Acquire)),
             interrupted: INTERRUPTED.each_ref().map(|i| i.load(Ordering::Acquire)),
@@ -397,12 +397,12 @@ fn create_thread(
     thread_set_affinity(th, cpu).map_err(|_| "stress::stop_repark: pin thread failed")
 }
 
-/// Stop and restart the waiter `cycles` times, waiting after each restart
+/// Stop and restart the waiter [`CYCLES`] times, waiting after each restart
 /// until it has entered a new wait. Returns the rounds that timed out.
-fn rounds(waiter: u32, cycles: u32) -> Result<u32, &'static str>
+fn rounds(waiter: u32) -> Result<u32, &'static str>
 {
     let mut starved = 0;
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         thread_stop(waiter).map_err(|e| {
             log_error("ktest: stress::stop_repark thread_stop error=", e);

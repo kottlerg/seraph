@@ -226,15 +226,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_target_vanishes: pin controller failed")?;
-    let result = phases(ctx, CYCLES);
+    let result = phases(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_target_vanishes: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run one phase of `cycles` rounds per way of vanishing and check each.
-fn phases(ctx: &TestContext, cycles: u32) -> TestResult
+/// Run one phase of [`CYCLES`] rounds per way of vanishing and check each.
+fn phases(ctx: &TestContext) -> TestResult
 {
     for (kind, name) in [
         (
@@ -248,7 +248,7 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
     ]
     {
         crate::log(name);
-        let seen = phase(ctx, kind, cycles)?;
+        let seen = phase(ctx, kind)?;
         report(&seen)?;
     }
     Ok(())
@@ -340,7 +340,7 @@ fn log_tallies(seen: &Seen)
 /// delete both whatever the outcome (a deletion ends a thread wherever it
 /// is, so the stacks are free for the next phase even after a failed
 /// round). Returns what the phase saw.
-fn phase(ctx: &TestContext, kind: Vanish, cycles: u32) -> Result<Seen, &'static str>
+fn phase(ctx: &TestContext, kind: Vanish) -> Result<Seen, &'static str>
 {
     for counter in [
         &QUIT,
@@ -368,8 +368,7 @@ fn phase(ctx: &TestContext, kind: Vanish, cycles: u32) -> Result<Seen, &'static 
     }
     let mut children = Children::default();
     let mut seen = Seen::default();
-    let ran = start(ctx, &mut children)
-        .and_then(|()| rounds(ctx, (kind, cycles), &mut children, &mut seen));
+    let ran = start(ctx, &mut children).and_then(|()| rounds(ctx, kind, &mut children, &mut seen));
     let ended = finish(&children);
     let released = release(&children);
     ran?;
@@ -441,17 +440,11 @@ fn create_thread(
     Ok(th)
 }
 
-/// Run the `(vanish, cycles)` pair `plan`'s rounds, stopping at the first
-/// that fails. Records the loops the stopper had counted by the end.
-fn rounds(
-    ctx: &TestContext,
-    plan: (Vanish, u32),
-    children: &mut Children,
-    seen: &mut Seen,
-) -> TestResult
+/// Run [`CYCLES`] rounds of vanishing by `kind`, stopping at the first that
+/// fails. Records the loops the stopper had counted by the end.
+fn rounds(ctx: &TestContext, kind: Vanish, children: &mut Children, seen: &mut Seen) -> TestResult
 {
-    let (kind, cycles) = plan;
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         stop_and_classify(cycle, children, seen)?;
         vanish_and_resume(ctx, kind, children, seen)?;

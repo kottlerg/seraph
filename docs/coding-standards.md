@@ -464,14 +464,22 @@ stability contract — a layout some consumer outside the Rust struct definition
 - An ABI or wire format shared across the boot boundary or with userspace.
 - A layout read from assembly or via raw-pointer cast (a per-CPU field offset; a header
   required at offset zero for a concrete-to-header pointer cast).
-- A hard size budget asserted elsewhere (a structure that must fit one page).
+- A hard size budget asserted elsewhere (a structure that must fit one page or chunk).
 
 Such an assertion is forbidden when the layout is purely internal and no external consumer
 depends on it; that is a constant mirror that breaks on any benign field reorder. When
 legitimate, layout assertions MUST be consolidated into one test per struct family or module,
-named for the contract, with a comment naming the consumer that depends on the layout:
+named for the contract, with a comment naming the consumer that depends on the layout. A hard
+size budget is the one exception: it MAY instead be a build-time `const` assertion beside its
+type, with a comment naming the consumer that depends on the budget, so that an overflow fails
+the build. That assertion is the one assertion for that budget, and the consolidated test does
+not repeat it:
 
 ```rust
+// Hard size budget: the bootloader writes BootInfo into one page, and the kernel
+// validates and reads it there.
+const _: () = assert!(size_of::<BootInfo>() <= 4096);
+
 // ABI contract: the bootloader writes these structures into the BootInfo page and the
 // kernel reads them back by offset; their sizes are part of BOOT_PROTOCOL_VERSION.
 #[test]
@@ -479,7 +487,6 @@ fn boot_protocol_struct_sizes_are_stable()
 {
     assert_eq!(size_of::<ReclaimRange>(), 16);
     assert_eq!(size_of::<MmioAperture>(), 16);
-    assert!(size_of::<BootInfo>() <= 4096);
 }
 ```
 

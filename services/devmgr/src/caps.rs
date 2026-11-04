@@ -104,6 +104,17 @@ pub struct DevmgrCaps
     // out of them, keeping every remainder.
     pub apertures: SpanTable<u32>,
 
+    /// The `Mmio` cap of every scanned ECAM window, kept apart from the
+    /// apertures so no BAR carve can reach configuration space: devmgr
+    /// carves from it the configuration page of each `VirtIO` function it
+    /// spawns a driver for, through which it clears the function's Bus
+    /// Master Enable when it withdraws the driver.
+    pub config_space: SpanTable<u32>,
+
+    /// The ECAM windows `config_space` holds, to locate a function's
+    /// configuration page (`firmware::pci::function_config_phys`).
+    pub ecam_windows: Vec<firmware::EcamLocation>,
+
     // ACPI reclaimable-region Memory caps.
     pub acpi_regions: Vec<AcpiRegion>,
 
@@ -147,6 +158,8 @@ impl DevmgrCaps
             dtb_page_base: 0,
             dtb_size: 0,
             apertures: SpanTable::new(),
+            config_space: SpanTable::new(),
+            ecam_windows: Vec::new(),
             acpi_regions: Vec::new(),
             procmgr_ep: info.procmgr_endpoint,
             registry_ep: 0,

@@ -57,7 +57,10 @@ Allocation Contract").
   for it; see [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's memory caps into the free pool (see
-  [`docs/memory-pool.md`](docs/memory-pool.md) §"Reclamation").
+  [`docs/memory-pool.md`](docs/memory-pool.md) §"Reclamation"); procmgr holds
+  it back for a DMA-capable driver until devmgr has confirmed the driver's
+  device stopped its DMA (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+  § Label 4).
 - **Mid-life reclamation** — on `RELEASE_MEMORY_CAPS` (or `UNREGISTER_REGION`
   for a demand-paged region) from a live process, return the named grant to the
   free pool so a per-unit-of-work retype loop holds a bounded footprint without

@@ -203,6 +203,15 @@ pub fn alloc_cspace_id() -> Option<CSpaceId>
     CSPACE_REGISTRY.alloc()
 }
 
+/// Number of `CSpace` ids in use: allocated by [`alloc_cspace_id`] and not
+/// yet returned by [`free_cspace_id`], the root `CSpace`'s included.
+/// `SYS_SYSTEM_INFO(LiveCSpaceCount)` reports it.
+#[must_use]
+pub fn live_cspace_count() -> u32
+{
+    CSPACE_REGISTRY.live()
+}
+
 /// Register a `CSpace` pointer under its ID.
 ///
 /// Called immediately after a [`CSpace`] is allocated. Returns the registry
@@ -299,25 +308,30 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
     sum
 }
 
-/// Target slot capacity for the root `CSpace`'s initial slot-page pool.
+/// Slots of the root `CSpace`'s initial slot-page pool beyond the boot mint:
+/// what userspace init mints, copies, and derives into it during memmgr /
+/// procmgr bootstrap (kernel-object inserts and the per-RAM-Memory
+/// derive/copy chains in `finalize_memmgr`), about 700 caps observed. Set
+/// at about 1.8× that, per the seeding policy in docs/capability-model.md
+/// (growth budgets), so realistic growth of init's own use (more services,
+/// more derivations per RAM extent) does not revisit it.
+#[cfg(not(test))]
+const ROOT_CSPACE_INIT_HEADROOM_SLOTS: u64 = 1280;
+
+/// Slots of the root `CSpace` the boot takes besides one per capability body:
+/// the permanently null slot 0 and the caps Phase 9 inserts over objects it
+/// does not count as bodies, init's `AddressSpace`, `Thread` and `CSpace`.
+#[cfg(not(test))]
+const ROOT_CSPACE_BOOT_EXTRA_SLOTS: u64 = 4;
+
+/// Slot capacity of the root `CSpace`'s initial slot-page pool: the boot's
+/// capability bodies ([`boot_body_bound`], from the `InitInfo` descriptor
+/// capacity Phase 7 sized from this boot's counts), the
+/// [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`], and [`ROOT_CSPACE_INIT_HEADROOM_SLOTS`]
+/// for init.
 ///
-/// `populate_cspace` plus [`mint_module_memory_caps`] mint ~150 caps into
-/// the root; userspace init then mints, copies, and derives ~700 more
-/// caps during memmgr / procmgr bootstrap (kernel-object inserts +
-/// per-RAM-Memory derive/copy chains in `finalize_memmgr`). Sized at
-/// 1536 slots per the seeding policy in docs/capability-model.md
-/// (growth budgets): roughly 1.8× the observed ~850-cap
-/// pre-memmgr-handover peak. The headroom absorbs realistic
-/// per-RAM-extent-count growth (more drained extents ⇒ more init-time
-/// Memory-cap derivations) and per-service growth (more boot modules ⇒
-/// more module-memory caps) without revisiting this knob. The boot mint is
-/// itself bounded by [`BOOT_BODY_BOUND`] (about 550 caps: the `InitInfo`
-/// descriptor capacity and Phase 9's Memory caps), so a boot at that bound, an
-/// ACPI-region-heavy memory map among them, still leaves init about 985 slots.
-///
-/// MUST be kept in sync with the boot footprint: a target below the
-/// peak boot slot count means `pre_allocate`'s grow loop hits an
-/// exhausted pool, the syscall errors out, and the userspace caller
+/// A pool below the peak slot count means `pre_allocate`'s grow loop hits
+/// an exhausted pool, the syscall errors out, and the userspace caller
 /// either retries indefinitely (e.g. `request_round` in a child) or
 /// surfaces an unexpected `OutOfMemory`.
 ///
@@ -330,7 +344,10 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// slots, a reserve sized for what it mints after the forward
 /// (services/init/src/bootstrap.rs), and hands the rest over at its reap.
 #[cfg(not(test))]
-const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
+fn root_cspace_init_slot_capacity() -> u64
+{
+    boot_body_bound() as u64 + ROOT_CSPACE_BOOT_EXTRA_SLOTS + ROOT_CSPACE_INIT_HEADROOM_SLOTS
+}
 
 /// Pool pages of the root `CSpace` beyond its slots, for the bodies its arena
 /// funds: init's bootstrap allocator splits a Memory cap once per page it hands
@@ -345,13 +362,15 @@ const ROOT_CSPACE_BODY_PAGES: u64 = 16;
 /// Pages carved from `SEED_MEMORY` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
 /// pages seed the slot-page pool. Sized so the pool holds at least
-/// [`ROOT_CSPACE_INIT_SLOT_CAPACITY`] slots regardless of `L2_SIZE`
+/// [`root_cspace_init_slot_capacity`] slots regardless of `L2_SIZE`
 /// (slots-per-page), plus [`ROOT_CSPACE_BODY_PAGES`] for the bodies of init's
-/// splits. The slot-0 reservation on page 0 costs one slot and is absorbed by
-/// rounding up.
+/// splits. The slot-0 reservation, on the pool's first slot page, is one of the
+/// [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`].
 #[cfg(not(test))]
-const ROOT_CSPACE_INIT_PAGES: u64 =
-    1 + ROOT_CSPACE_INIT_SLOT_CAPACITY.div_ceil(cspace::L2_SIZE as u64) + ROOT_CSPACE_BODY_PAGES;
+fn root_cspace_init_pages() -> u64
+{
+    1 + root_cspace_init_slot_capacity().div_ceil(cspace::L2_SIZE as u64) + ROOT_CSPACE_BODY_PAGES
+}
 
 /// Pages of init's bootstrap `AddressSpace` slab, retyped from SEED at Phase 9:
 /// 1 wrapper + 1 root PT + 16 PT pool pages. Phase 9 mappings (ELF segments,
@@ -366,21 +385,88 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 #[cfg(not(test))]
 pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 
-/// Descriptors the `InitInfo` block holds: its [`init_protocol::INIT_INFO_MAX_PAGES`]
-/// pages past the header, one [`CapDescriptor`] slot each. Phases 7 and 8 write
-/// the boot capability descriptors straight into the block (and the buddy
-/// drain its RAM extents before them, [`drain_and_install_seed`]), so this is
-/// the one bound on the capabilities that carry a descriptor: [`push_descriptor`]
-/// halts the boot by name past it. At `INIT_INFO_MAX_PAGES` = 4, past a header
-/// that holds the 85-entry module name table, that is 535 capabilities, which
-/// also bounds the ACPI region caps (one per
-/// `AcpiReclaimable` memory-map entry; real firmware reports 1 or 2). Phase 9's
-/// Memory caps reach init through header fields instead ([`BOOT_BODY_BOUND`]
-/// counts them).
-pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = (init_protocol::INIT_INFO_MAX_PAGES
-    * crate::mm::PAGE_SIZE
-    - core::mem::size_of::<init_protocol::InitInfo>())
-    / core::mem::size_of::<CapDescriptor>();
+/// Most descriptors an `InitInfo` block can hold: the
+/// [`init_protocol::INIT_INFO_MAX_PAGES`] (64) pages of the protocol's ceiling
+/// past the header, one [`CapDescriptor`] slot each, 10,775. Phase 7 sizes
+/// each boot's block from its own counts ([`init_info_descriptor_bound`]), so
+/// this binds only a boot whose counts pass it, which halts by name at the
+/// reservation; no platform comes near it (see the ceiling's rustdoc).
+pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize =
+    descriptors_in_pages(init_protocol::INIT_INFO_MAX_PAGES);
+
+/// Descriptors an `InitInfo` region of `pages` pages holds past its header.
+const fn descriptors_in_pages(pages: usize) -> usize
+{
+    (pages * crate::mm::PAGE_SIZE - core::mem::size_of::<init_protocol::InitInfo>())
+        / core::mem::size_of::<CapDescriptor>()
+}
+
+/// Pages of the `InitInfo` region that holds the header and `descriptors`
+/// descriptors.
+const fn init_info_pages(descriptors: usize) -> usize
+{
+    (core::mem::size_of::<init_protocol::InitInfo>()
+        + descriptors * core::mem::size_of::<CapDescriptor>())
+    .div_ceil(crate::mm::PAGE_SIZE)
+}
+
+/// Descriptors Phases 7 and 8 write besides one per RAM extent, ACPI
+/// region, MMIO aperture, boot module and reclaim range: the console UART
+/// `Mmio` cap, the `SchedControl` and root `Interrupt` caps, the RSDP and DTB
+/// `Memory` caps, the root `IoPort` or `SbiControl` cap, and two to spare.
+const FIXED_BOOT_DESCRIPTORS: usize = 8;
+
+/// The most descriptors this boot's Phases 7 and 8 can write into the
+/// `InitInfo` block: one per drained RAM extent (at most `ram_extents`), per
+/// `AcpiReclaimable` memory-map entry, per MMIO aperture, per boot module and
+/// per reclaim range, plus [`FIXED_BOOT_DESCRIPTORS`]. Every count is the
+/// platform's own, read before the drain, so the block Phase 7 reserves is
+/// sized for this boot.
+const fn init_info_descriptor_bound(
+    ram_extents: usize,
+    acpi_regions: usize,
+    apertures: usize,
+    modules: usize,
+    reclaim_ranges: usize,
+) -> usize
+{
+    ram_extents + acpi_regions + apertures + modules + reclaim_ranges + FIXED_BOOT_DESCRIPTORS
+}
+
+/// Descriptors the `InitInfo` block Phase 7 reserved holds, set once by
+/// `reserve_init_backing`; Phases 7 and 8 write the boot capability
+/// descriptors straight into the block (the buddy drain its RAM extents
+/// first, [`drain_and_install_seed`]), so this is the one bound on the
+/// capabilities that carry a descriptor: [`push_descriptor`] halts the boot
+/// by name past it. Phase 9's Memory caps reach init through header fields
+/// instead ([`boot_body_bound`] counts them).
+#[cfg(not(test))]
+static DESCRIPTOR_CAPACITY: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Host-test stand-in for the reserved block's capacity: a four-page
+/// region's, enough for the test maps.
+#[cfg(test)]
+const TEST_DESCRIPTOR_CAPACITY: usize = descriptors_in_pages(4);
+
+/// Descriptors the reserved `InitInfo` block holds ([`DESCRIPTOR_CAPACITY`]).
+fn descriptor_capacity() -> usize
+{
+    #[cfg(not(test))]
+    {
+        DESCRIPTOR_CAPACITY.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        TEST_DESCRIPTOR_CAPACITY
+    }
+}
+
+/// Pages of the `InitInfo` block Phase 7 reserved, set with
+/// [`DESCRIPTOR_CAPACITY`].
+#[cfg(not(test))]
+static INIT_INFO_BLOCK_PAGES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 // `mint_module_memory_caps` copies each boot module's `BootModule.name`
 // straight into its `InitModuleName.name`, so the two widths are one ABI fact,
@@ -396,16 +482,20 @@ const _: () = assert!(
         .is_multiple_of(core::mem::align_of::<CapDescriptor>())
 );
 
-/// Most boot-minted capability bodies: one per descriptor the `InitInfo`
-/// block can carry ([`INIT_INFO_DESCRIPTOR_CAPACITY`]), since every capability
+/// Most boot-minted capability bodies: one per descriptor the reserved
+/// `InitInfo` block can carry ([`descriptor_capacity`]), since every capability
 /// Phases 7 and 8 mint into the root `CSpace` is described to init there, plus
 /// the `Memory` bodies Phase 9 mints that init learns of through header fields
-/// instead: one per init segment, `InitInfo` page and init stack page.
+/// instead: one per init segment, `InitInfo` page and init stack page. Valid
+/// once Phase 7 has reserved the block.
 #[cfg(not(test))]
-const BOOT_BODY_BOUND: usize = INIT_INFO_DESCRIPTOR_CAPACITY
-    + boot_protocol::INIT_MAX_SEGMENTS
-    + init_protocol::INIT_INFO_MAX_PAGES
-    + INIT_STACK_PAGES;
+fn boot_body_bound() -> usize
+{
+    descriptor_capacity()
+        + boot_protocol::INIT_MAX_SEGMENTS
+        + INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+        + INIT_STACK_PAGES
+}
 
 /// Bytes of one boot-minted body: the 128-byte retype size class, which
 /// every body type fits (asserted below).
@@ -433,20 +523,23 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 // ── Phase-7 seed Memory cap ───────────────────────────────────────────────────
 
 /// The seed reserve less init's Thread slot ([`seed_reserve_bytes`] adds it):
-/// the fixed part of the boot footprint carved off the front of the largest
-/// drained RAM extent, every kernel object the boot mints before init runs:
+/// the part of the boot footprint carved off the front of the largest
+/// drained RAM extent that the `InitInfo` descriptor capacity sizes, every
+/// kernel object the boot mints before init runs:
 ///
-/// - the root `CSpace` slab ([`ROOT_CSPACE_INIT_PAGES`]: 1 + 28 + 16 = 45
-///   pages);
+/// - the root `CSpace` slab ([`root_cspace_init_pages`]: one wrapper page,
+///   the slot pages for [`root_cspace_init_slot_capacity`], and
+///   [`ROOT_CSPACE_BODY_PAGES`]);
 /// - init's bootstrap `AddressSpace` slab ([`INIT_ASPACE_PAGES`] 18);
-/// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (551) of
-///   [`BOOT_BODY_BYTES`] each (18 pages): one RAM `MemoryObject`
+/// - the boot-minted capability bodies, at most [`boot_body_bound`] of
+///   [`BOOT_BODY_BYTES`] each: one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
 ///   `SchedControl` and `SbiControl` roots, the firmware-table, boot-module,
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
-/// That is 85 pages (340 KiB), and init's Thread slot adds six or more
+/// Valid once Phase 7 has reserved the `InitInfo` block, which sets the
+/// capacity. init's Thread slot adds six or more pages
 /// (`sched::thread_slot::thread_slot_bytes`). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
@@ -458,19 +551,22 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// memmgr operate on virgin caps with zero behavioural change in their
 /// front-split allocators.
 #[cfg(not(test))]
-const SEED_FIXED_RESERVE_BYTES: u64 = (ROOT_CSPACE_INIT_PAGES
-    + INIT_ASPACE_PAGES
-    + (BOOT_BODY_BOUND * BOOT_BODY_BYTES).div_ceil(crate::mm::PAGE_SIZE) as u64
-    + SEED_ALIGNMENT_SLACK_PAGES)
-    * crate::mm::PAGE_SIZE as u64;
+fn seed_fixed_reserve_bytes() -> u64
+{
+    (root_cspace_init_pages()
+        + INIT_ASPACE_PAGES
+        + (boot_body_bound() * BOOT_BODY_BYTES).div_ceil(crate::mm::PAGE_SIZE) as u64
+        + SEED_ALIGNMENT_SLACK_PAGES)
+        * crate::mm::PAGE_SIZE as u64
+}
 
 /// Bytes carved off the front of the largest drained RAM extent for the boot
-/// footprint: [`SEED_FIXED_RESERVE_BYTES`] plus init's Thread slot, whose
+/// footprint: [`seed_fixed_reserve_bytes`] plus init's Thread slot, whose
 /// save area the boot CPU sized at Phase 5 (`sched::thread_slot`).
 #[cfg(not(test))]
 fn seed_reserve_bytes() -> u64
 {
-    SEED_FIXED_RESERVE_BYTES + crate::sched::thread_slot::thread_slot_bytes()
+    seed_fixed_reserve_bytes() + crate::sched::thread_slot::thread_slot_bytes()
 }
 
 /// BSS-static `MemoryObject` covering the seed RAM region.
@@ -596,7 +692,7 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// 1. `POOL_SEED_PAGES` — the kernel PT-frame pool seed.
 /// 2. Idle-thread kernel stacks — `cpu_count × KERNEL_STACK_PAGES`, one stack
 ///    per online CPU (pre-allocated in Phase 4 from the pristine buddy).
-/// 3. The `InitInfo` block — worst-case `INIT_INFO_MAX_PAGES`.
+/// 3. The `InitInfo` block — sized at Phase 7 from this boot's counts.
 /// 4. Init's user stack — `INIT_STACK_PAGES`.
 /// 5. The SEED arena — `seed_reserve_bytes()`.
 ///
@@ -604,13 +700,14 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// pool, leaving the post-handoff buddy fully empty. This value is a Phase-7
 /// diagnostic; the authoritative `kernel_reserved` is the complement of the
 /// `owns_memory` ledger computed at Phase 9 (`core/kernel/src/main.rs`, from
-/// [`owns_memory_minted_bytes`]).
+/// [`owns_memory_minted_bytes`]). Valid once Phase 7 has reserved the
+/// `InitInfo` block, which sizes terms 3 and 5.
 #[cfg(not(test))]
 pub(crate) fn kernel_reserve_pages() -> usize
 {
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let idle_stacks = cpu_count * crate::sched::KERNEL_STACK_PAGES;
-    let init_info = 1usize << INIT_INFO_RESERVE_ORDER;
+    let init_info = INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed);
     let seed = (seed_reserve_bytes() / crate::mm::PAGE_SIZE as u64) as usize;
     POOL_SEED_PAGES + idle_stacks + init_info + INIT_STACK_PAGES + seed
 }
@@ -619,25 +716,9 @@ pub(crate) fn kernel_reserve_pages() -> usize
 #[cfg(not(test))]
 const INIT_STACK_PAGES: usize = crate::mm::address_space::INIT_STACK_PAGES;
 
-/// Order of the pre-reserved `InitInfo` block: the smallest `2^order` that
-/// covers [`init_protocol::INIT_INFO_MAX_PAGES`] pages. The descriptor array's
-/// true page count is unknown until the drain has run (it scales with the
-/// drained-block count), so the bounded maximum is reserved as one contiguous
-/// extent — preserving the single-allocation backing the cross-page descriptor
-/// slice relies on.
-#[cfg(not(test))]
-const INIT_INFO_RESERVE_ORDER: usize = {
-    let mut o = 0;
-    while (1usize << o) < init_protocol::INIT_INFO_MAX_PAGES
-    {
-        o += 1;
-    }
-    o
-};
-
 /// Physical base of the `InitInfo` block reserved from the pristine buddy in
 /// [`drain_and_install_seed`], consumed once at Phase 9 via
-/// [`take_init_info_block_phys`].
+/// [`take_init_info_block`].
 #[cfg(not(test))]
 static INIT_INFO_BLOCK_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -648,42 +729,75 @@ static INIT_INFO_BLOCK_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic:
 static INIT_STACK_PHYS: [core::sync::atomic::AtomicU64; INIT_STACK_PAGES] =
     [const { core::sync::atomic::AtomicU64::new(0) }; INIT_STACK_PAGES];
 
+/// The counts, read from `BootInfo` before the drain, that bound this boot's
+/// non-RAM descriptors ([`init_info_descriptor_bound`]).
+pub(crate) struct DescriptorCounts
+{
+    /// `AcpiReclaimable` memory-map entries, one ACPI region cap each.
+    pub acpi_regions: usize,
+    /// MMIO apertures, one `Mmio` cap each.
+    pub apertures: usize,
+    /// Boot modules, one `Memory` cap each.
+    pub modules: usize,
+    /// Reclaim ranges, one reclaimable `Memory` cap each.
+    pub reclaim_ranges: usize,
+}
+
+impl DescriptorCounts
+{
+    /// The counts of `mmap`'s `AcpiReclaimable` entries, `apertures` and
+    /// `info`'s module and reclaim arrays: Phases 7 and 8 mint at most one
+    /// descriptor per entry of each (a zero-length ACPI entry or reclaim range
+    /// gets none).
+    fn of(
+        mmap: &[MemoryMapEntry],
+        apertures: &crate::platform::ValidatedApertures,
+        info: &BootInfo,
+    ) -> Self
+    {
+        Self {
+            acpi_regions: mmap
+                .iter()
+                .filter(|e| e.memory_type == MemoryType::AcpiReclaimable)
+                .count(),
+            apertures: apertures.iter().count(),
+            modules: info.modules.count as usize,
+            reclaim_ranges: info.reclaim_ranges.count as usize,
+        }
+    }
+
+    /// [`init_info_descriptor_bound`] over these counts and `ram_extents`.
+    const fn bound(&self, ram_extents: usize) -> usize
+    {
+        init_info_descriptor_bound(
+            ram_extents,
+            self.acpi_regions,
+            self.apertures,
+            self.modules,
+            self.reclaim_ranges,
+        )
+    }
+}
+
 /// Reserve, from the pristine buddy, every page Phase 9 consumes after the
-/// Phase-7 drain: the `InitInfo` block (one contiguous
-/// `2^INIT_INFO_RESERVE_ORDER`-page extent) and init's user-stack pages. Done
+/// Phase-7 drain: init's user-stack pages and the `InitInfo` block. Done
 /// before the drain so the drain can take 100% of the remainder, driving the
 /// post-handoff buddy free count to 0.
+///
+/// The block is sized for this boot: once the stack pages are out, the
+/// buddy's coalesced extents are counted without draining
+/// ([`crate::mm::buddy::BuddyAllocator::coalesced_extent_count`]), and the
+/// block taken holds that count plus two (taking it and returning its tail
+/// can each split one extent) together with the descriptors `counts` bounds.
+/// The block is one contiguous extent, so the descriptor array that spans its
+/// pages lives in a single backing allocation; the pages of its power-of-two
+/// buddy block past the region go back to the buddy, which the drain then
+/// takes. A boot whose region would pass the protocol's ceiling
+/// ([`init_protocol::INIT_INFO_MAX_PAGES`]) halts by name.
 #[cfg(not(test))]
-fn reserve_init_backing()
+fn reserve_init_backing(counts: &DescriptorCounts)
 {
     crate::mm::with_frame_allocator(|alloc| {
-        let info = alloc
-            .alloc(INIT_INFO_RESERVE_ORDER)
-            .unwrap_or_else(|| crate::fatal("Phase 7: out of memory reserving InitInfo block"));
-        INIT_INFO_BLOCK_PHYS.store(info, core::sync::atomic::Ordering::Relaxed);
-        let block = phys_to_virt(info) as *mut u8;
-        // SAFETY: the block was just taken from the buddy, so nothing else
-        // references it, and the direct map covers all RAM since Phase 3.
-        // Zeroed here, before the drain and the descriptors are written into
-        // it, so the header and every unused slot reach init as zeroes.
-        unsafe {
-            core::ptr::write_bytes(
-                block,
-                0,
-                (1usize << INIT_INFO_RESERVE_ORDER) * crate::mm::PAGE_SIZE,
-            );
-        }
-        // SAFETY: the header fits the block's first page, so the array start
-        // lies inside the block.
-        let array = unsafe { block.add(core::mem::size_of::<init_protocol::InitInfo>()) };
-        // cast_ptr_alignment: the block is page-aligned and the header's size
-        // is a multiple of the descriptor alignment (asserted at
-        // INIT_INFO_DESCRIPTOR_CAPACITY), so the array start is aligned.
-        #[allow(clippy::cast_ptr_alignment)]
-        DESCRIPTOR_ARRAY.store(
-            array.cast::<CapDescriptor>(),
-            core::sync::atomic::Ordering::Relaxed,
-        );
         for slot in &INIT_STACK_PHYS
         {
             let page = alloc
@@ -691,13 +805,64 @@ fn reserve_init_backing()
                 .unwrap_or_else(|| crate::fatal("Phase 7: out of memory reserving init stack"));
             slot.store(page, core::sync::atomic::Ordering::Relaxed);
         }
+
+        let bound = counts.bound(alloc.coalesced_extent_count() + 2);
+        if bound > INIT_INFO_DESCRIPTOR_CAPACITY
+        {
+            crate::kprintln!(
+                "Phase 7: {} boot descriptors; {} InitInfo pages, the protocol's ceiling, hold {}",
+                bound,
+                init_protocol::INIT_INFO_MAX_PAGES,
+                INIT_INFO_DESCRIPTOR_CAPACITY
+            );
+            crate::fatal("Phase 7: boot descriptors exceed the InitInfo region ceiling");
+        }
+        let pages = init_info_pages(bound);
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        let info = alloc
+            .alloc(order)
+            .unwrap_or_else(|| crate::fatal("Phase 7: out of memory reserving InitInfo block"));
+        let page = crate::mm::PAGE_SIZE as u64;
+        let tail = ((1usize << order) - pages) as u64 * page;
+        if tail != 0
+        {
+            // SAFETY: the tail pages are the end of the block just taken, so
+            // they were allocated from this buddy and nothing references them.
+            unsafe { alloc.free_range(info + pages as u64 * page, tail) };
+        }
+        INIT_INFO_BLOCK_PHYS.store(info, core::sync::atomic::Ordering::Relaxed);
+        INIT_INFO_BLOCK_PAGES.store(pages, core::sync::atomic::Ordering::Relaxed);
+        DESCRIPTOR_CAPACITY.store(
+            descriptors_in_pages(pages),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        let block = phys_to_virt(info) as *mut u8;
+        // SAFETY: the region's pages were just taken from the buddy, so
+        // nothing else references them, and the direct map covers all RAM
+        // since Phase 3. Zeroed here, before the drain and the descriptors are
+        // written into it, so the header and every unused slot reach init as
+        // zeroes.
+        unsafe {
+            core::ptr::write_bytes(block, 0, pages * crate::mm::PAGE_SIZE);
+        }
+        // SAFETY: the header fits the region's first page, so the array start
+        // lies inside the region.
+        let array = unsafe { block.add(core::mem::size_of::<init_protocol::InitInfo>()) };
+        // cast_ptr_alignment: the region is page-aligned and the header's size
+        // is a multiple of the descriptor alignment (asserted at
+        // INIT_INFO_DESCRIPTOR_CAPACITY), so the array start is aligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        DESCRIPTOR_ARRAY.store(
+            array.cast::<CapDescriptor>(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
     });
 }
 
-/// Physical base of the pre-reserved `InitInfo` block. Single consumption:
-/// returns the base and clears the slot.
+/// Physical base and page count of the pre-reserved `InitInfo` region.
+/// Single consumption: returns them and clears the base.
 #[cfg(not(test))]
-pub(crate) fn take_init_info_block_phys() -> u64
+pub(crate) fn take_init_info_block() -> (u64, usize)
 {
     // The block goes to init now, so the descriptor array is retired with it:
     // a later `descriptor_array()` halts, naming the array's lifetime (its
@@ -706,7 +871,10 @@ pub(crate) fn take_init_info_block_phys() -> u64
     DESCRIPTOR_ARRAY.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
-    phys
+    (
+        phys,
+        INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Physical base of init's pre-reserved user-stack page `i` (`i <
@@ -730,11 +898,12 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 /// `populate_cspace` mints a Memory cap per extent and completes each slot's
 /// descriptor in place.
 ///
-/// Before draining, reserves init's Phase-9 backing (the `InitInfo` block and
-/// user stack) and seeds [`crate::mm::kernel_pt_pool`] from the pristine buddy,
-/// so the drain takes 100% of the remaining RAM and the post-handoff buddy is
-/// empty. The pool is the cap-backed source for intermediate page-table frames
-/// on the kernel-side Phase-9 bootstrap maps.
+/// Before draining, seeds [`crate::mm::kernel_pt_pool`] and reserves init's
+/// Phase-9 backing (the user stack, then the `InitInfo` block sized from the
+/// buddy's extent count and `counts`) from the pristine buddy, so the drain
+/// takes 100% of the remaining RAM and the post-handoff buddy is empty. The
+/// pool is the cap-backed source for intermediate page-table frames on the
+/// kernel-side Phase-9 bootstrap maps.
 ///
 /// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
 /// [`boot_retype_cspace`] call against the seed, before Phase 9's
@@ -745,24 +914,26 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 /// # Safety
 /// Single-threaded Phase 7. Buddy active.
 #[cfg(not(test))]
-pub(crate) unsafe fn drain_and_install_seed() -> usize
+pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
 {
     use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
 
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let reserve_pages = kernel_reserve_pages();
 
-    // Reserve every page Phase 9 consumes after the drain — init's InitInfo
-    // block and user stack — plus the kernel PT-frame pool, from the pristine
-    // buddy first. With those out of the way the drain takes 100% of the
-    // remainder, so the post-handoff buddy free count reaches 0. The PT pool
-    // must also be live before Phase 9's first bootstrap map, which holds.
-    reserve_init_backing();
+    // Reserve every page Phase 9 consumes after the drain — the kernel
+    // PT-frame pool, init's user stack and InitInfo block — from the pristine
+    // buddy first, the InitInfo block last so the extent count it is sized
+    // from already reflects the others. With those out of the way the drain
+    // takes 100% of the remainder, so the post-handoff buddy free count
+    // reaches 0. The PT pool must also be live before Phase 9's first
+    // bootstrap map, which holds.
     // SAFETY: single-threaded Phase 7 with no other pool consumer live yet,
     // so the unlocked init has exclusive access.
     unsafe {
         crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
     }
+    reserve_init_backing(counts);
+    let reserve_pages = kernel_reserve_pages();
 
     crate::kprintln!(
         "Phase 7: kernel reserve {} pages = pool {} + idle {}×{} + initinfo {} + \
@@ -771,7 +942,7 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
         POOL_SEED_PAGES,
         cpu_count,
         crate::sched::KERNEL_STACK_PAGES,
-        1usize << INIT_INFO_RESERVE_ORDER,
+        INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed),
         INIT_STACK_PAGES,
         seed_reserve_bytes() / 1024,
     );
@@ -803,7 +974,7 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
         crate::kprintln!(
             "Phase 7: drain yielded {} RAM extents; the InitInfo block holds {} descriptors",
             overflow.extents,
-            INIT_INFO_DESCRIPTOR_CAPACITY
+            descriptor_capacity()
         );
         crate::fatal("Phase 7: drained RAM extents exceed the InitInfo descriptor capacity")
     });
@@ -1184,26 +1355,26 @@ pub struct CSpaceLayout
 }
 
 /// Start of the `InitInfo` descriptor array: the reserved `InitInfo` block's
-/// bytes past the header, [`INIT_INFO_DESCRIPTOR_CAPACITY`] slots, set by
+/// bytes past the header, [`descriptor_capacity`] slots, set by
 /// `reserve_init_backing` at Phase 7. Phases 7 and 8 write every boot
 /// capability's descriptor there, the buddy drain's RAM extents first (in the
 /// slots their descriptors take), and Phase 9 writes the header in front of
 /// them, so no copy of the array exists; after hand-off it is init's, and
-/// `take_init_info_block_phys` nulls this pointer.
+/// `take_init_info_block` nulls this pointer.
 #[cfg(not(test))]
 static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Host-test stand-in for the `InitInfo` descriptor array.
 #[cfg(test)]
-static mut TEST_DESCRIPTOR_ARRAY: [CapDescriptor; INIT_INFO_DESCRIPTOR_CAPACITY] = [CapDescriptor {
+static mut TEST_DESCRIPTOR_ARRAY: [CapDescriptor; TEST_DESCRIPTOR_CAPACITY] = [CapDescriptor {
     slot: 0,
     cap_type: init_protocol::CapType::Memory,
     pad: [0; 3],
     aux0: 0,
     aux1: 0,
 };
-    INIT_INFO_DESCRIPTOR_CAPACITY];
+    TEST_DESCRIPTOR_CAPACITY];
 
 /// The descriptor array's first slot.
 fn descriptor_array() -> *mut CapDescriptor
@@ -1234,9 +1405,9 @@ fn descriptor_array() -> *mut CapDescriptor
 #[cfg(not(test))]
 unsafe fn descriptor_slots_mut() -> &'static mut [CapDescriptor]
 {
-    // SAFETY: the array spans INIT_INFO_DESCRIPTOR_CAPACITY slots of the
-    // reserved block (or the test stand-in); caller contract for exclusivity.
-    unsafe { core::slice::from_raw_parts_mut(descriptor_array(), INIT_INFO_DESCRIPTOR_CAPACITY) }
+    // SAFETY: the array spans descriptor_capacity() slots of the reserved
+    // block; caller contract for exclusivity.
+    unsafe { core::slice::from_raw_parts_mut(descriptor_array(), descriptor_capacity()) }
 }
 
 /// Borrow the descriptor slice for the supplied [`CSpaceLayout`]: the first
@@ -1249,7 +1420,7 @@ unsafe fn descriptor_slots_mut() -> &'static mut [CapDescriptor]
 /// Single-threaded boot guarantees no concurrent writer.
 pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
 {
-    debug_assert!(layout.descriptor_count <= INIT_INFO_DESCRIPTOR_CAPACITY);
+    debug_assert!(layout.descriptor_count <= descriptor_capacity());
     // SAFETY: see function-level doc; the first descriptor_count slots are
     // written and nothing writes them while the slice lives.
     unsafe { core::slice::from_raw_parts(descriptor_array(), layout.descriptor_count) }
@@ -1278,15 +1449,15 @@ pub(crate) fn owns_memory_minted_bytes() -> u64
 
 /// Write `desc` to slot `*count` of the `InitInfo` descriptor array and bump
 /// the count. Halts the boot, naming the capacity, when the array is full: the
-/// boot describes at most [`INIT_INFO_DESCRIPTOR_CAPACITY`] capabilities, in
+/// boot describes at most [`descriptor_capacity`] capabilities, in
 /// Phases 7 and 8.
 fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 {
-    if *count >= INIT_INFO_DESCRIPTOR_CAPACITY
+    if *count >= descriptor_capacity()
     {
         crate::kprintln!(
             "cap: the boot capabilities exceed the {} descriptors the InitInfo block holds",
-            INIT_INFO_DESCRIPTOR_CAPACITY
+            descriptor_capacity()
         );
         crate::fatal("cap: boot capabilities exceed the InitInfo descriptor capacity");
     }
@@ -1345,8 +1516,9 @@ pub fn init_capability_system(
     // 6. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
     {
+        let counts = DescriptorCounts::of(mmap, &mmio_apertures, info);
         // SAFETY: first call; single-threaded Phase 7.
-        let ram_extents = unsafe { drain_and_install_seed() };
+        let ram_extents = unsafe { drain_and_install_seed(&counts) };
 
         let id = alloc_cspace_id()
             .unwrap_or_else(|| crate::fatal("root CSpace: alloc_cspace_id exhausted at boot"));
@@ -1356,7 +1528,7 @@ pub fn init_capability_system(
         );
         // SAFETY: SEED installed above.
         let (_cs_kobj_nn, cs_ptr) =
-            unsafe { boot_retype_cspace(seed_memory_ref(), ROOT_CSPACE_INIT_PAGES, id) };
+            unsafe { boot_retype_cspace(seed_memory_ref(), root_cspace_init_pages(), id) };
         // Nothing mints a `SlotId` from the epoch here: Phase 9 reads it
         // back with `registry_epoch` for init's TCB, so the returned value
         // is discarded.
@@ -1405,7 +1577,7 @@ pub fn init_capability_system(
 ///
 /// There is one cap per region, however many the map reports, and a root
 /// `CSpace` or descriptor array they overflowed
-/// ([`INIT_INFO_DESCRIPTOR_CAPACITY`]) would halt the boot with a message
+/// ([`descriptor_capacity`]) would halt the boot with a message
 /// rather than drop tables.
 fn mint_acpi_region_caps(
     cspace: &mut CSpace,
@@ -1560,7 +1732,7 @@ fn populate_cspace(
         // descriptors (ORDER above), so descriptor slot i is extent slot i.
         debug_assert_eq!(desc_count, 0, "RAM descriptors are not the first");
         // SAFETY: single-threaded Phase 7; the drain filled the first
-        // ram_extents <= INIT_INFO_DESCRIPTOR_CAPACITY slots, and no other
+        // ram_extents <= descriptor_capacity() slots, and no other
         // reference to the array is live while this one is.
         let extents = unsafe { &mut descriptor_slots_mut()[..ram_extents] };
         complete_extent_descriptors(extents, |cap_base, cap_size| {
@@ -2709,6 +2881,72 @@ mod tests
         }
     }
 
+    // Defect caught: a `populate_cspace` capability with a descriptor that
+    // the `InitInfo` bound does not count (a new fixed cap, or ACPI regions
+    // counted short by the counts Phase 7 sizes from), so a boot sized from the
+    // bound overruns the region it reserved. The aperture, module and reclaim
+    // descriptors are one per entry of the array each count reads.
+    #[test]
+    fn the_descriptor_bound_counts_every_fixed_and_acpi_descriptor_phase_7_mints()
+    {
+        let mut mmap = Vec::new();
+        for i in 0..5u64
+        {
+            mmap.push(MemoryMapEntry {
+                physical_base: 0x1000_0000 + i * 0x10_0000,
+                size: 0x2000,
+                memory_type: MemoryType::AcpiReclaimable,
+            });
+            mmap.push(MemoryMapEntry {
+                physical_base: 0x1000_8000 + i * 0x10_0000,
+                size: 0x1000,
+                memory_type: MemoryType::Usable,
+            });
+        }
+        // SAFETY: every `BootInfo` field is an integer, a raw pointer, an
+        // array of those, or a `repr(u32)` enum with a 0 variant, so the
+        // all-zero bit pattern is a valid value.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        info.acpi_rsdp = 0xE_0010;
+        let mut cspace = CSpace::new(0);
+        let layout = populate_cspace(
+            &mut cspace,
+            0,
+            &mmap,
+            crate::platform::ValidatedApertures::empty(),
+            &info,
+        );
+        let counts =
+            DescriptorCounts::of(&mmap, &crate::platform::ValidatedApertures::empty(), &info);
+        let non_ram = layout.descriptor_count - layout.memory_count as usize;
+        assert_eq!(
+            counts.acpi_regions,
+            layout.acpi_region_memory_count as usize
+        );
+        assert!(
+            non_ram <= counts.bound(0),
+            "{non_ram} non-RAM descriptors past the bound"
+        );
+        // The fixed caps this build mints, exactly: one more fails here until
+        // the list below and FIXED_BOOT_DESCRIPTORS count it.
+        let fixed = [
+            true, // SchedControl
+            true, // root Interrupt
+            info.acpi_rsdp != 0,
+            crate::mm::init::dtb_extent().is_some(),
+            crate::arch::current::platform::console_mmio().is_some(),
+            crate::arch::current::HAS_IO_PORTS,
+            crate::arch::current::HAS_SBI,
+        ];
+        let fixed_here = fixed.iter().filter(|&&f| f).count();
+        assert_eq!(non_ram - counts.acpi_regions, fixed_here);
+        // The most any build mints (IoPort and SbiControl are exclusive, no
+        // architecture has both), with the two spare slots, is what the
+        // constant holds.
+        assert!(!(crate::arch::current::HAS_IO_PORTS && crate::arch::current::HAS_SBI));
+        assert_eq!(fixed.len() - 1 + 2, FIXED_BOOT_DESCRIPTORS);
+    }
+
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────
 
     #[test]
@@ -2736,6 +2974,44 @@ mod tests
         let (outside, inside) = split_around_span(0x8000, 0x9000, 0x8000, 0x9000);
         assert!(outside.iter().all(|&(a, b)| a >= b));
         assert_eq!(inside, (0x8000, 0x9000));
+    }
+
+    // Defect caught: an InitInfo region sized for fewer descriptors than the
+    // bound counts, so Phase 7's drain or a later push overruns it, or one a
+    // page larger than the bound needs, or a ceiling capacity that the
+    // protocol's page limit does not hold.
+    #[test]
+    fn the_init_info_region_is_the_fewest_pages_that_hold_the_bound()
+    {
+        for bound in [
+            1,
+            50,
+            168,
+            169,
+            170,
+            500,
+            4096,
+            INIT_INFO_DESCRIPTOR_CAPACITY,
+        ]
+        {
+            let pages = init_info_pages(bound);
+            assert!(
+                descriptors_in_pages(pages) >= bound,
+                "{bound} in {pages} pages"
+            );
+            assert!(pages == 1 || descriptors_in_pages(pages - 1) < bound);
+        }
+        assert_eq!(
+            init_info_pages(INIT_INFO_DESCRIPTOR_CAPACITY),
+            init_protocol::INIT_INFO_MAX_PAGES
+        );
+        assert!(
+            init_info_pages(INIT_INFO_DESCRIPTOR_CAPACITY + 1) > init_protocol::INIT_INFO_MAX_PAGES
+        );
+        // Every count the bound takes adds one descriptor each.
+        let base = init_info_descriptor_bound(0, 0, 0, 0, 0);
+        assert_eq!(init_info_descriptor_bound(3, 0, 0, 0, 0), base + 3);
+        assert_eq!(init_info_descriptor_bound(0, 1, 2, 3, 4), base + 10);
     }
 
     // Defect guarded: an in-place completion that writes a descriptor over

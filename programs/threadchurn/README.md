@@ -35,12 +35,17 @@ The fixture samples two quantities: its populated slot count, read with
 [`QUERY_POOL_STATUS`](../../services/memmgr/docs/ipc-interface.md#label-6-query_pool_status)
 free-bytes word and returns `None` when memmgr is unreachable. It runs in three phases:
 
-1. **Warm-up.** Eight spawn-and-join iterations bring the reaper's death `EventQueue`, the
-   pooled object slabs, and the page-table budget to steady state, then the baseline slot
-   count and free pool are sampled.
+1. **Warm-up.** Eight spawn-and-join iterations bring the reaper's first death queue, the
+   pooled object slabs, and the page-table budget to steady state. A held burst follows: the
+   fixture funds its `CSpace` with `BURST_SLOTS_PER_THREAD` (8) slots per burst thread (thread
+   spawn does not grow the `CSpace`), then `HELD_BURST` (128) detached threads each wait on
+   one barrier until all are spawned, so all are bound at once, past the reaper's first
+   99-node death queue and past 64 slots. Once released, a 100 ms sleep and 16 spawn-and-join
+   iterations reap them, and the slot count must be within `BURST_SLACK` (8) of its value
+   before the burst. Then the baseline slot count and free pool are sampled.
 2. **Join churn.** `JOIN_CHURN` (600) spawn-and-join iterations, logging a progress line every
    25, then a slot sample.
-3. **Detach churn.** `DETACH_BATCH` (48) threads are spawned and their handles dropped at once,
+3. **Detach churn.** `DETACH_BATCH` (128) threads are spawned and their handles dropped at once,
    a 100 ms sleep lets them die, and `REAP_CHURN` (50) spawn-and-join iterations drive the
    reaper sweeps that reclaim them. A 50 ms sleep and 16 more iterations drain stragglers, then
    the slot count and free pool are sampled again.
@@ -49,10 +54,11 @@ Flat results depend on ruststd returning each reclaimed thread's slab to memmgr 
 recycling pooled object-slab bytes in place, per the
 [memory allocation contract](../../docs/userspace-memory-model.md#memory-allocation-contract).
 
-The fixture then checks two bounds:
+The fixture then checks three bounds:
 
 | Bound | Constant | Fails when |
 |---|---|---|
+| Held-burst growth | `BURST_SLACK` (8) | The slot count after the held burst is reaped exceeds its value before the burst by more than 8 (the second death queue and its slab, and the heap's growth for the slot table) |
 | Slot growth | `SLACK` (4) | The larger of the two post-churn slot samples exceeds the baseline by more than 4 |
 | Pool drop | `POOL_SLACK_BYTES` (1 MiB) | The final free pool is more than 1 MiB below the baseline; skipped when either sample is `None` |
 
@@ -67,18 +73,22 @@ distinguishable from slow progress.
 ## Fixture Output
 
 The fixture prints exactly one stdout line on a completed run and exits `0` on pass, `1` on a
-failed bound:
+failed bound or a refused burst:
 
 | Line | When |
 |---|---|
-| `threadchurn: PASS slot growth <g> within slack 4` | Both bounds held |
-| `threadchurn: FAIL slot growth <g> exceeds slack 4` | The slot bound failed; the pool bound is not checked |
+| `threadchurn: PASS slot growth <g> within slack 4` | Every bound held |
+| `threadchurn: FAIL CSpace funding for the held burst` | The `CSpace` could not be funded for the held burst; no bound is checked |
+| `threadchurn: FAIL held-burst spawn <n> refused` | The held burst's `n`th spawn failed; no bound is checked |
+| `threadchurn: FAIL held-burst slot growth <g> exceeds 8` | The held-burst bound failed; the later bounds are not checked |
+| `threadchurn: FAIL slot growth <g> exceeds slack 4` | The held-burst bound held and the slot bound failed; the pool bound is not checked |
 | `threadchurn: FAIL pool free dropped <d> exceeds slack 1048576` | The slot bound held and the pool bound failed |
 
-It also logs through `log!` under the `[threadchurn]` name: the baseline, a
-`join-churn progress <n>/600` line every 25 iterations, the post-churn samples, the measured
-pool drop when the pool bound is checked, and a `PASS` or `FAIL` line. A failed `cap_info`
-call or a panicked worker panics the fixture, so it exits non-zero with no stdout marker.
+It also logs through `log!` under the `[threadchurn]` name: the held burst's slot counts, the
+baseline, a `join-churn progress <n>/600` line every 25 iterations, the post-churn samples, the
+measured pool drop when the pool bound is checked, and a `PASS` or `FAIL` line (a refused
+held-burst spawn logs its count, the slot count and the headroom). A failed `cap_info` call or a
+panicked worker panics the fixture, so it exits non-zero with no stdout marker.
 
 ---
 

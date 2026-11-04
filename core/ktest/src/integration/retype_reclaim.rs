@@ -173,7 +173,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── CSpaceObj ────────────────────────────────────────────────────────────
     //
     // A 4-page slab: page 0 wrapper, three pool pages that would back three
-    // leaves (3 × 56 − 1 = 167 slots) on demand.
+    // leaves (3 × `CSPACE_SLOTS_PER_PAGE` − 1 slots, slot 0 reserved) on
+    // demand.
     let cspace_cap = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace failed")?;
     let mid = read_available(memory)?;

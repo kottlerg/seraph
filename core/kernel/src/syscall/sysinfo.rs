@@ -89,6 +89,12 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             Ok(crate::sched::thread_slot::thread_slot_bytes())
         }
+        11 =>
+        // LiveCSpaceCount — CSpace registry ids in use, system-wide; a count
+        // the ABI fixes as a diagnostic (`SystemInfoType::LiveCSpaceCount`).
+        {
+            Ok(u64::from(crate::cap::live_cspace_count()))
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }

@@ -85,6 +85,7 @@ pub fn run_all(ctx: &TestContext)
         "cap::move_out_of_bounds_err",
         cap::move_out_of_bounds_err(ctx)
     );
+    run_test!("cap::lookup_bounds", cap::lookup_bounds(ctx));
     run_test!("cap::derive_zero_rights", cap::derive_zero_rights(ctx));
     run_test!("cap::revoke_null_slot_err", cap::revoke_null_slot_err(ctx));
     run_test!(
@@ -635,6 +636,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "sysinfo::thread_retype_bytes_funds_one_thread",
         sysinfo::thread_retype_bytes_funds_one_thread(ctx)
+    );
+    run_test!(
+        "sysinfo::live_cspace_count",
+        sysinfo::live_cspace_count(ctx)
     );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────

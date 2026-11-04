@@ -459,6 +459,11 @@ pub const SYS_PROCESS_EXIT: u64 = 54;
 /// `core/kernel/docs/entropy.md`.
 pub const SYS_GETRANDOM: u64 = 55;
 
+/// One past the highest syscall number. Every number below it is assigned,
+/// and the kernel bounds its dispatch table by it, so a syscall numbered at or
+/// above it raises it.
+pub const SYSCALL_NR_BOUND: u64 = SYS_GETRANDOM + 1;
+
 // ── getrandom constants ───────────────────────────────────────────────────────
 
 /// Maximum bytes a single `SYS_GETRANDOM` call may request.
@@ -1181,6 +1186,12 @@ pub enum SystemInfoType
     /// whole pages), so it is fixed for a boot but not across machines. A
     /// process sizes the Memory cap it retypes a thread from with it.
     ThreadRetypeBytes = 10,
+    /// Number of `CSpace` ids in use system-wide: the kernel's `CSpace`
+    /// registry ids allocated and not yet returned by a `CSpace` teardown, the
+    /// root `CSpace`'s included. A diagnostic count, readable by any process
+    /// with no capability; ktest reads it to check that a teardown returns its
+    /// id (core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`).
+    LiveCSpaceCount = 11,
 }
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.

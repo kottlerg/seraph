@@ -9,8 +9,8 @@
 //! discriminant).
 
 use syscall::{
-    MAP_WRITABLE, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap, memory_merge,
-    memory_split, system_info,
+    MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap,
+    memory_merge, memory_split, system_info,
 };
 use syscall_abi::{
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE, SyscallError,
@@ -293,6 +293,40 @@ pub fn thread_retype_bytes_funds_one_thread(ctx: &TestContext) -> TestResult
     if left != Ok(0)
     {
         return Err("a thread left bytes in a grant of exactly ThreadRetypeBytes");
+    }
+    Ok(())
+}
+
+/// `system_info(LiveCSpaceCount)` counts `CSpace` ids in use: at least the
+/// root's, one more while a created `CSpace` lives, and back once it is
+/// deleted.
+///
+/// Defect caught: a `CSpace` teardown that does not return its id to the
+/// registry (the count stays raised after the delete), or a selector that
+/// does not follow creation.
+pub fn live_cspace_count(ctx: &TestContext) -> TestResult
+{
+    let count = || {
+        system_info(SystemInfoType::LiveCSpaceCount as u64)
+            .map_err(|_| "system_info(LiveCSpaceCount) failed")
+    };
+    let before = count()?;
+    if before == 0
+    {
+        return Err("system_info(LiveCSpaceCount) does not count ktest's own CSpace");
+    }
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "sysinfo::live_cspace_count: cap_create_cspace failed")?;
+    let during = count();
+    cap_delete(cs).map_err(|_| "sysinfo::live_cspace_count: cap_delete failed")?;
+    let after = count()?;
+    if during? != before + 1
+    {
+        return Err("system_info(LiveCSpaceCount) did not count a created CSpace");
+    }
+    if after != before
+    {
+        return Err("a CSpace teardown did not return its id (LiveCSpaceCount stayed raised)");
     }
     Ok(())
 }

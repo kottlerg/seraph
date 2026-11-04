@@ -202,10 +202,11 @@ pub fn new_child_at(
 ) -> Result<SpawnedChild, &'static str>
 {
     // cap_create_cspace(memory, augment_target=0, init_pages=4) — 3 pool
-    // pages back 167 usable slots, ample for tests that copy a few caps
-    // into the child. Tests needing a specific pool shape (e.g. the
-    // exhaustion fixtures in unit/ipc.rs seed a single pool page) bypass
-    // this helper and call cap_create_cspace directly.
+    // pages back 3 × `CSPACE_SLOTS_PER_PAGE` − 1 usable slots (slot 0 is
+    // reserved), ample for tests that copy a few caps into the child.
+    // Tests needing a specific pool shape (e.g. the exhaustion fixtures in
+    // unit/ipc.rs seed a single pool page) bypass this helper and call
+    // cap_create_cspace directly.
     let cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "spawn::new_child: cap_create_cspace failed")?;
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, sched_cap, priority)

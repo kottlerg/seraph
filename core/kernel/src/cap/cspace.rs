@@ -49,6 +49,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use super::object::{CSpaceKernelObject, KernelObjectHeader};
 use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
+use crate::arch::nospec;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -159,8 +160,9 @@ const _: () = assert!(
 // ── CSpaceDirPage ─────────────────────────────────────────────────────────────
 
 /// One pool-allocated directory page of the indirect region: `DIR_FANOUT`
-/// leaf-page pointers. All-zeros (every entry null) is the valid initial
-/// state. Entries are write-once while the `CSpace` is live: published with
+/// leaf-page pointers. Every entry names [`SENTINEL_LEAF`] in the initial
+/// state, set by [`CSpace::grow`] before the page is published; no entry is
+/// null. Entries are write-once while the `CSpace` is live: published with
 /// Release by [`CSpace::grow`], read with Acquire by the lock-free lookup
 /// path.
 #[repr(C)]
@@ -172,6 +174,45 @@ struct CSpaceDirPage
 // A CSpaceDirPage occupies exactly one page — `grow` pops one pool page per
 // directory page and casts it wholesale.
 const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_SIZE);
+
+// ── Sentinel pages ────────────────────────────────────────────────────────────
+
+/// The leaf every unallocated leaf pointer names: all slots `Null`, never
+/// written. It holds no interior mutability, so it is placed in read-only
+/// data and a stray write through it faults.
+///
+/// With it, a leaf pointer the lookup path loads is never null, so the path
+/// carries no null test whose misprediction could dereference a null leaf;
+/// the masked fallback of [`CSpace::leaf_ptr`] resolves here too
+/// (core/kernel/docs/capability-internals.md § Speculative-Execution
+/// Hardening).
+// SAFETY: all-zero bytes are a valid `CSpacePage` (every slot `Null`, with
+// `None` object and derivation links), the state a freshly zeroed pool page
+// has.
+static SENTINEL_LEAF: CSpacePage = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+
+/// The directory every unallocated indirect-region pointer names: each entry
+/// names [`SENTINEL_LEAF`]. Never written; its entries are atomics only
+/// because a live directory page's are.
+static SENTINEL_DIR: CSpaceDirPage = CSpaceDirPage {
+    entries: [const { AtomicPtr::new(sentinel_leaf()) }; DIR_FANOUT],
+};
+
+/// [`SENTINEL_LEAF`] as the pointer type a leaf entry holds. Nothing writes
+/// through it: [`CSpace::slot_mut`] refuses it, and a grow publishes a fresh
+/// page in its place.
+const fn sentinel_leaf() -> *mut CSpacePage
+{
+    (&raw const SENTINEL_LEAF).cast_mut()
+}
+
+/// [`SENTINEL_DIR`] as the pointer type an indirect entry holds. Its entries
+/// are never stored to: a grow into the indirect region publishes a fresh
+/// directory page first.
+const fn sentinel_dir() -> *mut CSpaceDirPage
+{
+    (&raw const SENTINEL_DIR).cast_mut()
+}
 
 // ── CSpace ────────────────────────────────────────────────────────────────────
 
@@ -198,14 +239,15 @@ pub struct CSpace
 {
     id: CSpaceId,
     /// Direct region: inline pointers to the first `L1_DIRECT` leaf
-    /// pages. Null = unallocated. Pages come from the retype pool (or the
-    /// host heap in the test stub — the `kobj` field discriminates: null =
+    /// pages. [`SENTINEL_LEAF`] = unallocated; never null. Pages come from
+    /// the retype pool (or the host heap in the test stub — the `kobj` field
+    /// discriminates: null =
     /// heap, Drop Box-frees each page; non-null = retype pool,
     /// `dealloc_object(CSpaceObj)` reclaims donations wholesale).
     direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
     /// Indirect region: inline pointers to pool-allocated directory pages,
-    /// each fanning out to `DIR_FANOUT` further leaves. Null =
-    /// unallocated.
+    /// each fanning out to `DIR_FANOUT` further leaves. [`SENTINEL_DIR`] =
+    /// unallocated; never null.
     indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
     /// Grow cursor: leaves `0..next_leaf` are allocated (contiguously);
     /// `next_leaf` is the next leaf `grow` will materialise. A `u32` holds it:
@@ -263,8 +305,8 @@ impl CSpace
     {
         Self {
             id,
-            direct: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
-            indirect: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
+            direct: core::array::from_fn(|_| AtomicPtr::new(sentinel_leaf())),
+            indirect: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir())),
             next_leaf: 0,
             allocated_slots: 0,
             pool_exhaustions: 0,
@@ -474,12 +516,19 @@ impl CSpace
         if leaf_idx >= L1_DIRECT
         {
             let dir_idx = (leaf_idx - L1_DIRECT) / DIR_FANOUT;
-            if self.indirect[dir_idx].load(Ordering::Relaxed).is_null()
+            if self.indirect[dir_idx].load(Ordering::Relaxed) == sentinel_dir()
             {
                 let dir_nn: NonNull<CSpaceDirPage> = self.alloc_zeroed_page()?;
-                // All-null entries are the valid empty state; the Release
-                // publication pairs with the lookup path's Acquire so a
-                // lock-free reader never observes uninitialised entries.
+                // Every entry names the sentinel leaf before publication (the
+                // empty state; no entry is ever null). The Release publication
+                // pairs with the lookup path's Acquire so a lock-free reader
+                // never observes an entry before this initialisation.
+                // SAFETY: dir_nn points at an exclusively-owned page not yet
+                // published to any reader.
+                for entry in unsafe { &dir_nn.as_ref().entries }
+                {
+                    entry.store(sentinel_leaf(), Ordering::Relaxed);
+                }
                 self.indirect[dir_idx].store(dir_nn.as_ptr(), Ordering::Release);
             }
         }
@@ -554,8 +603,9 @@ impl CSpace
         {
             let rel = leaf_idx - L1_DIRECT;
             let dir = self.indirect[rel / DIR_FANOUT].load(Ordering::Relaxed);
-            // SAFETY: ensured non-null above under the same lock; directory
-            // pages are write-once and never freed while the CSpace lives.
+            // SAFETY: a real directory page, ensured above under the same lock
+            // (never the sentinel); directory pages are write-once and never
+            // freed while the CSpace lives.
             unsafe {
                 (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
             }
@@ -567,56 +617,80 @@ impl CSpace
         Ok(())
     }
 
-    /// Resolve a leaf index to its page pointer, or `None` if the leaf is
-    /// unallocated or out of range.
+    /// Resolve a leaf index to its page pointer: the leaf's page when it is
+    /// allocated, [`SENTINEL_LEAF`] when it is unallocated or out of range.
+    ///
+    /// The region branch chooses between the direct and indirect loads, and
+    /// each arm bounds its own array index as data (`nospec::index_mask`) and
+    /// selects the sentinel when that bound fails, so no misprediction of the
+    /// region branch addresses an entry past its array, and the masked
+    /// fallback reaches no leaf but the sentinel. The loaded pointers are
+    /// never null (unallocated entries name the sentinels), so no null test
+    /// sits on the path.
     ///
     /// Acquire loads at each level pair with [`grow`][Self::grow]'s Release
-    /// publications, so a non-null result points at a fully-initialised
+    /// publications, so a non-sentinel result points at a fully-initialised
     /// page (see the struct's memory-ordering contract).
-    fn leaf_ptr(&self, leaf_idx: usize) -> Option<NonNull<CSpacePage>>
+    fn leaf_ptr(&self, leaf_idx: usize) -> *mut CSpacePage
     {
         if leaf_idx < L1_DIRECT
         {
-            NonNull::new(self.direct[leaf_idx].load(Ordering::Acquire))
-        }
-        else if leaf_idx < MAX_LEAVES
-        {
-            let rel = leaf_idx - L1_DIRECT;
-            let dir = NonNull::new(self.indirect[rel / DIR_FANOUT].load(Ordering::Acquire))?;
-            // SAFETY: directory pages are write-once, Release-published
-            // after zero-init, and never freed while the CSpace is live.
-            let dir_ref = unsafe { dir.as_ref() };
-            NonNull::new(dir_ref.entries[rel % DIR_FANOUT].load(Ordering::Acquire))
+            let in_range = nospec::index_mask(leaf_idx, L1_DIRECT);
+            let page = self.direct[leaf_idx & in_range].load(Ordering::Acquire);
+            nospec::select_ptr(in_range, page, sentinel_leaf())
         }
         else
         {
-            None
+            let rel = leaf_idx.wrapping_sub(L1_DIRECT);
+            let in_range = nospec::index_mask(rel, L1_INDIRECT * DIR_FANOUT);
+            let rel = rel & in_range;
+            let dir = self.indirect[rel / DIR_FANOUT].load(Ordering::Acquire);
+            // SAFETY: an indirect entry is never null: it names a directory
+            // page (write-once, Release-published after its entries were set,
+            // never freed while the CSpace is live) or the static sentinel.
+            let page = unsafe { (*dir).entries[rel % DIR_FANOUT].load(Ordering::Acquire) };
+            nospec::select_ptr(in_range, page, sentinel_leaf())
         }
     }
 
     /// Look up a slot by index. Returns `None` if the index is out of range
     /// or the backing page has not been allocated.
+    ///
+    /// The `None` decision follows the loads: on whichever path reaches the
+    /// slot read, the page is a live leaf of this `CSpace` or the all-`Null`
+    /// sentinel.
     pub fn slot(&self, index: u32) -> Option<&CapabilitySlot>
     {
         let idx = index as usize;
-        let page_nn = self.leaf_ptr(idx / L2_SIZE)?;
-        // SAFETY: leaf pages are never freed or moved while the CSpace is
-        // live; CapabilitySlot is repr(C) and the page bytes belong to this
-        // CSpace. Content races are defended by tag/generation checks at
-        // every resolution site.
-        let page = unsafe { page_nn.as_ref() };
+        let page = self.leaf_ptr(idx / L2_SIZE);
+        if page == sentinel_leaf()
+        {
+            return None;
+        }
+        // SAFETY: page is a live leaf (not the sentinel, checked above); leaf
+        // pages are never freed or moved while the CSpace is live;
+        // CapabilitySlot is repr(C) and the page bytes belong to this CSpace.
+        // Content races are defended by tag/generation checks at every
+        // resolution site.
+        let page = unsafe { &*page };
         Some(&page.slots[idx % L2_SIZE])
     }
 
-    /// Mutable variant of [`slot`][Self::slot].
+    /// Mutable variant of [`slot`][Self::slot]. Never returns a slot of the
+    /// sentinel leaf.
     pub fn slot_mut(&mut self, index: u32) -> Option<&mut CapabilitySlot>
     {
         let idx = index as usize;
-        let mut page_nn = self.leaf_ptr(idx / L2_SIZE)?;
+        let page = self.leaf_ptr(idx / L2_SIZE);
+        if page == sentinel_leaf()
+        {
+            return None;
+        }
         // SAFETY: same as `slot`; `&mut self` comes from the holder of
         // whichever lock domain guards the fields being written (see the
-        // struct's concurrency contract).
-        let page = unsafe { page_nn.as_mut() };
+        // struct's concurrency contract). The sentinel, which is shared and
+        // read-only, is refused above.
+        let page = unsafe { &mut *page };
         Some(&mut page.slots[idx % L2_SIZE])
     }
 
@@ -653,7 +727,7 @@ impl CSpace
             let last = (target_leaf - L1_DIRECT) / DIR_FANOUT;
             for d in first..=last
             {
-                if self.indirect[d].load(Ordering::Relaxed).is_null()
+                if self.indirect[d].load(Ordering::Relaxed) == sentinel_dir()
                 {
                     dirs += 1;
                 }
@@ -1044,11 +1118,12 @@ impl CSpace
     {
         for leaf_idx in 0..self.next_leaf as usize
         {
-            if let Some(page_nn) = self.leaf_ptr(leaf_idx)
+            let page = self.leaf_ptr(leaf_idx);
+            if page != sentinel_leaf()
             {
-                // SAFETY: page_nn is owned by this CSpace and not aliased
-                // outside the lock.
-                let page = unsafe { page_nn.as_ref() };
+                // SAFETY: page is a live leaf owned by this CSpace (not the
+                // sentinel, checked above) and not aliased outside the lock.
+                let page = unsafe { &*page };
                 let start = usize::from(leaf_idx == 0);
                 for slot_idx in start..L2_SIZE
                 {
@@ -1082,8 +1157,8 @@ impl Drop for CSpace
             {
                 for entry in &self.direct
                 {
-                    let p = entry.swap(core::ptr::null_mut(), Ordering::AcqRel);
-                    if !p.is_null()
+                    let p = entry.swap(sentinel_leaf(), Ordering::AcqRel);
+                    if p != sentinel_leaf()
                     {
                         // SAFETY: test stub: p came from Box::into_raw via
                         // alloc_zeroed_page's heap branch.
@@ -1092,8 +1167,8 @@ impl Drop for CSpace
                 }
                 for entry in &self.indirect
                 {
-                    let dir = entry.swap(core::ptr::null_mut(), Ordering::AcqRel);
-                    if dir.is_null()
+                    let dir = entry.swap(sentinel_dir(), Ordering::AcqRel);
+                    if dir == sentinel_dir()
                     {
                         continue;
                     }
@@ -1102,8 +1177,8 @@ impl Drop for CSpace
                     unsafe {
                         for leaf in &(*dir).entries
                         {
-                            let p = leaf.swap(core::ptr::null_mut(), Ordering::AcqRel);
-                            if !p.is_null()
+                            let p = leaf.swap(sentinel_leaf(), Ordering::AcqRel);
+                            if p != sentinel_leaf()
                             {
                                 drop(Box::from_raw(p));
                             }
@@ -1682,5 +1757,103 @@ mod tests
         }
         assert_eq!(drained, free_before + L2_SIZE);
         assert!(cs.free_head.is_none() && cs.free_tail.is_none());
+    }
+
+    /// Every byte of the sentinel leaf is zero (every slot `Null`) and every
+    /// sentinel-directory entry names the sentinel leaf.
+    fn assert_sentinels_pristine()
+    {
+        // SAFETY: SENTINEL_LEAF is a live static of `size_of::<CSpacePage>()`
+        // bytes, read as bytes only.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const SENTINEL_LEAF).cast::<u8>(),
+                core::mem::size_of::<CSpacePage>(),
+            )
+        };
+        assert!(bytes.iter().all(|&b| b == 0), "sentinel leaf written");
+        assert!(
+            SENTINEL_DIR
+                .entries
+                .iter()
+                .all(|e| e.load(Ordering::Relaxed) == sentinel_leaf()),
+            "sentinel directory written"
+        );
+    }
+
+    #[test]
+    fn unallocated_and_out_of_range_indices_resolve_nothing()
+    {
+        let mut cs = CSpace::new(0);
+        let probes = [
+            0u32,
+            1,
+            (L1_DIRECT * L2_SIZE - 1) as u32,
+            (L1_DIRECT * L2_SIZE) as u32,
+            (MAX_SLOTS_STRUCTURAL - 1) as u32,
+            MAX_SLOTS_STRUCTURAL as u32,
+            syscall::CAP_INDEX_MASK,
+            u32::MAX,
+        ];
+        for &i in &probes
+        {
+            assert!(cs.slot(i).is_none(), "fresh CSpace resolved index {i}");
+            assert!(
+                cs.slot_mut(i).is_none(),
+                "fresh CSpace resolved index {i} mutably"
+            );
+        }
+        cs.allocate_slot().unwrap();
+        assert!(cs.slot(0).is_some_and(CapabilitySlot::is_null));
+        for &i in &probes[2..]
+        {
+            assert!(cs.slot(i).is_none(), "one-leaf CSpace resolved index {i}");
+            assert!(
+                cs.slot_mut(i).is_none(),
+                "one-leaf CSpace resolved index {i} mutably"
+            );
+        }
+        assert_sentinels_pristine();
+    }
+
+    #[test]
+    fn unallocated_leaf_under_a_live_directory_resolves_nothing()
+    {
+        // Grow one leaf into the indirect region: its directory page is live,
+        // and every other entry of that directory names the sentinel leaf.
+        let mut cs = CSpace::new(0);
+        assert_eq!(
+            cs.grow_toward((L1_DIRECT * L2_SIZE) as u32, MAX_LEAVES),
+            Ok(true)
+        );
+        assert_eq!(cs.next_leaf as usize, L1_DIRECT + 1);
+        let first_indirect = (L1_DIRECT * L2_SIZE) as u32;
+        assert!(cs.slot(first_indirect).is_some());
+        let next_leaf = ((L1_DIRECT + 1) * L2_SIZE) as u32;
+        let last_in_dir = ((L1_DIRECT + DIR_FANOUT) * L2_SIZE - 1) as u32;
+        let next_dir = ((L1_DIRECT + DIR_FANOUT) * L2_SIZE) as u32;
+        for i in [next_leaf, last_in_dir, next_dir]
+        {
+            assert!(cs.slot(i).is_none(), "unallocated index {i} resolved");
+            assert!(
+                cs.slot_mut(i).is_none(),
+                "unallocated index {i} resolved mutably"
+            );
+        }
+        assert_sentinels_pristine();
+        drop(cs);
+        assert_sentinels_pristine();
+    }
+
+    #[test]
+    fn leaf_ptr_falls_back_to_the_sentinel()
+    {
+        let mut cs = CSpace::new(0);
+        cs.allocate_slot().unwrap();
+        assert_ne!(cs.leaf_ptr(0), sentinel_leaf());
+        for leaf in [1, L1_DIRECT, MAX_LEAVES, MAX_LEAVES + 1, usize::MAX]
+        {
+            assert_eq!(cs.leaf_ptr(leaf), sentinel_leaf(), "leaf {leaf}");
+        }
     }
 }

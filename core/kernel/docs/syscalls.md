@@ -2444,6 +2444,14 @@ pub enum SystemInfoType
     /// each rounded up to pages, at least one. Fixed for a boot, not across
     /// machines; ruststd, procmgr and init size every Thread slab from it.
     ThreadRetypeBytes   = 10,
+
+    /// Number of `CSpace` ids in use system-wide: ids of the kernel's `CSpace`
+    /// registry allocated at a `CSpace`'s creation and not yet returned by its
+    /// teardown (`free_cspace_id`), the root `CSpace`'s included
+    /// ([capability-internals.md](capability-internals.md) § CSpace Registry).
+    /// A diagnostic count, read by ktest to check that a teardown returns its
+    /// id; it counts every process's `CSpace`s.
+    LiveCSpaceCount     = 11,
 }
 ```
 

@@ -203,6 +203,15 @@ pub fn alloc_cspace_id() -> Option<CSpaceId>
     CSPACE_REGISTRY.alloc()
 }
 
+/// Number of `CSpace` ids in use: allocated by [`alloc_cspace_id`] and not
+/// yet returned by [`free_cspace_id`], the root `CSpace`'s included.
+/// `SYS_SYSTEM_INFO(LiveCSpaceCount)` reports it.
+#[must_use]
+pub fn live_cspace_count() -> u32
+{
+    CSPACE_REGISTRY.live()
+}
+
 /// Register a `CSpace` pointer under its ID.
 ///
 /// Called immediately after a [`CSpace`] is allocated. Returns the registry

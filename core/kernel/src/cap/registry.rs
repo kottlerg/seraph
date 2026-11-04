@@ -105,7 +105,12 @@ pub struct CSpaceRegistry
     /// Head of the intrusive free list of retired ids (`NO_NEXT` when empty).
     /// Mutated only under `free_lock`.
     free_head: AtomicU32,
-    /// Serialises `high_water`, `free_head`, and every entry's `next_free`.
+    /// Ids handed out by [`Self::alloc`] and not yet returned by
+    /// [`Self::retire`]. Mutated only under `free_lock`; read lock-free by
+    /// [`Self::live`].
+    live: AtomicU32,
+    /// Serialises `high_water`, `free_head`, `live`, and every entry's
+    /// `next_free`.
     /// `CSpace` create and destroy are rare beside the lookup paths, which
     /// never take it, and every hold is O(1).
     free_lock: crate::sync::Spinlock,
@@ -123,6 +128,7 @@ impl CSpaceRegistry
             capacity: AtomicU32::new(0),
             high_water: AtomicU32::new(0),
             free_head: AtomicU32::new(NO_NEXT),
+            live: AtomicU32::new(0),
             free_lock: crate::sync::Spinlock::new(),
         }
     }
@@ -250,6 +256,12 @@ impl CSpaceRegistry
             self.free_head.store(next, Ordering::Relaxed);
             Some(head)
         };
+        if id.is_some()
+        {
+            // At most `capacity` ids are live, so the count cannot overflow.
+            self.live
+                .store(self.live.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
         // SAFETY: paired with lock_raw above.
         unsafe { self.free_lock.unlock_raw(saved) };
         id
@@ -307,8 +319,22 @@ impl CSpaceRegistry
             .next_free
             .store(self.free_head.load(Ordering::Relaxed), Ordering::Relaxed);
         self.free_head.store(id, Ordering::Relaxed);
+        // Every retired id was handed out by `alloc` (the pre-condition), so
+        // the count is at least one here.
+        self.live.store(
+            self.live.load(Ordering::Relaxed).saturating_sub(1),
+            Ordering::Relaxed,
+        );
         // SAFETY: paired with lock_raw above.
         unsafe { self.free_lock.unlock_raw(saved) };
+    }
+
+    /// Ids in use: handed out by [`Self::alloc`] and not yet returned by
+    /// [`Self::retire`]. A snapshot; concurrent creates and teardowns move it.
+    #[must_use]
+    pub fn live(&self) -> u32
+    {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// `id`'s current epoch, or 0 when no installed chunk backs it.
@@ -459,6 +485,37 @@ mod tests
             assert_eq!(reg.alloc(), Some(expected));
         }
         assert_eq!(reg.alloc(), None);
+    }
+
+    // Defect caught: an alloc or retire path that does not move the count, so
+    // `SYS_SYSTEM_INFO(LiveCSpaceCount)` would miss a teardown that leaks its
+    // id or report one that was returned.
+    #[test]
+    fn live_counts_ids_handed_out_and_not_yet_retired()
+    {
+        let reg = registry(1);
+        assert_eq!(reg.live(), 0);
+        let a = reg.alloc().unwrap();
+        let b = reg.alloc().unwrap();
+        assert_eq!(reg.live(), 2);
+        reg.retire(a, 7);
+        assert_eq!(reg.live(), 1);
+        // A reused id counts again.
+        let c = reg.alloc().unwrap();
+        assert_eq!(c, a);
+        assert_eq!(reg.live(), 2);
+        reg.retire(b, 9);
+        reg.retire(c, 11);
+        assert_eq!(reg.live(), 0);
+    }
+
+    #[test]
+    fn exhausted_registry_counts_every_backed_id_live()
+    {
+        let reg = registry(1);
+        while reg.alloc().is_some()
+        {}
+        assert_eq!(reg.live(), reg.capacity());
     }
 
     #[test]

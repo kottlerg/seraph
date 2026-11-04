@@ -1181,6 +1181,12 @@ pub enum SystemInfoType
     /// whole pages), so it is fixed for a boot but not across machines. A
     /// process sizes the Memory cap it retypes a thread from with it.
     ThreadRetypeBytes = 10,
+    /// Number of `CSpace` ids in use system-wide: the kernel's `CSpace`
+    /// registry ids allocated and not yet returned by a `CSpace` teardown, the
+    /// root `CSpace`'s included. A diagnostic count, readable by any process
+    /// with no capability; ktest reads it to check that a teardown returns its
+    /// id (core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`).
+    LiveCSpaceCount = 11,
 }
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.

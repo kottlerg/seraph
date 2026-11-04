@@ -120,7 +120,8 @@ truth for "how work is tracked and shipped" on this project.
 
   The surface findings of a `NON-BLOCKING ISSUES ONLY` run enter the ledger
   because the pass below records them after every such run, whatever its
-  audit verdict and failed-agent list.
+  audit verdict and failed-agent list. The glob reads an auditor-only run's
+  `audit-<head>.json` too; its empty finding lists add no entry.
 
   Handle the run's findings as that section says, in one pass: fixes via
   commits; recorded findings via `gh issue edit` on the Issue the section
@@ -156,7 +157,20 @@ truth for "how work is tracked and shipped" on this project.
   it, and update each copy in the same push.
 
   After the fixes are pushed and CI is green again, run the workflow in
-  `delta` mode. Prompt for the merge decision only under that section's
+  `delta` mode, or, after a fix round whose delta is documentation or
+  comments only and merges no `master` in, the auditor-only run that
+  section allows: `@pr-auditor` alone, told it is that run, with the PR
+  number, the `since` head (the head the last run with the reviewer
+  reviewed), the claimed fixes, and the open Issue list. Save its report as
+  `target/xtask/review/pr<N>/audit-<head>.md` and its record as
+  `audit-<head>.json` in the shape `.claude/agents/worker.md` § Review
+  gives, whose `verdict` is the reviewer verdict that section gives the
+  run, and surface both verdict lines to the user verbatim. The next delta
+  that changes anything but documentation or comments, or merges `master`
+  in, takes the workflow in `delta` mode again, `since` the head of the
+  last run with the reviewer.
+
+  Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
   offer one more fix round beside the merge. Merge via
   `gh pr merge <N> --merge --delete-branch` (per

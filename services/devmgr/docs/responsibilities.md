@@ -105,8 +105,8 @@ devmgr's responsibilities are:
   reach that memory when it is freed. Each withdrawal resets once, and the
   wait for the confirmation holds devmgr's thread (the settle, or the registry
   loop) for up to `RESET_TIMEOUT` (5 s) per withdrawn device, all of it for
-  one that does not confirm. Two windows remain until a driver can be frozen
-  before its device is taken from it
+  one whose status does not read 0 within the bound. Two windows remain until
+  a driver can be frozen before its device is taken from it
   ([#731](https://github.com/kottlerg/seraph/issues/731)): a device that does
   not confirm its reset is logged and its driver destroyed anyway, so the
   device may still be writing that memory when it is freed; and the driver can
@@ -163,10 +163,10 @@ devmgr's responsibilities are:
   settled drivers. While a batch settles, devmgr receives on no registry
   endpoint, and every registry caller waits for the settle, at most the settle
   bound plus up to `RESET_TIMEOUT` for each withdrawn `VirtIO` device (all of
-  it for one that does not confirm its reset, above). devmgr cannot serve the
-  settled classes meanwhile: it must reply to a received call before its next
-  receive, and it holds no saved reply capability, so an input query cannot
-  wait while other labels are served.
+  it for one whose status does not read 0 within the bound, above). devmgr
+  cannot serve the settled classes meanwhile: it must reply to a received call
+  before its next receive, and it holds no saved reply capability, so an input
+  query cannot wait while other labels are served.
 
   The settle does not deadlock against the log path as long as the drivers'
   synchronous log calls reach a receiver that does not wait on devmgr. During

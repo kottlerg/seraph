@@ -63,12 +63,12 @@ dies while its device asserts a shared level-triggered line leaves the line's ot
 assertion to loop on once the reset lands; between the driver's death, which releases its binding,
 and the reset, they may see re-deliveries their own devices did not raise
 ([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
-§ Interrupt Delivery). Three windows remain until a driver can be frozen before its device is taken
+§ Interrupt Delivery). Two windows remain until a driver can be frozen before its device is taken
 from it ([#731](https://github.com/kottlerg/seraph/issues/731)): a device that does not confirm its
-reset, whose driver is destroyed anyway, may still be writing that driver's memory as it is freed; a
-driver can fault on its revoked BARs and be reaped before the reset lands; and a driver that dies on
-its own has its memory freed by procmgr before devmgr hears of the death and resets its device. The
-withdrawal, the reset among its steps, is specified in
+reset, whose driver is destroyed anyway, may still be writing that driver's memory as it is freed;
+and a driver can fault on its revoked BARs and be reaped before the reset lands. A driver that dies
+on its own has its memory freed by procmgr before devmgr hears of the death and resets its device,
+which #731 tracks too. The withdrawal, the reset among its steps, is specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities.
 

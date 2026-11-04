@@ -346,7 +346,7 @@ stated explicitly.
 13. Release tcb's fault-handler binding, if any: atomically swap
     tcb.fault_handler to null and dec_ref the prior EndpointObject; if its
     refcount reaches 0, push the orphaned endpoint header onto the dealloc
-    cascade stack (`CascadeStack`, step 19's mechanism) rather than recursing
+    cascade stack (`CascadeStack`, step 20's mechanism) rather than recursing
     into dealloc_object.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
     thread still on its send queue. Then take the death_observers chain and,
@@ -367,7 +367,14 @@ stated explicitly.
 16. Unregister tcb from the live-thread registry.
 17. Poison: tcb.magic = 0; tcb.priority = 0xFF.
 18. drop_in_place(tcb).
-19. retype_free + ancestor dec_ref + cascade (the dealloc cascade stack,
+19. Close the slot's guard page (`mm::stack_guard::close`): map it back into
+    the direct map before the slot returns to its Memory capability. On
+    riscv64, whose harts may cache the not-present entry, the close flushes
+    this hart's translation and broadcasts a kernel-root single-VA TLB
+    shootdown, waiting for every acknowledgement preempt-disabled with
+    interrupts enabled, so this CPU serves a peer's shootdown IPI meanwhile;
+    x86-64 caches no not-present entry and sends none.
+20. retype_free + ancestor dec_ref + cascade (the dealloc cascade stack,
     `CascadeStack`, that dealloc_object drains; step 13's orphaned endpoint
     and event queues, if any, are torn down from it after this arm returns).
 ```
@@ -381,7 +388,7 @@ the caller **is** `tcb` — a thread that deletes the last capability to its own
 `InvalidState` before the dec-ref), or whose own object a syscall pin's release or a batched move
 queued for deferred reclaim (`cap::object::release_ref`) — the running CPU's
 `current == tcb` can never clear from within the scan (the spin holds preemption
-disabled, so the thread never reschedules). Running steps 8-19 inline would wedge
+disabled, so the thread never reschedules). Running steps 8-20 inline would wedge
 that CPU (#341).
 
 `dealloc_object_one` detects this case
@@ -402,7 +409,7 @@ that CPU (#341).
 - **Off-CPU completion:** `drain_deferred_reclaim` — called from the syscall
   epilogue of the *next* live thread on this CPU, and from the idle loop — pops
   the object and re-enters `dealloc_object`. The thread is now off-CPU, so the
-  self check is false and the full protocol (steps 1-19) runs: steps 1-4 re-commit the
+  self check is false and the full protocol (steps 1-20) runs: steps 1-4 re-commit the
   already-set `Exited` harmlessly, step 8's scan finds no CPU
   running `tcb` on the first pass and step 9's `context_saved` gate is already
   satisfied. Any server-side reply-bound client (steps 5/10/11) is woken here.
@@ -450,7 +457,7 @@ Registry).
    snapshot, which names at most one CPU and may be stale once the locks drop. This bound holds only
    when the dealloc caller is a *different* thread than `tcb`: the running CPU reaches `schedule()`
    and switches away. When the caller *is* `tcb` (self-teardown), it never reaches `schedule()` from
-   within the spin, so steps 8-19 are skipped inline and deferred off-CPU instead — see
+   within the spin, so steps 8-20 are skipped inline and deferred off-CPU instead — see
    [Self-teardown](#self-teardown-the-caller-is-the-freed-thread).
 
 4. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs
@@ -501,7 +508,7 @@ Registry).
 8. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding
    (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler`
    EndpointObject. The drain swaps the field to null and dec_refs; if the endpoint's refcount
-   reaches 0 it is pushed onto the dealloc cascade stack (`CascadeStack`, step 19), not freed by a
+   reaches 0 it is pushed onto the dealloc cascade stack (`CascadeStack`, step 20), not freed by a
    nested `dealloc_object` call — the stack exists precisely to keep the cascade non-recursive.
    Ordering after step 11 ensures a queued faulter is off the endpoint's send queue before the
    endpoint can be torn down.

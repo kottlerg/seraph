@@ -135,24 +135,25 @@ branch does not hold on a mispredicted path, where the loads behind the branch e
 out-of-bound value, so every bound between a user-supplied handle and the object it names is also
 enforced as data.
 
-The primitive is `arch::current::speculation::index_mask(index, bound)`: all-ones when
-`index < bound`, else zero, computed without a branch (x86-64 `cmp` then `sbb`; riscv64 `sltu`
-then `neg`, base RV64I, since the RVA23 floor defines no speculation barrier). It is inline
-assembly so the compiler cannot prove the mask redundant inside the arm of the guarding branch and
-delete it, and it is not `pure`, so it is not moved into such an arm either.
-`arch::current::speculation::hide` passes a value through an empty, non-`pure` assembly block,
-giving a copy the compiler cannot relate to the original. `arch::nospec` builds the arch-neutral
-forms on the two: `mask_index`, `mask_index_u64`, `mask_if` (all-ones when a condition holds),
-`hide`, and `select_ptr` (one of two pointers chosen by a mask).
+The primitives are `arch::current::speculation::index_mask` and
+`arch::current::speculation::hide`. `index_mask(index, bound)` is all-ones when `index < bound`,
+else zero, computed without a branch (x86-64 `cmp` then `sbb`; riscv64 `sltu` then `neg`, base
+RV64I, since the RVA23 floor defines no speculation barrier). It is inline assembly so the
+compiler cannot prove the mask redundant inside the arm of the guarding branch and delete it, and
+it is not `pure`, so it is not moved into such an arm either. `hide` passes a value through an
+empty, non-`pure` assembly block, giving a copy the compiler cannot relate to the original.
+`arch::nospec` builds the arch-neutral forms on the two: `index_mask`, `mask_index`,
+`mask_index_u64`, `mask_if` (all-ones when a condition holds), `hide`, and `select_ptr` (one of two
+pointers chosen by a mask).
 
 A mask's output is opaque but its input is not. A condition that a dominating branch has already
 tested is a constant inside that branch's arm, so a condition mask (`mask_if`) taken there on the
 same condition is all-ones whatever the data. Every condition mask is therefore computed either
 ahead of the branch it backs, or, inside an arm of a dispatch on a slot's tag, from the tag
 `pin_checked` passed through `hide` at resolution (`PinnedCap::tag_mask`), which no later branch
-on the tag lets the compiler fold. An index mask (`index_mask`, `mask_index`) taken inside the arm
-of the bounds branch it backs stays data, since its input is the index, whose value the branch
-does not fix.
+on the tag lets the compiler fold. An index mask (`index_mask`, or a `mask_index*` form) taken
+inside the arm of the bounds branch it backs stays data, since its input is the index, whose value
+the branch does not fix.
 
 | Site | User-controlled value | Load it would steer | Hardening |
 |---|---|---|---|
@@ -179,8 +180,8 @@ A misspeculated use of the null object that `pin_checked` folds a failed lookup 
 null at a small offset. Userspace can map virtual page 0 (#741), and the documents do not state
 whether SMAP or a clear `SUM` stop that transient load. A rights bit a handler tests after
 resolution, beyond those its lookup requires, is a branch only, `sys_wait_set_add`'s member right
-aside (folded, above); those sites, and the user-supplied
-indexes that select a kernel array entry outside the capability path, are recorded on #270.
+aside (folded, above); those sites, and the user-supplied indexes that select a kernel array entry
+outside the capability path, are recorded on #270.
 
 ### Free Slot Tracking
 

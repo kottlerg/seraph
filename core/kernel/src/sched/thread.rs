@@ -804,7 +804,8 @@ pub struct ThreadControlBlock
     /// The guard epoch thread creation stamped when it holed the guard page
     /// below this thread's kernel stack (`mm::stack_guard::hole`), or 0 for a
     /// thread whose guard was made before any other CPU ran (the idle
-    /// threads). `schedule()` compares it at every switch-in
+    /// threads). `schedule()` compares it at every switch-in, and
+    /// `sched::enter` before init's first run
     /// (`mm::stack_guard::flush_before_run`). Immutable after construction.
     pub guard_epoch: u64,
 

@@ -66,7 +66,10 @@ Kernel space is divided into regions:
 The physical memory direct map gives the kernel a virtual address for every physical
 page. The RAM portion is mapped with 2 MiB large pages; a framebuffer or kernel MMIO
 region above the RAM ceiling gets 4 KiB pages, and so does a 2 MiB chunk below it that holds a
-kernel MMIO page, so that page can be mapped uncacheable.
+kernel MMIO page, so that page can be mapped uncacheable. The one exception to "every page" is
+the guard page below each kernel stack, which the direct map leaves unmapped so a stack overflow
+faults; the chunk holding a guard is mapped in 4 KiB pages too
+([memory-internals.md](../core/kernel/docs/memory-internals.md) § Kernel Stack Guards).
 
 Both the kernel image base and the direct-map base are randomized at boot behind
 the boot-entropy source (KASLR,

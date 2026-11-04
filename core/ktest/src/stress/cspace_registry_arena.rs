@@ -30,9 +30,10 @@ use crate::{TestContext, TestResult};
 /// entries, the least count that registry could not hold.
 const LIVE: usize = 4097;
 
-/// Slots per kernel `CSpace` leaf page (`cap::cspace::L2_SIZE`). An
-/// underestimate here shows as a slot-pool failure of a creation, which the
-/// test reports, not as a false pass.
+/// Slots per kernel `CSpace` leaf page (`cap::cspace::L2_SIZE`). A value above
+/// the kernel's `cap::cspace::L2_SIZE` underfunds the pool and shows as a
+/// slot-pool failure of a creation, which the test reports, not as a false
+/// pass; a value below it only funds more pages than needed.
 const SLOTS_PER_PAGE: usize = 56;
 
 /// Pages donated to ktest's `CSpace` for the [`LIVE`] caps: one leaf per

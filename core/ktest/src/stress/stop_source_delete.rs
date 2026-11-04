@@ -365,16 +365,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_source_delete: pin controller failed")?;
-    let result = phases(ctx, CYCLES, cpus);
+    let result = phases(ctx, cpus);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_source_delete: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run every phase of `cycles` rounds and check each; the served-call phases
+/// Run every phase of [`CYCLES`] rounds and check each; the served-call phases
 /// only with [`SERVED_MIN_CPUS`] CPUs.
-fn phases(ctx: &TestContext, cycles: u32, cpus: u64) -> TestResult
+fn phases(ctx: &TestContext, cpus: u64) -> TestResult
 {
     for race in [Race::Stop, Race::ThreadDelete]
     {
@@ -395,7 +395,7 @@ fn phases(ctx: &TestContext, cycles: u32, cpus: u64) -> TestResult
                 continue;
             }
             crate::log(phase_name(kind, race));
-            let seen = phase(ctx, kind, race, cycles)?;
+            let seen = phase(ctx, kind, race)?;
             log_seen(&seen);
             check(&seen, kind, race)?;
         }
@@ -517,9 +517,9 @@ fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
     Ok(())
 }
 
-/// One phase: start the racer, run `cycles` rounds, end the racer, and
+/// One phase: start the racer, run [`CYCLES`] rounds, end the racer, and
 /// delete it whatever the outcome. Returns what the phase saw.
-fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen, &'static str>
+fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str>
 {
     for counter in [
         &QUIT,
@@ -559,7 +559,7 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen,
     )
     .and_then(|th| thread_start(th).map_err(|_| "stress::stop_source_delete: start racer failed"))
     .and_then(|()| start_server(ctx, kind, &mut server))
-    .and_then(|()| rounds(ctx, kind, race, cycles));
+    .and_then(|()| rounds(ctx, kind, race));
     // QUIT ends the racer and the server alike.
     let ended = finish_racer();
     let server_ended = if server.is_some()
@@ -633,10 +633,10 @@ fn finish_racer() -> TestResult
 
 /// Run the phase's rounds, stopping at the first that fails. Returns the
 /// controller-side tallies.
-fn rounds(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen, &'static str>
+fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
-    for cycle in 0..cycles
+    for cycle in 0..CYCLES
     {
         let mut parts = RoundParts::default();
         let result = round(ctx, kind, race, cycle, &mut parts, &mut seen);
@@ -663,21 +663,7 @@ fn round(
     let done_before = WAITS_DONE.load(Ordering::Acquire);
     let source = create_source(ctx, kind, parts)?;
     SOURCE.store(source, Ordering::Release);
-    let waiter = create_thread(
-        ctx,
-        &mut parts.waiter,
-        waiter_entry,
-        WAITER_STACK,
-        kind.encode(),
-        WAITER_CPU,
-    )?;
-    thread_start(waiter).map_err(|_| "stress::stop_source_delete: start waiter failed")?;
-    if !await_within(ENTRY_WAIT_US, || {
-        WAITS_ENTERED.load(Ordering::Acquire) != entered_before
-    })?
-    {
-        seen.starved += 1;
-    }
+    let waiter = start_waiter(ctx, kind, entered_before, parts, seen)?;
     // 0 to 16383 spins (a multiplicative hash of the round), so the race
     // lands before the waiter's park commits, during it, or on a parked
     // waiter.
@@ -702,6 +688,61 @@ fn round(
     // The source's capability is gone whatever the delete returned.
     parts.source = None;
     deleted.map_err(|_| "stress::stop_source_delete: delete of the source failed")?;
+    settle_round(
+        kind,
+        race,
+        cycle,
+        waiter,
+        [entered_before, done_before],
+        parts,
+        seen,
+    )
+}
+
+/// Create and start the round's waiter, and wait (bounded) for it to enter
+/// its wait; a waiter that has not entered by then counts as starved.
+/// `entered_before` is the waiter's entered count from before the round.
+fn start_waiter(
+    ctx: &TestContext,
+    kind: Kind,
+    entered_before: u32,
+    parts: &mut RoundParts,
+    seen: &mut Seen,
+) -> Result<u32, &'static str>
+{
+    let waiter = create_thread(
+        ctx,
+        &mut parts.waiter,
+        waiter_entry,
+        WAITER_STACK,
+        kind.encode(),
+        WAITER_CPU,
+    )?;
+    thread_start(waiter).map_err(|_| "stress::stop_source_delete: start waiter failed")?;
+    if !await_within(ENTRY_WAIT_US, || {
+        WAITS_ENTERED.load(Ordering::Acquire) != entered_before
+    })?
+    {
+        seen.starved += 1;
+    }
+    Ok(waiter)
+}
+
+/// After round `cycle`'s source delete: wait for the racer's acknowledgement
+/// of its action (and, on a served call, for the server's receives to end),
+/// then settle the waiter by the race. `before` holds the waiter's entered
+/// and done counts from before the round.
+fn settle_round(
+    kind: Kind,
+    race: Race,
+    cycle: u32,
+    waiter: u32,
+    before: [u32; 2],
+    parts: &mut RoundParts,
+    seen: &mut Seen,
+) -> TestResult
+{
+    let [entered_before, done_before] = before;
     if !await_within(crate::scaled_bound(ACK_WAIT_US), || {
         RACER_DONE.load(Ordering::Acquire) == cycle + 1
     })?

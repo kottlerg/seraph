@@ -34,8 +34,6 @@ struct MapperArgs
     memory: u32,
     aspace: u32,
     done_bit: u64,
-    /// Map/unmap iterations to run.
-    iterations: u32,
 }
 
 static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock::new(MapperArgs {
@@ -43,7 +41,6 @@ static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock:
     memory: 0,
     aspace: 0,
     done_bit: 0,
-    iterations: 0,
 });
 
 /// Base VA for stress mappings, well above normal test VAs.
@@ -78,8 +75,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         children: [const { spawn::SpawnedChild::EMPTY }; NUM_CHILDREN],
         spawned: 0,
     };
-    let result =
-        start_mappers(ctx, done, MAP_ITERATIONS, &mut mappers).and_then(|()| await_mappers(done));
+    let result = start_mappers(ctx, done, &mut mappers).and_then(|()| await_mappers(done));
     let released = release(ctx, &mut mappers);
     cap_delete(done).ok();
     result?;
@@ -89,8 +85,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Allocate one pool frame per child, then start each child on its own
 /// frame and VA, recording each frame and child in `mappers` as soon as it
 /// exists.
-fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Mappers)
--> TestResult
+fn start_mappers(ctx: &TestContext, done: u32, mappers: &mut Mappers) -> TestResult
 {
     for i in 0..NUM_CHILDREN
     {
@@ -125,7 +120,6 @@ fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Ma
                     memory: child_memory,
                     aspace: child_aspace,
                     done_bit: 1u64 << i,
-                    iterations,
                 },
             )
         };
@@ -214,14 +208,13 @@ extern "C" fn mapper_entry(arg: u64) -> !
         memory: memory_cap,
         aspace,
         done_bit,
-        iterations,
     } = unsafe { spawn::child_args(arg) };
 
     // Determine our child index from done_bit (1<<i → i).
     let child_idx = done_bit.trailing_zeros() as usize;
     let va = VA_PER_CHILD[child_idx].load(core::sync::atomic::Ordering::Acquire);
 
-    for _ in 0..iterations
+    for _ in 0..MAP_ITERATIONS
     {
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.

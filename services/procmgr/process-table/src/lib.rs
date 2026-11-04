@@ -9,7 +9,8 @@
 //! Holds the plain-data process record ([`ProcessEntry`]), the heap-backed
 //! table ([`ProcessTable`]) with its insert/find/take/query operations, the
 //! time-bounded ring of recently reaped or destroyed processes
-//! ([`RecentExits`]), the pure badge-acceptance predicate
+//! ([`RecentExits`]), the memory reclaims held back for the children created
+//! with `CREATE_DMA_HOLD` ([`DmaHolds`]), the pure badge-acceptance predicate
 //! ([`badge_is_acceptable`]), the argv/env blob decoder for create requests
 //! ([`CreateBlobs`]), which parses client-controlled label fields and data
 //! words, the `CREATE_FROM_FILE` cap-layout split
@@ -31,12 +32,14 @@
 
 pub mod create_blobs;
 pub mod death_queues;
+pub mod dma_holds;
 pub mod fs_reads;
 pub mod init_reap;
 pub mod request_caps;
 
 pub use create_blobs::{ChildArgs, ChildEnv, CreateBlobs};
 pub use death_queues::DeathQueues;
+pub use dma_holds::{DmaHolds, HeldReclaim};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{FileCreateCaps, split_create_from_file_caps};
 
@@ -117,6 +120,10 @@ pub struct ProcessEntry
     /// its handover struct from the address the loader chose.
     pub process_info_va: u64,
     pub started: bool,
+    /// Set by `CREATE_DMA_HOLD`: once started, the child's teardown holds
+    /// its memmgr reclaim back until its creator's `RELEASE_HOLD`
+    /// ([`DmaHolds`]).
+    pub dma_hold: bool,
 }
 
 impl ProcessEntry
@@ -213,7 +220,19 @@ pub enum InsertError
     OutOfMemory,
 }
 
-/// procmgr's live processes, kept on the heap and sorted by badge.
+/// Why [`ProcessTable::arm_dma_hold`] armed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmError
+{
+    /// No live entry holds the badge.
+    NotFound,
+    /// The heap could not reserve the room the child's held record takes.
+    OutOfMemory,
+}
+
+/// procmgr's live processes, kept on the heap and sorted by badge, and the
+/// memory reclaims held back for the torn-down children created with
+/// `CREATE_DMA_HOLD`.
 ///
 /// The table grows with the number of live processes and holds no fixed
 /// ceiling of its own; a spawn fails when the heap cannot grow it. Lookups by
@@ -224,6 +243,7 @@ pub struct ProcessTable
 {
     /// Entries sorted by badge, no two sharing a badge.
     entries: Vec<ProcessEntry>,
+    holds: DmaHolds,
 }
 
 impl ProcessTable
@@ -233,6 +253,7 @@ impl ProcessTable
     {
         Self {
             entries: Vec::new(),
+            holds: DmaHolds::new(),
         }
     }
 
@@ -262,12 +283,40 @@ impl ProcessTable
         self.entries.is_empty()
     }
 
-    /// Whether a live entry holds `badge`. Badge minting redraws such a
-    /// candidate, so [`Self::insert`] does not refuse it later.
+    /// Whether a live entry or a held reclaim holds `badge`. Badge minting
+    /// redraws such a candidate, so [`Self::insert`] does not refuse it later
+    /// and no new child's process handle can release another's held reclaim.
     #[must_use]
     pub fn badge_in_use(&self, badge: u64) -> bool
     {
-        self.index_of_badge(badge).is_some()
+        self.index_of_badge(badge).is_some() || self.holds.holds(badge)
+    }
+
+    /// Arm the live entry `badge` for a held reclaim (`CREATE_DMA_HOLD`),
+    /// reserving the room its record takes when it parks. Arming an armed
+    /// entry again changes nothing.
+    ///
+    /// # Errors
+    /// [`ArmError::NotFound`] when no live entry holds the badge;
+    /// [`ArmError::OutOfMemory`] when the heap cannot reserve the room, the
+    /// entry then left unarmed.
+    pub fn arm_dma_hold(&mut self, badge: u64) -> Result<(), ArmError>
+    {
+        let idx = self.index_of_badge(badge).ok_or(ArmError::NotFound)?;
+        if self.entries[idx].dma_hold
+        {
+            return Ok(());
+        }
+        self.holds.arm().map_err(|_| ArmError::OutOfMemory)?;
+        self.entries[idx].dma_hold = true;
+        Ok(())
+    }
+
+    /// The held reclaims, for the teardown that parks an entry's
+    /// ([`DmaHolds::park`]) and the `RELEASE_HOLD` that takes it.
+    pub fn holds_mut(&mut self) -> &mut DmaHolds
+    {
+        &mut self.holds
     }
 
     /// Insert `entry`, changing nothing on refusal.
@@ -475,6 +524,7 @@ mod tests
             stack_top_vaddr: 0,
             process_info_va: 0,
             started: false,
+            dma_hold: false,
         }
     }
 
@@ -744,5 +794,33 @@ mod tests
         assert_eq!(recent.find(16, RECENT_EXIT_RETENTION_NS), Some(1));
         assert_eq!(recent.find(16, RECENT_EXIT_RETENTION_NS + 1), None);
         assert_eq!(recent.find(17, RECENT_EXIT_RETENTION_NS + 1), Some(2));
+    }
+
+    #[test]
+    fn arm_dma_hold_marks_a_live_entry_once_and_refuses_an_unknown_badge()
+    {
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(16)).unwrap();
+        assert_eq!(table.arm_dma_hold(17), Err(ArmError::NotFound));
+        assert_eq!(table.arm_dma_hold(16), Ok(()));
+        assert_eq!(table.arm_dma_hold(16), Ok(()));
+        let mut taken = table.take_by_badge(16).unwrap();
+        assert!(taken.dma_hold);
+        taken.started = true;
+        assert!(table.holds_mut().park(&taken));
+    }
+
+    #[test]
+    fn a_held_reclaim_keeps_its_badge_in_use_until_released()
+    {
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(16)).unwrap();
+        table.arm_dma_hold(16).unwrap();
+        let mut taken = table.take_by_badge(16).unwrap();
+        taken.started = true;
+        assert!(table.holds_mut().park(&taken));
+        assert!(table.badge_in_use(16));
+        assert!(table.holds_mut().release(16).is_some());
+        assert!(!table.badge_in_use(16));
     }
 }

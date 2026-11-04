@@ -270,7 +270,10 @@ memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
 
 ## Reclamation
 
-On `PROCESS_DIED(badge)` from procmgr:
+On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
+`CREATE_DMA_HOLD` process until its creator releases it, the frames staying on
+the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process_died)
+§ Label 4):
 
 1. Remove the per-process record from the index. If absent (untracked
    badge), return silently — the death notification is idempotent.

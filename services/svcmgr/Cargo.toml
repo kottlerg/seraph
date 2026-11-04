@@ -12,6 +12,8 @@ test = false
 [dependencies]
 ipc = { path = "../../shared/ipc" }
 svcmgr-defs = { path = "svc-defs" }
+# The death-queue set and main wait set (`DeathSet`).
+death-set = { path = "../../shared/death-set" }
 # The init → svcmgr handover endowment wire contract (svcmgr decodes it).
 svcmgr-endowment = { path = "endowment" }
 syscall = { path = "../../shared/syscall" }

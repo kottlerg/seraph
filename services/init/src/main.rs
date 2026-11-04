@@ -40,8 +40,8 @@ pub(crate) use syscall_abi::PAGE_SIZE;
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
 /// Page span a single Thread retype consumes from its source Memory cap's
-/// front bump (`SystemInfoType::ThreadRetypeBytes`, whole pages: kernel
-/// stack, TCB and wrapper page, extended-state save area, which the boot CPU
+/// front bump (`SystemInfoType::ThreadRetypeBytes`, whole pages: guard page,
+/// kernel stack, TCB and wrapper page, extended-state save area, which the boot CPU
 /// sizes). Sizes the retype reserve of init's and the tier-1 services'
 /// bootstrap arenas. init cannot size them without it, so a failed query
 /// ends init.

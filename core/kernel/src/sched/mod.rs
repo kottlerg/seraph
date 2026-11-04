@@ -45,7 +45,10 @@ pub const IDLE_PRIORITY: u8 = 0;
 /// reaches zero. A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
-/// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total).
+/// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total),
+/// each above one guard page the direct map leaves unmapped, so a path past
+/// the bound faults and halts instead of writing below the stack
+/// (`mm::stack_guard`).
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
@@ -57,9 +60,10 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// Maximum number of CPUs the kernel supports, matching the boot protocol's
-/// ceiling ([`boot_protocol::MAX_CPUS`]). Per-CPU sets ([`crate::cpu_mask`])
-/// size their word counts from this, and the boot path drops any CPUs the
-/// firmware enumerates beyond it.
+/// sanity ceiling ([`boot_protocol::MAX_CPUS`], 8192). No structure is sized
+/// from it: per-CPU slabs and CPU sets ([`crate::cpu_mask`]) take the boot's
+/// `cpu_count`, and the boot path drops any CPUs the firmware enumerates beyond
+/// it.
 pub const MAX_CPUS: usize = boot_protocol::MAX_CPUS;
 
 /// Hard affinity sentinel: no hard CPU affinity.
@@ -160,17 +164,30 @@ unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
     unsafe { base.add(cpu) }
 }
 
-/// Order of a single idle-thread kernel stack: smallest `2^order >=
-/// KERNEL_STACK_PAGES`. With `KERNEL_STACK_PAGES = 4` this is order 2.
+/// Order of the buddy block an idle-thread kernel stack is carved from: the
+/// smallest `2^order >= KERNEL_STACK_PAGES + 1`, the stack and its guard page.
+/// With `KERNEL_STACK_PAGES = 4` this is order 3.
 #[cfg(not(test))]
-const fn idle_stack_order() -> usize
+const fn idle_block_order() -> usize
 {
     let mut o = 0;
-    while (1usize << o) < KERNEL_STACK_PAGES
+    while (1usize << o) < KERNEL_STACK_PAGES + 1
     {
         o += 1;
     }
     o
+}
+
+/// An idle stack's place in its buddy block of `2^order` pages at `block`:
+/// `(guard, stack_base, spare_bytes)`. The stack is the block's top
+/// `KERNEL_STACK_PAGES` pages, the guard the page below it, and the
+/// `spare_bytes` below the guard, from `block`, go back to the buddy.
+const fn idle_block_layout(block: u64, order: usize) -> (u64, u64, u64)
+{
+    let page = PAGE_SIZE as u64;
+    let stack_base = block + ((1u64 << order) - KERNEL_STACK_PAGES as u64) * page;
+    let guard = stack_base - page;
+    (guard, stack_base, guard - block)
 }
 
 /// Number of CPUs, published once during boot by `init_storage` (Phase 4) and read lock-free
@@ -179,8 +196,9 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 
 // ── Reschedule-pending flag ──────────────────────────────────────────────────
 
-/// Per-CPU reschedule-pending bitmask, sized to support up to `MAX_CPUS`
-/// CPUs as a vector of `AtomicU64` words.
+/// The reschedule-pending set's words: one bit per CPU, `mask_words` words
+/// (`crate::cpu_mask`), allocated at Phase 4 by [`init_storage`]. Null before;
+/// no producer runs before Phase 4.
 ///
 /// Set by producers before the wake IPI and consumed by the idle loop with
 /// interrupts masked; the protocol and its ordering are specified in
@@ -194,7 +212,22 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///
 /// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
 /// producer does. On x86-64 the same contract holds.
-static RESCHEDULE_PENDING: crate::cpu_mask::AtomicCpuMask = crate::cpu_mask::AtomicCpuMask::new();
+static RESCHEDULE_PENDING: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// The reschedule-pending set, a view over [`RESCHEDULE_PENDING`]'s words; the
+/// empty, unattached set before Phase 4.
+fn reschedule_pending() -> crate::cpu_mask::AtomicCpuMask
+{
+    let words = RESCHEDULE_PENDING.load(core::sync::atomic::Ordering::Acquire);
+    if words.is_null()
+    {
+        return crate::cpu_mask::AtomicCpuMask::unattached();
+    }
+    // SAFETY: the words were allocated zeroed for this set at Phase 4 and live
+    // for the kernel's life; every access is through such views.
+    unsafe { crate::cpu_mask::AtomicCpuMask::from_words(words, crate::cpu_mask::mask_words()) }
+}
 
 /// Set the reschedule-pending bit for `cpu` (producer side).
 ///
@@ -203,7 +236,7 @@ static RESCHEDULE_PENDING: crate::cpu_mask::AtomicCpuMask = crate::cpu_mask::Ato
 /// `take_reschedule_pending`.
 pub fn set_reschedule_pending_for(cpu: usize)
 {
-    RESCHEDULE_PENDING.set_cpu(cpu, core::sync::atomic::Ordering::Release);
+    reschedule_pending().set_cpu(cpu, core::sync::atomic::Ordering::Release);
 }
 
 /// Check and clear the reschedule-pending flag for a CPU.
@@ -212,7 +245,7 @@ pub fn set_reschedule_pending_for(cpu: usize)
 /// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
 pub fn take_reschedule_pending(cpu: usize) -> bool
 {
-    RESCHEDULE_PENDING.take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
+    reschedule_pending().take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
 }
 
 // ── Softlockup watchdog ──────────────────────────────────────────────────────
@@ -2431,11 +2464,15 @@ pub unsafe fn init(cpu_count: u32) -> u32
         let stack_top = unsafe { *idle_stack_top_slot(cpu) };
 
         // Build idle TCB.
-        let saved = new_state(
+        let mut saved = new_state(
             idle_thread_entry as *const () as u64,
             stack_top,
             cpu as u64,
             crate::arch::ThreadKind::Kernel,
+        );
+        crate::arch::current::context::set_stack_floor(
+            &mut saved,
+            stack_top - (KERNEL_STACK_PAGES * PAGE_SIZE) as u64,
         );
 
         // Initialise this CPU's idle TCB in place inside the dynamic slab.
@@ -2484,6 +2521,8 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,
+                    // Phase 4 made the idle guard before any other CPU ran.
+                    guard_epoch: 0,
                     trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
@@ -2531,13 +2570,15 @@ pub unsafe fn init(cpu_count: u32) -> u32
     cpu_count
 }
 
-/// Allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
-/// TCBs, idle kernel stacks and their tops, watchdog ticks and breadcrumbs
-/// (`CPU_DIAG`), per-CPU arch data, the TLB-shootdown request slots, and the x86
-/// AP GDT/TSS/IST tables and NMI-backtrace storage), publish `CPU_COUNT`, and
-/// arm the BSP
-/// boot transient. Must run before Phase 5 (timer arm) so that the timer
-/// ISR's first read of `SCHEDULERS_PTR` is non-null.
+/// Fix every CPU set's width at `cpu_count` (`cpu_mask::set_boot_cpu_count`),
+/// allocate the reschedule-pending CPU set (`RESCHEDULE_PENDING`) and the
+/// per-CPU storage slabs sized to `cpu_count` (schedulers, idle TCBs, idle
+/// kernel stacks and their tops, watchdog ticks and breadcrumbs (`CPU_DIAG`),
+/// per-CPU arch data, the TLB-shootdown request slots and their
+/// acknowledgement sets, and the x86 AP GDT/TSS/IST tables and NMI-backtrace
+/// storage), publish `CPU_COUNT`, and arm the BSP boot transient. Must run
+/// before Phase 5 (timer arm) so that the timer ISR's first read of
+/// `SCHEDULERS_PTR` is non-null.
 ///
 /// # Panics
 /// Halts via `crate::fatal` on buddy exhaustion.
@@ -2556,6 +2597,15 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         "init_storage: must be called exactly once"
     );
     CPU_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
+    // Every CPU set is this boot's width from here on.
+    crate::cpu_mask::set_boot_cpu_count(cpu_count as usize);
+    // One CPU set, not a per-CPU slab: at most MAX_MASK_WORDS words (1 KiB).
+    let words = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
+        crate::cpu_mask::mask_words() * core::mem::size_of::<core::sync::atomic::AtomicU64>(),
+        allocator,
+        "RESCHEDULE_PENDING",
+    );
+    RESCHEDULE_PENDING.store(words, core::sync::atomic::Ordering::Release);
     BOOT_TRANSIENT_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
     init_per_cpu_storage(cpu_count, allocator);
 }
@@ -2628,23 +2678,34 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
 
     // Idle-stack-top slab, then one idle kernel stack per CPU drawn from the
-    // pristine buddy. Done here, in Phase 4, rather than in `init` (Phase 8):
-    // before the Phase-7 user-cap drain the buddy still holds large contiguous
-    // blocks, so each order-2 stack is a clean split. After the drain the only
-    // free blocks are the memory map's order-0/1 fragments, which cannot back
-    // an order-2 stack. `init` reads the tops back from this slab.
+    // pristine buddy, above a guard page the direct map leaves unmapped
+    // (`mm::stack_guard`), so an overflow faults. Done here, in Phase 4,
+    // rather than in `init` (Phase 8): before the Phase-7 user-cap drain the
+    // buddy still holds large contiguous blocks, so each order-3 block is a
+    // clean split, and no other CPU runs yet, so the guard's hole needs no
+    // cross-CPU flush. `init` reads the tops back from this slab.
     let tops_ptr = alloc_per_cpu_slab::<u64>(IDLE_STACK_TOPS_SLAB, n, allocator);
-    let stack_order = idle_stack_order();
+    let block_order = idle_block_order();
     for cpu in 0..n
     {
-        let stack_phys = allocator
-            .alloc(stack_order)
+        let block = allocator
+            .alloc(block_order)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
+        let (guard, stack_phys, spare) = idle_block_layout(block, block_order);
+        // SAFETY: the pages below the guard are this fresh block's, never
+        // reached, and the buddy is unsealed until Phase 7.
+        unsafe { allocator.free_range(block, spare) };
+        // SAFETY: Phase 4, only the boot CPU runs; the guard is this block's
+        // page, which nothing reaches through the direct map from here on.
+        if unsafe { crate::mm::stack_guard::hole_on_boot_cpu(guard) }.is_err()
+        {
+            crate::fatal("init_per_cpu_storage: cannot unmap an idle stack's guard page");
+        }
         // Stack grows downward; top = base + size (direct map).
         let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
         // Paint it for the depth report (crate::stack_depth).
-        // SAFETY: the fresh order-`stack_order` block is this CPU's idle stack
-        // alone, mapped through the direct map; no thread runs on it yet.
+        // SAFETY: the stack pages are this CPU's idle stack alone, mapped
+        // through the direct map; no thread runs on it yet.
         unsafe {
             crate::stack_depth::paint(phys_to_virt(stack_phys), KERNEL_STACK_PAGES * PAGE_SIZE);
         }
@@ -2695,8 +2756,8 @@ pub(crate) const fn slab_pages(bytes: usize) -> usize
 /// asks for at any CPU count is [`bytes`](Self::bytes) of that descriptor. The
 /// compile-time assert beside each descriptor of a fixed per-CPU element count
 /// checks it at every width up to [`MAX_CPUS`] against the target's own
-/// layout; the tag-state slab's count is set at boot, so a host test checks it
-/// instead.
+/// layout; the tag-state and TLB acknowledgement-set slabs' counts are set at
+/// boot, so host tests check them instead.
 #[derive(Clone, Copy)]
 pub(crate) struct PerCpuSlab
 {
@@ -2761,29 +2822,45 @@ impl PerCpuSlab
     }
 
     /// Whether the slab is sized ([`sized_at`](Self::sized_at)) at every CPU
-    /// count from one to [`MAX_CPUS`]. The compile-time assert beside each
+    /// count from one to [`MAX_CPUS`]. The byte count grows with the CPU count
+    /// and `sized_at` holds at a count whenever it holds at a larger one, so the
+    /// ceiling decides it; [`SLAB_CHECK_WIDTHS`] checks the word edges and a
+    /// shipping two-socket part besides. The compile-time assert beside each
     /// fixed-count descriptor calls it, so every build checks the target layout
     /// of its architecture.
     pub(crate) const fn sized_at_every_width(self) -> bool
     {
-        let mut cpus = 1;
-        while cpus <= MAX_CPUS
+        let mut i = 0;
+        while i < SLAB_CHECK_WIDTHS.len()
         {
-            if !self.sized_at(cpus)
+            if !self.sized_at(SLAB_CHECK_WIDTHS[i])
             {
                 return false;
             }
-            cpus += 1;
+            i += 1;
         }
         true
     }
 }
 
+/// The TLB acknowledgement-set slab (`mm::tlb_shootdown::init_storage`): each
+/// shootdown request's `AtomicCpuMask` words, [`crate::cpu_mask::mask_words`]
+/// per CPU. That count is set at Phase 4, so a host test (`slab_tests`) checks
+/// the sizing at every width instead of a compile-time assert. It is declared
+/// here, beside [`PerCpuSlab`], because the shootdown module is not built for
+/// host tests.
+pub(crate) const TLB_PENDING_CPUS_SLAB: PerCpuSlab =
+    PerCpuSlab::of::<core::sync::atomic::AtomicU64>("TLB_PENDING_CPUS");
+
+/// CPU counts [`PerCpuSlab::sized_at_every_width`] checks: the partial-word
+/// edges, the old 512 ceiling, a two-socket SMT part (768), and [`MAX_CPUS`].
+pub(crate) const SLAB_CHECK_WIDTHS: [usize; 7] = [1, 63, 64, 65, 512, 768, MAX_CPUS];
+
 /// Allocate `slab`'s storage for `cpu_count` CPUs through
 /// [`alloc_zeroed_slab`] and return a typed pointer to its first element.
 /// Halts when the byte count overflows (no fixed-count descriptor's
-/// compile-time assert, and for the tag-state slab no host test, admits one up
-/// to [`MAX_CPUS`]) or on buddy exhaustion.
+/// compile-time assert, and for the tag-state and TLB acknowledgement-set
+/// slabs no host test, admits one up to [`MAX_CPUS`]) or on buddy exhaustion.
 #[cfg(not(test))]
 pub(crate) fn alloc_per_cpu_slab<T>(
     slab: PerCpuSlab,
@@ -3708,7 +3785,8 @@ pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
 }
 
 /// Phase 1 of [`stop_threads_bound_to`]: under the registry lock, stop every
-/// bound thread not already `Exited`, then prod the CPUs found running one.
+/// bound thread not already `Exited`, and prod each CPU found running one as
+/// the walk finds it.
 /// Returns whether the running thread on `this_cpu` was among them.
 ///
 /// # Safety
@@ -3721,7 +3799,6 @@ unsafe fn mark_bound_threads(
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let mut self_bound = false;
-    let mut prod = crate::cpu_mask::CpuMask::empty();
     // SAFETY: caller contract (no conflicting locks held); the walk body
     // takes only locks ordered after the registry lock and never waits
     // on another CPU.
@@ -3757,18 +3834,19 @@ unsafe fn mark_bound_threads(
             else if let StateCommit::Committed(Some(cpu)) = committed
                 && cpu != this_cpu
             {
-                prod.set(cpu);
+                // Prodded here, inside the walk: the prod sends an IPI and
+                // waits on no other CPU, which the registry walk allows, so
+                // no set of CPUs to prod is held. A CPU running several bound
+                // threads is prodded once per thread; the prod is idempotent.
+                debug_assert!(
+                    cpu < cpu_count,
+                    "mark_bound_threads: a thread runs past cpu_count"
+                );
+                // SAFETY: cpu < cpu_count: a thread is current only on a
+                // started CPU.
+                prod_remote_cpu(cpu);
             }
         });
-    }
-    for cpu in prod.iter()
-    {
-        debug_assert!(
-            cpu < cpu_count,
-            "mark_bound_threads: a thread runs past cpu_count"
-        );
-        // SAFETY: cpu < cpu_count: a thread is current only on a started CPU.
-        unsafe { prod_remote_cpu(cpu) };
     }
     self_bound
 }
@@ -3850,10 +3928,10 @@ unsafe fn scan_bound_current(
 /// is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
 /// recorded as its retained exit reason in the same hold, the commit retried
 /// until no park was committed since the cancel ([`commit_cancelling_park`],
-/// draining every run queue); CPUs found running one are recorded. Phase 2,
-/// with the registry released — a CPU
-/// spinning on the registry lock inside `register` cannot deschedule, so it
-/// must not be waited for while the lock is held — prods those CPUs and
+/// draining every run queue), and the CPU found running one is prodded at
+/// once, inside the walk (the prod waits on no CPU). Phase 2, with the
+/// registry released — a CPU spinning on the registry lock inside `register`
+/// cannot deschedule, so it must not be waited for while the lock is held —
 /// spins until no CPU other than this one has a bound thread as `current`.
 /// A bound thread that appears as `current` without being `Exited` (bound
 /// after the walk, through a cap lookup that raced the object's last delete)
@@ -3966,8 +4044,8 @@ pub unsafe fn wait_until_aspace_inactive(
     spin_site_enter(SPIN_SITE_DEALLOC_AS_ACTIVE);
     let mut warn = SpinWarnOnce::new();
     let mut completed = true;
-    // SAFETY: aspace valid per contract; active_cpu_mask is an Acquire snapshot.
-    while !unsafe { (*aspace).active_cpu_mask() }.is_empty()
+    // SAFETY: aspace valid per contract; inactive_everywhere reads the set with Acquire.
+    while !unsafe { (*aspace).inactive_everywhere() }
     {
         // SAFETY: we are the running thread on this_cpu with preemption
         // disabled; no scheduler lock held.
@@ -5913,6 +5991,13 @@ pub unsafe fn schedule(requeue: Requeue)
         crate::arch::current::cpu::set_kernel_trap_stack(trap_stack);
     }
 
+    // Drop any stale translation of the incoming thread's guard page before
+    // it runs on its stack here (`mm::stack_guard`: holes send no shootdown).
+    // SAFETY: next is a valid TCB whose guard_epoch is immutable after
+    // creation; interrupts are disabled by the scheduler lock, on this CPU
+    // with its per-CPU pointer installed.
+    unsafe { crate::mm::stack_guard::flush_before_run((*next).guard_epoch) };
+
     // Switch address space tracking and page tables.
     //
     // Three cases:
@@ -6460,9 +6545,11 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 /// Start executing the highest-priority ready thread and never return.
 ///
 /// Called once at the end of kernel boot after the init TCB has been enqueued.
-/// Dequeues the init thread, sets the kernel trap stack (`set_kernel_trap_stack`),
-/// builds an initial user-mode [`TrapFrame`] on its kernel stack, and calls
-/// `first_entry_to_user`, which loads init's address space and enters user mode.
+/// Dequeues the init thread, drops any stale translation of its guard page
+/// (`mm::stack_guard::flush_before_run`), sets the kernel trap stack
+/// (`set_kernel_trap_stack`), builds an initial user-mode [`TrapFrame`] on its
+/// kernel stack, and calls `first_entry_to_user`, which loads init's address
+/// space and enters user mode.
 ///
 /// # Panics
 /// Calls `crate::fatal` if the run queue is empty (init TCB not enqueued).
@@ -6515,6 +6602,12 @@ pub unsafe fn enter() -> !
     unsafe {
         crate::arch::current::cpu::disable_interrupts();
     }
+
+    // Init's first run here is not a schedule() switch-in, so drop any stale
+    // translation of its guard page as one would (`mm::stack_guard`).
+    // SAFETY: interrupts disabled above, on the BSP with its per-CPU pointer
+    // installed; guard_epoch is immutable after creation.
+    unsafe { crate::mm::stack_guard::flush_before_run(init_tcb.guard_epoch) };
 
     // Set the kernel trap stack pointer before entering user mode so the first
     // ring-3 → ring-0 transition lands on the correct kernel stack.
@@ -6579,6 +6672,18 @@ pub unsafe fn enter() -> !
     // leaves the stack for init's kernel stack below. Record its depth.
     crate::stack_depth::record_handoff_stack();
 
+    // From the first trap init takes, the BSP runs on init's kernel stack.
+    // Until the `sret` below no trap can come (interrupts are off, and no
+    // direct-map hole has been closed, so no spurious fault either), so the
+    // floor may move ahead of the stack.
+    // SAFETY: the BSP's per-CPU pointer is installed (Phase 5); the floor is
+    // the base of the stack this CPU runs on from the `sret` on.
+    unsafe {
+        crate::percpu::set_kernel_stack_floor(
+            kernel_stack_top - (KERNEL_STACK_PAGES * PAGE_SIZE) as u64,
+        );
+    }
+
     // Activate init's address space (tagged when tagging is enabled) and enter
     // user mode. `first_entry_to_user` handles the arch-specific sequence:
     //   x86-64: switches CR3 (root + PCID) and executes iretq from init's kernel stack.
@@ -6591,9 +6696,30 @@ pub unsafe fn enter() -> !
 }
 
 #[cfg(test)]
+mod idle_block_tests
+{
+    use super::{KERNEL_STACK_PAGES, idle_block_layout};
+    use crate::mm::PAGE_SIZE;
+
+    // The defect caught: a stack that does not end at the block's top, a guard
+    // that is not the page right below the stack, or spare pages that reach
+    // the guard, so an overflow writes a page the buddy hands out again.
+    #[test]
+    fn an_idle_block_is_spare_pages_then_guard_then_stack_at_the_top()
+    {
+        let page = PAGE_SIZE as u64;
+        let block = 0x8_0000u64;
+        let (guard, stack, spare) = idle_block_layout(block, 3);
+        assert_eq!(stack + KERNEL_STACK_PAGES as u64 * page, block + 8 * page);
+        assert_eq!(guard, stack - page);
+        assert_eq!(block + spare, guard);
+    }
+}
+
+#[cfg(test)]
 mod slab_tests
 {
-    use super::{MAX_CPUS, PerCpuSlab, slab_pages};
+    use super::{MAX_CPUS, PerCpuSlab, TLB_PENDING_CPUS_SLAB, slab_pages};
     use crate::mm::PAGE_SIZE;
     use crate::mm::buddy::MAX_ORDER;
     use crate::mm::tag_allocator::{MAX_HW_TAGS, TAG_STATE_SLAB, tag_count};
@@ -6673,6 +6799,23 @@ mod slab_tests
             assert!(
                 TAG_STATE_SLAB.with_elems_per_cpu(n).sized_at(cpus),
                 "PER_CPU_TAG_STATE at {cpus} CPUs"
+            );
+        }
+    }
+
+    // The TLB acknowledgement-set slab's per-CPU count is the boot's CPU-set
+    // width (`cpu_mask::mask_words`), set at Phase 4, so it is checked here at
+    // every width from one CPU to `MAX_CPUS`.
+    #[test]
+    fn the_tlb_acknowledgement_set_slab_is_sized_at_every_width_up_to_max_cpus()
+    {
+        for cpus in 1..=MAX_CPUS
+        {
+            assert!(
+                TLB_PENDING_CPUS_SLAB
+                    .with_elems_per_cpu(crate::cpu_mask::words_for(cpus))
+                    .sized_at(cpus),
+                "TLB_PENDING_CPUS at {cpus} CPUs"
             );
         }
     }

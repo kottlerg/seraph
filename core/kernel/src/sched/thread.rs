@@ -801,6 +801,13 @@ pub struct ThreadControlBlock
     /// a kernel thread publishes 0. Immutable after construction.
     pub kernel_stack_top: u64,
 
+    /// The guard epoch thread creation stamped when it holed the guard page
+    /// below this thread's kernel stack (`mm::stack_guard::hole`), or 0 for a
+    /// thread whose guard was made before any other CPU ran (the idle
+    /// threads). `schedule()` compares it at every switch-in
+    /// (`mm::stack_guard::flush_before_run`). Immutable after construction.
+    pub guard_epoch: u64,
+
     /// Pointer to the `TrapFrame` of the thread's last entry from user mode,
     /// on its kernel stack below `kernel_stack_top` (null for kernel threads).
     ///

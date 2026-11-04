@@ -9,8 +9,9 @@
 //! `new_state` constructs the initial state for a new thread.
 //!
 //! `switch` saves the current thread's callee-saved registers to `*current`
-//! (including `ra` as the resume point) and restores from `*next`, then
-//! executes `ret` which jumps to `next.ra`.
+//! (including `ra` as the resume point) and restores from `*next`, writing
+//! `next.stack_floor` to the hart's `PerCpuData::kernel_stack_floor` at the
+//! stack-pointer swap, then executes `ret` which jumps to `next.ra`.
 //!
 //! `return_to_user` sets `sepc` to the user entry point, configures `sstatus`
 //! for U-mode return, restores all GPRs from a [`TrapFrame`], and executes `sret`.
@@ -44,6 +45,7 @@ use crate::arch::ThreadKind;
 /// | 96     | s10     |
 /// | 104    | s11     |
 /// | 112    | a0      |
+/// | 120    | stack_floor |
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(C)]
 pub struct SavedState
@@ -69,6 +71,12 @@ pub struct SavedState
     /// entry to a new kernel thread. Caller-saved; only meaningful at thread
     /// creation time.
     pub a0: u64,
+    /// Base of the thread's kernel stack ([`set_stack_floor`]), which
+    /// `switch` writes to `PerCpuData::kernel_stack_floor` with the stack
+    /// pointer, so the S-mode trap entry's overflow check
+    /// (`interrupts::trap_entry`) always compares against the stack the hart
+    /// runs on.
+    pub stack_floor: u64,
 }
 
 impl SavedState
@@ -101,6 +109,14 @@ impl SavedState
 /// therefore a no-op on RISC-V — `TrapFrame::set_tls_base` handles it.
 #[inline]
 pub fn seed_tls_base(_saved: &mut SavedState, _tls_base: u64) {}
+
+/// Record the base of the thread's kernel stack, `floor`, in `saved`, for
+/// `switch` to install as the hart's stack floor.
+#[inline]
+pub fn set_stack_floor(saved: &mut SavedState, floor: u64)
+{
+    saved.stack_floor = floor;
+}
 
 /// Round a user-supplied stack pointer to the ABI alignment expected at an
 /// `extern "C"` entry point. On RISC-V `LP64D` the return address lives in `ra`,
@@ -203,7 +219,12 @@ pub unsafe extern "C" fn switch(
         // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership
         // (RISC-V analogue, issue #133).
         "ld ra,     8(a1)", // return address (or entry function)
+        "ld t0,   120(a1)", // next's stack floor
         "ld sp,     0(a1)", // sp swap — now on next's kstack
+        // The floor follows sp at once: the store cannot fault (the per-CPU
+        // slab is never a guard), so no trap sees one stack with the other's
+        // floor.
+        "sd t0, {floor}(tp)",
         "ld s0,    16(a1)",
         "ld s1,    24(a1)",
         "ld s2,    32(a1)",
@@ -228,6 +249,7 @@ pub unsafe extern "C" fn switch(
         "sw   t0, 0(a2)", // *save_flag = 1
         "1:",
         "ret", // jr ra → jumps to next thread's entry or resume point
+        floor = const crate::percpu::PERCPU_KERNEL_STACK_FLOOR_OFFSET,
     );
 }
 

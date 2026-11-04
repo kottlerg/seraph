@@ -263,7 +263,7 @@ pub struct RestartCtx
     /// here with the same correlator they used pre-crash, so the routing
     /// in `dispatch_deaths` continues to land on the correct
     /// `ServiceEntry`.
-    pub deaths: crate::death_queues::DeathSet,
+    pub deaths: death_set::DeathSet,
     /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
     pub master_log_source: u64,
@@ -770,7 +770,7 @@ pub(crate) fn destroy_partial_child(process_handle: u64, thread_cap: u64, ipc_bu
 /// its `ServiceEntry`.
 fn rebind_death_notification(
     svc: &mut ServiceEntry,
-    deaths: &crate::death_queues::DeathSet,
+    deaths: &death_set::DeathSet,
     new_thread_cap: u64,
     correlator: u64,
 ) -> bool

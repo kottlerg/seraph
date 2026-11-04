@@ -601,8 +601,8 @@ pub fn raw_cap_create_cspace(
 /// generation).
 ///
 /// `memory_cap` must carry `MemRights::RETYPE` and have at least
-/// `SystemInfoType::ThreadRetypeBytes` of `available_bytes` (4 kstack pages,
-/// 1 page for the wrapper and TCB, and the FPU/SIMD/V save-area pages the
+/// `SystemInfoType::ThreadRetypeBytes` of `available_bytes` (1 guard page, 4
+/// kstack pages, 1 page for the wrapper and TCB, and the FPU/SIMD/V save-area pages the
 /// boot CPU sizes; see `cap::retype::dispatch_for(Thread)`).
 ///
 /// Creation priority: with `sched_cap == 0`, `priority` must also be 0 and

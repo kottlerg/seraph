@@ -164,8 +164,8 @@ pick_next(cpu):
 
 The TCB is the kernel's per-thread state. A thread's TCB lives in its Thread slab, which
 `SYS_CAP_CREATE_THREAD` retypes from the caller's Memory capability (boot code carves init's
-thread from the SEED reserve): the kernel stack, then the page holding the `ThreadObject` and
-TCB, then the extended-state area (see
+thread from the SEED reserve): a guard page, the kernel stack, then the page holding the
+`ThreadObject` and TCB, then the extended-state area (see
 [memory-internals.md § Kernel Stack Allocation](memory-internals.md#kernel-stack-allocation)).
 Idle threads' TCBs live in a per-CPU array allocated at boot. The excerpt below is abridged to
 the fields this document discusses; `core/kernel/src/sched/thread.rs` holds the full definition.
@@ -317,6 +317,12 @@ context_switch(current_tcb, next_tcb):
     //    RISC-V: writes PerCpuData::kernel_rsp (read by trap_entry to switch from the
     //    user stack). A kernel/idle thread passes 0.
     arch::current::cpu::set_kernel_trap_stack(next_tcb.kernel_stack_top)
+
+    // 1b. Flush this CPU's whole TLB when next_tcb's kernel-stack guard was
+    //     holed after this CPU's last guard flush, so no stale translation of
+    //     the guard page outlives the switch (memory-internals.md § Kernel
+    //     Stack Guards).
+    mm::stack_guard::flush_before_run(next_tcb.guard_epoch)
 
     // 2. Switch address space if different.
     if current_tcb.address_space != next_tcb.address_space:

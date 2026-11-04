@@ -346,7 +346,7 @@ fn bind_only(
     def: &Definition,
     thread_cap: u64,
     table: &mut ServiceTable,
-    deaths: &crate::death_queues::DeathSet,
+    deaths: &death_set::DeathSet,
 )
 {
     let Some((idx, correlator)) = table.reserve()

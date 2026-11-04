@@ -189,6 +189,18 @@ unsafe fn plic_write(offset: u64, val: u32)
 ///
 /// `context::return_to_user` arms `sscratch` the same way before the first `sret` to U-mode.
 ///
+/// ## Kernel stack overflow
+///
+/// An S-mode trap pushes its frame on the stack it interrupts. Before the first
+/// store the S-mode path compares the frame's base with the hart's
+/// `PerCpuData::kernel_stack_floor` (one load, one compare-and-branch): a frame
+/// that would land below the floor, in the guard page the direct map leaves
+/// unmapped under every kernel stack (`mm::stack_guard`), is an overflow. The
+/// path then switches to [`OVERFLOW_STACK`] and calls [`kernel_stack_overflow`],
+/// which halts with a diagnostic, instead of faulting again on the guard with
+/// each nested trap until the frames reach the memory below it. A floor of 0
+/// disables the check.
+///
 /// # Safety
 /// Installed only in `stvec` by `install_trap_vector`; never called from Rust. Requires
 /// `sscratch = 0` while in S-mode and `&PER_CPU` while in U-mode, `tp = &PER_CPU` in
@@ -225,10 +237,13 @@ unsafe extern "C" fn trap_entry()
 
         // ── S-mode path ─────────────────────────────────────────────────────────
         // t0 = 0; sscratch = old_t0; sp = kernel_sp (already correct)
-        // Restore t0: swap back so t0 = old_t0, sscratch = 0.
-        "csrrw t0, sscratch, t0",
-        // Allocate TrapFrame on the kernel stack.
+        // Load this hart's stack floor and allocate the TrapFrame below sp; a
+        // frame below the floor would land in the stack's guard page.
+        "ld t0, {floor}(x4)",
         "addi sp, sp, -280",
+        "bltu sp, t0, 5f",
+        // Restore t0 = old_t0 and clear sscratch (the S-mode value).
+        "csrrw t0, sscratch, zero",
         // Save t0 (x5) before reusing x5 as a temporary.
         "sd x5, 32(sp)",
         // Record original sp (= current sp + 280, the pre-allocation value).
@@ -381,8 +396,82 @@ unsafe extern "C" fn trap_entry()
         "ld x2,   8(sp)",           // restore sp last (user sp or original kernel sp)
         "sret",
 
+        // ── Kernel stack overflow (never returns) ───────────────────────────────
+        // sp = the frame base below the floor; t0 = the floor; sscratch = the
+        // interrupted t0, abandoned. The first hart to get here takes the
+        // overflow stack; any other parks.
+        "5:",
+        "mv a3, t0",                // a3 = floor
+        "addi a2, sp, 280",         // a2 = the interrupted sp
+        "la t0, {claim}",
+        "li t1, 1",
+        // The kernel target enables A, but the naked-asm assembler is not
+        // handed it; enable it for this one instruction.
+        ".option push",
+        ".option arch, +a",
+        "amoswap.w.aq t1, t1, (t0)",
+        ".option pop",
+        "bnez t1, 6f",
+        "la sp, {overflow_stack}",
+        "li t1, {overflow_bytes}",
+        "add sp, sp, t1",
+        "csrw sscratch, zero",
+        "csrr a0, sepc",
+        "csrr a1, stval",
+        "call {overflow}",
+        "6:",
+        "wfi",
+        "j 6b",
+
         dispatch = sym trap_dispatch,
+        floor = const crate::percpu::PERCPU_KERNEL_STACK_FLOOR_OFFSET,
+        claim = sym OVERFLOW_CLAIMED,
+        overflow_stack = sym OVERFLOW_STACK,
+        overflow_bytes = const OVERFLOW_STACK_BYTES,
+        overflow = sym kernel_stack_overflow,
     );
+}
+
+/// Bytes of [`OVERFLOW_STACK`]: room for `kernel_stack_overflow`'s report and
+/// `fatal`.
+#[cfg(not(test))]
+const OVERFLOW_STACK_BYTES: usize = 16 * 1024;
+
+/// The stack a hart switches to when its S-mode trap entry finds a kernel
+/// stack overflow (`trap_entry` § Kernel stack overflow). One for all harts:
+/// the first to overflow claims it through [`OVERFLOW_CLAIMED`] and halts
+/// there with its report; a later one parks without a report.
+#[cfg(not(test))]
+#[repr(C, align(16))]
+struct OverflowStack([u8; OVERFLOW_STACK_BYTES]);
+
+/// Storage of the overflow stack; written only by the asm in `trap_entry`
+/// (through `sp`) after it claims [`OVERFLOW_CLAIMED`].
+#[cfg(not(test))]
+static mut OVERFLOW_STACK: OverflowStack = OverflowStack([0; OVERFLOW_STACK_BYTES]);
+
+/// Nonzero once a hart has claimed [`OVERFLOW_STACK`].
+#[cfg(not(test))]
+static OVERFLOW_CLAIMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Report a kernel stack overflow `trap_entry` caught and halt: the trap at
+/// `sepc` (with `stval`) found the stack pointer `sp` within a frame of the
+/// stack's floor `floor`. Runs on [`OVERFLOW_STACK`].
+#[cfg(not(test))]
+extern "C" fn kernel_stack_overflow(sepc: u64, stval: u64, sp: u64, floor: u64) -> !
+{
+    crate::kprintln!("KERNEL STACK OVERFLOW: cpu={}", super::cpu::current_cpu());
+    // Kernel addresses; `fatal` halts: serial only
+    // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+    // diagnostics).
+    crate::kprintln_serial!(
+        "  sepc={:#x}  stval={:#x}  sp={:#x}  floor={:#x}",
+        sepc,
+        stval,
+        sp,
+        floor
+    );
+    crate::fatal("kernel stack overflow");
 }
 
 /// TLB shootdown / wakeup IPI handler.

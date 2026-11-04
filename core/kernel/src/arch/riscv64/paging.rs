@@ -1321,19 +1321,163 @@ pub unsafe fn unmap_identity_page(pa: u64)
     unsafe { flush_page(virt) };
 
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let current = crate::arch::current::cpu::current_cpu() as usize;
-    let mut remote = crate::cpu_mask::CpuMask::range(cpu_count);
-    remote.clear(current);
-    if !remote.is_empty()
+    let remote = crate::cpu_mask::MaskSource::Below(cpu_count);
+    crate::percpu::preempt_disable();
+    // SAFETY: root_pa is the active kernel root; remote names only online harts
+    // (the shootdown leaves this one out, and returns at once when it is the
+    // only one); preemption disabled around the shootdown. Tag 0: this is a
+    // kernel identity mapping torn down at boot, not a tagged user space.
+    unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
+    crate::percpu::preempt_enable();
+}
+
+// ── Direct-map holes ──────────────────────────────────────────────────────────
+// A guard page below a kernel stack (`crate::mm::stack_guard`) is a hole in
+// the direct map: one 4 KiB entry left invalid. The 2 MiB megapage that maps
+// a guard's chunk is first split into a leaf table of the same translation.
+// `stack_guard` serialises every edit and flushes the TLB.
+
+/// Direct-map flags of a RAM page: read-write, never executable, PMA memory
+/// type (`mm::paging::init_kernel_page_tables` maps RAM so).
+const DIRECT_RAM: PageFlags = PageFlags {
+    readable: true,
+    writable: true,
+    executable: false,
+    uncacheable: false,
+};
+
+/// Leave the direct-map page at `virt` invalid. When a 2 MiB megapage maps
+/// it, the megapage is first replaced by a leaf table with the same
+/// translation, built in the frame `take_table` returns.
+///
+/// # Errors
+/// - [`PagingError::NotMapped`] when the direct map does not map `virt`.
+/// - [`PagingError::OutOfFrames`] when a split is needed and `take_table`
+///   returns `None`.
+///
+/// # Safety
+/// `virt` is the direct-map address of a RAM page nothing reaches through the
+/// direct map until [`fill_direct_map_page`] restores it. The caller
+/// serialises every direct-map edit and flushes the TLB afterwards.
+#[cfg(not(test))]
+pub unsafe fn hole_direct_map_page(
+    virt: u64,
+    take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>
+{
+    use crate::mm::paging::{LARGE_PAGE_SIZE, kernel_root_table_pa, phys_to_virt};
+
+    let root_va = phys_to_virt(kernel_root_table_pa());
+    let top = paging_mode().levels() - 1;
+    // SAFETY: the kernel root and the tables under it are live table frames
+    // reached through the direct map; the caller serialises their edits.
+    let l1 = unsafe { descend_existing(root_va, virt, top, 1, phys_to_virt) }
+        .ok_or(PagingError::NotMapped)?;
+    let entry = &mut l1[vpn_index(1, virt)];
+    if !entry.is_present()
     {
-        crate::percpu::preempt_disable();
-        // SAFETY: root_pa is the active kernel root; remote covers
-        // only online harts; preemption disabled around the shootdown. Tag 0:
-        // this is a kernel identity mapping torn down at boot, not a tagged
-        // user space.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
-        crate::percpu::preempt_enable();
+        return Err(PagingError::NotMapped);
     }
+    if entry.0 & LEAF_BITS != 0
+    {
+        let table_pa = take_table().ok_or(PagingError::OutOfFrames)?;
+        // SAFETY: the frame is the caller's alone, reached through the direct
+        // map, and no table names it yet.
+        let table = unsafe { table_at(phys_to_virt(table_pa)) };
+        crate::mm::paging::fill_split_table(
+            table,
+            entry.phys_addr() & !(LARGE_PAGE_SIZE - 1),
+            |phys| PageTableEntry::new_page(phys, DIRECT_RAM),
+        );
+        // The entries are written before the level-1 entry names the table,
+        // so a walk through it, which reads the table through that entry,
+        // finds them.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        *entry = PageTableEntry::new_table(table_pa);
+    }
+    // SAFETY: the level-1 entry names a live leaf table (split above, or by
+    // an earlier hole).
+    let l0 = unsafe { table_at(phys_to_virt(entry.phys_addr())) };
+    l0[vpn_index(0, virt)] = PageTableEntry(0);
+    Ok(())
+}
+
+/// Map the direct-map page at `virt` to `phys` again, closing a hole
+/// [`hole_direct_map_page`] left. A hart may have cached the invalid entry
+/// ([`CACHES_NOT_PRESENT_ENTRIES`]), so the caller flushes every hart before
+/// the page is used.
+///
+/// # Safety
+/// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`];
+/// the caller serialises every direct-map edit.
+#[cfg(not(test))]
+pub unsafe fn fill_direct_map_page(virt: u64, phys: u64)
+{
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
+
+    let root_va = phys_to_virt(kernel_root_table_pa());
+    let top = paging_mode().levels() - 1;
+    // SAFETY: as in hole_direct_map_page; the hole left a leaf table here.
+    if let Some(l0) = unsafe { descend_existing(root_va, virt, top, 0, phys_to_virt) }
+    {
+        l0[vpn_index(0, virt)] = PageTableEntry::new_page(phys, DIRECT_RAM);
+    }
+}
+
+/// Whether the kernel's tables map the direct-map address `virt`.
+///
+/// # Safety
+/// The caller serialises the read against direct-map edits.
+#[cfg(not(test))]
+pub unsafe fn direct_map_page_present(virt: u64) -> bool
+{
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
+
+    let root_va = phys_to_virt(kernel_root_table_pa());
+    let top = paging_mode().levels() - 1;
+    // SAFETY: as in hole_direct_map_page.
+    let Some(l1) = (unsafe { descend_existing(root_va, virt, top, 1, phys_to_virt) })
+    else
+    {
+        return false;
+    };
+    let entry = l1[vpn_index(1, virt)];
+    if !entry.is_present() || entry.0 & LEAF_BITS != 0
+    {
+        return entry.is_present();
+    }
+    // SAFETY: a present non-leaf level-1 entry names a live leaf table.
+    let l0 = unsafe { table_at(phys_to_virt(entry.phys_addr())) };
+    l0[vpn_index(0, virt)].is_present()
+}
+
+/// Invalidate every translation this hart caches, in every address space
+/// (`sfence.vma zero, zero`).
+///
+/// # Safety
+/// Must execute in S-mode.
+#[cfg(not(test))]
+pub unsafe fn flush_all_contexts()
+{
+    // SAFETY: S-mode (caller contract).
+    unsafe { flush_tlb_all() };
+}
+
+/// Whether a hart may cache an invalid entry, so that a page made valid again
+/// needs a flush on every hart before another one reaches it: true on RISC-V
+/// without Svvptc, which the kernel does not require.
+pub const CACHES_NOT_PRESENT_ENTRIES: bool = true;
+
+/// Invalidate this hart's cached translations of the kernel address `virt`
+/// in every address space: `sfence.vma virt, zero` covers every ASID.
+///
+/// # Safety
+/// Must execute in S-mode.
+#[cfg(not(test))]
+pub unsafe fn flush_kernel_page(virt: u64)
+{
+    // SAFETY: S-mode (caller contract).
+    unsafe { flush_page(virt) };
 }
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.

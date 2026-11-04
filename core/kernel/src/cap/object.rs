@@ -4051,8 +4051,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     (*tcb).sched_lock.unlock_raw(saved);
                 }
 
-                // The per-thread XSAVE / FP-save area is pages N+1.. of the
-                // Thread retype slot (see sys_cap_create_thread layout); it
+                // The per-thread XSAVE / FP-save area is the pages after the
+                // wrapper page of the Thread retype slot
+                // (`sched::thread_slot::EXTENDED_OFFSET`); it
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.
 
@@ -4096,29 +4097,35 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: ancestor_ptr is non-null: every production object is
             // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            // The wrapper sits one full page above the slot's base,
-            // immediately after the kstack pages.
+            // The wrapper sits at the slot's `WRAPPER_OFFSET`, immediately
+            // after the guard and the kstack pages (`sched::thread_slot`).
             let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let kstack_pages_bytes =
-                (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
-            let block_phys = wrapper_phys - kstack_pages_bytes;
+            let block_phys = wrapper_phys - crate::sched::thread_slot::WRAPPER_OFFSET;
             let offset = block_phys - ancestor_memory.base;
             // Count this thread's stack depth before the slot is freed.
-            // SAFETY: the kstack pages lie below the wrapper in the retype
+            // SAFETY: the kstack pages lie above the guard in the retype
             // slot, mapped through the direct map; the thread is dead, so
             // nothing runs on them.
             unsafe {
                 crate::stack_depth::record_thread_stack(crate::mm::paging::phys_to_virt(
-                    block_phys,
+                    block_phys + crate::sched::thread_slot::STACK_OFFSET,
                 ));
             }
 
             // SAFETY: ptr is in-place ThreadObject.
             unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
 
-            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
-            // with `raw_bytes`, and is dropped above; nothing references it.
-            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
+            // Map the guard page back into the direct map before its memory
+            // returns to the cap, then free the slot.
+            // SAFETY: thread creation holed the slot's guard, and the thread
+            // is dead; this arm holds no lock (`dealloc_object_one`'s
+            // contract), after SMP bringup. The object was retyped from
+            // `ancestor_memory` at `offset` with `raw_bytes`, and is dropped
+            // above; nothing references it.
+            unsafe {
+                crate::mm::stack_guard::close(block_phys);
+                retype_free(ancestor_memory, offset, raw_bytes);
+            }
 
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
@@ -4185,8 +4192,8 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // No CPU still has this address space loaded in satp/CR3
                 // (waited for above), so the root page table can go.
                 debug_assert!(
-                    // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire snapshot.
-                    unsafe { (*as_ptr).active_cpu_mask() }.is_empty(),
+                    // SAFETY: as_ptr non-null; inactive_everywhere reads the set with Acquire.
+                    unsafe { (*as_ptr).inactive_everywhere() },
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 

@@ -150,8 +150,11 @@ policy in [memory-map.md](memory-map.md).
 
 The buffer allocation in step 2 increases the map size by at least one entry (the new
 `EfiLoaderData` region). The buffer must be sized to accommodate this; the bootloader
-adds 16 entries of slack, a prudent margin that also absorbs the further growth seen
-when `ExitBootServices` re-queries the map under contention (see below).
+adds 16 entries of slack (`uefi::MAP_BUFFER_SLACK_DESCRIPTORS`), a prudent margin that
+also absorbs the further growth seen when `ExitBootServices` re-queries the map under
+contention (see below). The buffer, rounded to whole pages, bounds every map read into
+it, and step 6 sizes the translated entry array to that bound
+([memory-map.md](memory-map.md) § Sizing the Entry Array).
 
 ### UEFI Memory Type Translation
 
@@ -223,7 +226,9 @@ resources degrade instead of failing: an absent GOP leaves the system headless, 
 failing entropy source falls back as
 [boot-flow.md § Step 5c](boot-flow.md#step-5c-boot-entropy-seed) describes. There is no recovery
 path for a `BootError` that reaches `efi_main`, no retry beyond the bounded `ExitBootServices`
-retry loop described above, and no fallback configuration.
+retry loop described above and the bounded redo of steps 6 and 7 on a memory map that outgrew
+its entry array ([memory-map.md](memory-map.md) § Sizing the Entry Array), and no fallback
+configuration.
 
 ### BootError Type
 
@@ -233,9 +238,10 @@ protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
 failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
 on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
-a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), and, in
-step 9, RAM descriptors past the translated memory map (`MemoryMapTruncated`,
-[memory-map.md](memory-map.md) § Sizing the Entry Array) and a `reclaim_ranges` overflow
+a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), a memory map
+that outgrows its entry array on every run of steps 6 and 7 (`MemoryMapKeptGrowing`,
+[memory-map.md](memory-map.md) § Sizing the Entry Array), and, in step 9, a
+`reclaim_ranges` overflow
 (`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
 source is the authority on the variant list and payloads.
 

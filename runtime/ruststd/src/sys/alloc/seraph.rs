@@ -1129,7 +1129,7 @@ pub fn object_slab_retype_reclaimable<T>(
 /// process's memmgr-pool footprint bounded instead of leaking a run per
 /// iteration until process death. The grant covers exactly the class-rounded
 /// `min_bytes`, the kernel's debit for the one retype the caller makes, with
-/// no metadata reserve: a 6-page Thread takes 6 pages, not 7.
+/// no metadata reserve: a Thread slab takes exactly its slot's pages, not one more.
 pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
     let need = slab_round_to_class(min_bytes);
     slab_acquire_fresh(need, need.div_ceil(PAGE_SIZE), 0)

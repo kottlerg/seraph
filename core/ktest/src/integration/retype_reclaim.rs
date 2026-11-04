@@ -17,7 +17,7 @@
 //! - `Notification` (sub-page, in-place)
 //! - `WaitSet`      (sub-page, in-place)
 //! - `EventQueue`   (sub-page when small, page-aligned split when large)
-//! - `Thread`       (page-aligned split — kstack + wrapper page + save area)
+//! - `Thread`       (page-aligned split — guard page + kstack + wrapper page + save area)
 //! - `AddressSpace` (page-aligned split — wrapper, root PT, `init_pages - 2` pool pages)
 //! - `CSpaceObj`    (page-aligned split — wrapper, `init_pages - 1` pool pages)
 //!

@@ -26,12 +26,11 @@ procmgr/
 │                                 table + badge logic, the create-request
 │                                 argv/env blob decoder and cap split, the
 │                                 fs-reply bounds, the init-reap state
-│                                 machine, and the death-queue bind order
-│                                 and growth, main wait set included
-│                                 (`DeathQueues`)
+│                                 machine, and the first death queue's
+│                                 size (`FIRST_POOL_OBSERVERS`)
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
-│   ├── death_queues.rs         # The death-queue set and main wait set (`DeathSet`)
+│   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
 │   ├── init_reap.rs            # Init-reap: reaps init after handover
@@ -214,7 +213,8 @@ once a pool reaches the kernel maximum); when memmgr refuses it, procmgr retries
 down to the first pool's size, whose request is three pages.
 
 The queues share procmgr's main wait set with its service endpoint, and procmgr's death-queue set
-(`DeathSet`, `src/death_queues.rs`) owns that wait set: it starts with room for two members (the
+(`DeathSet`, the [`shared/death-set`](../../shared/death-set/README.md) crate, following the
+`ruststd-death-queues` growth policy) owns that wait set: it starts with room for two members (the
 endpoint and the first queue), and when the queues fill it, procmgr creates one with twice the
 members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one;
 the main loop waits on whichever is current. The kernel queues a member that is already ready when

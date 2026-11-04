@@ -101,8 +101,8 @@ pub fn record_cpu_id(id: u32, ids: &mut [u32], count: &mut usize, truncated: &mu
 }
 
 /// Slots the `cpu_ids` array needs for a table listing `entries` enabled CPUs:
-/// one more for a BSP the table may omit, capped at [`MAX_CPUS`] (the kernel's
-/// CPU-count width) and never below one.
+/// one more for a BSP the table may omit, capped at [`MAX_CPUS`] (the boot
+/// protocol's CPU ceiling) and never below one.
 pub fn cpu_id_capacity(entries: usize) -> usize
 {
     entries.saturating_add(1).min(MAX_CPUS)
@@ -169,7 +169,7 @@ mod tests
     }
 
     // Defect caught: a capacity that leaves no slot for a BSP the table omits,
-    // or exceeds the kernel's CPU-count width.
+    // or exceeds the boot protocol's CPU ceiling.
     #[test]
     fn capacity_adds_the_bsp_and_caps_at_max_cpus()
     {

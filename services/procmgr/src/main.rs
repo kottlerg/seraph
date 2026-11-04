@@ -110,8 +110,13 @@ fn main() -> !
     // The main wait set, holding the service endpoint and the first death
     // queue; further queues join it as pools run out, and it is replaced by a
     // wider one as they fill it.
-    let Some(deaths) =
-        death_queues::DeathSet::new(boot.service_ep, WS_BADGE_SERVICE, WS_BADGE_DEATH)
+    let Some(deaths) = death_set::DeathSet::new(
+        boot.service_ep,
+        WS_BADGE_SERVICE,
+        WS_BADGE_DEATH,
+        death_queues::DEATH_EQ_CAPACITY,
+        process_table::death_queues::FIRST_POOL_OBSERVERS,
+    )
     else
     {
         syscall::thread_exit();
@@ -196,8 +201,8 @@ const WS_BADGE_SERVICE: u64 = 0;
 const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
-/// retype slab: `SystemInfoType::ThreadRetypeBytes` in pages (kernel stack,
-/// wrapper/TCB, extended-state save area, which the boot CPU sizes), all
+/// retype slab: `SystemInfoType::ThreadRetypeBytes` in pages (guard page,
+/// kernel stack, wrapper/TCB, extended-state save area, which the boot CPU sizes), all
 /// consumed by the kernel. Queried once and cached; `None` if the query
 /// fails, which fails the spawn.
 pub(crate) fn thread_retype_pages() -> Option<u64>
@@ -755,7 +760,7 @@ fn resolve_query_state(
 /// crosses the capacity ends after the drop; [`resync_deaths`] then finds the
 /// process whose post was lost.
 fn dispatch_death(
-    deaths: &death_queues::DeathSet,
+    deaths: &death_set::DeathSet,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
@@ -1242,7 +1247,7 @@ pub struct ProcmgrCtx
     /// with the service endpoint (`WS_BADGE_SERVICE`, every queue under
     /// `WS_BADGE_DEATH`). Every spawned child binds its main thread and its
     /// address space on the queues with `correlator = entry.badge`.
-    pub deaths: death_queues::DeathSet,
+    pub deaths: death_set::DeathSet,
     /// Procmgr's baseline `SchedControl` cap, delivered via its own
     /// `ProcessInfo.sched_control_cap` (band
     /// `[1, sched_policy::BASELINE_PRIORITY_MAX]`). The fan-out source for

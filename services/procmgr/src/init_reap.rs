@@ -41,7 +41,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::death_queues::DeathSet;
+use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_PHYS_BASE, MSG_CAP_SLOTS_MAX};
@@ -202,7 +202,7 @@ static STATE: Mutex<InitReap<InitReapState>> = Mutex::new(InitReap::Empty);
 /// `UNAUTHORIZED`. An un-badged sender gets `INVALID_ARGUMENT`, and its caps
 /// stay in procmgr's `CSpace` while they may still be init's live ones:
 ///   * an `AddressSpace` cap would trip `dealloc_object`'s
-///     `active_cpu_mask == 0` assert — init's threads still run on it while
+///     `inactive_everywhere()` assert — init's threads still run on it while
 ///     this IPC is in flight;
 ///   * a Memory cap would buddy-free pages that init's live address space
 ///     still maps, the aliasing window the reap ordering exists to prevent.

@@ -876,7 +876,30 @@ unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usiz
     Ok((map_size, descriptor_size))
 }
 
-/// Number of descriptors the firmware's memory map holds now
+/// Descriptors of slack [`get_memory_map`]'s buffer carries above the map the
+/// size query reports: the buffer's own allocation adds at least one, and the
+/// rest absorbs growth before the fill and in `ExitBootServices`' re-query.
+pub const MAP_BUFFER_SLACK_DESCRIPTORS: usize = 16;
+
+/// Bytes of the buffer [`get_memory_map`] allocates for a map of `map_bytes`
+/// at a stride of `descriptor_size`: the map plus
+/// [`MAP_BUFFER_SLACK_DESCRIPTORS`] descriptors, rounded up to whole pages.
+pub const fn map_buffer_bytes(map_bytes: usize, descriptor_size: usize) -> usize
+{
+    (map_bytes + MAP_BUFFER_SLACK_DESCRIPTORS * descriptor_size).div_ceil(4096) * 4096
+}
+
+/// Most descriptors a map buffer of `buffer_bytes` can hold at any stride
+/// [`check_descriptor_size`] accepts, the smallest being
+/// `EFI_MEMORY_DESCRIPTOR`'s: the bound on every map read into it, the
+/// `ExitBootServices` re-query's included, since that re-query writes into
+/// the same buffer.
+pub const fn map_buffer_descriptor_reach(buffer_bytes: usize) -> usize
+{
+    buffer_bytes / core::mem::size_of::<EfiMemoryDescriptor>()
+}
+
+/// The firmware's memory map now, as `(descriptor count, descriptor size)`
 /// ([`query_memory_map_size`]); nothing is allocated.
 ///
 /// # Errors
@@ -886,16 +909,17 @@ unsafe fn query_memory_map_size(bs: *mut EfiBootServices) -> Result<(usize, usiz
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<usize, BootError>
+pub unsafe fn memory_map_shape(bs: *mut EfiBootServices) -> Result<(usize, usize), BootError>
 {
     // SAFETY: forwarded caller contract.
     let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
     check_descriptor_size(descriptor_size)?;
-    Ok(map_size / descriptor_size)
+    Ok((map_size / descriptor_size, descriptor_size))
 }
 
-/// Query the UEFI memory map into a freshly allocated buffer sized with 16
-/// descriptors of slack. Returns the buffer address and capacity, map size,
+/// Query the UEFI memory map into a freshly allocated buffer sized with
+/// [`MAP_BUFFER_SLACK_DESCRIPTORS`] descriptors of slack
+/// ([`map_buffer_bytes`]). Returns the buffer address and capacity, map size,
 /// map key, and descriptor size. The acquisition protocol (key invalidation,
 /// final-allocation ordering, slack sizing) is specified in
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
@@ -916,13 +940,10 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     let mut map_key: usize = 0;
     let mut descriptor_version: u32 = 0;
 
-    // Add slack for the buffer allocation itself (which creates one new entry).
-    map_size += 16 * descriptor_size;
-
-    let pages = map_size.div_ceil(4096);
+    // Slack for the buffer allocation itself (which creates one new entry).
+    let buffer_size = map_buffer_bytes(map_size, descriptor_size);
     // SAFETY: bs is valid.
-    let buffer_phys = unsafe { allocate_pages(bs, pages)? };
-    let buffer_size = pages * 4096;
+    let buffer_phys = unsafe { allocate_pages(bs, buffer_size / 4096)? };
 
     // Second call: fill the buffer. This call's map_key is the one to use.
     map_size = buffer_size;
@@ -1337,7 +1358,38 @@ pub unsafe fn find_config_table(
 #[cfg(test)]
 mod tests
 {
-    use super::{BootError, EfiMemoryDescriptor, check_descriptor_size};
+    use super::{
+        BootError, EfiMemoryDescriptor, MAP_BUFFER_SLACK_DESCRIPTORS, check_descriptor_size,
+        map_buffer_bytes, map_buffer_descriptor_reach,
+    };
+
+    // Defect caught: an entry array sized for a map that a buffer allocated
+    // for a map no larger can outgrow (at the queried stride or any smaller
+    // one a re-query may report), so a map past the array reaches step 9.
+    #[test]
+    fn a_buffer_for_a_smaller_map_never_reaches_past_one_for_a_larger()
+    {
+        let min = core::mem::size_of::<EfiMemoryDescriptor>();
+        for stride in [min, 48, 56, 64, 80]
+        {
+            for sized_for in [0usize, 1, 50, 85, 86, 200, 1000]
+            {
+                let reach =
+                    map_buffer_descriptor_reach(map_buffer_bytes(sized_for * stride, stride));
+                assert!(reach >= sized_for + MAP_BUFFER_SLACK_DESCRIPTORS);
+                for actual in 0..=sized_for
+                {
+                    let buffer = map_buffer_bytes(actual * stride, stride);
+                    assert_eq!(buffer % 4096, 0);
+                    assert!(buffer >= (actual + MAP_BUFFER_SLACK_DESCRIPTORS) * stride);
+                    assert!(
+                        map_buffer_descriptor_reach(buffer) <= reach,
+                        "{stride} {actual}"
+                    );
+                }
+            }
+        }
+    }
 
     // Defect caught: a stride below the descriptor accepted, so the map
     // readers read past each descriptor; or a conforming stride refused.

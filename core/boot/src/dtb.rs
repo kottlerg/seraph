@@ -18,6 +18,8 @@
 //!   the `HART_CAP_*` bits every enabled hart advertises.
 //! - [`parse_boot_cpu_mmu_type`]: read the boot hart's `mmu-type` paging
 //!   claim for mode negotiation.
+//! - [`count_aperture_seed`]: count the seeds [`parse_aperture_seed`]
+//!   writes, which sizes the seed buffer.
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports) as seeds for
 //!   [`super::memory_map::derive_mmio_apertures`].
@@ -1075,33 +1077,56 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
 /// FDT blob. A zero `dtb_addr` returns 0 without reading.
 pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> usize
 {
+    // SAFETY: caller contract.
+    let (written, found) = unsafe { walk_aperture_seed(dtb_addr, out) };
+    if found != written
+    {
+        bprintln!("[--------] boot: DTB: aperture seeds past the seed buffer dropped");
+    }
+    written
+}
+
+/// The number of seeds [`parse_aperture_seed`] would write into a buffer
+/// large enough for every one: the same walk, writing nothing. The bootloader
+/// sizes the seed buffer from it before `ExitBootServices`; the blob does not
+/// change between the two walks.
+///
+/// # Safety
+/// As [`parse_aperture_seed`].
+pub unsafe fn count_aperture_seed(dtb_addr: u64) -> usize
+{
+    // SAFETY: caller contract.
+    unsafe { walk_aperture_seed(dtb_addr, &mut []) }.1
+}
+
+/// The walk behind [`parse_aperture_seed`] and [`count_aperture_seed`]:
+/// returns the seeds written to `out` and the seeds found, written or not.
+///
+/// # Safety
+/// As [`parse_aperture_seed`].
+unsafe fn walk_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> (usize, usize)
+{
     if dtb_addr == 0
     {
-        return 0;
+        return (0, 0);
     }
     // SAFETY: caller contract.
     let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
     else
     {
-        return 0;
+        return (0, 0);
     };
 
     let mut n: usize = 0;
-    let mut dropped = false;
+    let mut found: usize = 0;
 
     // Push a node's first `reg` entry as an aperture seed when its size is
     // non-zero; shared by every compatible string below.
     let push_first_reg =
-        |out: &mut [MmioAperture], n: &mut usize, dropped: &mut bool, node: &FdtNode| {
+        |out: &mut [MmioAperture], n: &mut usize, found: &mut usize, node: &FdtNode| {
             if node.reg_count > 0 && node.reg_entries[0].1 > 0
             {
-                push_seed(
-                    out,
-                    n,
-                    dropped,
-                    node.reg_entries[0].0,
-                    node.reg_entries[0].1,
-                );
+                push_seed(out, n, found, node.reg_entries[0].0, node.reg_entries[0].1);
             }
         };
 
@@ -1114,7 +1139,7 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     ]
     {
         fdt.walk_compatible(compat, |node| {
-            push_first_reg(out, &mut n, &mut dropped, &node);
+            push_first_reg(out, &mut n, &mut found, &node);
             true
         });
     }
@@ -1122,13 +1147,13 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     // PCI host bridge — reg is the ECAM window; ranges entries with
     // child-space 2 (32-bit MMIO) or 3 (64-bit MMIO) are BAR windows.
     fdt.walk_compatible(b"pci-host-ecam-generic", |node| {
-        push_first_reg(out, &mut n, &mut dropped, &node);
+        push_first_reg(out, &mut n, &mut found, &node);
         for (flags, cpu_addr, size) in fdt.pci_ranges(&node)
         {
             let space = (flags >> 24) & 0x3;
             if (space == 2 || space == 3) && size > 0
             {
-                push_seed(out, &mut n, &mut dropped, cpu_addr, size);
+                push_seed(out, &mut n, &mut found, cpu_addr, size);
             }
         }
         true
@@ -1136,29 +1161,22 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 
     // Each VirtIO MMIO transport advertises its own register window.
     fdt.walk_compatible(b"virtio,mmio", |node| {
-        push_first_reg(out, &mut n, &mut dropped, &node);
+        push_first_reg(out, &mut n, &mut found, &node);
         true
     });
 
-    if dropped
-    {
-        bprintln!("[--------] boot: DTB: aperture seeds past the seed buffer dropped");
-    }
-    n
+    (n, found)
 }
 
-/// Append the seed `(phys_base, size)` to `out[..*n]`, or set `dropped` when
-/// `out` is full.
-fn push_seed(out: &mut [MmioAperture], n: &mut usize, dropped: &mut bool, phys_base: u64, size: u64)
+/// Count the seed `(phys_base, size)` in `found`, and append it to `out[..*n]`
+/// when `out` has room.
+fn push_seed(out: &mut [MmioAperture], n: &mut usize, found: &mut usize, phys_base: u64, size: u64)
 {
+    *found += 1;
     if *n < out.len()
     {
         out[*n] = MmioAperture { phys_base, size };
         *n += 1;
-    }
-    else
-    {
-        *dropped = true;
     }
 }
 
@@ -1414,6 +1432,68 @@ mod tests
             false
         });
         assert_eq!(count, Some(40));
+    }
+
+    // Defect caught: a count pass that finds a different number of seeds
+    // than the fill pass writes, so the buffer sized from it drops seeds (or
+    // a seed counted twice wastes a slot).
+    #[test]
+    fn the_seed_count_pass_finds_every_seed_the_fill_pass_writes()
+    {
+        let mut ranges = Vec::new();
+        for i in 0..3u32
+        {
+            ranges.extend_from_slice(&0x0300_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&[0; 8]);
+            ranges
+                .extend_from_slice(&(0x4_0000_0000u64 + u64::from(i) * 0x1000_0000).to_be_bytes());
+            ranges.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+        }
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&0x3000_0000u64.to_be_bytes());
+        reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        b.prop(b"#address-cells", &2u32.to_be_bytes());
+        b.prop(b"#size-cells", &2u32.to_be_bytes());
+        b.begin_node(b"pcie@30000000");
+        b.prop(b"compatible", b"pci-host-ecam-generic\0");
+        b.prop(b"reg", &reg);
+        b.prop(b"ranges", &ranges);
+        b.end_node();
+        b.begin_node(b"virtio_mmio@10001000");
+        b.prop(b"compatible", b"virtio,mmio\0");
+        let mut vreg = Vec::new();
+        vreg.extend_from_slice(&0x1000_1000u64.to_be_bytes());
+        vreg.extend_from_slice(&0x1000u64.to_be_bytes());
+        b.prop(b"reg", &vreg);
+        b.end_node();
+        b.end_node();
+        let blob = b.finish();
+        let addr = blob.as_ptr() as u64;
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let counted = unsafe { count_aperture_seed(addr) };
+        let mut out = vec![
+            MmioAperture {
+                phys_base: 0,
+                size: 0
+            };
+            counted + 4
+        ];
+        // SAFETY: as above.
+        let written = unsafe { parse_aperture_seed(addr, &mut out) };
+        assert_eq!(counted, written);
+        assert_eq!(counted, 5, "ECAM, three windows and a virtio transport");
+        // A buffer of exactly the counted size drops nothing.
+        let mut exact = vec![
+            MmioAperture {
+                phys_base: 0,
+                size: 0
+            };
+            counted
+        ];
+        // SAFETY: as above.
+        assert_eq!(unsafe { parse_aperture_seed(addr, &mut exact) }, counted);
     }
 
     // Defect caught: a PLIC's `riscv,ndev` not reaching the walker's node, so the

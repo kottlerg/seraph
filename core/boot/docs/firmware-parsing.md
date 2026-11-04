@@ -94,11 +94,12 @@ after `ExitBootServices` by
    [`core/boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
    firmware source that is present, and with the GOP framebuffer, which
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
-   carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS`
-   (`MAX_SEEDS_PER_CLASS`, 256) seed buffer, the framebuffer seed included, are
-   dropped with a diagnostic. The ACPI seeder's heuristic PCI windows go to a separate
-   buffer (`MAX_HEURISTIC_SEEDS`, also 256); windows beyond it are dropped with a
-   diagnostic. Each seed is first clipped to the memory map as
+   carry past `ExitBootServices`. The seeds go to a buffer step 6 sized from a
+   count pass of the same seeders over the same tables (`count_aperture_seed`),
+   one slot more for the framebuffer, so every seed has a slot; the ACPI
+   seeder's heuristic PCI windows go to a separate buffer, sized the same way. A
+   seed past its buffer would be dropped with a diagnostic, which only a table
+   changed between the two passes could cause. Each seed is first clipped to the memory map as
    [§ Firmware exclusion](#firmware-exclusion) defines, so it contributes only
    the gaps the subtracted ranges leave, and a seed wholly inside one contributes
    nothing.
@@ -106,9 +107,11 @@ after `ExitBootServices` by
    `phys_base`, joining adjacent and overlapping entries, so the list is minimal
    and non-overlapping at every step and no scratch buffer bounds the input.
 4. Cap at the array's capacity, `memory_map::aperture_capacity` of the step 6
-   descriptor count plus its slack: every aperture starts at a descriptor's base, a
-   seed's base, or the end of a descriptor clipped out of a seed, so a map no larger
-   than step 6 sized for, with full seed buffers, always fits. When more pieces than
+   entry array's capacity: every aperture starts at a descriptor's base, a seed's
+   base, or the end of a descriptor clipped out of a seed, and no map read from the
+   step 7 buffer holds more descriptors than the entry array
+   ([memory-map.md](memory-map.md) § Sizing the Entry Array), so with the seeds step 6
+   counted the apertures always fit. When more pieces than
    the capacity are disjoint at once, a later piece could still bridge them, so the
    list is rebuilt by taking the pieces in ascending `phys_base` order, which keeps
    exactly the lowest apertures the array holds of the full merge; when the full

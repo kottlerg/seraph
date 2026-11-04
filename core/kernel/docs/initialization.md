@@ -446,31 +446,40 @@ Phase 7.
 ## Phase 7: Capability System
 
 ```
-1. Reserve init's Phase 9 backing (the InitInfo block, zeroed, and INIT_STACK_PAGES stack frames)
-   and seed the kernel page-table pool from the pristine buddy, then drain the remaining buddy RAM
-   as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
-   buddy, and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
-   (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
-   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (535 at
-   INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
-   Phase 7: drained RAM extents exceed the InitInfo descriptor capacity", the one check the in-place
-   mint of step 3a relies on. Every capability Phases 7 and 8 mint then has its descriptor written
-   into that array, in place, so no copy of it exists, and a boot whose capabilities outnumber the
-   slots halts by name in Phase 7 or 8 ("cap: boot capabilities exceed the InitInfo descriptor
-   capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such boot. Phase
-   9's capabilities reach init through InitInfo header fields instead. seed_reserve_bytes() is the
-   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs (the
-   thread slab sized from the boot CPU's save area, so it grows with a wider vector length), and
-   one 128-byte body for each descriptor slot and for each Memory capability Phase 9 mints (init
-   segments, InitInfo pages, init stack pages), plus alignment slack. Every drained extent exposed
-   to userspace (each drained extent, and the seed extent's tail past the reserve) is zeroed through
-   the direct map before step 3 mints it: free RAM still holds what firmware and the bootloader left
-   there, the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
-   reports the time the zeroing took
-2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
-   pages: one wrapper page plus a slot-page pool holding at least
-   ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots and ROOT_CSPACE_BODY_PAGES = 16 pages for the
-   bodies of init's own splits) and register it as CSpace id 0:
+1. Seed the kernel page-table pool and reserve init's INIT_STACK_PAGES stack frames from the
+   pristine buddy, then reserve init's InitInfo region, sized for this boot
+   (`cap::reserve_init_backing`): the buddy counts its coalesced extents without draining
+   (`BuddyAllocator::coalesced_extent_count`), and the region holds that count plus two (taking the
+   region and returning its buddy block's tail can each split one extent), one descriptor per
+   AcpiReclaimable memory-map entry, MMIO aperture, boot module and reclaim range, and
+   FIXED_BOOT_DESCRIPTORS more (`cap::init_info_descriptor_bound`), in the fewest pages that hold
+   them, one contiguous zeroed extent. A boot whose bound passes INIT_INFO_DESCRIPTOR_CAPACITY, the
+   10,775 slots of the protocol's INIT_INFO_MAX_PAGES = 64 ceiling, halts with "FATAL: Phase 7:
+   boot descriptors exceed the InitInfo region ceiling". Then drain the remaining buddy RAM as
+   address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the buddy,
+   and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
+   (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the region's
+   descriptor array, the 24-byte slots past the header, extent i in slot i; more extents than slots
+   halt the boot with "FATAL: Phase 7: drained RAM extents exceed the InitInfo descriptor
+   capacity", the one check the in-place mint of step 3a relies on. Every capability Phases 7 and 8
+   mint then has its descriptor written into that array, in place, so no copy of it exists, and a
+   boot whose capabilities outnumber the slots halts by name in Phase 7 or 8 ("cap: boot
+   capabilities exceed the InitInfo descriptor capacity"). Phase 9's capabilities reach init
+   through InitInfo header fields instead. seed_reserve_bytes() is the boot footprint, sized with
+   the region (about 320 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's
+   address-space and thread slabs (the thread slab sized from the boot CPU's save area, so it grows
+   with a wider vector length), and one 128-byte body for each descriptor slot and for each Memory
+   capability Phase 9 mints (init segments, InitInfo pages, init stack pages), plus alignment
+   slack. Every drained extent exposed to userspace (each drained extent, and the seed extent's
+   tail past the reserve) is zeroed through the direct map before step 3 mints it: free RAM still
+   holds what firmware and the bootloader left there, the UEFI stack among it, and the buddy's
+   free-list headers. The "Phase 7: drained" line reports the time the zeroing took
+2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, `root_cspace_init_pages()`
+   pages: one wrapper page plus a slot-page pool holding at least every capability body the boot
+   mints (`boot_body_bound`), ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace,
+   Thread and CSpace caps), and ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap,
+   and ROOT_CSPACE_BODY_PAGES = 16 pages for the bodies of init's own splits) and register it as
+   CSpace id 0:
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
@@ -690,9 +699,10 @@ calls `sched::enter()`.
       range added to the buddy ledger by `register_owned_range`) so init can
       donate the frames to memmgr on reap
    c. Write the InitInfo header in front of the CapDescriptor array Phases 7 and 8 left in the
-      contiguous block it reserved, map the region read-only at the chosen
-      InitInfo VA (`choose_init_layout().init_info_va`), and mint a
-      reclaimable Memory cap per mapped InitInfo page into the root CSpace
+      contiguous region Phase 7 reserved, map every page of the region read-only at the chosen
+      InitInfo VA (`choose_init_layout().init_info_va`), mint a reclaimable Memory cap per
+      page into the root CSpace, and record the page count in the header's
+      `init_info_memory_count`
 4. Map init's user stack (inlined in `kernel_entry_post_rebase`):
    a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
       Phase 7, before the user-cap drain, one at a time so each phys
@@ -822,7 +832,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
-| 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
+| 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
 | 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, or no Vector extension); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 

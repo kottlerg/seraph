@@ -1974,7 +1974,7 @@ programs nothing.
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
 `InvalidArgument` (IRQ cap covers more than one line, or names an id no discovered
 interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the root
-Interrupt cap spans 2048 GSIs; on RISC-V a source outside the PLIC's reported
+Interrupt cap spans 32768 GSIs; on RISC-V a source outside the PLIC's reported
 `1..=riscv,ndev`, where the root Interrupt cap spans the PLIC's 1024-id space; see
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions; or `mode`
 sets a bit outside `IRQ_MODE_MASK`, or differs from the mode the line's bindings recorded),
@@ -2607,7 +2607,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
-| `BOOT_PROTOCOL_VERSION` | 17 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 18 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

@@ -35,7 +35,9 @@ layout) that Phase 0 depends on, see
     at or below kernel_virtual_base
 11. Validate that a slid image (kernel_virtual_base above KERNEL_LINK_BASE) carries
     KASLR_IMAGE_RANDOMIZED in kaslr_flags
-12. arch::current::paging::init_paging_mode: read the paging mode (RISC-V: satp.MODE;
+12. Validate that cpu_ids is non-null and its cpu_count entries (at most MAX_CPUS) end at or
+    below the highest RAM address the memory map describes, so the direct map reaches them
+13. arch::current::paging::init_paging_mode: read the paging mode (RISC-V: satp.MODE;
     x86-64: CR4.LA57, 4- or 5-level), halt if direct_map_base is below that mode's
     kernel-half base (RISC-V: also if satp names no supported mode), then publish the mode
     and direct_map_base
@@ -192,7 +194,7 @@ again from the recorded BootInfo address.
    as reclaimable Memory caps into init's CSpace during Phase 7 by
    `cap::mint_reclaim_memory_caps`, alongside the other bootloader
    scratch pages (`BootInfo` page, descriptor arrays, MMIO aperture
-   array, reclaim-array page) and the bundle's non-module pages
+   array, reclaim-array page, CPU-id pages) and the bundle's non-module pages
    (header + entry table + 4 KiB pad, init ELF source body, and any
    inter-module or trailing slack — module bodies are excluded because
    `mint_module_memory_caps` already covers them).
@@ -449,7 +451,7 @@ Phase 7.
    as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
    buddy, and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
-   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 655 at
+   descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (535 at
    INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
    Phase 7: drained RAM extents exceed the InitInfo descriptor capacity", the one check the in-place
    mint of step 3a relies on. Every capability Phases 7 and 8 mint then has its descriptor written
@@ -490,7 +492,7 @@ Phase 7.
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
    d. One root Interrupt range capability (Notify rights) covering every valid
-      IRQ id on the architecture (ROOT_IRQ_COUNT: 2048 on x86-64, 1024 on RISC-V);
+      IRQ id on the architecture (ROOT_IRQ_COUNT: 32768 on x86-64, 1024 on RISC-V);
       userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
    e. Map-only Memory capabilities over firmware tables (not retypable, not
       buddy-backed): one per `AcpiReclaimable` memory-map region (as many
@@ -544,7 +546,7 @@ consecutive slots also halts, naming the run and the first slot out of place (fo
 **Completion criterion:** Root CSpace exists and contains capabilities for all
 boot-provided hardware resources, including the reclaimable Memory caps
 covering bootloader scratch pages (`BootInfo` page, descriptor arrays,
-MMIO aperture array, reclaim-array page, transient page-table frames)
+MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames)
 and the bundle's non-module pages (header + entry table + 4 KiB pad,
 init ELF source body, inter-module and trailing slack — module bodies
 are excluded because `mint_module_memory_caps` already covers them).

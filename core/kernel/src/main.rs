@@ -180,7 +180,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // Copy all fields needed beyond Phase 3 out of BootInfo now, while the
     // identity mapping is still live. After Phase 3 activates the kernel page
     // tables, the physical address in `info` is no longer mapped.
-    // The CPU ids stay in the BootInfo page, read through the direct map
+    // The CPU ids stay in the bootloader's pages, read through the direct map
     // after Phase 3 (`boot_cpu_ids`); only their count is copied.
     let boot_cpu_count = info.cpu_count.max(1);
     let trampoline_pa = info.ap_trampoline_page;
@@ -321,18 +321,23 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 ///
 /// # Safety
 /// Phase 3 has completed (the direct map is active), `boot_info_phys` is the
-/// `BootInfo` Phase 0 validated, its page is not yet scrubbed, and nothing
-/// writes its `cpu_ids` while the slice lives. `count` is the producer's
-/// `cpu_count`, at most `MAX_CPUS` by the boot protocol's contract; the slice
-/// is clamped to the array in any case.
+/// `BootInfo` Phase 0 validated, neither its page nor the CPU-id pages its
+/// `cpu_ids` names (a reclaim range of their own) are yet scrubbed by Phase 9's
+/// `cap::scrub_reclaim_ranges`, and nothing writes the ids while the slice
+/// lives. `count` is the producer's `cpu_count`, at most `MAX_CPUS` by the
+/// boot protocol's contract; the slice is clamped to `MAX_CPUS` in any case.
+/// Phase 0 confirmed the array lies below the RAM ceiling, so the direct map
+/// reaches it.
 #[cfg(not(test))]
 unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 {
     let bi = mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo;
-    // SAFETY: caller contract; the borrow covers `cpu_ids` alone, so a write
-    // elsewhere in the page (the Phase-5 seed scrub) does not alias it.
-    let ids: &[u32; boot_protocol::MAX_CPUS] = unsafe { &*core::ptr::addr_of!((*bi).cpu_ids) };
-    &ids[..(count as usize).min(boot_protocol::MAX_CPUS)]
+    // SAFETY: caller contract; reads the one pointer field of the page.
+    let ids_phys = unsafe { core::ptr::addr_of!((*bi).cpu_ids).read() } as u64;
+    let len = (count as usize).min(boot_protocol::MAX_CPUS);
+    // SAFETY: caller contract and Phase 0's check: `len` u32s at `ids_phys`
+    // lie in RAM the direct map covers, and nothing writes them.
+    unsafe { core::slice::from_raw_parts(mm::paging::phys_to_virt(ids_phys) as *const u32, len) }
 }
 
 /// Continuation of [`kernel_entry`] after the boot-stack rebase.
@@ -488,9 +493,10 @@ unsafe fn kernel_entry_post_rebase(
     // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
     // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.
     #[cfg(not(test))]
-    // SAFETY: single-threaded boot; the ids are read from the validated
-    // BootInfo page through the direct map; init_storage allocated the id slab;
-    // init_apic_ids writes it once before SMP is active.
+    // SAFETY: single-threaded boot; the ids are read through the direct map
+    // from the CPU-id pages the validated BootInfo names, unscrubbed until
+    // Phase 9; init_storage allocated the id slab; init_apic_ids writes it once
+    // before SMP is active.
     unsafe {
         percpu::init_apic_ids(boot_cpu_ids(boot_info_phys, boot_cpu_count));
     }
@@ -676,8 +682,8 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 let entry_fn = kernel_entry_ap as *const () as u64;
-                // SAFETY: the BootInfo page is intact until the reclaim scrub at
-                // the end of boot, and nothing writes its CPU ids.
+                // SAFETY: the BootInfo page and the CPU-id pages are intact
+                // until Phase 9's reclaim scrub, and nothing writes the ids.
                 let hw_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
 
                 for cpu_idx in 1..=ap_count

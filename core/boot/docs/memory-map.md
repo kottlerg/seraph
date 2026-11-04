@@ -113,7 +113,8 @@ The `Loaded` allocations are:
   every boot-module body, and the init ELF source.
 - `BootInfo` structure page.
 - `BootInfo.modules` descriptor page.
-- `MmioAperture` array page (`mmio_apertures.entries`).
+- `MmioAperture` array pages (`mmio_apertures.entries`).
+- CPU-id pages (`BootInfo.cpu_ids`).
 - Raw UEFI memory-map buffer (the `GetMemoryMap` output).
 - Translated `MemoryMapEntry` array (`BootInfo.memory_map`).
 - Reclaim-array page (the `BootInfo.reclaim_ranges` backing).

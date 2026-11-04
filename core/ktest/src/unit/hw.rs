@@ -179,7 +179,7 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 ///
 /// The root Interrupt cap spans more ids than the controllers implement on
 /// both architectures: on riscv64 the PLIC's 1024-id space against the sources
-/// its `riscv,ndev` reports, on x86-64 2048 GSIs against the pins the I/O APICs
+/// its `riscv,ndev` reports, on x86-64 32768 GSIs against the pins the I/O APICs
 /// report, which size the kernel's routing table. Each id of
 /// `crate::arch::UNROUTABLE_IRQ_IDS` is isolated as a single-id cap split off a
 /// derived copy of the first cap whose range contains it, so the original range

@@ -216,9 +216,9 @@ stack the bootloader ran on, `EfiBootServicesData` holding the slid kernel image
 addresses and the KASLR locals at handoff. Phase 9 zeroes every `reclaim_ranges`
 entry right before init is enqueued (`cap::scrub_reclaim_ranges`). That covers the
 transient page-table frames, whose populated entry indices encode the slid kernel
-VA; the `BootInfo` page and the descriptor arrays; the bundle's non-module pages;
-and the AP trampoline page, whose parameter block carried the AP entry point and
-idle-stack VAs ([initialization.md](initialization.md) § Phase 7 and § Phase 9).
+VA; the `BootInfo` page, the descriptor arrays, and the CPU-id pages; the bundle's
+non-module pages; and the AP trampoline page, whose parameter block carried the AP
+entry point and idle-stack VAs ([initialization.md](initialization.md) § Phase 7 and § Phase 9).
 Two earlier scrubs remain as defence in depth: Phase 5 clears the seed and the
 two KASLR bases from the `BootInfo` page once consumed, and the bootloader
 clears its own copies of the entropy words. Init's segment allocations are

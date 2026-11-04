@@ -87,6 +87,12 @@ static BUNDLE_PATH: [u16; 29] = [
 /// stack is derived from too.
 const KERNEL_STACK_PAGES: usize = boot_protocol::layout::HANDOFF_STACK_BYTES / 4096;
 
+/// Number of 4 KiB pages allocated for the handoff stack and its guard: the
+/// [`KERNEL_STACK_PAGES`] of stack above one guard page, which the boot page
+/// tables leave unmapped so an overflow of the stack faults instead of
+/// overwriting another allocation ([`handoff_stack_span`]).
+const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
+
 /// Number of 4 KiB pages allocated for the translated `MemoryMapEntry` output
 /// array. At 24 bytes per entry this accommodates roughly 680 entries, which
 /// comfortably exceeds any real UEFI memory map.
@@ -1075,15 +1081,16 @@ unsafe fn step6_allocate_and_build_page_tables(
     // MMIO aperture array: one page easily covers MAX_APERTURES × 16 bytes.
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, 1)? };
-    // Kernel stack.
+    // Kernel handoff stack, above its guard page.
     // SAFETY: bs is valid.
-    let stack_phys = unsafe { allocate_pages(ctx.bs, KERNEL_STACK_PAGES)? };
-    let stack_top = stack_phys + (KERNEL_STACK_PAGES as u64) * 4096;
+    let stack_alloc_phys = unsafe { allocate_pages(ctx.bs, HANDOFF_STACK_ALLOC_PAGES)? };
+    let (stack_phys, stack_top) = handoff_stack_span(stack_alloc_phys);
     // Paint the stack and mark its lowest word for the kernel's depth report
     // (core/boot/docs/boot-flow.md § Step 6; the kernel derives the span from
     // this page-aligned top).
-    // SAFETY: allocate_pages returned KERNEL_STACK_PAGES identity-mapped,
-    // page-aligned pages owned by this allocation; nothing uses them yet.
+    // SAFETY: allocate_pages returned HANDOFF_STACK_ALLOC_PAGES identity-mapped,
+    // page-aligned pages owned by this allocation, and [stack_phys, stack_top)
+    // is the KERNEL_STACK_PAGES of them above the guard; nothing uses them yet.
     unsafe {
         let words = (KERNEL_STACK_PAGES * 4096) / core::mem::size_of::<u64>();
         let p = stack_phys as *mut u64;
@@ -1128,11 +1135,22 @@ unsafe fn step6_allocate_and_build_page_tables(
     Ok((allocs, page_table))
 }
 
+/// The handoff stack's `[base, top)` in its allocation at `alloc_phys`
+/// ([`HANDOFF_STACK_ALLOC_PAGES`] pages): the allocation's lowest page is the
+/// guard, and the stack is the [`KERNEL_STACK_PAGES`] above it, so its top is
+/// the allocation's end and page-aligned.
+fn handoff_stack_span(alloc_phys: u64) -> (u64, u64)
+{
+    let base = alloc_phys + 4096;
+    (base, base + (KERNEL_STACK_PAGES as u64) * 4096)
+}
+
 /// Fill `out` with all physical regions that must be identity-mapped so the
 /// kernel can access them before establishing its own page tables. Returns
 /// the number of filled entries; silently caps at [`MAX_IDENTITY_REGIONS`].
 /// Module bodies lie inside the bundle mapping, so modules need no region of
-/// their own.
+/// their own. The handoff stack's region starts at `allocs.stack_phys`, above
+/// its guard page, which no region covers.
 fn collect_identity_regions(
     allocs: &BootAllocations,
     bundle: &BundleLoad,
@@ -1657,7 +1675,10 @@ unsafe fn step10_handoff(
 #[cfg(test)]
 mod tests
 {
-    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout, scrub};
+    use super::{
+        BootEntropy, ElfKind, HANDOFF_STACK_ALLOC_PAGES, KaslrOverride, choose_kaslr_layout,
+        handoff_stack_span, scrub,
+    };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
     const IMAGE: u64 = 8 << 20;
@@ -1730,6 +1751,22 @@ mod tests
         assert!(d.randomize_dm);
         assert_eq!(d.dm_rand, e.kaslr[1]);
         assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG);
+    }
+
+    // Defect caught: a span that starts at the allocation's base, leaving no
+    // guard page below the stack, or one that is shorter than the shared
+    // HANDOFF_STACK_BYTES or runs past the allocation's end.
+    #[test]
+    fn the_handoff_stack_sits_above_one_guard_page_and_ends_at_its_allocation_end()
+    {
+        let alloc = 0x7_e000u64;
+        let (base, top) = handoff_stack_span(alloc);
+        assert_eq!(base, alloc + 4096);
+        assert_eq!(
+            top - base,
+            boot_protocol::layout::HANDOFF_STACK_BYTES as u64
+        );
+        assert_eq!(top, alloc + (HANDOFF_STACK_ALLOC_PAGES as u64) * 4096);
     }
 
     #[test]

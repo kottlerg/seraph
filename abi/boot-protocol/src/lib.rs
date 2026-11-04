@@ -829,8 +829,9 @@ pub struct BootInfo
 
     /// Physical address of the Device Tree blob (RISC-V). Zero on x86-64 or if absent.
     ///
-    /// Passed through for userspace consumption (`devmgr`). The kernel does
-    /// not parse the Device Tree.
+    /// Passed through for userspace consumption (`devmgr`). The kernel reads
+    /// only the FDT header, to size the blob (core/kernel/docs/initialization.md
+    /// § Phase 3: Kernel Page Tables); it does not parse the tree.
     pub device_tree: u64,
 
     /// Arch-specific platform facts the kernel itself consumes.

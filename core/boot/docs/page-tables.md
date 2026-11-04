@@ -24,10 +24,11 @@ bootloader *builds*, described in later sections — is:
 - An identity map, read-write and non-executable, covers every page touched by the
   `BootInfo` page, the boot-module array page, the translated `MemoryMapEntry` array
   (`BootInfo.memory_map`), the `MmioAperture` array page, the reclaim-range array page, the
-  handoff stack, the `InitImage` segments (whose `phys_addr` carries the `p_vaddr` in-page
-  offset), the kernel segments' physical frames, the bundle blob (every boot module body),
-  the framebuffer when present, and the UART MMIO page on RISC-V, so the kernel can read
-  them using physical addresses before its own direct-physical map is established.
+  handoff stack (not the guard page below it), the `InitImage` segments (whose `phys_addr`
+  carries the `p_vaddr` in-page offset), the kernel segments' physical frames, the bundle
+  blob (every boot module body), the framebuffer when present, and the UART MMIO page on
+  RISC-V, so the kernel can read them using physical addresses before its own
+  direct-physical map is established.
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
   continues across the root-table switch (on x86-64, the LA57 toggle trampoline's page when
   the handoff changes the paging depth, § x86-64: Negotiated Paging Depth).
@@ -64,8 +65,10 @@ LA57 toggle page when the handoff changes the paging depth) are identity-mapped
 read-execute, so the instruction fetch after the root-table switch resolves.
 
 **Handoff stack** — the bootloader allocates the kernel's entry stack
-(`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages`, identity-maps it with read-write,
-non-executable permissions, and switches the stack pointer to it in the
+(`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages` with one more page below it, its
+guard, identity-maps the stack with read-write, non-executable permissions and leaves the
+guard out of every identity-map region ([boot-flow.md](boot-flow.md) § Step 6), and switches
+the stack pointer to the stack's top in the
 [handoff sequence](kernel-handoff.md#handoff-sequence) before jumping to the kernel.
 
 The firmware's own translation (a 1:1 mapping of physical memory under UEFI) stays active

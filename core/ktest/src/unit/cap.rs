@@ -7,8 +7,8 @@
 //!
 //! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (both auto-allocate and
 //! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
-//! `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, and `CSpace` teardown (batched drain,
-//! bound-thread stop).
+//! `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, `CSpace` teardown (batched drain,
+//! bound-thread stop), and the bounds of handle resolution itself.
 //!
 //! Each function tests one syscall or one distinct behaviour. Tests clean up
 //! caps they create where convenient, but leaks are acceptable — ktest exits
@@ -716,6 +716,95 @@ pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
         return Err("refused cap_move left the source slot empty");
     }
     Ok(())
+}
+
+// ── Handle resolution bounds (CSpace::slot, syscall::pin_slot) ────────────────
+
+/// Handles at the index-field and `CSpace`-region boundaries resolve nothing,
+/// with or without generation bits; a wrong-type handle answers
+/// `InvalidCapability` and an insufficient-rights one `InsufficientRights`;
+/// and none of the refusals leaves a reference on the object, so the Memory
+/// the objects were retyped from returns to its baseline once they are
+/// deleted (core/kernel/docs/capability-internals.md § Speculative-Execution
+/// Hardening).
+pub fn lookup_bounds(ctx: &TestContext) -> TestResult
+{
+    use syscall_abi::{
+        CAP_INDEX_BITS, CAP_INDEX_MASK, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_TAG_RIGHTS,
+    };
+
+    let invalid = SyscallError::InvalidCapability as i64;
+    // The kernel's leaf layout (core/kernel/src/cap/cspace.rs): 128 direct
+    // leaves, then 128 directory pages of 512 leaves, each leaf
+    // CSPACE_SLOTS_PER_PAGE slots. `first_indirect` is the first slot of the
+    // indirect region, `ceiling` the structural slot ceiling.
+    // cast_possible_truncation: CSPACE_SLOTS_PER_PAGE is 56.
+    #[allow(clippy::cast_possible_truncation)]
+    let per_leaf = syscall_abi::CSPACE_SLOTS_PER_PAGE as u32;
+    let first_indirect = 128 * per_leaf;
+    let ceiling = (128 + 128 * 512) * per_leaf;
+    let below_ceiling = [
+        1,
+        first_indirect - 1,
+        first_indirect,
+        first_indirect + 1,
+        ceiling - 1,
+    ];
+    let past_ceiling = [0, ceiling, ceiling + 1, CAP_INDEX_MASK - 1, CAP_INDEX_MASK];
+    for generation in [0u32, 0xFF]
+    {
+        for index in past_ceiling
+        {
+            let handle = (generation << CAP_INDEX_BITS) | index;
+            if notification_send(handle, 0x1) != Err(invalid)
+                || cap_info(handle, CAP_INFO_TAG_RIGHTS) != Err(invalid)
+            {
+                return Err("a handle at slot 0 or past the structural ceiling resolved");
+            }
+        }
+        for index in below_ceiling
+        {
+            let handle = (generation << CAP_INDEX_BITS) | index;
+            // A slot of ktest's own CSpace that is live at this handle is
+            // not a boundary probe; every other must resolve nothing.
+            if cap_info(handle, CAP_INFO_TAG_RIGHTS).is_ok()
+            {
+                continue;
+            }
+            if notification_send(handle, 0x1) != Err(invalid)
+            {
+                return Err("a handle to an unpopulated region boundary resolved");
+            }
+        }
+    }
+
+    let baseline = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "cap_info(MEMORY_AVAILABLE) baseline failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for lookup_bounds failed")?;
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for lookup_bounds failed")?;
+    let weak = cap_derive(sig, 0).map_err(|_| "cap_derive(0) for lookup_bounds failed")?;
+    let mut outcome = Ok(());
+    for _ in 0..64
+    {
+        if notification_send(ep, 0x1) != Err(invalid)
+        {
+            outcome = Err("notification_send on an Endpoint handle was not InvalidCapability");
+            break;
+        }
+        if notification_send(weak, 0x1) != Err(SyscallError::InsufficientRights as i64)
+        {
+            outcome = Err("notification_send without NOTIFY was not InsufficientRights");
+            break;
+        }
+    }
+    cap_delete(weak).map_err(|_| "cap_delete weak after lookup_bounds failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after lookup_bounds failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after lookup_bounds failed")?;
+    outcome?;
+    crate::spawn::wait_memory_baseline(ctx.memory_base, baseline, 100)
+        .map_err(|_| "a refused lookup left a reference: Memory did not return to baseline")
 }
 
 // ── SYS_CAP_DERIVE (zero rights) ────────────────────────────────────────────

@@ -19,6 +19,7 @@ pub mod interrupts;
 pub mod paging;
 pub mod platform;
 pub mod sbi;
+pub mod speculation;
 pub mod syscall;
 pub mod timer;
 pub mod trap_frame;

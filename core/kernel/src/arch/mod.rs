@@ -5,8 +5,9 @@
 
 //! Architecture dispatch module: selects the active architecture's module as
 //! `current` (see `docs/coding-standards.md` § C. Architecture Invariants and
-//! `core/kernel/docs/arch-interface.md`), and defines [`ThreadKind`], the one
-//! type both architectures' `context::new_state` share. Host test builds of
+//! `core/kernel/docs/arch-interface.md`), defines [`ThreadKind`], the one
+//! type both architectures' `context::new_state` share, and holds [`nospec`],
+//! the arch-neutral speculation-safe bounds built on `current::speculation`. Host test builds of
 //! other architectures also compile riscv64's `encoding` module, which
 //! depends on nothing else in its arch module, so its tests run on the host.
 
@@ -17,6 +18,8 @@ pub mod current;
 #[cfg(target_arch = "riscv64")]
 #[path = "riscv64/mod.rs"]
 pub mod current;
+
+pub mod nospec;
 
 // The riscv64 module's pure register-map and encoding arithmetic, compiled
 // alone into the host test builds of the other architectures so that

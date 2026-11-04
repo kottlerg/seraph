@@ -790,6 +790,12 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     const DEEP_SLOT: u32 = 1_000_000;
     // Pages to back DEEP_SLOT: leaves 0..=17,857 plus 35 directory pages.
     const DEEP_POOL_PAGES: u64 = 17_893;
+    // SMALL_SLOT one leaf on: slots per leaf page are the kernel's `L2_SIZE`,
+    // published in the ABI. Taken before any capability exists, so the
+    // refusal needs no cleanup.
+    let next_leaf_slot = u32::try_from(syscall_abi::CSPACE_SLOTS_PER_PAGE)
+        .map(|leaf| SMALL_SLOT + leaf)
+        .map_err(|_| "retype::indirect: CSPACE_SLOTS_PER_PAGE exceeds a slot index")?;
 
     let memory = ctx.memory_base;
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -844,7 +850,7 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     // CSpace and lands in the target.
     let mover = cap_create_notification(memory)
         .map_err(|_| "retype::indirect: cap_create_notification(mover) failed")?;
-    if syscall::cap_move(mover, cspace, SMALL_SLOT + 56).is_err()
+    if syscall::cap_move(mover, cspace, next_leaf_slot).is_err()
     {
         cap_delete(mover).ok();
         cap_delete(cspace).ok();
@@ -918,8 +924,9 @@ pub fn cspace_explicit_placement_fast_fail(ctx: &TestContext) -> TestResult
 /// again.
 pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 {
-    // 128 direct leaves x 56 slots, minus reserved slot 0.
-    const DIRECT_SLOTS: u32 = 128 * 56 - 1;
+    // 128 direct leaves of `CSPACE_SLOTS_PER_PAGE` slots (the kernel's
+    // `L2_SIZE`), minus reserved slot 0.
+    const DIRECT_SLOTS: u64 = 128 * syscall_abi::CSPACE_SLOTS_PER_PAGE - 1;
 
     let memory = ctx.memory_base;
     let cspace = cap_create_cspace(memory, 0, 2)
@@ -940,7 +947,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: boundary augment failed");
     }
-    for _ in 0..u64::from(DIRECT_SLOTS) - syscall_abi::CSPACE_IPC_RECV_RESERVE
+    for _ in 0..DIRECT_SLOTS - syscall_abi::CSPACE_IPC_RECV_RESERVE
     {
         if cap_copy(probe, cspace, 1).is_err()
         {
@@ -974,9 +981,9 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     }
 
     // One more page: the surviving directory page is not re-charged, so a
-    // single page now buys leaf 128. Its 56 slots join the 4 the IPC receive
-    // reserve kept free, so exactly 56 more general inserts succeed before
-    // the reserve is reached again.
+    // single page now buys leaf 128. Its `CSPACE_SLOTS_PER_PAGE` slots join
+    // the 4 the IPC receive reserve kept free, so exactly that many more
+    // general inserts succeed before the reserve is reached again.
     if cap_create_cspace(memory, cspace, 1).is_err()
     {
         cap_delete(probe).ok();

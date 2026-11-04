@@ -884,8 +884,10 @@ pub fn object_slab_retype_reclaimable<T>(
 /// Return `grant`'s run to memmgr's pool. The caller MUST have deleted the
 /// object retyped from it first. A release while the object is live is
 /// memory-safe (the kernel does not hand out live bytes) but strands the run
-/// in memmgr's pool until the object is deleted: memmgr takes it off the
-/// process's ledger at once, and no process can use it meanwhile.
+/// until the object is deleted: memmgr takes it off the process's ledger at
+/// once and returns it to its free pool, where it is re-grantable only whole
+/// and its next grantee cannot map it below the live object
+/// (`services/memmgr/docs/memory-pool.md` § Reclamation).
 /// Best-effort: a failed call leaves the run charged to the process until it
 /// dies.
 #[stable(feature = "seraph_ext", since = "1.0.0")]

@@ -73,7 +73,7 @@ impl DeathSet
         let (ws_cap, ws_grant) = create_wait_set(FIRST_WAIT_SET_MEMBERS).ok()?;
         if syscall::wait_set_add(ws_cap, service_ep, service_badge).is_err()
         {
-            delete_wait_set(ws_cap, ws_grant);
+            delete_object(ws_cap, ws_grant);
             return None;
         }
         let set = Self {
@@ -169,13 +169,13 @@ impl DeathSet
                     let _ = syscall::wait_set_remove(new, m);
                     let _ = syscall::wait_set_add(old, m, b);
                 }
-                delete_wait_set(new, new_grant);
+                delete_object(new, new_grant);
                 return Err(e);
             }
             moved.push((source, badge));
         }
         self.ws_cap.set(new);
-        delete_wait_set(old, self.ws_grant.replace(new_grant));
+        delete_object(old, self.ws_grant.replace(new_grant));
         std::os::seraph::log!("main wait set widened to {members} members");
         Ok(())
     }
@@ -214,7 +214,7 @@ impl DeathSet
 
 /// Fund and create a wait set of `members` members from svcmgr's memory,
 /// with the dedicated grant it was retyped from when it is page-sized (32
-/// members or more), for [`delete_wait_set`] to return.
+/// members or more), for [`delete_object`] to return.
 fn create_wait_set(members: u32) -> Result<(u32, Option<ObjectGrant>), i64>
 {
     std::os::seraph::object_slab_retype_reclaimable(
@@ -224,12 +224,13 @@ fn create_wait_set(members: u32) -> Result<(u32, Option<ObjectGrant>), i64>
     .ok_or(OUT_OF_MEMORY)
 }
 
-/// Delete wait set `ws`, then return the dedicated grant it was retyped
-/// from, if any, to memmgr's pool; deleting the set alone would leave the
-/// grant's pages charged to svcmgr for its life.
-fn delete_wait_set(ws: u32, grant: Option<ObjectGrant>)
+/// Delete kernel object `cap` (a wait set or a death queue), then return
+/// the dedicated grant it was retyped from, if any, to memmgr's pool;
+/// deleting the object alone would leave the grant's pages charged to svcmgr
+/// for its life.
+fn delete_object(cap: u32, grant: Option<ObjectGrant>)
 {
-    let _ = syscall::cap_delete(ws);
+    let _ = syscall::cap_delete(cap);
     if let Some(grant) = grant
     {
         std::os::seraph::object_slab_release(grant);
@@ -254,11 +255,7 @@ fn create_queue(ws_cap: u32, ws_badge: u64, observers: u32, made: usize) -> Resu
     {
         // A queue outside the wait set is never drained: delete it, and
         // return its dedicated grant, if it had one, to memmgr.
-        let _ = syscall::cap_delete(queue);
-        if let Some(grant) = grant
-        {
-            std::os::seraph::object_slab_release(grant);
-        }
+        delete_object(queue, grant);
         return Err(e);
     }
     if made > 0

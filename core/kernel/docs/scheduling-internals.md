@@ -1446,18 +1446,16 @@ defer to an in-flight TLB shootdown, as below.
 The heartbeat checks measure staleness in wall time, so their grace scales
 with CPU count (`heartbeat_stall_ticks`, stepping at multiples of 128 CPUs:
 <256 CPUs → 8 s, 256–383 → 16 s, 384–511 → 24 s, 512–639 → 32 s, and so on:
-8 s × ⌊`cpu_count` / 128⌋, at least 8 s, up to 512 s at the 8192-CPU ceiling). The 8 s base is
-sized above
-the slowest legitimate
-single-syscall CPU occupancy observed (a debug-build aperture-mapping
-syscall held the BSP just past 2 s on a slow TCG CI runner), and the
-CPU-count scaling covers oversubscribed wide guests, where vCPUs
-legitimately starve of timer service for seconds (the #376 512-vCPU runs
-saw a healthy BSP 2 s stale at ~7% aggregate tick delivery). A real wedge
-exceeds any finite threshold — the grace costs only detection latency. The owed-wake
-rules deliberately do not scale: rule 1's pop-before-scan ordering and
-rules 2–3's two-scan persistence ride the BSP's own cadence, which
-self-stretches under starvation.
+8 s × ⌊`cpu_count` / 128⌋, at least 8 s, up to 512 s at the 8192-CPU
+ceiling). The 8 s base is sized above the slowest legitimate single-syscall
+CPU occupancy observed (a debug-build aperture-mapping syscall held the BSP
+just past 2 s on a slow TCG CI runner), and the CPU-count scaling covers
+oversubscribed wide guests, where vCPUs legitimately starve of timer service
+for seconds (the #376 512-vCPU runs saw a healthy BSP 2 s stale at ~7%
+aggregate tick delivery). A real wedge exceeds any finite threshold — the
+grace costs only detection latency. The owed-wake rules deliberately do not
+scale: rule 1's pop-before-scan ordering and rules 2–3's two-scan persistence
+ride the BSP's own cadence, which self-stretches under starvation.
 
 Attaching GDB to a live guest (xtask `--debug-listen`) freezes every vCPU
 while guest-visible time keeps advancing, so on resume the heartbeat checks

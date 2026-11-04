@@ -430,14 +430,12 @@ mod tests
     {
         for cpus in WIDTHS
         {
+            // `mask` attaches, which empties the storage.
             let dst = mask(cpus);
             let empty = mask(cpus);
-            empty.fill_from(&MaskSource::Below(0), cpus, R);
             let only_last = mask(cpus);
-            only_last.fill_from(&MaskSource::Below(0), cpus, R);
             only_last.set_cpu(cpus - 1, R);
             let ends = mask(cpus);
-            ends.fill_from(&MaskSource::Below(0), cpus, R);
             ends.set_cpu(0, R);
             ends.set_cpu(cpus - 1, R);
             let sources = [

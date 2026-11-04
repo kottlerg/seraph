@@ -2548,14 +2548,15 @@ pub unsafe fn init(cpu_count: u32) -> u32
     cpu_count
 }
 
-/// Fix every CPU set's width at `cpu_count`'s (`cpu_mask::set_boot_cpu_count`),
+/// Fix every CPU set's width at `cpu_count` (`cpu_mask::set_boot_cpu_count`),
 /// allocate the reschedule-pending CPU set (`RESCHEDULE_PENDING`) and the
 /// per-CPU storage slabs sized to `cpu_count` (schedulers, idle TCBs, idle
 /// kernel stacks and their tops, watchdog ticks and breadcrumbs (`CPU_DIAG`),
 /// per-CPU arch data, the TLB-shootdown request slots and their
 /// acknowledgement sets, and the x86 AP GDT/TSS/IST tables and NMI-backtrace
-/// storage), publish `CPU_COUNT`, and arm the BSP boot transient. Must run before Phase 5 (timer arm) so that the timer
-/// ISR's first read of `SCHEDULERS_PTR` is non-null.
+/// storage), publish `CPU_COUNT`, and arm the BSP boot transient. Must run
+/// before Phase 5 (timer arm) so that the timer ISR's first read of
+/// `SCHEDULERS_PTR` is non-null.
 ///
 /// # Panics
 /// Halts via `crate::fatal` on buddy exhaustion.
@@ -3751,7 +3752,8 @@ pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
 }
 
 /// Phase 1 of [`stop_threads_bound_to`]: under the registry lock, stop every
-/// bound thread not already `Exited`, then prod the CPUs found running one.
+/// bound thread not already `Exited`, and prod each CPU found running one as
+/// the walk finds it.
 /// Returns whether the running thread on `this_cpu` was among them.
 ///
 /// # Safety
@@ -3893,10 +3895,10 @@ unsafe fn scan_bound_current(
 /// is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
 /// recorded as its retained exit reason in the same hold, the commit retried
 /// until no park was committed since the cancel ([`commit_cancelling_park`],
-/// draining every run queue); CPUs found running one are recorded. Phase 2,
-/// with the registry released — a CPU
-/// spinning on the registry lock inside `register` cannot deschedule, so it
-/// must not be waited for while the lock is held — prods those CPUs and
+/// draining every run queue), and the CPU found running one is prodded at
+/// once, inside the walk (the prod waits on no CPU). Phase 2, with the
+/// registry released — a CPU spinning on the registry lock inside `register`
+/// cannot deschedule, so it must not be waited for while the lock is held —
 /// spins until no CPU other than this one has a bound thread as `current`.
 /// A bound thread that appears as `current` without being `Exited` (bound
 /// after the walk, through a cap lookup that raced the object's last delete)

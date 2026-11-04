@@ -520,6 +520,22 @@ fn dispatch_ipc(
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
         }
 
+        procmgr_labels::RELEASE_HOLD =>
+        {
+            release_caps(req.caps());
+            // Badge from ipc_recv names the torn-down child whose held
+            // reclaim the creator releases.
+            let code = if process::release_hold(badge, ctx.memmgr_ep, ipc_buf, table.holds_mut())
+            {
+                procmgr_errors::SUCCESS
+            }
+            else
+            {
+                procmgr_errors::INVALID_BADGE
+            };
+            reply_empty(ipc_buf, code);
+        }
+
         procmgr_labels::QUERY_PROCESS =>
         {
             release_caps(req.caps());
@@ -766,7 +782,13 @@ fn dispatch_death(
         if let Some(entry) = table.take_by_badge(death.correlator)
         {
             recent.record(entry.badge(), death.exit_reason, now_ns());
-            process::teardown_entry(entry, death.exit_reason, memmgr_ep, ipc_buf);
+            process::teardown_entry(
+                entry,
+                death.exit_reason,
+                memmgr_ep,
+                ipc_buf,
+                table.holds_mut(),
+            );
         }
     });
     if full
@@ -828,7 +850,7 @@ fn resync_deaths(
         if let Some(entry) = table.take_by_badge(badge)
         {
             recent.record(badge, exit_reason, now_ns());
-            process::teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf);
+            process::teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, table.holds_mut());
         }
     }
 }
@@ -972,6 +994,30 @@ fn resolve_create_sched(
     Some(process::ChildSched { priority, band_max })
 }
 
+/// Arm the held reclaim of a child created with `CREATE_DMA_HOLD`, reserving
+/// its record's room, so its teardown never has to free its frames for want
+/// of a record. Returns `false` when the heap cannot reserve the room: the
+/// child, which has not run, is then destroyed with both reply caps deleted,
+/// and the create is answered `OUT_OF_MEMORY`.
+fn arm_dma_hold(
+    result: &process::CreateResult,
+    ipc_buf: *mut u64,
+    memmgr_ep: u32,
+    table: &mut process::ProcessTable,
+) -> bool
+{
+    if table.arm_dma_hold(result.badge).is_ok()
+    {
+        return true;
+    }
+    std::os::seraph::log!("no room for a held reclaim; destroying the child");
+    let _ = syscall::cap_delete(result.thread_for_caller);
+    let _ = syscall::cap_delete(result.process_handle);
+    let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
+    reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+    false
+}
+
 /// Reply with a successful process creation result, or destroy the child
 /// when the reply cannot deliver it.
 ///
@@ -1011,7 +1057,8 @@ fn reply_create_result(
 ///   bit  17       = `CREATE_DEATH_RELAY` (on `CREATE_FROM_FILE` only)
 ///   bits [18..23] = `CREATE_PRIORITY` (0 = default; see `resolve_create_sched`)
 ///   bits [23..28] = `CREATE_BAND_MAX` (0 = copy of the creator's band)
-///   bits [28..32] = reserved (must be zero)
+///   bit  28       = `CREATE_DMA_HOLD` (hold the reclaim for `RELEASE_HOLD`)
+///   bits [29..32] = reserved (must be zero)
 ///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
 ///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
 ///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
@@ -1142,7 +1189,11 @@ fn handle_create(
         Some(result) =>
         {
             log_spawn_sched(sched);
-            reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
+            if label & procmgr_labels::CREATE_DMA_HOLD == 0
+                || arm_dma_hold(&result, ipc_buf, ctx.memmgr_ep, table)
+            {
+                reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
+            }
         }
         None =>
         {
@@ -1293,7 +1344,11 @@ fn handle_create_from_file(
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
+            if label & procmgr_labels::CREATE_DMA_HOLD == 0
+                || arm_dma_hold(&result, ipc_buf, ctx.memmgr_ep, table)
+            {
+                reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
+            }
         }
         Err(code) =>
         {

@@ -18,6 +18,7 @@ pub mod interrupts;
 pub mod ioapic;
 pub mod paging;
 pub mod platform;
+pub mod speculation;
 pub mod syscall;
 pub mod timer;
 pub mod trap_frame;

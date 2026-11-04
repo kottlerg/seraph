@@ -117,8 +117,9 @@ discipline below has been applied end-to-end.
    `core/boot/`, or an in-tree crate either one depends on, check the rules
    of `docs/coding-standards.md` § CPU-Count Width. Report each line that
    introduces a structure with one entry or bit per CPU whose width does
-   not come from `MAX_CPUS`, a literal standing in for the CPU count or a
-   CPU-mask width, a fixed-width integer holding a set of CPUs, an `as`
+   not come from the boot's CPU count (a per-CPU slab, or an
+   `AtomicCpuMask` of `cpu_count.div_ceil(64)` words), or that `MAX_CPUS`
+   sizes, a literal standing in for the CPU count or a CPU-set width, a fixed-width integer holding a set of CPUs, an `as`
    cast of a CPU index or count to a type that cannot represent `MAX_CPUS`,
    or code filling a fixed-width window an external interface defines that
    neither rejects nor splits a CPU index the window cannot hold, as a

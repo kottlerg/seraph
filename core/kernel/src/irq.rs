@@ -32,6 +32,15 @@
 //! Delivery; `SYS_IRQ_REGISTER` and `SYS_IRQ_ACK` in
 //! core/kernel/docs/syscalls.md).
 //!
+//! # Mode
+//! A line carries one trigger and polarity mode (`IRQ_MODE_LEVEL`,
+//! `IRQ_MODE_ACTIVE_LOW` in `abi/syscall`), which its controller is programmed
+//! with when the first binding routes it. The first binding records the mode
+//! its `SYS_IRQ_REGISTER` passed; a later binding, or a rebind, that passes
+//! another is refused ([`RouteError::ModeMismatch`], [`mode_admits`]) and
+//! changes nothing. The line's release forgets the mode, so the next first
+//! binding may record another.
+//!
 //! # Thread safety
 //! The interrupt-context walk in `dispatch_device_irq` is lock-free: it reads the
 //! line's bindings through atomic pointers. Every binding change ([`register`],
@@ -230,13 +239,17 @@ struct IrqRoute
     /// raised its count before the change reads it, and the change waits for it
     /// (`drain`).
     in_flight: AtomicU32,
+    /// The mode the line's first binding recorded (module doc § Mode);
+    /// meaningful only while a binding is linked. Read and written only under
+    /// the routing lock, so `Relaxed`.
+    mode: AtomicU32,
     /// The line's bound and owing masks.
     masks: LineMasks,
 }
 
 // docs/limits.md states the routing table's per-line cost from this size (with
 // the routed-line set's two `u32` entries, `table_bytes`): an 8-byte list head,
-// the in-flight count padded to 8 bytes, and the two 8-byte masks.
+// the in-flight count and the mode (4 bytes each), and the two 8-byte masks.
 const _: () = assert!(core::mem::size_of::<IrqRoute>() == 32);
 
 /// Why a line could not be bound (`register`).
@@ -253,6 +266,17 @@ pub enum RouteError
     Exhausted,
     /// The line already holds [`MAX_IRQ_BINDINGS`] bindings.
     TooManyBindings,
+    /// The binding's mode differs from the one the line's bindings recorded
+    /// (module doc § Mode).
+    ModeMismatch,
+}
+
+/// Whether a binding passing `requested` may bind on a line that has bindings
+/// (`line_bound`) recorded with `recorded`: a line with none takes any mode,
+/// which it then records; a line with bindings takes only its own.
+const fn mode_admits(line_bound: bool, recorded: u32, requested: u32) -> bool
+{
+    !line_bound || recorded == requested
 }
 
 /// Dense set of line ids with constant-time insert and remove: the lines that
@@ -469,10 +493,12 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// Bind `binding` (the binding of an Interrupt object for line `irq`) to
-/// `notification` (`SYS_IRQ_REGISTER`).
+/// `notification` (`SYS_IRQ_REGISTER`), with the line's trigger and polarity
+/// `mode` (module doc § Mode).
 ///
-/// An unbound binding is added to the line: the line's first binding routes
-/// it at its controller, which leaves it masked; a later binding masks it. The
+/// An unbound binding is added to the line: the line's first binding records
+/// `mode` and routes the line at its controller in that mode, which leaves it
+/// masked; a later binding masks it. The
 /// new binding takes the lowest free bit of the line's masks and owes an
 /// acknowledgement, so the line stays masked until its receiver's first
 /// `SYS_IRQ_ACK`. A binding already bound is rebound to `notification`: it
@@ -482,9 +508,11 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 ///
 /// # Errors
 /// [`RouteError::NoSuchLine`] when the line is past the table or no controller
-/// implements it; [`RouteError::Exhausted`] when the controller cannot assign
-/// the line's first binding a delivery resource; [`RouteError::TooManyBindings`]
-/// when the line holds [`MAX_IRQ_BINDINGS`] bindings. Nothing changes on error.
+/// implements it; [`RouteError::ModeMismatch`] when the line has bindings and
+/// `mode` differs from the one they recorded; [`RouteError::Exhausted`] when the
+/// controller cannot assign the line's first binding a delivery resource;
+/// [`RouteError::TooManyBindings`] when the line holds [`MAX_IRQ_BINDINGS`]
+/// bindings. Nothing changes on error.
 ///
 /// # Safety
 /// - `notification` must be a valid, live `NotificationState` pointer.
@@ -497,6 +525,7 @@ pub unsafe fn register(
     irq: u32,
     binding: &IrqBinding,
     notification: *mut NotificationState,
+    mode: u32,
 ) -> Result<(), RouteError>
 {
     ROUTING.with(|routing| {
@@ -504,6 +533,11 @@ pub unsafe fn register(
             .routes
             .get(irq as usize)
             .ok_or(RouteError::NoSuchLine)?;
+        let head = route.bindings.load(Ordering::Relaxed);
+        if !mode_admits(!head.is_null(), route.mode.load(Ordering::Relaxed), mode)
+        {
+            return Err(RouteError::ModeMismatch);
+        }
         if binding.bit.load(Ordering::Relaxed) != UNBOUND
         {
             let previous = binding.notification.swap(notification, Ordering::SeqCst);
@@ -514,12 +548,12 @@ pub unsafe fn register(
             return Ok(());
         }
         let bit = route.masks.free_bit().ok_or(RouteError::TooManyBindings)?;
-        let head = route.bindings.load(Ordering::Relaxed);
         if head.is_null()
         {
             // SAFETY: called after Phase 5 with a line the table covers; serialised
             // with every other binding change by the routing lock.
-            unsafe { crate::arch::current::interrupts::route_device_irq(irq) }?;
+            unsafe { crate::arch::current::interrupts::route_device_irq(irq, mode) }?;
+            route.mode.store(mode, Ordering::Relaxed);
         }
         else
         {
@@ -718,6 +752,8 @@ unsafe fn unbind(
         Settle::Release =>
         {
             routed.remove(irq);
+            // The next first binding records its own mode.
+            route.mode.store(0, Ordering::Relaxed);
             // SAFETY: the line was routed; serialised by the routing lock. It
             // masks the line before releasing it.
             unsafe { crate::arch::current::interrupts::unroute_device_irq(irq) };
@@ -954,6 +990,21 @@ mod tests
     {
         masks.unbind_begin(bit);
         masks.unbind_settle(bit)
+    }
+
+    #[test]
+    fn a_line_with_no_binding_takes_any_mode()
+    {
+        assert!(mode_admits(false, 0, 0));
+        assert!(mode_admits(false, 0, 3));
+    }
+
+    #[test]
+    fn a_bound_line_takes_only_its_recorded_mode()
+    {
+        assert!(mode_admits(true, 1, 1));
+        assert!(!mode_admits(true, 1, 0));
+        assert!(!mode_admits(true, 0, 3));
     }
 
     #[test]

@@ -366,13 +366,6 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 #[cfg(not(test))]
 pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 
-/// Pages of init's Thread slab, retyped from SEED at Phase 9, in the layout
-/// `sys_cap_create_thread` establishes: the kernel stack
-/// (`KERNEL_STACK_PAGES`), then the `ThreadObject` followed by the
-/// `ThreadControlBlock`, then the per-thread FPU/SIMD/V save area.
-#[cfg(not(test))]
-pub(crate) const INIT_THREAD_PAGES: u64 = (crate::sched::KERNEL_STACK_PAGES + 2) as u64;
-
 /// Descriptors the `InitInfo` block holds: its [`init_protocol::INIT_INFO_MAX_PAGES`]
 /// pages past the header, one [`CapDescriptor`] slot each. Phases 7 and 8 write
 /// the boot capability descriptors straight into the block (and the buddy
@@ -423,7 +416,7 @@ const _: () = assert!(
         && core::mem::size_of::<object::IoPortObject>() <= BOOT_BODY_BYTES
         && core::mem::size_of::<object::SchedControlObject>() <= BOOT_BODY_BYTES
         && core::mem::size_of::<object::SbiControlObject>() <= BOOT_BODY_BYTES,
-    "a boot-minted body exceeds the size class SEED_RESERVE_BYTES budgets"
+    "a boot-minted body exceeds the size class the seed reserve budgets"
 );
 
 /// Pages the seed's bump cursor can lose to page alignment: one at each switch
@@ -435,13 +428,13 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 
 // ── Phase-7 seed Memory cap ───────────────────────────────────────────────────
 
-/// Bytes carved off the front of the largest drained RAM extent for the boot
-/// footprint, every kernel object the boot mints before init runs:
+/// The seed reserve less init's Thread slot ([`seed_reserve_bytes`] adds it):
+/// the fixed part of the boot footprint carved off the front of the largest
+/// drained RAM extent, every kernel object the boot mints before init runs:
 ///
 /// - the root `CSpace` slab ([`ROOT_CSPACE_INIT_PAGES`]: 1 + 28 + 16 = 45
 ///   pages);
-/// - init's bootstrap `AddressSpace` and Thread slabs ([`INIT_ASPACE_PAGES`]
-///   18, [`INIT_THREAD_PAGES`] 6);
+/// - init's bootstrap `AddressSpace` slab ([`INIT_ASPACE_PAGES`] 18);
 /// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (about
 ///   675) of [`BOOT_BODY_BYTES`] each (about 22 pages): one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
@@ -449,7 +442,8 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
-/// That is about 95 pages (380 KiB). Nothing draws on SEED at runtime: the
+/// That is about 89 pages (356 KiB), and init's Thread slot adds six or more
+/// (`sched::thread_slot::thread_slot_bytes`). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
 /// capabilities pass the descriptor capacity halts the boot by name in
@@ -460,12 +454,20 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// memmgr operate on virgin caps with zero behavioural change in their
 /// front-split allocators.
 #[cfg(not(test))]
-const SEED_RESERVE_BYTES: u64 = (ROOT_CSPACE_INIT_PAGES
+const SEED_FIXED_RESERVE_BYTES: u64 = (ROOT_CSPACE_INIT_PAGES
     + INIT_ASPACE_PAGES
-    + INIT_THREAD_PAGES
     + (BOOT_BODY_BOUND * BOOT_BODY_BYTES).div_ceil(crate::mm::PAGE_SIZE) as u64
     + SEED_ALIGNMENT_SLACK_PAGES)
     * crate::mm::PAGE_SIZE as u64;
+
+/// Bytes carved off the front of the largest drained RAM extent for the boot
+/// footprint: [`SEED_FIXED_RESERVE_BYTES`] plus init's Thread slot, whose
+/// save area the boot CPU sized at Phase 5 (`sched::thread_slot`).
+#[cfg(not(test))]
+fn seed_reserve_bytes() -> u64
+{
+    SEED_FIXED_RESERVE_BYTES + crate::sched::thread_slot::thread_slot_bytes()
+}
 
 /// BSS-static `MemoryObject` covering the seed RAM region.
 ///
@@ -475,7 +477,7 @@ const SEED_RESERVE_BYTES: u64 = (ROOT_CSPACE_INIT_PAGES
 /// boot-module `MemoryObject`s, plus init's ELF-segment `MemoryObject`s,
 /// plus the seed-tail `MemoryObject` exposing the rest of the largest
 /// drained extent) from this seed via [`crate::cap::retype::boot_retype_body`].
-/// The bodies land inside the seed's `SEED_RESERVE_BYTES` reservation,
+/// The bodies land inside the seed's `seed_reserve_bytes()` reservation,
 /// debited from `available_bytes` like every other byte.
 ///
 /// The seed itself is **not** inserted into init's `CSpace`: it is pure
@@ -546,7 +548,7 @@ pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
 }
 
 /// One-shot Phase-7 seed initializer. Sets the seed `MemoryObject`'s runtime
-/// fields (covering the front [`SEED_RESERVE_BYTES`] of the largest
+/// fields (covering the front [`seed_reserve_bytes`] of the largest
 /// drained extent) and bumps the refcount once for the kernel pin. Caller
 /// must invoke before any [`crate::cap::retype::boot_retype_body`] against
 /// the seed.
@@ -562,9 +564,9 @@ unsafe fn install_seed_memory(base: u64)
     // until after this call, so no other reader exists.
     unsafe {
         (*p).base = base;
-        (*p).size = SEED_RESERVE_BYTES;
+        (*p).size = seed_reserve_bytes();
         (*p).available_bytes
-            .store(SEED_RESERVE_BYTES, Ordering::Release);
+            .store(seed_reserve_bytes(), Ordering::Release);
         (*p).header.inc_ref();
     }
 }
@@ -592,7 +594,7 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 ///    per online CPU (pre-allocated in Phase 4 from the pristine buddy).
 /// 3. The `InitInfo` block — worst-case `INIT_INFO_MAX_PAGES`.
 /// 4. Init's user stack — `INIT_STACK_PAGES`.
-/// 5. The SEED arena — `SEED_RESERVE_BYTES`.
+/// 5. The SEED arena — `seed_reserve_bytes()`.
 ///
 /// Every other page of RAM is drained for userspace and routes to memmgr's
 /// pool, leaving the post-handoff buddy fully empty. This value is a Phase-7
@@ -605,7 +607,7 @@ pub(crate) fn kernel_reserve_pages() -> usize
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let idle_stacks = cpu_count * crate::sched::KERNEL_STACK_PAGES;
     let init_info = 1usize << INIT_INFO_RESERVE_ORDER;
-    let seed = (SEED_RESERVE_BYTES / crate::mm::PAGE_SIZE as u64) as usize;
+    let seed = (seed_reserve_bytes() / crate::mm::PAGE_SIZE as u64) as usize;
     POOL_SEED_PAGES + idle_stacks + init_info + INIT_STACK_PAGES + seed
 }
 
@@ -715,7 +717,7 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 
 /// Drain user-cap RAM from the buddy as coalesced extents and install
 /// [`SEED_MEMORY`] at the base of the largest, reserving its first
-/// [`SEED_RESERVE_BYTES`] for kernel-internal cap-identity storage. Zeroes
+/// [`seed_reserve_bytes`] for kernel-internal cap-identity storage. Zeroes
 /// every user-exposed extent (each drained extent, and the seed extent's tail
 /// past the reserve) through the direct map, which also clears the buddy's
 /// free-block links, and leaves the extents in the first slots of the
@@ -767,7 +769,7 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
         crate::sched::KERNEL_STACK_PAGES,
         1usize << INIT_INFO_RESERVE_ORDER,
         INIT_STACK_PAGES,
-        SEED_RESERVE_BYTES / 1024,
+        seed_reserve_bytes() / 1024,
     );
     // SAFETY: single-threaded Phase 7; the array was pointed at the block
     // `reserve_init_backing` just reserved, and nothing else borrows it.
@@ -815,19 +817,19 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
         .map(|(i, d)| (i, d.aux0, d.aux1))
         .max_by_key(|&(_, _, size)| size)
         .unwrap_or_else(|| crate::fatal("Phase 7: no drained RAM extents to seed Memory caps"));
-    if seed_extent_size <= SEED_RESERVE_BYTES
+    if seed_extent_size <= seed_reserve_bytes()
     {
-        crate::fatal("Phase 7: largest drained RAM extent too small to host SEED_RESERVE_BYTES");
+        crate::fatal("Phase 7: largest drained RAM extent too small to host the seed reserve");
     }
 
     // SAFETY: first and only call; single-threaded Phase 7.
     unsafe { install_seed_memory(seed_base) };
-    // Seed-tail: the front SEED_RESERVE_BYTES go to the SEED's pool
+    // Seed-tail: the front `seed_reserve_bytes()` bytes go to the SEED's pool
     // (kernel-internal); the remainder is exposed as a virgin RAM Memory cap.
-    out[seed_idx].aux0 = seed_base + SEED_RESERVE_BYTES;
-    out[seed_idx].aux1 = seed_extent_size - SEED_RESERVE_BYTES;
+    out[seed_idx].aux0 = seed_base + seed_reserve_bytes();
+    out[seed_idx].aux1 = seed_extent_size - seed_reserve_bytes();
 
-    let mut drained_pages: u64 = SEED_RESERVE_BYTES / BUDDY_PAGE_SIZE as u64;
+    let mut drained_pages: u64 = seed_reserve_bytes() / BUDDY_PAGE_SIZE as u64;
     let zero_start_us = crate::arch::current::timer::elapsed_us().unwrap_or(0);
     // The seed reserve is zeroed too, so no free-block link or firmware
     // leftover survives anywhere in the drained RAM.
@@ -838,7 +840,7 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
         core::ptr::write_bytes(
             phys_to_virt(seed_base) as *mut u8,
             0,
-            SEED_RESERVE_BYTES as usize,
+            seed_reserve_bytes() as usize,
         );
     }
     for &CapDescriptor {
@@ -870,7 +872,7 @@ pub(crate) unsafe fn drain_and_install_seed() -> usize
         drained_pages,
         coalesced,
         zero_us,
-        SEED_RESERVE_BYTES / 1024,
+        seed_reserve_bytes() / 1024,
     );
 
     let pool_remaining = crate::mm::kernel_pt_pool::remaining_pages();
@@ -1569,7 +1571,7 @@ fn populate_cspace(
                 // It routes to memmgr, which never destroys it; a free into the
                 // sealed buddy is an accounting violation
                 // (docs/userspace-memory-model.md § Ownership Boundaries). The
-                // seed's own SEED_RESERVE_BYTES prefix is owned by the pinned
+                // seed's own `seed_reserve_bytes()` prefix is owned by the pinned
                 // SEED_MEMORY.
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
                 allocator: crate::cap::retype::RetypeAllocator::new_inline(),

@@ -148,14 +148,6 @@ pub fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS
 // each object kind, so a change to an object's size changes them, and that is
 // an ABI-visible change by design.
 
-/// Raw retype debit of one `Thread`, in bytes: the kernel stack
-/// (`KERNEL_STACK_PAGES`, four pages), one page holding the object wrapper and
-/// the thread control block, and one page for the extended-state (FPU, SIMD,
-/// vector) save area, all page-granular (`dispatch_for(Thread)` in
-/// core/kernel/src/cap/retype.rs). A process sizes the Memory cap it retypes
-/// a thread from with it.
-pub const THREAD_RETYPE_BYTES: u64 = 6 * 4096;
-
 /// Raw retype debit of one `Endpoint`, in bytes.
 pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
 
@@ -697,6 +689,27 @@ pub const MAP_READ: u64 = 0x1;
 /// shootdown; intermediate tables persist until the address space is destroyed.
 pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 
+// ── Interrupt line modes ─────────────────────────────────────────────────────
+
+/// `SYS_IRQ_REGISTER` mode (arg2): the line is level-triggered. Clear, it is
+/// edge-triggered.
+///
+/// Every binding on a line passes the same mode: the line's first binding
+/// records it, and a binding with another mode is refused with
+/// `InvalidArgument` until the line's last binding goes. x86-64 programs the
+/// line's I/O APIC redirection entry from it; riscv64 validates it and ignores
+/// it (the PLIC gateway is level-sensitive). See
+/// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REGISTER`.
+pub const IRQ_MODE_LEVEL: u64 = 1 << 0;
+
+/// `SYS_IRQ_REGISTER` mode (arg2): the line asserts low. Clear, it asserts
+/// high. See [`IRQ_MODE_LEVEL`].
+pub const IRQ_MODE_ACTIVE_LOW: u64 = 1 << 1;
+
+/// Every bit a `SYS_IRQ_REGISTER` mode may set; a mode with any other bit is
+/// refused with `InvalidArgument`. Mode 0 is edge-triggered, active-high.
+pub const IRQ_MODE_MASK: u64 = IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW;
+
 // ── Capability rights masks ─────────────────────────────────────────────────
 //
 // `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters
@@ -1160,6 +1173,14 @@ pub enum SystemInfoType
     /// `InvalidArgument`. The classes and what each counts are in
     /// core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`.
     StackHighWater = 9,
+    /// Raw retype debit of one `Thread`, in bytes: the kernel stack, one page
+    /// holding the object wrapper and the thread control block, and the
+    /// extended-state (FPU, SIMD, vector) save area, all page-granular. The
+    /// save area's size is the boot CPU's (on x86-64 the XSAVE size of the
+    /// enabled components, on riscv64 `304 + 32 * vlenb`, each rounded up to
+    /// whole pages), so it is fixed for a boot but not across machines. A
+    /// process sizes the Memory cap it retypes a thread from with it.
+    ThreadRetypeBytes = 10,
 }
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.

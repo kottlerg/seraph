@@ -35,14 +35,28 @@
 //! any binding left would keep the line masked, yet once a fresh copy binds a
 //! fresh notification and acknowledges, a raise signals it; the 64 caps then
 //! bind again.
+//!
+//! Last, the line's mode (`IRQ_MODE_*` in `abi/syscall`): a first binding
+//! records level-triggered, active-high; a second binding passing another mode
+//! is refused, as is a rebind of the first, and binds nothing (with the first
+//! acknowledged, a raise signals it alone); a second passing the same mode
+//! binds, a raise signals both, and where the mode programs the line
+//! level-triggered (x86-64), with the line held asserted across both
+//! acknowledgements, it signals both again at the unmask, which an
+//! edge-triggered entry would not; once both go, a new first binding records
+//! edge-triggered again; a mode with a bit outside `IRQ_MODE_MASK` is refused.
+//! Every mode used is active-high, the UART line's own polarity, so no binding
+//! inverts the line.
 
 use syscall::{
-    RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive, irq_ack, irq_register,
-    notification_wait_timeout,
+    IRQ_MODE_LEVEL, IRQ_MODE_MASK, RIGHTS_ALL, cap_create_notification, cap_delete, cap_derive,
+    irq_ack, irq_register, notification_wait_timeout,
 };
 use syscall_abi::SyscallError;
 
-use crate::arch::serial::{UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt};
+use crate::arch::serial::{
+    UART_HELD_LEVEL_REDELIVERED, UART_IRQ, quiet_tx_interrupt, raise_tx_interrupt,
+};
 use crate::{TestContext, TestResult};
 
 /// The kernel's `MAX_IRQ_BINDINGS`: bindings one line holds.
@@ -102,8 +116,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     held.release();
     let bounded = shared.and_then(|()| binding_bound(ctx, line, &mut held));
     held.release();
+    let moded = bounded.and_then(|()| line_mode(ctx, line, &mut held));
+    quiet_tx_interrupt();
+    held.release();
     cap_delete(line).ok();
-    bounded
+    moded
 }
 
 /// The five steps of the module doc.
@@ -115,8 +132,8 @@ fn shared_line(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     let n1 = held.push(notification(ctx)?);
     let n2 = held.push(notification(ctx)?);
     let n3 = held.push(notification(ctx)?);
-    irq_register(a, n1)
-        .and_then(|()| irq_register(b, n2))
+    irq_register(a, n1, 0)
+        .and_then(|()| irq_register(b, n2, 0))
         .map_err(|_| "integration::irq_shared_line: binding A or B refused")?;
     acknowledge(&[a, b])?;
 
@@ -140,7 +157,7 @@ fn shared_line(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     cap_delete(a).map_err(|_| "integration::irq_shared_line: cap_delete(A) failed")?;
     raise_expect(&[n2], &[n1], "deleting the owing A did not leave B served")?;
 
-    irq_register(b, n3).map_err(|_| "integration::irq_shared_line: rebinding B refused")?;
+    irq_register(b, n3, 0).map_err(|_| "integration::irq_shared_line: rebinding B refused")?;
     acknowledge(&[b])?;
     raise_expect(&[n3], &[n1, n2], "a rebind left more than one binding")?;
     acknowledge(&[b])?;
@@ -156,21 +173,21 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     let ntf = held.push(notification(ctx)?);
     // `bound[0]` is the line's own cap; the rest are its copies.
     let mut bound = [line; MAX_IRQ_BINDINGS];
-    irq_register(line, ntf)
+    irq_register(line, ntf, 0)
         .map_err(|_| "integration::irq_shared_line: binding the line refused")?;
     for slot in &mut bound[1..]
     {
         *slot = held.push(derive(line)?);
-        irq_register(*slot, ntf)
+        irq_register(*slot, ntf, 0)
             .map_err(|_| "integration::irq_shared_line: a binding under the bound was refused")?;
     }
     let extra = held.push(derive(line)?);
-    if irq_register(extra, ntf) != Err(SyscallError::QuotaExceeded as i64)
+    if irq_register(extra, ntf, 0) != Err(SyscallError::QuotaExceeded as i64)
     {
         return Err("integration::irq_shared_line: a binding past the bound was not refused");
     }
     cap_delete(bound[1]).map_err(|_| "integration::irq_shared_line: cap_delete(copy) failed")?;
-    irq_register(extra, ntf)
+    irq_register(extra, ntf, 0)
         .map_err(|_| "integration::irq_shared_line: a freed binding did not make room")?;
     bound[1] = extra;
 
@@ -182,7 +199,7 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     cap_delete(ntf).map_err(|_| "integration::irq_shared_line: cap_delete(notification) failed")?;
     let fresh = held.push(notification(ctx)?);
     let probe = held.push(derive(line)?);
-    irq_register(probe, fresh)
+    irq_register(probe, fresh, 0)
         .map_err(|_| "integration::irq_shared_line: binding a probe after the teardown refused")?;
     acknowledge(&[probe])?;
     raise_expect(
@@ -194,8 +211,75 @@ fn binding_bound(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
     // The 64 caps bind again, filling the line.
     bound
         .iter()
-        .try_for_each(|&cap| irq_register(cap, fresh))
+        .try_for_each(|&cap| irq_register(cap, fresh, 0))
         .map_err(|_| "integration::irq_shared_line: refilling the line after the teardown failed")
+}
+
+/// The line's mode: the last scenario of the module doc. Runs once no binding
+/// remains on the line, so its first registration records the mode.
+fn line_mode(ctx: &TestContext, line: u32, held: &mut Held) -> TestResult
+{
+    let a = held.push(derive(line)?);
+    let b = held.push(derive(line)?);
+    let n1 = held.push(notification(ctx)?);
+    let n2 = held.push(notification(ctx)?);
+    irq_register(a, n1, IRQ_MODE_LEVEL)
+        .map_err(|_| "integration::irq_shared_line: a level first binding was refused")?;
+    if irq_register(b, n2, 0) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("integration::irq_shared_line: a binding of another mode was not refused");
+    }
+    if irq_register(a, n2, 0) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("integration::irq_shared_line: a rebind to another mode was not refused");
+    }
+    // The refusals bound nothing: with A acknowledged, a raise signals N1
+    // alone, where a B bound by a refused call would owe an acknowledgement
+    // and hold the line masked.
+    acknowledge(&[a])?;
+    raise_expect(&[n1], &[n2], "a refused registration bound the line")?;
+    irq_register(b, n2, IRQ_MODE_LEVEL)
+        .map_err(|_| "integration::irq_shared_line: a binding of the line's mode was refused")?;
+    // A raise signals both. Where the mode programs the line level-triggered
+    // (`UART_HELD_LEVEL_REDELIVERED`: x86-64's I/O APIC), the assertion, held
+    // across both acknowledgements, is delivered again at the unmask; an
+    // edge-triggered entry raises no new edge for it.
+    acknowledge(&[a, b])?;
+    raise_tx_interrupt();
+    let redelivered = expect_signalled(&[n1, n2], &[], "a level line did not signal both bindings")
+        .and_then(|()| {
+            if UART_HELD_LEVEL_REDELIVERED
+            {
+                acknowledge(&[a, b])?;
+                expect_signalled(
+                    &[n1, n2],
+                    &[],
+                    "a level line did not deliver an assertion held at the unmask",
+                )
+            }
+            else
+            {
+                Ok(())
+            }
+        });
+    quiet_tx_interrupt();
+    redelivered?;
+    cap_delete(a).map_err(|_| "integration::irq_shared_line: cap_delete(A) failed")?;
+    cap_delete(b).map_err(|_| "integration::irq_shared_line: cap_delete(B) failed")?;
+
+    // The last binding's removal released the line, so a new first binding may
+    // record another mode.
+    let c = held.push(derive(line)?);
+    irq_register(c, n1, 0).map_err(
+        |_| "integration::irq_shared_line: a released line kept the mode of its last bindings",
+    )?;
+    cap_delete(c).map_err(|_| "integration::irq_shared_line: cap_delete(C) failed")?;
+    let d = held.push(derive(line)?);
+    if irq_register(d, n1, IRQ_MODE_MASK + 1) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("integration::irq_shared_line: a mode with an unknown bit was not refused");
+    }
+    Ok(())
 }
 
 fn derive(line: u32) -> Result<u32, &'static str>
@@ -221,6 +305,15 @@ fn acknowledge(caps: &[u32]) -> TestResult
 fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
 {
     raise_tx_interrupt();
+    let result = expect_signalled(signalled, quiet, failure);
+    quiet_tx_interrupt();
+    result
+}
+
+/// Require every notification in `signalled` to see bit 0 and none in `quiet`
+/// to see anything, leaving the line as it is.
+fn expect_signalled(signalled: &[u32], quiet: &[u32], failure: &'static str) -> TestResult
+{
     let mut result = Ok(());
     for &ntf in signalled
     {
@@ -238,6 +331,5 @@ fn raise_expect(signalled: &[u32], quiet: &[u32], failure: &'static str) -> Test
             result = Err(failure);
         }
     }
-    quiet_tx_interrupt();
     result
 }

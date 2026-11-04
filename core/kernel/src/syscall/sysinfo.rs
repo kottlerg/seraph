@@ -83,6 +83,12 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::stack_depth::high_water(tf.arg(1))
         }
+        10 =>
+        // ThreadRetypeBytes — the debit of one Thread retype, sized at boot
+        // from the boot CPU's extended-state area.
+        {
+            Ok(crate::sched::thread_slot::thread_slot_bytes())
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }

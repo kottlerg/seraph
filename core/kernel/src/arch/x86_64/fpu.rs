@@ -209,6 +209,33 @@ pub unsafe fn enable_xsave()
     }
 }
 
+/// Bytes of the XSAVE area for the components XCR0 currently enables on the
+/// executing CPU (CPUID.0Dh:0.EBX): the per-thread save area [`save_to`]
+/// writes, which sizes every Thread retype slot
+/// (`crate::sched::thread_slot`). Valid once [`enable_xsave`] has written
+/// XCR0.
+#[cfg(not(test))]
+fn xsave_area_bytes() -> u64
+{
+    u64::from(super::cpu::cpuid(0xD).1)
+}
+
+/// Report the BSP's per-thread save-area size, [`xsave_area_bytes`], which
+/// sizes every Thread retype slot (`crate::sched::thread_slot`). Every CPU
+/// enables the same XCR0 components ([`enable_xsave`]), and the standard
+/// XSAVE layout of a given component set is architectural, so the BSP's size
+/// holds on every CPU and only the BSP reports it. The arch contract's
+/// `fpu::report_save_area`, called by Phase 5 after `percpu::init_bsp`.
+///
+/// # Safety
+/// Must execute at ring 0 on the BSP, once, after `interrupts::init` ran
+/// [`enable_xsave`] and before any Thread is created.
+#[cfg(not(test))]
+pub unsafe fn report_save_area()
+{
+    crate::sched::thread_slot::set_extended_bytes(xsave_area_bytes());
+}
+
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///
 /// `area` must be 64-byte aligned and point at a writable XSAVE buffer of

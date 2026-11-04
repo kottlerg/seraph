@@ -73,13 +73,21 @@ pub fn write_byte(byte: u8)
 /// with no interrupt-source override.
 pub const UART_IRQ: u32 = 4;
 
+/// Whether the UART line, bound level-triggered (`IRQ_MODE_LEVEL`), delivers again an
+/// assertion held across its receivers' acknowledgements: yes, since the mode programs the
+/// line's I/O APIC entry level-triggered, and the entry delivers a still-asserted line at the
+/// unmask.
+pub const UART_HELD_LEVEL_REDELIVERED: bool = true;
+
 /// IER bit 1: transmit-holding-register-empty interrupt enable.
 const IER_THRI: u8 = 0x02;
 
 /// Raise one COM1 transmit-empty interrupt: clear IER, then set its THRI bit.
 /// The holding register is empty whenever ktest is not writing, so setting
-/// THRI asserts the line again (a rising edge, which the edge-triggered
-/// I/O APIC entry delivers once unmasked).
+/// THRI asserts the line again: a rising edge, which an I/O APIC entry
+/// programmed edge-triggered (mode 0) delivers once unmasked, and a held
+/// level, which a level-triggered entry delivers at every unmask until
+/// [`quiet_tx_interrupt`] lowers it.
 ///
 /// Called only on the main thread (the only one bound to COM1's ports) once
 /// [`init`] has returned `true`.

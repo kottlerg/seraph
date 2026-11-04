@@ -263,8 +263,10 @@ mod live
 
     /// Unmap the RAM page at `phys`, a new thread's guard page, from the
     /// direct map, and return the guard epoch to stamp in the thread's TCB.
-    /// No CPU's TLB is flushed here: each CPU flushes before it first runs
-    /// the thread ([`flush_before_run`]).
+    /// No CPU's TLB is flushed here, this one's included: nothing reaches the
+    /// guard page before the new thread's first switch-in, and every CPU's
+    /// record, this one's too, predates the stamp, so each flushes at its own
+    /// switch-in to the thread ([`flush_before_run`]).
     ///
     /// # Errors
     /// As [`hole_on_boot_cpu`].

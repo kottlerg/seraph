@@ -544,7 +544,9 @@ pristine buddy in Phase 4 and counted in the kernel reserve, so a split never fa
 split chunk stays split and its table stays consumed, and the reserve's unused frames are
 never returned. One leaf lock serialises every hole, every fill and the reserve.
 
-Making a thread's hole sends no shootdown. A global guard epoch counts the holes: thread
+Making a thread's hole sends no shootdown and makes no local flush: nothing reaches the
+guard page before the new thread's first switch-in, and every CPU's flush record, the
+creating CPU's included, predates the hole. A global guard epoch counts the holes: thread
 creation advances it after the edit and stamps the new value in the TCB (`guard_epoch`),
 and each CPU records the epoch of its last guard flush (`PerCpuData::guard_epoch_flushed`).
 At every switch-in `schedule()` compares the incoming thread's stamp with that record and,

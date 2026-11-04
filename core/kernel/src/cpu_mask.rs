@@ -3,37 +3,58 @@
 
 // core/kernel/src/cpu_mask.rs
 
-//! Fixed-capacity sets of logical CPU indices.
+//! Sets of logical CPU indices, as wide as this boot's CPU count.
 //!
-//! Two representations of a subset of `[0, MAX_CPUS)`, both vectors of 64-bit
-//! words sized to cover [`crate::sched::MAX_CPUS`]:
+//! [`AtomicCpuMask`] is a concurrently-updated set where one CPU sets or clears
+//! its own bit while another reads, copies, or iterates the whole set: the
+//! TLB-shootdown acknowledgement set, an address space's active-CPU set, and the
+//! reschedule-pending set.
 //!
-//! - [`CpuMask`] — a plain value for building, snapshotting, and iterating a
-//!   set (the target set of a TLB shootdown, the online-CPU set).
-//! - [`AtomicCpuMask`] — a concurrently-updated set where one CPU sets or
-//!   clears its own bit while another reads or overwrites the whole set: the
-//!   TLB-shootdown acknowledgement set, an address space's active-CPU set, and
-//!   the reschedule-pending flag.
-//!
-//! These replace the single-`u64` masks that capped the system at 64 CPUs; the
-//! word count scales with `MAX_CPUS` so per-CPU bit arithmetic lives in one
-//! place rather than being open-coded as `1u64 << cpu` at each call site.
+//! Every mask holds [`mask_words`] 64-bit words, `cpu_count.div_ceil(64)`, fixed
+//! at Phase 4 ([`set_boot_cpu_count`]). A mask is a view over storage held with
+//! its object (an address space's wrapper page, a TLB request's slab slot, the
+//! scheduler's Phase 4 slab), so a boot pays only for the CPUs it has. No mask is
+//! held by value on a kernel stack: copies between sets are word by word
+//! ([`AtomicCpuMask::fill_from`]). `MAX_CPUS` bounds the CPU count but sizes no
+//! mask. A hierarchical mask is not the design: it still fixes a maximum, and
+//! adds a level to every bit test on the shootdown and context-switch paths.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sched::MAX_CPUS;
 
-/// Number of 64-bit words needed to cover every CPU index in `[0, MAX_CPUS)`.
-///
-/// Every mask is this wide whatever the boot CPU count, and is held by value in
-/// each `AddressSpace` and TLB-shootdown request: 64 B at today's 512. That is
-/// paid while `MAX_CPUS` caps `BootInfo.cpu_count`; the boot ABI no longer
-/// fixes it (`cpu_ids` lies in pages of its own), and the decided replacement is
-/// a per-boot width, `cpu_count.div_ceil(64)` words, held in storage sized with
-/// their object, so a mask costs only the CPUs booted. A hierarchical mask is
-/// not the design: it still fixes a maximum, and adds a level to every bit test
-/// on the shootdown and context-switch paths.
-pub const CPU_MASK_WORDS: usize = MAX_CPUS.div_ceil(64);
+/// Words a mask of this boot's CPUs needs: `cpu_count.div_ceil(64)`, set once
+/// by [`set_boot_cpu_count`] before any mask is built. Zero until then.
+static MASK_WORDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Words a mask of `cpu_count` CPUs needs.
+#[must_use]
+pub const fn words_for(cpu_count: usize) -> usize
+{
+    cpu_count.div_ceil(64)
+}
+
+/// Most words any boot's mask holds: [`words_for`] of `MAX_CPUS`. Bounds the
+/// storage an object reserves for its mask (an address space's wrapper page).
+pub const MAX_MASK_WORDS: usize = words_for(MAX_CPUS);
+
+/// Record this boot's CPU count, which fixes every mask's width. Called once,
+/// at Phase 4, before any mask is built.
+pub fn set_boot_cpu_count(cpu_count: usize)
+{
+    debug_assert!(
+        (1..=MAX_CPUS).contains(&cpu_count),
+        "set_boot_cpu_count: CPU count outside 1..=MAX_CPUS"
+    );
+    MASK_WORDS.store(words_for(cpu_count), Ordering::Relaxed);
+}
+
+/// Words every mask of this boot holds ([`set_boot_cpu_count`]).
+#[must_use]
+pub fn mask_words() -> usize
+{
+    MASK_WORDS.load(Ordering::Relaxed)
+}
 
 /// Map a CPU index to its `(word, bit)` position.
 #[inline]
@@ -42,201 +63,247 @@ const fn word_bit(cpu: usize) -> (usize, u64)
     (cpu / 64, 1u64 << (cpu % 64))
 }
 
-/// A plain (non-atomic) set of CPU indices in `[0, MAX_CPUS)`.
-#[derive(Clone, Copy)]
-pub struct CpuMask
+/// The set a mask is filled from by [`AtomicCpuMask::fill_from`].
+pub enum MaskSource<'a>
 {
-    words: [u64; CPU_MASK_WORDS],
+    /// Every CPU index in another mask, read with the given ordering.
+    Mask(&'a AtomicCpuMask, Ordering),
+    /// Every CPU index below the given count.
+    Below(usize),
 }
 
-impl CpuMask
-{
-    /// The empty set.
-    pub const fn empty() -> Self
-    {
-        Self {
-            words: [0; CPU_MASK_WORDS],
-        }
-    }
-
-    /// The set of all CPU indices in `[0, n)`. `n` must be `<= MAX_CPUS`.
-    pub fn range(n: usize) -> Self
-    {
-        debug_assert!(n <= MAX_CPUS, "CpuMask::range: n exceeds MAX_CPUS");
-        let mut m = Self::empty();
-        let full = (n / 64).min(CPU_MASK_WORDS);
-        for w in m.words.iter_mut().take(full)
-        {
-            *w = u64::MAX;
-        }
-        let rem = n % 64;
-        if rem != 0 && full < CPU_MASK_WORDS
-        {
-            m.words[full] = (1u64 << rem) - 1;
-        }
-        m
-    }
-
-    /// Add `cpu` to the set.
-    #[inline]
-    pub fn set(&mut self, cpu: usize)
-    {
-        let (w, b) = word_bit(cpu);
-        self.words[w] |= b;
-    }
-
-    /// Remove `cpu` from the set.
-    #[inline]
-    pub fn clear(&mut self, cpu: usize)
-    {
-        let (w, b) = word_bit(cpu);
-        self.words[w] &= !b;
-    }
-
-    /// Whether the set is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool
-    {
-        self.words.iter().all(|&w| w == 0)
-    }
-
-    /// The lowest CPU index in the set, or `None` if empty.
-    #[inline]
-    pub fn first(&self) -> Option<usize>
-    {
-        for (i, &w) in self.words.iter().enumerate()
-        {
-            if w != 0
-            {
-                return Some(i * 64 + w.trailing_zeros() as usize);
-            }
-        }
-        None
-    }
-
-    /// Iterate the CPU indices in the set in ascending order.
-    #[inline]
-    pub fn iter(&self) -> CpuMaskIter
-    {
-        CpuMaskIter {
-            words: self.words,
-            word: 0,
-        }
-    }
-}
-
-/// Ascending iterator over the CPU indices in a [`CpuMask`]. Consumes a copy
-/// of the underlying words, so it does not borrow the source mask.
-pub struct CpuMaskIter
-{
-    words: [u64; CPU_MASK_WORDS],
-    word: usize,
-}
-
-impl Iterator for CpuMaskIter
-{
-    type Item = usize;
-
-    fn next(&mut self) -> Option<usize>
-    {
-        while self.word < CPU_MASK_WORDS
-        {
-            let w = self.words[self.word];
-            if w != 0
-            {
-                let bit = w.trailing_zeros() as usize;
-                // Clear the lowest set bit so the next call advances.
-                self.words[self.word] = w & (w - 1);
-                return Some(self.word * 64 + bit);
-            }
-            self.word += 1;
-        }
-        None
-    }
-}
-
-/// A concurrently-updated set of CPU indices in `[0, MAX_CPUS)`.
+/// A concurrently-updated set of CPU indices, a view over words held with its
+/// object.
 ///
-/// Each word is updated independently; whole-set [`store`](Self::store) and
-/// [`snapshot`](Self::snapshot) are not atomic across words. Every reader needs only
-/// per-CPU atomicity: the shootdown ack-poll and the watchdog's `any_pending` re-read a
-/// draining set until it is empty, and the shootdown-target snapshot of an address
-/// space's active-CPU set relies, per CPU, on the `tlb_gen` check (see
+/// Each word is updated independently; whole-set [`fill_from`](Self::fill_from)
+/// and [`iter`](Self::iter) are not atomic across words. Every reader needs only
+/// per-CPU atomicity: the shootdown ack-poll and the watchdog's `any_pending`
+/// re-read a draining set until it is empty, and the shootdown-target copy of an
+/// address space's active-CPU set relies, per CPU, on the `tlb_gen` check (see
 /// [memory-internals.md § SMP TLB Shootdown](../docs/memory-internals.md#smp-tlb-shootdown)).
 pub struct AtomicCpuMask
 {
-    words: [AtomicU64; CPU_MASK_WORDS],
+    words: *const AtomicU64,
+    len: usize,
 }
+
+// SAFETY: the view only reads and writes its words through atomics, and the
+// storage it names lives as long as the object that holds the view.
+unsafe impl Send for AtomicCpuMask {}
+// SAFETY: as above.
+unsafe impl Sync for AtomicCpuMask {}
 
 impl AtomicCpuMask
 {
-    /// The empty set.
-    pub const fn new() -> Self
+    /// A mask with no storage yet: every set is empty and setting a bit is a
+    /// caller error. The holder attaches storage ([`attach`](Self::attach))
+    /// before any CPU uses it.
+    pub const fn unattached() -> Self
     {
         Self {
-            words: [const { AtomicU64::new(0) }; CPU_MASK_WORDS],
+            words: core::ptr::null(),
+            len: 0,
         }
+    }
+
+    /// A view over the `len` words at `words`, which become the empty set.
+    ///
+    /// # Safety
+    /// `words` is valid, 8-byte aligned, and reserved for this mask for as long
+    /// as the view is used; nothing else accesses it except through views.
+    pub unsafe fn attach(words: *mut AtomicU64, len: usize) -> Self
+    {
+        for i in 0..len
+        {
+            // SAFETY: caller contract: `len` reserved words at `words`.
+            unsafe { words.add(i).write(AtomicU64::new(0)) };
+        }
+        Self { words, len }
+    }
+
+    /// A view over the `len` words at `words`, keeping the set they hold.
+    ///
+    /// # Safety
+    /// `words` holds `len` initialised, 8-byte aligned atomic words that live
+    /// as long as the view is used and are only accessed through views.
+    pub unsafe fn from_words(words: *const AtomicU64, len: usize) -> Self
+    {
+        Self { words, len }
+    }
+
+    /// The mask's words.
+    #[inline]
+    fn words(&self) -> &[AtomicU64]
+    {
+        if self.len == 0
+        {
+            return &[];
+        }
+        // SAFETY: `attach` contract: `len` live words at `words`.
+        unsafe { core::slice::from_raw_parts(self.words, self.len) }
+    }
+
+    /// The word holding `cpu`'s bit, and the bit. `cpu` must lie in the mask.
+    #[inline]
+    fn slot(&self, cpu: usize) -> (&AtomicU64, u64)
+    {
+        let (w, b) = word_bit(cpu);
+        let words = self.words();
+        debug_assert!(w < words.len(), "AtomicCpuMask: CPU index past the mask");
+        (&words[w], b)
     }
 
     /// Add `cpu` to the set.
     #[inline]
     pub fn set_cpu(&self, cpu: usize, order: Ordering)
     {
-        let (w, b) = word_bit(cpu);
-        self.words[w].fetch_or(b, order);
+        let (word, b) = self.slot(cpu);
+        word.fetch_or(b, order);
     }
 
     /// Remove `cpu` from the set.
     #[inline]
     pub fn clear_cpu(&self, cpu: usize, order: Ordering)
     {
-        let (w, b) = word_bit(cpu);
-        self.words[w].fetch_and(!b, order);
+        let (word, b) = self.slot(cpu);
+        word.fetch_and(!b, order);
     }
 
     /// Remove `cpu` from the set, returning whether it had been present.
     #[inline]
     pub fn take_cpu(&self, cpu: usize, order: Ordering) -> bool
     {
-        let (w, b) = word_bit(cpu);
-        self.words[w].fetch_and(!b, order) & b != 0
+        let (word, b) = self.slot(cpu);
+        word.fetch_and(!b, order) & b != 0
     }
 
     /// Whether `cpu` is in the set.
     #[inline]
     pub fn test_cpu(&self, cpu: usize, order: Ordering) -> bool
     {
-        let (w, b) = word_bit(cpu);
-        self.words[w].load(order) & b != 0
+        let (word, b) = self.slot(cpu);
+        word.load(order) & b != 0
     }
 
     /// Whether the set is empty.
     #[inline]
     pub fn is_empty(&self, order: Ordering) -> bool
     {
-        self.words.iter().all(|w| w.load(order) == 0)
+        self.words().iter().all(|w| w.load(order) == 0)
     }
 
-    /// Overwrite the set with `mask`.
+    /// The lowest CPU index in the set, or `None` if empty.
     #[inline]
-    pub fn store(&self, mask: &CpuMask, order: Ordering)
+    pub fn first(&self, order: Ordering) -> Option<usize>
     {
-        for (w, &v) in self.words.iter().zip(mask.words.iter())
-        {
-            w.store(v, order);
+        self.iter(order).next()
+    }
+
+    /// Iterate the CPU indices in the set in ascending order, loading each
+    /// word with `order` when the iteration reaches it.
+    #[inline]
+    pub fn iter(&self, order: Ordering) -> AtomicCpuMaskIter<'_>
+    {
+        AtomicCpuMaskIter {
+            words: self.words(),
+            order,
+            word: 0,
+            bits: 0,
+            loaded: false,
         }
     }
 
-    /// Read the set into a plain [`CpuMask`].
-    #[inline]
-    pub fn snapshot(&self, order: Ordering) -> CpuMask
+    /// Overwrite the set with `source` less `except` (a CPU index, or one past
+    /// the mask to except none), storing each word with `order`. Returns
+    /// whether the result is non-empty.
+    pub fn fill_from(&self, source: &MaskSource<'_>, except: usize, order: Ordering) -> bool
     {
-        let mut m = CpuMask::empty();
-        for (slot, w) in m.words.iter_mut().zip(self.words.iter())
+        let mut any = false;
+        for (i, word) in self.words().iter().enumerate()
         {
-            *slot = w.load(order);
+            let v = source.word_except(i, except);
+            any |= v != 0;
+            word.store(v, order);
         }
-        m
+        any
+    }
+
+    /// Whether [`fill_from`](Self::fill_from) with these arguments would leave
+    /// the set non-empty, without storing anything.
+    pub fn fill_would_be_nonempty(&self, source: &MaskSource<'_>, except: usize) -> bool
+    {
+        (0..self.len).any(|i| source.word_except(i, except) != 0)
+    }
+}
+
+impl MaskSource<'_>
+{
+    /// Word `i` of the set, less `except`.
+    fn word_except(&self, i: usize, except: usize) -> u64
+    {
+        let v = match self
+        {
+            MaskSource::Mask(src, load) => src.words().get(i).map_or(0, |w| w.load(*load)),
+            MaskSource::Below(n) => below_word(*n, i),
+        };
+        let (except_word, except_bit) = word_bit(except);
+        if i == except_word { v & !except_bit } else { v }
+    }
+}
+
+/// Word `i` of the set of every CPU index below `n`.
+const fn below_word(n: usize, i: usize) -> u64
+{
+    let start = i * 64;
+    if n <= start
+    {
+        0
+    }
+    else if n - start >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << (n - start)) - 1
+    }
+}
+
+/// Ascending iterator over the CPU indices in an [`AtomicCpuMask`], loading
+/// each word once, when the iteration reaches it.
+pub struct AtomicCpuMaskIter<'a>
+{
+    words: &'a [AtomicU64],
+    order: Ordering,
+    word: usize,
+    bits: u64,
+    loaded: bool,
+}
+
+impl Iterator for AtomicCpuMaskIter<'_>
+{
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize>
+    {
+        while self.word < self.words.len()
+        {
+            if !self.loaded
+            {
+                self.bits = self.words[self.word].load(self.order);
+                self.loaded = true;
+            }
+            if self.bits != 0
+            {
+                let bit = self.bits.trailing_zeros() as usize;
+                // Clear the lowest set bit so the next call advances.
+                self.bits &= self.bits - 1;
+                return Some(self.word * 64 + bit);
+            }
+            self.word += 1;
+            self.loaded = false;
+        }
+        None
     }
 }
 
@@ -245,133 +312,166 @@ mod tests
 {
     use super::*;
 
-    /// Collect an iterator into a fixed buffer, returning the populated length.
-    fn drain<I: Iterator<Item = usize>>(it: I, out: &mut [usize; 128]) -> usize
+    /// A mask over freshly leaked storage for `cpus` CPUs.
+    fn mask(cpus: usize) -> AtomicCpuMask
     {
-        let mut n = 0;
-        for cpu in it
+        let words: &'static mut [AtomicU64] =
+            Vec::from_iter((0..words_for(cpus)).map(|_| AtomicU64::new(u64::MAX))).leak();
+        // SAFETY: leaked storage, reserved for this mask for the test's life.
+        unsafe { AtomicCpuMask::attach(words.as_mut_ptr(), words.len()) }
+    }
+
+    const R: Ordering = Ordering::Relaxed;
+
+    /// Widths that exercise the partial-word edges, a shipping two-socket part
+    /// (768) and the ceiling.
+    const WIDTHS: [usize; 7] = [1, 63, 64, 65, 512, 768, MAX_CPUS];
+
+    // Defect caught: a per-boot word count that rounds a partial word away,
+    // so the top CPUs of a boot past a multiple of 64 have no bit.
+    #[test]
+    fn a_boots_mask_holds_one_word_per_64_cpus_rounded_up()
+    {
+        assert_eq!(words_for(1), 1);
+        assert_eq!(words_for(64), 1);
+        assert_eq!(words_for(65), 2);
+        assert_eq!(words_for(128), 2);
+        assert_eq!(words_for(129), 3);
+        assert_eq!(words_for(MAX_CPUS), MAX_MASK_WORDS);
+    }
+
+    // Defect caught: attached storage that keeps what it held before, so a
+    // fresh address space starts active on CPUs it never ran on.
+    #[test]
+    fn an_attached_mask_starts_empty()
+    {
+        for cpus in WIDTHS
         {
-            out[n] = cpu;
-            n += 1;
+            let m = mask(cpus);
+            assert!(m.is_empty(R));
+            assert_eq!(m.first(R), None);
         }
-        n
     }
 
+    // Defect caught: a bit lost or misplaced at a word edge, or the top CPU of
+    // a boot unreachable.
     #[test]
-    fn range_sets_low_bits()
+    fn every_cpu_of_a_boot_sets_tests_takes_and_clears_its_own_bit()
     {
-        let m = CpuMask::range(3);
-        let mut buf = [0usize; 128];
-        let n = drain(m.iter(), &mut buf);
-        assert_eq!(&buf[..n], &[0, 1, 2]);
-        assert!(!m.is_empty());
-        assert_eq!(m.first(), Some(0));
-    }
-
-    #[test]
-    fn range_spans_words()
-    {
-        // Only meaningful when MAX_CPUS > 64.
-        if CPU_MASK_WORDS < 2
+        for cpus in WIDTHS
         {
-            return;
+            let m = mask(cpus);
+            for cpu in [0, cpus / 2, cpus - 1]
+            {
+                m.set_cpu(cpu, R);
+                assert!(m.test_cpu(cpu, R));
+                assert_eq!(m.iter(R).collect::<Vec<_>>(), [cpu]);
+                assert!(m.take_cpu(cpu, R));
+                assert!(!m.take_cpu(cpu, R));
+                m.set_cpu(cpu, R);
+                m.clear_cpu(cpu, R);
+                assert!(m.is_empty(R));
+            }
         }
-        let m = CpuMask::range(70);
-        let mut buf = [0usize; 128];
-        let n = drain(m.iter(), &mut buf);
-        assert_eq!(n, 70);
-        assert_eq!(buf[0], 0);
-        assert_eq!(buf[n - 1], 69);
     }
 
+    // Defect caught: an all-CPU target set that misses the top partial word or
+    // reaches past the boot's CPUs, or keeps the initiator in its own targets.
     #[test]
-    fn range_at_max_cpus_covers_every_index_and_one_less_drops_the_top()
+    fn filling_from_every_cpu_below_a_count_excepts_one()
     {
-        // The full width the kernel sizes its masks for, which no local boot
-        // reaches (docs/testing.md § Coverage tiers, Known boundaries).
-        let m = CpuMask::range(MAX_CPUS);
-        assert_eq!(m.iter().count(), MAX_CPUS);
-        assert_eq!(m.first(), Some(0));
-        assert_eq!(m.iter().last(), Some(MAX_CPUS - 1));
-        let below = CpuMask::range(MAX_CPUS - 1);
-        assert_eq!(below.iter().count(), MAX_CPUS - 1);
-        assert_eq!(below.iter().last(), Some(MAX_CPUS - 2));
+        for cpus in WIDTHS
+        {
+            let m = mask(cpus);
+            assert!(m.fill_from(&MaskSource::Below(cpus), cpus, R));
+            assert_eq!(m.iter(R).count(), cpus);
+            assert_eq!(m.iter(R).last(), Some(cpus - 1));
+            let except = cpus - 1;
+            let any = m.fill_from(&MaskSource::Below(cpus), except, R);
+            assert_eq!(any, cpus > 1);
+            assert_eq!(m.iter(R).count(), cpus - 1);
+            assert!(!m.test_cpu(except, R));
+        }
     }
 
+    // Defect caught: a shootdown target copy that drops bits of the source,
+    // keeps the initiator, or reports targets when only the initiator was
+    // active.
     #[test]
-    fn the_top_cpu_index_sets_clears_and_takes_in_both_mask_forms()
+    fn filling_from_a_mask_copies_it_less_the_excepted_cpu()
     {
-        let top = MAX_CPUS - 1;
-        let mut m = CpuMask::empty();
-        m.set(top);
-        assert_eq!(m.first(), Some(top));
-        assert_eq!(m.iter().collect::<Vec<_>>(), [top]);
-        m.clear(top);
-        assert!(m.is_empty());
-
-        let a = AtomicCpuMask::new();
-        a.set_cpu(top, Ordering::Relaxed);
-        assert!(a.test_cpu(top, Ordering::Relaxed));
-        assert_eq!(a.snapshot(Ordering::Relaxed).first(), Some(top));
-        assert!(a.take_cpu(top, Ordering::Relaxed));
-        assert!(!a.take_cpu(top, Ordering::Relaxed));
-        assert!(a.is_empty(Ordering::Relaxed));
+        for cpus in WIDTHS
+        {
+            let src = mask(cpus);
+            let dst = mask(cpus);
+            let set: Vec<usize> = [0, 63, 64, cpus - 1]
+                .into_iter()
+                .filter(|&c| c < cpus)
+                .collect();
+            for &c in &set
+            {
+                src.set_cpu(c, R);
+            }
+            assert!(dst.fill_from(&MaskSource::Mask(&src, R), cpus, R));
+            let mut want = set.clone();
+            want.dedup();
+            assert_eq!(dst.iter(R).collect::<Vec<_>>(), want);
+            let only = mask(cpus);
+            only.set_cpu(cpus - 1, R);
+            assert!(!dst.fill_from(&MaskSource::Mask(&only, R), cpus - 1, R));
+            assert!(dst.is_empty(R));
+        }
     }
 
+    // Defect caught: a shootdown gate that disagrees with the fill it guards,
+    // so an initiator skips every remote shootdown, or one with no target.
     #[test]
-    fn set_adds_bit()
+    fn the_non_empty_check_agrees_with_the_fill_it_guards()
     {
-        let mut m = CpuMask::empty();
-        m.set(2);
-        m.set(65);
-        let mut buf = [0usize; 128];
-        let n = drain(m.iter(), &mut buf);
-        assert_eq!(&buf[..n], &[2, 65]);
+        for cpus in WIDTHS
+        {
+            // `mask` attaches, which empties the storage.
+            let dst = mask(cpus);
+            let empty = mask(cpus);
+            let only_last = mask(cpus);
+            only_last.set_cpu(cpus - 1, R);
+            let ends = mask(cpus);
+            ends.set_cpu(0, R);
+            ends.set_cpu(cpus - 1, R);
+            let sources = [
+                MaskSource::Below(cpus),
+                MaskSource::Below(1),
+                MaskSource::Below(0),
+                MaskSource::Mask(&empty, R),
+                MaskSource::Mask(&only_last, R),
+                MaskSource::Mask(&ends, R),
+            ];
+            for source in &sources
+            {
+                for except in [0, cpus - 1, cpus]
+                {
+                    let predicted = dst.fill_would_be_nonempty(source, except);
+                    assert_eq!(
+                        predicted,
+                        dst.fill_from(source, except, R),
+                        "{cpus} CPUs, except {except}"
+                    );
+                    assert_eq!(predicted, !dst.is_empty(R));
+                }
+            }
+            // Only the excepted CPU active: no target.
+            assert!(!dst.fill_would_be_nonempty(&MaskSource::Mask(&only_last, R), cpus - 1));
+        }
     }
 
+    // Defect caught: an unattached mask that reports a member or faults on a
+    // read before its holder attaches storage.
     #[test]
-    fn clear_removes_bit()
+    fn an_unattached_mask_is_empty()
     {
-        let mut m = CpuMask::range(4);
-        m.clear(1);
-        let mut buf = [0usize; 128];
-        let n = drain(m.iter(), &mut buf);
-        assert_eq!(&buf[..n], &[0, 2, 3]);
-    }
-
-    #[test]
-    fn empty_is_empty()
-    {
-        let m = CpuMask::empty();
-        assert!(m.is_empty());
-        assert_eq!(m.first(), None);
-        assert_eq!(m.iter().next(), None);
-    }
-
-    #[test]
-    fn atomic_set_take_clear()
-    {
-        let a = AtomicCpuMask::new();
-        assert!(a.is_empty(Ordering::Relaxed));
-        a.set_cpu(5, Ordering::Relaxed);
-        a.set_cpu(63, Ordering::Relaxed);
-        assert!(a.test_cpu(5, Ordering::Relaxed));
-        assert!(!a.is_empty(Ordering::Relaxed));
-        assert!(a.take_cpu(5, Ordering::Relaxed));
-        assert!(!a.take_cpu(5, Ordering::Relaxed));
-        a.clear_cpu(63, Ordering::Relaxed);
-        assert!(a.is_empty(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn atomic_store_snapshot_roundtrip()
-    {
-        let a = AtomicCpuMask::new();
-        let src = CpuMask::range(4);
-        a.store(&src, Ordering::Relaxed);
-        let snap = a.snapshot(Ordering::Relaxed);
-        let mut buf = [0usize; 128];
-        let n = drain(snap.iter(), &mut buf);
-        assert_eq!(&buf[..n], &[0, 1, 2, 3]);
+        let m = AtomicCpuMask::unattached();
+        assert!(m.is_empty(R));
+        assert_eq!(m.first(R), None);
+        assert_eq!(m.iter(R).next(), None);
     }
 }

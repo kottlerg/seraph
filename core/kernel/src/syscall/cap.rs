@@ -375,9 +375,10 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// Create-mode slab layout:
 /// - page 0 — wrapper page: [`AddressSpaceObject`] at offset 0, immediately
-///   followed by the wrapped [`AddressSpace`]. Both are constructed in place
-///   via `core::ptr::write`; the wrapper's `address_space` pointer indexes
-///   into this same page.
+///   followed by the wrapped [`AddressSpace`] and then its active-CPU set's
+///   words (`AddressSpace::attach_active_cpus`). Both objects are constructed
+///   in place via `core::ptr::write`; the wrapper's `address_space` pointer
+///   indexes into this same page.
 /// - page 1 — root page table (PML4 or PML5 / RISC-V root), zeroed, kernel-half PT
 ///   entries copied from the active root.
 /// - pages `2..init_pages` — PT growth pool. Drawn on demand by
@@ -546,6 +547,11 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     let aspace = unsafe { AddressSpace::new_user_with_root(root_pt_phys) };
     // SAFETY: aspace_ptr lives in the wrapper page, exclusively owned.
     unsafe { core::ptr::write(aspace_ptr, aspace) };
+    // SAFETY: aspace_ptr is derived from the wrapper page's pointer and the
+    // AddressSpace just written is the last thing in that page, which holds
+    // its active-CPU words (ACTIVE_CPU_WORDS_FIT); nothing else references it
+    // and no CPU has it active.
+    unsafe { AddressSpace::attach_active_cpus(aspace_ptr) };
 
     // Construct the wrapper in place at offset 0; the back-pointer indexes
     // into the same page.

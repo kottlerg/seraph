@@ -951,7 +951,7 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
    the load balancer) stay coherent with the queue that actually holds the
    thread.
 6. set_reschedule_pending_for(target_cpu).
-   (RESCHEDULE_PENDING.set_cpu(target_cpu, Release).)
+   (reschedule_pending().set_cpu(target_cpu, Release).)
 7. Clear wake_in_flight (so a waiting dealloc_object(Thread) may proceed).
 8. Release target scheduler.lock (inner), then (*tcb).sched_lock (outer).
 9. wake_idle_cpu(target_cpu)  →  sends IPI (always; see below). NEVER under
@@ -1007,7 +1007,7 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 ```
 0. drain_deferred_reclaim(cpu)                     // interrupts enabled
 1. Mask interrupts.
-2. pending = take_reschedule_pending(cpu)          // RESCHEDULE_PENDING.take_cpu(cpu, AcqRel)
+2. pending = take_reschedule_pending(cpu)          // reschedule_pending().take_cpu(cpu, AcqRel)
 3. has_work = scheduler_ptr(cpu).has_runnable()    // non_empty.load(Acquire)
 4. if pending || has_work {
        enable interrupts;
@@ -1046,7 +1046,9 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
 **Why two notifications.** `non_empty` (per-CPU `AtomicU32`, "Ready thread at some
 priority") is updated by enqueue/dequeue and is the dispatcher's notification.
-`RESCHEDULE_PENDING` (global `AtomicCpuMask`, one bit per CPU) is set by
+`RESCHEDULE_PENDING` (a global CPU set, one bit per CPU: `cpu_count.div_ceil(64)` words
+allocated at Phase 4, whose base the `AtomicPtr` publishes with Release, viewed as an
+`AtomicCpuMask` through `reschedule_pending()`, which loads it with Acquire) is set by
 every path that links or nudges work onto a CPU (`enqueue_and_wake`,
 `enqueue_ready_thread`, `relocate_ready_thread`, `schedule()`'s cross-affinity
 requeue, and `sys_thread_set_affinity`) and is consumed only by the idle loop
@@ -1216,7 +1218,8 @@ the ordering choice is required for correctness; relaxations would introduce a r
 
 | Atomic | Location | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|---|
-| `RESCHEDULE_PENDING` (`AtomicCpuMask`) | `core/kernel/src/sched/mod.rs` (decl; ops `set_reschedule_pending_for` / `take_reschedule_pending`) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
+| `RESCHEDULE_PENDING` (`AtomicPtr<AtomicU64>`, the set's words) | `core/kernel/src/sched/mod.rs` (decl; store in `init_storage`, load in `reschedule_pending`) | Release `store` at Phase 4, once | Acquire `load` in `reschedule_pending` | Publishes the zeroed words before any reader: every reader runs after Phase 4 on the BSP, or on an AP the BSP starts after it. |
+| `RESCHEDULE_PENDING` set words (`AtomicCpuMask` view) | `core/kernel/src/sched/mod.rs` (ops `set_reschedule_pending_for` / `take_reschedule_pending`) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
 | `non_empty` (per PerCpuScheduler) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue` and `enqueue_at_head` (their shared `link`), `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `link.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
 | `queued_on` (per TCB, `AtomicI16`) | `core/kernel/src/sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` and `enqueue_at_head` (their shared `link`; set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the double-link guard of that shared `link`, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked at that priority on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms and its deferred-dispatch re-link, `relocate_ready_thread`, `relocate_ready_priority`), all excluded while the thread executes its own park commit. (The softlockup-watchdog dump also reads the field, under the walked thread's `sched_lock`; diagnostic-only, not load-bearing.) |
 | `context_saved` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release store of `1` inside `context::switch`, after the rsp/sp swap onto the incoming thread's kstack; **Relaxed clears to `0`** at the park commits (`commit_blocked_under_local_lock` and the IPC pre-clears) and `schedule()`'s switch-away / cross-affinity arms, each performed while the thread is `current` on the storing CPU; **Relaxed restores to `1`** by the IPC primitives when they do not park (payload harvested before parking, or a refused commit's rollback), while the thread is still `current` on the storing CPU | Acquire on the remote-dequeue spin-loop and in `schedule()`'s dispatch-flip read that defers an unpublished `next` when the outgoing thread is not idle (step 3.5); **also Acquire** in the load-balancer liveness gate (`pull_unpinned_ready` / `migrate_ready_thread`, step 11) and the `sys_thread_start` settle loop and commit (`start_under_all_locks`, `start_ready_to_link`) and the register-access gate (`with_held_frame`), and the `sys_thread_stop` drain and save wait (`drain_remote_stopped`, `await_stopped_save`), which pair with the switch-out Release so a stop returns only after the target's save is visible | Closes the partial-`SavedState`-visibility race on RVWMO, and (step 11) gates cross-CPU relocation/resume on a committed save — `cs == 1` ⇒ switched out and `current` nowhere; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) (steps 5/6/9/11) for the full sequence. The Relaxed `0`-clears are sufficient: every consumer reaches the cleared value transitively through a lock release/acquire chain (the waker/relocator hold `sched_lock` and the run-queue lock), the same argument the pre-existing IPC pre-clears rely on. |
@@ -1352,7 +1355,7 @@ via one of the two idioms in the table.
   `relocate_ready_priority`'s walk fallback (`sys_thread_set_priority`), and
   `dealloc_object(Thread)` each save one interrupt-flag word per CPU across the
   all-CPU-locks region (Lock Hierarchy rule 4). A `[u64; MAX_CPUS]` frame on the
-  caller's syscall stack scales with the CPU ceiling — 4 KiB at `MAX_CPUS = 512`.
+  caller's syscall stack scales with the CPU ceiling — 64 KiB at `MAX_CPUS = 8192`.
 
 The failure mode is silent and not size-checked by the compiler: the oversized
 frame clobbers a saved return-address chain and the next `ret` faults with
@@ -1364,10 +1367,12 @@ PR #167).
 | CPU0-owned `static mut` singleton | The path runs in exactly one non-reentrant context — a CPU0-gated ISR path behind an interrupt gate (IF=0). | The path is non-reentrant, so the single buffer needs no lock. | No ceiling-sized site today; `OWED_WAKE_LAST` (`core/kernel/src/sched/mod.rs`), the owed-wake detector's fixed eight-entry persistence set, uses the idiom. |
 | Per-CPU field on `PerCpuScheduler`, written under that CPU's own `scheduler.lock` | Several CPUs run the path serially and each needs its own slot. | Each slot is written only by the holder of that CPU's `scheduler.lock`; the all-CPU-locks region serialises every writer of a given slot, so the field needs no ordering beyond Relaxed (it is an `AtomicU64` only so the shared reference every CPU holds can reach it). | `saved_lock_flags` (`core/kernel/src/sched/run_queue.rs`) — per-CPU flag word for all three all-CPU-locks sites above (issue #168). |
 
-Outside the two contexts above, one `[bool; MAX_CPUS]` stack array remains:
-the prod set in `mark_bound_threads` (`core/kernel/src/sched/mod.rs`); other
-CPU-set state at the ceiling is carried as bitvectors
-(`core/kernel/src/cpu_mask.rs`), not per-CPU stack arrays.
+Outside the two contexts above, no ceiling-sized stack array remains either: CPU
+sets are `AtomicCpuMask` views over storage held with their object, as wide as
+the boot's CPU count (`core/kernel/src/cpu_mask.rs`), and none is held by value
+on a stack; `mark_bound_threads` (`core/kernel/src/sched/mod.rs`) prods each CPU
+it finds running a bound thread inside its registry walk instead of collecting
+a set.
 
 ---
 
@@ -1440,17 +1445,17 @@ defer to an in-flight TLB shootdown, as below.
 
 The heartbeat checks measure staleness in wall time, so their grace scales
 with CPU count (`heartbeat_stall_ticks`, stepping at multiples of 128 CPUs:
-<256 CPUs → 8 s, 256–383 → 16 s, 384–511 → 24 s, 512 → 32 s). The 8 s base is sized above
-the slowest legitimate
-single-syscall CPU occupancy observed (a debug-build aperture-mapping
-syscall held the BSP just past 2 s on a slow TCG CI runner), and the
-CPU-count scaling covers oversubscribed wide guests, where vCPUs
-legitimately starve of timer service for seconds (the #376 512-vCPU runs
-saw a healthy BSP 2 s stale at ~7% aggregate tick delivery). A real wedge
-exceeds any finite threshold — the grace costs only detection latency. The owed-wake
-rules deliberately do not scale: rule 1's pop-before-scan ordering and
-rules 2–3's two-scan persistence ride the BSP's own cadence, which
-self-stretches under starvation.
+<256 CPUs → 8 s, 256–383 → 16 s, 384–511 → 24 s, 512–639 → 32 s, and so on:
+8 s × ⌊`cpu_count` / 128⌋, at least 8 s, up to 512 s at the 8192-CPU
+ceiling). The 8 s base is sized above the slowest legitimate single-syscall
+CPU occupancy observed (a debug-build aperture-mapping syscall held the BSP
+just past 2 s on a slow TCG CI runner), and the CPU-count scaling covers
+oversubscribed wide guests, where vCPUs legitimately starve of timer service
+for seconds (the #376 512-vCPU runs saw a healthy BSP 2 s stale at ~7%
+aggregate tick delivery). A real wedge exceeds any finite threshold — the
+grace costs only detection latency. The owed-wake rules deliberately do not
+scale: rule 1's pop-before-scan ordering and rules 2–3's two-scan persistence
+ride the BSP's own cadence, which self-stretches under starvation.
 
 Attaching GDB to a live guest (xtask `--debug-listen`) freezes every vCPU
 while guest-visible time keeps advancing, so on resume the heartbeat checks
@@ -1608,10 +1613,11 @@ receives the retained reason through the bind; a commit refused because the
 thread exited on its own meanwhile writes neither, so the thread keeps its own
 reason; a thread stopped mid-exit, whose own exit commit then loses, still posts
 its own reason — only the retained value says killed), and records the CPU it
-was running on; once the walk has released the registry lock,
-`mark_bound_threads` prods those CPUs. Phase 2 then spins — interrupts enabled,
-preemption disabled, as the dealloc UAF gate does — until no CPU other than the
-caller's has a bound thread as `current`. A
+was running on, and `mark_bound_threads` prods that CPU at once, inside the walk:
+one IPI per bound running thread, sent under the registry lock with interrupts
+off (`wake_idle_cpu` takes no lock and waits on no remote CPU). Phase 2 then
+spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does —
+until no CPU other than the caller's has a bound thread as `current`. A
 bound thread found `current` but not `Exited` was bound after the walk (a
 `sys_cap_create_thread` whose unlocked cap lookup raced the object's last
 delete); the loop returns to phase 1 for it. The spin has no bound and warns

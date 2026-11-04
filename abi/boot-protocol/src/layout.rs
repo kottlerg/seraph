@@ -54,12 +54,12 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// of stack, above one guard page its page tables leave unmapped
 /// (core/boot/docs/boot-flow.md § Step 6).
 ///
-/// Measured bound (the kernel's paint report, ktest `stress::stack_depth`), on
-/// both architectures: debug builds peak at 6880 B of it at 4 CPUs and 6592 B at
-/// 16 and 128 CPUs (`riscv64`; 6072 B at each width on `x86_64`), and release
-/// builds at 4, 16 and 128 CPUs at 4984 B (`riscv64`; 4520 B on `x86_64`), so the
-/// deepest bound leaves a margin of about 90%. The report gives the depth, not the
-/// path that reached it.
+/// Measured bound (the kernel's paint report, ktest `stress::stack_depth`): debug
+/// builds peak at 15304 B of it on `x86_64` at 4, 16 and 128 CPUs, and on
+/// `riscv64` at 14160 B at 4, 14176 B at 16 and 13856 B at 128; release builds,
+/// measured at 4 CPUs, at 14856 B (`x86_64`) and 13672 B (`riscv64`). The deepest
+/// leaves a margin of about 76%. The report gives the depth, not the path that
+/// reached it.
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
 /// Word every idle, thread, and handoff stack is filled with when it is allocated, so the

@@ -1963,11 +1963,11 @@ mod tests
         assert_eq!(top, alloc + (HANDOFF_STACK_ALLOC_PAGES as u64) * 4096);
     }
 
-    // Defect caught: an array `BootInfo` references left out of the identity
-    // map at kernel entry, which no boot exposes while the kernel reads that
-    // array only through its direct map (the CPU-id pages, for one).
+    // Defect caught: one of the fixed boot allocations (the CPU-id pages, for
+    // one) dropped from the identity map at kernel entry or mapped short, which
+    // no boot exposes while the kernel reads it only through its direct map.
     #[test]
-    fn every_boot_array_is_identity_mapped_whole()
+    fn fixed_boot_allocations_are_identity_mapped_whole()
     {
         let allocs = BootAllocations {
             boot_info_phys: 0x1_0000,

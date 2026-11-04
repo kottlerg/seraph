@@ -22,7 +22,7 @@
 //! state for the next step — not to test each syscall in isolation (that is
 //! the job of `core/ktest/src/unit/thread.rs`).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread, cap_delete,
@@ -31,6 +31,7 @@ use syscall::{
 };
 
 use crate::arch::IP_OFFSET;
+use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult};
 
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
@@ -46,7 +47,18 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Cap slot for `phase2_entry` (see `PHASE2_SIG` in `core/ktest/src/unit/thread.rs`
 /// for the rationale).
-static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
+static PHASE2_SIG: AtomicU64 = AtomicU64::new(0);
+
+/// The blocker's arguments (handles in its own `CSpace`), handed to
+/// `blocker_entry` by address.
+#[derive(Clone, Copy)]
+struct BlockerArgs
+{
+    ready: u64,
+    block: u64,
+}
+
+static BLOCKER_ARGS: ArgBlock<BlockerArgs, 1> = ArgBlock::new(BlockerArgs { ready: 0, block: 0 });
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -65,7 +77,16 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::thread_lifecycle: cap_copy (block→child) failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
+    // SAFETY: the single blocker has not been started yet.
+    let blocker_arg = unsafe {
+        BLOCKER_ARGS.publish(
+            0,
+            BlockerArgs {
+                ready: child_ready,
+                block: child_block,
+            },
+        )
+    };
 
     // ── Step 3: Start — child signals readiness. ──────────────────────────────
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
@@ -145,12 +166,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: cap slot indices are guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
+/// `arg`: address of the blocker's [`BlockerArgs`].
 extern "C" fn blocker_entry(arg: u64) -> !
 {
-    let ready_slot = (arg >> 32) as u32;
-    let block_slot = (arg & 0xFFFF_FFFF) as u32;
+    // SAFETY: `arg` is the entry `run` published for this child.
+    let BlockerArgs {
+        ready: ready_slot,
+        block: block_slot,
+    } = unsafe { child_args(arg) };
     notification_send(ready_slot, 0x1).ok();
     notification_wait(block_slot).ok();
     loop

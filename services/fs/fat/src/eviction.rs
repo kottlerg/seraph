@@ -96,7 +96,7 @@ pub struct EvictReq
     pub slot_idx: usize,
     /// Per-cookie ancestor cap derived under the cache slot's
     /// memory cap. Revoking it kills only the caller's child cap.
-    pub ancestor_cap: u32,
+    pub ancestor_cap: u64,
 }
 
 pub struct EvictionState
@@ -273,7 +273,7 @@ enum Release
 /// the cost of cooperative release without a kernel-side
 /// IPC-cancellation primitive; [`MAX_WATCHDOGS`] bounds how many such
 /// threads exist, and past it nothing is sent.
-fn cooperative_release(endpoint: u32, cookie: u64) -> Release
+fn cooperative_release(endpoint: u64, cookie: u64) -> Release
 {
     let reserved = LIVE_WATCHDOGS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -349,7 +349,7 @@ fn cooperative_release(endpoint: u32, cookie: u64) -> Release
 enum Endpoint
 {
     /// The worker's own derived copy of the client's release SEND.
-    Copy(u32),
+    Copy(u64),
     /// The client delivered no release SEND.
     NoSend,
     /// The client delivered one, but the worker could not derive its copy.

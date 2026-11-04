@@ -173,10 +173,10 @@ pub(crate) struct BootArena
 {
     /// Arena Memory cap in init's `CSpace`. Full rights (R+W+X+RETYPE):
     /// retyped from its front, offset-mapped past the retype bump.
-    pub(crate) cap: u32,
+    pub(crate) cap: u64,
     /// `AddressSpace` cap the transient per-page scratch maps land in at
     /// [`ELF_PAGE_TEMP_VA`] — always init's own `AddressSpace`.
-    init_aspace: u32,
+    init_aspace: u64,
     /// Next free backing-page offset, in pages. Starts at the front reserve;
     /// advances one page per [`Self::place_page`].
     cursor: u64,
@@ -188,7 +188,7 @@ impl BootArena
     /// `alloc` with the cursor positioned past the retype reserve. The
     /// caller performs the three retypes against [`Self::cap`] before
     /// placing any backing page.
-    fn carve(alloc: &mut MemoryAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
+    fn carve(alloc: &mut MemoryAlloc, init_aspace: u64, backing_pages: u64) -> Option<Self>
     {
         Self::carve_reserve(alloc, init_aspace, retype_reserve_pages(), backing_pages)
     }
@@ -199,7 +199,7 @@ impl BootArena
     /// bound before placing backing pages at or above it.
     pub(crate) fn carve_reserve(
         alloc: &mut MemoryAlloc,
-        init_aspace: u32,
+        init_aspace: u64,
         reserve_pages: u64,
         backing_pages: u64,
     ) -> Option<Self>
@@ -226,7 +226,7 @@ impl BootArena
     /// contract of `syscall::mem_map`).
     pub(crate) unsafe fn place_page(
         &mut self,
-        target_aspace: u32,
+        target_aspace: u64,
         target_va: u64,
         prot: u64,
         populate: impl FnOnce(u64),
@@ -280,7 +280,7 @@ impl BootArena
     /// page (the contract of `syscall::mem_map`).
     pub(crate) unsafe fn place_segment(
         &mut self,
-        target_aspace: u32,
+        target_aspace: u64,
         target_va: u64,
         num_pages: u64,
         prot: u64,
@@ -422,7 +422,7 @@ unsafe fn place_main_tls(
     arena: &mut BootArena,
     ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
-    target_aspace: u32,
+    target_aspace: u64,
     tls_base: u64,
     bias: u64,
     rela: Option<elf::RelaTable>,
@@ -519,7 +519,7 @@ unsafe fn load_elf_into_arena(
     arena: &mut BootArena,
     ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
-    target_aspace: u32,
+    target_aspace: u64,
     bias: u64,
     rela: Option<elf::RelaTable>,
 ) -> Option<u64>
@@ -622,17 +622,17 @@ pub struct MemmgrBootstrap
     pub procmgr_badge: u64,
     /// Slot in init's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that init will install in procmgr's `ProcessInfo`.
-    pub procmgr_send_cap: u32,
+    pub procmgr_send_cap: u64,
     /// Memmgr's `CSpace` cap (in init's `CSpace`). Init copies RAM
     /// Memory caps into here at [`finalize_memmgr`] time.
-    pub mm_cspace: u32,
+    pub mm_cspace: u64,
     /// Memmgr's main `Thread` cap (in init's `CSpace`). Init invokes
     /// `thread_configure` + `thread_start` at [`finalize_memmgr`] time.
-    pub mm_thread: u32,
+    pub mm_thread: u64,
     /// Memmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
     /// as an in-use arena so its pages are accounted in memmgr's pool.
-    pub arena_cap: u32,
+    pub arena_cap: u64,
     /// Memmgr's ELF entry point.
     pub entry: u64,
     /// Stack top init chose and mapped for memmgr; passed as the initial SP to
@@ -653,7 +653,7 @@ pub struct MemmgrBootstrap
 pub struct InUseArena
 {
     /// Slot in memmgr's `CSpace` of the copied arena cap.
-    pub cap_slot: u32,
+    pub cap_slot: u64,
     /// Arena size in pages (`retype_reserve_pages()` + backing).
     pub page_count: u32,
     /// Arena physical base.
@@ -674,9 +674,9 @@ pub struct MemmgrFinalize
 {
     /// First slot of the RAM Memory caps init copied into memmgr's
     /// `CSpace` during finalization.
-    pub mm_memory_base: u32,
+    pub mm_memory_base: u64,
     /// Number of RAM memory caps delegated to memmgr.
-    pub mm_memory_count: u32,
+    pub mm_memory_count: u64,
     /// In-use bootstrap arenas (memmgr's, procmgr's, and init's own
     /// backing) copied into memmgr's `CSpace`. Init writes these into the
     /// phys-table page's in-use section; memmgr records them against
@@ -689,12 +689,12 @@ pub struct MemmgrFinalize
 /// Memmgr kernel object caps needed to populate `ProcessInfo`.
 struct MemmgrCaps
 {
-    aspace: u32,
-    cspace: u32,
-    thread: u32,
-    creator_endpoint_slot: u32,
+    aspace: u64,
+    cspace: u64,
+    thread: u64,
+    creator_endpoint_slot: u64,
     /// Baseline `SchedControl` cap (in init's `CSpace`) copied into memmgr.
-    sched_baseline: u32,
+    sched_baseline: u64,
 }
 
 /// Populate memmgr's `ProcessInfo` page from `arena` and map it read-only
@@ -710,7 +710,7 @@ struct MemmgrCaps
 #[allow(clippy::similar_names)]
 unsafe fn populate_memmgr_info(
     arena: &mut BootArena,
-    target_aspace: u32,
+    target_aspace: u64,
     caps: &MemmgrCaps,
     stack_pages: u32,
     layout: &ProcessLayout,
@@ -772,7 +772,7 @@ unsafe fn populate_memmgr_info(
 }
 
 /// Locate a `CapDescriptor` by slot index.
-fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
+fn descriptor_for(info: &InitInfo, slot: u64) -> Option<&CapDescriptor>
 {
     crate::descriptors(info).iter().find(|d| d.slot == slot)
 }
@@ -802,9 +802,9 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 pub fn bootstrap_memmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
-    init_bootstrap_ep: u32,
-    mm_service_ep: u32,
-    baseline_sched: u32,
+    init_bootstrap_ep: u64,
+    mm_service_ep: u64,
+    baseline_sched: u64,
 ) -> Option<MemmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
@@ -981,7 +981,7 @@ pub fn bootstrap_memmgr(
 /// tail), so it is never `memory_split`; the copy gives memmgr the accounting
 /// anchor while the original cap and the retypes keep the `MemoryObject`
 /// pinned for the immortal service's life.
-fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena>
+fn forward_arena(arena_cap: u64, mm_cspace: u64, kind: u64) -> Option<InUseArena>
 {
     let phys_base = syscall::cap_info(arena_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).ok()?;
     let size_bytes = syscall::cap_info(arena_cap, syscall::CAP_INFO_MEMORY_SIZE).ok()?;
@@ -1003,7 +1003,7 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
 /// not reach, so unforwarded they would stay in init's `CSpace` until the reap
 /// frees it and then free into the sealed post-handoff buddy, tripping the
 /// kernel's post-seal `debug_assert` in a debug build.
-fn push_free_run(src_cap: u32, mm_cspace: u32, base: &mut u32, count: &mut u32)
+fn push_free_run(src_cap: u64, mm_cspace: u64, base: &mut u64, count: &mut u64)
 {
     if let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
         && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL)
@@ -1035,7 +1035,7 @@ const INIT_FORWARD_HEADROOM: u64 = 512;
 
 /// Free slots of `cspace` a general allocation may take: capacity less
 /// populated slots less the IPC receive reserve. Zero when the queries fail.
-fn cspace_general_headroom(cspace: u32) -> u64
+fn cspace_general_headroom(cspace: u64) -> u64
 {
     let capacity = syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
     let used = syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(capacity);
@@ -1051,7 +1051,7 @@ fn cspace_general_headroom(cspace: u32) -> u64
 /// count, so a front bump past the reserve shows up as a consumed span larger
 /// than the reserve. Endpoints created after `finalize_memmgr` (devmgr/vfsd
 /// registries, phase 3) stay within the reserve's documented headroom.
-fn assert_init_arena_front_bounded(init_arena_cap: u32)
+fn assert_init_arena_front_bounded(init_arena_cap: u64)
 {
     if let (Ok(size), Ok(available)) = (
         syscall::cap_info(init_arena_cap, syscall::CAP_INFO_MEMORY_SIZE),
@@ -1095,9 +1095,9 @@ pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
     mm: &MemmgrBootstrap,
-    pm_arena_cap: u32,
-    init_arena_cap: u32,
-    phys_table_memory: u32,
+    pm_arena_cap: u64,
+    init_arena_cap: u64,
+    phys_table_memory: u64,
 ) -> Option<MemmgrFinalize>
 {
     // The bootstrap round names the forwarded RAM caps by slot range only
@@ -1113,8 +1113,8 @@ pub fn finalize_memmgr(
     // (The MemoryAlloc tail and the phys-table page have no InitInfo
     // descriptor, so the reap walk cannot reach them; they must ride here, in
     // the headroom the loop leaves.)
-    let mut mm_memory_base: u32 = 0;
-    let mut mm_memory_count: u32 = 0;
+    let mut mm_memory_base: u64 = 0;
+    let mut mm_memory_count: u64 = 0;
     let total_remaining = info.memory_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
@@ -1286,14 +1286,12 @@ pub unsafe fn write_memmgr_aux_memory(
     {
         let arena = mm_final.in_use[i];
         let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
-        // SAFETY: base + 2 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
+        // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
         unsafe {
-            core::ptr::write_volatile(
-                phys_dst.add(base),
-                u64::from(arena.cap_slot) | (u64::from(arena.page_count) << 32),
-            );
-            core::ptr::write_volatile(phys_dst.add(base + 1), arena.phys_base);
-            core::ptr::write_volatile(phys_dst.add(base + 2), arena.kind);
+            core::ptr::write_volatile(phys_dst.add(base), arena.cap_slot);
+            core::ptr::write_volatile(phys_dst.add(base + 1), u64::from(arena.page_count));
+            core::ptr::write_volatile(phys_dst.add(base + 2), arena.phys_base);
+            core::ptr::write_volatile(phys_dst.add(base + 3), arena.kind);
         }
     }
 }
@@ -1303,27 +1301,27 @@ pub unsafe fn write_memmgr_aux_memory(
 /// Procmgr kernel object caps needed to populate `ProcessInfo`.
 struct ProcmgrCaps
 {
-    aspace: u32,
-    cspace: u32,
-    thread: u32,
-    creator_endpoint_slot: u32,
+    aspace: u64,
+    cspace: u64,
+    thread: u64,
+    creator_endpoint_slot: u64,
     /// Slot index in procmgr's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint. Zero when memmgr is not yet wired — an early-boot-only
     /// condition.
-    memmgr_endpoint_slot: u32,
+    memmgr_endpoint_slot: u64,
     /// Slot in procmgr's `CSpace` holding a badged SEND on the
     /// system log endpoint with badge `LOG_BADGE_PROCMGR`. Std reads
     /// it from `pi.log_send_cap` at `_start` and installs it via
     /// `::log::install_badged_cap` for procmgr's own `seraph::log!`
     /// writes. Zero when no log endpoint is available.
-    log_send_slot: u32,
+    log_send_slot: u64,
     /// `PT_TLS` template metadata, propagated into procmgr's `ProcessInfo`
     /// so spawned-thread allocations (via std) can populate matching
     /// blocks. Zero `memsz` means "no TLS".
     tls: ChildTlsMeta,
     /// Baseline `SchedControl` cap (in init's `CSpace`). Copied into procmgr for
     /// its own use and as the fan-out source for every process procmgr creates.
-    sched_baseline: u32,
+    sched_baseline: u64,
 }
 
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
@@ -1345,7 +1343,7 @@ struct ProcmgrCaps
 #[allow(clippy::similar_names)]
 unsafe fn populate_procmgr_info(
     arena: &mut BootArena,
-    target_aspace: u32,
+    target_aspace: u64,
     caps: &ProcmgrCaps,
     stack_pages: u32,
     layout: &ProcessLayout,
@@ -1435,7 +1433,7 @@ unsafe fn populate_procmgr_info(
 /// checking what init holds there.
 unsafe fn place_stack_and_ipc(
     arena: &mut BootArena,
-    target_aspace: u32,
+    target_aspace: u64,
     ipc_buf_va: u64,
     stack_top: u64,
     stack_pages: u32,
@@ -1468,7 +1466,7 @@ unsafe fn place_stack_and_ipc(
 pub struct ProcmgrBootstrap
 {
     /// Send cap to procmgr's service endpoint (init uses for `CREATE_PROCESS`).
-    pub service_ep: u32,
+    pub service_ep: u64,
     /// Procmgr's bootstrap badge on init's bootstrap endpoint.
     pub bootstrap_badge: u64,
     /// Slot in procmgr's `CSpace` holding an un-badged SEND cap on
@@ -1478,7 +1476,7 @@ pub struct ProcmgrBootstrap
     /// child's `ProcessInfo.log_send_cap`. Zero when no log endpoint
     /// is available (very early boot); children born in that window
     /// receive zero and silent-drop `seraph::log!`.
-    pub log_endpoint_slot: u32,
+    pub log_endpoint_slot: u64,
     /// Slot in procmgr's `CSpace` holding an un-badged SEND cap on
     /// svcmgr's service endpoint (the global service registry).
     /// Procmgr uses it as the *source* for `cap_derive_badge` to mint
@@ -1488,14 +1486,14 @@ pub struct ProcmgrBootstrap
     /// `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT` — publish-authority
     /// caps are minted separately and handed only to init / devmgr /
     /// svcmgr.
-    pub registry_endpoint_slot: u32,
+    pub registry_endpoint_slot: u64,
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
-    pub thread: u32,
+    pub thread: u64,
     /// Procmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
     /// as an in-use arena so its pages are accounted in memmgr's pool.
-    pub arena_cap: u32,
+    pub arena_cap: u64,
 }
 
 /// Mint a fresh init-side bootstrap badge: a random `u64` from the kernel
@@ -1542,12 +1540,12 @@ pub fn mint_bootstrap_badge() -> Option<u64>
 pub fn bootstrap_procmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
-    init_bootstrap_ep: u32,
-    pm_service_ep: u32,
-    log_ep: u32,
-    svcmgr_service_ep: u32,
-    memmgr_send_cap: u32,
-    baseline_sched: u32,
+    init_bootstrap_ep: u64,
+    pm_service_ep: u64,
+    log_ep: u64,
+    svcmgr_service_ep: u64,
+    memmgr_send_cap: u64,
+    baseline_sched: u64,
 ) -> Option<ProcmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;

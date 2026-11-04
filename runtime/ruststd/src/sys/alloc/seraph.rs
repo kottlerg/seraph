@@ -135,9 +135,9 @@ struct Heap {
     max: usize,
     /// Cached memmgr endpoint cap used by `grow` to request additional
     /// pages. Zero before bootstrap; `grow` returns false in that state.
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     /// Cached aspace cap for mapping grow-path pages. Zero before bootstrap.
-    self_aspace: u32,
+    self_aspace: u64,
     /// Exclusive end of the demand-backed floor, or zero when the floor was
     /// mapped eagerly. Pages above it are always mapped eagerly by `grow`.
     floor_end: usize,
@@ -461,7 +461,7 @@ impl Heap {
     /// # Safety
     /// The contract of `syscall::mem_map` for `pages` pages at `va` in this
     /// process's own address space.
-    unsafe fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
+    unsafe fn mem_map_with_augment_retry(&self, memory_cap: u64, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
         for _ in 0..PT_FUND_ROUNDS {
             // SAFETY: the caller's contract covers the span.
@@ -526,7 +526,7 @@ const BOOTSTRAP_FAILED: u8 = 3;
 /// runs on the main thread's registered buffer.
 ///
 /// Returns `true` if the heap is usable after this call.
-pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
+pub fn heap_bootstrap(memmgr_ep: u64, self_aspace: u64) -> bool {
     if let Err(state) = BOOTSTRAP.compare_exchange(
         BOOTSTRAP_UNCLAIMED,
         BOOTSTRAP_RUNNING,
@@ -547,7 +547,7 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
 /// through [`Heap::grow_exact`]. On failure the heap is reset to its
 /// unbootstrapped state, so it serves no allocation; pages the failed attempt
 /// mapped stay mapped and accounted until the process exits.
-fn heap_install(memmgr_ep: u32, self_aspace: u32) -> bool {
+fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
     // The base draw happens before the allocator exists: the raw getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
     // the IPC wrappers `grow_exact` uses. A failed draw degrades to the
@@ -598,7 +598,7 @@ fn heap_install(memmgr_ep: u32, self_aspace: u32) -> bool {
 /// when the process has no pager (`ProcessInfo.pager_endpoint_cap` zero:
 /// pinned, or procmgr's binding failed) or funding or registration fails.
 /// Allocates nothing: it runs before the heap exists.
-fn register_demand_floor(memmgr_ep: u32, self_aspace: u32, heap_base: u64) -> bool {
+fn register_demand_floor(memmgr_ep: u64, self_aspace: u64, heap_base: u64) -> bool {
     let has_pager =
         crate::os::seraph::try_startup_info().is_some_and(|i| i.pager_endpoint_cap != 0);
     let ipc_buf = current_ipc_buf();
@@ -673,7 +673,7 @@ const SLAB_SHELF_SIZE: usize = 4;
 /// (fully drained ⇔ kernel `available_bytes == size`).
 #[derive(Clone, Copy)]
 struct ShelfEntry {
-    cap: u32,
+    cap: u64,
     phys: u64,
     size: u64,
 }
@@ -688,7 +688,7 @@ struct SlabPages {
 }
 
 struct ObjectSlab {
-    cap: crate::sync::atomic::AtomicU32,
+    cap: crate::sync::atomic::AtomicU64,
     local_avail: crate::sync::atomic::AtomicU64,
     pages: UnsafeCell<SlabPages>,
     lock: SpinLock,
@@ -699,7 +699,7 @@ unsafe impl Sync for ObjectSlab {}
 
 const fn empty_slab() -> ObjectSlab {
     ObjectSlab {
-        cap: crate::sync::atomic::AtomicU32::new(0),
+        cap: crate::sync::atomic::AtomicU64::new(0),
         local_avail: crate::sync::atomic::AtomicU64::new(0),
         pages: UnsafeCell::new(SlabPages {
             cur_phys: 0,
@@ -717,12 +717,12 @@ static SLAB_BIN_128: ObjectSlab = empty_slab();
 static SLAB_BIN_512: ObjectSlab = empty_slab();
 
 /// memmgr endpoint shared by every slab path. Set once at process start.
-static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU32 = crate::sync::atomic::AtomicU32::new(0);
+static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 
 /// Set the memmgr endpoint backing the object-slab refill path. The heap
 /// bootstrap sets it before funding a demand floor's page tables, and `_start`
 /// sets it again (to the same endpoint) after `heap_bootstrap`.
-pub fn object_slab_init(memmgr_ep: u32) {
+pub fn object_slab_init(memmgr_ep: u64) {
     SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
 }
 
@@ -765,7 +765,7 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// [`ipc::memmgr_grant_layout`] refuses, or a reply none of whose caps covers
 /// `min_pages`. A refused reply's caps are deleted the same way as the
 /// unchosen caps of an accepted one.
-pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
+pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return None;
@@ -799,9 +799,9 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
 /// The release is best-effort: memmgr ignores a base that matches no
 /// outstanding grant, and a failed IPC leaves the runs accounted the same way.
 fn release_reply_caps(
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
-    caps: &[u32],
+    caps: &[u64],
     bases: &[u64],
     keep: impl Fn(usize) -> bool,
 ) {
@@ -866,7 +866,7 @@ fn slab_retype_pooled<T>(
     pool: &ObjectSlab,
     need: u64,
     want_pages: u64,
-    retype: impl FnOnce(u32) -> Option<T>,
+    retype: impl FnOnce(u64) -> Option<T>,
 ) -> Option<T> {
     pool.lock.lock();
     let res = (|| -> Option<T> {
@@ -999,7 +999,7 @@ fn slab_retype_pooled<T>(
 /// kernel object retyped from `cap` has been deleted.
 #[derive(Clone, Copy)]
 pub struct SlabGrant {
-    pub cap: u32,
+    pub cap: u64,
     pub phys: u64,
 }
 
@@ -1080,7 +1080,7 @@ pub fn slab_release_fresh(phys: u64) {
 ///
 /// Returns `None` if memmgr is unreachable, refuses the request, returns
 /// a cap too small for the class, or `retype` itself fails.
-pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
+pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u64) -> Option<T>) -> Option<T> {
     object_slab_retype_reclaimable(min_bytes, retype).map(|(out, _)| out)
 }
 
@@ -1091,7 +1091,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
 /// runtime reclaims itself.
 pub fn object_slab_retype_reclaimable<T>(
     min_bytes: u64,
-    retype: impl FnOnce(u32) -> Option<T>,
+    retype: impl FnOnce(u64) -> Option<T>,
 ) -> Option<(T, Option<u64>)> {
     let need = slab_round_to_class(min_bytes);
     // Sized so `need` still fits after the ledger withholds
@@ -1172,7 +1172,7 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// after `PT_FUND_ROUNDS` rounds (another thread of the process drained
 /// it meanwhile); the subsequent map then fails with `OutOfMemory` rather
 /// than silently drawing on the reserve.
-pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
+pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
     if region_pages == 0 {
         return true;
     }
@@ -1211,7 +1211,7 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
 /// General-allocation headroom of `self_cspace`: free slots the kernel lets a
 /// general allocation take, excluding the IPC receive reserve
 /// (`CSPACE_IPC_RECV_RESERVE`). Zero when the queries fail.
-pub fn cspace_general_headroom(self_cspace: u32) -> u64 {
+pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
     let capacity =
         syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
     let used =
@@ -1241,7 +1241,7 @@ pub fn cspace_general_headroom(self_cspace: u32) -> u64 {
 /// unreachable, the request/augment fails (the object slab's own cap needs
 /// one free general slot), or the headroom still falls short after
 /// `CSPACE_FUND_ROUNDS` rounds.
-pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
+pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     let short = || {
         let budget =
             syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);

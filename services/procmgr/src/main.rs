@@ -48,12 +48,12 @@ use std::os::seraph::startup_info;
 #[allow(clippy::struct_field_names)]
 struct InitBootstrap
 {
-    service_ep: u32,
-    log_ep: u32,
-    registry_ep: u32,
+    service_ep: u64,
+    log_ep: u64,
+    registry_ep: u64,
 }
 
-fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstrap>
+fn bootstrap_from_init(creator_ep: u64, ipc_buf: *mut u64) -> Option<InitBootstrap>
 {
     if creator_ep == 0
     {
@@ -261,7 +261,7 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 /// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
 /// right record.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
+pub fn register_with_memmgr(memmgr_ep: u64, ipc_buf: *mut u64) -> (u64, u64)
 {
     if memmgr_ep == 0
     {
@@ -294,7 +294,7 @@ pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
 /// memmgr record and reclaimed on `PROCESS_DIED`. Memory caps allocated against
 /// procmgr's own `pi.memmgr_endpoint_cap` are accounted to procmgr.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
+pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     if memmgr_send == 0
     {
@@ -349,7 +349,7 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
 /// it carried is returned to memmgr's pool ([`release_grant`]) rather than
 /// left billed to the account behind `memmgr_send`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64) -> Option<u32>
+pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     if memmgr_send == 0 || pages == 0 || pages > u64::from(u32::MAX)
     {
@@ -383,7 +383,7 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64
 /// staying billed until the account's `PROCESS_DIED`. A reply whose layout
 /// does not decode names no base; its slots are deleted only.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn release_grant(memmgr_send: u32, reply: &IpcMessage, ipc_buf: *mut u64)
+pub fn release_grant(memmgr_send: u64, reply: &IpcMessage, ipc_buf: *mut u64)
 {
     release_caps(reply.caps());
     let Some((_, bases)) = ipc::memmgr_grant_layout(reply)
@@ -416,7 +416,7 @@ const CSPACE_TOPUP_SLOTS: u64 = 1024;
 /// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). A
 /// failed top-up is retried on the next loop pass; `warned` limits the log
 /// to the first failure of a streak.
-fn hold_cspace_headroom(self_cspace: u32, warned: &mut bool)
+fn hold_cspace_headroom(self_cspace: u64, warned: &mut bool)
 {
     // The growth budget also funds the body arena (the bodies of procmgr's
     // splits), so a page of it is held beyond the slots
@@ -460,7 +460,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// service endpoint; the sender is already queued so `ipc_recv` returns
 /// without blocking.
 fn dispatch_ipc(
-    service_ep: u32,
+    service_ep: u64,
     ipc_buf: *mut u64,
     ctx: &mut ProcmgrCtx,
     table: &mut process::ProcessTable,
@@ -603,7 +603,7 @@ fn dispatch_ipc(
 /// Delete each nonzero slot in `caps` from procmgr's `CSpace`: the caps a
 /// request transferred that its wire layout does not name, or every cap of a
 /// refused request.
-pub(crate) fn release_caps(caps: &[u32])
+pub(crate) fn release_caps(caps: &[u64])
 {
     for &slot in caps
     {
@@ -761,7 +761,7 @@ fn resolve_query_state(
 /// process whose post was lost.
 fn dispatch_death(
     deaths: &death_set::DeathSet,
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
     recent: &mut process::RecentExits,
@@ -815,7 +815,7 @@ fn dispatch_death(
 /// then waits, the benign hold of a handover that never completes
 /// (`services/procmgr/README.md` § Init reap).
 fn resync_deaths(
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
     recent: &mut process::RecentExits,
@@ -876,7 +876,7 @@ fn reply_empty(ipc_buf: *mut u64, code: u64)
 fn handle_configure_pipe(
     req: &IpcMessage,
     ipc_buf: *mut u64,
-    self_aspace: u32,
+    self_aspace: u64,
     table: &mut process::ProcessTable,
 )
 {
@@ -1002,7 +1002,7 @@ fn resolve_create_sched(
 fn arm_dma_hold(
     result: &process::CreateResult,
     ipc_buf: *mut u64,
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     table: &mut process::ProcessTable,
 ) -> bool
 {
@@ -1030,7 +1030,7 @@ fn arm_dma_hold(
 fn reply_create_result(
     result: &process::CreateResult,
     ipc_buf: *mut u64,
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     table: &mut process::ProcessTable,
 )
 {
@@ -1218,8 +1218,8 @@ fn log_spawn_sched(sched: process::ChildSched)
 /// fixed for the lifetime of the process.
 pub struct ProcmgrCtx
 {
-    pub self_aspace: u32,
-    pub self_endpoint: u32,
+    pub self_aspace: u64,
+    pub self_endpoint: u64,
     /// Un-badged SEND cap on the log endpoint received from init
     /// during procmgr's own bootstrap. Procmgr uses it as the
     /// `cap_derive_badge` source for minting a badged SEND cap per
@@ -1228,7 +1228,7 @@ pub struct ProcmgrCtx
     /// Zero if init did not provide one (very early boot); children
     /// born in that window receive zero and silent-drop
     /// `std::os::seraph::log!`.
-    pub log_ep: u32,
+    pub log_ep: u64,
     /// Un-badged SEND cap on svcmgr's service endpoint, received from init
     /// during procmgr's own bootstrap. Used as the `cap_derive_badge` source
     /// for minting a per-child badged SEND (badge = the child's process
@@ -1236,13 +1236,13 @@ pub struct ProcmgrCtx
     /// so the child can issue `svcmgr_labels::QUERY_ENDPOINT` against svcmgr
     /// for service-name lookups. Zero if init has not yet wired it; children
     /// born in that window receive zero and `registry_client::lookup` no-ops.
-    pub registry_ep: u32,
+    pub registry_ep: u64,
     /// Badged SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to
     /// notify `PROCESS_DIED`, and as the destination for procmgr's own
     /// memory-cap allocations (memmgr auto-registers procmgr's badge at
     /// bootstrap so `REQUEST_MEMORY_CAPS` on this cap is allowed).
-    pub memmgr_ep: u32,
+    pub memmgr_ep: u64,
     /// The death-notification event queues and the main wait set they share
     /// with the service endpoint (`WS_BADGE_SERVICE`, every queue under
     /// `WS_BADGE_DEATH`). Every spawned child binds its main thread and its
@@ -1255,7 +1255,7 @@ pub struct ProcmgrCtx
     /// authority behind creating child threads at their assigned level.
     /// Zero if init delegated none; children are then created at the floor
     /// and cannot set any priority.
-    pub sched_baseline: u32,
+    pub sched_baseline: u64,
 }
 
 /// Handle `CREATE_FROM_FILE` — create a process from a caller-supplied file cap.

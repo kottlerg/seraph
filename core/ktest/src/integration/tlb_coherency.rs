@@ -52,7 +52,7 @@ const SENTINEL: u64 = 0xA5A5_5A5A_DEAD_BEEF;
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Child's c2p (child-to-parent) notification slot, written by parent before `thread_start`.
-static mut CHILD_C2P_SLOT: u32 = 0;
+static mut CHILD_C2P_SLOT: u64 = 0;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -100,7 +100,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             &child,
             tlb_worker_thread,
             stack_top,
-            u64::from(child_p2c), // arg = p2c slot; c2p slot read from static
+            child_p2c, // arg = p2c slot; c2p slot read from static
             1,
         )
     }
@@ -223,12 +223,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 ///
 /// # Arguments
 ///
-/// * `p2c_slot` — parent-to-child Notification capability slot.
-// cast_possible_truncation: p2c_slot is a kernel cap slot index, guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
-extern "C" fn tlb_worker_thread(p2c_slot: u64) -> !
+/// * `p2c` — parent-to-child Notification capability slot.
+extern "C" fn tlb_worker_thread(p2c: u64) -> !
 {
-    let p2c = p2c_slot as u32;
     // SAFETY: parent wrote CHILD_C2P_SLOT before thread_start; no concurrent writes.
     let c2p = unsafe { CHILD_C2P_SLOT };
 

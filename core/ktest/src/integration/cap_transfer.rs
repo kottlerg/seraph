@@ -42,9 +42,9 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 #[derive(Clone, Copy)]
 struct ChildArgs
 {
-    ep: u32,
-    test_sig: u32,
-    sync_sig: u32,
+    ep: u64,
+    test_sig: u64,
+    sync_sig: u64,
 }
 
 static CHILD_ARGS: ArgBlock<ChildArgs, 1> = ArgBlock::new(ChildArgs {
@@ -123,7 +123,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::cap_transfer: ipc_recv failed")?;
     crate::log("cap_transfer: server ipc_recv returned");
 
-    // Transferred cap slot indices live on the returned IpcMessage.
+    // Transferred cap handles live on the returned IpcMessage.
     let caps = msg.caps();
     crate::log_u64("cap_transfer: cap_count=", caps.len() as u64);
     if caps.len() != 1
@@ -131,7 +131,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("integration::cap_transfer: expected exactly 1 transferred cap");
     }
     let recv_sig = caps[0];
-    crate::log_u64("cap_transfer: recv_sig slot=", u64::from(recv_sig));
+    crate::log_u64("cap_transfer: recv_sig slot=", recv_sig);
 
     // Verify the transferred cap is usable.
     crate::log("cap_transfer: calling notification_send on transferred cap");

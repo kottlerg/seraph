@@ -200,7 +200,7 @@ fn memmgr_call(msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
 }
 
 /// Request a one-page grant from memmgr: `(grant cap, physical base)`.
-fn request_one_page() -> (u32, u64)
+fn request_one_page() -> (u64, u64)
 {
     let want = 1 | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -221,7 +221,7 @@ fn request_one_page() -> (u32, u64)
 }
 
 /// Drop the grant cap and hand its region back to memmgr.
-fn release_one_page(grant: u32, phys_base: u64)
+fn release_one_page(grant: u64, phys_base: u64)
 {
     syscall::cap_delete(grant).expect("cap_delete of grant");
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)

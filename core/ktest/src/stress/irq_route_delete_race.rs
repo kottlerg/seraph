@@ -61,7 +61,7 @@
 //!
 //! Needs **≥ 2 CPUs**.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use init_protocol::InitInfo;
 use syscall::{
@@ -94,13 +94,13 @@ const EXIT_POLLS: u32 = 10_000;
 static ROUND: AtomicU32 = AtomicU32::new(0);
 /// Capability handle the deleter deletes this round: a notification, or, on a
 /// binding round, a bound Interrupt cap.
-static SIG: AtomicU32 = AtomicU32::new(0);
+static SIG: AtomicU64 = AtomicU64::new(0);
 /// Whether the deleter rebinds the line to the spare before this round's
 /// delete; published before the round.
 static REBIND: AtomicU32 = AtomicU32::new(0);
 /// The carved line and the spare notification the deleter rebinds it to.
-static LINE: AtomicU32 = AtomicU32::new(0);
-static SPARE: AtomicU32 = AtomicU32::new(0);
+static LINE: AtomicU64 = AtomicU64::new(0);
+static SPARE: AtomicU64 = AtomicU64::new(0);
 /// Round whose delete (with its rebind, on a rebound round) the deleter has
 /// begun.
 static DELETING: AtomicU32 = AtomicU32::new(0);
@@ -144,7 +144,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// An Interrupt cap naming exactly the UART's line, split from a derived copy
 /// of the root Interrupt cap, so the root stays whole.
-fn carve_line(ctx: &TestContext) -> Result<u32, &'static str>
+fn carve_line(ctx: &TestContext) -> Result<u64, &'static str>
 {
     // SAFETY: the kernel maps the read-only InitInfo page at `init_info_va`
     // for ktest's lifetime.
@@ -172,7 +172,7 @@ fn carve_line(ctx: &TestContext) -> Result<u32, &'static str>
 
 /// Prove the stand-in delivers, then run [`CYCLES`] notification rounds and
 /// [`BINDING_CYCLES`] binding rounds.
-fn race(ctx: &TestContext, line: u32) -> TestResult
+fn race(ctx: &TestContext, line: u64) -> TestResult
 {
     probe_delivery(ctx, line)?;
 
@@ -235,7 +235,7 @@ fn race(ctx: &TestContext, line: u32) -> TestResult
 /// last binding) is deleted so each binding round routes the line afresh, the
 /// binding rounds; returns how many rounds of each kind armed the race. The
 /// spare is deleted whatever the outcome.
-fn phases(ctx: &TestContext, line: u32, spare: u32) -> Result<[u32; 3], &'static str>
+fn phases(ctx: &TestContext, line: u64, spare: u64) -> Result<[u32; 3], &'static str>
 {
     let notified = rounds(ctx, line);
     cap_delete(spare).ok();
@@ -246,7 +246,7 @@ fn phases(ctx: &TestContext, line: u32, spare: u32) -> Result<[u32; 3], &'static
 
 /// Bind the line to a fresh notification and require one raise to signal
 /// it, so the rounds below are not vacuous.
-fn probe_delivery(ctx: &TestContext, line: u32) -> TestResult
+fn probe_delivery(ctx: &TestContext, line: u64) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create probe notification failed")?;
@@ -272,7 +272,7 @@ fn rebound(round: u32) -> bool
 
 /// The rounds; returns, for direct deletes and deletes after a rebind, how
 /// many began a raise while the delete was running.
-fn rounds(ctx: &TestContext, line: u32) -> Result<[u32; 2], &'static str>
+fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
 {
     let mut armed = [0u32; 2];
     for round in 1..=CYCLES
@@ -341,7 +341,7 @@ fn await_delete(round: u32) -> TestResult
 
 /// [`BINDING_CYCLES`] binding rounds numbered from `first`; returns how many
 /// armed the race.
-fn binding_rounds(ctx: &TestContext, line: u32, first: u32) -> Result<u32, &'static str>
+fn binding_rounds(ctx: &TestContext, line: u64, first: u32) -> Result<u32, &'static str>
 {
     let keeper = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::irq_route_delete_race: create keeper notification failed")?;
@@ -365,7 +365,7 @@ fn binding_rounds(ctx: &TestContext, line: u32, first: u32) -> Result<u32, &'sta
 /// keeper) and a doomed copy bound to `ntfs[1]`, whose cap the deleter
 /// deletes while the controller raises; then the kept binding must be served.
 /// Returns whether a raise began while the delete was running.
-fn binding_round(line: u32, round: u32, ntfs: [u32; 2]) -> Result<bool, &'static str>
+fn binding_round(line: u64, round: u32, ntfs: [u64; 2]) -> Result<bool, &'static str>
 {
     let kept = cap_derive(line, RIGHTS_ALL)
         .map_err(|_| "stress::irq_route_delete_race: derive the kept copy failed")?;
@@ -383,9 +383,9 @@ fn binding_round(line: u32, round: u32, ntfs: [u32; 2]) -> Result<bool, &'static
 /// deleted, and require `kept`'s notification to be signalled after.
 fn race_binding_delete(
     round: u32,
-    kept: u32,
-    doomed: u32,
-    ntfs: [u32; 2],
+    kept: u64,
+    doomed: u64,
+    ntfs: [u64; 2],
 ) -> Result<bool, &'static str>
 {
     if irq_register(kept, ntfs[0], 0)

@@ -36,18 +36,18 @@ use super::slot::{CapTag, SlotId};
 pub struct CapMove
 {
     src: SlotId,
-    src_gen: u8,
+    src_gen: u32,
     dst: SlotId,
-    dst_gen: u8,
+    dst_gen: u32,
     /// Destination handle (generation + index), minted at insert.
-    handle: u32,
+    handle: u64,
     object: NonNull<KernelObjectHeader>,
 }
 
 impl CapMove
 {
     /// The destination handle the move will return.
-    pub fn handle(&self) -> u32
+    pub fn handle(&self) -> u64
     {
         self.handle
     }
@@ -63,7 +63,7 @@ pub enum MoveStep
     /// concurrent operation consumed the source and its reference).
     Done
     {
-        handle: u32,
+        handle: u64,
         release: Option<NonNull<KernelObjectHeader>>,
     },
     /// Children remain. Release `DERIVATION_LOCK` and continue with
@@ -83,7 +83,7 @@ pub enum MoveStep
     /// produces — so a revoke on the source reclaims it.
     Abandoned
     {
-        handle: u32
+        handle: u64
     },
 }
 
@@ -141,7 +141,7 @@ pub enum DestRef
 ///
 /// The caller holds `cs`'s lock, so every occupied slot's object is live for
 /// the call.
-pub unsafe fn check_transfer_ref_limits(cs: &CSpace, handles: &[u32]) -> Result<(), SyscallError>
+pub unsafe fn check_transfer_ref_limits(cs: &CSpace, handles: &[u64]) -> Result<(), SyscallError>
 {
     for &handle in handles
     {
@@ -183,7 +183,7 @@ pub unsafe fn check_transfer_ref_limits(cs: &CSpace, handles: &[u32]) -> Result<
 /// `src_cspace` and `dst_cspace` must be valid, live `CSpace` pointers.
 pub unsafe fn move_cap_begin(
     src_cspace: *mut CSpace,
-    src_handle: u32,
+    src_handle: u64,
     dst_cspace: *mut CSpace,
     placement: Placement,
     dst_ref: DestRef,
@@ -206,7 +206,7 @@ pub unsafe fn move_cap_begin(
 /// As for [`move_cap_begin`].
 unsafe fn stage_move(
     src_cspace: *mut CSpace,
-    src_handle: u32,
+    src_handle: u64,
     dst_cspace: *mut CSpace,
     placement: Placement,
     dst_ref: DestRef,
@@ -600,7 +600,7 @@ unsafe fn free_source(mv: &CapMove, src_lock: SourceLock) -> bool
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK`.
-unsafe fn live(id: SlotId, generation: u8, object: NonNull<KernelObjectHeader>) -> bool
+unsafe fn live(id: SlotId, generation: u32, object: NonNull<KernelObjectHeader>) -> bool
 {
     // SAFETY: caller contract.
     unsafe { resolve_slot_mut(id) }.is_some_and(|s| {
@@ -659,7 +659,7 @@ mod tests
         id: CSpaceId,
         kids: usize,
         obj: NonNull<KernelObjectHeader>,
-    ) -> (SlotId, SlotId, SlotId, std::vec::Vec<SlotId>, u32)
+    ) -> (SlotId, SlotId, SlotId, std::vec::Vec<SlotId>, u64)
     {
         let root = occupy(cs, id);
         let src = occupy(cs, id);
@@ -722,7 +722,7 @@ mod tests
             .count()
     }
 
-    fn dst_of(cs_id: CSpaceId, handle: u32) -> SlotId
+    fn dst_of(cs_id: CSpaceId, handle: u64) -> SlotId
     {
         SlotId::current(
             cs_id,
@@ -734,7 +734,7 @@ mod tests
     /// locks; the test CSpaces are single-threaded).
     fn begin(
         src_cs: *mut CSpace,
-        src_handle: u32,
+        src_handle: u64,
         dst_cs: *mut CSpace,
         placement: Placement,
     ) -> Result<MoveStep, SyscallError>

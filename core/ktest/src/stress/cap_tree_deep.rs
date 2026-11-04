@@ -24,7 +24,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "cap_tree_deep: create_notification failed")?;
 
         // Build chain: root → level[0] → level[1] → ... → level[7]
-        let mut chain = [0u32; CHAIN_DEPTH];
+        let mut chain = [0u64; CHAIN_DEPTH];
         let mut parent = root;
         for slot in &mut chain
         {

@@ -84,7 +84,7 @@ struct TreeNode
     /// crosses this mount mints a freshly-attenuated badged SEND from
     /// it (see `EntryTarget::External`); the endpoint is held here and
     /// never handed out directly.
-    terminal_endpoint: u32,
+    terminal_endpoint: u64,
     /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
     /// forward unmatched `NS_LOOKUP` requests so root-fs entries
@@ -92,7 +92,7 @@ struct TreeNode
     /// such fall-through is available (the path does not exist in the
     /// root filesystem, or the root mount has not been installed yet).
     /// On `NodeId::ROOT` this field carries the root mount cap.
-    fallthrough_cap: u32,
+    fallthrough_cap: u64,
 }
 
 /// In-process synthetic root for vfsd.
@@ -182,7 +182,7 @@ impl VfsdRootBackend
     /// fails [`validate_name`], an attempt to mount on top of an
     /// already-terminal node, a re-install of the root mount (see
     /// [`Self::can_install`]), or a failure to allocate the new nodes.
-    pub fn install(&mut self, path: &[u8], cap: u32) -> Option<InstallResult>
+    pub fn install(&mut self, path: &[u8], cap: u64) -> Option<InstallResult>
     {
         // Validate the whole path, and allocate every node and name the
         // walk creates, before mutating anything.
@@ -305,7 +305,7 @@ impl VfsdRootBackend
     /// Set a synthetic intermediate's `fallthrough_cap`. Called by the
     /// MOUNT path after walking the root mount to the corresponding
     /// directory. An index outside the pool is ignored.
-    pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u32)
+    pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u64)
     {
         if let Some(node) = self.node_mut(node_idx)
         {
@@ -355,7 +355,7 @@ impl VfsdRootBackend
     /// no root mount has been installed. Consulted by mount-config
     /// parsing and the install-time fall-through walk.
     #[must_use]
-    pub fn root_mount_cap(&self) -> u32
+    pub fn root_mount_cap(&self) -> u64
     {
         self.root.fallthrough_cap
     }
@@ -380,7 +380,7 @@ impl VfsdRootBackend
 
     /// Fall-through cap stored on the node at pool index `idx`, or `0`.
     #[must_use]
-    pub fn fallthrough_of(&self, idx: u32) -> u32
+    pub fn fallthrough_of(&self, idx: u32) -> u64
     {
         self.node(idx).map_or(0, |n| n.fallthrough_cap)
     }
@@ -575,7 +575,7 @@ mod tests
     use super::*;
 
     /// Cap value standing in for a driver endpoint; the tree only stores it.
-    const CAP: u32 = 7;
+    const CAP: u64 = 7;
 
     /// A pool index no install below creates.
     const UNUSED_IDX: u32 = 30;

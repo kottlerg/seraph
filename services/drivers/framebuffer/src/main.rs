@@ -52,12 +52,12 @@ const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 
 struct BootCaps
 {
-    service_ep: u32,
-    mmio_cap: u32,
-    devmgr_query_ep: u32,
+    service_ep: u64,
+    mmio_cap: u64,
+    devmgr_query_ep: u64,
 }
 
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -93,7 +93,7 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
 /// Query devmgr for this device's [`FramebufferInfo`] via the generic
 /// `QUERY_DEVICE_INFO` reply schema. Verifies kind and version before
 /// deserialising.
-fn query_framebuffer_info(devmgr_ep: u32, ipc_buf: *mut u64) -> Option<FramebufferInfo>
+fn query_framebuffer_info(devmgr_ep: u64, ipc_buf: *mut u64) -> Option<FramebufferInfo>
 {
     let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_INFO)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -249,7 +249,7 @@ unsafe fn render_at(writer: &mut render::FramebufferWriter, cp: u32)
     });
 }
 
-fn service_loop(service_ep: u32, mut writer: render::FramebufferWriter, ipc_buf: *mut u64) -> !
+fn service_loop(service_ep: u64, mut writer: render::FramebufferWriter, ipc_buf: *mut u64) -> !
 {
     let mut decoder = Utf8Decoder::new();
     // No diagnostic hook: a `log!` here is a blocking call into logd, which

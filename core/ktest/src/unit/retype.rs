@@ -107,9 +107,9 @@ const MAX_POLLS: u32 = 2000;
 /// translation cache is coherent with stores.
 fn install_stub(
     ctx: &TestContext,
-    aspace: u32,
+    aspace: u64,
     emit: impl FnOnce(&mut [u8]) -> usize,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let frame =
         crate::frame_pool::alloc().ok_or("retype::stub: frame_pool::alloc returned None")?;
@@ -150,7 +150,7 @@ fn install_stub(
 }
 
 /// Exit reason of an already-`Exited` thread, or an error naming `what`.
-fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
+fn exited_reason(thread: u64, what: &'static str) -> Result<u64, &'static str>
 {
     let state = cap_info(thread, CAP_INFO_THREAD_STATE)
         .map_err(|_| "retype::aspace_stop: cap_info(thread state) failed")?;
@@ -165,7 +165,7 @@ fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
 /// returns it with [`ScratchFrame::release`] once the address space it mapped
 /// the frame into is destroyed; a failure path that returns before that
 /// release leaks the frame.
-struct ScratchFrame(u32);
+struct ScratchFrame(u64);
 
 impl ScratchFrame
 {

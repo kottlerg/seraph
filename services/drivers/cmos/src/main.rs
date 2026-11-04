@@ -34,8 +34,8 @@ const HOUR_PM_BIT: u8 = 0x80;
 
 struct BootCaps
 {
-    service_ep: u32,
-    ioport_cap: u32,
+    service_ep: u64,
+    ioport_cap: u64,
     /// CMOS RAM index of the century register, from the FADT `CENTURY`
     /// field devmgr sends as the round's data word; `None` when it names
     /// none (0), names one the driver cannot read
@@ -43,13 +43,13 @@ struct BootCaps
     century_reg: Option<u8>,
     /// devmgr query cap: a SEND badged with this device's badge on its spawn
     /// batch's private endpoint, for `DRIVER_READY`.
-    devmgr_query_ep: u32,
+    devmgr_query_ep: u64,
 }
 
 /// Request the two bootstrap rounds: round 1 (not terminal)
 /// `[service_ep, ioport_cap]` with the century index as its data word,
 /// round 2 (terminal) `[devmgr_query_ep]`.
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -296,7 +296,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
-fn service_loop(service_ep: u32, century_reg: Option<u8>, ipc_buf: *mut u64) -> !
+fn service_loop(service_ep: u64, century_reg: Option<u8>, ipc_buf: *mut u64) -> !
 {
     std::os::seraph::log!("ready");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);

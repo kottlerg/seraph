@@ -21,7 +21,7 @@
 //! return path clobbers in `a0`), the cap slot is stored in `PHASE2_SIG`
 //! before resuming. See the comment on that static for details.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_derive, notification_send,
@@ -129,7 +129,58 @@ static BALANCE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 /// would clobber any value written there by `thread_write_regs`. Storing the
 /// cap here and reading it in `phase2_entry` sidesteps the conflict and keeps
 /// the pattern correct on both architectures.
-static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
+static PHASE2_SIG: AtomicU64 = AtomicU64::new(0);
+
+/// [`blocker_entry`]'s two notification caps, handed to it by address: each
+/// handle fills a whole `u64`, so the pair does not fit the one argument word.
+#[derive(Clone, Copy)]
+struct BlockerArgs
+{
+    /// NOTIFY copy of the readiness notification.
+    ready: u64,
+    /// WAIT copy of the blocking notification.
+    block: u64,
+}
+
+/// One [`BlockerArgs`] entry per test that starts a [`blocker_entry`] child,
+/// so no entry is rewritten while an earlier test's child may still read it.
+static BLOCKER_ARGS: crate::spawn::ArgBlock<BlockerArgs, 4> =
+    crate::spawn::ArgBlock::new(BlockerArgs { ready: 0, block: 0 });
+
+/// [`BLOCKER_ARGS`] entry of [`stop_read_regs`].
+const BLOCKER_STOP_READ_REGS: usize = 0;
+/// [`BLOCKER_ARGS`] entry of [`stop_again_invalid_state`].
+const BLOCKER_DOUBLE_STOP: usize = 1;
+/// [`BLOCKER_ARGS`] entry of [`write_regs_resume`].
+const BLOCKER_WRITE_REGS: usize = 2;
+/// [`BLOCKER_ARGS`] entry of [`configure_running_thread_err`].
+const BLOCKER_CONFIGURE_ERR: usize = 3;
+
+/// [`split_rollback_child_entry`]'s caps, handed to it by address.
+#[derive(Clone, Copy)]
+struct SplitRollbackArgs
+{
+    /// The child's copy of the root `SchedControl` cap.
+    sched: u64,
+    /// NOTIFY copy of the report notification.
+    done: u64,
+}
+
+static SPLIT_ROLLBACK_ARGS: crate::spawn::ArgBlock<SplitRollbackArgs, 1> =
+    crate::spawn::ArgBlock::new(SplitRollbackArgs { sched: 0, done: 0 });
+
+/// [`balance_spinner_entry`]'s arguments, handed to it by address.
+#[derive(Clone, Copy)]
+struct BalanceArgs
+{
+    /// The spinner's index into [`BALANCE_OBSERVED_CPU`].
+    idx: usize,
+    /// NOTIFY copy of the spinner's exit notification.
+    sig: u64,
+}
+
+static BALANCE_ARGS: crate::spawn::ArgBlock<BalanceArgs, BALANCE_MAX_SPINNERS> =
+    crate::spawn::ArgBlock::new(BalanceArgs { idx: 0, sig: 0 });
 
 // ── SYS_THREAD_CONFIGURE / SYS_THREAD_START ──────────────────────────────────
 
@@ -148,10 +199,8 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE));
     // SAFETY: the stack is `STACK_CONFIGURE`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-    }
-    .map_err(|_| "thread::configure_start: configure_and_start failed")?;
+    unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
+        .map_err(|_| "thread::configure_start: configure_and_start failed")?;
 
     let bits = notification_wait(sig).map_err(|_| "notification_wait after thread_start failed")?;
     if bits != 0xBEEF
@@ -199,7 +248,13 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy (block) for stop_read_regs failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS));
-    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
+    let args = BlockerArgs {
+        ready: child_ready,
+        block: child_block,
+    };
+    // SAFETY: the entry is this test's own, and no child reads it: any child
+    // an earlier run of this test started on it was deleted before it returned.
+    let blocker_arg = unsafe { BLOCKER_ARGS.publish(BLOCKER_STOP_READ_REGS, args) };
     // SAFETY: the stack is `STACK_STOP_REGS`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
@@ -265,7 +320,13 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DOUBLE_STOP));
-    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
+    let args = BlockerArgs {
+        ready: child_ready,
+        block: child_block,
+    };
+    // SAFETY: the entry is this test's own, and no child reads it: any child
+    // an earlier run of this test started on it was deleted before it returned.
+    let blocker_arg = unsafe { BLOCKER_ARGS.publish(BLOCKER_DOUBLE_STOP, args) };
     // SAFETY: the stack is `STACK_DOUBLE_STOP`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
@@ -327,7 +388,13 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy (block) for write_regs_resume failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
-    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
+    let args = BlockerArgs {
+        ready: child_ready,
+        block: child_block,
+    };
+    // SAFETY: the entry is this test's own, and no child reads it: any child
+    // an earlier run of this test started on it was deleted before it returned.
+    let blocker_arg = unsafe { BLOCKER_ARGS.publish(BLOCKER_WRITE_REGS, args) };
     // SAFETY: the stack is `STACK_WRITE_REGS`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
@@ -553,7 +620,13 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::split_rollback: cap_copy sched failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "thread::split_rollback: cap_copy done failed")?;
-    let arg = u64::from(child_sched) | (u64::from(child_done) << 32);
+    let args = SplitRollbackArgs {
+        sched: child_sched,
+        done: child_done,
+    };
+    // SAFETY: the block is this test's own, and no child reads its entry: any
+    // child an earlier run of this test started was deleted before it returned.
+    let arg = unsafe { SPLIT_ROLLBACK_ARGS.publish(0, args) };
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_SPLIT_ROLLBACK));
     // SAFETY: the stack is `STACK_SPLIT_ROLLBACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
@@ -588,8 +661,12 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
 extern "C" fn split_rollback_child_entry(arg: u64) -> !
 {
     const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
-    let sched_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `SPLIT_ROLLBACK_ARGS` entry the parent published
+    // before starting this child, unchanged since.
+    let SplitRollbackArgs {
+        sched: sched_slot,
+        done: done_slot,
+    } = unsafe { crate::spawn::child_args(arg) };
 
     let bits = 'run: {
         // Fill the CSpace until the pool is exhausted, keeping the last cap.
@@ -764,7 +841,7 @@ pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
     let ret = unsafe {
         syscall::raw_syscall3(
             syscall_abi::SYS_THREAD_SET_AFFINITY,
-            u64::from(child.th),
+            child.th,
             0x1_0000_0000,
             0,
         )
@@ -807,8 +884,8 @@ pub fn set_fault_handler_badge_arg_err(ctx: &TestContext) -> TestResult
         unsafe {
             syscall::raw_syscall4(
                 syscall_abi::SYS_THREAD_SET_FAULT_HANDLER,
-                u64::from(child.th),
-                u64::from(ep),
+                child.th,
+                ep,
                 badge,
                 syscall_abi::FAULT_CLASS_ALL,
             )
@@ -847,9 +924,9 @@ pub fn set_priority_wide_arg_err(ctx: &TestContext) -> TestResult
     let ret = unsafe {
         syscall::raw_syscall3(
             syscall_abi::SYS_THREAD_SET_PRIORITY,
-            u64::from(child.th),
+            child.th,
             0x105,
-            u64::from(ctx.sched_control_cap),
+            ctx.sched_control_cap,
         )
     };
     if ret != SyscallError::InvalidArgument as i64
@@ -880,9 +957,7 @@ pub fn sched_split_wide_arg_err(ctx: &TestContext) -> TestResult
     // the registers the call clobbers in this thread; and in ktest's CSpace it
     // changes only the slot `root_copy` names and the fresh slots it fills with
     // the two band children.
-    let ret = unsafe {
-        syscall::raw_syscall3(syscall_abi::SYS_SCHED_SPLIT, u64::from(root_copy), 0x115, 0)
-    };
+    let ret = unsafe { syscall::raw_syscall3(syscall_abi::SYS_SCHED_SPLIT, root_copy, 0x115, 0) };
     if ret != SyscallError::InvalidArgument as i64
     {
         return Err("sched_split(0x115) did not return InvalidArgument");
@@ -914,7 +989,13 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy (block) for configure_running_thread_err failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
-    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
+    let args = BlockerArgs {
+        ready: child_ready,
+        block: child_block,
+    };
+    // SAFETY: the entry is this test's own, and no child reads it: any child
+    // an earlier run of this test started on it was deleted before it returned.
+    let blocker_arg = unsafe { BLOCKER_ARGS.publish(BLOCKER_CONFIGURE_ERR, args) };
     // SAFETY: the stack is `STACK_CONFIGURE_ERR`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
@@ -1031,7 +1112,7 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
             &child,
             affinity_sender_entry,
             stack_top,
-            u64::from(child_sig),
+            child_sig,
             1,
         )
     }
@@ -1136,13 +1217,7 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     // SAFETY: the stack is `STACK_AFFINITY_MIGRATE_READY`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
-        crate::spawn::configure_and_start_pinned(
-            &child,
-            report_cpu_entry,
-            stack_top,
-            u64::from(child_sig),
-            0,
-        )
+        crate::spawn::configure_and_start_pinned(&child, report_cpu_entry, stack_top, child_sig, 0)
     }
     .map_err(|_| "thread::affinity_migrate_ready_queued: configure_and_start_pinned failed")?;
 
@@ -1220,7 +1295,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
             &child,
             migrate_spinner_entry,
             stack_top,
-            u64::from(child_sig),
+            child_sig,
             1,
         )
     }
@@ -1287,9 +1362,9 @@ fn balance_spawn_spinners(
     n: usize,
     initial_cpu: u32,
     final_affinity: u32,
-) -> Result<[(crate::spawn::SpawnedChild, u32); BALANCE_MAX_SPINNERS], &'static str>
+) -> Result<[(crate::spawn::SpawnedChild, u64); BALANCE_MAX_SPINNERS], &'static str>
 {
-    let mut triples = [const { (crate::spawn::SpawnedChild::EMPTY, 0u32) }; BALANCE_MAX_SPINNERS];
+    let mut triples = [const { (crate::spawn::SpawnedChild::EMPTY, 0u64) }; BALANCE_MAX_SPINNERS];
 
     for i in 0..n
     {
@@ -1303,7 +1378,13 @@ fn balance_spawn_spinners(
         // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
-        let arg = (i as u64) << 32 | u64::from(child_sig);
+        let args = BalanceArgs {
+            idx: i,
+            sig: child_sig,
+        };
+        // SAFETY: i < n <= BALANCE_MAX_SPINNERS, and no child reads entry `i`:
+        // the previous spinner on it exited in that test's teardown.
+        let arg = unsafe { BALANCE_ARGS.publish(i, args) };
         // SAFETY: the stack is `STACK_BALANCE_SPINNERS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe {
@@ -1335,7 +1416,7 @@ fn balance_spawn_spinners(
 /// Helper: tear down the spinners spawned by `balance_spawn_spinners`.
 /// Signals exit, drains each spinner's `notification_send`, and deletes the caps.
 fn balance_teardown(
-    triples: &mut [(crate::spawn::SpawnedChild, u32); BALANCE_MAX_SPINNERS],
+    triples: &mut [(crate::spawn::SpawnedChild, u64); BALANCE_MAX_SPINNERS],
     n: usize,
 ) -> TestResult
 {
@@ -1498,7 +1579,7 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
             &child,
             affinity_sender_entry,
             stack_top,
-            u64::from(child_sig),
+            child_sig,
             1,
         )
     }
@@ -1554,10 +1635,8 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY));
     // SAFETY: the stack is `STACK_DEFAULT_AFFINITY`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-    }
-    .map_err(|_| "thread::default_affinity_runs: configure_and_start failed")?;
+    unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
+        .map_err(|_| "thread::default_affinity_runs: configure_and_start failed")?;
 
     // If the thread successfully signals back, default affinity routing worked.
     let bits =
@@ -1583,20 +1662,16 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
 ///
 /// Used by [`affinity_bind_cpu1`] and [`affinity_respected`] — the child is
 /// bound to CPU 1 and confirms it ran by notifying back.
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn affinity_sender_entry(sig_slot: u64) -> !
 {
-    notification_send(sig_slot as u32, 0xC1A1).ok();
+    notification_send(sig_slot, 0xC1A1).ok();
     thread_exit()
 }
 
 /// Simple sender: sends 0xBEEF and exits.
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn sender_entry(sig_slot: u64) -> !
 {
-    notification_send(sig_slot as u32, 0xBEEF).ok();
+    notification_send(sig_slot, 0xBEEF).ok();
     thread_exit()
 }
 
@@ -1606,15 +1681,17 @@ extern "C" fn sender_entry(sig_slot: u64) -> !
 /// `TrapFrame` for `thread_read_regs` / `thread_write_regs`. If the parent
 /// later resumes it (via `write_regs` redirect), execution jumps to `phase2_entry`
 /// instead of returning from this `notification_wait`.
-// cast_possible_truncation: cap slot indices are guaranteed < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn blocker_entry(arg: u64) -> !
 {
-    // arg packs (ready_slot << 32) | block_slot. Two distinct caps so the
+    // `arg` addresses a `BLOCKER_ARGS` entry naming two distinct caps, so the
     // child cannot self-deliver its own readiness send before the parent has
     // registered as the waiter.
-    let ready_slot = (arg >> 32) as u32;
-    let block_slot = (arg & 0xFFFF_FFFF) as u32;
+    // SAFETY: `arg` is the `BLOCKER_ARGS` entry the parent published before
+    // starting this child, unchanged since.
+    let BlockerArgs {
+        ready: ready_slot,
+        block: block_slot,
+    } = unsafe { crate::spawn::child_args(arg) };
     notification_send(ready_slot, 0x1).ok();
     // Block so the parent can stop us and read a stable TrapFrame.
     // If write_regs redirects our IP, we jump directly to phase2_entry on resume.
@@ -1640,7 +1717,8 @@ extern "C" fn blocker_entry(arg: u64) -> !
 /// bit-per-CPU encoding is always non-zero for any valid CPU id, so the wake
 /// always lands; a stale-CPU run fails as "Ready-thread migration did not
 /// land on CPU 1" instead of as a timeout.
-// cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
+// cast_possible_truncation: a CPU id fits in u32, and the `u64::MAX` fallback
+// only feeds `wrapping_shl`, which masks the count modulo 64 anyway.
 #[allow(clippy::cast_possible_truncation)]
 extern "C" fn report_cpu_entry(sig_slot: u64) -> !
 {
@@ -1649,22 +1727,24 @@ extern "C" fn report_cpu_entry(sig_slot: u64) -> !
     // keeping the result non-zero (and therefore acceptable to
     // `notification_send`) even on the defensive `u64::MAX` fallback above —
     // a plain `1u64 << cpu` would shift-overflow and panic in debug.
-    notification_send(sig_slot as u32, 1u64.wrapping_shl(cpu as u32)).ok();
+    notification_send(sig_slot, 1u64.wrapping_shl(cpu as u32)).ok();
     thread_exit()
 }
 
 /// Spinner used by the load-balancer tests.
 ///
-/// `arg` packs `(spinner_index << 32) | exit_notification_cap`. On every iteration
-/// the spinner publishes the current CPU id into the per-index slot of
-/// [`BALANCE_OBSERVED_CPU`]. When [`BALANCE_SHOULD_EXIT`] is set, the
-/// spinner sends `0xC0FE` on its notification cap and exits.
-// cast_possible_truncation: spinner indices and cap slot indices fit in u32.
+/// `arg` addresses a [`BALANCE_ARGS`] entry naming the spinner's index and its
+/// exit notification cap. On every iteration the spinner publishes the
+/// current CPU id into the per-index slot of [`BALANCE_OBSERVED_CPU`]. When
+/// [`BALANCE_SHOULD_EXIT`] is set, the spinner sends `0xC0FE` on its
+/// notification cap and exits.
+// cast_possible_truncation: CPU ids fit in u32.
 #[allow(clippy::cast_possible_truncation)]
 extern "C" fn balance_spinner_entry(arg: u64) -> !
 {
-    let idx = (arg >> 32) as usize;
-    let sig_slot = (arg & 0xFFFF_FFFF) as u32;
+    // SAFETY: `arg` is the `BALANCE_ARGS` entry the parent published before
+    // starting this spinner, unchanged since.
+    let BalanceArgs { idx, sig: sig_slot } = unsafe { crate::spawn::child_args(arg) };
     loop
     {
         let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX) as u32;
@@ -1689,7 +1769,7 @@ extern "C" fn balance_spinner_entry(arg: u64) -> !
 /// Publishes the latest observed CPU id into [`MIGRATE_OBSERVED_CPU`] on
 /// every iteration. Exits when [`MIGRATE_SHOULD_EXIT`] is set, notifying
 /// the parent first so it can complete `notification_wait`.
-// cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
+// cast_possible_truncation: CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
 extern "C" fn migrate_spinner_entry(sig_slot: u64) -> !
 {
@@ -1699,7 +1779,7 @@ extern "C" fn migrate_spinner_entry(sig_slot: u64) -> !
         MIGRATE_OBSERVED_CPU.store(cpu, Ordering::Relaxed);
         if MIGRATE_SHOULD_EXIT.load(Ordering::Relaxed) != 0
         {
-            notification_send(sig_slot as u32, 0xC0FE).ok();
+            notification_send(sig_slot, 0xC0FE).ok();
             thread_exit();
         }
         // Tiny back-off so the parent gets a chance to run between observations.
@@ -1821,7 +1901,7 @@ pub fn bind_notification_nodes_come_from_the_queue(ctx: &TestContext) -> TestRes
 
 /// Body of [`bind_notification_nodes_come_from_the_queue`] on `eq`, a queue
 /// of capacity 8 with `nodes` observer nodes.
-fn bind_nodes_on(ctx: &TestContext, eq: u32, nodes: u32) -> TestResult
+fn bind_nodes_on(ctx: &TestContext, eq: u64, nodes: u32) -> TestResult
 {
     let mut child =
         crate::spawn::new_child(ctx).map_err(|_| "thread::bind_nodes: spawn::new_child failed")?;

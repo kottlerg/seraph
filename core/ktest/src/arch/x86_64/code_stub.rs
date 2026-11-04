@@ -17,16 +17,18 @@ pub fn emit_spin(buf: &mut [u8]) -> usize
 }
 
 /// Encode `cap_delete(handle); loop {}` into `buf`; returns the byte count.
-pub fn emit_self_delete(buf: &mut [u8], handle: u32) -> usize
+pub fn emit_self_delete(buf: &mut [u8], handle: u64) -> usize
 {
-    // mov eax, SYS_CAP_DELETE ; mov edi, handle ; syscall ; jmp .
+    // mov eax, SYS_CAP_DELETE ; movabs rdi, handle ; syscall ; jmp .
+    // The handle takes the full 64-bit immediate: its generation sits above
+    // the 32-bit index.
     // cast_possible_truncation: syscall numbers fit 32 bits.
     #[allow(clippy::cast_possible_truncation)]
     let nr = SYS_CAP_DELETE as u32;
     buf[0] = 0xB8;
     buf[1..5].copy_from_slice(&nr.to_le_bytes());
-    buf[5] = 0xBF;
-    buf[6..10].copy_from_slice(&handle.to_le_bytes());
-    buf[10..12].copy_from_slice(&[0x0F, 0x05]);
-    12 + emit_spin(&mut buf[12..])
+    buf[5..7].copy_from_slice(&[0x48, 0xBF]);
+    buf[7..15].copy_from_slice(&handle.to_le_bytes());
+    buf[15..17].copy_from_slice(&[0x0F, 0x05]);
+    17 + emit_spin(&mut buf[17..])
 }

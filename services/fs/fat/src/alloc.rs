@@ -97,7 +97,7 @@ fn read_fat_entry(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<u32, FatError>
 {
@@ -148,7 +148,7 @@ pub fn update_fat_entry(
     cluster: u32,
     value: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
@@ -234,7 +234,7 @@ pub fn allocate_cluster(
     state: &mut FatState,
     prev: Option<u32>,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<u32, FatError>
 {
@@ -334,7 +334,7 @@ fn found_is_bad(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     bad: u32,
 ) -> Result<bool, FatError>
@@ -361,7 +361,7 @@ pub fn free_cluster_chain(
     state: &mut FatState,
     start: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<u32, FatError>
 {
@@ -421,7 +421,7 @@ pub fn free_cluster_chain(
 /// at the sentinel and `fsinfo_sector` is reset to `u32::MAX`, so
 /// [`flush_fsinfo`] never writes hints into a sector that is not an
 /// `FSInfo` sector. The allocator still operates from the FAT itself.
-pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_buf: *mut u64)
+pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_buf: *mut u64)
 {
     if !matches!(state.fat_type, FatType::Fat32) || state.fsinfo_sector == u32::MAX
     {
@@ -466,7 +466,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
 /// Write the current `next_free_hint` and `free_count_hint` back to
 /// the `FSInfo` sector. Best-effort: failures are logged but not
 /// propagated, since the `FSInfo` sector is advisory per Microsoft spec.
-pub fn flush_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_buf: *mut u64)
+pub fn flush_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_buf: *mut u64)
 {
     if !matches!(state.fat_type, FatType::Fat32) || state.fsinfo_sector == u32::MAX
     {

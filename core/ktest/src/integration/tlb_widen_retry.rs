@@ -223,7 +223,7 @@ fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
 
 /// Wait for the child to exit cooperatively, then delete its caps, unmap the
 /// page, and return the cap to the pool. Safe to call on any error path.
-fn cleanup(ctx: &TestContext, child: Option<&mut crate::spawn::SpawnedChild>, memory_cap: u32)
+fn cleanup(ctx: &TestContext, child: Option<&mut crate::spawn::SpawnedChild>, memory_cap: u64)
 {
     if let Some(child) = child
     {

@@ -53,7 +53,7 @@ pub struct BootstrapRound
 {
     /// Capability handles of the received caps in the child's `CSpace`. Only
     /// the first `cap_count` entries are valid.
-    pub caps: [u32; MSG_CAP_SLOTS_MAX],
+    pub caps: [u64; MSG_CAP_SLOTS_MAX],
     /// Number of valid handles in `caps`.
     pub cap_count: usize,
     /// Owned data words delivered with this round. Only the first
@@ -111,7 +111,7 @@ pub const fn unpack_data_words(label: u64) -> usize
 /// [`unpack_slots`].
 pub struct PackedSlots
 {
-    caps: [u32; MSG_CAP_SLOTS_MAX],
+    caps: [u64; MSG_CAP_SLOTS_MAX],
     cap_count: usize,
     /// A `u64` mask covers every slot of a round, which carries at most
     /// `MSG_CAP_SLOTS_MAX` caps.
@@ -122,7 +122,7 @@ impl PackedSlots
 {
     /// The caps the round transfers, in slot order, none of them `0`.
     #[must_use]
-    pub fn caps(&self) -> &[u32]
+    pub fn caps(&self) -> &[u64]
     {
         &self.caps[..self.cap_count]
     }
@@ -140,7 +140,7 @@ impl PackedSlots
 /// are not packed; a longer slot list is split over rounds by
 /// [`slot_rounds`].
 #[must_use]
-pub fn pack_slots(slots: &[u32]) -> PackedSlots
+pub fn pack_slots(slots: &[u64]) -> PackedSlots
 {
     let mut packed = PackedSlots {
         caps: [0; MSG_CAP_SLOTS_MAX],
@@ -167,7 +167,7 @@ pub fn pack_slots(slots: &[u32]) -> PackedSlots
 /// [`bootstrap_errors::INVALID`] when the round carries no presence word,
 /// the word sets a bit at or above `MSG_CAP_SLOTS_MAX`, or it names a
 /// different number of caps than the round delivered.
-pub fn unpack_slots(round: &BootstrapRound) -> Result<[u32; MSG_CAP_SLOTS_MAX], u64>
+pub fn unpack_slots(round: &BootstrapRound) -> Result<[u64; MSG_CAP_SLOTS_MAX], u64>
 {
     if round.data_words == 0
     {
@@ -186,13 +186,13 @@ pub fn unpack_slots(round: &BootstrapRound) -> Result<[u32; MSG_CAP_SLOTS_MAX], 
 /// [`bootstrap_errors::INVALID`] when `presence` sets a bit at or above
 /// `MSG_CAP_SLOTS_MAX` or names a different number of caps than `caps`
 /// holds.
-pub fn spread_slots(caps: &[u32], presence: u64) -> Result<[u32; MSG_CAP_SLOTS_MAX], u64>
+pub fn spread_slots(caps: &[u64], presence: u64) -> Result<[u64; MSG_CAP_SLOTS_MAX], u64>
 {
     if presence >> MSG_CAP_SLOTS_MAX != 0 || presence.count_ones() as usize != caps.len()
     {
         return Err(bootstrap_errors::INVALID);
     }
-    let mut slots = [0u32; MSG_CAP_SLOTS_MAX];
+    let mut slots = [0u64; MSG_CAP_SLOTS_MAX];
     let mut next = caps.iter();
     for (i, slot) in slots.iter_mut().enumerate()
     {
@@ -225,7 +225,7 @@ pub const fn slot_round_count(slot_count: usize) -> usize
 /// is relative to that window. Yields [`slot_round_count`] rounds; no slots
 /// still yield one empty round. A child concatenates the rounds with
 /// [`SlotAccumulator`].
-pub fn slot_rounds(slots: &[u32]) -> impl Iterator<Item = PackedSlots> + '_
+pub fn slot_rounds(slots: &[u64]) -> impl Iterator<Item = PackedSlots> + '_
 {
     (0..slot_round_count(slots.len())).map(move |k| {
         let start = (k * MSG_CAP_SLOTS_MAX).min(slots.len());
@@ -239,7 +239,7 @@ pub fn slot_rounds(slots: &[u32]) -> impl Iterator<Item = PackedSlots> + '_
 /// slots `k * MSG_CAP_SLOTS_MAX` onwards. A slot no round filled is `0`.
 pub struct SlotAccumulator<const N: usize>
 {
-    slots: [u32; N],
+    slots: [u64; N],
     rounds: usize,
 }
 
@@ -274,9 +274,9 @@ impl<const N: usize> SlotAccumulator<N>
     /// `overflow`, so every cap of that round is still the caller's.
     pub fn push(
         &mut self,
-        caps: &[u32],
+        caps: &[u64],
         presence: u64,
-        mut overflow: impl FnMut(u32),
+        mut overflow: impl FnMut(u64),
     ) -> Result<(), u64>
     {
         let window = spread_slots(caps, presence)?;
@@ -299,7 +299,7 @@ impl<const N: usize> SlotAccumulator<N>
 
     /// The slots filled so far.
     #[must_use]
-    pub fn slots(&self) -> &[u32; N]
+    pub fn slots(&self) -> &[u64; N]
     {
         &self.slots
     }
@@ -329,7 +329,7 @@ impl<const N: usize> SlotAccumulator<N>
 ///   differs from the count the label declares, or the label declares more
 ///   data words than a message carries. The caps such a reply delivered
 ///   are deleted.
-pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
+pub unsafe fn request_round(creator_ep: u64, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
 {
     let request = IpcMessage::new(REQUEST);
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
@@ -352,7 +352,7 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
                 delete_slots(reply_caps);
                 return Err(bootstrap_errors::INVALID);
             }
-            let mut caps = [0u32; MSG_CAP_SLOTS_MAX];
+            let mut caps = [0u64; MSG_CAP_SLOTS_MAX];
             caps[..reply_caps.len()].copy_from_slice(reply_caps);
             let mut data = [0u64; MSG_DATA_WORDS_MAX];
             let words = reply.words();
@@ -391,9 +391,9 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
 /// [`bootstrap_errors::INVALID`] for a round with no presence word or one
 /// that does not decode. On an error every cap received so far is deleted.
 pub unsafe fn request_slots<const N: usize>(
-    creator_ep: u32,
+    creator_ep: u64,
     ipc_buf: *mut u64,
-) -> Result<[u32; N], u64>
+) -> Result<[u64; N], u64>
 {
     let mut acc = SlotAccumulator::<N>::new();
     loop
@@ -433,7 +433,7 @@ pub unsafe fn request_slots<const N: usize>(
 }
 
 /// Delete every non-zero cap in `caps`.
-fn delete_slots(caps: &[u32])
+fn delete_slots(caps: &[u64])
 {
     for &cap in caps
     {
@@ -459,7 +459,7 @@ fn delete_slots(caps: &[u32])
 /// Panics when `data` is longer than `MSG_DATA_WORDS_MAX` words.
 pub unsafe fn reply_round(
     done: bool,
-    cap_slots: &[u32],
+    cap_slots: &[u64],
     data: &[u64],
     ipc_buf: *mut u64,
 ) -> Result<(), i64>
@@ -510,11 +510,11 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
 /// * `Err(bootstrap_errors::NO_CHILD)` — unexpected badge.
 /// * `Err(bootstrap_errors::INVALID)` — protocol error.
 pub unsafe fn serve_round(
-    bootstrap_ep: u32,
+    bootstrap_ep: u64,
     expected_badge: u64,
     ipc_buf: *mut u64,
     done: bool,
-    caps: &[u32],
+    caps: &[u64],
     data: &[u64],
 ) -> Result<(), u64>
 {
@@ -565,12 +565,12 @@ mod tests
     {
         for mask in 0u32..(1 << MSG_CAP_SLOTS_MAX)
         {
-            let mut slots = [0u32; MSG_CAP_SLOTS_MAX];
+            let mut slots = [0u64; MSG_CAP_SLOTS_MAX];
             for (i, slot) in slots.iter_mut().enumerate()
             {
                 if mask & (1 << i) != 0
                 {
-                    *slot = 0x40 + i as u32;
+                    *slot = 0x40 + i as u64;
                 }
             }
             let packed = pack_slots(&slots);
@@ -611,10 +611,10 @@ mod tests
     /// The slots a child holds after pushing every round of `slot_rounds`,
     /// and the caps handed to `overflow` (the crate is `no_std`, so a fixed
     /// buffer and its fill count).
-    fn concatenated<const N: usize>(slots: &[u32]) -> ([u32; N], [u32; 8], usize)
+    fn concatenated<const N: usize>(slots: &[u64]) -> ([u64; N], [u64; 8], usize)
     {
         let mut acc = SlotAccumulator::<N>::new();
-        let mut dropped = [0u32; 8];
+        let mut dropped = [0u64; 8];
         let mut dropped_count = 0;
         for round in slot_rounds(slots)
         {

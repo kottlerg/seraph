@@ -152,10 +152,10 @@ fn failure_message(code: u32) -> &'static str
 #[derive(Clone, Copy)]
 struct RaceArgs
 {
-    eq: u32,
-    gate: u32,
-    ack: u32,
-    done: u32,
+    eq: u64,
+    gate: u64,
+    ack: u64,
+    done: u64,
 }
 
 /// Entry 0 is the poller's, entry 1 the poster's (their stack indices).
@@ -171,7 +171,7 @@ static RACE_ARGS: spawn::ArgBlock<RaceArgs, 2> = spawn::ArgBlock::new(RaceArgs {
 /// [`RaceArgs`] entry the child receives by address.
 fn start_pinned_child(
     ctx: &TestContext,
-    caps: [u32; 4],
+    caps: [u64; 4],
     rights: [u64; 4],
     entry: extern "C" fn(u64) -> !,
     stack_idx: usize,
@@ -180,7 +180,7 @@ fn start_pinned_child(
 {
     let child = spawn::new_child(ctx)
         .map_err(|_| "stress::event_try_recv_post_race: spawn child failed")?;
-    let mut slots = [0u32; 4];
+    let mut slots = [0u64; 4];
     for (slot, (&cap, &r)) in slots.iter_mut().zip(caps.iter().zip(rights.iter()))
     {
         *slot = cap_copy(cap, child.cs, r)
@@ -319,7 +319,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 // ── Child entries ───────────────────────────────────────────────────────────
 
 /// Decode the four cap slots shared by both child entries.
-fn decode(arg: u64) -> (u32, u32, u32, u32)
+fn decode(arg: u64) -> (u64, u64, u64, u64)
 {
     // SAFETY: `arg` is the entry `start_pinned_child` published for this child.
     let a: RaceArgs = unsafe { spawn::child_args(arg) };

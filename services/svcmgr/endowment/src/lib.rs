@@ -86,23 +86,23 @@ const ROUND_DATA_WORDS: usize = 4;
 pub struct CapsRound
 {
     /// svcmgr's service endpoint (RECV).
-    pub service_ep: u32,
+    pub service_ep: u64,
     /// svcmgr's own bootstrap endpoint (RECV).
-    pub bootstrap_ep: u32,
+    pub bootstrap_ep: u64,
     /// SEND on the root filesystem's namespace endpoint, or `0`.
-    pub rootfs_root: u32,
+    pub rootfs_root: u64,
     /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint, or `0`.
-    pub devmgr_registry: u32,
+    pub devmgr_registry: u64,
     /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint, or `0`.
-    pub vfsd_mount: u32,
+    pub vfsd_mount: u64,
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, or `0`.
-    pub vfsd_deny: u32,
+    pub vfsd_deny: u64,
 }
 
 impl CapsRound
 {
     /// The positional slot list, indexed by [`caps_slot`].
-    fn slots(&self) -> [u32; CAPS_SLOTS]
+    fn slots(&self) -> [u64; CAPS_SLOTS]
     {
         let mut slots = [0; CAPS_SLOTS];
         slots[caps_slot::SERVICE] = self.service_ep;
@@ -114,7 +114,7 @@ impl CapsRound
         slots
     }
 
-    fn from_slots(slots: &[u32; CAPS_SLOTS]) -> Self
+    fn from_slots(slots: &[u64; CAPS_SLOTS]) -> Self
     {
         CapsRound {
             service_ep: slots[caps_slot::SERVICE],
@@ -132,16 +132,16 @@ impl CapsRound
 pub struct LogdSources
 {
     /// Reserved master-log endpoint source, or `0`.
-    pub master_log_source: u32,
+    pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint, or `0`.
-    pub procmgr_death_auth_source: u32,
+    pub procmgr_death_auth_source: u64,
 }
 
 /// One encoded round: the caps to transfer, none of them `0`, and the data
 /// words, `data[0]` being the round kind.
 pub struct Round
 {
-    caps: [u32; MSG_CAP_SLOTS_MAX],
+    caps: [u64; MSG_CAP_SLOTS_MAX],
     cap_count: usize,
     data: [u64; ROUND_DATA_WORDS],
     data_words: usize,
@@ -151,7 +151,7 @@ impl Round
 {
     /// The caps the round transfers, in wire order.
     #[must_use]
-    pub fn caps(&self) -> &[u32]
+    pub fn caps(&self) -> &[u64]
     {
         &self.caps[..self.cap_count]
     }
@@ -186,7 +186,7 @@ impl Round
 
     /// Append `cap` when it is present, and return `bit` for the presence
     /// bitmap, or `0` when it is absent.
-    fn push_optional(&mut self, cap: u32, bit: u64) -> u64
+    fn push_optional(&mut self, cap: u64, bit: u64) -> u64
     {
         if cap == 0
         {
@@ -284,10 +284,10 @@ impl<const N: usize> SlotListDecoder<N>
     /// past slot `N`.
     fn push(
         &mut self,
-        caps: &[u32],
+        caps: &[u64],
         presence: u64,
         rounds_left: u64,
-    ) -> Result<Option<[u32; N]>, DecodeError>
+    ) -> Result<Option<[u64; N]>, DecodeError>
     {
         let owed_after = Self::ROUNDS
             .checked_sub(self.received + 1)
@@ -349,7 +349,7 @@ impl CapsDecoder
     /// word disagrees with the rounds still owed, or the last round leaves a
     /// required endpoint absent. On an error the round's caps are still the
     /// caller's to release.
-    pub fn push(&mut self, caps: &[u32], data: &[u64]) -> Result<Option<CapsRound>, DecodeError>
+    pub fn push(&mut self, caps: &[u64], data: &[u64]) -> Result<Option<CapsRound>, DecodeError>
     {
         if data.first() != Some(&kind::CAPS)
         {
@@ -385,7 +385,7 @@ impl CapsDecoder
 /// [`DecodeError::Malformed`] when the kind is not `LOGD_SOURCES`, the
 /// presence word is missing, or the presence bitmap disagrees with the
 /// delivered caps.
-pub fn decode_logd_sources(caps: &[u32], data: &[u64]) -> Result<LogdSources, DecodeError>
+pub fn decode_logd_sources(caps: &[u64], data: &[u64]) -> Result<LogdSources, DecodeError>
 {
     if data.first() != Some(&kind::LOGD_SOURCES)
     {
@@ -412,11 +412,11 @@ mod tests
 {
     use super::*;
 
-    const SERVICE: u32 = 0x11;
-    const BOOTSTRAP: u32 = 0x12;
+    const SERVICE: u64 = 0x11;
+    const BOOTSTRAP: u64 = 0x12;
     const VERSION: u64 = ipc::SVCMGR_LABELS_VERSION as u64;
 
-    fn caps_round(rootfs_root: u32, devmgr_registry: u32) -> CapsRound
+    fn caps_round(rootfs_root: u64, devmgr_registry: u64) -> CapsRound
     {
         CapsRound {
             service_ep: SERVICE,
@@ -451,7 +451,7 @@ mod tests
     {
         for mask in 0u32..16
         {
-            let pick = |bit: u32, cap: u32| if mask & bit != 0 { cap } else { 0 };
+            let pick = |bit: u32, cap: u64| if mask & bit != 0 { cap } else { 0 };
             let sent = CapsRound {
                 vfsd_mount: pick(4, 0x23),
                 vfsd_deny: pick(8, 0x24),

@@ -174,9 +174,9 @@ impl RingRelease {
 /// responsibility once the transfer completes (no caller cleanup).
 #[derive(Clone, Copy)]
 pub struct PipeCaps {
-    pub memory: u32,
-    pub data_notification: u32,
-    pub space_notification: u32,
+    pub memory: u64,
+    pub data_notification: u64,
+    pub space_notification: u64,
 }
 
 /// One end of a shmem-backed pipe.
@@ -190,12 +190,12 @@ pub struct PipeCaps {
 /// child death (clean exit or fault). Readers drain the ring once more
 /// after observing either flag before reporting EOF.
 pub struct Pipe {
-    memory_cap: u32,
+    memory_cap: u64,
     ring_vaddr: u64,
-    data_notification: u32,
-    space_notification: u32,
+    data_notification: u64,
+    space_notification: u64,
     role: Role,
-    aspace: u32,
+    aspace: u64,
     /// Reservation-arena range backing `ring_vaddr`, for ends that drew
     /// their ring VA from this process's arena (both `create_for_child`
     /// and `attach_from_caps` ends). Drop unmaps the ring page first,
@@ -431,11 +431,11 @@ impl Pipe {
     /// per piped direction. On failure the reservation is returned to the
     /// arena; on success the `Pipe` owns it and Drop returns it.
     pub fn attach_from_caps(
-        memory_cap: u32,
-        data_notification: u32,
-        space_notification: u32,
+        memory_cap: u64,
+        data_notification: u64,
+        space_notification: u64,
         role: Role,
-        aspace: u32,
+        aspace: u64,
         reserved: ReservedRange,
     ) -> io::Result<Pipe> {
         let child_va = reserved.va_start();
@@ -498,14 +498,14 @@ impl Pipe {
     /// Parent-side `data_notification` cap slot. Exposed for the death-bridge
     /// thread to `notification_send` on, to wake any blocked reader after
     /// `peer_dead` is flipped.
-    pub fn data_notification_cap(&self) -> u32 {
+    pub fn data_notification_cap(&self) -> u64 {
         self.data_notification
     }
 
     /// Parent-side `space_notification` cap slot. Symmetric to
     /// `data_notification_cap`; the bridge kicks this to wake any blocked
     /// writer.
-    pub fn space_notification_cap(&self) -> u32 {
+    pub fn space_notification_cap(&self) -> u64 {
         self.space_notification
     }
 
@@ -759,8 +759,8 @@ impl Drop for Pipe {
 /// `reserved` must be the arena reservation the ring page is mapped at, and
 /// no Rust reference into the page may be live (no `Pipe` was built over it).
 unsafe fn discard_mapped_ring(
-    aspace: u32,
-    memory_cap: u32,
+    aspace: u64,
+    memory_cap: u64,
     ring_phys: u64,
     reserved: ReservedRange,
 ) {

@@ -103,10 +103,10 @@ static mut CALLER_IPC_BUFS: [IpcBufPage; CALLERS] = [
 #[derive(Clone, Copy)]
 struct CallerArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     /// The notification caller A parks on after reporting (unused by B, C).
-    park: u32,
+    park: u64,
     /// Index into the stacks and buffers.
     index: usize,
     /// The call's label and the caller's `done` bits.
@@ -167,9 +167,9 @@ const CALLER_C: Caller = Caller {
 #[derive(Default)]
 struct Parts
 {
-    ep: Option<u32>,
-    done: Option<u32>,
-    park: Option<u32>,
+    ep: Option<u64>,
+    done: Option<u64>,
+    park: Option<u64>,
     callers: [Option<spawn::SpawnedChild>; CALLERS],
     faulter: Option<spawn::SpawnedChild>,
 }
@@ -177,9 +177,9 @@ struct Parts
 /// The objects the phases share.
 struct Objects
 {
-    ep: u32,
-    done: u32,
-    park: u32,
+    ep: u64,
+    done: u64,
+    park: u64,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -343,7 +343,7 @@ fn call_and_receive(
 /// receiving it. Returns the `done` bits collected.
 fn reply_and_check(
     ctx: &TestContext,
-    done: u32,
+    done: u64,
     acc: u64,
     caller: &Caller,
 ) -> Result<u64, &'static str>
@@ -405,7 +405,7 @@ fn start_caller(
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
 /// failing when a scaled [`REPORT_MS`] wait passes with nothing new.
-fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
+fn wait_for(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {

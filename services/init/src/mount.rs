@@ -31,7 +31,7 @@ use ipc::vfsd_labels;
 /// seed from which all later tier-3 namespace-cap distribution flows
 /// (`cap_copy` for the parent-inherit default, walk-and-attenuate for
 /// sandboxed views).
-pub fn request_system_root(vfsd_ep: u32, ipc_buf: *mut u64) -> u32
+pub fn request_system_root(vfsd_ep: u64, ipc_buf: *mut u64) -> u64
 {
     let msg = ipc::IpcMessage::builder(vfsd_labels::GET_SYSTEM_ROOT_CAP)
         .word(0, u64::from(ipc::VFSD_LABELS_VERSION))

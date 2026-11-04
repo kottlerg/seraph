@@ -28,7 +28,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::sync::atomic::AtomicU32;
+use crate::sync::atomic::{AtomicU32, AtomicU64};
 use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 const WRITER_BIT: u32 = 1 << 30;
@@ -41,13 +41,13 @@ const MAX_READERS: u32 = READER_MASK - 1;
 
 pub struct RwLock {
     state: AtomicU32,
-    notification: AtomicU32,
+    notification: AtomicU64,
 }
 
 impl RwLock {
     #[inline]
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(0), notification: AtomicU32::new(0) }
+        Self { state: AtomicU32::new(0), notification: AtomicU64::new(0) }
     }
 
     #[inline]
@@ -204,7 +204,7 @@ impl RwLock {
 }
 
 /// Block until a wake arrives on `sig`, or spin once without a cap.
-fn park(sig: u32) {
+fn park(sig: u64) {
     if sig != 0 {
         let _ = syscall::notification_wait(sig);
     } else {
@@ -231,7 +231,7 @@ impl Drop for RwLock {
     }
 }
 
-fn ensure_notification(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU64) -> u64 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;

@@ -185,9 +185,9 @@ static mut SYNCER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 #[derive(Clone, Copy)]
 struct HandlerArgs
 {
-    ep: u32,
-    aspace: u32,
-    frame: u32,
+    ep: u64,
+    aspace: u64,
+    frame: u64,
 }
 
 static HANDLER_ARGS: spawn::ArgBlock<HandlerArgs, 1> = spawn::ArgBlock::new(HandlerArgs {
@@ -196,18 +196,31 @@ static HANDLER_ARGS: spawn::ArgBlock<HandlerArgs, 1> = spawn::ArgBlock::new(Hand
     frame: 0,
 });
 
+/// The syncer's arguments, handed to its entry by address.
+#[derive(Clone, Copy)]
+struct SyncerArgs
+{
+    /// The endpoint the syncer calls the handler on.
+    ep: u64,
+    /// The notification the controller sends sync requests on.
+    notif: u64,
+}
+
+static SYNCER_ARGS: spawn::ArgBlock<SyncerArgs, 1> =
+    spawn::ArgBlock::new(SyncerArgs { ep: 0, notif: 0 });
+
 /// What the test creates; each is released on every path. The children run
 /// in ktest's own `CSpace`, so they share the test's cap handles and a
 /// respawn copies nothing.
 #[derive(Default)]
 struct Parts
 {
-    ep: Option<u32>,
-    frame: Option<u32>,
-    sync_notif: Option<u32>,
-    handler: Option<u32>,
-    syncer: Option<u32>,
-    faulter: Option<u32>,
+    ep: Option<u64>,
+    frame: Option<u64>,
+    sync_notif: Option<u64>,
+    handler: Option<u64>,
+    syncer: Option<u64>,
+    faulter: Option<u64>,
 }
 
 /// What the rounds saw.
@@ -403,20 +416,21 @@ fn setup(ctx: &TestContext, parts: &mut Parts) -> TestResult
 }
 
 /// Create the syncer's request notification, then the syncer, handed the
-/// endpoint and the notification as the two halves of its argument, and
-/// start it.
-fn spawn_syncer(ctx: &TestContext, parts: &mut Parts, ep: u32) -> TestResult
+/// endpoint and the notification through [`SYNCER_ARGS`], and start it.
+fn spawn_syncer(ctx: &TestContext, parts: &mut Parts, ep: u64) -> TestResult
 {
     let notif = *parts.sync_notif.insert(
         cap_create_notification(ctx.memory_base)
             .map_err(|_| "stress::stop_fault_sender: create sync notification failed")?,
     );
+    // SAFETY: the single entry is published once, before the syncer starts.
+    let arg = unsafe { SYNCER_ARGS.publish(0, SyncerArgs { ep, notif }) };
     create_thread(
         ctx,
         &mut parts.syncer,
         syncer_entry,
         SYNCER_STACK,
-        (u64::from(notif) << 32) | u64::from(ep),
+        arg,
         SYNCER_CPU,
     )?;
     let syncer = parts.syncer.ok_or("stress::stop_fault_sender: no syncer")?;
@@ -428,7 +442,7 @@ fn spawn_syncer(ctx: &TestContext, parts: &mut Parts, ep: u32) -> TestResult
 /// is recorded in `slot` before anything else can fail.
 fn create_thread(
     ctx: &TestContext,
-    slot: &mut Option<u32>,
+    slot: &mut Option<u64>,
     entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
@@ -459,7 +473,7 @@ fn spawn_faulter(ctx: &TestContext, parts: &mut Parts) -> TestResult
         &mut parts.faulter,
         faulter_entry,
         FAULTER_STACK,
-        u64::from(ctx.aspace_cap),
+        ctx.aspace_cap,
         FAULTER_CPU,
     )?;
     let th = parts
@@ -473,7 +487,7 @@ fn spawn_faulter(ctx: &TestContext, parts: &mut Parts) -> TestResult
 
 /// Wait, bounded, until the handler has registered its IPC buffer, so no
 /// sync call queues on an endpoint nothing receives on.
-fn await_handler_ready(handler: u32) -> TestResult
+fn await_handler_ready(handler: u64) -> TestResult
 {
     for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
@@ -515,7 +529,7 @@ fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
 
 /// One round against the live faulter `th`, served by `handler`. Returns
 /// the faulter's exit reason if it died.
-fn round(th: u32, handler: u32, cycle: u32, tally: &mut Tally)
+fn round(th: u64, handler: u64, cycle: u32, tally: &mut Tally)
 -> Result<Option<u64>, &'static str>
 {
     if arm(th, handler, cycle, tally)? == Wait::Exited
@@ -528,7 +542,7 @@ fn round(th: u32, handler: u32, cycle: u32, tally: &mut Tally)
 /// Wait for a fault attempt in flight, then for the handler's next receive
 /// entry (or the faulter completing the fault meanwhile), then spin the
 /// round's phase. Returns [`Wait::Exited`] if the faulter died meanwhile.
-fn arm(th: u32, handler: u32, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
+fn arm(th: u64, handler: u64, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
 {
     let attempted = await_faulter(th, handler, tally, || {
         ATTEMPTS.load(Ordering::Acquire) != PROGRESS.load(Ordering::Acquire)
@@ -577,7 +591,7 @@ fn phase_spins(cycle: u32) -> u32
 /// Stop the faulter, note whether a fault attempt was in flight and whether
 /// a reply returned `Ok` during the stop, restart it, and wait for it to
 /// complete the fault or die. Returns its exit reason if it died.
-fn stop_and_restart(th: u32, handler: u32, tally: &mut Tally) -> Result<Option<u64>, &'static str>
+fn stop_and_restart(th: u64, handler: u64, tally: &mut Tally) -> Result<Option<u64>, &'static str>
 {
     let resumed = RESUMED.load(Ordering::Acquire);
     if let Err(e) = thread_stop(th)
@@ -637,8 +651,8 @@ fn stop_and_restart(th: u32, handler: u32, tally: &mut Tally) -> Result<Option<u
 /// syscalls, polled every [`POLL_SPINS`] spins so the reaction to `done`
 /// stays tight.
 fn await_faulter(
-    th: u32,
-    handler: u32,
+    th: u64,
+    handler: u64,
     tally: &mut Tally,
     done: impl Fn() -> bool,
 ) -> Result<Wait, &'static str>
@@ -680,7 +694,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 }
 
 /// The exit reason of the exited faulter `th`.
-fn exit_reason(th: u32) -> Result<u64, &'static str>
+fn exit_reason(th: u64) -> Result<u64, &'static str>
 {
     spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::stop_fault_sender: the faulter's exit reason could not be read")
@@ -859,11 +873,9 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
 
 /// Faulter: until told to quit, count an attempt, store to the reserved
 /// page, unmap the page the handler mapped for it, and count the completion.
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn faulter_entry(arg: u64) -> !
 {
-    let aspace = arg as u32;
+    let aspace = arg;
     let page = RESERVED_VA as *mut u64;
     while QUIT.load(Ordering::Acquire) == 0
     {
@@ -1010,14 +1022,12 @@ fn service_fault(args: &HandlerArgs, buf: *mut u64)
 /// Syncer: register the IPC buffer, then, per request the controller sends
 /// on the notification, call the handler with the requested label, tally a
 /// call that failed or was answered with another label, and count the call
-/// done; exit after the quit call. `arg` holds the endpoint in its low half
-/// and the notification in its high half.
-// cast_possible_truncation: each half of the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
+/// done; exit after the quit call. `arg` is the [`SYNCER_ARGS`] entry that
+/// holds the endpoint and the notification.
 extern "C" fn syncer_entry(arg: u64) -> !
 {
-    let ep = arg as u32;
-    let notif = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry `spawn_syncer` published for the syncer.
+    let SyncerArgs { ep, notif } = unsafe { spawn::child_args(arg) };
     // SAFETY: sole user of SYNCER_IPC_BUF (one syncer per test; stress tests
     // run sequentially).
     let buf = core::ptr::addr_of_mut!(SYNCER_IPC_BUF).cast::<u64>();

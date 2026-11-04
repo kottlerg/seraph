@@ -12,7 +12,7 @@
 //! owns the run's terminal marker: `ALL TESTS PASSED` from `main` after
 //! the last phase, or `SOME TESTS FAILED` from a failure hook.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bootstrap::Caps;
 
@@ -27,7 +27,7 @@ pub struct Phase
 
 /// The authority-badged pwrmgr cap the failure hooks send `SHUTDOWN` on;
 /// zero until the bootstrap rounds deliver it.
-static SHUTDOWN_CAP: AtomicU32 = AtomicU32::new(0);
+static SHUTDOWN_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Set by the first path that claims the run's terminal marker, so a run
 /// logs exactly one (docs/testing.md § Reporting marker) even when a

@@ -54,6 +54,19 @@ const CPU_WAIT_SLICE_MS: u64 = 5;
 /// changes.
 static WORKER_CPU: [AtomicU32; NUM_WORKERS] = [const { AtomicU32::new(u32::MAX) }; NUM_WORKERS];
 
+/// Per-worker arguments, handed to `spinner_entry` by address.
+#[derive(Clone, Copy)]
+struct SpinnerArgs
+{
+    /// The worker's notify copy of the controller's `moved` notification.
+    moved: u64,
+    /// Worker index: its `moved` bit and its [`WORKER_CPU`] entry.
+    index: usize,
+}
+
+static SPINNER_ARGS: spawn::ArgBlock<SpinnerArgs, NUM_WORKERS> =
+    spawn::ArgBlock::new(SpinnerArgs { moved: 0, index: 0 });
+
 /// The workers' guards; Phase 2 deletes each, and a failed phase leaves
 /// the rest for the cleanup in [`run`].
 struct Workers
@@ -94,7 +107,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Start the workers, each reporting its CPU on `moved`, and wait until
 /// every one has run (they are created at the floor, strictly below this
 /// thread) — priority placement only matters once they have been on a queue.
-fn spawn_workers(ctx: &TestContext, moved: u32, workers: &mut Workers) -> TestResult
+fn spawn_workers(ctx: &TestContext, moved: u64, workers: &mut Workers) -> TestResult
 {
     for i in 0..NUM_WORKERS
     {
@@ -103,8 +116,17 @@ fn spawn_workers(ctx: &TestContext, moved: u32, workers: &mut Workers) -> TestRe
         let child = &workers.children[i];
         let child_moved = cap_copy(moved, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "stress::priority_dealloc_race: cap_copy moved failed")?;
-        // arg packs moved_slot[31:0] | worker index[63:32].
-        let arg = u64::from(child_moved) | ((i as u64) << 32);
+        // SAFETY: i < NUM_WORKERS; entry i's previous worker (if any, from
+        // an earlier run) was deleted before that run returned.
+        let arg = unsafe {
+            SPINNER_ARGS.publish(
+                i,
+                SpinnerArgs {
+                    moved: child_moved,
+                    index: i,
+                },
+            )
+        };
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
@@ -126,7 +148,7 @@ fn spawn_workers(ctx: &TestContext, moved: u32, workers: &mut Workers) -> TestRe
 /// delete each worker through its guard).
 fn churn_and_delete(
     ctx: &TestContext,
-    moved: u32,
+    moved: u64,
     cpu_mod: u32,
     workers: &mut Workers,
 ) -> TestResult
@@ -209,7 +231,7 @@ fn churn_and_delete(
 /// Wait, bounded by [`CPU_WAIT_SLICES`], until worker `index` reports
 /// running on `cpu`. Each slice blocks on `moved`, so a worker sharing this
 /// thread's CPU runs meanwhile.
-fn await_worker_on(moved: u32, index: usize, cpu: u32) -> TestResult
+fn await_worker_on(moved: u64, index: usize, cpu: u32) -> TestResult
 {
     for _ in 0..crate::scaled_bound(CPU_WAIT_SLICES)
     {
@@ -232,14 +254,14 @@ fn await_worker_on(moved: u32, index: usize, cpu: u32) -> TestResult
 
 /// Spin, reading this worker's CPU every [`CPU_CHECK_SPINS`] spins and, when
 /// it changed, publishing it in [`WORKER_CPU`] and sending this worker's bit
-/// on `moved` (the low half of `arg`; the worker index is the high half).
-// cast_possible_truncation: the low half is a 32-bit cap handle, the high
-// half a worker index below NUM_WORKERS, and a CPU index fits u32.
+/// on `moved` (both read from the [`SpinnerArgs`] entry at `arg`).
+// cast_possible_truncation: a CPU index fits u32.
 #[allow(clippy::cast_possible_truncation)]
 extern "C" fn spinner_entry(arg: u64) -> !
 {
-    let moved = arg as u32;
-    let index = (arg >> 32) as usize;
+    // SAFETY: `arg` is the `SPINNER_ARGS.publish` value for this worker;
+    // the entry is not rewritten while the worker lives.
+    let SpinnerArgs { moved, index } = unsafe { spawn::child_args(arg) };
     loop
     {
         if let Ok(cpu) = system_info(SystemInfoType::CurrentCpu as u64)

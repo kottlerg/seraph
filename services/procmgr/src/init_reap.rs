@@ -69,7 +69,7 @@ const PROBE_SETTLE_BUDGET_NS: u64 = 500_000_000;
 struct ReleaseProbe
 {
     /// procmgr's slot for the one-page grant the endpoint is retyped from.
-    page: u32,
+    page: u64,
     /// The grant's physical base, naming it to `RELEASE_MEMORY_CAPS`.
     phys_base: u64,
     /// The page's `available_bytes` with the endpoint alive.
@@ -81,7 +81,7 @@ impl ReleaseProbe
     /// Retype the probe endpoint and move it into init's `CSpace` through
     /// procmgr's `cspace` cap. `None` when any step fails, after undoing the
     /// steps that succeeded; the reap then reports no probe result.
-    fn place(memmgr_ep: u32, cspace: u32, ipc_buf: *mut u64) -> Option<Self>
+    fn place(memmgr_ep: u64, cspace: u64, ipc_buf: *mut u64) -> Option<Self>
     {
         let page = crate::memmgr_alloc_pages_contig(memmgr_ep, 1, ipc_buf)?;
         let Ok(phys_base) = syscall::cap_info(page, CAP_INFO_MEMORY_PHYS_BASE)
@@ -123,7 +123,7 @@ impl ReleaseProbe
     /// still backs the page, so the page is then kept (its cap dropped, its
     /// pages still billed to procmgr) rather than reissued under a live
     /// object.
-    fn settle(self, memmgr_ep: u32, ipc_buf: *mut u64) -> u64
+    fn settle(self, memmgr_ep: u64, ipc_buf: *mut u64) -> u64
     {
         let released = poll_within(
             PROBE_SETTLE_BUDGET_NS,
@@ -148,7 +148,7 @@ impl ReleaseProbe
 
 /// Drop procmgr's cap on a one-page grant and return the page to memmgr's
 /// pool by its physical base (`RELEASE_MEMORY_CAPS`).
-fn release_page(memmgr_ep: u32, page: u32, phys_base: u64, ipc_buf: *mut u64)
+fn release_page(memmgr_ep: u64, page: u64, phys_base: u64, ipc_buf: *mut u64)
 {
     let _ = syscall::cap_delete(page);
     let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
@@ -183,11 +183,11 @@ pub fn handle_query(req: &IpcMessage, ipc_buf: *mut u64)
 /// and boot-module ELF sources).
 pub struct InitReapState
 {
-    aspace: u32,
-    cspace: u32,
-    main_thread: u32,
-    logd_thread: u32,
-    donate_caps: Vec<u32>,
+    aspace: u64,
+    cspace: u64,
+    main_thread: u64,
+    logd_thread: u64,
+    donate_caps: Vec<u64>,
 }
 
 /// The handoff: `Empty` until init's first `REGISTER_INIT_TEARDOWN`,
@@ -210,7 +210,7 @@ static STATE: Mutex<InitReap<InitReapState>> = Mutex::new(InitReap::Empty);
 /// Init observes the error reply and aborts its handoff, so those caps are a
 /// one-shot leak on a failure-only path. After the reap no init mapping is
 /// left, and the caps are deleted.
-fn refuse(refusal: Refusal, caps: &[u32], ipc_buf: *mut u64)
+fn refuse(refusal: Refusal, caps: &[u64], ipc_buf: *mut u64)
 {
     let (code, disposition) = match refusal
     {
@@ -316,7 +316,7 @@ pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 /// threadless, whether or not `INIT_TEARDOWN_DONE` armed the handoff: a
 /// threadless init can send no further round. A death with no open handoff
 /// (none opened, or the reap already ran) is a no-op.
-pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
+pub fn run_reap(memmgr_ep: u64, ipc_buf: *mut u64)
 {
     let outcome = STATE.lock().expect("init-reap state poisoned").death();
     match outcome
@@ -337,7 +337,7 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
 /// Tear init down once it is threadless: both threads `Exited` via the normal
 /// handover path (init-logd exits on real-logd's `HANDOVER_RELEASE`). Ordering
 /// matters — see the inline steps.
-fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
+fn do_reap(state: InitReapState, memmgr_ep: u64, ipc_buf: *mut u64)
 {
     // Consume the teardown state — this reap is one-shot.
     let InitReapState {
@@ -408,7 +408,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     );
 }
 
-fn donate_to_memmgr(memmgr_ep: u32, caps: &[u32], ipc_buf: *mut u64) -> (u32, u64, u64)
+fn donate_to_memmgr(memmgr_ep: u64, caps: &[u64], ipc_buf: *mut u64) -> (u32, u64, u64)
 {
     if memmgr_ep == 0 || caps.is_empty()
     {

@@ -33,7 +33,7 @@ pub enum CreateSource
     /// [`spawn_simple_device`] deletes the cap on the caller's behalf — a
     /// retained boot-module cap is a live derivation child of init's donated
     /// pool-run source and pins that run unsplittable.
-    Module(u32),
+    Module(u64),
     /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
     /// the file size hint reported by the resolving `NS_LOOKUP`. On any
     /// pre-`ipc_call` failure inside [`spawn_simple_device`], the function
@@ -41,7 +41,7 @@ pub enum CreateSource
     /// derived by the namespace walk and has no retry value.
     File
     {
-        file_cap: u32, size: u64
+        file_cap: u64, size: u64
     },
 }
 
@@ -57,12 +57,12 @@ pub enum CreateSource
 /// `CREATE_PROCESS` `ipc_call` returned, transferring the cap, or an inner spawn
 /// step has taken over its lifecycle) so the cap is not double-freed — the slot
 /// is freed and the kernel's LIFO freelist promptly reuses it for a live cap.
-pub struct ModuleCapGuard(u32);
+pub struct ModuleCapGuard(u64);
 
 impl ModuleCapGuard
 {
     /// Arm a guard over `slot` (0 = nothing to guard).
-    pub fn new(slot: u32) -> Self
+    pub fn new(slot: u64) -> Self
     {
         Self(slot)
     }
@@ -95,8 +95,8 @@ impl Drop for ModuleCapGuard
 /// of leaving it hung in `request_round`.
 struct ChildGuard
 {
-    process_handle: u32,
-    thread_cap: u32,
+    process_handle: u64,
+    thread_cap: u64,
     ipc_buf: *mut u64,
     destroy: bool,
 }
@@ -104,7 +104,7 @@ struct ChildGuard
 impl ChildGuard
 {
     /// Arm a guard over a freshly-created child's reply caps.
-    fn new(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64) -> Self
+    fn new(process_handle: u64, thread_cap: u64, ipc_buf: *mut u64) -> Self
     {
         Self {
             process_handle,
@@ -119,7 +119,7 @@ impl ChildGuard
     /// settles (to destroy a driver that never reports ready) or withdraws
     /// the started driver at once when its bootstrap failed. `Drop` still
     /// frees the thread cap.
-    fn keep_handle(mut self) -> u32
+    fn keep_handle(mut self) -> u64
     {
         self.destroy = false;
         core::mem::take(&mut self.process_handle)
@@ -151,7 +151,7 @@ impl Drop for ChildGuard
 /// created with `CREATE_DMA_HOLD` and started, whose pages procmgr then holds
 /// until a `RELEASE_HOLD` this function never sends) and release the handle.
 /// A child that has already died is a no-op for procmgr.
-pub fn destroy_child(process_handle: u32, ipc_buf: *mut u64)
+pub fn destroy_child(process_handle: u64, ipc_buf: *mut u64)
 {
     send_destroy(process_handle, ipc_buf);
     let _ = syscall::cap_delete(process_handle);
@@ -162,7 +162,7 @@ pub fn destroy_child(process_handle: u32, ipc_buf: *mut u64)
 /// only once the child's device is confirmed quiet; procmgr's teardown of the
 /// child, by this destroy or by its own reap of a dead child, precedes the
 /// release, since procmgr serves both calls in order.
-pub fn destroy_and_release(process_handle: u32, ipc_buf: *mut u64)
+pub fn destroy_and_release(process_handle: u64, ipc_buf: *mut u64)
 {
     send_destroy(process_handle, ipc_buf);
     let release_msg = IpcMessage::new(procmgr_labels::RELEASE_HOLD);
@@ -177,7 +177,7 @@ pub fn destroy_and_release(process_handle: u32, ipc_buf: *mut u64)
 
 /// Send `DESTROY_PROCESS` on `process_handle`; procmgr replies success
 /// whatever the child's state.
-fn send_destroy(process_handle: u32, ipc_buf: *mut u64)
+fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
 {
     let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -208,7 +208,7 @@ fn mint_bootstrap_badge() -> Option<u64>
 pub struct BarSpec
 {
     pub bar: u8,
-    pub cap: u32,
+    pub cap: u64,
     pub bytes: u64,
 }
 
@@ -217,8 +217,8 @@ pub struct BarSpec
 /// driver spawn needs the full set.
 pub struct DriverSpawnConfig<'a>
 {
-    pub procmgr_ep: u32,
-    pub bootstrap_ep: u32,
+    pub procmgr_ep: u64,
+    pub bootstrap_ep: u64,
     /// ELF source for the child: a boot-module Memory cap
     /// ([`CreateSource::Module`], the bootstrap-essential PCI drivers) or a
     /// rootfs file cap ([`CreateSource::File`], for on-disk PCI drivers loaded
@@ -231,19 +231,19 @@ pub struct DriverSpawnConfig<'a>
     /// regions name, in ascending BAR index
     /// ([`virtio_core::RegisterLayout::bars`]); 1 to [`MAX_VIRTIO_BARS`].
     pub bars: &'a [BarSpec],
-    pub irq_cap: Option<u32>,
+    pub irq_cap: Option<u64>,
     /// The `SYS_IRQ_REGISTER` mode of `irq_cap`'s line, delivered as round 2's
     /// mode word ([`virtio_core::bootstrap::DATA_IRQ_MODE`]); 0 without an IRQ.
     pub irq_mode: u64,
-    pub service_ep: u32,
+    pub service_ep: u64,
     /// Endpoint the driver's devmgr query cap is a `device_badge`-badged
     /// SEND on: the private driver endpoint of the driver's settle batch
     /// ([`crate::settle::SettleBatch::driver_ep`]).
-    pub query_ep: u32,
+    pub query_ep: u64,
     /// Event queue the driver's death observer posts to, with `device_badge`
     /// as the correlator: devmgr's driver death queue
     /// ([`crate::settle::DriverWatch::death_eq`]).
-    pub death_eq: u32,
+    pub death_eq: u64,
     pub device_badge: u64,
     /// Priority level the driver is created at; its band ceiling equals
     /// its level (a driver never spawns further processes). Rides the
@@ -257,11 +257,11 @@ pub struct DriverSpawnConfig<'a>
 pub enum DriverSpawn
 {
     /// The driver completed its bootstrap: its badged process handle.
-    Bootstrapped(u32),
+    Bootstrapped(u64),
     /// The driver was started but its bootstrap failed after it, so it may
     /// hold the device's BAR caps: its process handle, through which the
     /// caller withdraws it from the device and destroys it as a live driver.
-    Unbootstrapped(u32),
+    Unbootstrapped(u64),
     /// The spawn failed before the driver started; the child, if created,
     /// is torn down and its pages returned.
     Failed,
@@ -406,10 +406,10 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
     // Derive all per-child caps for delivery via bootstrap. Each derivation
     // owns a devmgr slot that must be released on later failure paths so devmgr
     // does not leak it; the child itself is reaped by `child_guard`.
-    let mut bar_copies = [0u32; MAX_VIRTIO_BARS];
+    let mut bar_copies = [0u64; MAX_VIRTIO_BARS];
     let mut bar_indices = [0u64; MAX_VIRTIO_BARS];
     let bar_count = config.bars.len();
-    let drop_bars = |copies: &[u32]| {
+    let drop_bars = |copies: &[u64]| {
         for &c in copies
         {
             let _ = syscall::cap_delete(c);
@@ -514,7 +514,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
     // IRQ line's mode, done. A null slot cannot be transferred, so an absent
     // IRQ (devmgr could give the device none) is named absent in the
     // presence word instead.
-    let mut slots = [0u32; ROUND2_SLOTS];
+    let mut slots = [0u64; ROUND2_SLOTS];
     slots[SLOT_SERVICE] = service_copy;
     slots[SLOT_IRQ] = irq_copy;
     slots[SLOT_DEVMGR_QUERY] = devmgr_copy;
@@ -555,26 +555,26 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
 /// spawn ([`spawn_simple_device`]).
 pub struct SimpleSpawnConfig<'a>
 {
-    pub procmgr_ep: u32,
-    pub bootstrap_ep: u32,
+    pub procmgr_ep: u64,
+    pub bootstrap_ep: u64,
     /// ELF source: a boot-module Memory cap (serial, framebuffer) or a
     /// rootfs file cap (the per-arch RTC, `test-orphan`).
     pub source: CreateSource,
     /// devmgr-owned service endpoint; the driver receives on a copy.
-    pub service_ep: u32,
+    pub service_ep: u64,
     /// The device's arch authority cap, moved into the child.
-    pub hw_cap: u32,
+    pub hw_cap: u64,
     /// The UART interrupt cap, moved into the child; 0 for none.
-    pub irq_cap: u32,
+    pub irq_cap: u64,
     /// The driver's devmgr query cap, moved into the child: a SEND badged
     /// with `device_badge` on its settle batch's private endpoint
     /// ([`crate::settle::SettleBatch::driver_ep`]).
-    pub query_ep: u32,
+    pub query_ep: u64,
     /// Event queue the driver's death observer posts to, with
     /// `device_badge` as the correlator: devmgr's driver death queue
     /// ([`crate::settle::DriverWatch::death_eq`]). `None` binds no observer
     /// (the `test-orphan` shim, whose child never runs past its bootstrap).
-    pub death_eq: Option<u32>,
+    pub death_eq: Option<u64>,
     pub device_badge: u64,
     /// Data words round 1 carries: the CMOS RTC's century register index,
     /// and empty for every other device.
@@ -614,7 +614,7 @@ pub struct SimpleSpawnConfig<'a>
 // extracting helpers requires threading the same parameters through. The
 // linear presentation matches the bootstrap protocol one-to-one.
 #[allow(clippy::too_many_lines)]
-pub fn spawn_simple_device(config: &SimpleSpawnConfig, ipc_buf: *mut u64) -> Option<u32>
+pub fn spawn_simple_device(config: &SimpleSpawnConfig, ipc_buf: *mut u64) -> Option<u64>
 {
     let source_cap = match config.source
     {
@@ -748,7 +748,7 @@ pub fn spawn_simple_device(config: &SimpleSpawnConfig, ipc_buf: *mut u64) -> Opt
 
     // Round 1 (not terminal): [service, hw_cap, irq_cap?] with the round-1
     // words. irq_cap rides only when present (the serial driver).
-    let round1_caps: [u32; 3] = [service_copy, config.hw_cap, config.irq_cap];
+    let round1_caps: [u64; 3] = [service_copy, config.hw_cap, config.irq_cap];
     let round1_len = if config.irq_cap != 0 { 3 } else { 2 };
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {

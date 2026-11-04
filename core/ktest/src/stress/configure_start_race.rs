@@ -131,7 +131,7 @@ static READY: AtomicU32 = AtomicU32::new(0);
 static GO: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 /// The armed round's thread, a handle in ktest's `CSpace`.
-static TARGET: AtomicU32 = AtomicU32::new(0);
+static TARGET: AtomicU64 = AtomicU64::new(0);
 /// The helper's configure result for the round it last finished.
 static OUTCOME: AtomicU32 = AtomicU32::new(0);
 /// The top of each entry's stack, published once per run.
@@ -217,19 +217,11 @@ fn report(tally: &Tally) -> TestResult
 /// next test even after a failed round).
 fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str>
 {
-    for counter in [
-        &QUIT,
-        &HELPER_EXITED,
-        &ARMED,
-        &READY,
-        &GO,
-        &DONE,
-        &TARGET,
-        &OUTCOME,
-    ]
+    for counter in [&QUIT, &HELPER_EXITED, &ARMED, &READY, &GO, &DONE, &OUTCOME]
     {
         counter.store(0, Ordering::Release);
     }
+    TARGET.store(0, Ordering::Release);
     for tally in [&BAD_CONFIGURES, &BAD_FRAMES]
     {
         tally.reset();
@@ -273,7 +265,7 @@ fn stack_top(index: usize) -> u64
 /// controller publishes are valid for it), on its stress stack, pinned to
 /// [`HELPER_CPU`], and start it. It is recorded in `slot` before anything
 /// else can fail.
-fn start_helper(ctx: &TestContext, slot: &mut Option<u32>) -> Result<u32, &'static str>
+fn start_helper(ctx: &TestContext, slot: &mut Option<u64>) -> Result<u64, &'static str>
 {
     let th = *slot.insert(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
@@ -345,8 +337,8 @@ fn create_target(
     ctx: &TestContext,
     seq: u32,
     target_cpu: u32,
-    slot: &mut Option<u32>,
-) -> Result<u32, &'static str>
+    slot: &mut Option<u64>,
+) -> Result<u64, &'static str>
 {
     let th = *slot.insert(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
@@ -372,7 +364,7 @@ fn create_target(
 /// Arm the round, wait for the helper, release it, spin this side's delay,
 /// start the thread, then wait for the helper's configure and the thread's
 /// exit and check the outcome.
-fn race(th: u32, seq: u32) -> Result<u32, &'static str>
+fn race(th: u64, seq: u32) -> Result<u32, &'static str>
 {
     TARGET.store(th, Ordering::Release);
     ARMED.store(seq, Ordering::Release);
@@ -413,7 +405,7 @@ fn race(th: u32, seq: u32) -> Result<u32, &'static str>
 
 /// Wait, bounded, for the raced thread to reach `Exited`, and require it to
 /// have exited voluntarily (a torn frame faults, or runs garbage).
-fn await_exit(th: u32) -> TestResult
+fn await_exit(th: u64) -> TestResult
 {
     let reason = spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::configure_start_race: the thread did not reach Exited")?;
@@ -461,7 +453,7 @@ fn check_ran(seq: u32, outcome: u32) -> TestResult
 
 /// Set [`QUIT`] and wait, bounded, for the helper to exit, then require it
 /// to have exited voluntarily.
-fn finish(helper: u32) -> TestResult
+fn finish(helper: u64) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     let reason = spawn::wait_until_exited(helper, crate::scaled_polls(EXIT_POLLS))

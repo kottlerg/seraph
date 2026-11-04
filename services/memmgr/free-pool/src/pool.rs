@@ -22,7 +22,7 @@ use crate::arena::{Arena, NODE_NULL, Node, NodeIdx, SlotStore};
 pub const MAX_GRANT_RUNS: usize = MSG_CAP_SLOTS_MAX;
 
 /// One granted entry: `(cap_slot, page_count, phys_base)`.
-pub type GrantEntry = (u32, u32, u64);
+pub type GrantEntry = (u64, u32, u64);
 
 /// A selection: the granted entries, `count` of them valid. Its page total
 /// MAY be below the request for a best-effort grant (see
@@ -284,8 +284,8 @@ impl FreePool
         arena: &mut Arena<S>,
         c: Cursor,
         want: u32,
-        split: impl FnOnce(u32, u64) -> Option<u32>,
-    ) -> Option<(u32, u64)>
+        split: impl FnOnce(u64, u64) -> Option<u64>,
+    ) -> Option<(u64, u64)>
     {
         let run = run_of(arena, c.cur)?;
         let want_pages = u64::from(want);
@@ -322,7 +322,7 @@ impl FreePool
     pub fn coalesce_with<S: SlotStore>(
         &mut self,
         arena: &mut Arena<S>,
-        merge: impl Fn(u32, u32) -> bool,
+        merge: impl Fn(u64, u64) -> bool,
     )
     {
         let mut cur = self.head;
@@ -381,7 +381,7 @@ impl FreePool
         arena: &mut Arena<S>,
         want: u32,
         fit: Fit,
-        mut split: impl FnMut(u32, u64) -> Option<u32>,
+        mut split: impl FnMut(u64, u64) -> Option<u64>,
     ) -> Result<Grant, SelectError>
     {
         let mut grant = Grant {
@@ -441,7 +441,7 @@ impl FreePool
         &mut self,
         arena: &mut Arena<S>,
         run: FreeRun,
-        merge: impl FnOnce(u32, u32) -> bool,
+        merge: impl FnOnce(u64, u64) -> bool,
     ) -> bool
     {
         let Some(end) = run
@@ -499,7 +499,7 @@ mod tests
     use super::*;
     use crate::arena::test_store::VecStore;
 
-    fn run(cap_slot: u32, page_count: u64, phys_base: u64) -> FreeRun
+    fn run(cap_slot: u64, page_count: u64, phys_base: u64) -> FreeRun
     {
         FreeRun {
             cap_slot,
@@ -523,7 +523,7 @@ mod tests
         v
     }
 
-    fn no_split(_: u32, _: u64) -> Option<u32>
+    fn no_split(_: u64, _: u64) -> Option<u64>
     {
         panic!("split must not run")
     }
@@ -670,7 +670,7 @@ mod tests
             t != 30
         });
         assert_eq!(*asked.borrow(), [(10, 20), (10, 30)]);
-        let rest: Vec<(u32, u64)> = runs(&pool, &a)
+        let rest: Vec<(u64, u64)> = runs(&pool, &a)
             .iter()
             .map(|r| (r.cap_slot, r.page_count))
             .collect();
@@ -700,7 +700,7 @@ mod tests
         let mut pool = FreePool::new();
         for i in 0..6u32
         {
-            pool.push(&mut a, run(i, 1, u64::from(i) * 0x10000))
+            pool.push(&mut a, run(u64::from(i), 1, u64::from(i) * 0x10000))
                 .unwrap();
         }
         let grant = pool.select(&mut a, 6, Fit::BestEffort, no_split).unwrap();
@@ -737,7 +737,7 @@ mod tests
         let grant = pool
             .select(&mut a, 6, Fit::BestEffort, |cap, _| Some(cap + 100))
             .unwrap();
-        let caps: Vec<(u32, u32)> = grant.entries().iter().map(|e| (e.0, e.1)).collect();
+        let caps: Vec<(u64, u32)> = grant.entries().iter().map(|e| (e.0, e.1)).collect();
         assert_eq!(caps, [(2, 5), (1, 1)]);
         assert_eq!(pool.free_pages(), 2);
     }
@@ -817,7 +817,9 @@ mod tests
         unsafe { a.add_page() };
         let mut pool = FreePool::new();
         let mut i = 0u32;
-        while pool.push(&mut a, run(i, 1, u64::from(i) * 0x10000)).is_ok()
+        while pool
+            .push(&mut a, run(u64::from(i), 1, u64::from(i) * 0x10000))
+            .is_ok()
         {
             i += 1;
         }

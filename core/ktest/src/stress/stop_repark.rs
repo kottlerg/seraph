@@ -160,7 +160,7 @@ struct ChildArgs
 {
     kind: Kind,
     /// The two sources, handles in ktest's `CSpace`.
-    sources: [u32; SOURCES],
+    sources: [u64; SOURCES],
 }
 
 static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 1> = spawn::ArgBlock::new(ChildArgs {
@@ -173,9 +173,9 @@ static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 1> = spawn::ArgBlock::new(ChildArg
 #[derive(Default)]
 struct Parts
 {
-    sources: [Option<u32>; SOURCES],
-    waiter: Option<u32>,
-    sender: Option<u32>,
+    sources: [Option<u64>; SOURCES],
+    waiter: Option<u64>,
+    sender: Option<u64>,
 }
 
 /// What a phase's rounds saw.
@@ -347,7 +347,7 @@ fn setup(ctx: &TestContext, kind: Kind, parts: &mut Parts) -> TestResult
 }
 
 /// Create one source of `kind`.
-fn create_source(ctx: &TestContext, kind: Kind) -> Result<u32, &'static str>
+fn create_source(ctx: &TestContext, kind: Kind) -> Result<u64, &'static str>
 {
     match kind
     {
@@ -359,7 +359,7 @@ fn create_source(ctx: &TestContext, kind: Kind) -> Result<u32, &'static str>
 }
 
 /// The phase's two sources, once both are created.
-fn sources_of(parts: &Parts) -> Result<[u32; SOURCES], &'static str>
+fn sources_of(parts: &Parts) -> Result<[u64; SOURCES], &'static str>
 {
     let [Some(a), Some(b)] = parts.sources
     else
@@ -374,7 +374,7 @@ fn sources_of(parts: &Parts) -> Result<[u32; SOURCES], &'static str>
 /// is recorded in `slot` before anything else can fail.
 fn create_thread(
     ctx: &TestContext,
-    slot: &mut Option<u32>,
+    slot: &mut Option<u64>,
     entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
@@ -399,7 +399,7 @@ fn create_thread(
 
 /// Stop and restart the waiter [`CYCLES`] times, waiting after each restart
 /// until it has entered a new wait. Returns the rounds that timed out.
-fn rounds(waiter: u32) -> Result<u32, &'static str>
+fn rounds(waiter: u64) -> Result<u32, &'static str>
 {
     let mut starved = 0;
     for cycle in 0..CYCLES
@@ -482,7 +482,7 @@ fn pause_sender() -> TestResult
 /// With the stops over and the sender paused, deliver to each source until
 /// the waiter has consumed a delivery on it, bounded by [`FINAL_POLLS`]. A
 /// waiter that consumes none on a source lost a wake or is stranded.
-fn final_check(kind: Kind, sources: [u32; SOURCES]) -> TestResult
+fn final_check(kind: Kind, sources: [u64; SOURCES]) -> TestResult
 {
     let base = DELIVERED.each_ref().map(|d| d.load(Ordering::Acquire));
     for _ in 0..crate::scaled_polls(FINAL_POLLS)
@@ -521,7 +521,7 @@ fn final_check(kind: Kind, sources: [u32; SOURCES]) -> TestResult
 
 /// Set [`QUIT`] and wait for both children to exit, delivering to both
 /// sources until the waiter has left its waits.
-fn finish(kind: Kind, sources: [u32; SOURCES]) -> TestResult
+fn finish(kind: Kind, sources: [u64; SOURCES]) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     for _ in 0..crate::scaled_polls(EXIT_POLLS)
@@ -566,7 +566,7 @@ fn release(parts: &Parts) -> TestResult
 }
 
 /// Block on `source` of `kind`; returns the bits or payload delivered.
-fn wait(kind: Kind, source: u32) -> Result<u64, i64>
+fn wait(kind: Kind, source: u64) -> Result<u64, i64>
 {
     match kind
     {
@@ -576,7 +576,7 @@ fn wait(kind: Kind, source: u32) -> Result<u64, i64>
 }
 
 /// Deliver `value` to `source` of `kind`.
-fn deliver(kind: Kind, source: u32, value: u64) -> Result<(), i64>
+fn deliver(kind: Kind, source: u64, value: u64) -> Result<(), i64>
 {
     match kind
     {
@@ -656,7 +656,7 @@ extern "C" fn sender_entry(arg: u64) -> !
 /// the source (a notification bit, or a queue entry
 /// [`EVENT_QUEUE_CAPACITY`] has room for) and the waiter's next wait on it
 /// consumes it.
-fn serve(kind: Kind, sources: [u32; SOURCES], entered: u32)
+fn serve(kind: Kind, sources: [u64; SOURCES], entered: u32)
 {
     let index = usize::from((entered & 1) == 0);
     // 0 to 2047 spins (a multiplicative hash of the entry).

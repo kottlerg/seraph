@@ -90,9 +90,9 @@ pub enum RegistryWake
 /// the settles wait on.
 pub struct DriverWatch
 {
-    death_eq: u32,
-    wait_set: u32,
-    registry_ep: u32,
+    death_eq: u64,
+    wait_set: u64,
+    registry_ep: u64,
     /// Whether `registry_ep` is a member of `wait_set`.
     registry_open: bool,
 }
@@ -107,7 +107,7 @@ impl DriverWatch
     /// bind of a driver beyond the queue's nodes fails and that driver is not
     /// spawned, logged. Returns `None`, logging why and releasing what it
     /// created, when an object cannot be created.
-    pub fn new(drivers: usize, registry_ep: u32) -> Option<Self>
+    pub fn new(drivers: usize, registry_ep: u64) -> Option<Self>
     {
         let capacity = u32::try_from(drivers)
             .unwrap_or(u32::MAX)
@@ -157,7 +157,7 @@ impl DriverWatch
 
     /// The death event queue a driver's death observer posts to.
     #[must_use]
-    pub fn death_eq(&self) -> u32
+    pub fn death_eq(&self) -> u64
     {
         self.death_eq
     }
@@ -221,7 +221,7 @@ impl DriverWatch
 /// receiver devmgr no longer serves.
 pub struct SettleBatch
 {
-    driver_ep: u32,
+    driver_ep: u64,
 }
 
 impl SettleBatch
@@ -245,7 +245,7 @@ impl SettleBatch
     /// The private driver endpoint, from which a driver's devmgr query cap
     /// is derived.
     #[must_use]
-    pub fn driver_ep(&self) -> u32
+    pub fn driver_ep(&self) -> u64
     {
         self.driver_ep
     }
@@ -324,8 +324,8 @@ impl Drop for SettleBatch
 /// thread never touches a slot devmgr may have reused.
 struct Timer
 {
-    wait_set: u32,
-    sig: u32,
+    wait_set: u64,
+    sig: u64,
 }
 
 impl Timer
@@ -333,7 +333,7 @@ impl Timer
     /// Create the notification, add it to `wait_set`, and start the timer
     /// thread. Returns `None`, logged and with what it created released,
     /// when any step fails; the settle then has no bound.
-    fn arm(wait_set: u32, bound: Duration) -> Option<Self>
+    fn arm(wait_set: u64, bound: Duration) -> Option<Self>
     {
         let Some(sig) = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,

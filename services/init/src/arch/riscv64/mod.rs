@@ -5,7 +5,7 @@
 
 //! RISC-V serial output via 16550 UART MMIO and architecture constants.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use init_protocol::{CapType, InitInfo};
 
@@ -21,7 +21,7 @@ const SERIAL_VA: u64 = 0x0000_0000_3000_0000;
 static UART_BASE: AtomicU64 = AtomicU64::new(0);
 /// The Mmio cap slot `serial_init` mapped the UART aperture through; 0 until
 /// it maps one and after `serial_release` takes it.
-static UART_MMIO_CAP: AtomicU32 = AtomicU32::new(0);
+static UART_MMIO_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Initialise UART serial output via MMIO.
 ///
@@ -29,10 +29,10 @@ static UART_MMIO_CAP: AtomicU32 = AtomicU32::new(0);
 /// maps the full aperture at `SERIAL_VA`, and records the UART's virtual
 /// address including its in-aperture offset. v6 apertures are coarse —
 /// the UART is typically one of several devices inside the aperture.
-pub fn serial_init(info: &InitInfo, _thread_cap: u32)
+pub fn serial_init(info: &InitInfo, _thread_cap: u64)
 {
     let descriptors = crate::descriptors(info);
-    let mut aperture: Option<(u32, u64, u64)> = None;
+    let mut aperture: Option<(u64, u64, u64)> = None;
     for d in descriptors
     {
         if d.cap_type != CapType::Mmio

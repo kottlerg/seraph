@@ -24,7 +24,7 @@ mod handover;
 mod slot;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -49,24 +49,24 @@ struct BootCaps
     /// RECV cap on the master log endpoint. Real-logd is now the
     /// RECV-holder; init-logd has already terminated by the time
     /// this cap is in use.
-    log_ep_recv: u32,
+    log_ep_recv: u64,
     /// SEND cap on the master log endpoint, used only for the
     /// `HANDOVER_PULL` drain and `HANDOVER_RELEASE` rounds with
     /// init-logd. Deleted after handover.
-    log_ep_handover_send: u32,
+    log_ep_handover_send: u64,
     /// `SEND|GRANT` cap on procmgr carrying `DEATH_EQ_AUTHORITY`, used to
     /// call `REGISTER_DEATH_EQ` at startup and, from the resync helper
     /// thread, `QUERY_LIVE_PROCESSES`. Kept across the lifetime of real-logd.
-    procmgr_death_auth_send: u32,
+    procmgr_death_auth_send: u64,
     /// SEND cap on devmgr's registry endpoint carrying
     /// `REGISTRY_QUERY_AUTHORITY`. logd resolves the serial driver's
     /// write endpoint through it via `QUERY_SERIAL_DEVICE`. Zero
     /// disables serial output (logd then buffers received log lines in
     /// memory only).
-    devmgr_registry_ep: u32,
+    devmgr_registry_ep: u64,
 }
 
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -206,7 +206,7 @@ const DEATH_EQ_CAPACITY: u32 = 128;
 /// [`DEATH_EQ_CAPACITY`] entries. It has no death-observer nodes: nothing
 /// binds it, since procmgr posts each death to it itself
 /// (`services/procmgr/docs/ipc-interface.md` § `REGISTER_DEATH_EQ`).
-fn create_death_eq() -> Option<u32>
+fn create_death_eq() -> Option<u64>
 {
     // The kernel's raw EventQueue debit for that capacity and no nodes.
     let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY), 0);
@@ -217,7 +217,7 @@ fn create_death_eq() -> Option<u32>
 
 /// Create the notification the resync helper thread signals when its walk
 /// ends.
-fn create_resync_note() -> Option<u32>
+fn create_resync_note() -> Option<u64>
 {
     std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
         syscall::cap_create_notification(slab).ok()
@@ -227,7 +227,7 @@ fn create_resync_note() -> Option<u32>
 /// Build a 3-member wait set: the log endpoint (`WS_BADGE_LOG`), the death
 /// event queue (`WS_BADGE_DEATH`), and the resync notification
 /// (`WS_BADGE_RESYNC`).
-fn create_wait_set(log_ep_recv: u32, death_eq: u32, resync_note: u32) -> Option<u32>
+fn create_wait_set(log_ep_recv: u64, death_eq: u64, resync_note: u64) -> Option<u64>
 {
     // The set's member capacity: the three members above.
     const WS_MEMBERS: u32 = 3;
@@ -274,7 +274,7 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32, resync_note: u32) -> Option<
 /// `event_try_recv` keep working, so it first derives a POST-only
 /// copy and transfers that. The POST right is what procmgr's
 /// `SYS_EVENT_POST` of each death to the queue needs.
-fn register_with_procmgr(procmgr_send: u32, death_eq: u32, ipc_buf: *mut u64)
+fn register_with_procmgr(procmgr_send: u64, death_eq: u64, ipc_buf: *mut u64)
 {
     if procmgr_send == 0
     {
@@ -316,9 +316,9 @@ fn register_with_procmgr(procmgr_send: u32, death_eq: u32, ipc_buf: *mut u64)
 /// process its in-flight messages (matches procmgr's drain-deaths-
 /// first pattern).
 fn event_loop(
-    ws_cap: u32,
-    death_eq: u32,
-    log_ep_recv: u32,
+    ws_cap: u64,
+    death_eq: u64,
+    log_ep_recv: u64,
     ipc_buf: *mut u64,
     table: &mut SlotTable,
     resync: &mut Resync,
@@ -369,9 +369,9 @@ struct Resync
 {
     /// `DEATH_EQ_AUTHORITY` SEND on procmgr the helper walks through; zero
     /// disables resync.
-    procmgr_send: u32,
+    procmgr_send: u64,
     /// Notification in the wait set the helper signals when it is done.
-    note: u32,
+    note: u64,
     /// The walk in flight: the slot snapshot taken before it began and the
     /// channel its live list arrives on (`None` when the walk failed).
     in_flight: Option<(Vec<u64>, LiveReceiver)>,
@@ -385,7 +385,7 @@ type LiveReceiver = std::sync::mpsc::Receiver<Option<Vec<u64>>>;
 
 impl Resync
 {
-    fn new(procmgr_send: u32, note: u32) -> Self
+    fn new(procmgr_send: u64, note: u64) -> Self
     {
         Self {
             procmgr_send,
@@ -504,7 +504,7 @@ fn log_reclaim(badge: u64, cause: Cause, name: &[u8])
 /// Walk procmgr's live badges (`QUERY_LIVE_PROCESSES`) page by page on the
 /// calling thread's IPC buffer; runs on the resync helper thread only.
 /// `None` when a call fails or a reply does not decode.
-fn walk_live_processes(procmgr_send: u32) -> Option<Vec<u64>>
+fn walk_live_processes(procmgr_send: u64) -> Option<Vec<u64>>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
@@ -557,7 +557,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// badge. Returns whether the drain took a full queue's worth of events: the
 /// queue may then have filled, and a post to a full queue is dropped, so the
 /// caller starts a [`Resync`].
-fn drain_deaths(death_eq: u32, table: &mut SlotTable) -> bool
+fn drain_deaths(death_eq: u64, table: &mut SlotTable) -> bool
 {
     let mut drained: u32 = 0;
     while let Ok(death) = syscall::event_try_recv_death(death_eq)
@@ -589,7 +589,7 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable) -> bool
 }
 
 fn dispatch_log(
-    log_ep_recv: u32,
+    log_ep_recv: u64,
     ipc_buf: *mut u64,
     table: &mut SlotTable,
     guard: &mut ipc::recv_guard::RecvGuard,
@@ -700,28 +700,28 @@ fn register_name(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: 
 // ── Serial output (driver-mediated) ────────────────────────────────────────
 
 /// SEND cap on devmgr's registry endpoint (`REGISTRY_QUERY_AUTHORITY`).
-static DEVMGR_REGISTRY_EP: AtomicU32 = AtomicU32::new(0);
+static DEVMGR_REGISTRY_EP: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the serial driver's service endpoint, cached after
 /// the first successful `QUERY_SERIAL_DEVICE`. Zero = unresolved.
-static SERIAL_CAP: AtomicU32 = AtomicU32::new(0);
+static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
 /// Resolved SEND cap on the framebuffer driver's service endpoint. `0` =
 /// not yet attempted; [`FB_UNAVAILABLE`] = attempted and no driver present
 /// (headless boot); any other value = the resolved cap. The resolve runs at
 /// most once, caching its outcome either way so framebuffer mirroring stays a
 /// no-op on a headless boot without re-querying devmgr.
-static FB_CAP: AtomicU32 = AtomicU32::new(0);
+static FB_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Sentinel stored in [`FB_CAP`] once a resolution attempt finds no
 /// framebuffer driver. Repeating the `QUERY_FRAMEBUFFER_DEVICE` per log line
 /// would open a deadlock window against devmgr's own logging — devmgr →
 /// `log_ep` → logd, while logd blocks here on devmgr's reply — so the attempt
-/// is made exactly once. `u32::MAX` is never a valid `CSpace` slot.
-const FB_UNAVAILABLE: u32 = u32::MAX;
+/// is made exactly once. `u64::MAX` names no cap: no handle sets bit 63.
+const FB_UNAVAILABLE: u64 = u64::MAX;
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` (one full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
 /// Record the devmgr-registry cap for the emit path.
-fn serial_init(devmgr_registry_ep: u32)
+fn serial_init(devmgr_registry_ep: u64)
 {
     DEVMGR_REGISTRY_EP.store(devmgr_registry_ep, Ordering::Release);
 }
@@ -739,7 +739,7 @@ fn emit_ipc_buf() -> *mut u64
 /// `QUERY_SERIAL_DEVICE`. Returns 0 while the driver is not yet resolvable
 /// (devmgr not reachable, or driver not spawned); the caller then drops the
 /// bytes.
-fn resolve_serial_cap(ipc_buf: *mut u64) -> u32
+fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
 {
     let cached = SERIAL_CAP.load(Ordering::Acquire);
     if cached != 0
@@ -810,7 +810,7 @@ fn serial_write(bytes: &[u8])
 /// resolvable (devmgr unreachable, headless boot, or driver not spawned);
 /// the caller then skips the framebuffer mirror. Reuses the same registry
 /// cap and IPC buffer the serial path resolved through.
-fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
+fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
 {
     let cached = FB_CAP.load(Ordering::Acquire);
     if cached == FB_UNAVAILABLE

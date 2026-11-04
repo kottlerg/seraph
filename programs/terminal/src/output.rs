@@ -26,14 +26,14 @@ const PAYLOAD_MAX: usize = 512;
 /// and partial-sequence state across writes, so the sink is `&mut`.
 pub struct Sink
 {
-    framebuffer: Option<u32>,
-    serial: u32,
+    framebuffer: Option<u64>,
+    serial: u64,
     parser: AnsiParser,
 }
 
 impl Sink
 {
-    pub fn new(framebuffer: Option<u32>, serial: u32) -> Self
+    pub fn new(framebuffer: Option<u64>, serial: u64) -> Self
     {
         Self {
             framebuffer,
@@ -89,7 +89,7 @@ impl Sink
 /// framebuffer driver. Returns whether the driver acknowledged with `SUCCESS`;
 /// the parser advances its dedup only on success, so a failed set is retried on
 /// the next change rather than masked.
-fn fb_set_attrs(cap: u32, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
+fn fb_set_attrs(cap: u64, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
 {
     let payload = [fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]];
     let msg = IpcMessage::builder(fb_labels::FB_SET_ATTRS | (6u64 << 16))
@@ -119,7 +119,7 @@ fn fb_set_attrs(cap: u32, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
 /// framebuffer and serial drivers share this wire format (`label = opcode |
 /// (len << 16)`, payload via `.bytes(0, …)`); only the opcode/success code and
 /// the cap differ.
-fn write_chunked(cap: u32, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mut u64, label: &str)
+fn write_chunked(cap: u64, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mut u64, label: &str)
 {
     let mut rest = bytes;
     while !rest.is_empty()

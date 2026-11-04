@@ -26,12 +26,12 @@ const SRST_REASON_NONE: u64 = 0;
 /// lifetime.
 pub struct Actuator
 {
-    sbi_control_cap: u32,
+    sbi_control_cap: u64,
 }
 
 /// Resolve the SBI SRST authority from devmgr. Returns `None` if the query
 /// fails or devmgr served no cap.
-pub fn resolve(devmgr_registry: u32, _self_aspace: u32, ipc_buf: *mut u64) -> Option<Actuator>
+pub fn resolve(devmgr_registry: u64, _self_aspace: u64, ipc_buf: *mut u64) -> Option<Actuator>
 {
     let reply = devmgr_call(
         devmgr_registry,
@@ -45,13 +45,13 @@ pub fn resolve(devmgr_registry: u32, _self_aspace: u32, ipc_buf: *mut u64) -> Op
 }
 
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
-pub fn shutdown(_self_thread: u32, act: &Actuator)
+pub fn shutdown(_self_thread: u64, act: &Actuator)
 {
     sbi_reset(act, SRST_TYPE_SHUTDOWN, "shutdown");
 }
 
 /// Attempt SBI SRST cold reboot. Logs and returns on failure.
-pub fn reboot(_self_thread: u32, act: &Actuator)
+pub fn reboot(_self_thread: u64, act: &Actuator)
 {
     sbi_reset(act, SRST_TYPE_COLD_REBOOT, "reboot");
 }

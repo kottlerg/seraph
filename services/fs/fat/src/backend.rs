@@ -184,7 +184,7 @@ pub struct FatfsBackend<'a>
 {
     state: &'a mut FatState,
     cache: &'a PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     nodes: &'a mut NodeTable,
 }
@@ -194,7 +194,7 @@ impl<'a> FatfsBackend<'a>
     pub fn new(
         state: &'a mut FatState,
         cache: &'a PageCache,
-        block_dev: u32,
+        block_dev: u64,
         ipc_buf: *mut u64,
         nodes: &'a mut NodeTable,
     ) -> Self

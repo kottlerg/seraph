@@ -13,7 +13,7 @@ pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_X86_64;
 const COM1: u16 = 0x3F8;
 
 /// Initialise COM1 serial output at 115200 8N1.
-pub fn serial_init(info: &InitInfo, thread_cap: u32)
+pub fn serial_init(info: &InitInfo, thread_cap: u64)
 {
     let Some(slot) = crate::find_cap_by_type(info, init_protocol::CapType::IoPort)
     else

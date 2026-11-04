@@ -31,10 +31,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
         // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe {
-            spawn::configure_and_start(&child, churn_entry, stack_top, u64::from(child_done))
-        }
-        .map_err(|_| "thread_churn: configure_and_start failed")?;
+        unsafe { spawn::configure_and_start(&child, churn_entry, stack_top, child_done) }
+            .map_err(|_| "thread_churn: configure_and_start failed")?;
 
         // Wait, bounded, for the child to complete.
         let mut bits = 0u64;
@@ -56,10 +54,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn churn_entry(done_slot: u64) -> !
 {
-    notification_send(done_slot as u32, 0x1).ok();
+    notification_send(done_slot, 0x1).ok();
     thread_exit()
 }

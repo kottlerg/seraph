@@ -28,7 +28,7 @@ const SERIAL_RX_POLL_MS: u64 = 20;
 
 /// Block reading the keysym stream and forward decoded bytes as [`Msg::Input`].
 /// Returns (ending the thread) only on a fatal IPC error or a closed channel.
-pub fn keyboard_loop(input_cap: u32, tx: &Sender<Msg>)
+pub fn keyboard_loop(input_cap: u64, tx: &Sender<Msg>)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
@@ -81,7 +81,7 @@ pub fn keyboard_loop(input_cap: u32, tx: &Sender<Msg>)
 /// bytes are raw — the consumer's line discipline already handles CR, DEL/BS,
 /// and printables, so no decoding is needed here. Returns (ending the thread)
 /// only on a fatal IPC error or a closed channel.
-pub fn serial_loop(serial_cap: u32, tx: &Sender<Msg>)
+pub fn serial_loop(serial_cap: u64, tx: &Sender<Msg>)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()

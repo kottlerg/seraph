@@ -50,11 +50,11 @@ const MAX_POLLS: u32 = 2000;
 #[derive(Default)]
 struct Parts
 {
-    frames: [Option<u32>; 2],
-    queues: [Option<u32>; 2],
-    aspace: Option<u32>,
-    cspace: Option<u32>,
-    thread: Option<u32>,
+    frames: [Option<u64>; 2],
+    queues: [Option<u64>; 2],
+    aspace: Option<u64>,
+    cspace: Option<u64>,
+    thread: Option<u64>,
 }
 
 impl Parts
@@ -78,7 +78,7 @@ impl Parts
 }
 
 /// Available bytes of the Memory cap `frame`.
-fn available(frame: u32) -> Result<u64, &'static str>
+fn available(frame: u64) -> Result<u64, &'static str>
 {
     cap_info(frame, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "death_observer_outlives_queue_caps: cap_info(MEMORY_AVAILABLE) failed")
@@ -86,7 +86,7 @@ fn available(frame: u32) -> Result<u64, &'static str>
 
 /// Whether every frame in `frames` reports exactly the matching `expected`
 /// available byte count.
-fn frames_at(frames: [u32; 2], expected: [u64; 2]) -> Result<bool, &'static str>
+fn frames_at(frames: [u64; 2], expected: [u64; 2]) -> Result<bool, &'static str>
 {
     Ok(available(frames[0])? == expected[0] && available(frames[1])? == expected[1])
 }
@@ -101,10 +101,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 fn run_with(ctx: &TestContext, parts: &mut Parts) -> TestResult
 {
-    let mut frames = [0u32; 2];
+    let mut frames = [0u64; 2];
     let mut empty = [0u64; 2];
     let mut occupied = [0u64; 2];
-    let mut queues = [0u32; 2];
+    let mut queues = [0u64; 2];
     for i in 0..2
     {
         frames[i] = crate::frame_pool::alloc()

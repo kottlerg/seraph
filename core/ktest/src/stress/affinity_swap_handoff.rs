@@ -70,6 +70,19 @@ const SPINS_PER_YIELD: u32 = 64;
 /// The CPU each worker last reported (`u32::MAX` before it first runs).
 static WORKER_CPU: [AtomicU32; 2 * MAX_PAIRS] = [const { AtomicU32::new(u32::MAX) }; 2 * MAX_PAIRS];
 
+/// Per-worker arguments, handed to `worker_entry` by address.
+#[derive(Clone, Copy)]
+struct WorkerArgs
+{
+    /// The worker's copy of the controller's `moved` notification.
+    moved: u64,
+    /// The worker's index into [`WORKER_CPU`] and its bit on `moved`.
+    index: usize,
+}
+
+static WORKER_ARGS: spawn::ArgBlock<WorkerArgs, { 2 * MAX_PAIRS }> =
+    spawn::ArgBlock::new(WorkerArgs { moved: 0, index: 0 });
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -106,7 +119,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 fn swap_rounds(
     ctx: &TestContext,
     cpus: u64,
-    moved: u32,
+    moved: u64,
     workers: &mut [spawn::SpawnedChild; 2 * MAX_PAIRS],
 ) -> TestResult
 {
@@ -127,8 +140,17 @@ fn swap_rounds(
         let child = &workers[i];
         let child_moved = cap_copy(moved, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "stress::affinity_swap_handoff: cap_copy moved failed")?;
-        // arg packs moved_slot[31:0] | worker index[63:32].
-        let arg = u64::from(child_moved) | ((i as u64) << 32);
+        // SAFETY: i < 2 * MAX_PAIRS; worker i has not started, and its
+        // entry's previous worker, from an earlier run, has been deleted.
+        let arg = unsafe {
+            WORKER_ARGS.publish(
+                i,
+                WorkerArgs {
+                    moved: child_moved,
+                    index: i,
+                },
+            )
+        };
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
@@ -164,7 +186,7 @@ fn swap_rounds(
 /// Wait, bounded by [`ROUND_SLICES`], until worker `i` reports running on
 /// `cpus[i]` for every `i`. Each slice blocks on `moved`, so a worker that
 /// shares this thread's CPU runs meanwhile.
-fn await_workers_on(moved: u32, cpus: &[u32]) -> TestResult
+fn await_workers_on(moved: u64, cpus: &[u32]) -> TestResult
 {
     let on_target = || {
         cpus.iter()
@@ -191,15 +213,14 @@ fn await_workers_on(moved: u32, cpus: &[u32]) -> TestResult
 }
 
 /// Read this worker's CPU and, when it changed, publish it in [`WORKER_CPU`]
-/// and send this worker's bit on `moved` (the low half of `arg`; the worker
-/// index is the high half); then yield, spin a little, and repeat.
-// cast_possible_truncation: the low half is a 32-bit cap handle, the high
-// half a worker index below 2 * MAX_PAIRS, and a CPU index fits u32.
+/// and send this worker's bit on `moved` (both from the [`WorkerArgs`] entry
+/// at `arg`); then yield, spin a little, and repeat.
+// cast_possible_truncation: a CPU index fits u32.
 #[allow(clippy::cast_possible_truncation)]
 extern "C" fn worker_entry(arg: u64) -> !
 {
-    let moved = arg as u32;
-    let index = (arg >> 32) as usize;
+    // SAFETY: `arg` is the entry `swap_rounds` published for this worker.
+    let WorkerArgs { moved, index } = unsafe { spawn::child_args(arg) };
     loop
     {
         if let Ok(cpu) = system_info(SystemInfoType::CurrentCpu as u64)

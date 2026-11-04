@@ -67,8 +67,8 @@ static mut CHILD_STACKS: [ChildStack; MAX_CHILDREN] = [ChildStack::ZERO; MAX_CHI
 #[derive(Clone, Copy)]
 struct ChildArgs
 {
-    source_cap: u32,
-    done: u32,
+    source_cap: u64,
+    done: u64,
     shift: u32,
 }
 
@@ -165,8 +165,8 @@ fn park_and_destroy(
     ctx: &TestContext,
     source: Source,
     count: usize,
-    object: &mut Option<u32>,
-    done: u32,
+    object: &mut Option<u64>,
+    done: u64,
     children: &mut [Option<spawn::SpawnedChild>; MAX_CHILDREN],
 ) -> TestResult
 {
@@ -202,7 +202,7 @@ fn park_and_destroy(
 
 /// Create the phase's object; a wait set gets one member that never fires,
 /// returned so it can be deleted after the set.
-fn create_source(ctx: &TestContext, source: Source) -> Result<(u32, Option<u32>), &'static str>
+fn create_source(ctx: &TestContext, source: Source) -> Result<(u64, Option<u64>), &'static str>
 {
     let object = match source
     {
@@ -247,8 +247,8 @@ fn shift(index: usize) -> u32
 fn start_child(
     ctx: &TestContext,
     source: Source,
-    object: u32,
-    done: u32,
+    object: u64,
+    done: u64,
     index: usize,
     slot: &mut Option<spawn::SpawnedChild>,
 ) -> TestResult
@@ -292,7 +292,7 @@ fn start_child(
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
 /// failing once a scaled [`REPORT_MS`] wait passes with nothing new (a child that
 /// never parked, or a waiter the destroy never woke).
-fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
+fn wait_for(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {
@@ -309,7 +309,7 @@ fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 }
 
 /// Raise READY, wait once, report the verdict on `done`, and exit.
-fn park_and_report(arg: u64, wait: fn(u32) -> Result<u64, i64>) -> !
+fn park_and_report(arg: u64, wait: fn(u64) -> Result<u64, i64>) -> !
 {
     // SAFETY: `arg` is the entry `start_child` published for this child.
     let ChildArgs {

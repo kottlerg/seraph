@@ -38,8 +38,8 @@ static mut STACK_C: ChildStack = ChildStack::ZERO;
 #[derive(Clone, Copy)]
 struct CallerArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     label: u64,
 }
 
@@ -54,7 +54,7 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 3> = spawn::ArgBlock::new(Caller
 /// # Safety
 ///
 /// `index < 3`, and that caller has not been started yet in this run.
-unsafe fn caller_arg(index: usize, ep: u32, done: u32, label: u64) -> u64
+unsafe fn caller_arg(index: usize, ep: u64, done: u64, label: u64) -> u64
 {
     // SAFETY: caller contract (entry `index` is that caller's alone).
     unsafe { CALLER_ARGS.publish(index, CallerArgs { ep, done, label }) }

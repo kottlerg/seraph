@@ -296,7 +296,7 @@ pub fn ns_system_root_phase(_: &Caps)
 /// the root-fs entries behind its fall-through, and answers `END_OF_DIR`
 /// for every index beyond `u32`. An index of `2^32 + i` that vfsd
 /// truncated to `i` would return the `i`-th entry instead.
-fn system_root_readdir_index_bound(system_root_cap: u32, ipc_buf: *mut u64)
+fn system_root_readdir_index_bound(system_root_cap: u64, ipc_buf: *mut u64)
 {
     let mut names: Vec<Vec<u8>> = Vec::new();
     for idx in 0..256u64

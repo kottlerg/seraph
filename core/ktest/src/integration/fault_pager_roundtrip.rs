@@ -66,10 +66,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(&child, fault_child, stack_top, u64::from(child_sig))
-    }
-    .map_err(|_| "fault_pager_roundtrip: configure_and_start failed")?;
+    unsafe { crate::spawn::configure_and_start(&child, fault_child, stack_top, child_sig) }
+        .map_err(|_| "fault_pager_roundtrip: configure_and_start failed")?;
 
     // Act as the pager: receive the fault, verify its shape, back the page.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -150,10 +148,7 @@ extern "C" fn fault_child(child_sig: u64) -> !
     let readback = unsafe { p.read_volatile() };
     if readback == SENTINEL
     {
-        // cast_possible_truncation: child_sig is the u32 cap handle `run` zero-
-        // extended into the u64 entry argument.
-        #[allow(clippy::cast_possible_truncation)]
-        syscall::notification_send(child_sig as u32, 1).ok();
+        syscall::notification_send(child_sig, 1).ok();
     }
     loop
     {

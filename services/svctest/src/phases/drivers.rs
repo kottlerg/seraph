@@ -48,7 +48,7 @@ const TERMINAL_RECIPE: &str = "/config/svcmgr/services/terminal.svc";
 /// A no-authority SEND on the driver `query_label` names, from devmgr's
 /// `TEST_QUERY_DENY_DEVICE`, or `None` when devmgr still reports
 /// `NO_DEVICE` after `attempts` tries.
-fn deny_send(devmgr_test: u32, query_label: u64, name: &str, attempts: u32) -> Option<u32>
+fn deny_send(devmgr_test: u64, query_label: u64, name: &str, attempts: u32) -> Option<u64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let req = ipc::IpcMessage::builder(ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE)
@@ -79,7 +79,7 @@ fn deny_send(devmgr_test: u32, query_label: u64, name: &str, attempts: u32) -> O
 
 /// `msg` sent on the no-authority `cap` replies `unauthorized` and carries
 /// no cap.
-fn assert_denied(cap: u32, msg: &ipc::IpcMessage, unauthorized: u64, what: &str)
+fn assert_denied(cap: u64, msg: &ipc::IpcMessage, unauthorized: u64, what: &str)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.

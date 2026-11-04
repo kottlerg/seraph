@@ -583,16 +583,13 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 /// `OutOfMemory` if the queue has no free node (only reachable while the
 /// thread is still live — a bind onto an already-exited thread takes none).
 #[cfg(not(test))]
-// cast_possible_truncation: cap handles are u32 by ABI contract; the
-// truncation discards any upper bits a caller sets.
-#[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{EqRights, ThreadRights};
     use crate::sched::thread::ThreadState;
 
-    let thread_cap_idx = tf.arg(0) as u32;
-    let eq_cap_idx = tf.arg(1) as u32;
+    let thread_cap_idx = tf.arg(0);
+    let eq_cap_idx = tf.arg(1);
     let correlator = tf.arg(2);
 
     // SAFETY: current_tcb valid in syscall context.
@@ -737,15 +734,12 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// queue's pool until the address space's teardown; returns `OutOfMemory` if
 /// the queue has no free node (only reachable before the first fault).
 #[cfg(not(test))]
-// cast_possible_truncation: cap handles are u32 by ABI contract; the
-// truncation discards any upper bits a caller sets.
-#[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{AsRights, EqRights};
 
-    let aspace_cap_idx = tf.arg(0) as u32;
-    let eq_cap_idx = tf.arg(1) as u32;
+    let aspace_cap_idx = tf.arg(0);
+    let eq_cap_idx = tf.arg(1);
     let correlator = tf.arg(2);
 
     // SAFETY: current_tcb valid in syscall context.
@@ -969,7 +963,7 @@ impl Drop for PinnedCap
 #[cfg(not(test))]
 pub(crate) unsafe fn pin_slot(
     cspace: *mut crate::cap::cspace::CSpace,
-    handle: u32,
+    handle: u64,
 ) -> Result<PinnedCap, SyscallError>
 {
     // SAFETY: forwarded caller contract.
@@ -1007,7 +1001,7 @@ pub(crate) unsafe fn pin_slot(
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,
-    handle: u32,
+    handle: u64,
     required_rights: crate::cap::slot::TypedRights<K>,
 ) -> Result<PinnedCap, SyscallError>
 {
@@ -1041,7 +1035,7 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
 #[allow(clippy::needless_bitwise_bool)]
 unsafe fn pin_checked(
     cspace: *mut crate::cap::cspace::CSpace,
-    handle: u32,
+    handle: u64,
     tag: Option<crate::cap::slot::CapTag>,
     required: crate::cap::slot::Rights,
 ) -> Result<PinnedCap, SyscallError>

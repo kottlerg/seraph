@@ -36,9 +36,9 @@ static UART_BASE: AtomicU64 = AtomicU64::new(0);
 /// must name an `Mmio` region of one page, so the whole-region mapping
 /// stays inside the one-page reservation (`syscall::mmio_map`'s contract).
 pub unsafe fn serial_init(
-    _self_thread: u32,
-    self_aspace: u32,
-    mmio_cap: u32,
+    _self_thread: u64,
+    self_aspace: u64,
+    mmio_cap: u64,
     enable_rx_irq: bool,
 ) -> bool
 {

@@ -33,7 +33,7 @@ static mut SERIAL_READY: bool = false;
 /// # Safety
 /// Must be called once during early ktest startup, before any `write_str`
 /// or `write_byte` call, and after `crate::arch::init_io_ports`.
-pub unsafe fn init(info: &InitInfo, aspace_cap: u32, thread_cap: u32)
+pub unsafe fn init(info: &InitInfo, aspace_cap: u64, thread_cap: u64)
 {
     // SAFETY: caller guarantees at-most-once, single-threaded, after the I/O
     // port seed.

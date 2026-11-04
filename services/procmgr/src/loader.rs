@@ -24,12 +24,12 @@ use syscall_abi::PAGE_SIZE;
 pub struct ScratchMapping
 {
     range: Option<ReservedRange>,
-    self_aspace: u32,
+    self_aspace: u64,
     pages: u64,
     /// Optional Memory cap slot to `cap_delete` on drop. Used when the
     /// caller derived a temporary read-only cap solely for this mapping
     /// (see [`map_module`]).
-    owns_cap: u32,
+    owns_cap: u64,
 }
 
 impl ScratchMapping
@@ -37,7 +37,7 @@ impl ScratchMapping
     /// Reserve `pages` VA pages, then `mem_map` the memory cap at the reserved
     /// base with the given protection flags. Returns `None` on either
     /// reservation or mapping failure.
-    pub fn map(self_aspace: u32, memory_cap: u32, pages: u64, prot: u64) -> Option<Self>
+    pub fn map(self_aspace: u64, memory_cap: u64, pages: u64, prot: u64) -> Option<Self>
     {
         let range = reserve_pages(pages).ok()?;
         let va = range.va_start();
@@ -69,7 +69,7 @@ impl ScratchMapping
 
     /// Transfer ownership of `cap_slot` to this mapping; the slot is
     /// `cap_delete`d when the mapping is dropped.
-    pub fn set_owns_cap(&mut self, cap_slot: u32)
+    pub fn set_owns_cap(&mut self, cap_slot: u64)
     {
         self.owns_cap = cap_slot;
     }
@@ -108,7 +108,7 @@ impl Drop for ScratchMapping
 /// mapping; otherwise `mem_map`'s derive-from-cap path produces a
 /// writable+executable mapping that violates W^X. The derived cap is owned by
 /// the returned [`ScratchMapping`] and dropped alongside the unmap.
-pub fn map_module(module_memory_cap: u32, self_aspace: u32) -> Option<(ScratchMapping, u64)>
+pub fn map_module(module_memory_cap: u64, self_aspace: u64) -> Option<(ScratchMapping, u64)>
 {
     let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
     let mut pages: u64 = 128;
@@ -127,7 +127,7 @@ pub fn map_module(module_memory_cap: u32, self_aspace: u32) -> Option<(ScratchMa
 }
 
 /// Derive a memory cap with the given protection rights for mapping.
-pub fn derive_memory_for_prot(memory_cap: u32, prot: u64) -> Option<u32>
+pub fn derive_memory_for_prot(memory_cap: u64, prot: u64) -> Option<u64>
 {
     if prot == syscall::MAP_EXECUTABLE
     {
@@ -184,9 +184,9 @@ pub(crate) unsafe fn load_elf_segment_into_child(
     num_pages: u64,
     prot: u64,
     ro_range: Option<(u64, u64)>,
-    self_aspace: u32,
-    child_aspace: u32,
-    child_memmgr_send: u32,
+    self_aspace: u64,
+    child_aspace: u64,
+    child_memmgr_send: u64,
     ipc_buf: *mut u64,
     fill: impl FnOnce(&mut [u8]),
 ) -> Result<(), u64>
@@ -196,9 +196,9 @@ pub(crate) unsafe fn load_elf_segment_into_child(
     struct SegmentScratch
     {
         range: Option<ReservedRange>,
-        self_aspace: u32,
+        self_aspace: u64,
         mapped: u64,
-        caps: Vec<u32>,
+        caps: Vec<u64>,
     }
 
     impl Drop for SegmentScratch

@@ -216,7 +216,7 @@ fn find_table_in_acpi_regions(
     info: &InitInfo,
     sig: [u8; 4],
     map_vaddr: u64,
-) -> Option<(u32, u64, u64, usize)>
+) -> Option<(u64, u64, u64, usize)>
 {
     for d in crate::init_info::descriptors(info)
     {

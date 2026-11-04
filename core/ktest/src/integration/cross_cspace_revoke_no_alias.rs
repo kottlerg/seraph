@@ -79,9 +79,9 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 #[derive(Clone, Copy)]
 struct ChildArgs
 {
-    ep: u32,
-    go: u32,
-    report: u32,
+    ep: u64,
+    go: u64,
+    report: u64,
 }
 
 static CHILD_ARGS: ArgBlock<ChildArgs, 1> = ArgBlock::new(ChildArgs {
@@ -161,7 +161,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // it can confirm the recycle aliased `c1`'s slot.
     let recycled = cap_copy(decoy, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cross_cspace_revoke_no_alias: cap_copy (recycle) failed")?;
-    notification_send(go, u64::from(recycled))
+    notification_send(go, recycled)
         .map_err(|_| "cross_cspace_revoke_no_alias: notification_send (go) failed")?;
 
     let verdict = notification_wait_timeout(report, crate::scaled_bound(REPORT_TIMEOUT_MS))
@@ -250,9 +250,8 @@ extern "C" fn child_entry(arg: u64) -> !
     {
         thread_exit()
     };
-    // The parent zero-extended a u32 handle into the notification word; the low
-    // 32 bits are exact.
-    let recycled = (recycled_bits & 0xFFFF_FFFF) as u32;
+    // The parent sent the whole handle as the notification word.
+    let recycled = recycled_bits;
 
     let _ = notification_send(report_slot, child_verdict(c1, recycled));
     thread_exit()
@@ -261,7 +260,7 @@ extern "C" fn child_entry(arg: u64) -> !
 /// Compute the child's verdict: the recycle must have landed on `c1`'s slot with
 /// an advanced generation, the stale `c1` handle must fail closed, and the fresh
 /// `recycled` handle to that slot must still work.
-fn child_verdict(c1: u32, recycled: u32) -> u64
+fn child_verdict(c1: u64, recycled: u64) -> u64
 {
     if cap_handle_index(recycled) != cap_handle_index(c1)
     {

@@ -38,9 +38,9 @@ const FUND_PAGES: u64 = (LIVE as u64).div_ceil(CSPACE_SLOTS_PER_PAGE) + 4;
 
 const PAGE: u64 = 4096;
 
-/// Handles of the live `CSpace`s. Static because the array (16.4 KB) is too
+/// Handles of the live `CSpace`s. Static because the array (32.8 KB) is too
 /// large for the harness stack; only this single-threaded test touches it.
-static mut HANDLES: [u32; LIVE] = [0; LIVE];
+static mut HANDLES: [u64; LIVE] = [0; LIVE];
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

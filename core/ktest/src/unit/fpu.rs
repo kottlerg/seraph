@@ -64,7 +64,7 @@ extern "C" fn child_a_entry(sig_slot: u64) -> !
 {
     let mismatches = crate::arch::fpu::preempt_capture(PATTERN_A, SPIN_ITERS);
     A_MISMATCHES.store(mismatches, Ordering::Release);
-    let _ = notification_send(u32::try_from(sig_slot).unwrap_or(0), 0x1);
+    let _ = notification_send(sig_slot, 0x1);
     thread_exit();
 }
 
@@ -72,7 +72,7 @@ extern "C" fn child_b_entry(sig_slot: u64) -> !
 {
     let mismatches = crate::arch::fpu::preempt_capture(PATTERN_B, SPIN_ITERS);
     B_MISMATCHES.store(mismatches, Ordering::Release);
-    let _ = notification_send(u32::try_from(sig_slot).unwrap_or(0), 0x1);
+    let _ = notification_send(sig_slot, 0x1);
     thread_exit();
 }
 
@@ -118,7 +118,7 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
             th_a,
             child_a_entry as *const () as u64,
             stack_a,
-            u64::from(child_sig_a),
+            child_sig_a,
         )
     }
     .map_err(|_| "thread_configure a for fpu::preempt_isolation failed")?;
@@ -130,7 +130,7 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
             th_b,
             child_b_entry as *const () as u64,
             stack_b,
-            u64::from(child_sig_b),
+            child_sig_b,
         )
     }
     .map_err(|_| "thread_configure b for fpu::preempt_isolation failed")?;
@@ -182,13 +182,13 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 
 /// Per-thread stack for the cross-CPU child.
 static mut STACK_CROSS: ChildStack = ChildStack::ZERO;
-/// Slot indices, in the cross-CPU child's `CSpace`, of its ready, resume, and
+/// Handles, in the cross-CPU child's `CSpace`, of its ready, resume, and
 /// done notification caps. The child loads ready and resume before its
 /// inline-asm block (so no Rust call runs between the FP load and the
 /// capture) and done after it.
-static CROSS_SIG_READY: AtomicU32 = AtomicU32::new(0);
-static CROSS_SIG_RESUME: AtomicU32 = AtomicU32::new(0);
-static CROSS_SIG_DONE: AtomicU32 = AtomicU32::new(0);
+static CROSS_SIG_READY: AtomicU64 = AtomicU64::new(0);
+static CROSS_SIG_RESUME: AtomicU64 = AtomicU64::new(0);
+static CROSS_SIG_DONE: AtomicU64 = AtomicU64::new(0);
 /// Mismatch count written by the cross-CPU child after the post-migration
 /// register capture. The parent reads it only after the `done` notification so
 /// the zero default is never mistaken for a pass.

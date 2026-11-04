@@ -25,7 +25,7 @@
 //! sending a fault message, leaving the harness blocked in the unbounded
 //! `ipc_recv`, so the run hangs rather than passing.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
@@ -51,7 +51,7 @@ const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 
 /// Child cap slot for the success notification, stashed so the recovery routine
 /// can read it without depending on register state across the PC redirect.
-static RECOVERY_SIG: AtomicU32 = AtomicU32::new(0);
+static RECOVERY_SIG: AtomicU64 = AtomicU64::new(0);
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

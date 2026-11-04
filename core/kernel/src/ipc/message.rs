@@ -3,16 +3,18 @@
 
 // core/kernel/src/ipc/message.rs
 
-//! IPC message type — label + inline data words + capability slot indices.
+//! IPC message type — label + inline data words + capability handles.
 //!
 //! A [`Message`] carries:
 //! - A 64-bit `label` — caller-defined tag identifying the operation.
 //! - Up to [`MSG_DATA_WORDS_MAX`] data words (u64 values).
-//! - Up to [`MSG_CAP_SLOTS_MAX`] capability slot indices (u32 values).
+//! - Up to [`MSG_CAP_SLOTS_MAX`] full capability handles (u64 values).
 //!
-//! The kernel copies a `Message` by value. Its data words are read from the
-//! sender's per-thread IPC buffer page (registered via `SYS_IPC_BUFFER_SET`)
-//! and written to the receiver's; no memory is shared between the threads.
+//! The kernel copies a `Message` by value. Its data words and the sender's
+//! cap handles (the cap block from `syscall::MSG_CAP_HANDLES_WORD`) are read
+//! from the sender's per-thread IPC buffer page (registered via
+//! `SYS_IPC_BUFFER_SET`); the data words and the delivered handles are
+//! written to the receiver's; no memory is shared between the threads.
 //! Bulk data travels as a shared memory capability (`docs/ipc-design.md`
 //! § Message Format and § Large Data Transfers).
 
@@ -42,11 +44,10 @@ pub struct Message
     /// Actual number of valid entries in `data` (`0..=MSG_DATA_WORDS_MAX`).
     pub data_count: usize,
     /// Capability handles in transfer: on the send side, the sender's full
-    /// cap handles (index + generation) as unpacked from the syscall's two
-    /// packed words; after a completed transfer, rewritten to the
-    /// destination-side handles delivered to the recipient. Four because each
-    /// of the two packed words carries two `u32` handles (`MSG_CAP_SLOTS_MAX`).
-    pub cap_slots: [u32; MSG_CAP_SLOTS_MAX],
+    /// cap handles (index + generation) as copied from its IPC buffer's cap
+    /// block (`syscall::MSG_CAP_HANDLES_WORD`); after a completed transfer,
+    /// rewritten to the destination-side handles delivered to the recipient.
+    pub cap_slots: [u64; MSG_CAP_SLOTS_MAX],
     /// Actual number of valid entries in `cap_slots`.
     pub cap_count: usize,
 }
@@ -60,7 +61,7 @@ impl Default for Message
             badge: 0,
             data: [0u64; MSG_DATA_WORDS_MAX],
             data_count: 0,
-            cap_slots: [0u32; MSG_CAP_SLOTS_MAX],
+            cap_slots: [0u64; MSG_CAP_SLOTS_MAX],
             cap_count: 0,
         }
     }

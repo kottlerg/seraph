@@ -63,8 +63,8 @@ where
 /// deletes. Returns `(kept, surplus)`: `kept` is `None` when the reply is not
 /// a usable success (failure label, zero bytes, or no cap).
 #[must_use]
-pub fn read_memory_reply_caps(label: u64, bytes_valid: usize, caps: &[u32])
--> (Option<u32>, &[u32])
+pub fn read_memory_reply_caps(label: u64, bytes_valid: usize, caps: &[u64])
+-> (Option<u64>, &[u64])
 {
     match caps.split_first()
     {

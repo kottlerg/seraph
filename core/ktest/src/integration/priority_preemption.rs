@@ -46,17 +46,18 @@ const PREEMPT_BUDGET_US: u64 = 100_000;
 /// deleting it wherever it is.
 const HOG_DRAIN_WINDOWS: u32 = 12;
 
+/// `done` bit the hog posts when its spin finishes.
+const HOG_BIT: u64 = 0x1;
+/// `done` bit the elevated child posts when it runs.
+const ELEVATED_BIT: u64 = 0x2;
+
 static mut HOG_STACK: ChildStack = ChildStack::ZERO;
 static mut ELEVATED_STACK: ChildStack = ChildStack::ZERO;
 
-/// Hog: spin `SPIN_ITERS` times and post `done_bit` (high 32 bits) on
-/// `done_slot` (low 32 bits).
-// cast_possible_truncation: slot indices are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
-extern "C" fn hog_entry(arg: u64) -> !
+/// Hog: spin `SPIN_ITERS` times and post [`HOG_BIT`] on `done_slot`, the
+/// `arg` handle.
+extern "C" fn hog_entry(done_slot: u64) -> !
 {
-    let done_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_bit = arg >> 32;
     let mut n = SPIN_ITERS;
     while n != 0
     {
@@ -69,19 +70,15 @@ extern "C" fn hog_entry(arg: u64) -> !
         core::hint::black_box(n);
         n -= 1;
     }
-    notification_send(done_slot, done_bit).ok();
+    notification_send(done_slot, HOG_BIT).ok();
     thread_exit();
 }
 
-/// Elevated: immediately post `done_bit` (high 32 bits) on `done_slot`
-/// (low 32 bits) and exit.
-// cast_possible_truncation: slot indices are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
-extern "C" fn elevated_entry(arg: u64) -> !
+/// Elevated: immediately post [`ELEVATED_BIT`] on `done_slot`, the `arg`
+/// handle, and exit.
+extern "C" fn elevated_entry(done_slot: u64) -> !
 {
-    let done_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_bit = arg >> 32;
-    notification_send(done_slot, done_bit).ok();
+    notification_send(done_slot, ELEVATED_BIT).ok();
     thread_exit();
 }
 
@@ -106,11 +103,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: spawn::new_child_at (hog) failed")?;
     let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
-    let hog_arg = u64::from(hog_done) | (0x1u64 << 32);
     let hog_stack = ChildStack::top(core::ptr::addr_of!(HOG_STACK));
     // SAFETY: the stack is `HOG_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe { crate::spawn::configure_and_start_pinned(&hog, hog_entry, hog_stack, hog_arg, 0) }
+    unsafe { crate::spawn::configure_and_start_pinned(&hog, hog_entry, hog_stack, hog_done, 0) }
         .map_err(|_| "priority_preemption: hog configure_and_start_pinned failed")?;
 
     // Sleep so the hog (strictly below this thread's INIT_PRIORITY) gets
@@ -122,7 +118,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: spawn::new_child_at (elevated) failed")?;
     let elevated_done = cap_copy(done, elevated.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy elevated_done failed")?;
-    let elevated_arg = u64::from(elevated_done) | (0x2u64 << 32);
     let elevated_stack = ChildStack::top(core::ptr::addr_of!(ELEVATED_STACK));
 
     let budget_us = crate::scaled_bound(PREEMPT_BUDGET_US);
@@ -135,14 +130,14 @@ pub fn run(ctx: &TestContext) -> TestResult
             &elevated,
             elevated_entry,
             elevated_stack,
-            elevated_arg,
+            elevated_done,
             0,
         )
     }
     .map_err(|_| "priority_preemption: elevated configure_and_start_pinned failed")?;
 
-    // Wait for either notification: elevated bit 0x2 means preemption succeeded,
-    // hog bit 0x1 means the hog finished before being preempted (failure).
+    // Wait for either notification: ELEVATED_BIT means preemption succeeded,
+    // HOG_BIT means the hog finished before being preempted (failure).
     let bits = notification_wait_timeout(done, budget_us / 1000)
         .map_err(|_| "priority_preemption: notification_wait_timeout failed")?;
 
@@ -150,7 +145,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: system_info after wait failed")?;
     let elapsed_us = t_observed.wrapping_sub(t_made_runnable);
 
-    if bits & 0x2 == 0
+    if bits & ELEVATED_BIT == 0
     {
         crate::log_u64("priority_preemption: bits=", bits);
         crate::log_u64("priority_preemption: elapsed_us=", elapsed_us);
@@ -175,7 +170,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut seen = bits;
     for _ in 0..HOG_DRAIN_WINDOWS
     {
-        if seen & 0x1 != 0
+        if seen & HOG_BIT != 0
         {
             break;
         }

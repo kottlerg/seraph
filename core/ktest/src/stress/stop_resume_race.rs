@@ -107,6 +107,24 @@ const ALL_DONE: u64 = BIT_STOP_DONE | BIT_START_DONE;
 /// controller flips it to 1 to release STOPPER and STARTER at the same instant.
 static RELEASE: AtomicU32 = AtomicU32::new(0);
 
+/// A racer's arguments, handed to `stopper_entry` / `starter_entry` by
+/// address.
+#[derive(Clone, Copy)]
+struct RacerArgs
+{
+    /// The racer's CONTROL copy of the victim's Thread cap.
+    victim: u64,
+    /// The racer's signal copy of the cycle's `done` notification.
+    done: u64,
+}
+
+/// Entry [`STOPPER_ARG`] is the stopper's, entry [`STARTER_ARG`] the
+/// starter's; each cycle's racers are deleted before the next cycle publishes.
+static RACER_ARGS: spawn::ArgBlock<RacerArgs, 2> =
+    spawn::ArgBlock::new(RacerArgs { victim: 0, done: 0 });
+const STOPPER_ARG: usize = 0;
+const STARTER_ARG: usize = 1;
+
 // too_many_lines: one stress cell's setup, cycle loop, and teardown; the three
 // child starts' `unsafe` wrappers push it past the limit, and splitting would
 // thread each cycle's caps and stacks through helpers.
@@ -157,7 +175,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                 &victim,
                 victim_entry,
                 victim_stack,
-                u64::from(victim_done),
+                victim_done,
                 victim_cpu,
             )
         }
@@ -170,8 +188,17 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper victim failed")?;
         let stopper_done = cap_copy(done, stopper.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper done failed")?;
-        // arg packs victim_slot[31:0] | done_slot[63:32].
-        let stopper_arg = u64::from(stopper_victim) | (u64::from(stopper_done) << 32);
+        // SAFETY: entry STOPPER_ARG < 2; the previous cycle's stopper was
+        // deleted before this cycle began.
+        let stopper_arg = unsafe {
+            RACER_ARGS.publish(
+                STOPPER_ARG,
+                RacerArgs {
+                    victim: stopper_victim,
+                    done: stopper_done,
+                },
+            )
+        };
         // SAFETY: stack index 1 is the stopper's; sequential cycles never alias.
         let stopper_stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
@@ -195,8 +222,17 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::stop_resume_race: cap_copy starter victim failed")?;
         let starter_done = cap_copy(done, starter.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy starter done failed")?;
-        // arg packs victim_slot[31:0] | done_slot[63:32].
-        let starter_arg = u64::from(starter_victim) | (u64::from(starter_done) << 32);
+        // SAFETY: entry STARTER_ARG < 2; the previous cycle's starter was
+        // deleted before this cycle began.
+        let starter_arg = unsafe {
+            RACER_ARGS.publish(
+                STARTER_ARG,
+                RacerArgs {
+                    victim: starter_victim,
+                    done: starter_done,
+                },
+            )
+        };
         // SAFETY: stack index 2 is the starter's; sequential cycles never alias.
         let starter_stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
@@ -285,11 +321,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// VICTIM: announce `Running`, then spin in pure userspace forever. No
 /// syscalls after the signal, so it stays `current` on its CPU until a stop
 /// drains it or the controller `cap_delete`s it.
-// cast_possible_truncation: done is a kernel cap slot index < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn victim_entry(arg: u64) -> !
 {
-    let done = (arg & 0xFFFF_FFFF) as u32;
+    let done = arg;
     notification_send(done, BIT_VICTIM_RUNNING).ok();
     loop
     {
@@ -299,12 +333,11 @@ extern "C" fn victim_entry(arg: u64) -> !
 
 /// STOPPER: park on the barrier, then `thread_stop(victim)` while the victim is
 /// `Running` on another CPU — opening the cross-CPU drain the resume races.
-// cast_possible_truncation: cap slots are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn stopper_entry(arg: u64) -> !
 {
-    let victim = (arg & 0xFFFF_FFFF) as u32;
-    let done = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `RACER_ARGS.publish` value for this stopper; the
+    // entry is not rewritten while the stopper lives.
+    let RacerArgs { victim, done } = unsafe { spawn::child_args(arg) };
     notification_send(done, BIT_STOPPER_READY).ok();
     wait_for_release();
     let _ = thread_stop(victim);
@@ -314,12 +347,11 @@ extern "C" fn stopper_entry(arg: u64) -> !
 
 /// STARTER: park on the barrier, then `thread_start(victim)` concurrently with
 /// STOPPER — the resume that re-dispatches the victim mid-drain.
-// cast_possible_truncation: cap slots are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn starter_entry(arg: u64) -> !
 {
-    let victim = (arg & 0xFFFF_FFFF) as u32;
-    let done = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `RACER_ARGS.publish` value for this starter; the
+    // entry is not rewritten while the starter lives.
+    let RacerArgs { victim, done } = unsafe { spawn::child_args(arg) };
     notification_send(done, BIT_STARTER_READY).ok();
     wait_for_release();
     let _ = thread_start(victim);

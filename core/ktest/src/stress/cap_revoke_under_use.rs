@@ -31,10 +31,10 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 #[derive(Clone, Copy)]
 struct SenderArgs
 {
-    sig: u32,
-    done: u32,
+    sig: u64,
+    done: u64,
     /// Signal copy of the parent's `sending` notification.
-    sending: u32,
+    sending: u64,
     bit_index: u64,
 }
 
@@ -55,7 +55,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_revoke_under_use: create sending failed")?;
 
     // Derive NUM_CHILDREN children from root.
-    let mut derived = [0u32; NUM_CHILDREN];
+    let mut derived = [0u64; NUM_CHILDREN];
     for slot in &mut derived
     {
         *slot =
@@ -64,7 +64,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Ballast: pad the subtree past one revoke batch so the revoke below is
     // multi-batch while the sender threads are running.
-    let mut ballast_probe = 0u32;
+    let mut ballast_probe = 0u64;
     for _ in 0..BALLAST_CHILDREN
     {
         ballast_probe = cap_derive(root, RIGHTS_NOTIFY)
@@ -155,8 +155,8 @@ struct Senders
 /// it exists.
 fn start_senders(
     ctx: &TestContext,
-    derived: &[u32; NUM_CHILDREN],
-    reports: (u32, u32),
+    derived: &[u64; NUM_CHILDREN],
+    reports: (u64, u64),
     senders: &mut Senders,
 ) -> TestResult
 {

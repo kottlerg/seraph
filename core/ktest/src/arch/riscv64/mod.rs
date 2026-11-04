@@ -41,7 +41,7 @@ use crate::TestContext;
 /// descriptors, whose slots were never recycled, so their handles carry
 /// generation 0; one an earlier test consumed refuses the derive and is
 /// skipped.
-pub fn fresh_range_root(ctx: &TestContext) -> Option<u32>
+pub fn fresh_range_root(ctx: &TestContext) -> Option<u64>
 {
     // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
     // ktest's lifetime.

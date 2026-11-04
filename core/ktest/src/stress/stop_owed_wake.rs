@@ -337,7 +337,7 @@ fn with_children(
 /// storing each in `children` before anything can fail.
 fn start(
     ctx: &TestContext,
-    sig: u32,
+    sig: u64,
     cpus: [u32; CHILDREN],
     children: &mut [Option<spawn::SpawnedChild>; CHILDREN],
 ) -> TestResult
@@ -369,10 +369,8 @@ fn start(
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[index]) });
         // SAFETY: the stack is `super::STRESS_STACKS[index]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe {
-            spawn::configure_and_start_pinned(child, entry, stack, u64::from(arg), cpus[index])
-        }
-        .map_err(|_| "stress::stop_owed_wake: start child failed")?;
+        unsafe { spawn::configure_and_start_pinned(child, entry, stack, arg, cpus[index]) }
+            .map_err(|_| "stress::stop_owed_wake: start child failed")?;
     }
     Ok(())
 }
@@ -382,7 +380,7 @@ fn start(
 /// restart, and stopped and restarted by the controller every
 /// [`STARTER_STOP_PERIOD`] rounds), [`CYCLES`] rounds each; returns what they
 /// saw.
-fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, &'static str>
+fn run_phases(waiter_th: u64, starter_th: u64, phases: Phases) -> Result<Armed, &'static str>
 {
     let alone_losses = rounds(waiter_th, None)?;
     if alone_losses != 0
@@ -430,7 +428,7 @@ fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, 
 /// waiter, and restart it once the waiter's restart returns. Returns how many
 /// of the waiter's restarts returned `InvalidArgument` (lost to the
 /// starter's).
-fn rounds(waiter_th: u32, starter_th: Option<u32>) -> Result<u32, &'static str>
+fn rounds(waiter_th: u64, starter_th: Option<u64>) -> Result<u32, &'static str>
 {
     let mut lost = 0;
     for cycle in 0..CYCLES
@@ -491,7 +489,7 @@ fn await_waiter_entry(entered: u32)
 
 /// Stop `thread`, failing with `message` (and logging the error) if the stop
 /// fails.
-fn stop(thread: u32, message: &'static str) -> TestResult
+fn stop(thread: u64, message: &'static str) -> TestResult
 {
     thread_stop(thread).map_err(|e| {
         log_error("ktest: stress::stop_owed_wake thread_stop error=", e);
@@ -501,7 +499,7 @@ fn stop(thread: u32, message: &'static str) -> TestResult
 
 /// Restart the stopped waiter; returns whether the restart lost to the
 /// starter's (returned `InvalidArgument`).
-fn restart_waiter(waiter_th: u32) -> Result<bool, &'static str>
+fn restart_waiter(waiter_th: u64) -> Result<bool, &'static str>
 {
     match thread_start(waiter_th)
     {
@@ -517,7 +515,7 @@ fn restart_waiter(waiter_th: u32) -> Result<bool, &'static str>
 
 /// Leave the starter started: restart it if it is stopped. A starter already
 /// running refuses the start with `InvalidArgument`, which is accepted.
-fn ensure_started(starter_th: u32) -> TestResult
+fn ensure_started(starter_th: u64) -> TestResult
 {
     if let Err(e) = thread_start(starter_th)
         && e != SyscallError::InvalidArgument as i64
@@ -545,7 +543,7 @@ fn await_starter_idle() -> TestResult
 }
 
 /// Wait for every child to exit, waking the waiter until it does.
-fn await_exit(sig: u32) -> TestResult
+fn await_exit(sig: u64) -> TestResult
 {
     for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
@@ -560,11 +558,9 @@ fn await_exit(sig: u32) -> TestResult
 }
 
 /// Waiter: wait on the notification until told to quit, tallying results.
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn waiter_entry(arg: u64) -> !
 {
-    let sig = arg as u32;
+    let sig = arg;
     while QUIT.load(Ordering::Acquire) == 0
     {
         WAITS_ENTERED.fetch_add(1, Ordering::AcqRel);
@@ -592,11 +588,9 @@ extern "C" fn waiter_entry(arg: u64) -> !
 }
 
 /// Sender: deliver to the notification until told to quit.
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn sender_entry(arg: u64) -> !
 {
-    let sig = arg as u32;
+    let sig = arg;
     while QUIT.load(Ordering::Acquire) == 0
     {
         if let Err(e) = notification_send(sig, 1)
@@ -617,11 +611,9 @@ extern "C" fn sender_entry(arg: u64) -> !
 /// those interrupted by the controller stopping it. Until then (and
 /// throughout when the second phase is skipped) it sleeps, leaving its CPU to
 /// the others.
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn starter_entry(arg: u64) -> !
 {
-    let waiter_th = arg as u32;
+    let waiter_th = arg;
     while QUIT.load(Ordering::Acquire) == 0
     {
         STARTER_BUSY.store(1, Ordering::SeqCst);

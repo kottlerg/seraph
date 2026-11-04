@@ -17,7 +17,7 @@ use std::os::seraph::StartupInfo;
 #[derive(Clone, Copy)]
 pub struct AcpiRegion
 {
-    pub slot: u32,
+    pub slot: u64,
     pub base: u64,
     pub size: u64,
 }
@@ -93,23 +93,23 @@ mod present
 pub struct DevmgrCaps
 {
     // Authority caps from init.
-    pub irq_range_cap: u32,
-    pub rsdp_memory_cap: u32,
+    pub irq_range_cap: u64,
+    pub rsdp_memory_cap: u64,
     pub rsdp_page_base: u64,
-    pub dtb_memory_cap: u32,
+    pub dtb_memory_cap: u64,
     pub dtb_page_base: u64,
     pub dtb_size: u64,
 
     // MMIO aperture caps — devmgr owns these and carves per-device caps
     // out of them, keeping every remainder.
-    pub apertures: SpanTable<u32>,
+    pub apertures: SpanTable<u64>,
 
     /// The `Mmio` cap of every scanned ECAM window, kept apart from the
     /// apertures so no BAR carve can reach configuration space: devmgr
     /// carves from it the configuration page of each `VirtIO` function it
     /// spawns a driver for, through which it clears the function's Bus
     /// Master Enable when it withdraws the driver.
-    pub config_space: SpanTable<u32>,
+    pub config_space: SpanTable<u64>,
 
     /// The ECAM windows `config_space` holds, to locate a function's
     /// configuration page (`firmware::pci::function_config_phys`).
@@ -119,21 +119,21 @@ pub struct DevmgrCaps
     pub acpi_regions: Vec<AcpiRegion>,
 
     // From StartupInfo / endpoints.
-    pub procmgr_ep: u32,
-    pub registry_ep: u32,
-    pub self_bootstrap_ep: u32,
-    pub self_aspace: u32,
+    pub procmgr_ep: u64,
+    pub registry_ep: u64,
+    pub self_bootstrap_ep: u64,
+    pub self_aspace: u64,
 
     // Driver module caps, one slot per `module_kind` (indexed by
     // `module_kind::index`), so a module is resolved by class rather than by
     // delivery position; 0 where no module of that kind was delivered.
-    pub driver_modules: [u32; module_kind::COUNT],
+    pub driver_modules: [u64; module_kind::COUNT],
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
     // badged on. Reserved for devmgr-initiated publications (who
     // publishes the active names: `docs/process-lifecycle.md`
     // § Init → remaining services).
-    pub svcmgr_publish_cap: u32,
+    pub svcmgr_publish_cap: u64,
 
     /// Arch authority caps from the `SVCMGR_BUNDLE` round: the full-rights
     /// `IoPort` on x86-64, the Reset + Suspend `SbiControl` on RISC-V (see
@@ -174,7 +174,7 @@ impl DevmgrCaps
 
     /// Resolve a delivered driver-module cap by its [`module_kind`] tag.
     /// Returns `0` if no module of that class was delivered.
-    pub fn module_cap_for_kind(&self, kind: u64) -> u32
+    pub fn module_cap_for_kind(&self, kind: u64) -> u64
     {
         module_kind::index(kind).map_or(0, |i| self.driver_modules[i])
     }
@@ -210,7 +210,7 @@ impl DevmgrCaps
 /// Round 1: the authority-cap handshake. Caps after `registry_ep` appear
 /// in the order `IRQ_RANGE`, `RSDP`, `DTB`, restricted to those present
 /// in the bitmap at `data[0]`.
-fn bootstrap_round1(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
+fn bootstrap_round1(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
 {
     // SAFETY: `ipc_buf` is the caller-supplied kernel-registered per-thread IPC buffer page.
     let round1 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
@@ -250,7 +250,7 @@ fn bootstrap_round1(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
 /// for more apertures. An aperture the table cannot record (an empty range,
 /// or the table cannot grow) is logged and its cap released.
 fn absorb_aperture_round(
-    round_caps: &[u32],
+    round_caps: &[u64],
     round_cap_count: usize,
     round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
     caps: &mut DevmgrCaps,
@@ -282,7 +282,7 @@ fn absorb_aperture_round(
 /// the caps one round carries. A region the list cannot grow to hold is
 /// logged and its cap released.
 fn absorb_acpi_region_round(
-    round_caps: &[u32],
+    round_caps: &[u64],
     round_cap_count: usize,
     round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
     caps: &mut DevmgrCaps,
@@ -318,7 +318,7 @@ fn absorb_acpi_region_round(
 /// already held, is logged and its cap released: a retained module cap pins
 /// init's donated pool run.
 fn absorb_module_round(
-    round_caps: &[u32],
+    round_caps: &[u64],
     round_cap_count: usize,
     round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
     caps: &mut DevmgrCaps,
@@ -377,7 +377,7 @@ fn absorb_framebuffer_info_round(
 }
 
 /// Drive the post-R1 bootstrap rounds until init marks the stream done.
-fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
+fn bootstrap_rounds(creator: u64, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
 {
     loop
     {

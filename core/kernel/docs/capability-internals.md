@@ -219,8 +219,9 @@ of place (`cap::extend_slot_run_or_fatal`;
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
 was just allocated and not yet populated, and the list tail is byte-identical to a
 cleared slot. Each linked slot therefore also carries an on-free-list marker in
-`CapabilitySlot.pad[0]`; `is_on_free_list()` reports membership in O(1) from
-`tag == Null && pad[0] == marker`. `free_slot` consults it to reject a double-free of
+`CapabilitySlot.badge`, which carries no badge while the slot is `Null`;
+`is_on_free_list()` reports membership in O(1) from `tag == Null && badge == marker`.
+`free_slot` consults it to reject a double-free of
 any slot — re-pushing a slot already on the list would splice it in twice and cycle
 the list, after which allocation could hand back an occupied slot. The marker is set
 when a slot is linked (`set_next_free`) and cleared when it leaves the list (on
@@ -462,15 +463,18 @@ pub struct CapabilitySlot
     /// Discriminant identifying the kind of capability (or Null).
     tag: CapTag,
 
-    /// pad[0] = free-list marker, pad[1] = per-slot generation,
-    /// pad[2] = in-flight pin.
-    pad: [u8; 3],
+    /// In-flight pin (non-zero while pinned).
+    pin: u8,
 
-    /// Rights bitmask for this slot. Interpretation is tag-dependent.
+    /// Rights bitmask for this slot (16 bits). Interpretation is tag-dependent.
     rights: Rights,
 
+    /// Per-slot generation, wrapping at 2^31.
+    generation: u32,
+
     /// Caller-identifying badge (0 = unbadged). Set via SYS_CAP_DERIVE_BADGE.
-    /// Immutable once set; inherited by derivation and copy.
+    /// Immutable once set; inherited by derivation and copy. On a Null slot
+    /// linked on the free list: the free-list marker.
     badge: u64,
 
     /// Pointer to the kernel object this capability refers to.
@@ -485,7 +489,8 @@ pub struct CapabilitySlot
 }
 ```
 
-The slot is 72 bytes (`#[repr(C)]`). 56 slots per CSpace page = 4032 bytes, fitting
+The slot is 72 bytes (`#[repr(C)]`): the tag, pin, rights, and generation fill its
+first word with no implicit padding. 56 slots per CSpace page = 4032 bytes, fitting
 one 4096-byte pool page with 64 B of tail slack.
 
 `SlotId` is a global identifier combining a CSpace ID, an epoch generation
@@ -507,7 +512,8 @@ The registry that maps a `CSpaceId` to its live `CSpace` and epoch is described 
 
 ### Per-Slot Generation
 
-Each slot carries an 8-bit **generation** counter (in `pad[1]`, keeping the slot at 72 bytes).
+Each slot carries a 32-bit **generation** field holding a counter that wraps at 2^31
+(`CAP_GEN_BITS`), so it fits the handle's generation field and leaves the handle's bit 63 clear.
 `CSpace::free_slot` increments it every time the slot is recycled. The generation is encoded into
 the capability handle userspace receives — `handle = (generation << CAP_INDEX_BITS) | index` (see
 [capability-model.md](../../../docs/capability-model.md) § Capability Handle Format) — and
@@ -521,13 +527,14 @@ the bare index — the backward-compatibility hinge that lets long-lived boot ca
 historical handle values.
 
 The generation is distinct from `SlotId.epoch` (the `CSpace` registry epoch, a random value redrawn
-each time the id is recycled) and from the `pad[0]` free-list marker. It must survive the
+each time the id is recycled) and from the free-list marker. It must survive the
 free→reallocate transition: `free_slot` bumps it *before* threading the slot onto the free list,
-`set_next_free` preserves `pad[1]`, and `allocate_slot` clears the slot with `clear_keep_generation`
-(which keeps `pad[1]`). The 8-bit counter wraps after 256 recycles of one index — a bounded ABA
-window: on wrap a replayed handle is no better protected than under the pre-generation scheme, and
-no worse. No pad byte is spare (`pad[2]` holds the in-flight pin), so widening the generation past 8
-bits would need a byte reclaimed elsewhere in the 72-byte layout.
+`set_next_free` preserves it, and `allocate_slot` clears the slot with `clear_keep_generation`
+(which keeps it). The counter wraps after 2^31 recycles of one index, a bounded ABA window: a
+handle held across exactly a multiple of 2^31 recycles of its index matches the slot's generation
+again and resolves to the occupant of the moment. The slot index stays in service at wrap rather
+than being retired, since a retired index is a slot leaked for the `CSpace`'s life and a hot index
+on the LIFO free list is recycled at the rate of its create/delete cycle.
 
 ### Capability Tags
 
@@ -554,14 +561,18 @@ pub enum CapTag
 
 ### Rights Bitmask
 
-Rights are scoped per capability type: each slot stores one 32-bit erased rights
+Rights are scoped per capability type: each slot stores one 16-bit erased rights
 word (`Rights`), and the slot's `CapTag` selects which type's vocabulary
 interprets it. Every type numbers its bits from 0 in its own full-width space.
 The `u64` `RIGHTS_*` constants in `abi/syscall` are the single source of truth
 for bit values; the kernel defines a `TypedRights<K: CapKind>` newtype per type
 (`MemRights`, `EpRights`, `NtfRights`, ...) whose constants are derived from the
 ABI values, so a rights constant of the wrong capability type cannot be passed
-to a lookup at compile time. Scoping and attenuation semantics are in
+to a lookup at compile time; deriving them const-asserts each ABI bit is below
+bit 16, so a type with a seventeenth right fails the build until the word
+widens. A `u64` rights mask a syscall takes keeps its low 16 bits
+(`Rights::from_mask`): the bits above name no right of any type, so attenuation
+is unchanged. Scoping and attenuation semantics are in
 [docs/capability-model.md](../../../docs/capability-model.md) § Rights and Attenuation.
 
 Per-type vocabularies (bit positions within each type's own space):
@@ -971,7 +982,7 @@ is released would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with the
-**in-flight pin** (`CapabilitySlot::pinned`, stored in `pad[2]`, written only under
+**in-flight pin** (`CapabilitySlot::pinned`, stored in the slot's `pin` byte, written only under
 the derivation write lock and read under it by every path that acts on it; the advisory
 pre-checks of [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix) read it
 without that lock, and their locked path re-decides; a move pins its source and destination
@@ -1278,7 +1289,10 @@ Its id, 0, is recycled then like any other.
 ## Capability Transfer in IPC
 
 IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots) begins the move of
-all of a message's capabilities or of none of them — all-or-nothing at commit. A refusal detectable
+all of a message's capabilities or of none of them — all-or-nothing at commit. The sender names the
+caps by their full handles in its IPC buffer's cap block (word `MSG_CAP_HANDLES_WORD` on); the
+syscall copies them once into the message it validates and queues, so a later write to the page
+changes nothing the transfer acts on. A refusal detectable
 before the caller blocks fails the `SYS_IPC_CALL`; one that arises after the caller blocked delivers
 the message with zero capabilities, the sender keeping its own; a refused `SYS_IPC_REPLY` transfer
 returns the error to the server and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` reply in

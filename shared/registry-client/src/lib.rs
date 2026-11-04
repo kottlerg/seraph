@@ -39,7 +39,7 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{IpcMessage, svcmgr_errors, svcmgr_labels};
 
@@ -50,19 +50,19 @@ pub use ipc::svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name};
 
 /// Per-process cached SEND cap on svcmgr's service endpoint. Zero means
 /// "no registry available" — `_start` did not install one, or the
-/// process was spawned before svcmgr existed. `AtomicU32` because a cap
-/// handle is `u32` in the syscall ABI.
-static REGISTRY_CAP: AtomicU32 = AtomicU32::new(0);
+/// process was spawned before svcmgr existed. `AtomicU64` because a cap
+/// handle is `u64` in the syscall ABI.
+static REGISTRY_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Install the per-process registry cap. Called once by `_start` from
 /// `ProcessInfo.service_registry_cap`. Idempotent; last writer wins.
-pub fn install_registry_cap(cap: u32)
+pub fn install_registry_cap(cap: u64)
 {
     REGISTRY_CAP.store(cap, Ordering::Release);
 }
 
 /// Return the installed registry cap, or zero if none.
-pub fn registry_cap() -> u32
+pub fn registry_cap() -> u64
 {
     REGISTRY_CAP.load(Ordering::Acquire)
 }
@@ -76,7 +76,7 @@ pub fn registry_cap() -> u32
 /// `ipc_buf` must point at the registered IPC buffer page for this
 /// thread.
 #[must_use]
-pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u32>
+pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u64>
 {
     let registry = REGISTRY_CAP.load(Ordering::Acquire);
     if registry == 0 || name.is_empty()

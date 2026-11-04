@@ -181,7 +181,7 @@ fn forward_lines<R: std::io::Read>(tester: &str, stream: &str, mut r: R)
 /// badged SEND (slot 0). The recipe seeds `pwrmgr.shutdown` first; absent
 /// caps come back as zero and the shutdown step logs a skip instead of
 /// powering off (boot stays up for inspection).
-fn bootstrap_pwrmgr_auth() -> u32
+fn bootstrap_pwrmgr_auth() -> u64
 {
     let info = startup_info();
     if info.creator_endpoint == 0
@@ -202,7 +202,7 @@ fn bootstrap_pwrmgr_auth() -> u32
 /// failure (cap missing the authority badge or pwrmgr cannot power off);
 /// in that case the log records the symptom and the process falls through
 /// to its normal exit, leaving the system idle.
-fn shutdown(pwrmgr_auth: u32)
+fn shutdown(pwrmgr_auth: u64)
 {
     if pwrmgr_auth == 0
     {

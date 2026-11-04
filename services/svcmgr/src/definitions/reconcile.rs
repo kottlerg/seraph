@@ -43,7 +43,7 @@ pub struct PendingRegistration
     /// The service name the substrate round carried, at most
     /// `ipc::svcmgr_labels::NAME_MAX` bytes.
     pub name: String,
-    pub thread_cap: u32,
+    pub thread_cap: u64,
     /// Set to `true` once a `.svc` definition has consumed this entry, or
     /// when the scan has no memory for the parsed recipes and releases it
     /// unsupervised (`release_unsupervised`). Entries still `false` after
@@ -344,7 +344,7 @@ fn handle_definition(
 /// bind lands on the already-exited thread, not dropped (#106 Window 2).
 fn bind_only(
     def: &Definition,
-    thread_cap: u32,
+    thread_cap: u64,
     table: &mut ServiceTable,
     deaths: &death_set::DeathSet,
 )

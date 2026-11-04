@@ -888,7 +888,7 @@ pub fn fs_write_invariants_phase(_: &Caps)
 
         let pattern_a = vec![0xA5u8; CLUSTER];
         let pattern_b = vec![0x5Au8; CLUSTER];
-        let write_pattern = |cap: u32, base: usize, src: &[u8]| {
+        let write_pattern = |cap: u64, base: usize, src: &[u8]| {
             let mut written = 0usize;
             while written < src.len()
             {
@@ -1031,7 +1031,7 @@ pub fn fs_long_name_insert_phase(_: &Caps)
 /// `FS_READ_MEMORY` at `offset` with `cookie` through a fresh open of file
 /// node cap `cap`, opting out of cooperative release. Returns `bytes_valid`
 /// after releasing the page it returned, if any, and closing the open.
-fn read_memory_bytes_valid(cap: u32, offset: u64, cookie: u64, ipc_buf: *mut u64) -> u64
+fn read_memory_bytes_valid(cap: u64, offset: u64, cookie: u64, ipc_buf: *mut u64) -> u64
 {
     let open = fs_open(cap, 0, ipc_buf).expect("FS_OPEN for FS_READ_MEMORY");
     let (page, bytes_valid) = fs_read_memory(open, offset, cookie, ipc_buf)
@@ -1229,7 +1229,7 @@ fn page_tag(index: usize) -> [u8; 8]
 struct HeldPage
 {
     index: usize,
-    cap: u32,
+    cap: u64,
     range: std::os::seraph::ReservedRange,
     data_offset: u64,
 }
@@ -1241,7 +1241,7 @@ impl HeldPage
     /// `FS_RELEASE_MEMORY` without unmapping. fatfs revokes the cap and drops
     /// its slot while the mapping stays. `None` when fatfs answers `IO_ERROR`,
     /// finding no slot it may reuse.
-    fn take(open: u32, index: usize, ipc_buf: *mut u64) -> Option<Self>
+    fn take(open: u64, index: usize, ipc_buf: *mut u64) -> Option<Self>
     {
         let cookie = 0x5107_0000 + index as u64;
         let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)

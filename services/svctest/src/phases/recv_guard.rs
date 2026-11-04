@@ -5,6 +5,8 @@
 
 //! Shared recv-loop failure policy (`RecvGuard`) surface.
 
+use std::os::seraph::process::ChildExt;
+
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -34,7 +36,7 @@ fn recv_wedge_phase(_: &Caps)
         .spawn()
         .expect("spawn /programs/capexhaust failed");
 
-    let id = child.id();
+    let id = child.process_handle();
     std::os::seraph::log!("spawned /programs/capexhaust handle={id:#x}");
 
     let status = child.wait().expect("capexhaust wait failed");

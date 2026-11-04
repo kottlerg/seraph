@@ -183,7 +183,7 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 }
 
 /// Bounded poll for a death event the child posts asynchronously on its own CPU.
-fn poll_event(eq: u32) -> Result<DeathEvent, &'static str>
+fn poll_event(eq: u64) -> Result<DeathEvent, &'static str>
 {
     let bound = crate::scaled_polls(MAX_POLLS);
     let mut polls = 0;

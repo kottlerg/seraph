@@ -17,9 +17,7 @@ static mut BENCH_LIFECYCLE_STACK: ChildStack = ChildStack::ZERO;
 
 extern "C" fn lifecycle_entry(done_slot: u64) -> !
 {
-    // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
-    #[allow(clippy::cast_possible_truncation)]
-    notification_send(done_slot as u32, 0x1).ok();
+    notification_send(done_slot, 0x1).ok();
     thread_exit()
 }
 
@@ -56,10 +54,8 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
         };
         // SAFETY: the stack is `BENCH_LIFECYCLE_STACK`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        if unsafe {
-            spawn::configure_and_start(&child, lifecycle_entry, stack_top, u64::from(child_done))
-        }
-        .is_err()
+        if unsafe { spawn::configure_and_start(&child, lifecycle_entry, stack_top, child_done) }
+            .is_err()
         {
             break;
         }
@@ -110,9 +106,7 @@ extern "C" fn ctxswitch_child_entry(done_slot: u64) -> !
     {
         let _ = syscall::thread_yield();
     }
-    // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
-    #[allow(clippy::cast_possible_truncation)]
-    notification_send(done_slot as u32, 0x1).ok();
+    notification_send(done_slot, 0x1).ok();
     thread_exit()
 }
 
@@ -161,13 +155,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     // SAFETY: the stack is `BENCH_CTXSWITCH_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     if unsafe {
-        spawn::configure_and_start_pinned(
-            &child,
-            ctxswitch_child_entry,
-            stack_top,
-            u64::from(child_done),
-            0,
-        )
+        spawn::configure_and_start_pinned(&child, ctxswitch_child_entry, stack_top, child_done, 0)
     }
     .is_err()
     {

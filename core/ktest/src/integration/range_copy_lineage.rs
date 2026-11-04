@@ -23,7 +23,7 @@
 //!    still be derived from, and that page returns to its Memory capability
 //!    once the copy is deleted.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread, cap_delete,
@@ -42,12 +42,13 @@ static mut MOVER_STACK: ChildStack = ChildStack::ZERO;
 
 /// The mover's handles, all in the funding `CSpace`: the copy to move, ktest's
 /// `CSpace`, and the notification it signals when done.
-static MOVER_COPY: AtomicU32 = AtomicU32::new(0);
-static MOVER_DEST: AtomicU32 = AtomicU32::new(0);
-static MOVER_DONE: AtomicU32 = AtomicU32::new(0);
+static MOVER_COPY: AtomicU64 = AtomicU64::new(0);
+static MOVER_DEST: AtomicU64 = AtomicU64::new(0);
+static MOVER_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// The mover's result: the moved copy's handle in ktest's `CSpace`, with bit
-/// 63 set once the move succeeded.
+/// 63 set once the move succeeded (bit 63 of a kernel-issued handle is clear,
+/// since a slot's generation wraps below 2^31).
 static MOVED: AtomicU64 = AtomicU64::new(0);
 
 const MOVED_OK: u64 = 1 << 63;
@@ -60,7 +61,7 @@ extern "C" fn mover_entry(_arg: u64) -> !
     let dest = MOVER_DEST.load(Ordering::Acquire);
     if let Ok(h) = syscall::cap_move(copy, dest, 0)
     {
-        MOVED.store(MOVED_OK | u64::from(h), Ordering::Release);
+        MOVED.store(MOVED_OK | h, Ordering::Release);
     }
     syscall::notification_send(MOVER_DONE.load(Ordering::Acquire), 1).ok();
     syscall::thread_exit();
@@ -75,7 +76,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     };
 
-    let mut copies = [0u32; COPIES];
+    let mut copies = [0u64; COPIES];
     let mut made = 0;
     let mut result = many_copies(root, &mut copies, &mut made);
     if result.is_ok()
@@ -90,7 +91,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     result
 }
 
-fn many_copies(root: u32, copies: &mut [u32; COPIES], made: &mut usize) -> TestResult
+fn many_copies(root: u64, copies: &mut [u64; COPIES], made: &mut usize) -> TestResult
 {
     while *made < COPIES
     {
@@ -114,7 +115,7 @@ fn many_copies(root: u32, copies: &mut [u32; COPIES], made: &mut usize) -> TestR
     Ok(())
 }
 
-fn funded_by_destination(ctx: &TestContext, source: u32) -> TestResult
+fn funded_by_destination(ctx: &TestContext, source: u64) -> TestResult
 {
     // One pool page: the copy's body takes it, and its slot has none.
     let cs = cap_create_cspace(ctx.memory_base, 0, 2)
@@ -129,7 +130,7 @@ fn funded_by_destination(ctx: &TestContext, source: u32) -> TestResult
     result
 }
 
-fn outlives_funder(ctx: &TestContext, source: u32, cs: u32, frame: u32) -> TestResult
+fn outlives_funder(ctx: &TestContext, source: u64, cs: u64, frame: u64) -> TestResult
 {
     if cap_copy(source, cs, RIGHTS_ALL) != Err(SyscallError::OutOfMemory as i64)
     {
@@ -169,7 +170,7 @@ fn outlives_funder(ctx: &TestContext, source: u32, cs: u32, frame: u32) -> TestR
 
 /// Move `copy` (a handle in `cs`) into ktest's own `CSpace` from a thread
 /// bound to `cs`; returns its new handle.
-fn move_out(ctx: &TestContext, cs: u32, copy: u32) -> Result<u32, &'static str>
+fn move_out(ctx: &TestContext, cs: u64, copy: u64) -> Result<u64, &'static str>
 {
     let parent_cs = cap_copy(ctx.cspace_cap, cs, RIGHTS_ALL)
         .map_err(|_| "integration::range_copy_lineage: cap_copy(cspace) failed")?;
@@ -197,8 +198,7 @@ fn move_out(ctx: &TestContext, cs: u32, copy: u32) -> Result<u32, &'static str>
         {
             return Err("integration::range_copy_lineage: the move out of the funder failed");
         }
-        u32::try_from(moved & !MOVED_OK)
-            .map_err(|_| "integration::range_copy_lineage: the moved handle is not a handle")
+        Ok(moved & !MOVED_OK)
     })();
     cap_delete(done).ok();
     result

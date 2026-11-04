@@ -45,7 +45,7 @@ pub struct Disk
     /// `blk_labels::MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` on the
     /// disk's block driver, from `QUERY_BLOCK_DEVICE`. Every
     /// `REGISTER_PARTITION` for a partition of this disk goes here.
-    pub blk_ep: u32,
+    pub blk_ep: u64,
     /// Every used GPT entry of this disk, parsed once at startup; empty when
     /// its GPT could not be read or validated.
     pub partitions: Vec<GptEntry>,
@@ -76,11 +76,11 @@ pub struct Disk
 /// only refused, so do the old page and its slot: at most one page per
 /// such disk, at startup.
 pub fn discover_disks(
-    registry_ep: u32,
-    memmgr_ep: u32,
-    self_aspace: u32,
+    registry_ep: u64,
+    memmgr_ep: u64,
+    self_aspace: u64,
     ipc_buf: *mut u64,
-    scratch_cap: &mut u32,
+    scratch_cap: &mut u64,
     scratch_va: &mut u64,
 ) -> Vec<Disk>
 {
@@ -155,10 +155,10 @@ pub fn discover_disks(
 /// read fails and the disk is held with no partitions.
 fn replace_scratch(
     ordinal: u64,
-    memmgr_ep: u32,
-    self_aspace: u32,
+    memmgr_ep: u64,
+    self_aspace: u64,
     ipc_buf: *mut u64,
-    scratch_cap: &mut u32,
+    scratch_cap: &mut u64,
     scratch_va: &mut u64,
 )
 {
@@ -190,11 +190,11 @@ enum BlockDeviceReply
     /// A `SUCCESS` reply that carried no cap.
     NoCap,
     /// The whole-disk cap on the driver at this ordinal.
-    Disk(u32),
+    Disk(u64),
 }
 
 /// `QUERY_BLOCK_DEVICE` at instance ordinal `ordinal` (`data[1]`).
-fn query_block_device(registry_ep: u32, ordinal: u64, ipc_buf: *mut u64) -> BlockDeviceReply
+fn query_block_device(registry_ep: u64, ordinal: u64, ipc_buf: *mut u64) -> BlockDeviceReply
 {
     let msg = IpcMessage::builder(devmgr_labels::QUERY_BLOCK_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -243,7 +243,7 @@ fn log_gpt_error(ordinal: u64, e: &GptError)
 /// `ReservedRange` has no Drop and the memory cap is intentionally not
 /// released. A driver that dies while it holds the cap during a read
 /// destroys it ([`discover_disks`] then allocates a replacement).
-pub fn alloc_scratch(memmgr_ep: u32, self_aspace: u32, ipc_buf: *mut u64) -> Option<(u32, u64)>
+pub fn alloc_scratch(memmgr_ep: u64, self_aspace: u64, ipc_buf: *mut u64) -> Option<(u64, u64)>
 {
     let scratch_va = {
         let range = reserve_pages(1).ok()?;
@@ -258,7 +258,7 @@ pub fn alloc_scratch(memmgr_ep: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
 }
 
 /// Acquire one single-page Memory cap from memmgr.
-fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
+fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -280,7 +280,7 @@ fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 /// The device's logical block size, from `BLK_GET_GEOMETRY` on the
 /// whole-disk cap, or `None` when the driver refuses or replies a size the
 /// GPT parser does not take.
-fn query_block_size(blk_ep: u32, ipc_buf: *mut u64) -> Option<usize>
+fn query_block_size(blk_ep: u64, ipc_buf: *mut u64) -> Option<usize>
 {
     let msg = IpcMessage::builder(blk_labels::BLK_GET_GEOMETRY)
         .word(0, u64::from(ipc::BLK_LABELS_VERSION))
@@ -307,10 +307,10 @@ fn query_block_size(blk_ep: u32, ipc_buf: *mut u64) -> Option<usize>
 /// `&mut scratch_cap` is updated on every outcome (success or failure) so the
 /// next call uses the current cap location.
 fn read_block_sector(
-    blk_ep: u32,
+    blk_ep: u64,
     sector: u64,
     buf: &mut [u8],
-    scratch_cap: &mut u32,
+    scratch_cap: &mut u64,
     scratch_va: u64,
     ipc_buf: *mut u64,
 ) -> bool
@@ -354,8 +354,8 @@ fn read_block_sector(
 /// Read the GPT header at LBA 1, one logical block of the device's size, and
 /// validate it via the pure parser.
 fn read_and_validate_header(
-    blk_ep: u32,
-    scratch_cap: &mut u32,
+    blk_ep: u64,
+    scratch_cap: &mut u64,
     scratch_va: u64,
     ipc_buf: *mut u64,
 ) -> Result<GptHeader, GptError>
@@ -383,9 +383,9 @@ fn read_and_validate_header(
 /// deposited the returned cap.
 fn parse_gpt(
     ordinal: u64,
-    blk_ep: u32,
+    blk_ep: u64,
     ipc_buf: *mut u64,
-    scratch_cap: &mut u32,
+    scratch_cap: &mut u64,
     scratch_va: u64,
 ) -> Result<Vec<GptEntry>, GptError>
 {

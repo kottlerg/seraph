@@ -70,6 +70,21 @@ const WAIT_MS: u64 = 1;
 /// Wait results outside the accepted set, with one of their result words.
 static BAD_WAITS: BadTally = BadTally::new();
 
+/// The waiter's arguments, handed to `notif_waiter` / `queue_waiter` by
+/// address.
+#[derive(Clone, Copy)]
+struct WaiterArgs
+{
+    /// The waiter's copy of the cycle's source (a notification or a queue).
+    source: u64,
+    /// The waiter's signal copy of the `done` notification.
+    done: u64,
+}
+
+/// One entry: each cycle's waiter is deleted before the next publishes.
+static WAITER_ARGS: spawn::ArgBlock<WaiterArgs, 1> =
+    spawn::ArgBlock::new(WaiterArgs { source: 0, done: 0 });
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -129,7 +144,7 @@ fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
 /// One cycle: park a waiter on a fresh source, destroy the source around its
 /// deadlines, and take its verdict. Returns whether the waiter was
 /// interrupted.
-fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool, &'static str>
+fn one_cycle(ctx: &TestContext, done: u64, cycle: u32, cpus: u32) -> Result<bool, &'static str>
 {
     let (source, entry): (_, extern "C" fn(u64) -> !) = if cycle & 1 == 1
     {
@@ -180,8 +195,8 @@ fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool
 fn race(
     child: &spawn::SpawnedChild,
     entry: extern "C" fn(u64) -> !,
-    source: u32,
-    done: u32,
+    source: u64,
+    done: u64,
     cycle: u32,
     cpus: u32,
 ) -> Result<u64, &'static str>
@@ -196,18 +211,21 @@ fn race(
     // The waiter alternates between CPU 0, which runs the timer, and a CPU
     // other than the controller's 1 (CPU 0 again on a 2-CPU run).
     let waiter_cpu = if (cycle >> 1) & 1 == 0 { 0 } else { 2 % cpus };
+    // SAFETY: entry 0 < 1; the previous cycle's waiter was deleted before
+    // this cycle began.
+    let arg = unsafe {
+        WAITER_ARGS.publish(
+            0,
+            WaiterArgs {
+                source: c_source,
+                done: c_done,
+            },
+        )
+    };
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        spawn::configure_and_start_pinned(
-            child,
-            entry,
-            stack,
-            u64::from(c_source) | (u64::from(c_done) << 32),
-            waiter_cpu,
-        )
-    }
-    .map_err(|_| "stress::timed_wait_source_delete: start waiter failed")?;
+    unsafe { spawn::configure_and_start_pinned(child, entry, stack, arg, waiter_cpu) }
+        .map_err(|_| "stress::timed_wait_source_delete: start waiter failed")?;
 
     let mut acc = 0u64;
     await_report(
@@ -235,17 +253,19 @@ fn race(
     Ok(acc)
 }
 
-// cast_possible_truncation: packed fields are 32-bit cap handles.
-#[allow(clippy::cast_possible_truncation)]
-fn unpack(arg: u64) -> (u32, u32)
+/// Read the waiter's `(source, done)` handles from the entry at `arg`.
+fn unpack(arg: u64) -> (u64, u64)
 {
-    ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32)
+    // SAFETY: `arg` is the `WAITER_ARGS.publish` value for this waiter; the
+    // entry is not rewritten while the waiter lives.
+    let WaiterArgs { source, done } = unsafe { spawn::child_args(arg) };
+    (source, done)
 }
 
 /// Re-arm the timed wait while `timed_out` accepts its result; report how
 /// the loop ended.
 fn wait_loop(
-    done: u32,
+    done: u64,
     mut wait: impl FnMut() -> Result<u64, i64>,
     timed_out: fn(Result<u64, i64>) -> bool,
 ) -> !

@@ -156,9 +156,9 @@ static SECOND_STOPS_OK: AtomicU32 = AtomicU32::new(0);
 struct StopperArgs
 {
     /// CONTROL copy of the client's Thread cap.
-    target: u32,
+    target: u64,
     /// Signal copy of the cycle's `done`.
-    done: u32,
+    done: u64,
     /// The cycle, counted from 1.
     round: u32,
 }
@@ -168,6 +168,23 @@ static STOPPER_ARGS: spawn::ArgBlock<StopperArgs, 1> = spawn::ArgBlock::new(Stop
     done: 0,
     round: 0,
 });
+
+/// The client's and the server's arguments, handed to `client_entry` and
+/// `server_entry` by address (cap handles in the child's own `CSpace`).
+#[derive(Clone, Copy)]
+struct PeerArgs
+{
+    /// The child's copy of the cycle's endpoint.
+    ep: u64,
+    /// Signal copy of the cycle's `done`.
+    done: u64,
+}
+
+/// Entry [`CLIENT_ARG`] is the client's, entry [`SERVER_ARG`] the server's;
+/// each cycle's reap deletes both before the next cycle publishes.
+static PEER_ARGS: spawn::ArgBlock<PeerArgs, 2> = spawn::ArgBlock::new(PeerArgs { ep: 0, done: 0 });
+const CLIENT_ARG: usize = 0;
+const SERVER_ARG: usize = 1;
 
 /// A page-aligned 4 KiB IPC buffer page (512 `u64` words, the same shape as
 /// ktest's own `IPC_BUF`). One per concurrent child.
@@ -282,8 +299,8 @@ fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 #[derive(Default)]
 struct CycleParts
 {
-    ep: Option<u32>,
-    done: Option<u32>,
+    ep: Option<u64>,
+    done: Option<u64>,
     client: Option<spawn::SpawnedChild>,
     stopper: Option<spawn::SpawnedChild>,
     server: Option<spawn::SpawnedChild>,
@@ -401,7 +418,7 @@ fn arm_and_race(
 
 /// Probe, at most [`EXIT_PROBES`] times back to back, whether `server`
 /// reports `Exited`; the race accepts either answer.
-fn probe_exited(server: u32) -> TestResult
+fn probe_exited(server: u64) -> TestResult
 {
     for _ in 0..EXIT_PROBES
     {
@@ -508,7 +525,7 @@ fn check_second_stops() -> TestResult
 /// parity to cover both interleavings. A second stopper, if any, is released
 /// first and races A with a second cancel. B deletes the Thread cap through
 /// `server`, its guard.
-fn race(cycle: u32, client_th: u32, server: &mut spawn::SpawnedChild) -> TestResult
+fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild) -> TestResult
 {
     STOPPER_GO.store(cycle + 1, Ordering::Release);
     // The stop's outcome depends on which teardown reached the client first
@@ -537,11 +554,11 @@ fn race(cycle: u32, client_th: u32, server: &mut spawn::SpawnedChild) -> TestRes
 /// the cycle's reap deletes it). Returns its Thread cap.
 fn spawn_client(
     ctx: &TestContext,
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     cpu: u32,
     slot: &mut Option<spawn::SpawnedChild>,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let client = slot.insert(
         spawn::new_child(ctx)
@@ -551,9 +568,19 @@ fn spawn_client(
         .map_err(|_| "stress::stop_reply_race: cap_copy client ep failed")?;
     let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
         .map_err(|_| "stress::stop_reply_race: cap_copy client done failed")?;
-    // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
-    // dedicated IPC buffer address from the static directly.
-    let arg = u64::from(client_ep) | (u64::from(client_done) << 32);
+    // The child reads its own dedicated IPC buffer address from the static
+    // directly.
+    // SAFETY: entry CLIENT_ARG < 2; the previous cycle's client was deleted
+    // by that cycle's reap.
+    let arg = unsafe {
+        PEER_ARGS.publish(
+            CLIENT_ARG,
+            PeerArgs {
+                ep: client_ep,
+                done: client_done,
+            },
+        )
+    };
     // SAFETY: stack index 1 is the client's; each cycle reaps its client
     // before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
@@ -569,11 +596,11 @@ fn spawn_client(
 /// cycle's reap deletes it). Returns its Thread cap.
 fn spawn_server(
     ctx: &TestContext,
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     cpu: u32,
     slot: &mut Option<spawn::SpawnedChild>,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let server = slot.insert(
         spawn::new_child(ctx)
@@ -583,9 +610,19 @@ fn spawn_server(
         .map_err(|_| "stress::stop_reply_race: cap_copy server ep failed")?;
     let server_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
         .map_err(|_| "stress::stop_reply_race: cap_copy server done failed")?;
-    // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
-    // dedicated IPC buffer address from the static directly.
-    let arg = u64::from(server_ep) | (u64::from(server_done) << 32);
+    // The child reads its own dedicated IPC buffer address from the static
+    // directly.
+    // SAFETY: entry SERVER_ARG < 2; the previous cycle's server was deleted
+    // by that cycle's reap.
+    let arg = unsafe {
+        PEER_ARGS.publish(
+            SERVER_ARG,
+            PeerArgs {
+                ep: server_ep,
+                done: server_done,
+            },
+        )
+    };
     // SAFETY: stack index 0 is the server's; each cycle reaps its server
     // before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
@@ -639,16 +676,15 @@ fn spawn_stopper(
 
 // ── Child entries ───────────────────────────────────────────────────────────
 
-/// Decode the two packed fields shared by both child entries:
-/// `ep_slot[31:0]`, `done_slot[63:32]` (cap handles in the child's own
-/// `CSpace`). Each child reads its dedicated IPC buffer from its module static.
-// cast_possible_truncation: ep/done are kernel cap slot indices < 2^32.
-#[allow(clippy::cast_possible_truncation)]
-fn decode(arg: u64) -> (u32, u32)
+/// Decode the `(ep, done)` handles both child entries receive through
+/// [`PEER_ARGS`] (cap handles in the child's own `CSpace`). Each child reads
+/// its dedicated IPC buffer from its module static.
+fn decode(arg: u64) -> (u64, u64)
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
-    (ep_slot, done_slot)
+    // SAFETY: `arg` is the `PEER_ARGS.publish` value for this child; the
+    // entry is not rewritten while the child lives.
+    let PeerArgs { ep, done } = unsafe { spawn::child_args(arg) };
+    (ep, done)
 }
 
 /// Server: receive one caller (making it `BlockedOnReply`), announce that the

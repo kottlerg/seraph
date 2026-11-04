@@ -192,7 +192,7 @@ fn mappings_windows(ctx: &TestContext) -> TestResult
 
 /// Map `memory_cap` into ktest's address space and a fresh one, checking the
 /// count after each step. Unmaps it from both on every path that can.
-fn mappings_probe(ctx: &TestContext, memory_cap: u32) -> TestResult
+fn mappings_probe(ctx: &TestContext, memory_cap: u64) -> TestResult
 {
     let count = || {
         cap_info_memory_mappings(memory_cap, 0, 1)
@@ -269,7 +269,7 @@ pub fn memory_fields(_ctx: &TestContext) -> TestResult
 
 /// Read `memory_cap`'s size, available bytes, has-retype flag, and packed
 /// tag-and-rights word, in that order.
-fn read_memory_fields(memory_cap: u32) -> Result<(u64, u64, u64, u64), &'static str>
+fn read_memory_fields(memory_cap: u64) -> Result<(u64, u64, u64, u64), &'static str>
 {
     let size = cap_info(memory_cap, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "cap_info(memory_cap, MEMORY_SIZE) failed")?;
@@ -349,7 +349,7 @@ pub fn ram_descriptors_match_caps(ctx: &TestContext) -> TestResult
                 && (info.memory_base..info.memory_base + info.memory_count).contains(&d.slot)
         })
     };
-    if ram().count() != info.memory_count as usize || info.memory_count == 0
+    if u64::try_from(ram().count()) != Ok(info.memory_count) || info.memory_count == 0
     {
         return Err("ram_descriptors_match_caps: not one descriptor per RAM Memory cap");
     }
@@ -429,7 +429,7 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 }
 
 /// Rights word of `cap` (via `CAP_INFO_TAG_RIGHTS`) equals `expected` exactly.
-fn check_mask(cap: u32, expected: u64, what: &'static str) -> TestResult
+fn check_mask(cap: u64, expected: u64, what: &'static str) -> TestResult
 {
     // The ABI constants are u64 with all bits in the low 32 (asserted by the
     // abi host tests); the rights half of the packed value is u32.

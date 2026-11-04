@@ -94,10 +94,7 @@ pub fn sys_sbi_call(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::NotSupported);
     }
 
-    // cast_possible_truncation: cap handles are u32 by ABI contract; the
-    // truncation discards any upper bits a caller sets.
-    #[allow(clippy::cast_possible_truncation)]
-    let sbi_cap_idx = tf.arg(0) as u32;
+    let sbi_cap_idx = tf.arg(0);
     let extension = tf.arg(1);
     let function = tf.arg(2);
     let a0 = tf.arg(3);

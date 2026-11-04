@@ -88,7 +88,7 @@
 //!
 //! Needs **≥ 4 CPUs**.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     cap_create_notification, cap_create_thread, cap_delete, event_post, event_queue_create,
@@ -165,10 +165,10 @@ static SENDER_EXITED: AtomicU32 = AtomicU32::new(0);
 static STOPPER_EXITED: AtomicU32 = AtomicU32::new(0);
 /// The round's source, a handle in ktest's `CSpace`, published before the
 /// round goes live.
-static SOURCE: AtomicU32 = AtomicU32::new(0);
+static SOURCE: AtomicU64 = AtomicU64::new(0);
 /// The round's waiter, a handle in ktest's `CSpace`, published before the
 /// second stopper is armed.
-static WAITER: AtomicU32 = AtomicU32::new(0);
+static WAITER: AtomicU64 = AtomicU64::new(0);
 /// Controller → second stopper: the round, counted from 1, whose waiter it
 /// is to stop, published after [`WAITER`]; and the round whose stop it has
 /// finished, after which the controller may delete the waiter.
@@ -230,16 +230,16 @@ struct Phase
 #[derive(Default)]
 struct Helpers
 {
-    sender: Option<u32>,
-    stopper: Option<u32>,
+    sender: Option<u64>,
+    stopper: Option<u64>,
 }
 
 /// What a round creates; each is deleted on every path, the source first.
 #[derive(Default)]
 struct RoundParts
 {
-    source: Option<u32>,
-    waiter: Option<u32>,
+    source: Option<u64>,
+    waiter: Option<u64>,
 }
 
 /// What a phase saw.
@@ -382,8 +382,6 @@ fn phase(ctx: &TestContext, kind: Kind, stops: Stops) -> Result<Seen, &'static s
         &SENDER_BUSY,
         &SENDER_EXITED,
         &STOPPER_EXITED,
-        &SOURCE,
-        &WAITER,
         &STOP_ARMED,
         &STOPPER_DONE,
         &WAITS_ENTERED,
@@ -396,6 +394,8 @@ fn phase(ctx: &TestContext, kind: Kind, stops: Stops) -> Result<Seen, &'static s
     {
         counter.store(0, Ordering::Release);
     }
+    SOURCE.store(0, Ordering::Release);
+    WAITER.store(0, Ordering::Release);
     for tally in [&BAD_WAITS, &BAD_SENDS, &BAD_STOPS]
     {
         tally.reset();
@@ -584,7 +584,7 @@ fn arm_and_stop(
 /// reached the waiter first), and the second stopper's stop is waited out,
 /// bounded by [`ACK_WAIT_US`], so the waiter is stopped and off its CPU,
 /// and its handle is free to delete, whichever stop committed.
-fn stop(waiter: u32, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
+fn stop(waiter: u64, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
 {
     if stops == Stops::Single
     {
@@ -645,7 +645,7 @@ fn release_round(parts: &RoundParts) -> TestResult
 }
 
 /// Create one source of `kind`.
-fn create_source(ctx: &TestContext, kind: Kind) -> Result<u32, &'static str>
+fn create_source(ctx: &TestContext, kind: Kind) -> Result<u64, &'static str>
 {
     match kind
     {
@@ -662,12 +662,12 @@ fn create_source(ctx: &TestContext, kind: Kind) -> Result<u32, &'static str>
 /// returned.
 fn create_thread(
     ctx: &TestContext,
-    slot: &mut Option<u32>,
+    slot: &mut Option<u64>,
     entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
     cpu: u32,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let th = *slot.insert(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
@@ -724,7 +724,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 }
 
 /// Block on `source` of `kind`; returns the bits or payload delivered.
-fn wait(kind: Kind, source: u32) -> Result<u64, i64>
+fn wait(kind: Kind, source: u64) -> Result<u64, i64>
 {
     match kind
     {
@@ -734,7 +734,7 @@ fn wait(kind: Kind, source: u32) -> Result<u64, i64>
 }
 
 /// Deliver [`VALUE`] to `source` of `kind`.
-fn deliver(kind: Kind, source: u32) -> Result<(), i64>
+fn deliver(kind: Kind, source: u64) -> Result<(), i64>
 {
     match kind
     {

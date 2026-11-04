@@ -44,8 +44,8 @@ const WORKER_BIT: [u64; NUM_WORKERS] = worker_bits();
 #[derive(Clone, Copy)]
 struct WorkerArgs
 {
-    memory: u32,
-    done: u32,
+    memory: u64,
+    done: u64,
     bit_index: usize,
 }
 

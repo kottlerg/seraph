@@ -46,7 +46,7 @@
 //! tails' bodies live, and that every page, the arena pages included, is back
 //! in `memory_base` at the end.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use init_protocol::{CapType, InitInfo};
 use syscall::{
@@ -67,13 +67,13 @@ static mut SPLITTER_STACK: ChildStack = ChildStack::ZERO;
 
 /// The splitter's inputs, handles in its `CSpace`: the two-page Memory cap to
 /// split, ktest's `CSpace`, and the notification it signals when done.
-static SPLIT_SRC: AtomicU32 = AtomicU32::new(0);
-static SPLIT_DEST: AtomicU32 = AtomicU32::new(0);
-static SPLIT_DONE: AtomicU32 = AtomicU32::new(0);
+static SPLIT_SRC: AtomicU64 = AtomicU64::new(0);
+static SPLIT_DEST: AtomicU64 = AtomicU64::new(0);
+static SPLIT_DONE: AtomicU64 = AtomicU64::new(0);
 /// The splitter's results, handles in ktest's `CSpace` (0 on failure): the
 /// one-page head and the tail whose body its `CSpace` funded.
-static SPLIT_HEAD: AtomicU32 = AtomicU32::new(0);
-static SPLIT_TAIL: AtomicU32 = AtomicU32::new(0);
+static SPLIT_HEAD: AtomicU64 = AtomicU64::new(0);
+static SPLIT_TAIL: AtomicU64 = AtomicU64::new(0);
 
 /// Bodies case 4 places: three arena pages' worth at 31 bodies a page.
 const MANY: usize = 70;
@@ -83,11 +83,11 @@ const P_PAGES: u64 = 16;
 const T_PAGES: u64 = 8;
 /// The copier's inputs, handles in its `CSpace`: the `Mmio` capability to
 /// derive from, ktest's `CSpace`, and the notification it signals when done.
-static COPY_SRC: AtomicU32 = AtomicU32::new(0);
-static COPY_DEST: AtomicU32 = AtomicU32::new(0);
-static COPY_DONE: AtomicU32 = AtomicU32::new(0);
+static COPY_SRC: AtomicU64 = AtomicU64::new(0);
+static COPY_DEST: AtomicU64 = AtomicU64::new(0);
+static COPY_DONE: AtomicU64 = AtomicU64::new(0);
 /// The copier's results, handles in ktest's `CSpace` (0 where it stopped).
-static COPIES: [AtomicU32; MANY] = [const { AtomicU32::new(0) }; MANY];
+static COPIES: [AtomicU64; MANY] = [const { AtomicU64::new(0) }; MANY];
 
 /// Splitter entry, bound to the funding `CSpace`: split the two-page cap at
 /// one page, so the tail's body is a chunk of this `CSpace`'s arena, then
@@ -135,7 +135,7 @@ extern "C" fn copier_entry(_arg: u64) -> !
 /// Run `entry` on a thread bound to `cs` and wait on `done`, which the
 /// entry signals through its copy in `cs`; the caller has set the entry's
 /// inputs.
-fn run_bound(ctx: &TestContext, cs: u32, done: u32, entry: extern "C" fn(u64) -> !) -> TestResult
+fn run_bound(ctx: &TestContext, cs: u64, done: u64, entry: extern "C" fn(u64) -> !) -> TestResult
 {
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
@@ -155,14 +155,14 @@ fn run_bound(ctx: &TestContext, cs: u32, done: u32, entry: extern "C" fn(u64) ->
 /// a thread bound to `cs`, so the tail's body is in `cs`'s arena.
 struct Funded
 {
-    head: u32,
-    tail: u32,
+    head: u64,
+    tail: u64,
 }
 
 /// Split two pages off the top of `memory_base`, move them into `cs`, and have
 /// a thread bound to `cs` split them; returns the head and the tail, both back
 /// in ktest's `CSpace`.
-fn split_in(ctx: &TestContext, cs: u32) -> Result<Funded, &'static str>
+fn split_in(ctx: &TestContext, cs: u64) -> Result<Funded, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
@@ -207,7 +207,7 @@ fn merge_back(ctx: &TestContext, f: &Funded) -> TestResult
         .map_err(|_| "integration::arena_reclaim: memory_merge(memory_base, head) failed")
 }
 
-fn available(cap: u32) -> u64
+fn available(cap: u64) -> u64
 {
     cap_info(cap, CAP_INFO_MEMORY_AVAILABLE).unwrap_or(u64::MAX)
 }
@@ -226,7 +226,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// The probe `Mmio` capability init hands ktest, if the platform has one.
-fn probe_mmio(ctx: &TestContext) -> Option<u32>
+fn probe_mmio(ctx: &TestContext) -> Option<u64>
 {
     // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
     // ktest's lifetime.
@@ -431,7 +431,7 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
         // and a slot page takes the third.
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, a, 0, 0)
             .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
-        bound = (1..=crate::unit::hw::scan_bound(ctx))
+        bound = (1..=u64::from(crate::unit::hw::scan_bound(ctx)))
             .any(|slot| syscall::ioport_bind(th, slot).is_ok());
         cap_delete(th).ok();
         if !bound
@@ -451,7 +451,7 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
 }
 
 /// Split a piece of `pages` pages off the top of `memory_base`.
-fn split_piece(ctx: &TestContext, pages: u64) -> Result<u32, &'static str>
+fn split_piece(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
@@ -461,7 +461,7 @@ fn split_piece(ctx: &TestContext, pages: u64) -> Result<u32, &'static str>
 
 /// Have a thread bound to `a` derive `MANY` `Mmio` capabilities from a copy of
 /// `probe` in `a`, each a body in `a`'s arena, and move each into `COPIES`.
-fn place_moved_bodies(ctx: &TestContext, a: u32, probe: u32) -> TestResult
+fn place_moved_bodies(ctx: &TestContext, a: u64, probe: u64) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::arena_reclaim: cap_create_notification failed")?;
@@ -492,8 +492,8 @@ fn place_moved_bodies(ctx: &TestContext, a: u32, probe: u32) -> TestResult
 /// whole once they go.
 fn finish_kept(
     ctx: &TestContext,
-    a: u32,
-    piece: u32,
+    a: u64,
+    piece: u64,
     pages: u64,
     base_before: u64,
     placed: TestResult,

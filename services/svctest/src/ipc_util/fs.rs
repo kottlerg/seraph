@@ -14,7 +14,7 @@ use crate::ipc_util::ns::ns_lookup;
 
 /// Walk the per-test `/data/svctest` directory from the std-overlay
 /// root-dir cap and return the dir cap.
-pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u32
+pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u64
 {
     let root = std::os::seraph::root_dir_cap();
     let (data_cap, _kind, _) =
@@ -27,7 +27,7 @@ pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u32
 
 /// `FS_CREATE` returns `(node_cap, kind)` on success. Returns the wire
 /// error code on failure.
-pub fn fs_create(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
+pub fn fs_create(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(u64, u64), u64>
 {
     let label = ipc::fs_labels::FS_CREATE | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
@@ -42,7 +42,7 @@ pub fn fs_create(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32
 }
 
 /// `FS_MKDIR`. Same shape as `FS_CREATE`.
-pub fn fs_mkdir(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
+pub fn fs_mkdir(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(u64, u64), u64>
 {
     let label = ipc::fs_labels::FS_MKDIR | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
@@ -57,7 +57,7 @@ pub fn fs_mkdir(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32,
 }
 
 /// `FS_REMOVE`. Returns `Ok(())` on success.
-pub fn fs_remove(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
+pub fn fs_remove(parent_cap: u64, name: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
 {
     let label = ipc::fs_labels::FS_REMOVE | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
@@ -71,7 +71,7 @@ pub fn fs_remove(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(), 
 }
 
 /// `FS_RENAME` within a single directory. Returns `Ok(())` on success.
-pub fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
+pub fn fs_rename(dir_cap: u64, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
 {
     let mut combined = Vec::with_capacity(src.len() + dst.len());
     combined.extend_from_slice(src);
@@ -92,7 +92,7 @@ pub fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Res
 
 /// `FS_WRITE` inline: returns `bytes_written`.
 pub fn fs_write_inline(
-    file_cap: u32,
+    file_cap: u64,
     offset: u64,
     payload: &[u8],
     ipc_buf: *mut u64,
@@ -114,7 +114,7 @@ pub fn fs_write_inline(
 
 /// Round-trip `FS_READ`: returns the bytes the driver reports.
 pub fn fs_read_bytes(
-    file_cap: u32,
+    file_cap: u64,
     offset: u64,
     max_len: u64,
     ipc_buf: *mut u64,
@@ -140,7 +140,7 @@ pub fn fs_read_bytes(
 /// `FS_OPEN` on file node cap `node_cap`, carrying `release` (a release
 /// endpoint SEND, moved to fatfs) in `caps[0]` when it is non-zero. Returns
 /// the open cap, or the wire error code.
-pub fn fs_open(node_cap: u32, release: u32, ipc_buf: *mut u64) -> Result<u32, u64>
+pub fn fs_open(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<u64, u64>
 {
     let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN);
     if release != 0
@@ -162,7 +162,7 @@ pub fn fs_open(node_cap: u32, release: u32, ipc_buf: *mut u64) -> Result<u32, u6
 
 /// `FS_CLOSE` on `cap`; returns the reply label (`u64::MAX` when the call
 /// fails).
-pub fn fs_close(cap: u32, ipc_buf: *mut u64) -> u64
+pub fn fs_close(cap: u64, ipc_buf: *mut u64) -> u64
 {
     let msg = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -173,11 +173,11 @@ pub fn fs_close(cap: u32, ipc_buf: *mut u64) -> u64
 /// Returns `(page_cap, bytes_valid)` (`page_cap` 0 at end of file), or the
 /// wire error code.
 pub fn fs_read_memory(
-    open: u32,
+    open: u64,
     offset: u64,
     cookie: u64,
     ipc_buf: *mut u64,
-) -> Result<(u32, u64), u64>
+) -> Result<(u64, u64), u64>
 {
     let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
         .word(0, offset)
@@ -194,7 +194,7 @@ pub fn fs_read_memory(
 
 /// `FS_RELEASE_MEMORY` of `cookie` on open cap `open`; returns the reply
 /// label (`u64::MAX` when the call fails).
-pub fn fs_release_memory(open: u32, cookie: u64, ipc_buf: *mut u64) -> u64
+pub fn fs_release_memory(open: u64, cookie: u64, ipc_buf: *mut u64) -> u64
 {
     let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
         .word(0, cookie)

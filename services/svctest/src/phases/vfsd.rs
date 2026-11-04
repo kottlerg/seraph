@@ -57,7 +57,7 @@ fn mount_request(role: u64, path: &[u8], path_len: u64) -> ipc::IpcMessage
 
 /// Send `msg` on `cap` and return the reply label, asserting it carries no
 /// cap (none of these cases may yield a mount's namespace SEND).
-fn mount_reply(cap: u32, msg: &ipc::IpcMessage, what: &str) -> u64
+fn mount_reply(cap: u64, msg: &ipc::IpcMessage, what: &str) -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.

@@ -75,8 +75,8 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 struct FatCaps
 {
-    block_dev: u32,
-    service: u32,
+    block_dev: u64,
+    service: u64,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 /// The block device's logical block size, from `BLK_GET_GEOMETRY` on the
 /// partition cap, or `None` when the driver refuses or reports a size that
 /// is no FAT sector size ([`fat_parse::is_sector_size`]).
-fn query_block_size(block_dev: u32, ipc_buf: *mut u64) -> Option<u32>
+fn query_block_size(block_dev: u64, ipc_buf: *mut u64) -> Option<u32>
 {
     let msg = IpcMessage::builder(ipc::blk_labels::BLK_GET_GEOMETRY)
         .word(0, u64::from(ipc::BLK_LABELS_VERSION))
@@ -579,7 +579,7 @@ fn label_accepts(opcode: u64, kind: CapKind) -> bool
 
 /// Delete every cap in `caps` from fatfs's `CSpace`: caps a request carried
 /// that its handler neither records nor returns.
-fn drop_caps(caps: &[u32])
+fn drop_caps(caps: &[u64])
 {
     for &cap in caps
     {
@@ -599,7 +599,7 @@ fn handle_read(
     state: &mut FatState,
     nodes: &NodeTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -674,7 +674,7 @@ fn read_memory_for_open(
     state: &mut FatState,
     files: &mut OpenTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     eviction: &EvictionState,
 )
@@ -1206,7 +1206,7 @@ fn write_file_bytes(
     data: &[u8],
     state: &mut FatState,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(u32, u32), FatError>
 {
@@ -1325,7 +1325,7 @@ fn handle_write(
     state: &mut FatState,
     nodes: &mut NodeTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -1404,7 +1404,7 @@ fn handle_write_memory(
     state: &mut FatState,
     nodes: &mut NodeTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -1597,10 +1597,10 @@ fn write_memory_va() -> u64
 }
 
 /// Locate the current process's `AddressSpace` cap, cached.
-fn self_aspace_cap() -> Option<u32>
+fn self_aspace_cap() -> Option<u64>
 {
     use std::sync::OnceLock;
-    static SELF_ASPACE: OnceLock<u32> = OnceLock::new();
+    static SELF_ASPACE: OnceLock<u64> = OnceLock::new();
     if let Some(c) = SELF_ASPACE.get()
     {
         return Some(*c);
@@ -1834,7 +1834,7 @@ fn handle_remove_node_cap(
     state: &mut FatState,
     nodes: &mut NodeTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -1945,7 +1945,7 @@ fn failed_removal_state(
     failure: &dir::RemoveFailure,
     sfn_loc: dir::DirEntryLocation,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> DeviceSlotState
 {
@@ -1971,7 +1971,7 @@ fn restore_lfn_slots(
     failure: &dir::RemoveFailure,
     sfn_loc: dir::DirEntryLocation,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -1994,7 +1994,7 @@ fn handle_rename_node_cap(
     state: &mut FatState,
     nodes: &mut NodeTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {
@@ -2128,7 +2128,7 @@ fn handle_truncate(
     state: &mut FatState,
     nodes: &mut NodeTable,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 )
 {

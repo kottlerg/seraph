@@ -99,9 +99,10 @@ truth for "how work is tracked and shipped" on this project.
   findings (status `unverified`, since no refuter judged them, or `nit`
   for a nit that cannot block), the recorded and dropped ones, the
   ledger-flagged ones its `Ledger (not re-raised)` heading lists as
-  `ledgered`, the `verdict`, and the head as `stats.head`, as
-  `<mode>-<head>.json` in the workflow's shape, so the ledger command reads
-  a fallback run too, and apply the same verdict handling.
+  `ledgered`, the `verdict`, the head as `stats.head`, and the agents that
+  returned no result as `stats.failed`, as `<mode>-<head>.json` in the
+  workflow's shape, so the ledger command and the auditor-only run read a
+  fallback run too, and apply the same verdict handling.
 
   Before each run after the first (every `delta` run, and a `full` run
   once a record exists), build the ledger that section names from every

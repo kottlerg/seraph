@@ -636,6 +636,10 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::thread_retype_bytes_funds_one_thread",
         sysinfo::thread_retype_bytes_funds_one_thread(ctx)
     );
+    run_test!(
+        "sysinfo::live_cspace_count",
+        sysinfo::live_cspace_count(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

@@ -224,7 +224,10 @@ Phase-7 drain; a short buddy is fatal.
 `alloc_cspace_id` hands out the most recently retired id, else the next fresh one, under one
 spinlock with O(1) holds. A vacant entry keeps its epoch and threads the free list through its
 link word, so the epoch `free_cspace_id` redraws at retirement (§ Representation) persists across
-the vacancy and is the one the next tenant's `register_cspace` returns.
+the vacancy and is the one the next tenant's `register_cspace` returns. The same lock counts the
+ids handed out and not yet retired (`live_cspace_count`), which
+`SYS_SYSTEM_INFO(LiveCSpaceCount)` reports ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
+ktest reads it to check that every `CSpace` teardown returns its id.
 
 `lookup_cspace` takes no lock. It loads the chunk pointer (Acquire), then reads the entry's
 epoch, its pointer, and its epoch again, each with Acquire, and resolves only when both epoch

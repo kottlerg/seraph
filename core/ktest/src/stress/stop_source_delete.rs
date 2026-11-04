@@ -688,15 +688,7 @@ fn round(
     // The source's capability is gone whatever the delete returned.
     parts.source = None;
     deleted.map_err(|_| "stress::stop_source_delete: delete of the source failed")?;
-    settle_round(
-        kind,
-        race,
-        cycle,
-        waiter,
-        [entered_before, done_before],
-        parts,
-        seen,
-    )
+    settle_round(kind, race, cycle, entered_before, done_before, parts, seen)
 }
 
 /// Create and start the round's waiter, and wait (bounded) for it to enter
@@ -730,19 +722,19 @@ fn start_waiter(
 
 /// After round `cycle`'s source delete: wait for the racer's acknowledgement
 /// of its action (and, on a served call, for the server's receives to end),
-/// then settle the waiter by the race. `before` holds the waiter's entered
-/// and done counts from before the round.
+/// then settle the round's waiter (`parts.waiter`) by the race.
+/// `entered_before` and `done_before` are the waiter's entered and done
+/// counts from before the round.
 fn settle_round(
     kind: Kind,
     race: Race,
     cycle: u32,
-    waiter: u32,
-    before: [u32; 2],
+    entered_before: u32,
+    done_before: u32,
     parts: &mut RoundParts,
     seen: &mut Seen,
 ) -> TestResult
 {
-    let [entered_before, done_before] = before;
     if !await_within(crate::scaled_bound(ACK_WAIT_US), || {
         RACER_DONE.load(Ordering::Acquire) == cycle + 1
     })?
@@ -765,7 +757,13 @@ fn settle_round(
         {
             classify_stop(action, entered_before, done_before, seen)
         }
-        Race::Stop => settle_stopped(waiter, action, entered_before, done_before, seen),
+        Race::Stop =>
+        {
+            let waiter = parts
+                .waiter
+                .ok_or("stress::stop_source_delete: the round has no waiter")?;
+            settle_stopped(waiter, action, entered_before, done_before, seen)
+        }
         Race::ThreadDelete => settle_deleted(parts, action, entered_before, done_before, seen),
     }
 }

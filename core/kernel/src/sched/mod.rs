@@ -5948,8 +5948,10 @@ pub unsafe fn schedule(requeue: Requeue)
 
     // Drop any stale translation of the incoming thread's guard page before
     // it runs on its stack here (`mm::stack_guard`: holes send no shootdown).
-    // SAFETY: next is a valid TCB; guard_epoch is immutable after creation.
-    crate::mm::stack_guard::flush_before_run(unsafe { (*next).guard_epoch });
+    // SAFETY: next is a valid TCB whose guard_epoch is immutable after
+    // creation; interrupts are disabled by the scheduler lock, on this CPU
+    // with its per-CPU pointer installed.
+    unsafe { crate::mm::stack_guard::flush_before_run((*next).guard_epoch) };
 
     // Switch address space tracking and page tables.
     //
@@ -6560,6 +6562,12 @@ pub unsafe fn enter() -> !
     // On RISC-V: writes PerCpuData::kernel_rsp (offset 8 from tp); trap_entry
     //   loads this to locate the kernel stack on U-mode entry.  sscratch is set
     //   to &PER_CPU by return_to_user just before sret.
+    // Init's first run here is not a schedule() switch-in, so drop any stale
+    // translation of its guard page as one would (`mm::stack_guard`).
+    // SAFETY: interrupts disabled above, on the BSP with its per-CPU pointer
+    // installed; guard_epoch is immutable after creation.
+    unsafe { crate::mm::stack_guard::flush_before_run(init_tcb.guard_epoch) };
+
     // SAFETY: single-boot-thread; kernel_stack_top is valid from init TCB.
     unsafe {
         crate::arch::current::cpu::set_kernel_trap_stack(kernel_stack_top);

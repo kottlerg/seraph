@@ -1319,7 +1319,8 @@ unsafe fn kernel_entry_post_rebase(
             // does (`mm::stack_guard`).
             // SAFETY: after SMP bringup (Phase 8), with no lock held; the
             // guard is the fresh slab's first page, which nothing reaches
-            // until the reclaim of init's Thread closes it.
+            // until the reclaim of init's Thread closes it; the returned
+            // epoch is stamped in init's TCB below, before `sched::enter`.
             let Ok(init_guard_epoch) = (unsafe { mm::stack_guard::hole(block_phys) })
             else
             {

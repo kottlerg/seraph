@@ -401,21 +401,30 @@ pub unsafe fn set_kernel_stack_floor(floor: u64)
 
 /// The guard epoch at this CPU's last whole-TLB flush
 /// ([`PerCpuData::guard_epoch_flushed`]).
+///
+/// # Safety
+/// Interrupts disabled, so the CPU cannot change between the CPU-index read
+/// and the field read; this CPU's per-CPU pointer is installed.
 #[cfg(not(test))]
-pub fn guard_epoch_flushed() -> u64
+pub unsafe fn guard_epoch_flushed() -> u64
 {
     let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
-    // SAFETY: this CPU's own entry, written only by this CPU.
+    // SAFETY: this CPU's own entry (caller contract), written only by this
+    // CPU.
     unsafe { (*ptr).guard_epoch_flushed }
 }
 
 /// Record `epoch` as the guard epoch of this CPU's last whole-TLB flush.
-/// Called with interrupts disabled, so the CPU does not change mid-call.
+///
+/// # Safety
+/// As [`guard_epoch_flushed`]; `epoch` was read before a whole-TLB flush on
+/// this CPU.
 #[cfg(not(test))]
-pub fn set_guard_epoch_flushed(epoch: u64)
+pub unsafe fn set_guard_epoch_flushed(epoch: u64)
 {
     let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
-    // SAFETY: this CPU's own entry, written only by this CPU.
+    // SAFETY: this CPU's own entry (caller contract), written only by this
+    // CPU.
     unsafe { (*ptr).guard_epoch_flushed = epoch };
 }
 

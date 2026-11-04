@@ -1088,7 +1088,9 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // Unmap the guard page below the stack from the direct map, so an
     // overflow faults instead of writing below the slot.
     // SAFETY: after SMP bringup, with no lock held; the guard is this call's
-    // fresh slot page, which nothing reaches until the reclaim closes it.
+    // fresh slot page, which nothing reaches until the reclaim closes it; the
+    // returned epoch is stamped in the new TCB's guard_epoch below, before
+    // the thread can be enqueued.
     let Ok(guard_epoch) = (unsafe { crate::mm::stack_guard::hole(block_phys) })
     else
     {

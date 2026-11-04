@@ -19,7 +19,8 @@
 //! flushes the CPU's whole TLB first when the stamp is newer
 //! ([`flush_before_run`]). A stale translation of a thread's guard lets an
 //! overflow through only while that thread runs on that CPU, and every run
-//! starts with a switch-in.
+//! starts with a switch-in, or, for init's first, with `sched::enter`, which
+//! makes the same check.
 //!
 //! A hole in a 2 MiB chunk mapped by one large leaf splits the chunk into a
 //! leaf table first. The leaf tables come from a reserve seeded in Phase 4
@@ -264,9 +265,9 @@ mod live
     /// Unmap the RAM page at `phys`, a new thread's guard page, from the
     /// direct map, and return the guard epoch to stamp in the thread's TCB.
     /// No CPU's TLB is flushed here, this one's included: nothing reaches the
-    /// guard page before the new thread's first switch-in, and every CPU's
-    /// record, this one's too, predates the stamp, so each flushes at its own
-    /// switch-in to the thread ([`flush_before_run`]).
+    /// guard page before the new thread first runs, and every CPU's record,
+    /// this one's too, predates the stamp, so each flushes before it runs the
+    /// thread ([`flush_before_run`], at a switch-in or in `sched::enter`).
     ///
     /// # Errors
     /// As [`hole_on_boot_cpu`].
@@ -290,25 +291,34 @@ mod live
     /// Flush this CPU's whole TLB, in every address space, when `stamp`, the
     /// incoming thread's guard epoch, is newer than the epoch this CPU last
     /// flushed at, so no stale translation of that thread's guard page
-    /// outlives the switch-in. Called by `schedule()` on every switch-in,
-    /// with interrupts disabled.
+    /// outlives the switch-in. Called by `schedule()` on every switch-in and
+    /// by `sched::enter` before init's first run.
     ///
     /// The flush is `flush_all_contexts`: INVPCID's all-context form on
     /// x86-64 with tagged TLBs, a CR3 reload without them, and
     /// `sfence.vma zero, zero` on riscv64.
-    pub fn flush_before_run(stamp: u64)
+    ///
+    /// # Safety
+    /// Ring 0 / S-mode with interrupts disabled, so this CPU's per-CPU record
+    /// is read and written on the CPU that flushes; after `percpu::init_bsp`
+    /// or `percpu::init_ap` installed the CPU's per-CPU pointer.
+    pub unsafe fn flush_before_run(stamp: u64)
     {
-        if stamp <= crate::percpu::guard_epoch_flushed()
+        // SAFETY: interrupts disabled (caller contract).
+        if stamp <= unsafe { crate::percpu::guard_epoch_flushed() }
         {
             return;
         }
         // Read before the flush: every hole up to this epoch was published
         // before it was advanced, so the flush drops each one's stale entry.
         let epoch = GUARD_EPOCH.load(Ordering::Acquire);
-        // SAFETY: ring 0 / S-mode with interrupts disabled (caller
-        // contract); dropping every cached translation is always safe.
-        unsafe { crate::arch::current::paging::flush_all_contexts() };
-        crate::percpu::set_guard_epoch_flushed(epoch);
+        // SAFETY: ring 0 / S-mode with interrupts disabled (caller contract);
+        // dropping every cached translation is always safe; the record is
+        // this CPU's, which the flush above covers.
+        unsafe {
+            crate::arch::current::paging::flush_all_contexts();
+            crate::percpu::set_guard_epoch_flushed(epoch);
+        }
     }
 
     /// Map the page at `phys`, holed by [`hole`], into the direct map again,

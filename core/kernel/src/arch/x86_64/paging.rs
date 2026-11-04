@@ -1411,14 +1411,9 @@ pub unsafe fn flush_kernel_page(virt: u64)
 {
     if crate::mm::tag_allocator::tagging_enabled()
     {
-        let desc = InvpcidDescriptor {
-            pcid: 0,
-            linear_addr: 0,
-        };
-        // SAFETY: tagging enabled implies CR4.PCIDE on every CPU (each AP
-        // enables it before its first tagged activate); the type-2
-        // descriptor's fields are ignored and zero.
-        unsafe { invpcid(INVPCID_TYPE_ALL_GLOBAL, &desc) };
+        // SAFETY: ring 0 (caller contract); with tags this is INVPCID's
+        // all-context form.
+        unsafe { flush_all_contexts() };
     }
     else
     {

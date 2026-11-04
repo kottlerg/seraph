@@ -736,8 +736,8 @@ calls `sched::enter()`.
    e. Guard page (unmapped) sits immediately below the stack; stack overflows fault
 5. Create init's TCB:
    a. Retype init's Thread slot from SEED_MEMORY in the layout SYS_CAP_CREATE_THREAD uses
-      (`sched::thread_slot`): a guard page, unmapped from the direct map with a shootdown
-      to the online APs (`mm::stack_guard::hole`), then init's kernel stack
+      (`sched::thread_slot`): a guard page, unmapped from the direct map with no shootdown,
+      its guard epoch stamped in init's TCB (`mm::stack_guard::hole`), then init's kernel stack
       (KERNEL_STACK_PAGES = 4 pages = 16 KiB), the ThreadObject and TCB page, and the
       save area
    b. new_state(entry=init_image.entry_point, stack_top=kstack_top,

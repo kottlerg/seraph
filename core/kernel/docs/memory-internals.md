@@ -545,16 +545,17 @@ split chunk stays split and its table stays consumed, and the reserve's unused f
 never returned. One leaf lock serialises every hole, every fill and the reserve.
 
 Making a thread's hole sends no shootdown and makes no local flush: nothing reaches the
-guard page before the new thread's first switch-in, and every CPU's flush record, the
-creating CPU's included, predates the hole. A global guard epoch counts the holes: thread
+guard page before the new thread first runs, and every CPU's flush record, the creating
+CPU's included, predates the hole. A global guard epoch counts the holes: thread
 creation advances it after the edit and stamps the new value in the TCB (`guard_epoch`),
 and each CPU records the epoch of its last guard flush (`PerCpuData::guard_epoch_flushed`).
 At every switch-in `schedule()` compares the incoming thread's stamp with that record and,
 when the stamp is newer, reads the current epoch, flushes the CPU's whole TLB in every
 address space (`flush_all_contexts`), and records the epoch it read
-(`stack_guard::flush_before_run`). A stale translation of a thread's guard page lets an
-overflow through only while that thread runs on that CPU, and every run starts with a
-switch-in there, which flushes first whenever the CPU's last flush predates the hole; the
+(`stack_guard::flush_before_run`), as `sched::enter` does before init's first run, which no
+switch-in starts. A stale translation of a thread's guard page lets an overflow through only
+while that thread runs on that CPU, and every run starts with a switch-in there or with
+`sched::enter`, which flushes first whenever the CPU's last flush predates the hole; the
 epoch is advanced after the edit, so a CPU that reads an epoch at or past the stamp
 flushes after the edit is visible. The direct map's entries are not global and are cached
 under every address space a CPU has run, so on x86-64 with tagged TLBs the flush is

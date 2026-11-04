@@ -1205,10 +1205,8 @@ unsafe fn step6_allocate_and_build_page_tables(
     // MMIO aperture array, sized from the entry array's capacity (the bound
     // step 7 checks the map buffer against) and the seed counts
     // (memory_map::aperture_capacity).
-    let aperture_capacity = memory_map::aperture_capacity(
-        entry_array_capacity(mem_entries_pages),
-        seeds_capacity + heuristic_capacity,
-    );
+    let aperture_capacity =
+        aperture_array_capacity(mem_entries_pages, seeds_capacity + heuristic_capacity);
     let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
@@ -1450,6 +1448,16 @@ fn entry_array_pages(descriptors: usize, slack: usize, stride: usize) -> usize
         stride,
     ));
     (reach * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096)
+}
+
+/// Apertures the `MmioAperture` array step 6 allocates holds, for an entry
+/// array of `mem_entries_pages` pages and `seeds` seeds of both classes: the
+/// [`memory_map::aperture_capacity`] of the entry array's capacity, so a map
+/// any buffer [`map_buffer_fits`] accepts derives no more apertures than it
+/// holds.
+fn aperture_array_capacity(mem_entries_pages: usize, seeds: usize) -> usize
+{
+    memory_map::aperture_capacity(entry_array_capacity(mem_entries_pages), seeds)
 }
 
 /// Whether step 7's map buffer of `buffer_bytes` fits the entry array of
@@ -2070,9 +2078,9 @@ mod tests
 {
     use super::{
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
-        KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions, choose_kaslr_layout,
-        entry_array_capacity, entry_array_pages, handoff_stack_span, map_buffer_fits, memory_map,
-        push_reclaim_range, scrub, step6_and_7_spans, uefi,
+        KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions,
+        aperture_array_capacity, choose_kaslr_layout, entry_array_pages, handoff_stack_span,
+        map_buffer_fits, memory_map, push_reclaim_range, scrub, step6_and_7_spans, uefi,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -2224,8 +2232,9 @@ mod tests
         }
     }
 
-    // Defect caught: an aperture array sized from a smaller capacity than the
-    // one step 7 accepts a map buffer against, so a map that passes the check
+    // Defect caught: step 6 sizing the aperture array from a smaller capacity
+    // than the one step 7 accepts a map buffer against (the entry array's
+    // reach before page rounding, for one), so a map that passes the check
     // derives more apertures than the array holds; or a buffer for a map no
     // larger than step 6 allowed for that fails the check.
     #[test]
@@ -2239,8 +2248,7 @@ mod tests
                 for slack in [32usize, 64, 128]
                 {
                     let pages = entry_array_pages(descriptors, slack, stride);
-                    let capacity = entry_array_capacity(pages);
-                    let apertures = memory_map::aperture_capacity(capacity, seeds);
+                    let apertures = aperture_array_capacity(pages, seeds);
                     for grown in 0..=descriptors + slack
                     {
                         let buffer = uefi::map_buffer_bytes(grown * stride, stride);
@@ -2249,12 +2257,17 @@ mod tests
                             "{stride} {descriptors} {grown}"
                         );
                     }
+                    // Every buffer step 7 accepts, up to the largest: a map read
+                    // into one derives at most `aperture_capacity` of its
+                    // reach, which the array step 6 sizes must hold.
                     let mut buffer = 4096;
                     while map_buffer_fits(buffer, pages)
                     {
                         let reach = uefi::map_buffer_descriptor_reach(buffer);
-                        assert!(reach <= capacity);
-                        assert!(memory_map::aperture_capacity(reach, seeds) <= apertures);
+                        assert!(
+                            memory_map::aperture_capacity(reach, seeds) <= apertures,
+                            "{stride} {descriptors} {slack}: reach {reach}"
+                        );
                         buffer += 4096;
                     }
                 }

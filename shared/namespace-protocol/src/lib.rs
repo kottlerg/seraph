@@ -34,8 +34,10 @@ pub mod name;
 pub mod rights;
 pub mod wire;
 
-pub use badge::{NODE_ID_BITS, NODE_ID_MASK, NodeId, pack};
-pub use gate::{GateError, compose_forward_lookup_rights, gate};
+pub use badge::{
+    NODE_ID_BITS, NODE_ID_MASK, NodeId, OPEN_INSTANCE, is_open_instance, pack, pack_open,
+};
+pub use gate::{GateError, compose_forward_lookup_rights, gate, gate_open};
 pub use name::{MAX_NAME_LEN, MIN_NAME_LEN, NameError, validate_name};
 pub use rights::{NamespaceRights, RIGHTS_BITS, RIGHTS_MASK};
 pub use wire::NsError;
@@ -315,8 +317,10 @@ pub trait NamespaceBackend
 /// `ns_labels::*` and pass them here; everything else is theirs to
 /// handle.
 ///
-/// `received.badge` MUST be the `pack(node_id, rights)` badge the
-/// kernel delivered with the request. Backends do not see the wire
+/// `received.badge` MUST be the badge the kernel delivered with the
+/// request. A `pack(node_id, rights)` badge is dispatched; an
+/// open-instance badge ([`badge::OPEN_INSTANCE`]) is answered
+/// [`NsError::NotSupported`]. Backends do not see the wire
 /// layer — they only see decoded `NodeId` / `&[u8]` / `u64`
 /// arguments.
 ///
@@ -331,17 +335,33 @@ pub unsafe fn dispatch_request<B: NamespaceBackend>(
     ipc_buf: *mut u64,
 )
 {
-    let opcode = received.label & 0xFFFF;
-    let reply = match opcode
+    let reply = request_reply(backend, received, namespace_endpoint);
+    // SAFETY: `ipc_buf` is the registered IPC buffer page per the
+    // function-level safety contract.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// The reply [`dispatch_request`] sends for `received`.
+fn request_reply<B: NamespaceBackend>(
+    backend: &mut B,
+    received: &ipc::IpcMessage,
+    namespace_endpoint: u64,
+) -> ipc::IpcMessage
+{
+    // An open-instance badge's low bits are an open id, not a NodeId
+    // (badge::OPEN_INSTANCE): decoding one as a node would act on whichever
+    // node shares the number.
+    if badge::is_open_instance(received.badge)
+    {
+        return ipc::IpcMessage::new(NsError::NotSupported.as_label());
+    }
+    match received.label & 0xFFFF
     {
         ipc::ns_labels::NS_LOOKUP => handle_lookup(backend, received, namespace_endpoint),
         ipc::ns_labels::NS_STAT => handle_stat(backend, received),
         ipc::ns_labels::NS_READDIR => handle_readdir(backend, received),
         _ => ipc::IpcMessage::new(NsError::NotSupported.as_label()),
-    };
-    // SAFETY: `ipc_buf` is the registered IPC buffer page per the
-    // function-level safety contract.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    }
 }
 
 /// Decode an `NS_LOOKUP` request's `caller_requested` word into a
@@ -415,9 +435,9 @@ fn handle_lookup<B: NamespaceBackend>(
         {
             let badge = pack(node, returned_rights);
             // SEND_GRANT lets the holder attach caps to IPC requests
-            // through this node cap (e.g. the per-process release-
-            // endpoint SEND that travels in `caps[0]` of the first
-            // `FS_READ_MEMORY`). It does not widen authority — the
+            // through this node cap (e.g. the release-endpoint SEND that
+            // travels in `caps[0]` of `FS_OPEN`, or `FS_WRITE_MEMORY`'s
+            // source page). It does not widen authority — the
             // recipient still validates every received cap. SEND-only
             // would force the kernel to reject any cap-bearing IPC.
             match syscall::cap_derive_badge(
@@ -442,8 +462,8 @@ fn handle_lookup<B: NamespaceBackend>(
             // stored badged cap could only ever be copied at its original
             // full rights. GRANT is carried for the same reason as in the
             // `Local` arm: a node cap across a mount must still be able to
-            // attach caps (the release-endpoint SEND of `FS_READ_MEMORY`)
-            // to its requests.
+            // attach caps (the release-endpoint SEND of `FS_OPEN`) to its
+            // requests.
             let badge = pack(node, returned_rights);
             match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_EP_SEND_GRANT, badge)
             {
@@ -781,6 +801,28 @@ mod tests
     fn readdir_lists_hidden_entries_to_a_caller_holding_their_rights()
     {
         assert_listing(rights::READDIR | rights::ADMIN, &[b"a", b"secret", b"b"]);
+    }
+
+    #[test]
+    fn an_open_instance_badge_is_refused_before_it_is_read_as_a_node()
+    {
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: None,
+            hides: false,
+        };
+        let r = NamespaceRights::from_raw(rights::READDIR | rights::ADMIN);
+        let mut msg = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR)
+            .word(0, 0)
+            .build();
+        msg.badge = pack(NodeId::new(5).expect("fits"), r);
+        assert_eq!(request_reply(&mut dir, &msg, 0).label, 0);
+        // The same number as an open id names no node: refused, not listed.
+        msg.badge = badge::pack_open(5, r).expect("fits");
+        assert_eq!(
+            request_reply(&mut dir, &msg, 0).label,
+            NsError::NotSupported.as_label()
+        );
     }
 
     #[test]

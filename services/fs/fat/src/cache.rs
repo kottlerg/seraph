@@ -94,14 +94,21 @@ struct ScratchMemory
     va: u64,
 }
 
+/// General capability slots the fs keeps free for the caps it takes at run
+/// time beyond the cache's own: a read's transient child derivation,
+/// block-device replies, the eviction worker's release-SEND copies, and the
+/// release SENDs `FS_OPEN` records until [`PageCache::fund_run_time_headroom`]
+/// next tops the `CSpace` up.
+const RUN_TIME_CSPACE_HEADROOM: usize = 64;
+
 /// General capability slots [`PageCache::init`] funds in the fs process's
 /// own `CSpace` before filling a cache of `slots` slots: one per slot page,
-/// one per page the quarantine may add, the scratch page, and headroom for
-/// the caps the fs takes at run time (per-read derivations, block-device
-/// replies).
+/// one per page the quarantine may add, one per-read ancestor per slot (each
+/// outstanding `FS_READ_MEMORY` page holds one, and every slot can be
+/// outstanding at once), the scratch page, and [`RUN_TIME_CSPACE_HEADROOM`].
 fn cache_cspace_funding(slots: usize) -> u64
 {
-    (slots + QUARANTINE_MAX) as u64 + 1 + 64
+    (2 * slots + QUARANTINE_MAX + 1 + RUN_TIME_CSPACE_HEADROOM) as u64
 }
 
 /// Sector size before mount sets the device's ([`PageCache::set_sector_size`]).
@@ -169,6 +176,12 @@ pub struct PageCache
     /// nothing. Only the dispatch thread picks victims; the lock makes the
     /// sharing explicit.
     victim_skips: Mutex<Box<[bool]>>,
+    /// Set when a page acquisition found every slot held, for whichever
+    /// request it served: a memory-cap read's page, or a FAT, directory, or
+    /// inline-read sector. The dispatch loop takes it
+    /// ([`Self::take_pressure`]) and queues a held page for eviction, so
+    /// pressure met on any path relieves the cache.
+    pressure: AtomicBool,
 }
 
 /// Cache-init failure cause.
@@ -255,6 +268,7 @@ impl PageCache
                 spare: Vec::with_capacity(QUARANTINE_MAX),
             }),
             victim_skips: Mutex::new(skips.into_boxed_slice()),
+            pressure: AtomicBool::new(false),
         }));
 
         // Allocate and map the single-page scratch memory cap used for
@@ -317,6 +331,31 @@ impl PageCache
     pub fn slot_ceiling(&self) -> usize
     {
         self.slots.len()
+    }
+
+    /// Whether a page acquisition found every slot held since the last
+    /// call, clearing the mark (the `pressure` field).
+    pub fn take_pressure(&self) -> bool
+    {
+        self.pressure.swap(false, Ordering::AcqRel)
+    }
+
+    /// Top the fs process's `CSpace` (`cspace`) up so every general slot the
+    /// cache can still take stays free: a page cap for each slot not yet
+    /// provisioned, a per-read ancestor for every slot, the quarantine's
+    /// replacements, and [`RUN_TIME_CSPACE_HEADROOM`] (the init funding,
+    /// less the slot pages and the scratch page already held). Called before
+    /// `FS_OPEN` records a release SEND, which holds a slot for the open's
+    /// lifetime, so the `CSpace` grows with the opens instead of starving
+    /// reads. A no-op
+    /// beyond reading the `CSpace`'s headroom while it suffices; `false`
+    /// when memmgr cannot fund it.
+    pub fn fund_run_time_headroom(&self, cspace: u64) -> bool
+    {
+        let ceiling = self.slot_ceiling();
+        let unprovisioned = ceiling - self.provisioned.load(Ordering::Acquire);
+        let slots = unprovisioned + ceiling + QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM;
+        std::os::seraph::fund_cspace_slot_budget(cspace, slots as u64)
     }
 
     /// The slots that hold a page: the provisioned prefix of `slots`.
@@ -545,9 +584,14 @@ impl PageCache
         {
             return Some(i);
         }
-        let victim = self
+        let Some(victim) = self
             .free_or_new_slot(ipc_buf)
-            .or_else(|| self.pick_victim(ipc_buf))?;
+            .or_else(|| self.pick_victim(ipc_buf))
+        else
+        {
+            self.pressure.store(true, Ordering::Release);
+            return None;
+        };
         let slot = &self.slots[victim];
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.

@@ -454,7 +454,7 @@ Tracked by [#672](https://github.com/kottlerg/seraph/issues/672) (argv) and
 | svcmgr and namespace label name lengths | `shared/ipc/src/lib.rs` | 16-bit fields | encoding artefact | none | correct as is | The binding limits are the name constants |
 | FS_WRITE, FS_READ inline payloads | `shared/ipc/src/lib.rs` | 504 B per call | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | Large transfers use the memory verbs (#87) |
 | FS_READ_MEMORY, FS_WRITE_MEMORY | `shared/ipc/src/lib.rs` | one page per call | encoding artefact (one slot cap per reply) | none | correct as is | Callers iterate; batching is a throughput question (#229) |
-| FS_READ_MEMORY release cookie | `shared/ipc/src/lib.rs` | `u64`, client-chosen | ABI width | none | correct as is | None (#530) |
+| FS_READ_MEMORY release cookie | `shared/ipc/src/lib.rs` | `u64`, client-chosen | ABI width | none | correct as is | None |
 | QUERY_DEVICE_INFO badge | `shared/ipc/src/lib.rs` | `u64` | encoding artefact (catalog index plus one, never recycled) | none | correct as is | None |
 | `blk_labels` partition badges | `shared/ipc/src/lib.rs` | `u64`, one per distinct registered range | ABI width | none | correct as is | None |
 | `INVALID_MEMORY_CAP` byte limit | `shared/ipc/src/lib.rs` | `count * block_size <= u32::MAX` | hardware spec (VirtIO descriptor `u32` length) | none | correct as is | 4 GiB per request |
@@ -715,19 +715,17 @@ Every entry here is `correct as is`; none is tracked.
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `node_slab::MAX_ENTRIES` (`NodeTable`) | `services/fs/fat/fat-parse/src/node_slab.rs` | 2^24 - 1 live nodes, one per distinct live entry looked up; freed when the entry is removed or renamed and recycled under a 16-bit generation, retired at wrap | encoding artefact (40-bit `NodeId`) | heap, per live node | correct as is | None |
-| `NO_OPEN_SLOT` | `services/fs/fat/src/backend.rs` | `u32::MAX` | provably unreachable | none | correct as is | None |
-| open-file table | `services/fs/fat/src/main.rs` | heap `Vec`, at most one slot per live node, closed slots reused | per-instance | none | correct as is | Key by open instance (#530) |
-| `track_outstanding` limit | `services/fs/fat/src/file.rs` | the cache's slot ceiling, pages per file, the table grown on demand | follows the cache | none | correct as is | None |
+| `node_slab::MAX_ENTRIES` (`OpenTable`) | `services/fs/fat/fat-parse/src/open_slab.rs` | 2^24 - 1 live opens, one per `FS_OPEN` not yet closed or released with its node, recycled under a 16-bit generation, retired at wrap; past it `TOO_MANY_OPEN`. No per-client bound is enforceable: the driver has no client identity and an open cap can be delegated | encoding artefact (40-bit open id in the open cap's badge) | heap, per live open | correct as is | Reclaim a dead client's opens (#742) |
+| `track_outstanding` limit | `services/fs/fat/src/file.rs` | the cache's slot ceiling, pages per open, the table grown on demand | follows the cache | none | correct as is | None |
 | eviction queue | `services/fs/fat/src/eviction.rs` | heap `VecDeque`, one entry per outstanding page at most | provably unreachable (each page is queued at most once) | none | correct as is | None |
 | `RELEASE_TIMEOUT_MS` | `services/fs/fat/src/eviction.rs` | 100 ms | tuning | none | correct as is | None |
 | `MAX_WATCHDOGS` | `services/fs/fat/src/eviction.rs` | 4 watchdog threads alive at once | tuning (past it a release skips the advisory round trip) | none | correct as is | Cancel a blocked call (#31) |
 | `SLOT_COUNT`, `SLOT_RAM_DIVISOR`, `slot_ceiling` (`PageCache.slots`) | `services/fs/fat/fat-parse/src/lib.rs` | one slot per 512 pages of RAM, at least 256, fixed at init; each page taken from memmgr on its slot's first use | per-instance, RAM-scaled | a slot table entry per slot, and the slots filled | correct as is | None |
 | `QUARANTINE_MAX` | `services/fs/fat/fat-parse/src/lib.rs` | 32 | tuning (bounds what non-unmapping clients cost) | 256 B | correct as is | None (#52) |
-| `cache_cspace_funding` | `services/fs/fat/src/cache.rs` | slot ceiling `+ QUARANTINE_MAX + 1 + 64` slots | follows its factors, plus run-time headroom | the slot pages it funds | correct as is | None |
+| `cache_cspace_funding`, `RUN_TIME_CSPACE_HEADROOM` | `services/fs/fat/src/cache.rs` | twice the slot ceiling (a slot page and a per-read ancestor per slot) `+ QUARANTINE_MAX + 1 + 64` slots at init; `FS_OPEN` keeps the same free, less the slot pages and scratch page already held | follows its factors, plus run-time headroom | the slot pages it funds | correct as is | None |
 | `PageCache::sectors_per_page` | `services/fs/fat/src/cache.rs` | `PAGE_SIZE` over the device block size, 1 to 8 | hardware spec (page over sector) | none | correct as is | None |
 | `SCRATCH_MEMORY` | `services/fs/fat/src/cache.rs` | one page | encoding artefact (block DMA from offset 0) | one page | correct as is | None (#83) |
 | `FatState.cached_fat_sector` | `services/fs/fat/src/bpb.rs` | one sector | tuning (memo above the cache) | 4 KiB | correct as is | None |
-| `NEXT_BADGE` | `services/fs/fat/src/main.rs` | `u64`, monotonic | provably unreachable | none | correct as is | None |
 | FS_READ reply size | `services/fs/fat/src/main.rs` | 504 B | ABI width | 512 B stack | correct as is | None |
 | memory verbs | `services/fs/fat/src/main.rs` | one page per call | encoding artefact | none | correct as is | None |
 | cluster-chain walk | `services/fs/fat/src/main.rs`, `fat.rs` | at most file size over cluster size | encoding artefact (`u32` file size) | none | correct as is | Add a cycle guard |

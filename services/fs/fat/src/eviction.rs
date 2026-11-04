@@ -5,18 +5,22 @@
 
 //! Eviction worker for the FAT page cache.
 //!
-//! When `read_memory_at_slot` cannot acquire a cache slot (every slot
-//! has `refcount > 0`), main scans the per-file outstanding-page
-//! tables for a page not already queued, marks it queued, enqueues an
-//! [`EvictReq`] for it, and replies `IO_ERROR`. The eviction worker
+//! When a request cannot acquire a cache slot (every slot has
+//! `refcount > 0`), whether for a memory-cap read's page or for a FAT,
+//! directory, or inline-read sector, main scans the per-open
+//! outstanding-page tables for a page not already queued, marks it
+//! queued, and enqueues an [`EvictReq`] for it (`relieve_pressure`); the
+//! request is answered `IO_ERROR` and the client retries. The eviction worker
 //! pops the request and first checks that the page is still
 //! outstanding, skipping it if the client's synchronous release or
-//! `FS_CLOSE` already cleaned it up. When the client delivered a
-//! release SEND, the worker sends `FS_RELEASE_MEMORY`
-//! on its own derived copy of it and waits up to [`RELEASE_TIMEOUT_MS`]
+//! `FS_CLOSE` already cleaned it up. When the open that read the page
+//! carried a release SEND on its `FS_OPEN`, the worker sends
+//! `FS_RELEASE_MEMORY` on its own derived copy of that open's SEND, so
+//! each page's release reaches the client that read it, and waits up to
+//! [`RELEASE_TIMEOUT_MS`]
 //! for `FS_RELEASE_ACK`; with no SEND, or when it cannot derive the copy
 //! or spawn the watchdog, it sends nothing. Either way the worker then
-//! takes the per-file outstanding-page entry and, if no other path has
+//! takes the per-open outstanding-page entry and, if no other path has
 //! cleaned it up meanwhile, `cap_revoke`s the per-cookie ancestor cap,
 //! drops it, and decrements the cache slot's refcount. An ack means
 //! the client has already unmapped the page. The revoke invalidates
@@ -56,7 +60,7 @@ use std::time::Duration;
 use ipc::{IpcMessage, fs_labels};
 
 use crate::cache::PageCache;
-use crate::file::{OpenFile, find_by_badge};
+use crate::file::OpenTable;
 
 /// Cooperative release watchdog: how long the worker waits for the
 /// client's reply before revoking the ancestor cap anyway. The worker
@@ -80,13 +84,13 @@ static LIVE_WATCHDOGS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy)]
 pub struct EvictReq
 {
-    /// `OpenFile.badge` identifying which file this entry belongs
-    /// to. Used at cleanup time to clear the matching
-    /// outstanding-page slot.
-    pub file_badge: u64,
+    /// Identifier of the open this entry belongs to in the [`OpenTable`].
+    /// Generation-checked: once the open is closed, it names no open, even
+    /// after its index is reused.
+    pub open_id: u64,
     /// Caller-visible cookie originally returned in
     /// `FS_READ_MEMORY`. Carried in `FS_RELEASE_MEMORY`'s `data[0]`
-    /// and used to disambiguate cleanup against `file_badge`.
+    /// and used to disambiguate cleanup against `open_id`.
     pub cookie: u64,
     /// Cache slot whose refcount is held by this entry.
     pub slot_idx: usize,
@@ -129,8 +133,8 @@ impl EvictionState
         else
         {
             std::os::seraph::log!(
-                "eviction enqueue: no memory; dropped req (badge={}, cookie={}, slot={})",
-                req.file_badge,
+                "eviction enqueue: no memory; dropped req (open={:#x}, cookie={}, slot={})",
+                req.open_id,
                 req.cookie,
                 req.slot_idx
             );
@@ -141,13 +145,10 @@ impl EvictionState
 /// Eviction worker entry point. Runs forever.
 ///
 /// The spawning closure owns `Arc` clones of the `EvictionState` and the
-/// open-file table and lends them here; since this never returns, they
+/// open table and lends them here; since this never returns, they
 /// stay alive for the lifetime of the fs process.
-pub fn worker_loop(
-    state: &EvictionState,
-    files: &Mutex<Vec<OpenFile>>,
-    cache: &'static PageCache,
-) -> !
+pub fn worker_loop(state: &EvictionState, files: &Mutex<OpenTable>, cache: &'static PageCache)
+-> !
 {
     loop
     {
@@ -226,11 +227,11 @@ fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
         "page already released"
     };
     std::os::seraph::log!(
-        "{} (label={}); {} (badge={}, slot={})",
+        "{} (label={}); {} (open={:#x}, slot={})",
         what,
         label,
         action,
-        req.file_badge,
+        req.open_id,
         req.slot_idx
     );
 }
@@ -356,15 +357,15 @@ enum Endpoint
 }
 
 /// Under the open-file lock, check that `req`'s outstanding page is still
-/// in the table (same file, cookie, cache slot, and ancestor cap) and return
-/// a derived copy of its file's release SEND. The copy is the worker's own,
+/// in the table (same open, cookie, cache slot, and ancestor cap) and return
+/// a derived copy of its open's release SEND. The copy is the worker's own,
 /// so an `FS_CLOSE` that deletes the slot's SEND meanwhile cannot free or
 /// reuse the slot the worker calls on. `None` means the page was already
 /// cleaned up.
-fn live_release_endpoint(files: &Mutex<Vec<OpenFile>>, req: &EvictReq) -> Option<Endpoint>
+fn live_release_endpoint(files: &Mutex<OpenTable>, req: &EvictReq) -> Option<Endpoint>
 {
     let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let file = &files_g[find_by_badge(&files_g, req.file_badge)?];
+    let file = files_g.get(req.open_id)?;
     let present = file.outstanding.iter().flatten().any(|e| {
         e.cookie == req.cookie && e.slot_idx == req.slot_idx && e.ancestor_cap == req.ancestor_cap
     });
@@ -384,18 +385,18 @@ fn live_release_endpoint(files: &Mutex<Vec<OpenFile>>, req: &EvictReq) -> Option
 
 /// Take `req`'s outstanding-page entry out of the open-file table, under
 /// the table lock the main thread's release and close paths hold. Returns
-/// whether the entry was still there (same file, cookie, cache slot, and
+/// whether the entry was still there (same open, cookie, cache slot, and
 /// ancestor cap), in which case the caller owns its cleanup; `false` means
 /// another path already cleaned it up.
-fn take_outstanding(files: &Mutex<Vec<OpenFile>>, req: &EvictReq) -> bool
+fn take_outstanding(files: &Mutex<OpenTable>, req: &EvictReq) -> bool
 {
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(idx) = find_by_badge(&files_g, req.file_badge)
+    let Some(file) = files_g.get_mut(req.open_id)
     else
     {
         return false;
     };
-    for slot in &mut files_g[idx].outstanding
+    for slot in &mut file.outstanding
     {
         if let Some(entry) = slot
             && entry.cookie == req.cookie

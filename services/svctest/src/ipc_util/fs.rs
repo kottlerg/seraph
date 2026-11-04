@@ -136,3 +136,69 @@ pub fn fs_read_bytes(
     let n = reply.word(0) as usize;
     Ok(reply.data_bytes()[8..8 + n].to_vec())
 }
+
+/// `FS_OPEN` on file node cap `node_cap`, carrying `release` (a release
+/// endpoint SEND, moved to fatfs) in `caps[0]` when it is non-zero. Returns
+/// the open cap, or the wire error code.
+pub fn fs_open(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<u64, u64>
+{
+    let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN);
+    if release != 0
+    {
+        builder = builder.cap(release);
+    }
+    let msg = builder.build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    Ok(*reply
+        .caps()
+        .first()
+        .expect("FS_OPEN success without an open cap"))
+}
+
+/// `FS_CLOSE` on `cap`; returns the reply label (`u64::MAX` when the call
+/// fails).
+pub fn fs_close(cap: u64, ipc_buf: *mut u64) -> u64
+{
+    let msg = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }.map_or(u64::MAX, |r| r.label)
+}
+
+/// `FS_READ_MEMORY` on open cap `open` at byte `offset` with `cookie`.
+/// Returns `(page_cap, bytes_valid)` (`page_cap` 0 at end of file), or the
+/// wire error code.
+pub fn fs_read_memory(
+    open: u64,
+    offset: u64,
+    cookie: u64,
+    ipc_buf: *mut u64,
+) -> Result<(u64, u64), u64>
+{
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
+        .word(0, offset)
+        .word(1, cookie)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(open, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    Ok((reply.caps().first().copied().unwrap_or(0), reply.word(0)))
+}
+
+/// `FS_RELEASE_MEMORY` of `cookie` on open cap `open`; returns the reply
+/// label (`u64::MAX` when the call fails).
+pub fn fs_release_memory(open: u64, cookie: u64, ipc_buf: *mut u64) -> u64
+{
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
+        .word(0, cookie)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    unsafe { ipc::ipc_call(open, &msg, ipc_buf) }.map_or(u64::MAX, |r| r.label)
+}

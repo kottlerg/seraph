@@ -619,6 +619,18 @@ impl DirectMapLayout<'_>
     }
 }
 
+/// Fill `table` with the 512 4 KiB leaves `leaf` builds for the pages of the
+/// 2 MiB chunk at `chunk`, in order: the leaf table that splits a large
+/// direct-map leaf into the same translation (each arch's
+/// `hole_direct_map_page`).
+pub fn fill_split_table<E>(table: &mut [E; 512], chunk: u64, leaf: impl Fn(u64) -> E)
+{
+    for (i, entry) in table.iter_mut().enumerate()
+    {
+        *entry = leaf(chunk + (i * PAGE_SIZE) as u64);
+    }
+}
+
 /// The handoff stack's guard page for the stack pointer `entry_sp` at
 /// `kernel_entry`'s first statement, when `base_mark` (the word at the stack
 /// base derived from it, `stack_depth::handoff_base`) confirms the reference
@@ -1431,6 +1443,21 @@ mod tests
     }
 
     // ── Direct-map hole ──────────────────────────────────────────────────────
+
+    // Defect caught: a split table whose entry i maps any frame but the
+    // chunk's page i (an index or stride slip), which would alias every
+    // direct-map access in the chunk to the wrong memory.
+    #[test]
+    fn a_split_table_maps_each_entry_to_its_own_page_of_the_chunk()
+    {
+        let chunk = 0x8060_0000u64;
+        let mut table = [0u64; 512];
+        fill_split_table(&mut table, chunk, |phys| phys);
+        for (i, &phys) in table.iter().enumerate()
+        {
+            assert_eq!(phys, chunk + (i as u64) * 0x1000);
+        }
+    }
 
     // Defect caught: a hole that splits the wrong chunk, or a split chunk that
     // leaves out a page other than the hole (or none), so the guard is mapped

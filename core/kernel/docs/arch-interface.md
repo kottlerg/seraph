@@ -327,11 +327,15 @@ pub unsafe fn hole_direct_map_page(
     take_table: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(), PagingError>;
 
-/// Map the direct-map page at `virt` to `phys` again, closing a hole. No CPU
-/// needs a flush: x86-64 caches no not-present entry, and the riscv64 S-mode
-/// page-fault handler retries a fault the kernel's tables already satisfy
-/// (an arch-internal check, as `user_fault_is_spurious` is for user faults).
+/// Map the direct-map page at `virt` to `phys` again, closing a hole. The
+/// caller flushes every CPU before the page is reused when
+/// `CACHES_NOT_PRESENT_ENTRIES` holds.
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64);
+
+/// Whether a CPU may cache a not-present entry, so that a page made present
+/// again needs a flush on every CPU before another reaches it: `false` on
+/// x86-64, `true` on RISC-V (no Svvptc requirement).
+pub const CACHES_NOT_PRESENT_ENTRIES: bool;
 
 /// Whether the kernel's tables map the direct-map address `virt`.
 pub unsafe fn direct_map_page_present(virt: u64) -> bool;

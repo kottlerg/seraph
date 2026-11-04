@@ -1261,10 +1261,9 @@ const DIRECT_RAM: PageFlags = PageFlags {
 /// `chunk`: the translation of the large leaf it replaces.
 fn split_chunk_entries(table: &mut [PageTableEntry; 512], chunk: u64)
 {
-    for (i, entry) in table.iter_mut().enumerate()
-    {
-        *entry = PageTableEntry::new_page(chunk + (i * 4096) as u64, DIRECT_RAM);
-    }
+    crate::mm::paging::fill_split_table(table, chunk, |phys| {
+        PageTableEntry::new_page(phys, DIRECT_RAM)
+    });
 }
 
 /// Leave the direct-map page at `virt` not present. When a 2 MiB leaf maps
@@ -1318,12 +1317,12 @@ pub unsafe fn hole_direct_map_page(
 }
 
 /// Map the direct-map page at `virt` to `phys` again, closing a hole
-/// [`hole_direct_map_page`] left.
+/// [`hole_direct_map_page`] left. No flush is needed: x86-64 caches no
+/// not-present entry ([`CACHES_NOT_PRESENT_ENTRIES`]).
 ///
 /// # Safety
 /// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`];
-/// the caller serialises every direct-map edit. No flush is needed: x86-64
-/// caches no not-present entry.
+/// the caller serialises every direct-map edit.
 #[cfg(not(test))]
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64)
 {
@@ -1362,6 +1361,10 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     let pt = unsafe { table_at(phys_to_virt(pde.phys_addr())) };
     pt[table_index(0, virt)].is_present()
 }
+
+/// Whether a CPU may cache a not-present entry, so that a page made present
+/// again needs a flush on every CPU: never on x86-64.
+pub const CACHES_NOT_PRESENT_ENTRIES: bool = false;
 
 /// INVPCID type 2: invalidate every translation, global ones included, of
 /// every PCID.
@@ -1683,11 +1686,11 @@ mod tests
 
     // ── Direct-map split ──────────────────────────────────────────────────────
 
-    // The defect caught: a split table that maps an entry to the wrong frame
-    // (an index or stride slip) or with other flags than the large leaf it
-    // replaces, which would corrupt every direct-map access in the chunk.
+    // The defect caught: split entries with other flags than the large
+    // direct-map leaf they replace (read-only, executable, uncacheable, or a
+    // stray PS bit), which would change every direct-map access in the chunk.
     #[test]
-    fn a_split_chunk_maps_each_page_to_its_own_frame_read_write_no_execute()
+    fn a_split_chunk_maps_its_pages_read_write_no_execute_write_back()
     {
         let chunk = 0x4020_0000;
         let mut table = [PageTableEntry(0); 512];

@@ -293,9 +293,10 @@ pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
 /// # Contract
 /// - Caller must have called `preempt_disable()` before this function.
 /// - `root_phys` must be a valid page table root physical address or 0 for full flush.
-///   The kernel root (`mm::paging::kernel_root_table_pa`) with `tag` 0 names a
-///   kernel mapping: each target drops its translation in every address space
-///   (`flush_kernel_page`).
+///   A single-page request (`pages` 1) on the kernel root
+///   (`mm::paging::kernel_root_table_pa`) with `tag` 0 names a kernel mapping:
+///   each target drops its translation in every address space
+///   (`flush_kernel_page`). No caller sends a range on the kernel root.
 /// - `virt == u64::MAX` (or `root_phys == 0`) requests a full flush; `pages`
 ///   is ignored on that path.
 /// - `pages` must be at least 1 and small enough that the per-page handler

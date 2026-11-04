@@ -439,8 +439,8 @@ const OVERFLOW_STACK_BYTES: usize = 16 * 1024;
 
 /// The stack a hart switches to when its S-mode trap entry finds a kernel
 /// stack overflow (`trap_entry` § Kernel stack overflow). One for all harts:
-/// the first to overflow claims it through [`OVERFLOW_CLAIMED`], and the halt
-/// that follows ends the boot.
+/// the first to overflow claims it through [`OVERFLOW_CLAIMED`] and halts
+/// there with its report; a later one parks without a report.
 #[cfg(not(test))]
 #[repr(C, align(16))]
 struct OverflowStack([u8; OVERFLOW_STACK_BYTES]);
@@ -812,21 +812,6 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
             {
                 live.sepc = fixup;
-                return;
-            }
-
-            // Spurious stale-TLB retry for the kernel: a load or store fault
-            // the kernel's tables already satisfy is an invalid entry this hart
-            // cached before a closed direct-map hole or a fresh split
-            // (`mm::stack_guard`). Flush it locally and re-execute.
-            let spurious = matches!(cause_code, 13 | 15) && {
-                // SAFETY: S-mode.
-                unsafe { super::paging::kernel_fault_is_spurious(live.stval, cause_code == 15) }
-            };
-            if spurious
-            {
-                // SAFETY: S-mode; drops the stale entry for the retry.
-                unsafe { super::paging::flush_page(live.stval) };
                 return;
             }
 

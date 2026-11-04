@@ -279,8 +279,10 @@ framebuffer) prints only the opaque `kaslr_flags`. Paths that end in `fatal`, wh
 faulting CPU (so on SMP the rest of the system, userspace included, keeps running), print an
 address-free header via `kprintln!` and every value that can be a kernel VA via `kprintln_serial!`:
 the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, and the register file serial-only; the vector,
-error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL EXCEPTION` dump (`sepc`,
-`stval`, `satp`, and the register file serial-only; `scause` and `sstatus` on the console), the
+error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL STACK OVERFLOW` dump
+(`sepc`, `stval`, `sp`, and `floor` serial-only; the CPU on the console), the riscv64
+`KERNEL EXCEPTION` dump (`sepc`, `stval`, `satp`, and the register file serial-only; `scause`
+and `sstatus` on the console), the
 riscv64 unknown-interrupt path (`sepc` serial-only), and the riscv64 `BUG: ecall return sepc` path
 (`sepc`, `ra`, `sp`, and `a7` serial-only).
 

@@ -164,8 +164,8 @@ pick_next(cpu):
 
 The TCB is the kernel's per-thread state. A thread's TCB lives in its Thread slab, which
 `SYS_CAP_CREATE_THREAD` retypes from the caller's Memory capability (boot code carves init's
-thread from the SEED reserve): the kernel stack, then the page holding the `ThreadObject` and
-TCB, then the extended-state area (see
+thread from the SEED reserve): a guard page, the kernel stack, then the page holding the
+`ThreadObject` and TCB, then the extended-state area (see
 [memory-internals.md § Kernel Stack Allocation](memory-internals.md#kernel-stack-allocation)).
 Idle threads' TCBs live in a per-CPU array allocated at boot. The excerpt below is abridged to
 the fields this document discusses; `core/kernel/src/sched/thread.rs` holds the full definition.

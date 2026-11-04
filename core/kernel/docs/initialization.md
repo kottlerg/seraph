@@ -296,8 +296,9 @@ subsystem's per-CPU state is described in [entropy.md](entropy.md).
 registry allocation, or an idle stack's guard page the direct map cannot unmap, halts the
 kernel.
 
-**Completion criterion:** per-CPU storage, the frame map table, and the `CSpace` registry are
-allocated; there is no kernel allocator to activate.
+**Completion criterion:** the guard-table reserve, per-CPU storage (each idle stack's guard
+page unmapped), the frame map table, and the `CSpace` registry are allocated; there is no
+kernel allocator to activate.
 
 ---
 

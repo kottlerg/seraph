@@ -44,8 +44,10 @@
 //! ## Adding new fields
 //! Append fields at the end of the struct. If assembly reads the field, add
 //! its `PERCPU_*_OFFSET` constant, a row in the table above, and an
-//! `offset_of!` line in `tests::percpu_offsets_match_asm_constants`, and update
-//! that assembly; otherwise update only the size assertion in that test.
+//! `offset_of!` line in `tests::percpu_offsets_match_asm_constants` (none for
+//! a constant defined as `offset_of!` itself, which asm takes as a `const`
+//! operand), and update that assembly; otherwise update only the size
+//! assertion in that test.
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 

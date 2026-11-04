@@ -19,13 +19,13 @@
 //! ([`reserve_frames`]), so a split never fails. A split chunk stays split and
 //! its table stays consumed; the reserve's unused frames are never returned.
 
-use boot_protocol::{MemoryMapEntry, MemoryType};
+use boot_protocol::MemoryMapEntry;
 
 use crate::mm::paging::LARGE_PAGE_SIZE;
 
 /// Leaf tables the reserve holds for a memory map: one for each 2 MiB chunk a
-/// RAM region (`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`, the
-/// regions the direct map covers as RAM) touches, counted once when regions
+/// RAM region (`mm::init::is_dram`, the regions the direct map covers as RAM)
+/// touches, counted once when regions
 /// share a chunk. Every guard page is RAM, so the count bounds the chunks any
 /// set of guards can split. Entries are in ascending base order, as the boot
 /// protocol guarantees (`MemoryMapSlice`).
@@ -37,14 +37,7 @@ pub fn reserve_frames(entries: &[MemoryMapEntry]) -> usize
     let mut counted_end = 0u64;
     for e in entries
     {
-        let ram = matches!(
-            e.memory_type,
-            MemoryType::Usable
-                | MemoryType::Loaded
-                | MemoryType::AcpiReclaimable
-                | MemoryType::Persistent
-        );
-        if !ram || e.size == 0
+        if !crate::mm::init::is_dram(e.memory_type) || e.size == 0
         {
             continue;
         }
@@ -58,28 +51,95 @@ pub fn reserve_frames(entries: &[MemoryMapEntry]) -> usize
         counted_end = counted_end.max(end);
     }
     // The chunk count of any memory map the 64-bit kernel can map fits usize.
-    #[allow(clippy::cast_possible_truncation)]
-    let frames = frames as usize;
-    frames
+    usize::try_from(frames).unwrap_or(usize::MAX)
 }
 
 #[cfg(not(test))]
 mod live
 {
+    use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::mm::paging::{PagingError, phys_to_virt};
     use crate::sync::Spinlock;
 
-    /// Serialises every direct-map edit this module makes and the reserve's
-    /// free list. A leaf lock: nothing is acquired while it is held
-    /// (`core/kernel/docs/scheduling-internals.md` § Lock Hierarchy).
-    static LOCK: Spinlock = Spinlock::new();
+    /// The reserve's free list and the lock that serialises it together with
+    /// every direct-map edit this module makes. A leaf lock: nothing is
+    /// acquired while it is held (`core/kernel/docs/scheduling-internals.md`
+    /// § Lock Hierarchy).
+    struct Reserve
+    {
+        lock: Spinlock,
+        /// Head of the free list, or 0 when empty. Each free frame's first
+        /// 8 bytes, reached through the direct map, hold the next frame's
+        /// address. Reached only through [`Reserve::with`], under `lock`.
+        head: UnsafeCell<u64>,
+    }
 
-    /// Head of the reserve's free list, or 0 when empty. Each free frame's
-    /// first 8 bytes, reached through the direct map, hold the next frame's
-    /// address. Owned by [`LOCK`].
-    static mut FREE_HEAD: u64 = 0;
+    // SAFETY: `head` is reached only through `Reserve::with`, which holds
+    // `lock` for the access.
+    unsafe impl Sync for Reserve {}
+
+    impl Reserve
+    {
+        /// Run `f` with the lock held, handing it the free list.
+        fn with<R>(&self, f: impl FnOnce(&mut FreeList) -> R) -> R
+        {
+            // SAFETY: the lock is released below, after `f`, which cannot
+            // retain the list past its call.
+            let saved = unsafe { self.lock.lock_raw() };
+            // SAFETY: the lock is held, so this is the head's only reference.
+            let head = unsafe { &mut *self.head.get() };
+            let mut list = FreeList { head };
+            let r = f(&mut list);
+            // SAFETY: paired with the acquisition above.
+            unsafe { self.lock.unlock_raw(saved) };
+            r
+        }
+    }
+
+    /// The reserve's free list, borrowed under its lock ([`Reserve::with`]).
+    struct FreeList<'a>
+    {
+        head: &'a mut u64,
+    }
+
+    impl FreeList<'_>
+    {
+        /// Push the frame at `frame`.
+        ///
+        /// # Safety
+        /// `frame` is a page-aligned RAM frame the caller hands over, reached
+        /// through the direct map, and on no list.
+        unsafe fn push(&mut self, frame: u64)
+        {
+            // SAFETY: caller contract; the frame's first word is its link.
+            unsafe { (phys_to_virt(frame) as *mut u64).write(*self.head) };
+            *self.head = frame;
+            REMAINING.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Pop a frame, or `None` when the list is empty.
+        fn pop(&mut self) -> Option<u64>
+        {
+            let frame = *self.head;
+            if frame == 0
+            {
+                return None;
+            }
+            // SAFETY: every frame on the list was pushed by `push`, which
+            // wrote its link through the direct map.
+            *self.head = unsafe { (phys_to_virt(frame) as *const u64).read() };
+            REMAINING.fetch_sub(1, Ordering::Relaxed);
+            Some(frame)
+        }
+    }
+
+    /// The guard-table reserve.
+    static RESERVE: Reserve = Reserve {
+        lock: Spinlock::new(),
+        head: UnsafeCell::new(0),
+    };
 
     /// Frames [`seed`] put in the reserve.
     static SEEDED: AtomicUsize = AtomicUsize::new(0);
@@ -96,21 +156,18 @@ mod live
     /// Halts via `crate::fatal` when the buddy cannot supply a frame.
     pub unsafe fn seed(frames: usize, allocator: &mut crate::mm::BuddyAllocator)
     {
-        for _ in 0..frames
-        {
-            let frame = allocator.alloc(0).unwrap_or_else(|| {
-                crate::fatal("Phase 4: out of memory for the guard-table reserve")
-            });
-            // SAFETY: single boot thread before any hole (caller contract), so
-            // nothing else reads the list; the frame is fresh from the buddy
-            // and reached through the direct map.
-            unsafe {
-                (phys_to_virt(frame) as *mut u64).write(FREE_HEAD);
-                FREE_HEAD = frame;
+        RESERVE.with(|list| {
+            for _ in 0..frames
+            {
+                let frame = allocator.alloc(0).unwrap_or_else(|| {
+                    crate::fatal("Phase 4: out of memory for the guard-table reserve")
+                });
+                // SAFETY: the frame is fresh from the buddy, this call's
+                // alone, and reached through the direct map.
+                unsafe { list.push(frame) };
             }
-        }
+        });
         SEEDED.store(frames, Ordering::Relaxed);
-        REMAINING.store(frames, Ordering::Relaxed);
     }
 
     /// Frames the reserve was seeded with.
@@ -125,45 +182,44 @@ mod live
         REMAINING.load(Ordering::Relaxed)
     }
 
-    /// Pop a frame from the reserve.
-    ///
-    /// # Safety
-    /// [`LOCK`] is held.
-    unsafe fn take_frame() -> Option<u64>
-    {
-        // SAFETY: LOCK held (caller contract); the head and each link are
-        // frames this module seeded, reached through the direct map.
-        unsafe {
-            let head = FREE_HEAD;
-            if head == 0
-            {
-                return None;
-            }
-            FREE_HEAD = (phys_to_virt(head) as *const u64).read();
-            REMAINING.fetch_sub(1, Ordering::Relaxed);
-            Some(head)
-        }
-    }
-
-    /// Unmap the page at `phys` from the direct map under [`LOCK`].
+    /// Unmap the page at `phys` from the direct map under the reserve's lock.
     ///
     /// # Safety
     /// As [`hole`].
     unsafe fn hole_locked(phys: u64) -> Result<(), PagingError>
     {
-        // The arch walk calls this only during the edit, under LOCK.
-        let mut take = || {
-            // SAFETY: LOCK is held for the whole edit below.
-            unsafe { take_frame() }
-        };
-        // SAFETY: LOCK serialises the edit and the reserve; the caller owns
-        // the page and keeps everything off it.
+        RESERVE.with(|list| {
+            // SAFETY: the lock serialises the edit and the reserve; the
+            // caller owns the page and keeps everything off it.
+            unsafe {
+                crate::arch::current::paging::hole_direct_map_page(phys_to_virt(phys), &mut || {
+                    list.pop()
+                })
+            }
+        })
+    }
+
+    /// Drop every other online CPU's cached translation of the kernel address
+    /// `virt`, with a single-VA shootdown on the kernel root, which each
+    /// target serves in every address space (`flush_kernel_page`).
+    ///
+    /// # Safety
+    /// After SMP bringup, with no lock held and preemption disabled.
+    unsafe fn shoot_down_kernel_page(virt: u64)
+    {
+        let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+        let mut remote = crate::cpu_mask::CpuMask::range(cpu_count);
+        remote.clear(crate::arch::current::cpu::current_cpu() as usize);
+        // SAFETY: the kernel root is the shared kernel half of every address
+        // space; `remote` holds only online CPUs, not this one; preemption is
+        // disabled (caller contract).
         unsafe {
-            let saved = LOCK.lock_raw();
-            let r =
-                crate::arch::current::paging::hole_direct_map_page(phys_to_virt(phys), &mut take);
-            LOCK.unlock_raw(saved);
-            r
+            crate::mm::tlb_shootdown::shootdown(
+                crate::mm::paging::kernel_root_table_pa(),
+                &remote,
+                virt,
+                0,
+            );
         }
     }
 
@@ -178,7 +234,7 @@ mod live
     /// # Safety
     /// Before any other CPU starts (Phase 4). `phys` is a page-aligned RAM
     /// page the caller owns, which nothing reaches through the direct map
-    /// until [`close`].
+    /// while it is holed.
     pub unsafe fn hole_on_boot_cpu(phys: u64) -> Result<(), PagingError>
     {
         // SAFETY: caller contract.
@@ -209,24 +265,11 @@ mod live
         let r = unsafe { hole_locked(phys) };
         if r.is_ok()
         {
-            // SAFETY: ring 0 / S-mode.
-            unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
-            let cpu_count =
-                crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-            let mut remote = crate::cpu_mask::CpuMask::range(cpu_count);
-            remote.clear(crate::arch::current::cpu::current_cpu() as usize);
-            // SAFETY: the kernel root is the active kernel half of every
-            // address space; `remote` holds only online CPUs, not this one;
-            // preemption is disabled. A request on the kernel root makes each
-            // target drop the translation in every address space
-            // (`tlb_shootdown::service_shootdowns`).
+            // SAFETY: ring 0 / S-mode; after SMP bringup with no lock held
+            // and preemption disabled (above).
             unsafe {
-                crate::mm::tlb_shootdown::shootdown(
-                    crate::mm::paging::kernel_root_table_pa(),
-                    &remote,
-                    virt,
-                    0,
-                );
+                crate::arch::current::paging::flush_kernel_page(virt);
+                shoot_down_kernel_page(virt);
             }
         }
         crate::percpu::preempt_enable();
@@ -238,38 +281,43 @@ mod live
     }
 
     /// Map the page at `phys`, holed by [`hole`], into the direct map again,
-    /// so the page can hold anything once more.
-    ///
-    /// x86-64 caches no not-present entry, so no CPU needs a flush. A riscv64
-    /// hart may hold the invalid one: this hart fences, and another one that
-    /// reaches the page takes the S-mode spurious-fault retry
-    /// (`arch::riscv64::paging::kernel_fault_is_spurious`).
+    /// so the page can hold anything once more, and drop every CPU's cached
+    /// not-present entry for it where the architecture caches one
+    /// (`CACHES_NOT_PRESENT_ENTRIES`: riscv64, whose harts may hold the
+    /// invalid entry; x86-64 caches none).
     ///
     /// # Safety
-    /// `phys` was holed by [`hole`] or [`hole_on_boot_cpu`] and is not holed
-    /// again until this returns.
+    /// After SMP bringup, with no lock held. `phys` was holed by [`hole`] and
+    /// is not holed again until this returns.
     pub unsafe fn close(phys: u64)
     {
         let virt = phys_to_virt(phys);
-        // SAFETY: LOCK serialises the edit; the hole left a leaf table.
-        unsafe {
-            let saved = LOCK.lock_raw();
-            crate::arch::current::paging::fill_direct_map_page(virt, phys);
-            LOCK.unlock_raw(saved);
-            crate::arch::current::paging::flush_kernel_page(virt);
+        crate::percpu::preempt_disable();
+        RESERVE.with(|_| {
+            // SAFETY: the reserve's lock serialises the edit; the hole left a
+            // leaf table.
+            unsafe { crate::arch::current::paging::fill_direct_map_page(virt, phys) };
+        });
+        if crate::arch::current::paging::CACHES_NOT_PRESENT_ENTRIES
+        {
+            // SAFETY: ring 0 / S-mode; after SMP bringup with no lock held and
+            // preemption disabled (above).
+            unsafe {
+                crate::arch::current::paging::flush_kernel_page(virt);
+                shoot_down_kernel_page(virt);
+            }
         }
+        crate::percpu::preempt_enable();
     }
 
     /// Whether the direct map maps the page at `phys`.
     pub fn is_mapped(phys: u64) -> bool
     {
-        // SAFETY: LOCK serialises the read against the edits.
-        unsafe {
-            let saved = LOCK.lock_raw();
-            let mapped = crate::arch::current::paging::direct_map_page_present(phys_to_virt(phys));
-            LOCK.unlock_raw(saved);
-            mapped
-        }
+        RESERVE.with(|_| {
+            // SAFETY: the reserve's lock serialises the read against the
+            // edits.
+            unsafe { crate::arch::current::paging::direct_map_page_present(phys_to_virt(phys)) }
+        })
     }
 }
 
@@ -280,6 +328,7 @@ pub use live::{close, hole, hole_on_boot_cpu, is_mapped, remaining_frames, seed,
 mod tests
 {
     use super::*;
+    use boot_protocol::MemoryType;
 
     const MIB: u64 = 1024 * 1024;
 

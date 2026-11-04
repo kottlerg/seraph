@@ -543,14 +543,17 @@ Shootdown), which each target serves with `flush_kernel_page`, since the direct 
 entries are cached under every address space a CPU has run. On x86-64 with tagged TLBs
 that is INVPCID's all-context form, a whole-TLB flush, because no instruction drops one
 non-global address from every PCID; without tags, and on riscv64 (`sfence.vma va, zero`),
-it is the one address. Filling a hole needs no shootdown: x86-64 caches no not-present
-entry, and a riscv64 hart that cached the invalid one takes the S-mode spurious-fault
-retry (`paging::kernel_fault_is_spurious`), which flushes the address and re-executes.
+it is the one address. Filling a hole, before the slab returns to its Memory capability,
+drops the not-present entry wherever a CPU may cache one (`CACHES_NOT_PRESENT_ENTRIES`):
+riscv64, without Svvptc, broadcasts the same shootdown, since a hart that kept the invalid
+entry would fault on the page's next use, and if that use is a kernel stack the fault's
+trap frame lands on the same page and faults again before the first trap has saved its
+state; x86-64 caches no not-present entry and needs none.
 
-An overflow halts the boot with a diagnostic. On x86-64 the fault on the guard cannot
-push its frame on the overflowed stack and escalates to a double fault, which runs on
-IST1. On riscv64 an S-mode trap pushes its frame on the stack it interrupts, so the trap
-entry compares the frame's base with the hart's stack floor
+An overflow halts the overflowing CPU with a diagnostic (`fatal`). On x86-64 the fault on
+the guard cannot push its frame on the overflowed stack and escalates to a double fault,
+which runs on IST1. On riscv64 an S-mode trap pushes its frame on the stack it interrupts,
+so the trap entry compares the frame's base with the hart's stack floor
 (`PerCpuData::kernel_stack_floor`, the base of the stack it runs on) and, below it,
 switches to a static overflow stack and halts (`interrupts::kernel_stack_overflow`)
 instead of nesting faults until the frames pass the guard. `context::switch` writes the

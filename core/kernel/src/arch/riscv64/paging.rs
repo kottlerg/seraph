@@ -1389,14 +1389,14 @@ pub unsafe fn hole_direct_map_page(
         // SAFETY: the frame is the caller's alone, reached through the direct
         // map, and no table names it yet.
         let table = unsafe { table_at(phys_to_virt(table_pa)) };
-        let chunk = entry.phys_addr() & !(LARGE_PAGE_SIZE - 1);
-        for (i, e) in table.iter_mut().enumerate()
-        {
-            *e = PageTableEntry::new_page(chunk + (i * 4096) as u64, DIRECT_RAM);
-        }
+        crate::mm::paging::fill_split_table(
+            table,
+            entry.phys_addr() & !(LARGE_PAGE_SIZE - 1),
+            |phys| PageTableEntry::new_page(phys, DIRECT_RAM),
+        );
         // The entries are written before the level-1 entry names the table,
-        // so a walk through it finds them; a hart that walks it early takes
-        // the spurious-fault retry (`kernel_fault_is_spurious`).
+        // so a walk through it, which reads the table through that entry,
+        // finds them.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         *entry = PageTableEntry::new_table(table_pa);
     }
@@ -1408,9 +1408,9 @@ pub unsafe fn hole_direct_map_page(
 }
 
 /// Map the direct-map page at `virt` to `phys` again, closing a hole
-/// [`hole_direct_map_page`] left. The caller fences this hart; another hart
-/// that cached the invalid entry takes the spurious-fault retry
-/// ([`kernel_fault_is_spurious`]) on its next access.
+/// [`hole_direct_map_page`] left. A hart may have cached the invalid entry
+/// ([`CACHES_NOT_PRESENT_ENTRIES`]), so the caller flushes every hart before
+/// the page is used.
 ///
 /// # Safety
 /// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`];
@@ -1456,39 +1456,10 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     l0[vpn_index(0, virt)].is_present()
 }
 
-/// Whether an S-mode load or store page fault at the kernel address `va` is
-/// stale: the kernel's tables map `va` with a 4 KiB leaf that permits the
-/// access, so the hart cached the invalid entry a closed direct-map hole
-/// ([`fill_direct_map_page`]) or an early walk of a fresh split left, and
-/// resolves it on retry after a local `sfence.vma`.
-///
-/// A megapage leaf is never stale this way (no megapage of the direct map is
-/// ever invalid), so only a leaf table is consulted.
-///
-/// # Safety
-/// Must run in S-mode.
-#[cfg(not(test))]
-pub unsafe fn kernel_fault_is_spurious(va: u64, write: bool) -> bool
-{
-    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
-
-    let root_pa = kernel_root_table_pa();
-    if root_pa == 0 || va >> 63 == 0
-    {
-        return false;
-    }
-    let top = paging_mode().levels() - 1;
-    // SAFETY: the kernel root and its tables are live frames reached through
-    // the direct map; a racing edit at worst makes this read report a stale
-    // answer, and a wrong `true` re-faults on retry into the same check.
-    let Some(l0) = (unsafe { descend_existing(phys_to_virt(root_pa), va, top, 0, phys_to_virt) })
-    else
-    {
-        return false;
-    };
-    let leaf = l0[vpn_index(0, va)];
-    leaf.is_present() && leaf.0 & READ != 0 && (!write || leaf.0 & WRITE != 0)
-}
+/// Whether a hart may cache an invalid entry, so that a page made valid again
+/// needs a flush on every hart before another one reaches it: true on RISC-V
+/// without Svvptc, which the kernel does not require.
+pub const CACHES_NOT_PRESENT_ENTRIES: bool = true;
 
 /// Invalidate this hart's cached translations of the kernel address `virt`
 /// in every address space: `sfence.vma virt, zero` covers every ASID.

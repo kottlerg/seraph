@@ -4032,8 +4032,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     (*tcb).sched_lock.unlock_raw(saved);
                 }
 
-                // The per-thread XSAVE / FP-save area is pages N+1.. of the
-                // Thread retype slot (see sys_cap_create_thread layout); it
+                // The per-thread XSAVE / FP-save area is the pages after the
+                // wrapper page of the Thread retype slot
+                // (`sched::thread_slot::EXTENDED_OFFSET`); it
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.
 
@@ -4098,9 +4099,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // Map the guard page back into the direct map before its memory
             // returns to the cap, then free the slot.
             // SAFETY: thread creation holed the slot's guard, and the thread
-            // is dead; the object was retyped from `ancestor_memory` at
-            // `offset` with `raw_bytes`, and is dropped above; nothing
-            // references it.
+            // is dead; this arm holds no lock (`dealloc_object_one`'s
+            // contract), after SMP bringup. The object was retyped from
+            // `ancestor_memory` at `offset` with `raw_bytes`, and is dropped
+            // above; nothing references it.
             unsafe {
                 crate::mm::stack_guard::close(block_phys);
                 retype_free(ancestor_memory, offset, raw_bytes);

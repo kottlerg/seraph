@@ -891,11 +891,11 @@ hazard is the same. Keeping the publication below the sp swap closes the window.
 the hart's `PerCpuData::kernel_stack_floor`, the base of the stack it runs on
 ([memory-internals.md](memory-internals.md) § Kernel Stack Guards), so the floor MUST name the
 stack `sp` is on whenever a trap can be taken. `switch()` loads `next.saved_state.stack_floor`
-before `ld sp, 0(a1)` and stores it to the per-CPU floor immediately after: the load can fault (a
-spurious S-mode fault on the TCB is retried) while sp and floor still name the outgoing stack, and
-the store, to the per-CPU slab, which is never a guard, cannot. A floor written earlier, in Rust
-before the call, would leave a window where a retried fault on the outgoing stack is compared
-against the incoming stack's floor and halts as an overflow. x86-64 checks no floor.
+before `ld sp, 0(a1)` and stores it to the per-CPU floor immediately after: a fault on the load is
+taken while sp and floor still name the outgoing stack, and the store, to the per-CPU slab, which
+is never a guard, cannot fault. A floor written earlier, in Rust before the call, would leave a
+window where a fault taken on the outgoing stack is compared against the incoming stack's floor
+and reported as an overflow instead of as itself. x86-64 checks no floor.
 
 Per-arch step ordering: both arches follow the textbook sequence above literally —
 `sched.lock.release_lock_only()` (step 3) runs in Rust before the lockless `next.context_saved`

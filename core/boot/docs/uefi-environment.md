@@ -150,8 +150,11 @@ policy in [memory-map.md](memory-map.md).
 
 The buffer allocation in step 2 increases the map size by at least one entry (the new
 `EfiLoaderData` region). The buffer must be sized to accommodate this; the bootloader
-adds 16 entries of slack, a prudent margin that also absorbs the further growth seen
-when `ExitBootServices` re-queries the map under contention (see below).
+adds 16 entries of slack (`uefi::MAP_BUFFER_SLACK_DESCRIPTORS`), a prudent margin that
+also absorbs the further growth seen when `ExitBootServices` re-queries the map under
+contention (see below). The buffer, rounded to whole pages, bounds every map read into
+it, and step 6 sizes the translated entry array to that bound
+([memory-map.md](memory-map.md) § Sizing the Entry Array).
 
 ### UEFI Memory Type Translation
 
@@ -236,9 +239,8 @@ ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
 failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
 on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
 a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), a memory map
-that outgrows its entry array on every run of steps 6 and 7 (`MemoryMapKeptGrowing`), and, in
-step 9, RAM descriptors past the translated memory map after step 8's stale-key re-query
-(`MemoryMapTruncated`, [memory-map.md](memory-map.md) § Sizing the Entry Array) and a
+that outgrows its entry array on every run of steps 6 and 7 (`MemoryMapKeptGrowing`,
+[memory-map.md](memory-map.md) § Sizing the Entry Array), and, in step 9, a
 `reclaim_ranges` overflow
 (`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
 source is the authority on the variant list and payloads.

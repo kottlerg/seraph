@@ -58,16 +58,10 @@ pub enum BootError
     #[allow(dead_code)]
     PagingModeUnsupported,
 
-    /// The final memory map held RAM descriptors past the translated
-    /// `MemoryMapEntry` array (step 9): the kernel would boot without that
-    /// memory. Reached only when `ExitBootServices`' stale-key re-query (step
-    /// 8) returns a map larger than the one step 7 sized the array for. The
-    /// `usize` is the number of RAM descriptors left out.
-    MemoryMapTruncated(usize),
-
-    /// The memory map outgrew the entry array step 6 sized for it on every one
-    /// of the `MEM_MAP_ATTEMPTS` runs of steps 6 and 7, the slack doubling each
-    /// time. The `usize` is the last attempt's descriptor count.
+    /// The final map's buffer could hold more descriptors than the entry array
+    /// step 6 sized, on every one of the `MEM_MAP_ATTEMPTS` runs of steps 6
+    /// and 7, the slack doubling each time. The `usize` is the last attempt's
+    /// buffer reach (`uefi::map_buffer_descriptor_reach`).
     MemoryMapKeptGrowing(usize),
 
     /// The firmware's memory map violates the UEFI contract (a descriptor size
@@ -145,10 +139,6 @@ impl BootError
             {
                 "no supported RISC-V paging mode (Sv39 is the platform minimum)"
             }
-            BootError::MemoryMapTruncated(_) =>
-            {
-                "memory map has RAM descriptors past the translated entry array"
-            }
             BootError::MemoryMapKeptGrowing(_) =>
             {
                 "memory map kept outgrowing the entry array across the step 6 and 7 retries"
@@ -172,13 +162,9 @@ impl core::fmt::Display for BootError
         {
             write!(f, ": status={code:#018x}")?;
         }
-        if let BootError::MemoryMapTruncated(ram) = self
+        if let BootError::MemoryMapKeptGrowing(reach) = self
         {
-            write!(f, ": {ram} RAM descriptors left out")?;
-        }
-        if let BootError::MemoryMapKeptGrowing(descriptors) = self
-        {
-            write!(f, ": {descriptors} descriptors on the last attempt")?;
+            write!(f, ": a buffer of {reach} descriptors on the last attempt")?;
         }
         Ok(())
     }
@@ -207,7 +193,6 @@ mod tests
             BootError::ExitBootServicesFailed,
             BootError::InvalidBundle("b"),
             BootError::PagingModeUnsupported,
-            BootError::MemoryMapTruncated(1),
             BootError::MemoryMapKeptGrowing(1),
             BootError::InvalidMemoryMap("m"),
             BootError::ReclaimRangesOverflow,

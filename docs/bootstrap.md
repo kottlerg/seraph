@@ -18,7 +18,7 @@ the kernel from `\EFI\seraph\kernel`, ELF-parses the bundle entry named
 `init` into `BootInfo.init_image`, exposes every other bundle entry as a
 named `BootModule`, builds initial page tables, queries the final UEFI
 memory map (redoing the page-table step with more slack, a bounded number of
-times, when the final map outgrows the array sized for it), calls
+times, when the final map's buffer outgrows the array sized for it), calls
 `ExitBootServices`, populates `BootInfo`, and jumps to the kernel entry point.
 The sequence is specified in ten bootloader steps in
 [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).

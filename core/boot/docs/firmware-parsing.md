@@ -107,9 +107,11 @@ after `ExitBootServices` by
    `phys_base`, joining adjacent and overlapping entries, so the list is minimal
    and non-overlapping at every step and no scratch buffer bounds the input.
 4. Cap at the array's capacity, `memory_map::aperture_capacity` of the step 6
-   descriptor count plus its slack: every aperture starts at a descriptor's base, a
-   seed's base, or the end of a descriptor clipped out of a seed, so a map no larger
-   than step 6 sized for, with the seeds step 6 counted, always fits. When more pieces than
+   entry array's capacity: every aperture starts at a descriptor's base, a seed's
+   base, or the end of a descriptor clipped out of a seed, and no map read from the
+   step 7 buffer holds more descriptors than the entry array
+   ([memory-map.md](memory-map.md) § Sizing the Entry Array), so with the seeds step 6
+   counted the apertures always fit. When more pieces than
    the capacity are disjoint at once, a later piece could still bridge them, so the
    list is rebuilt by taking the pieces in ascending `phys_base` order, which keeps
    exactly the lowest apertures the array holds of the full merge; when the full

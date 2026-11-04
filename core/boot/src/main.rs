@@ -92,20 +92,25 @@ const KERNEL_STACK_PAGES: usize = boot_protocol::layout::HANDOFF_STACK_BYTES / 4
 /// overwriting another allocation ([`handoff_stack_span`]).
 const HANDOFF_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + 1;
 
-/// Entries of headroom the translated `MemoryMapEntry` array carries above the
-/// firmware's descriptor count, which step 6 reads before its first
-/// allocation. Each allocation after the count (the ten of steps 6 and 7:
-/// the `BootInfo`, module, entry, aperture, two seed and reclaim pages, the
-/// stack, the page-table pool, and the raw map buffer) adds at most two
-/// descriptors, 20 in all; the other 12 absorb the firmware's own housekeeping allocations in
-/// that window, which no count bounds. A final map (step 7) past the array
-/// makes the bootloader free steps 6 and 7 and redo them with twice the slack,
-/// up to [`MEM_MAP_ATTEMPTS`] times, so the slack is a first guess, not a bound.
+/// Descriptors of growth the translated `MemoryMapEntry` array allows for
+/// above the firmware's descriptor count, which step 6 reads before its first
+/// allocation; the array then holds every descriptor the buffer step 7
+/// allocates for a map that large could ever hold
+/// ([`uefi::map_buffer_descriptor_reach`]). Each allocation after the count
+/// (the ten of steps 6 and 7: the `BootInfo`, module, entry, aperture, two
+/// seed and reclaim pages, the stack, the page-table pool, and the raw map
+/// buffer) adds at most two descriptors, 20 in all; the other 12 absorb the
+/// firmware's own housekeeping allocations in that window, which no count
+/// bounds. Its overflow costs only another round: a final map (step 7) whose
+/// buffer reaches past the array makes the bootloader free steps 6 and 7 and
+/// redo them with twice the slack, up to [`MEM_MAP_ATTEMPTS`] times.
 const MEM_MAP_SLACK_ENTRIES: usize = 32;
 
 /// Times steps 6 and 7 run before the bootloader gives up on a memory map
 /// that keeps outgrowing the entry array sized for it, the slack doubling each
-/// time ([`BootError::MemoryMapKeptGrowing`]). A redo frees the first
+/// time ([`BootError::MemoryMapKeptGrowing`]). It bounds no capacity: it is a
+/// retry guard against firmware that never stops allocating, as
+/// `uefi::EXIT_BOOT_SERVICES_MAX_ATTEMPTS` is. A redo frees the first
 /// attempt's allocations before it counts again, so its count includes what
 /// the firmware itself allocated during the first window; a third attempt is
 /// reached only by firmware that outgrows twice that slack in the second.
@@ -275,8 +280,9 @@ struct BootAllocations
     modules_phys: u64,
     mem_entries_phys: u64,
     /// Pages of the `MemoryMapEntry` array at `mem_entries_phys`, sized at
-    /// step 6 from the firmware's descriptor count plus the attempt's slack
-    /// ([`MEM_MAP_SLACK_ENTRIES`], doubled on each redo).
+    /// step 6 to the reach of the map buffer for the firmware's descriptor
+    /// count plus the attempt's slack ([`MEM_MAP_SLACK_ENTRIES`], doubled on
+    /// each redo).
     mem_entries_pages: usize,
     apertures_phys: u64,
     /// Apertures the array at `apertures_phys` holds
@@ -1165,13 +1171,18 @@ unsafe fn step6_allocate_and_build_page_tables(
     slack: usize,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
-    // The memory map's descriptor count, read before this step's first
-    // allocation; the entry array below adds `slack` entries of headroom
+    // The memory map's descriptor count and stride, read before this step's
+    // first allocation. The entry array holds every descriptor the buffer
+    // step 7 allocates could hold, for a map `slack` descriptors larger
     // (MEM_MAP_SLACK_ENTRIES on the first attempt; its doc gives the budget).
     // SAFETY: bs is valid; the size query allocates nothing.
-    let firmware_descriptors = unsafe { uefi::memory_map_descriptor_count(ctx.bs)? };
+    let (firmware_descriptors, stride) = unsafe { uefi::memory_map_shape(ctx.bs)? };
+    let entry_capacity = uefi::map_buffer_descriptor_reach(uefi::map_buffer_bytes(
+        (firmware_descriptors + slack) * stride,
+        stride,
+    ));
     let mem_entries_pages =
-        ((firmware_descriptors + slack) * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096);
+        (entry_capacity * core::mem::size_of::<MemoryMapEntry>()).div_ceil(4096);
     // BootInfo: one page — holds the BootInfo struct populated in step 9.
     // SAFETY: bs is valid.
     let boot_info_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -1196,12 +1207,10 @@ unsafe fn step6_allocate_and_build_page_tables(
     let heuristic_pages = (heuristic_capacity * seed_bytes).div_ceil(4096).max(1);
     // SAFETY: bs is valid.
     let heuristic_phys = unsafe { allocate_pages(ctx.bs, heuristic_pages)? };
-    // MMIO aperture array, sized from the same descriptor count and the seed
-    // counts (memory_map::aperture_capacity).
-    let aperture_capacity = memory_map::aperture_capacity(
-        firmware_descriptors + slack,
-        seeds_capacity + heuristic_capacity,
-    );
+    // MMIO aperture array, sized from the entry array's capacity and the
+    // seed counts (memory_map::aperture_capacity).
+    let aperture_capacity =
+        memory_map::aperture_capacity(entry_capacity, seeds_capacity + heuristic_capacity);
     let apertures_pages = (aperture_capacity * core::mem::size_of::<MmioAperture>()).div_ceil(4096);
     // SAFETY: bs is valid.
     let apertures_phys = unsafe { allocate_pages(ctx.bs, apertures_pages)? };
@@ -1424,15 +1433,17 @@ unsafe fn step7_query_memory_map(ctx: &UefiContext) -> Result<uefi::MemoryMapRes
     unsafe { get_memory_map(ctx.bs) }
 }
 
-/// Run steps 6 and 7 until the final memory map fits the entry array step 6
-/// sized for it: a map past the array frees both steps' allocations
+/// Run steps 6 and 7 until the final memory map's buffer holds no more
+/// descriptors than the entry array step 6 sized
+/// ([`uefi::map_buffer_descriptor_reach`], which bounds step 8's re-query
+/// into the same buffer too): a buffer past the array frees both steps' allocations
 /// ([`release_step6_and_7`]) and redoes them with twice the slack, from
 /// [`MEM_MAP_SLACK_ENTRIES`], up to [`MEM_MAP_ATTEMPTS`] times
 /// (`core/boot/docs/memory-map.md` § Sizing the Entry Array).
 ///
 /// # Errors
-/// [`BootError::MemoryMapKeptGrowing`] when the last attempt's map still
-/// outgrows its array, and any error of steps 6 and 7 or of the frees.
+/// [`BootError::MemoryMapKeptGrowing`] when the last attempt's buffer still
+/// reaches past its array, and any error of steps 6 and 7 or of the frees.
 ///
 /// # Safety
 /// As [`step6_allocate_and_build_page_tables`]; nothing between the returned
@@ -1473,19 +1484,19 @@ unsafe fn steps6_and_7_sized_to_the_map(
         };
         // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
         let uefi_map = unsafe { step7_query_memory_map(ctx)? };
-        let descriptors = uefi_map.map_size / uefi_map.descriptor_size.max(1);
+        let reach = uefi::map_buffer_descriptor_reach(uefi_map.buffer_size);
         let capacity = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
-        if descriptors <= capacity
+        if reach <= capacity
         {
             return Ok((allocs, page_table, uefi_map));
         }
         if attempt == MEM_MAP_ATTEMPTS
         {
-            return Err(BootError::MemoryMapKeptGrowing(descriptors));
+            return Err(BootError::MemoryMapKeptGrowing(reach));
         }
         bprintln!(
-            "[--------] boot: memory map: {descriptors} descriptors past the {capacity}-entry \
-             array; redoing steps 6 and 7"
+            "[--------] boot: memory map: a buffer of {reach} descriptors past the \
+             {capacity}-entry array; redoing steps 6 and 7"
         );
         // SAFETY: bs is valid pre-exit; the spans are the allocations steps 6
         // and 7 just made, which nothing else references.
@@ -1578,9 +1589,8 @@ unsafe fn step8_exit_boot_services(
 /// aperture list.
 ///
 /// # Errors
-/// [`BootError::MemoryMapTruncated`] when the final map holds RAM descriptors
-/// past the translated entry array, and [`BootError::ReclaimRangesOverflow`]
-/// when step 9 has more reclaim entries than `MAX_RECLAIM_ENTRIES` allows for.
+/// [`BootError::ReclaimRangesOverflow`] when step 9 has more reclaim entries
+/// than `MAX_RECLAIM_ENTRIES` allows for.
 ///
 /// # Safety
 /// All physical allocations named in `allocs` must remain identity-mapped and
@@ -1622,11 +1632,11 @@ unsafe fn step9_populate_boot_info(
     // Translate + sort the UEFI memory map.
     let entry_out = allocs.mem_entries_phys as *mut MemoryMapEntry;
     let max_entries = (allocs.mem_entries_pages * 4096) / core::mem::size_of::<MemoryMapEntry>();
+    // Step 7 sized the array to the map buffer's reach, which bounds the
+    // step 8 re-query too, so every descriptor has an entry.
     // SAFETY: entry_out is a valid allocated buffer of max_entries entries;
     // uefi_map is a valid map buffer populated by UEFI GetMemoryMap.
-    let translation = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
-    report_map_truncation(&translation)?;
-    let entry_count = translation.count;
+    let entry_count = unsafe { memory_map::translate_memory_map(uefi_map, entry_out, max_entries) };
     // SAFETY: elements [0..entry_count] were written by the call above.
     unsafe { memory_map::insertion_sort_memory_map(entry_out, entry_count) };
 
@@ -1996,30 +2006,6 @@ fn push_reclaim_range(
     Ok(())
 }
 
-/// Report the descriptors the translated memory map had no room for. A RAM
-/// descriptor among them is [`BootError::MemoryMapTruncated`]: the kernel
-/// would boot without knowing that memory (core/boot/docs/memory-map.md
-/// § Sizing the Entry Array). Descriptors of other types are dropped with a
-/// diagnostic and the boot goes on.
-///
-/// # Errors
-/// [`BootError::MemoryMapTruncated`] when `t.dropped_ram` is non-zero.
-fn report_map_truncation(t: &memory_map::MapTranslation) -> Result<(), BootError>
-{
-    if t.dropped_other != 0
-    {
-        bprintln!(
-            "[--------] boot: memory map: {} non-RAM descriptors past the entry array dropped",
-            t.dropped_other
-        );
-    }
-    if t.dropped_ram != 0
-    {
-        return Err(BootError::MemoryMapTruncated(t.dropped_ram));
-    }
-    Ok(())
-}
-
 // ── Step 10: Kernel handoff ──────────────────────────────────────────────────
 
 /// Transfer control to the kernel. Installs new page tables, sets the stack,
@@ -2057,8 +2043,7 @@ mod tests
     use super::{
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
         KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions, choose_kaslr_layout,
-        handoff_stack_span, memory_map, push_reclaim_range, report_map_truncation, scrub,
-        step6_and_7_spans,
+        handoff_stack_span, push_reclaim_range, scrub, step6_and_7_spans,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -2233,28 +2218,6 @@ mod tests
                 "{region:x?} is not identity-mapped"
             );
         }
-    }
-
-    // Defect caught: a truncated map that drops RAM yet boots, or one that
-    // drops only non-RAM descriptors and fails the boot.
-    #[test]
-    fn only_lost_ram_fails_the_boot()
-    {
-        let lost_ram = memory_map::MapTranslation {
-            count: 4,
-            dropped_ram: 2,
-            dropped_other: 1,
-        };
-        assert!(matches!(
-            report_map_truncation(&lost_ram),
-            Err(BootError::MemoryMapTruncated(2))
-        ));
-        let lost_other = memory_map::MapTranslation {
-            count: 4,
-            dropped_ram: 0,
-            dropped_other: 3,
-        };
-        assert!(report_map_truncation(&lost_other).is_ok());
     }
 
     // Defect caught: a push past the reclaim array's page, or one that records

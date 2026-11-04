@@ -242,10 +242,11 @@ stays in its buffer; step 9 translates it from UEFI memory types to the `MemoryT
 values defined in the boot protocol and sorts it by `physical_base`, per the policy in
 [memory-map.md](memory-map.md).
 
-When the final map holds more descriptors than the entry array step 6 sized, the
-bootloader frees every allocation of steps 6 and 7 (the page-table frame pool included) and
-runs both again with twice the slack, up to `MEM_MAP_ATTEMPTS` (3) times; a map that
-still outgrows the array fails the boot with `BootError::MemoryMapKeptGrowing`
+When the final map's buffer could hold more descriptors than the entry array step 6
+sized (the buffer bounds step 8's re-query too), the bootloader frees every allocation
+of steps 6 and 7 (the page-table frame pool included) and runs both again with twice
+the slack, up to `MEM_MAP_ATTEMPTS` (3) times; a buffer that still outgrows the array
+fails the boot with `BootError::MemoryMapKeptGrowing`
 ([memory-map.md](memory-map.md#sizing-the-entry-array)).
 
 Detail: [uefi-environment.md](uefi-environment.md)
@@ -283,7 +284,7 @@ this donated page after consuming them. The `version` field is set to
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
 | `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
-| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines), in pages allocated in step 6 and sized from the firmware's descriptor count and the seeders' seed counts (`memory_map::aperture_capacity`). Empty if no MMIO regions were reported. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines), in pages allocated in step 6 and sized from the entry array's capacity and the seeders' seed counts (`memory_map::aperture_capacity`). Empty if no MMIO regions were reported. |
 | `cpu_count` | Count of distinct hardware IDs among the enabled or online-capable Local APIC / Local x2APIC entries from MADT (x86-64) or the enabled RINTC entries (RISC-V), the BSP counted once whether or not the MADT lists it, capped at `MAX_CPUS`; or the DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Physical address of the per-CPU hardware identifiers, `cpu_count` `u32`s in pages of their own allocated in step 5; `cpu_ids[0] == bsp_id` |

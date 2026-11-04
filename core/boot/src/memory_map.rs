@@ -54,8 +54,11 @@ impl Iterator for RawDescriptors<'_>
         // every read of the firmware's map (the step 6 count query, the step 7
         // fill, and the `ExitBootServices` retry), and the guard reads nothing
         // from a map that carries one, a zero stride included.
+        // The firmware reports `map_size`; the buffer bounds it, so a map no
+        // reader is sized for is never read past the buffer.
+        let end = self.map.map_size.min(self.map.buffer_size);
         if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
-            || self.offset + self.map.descriptor_size > self.map.map_size
+            || self.offset + self.map.descriptor_size > end
         {
             return None;
         }
@@ -73,37 +76,16 @@ impl Iterator for RawDescriptors<'_>
 
 // ── Memory map translation ───────────────────────────────────────────────────
 
-/// Outcome of [`translate_memory_map`]: the entries written, and the
-/// descriptors past the output's capacity that were not, split by whether
-/// they translate to RAM.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MapTranslation
-{
-    /// Entries written to the output.
-    pub count: usize,
-    /// Descriptors not written that translate to a RAM type (`Usable`,
-    /// `Loaded`, `AcpiReclaimable` or `Persistent`): memory the kernel would
-    /// never learn of.
-    pub dropped_ram: usize,
-    /// Descriptors not written that translate to `Reserved`.
-    pub dropped_other: usize,
-}
-
-/// Whether `t` names RAM: the types the boot protocol's
-/// `mmio_apertures` contract (abi/boot-protocol/README.md) classifies as RAM.
-fn is_ram(t: MemoryType) -> bool
-{
-    !matches!(t, MemoryType::Reserved)
-}
-
 /// Translate a UEFI memory map into the boot protocol's `MemoryMapEntry` format.
 ///
-/// Iterates `uefi_map.map_size / uefi_map.descriptor_size` descriptors (none
-/// when the descriptor size is below `EFI_MEMORY_DESCRIPTOR`'s) and
-/// converts each UEFI memory type to a [`MemoryType`]. Writes at most
-/// `max_entries` entries to `out` and counts the descriptors past that
-/// capacity, by class, in the returned [`MapTranslation`], so the caller can
-/// refuse to boot on lost RAM.
+/// Iterates the descriptors of `uefi_map` (none when the descriptor size is
+/// below `EFI_MEMORY_DESCRIPTOR`'s, and none past `uefi_map.buffer_size`),
+/// converts each UEFI memory type to a [`MemoryType`], and returns the number
+/// of entries written. A `max_entries` of at least
+/// `uefi::map_buffer_descriptor_reach(uefi_map.buffer_size)` holds every
+/// descriptor; the write stops at `max_entries` regardless, and the
+/// bootloader's step 7 check makes that bound unreachable
+/// (`core/boot/docs/memory-map.md` § Sizing the Entry Array).
 ///
 /// # Safety
 /// `out` must point to an allocation of at least `max_entries * size_of::<MemoryMapEntry>()`
@@ -115,28 +97,19 @@ pub unsafe fn translate_memory_map(
     uefi_map: &crate::uefi::MemoryMapResult,
     out: *mut MemoryMapEntry,
     max_entries: usize,
-) -> MapTranslation
+) -> usize
 {
-    let mut result = MapTranslation::default();
     let mut count: usize = 0;
 
     // SAFETY: this function's `# Safety` contract is `RawDescriptors::new`'s.
     for desc in unsafe { RawDescriptors::new(uefi_map) }
     {
-        let memory_type = translate_memory_type(desc.memory_type);
-        let size_bytes = desc.number_of_pages * 4096;
         if count >= max_entries
         {
-            if is_ram(memory_type)
-            {
-                result.dropped_ram += 1;
-            }
-            else
-            {
-                result.dropped_other += 1;
-            }
-            continue;
+            break;
         }
+        let memory_type = translate_memory_type(desc.memory_type);
+        let size_bytes = desc.number_of_pages * 4096;
 
         // SAFETY: count < max_entries; out[count] is within the allocated array.
         unsafe {
@@ -152,8 +125,7 @@ pub unsafe fn translate_memory_map(
         count += 1;
     }
 
-    result.count = count;
-    result
+    count
 }
 
 /// Translate a UEFI `EFI_MEMORY_TYPE` value to the boot protocol's [`MemoryType`].
@@ -514,8 +486,8 @@ mod tests
     use core::mem::size_of;
 
     use super::{
-        MapTranslation, aperture_capacity, derive_mmio_apertures, insertion_sort_memory_map,
-        subtract_excluded, translate_memory_map, translate_memory_type,
+        aperture_capacity, derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded,
+        translate_memory_map, translate_memory_type,
     };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
@@ -725,8 +697,8 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; max_entries];
-        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
-        out.truncate(t.count);
+        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), max_entries) };
+        out.truncate(count);
         out
     }
 
@@ -797,29 +769,25 @@ mod tests
         assert_eq!(entries.len(), 1);
     }
 
-    // Defect caught: a truncation that drops descriptors past the capacity
-    // without reporting them, so lost RAM boots unnoticed.
+    // Defect caught: a map size the firmware reports past its buffer read
+    // beyond the buffer, so translation reads memory that holds no descriptor
+    // and the entry array's bound (sized from the buffer) no longer holds.
     #[test]
-    fn descriptors_past_the_capacity_are_counted_by_class()
+    fn a_map_size_past_the_buffer_reads_only_the_buffer()
     {
-        let d = |memory_type, physical_start| EfiMemoryDescriptor {
-            memory_type,
+        let d = |physical_start| EfiMemoryDescriptor {
+            memory_type: EFI_CONVENTIONAL_MEMORY,
             physical_start,
             virtual_start: 0,
             number_of_pages: 1,
             attribute: 0,
         };
-        let descs = [
-            d(EFI_CONVENTIONAL_MEMORY, 0x0000),
-            d(EFI_CONVENTIONAL_MEMORY, 0x1000),
-            d(EFI_MEMORY_MAPPED_IO, 0x2000),
-            d(EFI_LOADER_DATA, 0x3000),
-        ];
+        let descs = [d(0x0000), d(0x1000), d(0x2000)];
         let stride = size_of::<EfiMemoryDescriptor>();
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
-            buffer_size: descs.len() * stride,
-            map_size: descs.len() * stride,
+            buffer_size: 2 * stride,
+            map_size: 3 * stride,
             map_key: 0,
             descriptor_size: stride,
         };
@@ -828,16 +796,10 @@ mod tests
             size: 0,
             memory_type: MemoryType::Reserved,
         };
-        let mut out = vec![dummy; 1];
-        let t = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 1) };
-        assert_eq!(
-            t,
-            MapTranslation {
-                count: 1,
-                dropped_ram: 2,
-                dropped_other: 1,
-            }
-        );
+        let mut out = vec![dummy; 3];
+        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 3) };
+        assert_eq!(count, 2);
+        assert_eq!(out[1].physical_base, 0x1000);
     }
 
     // Defect caught: a translation loop that never advances on a zero
@@ -872,8 +834,8 @@ mod tests
                 descriptor_size: stride,
                 ..uefi_map
             };
-            let t = unsafe { translate_memory_map(&map, out.as_mut_ptr(), 1) };
-            assert_eq!(t, MapTranslation::default(), "stride {stride}");
+            let count = unsafe { translate_memory_map(&map, out.as_mut_ptr(), 1) };
+            assert_eq!(count, 0, "stride {stride}");
         }
     }
 
@@ -918,7 +880,7 @@ mod tests
             memory_type: MemoryType::Reserved,
         };
         let mut out = vec![dummy; 4];
-        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) }.count;
+        let count = unsafe { translate_memory_map(&uefi_map, out.as_mut_ptr(), 4) };
         assert_eq!(count, 1);
         assert_eq!(out[0].memory_type, MemoryType::Persistent);
         assert_eq!(out[0].physical_base, 0x4000);

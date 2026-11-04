@@ -139,30 +139,34 @@ its slack margin, is owned by
 
 The translated `MemoryMapEntry` array is allocated in step 6, before the final
 map exists, so it is sized from the firmware's map at that point: step 6 reads
-the descriptor count with a `GetMemoryMap` size query before its first
-allocation, and the array holds that count plus `MEM_MAP_SLACK_ENTRIES` (32).
-Each allocation after the query (the bootloader's own in steps 6 and 7) adds at
-most two descriptors, and the rest of the slack absorbs the firmware's own
-housekeeping allocations in that window (§ ExitBootServices in
-[uefi-environment.md](uefi-environment.md)), which nothing bounds, so the slack
-is a first guess, not a proof.
+the descriptor count and stride with a `GetMemoryMap` size query before its first
+allocation. The array holds every descriptor that the buffer step 7 would allocate
+for a map `MEM_MAP_SLACK_ENTRIES` (32) descriptors larger could hold at the
+smallest stride the UEFI contract allows (`EFI_MEMORY_DESCRIPTOR`'s 40 bytes):
+`uefi::map_buffer_descriptor_reach` of `uefi::map_buffer_bytes`, the map plus the
+buffer's own 16 descriptors of slack, in whole pages
+([uefi-environment.md](uefi-environment.md) § Memory Map Acquisition). Each
+allocation after the query (the bootloader's own in steps 6 and 7) adds at most two
+descriptors, and the rest of the slack absorbs the firmware's own housekeeping
+allocations in that window (§ ExitBootServices in
+[uefi-environment.md](uefi-environment.md)), which nothing bounds, so the slack is
+a first guess, not a proof.
 
-The guess is checked before `ExitBootServices`: when step 7's final map holds
-more descriptors than the array, the bootloader frees every allocation of steps 6
+The guess is checked before `ExitBootServices`: when the reach of step 7's map
+buffer exceeds the array, the bootloader frees every allocation of steps 6
 and 7, the page-table frame pool included (the AP trampoline page, the CPU-id
 pages and the x86-64 LA57 toggle page are earlier steps' and stay), and runs both
 again with twice the slack. The redo counts the map after those frees, so its count
 includes what the firmware itself allocated during the first window. After
-`MEM_MAP_ATTEMPTS` (3) attempts a map that still outgrows its array fails the boot
-with `BootError::MemoryMapKeptGrowing`; only firmware that outgrows twice the slack
-in the second window reaches a third.
+`MEM_MAP_ATTEMPTS` (3) attempts a buffer that still reaches past its array fails
+the boot with `BootError::MemoryMapKeptGrowing`; only firmware that outgrows twice
+the slack in the second window reaches a third.
 
-A map can still grow after step 7, when `ExitBootServices` refuses a stale key and
-step 8 re-queries it. Such a map does not boot silently short of memory:
-`translate_memory_map` counts the descriptors past the array by class, and step 9
-fails the boot with `BootError::MemoryMapTruncated` when one of them is RAM
-(`Usable`, `Loaded`, `AcpiReclaimable` or `Persistent`), and drops the others with
-a diagnostic.
+The check bounds the buffer, not the map in it, because a map can still grow after
+step 7: when `ExitBootServices` refuses a stale key, step 8 re-queries the map into
+the same buffer, and a map past the buffer fails that re-query. Translation reads
+no descriptor past the buffer, so every map step 9 translates fits the array and no
+descriptor is lost.
 
 ---
 

@@ -77,7 +77,7 @@ impl<T> OpenSlab<T>
     ///
     /// Returns `None`, leaving `value` dropped, when the slab already holds
     /// its bound of slots ([`MAX_ENTRIES`] for [`Self::new`]) with every
-    /// freed index live or retired, or the heap cannot grow the table.
+    /// index live or retired, or the heap cannot grow the table.
     pub fn insert(&mut self, value: T) -> Option<u64>
     {
         let idx = if let Some(idx) = self.free.pop()

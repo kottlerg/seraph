@@ -192,8 +192,9 @@ the phase waits the fault batch's settle bound (`TEST_FAULT_SETTLE_TIMEOUT_MS`, 
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
 also read the build-synthesised `/data/svctest/large.bin` and write their scratch files under
-`/data/svctest/`; and `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
-build-synthesised `/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
+`/data/svctest/`; `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
+build-synthesised `/data/svctest/bench.bin`, which the `fs_eviction_routes_release_to_its_open`
+phase also holds open. The sysroot placement of all of these is listed in
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---

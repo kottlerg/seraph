@@ -544,8 +544,9 @@ fn service_loop(
 }
 
 /// The kind of cap a badged request arrived on, told apart by the badge's
-/// `OPEN_INSTANCE` bit: a node cap (minted by `NS_LOOKUP`, `FS_CREATE`, and
-/// `FS_MKDIR`) or an open cap (minted by `FS_OPEN`).
+/// `OPEN_INSTANCE` bit: a node cap (one `NS_LOOKUP`, `FS_CREATE`, or
+/// `FS_MKDIR` minted, or the mount's root cap vfsd derives) or an open cap
+/// (one `FS_OPEN` minted).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CapKind
 {

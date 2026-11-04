@@ -76,7 +76,7 @@ pub struct BundleHeader
     /// Number of [`BundleEntryHeader`] records that follow.
     ///
     /// The `u32` is an ABI width of the wire format; the binding bound on the
-    /// module count is the bootloader's `MAX_MODULES`.
+    /// module count is [`crate::MAX_BOOT_MODULES`].
     pub entry_count: u32,
 }
 

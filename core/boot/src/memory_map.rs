@@ -15,7 +15,7 @@ use crate::uefi::{
     EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY, EFI_RUNTIME_SERVICES_CODE,
     EFI_RUNTIME_SERVICES_DATA, EfiMemoryDescriptor,
 };
-use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
+use boot_protocol::{MemoryMapEntry, MemoryType, MmioAperture};
 
 // ── Raw descriptor iteration ─────────────────────────────────────────────────
 
@@ -263,6 +263,26 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
     )
 }
 
+/// Seeds of each class [`derive_mmio_apertures`] takes at most: the named
+/// seed buffer and the heuristic-window buffer each hold this many
+/// (core/boot/src/main.rs `MAX_APERTURE_SEEDS`, `MAX_HEURISTIC_SEEDS`).
+pub const MAX_SEEDS_PER_CLASS: usize = 256;
+
+/// Apertures [`derive_mmio_apertures`] can derive from a map of at most
+/// `descriptors` descriptors and full seed buffers, which sizes the aperture
+/// array at step 6.
+///
+/// Every derived aperture is a maximal run of the merged pieces, so it starts
+/// where some piece starts: an MMIO descriptor's base, a seed's base, or the
+/// end of a descriptor clipped out of a seed. That is at most `descriptors`
+/// descriptor bases, two seed classes of [`MAX_SEEDS_PER_CLASS`] bases each,
+/// and `descriptors` descriptor ends.
+#[must_use]
+pub const fn aperture_capacity(descriptors: usize) -> usize
+{
+    2 * descriptors + 2 * MAX_SEEDS_PER_CLASS
+}
+
 /// Derive the coarse MMIO aperture array from the raw UEFI memory map and
 /// the caller-supplied seeds, following `core/boot/docs/firmware-parsing.md`
 /// § `mmio_apertures` construction. Two seed classes are clipped
@@ -283,11 +303,11 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
 /// No aperture therefore covers RAM. Each piece is merged into `out` as it
 /// arrives ([`insert_merged`]), so `out` holds the sorted, merged apertures at
 /// every step and no scratch buffer bounds the input. When more than
-/// `MAX_APERTURES` pieces are disjoint at once, which a later piece bridging
+/// `out.len()` pieces are disjoint at once, which a later piece bridging
 /// them could still undo, `out` is rebuilt by [`sweep_merged`], which takes the
-/// pieces in ascending order and so keeps exactly the lowest `MAX_APERTURES`
+/// pieces in ascending order and so keeps exactly the lowest `out.len()`
 /// apertures of the full merge. Returns the number of apertures in `out`; when
-/// the full merge holds more than `MAX_APERTURES`, the highest are dropped with
+/// the full merge holds more than `out.len()`, the highest are dropped with
 /// a diagnostic.
 ///
 /// Apertures are coarse by design; see `docs/device-management.md`
@@ -302,7 +322,7 @@ pub unsafe fn derive_mmio_apertures(
     uefi_map: &crate::uefi::MemoryMapResult,
     seed: &[MmioAperture],
     heuristic: &[MmioAperture],
-    out: &mut [MmioAperture; MAX_APERTURES],
+    out: &mut [MmioAperture],
 ) -> usize
 {
     // SAFETY: the caller's contract is `RawDescriptors::new`'s.
@@ -326,7 +346,8 @@ pub unsafe fn derive_mmio_apertures(
     if dropped
     {
         bprintln!(
-            "[--------] boot: MMIO apertures: more than MAX_APERTURES disjoint; the highest dropped"
+            "[--------] boot: MMIO apertures: more disjoint than the array holds; the \
+             highest dropped"
         );
     }
     n
@@ -499,8 +520,8 @@ mod tests
     use core::mem::size_of;
 
     use super::{
-        MapTranslation, derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded,
-        translate_memory_map, translate_memory_type,
+        MAX_SEEDS_PER_CLASS, MapTranslation, aperture_capacity, derive_mmio_apertures,
+        insertion_sort_memory_map, subtract_excluded, translate_memory_map, translate_memory_type,
     };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
@@ -508,7 +529,10 @@ mod tests
         EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY,
         EFI_RUNTIME_SERVICES_CODE, EFI_RUNTIME_SERVICES_DATA, EfiMemoryDescriptor, MemoryMapResult,
     };
-    use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
+    use boot_protocol::{MemoryMapEntry, MemoryType, MmioAperture};
+
+    /// Aperture array size the cap tests derive into.
+    const MAX_APERTURES: usize = 256;
 
     // ── translate_memory_type ─────────────────────────────────────────────────
 
@@ -940,10 +964,13 @@ mod tests
             map_key: 0,
             descriptor_size: stride,
         };
-        let mut out = [MmioAperture {
-            phys_base: 0,
-            size: 0,
-        }; MAX_APERTURES];
+        let mut out = vec![
+            MmioAperture {
+                phys_base: 0,
+                size: 0,
+            };
+            MAX_APERTURES
+        ];
         // SAFETY: `descs` is a live, aligned descriptor array covering
         // `map_size`; a zero stride reads nothing.
         let n = unsafe { derive_mmio_apertures(&uefi_map, seed, heuristic, &mut out) };
@@ -1065,6 +1092,51 @@ mod tests
         let out = run_derive(&descs, &[]);
         assert_eq!(out.len(), MAX_APERTURES);
         assert_eq!(pairs(&out[..1]), vec![(0x1000_0000, 0x6000)]);
+    }
+
+    // Defect caught: an aperture array sized below what the map and full seed
+    // buffers can yield, so apertures are dropped on a map the array was sized
+    // for.
+    #[test]
+    fn the_aperture_capacity_holds_the_worst_case_derivation()
+    {
+        // Disjoint MMIO descriptors, each one aperture, and full seed buffers of
+        // disjoint three-page windows, each cut in two by a one-page RAM
+        // descriptor in its middle, so half the seed-derived apertures start at
+        // the end of a clipped descriptor.
+        let mut descs = Vec::new();
+        for i in 0..40u64
+        {
+            descs.push(mmio_desc(0x1_0000_0000 + i * 0x20_0000, 1));
+        }
+        let mut seeds = Vec::new();
+        let mut heuristic = Vec::new();
+        for i in 0..MAX_SEEDS_PER_CLASS as u64
+        {
+            let named = 0x2_0000_0000 + i * 0x10_0000;
+            seeds.push(ap(named, 0x3000));
+            descs.push(desc(EFI_CONVENTIONAL_MEMORY, named + 0x1000, 1));
+            let window = 0x3_0000_0000 + i * 0x10_0000;
+            heuristic.push(ap(window, 0x3000));
+            descs.push(desc(EFI_CONVENTIONAL_MEMORY, window + 0x1000, 1));
+        }
+        let capacity = aperture_capacity(descs.len());
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
+            map_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
+            map_key: 0,
+            descriptor_size: size_of::<EfiMemoryDescriptor>(),
+        };
+        let mut out = vec![ap(0, 0); capacity];
+        // SAFETY: `descs` is a live, aligned descriptor array covering `map_size`.
+        let n = unsafe { derive_mmio_apertures(&uefi_map, &seeds, &heuristic, &mut out) };
+        assert_eq!(n, 40 + 4 * MAX_SEEDS_PER_CLASS);
+        assert!(n <= capacity);
+        let derived = pairs(&out[..n]);
+        assert!(derived.contains(&(0x2_0000_0000, 0x1000)));
+        assert!(derived.contains(&(0x2_0000_2000, 0x1000)));
+        assert!(derived.contains(&(0x3_0000_2000, 0x1000)));
     }
 
     #[test]

@@ -66,8 +66,8 @@ pub const PAGE_FAULT_LOAD_VECTOR: u64 = 14;
 /// Interrupt ids the root Interrupt cap names but the kernel does not route,
 /// which `unit::hw::irq_register_unroutable_id_err` expects `irq_register` to
 /// refuse: GSI 24, the first past the 24 pins of the q35 I/O APIC, and GSI
-/// 2047, the top of the 2048-GSI id space, which no I/O APIC there covers.
-pub const UNROUTABLE_IRQ_IDS: &[u32] = &[24, 2047];
+/// 32767, the top of the 32768-GSI id space, which no I/O APIC there covers.
+pub const UNROUTABLE_IRQ_IDS: &[u32] = &[24, 32767];
 
 /// Interrupt ids the kernel routes that a fixed-size table once refused,
 /// which `unit::hw::irq_register_high_id` expects `irq_register` to accept:

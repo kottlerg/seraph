@@ -95,8 +95,8 @@ after `ExitBootServices` by
    firmware source that is present, and with the GOP framebuffer, which
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
    carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS`
-   (`MAX_APERTURES`, 256) seed buffer, the framebuffer seed included, are dropped
-   with a diagnostic. The ACPI seeder's heuristic PCI windows go to a separate
+   (`MAX_SEEDS_PER_CLASS`, 256) seed buffer, the framebuffer seed included, are
+   dropped with a diagnostic. The ACPI seeder's heuristic PCI windows go to a separate
    buffer (`MAX_HEURISTIC_SEEDS`, also 256); windows beyond it are dropped with a
    diagnostic. Each seed is first clipped to the memory map as
    [§ Firmware exclusion](#firmware-exclusion) defines, so it contributes only
@@ -105,12 +105,14 @@ after `ExitBootServices` by
 3. Merge every piece, as it is collected, into the output list kept sorted by
    `phys_base`, joining adjacent and overlapping entries, so the list is minimal
    and non-overlapping at every step and no scratch buffer bounds the input.
-4. Cap at `MAX_APERTURES` (256, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs),
-   the capacity of the array's page). When more pieces than that are disjoint at
-   once, a later piece could still bridge them, so the list is rebuilt by taking
-   the pieces in ascending `phys_base` order, which keeps exactly the lowest
-   `MAX_APERTURES` apertures of the full merge; when the full merge holds more, the
-   highest are dropped with a diagnostic.
+4. Cap at the array's capacity, `memory_map::aperture_capacity` of the step 6
+   descriptor count plus its slack: every aperture starts at a descriptor's base, a
+   seed's base, or the end of a descriptor clipped out of a seed, so a map no larger
+   than step 6 sized for, with full seed buffers, always fits. When more pieces than
+   the capacity are disjoint at once, a later piece could still bridge them, so the
+   list is rebuilt by taking the pieces in ascending `phys_base` order, which keeps
+   exactly the lowest apertures the array holds of the full merge; when the full
+   merge holds more, the highest are dropped with a diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often

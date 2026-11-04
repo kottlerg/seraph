@@ -83,7 +83,10 @@
 ///     never-recycled generation-0 slot, so the delivered values are
 ///     byte-identical; the semantic change is that the handle's high bits are
 ///     now meaningful and the kernel validates them on every use.
-pub const INIT_PROTOCOL_VERSION: u32 = 13;
+/// v14: [`INIT_MAX_NAMED_MODULES`] rose from 12 to 85, one per boot module a
+///     `BootInfo` can list; [`InitInfo::module_names`] grows with it, so every
+///     field after it moves.
+pub const INIT_PROTOCOL_VERSION: u32 = 14;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle
@@ -91,12 +94,12 @@ pub const INIT_PROTOCOL_VERSION: u32 = 13;
 pub const INIT_MODULE_NAME_LEN: usize = 32;
 
 /// Maximum number of named boot-module entries the kernel can publish in
-/// [`InitInfo::module_names`]. Sized to comfortably cover the current
-/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, serial, framebuffer,
-/// fatfs` bootstrap-essential set plus future modules (e.g. keyboard)
-/// before the table fills. Non-bootstrap drivers (the per-arch RTC)
-/// live on the rootfs and do not consume slots here.
-pub const INIT_MAX_NAMED_MODULES: usize = 12;
+/// [`InitInfo::module_names`]: one per boot module a `BootInfo` can list
+/// (`boot_protocol::MAX_BOOT_MODULES`, 85, the entries of the bootloader's
+/// one-page module array), so every module gets a name. This crate depends on
+/// nothing outside `core`, so the kernel, which sees both crates, asserts the
+/// two are equal. The table keeps the `InitInfo` header within its first page.
+pub const INIT_MAX_NAMED_MODULES: usize = 85;
 
 // ── Address space constants ──────────────────────────────────────────────────
 //
@@ -291,15 +294,15 @@ pub struct InitInfo
 // Compile-time invariants for the `InitInfo` layout. The kernel writes
 // the `CapDescriptor` array at byte offset `cap_descriptors_offset =
 // size_of::<InitInfo>()` and the entries contain `u64` fields, so the
-// total size must be 8-byte aligned. The whole region must also fit
-// within `INIT_INFO_MAX_PAGES`.
+// total size must be 8-byte aligned. The header must also fit within the
+// region's first page.
 const _: () = assert!(
     core::mem::size_of::<InitInfo>().is_multiple_of(8),
     "InitInfo size must be 8-byte aligned so cap_descriptors_offset is 8-byte aligned",
 );
 const _: () = assert!(
-    core::mem::size_of::<InitInfo>() <= INIT_INFO_MAX_PAGES * 4096,
-    "InitInfo header must fit within INIT_INFO_MAX_PAGES",
+    core::mem::size_of::<InitInfo>() <= 4096,
+    "InitInfo header must fit within the region's first page",
 );
 
 // ── CapDescriptor / CapType ──────────────────────────────────────────────────

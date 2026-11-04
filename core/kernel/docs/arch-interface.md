@@ -758,7 +758,7 @@ pub const ARCH_NAME: &str;
 /// (`EM_X86_64` / `EM_RISCV`); `mm::init_reloc` checks relocations against it.
 pub const EXPECTED_ELF_MACHINE: u16;
 
-/// External-interrupt id range (GSIs 0..=2047 on x86-64; PLIC sources 1..=1023
+/// External-interrupt id range (GSIs 0..=32767 on x86-64; PLIC sources 1..=1023
 /// on RISC-V, the specification's). `SYS_IRQ_REGISTER` refuses an id outside it
 /// with `InvalidArgument`, and within it an id no discovered controller
 /// implements (`irq_line_count`).
@@ -766,7 +766,7 @@ pub const MIN_IRQ_ID: u32;
 pub const MAX_IRQ_ID: u32;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7, the
-/// interrupt id space (2048 on x86-64: `MAX_IOAPICS` I/O APICs of 256 pins;
+/// interrupt id space (32768 on x86-64: `MAX_IOAPICS` I/O APICs of 256 pins;
 /// 1024 on RISC-V, the PLIC id space). The discovered controllers implement
 /// fewer; a split names the other ids, `SYS_IRQ_REGISTER` refuses them, and the
 /// Interrupt teardown leaves their routing untouched.

@@ -311,9 +311,9 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// per-RAM-extent-count growth (more drained extents ⇒ more init-time
 /// Memory-cap derivations) and per-service growth (more boot modules ⇒
 /// more module-memory caps) without revisiting this knob. The boot mint is
-/// itself bounded by [`BOOT_BODY_BOUND`] (about 675 caps: the `InitInfo`
+/// itself bounded by [`BOOT_BODY_BOUND`] (about 550 caps: the `InitInfo`
 /// descriptor capacity and Phase 9's Memory caps), so a boot at that bound, an
-/// ACPI-region-heavy memory map among them, still leaves init about 860 slots.
+/// ACPI-region-heavy memory map among them, still leaves init about 985 slots.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -371,8 +371,9 @@ pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 /// the boot capability descriptors straight into the block (and the buddy
 /// drain its RAM extents before them, [`drain_and_install_seed`]), so this is
 /// the one bound on the capabilities that carry a descriptor: [`push_descriptor`]
-/// halts the boot by name past it. At `INIT_INFO_MAX_PAGES` = 4 that is about
-/// 655 capabilities, which also bounds the ACPI region caps (one per
+/// halts the boot by name past it. At `INIT_INFO_MAX_PAGES` = 4, past a header
+/// that holds the 85-entry module name table, that is 535 capabilities, which
+/// also bounds the ACPI region caps (one per
 /// `AcpiReclaimable` memory-map entry; real firmware reports 1 or 2). Phase 9's
 /// Memory caps reach init through header fields instead ([`BOOT_BODY_BOUND`]
 /// counts them).
@@ -382,8 +383,11 @@ pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = (init_protocol::INIT_INFO_MAX_P
     / core::mem::size_of::<CapDescriptor>();
 
 // `mint_module_memory_caps` copies each boot module's `BootModule.name`
-// straight into its `InitModuleName.name`, so the two widths are one ABI fact.
+// straight into its `InitModuleName.name`, so the two widths are one ABI fact,
+// and publishes one name per module, so the name table holds as many entries
+// as a `BootInfo` can list modules.
 const _: () = assert!(init_protocol::INIT_MODULE_NAME_LEN == boot_protocol::BOOT_MODULE_NAME_LEN);
+const _: () = assert!(init_protocol::INIT_MAX_NAMED_MODULES == boot_protocol::MAX_BOOT_MODULES);
 
 // The descriptor array starts right after the header, at an offset its
 // element alignment divides.
@@ -435,14 +439,14 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// - the root `CSpace` slab ([`ROOT_CSPACE_INIT_PAGES`]: 1 + 28 + 16 = 45
 ///   pages);
 /// - init's bootstrap `AddressSpace` slab ([`INIT_ASPACE_PAGES`] 18);
-/// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (about
-///   675) of [`BOOT_BODY_BYTES`] each (about 22 pages): one RAM `MemoryObject`
+/// - the boot-minted capability bodies, at most [`BOOT_BODY_BOUND`] (551) of
+///   [`BOOT_BODY_BYTES`] each (18 pages): one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
 ///   `SchedControl` and `SbiControl` roots, the firmware-table, boot-module,
 ///   init-segment, `InitInfo`/stack and reclaim Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
-/// That is about 89 pages (356 KiB), and init's Thread slot adds six or more
+/// That is 85 pages (340 KiB), and init's Thread slot adds six or more
 /// (`sched::thread_slot::thread_slot_bytes`). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
@@ -1511,8 +1515,8 @@ fn populate_cspace(
     use init_protocol::CapType;
 
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
-    /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 2048 GSIs on x86-64,
-    /// eight I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
+    /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 32768 GSIs on x86-64,
+    /// `MAX_IOAPICS` (128) I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
     /// sources 1-1023). `SYS_IRQ_REGISTER` refuses an id no discovered controller
     /// implements, and the routing table ignores one past its discovered size,
     /// so oversizing is safe.
@@ -1760,8 +1764,8 @@ fn populate_cspace(
     // this arch. Userspace narrows it to single-IRQ children via
     // `SYS_IRQ_SPLIT` and delegates one per device.
     //
-    // x86-64: 2048 GSI lines, every pin of the eight I/O APICs the boot
-    // protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
+    // x86-64: 32768 GSI lines, every pin of the `MAX_IOAPICS` (128) I/O
+    // APICs the boot protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
     // 1-1023) is the spec maximum; most platforms expose far fewer (e.g.
     // 95). Sizing the root at the id space is safe because
     // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
@@ -2036,15 +2040,16 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // Publish a name → slot entry in the InitInfo header table so
         // init can resolve modules by name without scanning descriptors.
         let name_slot = layout.module_name_count as usize;
-        if name_slot < init_protocol::INIT_MAX_NAMED_MODULES
+        if name_slot >= init_protocol::INIT_MAX_NAMED_MODULES
         {
-            layout.module_names[name_slot] = init_protocol::InitModuleName {
-                slot,
-                _pad: 0,
-                name: module.name,
-            };
-            layout.module_name_count += 1;
+            crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
         }
+        layout.module_names[name_slot] = init_protocol::InitModuleName {
+            slot,
+            _pad: 0,
+            name: module.name,
+        };
+        layout.module_name_count += 1;
     }
 
     layout.total_populated = cspace.populated_count();
@@ -2055,9 +2060,9 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
 /// descriptor array, memory-map entry array, the raw UEFI memory-map buffer
 /// (zeroed by the bootloader after its last read), MMIO aperture array, the
-/// reclaim-array page itself, the bootloader's transient page-table
-/// frames, and the bundle's non-module pages (header + entry table +
-/// pad, init ELF source body, inter-module and trailing slack —
+/// reclaim-array page itself, the CPU-id pages, the bootloader's
+/// transient page-table frames, and the bundle's non-module pages (header +
+/// entry table + pad, init ELF source body, inter-module and trailing slack —
 /// module bodies are excluded because [`mint_module_memory_caps`]
 /// covers them) — and mints one reclaimable `MemoryObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
@@ -2315,8 +2320,8 @@ const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = (boot_protocol::MAX_RECLAIM_RANGES
 /// Zero every range `BootInfo.reclaim_ranges` records, late-flagged entries
 /// included, through the direct map, so no page the bootloader wrote (its
 /// transient page tables, which encode the slid kernel layout, the `BootInfo`
-/// page, the descriptor arrays, the bundle's non-module pages, and the AP
-/// trampoline page) reaches userspace with its contents intact
+/// page, the descriptor arrays, the CPU-id pages, the bundle's non-module
+/// pages, and the AP trampoline page) reaches userspace with its contents intact
 /// (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel state in donated
 /// memory).
 ///

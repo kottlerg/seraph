@@ -60,9 +60,12 @@ It then reads the top of its user half once (`SystemInfoType::UserVaTop`, expose
 (`process_layout::growth_zones`), registers the IPC buffer, builds `std::os::seraph::StartupInfo`
 from the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the
 page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
-if that fails). Last it runs the rustc-synthesised `main`, which drives `std::rt::lang_start` and
-the binary's idiomatic `fn main()`; when `main` returns, `_start` closes the stdio pipes and exits
-the process with its return code.
+if that fails), and, when the page carries a pager and the image is `ET_DYN`, registers the
+main-thread stack's demand-growth range
+([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
+rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
+`fn main()`; when `main` returns, `_start` closes the stdio pipes and exits the process with its
+return code.
 
 `std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
 (which only memmgr's bespoke runtime constructs); a binary reads it through
@@ -77,7 +80,9 @@ its version gating are defined in [abi/process-abi/README.md](../../abi/process-
 
 `std::sys::seraph` is the per-process owner of virtual-address policy. It
 exposes two distinct surfaces; the third (bootstrap-cross-boundary VAs) is
-chosen by the process creator and only consumed by std at `_start`. See
+chosen by the process creator and consumed by std at `_start`, which in a
+demand-paged `ET_DYN` process extends the main-thread stack below its committed pages
+([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). See
 [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) for
 the full contract.
 
@@ -151,11 +156,11 @@ The std userspace targets emit inline stack probes
 larger than one page touches each of its pages in turn and faults on the guard page rather than
 skipping it into an adjacent registered region, such as another thread's stack, which memmgr
 would back without a fault. The usable size is the larger of the requested stack size (at least
-`DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages (2 MiB). If the reservation, the page-table
-funding, or the registration fails, or the process is not demand-paged, the stack is instead an
-eager byte-heap allocation of the requested size (at least 64 KiB, rounded up to whole pages)
-with no guard page. `join` frees the stack once the thread has left user mode: a demand stack
-through
+`DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the
+reservation, the page-table funding, or the registration fails, or the process is not
+demand-paged, the stack is instead an eager byte-heap allocation of the requested size (at least
+64 KiB, rounded up to whole pages) with no guard page. `join` frees the stack once the thread has
+left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and
 release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or that
 of a joined thread whose join wait failed with an error other than `Interrupted` (its private
@@ -202,6 +207,23 @@ other std-built process; see the owner column of
 [§ VA Management Surfaces](../../docs/userspace-memory-model.md#va-management-surfaces)).
 Subsequent foreign mappings go through the page-reservation allocator above. See
 [§ Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas).
+
+The main-thread stack is the one bootstrap surface std extends. The loader maps the stack's
+committed pages (`ProcessInfo.stack_pages`) ending at `ProcessInfo.stack_top_vaddr`, inside the
+reservation of `1 + MAX_PROCESS_STACK_PAGES` pages the creator's layout leaves below every stack
+top, for every `ET_DYN` image. In a demand-paged process (`ProcessInfo.pager_endpoint_cap`
+non-zero) whose image is `ET_DYN` (read from its own ELF header, `__ehdr_start`) `_start` funds the
+address space's page-table budget for, and registers with memmgr through
+[`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), the
+pages below the committed ones down to a 512-page (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB) stack,
+the range `process_layout::main_stack_growth` computes, so the main thread's stack grows on first
+touch to the size a spawned thread's has. The page below the range stays unregistered as the
+guard: an overflow past it faults on an address the pager declines and ends the whole process,
+as an overflow of a spawned thread's stack does. A binary whose `stack_pages!` note declares 512
+pages or more, a pinned process, an `ET_EXEC` image (which the loaders place at its link
+addresses unchecked against the reservation), and a process whose funding or registration fails
+keep the committed pages alone, the page below which faults the same way. The range is never
+unregistered; memmgr reclaims its frames at process death.
 
 ---
 
@@ -287,13 +309,16 @@ primitives.
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo` layout and version gating |
+| [shared/process-layout/README.md](../../shared/process-layout/README.md) | The stack reservation below every main-thread stack top; `main_stack_growth` |
 
 ---
 
 ## Summarized By
 
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
+[Fault Handling](../../docs/fault-handling.md),
 [Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[Userspace Memory Model](../../docs/userspace-memory-model.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
 [`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

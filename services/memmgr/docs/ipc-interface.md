@@ -295,12 +295,15 @@ stays out of the free pool and counted, as for a live process; a hold that is
 never released keeps them so for the rest of the boot. devmgr creates every
 DMA-capable driver so and releases the hold only once the driver's device is
 confirmed to have stopped its DMA, so memmgr never hands out a frame of the
-driver's own record that such a device may still write
+driver's own record that such a device may still write, unless the driver
+handed a copy of its procmgr capability onward, through which its hold can be
+released early
 ([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
 § DMA-Safe Teardown). The hold covers that record only: a frame a client lends
 the driver for a transfer is on the client's record, which returns it to the
-pool when the client releases it or dies, whatever the device's state. memmgr
-itself treats a held-back `PROCESS_DIED` like any other.
+pool when the client releases it or dies, whatever the device's state
+([#749](https://github.com/kottlerg/seraph/issues/749)). memmgr itself treats a
+held-back `PROCESS_DIED` like any other.
 
 ### Label 5: `DONATE_MEMORY_CAPS`
 

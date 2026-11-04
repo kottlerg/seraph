@@ -129,9 +129,10 @@ devmgr's responsibilities are:
      memory only: the frames a client lends a virtio-blk driver for a transfer
      are on the client's memmgr record, which no hold covers, so they return to
      the pool when the client releases them or dies, whatever the device's
-     state. A status byte past the span its BAR
-     cap was carved to is not written, and a BAR copy whose revocation fails
-     leaves the driver its mapping; either counts as an unconfirmed reset.
+     state ([#749](https://github.com/kottlerg/seraph/issues/749)). A status
+     byte past the span its BAR cap was carved to is not written, and a BAR
+     copy whose revocation fails leaves the driver its mapping; either counts
+     as an unconfirmed reset.
 
   Each withdrawal resets once, and the wait for the confirmation holds
   devmgr's thread (the settle, or the registry loop) for up to `RESET_TIMEOUT`
@@ -148,15 +149,24 @@ devmgr's responsibilities are:
   configuration-page, and IRQ caps released. A withdrawn driver of any other
   class is destroyed through its process handle while devmgr still keeps it
   (until its batch settles); none of them drives a DMA-capable device, and none
-  is created `CREATE_DMA_HOLD`. No boot kills a `VirtIO` driver with a request
-  in flight to observe whether its frames are reused before the reset: only
-  devmgr holds a `VirtIO` driver's process handle, the only virtio-blk driver
-  of a test boot serves its root filesystem, and the emulated devices complete
-  a request on their own event loop, with nothing a guest can hold in flight,
-  so a late device write cannot be placed after a free. svctest's
-  `procmgr_dma_hold` phase checks the held reclaim the order rests on instead:
-  a started held child's pages stay out of memmgr's pool after its teardown
-  until its creator releases them.
+  is created `CREATE_DMA_HOLD`.
+
+  No boot withdraws a `VirtIO` driver, so none runs this order. A boot serves
+  every `VirtIO` driver that reports ready, and devmgr withdraws one only on
+  its death or a failed settle. A test boot cannot cause either without a
+  test-only label to kill a `VirtIO` driver, which the enumeration redesign
+  removes ([#165](https://github.com/kottlerg/seraph/issues/165)): only devmgr
+  holds a `VirtIO` driver's process handle, and the only virtio-blk driver of a
+  test boot serves its root filesystem. Nor could a boot place a late device
+  write after a free, since the emulated devices complete a request on their
+  own event loop, with nothing a guest can hold in flight. What every boot does
+  run is the carve of each `VirtIO` function's configuration page and the
+  mapping helper (`with_mmio_mapped`), through which the ECAM scan maps each
+  window; the configuration page itself is mapped only on a withdrawal. The
+  Command register arithmetic is host-tested in the devmgr firmware crate, and
+  svctest's `procmgr_dma_hold` phase checks the held reclaim the order rests
+  on: a started held child's pages stay out of memmgr's pool after its
+  teardown until its release.
 
   The catalog entry of a withdrawn driver, or of one that failed to spawn,
   stays, so a badge is never reused. No `QUERY_*` reply hands out the endpoint

@@ -13,10 +13,10 @@
 //! syscall: the binds, the queue creates and the reclaims are the caller's.
 //! The crate is a host-tested workspace member and, under the
 //! `rustc-dep-of-std` feature, a dependency of the seraph std overlay's
-//! thread reaper. A service that binds death observers takes it as a path
-//! dependency (procmgr and svcmgr keep their own copies until they move onto
-//! it, #740); std does not re-export it, since the items of std's
-//! dependencies are unstable (`rustc_private`) to std's users. See
+//! thread reaper. Services reach the policy through the `death-set` crate
+//! (shared/death-set), whose `DeathSet` makes the syscalls for procmgr and
+//! svcmgr; std does not re-export it, since the items of std's dependencies
+//! are unstable (`rustc_private`) to std's users. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 // Under `rustc-dep-of-std` (build-std), use the core and alloc facades and

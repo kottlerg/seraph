@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "death-set"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# std: the death-queue set and main wait set of supervisor services (procmgr
+# and svcmgr). Makes the syscalls and funds the objects through
+# `std::os::seraph`, so its contents compile only for seraph; the growth
+# policy it follows is host-tested in `ruststd-death-queues`.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+death-queues = { path = "../../runtime/ruststd/death-queues", package = "ruststd-death-queues" }
+syscall = { path = "../syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

@@ -25,7 +25,8 @@ svcmgr retries at half the pool, down to the first pool's size. A bind that
 still fails fails the launch, restart, or adoption.
 
 The WaitSet holds the service endpoint (badge 0) and every death queue
-(badge 1), and svcmgr's death-queue set (`DeathSet`,
+(badge 1), and svcmgr's death-queue set (`DeathSet`, the
+[`shared/death-set`](../../../shared/death-set/README.md) crate, sized by
 [`src/death_queues.rs`](../src/death_queues.rs)) owns it: it starts with
 room for two members, and when the queues fill it, svcmgr creates one with
 twice the members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member

@@ -15,9 +15,9 @@
 //! words, the `CREATE_FROM_FILE` cap-layout split
 //! ([`split_create_from_file_caps`]), the bounds procmgr applies to fs-driver
 //! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), the
-//! init-reap handoff state machine ([`InitReap`]), and the bind order and
-//! growth of the death queues ([`DeathQueues`]). None of these touch a syscall,
-//! IPC, or `std::os::seraph` surface — the cap fields are slot *indices* (plain
+//! init-reap handoff state machine ([`InitReap`]), and the size of procmgr's
+//! first death queue ([`death_queues::FIRST_POOL_OBSERVERS`]). None of these
+//! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are slot *indices* (plain
 //! integers), never live capabilities, and the decoder reads a stack
 //! [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
 //! host-tested. The syscall/IPC-bearing operations (pipe/namespace
@@ -36,7 +36,6 @@ pub mod init_reap;
 pub mod request_caps;
 
 pub use create_blobs::{ChildArgs, ChildEnv, CreateBlobs};
-pub use death_queues::DeathQueues;
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{FileCreateCaps, split_create_from_file_caps};
 

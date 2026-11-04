@@ -9,8 +9,8 @@
 //! from in-memory ELF images or by streaming from VFS, as well as starting
 //! suspended processes.
 
-use crate::death_queues::DeathSet;
 use crate::loader::{self, ScratchMapping};
+use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};

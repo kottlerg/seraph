@@ -12,6 +12,8 @@ test = false
 [dependencies]
 # Pure process-table + badge logic, extracted so it is host-testable.
 process_table = { path = "process-table", package = "procmgr-process-table" }
+# The death-queue set and main wait set (`DeathSet`).
+death-set = { path = "../../shared/death-set" }
 process-abi = { path = "../../abi/process-abi" }
 process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }

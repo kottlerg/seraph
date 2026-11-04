@@ -14,10 +14,10 @@
 //!    else touches them.
 //! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end
 //!    (but before [`pwrmgr`]), and [`layout::after_fs`] after them: it
-//!    writes a fixture under `/data/svctest`.
-//! 2a. [`fs_opens`] before [`fs_ipc`]: its eviction phase needs `/data`'s
-//!    page cache cold (slots not yet provisioned), and it writes the
-//!    slot-reuse file that `fs_ipc`'s slot-reuse phase reads and removes.
+//!    writes a fixture under `/data/svctest`. [`fs_opens`] comes before
+//!    [`fs_ipc`]: its eviction phase needs `/data`'s page cache cold (slots
+//!    not yet provisioned), and it writes the slot-reuse file that
+//!    `fs_ipc`'s slot-reuse phase reads and removes.
 //! 3. `fs_open_relative_phase` last inside [`fs_ipc`]: it installs a
 //!    process-global `current_dir_cap` whose cap-derivation pressure
 //!    on TCG-emulated arches affects subsequent phases.

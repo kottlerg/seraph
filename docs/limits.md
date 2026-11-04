@@ -99,8 +99,8 @@ An entry an existing open Issue already names cites it in the recommendation.
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
   TLS block each reach 1 GiB of VA.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
-  copies: `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `L2_SIZE` (in `unit::cap_info`),
-  `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
+  copies: `REAPER_SLOTS` and `GEN_BITS`, the ktest mirrors of `MAX_IRQ_BINDINGS` and
+  `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
 - **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
   depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
   (`bounded_wait::DEADLOCK_BUDGET_US`) are the time-based model.
@@ -390,7 +390,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | Arena zone (`growth_zones`) | `shared/process-layout/src/lib.rs` | Sv39: base window `[64 GiB, 96 GiB)`, 32 GiB span; user half `H` above 2^38: `H/4` span | hardware spec (user half) | none (VA only) | correct as is | None |
 | Zone-map asserts | `shared/process-layout/src/lib.rs` | stride chain, defaults, fixed image zone, and the growth zones under every supported paging mode | encoding artefact | none | correct as is | Keep |
 | `LAYOUT_ENTROPY_BYTES` | `shared/process-layout/src/lib.rs` | 32 | provably unreachable (exactly four surfaces) | none | correct as is | None |
-| `DEFAULT_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 8 | default (per-binary override exists) | 32 KiB per process | correct as is | None |
+| `DEFAULT_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 8 | default (per-binary override exists): the main-thread stack pages the loader commits; in a demand-paged process an `ET_DYN` image's stack grows on demand below them to `DEFAULT_DEMAND_STACK_PAGES` | 32 KiB per process | correct as is | None |
 | `MAX_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | `(1 << 18) - 1` (just under 1 GiB) | encoding artefact (the window region tail less the guard page) | none (VA only; loaders map the declared stack) | correct as is | None; loaders refuse a larger note |
 | `PROCESS_MAIN_TLS_MAX_PAGES` | `abi/process-abi/src/lib.rs` | `1 << 18` (1 GiB) | encoding artefact (the TLS window's region tail) | none (loaders map the `PT_TLS` size) | correct as is | None |
 | `ProcessInfo` page (argv and env blobs share it) | `abi/process-abi/src/lib.rs` | 4096 B less the struct | BSS budget (one page) | 4 KiB per process | needs a design | See the argv entries in the procmgr section (#672) |
@@ -408,7 +408,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `REAPER_SLOTS` (`Registry.slots`) | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 | unknown | about 6 KiB static | make pay-as-you-go | Detached threads past 64 leak until exit |
 | thread `EQ_CAPACITY` | `runtime/ruststd/src/sys/thread/seraph.rs` | 128 | unknown | about 2.1 KiB retype | raise | Overflow drops death posts |
 | `GEN_BITS` correlator | `runtime/ruststd/src/sys/thread/seraph.rs` | 26-bit generation, 6-bit slot | encoding artefact (packed in 32 bits of the `u64` correlator) | none | correct as is | Freshness-only; pin `REAPER_SLOTS` against it with a const assert |
-| `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
+| `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/os/seraph.rs` | 512 (2 MiB), a spawned thread's usable stack and the main thread's stack with its demand-growth range | default (VA only, lazy) | none | correct as is | None: with its guard page a spawned thread's default stack takes 513 pages of the arena zone, so the 32 GiB Sv39 zone holds about 16 000 beside its other reservations; the main thread's lies in its own stack reservation (`MAX_PROCESS_STACK_PAGES`) |
 | `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | default (inline stack probes, #503, touch every page of a larger frame) | VA only | correct as is | None |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |
 | `SystemInfoType::ThreadRetypeBytes` | `abi/syscall/src/lib.rs` | the kernel's Thread slot (`thread_slot_bytes`), six pages or more | encoding artefact (the kernel's `dispatch_for(Thread)`: kernel stack, TCB page, extended-state pages, read at boot) | one slot per thread | correct as is | None |

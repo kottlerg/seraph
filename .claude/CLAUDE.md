@@ -80,8 +80,8 @@ truth for "how work is tracked and shipped" on this project.
   fetch):
   `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
   first run on a PR (a later full run adds `ledger` once one exists), then
-  `mode: "delta"` with `since` set to the head the previous run reviewed
-  and `ledger` set to the ledger file built below. The named workflow is
+  `mode: "delta"` with `since` the head the last run with the reviewer
+  reviewed, and `ledger` the ledger file built below. The named workflow is
   the copy the session loaded at its start: when the script changed since,
   pass `scriptPath` with the file's path instead of `name`. The workflow's
   header comment describes what it does. Save the report as
@@ -157,18 +157,21 @@ truth for "how work is tracked and shipped" on this project.
   it, and update each copy in the same push.
 
   After the fixes are pushed and CI is green again, run the workflow in
-  `delta` mode, or, after a fix round whose delta is documentation or
+  `delta` mode, or, when the last run with the reviewer completed with no
+  failed agent and the fix round's delta since it is documentation or
   comments only and merges no `master` in, the auditor-only run that
   section allows: `@pr-auditor` alone, told it is that run, with the PR
   number, the `since` head (the head the last run with the reviewer
-  reviewed), the claimed fixes, and the open Issue list. Save its report as
+  reviewed), the path of that run's record, the claimed fixes, and the
+  open Issue list. Save its report as
   `target/xtask/review/pr<N>/audit-<head>.md` and its record as
   `audit-<head>.json` in the shape `.claude/agents/worker.md` § Review
-  gives, whose `verdict` is the reviewer verdict that section gives the
-  run, and surface both verdict lines to the user verbatim. The next delta
-  that changes anything but documentation or comments, or merges `master`
-  in, takes the workflow in `delta` mode again, `since` the head of the
-  last run with the reviewer.
+  gives, whose `verdict` is the reviewer verdict the audit states, as
+  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
+  gives it, and surface both verdict lines to the user verbatim. Any later
+  delta that changes anything but documentation or comments, or merges
+  `master` in, takes the workflow in `delta` mode again, `since` the head
+  of the last run with the reviewer.
 
   Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,

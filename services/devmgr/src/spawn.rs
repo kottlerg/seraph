@@ -175,12 +175,13 @@ fn mint_bootstrap_badge() -> Option<u64>
 }
 
 /// One BAR `Mmio` cap delivered to a driver, with the PCI BAR index (0-5)
-/// it covers.
+/// it covers and the bytes of the BAR, from its start, the cap was carved to.
 #[derive(Clone, Copy, Default)]
 pub struct BarSpec
 {
     pub bar: u8,
     pub cap: u32,
+    pub bytes: u64,
 }
 
 /// Endpoints and identifiers needed to spawn a driver process and hand it
@@ -201,6 +202,9 @@ pub struct DriverSpawnConfig<'a>
     /// ([`virtio_core::RegisterLayout::bars`]); 1 to [`MAX_VIRTIO_BARS`].
     pub bars: &'a [BarSpec],
     pub irq_cap: Option<u32>,
+    /// The `SYS_IRQ_REGISTER` mode of `irq_cap`'s line, delivered as round 2's
+    /// mode word ([`virtio_core::bootstrap::DATA_IRQ_MODE`]); 0 without an IRQ.
+    pub irq_mode: u64,
     pub service_ep: u32,
     /// Endpoint the driver's devmgr query cap is a `device_badge`-badged
     /// SEND on: the private driver endpoint of the driver's settle batch
@@ -234,8 +238,9 @@ pub struct DriverSpawnConfig<'a>
 ///   Round 1: one `Mmio` cap per entry of `bars`, in its order, with that
 ///     entry's BAR index as the matching data word.
 ///   Round 2 (terminal): the positional slots service endpoint, IRQ, and
-///     devmgr query endpoint, packed with [`ipc::bootstrap::pack_slots`];
-///     the IRQ slot is absent when `irq_cap` is `None`.
+///     devmgr query endpoint, packed with [`ipc::bootstrap::pack_slots`],
+///     the presence word, then `irq_mode`; the IRQ slot is absent when
+///     `irq_cap` is `None`.
 ///
 /// log + procmgr endpoints arrive via `ProcessInfo`. Returns the child's
 /// badged process handle, which the caller keeps until the driver's settle
@@ -451,9 +456,10 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
         return None;
     }
 
-    // Round 2: [service, irq, devmgr_query] as positional slots, done. A
-    // null slot cannot be transferred, so an absent IRQ (a device sharing
-    // an INTx line) is named absent in the presence word instead.
+    // Round 2: [service, irq, devmgr_query] as positional slots, then the
+    // IRQ line's mode, done. A null slot cannot be transferred, so an absent
+    // IRQ (devmgr could give the device none) is named absent in the
+    // presence word instead.
     let mut slots = [0u32; ROUND2_SLOTS];
     slots[SLOT_SERVICE] = service_copy;
     slots[SLOT_IRQ] = irq_copy;
@@ -467,7 +473,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> Option<u32
             ipc_buf,
             true,
             round2.caps(),
-            &[round2.presence()],
+            &[round2.presence(), config.irq_mode],
         )
     }
     .is_err()

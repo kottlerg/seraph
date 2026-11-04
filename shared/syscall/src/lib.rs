@@ -59,15 +59,16 @@ pub use syscall_abi::{
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
     CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY, EXIT_FAULT_BASE, EXIT_KILLED,
-    EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ,
-    MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ,
-    RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
-    RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
-    RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
-    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP,
-    RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC,
-    RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD,
-    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
+    EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, IRQ_MODE_MASK,
+    MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL,
+    RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE,
+    RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE,
+    RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE,
+    RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX,
+    RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY,
+    RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU,
+    RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL,
+    RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -2069,24 +2070,31 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// After registration the IRQ is masked until this binding's first `irq_ack`. The
 /// driver must call `irq_ack` after servicing each interrupt to re-enable delivery.
 ///
+/// `mode` is the line's trigger and polarity (`IRQ_MODE_LEVEL`,
+/// `IRQ_MODE_ACTIVE_LOW`; 0 is edge-triggered, active-high). Every binding on a
+/// line passes the same mode: the line's first binding records it.
+///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
 /// names an id no discovered interrupt controller implements (a GSI no I/O APIC
-/// reports on x86-64, a source past the PLIC's `riscv,ndev` on RISC-V), or
-/// `QuotaExceeded` when the line already holds 64 bindings or, for its first
-/// binding, the controller has no delivery resource left (x86-64: every device
-/// vector is assigned).
+/// reports on x86-64, a source past the PLIC's `riscv,ndev` on RISC-V), if
+/// `mode` sets a bit outside `IRQ_MODE_MASK`, or if it differs from the mode
+/// the line's bindings recorded, or `QuotaExceeded` when the line already holds
+/// 64 bindings or, for its first binding, the controller has no delivery
+/// resource left (x86-64: every device vector is assigned).
 #[inline]
-pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
+pub fn irq_register(irq_cap: u32, notification_cap: u32, mode: u64) -> Result<(), i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; irq_cap and notification_cap are cap indices as u64;
-    // kernel validates caps and binds IRQ to a notification for interrupt delivery.
+    // SAFETY: syscall3 issues raw syscall instruction; irq_cap and notification_cap are cap
+    // indices as u64 and mode a plain word; the kernel validates the caps and the mode and
+    // binds the IRQ to the notification for interrupt delivery.
     let ret = unsafe {
-        syscall2(
+        syscall3(
             SYS_IRQ_REGISTER,
             u64::from(irq_cap),
             u64::from(notification_cap),
+            mode,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }

@@ -689,6 +689,27 @@ pub const MAP_READ: u64 = 0x1;
 /// shootdown; intermediate tables persist until the address space is destroyed.
 pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 
+// ── Interrupt line modes ─────────────────────────────────────────────────────
+
+/// `SYS_IRQ_REGISTER` mode (arg2): the line is level-triggered. Clear, it is
+/// edge-triggered.
+///
+/// Every binding on a line passes the same mode: the line's first binding
+/// records it, and a binding with another mode is refused with
+/// `InvalidArgument` until the line's last binding goes. x86-64 programs the
+/// line's I/O APIC redirection entry from it; riscv64 validates it and ignores
+/// it (the PLIC gateway is level-sensitive). See
+/// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REGISTER`.
+pub const IRQ_MODE_LEVEL: u64 = 1 << 0;
+
+/// `SYS_IRQ_REGISTER` mode (arg2): the line asserts low. Clear, it asserts
+/// high. See [`IRQ_MODE_LEVEL`].
+pub const IRQ_MODE_ACTIVE_LOW: u64 = 1 << 1;
+
+/// Every bit a `SYS_IRQ_REGISTER` mode may set; a mode with any other bit is
+/// refused with `InvalidArgument`. Mode 0 is edge-triggered, active-high.
+pub const IRQ_MODE_MASK: u64 = IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW;
+
 // ── Capability rights masks ─────────────────────────────────────────────────
 //
 // `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters

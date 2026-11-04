@@ -15,7 +15,8 @@
 //! 3. Load GDT + TSS with the IST stack pointers.
 //! 4. Load IDT.
 //!    4a. Switch to x2APIC mode when CPUID.01H:ECX[21] advertises it.
-//! 5. Software-enable the local APIC: set SVR bit 8, spurious vector 255.
+//! 5. Software-enable the local APIC: set SVR bit 8, spurious vector 255, and clear bit 12
+//!    (EOI-broadcast suppression).
 //! 6. Mask all LVT entries.
 //! 7. Initialise the I/O APICs (`ioapic::init`): read pin counts, mask every entry.
 //!
@@ -53,6 +54,10 @@ use super::{cpu, fpu, gdt, idt};
 
 /// Spurious Interrupt Vector Register offset.
 const APIC_SVR: usize = 0xF0;
+/// SVR bit 12, EOI-broadcast suppression: cleared at every local APIC's setup, so an EOI
+/// reaches the I/O APICs and clears a level-triggered entry's Remote IRR (`ioapic` module doc
+/// § Trigger and polarity), whatever the firmware left set.
+const SVR_SUPPRESS_EOI_BROADCAST: u32 = 1 << 12;
 /// End-of-Interrupt register offset (write 0 to acknowledge).
 const APIC_EOI: usize = 0xB0;
 /// LVT Timer register offset.
@@ -264,10 +269,14 @@ pub unsafe fn init()
     );
 
     // 5. Software-enable the local APIC.
-    // Set SVR bit 8 (APIC Software Enable) and program spurious vector 255.
+    // Set SVR bit 8 (APIC Software Enable), program spurious vector 255, and clear bit 12
+    // (EOI-broadcast suppression).
     // SAFETY: direct map / x2APIC MSRs active; SVR write is architecture-defined.
     unsafe {
-        apic_write(APIC_SVR, apic_read(APIC_SVR) | 0x100 | 0xFF);
+        apic_write(
+            APIC_SVR,
+            (apic_read(APIC_SVR) | 0x100 | 0xFF) & !SVR_SUPPRESS_EOI_BROADCAST,
+        );
     }
 
     // 6. Mask all LVT entries to prevent unexpected interrupts before the
@@ -639,7 +648,10 @@ pub unsafe fn init_ap()
 
     // SAFETY: AP has loaded GDT/IDT; direct map / x2APIC MSRs active; SVR and LVT writes are architecture-defined.
     unsafe {
-        apic_write(APIC_SVR, apic_read(APIC_SVR) | 0x100 | 0xFF);
+        apic_write(
+            APIC_SVR,
+            (apic_read(APIC_SVR) | 0x100 | 0xFF) & !SVR_SUPPRESS_EOI_BROADCAST,
+        );
         apic_write(APIC_LVT_TIMER, LVT_MASK);
         apic_write(APIC_LVT_LINT0, LVT_MASK);
         apic_write(APIC_LVT_LINT1, LVT_MASK);
@@ -758,8 +770,9 @@ pub fn unmask(_irq: u32) {}
 
 /// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: assign it a
 /// device vector ([`super::ioapic::assign_vector`]) and a destination CPU, and program its
-/// redirection entry. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
-/// handler. Called by `irq::register` for the GSI's first binding; the route is kept
+/// redirection entry with `mode`'s trigger and polarity (the `SYS_IRQ_REGISTER` word,
+/// validated by the syscall). The driver unmasks via `SYS_IRQ_ACK` once it has registered
+/// a handler. Called by `irq::register` for the GSI's first binding; the route is kept
 /// while any binding remains.
 ///
 /// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id the
@@ -773,7 +786,7 @@ pub fn unmask(_irq: u32) {}
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised), under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(irq: u32, mode: u32) -> Result<(), crate::irq::RouteError>
 {
     if !super::ioapic::owns(irq)
     {
@@ -792,7 +805,7 @@ pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
     // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
     // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
     unsafe {
-        super::ioapic::route(irq, vector, apic_id);
+        super::ioapic::route(irq, vector, apic_id, mode);
     }
     Ok(())
 }
@@ -802,7 +815,7 @@ pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
+pub unsafe fn route_device_irq(_irq: u32, _mode: u32) -> Result<(), crate::irq::RouteError>
 {
     Ok(())
 }
@@ -813,7 +826,9 @@ pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
 /// new owner as one spurious delivery, which a driver tolerates as it does any interrupt
 /// its device did not raise. Vectors are assigned in turn and the cursor moves past a
 /// released one (`ioapic::assign_vector`), so the next route does not take it while other
-/// vectors are free.
+/// vectors are free. On a level-triggered line such a latched delivery also leaves the
+/// entry's Remote IRR set, which stays set when the line is routed again before that
+/// delivery's EOI; `ioapic::route` clears it before the line is programmed again.
 ///
 /// # Safety
 /// Must be called after Phase 5 init, under `irq`'s routing lock.

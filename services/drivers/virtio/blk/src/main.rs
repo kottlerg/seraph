@@ -51,14 +51,17 @@ const QUEUE_SIZE: u16 = 4;
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
 // devmgr serves the two rounds `virtio_core::bootstrap` specifies: the BAR
-// caps with their BAR indices, then the service endpoint, the IRQ, and the
-// per-device devmgr query endpoint. log_ep and procmgr_ep arrive via
-// `ProcessInfo`/`StartupInfo`, not through this protocol.
+// caps with their BAR indices, then the service endpoint, the IRQ with its
+// line's mode word, and the per-device devmgr query endpoint. log_ep and
+// procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through this
+// protocol.
 
 struct DriverCaps
 {
     bars: DeliveredBars,
     irq_slot: u32,
+    /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
+    irq_mode: u64,
     memmgr_ep: u32,
     service_ep: u32,
     devmgr_ep: u32,
@@ -84,6 +87,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     Some(DriverCaps {
         bars,
         irq_slot: endpoints.irq,
+        irq_mode: endpoints.irq_mode,
         service_ep: endpoints.service,
         memmgr_ep: info.memmgr_endpoint,
         devmgr_ep: endpoints.devmgr_query,
@@ -1062,7 +1066,7 @@ fn main() -> !
         std::os::seraph::log!("failed to create the completion notification");
         syscall::thread_exit();
     };
-    if syscall::irq_register(caps.irq_slot, irq_notification).is_err()
+    if syscall::irq_register(caps.irq_slot, irq_notification, caps.irq_mode).is_err()
     {
         std::os::seraph::log!("irq_register failed");
         syscall::thread_exit();

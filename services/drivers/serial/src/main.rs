@@ -146,7 +146,11 @@ fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
     else if op == serial_labels::SERIAL_REGISTER_RX_NOTIFY
     {
         let notif = msg.caps().first().copied().unwrap_or(0);
-        if irq_cap != 0 && notif != 0 && syscall::irq_register(irq_cap, notif).is_ok()
+        // Mode 0, edge-triggered and active-high: the x86-64 COM1 line is ISA
+        // IRQ 4, which no MADT override reroutes, and riscv64 programs nothing
+        // from the mode. devmgr keeps the line exclusive, so no other binding
+        // has recorded another mode on it.
+        if irq_cap != 0 && notif != 0 && syscall::irq_register(irq_cap, notif, 0).is_ok()
         {
             // irq_register leaves the line masked; the first ack arms it.
             let _ = syscall::irq_ack(irq_cap);

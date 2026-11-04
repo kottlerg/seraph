@@ -29,8 +29,9 @@ virtio/blk/
 Devmgr spawns the driver, creates its service endpoint, and delivers an `Mmio`
 cap for every BAR the device's VirtIO register regions name in the first
 bootstrap round, each with its PCI BAR index, then the service endpoint, the
-IRQ, and a per-device badged devmgr query endpoint in the second (the rounds
-`virtio_core::bootstrap` specifies). The driver maps the BARs into one
+IRQ with its line's `SYS_IRQ_REGISTER` mode, and a per-device badged devmgr
+query endpoint in the second (the rounds `virtio_core::bootstrap` specifies).
+The driver maps the BARs into one
 register window and reaches each region through its own BAR's mapping. Once
 its device is set up, immediately before its service loop, the driver reports
 `DRIVER_READY` on the devmgr query endpoint; devmgr serves the driver's

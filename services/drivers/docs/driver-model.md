@@ -3,10 +3,12 @@
 Driver lifecycle specification: device discovery, driver binding, per-device
 capability delegation, service-endpoint delivery, and driver teardown.
 
-Only § Adding a Driver is written here; devmgr's discovery, binding, and delegation are
-specified in
+§ Adding a Driver is written here, and § Withdrawal summarizes devmgr's withdrawal of a driver;
+devmgr's discovery, binding, delegation, and withdrawal are specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md).
-TODO: specify driver teardown.
+TODO: specify a driver's own teardown: how a driver stops its device and releases what it holds
+when it exits on its own, and what devmgr does for a non-`VirtIO` device whose driver is
+withdrawn.
 
 ---
 
@@ -23,7 +25,7 @@ TODO: specify driver teardown.
    registry (`QUERY_*_DEVICE`). A driver MUST report `DRIVER_READY` on its devmgr query cap once
    its device is set up, immediately before its service loop (`ipc::report_driver_ready`), and
    exit when devmgr refuses the report: devmgr serves its endpoint only after that report, and
-   withdraws and destroys a driver that has not reported within its settle bound; see
+   destroys and withdraws a driver that has not reported within its settle bound; see
    [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities.
 5. A driver holding an IRQ binding on a line devmgr may share (a PCI `INTx` line) MUST
@@ -34,7 +36,9 @@ TODO: specify driver teardown.
    § Interrupt Delivery). The VirtIO drivers run an interrupt-service thread, the only waiter on
    the line's notification, which reads the device's interrupt status and acknowledges every
    delivery, and reads the status on a bounded timeout too, so an interrupt whose edge was lost on
-   x86-64 is still seen (`virtio_core::isr::serve_interrupts`, at most `ISR_POLL_MS` late). A
+   an x86-64 line programmed edge-triggered is still seen (`virtio_core::isr::serve_interrupts`,
+   at most `ISR_POLL_MS` late). Every driver on a line passes `SYS_IRQ_REGISTER` the line's mode
+   devmgr delivers with the IRQ (docs/device-management.md § Interrupt Delivery). A
    driver that does not acknowledge promptly needs its line kept exclusive: the serial driver
    acknowledges only when its client reads
    ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr
@@ -43,6 +47,30 @@ TODO: specify driver teardown.
    32 to 35), so the exclusivity costs no device a cap in practice.
 6. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
+
+---
+
+## Withdrawal
+
+devmgr withdraws every driver it does not, or no longer, serves: one that dies, fails its device
+setup, overruns its settle bound, or that devmgr cannot record or serve. For a `VirtIO` PCI driver
+it takes the device from the driver, revoking the driver's mappings of its BARs, then resets the
+device through a BAR cap it keeps (`device_status` 0, complete once the status reads back 0), which
+stops the device's DMA and drops its pending interrupt, before it releases the device's caps. A
+driver still running is taken from its device and reset before it is destroyed, so a device that
+confirms its reset can no longer reach the driver's memory when that memory is freed. A driver that
+dies while its device asserts a shared level-triggered line leaves the line's other receivers no
+assertion to loop on once the reset lands; between the driver's death, which releases its binding,
+and the reset, they may see re-deliveries their own devices did not raise
+([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
+§ Interrupt Delivery). Two windows remain until a driver can be frozen before its device is taken
+from it ([#731](https://github.com/kottlerg/seraph/issues/731)): a device that does not confirm its
+reset, whose driver is destroyed anyway, may still be writing that driver's memory as it is freed;
+and a driver can fault on its revoked BARs and be reaped before the reset lands. A driver that dies
+on its own has its memory freed by procmgr before devmgr hears of the death and resets its device,
+which #731 tracks too. The withdrawal, the reset among its steps, is specified in
+[services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
+§ Responsibilities.
 
 ---
 

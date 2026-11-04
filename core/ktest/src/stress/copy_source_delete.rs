@@ -25,26 +25,26 @@
 //! ## How this exercises it
 //!
 //! Two phases, one per way of freeing: a delete of the source's original
-//! capability, then a revoke of that original (which removes the derived
-//! copy the caller uses) immediately followed by the delete of the original.
-//! A long-lived caller, pinned to CPU 1, and the controller, pinned to CPU 0,
-//! both live in ktest's own `CSpace`. The controller runs [`CYCLES`] rounds
-//! per phase. Each round creates a fresh endpoint, publishes the handle the
-//! caller is to use (the endpoint's original capability, or a copy derived
-//! from it in the revoke phase), and opens the round. The caller loops over one group of calls
-//! through that handle until a call finds it gone: copy it into ktest's own
-//! `CSpace`, derive from it, derive a badged capability from it, deleting each
-//! new capability at once. In the delete phase the controller's free is the
-//! source's last reference, or is followed by the caller's delete of a
+//! capability, then a revoke of that original (which removes the derived copy
+//! the caller uses) immediately followed by the delete of the original. A
+//! long-lived caller, pinned to CPU 1, and the controller, pinned to CPU 0,
+//! both live in ktest's own `CSpace`. The controller runs [`CYCLES`] rounds per
+//! phase. Each round creates a fresh endpoint, publishes the handle the caller
+//! is to use (the endpoint's original capability, or a copy derived from it in
+//! the revoke phase), and opens the round. The caller loops over one group of
+//! calls through that handle until a call finds it gone: copy it into ktest's
+//! own `CSpace`, derive from it, derive a badged capability from it, deleting
+//! each new capability at once. In the delete phase the controller's free is
+//! the source's last reference, or is followed by the caller's delete of a
 //! just-made copy, which then is; in the revoke phase the revoke clears the
-//! caller's copy and everything just made from it.
-//! The caller flags the call it is inside. The controller aims each round at
-//! one of the three calls in turn: it waits, bounded by [`ROUND_WAIT_US`],
-//! until the caller flags that call (a round whose aim never shows up
-//! proceeds anyway), spins a varying few hundred iterations, notes which call
-//! the caller is inside, and frees the endpoint's original. The caller reports
-//! the round's handle gone once a call has returned `InvalidCapability`; the
-//! controller waits for that report, bounded, before the next round.
+//! caller's copy and everything just made from it. The caller flags the call it
+//! is inside. The controller aims each round at one of the three calls in turn:
+//! it waits, bounded by [`ROUND_WAIT_US`], until the caller flags that call (a
+//! round whose aim never shows up proceeds anyway), spins a varying few hundred
+//! iterations, notes which call the caller is inside, and frees the endpoint's
+//! original. The caller reports the round's handle gone once a call has
+//! returned `InvalidCapability`; the controller waits for that report, bounded,
+//! before the next round.
 //!
 //! Accepted results, per call (anything else is recorded as bad): `Ok`, after
 //! which the caller deletes the new capability (a failed delete is bad; a

@@ -119,7 +119,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Set the delegated address-space cap of `rec`.
-    pub fn set_aspace_cap(&mut self, rec: NodeIdx, cap: u32)
+    pub fn set_aspace_cap(&mut self, rec: NodeIdx, cap: u64)
     {
         if let Some(mut r) = self.record(rec)
         {
@@ -406,7 +406,7 @@ mod tests
         l
     }
 
-    fn frame(cap_slot: u32, page_count: u32, phys_base: u64, va: u64) -> FrameDesc
+    fn frame(cap_slot: u64, page_count: u32, phys_base: u64, va: u64) -> FrameDesc
     {
         FrameDesc {
             cap_slot,

@@ -43,14 +43,14 @@ pub struct Actuator
 {
     pm1a_port: u16,
     slp_typa: u16,
-    pm1a_ioport_cap: u32,
-    kbc_ioport_cap: u32,
+    pm1a_ioport_cap: u64,
+    kbc_ioport_cap: u64,
 }
 
 /// Resolve the shutdown actuation state from devmgr. Returns `None` if any
 /// query or parse fails; the caller then serves SHUTDOWN/REBOOT with no
 /// actuator and replies an error to any request.
-pub fn resolve(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Option<Actuator>
+pub fn resolve(devmgr_registry: u64, self_aspace: u64, ipc_buf: *mut u64) -> Option<Actuator>
 {
     let (pm1a_port, dsdt_phys) = resolve_fadt(devmgr_registry, self_aspace, ipc_buf)?;
 
@@ -89,7 +89,7 @@ pub fn resolve(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
 /// Acquire the FADT from devmgr and read `(PM1a_CNT_BLK, DSDT address)` from
 /// it. Returns `None`, after logging, when the query, the mapping, or the
 /// parse fails, or when `PM1a_CNT_BLK` is zero.
-fn resolve_fadt(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Option<(u16, u64)>
+fn resolve_fadt(devmgr_registry: u64, self_aspace: u64, ipc_buf: *mut u64) -> Option<(u16, u64)>
 {
     let facp_sig = u64::from(u32::from_le_bytes(*b"FACP"));
     let fadt = query_acpi_table(devmgr_registry, facp_sig, 0, ipc_buf)?;
@@ -113,7 +113,7 @@ fn resolve_fadt(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Op
 /// including a write the platform does not act on within
 /// [`crate::await_reset`]'s grace, logs and returns so the caller can reply
 /// with an error.
-pub fn shutdown(self_thread: u32, act: &Actuator)
+pub fn shutdown(self_thread: u64, act: &Actuator)
 {
     if syscall::ioport_bind(self_thread, act.pm1a_ioport_cap).is_err()
     {
@@ -134,7 +134,7 @@ pub fn shutdown(self_thread: u32, act: &Actuator)
 /// success; on failure, including a pulse the platform does not act on
 /// within [`crate::await_reset`]'s grace, logs and returns so the caller can
 /// reply with an error.
-pub fn reboot(self_thread: u32, act: &Actuator)
+pub fn reboot(self_thread: u64, act: &Actuator)
 {
     /// 8042 keyboard-controller command port (legacy CPU reset path).
     const KBC_COMMAND_PORT: u16 = 0x64;
@@ -206,7 +206,7 @@ unsafe fn outb(port: u16, value: u8)
 /// and index to the table.
 struct TableView
 {
-    memory_cap: u32,
+    memory_cap: u64,
     region_base: u64,
     region_size: u64,
     table_phys: u64,
@@ -214,7 +214,7 @@ struct TableView
 
 /// Query devmgr for an ACPI table by signature (`phys == 0`) or by
 /// physical address (`sig == 0`). Returns the served Memory cap + geometry.
-fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Option<TableView>
+fn query_acpi_table(registry: u64, sig: u64, phys: u64, ipc_buf: *mut u64) -> Option<TableView>
 {
     let reply = devmgr_call(
         registry,
@@ -241,7 +241,7 @@ fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Op
 /// length field it reads is checked against what is actually mapped.
 /// Returns `None` when the table does not start inside the region's
 /// mapping, when the reservation or the mapping fails, or when `f` does.
-fn with_table_mapped<F, R>(self_aspace: u32, view: &TableView, f: F) -> Option<R>
+fn with_table_mapped<F, R>(self_aspace: u64, view: &TableView, f: F) -> Option<R>
 where
     F: FnOnce(&[u8]) -> Option<R>,
 {

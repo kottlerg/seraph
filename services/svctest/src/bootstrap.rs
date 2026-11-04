@@ -22,24 +22,24 @@ pub struct Caps
     /// Badged SEND on the unified root-filesystem namespace at its
     /// root directory (vfsd's synthetic root). The fs driver behind
     /// vfsd's delegation is opaque.
-    pub root_fs: u32,
-    pub pwrmgr_auth: u32,
+    pub root_fs: u64,
+    pub pwrmgr_auth: u64,
     /// `pwrmgr.deny`, resolved through `QUERY_ENDPOINT`.
-    pub pwrmgr_noauth: u32,
+    pub pwrmgr_noauth: u64,
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint (`devmgr.registry`).
-    pub devmgr_registry: u32,
+    pub devmgr_registry: u64,
     /// `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`-badged SEND on
     /// devmgr's registry endpoint (`devmgr.test`), for the
     /// `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`. TODO(#165):
     /// retire with those labels.
-    pub devmgr_test: u32,
+    pub devmgr_test: u64,
     /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint
     /// (`vfsd.mount`), in slot 4.
-    pub vfsd_mount: u32,
+    pub vfsd_mount: u64,
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint (`vfsd.deny`),
     /// in slot 5.
-    pub vfsd_deny: u32,
+    pub vfsd_deny: u64,
 }
 
 /// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,

@@ -165,7 +165,7 @@ pub struct TestContext
     ///
     /// Used for memory management tests, thread creation (threads must be
     /// bound to an address space), and hardware access tests.
-    pub aspace_cap: u32,
+    pub aspace_cap: u64,
 
     /// ktest's own `CSpace` capability slot, provided by the kernel.
     ///
@@ -175,13 +175,13 @@ pub struct TestContext
     /// allocated after `aspace_cap` (e.g. narrow `IoPort` caps minted
     /// by `bind_port_range` (`src/arch/x86_64/ioport.rs`) callers such as
     /// `serial::init` on `x86_64`).
-    pub cspace_cap: u32,
+    pub cspace_cap: u64,
 
     /// ktest's own `Thread` capability slot (CONTROL right), provided by
     /// the kernel via `InitInfo::thread_cap`. Tests that need to pin the
     /// harness thread to a specific CPU or adjust its priority for the
     /// duration of a test use this cap.
-    pub thread_cap: u32,
+    pub thread_cap: u64,
 
     /// Pointer to the registered IPC buffer page (4 KiB, page-aligned).
     ///
@@ -197,19 +197,19 @@ pub struct TestContext
     /// that need to inspect the rights/state of an actual RAM cap; the
     /// `frame_pool` slots are single-page frames split from this cap's tail,
     /// leaving its head at `memory_base`.
-    pub memory_base: u32,
+    pub memory_base: u64,
 
     /// RISC-V SBI control cap (slot index), kernel-minted in init's
     /// initial cap set. Zero on x86-64, where SBI is unavailable.
     /// Tests of `SYS_SBI_CALL` use this cap.
-    pub sbi_control_cap: u32,
+    pub sbi_control_cap: u64,
 
     /// Root `SchedControl` cap (slot index), kernel-minted in init's initial
     /// cap set, spanning the full userspace priority range `[1, PRIORITY_MAX]`.
     /// ktest is loaded as init, so it holds the unsplit root. Priority tests
     /// pass it (or a `sched_split` child) as the `SchedControl` argument to
     /// `SYS_THREAD_SET_PRIORITY`.
-    pub sched_control_cap: u32,
+    pub sched_control_cap: u64,
 
     /// VA of the read-only `InitInfo` page, as delivered in the entry
     /// register — the kernel's per-boot `choose_init_layout` draw (ASLR,
@@ -739,7 +739,7 @@ fn wait_us(target_us: u64)
 ///
 /// # Errors
 /// The failing syscall's error code.
-pub fn bind_fault_handler(thread: u32, endpoint: u32, badge: u64) -> Result<(), i64>
+pub fn bind_fault_handler(thread: u64, endpoint: u64, badge: u64) -> Result<(), i64>
 {
     let badged = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_ALL, badge)?;
     let bound = syscall::thread_set_fault_handler(thread, badged, syscall_abi::FAULT_CLASS_ALL);

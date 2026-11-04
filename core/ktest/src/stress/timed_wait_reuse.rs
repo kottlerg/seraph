@@ -107,6 +107,20 @@ const TIMED_DELIVERY: u32 = 0;
 const TIMED_TIMEOUT: u32 = 1;
 const TIMED_BAD: u32 = 2;
 
+/// The waiter's arguments, handed to `waiter_entry` by address.
+#[derive(Clone, Copy)]
+struct WaiterArgs
+{
+    /// The waiter's copy of the notification source.
+    sig: u64,
+    /// The waiter's copy of the event-queue source.
+    eq: u64,
+}
+
+/// One entry: the test's single waiter is deleted before the test returns.
+static WAITER_ARGS: spawn::ArgBlock<WaiterArgs, 1> =
+    spawn::ArgBlock::new(WaiterArgs { sig: 0, eq: 0 });
+
 /// How the waiter's untimed wait ended, read from `UNTIMED_OK`: in a
 /// delivery, or in a timeout or an error.
 enum UntimedOutcome
@@ -219,8 +233,8 @@ fn with_waiter(ctx: &TestContext, waiter_cpu: u32) -> Result<Tally, &'static str
 
 fn start_waiter(
     ctx: &TestContext,
-    sig: u32,
-    eq: u32,
+    sig: u64,
+    eq: u64,
     waiter_cpu: u32,
     child: &mut Option<spawn::SpawnedChild>,
 ) -> TestResult
@@ -234,22 +248,25 @@ fn start_waiter(
     // SAFETY: stack index 0 is this test's only child; stress tests run
     // sequentially and the child is deleted before this test returns.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    // SAFETY: entry 0 < 1; the previous run's waiter was deleted before that
+    // run returned.
+    let arg = unsafe {
+        WAITER_ARGS.publish(
+            0,
+            WaiterArgs {
+                sig: c_sig,
+                eq: c_eq,
+            },
+        )
+    };
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        spawn::configure_and_start_pinned(
-            c,
-            waiter_entry,
-            stack,
-            u64::from(c_sig) | (u64::from(c_eq) << 32),
-            waiter_cpu,
-        )
-    }
-    .map_err(|_| "stress::timed_wait_reuse: start waiter failed")
+    unsafe { spawn::configure_and_start_pinned(c, waiter_entry, stack, arg, waiter_cpu) }
+        .map_err(|_| "stress::timed_wait_reuse: start waiter failed")
 }
 
 /// Drive every cycle; returns the late rounds' tally.
-fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
+fn cycles(sig: u64, eq: u64) -> Result<Tally, &'static str>
 {
     let mut tally = Tally::default();
     for cycle in 1..=CYCLES
@@ -387,7 +404,7 @@ fn await_results(
 /// Take any bits a release left pending on the notification. The wait
 /// returns pending bits at once, else times out after 1 ms; the controller
 /// is the only sender and has stopped sending, so nothing arrives later.
-fn drain_notification(sig: u32) -> TestResult
+fn drain_notification(sig: u64) -> TestResult
 {
     notification_wait_timeout(sig, 1)
         .map(|_| ())
@@ -395,7 +412,7 @@ fn drain_notification(sig: u32) -> TestResult
 }
 
 /// Take every release left queued on the event queue.
-fn drain_queue(eq: u32) -> TestResult
+fn drain_queue(eq: u64) -> TestResult
 {
     loop
     {
@@ -448,12 +465,11 @@ fn elapsed_us() -> Result<u64, &'static str>
 
 /// Waiter: per cycle, a timed wait then an untimed wait on the cycle's
 /// source; publishes how each ended.
-// cast_possible_truncation: packed fields are 32-bit cap handles.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn waiter_entry(arg: u64) -> !
 {
-    let sig = (arg & 0xFFFF_FFFF) as u32;
-    let eq = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `WAITER_ARGS.publish` value for this waiter; the
+    // entry is not rewritten while the waiter lives.
+    let WaiterArgs { sig, eq } = unsafe { spawn::child_args(arg) };
     for cycle in 1..=CYCLES
     {
         while ACKED.load(Ordering::Acquire) != cycle - 1

@@ -135,7 +135,7 @@ fn checked_cpu(k: u32, cpus: u32) -> u32
 /// [`exit_entry`] and check it exits
 /// voluntarily. The child's caps are deleted on every path (the `SpawnedChild`
 /// guard).
-fn expect_gp(ctx: &TestContext, ep: u32, which: u64, cpu: u32) -> TestResult
+fn expect_gp(ctx: &TestContext, ep: u64, which: u64, cpu: u32) -> TestResult
 {
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::umip_descriptor_reads_fault: spawn::new_child failed")?;

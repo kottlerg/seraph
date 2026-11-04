@@ -35,9 +35,9 @@ const PAGE_SIZE: u64 = 0x1000;
 /// (`core/kernel/docs/initialization.md` § Phase 7 and § Phase 8); the RAM
 /// caps are checked separately, through the frame pool, and the firmware and
 /// module caps carry content by design.
-fn is_named_memory_cap(info: &InitInfo, slot: u32) -> bool
+fn is_named_memory_cap(info: &InitInfo, slot: u64) -> bool
 {
-    let in_range = |base: u32, count: u32| slot >= base && slot < base.saturating_add(count);
+    let in_range = |base: u64, count: u64| slot >= base && slot < base.saturating_add(count);
     in_range(info.memory_base, info.memory_count)
         || (info.acpi_rsdp_memory_cap != 0 && slot == info.acpi_rsdp_memory_cap)
         || (info.dtb_memory_cap != 0 && slot == info.dtb_memory_cap)
@@ -72,7 +72,7 @@ impl ProbeError
 
 /// Map `pages` pages of `cap` from `offset` at
 /// [`PROBE_VA`] read-only and report whether every byte is zero.
-fn window_is_zero(ctx: &TestContext, cap: u32, offset: u64, pages: u64)
+fn window_is_zero(ctx: &TestContext, cap: u64, offset: u64, pages: u64)
 -> Result<bool, ProbeError>
 {
     let Ok(words) = usize::try_from(pages * PAGE_SIZE / 8)
@@ -146,7 +146,7 @@ pub fn reclaimed_bootloader_pages_are_zero(ctx: &TestContext) -> TestResult
 /// reaches userspace.
 pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
 {
-    let mut taken = [0u32; crate::frame_pool::POOL_SIZE];
+    let mut taken = [0u64; crate::frame_pool::POOL_SIZE];
     let mut n = 0;
     while n < taken.len()
     {

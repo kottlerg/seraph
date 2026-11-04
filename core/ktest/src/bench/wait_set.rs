@@ -13,7 +13,7 @@ use syscall::{
 use super::{cycles_now, log_bench_header};
 
 // Thin wrapper — same as `cap_create_wait_set` in core/ktest/src/unit/cap.rs.
-fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
+fn cap_create_wait_set(memory_cap: u64) -> Result<u64, i64>
 {
     syscall::wait_set_create(memory_cap, crate::WS_CAPACITY)
 }

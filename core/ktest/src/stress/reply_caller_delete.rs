@@ -196,13 +196,13 @@ static mut CALLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 #[derive(Clone, Copy)]
 struct ServerArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     /// The controller's signal that its delete returned (delete-first
     /// rounds only; 0 for the other orders).
-    go: u32,
+    go: u64,
     /// The capability the cap-kind reply transfers (0 for the other kinds).
-    gift: u32,
+    gift: u64,
     kind: u32,
     /// Spins between the armed report and the reply.
     delay: u32,
@@ -216,6 +216,20 @@ static SERVER_ARGS: spawn::ArgBlock<ServerArgs, 1> = spawn::ArgBlock::new(Server
     kind: 0,
     delay: 0,
 });
+
+/// The caller's arguments, handed to `caller_entry` / `faulter_entry` by
+/// address.
+#[derive(Clone, Copy)]
+struct CallerArgs
+{
+    /// The caller's send copy of the round's endpoint.
+    ep: u64,
+    /// The caller's signal copy of the round's `done` notification.
+    done: u64,
+}
+
+static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 1> =
+    spawn::ArgBlock::new(CallerArgs { ep: 0, done: 0 });
 
 /// Per-run outcome counts of the race rounds (a steered round's outcome is
 /// fixed by its order and checked in that round).
@@ -280,11 +294,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// The round's capabilities, reaped in [`reap`] whatever the round's result.
 struct Round
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     /// The delete-first rounds' `go` notification (0 for the other orders).
-    go: u32,
-    gift: u32,
+    go: u64,
+    gift: u64,
     caller: Option<spawn::SpawnedChild>,
     server: Option<spawn::SpawnedChild>,
 }
@@ -351,20 +365,23 @@ fn run_round(
     // SAFETY: the caller's stack index is this round's only user of it; the
     // previous round's caller was deleted before this one was spawned.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[CALLER_STACK]) });
+    // SAFETY: entry 0 is the round's caller's alone; the previous round's
+    // caller was deleted before this one was spawned.
+    let arg = unsafe {
+        CALLER_ARGS.publish(
+            0,
+            CallerArgs {
+                ep: c_ep,
+                done: c_done,
+            },
+        )
+    };
     if let Some(caller) = round.caller.as_ref()
     {
         // SAFETY: the stack is `super::STRESS_STACKS[CALLER_STACK]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe {
-            spawn::configure_and_start_pinned(
-                caller,
-                entry,
-                stack,
-                u64::from(c_ep) | (u64::from(c_done) << 32),
-                CALLER_CPU,
-            )
-        }
-        .map_err(|_| "stress::reply_caller_delete: start caller failed")?;
+        unsafe { spawn::configure_and_start_pinned(caller, entry, stack, arg, CALLER_CPU) }
+            .map_err(|_| "stress::reply_caller_delete: start caller failed")?;
     }
     let mut acc = 0u64;
     await_report(
@@ -560,11 +577,13 @@ fn classify(acc: u64, order: Order, outcomes: &mut Outcomes) -> TestResult
     }
 }
 
-// cast_possible_truncation: packed fields are 32-bit cap handles.
-#[allow(clippy::cast_possible_truncation)]
-fn unpack(arg: u64) -> (u32, u32)
+/// Read the caller's `(ep, done)` handles from the entry at `arg`.
+fn unpack(arg: u64) -> (u64, u64)
 {
-    ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32)
+    // SAFETY: `arg` is the `CALLER_ARGS.publish` value for this caller; the
+    // entry is not rewritten while the caller lives.
+    let CallerArgs { ep, done } = unsafe { spawn::child_args(arg) };
+    (ep, done)
 }
 
 /// Server: receive the round's caller (arming the reply binding), report the
@@ -655,7 +674,7 @@ extern "C" fn server_entry(arg: u64) -> !
 /// For the cap kind: the reply moves `gift` out of the server's `CSpace`
 /// exactly when it returns `Ok`; a refused reply leaves it in place.
 /// Returns `bit`, or [`BIT_SERVER_BAD`] (tallied) on a mismatch.
-fn check_gift(gift: u32, bit: u64) -> u64
+fn check_gift(gift: u64, bit: u64) -> u64
 {
     let present = cap_info(gift, CAP_INFO_TAG_RIGHTS).is_ok();
     if present == (bit == BIT_REPLY_OK) && bit != BIT_SERVER_BAD

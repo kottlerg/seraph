@@ -49,7 +49,7 @@ fn next_dir_cluster(
     cluster: u32,
     steps: &mut u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<Option<u32>, FatError>
 {
@@ -120,7 +120,7 @@ pub fn find_in_directory(
     name: &[u8],
     state: &mut FatState,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<Option<DirEntry>, FatError>
 {
@@ -171,7 +171,7 @@ fn find_in_fat16_root(
     name: &[u8],
     state: &mut FatState,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<Option<DirEntry>, FatError>
 {
@@ -214,7 +214,7 @@ pub fn find_in_directory_with_location(
     name: &[u8],
     state: &mut FatState,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Option<(DirEntry, DirEntryLocation)>
 {
@@ -396,7 +396,7 @@ pub fn read_dir_entry_at_index(
     index: u64,
     state: &mut FatState,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
 {
@@ -621,7 +621,7 @@ pub fn insert_entry(
     start_cluster: u32,
     size: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<DirEntryLocation, FatError>
 {
@@ -742,7 +742,7 @@ pub fn remove_entry(
     parent_dir_cluster: u32,
     name: &[u8],
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<RemovedEntry, RemoveFailure>
 {
@@ -795,7 +795,7 @@ pub fn remove_entry(
 pub fn restore_slot_first_bytes(
     slots: &[SlotFirstByte],
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
@@ -843,7 +843,7 @@ pub enum DeviceSlotState
 pub fn device_slot_state(
     loc: DirEntryLocation,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> DeviceSlotState
 {
@@ -873,7 +873,7 @@ pub fn update_entry_metadata(
     new_first_cluster: u32,
     new_size: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
@@ -912,7 +912,7 @@ pub fn directory_is_empty(
     state: &mut FatState,
     dir_cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<bool, FatError>
 {
@@ -963,7 +963,7 @@ pub fn write_dot_entries(
     new_dir_cluster: u32,
     parent_cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
@@ -1028,7 +1028,7 @@ fn find_free_slot_run(
     parent_dir_cluster: u32,
     count: usize,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<FreeRunScan<DirEntryLocation>, FatError>
 {
@@ -1101,7 +1101,7 @@ fn find_free_slot_run(
 fn scan_sector_free_run(
     sector_lba: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     buf: &mut [u8],
     scan: &mut FreeRunScan<DirEntryLocation>,
@@ -1131,7 +1131,7 @@ fn zero_cluster(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
@@ -1151,7 +1151,7 @@ fn write_dir_slot(
     loc: DirEntryLocation,
     raw: &[u8; 32],
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
@@ -1244,7 +1244,7 @@ fn generate_sfn(
     parent_dir_cluster: u32,
     name: &[u8],
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<[u8; 11], FatError>
 {
@@ -1377,7 +1377,7 @@ fn for_each_short_name(
     state: &mut FatState,
     parent_dir_cluster: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     mut visit: impl FnMut(&[u8; 11]),
 ) -> Result<(), FatError>
@@ -1444,7 +1444,7 @@ fn for_each_short_name(
 fn visit_sector_short_names(
     sector_lba: u32,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     buf: &mut [u8],
     visit: &mut impl FnMut(&[u8; 11]),
@@ -1480,7 +1480,7 @@ fn locate_entry_with_lfn_run(
     parent_dir_cluster: u32,
     name: &[u8],
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(RemovedEntry, RemoveRunScan<DirEntryLocation>), FatError>
 {
@@ -1556,7 +1556,7 @@ fn scan_sector_for_remove(
     sector_lba: u32,
     name: &[u8],
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
     buf: &mut [u8],
     scan: &mut RemoveRunScan<DirEntryLocation>,
@@ -1601,7 +1601,7 @@ pub fn free_entry_data(
     state: &mut FatState,
     entry: &RemovedEntry,
     cache: &PageCache,
-    block_dev: u32,
+    block_dev: u64,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {

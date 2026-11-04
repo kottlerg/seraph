@@ -335,7 +335,7 @@ pub fn live_cspace_count(ctx: &TestContext) -> TestResult
 
 /// Split a virgin grant of `pages` pages off the top of `ctx.memory_base`,
 /// for the caller to merge back.
-fn split_top(ctx: &TestContext, pages: u64) -> Result<u32, &'static str>
+fn split_top(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "sysinfo::thread_retype_bytes: cap_info(memory_base) failed")?;

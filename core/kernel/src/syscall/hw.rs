@@ -23,9 +23,9 @@
 //! 5. Add a userspace wrapper in `shared/syscall/src/lib.rs`.
 
 // cast_possible_truncation: user-supplied u64 trap-frame args are narrowed to the
-// ABI's u32 capability handles and IRQ ids, keeping the low 32 bits (upper bits
-// are discarded). The remaining narrowings (u64->usize on 64-bit targets, the
-// IoPort u32->u16 halves) are lossless or range-checked beside the cast.
+// ABI's u32 IRQ ids, keeping the low 32 bits (upper bits are discarded). The
+// remaining narrowings (u64->usize on 64-bit targets, the IoPort u32->u16
+// halves) are lossless or range-checked beside the cast.
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
@@ -57,7 +57,7 @@ pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::IrqRights;
     use crate::syscall::current_tcb;
 
-    let irq_cap_idx = tf.arg(0) as u32;
+    let irq_cap_idx = tf.arg(0);
 
     // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
     // CPU's current thread.
@@ -141,8 +141,8 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{IrqRights, NtfRights};
     use crate::syscall::current_tcb;
 
-    let irq_cap_idx = tf.arg(0) as u32;
-    let sig_cap_idx = tf.arg(1) as u32;
+    let irq_cap_idx = tf.arg(0);
+    let sig_cap_idx = tf.arg(1);
     let mode = tf.arg(2);
     if mode & !syscall::IRQ_MODE_MASK != 0
     {
@@ -268,8 +268,8 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Virtual address must be page-aligned and in user half.
     let user_va_top = crate::mm::user_va_top();
-    let aspace_idx = tf.arg(0) as u32;
-    let mmio_idx = tf.arg(1) as u32;
+    let aspace_idx = tf.arg(0);
+    let mmio_idx = tf.arg(1);
 
     let virt_base = tf.arg(2);
     let flags = tf.arg(3);
@@ -424,8 +424,8 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
         use crate::cap::slot::{IoPortRights, ThreadRights};
         use crate::syscall::current_tcb;
 
-        let thread_idx = tf.arg(0) as u32;
-        let ioport_idx = tf.arg(1) as u32;
+        let thread_idx = tf.arg(0);
+        let ioport_idx = tf.arg(1);
 
         // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
         // CPU's current thread.
@@ -579,7 +579,7 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
-    let mmio_handle = tf.arg(0) as u32;
+    let mmio_handle = tf.arg(0);
     let split_offset = tf.arg(1);
     // arg2 is reserved; ignore.
 
@@ -694,8 +694,8 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
     // Deliver both child handles: first in the primary return register, second
     // in the secondary (rdx / a1). Never packed into one word, so a high
     // generation cannot set the sign bit of the i64 return (#349).
-    tf.set_ipc_return(u64::from(handle1), u64::from(handle2));
-    Ok(u64::from(handle1))
+    tf.set_ipc_return(handle1, handle2);
+    Ok(handle1)
 }
 
 #[cfg(test)]
@@ -729,7 +729,7 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
-    let irq_handle = tf.arg(0) as u32;
+    let irq_handle = tf.arg(0);
     let split_at = tf.arg(1) as u32;
     // arg2 reserved.
 
@@ -817,8 +817,8 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     }?;
     // Deliver both child handles: first in the primary return register, second
     // in the secondary (rdx / a1). Never packed into one word (#349).
-    tf.set_ipc_return(u64::from(handle1), u64::from(handle2));
-    Ok(u64::from(handle1))
+    tf.set_ipc_return(handle1, handle2);
+    Ok(handle1)
 }
 
 #[cfg(test)]
@@ -863,7 +863,7 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         use crate::cap::split::install_split_children;
         use crate::syscall::current_tcb;
 
-        let port_handle = tf.arg(0) as u32;
+        let port_handle = tf.arg(0);
         let split_at_raw = tf.arg(1);
         // arg2 reserved.
 
@@ -980,8 +980,8 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         }?;
         // Deliver both child handles: first in the primary return register,
         // second in the secondary (rdx / a1). Never packed into one word (#349).
-        tf.set_ipc_return(u64::from(handle1), u64::from(handle2));
-        Ok(u64::from(handle1))
+        tf.set_ipc_return(handle1, handle2);
+        Ok(handle1)
     }
 }
 

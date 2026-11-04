@@ -25,7 +25,7 @@ use syscall_abi::PAGE_SIZE;
 /// otherwise what `read` returns.
 fn with_mapped<R>(
     caps: &DevmgrCaps,
-    cap: u32,
+    cap: u64,
     first_page: u64,
     page_count: u64,
     read: impl FnOnce(&[u8]) -> Option<R>,

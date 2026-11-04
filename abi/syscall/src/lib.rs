@@ -47,94 +47,74 @@ pub const PAGE_SIZE: u64 = 0x1000;
 
 /// Number of low bits in a capability handle that hold the `CSpace` slot index.
 ///
-/// The remaining high bits hold a per-slot generation counter (see
-/// [`cap_handle_gen`]). 24 index bits cover the maximum `CSpace` capacity with
-/// generous headroom; the kernel static-asserts that its slot capacity fits.
-pub const CAP_INDEX_BITS: u32 = 24;
+/// A handle is a `u64`: the slot index in bits `0..CAP_INDEX_BITS` and the
+/// per-slot generation (see [`cap_handle_gen`]) in the bits above it. The
+/// index field is wider than any `CSpace` the kernel can build; the kernel
+/// static-asserts that its structural slot ceiling fits it, so the ceiling is
+/// set by the kernel's directory, not by the handle.
+pub const CAP_INDEX_BITS: u32 = 32;
 
 /// Mask selecting the slot-index bits of a capability handle.
-pub const CAP_INDEX_MASK: u32 = (1u32 << CAP_INDEX_BITS) - 1;
+pub const CAP_INDEX_MASK: u64 = (1u64 << CAP_INDEX_BITS) - 1;
 
-// Generation (8 bits) plus index (`CAP_INDEX_BITS`) must fit in the u32 handle.
-// The handle is returned to userspace in a u64 register and reinterpreted as
-// i64 by the dispatcher; a u32 zero-extends with bit 63 clear, so a single-cap
-// return is never misread as a negative error code.
-const _: () = assert!(CAP_INDEX_BITS + 8 <= 32);
+/// Number of significant generation bits in a capability handle.
+///
+/// The generation occupies bits `CAP_INDEX_BITS..CAP_INDEX_BITS +
+/// CAP_GEN_BITS`, and the kernel wraps a slot's generation at
+/// `1 << CAP_GEN_BITS`. Bit 63 of a handle is therefore always clear: a
+/// handle is returned in the primary syscall return register, which the
+/// wrappers read as `i64` and treat as an error when negative.
+pub const CAP_GEN_BITS: u32 = 31;
+
+/// Mask selecting the significant bits of a per-slot generation (the value the
+/// kernel wraps a slot's generation into).
+pub const CAP_GEN_MASK: u32 = (1u32 << CAP_GEN_BITS) - 1;
+
+// The index and the generation fill the handle up to, not including, the sign
+// bit of the primary return register.
+const _: () = assert!(CAP_INDEX_BITS + CAP_GEN_BITS == 63);
 
 /// Build a capability handle from a slot `index` and per-slot `generation`.
 ///
 /// The handle userspace receives and passes back is
-/// `(generation << CAP_INDEX_BITS) | index`. A `generation` of `0` makes the
-/// handle numerically equal to the bare index, so a long-lived cap minted once
-/// and never recycled keeps its historical handle value under this encoding
-/// (the backward-compatibility hinge).
+/// `(generation << CAP_INDEX_BITS) | index`, with `generation` taken modulo
+/// `1 << CAP_GEN_BITS`. A `generation` of `0` makes the handle numerically
+/// equal to the bare index, so a cap minted once and never recycled has the
+/// handle value of its index, and handle `0` names the permanently null slot.
 #[inline]
 #[must_use]
-// `u32::from` is not const-stable; the `u8 -> u32` widening cast is exact.
-#[allow(clippy::cast_lossless)]
-pub const fn cap_handle_encode(index: u32, generation: u8) -> u32
+pub const fn cap_handle_encode(index: u32, generation: u32) -> u64
 {
-    ((generation as u32) << CAP_INDEX_BITS) | (index & CAP_INDEX_MASK)
+    // `u64::from` is not const-stable; both `u32 -> u64` widening casts are exact.
+    #[allow(clippy::cast_lossless)]
+    let handle = (((generation & CAP_GEN_MASK) as u64) << CAP_INDEX_BITS) | index as u64;
+    handle
 }
 
 /// Extract the slot index from a capability handle.
 #[inline]
 #[must_use]
-pub const fn cap_handle_index(handle: u32) -> u32
+pub const fn cap_handle_index(handle: u64) -> u32
 {
-    handle & CAP_INDEX_MASK
+    // `& CAP_INDEX_MASK` leaves at most 32 significant bits, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let index = (handle & CAP_INDEX_MASK) as u32;
+    index
 }
 
 /// Extract the per-slot generation from a capability handle.
+///
+/// Returns every bit above the index field, so a handle with bit 63 set (one
+/// no kernel-issued handle has) yields a value above [`CAP_GEN_MASK`], which
+/// matches no slot's generation.
 #[inline]
 #[must_use]
-// `>> CAP_INDEX_BITS` leaves at most 8 significant bits, so the `as u8` is exact.
-#[allow(clippy::cast_possible_truncation)]
-pub const fn cap_handle_gen(handle: u32) -> u8
+pub const fn cap_handle_gen(handle: u64) -> u32
 {
-    (handle >> CAP_INDEX_BITS) as u8
-}
-
-/// Pack up to [`MSG_CAP_SLOTS_MAX`] cap handles into the two IPC transfer
-/// words: two 32-bit **full** handles per word (handles 0/1 in the low
-/// word, 2/3 in the high word). Carrying the whole handle — index plus
-/// per-slot generation — lets the kernel generation-validate the sender's
-/// named slots and fail a stale, recycled handle closed. The inverse of
-/// [`unpack_cap_handles`]; both ends of the wire use this one encoding.
-/// Handles beyond [`MSG_CAP_SLOTS_MAX`] are silently ignored.
-#[must_use]
-pub fn pack_cap_handles(handles: &[u32]) -> (u64, u64)
-{
-    let mut lo: u64 = 0;
-    let mut hi: u64 = 0;
-    for (i, &handle) in handles.iter().take(MSG_CAP_SLOTS_MAX).enumerate()
-    {
-        let word = if i < 2 { &mut lo } else { &mut hi };
-        *word |= u64::from(handle) << ((i % 2) * 32);
-    }
-    (lo, hi)
-}
-
-/// Unpack `count` cap handles from the two IPC transfer words packed by
-/// [`pack_cap_handles`].
-#[must_use]
-pub fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
-{
-    let mut out = [0u32; MSG_CAP_SLOTS_MAX];
-    for (i, item) in out
-        .iter_mut()
-        .enumerate()
-        .take(count.min(MSG_CAP_SLOTS_MAX))
-    {
-        let word = if i < 2 { lo } else { hi };
-        let shift = (i % 2) * 32;
-        // cast_possible_truncation: deliberate — each 32-bit field is one handle.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            *item = (word >> shift) as u32;
-        }
-    }
-    out
+    // `>> CAP_INDEX_BITS` leaves at most 32 significant bits, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let generation = (handle >> CAP_INDEX_BITS) as u32;
+    generation
 }
 
 // ── Retype costs ──────────────────────────────────────────────────────────────
@@ -576,11 +556,22 @@ pub const MSG_DATA_WORDS_MAX: usize = 64;
 
 /// Maximum number of capability slots transferable in a single IPC message.
 ///
-/// Four is an encoding artefact: the handles travel two `u32`s per transfer
-/// register (`pack_cap_handles`). It bounds caps per message, not per
+/// A protocol width, not a capacity: it fixes the cap block of the IPC buffer
+/// page (the sender's handles at [`MSG_CAP_HANDLES_WORD`], the receiver's
+/// result block at word `MSG_DATA_WORDS_MAX`) and the IPC receive reserve
+/// ([`CSPACE_IPC_RECV_RESERVE`]). It bounds caps per message, not per
 /// transfer: every protocol that moves more caps iterates over rounds, as the
 /// `shared/ipc` bootstrap rounds and procmgr's `DONATE_MEMORY_CAPS` rounds do.
 pub const MSG_CAP_SLOTS_MAX: usize = 4;
+
+/// IPC buffer word at which a sender places the capability handles a
+/// `SYS_IPC_CALL` or `SYS_IPC_REPLY` transfers: handle `i` (of the call's
+/// `cap_count`) at word `MSG_CAP_HANDLES_WORD + i`, one full 64-bit handle per
+/// word. The kernel reads them from the sending thread's IPC buffer page when
+/// `cap_count` is non-zero. The receive side's result block shares the layout:
+/// the delivered count at word `MSG_DATA_WORDS_MAX`, the delivered handles from
+/// this word on.
+pub const MSG_CAP_HANDLES_WORD: usize = MSG_DATA_WORDS_MAX + 1;
 
 /// Free slots every `CSpace` keeps back from general allocations for IPC
 /// capability transfer: one message's worth ([`MSG_CAP_SLOTS_MAX`]). A
@@ -629,10 +620,9 @@ pub const fn cspace_topup_pages(headroom: u64, budget_bytes: u64, slots: u64) ->
     pages + 1
 }
 
-// The two-word transfer layout (`pack_cap_handles` / `unpack_cap_handles`)
-// holds exactly four 32-bit fields; raising MSG_CAP_SLOTS_MAX past 4 would
-// silently alias fields. Trip at compile time instead.
-const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
+// The cap block (count word plus the handles) must stay inside the one IPC
+// buffer page the kernel reads and writes.
+const _: () = assert!(((MSG_CAP_HANDLES_WORD + MSG_CAP_SLOTS_MAX) * 8) as u64 <= PAGE_SIZE);
 
 /// Synthetic reply label written to the caller's IPC message by the kernel
 /// when `SYS_IPC_REPLY` cannot deliver the server's reply intact: rejected
@@ -719,7 +709,7 @@ pub const IRQ_MODE_MASK: u64 = IRQ_MODE_LEVEL | IRQ_MODE_ACTIVE_LOW;
 //
 // `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters
 // and the rights half of `CAP_INFO_TAG_RIGHTS`. Rights are scoped per
-// capability type: the kernel stores one 32-bit rights word per slot and
+// capability type: the kernel stores one 16-bit rights word per slot and
 // interprets it through the slot's type tag, so every type numbers its bits
 // from 0 in its own full-width space. These constants are the single source
 // of truth; the kernel's typed rights constants are derived from them.
@@ -1236,35 +1226,36 @@ mod tests
         assert_eq!(cspace_topup_pages(256 + s - 1, p, 256), 2);
     }
 
+    // Defects guarded: an encode or decode that drops index or generation bits
+    // (a 32-bit truncation anywhere names the gen-0 handle of the index), a
+    // generation that reaches bit 63 (a kernel-issued handle then reads as an
+    // error code), and a gen-0 handle that differs from its bare index.
     #[test]
-    fn cap_handle_pack_round_trips_all_four_fields()
+    fn cap_handle_round_trips_full_index_and_generation_ranges()
     {
-        // Populated handles with distinct generations, including indices in
-        // both the low and high packed words — the lo/hi boundary is where
-        // the two ends of the wire could disagree.
-        let handles = [
-            cap_handle_encode(1, 0),
-            cap_handle_encode(0xFFFF, 3),
-            cap_handle_encode(70_000, 255),
-            cap_handle_encode(CAP_INDEX_MASK, 7),
-        ];
-        let (lo, hi) = pack_cap_handles(&handles);
-        assert_eq!(unpack_cap_handles(lo, hi, 4), handles);
-
-        // Partial counts leave the untransmitted tail zeroed.
-        let (lo, hi) = pack_cap_handles(&handles[..2]);
-        assert_eq!(hi, 0);
-        let out = unpack_cap_handles(lo, hi, 2);
-        assert_eq!(&out[..2], &handles[..2]);
-        assert_eq!(&out[2..], &[0, 0]);
+        for &index in &[0u32, 1, 255, 70_000, 3_677_183, u32::MAX]
+        {
+            for &generation in &[0u32, 1, 255, 256, 1 << 24, CAP_GEN_MASK]
+            {
+                let h = cap_handle_encode(index, generation);
+                assert_eq!(cap_handle_index(h), index);
+                assert_eq!(cap_handle_gen(h), generation);
+                assert_eq!(h >> 63, 0, "bit 63 set in {h:#x}");
+            }
+        }
+        assert_eq!(cap_handle_encode(7, 0), 7);
+        // The generation wraps at 1 << CAP_GEN_BITS.
+        assert_eq!(cap_handle_encode(7, CAP_GEN_MASK + 1), 7);
+        // A handle with bit 63 set decodes to a generation no slot carries.
+        assert!(cap_handle_gen(1u64 << 63) > CAP_GEN_MASK);
     }
 
     // Defects guarded: a per-bit rights constant that overlaps another bit of
     // the same capability type (attenuating one right would silently attenuate
-    // the other), and a bit at position >= 32 (silently truncated by the
-    // kernel's u64 -> u32 rights decode).
+    // the other), and a bit at position >= 16 (dropped by the kernel's 16-bit
+    // slot rights word).
     #[test]
-    fn per_type_rights_bits_are_single_disjoint_and_fit_u32()
+    fn per_type_rights_bits_are_single_disjoint_and_fit_u16()
     {
         let spaces: &[&[u64]] = &[
             // Memory
@@ -1320,8 +1311,8 @@ mod tests
                     "rights bit {bit:#x} is not a single bit"
                 );
                 assert!(
-                    bit < (1u64 << 32),
-                    "rights bit {bit:#x} exceeds the 32-bit slot word"
+                    bit < (1u64 << 16),
+                    "rights bit {bit:#x} exceeds the 16-bit slot word"
                 );
                 assert_eq!(
                     seen & bit,

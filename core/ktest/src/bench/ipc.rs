@@ -24,8 +24,8 @@ static mut BENCH_IPC_STACK: ChildStack = ChildStack::ZERO;
 #[derive(Clone, Copy)]
 struct CallerArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     n: u64,
 }
 
@@ -107,8 +107,8 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
 /// cannot be set up.
 fn run_round_trips(
     ctx: &crate::TestContext,
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     child: &spawn::SpawnedChild,
     iters: u32,
 )

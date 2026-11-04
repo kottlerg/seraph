@@ -19,6 +19,22 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
 
+/// Per-child arguments, handed to `spinner_entry` by address.
+#[derive(Clone, Copy)]
+struct SpinnerArgs
+{
+    /// The child's copy of the parent's `running` notification.
+    running: u64,
+    /// The child's bit on `running`.
+    index: usize,
+}
+
+static SPINNER_ARGS: spawn::ArgBlock<SpinnerArgs, NUM_CHILDREN> =
+    spawn::ArgBlock::new(SpinnerArgs {
+        running: 0,
+        index: 0,
+    });
+
 /// The children's guards; the first `spawned` hold live children.
 struct Children
 {
@@ -74,7 +90,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Start every child, each reporting on its copy of `running`, recording each
 /// in `children` as soon as it exists.
-fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> TestResult
+fn spawn_children(ctx: &TestContext, running: u64, children: &mut Children) -> TestResult
 {
     for i in 0..NUM_CHILDREN
     {
@@ -84,8 +100,17 @@ fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> T
         let child = &children.guards[i];
         let child_running = cap_copy(running, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_delete_running: cap_copy running failed")?;
-        // arg packs running_slot[31:0] | child index[63:32].
-        let arg = u64::from(child_running) | ((i as u64) << 32);
+        // SAFETY: i < NUM_CHILDREN; child i has not started, and the entry's
+        // previous child, from an earlier run, has been deleted.
+        let arg = unsafe {
+            SPINNER_ARGS.publish(
+                i,
+                SpinnerArgs {
+                    running: child_running,
+                    index: i,
+                },
+            )
+        };
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
@@ -97,15 +122,12 @@ fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> T
     Ok(())
 }
 
-/// Report on `running` (the low half of `arg`) with this child's bit (the
-/// high half), then spin with no syscalls.
-// cast_possible_truncation: the low half is a 32-bit cap handle and the high
-// half a child index below NUM_CHILDREN.
-#[allow(clippy::cast_possible_truncation)]
+/// Report on `running` with this child's bit (both from the [`SpinnerArgs`]
+/// entry at `arg`), then spin with no syscalls.
 extern "C" fn spinner_entry(arg: u64) -> !
 {
-    let running = arg as u32;
-    let index = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry `spawn_children` published for this child.
+    let SpinnerArgs { running, index } = unsafe { spawn::child_args(arg) };
     // A failed send fails the parent's bounded wait for the bit.
     notification_send(running, 1u64 << index).ok();
     loop

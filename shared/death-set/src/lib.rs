@@ -40,12 +40,12 @@ const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
 pub struct DeathSet
 {
     /// The main wait set; replaced when the queues fill it.
-    ws_cap: Cell<u32>,
+    ws_cap: Cell<u64>,
     /// The dedicated grant the main wait set was retyped from, returned to
     /// memmgr when a replacement deletes the set; `None` while the set is a
     /// sub-page retype the runtime reclaims itself.
     ws_grant: Cell<Option<ObjectGrant>>,
-    service_ep: u32,
+    service_ep: u64,
     service_badge: u64,
     death_badge: u64,
     /// Ring capacity of each death queue. The kernel drops a death post to
@@ -64,7 +64,7 @@ impl DeathSet
     /// nodes. `None` if any of them cannot be funded, created, or added.
     #[must_use]
     pub fn new(
-        service_ep: u32,
+        service_ep: u64,
         service_badge: u64,
         death_badge: u64,
         entries: u32,
@@ -99,7 +99,7 @@ impl DeathSet
     /// The main wait set to wait on. It changes when the queues outgrow it,
     /// so the main loop reads it before every wait.
     #[must_use]
-    pub fn ws_cap(&self) -> u32
+    pub fn ws_cap(&self) -> u64
     {
         self.ws_cap.get()
     }
@@ -117,7 +117,7 @@ impl DeathSet
     /// its memory returned); or the `SYS_WAIT_SET_REMOVE` /
     /// `SYS_WAIT_SET_ADD` error that stopped the move into a wider set
     /// (every member is back in the old one).
-    pub fn bind_thread(&self, thread_cap: u32, correlator: u64) -> Result<(), i64>
+    pub fn bind_thread(&self, thread_cap: u64, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::thread_bind_notification(thread_cap, q, correlator))
     }
@@ -128,14 +128,14 @@ impl DeathSet
     /// # Errors
     /// The `SYS_ASPACE_BIND_NOTIFICATION` error, or a growth error as for
     /// [`Self::bind_thread`].
-    pub fn bind_aspace(&self, aspace_cap: u32, correlator: u64) -> Result<(), i64>
+    pub fn bind_aspace(&self, aspace_cap: u64, correlator: u64) -> Result<(), i64>
     {
         self.bind(|q| syscall::aspace_bind_notification(aspace_cap, q, correlator))
     }
 
     fn bind<B>(&self, bind: B) -> Result<(), i64>
     where
-        B: FnMut(u32) -> Result<(), i64>,
+        B: FnMut(u64) -> Result<(), i64>,
     {
         let mut queues = self.queues.borrow_mut();
         let made = queues.queues().len();
@@ -159,12 +159,12 @@ impl DeathSet
     /// Replace the main wait set with one of `members` members and move the
     /// service endpoint and every queue in `queues` across. On any failure
     /// every member is back in the old set and the new one is deleted.
-    fn replace_wait_set(&self, queues: &[u32], members: u32) -> Result<(), i64>
+    fn replace_wait_set(&self, queues: &[u64], members: u32) -> Result<(), i64>
     {
         let old = self.ws_cap.get();
         // Reserve before creating the new set, so a heap that cannot hold
         // the move list leaves no new set behind.
-        let mut moved: Vec<(u32, u64)> = Vec::new();
+        let mut moved: Vec<(u64, u64)> = Vec::new();
         moved
             .try_reserve_exact(queues.len() + 1)
             .map_err(|_| OUT_OF_MEMORY)?;
@@ -234,7 +234,7 @@ impl DeathSet
 /// Fund and create a wait set of `members` members from the service's
 /// memory, with the dedicated grant it was retyped from when it is
 /// page-sized (32 members or more), for [`delete_object`] to return.
-fn create_wait_set(members: u32) -> Result<(u32, Option<ObjectGrant>), i64>
+fn create_wait_set(members: u32) -> Result<(u64, Option<ObjectGrant>), i64>
 {
     std::os::seraph::object_slab_retype_reclaimable(
         std::os::seraph::wait_set_retype_bytes(u64::from(members)),
@@ -247,7 +247,7 @@ fn create_wait_set(members: u32) -> Result<(u32, Option<ObjectGrant>), i64>
 /// the dedicated grant it was retyped from, if any, to memmgr's pool;
 /// deleting the object alone would leave the grant's pages charged to the
 /// service for its life.
-fn delete_object(cap: u32, grant: Option<ObjectGrant>)
+fn delete_object(cap: u64, grant: Option<ObjectGrant>)
 {
     let _ = syscall::cap_delete(cap);
     if let Some(grant) = grant
@@ -262,12 +262,12 @@ fn delete_object(cap: u32, grant: Option<ObjectGrant>)
 /// A refused grant is `OutOfMemory`, which the policy retries at a smaller
 /// pool.
 fn create_queue(
-    ws_cap: u32,
+    ws_cap: u64,
     ws_badge: u64,
     entries: u32,
     observers: u32,
     made: usize,
-) -> Result<u32, i64>
+) -> Result<u64, i64>
 {
     let bytes = std::os::seraph::event_queue_retype_bytes(u64::from(entries), u64::from(observers));
     let (queue, grant) = std::os::seraph::object_slab_retype_reclaimable(bytes, |slab| {

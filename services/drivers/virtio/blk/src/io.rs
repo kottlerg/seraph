@@ -209,7 +209,7 @@ pub fn submit_and_wait(
     vq: &mut SplitVirtqueue,
     transport: &PciTransport,
     queue_notify_off: u16,
-    completion: u32,
+    completion: u64,
 ) -> IoOutcome
 {
     layout.prepare(dir, sector);

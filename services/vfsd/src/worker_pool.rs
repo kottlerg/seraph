@@ -54,9 +54,9 @@ pub struct BootstrapOrder
     /// Badge the child carries on its REQUEST; identifies which order to fill.
     pub badge: u64,
     /// Partition-scoped (badged) SEND cap on virtio-blk's service endpoint.
-    pub blk: u32,
+    pub blk: u64,
     /// Service-endpoint cap with `RIGHTS_ALL` for the new fatfs instance.
-    pub service: u32,
+    pub service: u64,
 }
 
 /// Spawn a process from a caller-resolved file cap via procmgr. The active
@@ -65,11 +65,11 @@ pub struct BootstrapOrder
 /// when the child REQUESTs.
 pub struct CreateFromFileOrder
 {
-    pub procmgr_ep: u32,
+    pub procmgr_ep: u64,
     /// Badged SEND on the owning fs driver's namespace endpoint
     /// addressing the binary node. Ownership transferred to the worker;
     /// the worker forwards it to procmgr in `caps[0]` of `CREATE_FROM_FILE`.
-    pub file_cap: u32,
+    pub file_cap: u64,
     /// File size as reported by the resolving `NS_LOOKUP`'s size hint;
     /// rides as data word 0 of `CREATE_FROM_FILE` so procmgr can bound
     /// header / section walks during ELF load.
@@ -77,7 +77,7 @@ pub struct CreateFromFileOrder
     /// Badged SEND cap on the bootstrap endpoint, derived by the caller and
     /// moved to the worker. Forwarded to procmgr as the child's
     /// `creator_endpoint`.
-    pub badged_creator: u32,
+    pub badged_creator: u64,
     /// The bootstrap caps to deliver once the child REQUESTs.
     pub bootstrap: BootstrapOrder,
 }
@@ -124,8 +124,8 @@ impl WorkHandle
 pub struct PendingBootstrap
 {
     pub badge: u64,
-    pub blk: u32,
-    pub service: u32,
+    pub blk: u64,
+    pub service: u64,
     pub channel: Channel,
 }
 
@@ -179,7 +179,7 @@ impl ActiveState
 /// a small pool of active workers.
 pub struct WorkerPool
 {
-    bootstrap_ep: u32,
+    bootstrap_ep: u64,
     bootstrap_state: Arc<Mutex<BootstrapState>>,
     active_state: Arc<ActiveState>,
 }
@@ -223,7 +223,7 @@ impl WorkerPool
 
     /// SEND cap on the bootstrap endpoint. The main thread derives badged
     /// SEND copies of this cap as the `creator_endpoint` handed to each child.
-    pub fn bootstrap_ep(&self) -> u32
+    pub fn bootstrap_ep(&self) -> u64
     {
         self.bootstrap_ep
     }
@@ -331,7 +331,7 @@ pub fn take_pending_by_badge(state: &Mutex<BootstrapState>, badge: u64)
 }
 
 /// Delete the two caps of a bootstrap order that never reached its child.
-pub fn delete_bootstrap_caps(blk: u32, service: u32)
+pub fn delete_bootstrap_caps(blk: u64, service: u64)
 {
     let _ = syscall::cap_delete(blk);
     let _ = syscall::cap_delete(service);

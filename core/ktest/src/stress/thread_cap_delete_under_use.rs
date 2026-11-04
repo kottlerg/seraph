@@ -82,7 +82,7 @@
 //!
 //! Needs **≥ 3 CPUs**.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_create_endpoint, cap_create_notification, cap_create_thread, cap_delete,
@@ -181,10 +181,10 @@ static CALLER_EXITED: AtomicU32 = AtomicU32::new(0);
 static ROUND: AtomicU32 = AtomicU32::new(0);
 /// The handle the caller uses in the open round, published before the round
 /// opens.
-static HANDLE: AtomicU32 = AtomicU32::new(0);
+static HANDLE: AtomicU64 = AtomicU64::new(0);
 /// The phase's endpoint, which the caller binds as the target's fault
 /// handler.
-static ENDPOINT: AtomicU32 = AtomicU32::new(0);
+static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 /// The call the caller is inside (one of the call constants), or `NONE`.
 static IN_CALL: AtomicU32 = AtomicU32::new(NONE);
 /// Per call, the results that returned `Ok`.
@@ -299,17 +299,11 @@ fn report(landed: &[u32; 8]) -> TestResult
 /// inside that call (`NONE`: outside any).
 fn phase(ctx: &TestContext, free: Free) -> Result<[u32; 8], &'static str>
 {
-    for counter in [
-        &QUIT,
-        &CALLER_EXITED,
-        &ROUND,
-        &HANDLE,
-        &IN_CALL,
-        &VANISHED_ROUNDS,
-    ]
+    for counter in [&QUIT, &CALLER_EXITED, &ROUND, &IN_CALL, &VANISHED_ROUNDS]
     {
         counter.store(0, Ordering::Release);
     }
+    HANDLE.store(0, Ordering::Release);
     for counter in &OKS
     {
         counter.store(0, Ordering::Release);
@@ -350,16 +344,9 @@ fn phase(ctx: &TestContext, free: Free) -> Result<[u32; 8], &'static str>
 /// Create the caller in ktest's own `CSpace` (so the handles it uses are the
 /// controller's), configured to report on `done`, pinned to its CPU, and
 /// start it. The caller is recorded in `slot` before anything else can fail.
-fn start_caller(ctx: &TestContext, done: u32, slot: &mut Option<u32>) -> TestResult
+fn start_caller(ctx: &TestContext, done: u64, slot: &mut Option<u64>) -> TestResult
 {
-    let th = create_thread(
-        ctx,
-        slot,
-        caller_entry,
-        CALLER_STACK,
-        CALLER_CPU,
-        u64::from(done),
-    )?;
+    let th = create_thread(ctx, slot, caller_entry, CALLER_STACK, CALLER_CPU, done)?;
     thread_start(th).map_err(|_| "stress::thread_cap_delete_under_use: start caller failed")
 }
 
@@ -368,12 +355,12 @@ fn start_caller(ctx: &TestContext, done: u32, slot: &mut Option<u32>) -> TestRes
 /// recorded in `slot` before anything else can fail; its handle is returned.
 fn create_thread(
     ctx: &TestContext,
-    slot: &mut Option<u32>,
+    slot: &mut Option<u64>,
     entry: extern "C" fn(u64) -> !,
     stack: usize,
     cpu: u32,
     arg: u64,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let th = *slot.insert(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
@@ -401,7 +388,7 @@ fn create_thread(
 /// wait for the caller's report that the handle is gone. Tallies, in
 /// `landed`, which call the caller was flagged inside when the free was
 /// issued.
-fn round(ctx: &TestContext, free: Free, cycle: u32, done: u32, landed: &mut [u32; 8])
+fn round(ctx: &TestContext, free: Free, cycle: u32, done: u64, landed: &mut [u32; 8])
 -> TestResult
 {
     let mut target = None;
@@ -508,7 +495,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 
 /// Set [`QUIT`], wait, bounded, for the caller to exit, and check it exited
 /// voluntarily.
-fn finish(caller: u32) -> TestResult
+fn finish(caller: u64) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     let reason = spawn::wait_until_exited(caller, crate::scaled_polls(EXIT_POLLS))
@@ -529,9 +516,7 @@ fn finish(caller: u32) -> TestResult
 /// (the argument); exit once told to quit.
 extern "C" fn caller_entry(arg: u64) -> !
 {
-    // cast_possible_truncation: the argument is a 32-bit cap handle.
-    #[allow(clippy::cast_possible_truncation)]
-    let done = arg as u32;
+    let done = arg;
     let mut regs = [0u8; REGS_BUF];
     let mut seen_round = 0u32;
     loop
@@ -560,7 +545,7 @@ extern "C" fn caller_entry(arg: u64) -> !
 
 /// Run one group of calls through `handle`; returns `false` once a call has
 /// found the handle gone.
-fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
+fn group(handle: u64, regs: &mut [u8; REGS_BUF]) -> bool
 {
     let ep = ENDPOINT.load(Ordering::Acquire);
     let refused = SyscallError::InvalidState as i64;

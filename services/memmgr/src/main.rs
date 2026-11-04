@@ -259,7 +259,7 @@ static mut LEDGER: MemLedger = Ledger::new(
 
 /// memmgr's own `AddressSpace` cap, for arena and index page maps and their
 /// page-table funding. Set once at boot.
-static mut SELF_ASPACE: u32 = 0;
+static mut SELF_ASPACE: u64 = 0;
 
 // static_mut_refs: `LEDGER` is reached only through this accessor, and memmgr
 // is single-threaded, so the one `&mut` each handler takes is never aliased.
@@ -271,7 +271,7 @@ fn ledger_mut() -> &'static mut MemLedger
     unsafe { &mut LEDGER }
 }
 
-fn self_aspace() -> u32
+fn self_aspace() -> u64
 {
     // SAFETY: single-threaded; written once in `ledger_init`.
     unsafe { SELF_ASPACE }
@@ -281,7 +281,7 @@ fn self_aspace() -> u32
 /// #39). Called once at boot, before any page is carved. A failed draw — a
 /// kernel-contract violation once the pool is seeded — degrades to the
 /// deterministic default base.
-fn ledger_init(self_aspace_cap: u32)
+fn ledger_init(self_aspace_cap: u64)
 {
     let low_base = match syscall::random_u64()
     {
@@ -306,13 +306,13 @@ fn ledger_init(self_aspace_cap: u32)
 // ── Pool primitives ──────────────────────────────────────────────────────────
 
 /// The kernel's `memory_split` as the pool's injected split.
-fn split(cap: u32, offset: u64) -> Option<u32>
+fn split(cap: u64, offset: u64) -> Option<u64>
 {
     syscall::memory_split(cap, offset).ok()
 }
 
 /// The kernel's `memory_merge` as the pool's injected merge.
-fn merge(parent: u32, tail: u32) -> bool
+fn merge(parent: u64, tail: u64) -> bool
 {
     syscall::memory_merge(parent, tail).is_ok()
 }
@@ -359,7 +359,7 @@ fn push_last_resort(l: &mut MemLedger, run: FreeRun)
 /// the remainder of the split that produced it, which needs no slot and so
 /// leaves a slot an enclosing take freed for that take's own return; else
 /// into a free slot, the reserve included ([`push_last_resort`]).
-fn return_taken(l: &mut MemLedger, cap_slot: u32, pages: u32, phys_base: u64)
+fn return_taken(l: &mut MemLedger, cap_slot: u64, pages: u32, phys_base: u64)
 {
     let run = FreeRun {
         cap_slot,
@@ -411,7 +411,7 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
 /// `va` MUST be the next unmapped page of the arena layout or of the index
 /// window: a page of memmgr's private zones (the zone map above) that nothing
 /// maps yet and where no image, stack, or IPC page lies.
-unsafe fn map_self_page(l: &mut MemLedger, cap: u32, va: u64) -> bool
+unsafe fn map_self_page(l: &mut MemLedger, cap: u64, va: u64) -> bool
 {
     for _ in 0..=PT_FUND_ROUNDS
     {
@@ -631,7 +631,7 @@ const INIT_SELF_BADGE: u64 = u64::MAX - 1;
 #[derive(Clone, Copy, Default)]
 struct BootInUse
 {
-    cap_slot: u32,
+    cap_slot: u64,
     page_count: u32,
     phys_base: u64,
     kind: u64,
@@ -639,10 +639,10 @@ struct BootInUse
 
 struct InitBootstrap
 {
-    service_ep: u32,
+    service_ep: u64,
     procmgr_badge: u64,
-    memory_base: u32,
-    memory_count: u32,
+    memory_base: u64,
+    memory_count: u64,
     // Cannot fill: init forwards one arena each for memmgr, procmgr and
     // itself, one under `MAX_IN_USE`.
     in_use: [BootInUse; ipc::memmgr_bootstrap::MAX_IN_USE],
@@ -652,8 +652,8 @@ struct InitBootstrap
 }
 
 fn bootstrap_from_init(
-    creator_ep: u32,
-    self_aspace_cap: u32,
+    creator_ep: u64,
+    self_aspace_cap: u64,
     ipc_buf: *mut u64,
 ) -> Option<InitBootstrap>
 {
@@ -710,17 +710,18 @@ fn bootstrap_from_init(
     for (i, entry) in in_use.iter_mut().enumerate().take(in_use_count)
     {
         let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
-        // SAFETY: base + 2 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the mapped page.
-        let (w0, phys_base, kind) = unsafe {
+        // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the mapped page.
+        let (cap_slot, page_count, phys_base, kind) = unsafe {
             (
                 core::ptr::read_volatile(phys_ptr.add(base)),
                 core::ptr::read_volatile(phys_ptr.add(base + 1)),
                 core::ptr::read_volatile(phys_ptr.add(base + 2)),
+                core::ptr::read_volatile(phys_ptr.add(base + 3)),
             )
         };
         *entry = BootInUse {
-            cap_slot: w0 as u32,
-            page_count: (w0 >> 32) as u32,
+            cap_slot,
+            page_count: u32::try_from(page_count).unwrap_or(0),
             phys_base,
             kind,
         };
@@ -746,8 +747,8 @@ fn bootstrap_from_init(
     Some(InitBootstrap {
         service_ep: round.caps[0],
         procmgr_badge: round.data[2],
-        memory_base: round.data[0] as u32,
-        memory_count: round.data[1] as u32,
+        memory_base: round.data[0],
+        memory_count: round.data[1],
         in_use,
         in_use_count,
         system_ram_bytes,
@@ -766,14 +767,14 @@ fn bootstrap_from_init(
 /// variants for distinct page mappings (procmgr's ELF loader covers all
 /// three). Restricting to `RIGHTS_MEM_MAP_RW` here would silently break
 /// executable-segment maps, since `cap_derive` only narrows rights.
-fn derive_for_caller(outer_slot: u32) -> Option<u32>
+fn derive_for_caller(outer_slot: u64) -> Option<u64>
 {
     syscall::cap_derive(outer_slot, syscall::RIGHTS_ALL).ok()
 }
 
 /// Roll back a grant: return its first `entries` runs to the pool and delete
 /// the inner derivations already minted.
-fn rollback_grant(l: &mut MemLedger, grant: &Grant, inner: &[u32])
+fn rollback_grant(l: &mut MemLedger, grant: &Grant, inner: &[u64])
 {
     for &(o, p, phys) in grant.entries()
     {
@@ -858,7 +859,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // Account each peeled outer to the caller's record, then derive the
     // inner copy that ships in the reply. On any failure, roll the entire
     // grant back to the pool.
-    let mut inner = [0u32; MAX_GRANT_RUNS];
+    let mut inner = [0u64; MAX_GRANT_RUNS];
     for (i, &(outer, pages, phys)) in grant.entries().iter().enumerate()
     {
         let frame = FrameDesc {
@@ -950,7 +951,7 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
-fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32, procmgr_badge: u64)
+fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
     {
@@ -1067,7 +1068,7 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 
 /// Procmgr-only: take permanent ownership of the Memory caps in `caps` (every
 /// cap the message carried) and add them to the free pool.
-fn handle_donate_memory_caps(badge: u64, caps: &[u32], ipc_buf: *mut u64, procmgr_badge: u64)
+fn handle_donate_memory_caps(badge: u64, caps: &[u64], ipc_buf: *mut u64, procmgr_badge: u64)
 {
     // Caller (procmgr's init reap) is permanently transferring init's
     // reclaimed Memory caps into memmgr's pool (the donated set is specified
@@ -1127,7 +1128,7 @@ fn handle_donate_memory_caps(badge: u64, caps: &[u32], ipc_buf: *mut u64, procmg
 /// its whole size (any size, as a `u64` page count) and physical base.
 /// `None` when the slot is not a Memory cap, lacks the full pool-frame
 /// rights ([`POOL_FRAME_RIGHTS`]), or covers no whole page.
-fn pool_run_of(slot: u32) -> Option<FreeRun>
+fn pool_run_of(slot: u64) -> Option<FreeRun>
 {
     // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
     // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE). An
@@ -1272,7 +1273,7 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
 /// [`handle_fault`] can map backing frames into it. Keyed by the child's
 /// memmgr badge in `data[0]`; the cap arrives in `caps[0]`, which [`dispatch`]
 /// passes as `caps` (it has already deleted any cap after it).
-fn handle_delegate_aspace(req: &IpcMessage, caps: &[u32], ipc_buf: *mut u64, procmgr_badge: u64)
+fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
     {
@@ -1483,7 +1484,7 @@ const CSPACE_TOPUP_PAGES: u32 = 16;
 
 /// Free slots of memmgr's `CSpace` a general allocation may take: capacity
 /// less populated slots less the IPC receive reserve.
-fn cspace_headroom(self_cspace: u32) -> u64
+fn cspace_headroom(self_cspace: u64) -> u64
 {
     let capacity =
         syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
@@ -1505,7 +1506,7 @@ fn cspace_headroom(self_cspace: u32) -> u64
 /// for this memory, which is why it funds itself from its own pool. A
 /// failed top-up (no contiguous run, or the augment refused) is retried
 /// before the next receive; a refused augment returns the frame to the pool.
-fn hold_cspace_headroom(self_cspace: u32)
+fn hold_cspace_headroom(self_cspace: u64)
 {
     // Every grant's split takes a body from the arena as well as a slot, and
     // the arena draws whole pages from the same growth budget, so a page of it
@@ -1630,7 +1631,7 @@ fn insert_boot_records(procmgr_badge: u64) -> bool
 }
 
 /// Delete every cap in `caps` from memmgr's `CSpace`.
-fn delete_caps(caps: &[u32])
+fn delete_caps(caps: &[u64])
 {
     for &slot in caps
     {

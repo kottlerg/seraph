@@ -115,7 +115,7 @@ fn choose_image_bias_or_default() -> u64
 /// procmgr's single-threaded dispatch); readers race only with the
 /// writer, and the Acquire load pairs with the Release half of the store on
 /// registration.
-pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Install logd's death-notification EQ cap. Called by
 /// `REGISTER_DEATH_EQ`'s handler.
@@ -129,7 +129,7 @@ pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// later attacker's registration is always second and is rejected
 /// here. The caller (`handle_register_death_eq`) is responsible for
 /// `cap_delete`ing the just-transferred slot when this returns false.
-pub fn install_logd_death_eq(logd_eq: u32) -> bool
+pub fn install_logd_death_eq(logd_eq: u64) -> bool
 {
     if logd_eq == 0
     {
@@ -206,14 +206,14 @@ pub(crate) trait TableExt
     fn configure_pipe(
         &mut self,
         badge: u64,
-        self_aspace: u32,
+        self_aspace: u64,
         direction: u64,
-        memory_cap: u32,
-        data_notification: u32,
-        space_notification: u32,
+        memory_cap: u64,
+        data_notification: u64,
+        space_notification: u64,
     ) -> Result<(), u64>;
 
-    fn configure_namespace(&mut self, badge: u64, root_cap: u32, cwd_cap: u32) -> Result<(), u64>;
+    fn configure_namespace(&mut self, badge: u64, root_cap: u64, cwd_cap: u64) -> Result<(), u64>;
 }
 
 impl TableExt for ProcessTable
@@ -249,11 +249,11 @@ impl TableExt for ProcessTable
     fn configure_pipe(
         &mut self,
         badge: u64,
-        self_aspace: u32,
+        self_aspace: u64,
         direction: u64,
-        memory_cap: u32,
-        data_notification: u32,
-        space_notification: u32,
+        memory_cap: u64,
+        data_notification: u64,
+        space_notification: u64,
     ) -> Result<(), u64>
     {
         if memory_cap == 0 || data_notification == 0 || space_notification == 0
@@ -337,7 +337,7 @@ impl TableExt for ProcessTable
     /// - `procmgr_errors::INVALID_BADGE` — no entry for `badge` (caps dropped).
     /// - `procmgr_errors::ALREADY_STARTED` — target is already running (caps dropped).
     /// - `procmgr_errors::INVALID_ARGUMENT` — `root_cap` is zero.
-    fn configure_namespace(&mut self, badge: u64, root_cap: u32, cwd_cap: u32) -> Result<(), u64>
+    fn configure_namespace(&mut self, badge: u64, root_cap: u64, cwd_cap: u64) -> Result<(), u64>
     {
         if root_cap == 0
         {
@@ -391,11 +391,11 @@ impl TableExt for ProcessTable
 /// either way; the child's copies outlive them.
 ///
 /// Returns the child-side slots, or `None` with nothing installed.
-fn copy_all_into_child<const N: usize>(child_cspace: u32, caps: [(u32, u64); N])
--> Option<[u32; N]>
+fn copy_all_into_child<const N: usize>(child_cspace: u64, caps: [(u64, u64); N])
+-> Option<[u64; N]>
 {
-    let mut intermediates = [0u32; N];
-    let mut slots = [0u32; N];
+    let mut intermediates = [0u64; N];
+    let mut slots = [0u64; N];
     let mut complete = true;
     for (i, &(cap, rights)) in caps.iter().enumerate()
     {
@@ -435,9 +435,9 @@ fn copy_all_into_child<const N: usize>(child_cspace: u32, caps: [(u32, u64); N])
 pub struct CreateResult
 {
     /// Badged endpoint cap for the caller to use with `START_PROCESS`.
-    pub process_handle: u32,
+    pub process_handle: u64,
     /// Derived Thread cap to transfer to caller (CONTROL right).
-    pub thread_for_caller: u32,
+    pub thread_for_caller: u64,
     /// The child's process badge (its table key), so a create whose reply
     /// cannot be delivered can destroy the child.
     pub badge: u64,
@@ -479,7 +479,7 @@ pub struct ChildSched
 /// `START_PROCESS`.
 pub struct UniversalCaps
 {
-    pub procmgr_endpoint: u32,
+    pub procmgr_endpoint: u64,
     /// Un-badged SEND cap on the system log endpoint, sourced from
     /// the slot procmgr received during init bootstrap. Used as the
     /// `cap_derive_badge` source for minting a badged SEND per child
@@ -487,7 +487,7 @@ pub struct UniversalCaps
     /// endpoint (e.g. a future no-log boot mode); children born in
     /// that case receive zero in `pi.log_send_cap` and silent-drop
     /// `seraph::log!`.
-    pub log_send_source: u32,
+    pub log_send_source: u64,
     /// Badged SEND cap on memmgr's service endpoint, freshly minted by
     /// `memmgr_labels::REGISTER_PROCESS` for this child. The cap lives in
     /// procmgr's `CSpace` on entry; `populate_child_info` copies it into
@@ -495,7 +495,7 @@ pub struct UniversalCaps
     /// `ProcessInfo.memmgr_endpoint_cap`. Zero when memmgr is not yet
     /// reachable (procmgr itself, init); the child's heap-bootstrap then
     /// no-ops and the child cannot allocate.
-    pub memmgr_endpoint: u32,
+    pub memmgr_endpoint: u64,
     /// Memmgr-side process badge paired with `memmgr_endpoint`. Sent in
     /// `memmgr_labels::PROCESS_DIED` at child teardown so memmgr can
     /// reclaim the right ledger entry. Zero when memmgr is not wired.
@@ -509,7 +509,7 @@ pub struct UniversalCaps
     /// `svcmgr_labels::QUERY_ENDPOINT`. Zero when svcmgr is not yet
     /// reachable; children born in that case receive zero in
     /// `pi.service_registry_cap` and `registry_client::lookup` no-ops.
-    pub registry_send_source: u32,
+    pub registry_send_source: u64,
     /// Baseline `SchedControl` cap in procmgr's `CSpace` (procmgr's own
     /// `ProcessInfo.sched_control_cap`, band
     /// `[1, sched_policy::BASELINE_PRIORITY_MAX]`). Source of every child's
@@ -520,7 +520,7 @@ pub struct UniversalCaps
     /// to create child threads at their assigned level. Zero when procmgr
     /// was given no baseline; children then receive zero, are created at
     /// the floor, and cannot set any priority.
-    pub sched_baseline: u32,
+    pub sched_baseline: u64,
     /// Whether the child is demand-paged. Demand paging is the default; this
     /// is false only when the caller set `procmgr_labels::CREATE_PINNED` (a
     /// DMA driver that must be eager-mapped). When true, `finalize_creation`
@@ -532,7 +532,7 @@ pub struct UniversalCaps
     /// issue the procmgr-only `DELEGATE_ASPACE`. Distinct from
     /// [`Self::memmgr_endpoint`] (the child's badged cap). Zero when memmgr is
     /// not reachable.
-    pub self_memmgr_ep: u32,
+    pub self_memmgr_ep: u64,
 }
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
@@ -554,7 +554,7 @@ pub struct ChildTlsTemplate
 #[derive(Clone, Copy, Default)]
 pub struct MainTls
 {
-    pub memory_cap: u32,
+    pub memory_cap: u64,
     pub base_va: u64,
 }
 
@@ -587,11 +587,11 @@ pub struct MainTls
     clippy::too_many_lines
 )]
 unsafe fn populate_child_info(
-    self_aspace: u32,
-    child_aspace: u32,
-    child_cspace: u32,
-    child_thread: u32,
-    creator_endpoint: u32,
+    self_aspace: u64,
+    child_aspace: u64,
+    child_cspace: u64,
+    child_thread: u64,
+    creator_endpoint: u64,
     universals: &UniversalCaps,
     tls: &ChildTlsTemplate,
     args: &ChildArgs<'_>,
@@ -601,7 +601,7 @@ unsafe fn populate_child_info(
     process_badge: u64,
     sched: ChildSched,
     layout: &ProcessLayout,
-) -> Option<u32>
+) -> Option<u64>
 {
     // Guarded from allocation: every early `None` below deletes the slot.
     let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
@@ -952,9 +952,9 @@ impl MainTlsAlloc
 /// starting at the scratch VA and then call [`finalize_main_tls`] to install
 /// the TCB self-pointer and remap the memory cap into the child.
 fn alloc_main_tls_memory(
-    self_aspace: u32,
+    self_aspace: u64,
     tls: &ChildTlsTemplate,
-    child_memmgr_send: u32,
+    child_memmgr_send: u64,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
 ) -> Option<MainTlsAlloc>
@@ -1004,8 +1004,8 @@ fn alloc_main_tls_memory(
 /// without checking what procmgr holds there.
 unsafe fn finalize_main_tls(
     alloc: MainTlsAlloc,
-    _self_aspace: u32,
-    child_aspace: u32,
+    _self_aspace: u64,
+    child_aspace: u64,
 ) -> Option<MainTls>
 {
     // SAFETY: scratch_va is mapped writable for the whole block, which holds
@@ -1060,11 +1060,11 @@ unsafe fn finalize_main_tls(
 // prepare_main_tls_from_vfs.
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare_main_tls_from_bytes(
-    self_aspace: u32,
-    child_aspace: u32,
+    self_aspace: u64,
+    child_aspace: u64,
     tls: &ChildTlsTemplate,
     template_bytes: &[u8],
-    child_memmgr_send: u32,
+    child_memmgr_send: u64,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     relocate: impl FnOnce(&mut [u8]),
@@ -1111,12 +1111,12 @@ unsafe fn prepare_main_tls_from_bytes(
 // IPC scratch, chosen layout); grouping them would not reduce coupling.
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare_main_tls_from_vfs(
-    self_aspace: u32,
-    child_aspace: u32,
+    self_aspace: u64,
+    child_aspace: u64,
     tls: &ChildTlsTemplate,
     file_offset: u64,
-    file_cap: u32,
-    child_memmgr_send: u32,
+    file_cap: u64,
+    child_memmgr_send: u64,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     relocate: impl FnOnce(&mut [u8]),
@@ -1163,8 +1163,8 @@ unsafe fn prepare_main_tls_from_vfs(
 /// the function maps pages into it, at VAs the child's layout chooses,
 /// without checking what procmgr holds there.
 unsafe fn map_child_stack_and_ipc(
-    child_aspace: u32,
-    child_memmgr_send: u32,
+    child_aspace: u64,
+    child_memmgr_send: u64,
     ipc_buf: *mut u64,
     stack_pages: u32,
     layout: &ProcessLayout,
@@ -1204,8 +1204,8 @@ unsafe fn map_child_stack_and_ipc(
 /// the function maps pages into it, at VAs the child's layout chooses,
 /// without checking what procmgr holds there.
 unsafe fn map_fresh_child_page(
-    child_aspace: u32,
-    child_memmgr_send: u32,
+    child_aspace: u64,
+    child_memmgr_send: u64,
     ipc_buf: *mut u64,
     va: u64,
 ) -> Option<()>
@@ -1292,7 +1292,7 @@ where
 /// (end of file) stops it. Every reply is clamped to the bytes requested
 /// ([`process_table::fs_reads::fill_exact`]), so a driver over-reporting its
 /// count cannot make procmgr copy past `dst`.
-fn vfs_read_exact(file_cap: u32, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) -> Option<usize>
+fn vfs_read_exact(file_cap: u64, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) -> Option<usize>
 {
     process_table::fs_reads::fill_exact(dst, off, VFS_CHUNK_SIZE as usize, |at, window| {
         vfs_read(file_cap, ipc_buf, at, window.len() as u64, window)
@@ -1305,25 +1305,25 @@ fn vfs_read_exact(file_cap: u32, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) ->
 // reducing call sites — this helper is called from exactly two places.
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
 fn finalize_creation(
-    child_aspace: u32,
-    child_cspace: u32,
-    child_thread: u32,
-    pi_memory_cap: u32,
+    child_aspace: u64,
+    child_cspace: u64,
+    child_thread: u64,
+    pi_memory_cap: u64,
     entry_point: u64,
     main_tls: MainTls,
     table: &mut ProcessTable,
-    self_endpoint: u32,
+    self_endpoint: u64,
     deaths: &DeathSet,
-    memmgr_send_cap: u32,
+    memmgr_send_cap: u64,
     memmgr_badge: u64,
     process_badge: u64,
     demand_paged: bool,
-    self_memmgr_ep: u32,
-    parent_relay_cap: u32,
+    self_memmgr_ep: u64,
+    parent_relay_cap: u64,
     band_max: u8,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
-    self_aspace: u32,
+    self_aspace: u64,
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
@@ -1450,11 +1450,11 @@ fn finalize_creation(
 /// fault handler to `memmgr_send_cap`. Returns `true` only when both took
 /// effect, so the child's demand faults reach a pager that can map them.
 fn bind_pager(
-    child_aspace: u32,
-    child_thread: u32,
-    memmgr_send_cap: u32,
+    child_aspace: u64,
+    child_thread: u64,
+    memmgr_send_cap: u64,
     memmgr_badge: u64,
-    self_memmgr_ep: u32,
+    self_memmgr_ep: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -1501,7 +1501,7 @@ fn bind_pager(
 /// runtime's information. When the page cannot be mapped the fields stay
 /// zero and the child runs as if it had no pager, which is safe: its memory
 /// stays eager.
-fn advertise_pager(self_aspace: u32, pi_memory_cap: u32, memmgr_badge: u64)
+fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 {
     let Some(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
     else
@@ -1526,10 +1526,10 @@ fn advertise_pager(self_aspace: u32, pi_memory_cap: u32, memmgr_badge: u64)
 )]
 fn create_process_from_bytes(
     module_bytes: &[u8],
-    self_aspace: u32,
+    self_aspace: u64,
     table: &mut ProcessTable,
-    self_endpoint: u32,
-    creator_endpoint: u32,
+    self_endpoint: u64,
+    creator_endpoint: u64,
     universals: &UniversalCaps,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
@@ -1790,13 +1790,13 @@ fn create_process_from_bytes(
 /// Maps the memory cap, delegates to `create_process_from_bytes`, then unmaps.
 #[allow(clippy::too_many_arguments)]
 pub fn create_process(
-    module_memory_cap: u32,
-    self_aspace: u32,
-    _self_memmgr_ep: u32,
+    module_memory_cap: u64,
+    self_aspace: u64,
+    _self_memmgr_ep: u64,
     ipc_buf: *mut u64,
     table: &mut ProcessTable,
-    self_endpoint: u32,
-    creator_endpoint: u32,
+    self_endpoint: u64,
+    creator_endpoint: u64,
     universals: &UniversalCaps,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
@@ -1870,10 +1870,10 @@ fn next_memory_cookie() -> Option<u64>
 /// cap other than the returned one is deleted, and on a failed or empty reply
 /// every reply cap ([`process_table::fs_reads::read_memory_reply_caps`]).
 fn vfs_read_memory(
-    file_cap: u32,
+    file_cap: u64,
     ipc_buf: *mut u64,
     offset: u64,
-) -> Option<(u32, usize, usize, u64)>
+) -> Option<(u64, usize, usize, u64)>
 {
     let cookie = next_memory_cookie()?;
     let msg = IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
@@ -1898,7 +1898,7 @@ fn vfs_read_memory(
 /// caller intentionally requested more than it is staging this call; callers
 /// clamp as needed).
 fn vfs_read(
-    file_cap: u32,
+    file_cap: u64,
     ipc_buf: *mut u64,
     offset: u64,
     max_len: u64,
@@ -1935,7 +1935,7 @@ fn vfs_read(
 /// procmgr's pages and close touch no other opener's state
 /// (`fs/docs/fs-driver-protocol.md` § Label 18). `None` when the call fails
 /// or the reply carries no open cap; every other reply cap is deleted.
-fn vfs_open(node_cap: u32, ipc_buf: *mut u64) -> Option<u32>
+fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1953,7 +1953,7 @@ fn vfs_open(node_cap: u32, ipc_buf: *mut u64) -> Option<u32>
 }
 
 /// Close an open file via its open cap and delete the cap.
-fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
+fn vfs_close(file_cap: u64, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1978,23 +1978,23 @@ fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 /// path consumes it.
 struct FileCapGuard
 {
-    cap: u32,
+    cap: u64,
     ipc_buf: *mut u64,
 }
 
 impl FileCapGuard
 {
-    fn new(cap: u32, ipc_buf: *mut u64) -> Self
+    fn new(cap: u64, ipc_buf: *mut u64) -> Self
     {
         Self { cap, ipc_buf }
     }
 
-    fn cap(&self) -> u32
+    fn cap(&self) -> u64
     {
         self.cap
     }
 
-    fn disarm(mut self) -> u32
+    fn disarm(mut self) -> u64
     {
         let c = self.cap;
         self.cap = 0;
@@ -2025,9 +2025,9 @@ impl Drop for FileCapGuard
 /// procmgr-held cap still uses.
 pub(crate) struct MemmgrSendGuard
 {
-    cap: u32,
+    cap: u64,
     badge: u64,
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
 }
 
@@ -2036,7 +2036,7 @@ impl MemmgrSendGuard
     /// Guard the `(cap, badge)` pair `register_with_memmgr` returned;
     /// `memmgr_ep` is procmgr's own memmgr endpoint, the one `PROCESS_DIED`
     /// is accepted on.
-    pub(crate) fn new(cap: u32, badge: u64, memmgr_ep: u32, ipc_buf: *mut u64) -> Self
+    pub(crate) fn new(cap: u64, badge: u64, memmgr_ep: u64, ipc_buf: *mut u64) -> Self
     {
         Self {
             cap,
@@ -2046,7 +2046,7 @@ impl MemmgrSendGuard
         }
     }
 
-    pub(crate) fn cap(&self) -> u32
+    pub(crate) fn cap(&self) -> u64
     {
         self.cap
     }
@@ -2056,7 +2056,7 @@ impl MemmgrSendGuard
         self.badge
     }
 
-    pub(crate) fn disarm(mut self) -> (u32, u64)
+    pub(crate) fn disarm(mut self) -> (u64, u64)
     {
         let p = (self.cap, self.badge);
         self.cap = 0;
@@ -2082,14 +2082,14 @@ impl Drop for MemmgrSendGuard
 /// reverse-creation order (thread → cspace → aspace).
 struct ChildKernelObjects
 {
-    aspace: u32,
-    cspace: u32,
-    thread: u32,
+    aspace: u64,
+    cspace: u64,
+    thread: u64,
 }
 
 impl ChildKernelObjects
 {
-    fn new(aspace: u32, cspace: u32, thread: u32) -> Self
+    fn new(aspace: u64, cspace: u64, thread: u64) -> Self
     {
         Self {
             aspace,
@@ -2098,22 +2098,22 @@ impl ChildKernelObjects
         }
     }
 
-    fn aspace(&self) -> u32
+    fn aspace(&self) -> u64
     {
         self.aspace
     }
 
-    fn cspace(&self) -> u32
+    fn cspace(&self) -> u64
     {
         self.cspace
     }
 
-    fn thread(&self) -> u32
+    fn thread(&self) -> u64
     {
         self.thread
     }
 
-    fn disarm(mut self) -> (u32, u32, u32)
+    fn disarm(mut self) -> (u64, u64, u64)
     {
         let t = (self.aspace, self.cspace, self.thread);
         self.aspace = 0;
@@ -2150,8 +2150,8 @@ impl Drop for ChildKernelObjects
 /// so a failure at any step leaves nothing in procmgr's `CSpace`; the
 /// returned guard owns the three kernel objects until disarmed.
 fn create_child_kernel_objects(
-    memmgr_send: u32,
-    sched_baseline: u32,
+    memmgr_send: u64,
+    sched_baseline: u64,
     priority: u8,
     ipc_buf: *mut u64,
 ) -> Option<ChildKernelObjects>
@@ -2206,22 +2206,22 @@ fn create_child_kernel_objects(
 /// construction means "no cap yet"; the guard becomes a no-op.
 struct CapGuard
 {
-    cap: u32,
+    cap: u64,
 }
 
 impl CapGuard
 {
-    fn new(cap: u32) -> Self
+    fn new(cap: u64) -> Self
     {
         Self { cap }
     }
 
-    fn cap(&self) -> u32
+    fn cap(&self) -> u64
     {
         self.cap
     }
 
-    fn disarm(mut self) -> u32
+    fn disarm(mut self) -> u64
     {
         let c = self.cap;
         self.cap = 0;
@@ -2247,9 +2247,9 @@ impl Drop for CapGuard
 /// transient cache-page scratch mappings).
 pub struct ElfLoadCtx
 {
-    pub file_cap: u32,
+    pub file_cap: u64,
     pub ipc_buf: *mut u64,
-    pub self_aspace: u32,
+    pub self_aspace: u64,
 }
 
 /// Stream segment file data from VFS into the segment's scratch span.
@@ -2334,7 +2334,7 @@ fn stream_segment_bytes(
 /// refcount and clear the outstanding-page tracking entry for `cookie`.
 /// Failure is non-fatal — the slot will be reclaimed at `FS_CLOSE` time
 /// even if the proactive release is lost.
-fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
+fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
 {
     let msg = IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
         .word(0, cookie)
@@ -2369,16 +2369,16 @@ fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
 )]
 pub fn create_process_from_file(
     ctx: &crate::ProcmgrCtx,
-    file_cap: u32,
+    file_cap: u64,
     file_size: u64,
     table: &mut ProcessTable,
     ipc_buf: *mut u64,
-    creator_endpoint: u32,
+    creator_endpoint: u64,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
     deaths: &DeathSet,
     demand_paged: bool,
-    parent_relay_cap: u32,
+    parent_relay_cap: u64,
     sched: ChildSched,
 ) -> Result<CreateResult, u64>
 {
@@ -2789,7 +2789,7 @@ pub fn create_process_from_file(
 /// Idempotent: returns `None` if the badge is unknown (already destroyed).
 pub fn destroy_process(
     badge: u64,
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
     table: &mut ProcessTable,
 ) -> Option<u64>
@@ -2811,7 +2811,7 @@ pub fn destroy_process(
 /// `CREATE_DMA_HOLD` child `badge` (`RELEASE_HOLD`), then drop procmgr's
 /// badged memmgr SEND for it. Returns `false` when `holds` keeps no reclaim
 /// for the badge.
-pub fn release_hold(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, holds: &mut DmaHolds) -> bool
+pub fn release_hold(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, holds: &mut DmaHolds) -> bool
 {
     let Some(held) = holds.release(badge)
     else
@@ -2828,7 +2828,7 @@ pub fn release_hold(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, holds: &mut D
 
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed
 /// to the process badge to the free pool. Idempotent on memmgr's side.
-fn notify_memmgr_died(memmgr_ep: u32, memmgr_badge: u64, ipc_buf: *mut u64)
+fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 {
     if memmgr_ep == 0 || memmgr_badge == 0
     {
@@ -2862,7 +2862,7 @@ fn notify_memmgr_died(memmgr_ep: u32, memmgr_badge: u64, ipc_buf: *mut u64)
 pub fn teardown_entry(
     entry: ProcessEntry,
     exit_reason: u64,
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
     holds: &mut DmaHolds,
 )
@@ -2940,7 +2940,7 @@ pub fn teardown_entry(
 /// - `procmgr_errors::THREAD_START_FAILED` (6) — `thread_start` of the
 ///   child's main thread failed with an error other than `Interrupted`,
 ///   which is retried.
-pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
+pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> Result<(), u64>
 {
     let entry = table
         .find_mut_by_badge(badge)

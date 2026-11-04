@@ -18,12 +18,12 @@
 //! # Child arguments
 //!
 //! A child entry receives one `u64` register argument. A capability handle
-//! is 32 bits (a 24-bit slot index plus an 8-bit generation, see
-//! `syscall_abi::cap_handle_encode`), so at most two fit in that word, as
-//! 32-bit halves (`u64::from(a) | (u64::from(b) << 32)`). A child that
-//! needs more than two values receives the address of an entry in a
-//! per-test [`ArgBlock`] instead, and decodes it with [`child_args`].
-//! Narrower packings truncate the generation and alias a recycled slot.
+//! fills a whole `u64` (a 32-bit slot index plus the slot's generation above
+//! it, see `syscall_abi::cap_handle_encode`), so the word carries at most one
+//! handle, passed as is. A child that needs more than one value receives the
+//! address of an entry in a per-test [`ArgBlock`] instead, and decodes it
+//! with [`child_args`]. Packing a handle into fewer bits truncates its
+//! generation and aliases a recycled slot.
 
 use core::cell::UnsafeCell;
 
@@ -117,8 +117,8 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
 /// a thread bound to ktest's own `CSpace` is guarded with `cs: 0`.
 pub struct SpawnedChild
 {
-    pub th: u32,
-    pub cs: u32,
+    pub th: u64,
+    pub cs: u64,
 }
 
 impl SpawnedChild
@@ -157,7 +157,7 @@ impl SpawnedChild
 /// succeeded, or was refused with `InvalidCapability` because the handle names
 /// no cap. Every other refusal leaves the cap in place, so the handle is kept.
 /// A zero handle holds none.
-fn delete_held(handle: &mut u32) -> Result<(), i64>
+fn delete_held(handle: &mut u64) -> Result<(), i64>
 {
     if *handle == 0
     {
@@ -197,7 +197,7 @@ pub fn new_child(ctx: &TestContext) -> Result<SpawnedChild, &'static str>
 /// `core/kernel/docs/syscalls.md` § `SYS_CAP_CREATE_THREAD`).
 pub fn new_child_at(
     ctx: &TestContext,
-    sched_cap: u32,
+    sched_cap: u64,
     priority: u8,
 ) -> Result<SpawnedChild, &'static str>
 {
@@ -255,7 +255,7 @@ pub unsafe fn configure_and_start(
 /// # Safety
 /// The contract of [`configure_and_start`].
 pub unsafe fn configure_and_start_thread(
-    th: u32,
+    th: u64,
     entry: extern "C" fn(u64) -> !,
     stack_top: u64,
     arg: u64,
@@ -327,7 +327,7 @@ pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
 /// `cap_info` checks no right, so the only refusal is a handle that does
 /// not name a live Thread cap in the caller's `CSpace`: an empty or stale
 /// slot, or a cap of another type.
-fn thread_state(thread: u32) -> Result<(u32, u64), &'static str>
+fn thread_state(thread: u64) -> Result<(u32, u64), &'static str>
 {
     let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
         .map_err(|_| "spawn::thread_state: cap_info(THREAD_STATE) failed")?;
@@ -344,7 +344,7 @@ fn thread_state(thread: u32) -> Result<(u32, u64), &'static str>
 /// `cap_info` refused `thread`: the handle names no live Thread cap in the
 /// caller's `CSpace` (an empty or stale slot, or a cap of another type).
 /// `cap_info` checks no right, so any Thread cap suffices.
-pub fn is_exited(thread: u32) -> Result<bool, &'static str>
+pub fn is_exited(thread: u64) -> Result<bool, &'static str>
 {
     let (state, _) = thread_state(thread)?;
     Ok(state == syscall_abi::THREAD_STATE_EXITED)
@@ -362,7 +362,7 @@ pub fn is_exited(thread: u32) -> Result<bool, &'static str>
 /// - `thread` was not `Exited` after `max_polls` polls (about `max_polls`
 ///   ms, one `thread_sleep(1)` between polls); the bound a test relies on to
 ///   fail instead of hang when its child never dies.
-pub fn wait_until_exited(thread: u32, max_polls: u32) -> Result<u64, &'static str>
+pub fn wait_until_exited(thread: u64, max_polls: u32) -> Result<u64, &'static str>
 {
     let mut polls = 0;
     loop
@@ -384,7 +384,7 @@ pub fn wait_until_exited(thread: u32, max_polls: u32) -> Result<u64, &'static st
 /// Poll `memory`'s `MEMORY_AVAILABLE` at 1 ms intervals until it returns to
 /// `baseline` — for objects whose free is deferred off-CPU (a thread that
 /// destroyed its own `CSpace` or `AddressSpace`). Fails after `max_polls`.
-pub fn wait_memory_baseline(memory: u32, baseline: u64, max_polls: u32)
+pub fn wait_memory_baseline(memory: u64, baseline: u64, max_polls: u32)
 -> Result<(), &'static str>
 {
     let mut polls = 0;

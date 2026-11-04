@@ -16,7 +16,7 @@
 //! `timed_errors::WALL_CLOCK_UNAVAILABLE`.
 
 use crate::time::Duration;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::{IpcMessage, timed_errors, timed_labels};
 use syscall_abi::SystemInfoType;
@@ -32,7 +32,7 @@ pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 /// Cached SEND cap on `timed`'s service endpoint. Zero means "not yet
 /// resolved or resolution failed"; any non-zero value is a valid slot in
 /// this process's CSpace for the rest of its lifetime.
-static TIMED_CAP: AtomicU32 = AtomicU32::new(0);
+static TIMED_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Resolution state machine for `TIMED_CAP`:
 /// `0` = untried, `1` = resolving (some thread is doing the registry
@@ -65,7 +65,7 @@ fn elapsed_us() -> u64
 /// compare-exchange; on collision (resolver finished first) it deletes
 /// its now-redundant cap and returns the resolver's. This bounds
 /// CSpace consumption to one slot per stuck-resolver event.
-fn timed_cap_once(ipc_buf: *mut u64) -> u32
+fn timed_cap_once(ipc_buf: *mut u64) -> u64
 {
     let c = TIMED_CAP.load(Ordering::Acquire);
     if c != 0

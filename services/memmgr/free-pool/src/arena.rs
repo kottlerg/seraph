@@ -31,7 +31,7 @@ pub const NODE_NULL: NodeIdx = u64::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameDesc
 {
-    pub cap_slot: u32,
+    pub cap_slot: u64,
     pub page_count: u32,
     pub phys_base: u64,
     pub va: u64,
@@ -47,7 +47,7 @@ pub struct ProcessRecord
     pub frame_head: NodeIdx,
     pub region_head: NodeIdx,
     /// Delegated child `AddressSpace` cap, or `0` when not demand-paged.
-    pub aspace_cap: u32,
+    pub aspace_cap: u64,
 }
 
 /// The payload of one arena slot.

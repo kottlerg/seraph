@@ -17,13 +17,13 @@
 pub struct FileCreateCaps<'a>
 {
     /// cap[0]: the file cap for the binary (nonzero).
-    pub file: u32,
+    pub file: u64,
     /// cap[1]: the optional creator endpoint; zero when absent.
-    pub creator: u32,
+    pub creator: u64,
     /// The last cap when `CREATE_DEATH_RELAY` is set; zero otherwise.
-    pub relay: u32,
+    pub relay: u64,
     /// Caps the layout does not name, which procmgr deletes.
-    pub extra: &'a [u32],
+    pub extra: &'a [u64],
 }
 
 /// Split the caps of a `CREATE_FROM_FILE` request.
@@ -39,7 +39,7 @@ pub struct FileCreateCaps<'a>
 /// set on a single-cap message. The caller then releases every transferred
 /// cap and replies `INVALID_ARGUMENT`.
 #[must_use]
-pub fn split_create_from_file_caps(caps: &[u32], death_relay: bool) -> Option<FileCreateCaps<'_>>
+pub fn split_create_from_file_caps(caps: &[u64], death_relay: bool) -> Option<FileCreateCaps<'_>>
 {
     let (&file, rest) = caps.split_first()?;
     if file == 0

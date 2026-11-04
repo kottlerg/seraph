@@ -206,7 +206,7 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
 /// `registry_lookup_derived` re-derives a SEND per consumer and the badge
 /// survives. Logs and skips when the cap is absent; deletes it when the
 /// publish fails.
-fn publish_endowed_send(registry: &mut registry::Registry, cap: u32, name: &[u8])
+fn publish_endowed_send(registry: &mut registry::Registry, cap: u64, name: &[u8])
 {
     let shown = core::str::from_utf8(name).unwrap_or("?");
     if cap == 0
@@ -226,7 +226,7 @@ fn publish_endowed_send(registry: &mut registry::Registry, cap: u32, name: &[u8]
 /// absent or the derive or publish fails.
 fn publish_devmgr_registry_send(
     registry: &mut registry::Registry,
-    source: u32,
+    source: u64,
     name: &[u8],
     badge: u64,
 )
@@ -427,7 +427,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// bootstrap / death-queue state the `HANDOVER_COMPLETE` →
 /// `reconcile_and_launch` path needs to spawn `.svc`-defined services.
 fn dispatch_ipc(
-    service_ep: u32,
+    service_ep: u64,
     state: &mut SvcmgrState,
     ctx: &restart::RestartCtx,
     guard: &mut ipc::recv_guard::RecvGuard,
@@ -563,7 +563,7 @@ pub(crate) fn registry_lookup_derived(
     registry: &mut registry::Registry,
     name: &[u8],
     resolver: Resolver,
-) -> Result<u32, u64>
+) -> Result<u64, u64>
 {
     let Some(cap) = registry.lookup(name, resolver)
     else

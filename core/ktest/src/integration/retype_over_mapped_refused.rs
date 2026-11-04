@@ -91,7 +91,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     result
 }
 
-fn phases(ctx: &TestContext, grant: u32, other: u32) -> TestResult
+fn phases(ctx: &TestContext, grant: u64, other: u64) -> TestResult
 {
     refusal_leaves_ledger(ctx, grant, other)?;
     refusal_survives_split_and_merge(ctx, grant)?;
@@ -104,7 +104,7 @@ fn phases(ctx: &TestContext, grant: u32, other: u32) -> TestResult
 /// # Safety
 /// `va` is a scratch VA of ktest's own address space (crate docs § Scratch
 /// VAs), or `aspace` is an address space ktest runs nothing in.
-unsafe fn map_one(memory: u32, aspace: u32, va: u64, page: u64) -> TestResult
+unsafe fn map_one(memory: u64, aspace: u64, va: u64, page: u64) -> TestResult
 {
     // SAFETY: caller contract.
     unsafe { mem_map(memory, aspace, va, page, 1, MAP_WRITABLE) }
@@ -122,7 +122,7 @@ fn unmap_own(ctx: &TestContext) -> TestResult
 
 /// Assert a one-page `CSpace` retype from `memory` is refused with
 /// `OutOfMemory`, deleting the `CSpace` if it was not.
-fn expect_refused(memory: u32) -> TestResult
+fn expect_refused(memory: u64) -> TestResult
 {
     match cap_create_cspace(memory, 0, 1)
     {
@@ -137,13 +137,13 @@ fn expect_refused(memory: u32) -> TestResult
 }
 
 /// Assert a one-page `CSpace` retype from `memory` succeeds, and delete it.
-fn expect_retype(memory: u32) -> TestResult
+fn expect_retype(memory: u64) -> TestResult
 {
     expect_retype_pages(memory, 1)
 }
 
 /// Assert a `pages`-page `CSpace` retype from `memory` succeeds, and delete it.
-fn expect_retype_pages(memory: u32, pages: u64) -> TestResult
+fn expect_retype_pages(memory: u64, pages: u64) -> TestResult
 {
     let cs = cap_create_cspace(memory, 0, pages)
         .map_err(|_| "integration::retype_over_mapped_refused: a retype of free pages failed")?;
@@ -152,7 +152,7 @@ fn expect_retype_pages(memory: u32, pages: u64) -> TestResult
 
 /// The refused retype changes nothing: the ledger, the cursor, and the other
 /// grant's capacity are as before, and unmapping the page lifts the refusal.
-fn refusal_leaves_ledger(ctx: &TestContext, grant: u32, other: u32) -> TestResult
+fn refusal_leaves_ledger(ctx: &TestContext, grant: u64, other: u64) -> TestResult
 {
     // SAFETY: `OWN_VA` is a scratch VA (crate docs § Scratch VAs).
     unsafe { map_one(grant, ctx.aspace_cap, OWN_VA, 0) }?;
@@ -179,7 +179,7 @@ fn refusal_leaves_ledger(ctx: &TestContext, grant: u32, other: u32) -> TestResul
 
 /// A frame mapped through the grant stays unretypable through a split of the
 /// grant and a merge and re-split of its tail.
-fn refusal_survives_split_and_merge(ctx: &TestContext, grant: u32) -> TestResult
+fn refusal_survives_split_and_merge(ctx: &TestContext, grant: u64) -> TestResult
 {
     // SAFETY: `OWN_VA` is a scratch VA (crate docs § Scratch VAs).
     unsafe { map_one(grant, ctx.aspace_cap, OWN_VA, 2) }?;
@@ -197,7 +197,7 @@ fn refusal_survives_split_and_merge(ctx: &TestContext, grant: u32) -> TestResult
 /// Split the grant's last two pages off, assert a retype from the tail (whose
 /// first page the caller has mapped through the grant) is refused, and merge
 /// the tail back.
-fn split_tail_refuses(grant: u32) -> TestResult
+fn split_tail_refuses(grant: u64) -> TestResult
 {
     let tail = memory_split(grant, 2 * PAGE)
         .map_err(|_| "integration::retype_over_mapped_refused: memory_split of the grant failed")?;
@@ -209,7 +209,7 @@ fn split_tail_refuses(grant: u32) -> TestResult
 
 /// A frame mapped only into another address space is unretypable until that
 /// address space is destroyed.
-fn teardown_releases_frames(ctx: &TestContext, grant: u32) -> TestResult
+fn teardown_releases_frames(ctx: &TestContext, grant: u64) -> TestResult
 {
     let aspace = cap_create_aspace(ctx.memory_base, 0, 8)
         .map_err(|_| "integration::retype_over_mapped_refused: cap_create_aspace failed")?;
@@ -243,7 +243,7 @@ fn span_unmap_releases_every_frame(ctx: &TestContext) -> TestResult
 /// Map page `2 * i` of `wide` at `SPAN_VA + i` pages, so no two adjacent
 /// leaves name adjacent frames, then check the retype refusal before and after
 /// one reclaiming unmap of the span.
-fn span_phase(ctx: &TestContext, wide: u32) -> TestResult
+fn span_phase(ctx: &TestContext, wide: u64) -> TestResult
 {
     let mut mapped = Ok(());
     for i in 0..SPAN_PAGES

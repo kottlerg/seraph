@@ -90,7 +90,7 @@ static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 struct HandlerArgs
 {
-    ep: u32,
+    ep: u64,
     badge: u64,
     index: usize,
 }
@@ -105,10 +105,10 @@ static HANDLER_ARGS: ArgBlock<HandlerArgs, 2> = ArgBlock::new(HandlerArgs {
 #[derive(Default)]
 struct Parts
 {
-    eps: [Option<u32>; 2],
-    badged: [Option<u32>; 2],
-    handlers: [Option<u32>; 2],
-    faulter: Option<u32>,
+    eps: [Option<u64>; 2],
+    badged: [Option<u64>; 2],
+    handlers: [Option<u64>; 2],
+    faulter: Option<u64>,
 }
 
 impl Parts
@@ -122,7 +122,7 @@ impl Parts
         {
             if let (Some(cap), Some(_)) = (badged, self.handlers[i])
             {
-                raw_ipc_call(*cap, QUIT_LABEL, 0, 0, 0, 0).ok();
+                raw_ipc_call(*cap, QUIT_LABEL, 0, 0).ok();
             }
         }
         for cap in [self.faulter.take()]
@@ -219,7 +219,7 @@ fn race(ctx: &TestContext, parts: &mut Parts) -> TestResult
 
 /// One round: start a faulter bound to E1, race rebinds, a last-reference
 /// rebind, and an unbind against its deliveries, then reap it.
-fn round(ctx: &TestContext, parts: &mut Parts, badged: [u32; 2]) -> TestResult
+fn round(ctx: &TestContext, parts: &mut Parts, badged: [u64; 2]) -> TestResult
 {
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
         .map_err(|_| "stress::fault_bind_race: create faulter failed")?;
@@ -292,7 +292,7 @@ fn round(ctx: &TestContext, parts: &mut Parts, badged: [u32; 2]) -> TestResult
 }
 
 /// Configure `th` to enter `entry(arg)` on `top`, pin it to `cpu`, start it.
-fn start_pinned(th: u32, entry: extern "C" fn(u64) -> !, top: u64, arg: u64, cpu: u32)
+fn start_pinned(th: u64, entry: extern "C" fn(u64) -> !, top: u64, arg: u64, cpu: u32)
 -> TestResult
 {
     // SAFETY: `entry` is an `extern "C" fn(u64) -> !` and `top` tops a stack
@@ -342,11 +342,11 @@ extern "C" fn handler_entry(arg: u64) -> !
                 SERVED[args.index].fetch_add(1, Ordering::AcqRel);
                 // A reply that fails found the fault cancelled (its faulter
                 // killed), which this test causes by design.
-                raw_ipc_reply(FAULT_REPLY_RESUME, 0, 0, 0, 0).ok();
+                raw_ipc_reply(FAULT_REPLY_RESUME, 0, 0).ok();
             }
             Ok((label, _, _)) =>
             {
-                raw_ipc_reply(label, 0, 0, 0, 0).ok();
+                raw_ipc_reply(label, 0, 0).ok();
                 if label == QUIT_LABEL
                 {
                     break;

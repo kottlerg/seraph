@@ -10,8 +10,9 @@
 //! the handler here as a `pub fn sys_mem_*` / `sys_memory_*`, then add a userspace wrapper
 //! to `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: u64→u32/usize casts extract cap indices and sizes
-// from 64-bit trap frame args. Seraph is 64-bit only; all values fit in the target type.
+// cast_possible_truncation: u64→usize casts extract page counts and offsets
+// from 64-bit trap frame args. Seraph is 64-bit only; all values fit in the
+// target type.
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
@@ -36,8 +37,8 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::PageFlags;
     use crate::syscall::current_tcb;
 
-    let memory_idx = tf.arg(0) as u32;
-    let aspace_idx = tf.arg(1) as u32;
+    let memory_idx = tf.arg(0);
+    let aspace_idx = tf.arg(1);
     let virt_base = tf.arg(2);
     let offset_pages = tf.arg(3) as usize;
     let page_count = tf.arg(4) as usize;
@@ -293,7 +294,7 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     use syscall::MEM_UNMAP_RECLAIM_PTS;
 
-    let aspace_idx = tf.arg(0) as u32;
+    let aspace_idx = tf.arg(0);
     let virt_base = tf.arg(1);
     let page_count = tf.arg(2) as usize;
     let flags = tf.arg(3);
@@ -395,8 +396,8 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::{PageFlags, PagingError};
     use crate::syscall::current_tcb;
 
-    let memory_idx = tf.arg(0) as u32;
-    let aspace_idx = tf.arg(1) as u32;
+    let memory_idx = tf.arg(0);
+    let aspace_idx = tf.arg(1);
     let virt_base = tf.arg(2);
     let page_count = tf.arg(3) as usize;
     let prot_bits = tf.arg(4);
@@ -530,7 +531,7 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
-    let memory_handle = tf.arg(0) as u32;
+    let memory_handle = tf.arg(0);
     let memory_idx = syscall::cap_handle_index(memory_handle);
     let split_offset = tf.arg(1);
     // arg2 is reserved; ignore.
@@ -757,7 +758,7 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     parent_ref.write_unlock();
     DERIVATION_LOCK.write_unlock();
 
-    Ok(u64::from(tail_handle))
+    Ok(tail_handle)
 }
 
 // Test stub.
@@ -785,8 +786,8 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{MemRights, SlotId};
     use crate::syscall::current_tcb;
 
-    let parent_handle = tf.arg(0) as u32;
-    let tail_handle = tf.arg(1) as u32;
+    let parent_handle = tf.arg(0);
+    let tail_handle = tf.arg(1);
     let parent_idx = syscall::cap_handle_index(parent_handle);
     let tail_idx = syscall::cap_handle_index(tail_handle);
     // arg2 reserved.

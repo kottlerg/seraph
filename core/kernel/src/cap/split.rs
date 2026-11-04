@@ -71,13 +71,13 @@ use syscall::SyscallError;
 pub(crate) unsafe fn install_split_children(
     caller_cspace: *mut CSpace,
     cspace_id: CSpaceId,
-    orig_handle: u32,
+    orig_handle: u64,
     tag: CapTag,
     rights: Rights,
     orig_obj_ptr: NonNull<KernelObjectHeader>,
     child1_ptr: NonNull<KernelObjectHeader>,
     child2_ptr: NonNull<KernelObjectHeader>,
-) -> Result<(u32, u32), SyscallError>
+) -> Result<(u64, u64), SyscallError>
 {
     let orig_idx = syscall::cap_handle_index(orig_handle);
     let orig_gen = syscall::cap_handle_gen(orig_handle);
@@ -212,7 +212,7 @@ pub(crate) unsafe fn install_split_children(
 struct Original
 {
     idx: u32,
-    generation: u8,
+    generation: u32,
     tag: CapTag,
     object: NonNull<KernelObjectHeader>,
 }
@@ -355,7 +355,7 @@ unsafe fn insert_and_link_children(
 struct InsertedChild
 {
     slot: NonZeroU32,
-    handle: u32,
+    handle: u64,
     object: NonNull<KernelObjectHeader>,
 }
 

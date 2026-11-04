@@ -103,7 +103,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     let cs = cap_create_cspace(ctx.memory_base, 0, 8)
         .map_err(|_| "stress::sleep_list_wide: create child cspace failed")?;
-    let mut children = [0u32; CHILDREN];
+    let mut children = [0u64; CHILDREN];
     let mut created = 0usize;
     let mut result = spawn_children(ctx, cs, &mut children, &mut created)
         .and_then(|()| timed_waits_take_their_timeout(ctx));
@@ -131,8 +131,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// wait until all have finished.
 fn spawn_children(
     ctx: &TestContext,
-    cs: u32,
-    children: &mut [u32; CHILDREN],
+    cs: u64,
+    children: &mut [u64; CHILDREN],
     created: &mut usize,
 ) -> TestResult
 {

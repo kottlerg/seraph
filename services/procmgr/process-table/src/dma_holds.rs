@@ -32,7 +32,7 @@ pub struct HeldReclaim
     pub memmgr_badge: u64,
     /// procmgr's slot of the child's badged memmgr SEND, deleted after the
     /// `PROCESS_DIED` round trip; zero when there is none.
-    pub memmgr_send_cap: u32,
+    pub memmgr_send_cap: u64,
 }
 
 /// The held reclaims, with room reserved for every armed child's.

@@ -18,21 +18,35 @@ use syscall::{
 };
 use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
+use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult};
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-/// Child entry: issue one `ipc_call` via the slot whose index is packed
-/// in the low 32 bits of `arg`, then `notification_send` on `done_slot` (high 32 bits) and exit.
-// cast_possible_truncation: slot indices are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
+/// The child's arguments (handles in its own `CSpace`), handed to
+/// `caller_entry` by address.
+#[derive(Clone, Copy)]
+struct CallerArgs
+{
+    ep: u64,
+    done: u64,
+}
+
+static CALLER_ARGS: ArgBlock<CallerArgs, 1> = ArgBlock::new(CallerArgs { ep: 0, done: 0 });
+
 /// IPC page of the [`caller_entry`] child.
 static mut CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
 
+/// Child entry: issue one `ipc_call` via the moved endpoint, then
+/// `notification_send` on the done notification and exit. `arg`: address of
+/// the child's [`CallerArgs`].
 extern "C" fn caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the entry `run` published for this child.
+    let CallerArgs {
+        ep: ep_slot,
+        done: done_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CALLER_IPC_PAGE));
     // SAFETY: `CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
@@ -85,7 +99,16 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("cap_move_into_fresh_cspace_then_ipc: source slot still usable after cap_move");
     }
 
-    let arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: the single child has not been started yet.
+    let arg = unsafe {
+        CALLER_ARGS.publish(
+            0,
+            CallerArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).

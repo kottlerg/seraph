@@ -31,7 +31,7 @@ pub struct WalkedFile
 {
     /// Badged SEND addressing the resolved file node. Caller owns and
     /// must `cap_delete` when no longer needed.
-    pub file_cap: u32,
+    pub file_cap: u64,
     /// Size hint reported by the resolving `NS_LOOKUP`.
     pub size: u64,
 }
@@ -56,7 +56,7 @@ pub struct WalkedFile
 /// as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`, which each hop issues through it).
 pub unsafe fn walk_to_file(
-    root_cap: u32,
+    root_cap: u64,
     path: &[u8],
     requested_rights: u64,
     ipc_buf: *mut u64,
@@ -97,11 +97,11 @@ pub unsafe fn walk_to_file(
 /// as registered via `syscall::ipc_buffer_set` (the contract of
 /// `ipc::ipc_call`, which each hop issues through it).
 pub unsafe fn walk_to_dir(
-    root_cap: u32,
+    root_cap: u64,
     path: &[u8],
     requested_rights: u64,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<u64>
 {
     // SAFETY: the caller's contract makes `ipc_buf` the registered IPC page.
     let WalkResult { cap, kind, .. } = unsafe { walk(root_cap, path, requested_rights, ipc_buf) }?;
@@ -115,7 +115,7 @@ pub unsafe fn walk_to_dir(
 
 struct WalkResult
 {
-    cap: u32,
+    cap: u64,
     kind: u64,
     size: u64,
 }
@@ -128,7 +128,7 @@ struct WalkResult
 /// # Safety
 /// The contract of [`walk_to_file`] for `ipc_buf`.
 unsafe fn walk(
-    root_cap: u32,
+    root_cap: u64,
     path: &[u8],
     requested_rights: u64,
     ipc_buf: *mut u64,

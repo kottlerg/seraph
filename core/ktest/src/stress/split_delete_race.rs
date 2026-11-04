@@ -55,8 +55,8 @@ static GO: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Copy)]
 struct SiblingArgs
 {
-    orig: u32,
-    done: u32,
+    orig: u64,
+    done: u64,
 }
 
 static SIBLING_ARGS: ArgBlock<SiblingArgs, 1> = ArgBlock::new(SiblingArgs { orig: 0, done: 0 });
@@ -77,7 +77,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let orig = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
             .map_err(|_| "stress::split_delete_race: derive original failed")?;
-        let mut children = [0u32; CHILDREN];
+        let mut children = [0u64; CHILDREN];
         for child in &mut children
         {
             *child = cap_derive(orig, RIGHTS_ALL)

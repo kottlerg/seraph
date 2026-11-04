@@ -467,12 +467,12 @@ Phase 7.
    AcpiReclaimable memory-map entry, MMIO aperture, boot module and reclaim range, and
    FIXED_BOOT_DESCRIPTORS more (`cap::init_info_descriptor_bound`), in the fewest pages that hold
    them, one contiguous zeroed extent. A boot whose bound passes INIT_INFO_DESCRIPTOR_CAPACITY, the
-   10,775 slots of the protocol's INIT_INFO_MAX_PAGES = 64 ceiling, halts with "FATAL: Phase 7:
+   8,079 slots of the protocol's INIT_INFO_MAX_PAGES = 64 ceiling, halts with "FATAL: Phase 7:
    boot descriptors exceed the InitInfo region ceiling". Then drain the remaining buddy RAM as
    address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the buddy,
    and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the region's
-   descriptor array, the 24-byte slots past the header, extent i in slot i; more extents than slots
+   descriptor array, the 32-byte slots past the header, extent i in slot i; more extents than slots
    halt the boot with "FATAL: Phase 7: drained RAM extents exceed the InitInfo descriptor
    capacity", the one check the in-place mint of step 3a relies on. Every capability Phases 7 and 8
    mint then has its descriptor written into that array, in place, so no copy of it exists, and a

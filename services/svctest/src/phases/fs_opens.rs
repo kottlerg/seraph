@@ -38,7 +38,7 @@ const PAGE: usize = 4096;
 
 /// Write a file of `pages` pages at `/data/svctest/<name>` through `std::fs`
 /// and return the `/data/svctest` directory cap and the file's node cap.
-fn scratch_file(name: &str, pages: usize, ipc_buf: *mut u64) -> (u32, u32)
+fn scratch_file(name: &str, pages: usize, ipc_buf: *mut u64) -> (u64, u64)
 {
     use std::io::Write;
 
@@ -58,7 +58,7 @@ fn scratch_file(name: &str, pages: usize, ipc_buf: *mut u64) -> (u32, u32)
 
 /// Whether `cap` still names a capability in this `CSpace`: a page cap the
 /// driver revoked does not.
-fn cap_live(cap: u32) -> bool
+fn cap_live(cap: u64) -> bool
 {
     syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok()
 }
@@ -178,11 +178,11 @@ const STOP_LABEL: u64 = 0x5709;
 /// it holds.
 struct Opener
 {
-    open: u32,
+    open: u64,
     tag: u64,
-    endpoint: u32,
-    stop: u32,
-    pages: Vec<u32>,
+    endpoint: u64,
+    stop: u64,
+    pages: Vec<u64>,
     /// The file page indices `pages` holds, in the same order.
     held: Vec<usize>,
 }
@@ -196,7 +196,7 @@ impl Opener
     /// A release endpoint with a handler thread that logs each
     /// `FS_RELEASE_MEMORY` under `tag` and acks it, and an `FS_OPEN` of
     /// `node` carrying a SEND on it.
-    fn new(node: u32, tag: u64, log: &ReleaseLog, ipc_buf: *mut u64) -> Self
+    fn new(node: u64, tag: u64, log: &ReleaseLog, ipc_buf: *mut u64) -> Self
     {
         let endpoint =
             std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
@@ -258,7 +258,7 @@ impl Opener
 
 /// Receive on `endpoint` until a [`STOP_LABEL`] message, logging each
 /// `FS_RELEASE_MEMORY` cookie under `tag` and acking it.
-fn serve_releases(endpoint: u32, tag: u64, log: &ReleaseLog)
+fn serve_releases(endpoint: u64, tag: u64, log: &ReleaseLog)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     loop

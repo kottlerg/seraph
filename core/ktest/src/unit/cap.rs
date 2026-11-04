@@ -28,6 +28,17 @@ static mut TEARDOWN_BATCH_STACK: ChildStack = ChildStack::ZERO;
 static mut STOP_BLOCKED_STACK: ChildStack = ChildStack::ZERO;
 static mut STOP_SPINNING_STACK: ChildStack = ChildStack::ZERO;
 
+/// The two handles each two-handle child of this module receives, one word
+/// apiece: a handle fills the child's whole argument word, so the pair goes
+/// by address (`spawn::ArgBlock`). One entry per child entry point; each
+/// test runs one such child at a time and reaps it before returning.
+static TEARDOWN_BATCH_ARGS: crate::spawn::ArgBlock<(u64, u64), 1> =
+    crate::spawn::ArgBlock::new((0, 0));
+static STOP_BLOCKED_ARGS: crate::spawn::ArgBlock<(u64, u64), 1> =
+    crate::spawn::ArgBlock::new((0, 0));
+static SELF_DELETE_ARGS: crate::spawn::ArgBlock<(u64, u64), 1> =
+    crate::spawn::ArgBlock::new((0, 0));
+
 // Notification NOTIFY (send) right, from syscall_abi (abi/syscall).
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
@@ -112,7 +123,7 @@ pub fn create_wait_set(ctx: &TestContext) -> TestResult
 
 // Thin wrapper — the syscall wrapper is `wait_set_create` in shared/syscall but
 // the underlying syscall number is `SYS_CAP_CREATE_WAIT_SET`.
-fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
+fn cap_create_wait_set(memory_cap: u64) -> Result<u64, i64>
 {
     syscall::wait_set_create(memory_cap, crate::WS_CAPACITY)
 }
@@ -306,7 +317,7 @@ pub fn delete_intermediate_keeps_grandchildren_revocable(ctx: &TestContext) -> T
     let body = || -> TestResult {
         let mid =
             cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "delete_intermediate: derive mid failed")?;
-        let mut probes: [Option<u32>; 3] = [None; 3];
+        let mut probes: [Option<u64>; 3] = [None; 3];
         for i in 0..GRANDCHILDREN
         {
             let gc = cap_derive(mid, RIGHTS_NOTIFY)
@@ -381,7 +392,7 @@ pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
 
     // Cycle 1: wide fan-out — 600 direct children of the root.
     // Probes: head, middle, and tail of the child list.
-    let mut probes: [Option<u32>; 3] = [None; 3];
+    let mut probes: [Option<u64>; 3] = [None; 3];
     for i in 0..WIDE_CHILDREN
     {
         let child = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive (wide) failed")?;
@@ -488,7 +499,7 @@ pub fn move_large_subtree(ctx: &TestContext) -> TestResult
     {
         let sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "create_notification for move_large_subtree failed")?;
-        let mut probes: [Option<u32>; 3] = [None; 3];
+        let mut probes: [Option<u64>; 3] = [None; 3];
         let mut grandchild = None;
         for i in 0..CHILDREN
         {
@@ -675,11 +686,24 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
     }
 
     // The wrapper refuses index 0, which the kernel reads as "allocate a
-    // slot"; the kernel refuses an index above the handle's index field.
+    // slot"; the kernel refuses an index above the handle's index field,
+    // which the wrapper's `u32` index cannot carry, so that case goes raw.
     let invalid = SyscallError::InvalidArgument as i64;
     let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
-    if cap_insert(sig, dest_cs, 0, syscall::RIGHTS_ALL) != Err(invalid)
-        || cap_insert(sig, dest_cs, above_field, syscall::RIGHTS_ALL) != Err(invalid)
+    // SAFETY: raw_syscall4's four conditions hold. SYS_CAP_COPY takes no
+    // pointer and uses no IPC buffer; it changes no mapping and no thread;
+    // its destination is `dest_cs`, not the caller's CSpace, so it changes
+    // no slot of the caller's CSpace.
+    let raw = unsafe {
+        syscall::raw_syscall4(
+            syscall_abi::SYS_CAP_COPY,
+            sig,
+            dest_cs,
+            above_field,
+            syscall::RIGHTS_ALL,
+        )
+    };
+    if cap_insert(sig, dest_cs, 0, syscall::RIGHTS_ALL) != Err(invalid) || raw != invalid
     {
         return Err("cap_insert with slot 0 or an index above CAP_INDEX_MASK should fail");
     }
@@ -701,13 +725,20 @@ pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
     let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for move_oob test failed")?;
 
+    // The wrapper's `u32` index cannot carry bits above the index field, so
+    // the move goes raw.
     let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
-    let moved = cap_move(sig, dest_cs, above_field);
+    // SAFETY: raw_syscall3's four conditions hold. SYS_CAP_MOVE takes no
+    // pointer and uses no IPC buffer; it changes no mapping and no thread;
+    // in the caller's CSpace it changes only `sig`, the slot its source
+    // argument names.
+    let moved =
+        unsafe { syscall::raw_syscall3(syscall_abi::SYS_CAP_MOVE, sig, dest_cs, above_field) };
     let source_kept = notification_send(sig, 0x1).is_ok();
 
     cap_delete(sig).ok();
     cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after move_oob test failed")?;
-    if moved != Err(SyscallError::InvalidArgument as i64)
+    if moved != SyscallError::InvalidArgument as i64
     {
         return Err("cap_move to an index above CAP_INDEX_MASK should fail");
     }
@@ -730,7 +761,7 @@ pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
 pub fn lookup_bounds(ctx: &TestContext) -> TestResult
 {
     use syscall_abi::{
-        CAP_INDEX_BITS, CAP_INDEX_MASK, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_TAG_RIGHTS,
+        CAP_GEN_MASK, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_TAG_RIGHTS, cap_handle_encode,
     };
 
     let invalid = SyscallError::InvalidCapability as i64;
@@ -750,12 +781,13 @@ pub fn lookup_bounds(ctx: &TestContext) -> TestResult
         first_indirect + 1,
         ceiling - 1,
     ];
-    let past_ceiling = [0, ceiling, ceiling + 1, CAP_INDEX_MASK - 1, CAP_INDEX_MASK];
-    for generation in [0u32, 0xFF]
+    // The index field is the handle's low 32 bits, so `u32::MAX` is its top.
+    let past_ceiling = [0, ceiling, ceiling + 1, u32::MAX - 1, u32::MAX];
+    for generation in [0u32, CAP_GEN_MASK]
     {
         for index in past_ceiling
         {
-            let handle = (generation << CAP_INDEX_BITS) | index;
+            let handle = cap_handle_encode(index, generation);
             if notification_send(handle, 0x1) != Err(invalid)
                 || cap_info(handle, CAP_INFO_TAG_RIGHTS) != Err(invalid)
             {
@@ -764,7 +796,7 @@ pub fn lookup_bounds(ctx: &TestContext) -> TestResult
         }
         for index in below_ceiling
         {
-            let handle = (generation << CAP_INDEX_BITS) | index;
+            let handle = cap_handle_encode(index, generation);
             // A slot of ktest's own CSpace that is live at this handle is
             // not a boundary probe; every other must resolve nothing.
             if cap_info(handle, CAP_INFO_TAG_RIGHTS).is_ok()
@@ -1034,7 +1066,9 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
         .map_err(|_| "teardown_batch: cap_copy ep failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "teardown_batch: cap_copy done failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
+    // SAFETY: index 0 < 1; this test's previous child on the entry has
+    // exited, and this one has not started.
+    let child_arg = unsafe { TEARDOWN_BATCH_ARGS.publish(0, (child_ep, child_done)) };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TEARDOWN_BATCH_STACK));
     // SAFETY: the stack is `TEARDOWN_BATCH_STACK`, this test's own `ChildStack`,
@@ -1106,7 +1140,7 @@ const STOP_CORR_LATE: u64 = 0x5702;
 /// Death-event side of a teardown stop: the observer bound before the stop
 /// (`early`) received nothing, and a fresh observer bound now receives the
 /// retained `EXIT_KILLED` exactly once. Consumes `early`.
-fn check_stop_observers(ctx: &TestContext, thread: u32, early: u32) -> TestResult
+fn check_stop_observers(ctx: &TestContext, thread: u64, early: u64) -> TestResult
 {
     let late = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "stop_bound: event_queue_create (late) failed")?;
@@ -1161,7 +1195,9 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "stop_bound: cap_copy ready failed")?;
     let child_block = cap_copy(block, child.cs, syscall_abi::RIGHTS_NTF_WAIT)
         .map_err(|_| "stop_bound: cap_copy block failed")?;
-    let arg = u64::from(child_ready) | (u64::from(child_block) << 32);
+    // SAFETY: index 0 < 1; this test's previous child on the entry has
+    // exited, and this one has not started.
+    let arg = unsafe { STOP_BLOCKED_ARGS.publish(0, (child_ready, child_block)) };
     let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_BLOCKED_STACK));
     // SAFETY: the stack is `STOP_BLOCKED_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
@@ -1207,12 +1243,7 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     // SAFETY: the stack is `STOP_SPINNING_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
-        crate::spawn::configure_and_start(
-            &child,
-            stop_spinning_child_entry,
-            stack_top,
-            u64::from(child_ready),
-        )
+        crate::spawn::configure_and_start(&child, stop_spinning_child_entry, stack_top, child_ready)
     }
     .map_err(|_| "stop_bound: configure_and_start (spin) failed")?;
     notification_wait(ready).map_err(|_| "stop_bound: wait ready (spin) failed")?;
@@ -1251,8 +1282,8 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 /// which the test never expects.
 extern "C" fn stop_blocked_child_entry(arg: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF_FFFF) as u32;
-    let block_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `STOP_BLOCKED_ARGS` entry the test published.
+    let (ready_slot, block_slot): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
     notification_send(ready_slot, 0x1).ok();
     notification_wait(block_slot).ok();
     syscall::thread_exit()
@@ -1260,9 +1291,8 @@ extern "C" fn stop_blocked_child_entry(arg: u64) -> !
 
 /// Child for [`cspace_delete_stops_bound_thread`] and
 /// [`spawned_child_drop_stops_running_child`]: signal, then yield forever.
-extern "C" fn stop_spinning_child_entry(arg: u64) -> !
+extern "C" fn stop_spinning_child_entry(ready_slot: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF_FFFF) as u32;
     notification_send(ready_slot, 0x1).ok();
     loop
     {
@@ -1299,7 +1329,7 @@ pub fn spawned_child_drop_stops_running_child(ctx: &TestContext) -> TestResult
 /// Start a child spinning on `thread_yield`, wait until it has run, and drop
 /// its guard with both caps still held; returns a derived copy of its Thread
 /// cap, minted before the start.
-fn spawn_and_drop_spinner(ctx: &TestContext, ready: u32) -> Result<u32, &'static str>
+fn spawn_and_drop_spinner(ctx: &TestContext, ready: u64) -> Result<u64, &'static str>
 {
     let child = crate::spawn::new_child(ctx).map_err(|_| "guard_drop: new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -1310,12 +1340,7 @@ fn spawn_and_drop_spinner(ctx: &TestContext, ready: u32) -> Result<u32, &'static
     // SAFETY: the stack is `GUARD_DROP_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     let started = unsafe {
-        crate::spawn::configure_and_start(
-            &child,
-            stop_spinning_child_entry,
-            stack_top,
-            u64::from(child_ready),
-        )
+        crate::spawn::configure_and_start(&child, stop_spinning_child_entry, stack_top, child_ready)
     }
     .and_then(|()| {
         notification_wait(ready)
@@ -1363,7 +1388,9 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .delete_cspace()
         .map_err(|_| "self_delete: cap_delete(cspace) failed")?;
 
-    let arg = u64::from(child_ready) | (u64::from(own_cs) << 32);
+    // SAFETY: index 0 < 1; this test's previous child on the entry has
+    // exited, and this one has not started.
+    let arg = unsafe { SELF_DELETE_ARGS.publish(0, (child_ready, own_cs)) };
     let stack_top = ChildStack::top(core::ptr::addr_of!(SELF_DELETE_STACK));
     // SAFETY: the stack is `SELF_DELETE_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
@@ -1394,8 +1421,8 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
 /// yield loop only satisfies the signature.
 extern "C" fn self_delete_child_entry(arg: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF_FFFF) as u32;
-    let own_cs = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `SELF_DELETE_ARGS` entry the test published.
+    let (ready_slot, own_cs): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
     notification_send(ready_slot, 0x1).ok();
     cap_delete(own_cs).ok();
     loop
@@ -1409,8 +1436,8 @@ extern "C" fn self_delete_child_entry(arg: u64) -> !
 /// signals completion, and exits without cleaning up — teardown is the test.
 extern "C" fn teardown_batch_child_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
-    let done_slot = (arg >> 32) as u32;
+    // SAFETY: `arg` is the `TEARDOWN_BATCH_ARGS` entry the test published.
+    let (ep_slot, done_slot): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
 
     let mut ok = true;
     for _ in 0..TEARDOWN_BATCH_DERIVES

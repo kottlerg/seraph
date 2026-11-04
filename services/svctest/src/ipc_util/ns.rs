@@ -7,11 +7,11 @@
 
 /// Issue `NS_LOOKUP` against `dir_cap` and return `(node_cap, kind, size)`.
 pub fn ns_lookup(
-    dir_cap: u32,
+    dir_cap: u64,
     name: &[u8],
     requested_rights: u64,
     ipc_buf: *mut u64,
-) -> Result<(u32, u64, u64), u64>
+) -> Result<(u64, u64, u64), u64>
 {
     let label = ipc::ns_labels::NS_LOOKUP | ((name.len() as u64) << 16);
     let msg = ipc::IpcMessage::builder(label)
@@ -32,7 +32,7 @@ pub fn ns_lookup(
 }
 
 /// Issue `NS_STAT` against `node_cap` and return `(size, mtime, kind)`.
-pub fn ns_stat(node_cap: u32, ipc_buf: *mut u64) -> Result<(u64, u64, u64), u64>
+pub fn ns_stat(node_cap: u64, ipc_buf: *mut u64) -> Result<(u64, u64, u64), u64>
 {
     let msg = ipc::IpcMessage::new(ipc::ns_labels::NS_STAT);
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -48,7 +48,7 @@ pub fn ns_stat(node_cap: u32, ipc_buf: *mut u64) -> Result<(u64, u64, u64), u64>
 /// Issue `NS_READDIR(idx)` against `dir_cap`. Returns `Ok(None)` on
 /// `END_OF_DIR`, `Ok(Some((kind, name)))` for a populated entry, and
 /// `Err(code)` on protocol error.
-pub fn ns_readdir(dir_cap: u32, idx: u64, ipc_buf: *mut u64)
+pub fn ns_readdir(dir_cap: u64, idx: u64, ipc_buf: *mut u64)
 -> Result<Option<(u64, Vec<u8>)>, u64>
 {
     let msg = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR)

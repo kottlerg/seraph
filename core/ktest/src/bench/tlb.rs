@@ -57,8 +57,8 @@ static mut SHOOTDOWN_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZER
 #[derive(Clone, Copy)]
 struct SpinnerArgs
 {
-    ready: u32,
-    done: u32,
+    ready: u64,
+    done: u64,
     bit_index: usize,
 }
 
@@ -294,7 +294,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 /// exit, though it may not yet be Exited. If a worker does not report
 /// within the bound, the timeout is logged. Either way a Thread may still
 /// be running when deleted, which the kernel's Thread teardown drains.
-fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, ready: u32, done: u32)
+fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, ready: u64, done: u64)
 {
     await_worker_bits(
         done,
@@ -314,7 +314,7 @@ fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, rea
 /// workers' bit (`1 << i`) on `notif`. On a timeout or a failed wait, log
 /// `label` and return, so a worker that never reports cannot hang the bench
 /// (the benches produce no verdict; their teardown deletes the workers).
-fn await_worker_bits(notif: u32, spawned: usize, label: &'static str)
+fn await_worker_bits(notif: u64, spawned: usize, label: &'static str)
 {
     if spawned == 0
     {
@@ -361,10 +361,10 @@ static mut CONC_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; 
 #[derive(Clone, Copy)]
 struct ConcArgs
 {
-    ready: u32,
-    done: u32,
-    memory: u32,
-    aspace: u32,
+    ready: u64,
+    done: u64,
+    memory: u64,
+    aspace: u64,
     bit_index: usize,
     iters: u64,
 }
@@ -526,7 +526,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     };
 
     // One pool frame per worker.
-    let mut memory_caps = [0u32; MAX_PINNED];
+    let mut memory_caps = [0u64; MAX_PINNED];
     let mut allocated = 0usize;
     for f in memory_caps.iter_mut().take(want)
     {

@@ -18,7 +18,7 @@
 //! so consumers never learn the transport.
 
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
+// are lossless. Narrower casts extract the fields a packed `u64` word carries.
 #![allow(clippy::cast_possible_truncation)]
 
 mod decode;
@@ -60,13 +60,13 @@ const POLL_INTERVAL_MS: u64 = 20;
 struct DriverCaps
 {
     bars: DeliveredBars,
-    irq_slot: u32,
+    irq_slot: u64,
     /// The `SYS_IRQ_REGISTER` mode devmgr derived for the IRQ line.
     irq_mode: u64,
-    memmgr_ep: u32,
-    service_ep: u32,
-    devmgr_ep: u32,
-    self_aspace: u32,
+    memmgr_ep: u64,
+    service_ep: u64,
+    devmgr_ep: u64,
+    self_aspace: u64,
 }
 
 fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
@@ -149,7 +149,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
 
 /// Query devmgr for `VirtIO` PCI capability locations. Identical generic
 /// `QUERY_DEVICE_INFO` schema as virtio-blk; the badge identifies the device.
-fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
+fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 {
     let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_INFO)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -211,7 +211,7 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 /// this driver's service endpoint only after the report. Logs the
 /// `ReadyError` and exits when the call fails or devmgr refuses the report,
 /// since devmgr then serves no client this driver.
-fn report_ready(devmgr_ep: u32, ipc_buf: *mut u64)
+fn report_ready(devmgr_ep: u64, ipc_buf: *mut u64)
 {
     // SAFETY: ipc_buf is the registered IPC buffer.
     if let Err(e) = unsafe { ipc::report_driver_ready(devmgr_ep, ipc_buf) }
@@ -226,7 +226,7 @@ fn report_ready(devmgr_ep: u32, ipc_buf: *mut u64)
 /// Request a single contiguous Memory cap covering `page_count` pages from
 /// memmgr. Returns `(cap_slot, phys_base)`; the physical base is needed for
 /// DMA programming on no-IOMMU systems.
-fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
+fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Option<(u64, u64)>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -446,7 +446,7 @@ struct InputRuntime
     /// interrupt its timed ISR read finds ([`start_isr_thread`]), never
     /// signalled when no IRQ is bound, in which case the bounded wait is a
     /// timed poll.
-    wake: u32,
+    wake: u64,
     ring: EventRing,
     mods: ModifierState,
 }
@@ -508,7 +508,7 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
 /// notification bound to the device's line: it acknowledges every delivery
 /// at once, a read in flight or not, and signals `wake` for the read loop.
 /// Returns whether the thread started.
-fn start_isr_thread(transport: PciTransport, irq_notification: u32, irq_cap: u32, wake: u32)
+fn start_isr_thread(transport: PciTransport, irq_notification: u64, irq_cap: u64, wake: u64)
 -> bool
 {
     std::thread::Builder::new()
@@ -558,7 +558,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
-fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
+fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
 {
     std::os::seraph::log!("ready, entering service loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);

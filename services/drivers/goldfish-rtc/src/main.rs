@@ -29,16 +29,16 @@ const REG_TIME_HIGH: u64 = 0x04;
 
 struct BootCaps
 {
-    service_ep: u32,
-    mmio_cap: u32,
+    service_ep: u64,
+    mmio_cap: u64,
     /// devmgr query cap: a SEND badged with this device's badge on its spawn
     /// batch's private endpoint, for `DRIVER_READY`.
-    devmgr_query_ep: u32,
+    devmgr_query_ep: u64,
 }
 
 /// Request the two bootstrap rounds: round 1 (not terminal)
 /// `[service_ep, mmio_cap]`, round 2 (terminal) `[devmgr_query_ep]`.
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -125,7 +125,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
-fn service_loop(service_ep: u32, ipc_buf: *mut u64, base_va: u64) -> !
+fn service_loop(service_ep: u64, ipc_buf: *mut u64, base_va: u64) -> !
 {
     std::os::seraph::log!("ready");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);

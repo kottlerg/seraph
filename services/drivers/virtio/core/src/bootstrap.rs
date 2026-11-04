@@ -58,7 +58,7 @@ const _: () = assert!(ROUND2_SLOTS <= MSG_CAP_SLOTS_MAX);
 /// The BAR caps a driver received in round 1, each with its PCI BAR index.
 pub struct DeliveredBars
 {
-    caps: [u32; MAX_VIRTIO_BARS],
+    caps: [u64; MAX_VIRTIO_BARS],
     bar_indices: [u64; MAX_VIRTIO_BARS],
     count: usize,
 }
@@ -88,7 +88,7 @@ impl DeliveredBars
 
     /// The BAR caps, in delivery order.
     #[must_use]
-    pub fn caps(&self) -> &[u32]
+    pub fn caps(&self) -> &[u64]
     {
         &self.caps[..self.count]
     }
@@ -107,15 +107,15 @@ impl DeliveredBars
 pub struct DriverEndpoints
 {
     /// The driver's service endpoint ([`SLOT_SERVICE`]).
-    pub service: u32,
+    pub service: u64,
     /// The device's IRQ cap ([`SLOT_IRQ`]), `0` when devmgr delivered none.
-    pub irq: u32,
+    pub irq: u64,
     /// The mode the driver passes to `SYS_IRQ_REGISTER` for [`Self::irq`]
     /// ([`DATA_IRQ_MODE`]).
     pub irq_mode: u64,
     /// devmgr's per-device query and ready-report endpoint
     /// ([`SLOT_DEVMGR_QUERY`]).
-    pub devmgr_query: u32,
+    pub devmgr_query: u64,
 }
 
 impl DriverEndpoints
@@ -157,7 +157,7 @@ mod tests
 
     use syscall_abi::MSG_DATA_WORDS_MAX;
 
-    fn round(done: bool, caps: &[u32], data: &[u64]) -> BootstrapRound
+    fn round(done: bool, caps: &[u64], data: &[u64]) -> BootstrapRound
     {
         let mut r = BootstrapRound {
             caps: [0; MSG_CAP_SLOTS_MAX],

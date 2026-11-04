@@ -98,7 +98,7 @@ fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
 /// One cycle: start a timed waiter, then delete its last Thread cap around
 /// its deadlines. The waiter is deleted on every path, so the stack is free
 /// for the next cycle.
-fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u32, eq: u32) -> TestResult
+fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u64, eq: u64) -> TestResult
 {
     let mut child = spawn::new_child(ctx)
         .map_err(|_| "stress::timed_waiter_thread_delete: spawn waiter failed")?;
@@ -126,10 +126,10 @@ fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u32, eq: u32) -> Tes
 
 /// Configure and start this cycle's waiter: a plain sleeper, a timed
 /// notification waiter, or a timed event-queue waiter, by cycle.
-fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u32, eq: u32)
+fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u64, eq: u64)
 -> TestResult
 {
-    let (entry, source): (extern "C" fn(u64) -> !, u32) = match cycle % 3
+    let (entry, source): (extern "C" fn(u64) -> !, u64) = match cycle % 3
     {
         0 => (sleep_waiter, 0),
         1 => (notif_waiter, sig),
@@ -153,10 +153,8 @@ fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u32, eq
     let waiter_cpu = if (cycle / 3) & 1 == 0 { 0 } else { 2 % cpus };
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        spawn::configure_and_start_pinned(child, entry, stack, u64::from(c_source), waiter_cpu)
-    }
-    .map_err(|_| "stress::timed_waiter_thread_delete: start waiter failed")
+    unsafe { spawn::configure_and_start_pinned(child, entry, stack, c_source, waiter_cpu) }
+        .map_err(|_| "stress::timed_waiter_thread_delete: start waiter failed")
 }
 
 /// Count a started wait, then run it; loop until deleted.
@@ -176,21 +174,17 @@ extern "C" fn sleep_waiter(_arg: u64) -> !
     })
 }
 
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn notif_waiter(arg: u64) -> !
 {
-    let sig = arg as u32;
+    let sig = arg;
     wait_loop(|| {
         let _ = notification_wait_timeout(sig, WAIT_MS);
     })
 }
 
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn queue_waiter(arg: u64) -> !
 {
-    let eq = arg as u32;
+    let eq = arg;
     wait_loop(|| {
         let _ = event_recv_timeout(eq, WAIT_MS);
     })

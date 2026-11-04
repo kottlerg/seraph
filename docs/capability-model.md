@@ -47,16 +47,26 @@ A capability handle — the value userspace passes to and receives from the kern
 packs a per-slot **generation** with the slot index:
 
 ```
-handle = (generation << CAP_INDEX_BITS) | index      // CAP_INDEX_BITS = 24
+handle = (generation << CAP_INDEX_BITS) | index      // CAP_INDEX_BITS = 32
 ```
 
-The low 24 bits are the slot index; the high 8 bits are the slot's generation
-counter, which the kernel increments each time the slot is freed and recycled. On
-every operation the kernel checks the handle's generation against the slot's
-current generation and returns `InvalidCapability` on mismatch. This closes the
-stale-slot alias class (#349): a handle held across a free/reallocate of its slot
-fails closed instead of silently operating on whatever unrelated capability now
-occupies the index.
+The handle is a `u64`. The low 32 bits are the slot index; bits 32 to 62 are the
+slot's generation counter (`CAP_GEN_BITS = 31`), which the kernel increments each
+time the slot is freed and recycled, wrapping at 2^31. Bit 63 is always clear: a
+handle returned in the primary syscall return register never reads as a negative
+error code. On every operation the kernel checks the handle's generation against
+the slot's current generation and returns `InvalidCapability` on mismatch, a handle
+with bit 63 set included. This closes the stale-slot alias class (#349): a handle
+held across a free/reallocate of its slot fails closed instead of silently
+operating on whatever unrelated capability now occupies the index. The check fails
+open only for a handle held across exactly a multiple of 2^31 recycles of its one
+index, when the wrapped generation matches again.
+
+The index field is wider than any `CSpace` the kernel builds: the structural slot
+ceiling is the kernel's directory geometry
+([capability-internals.md](../core/kernel/docs/capability-internals.md) § Storage:
+Hybrid Two-Level Radix), which the kernel asserts fits the field, so a deeper
+directory raises the ceiling with no handle change.
 
 A never-recycled slot has generation 0, so its handle is numerically identical to
 the bare slot index. Long-lived capabilities minted once at boot or process spawn
@@ -64,17 +74,16 @@ the bare slot index. Long-lived capabilities minted once at boot or process spaw
 historical handle values, and the `handle == 0` "no capability" sentinel still
 holds (a live cap always has index ≥ 1 in the low bits).
 
-The handle is `u32`-wide and travels in the low half of a 64-bit syscall register.
-Capabilities transferred over IPC, and the second child of a range split, are
-delivered with their generation intact (the split delivers its two children in the
-two return registers rather than packing them into one). The IPC *send* path
-carries the full handle as well — the packed transfer words hold one 32-bit
-handle per field — so the kernel generation-validates the sender's named slots:
-a stale, recycled handle fails closed with `InvalidCapability` instead of
-transmitting the slot's current occupant. Every handle-resolution path is
-covered by the generation check (#349). The cap the recipient *receives* is
-generation-correct: the kernel re-derives it from the freshly inserted
-destination slot.
+The handle fills a 64-bit syscall register. Capabilities transferred over IPC, and
+the second child of a range split, are delivered with their generation intact (the
+split delivers its two children in the two return registers). The IPC *send* path
+carries the full handle as well, one handle per word of the sender's IPC buffer cap
+block ([ipc-design.md](ipc-design.md) § Message Format), so the kernel
+generation-validates the sender's named slots: a stale, recycled handle fails closed
+with `InvalidCapability` instead of transmitting the slot's current occupant. Every
+handle-resolution path is covered by the generation check (#349). The cap the
+recipient *receives* is generation-correct: the kernel re-derives it from the freshly
+inserted destination slot.
 
 ---
 
@@ -339,7 +348,7 @@ an EID set carried by `SbiControlObject`, because the extension set is small and
 non-numeric and only one actuating consumer exists (pwrmgr, SRST-only).
 `SbiControlObject` carries no fields, and its init descriptor has `aux0 = aux1 = 0`.
 Rights are scoped
-per capability type, so `SbiControl` draws on its own full 32-bit space —
+per capability type, so `SbiControl` draws on its own full 16-bit space —
 sanctioning further extensions does not compete with any other type's rights.
 
 ### SchedControl

@@ -182,7 +182,7 @@ fn all_phases(ctx: &TestContext, server_cpu: u32) -> TestResult
 /// The peer's source and, for the IPC kind, the server answering it.
 struct PhaseObjects
 {
-    source: Option<u32>,
+    source: Option<u64>,
     server: Option<spawn::SpawnedChild>,
 }
 
@@ -251,10 +251,8 @@ fn setup(
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
         // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe {
-            spawn::configure_and_start_pinned(s, server_entry, stack, u64::from(s_ep), server_cpu)
-        }
-        .map_err(|_| "stress::stop_park_race: start server failed")?;
+        unsafe { spawn::configure_and_start_pinned(s, server_entry, stack, s_ep, server_cpu) }
+            .map_err(|_| "stress::stop_park_race: start server failed")?;
     }
 
     let p = spawn::new_child(ctx).map_err(|_| "stress::stop_park_race: spawn peer failed")?;
@@ -275,7 +273,7 @@ fn setup(
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe { spawn::configure_and_start_pinned(p, entry, stack, u64::from(p_source), 1) }
+    unsafe { spawn::configure_and_start_pinned(p, entry, stack, p_source, 1) }
         .map_err(|_| "stress::stop_park_race: start peer failed")
 }
 
@@ -306,7 +304,7 @@ fn teardown(peer: Option<&mut spawn::SpawnedChild>, objects: &mut PhaseObjects) 
 /// One race: wait for the peer to approach its park, stop and restart it,
 /// release it if the stop missed, and check its result. Returns whether the
 /// park ended `Interrupted`.
-fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<bool, &'static str>
+fn race_once(kind: Kind, peer: u64, source: Option<u64>, cycle: u32) -> Result<bool, &'static str>
 {
     await_parking(peer, cycle)?;
     // Vary the stop's phase against the park: 0 to 4095 spins (a
@@ -336,7 +334,7 @@ fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<b
 /// and the clock are polled every [`POLL_SPINS`] spins, so the reaction to
 /// the announcement stays tight; a peer that exited, or that never
 /// announced in time, fails the race.
-fn await_parking(peer: u32, cycle: u32) -> TestResult
+fn await_parking(peer: u64, cycle: u32) -> TestResult
 {
     let bound = crate::scaled_bound(APPROACH_WAIT_US);
     let start = elapsed_us()?;
@@ -358,7 +356,7 @@ fn await_parking(peer: u32, cycle: u32) -> TestResult
 /// rounds, then release a notification peer through its genuine waker
 /// (once) and yield in 1 ms sleeps, for at most [`RESULT_WAIT_US`] on the
 /// `ElapsedUs` clock.
-fn await_result(kind: Kind, source: Option<u32>, cycle: u32) -> TestResult
+fn await_result(kind: Kind, source: Option<u64>, cycle: u32) -> TestResult
 {
     let bound = crate::scaled_bound(RESULT_WAIT_US);
     let start = elapsed_us()?;
@@ -426,11 +424,9 @@ fn is_interrupted(e: i64) -> bool
     e == SyscallError::Interrupted as i64
 }
 
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn notif_peer(arg: u64) -> !
 {
-    let sig = arg as u32;
+    let sig = arg;
     peer_loop(|| match notification_wait(sig)
     {
         Ok(bits) if bits == RESCUE_BITS => RESULT_GENUINE,
@@ -439,11 +435,9 @@ extern "C" fn notif_peer(arg: u64) -> !
     })
 }
 
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn call_peer(arg: u64) -> !
 {
-    let ep = arg as u32;
+    let ep = arg;
     // SAFETY: sole live user of PEER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(PEER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
@@ -478,11 +472,9 @@ extern "C" fn sleep_peer(_arg: u64) -> !
 /// was cancelled meanwhile fails and is ignored. Runs until deleted (or
 /// until its endpoint goes first); a `RecvGuard` bounds the retries of a
 /// failed receive (docs/ipc-design.md § Receive-Failure Policy).
-// cast_possible_truncation: the argument is a 32-bit cap handle.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn server_entry(arg: u64) -> !
 {
-    let ep = arg as u32;
+    let ep = arg;
     // SAFETY: sole live user of SERVER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),

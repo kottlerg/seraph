@@ -5,6 +5,8 @@
 
 //! Kernel process-fault surfaces (stack guard, RELRO seal).
 
+use std::os::seraph::process::ChildExt;
+
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -35,7 +37,7 @@ pub fn stack_overflow_phase(_: &Caps)
         .spawn()
         .expect("spawn /programs/stackoverflow failed");
 
-    let id = child.id();
+    let id = child.process_handle();
     std::os::seraph::log!("spawned /programs/stackoverflow handle={id:#x}");
 
     let status = child.wait().expect("stackoverflow wait failed");

@@ -34,7 +34,7 @@ const LSR: usize = 5;
 ///
 /// # Safety
 /// Must be called once, from the main thread, after `InitInfo` is mapped.
-pub unsafe fn init(info: &InitInfo, aspace_cap: u32, _thread_cap: u32) -> bool
+pub unsafe fn init(info: &InitInfo, aspace_cap: u64, _thread_cap: u64) -> bool
 {
     let Some((slot, size)) = find_uart_cap(info)
     else
@@ -70,7 +70,7 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32, _thread_cap: u32) -> bool
 
 /// The `CSpace` slot and byte size of the `Mmio` cap whose base is the UART,
 /// if `InitInfo` carries one.
-fn find_uart_cap(info: &InitInfo) -> Option<(u32, u64)>
+fn find_uart_cap(info: &InitInfo) -> Option<(u64, u64)>
 {
     crate::init_info::descriptors(info)
         .iter()

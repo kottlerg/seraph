@@ -61,7 +61,7 @@ fn svcmgr_second_seed_round_phase(caps: &Caps)
 
 /// The registry SEND procmgr installed in svctest's `ProcessInfo`, and the
 /// IPC buffer to call it with.
-fn registry_cap_and_buf(phase: &str) -> (u32, *mut u64)
+fn registry_cap_and_buf(phase: &str) -> (u64, *mut u64)
 {
     let info = startup_info();
     let registry_cap = info.service_registry_cap;

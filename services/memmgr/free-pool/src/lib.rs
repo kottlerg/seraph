@@ -43,7 +43,7 @@ pub const DEMAND_CHUNK_PAGES: u32 = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FreeRun
 {
-    pub cap_slot: u32,
+    pub cap_slot: u64,
     pub page_count: u64,
     pub phys_base: u64,
 }

@@ -34,8 +34,8 @@ const PROGRESS_INTERVAL_US: u64 = 10_000_000;
 #[derive(Clone, Copy)]
 struct CallerArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     /// 1-based caller label carried in the call.
     label: u64,
     bit_index: u64,

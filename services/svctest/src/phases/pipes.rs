@@ -5,6 +5,8 @@
 
 //! Kernel pipe object surface (Stdio piped, death-bridge EOF).
 
+use std::os::seraph::process::ChildExt;
+
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -189,7 +191,7 @@ pub fn pipe_fault_eof_phase(_: &Caps)
         .spawn()
         .expect("spawn /programs/pipefault failed");
 
-    let id = child.id();
+    let id = child.process_handle();
     std::os::seraph::log!("spawned /programs/pipefault handle={id:#x}");
 
     let mut stdout = child.stdout.take().expect("piped stdout missing");

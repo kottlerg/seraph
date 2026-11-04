@@ -87,7 +87,7 @@
 //!
 //! Needs **≥ 3 CPUs**.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     cap_create_thread, cap_delete, cap_move, system_info, thread_configure, thread_exit,
@@ -152,7 +152,7 @@ static TARGET_EXITED: AtomicU32 = AtomicU32::new(0);
 /// The target's current handle in ktest's `CSpace`, published by the
 /// controller before the stopper starts and after each vanish; the stopper
 /// re-reads it after an `InvalidCapability`.
-static TARGET_HANDLE: AtomicU32 = AtomicU32::new(0);
+static TARGET_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Set by the stopper across its stop syscall; the controller reads it once
 /// the stopper is off its CPU to classify where its stop landed.
 static STOPPER_IN_STOP: AtomicU32 = AtomicU32::new(0);
@@ -192,8 +192,8 @@ enum Vanish
 #[derive(Default)]
 struct Children
 {
-    stopper: Option<u32>,
-    target: Option<u32>,
+    stopper: Option<u64>,
+    target: Option<u64>,
 }
 
 /// What the controller saw in a phase.
@@ -347,7 +347,6 @@ fn phase(ctx: &TestContext, kind: Vanish) -> Result<Seen, &'static str>
         &STOPPER_QUIESCED,
         &STOPPER_EXITED,
         &TARGET_EXITED,
-        &TARGET_HANDLE,
         &STOPPER_IN_STOP,
         &STOPPER_PROGRESS,
         &TARGET_PROGRESS,
@@ -362,6 +361,7 @@ fn phase(ctx: &TestContext, kind: Vanish) -> Result<Seen, &'static str>
     {
         counter.store(0, Ordering::Release);
     }
+    TARGET_HANDLE.store(0, Ordering::Release);
     for tally in [&BAD_STOPS, &BAD_STARTS]
     {
         tally.reset();
@@ -416,11 +416,11 @@ fn spawn_target(ctx: &TestContext, children: &mut Children) -> TestResult
 /// returned.
 fn create_thread(
     ctx: &TestContext,
-    slot: &mut Option<u32>,
+    slot: &mut Option<u64>,
     entry: extern "C" fn(u64) -> !,
     stack: usize,
     cpu: u32,
-) -> Result<u32, &'static str>
+) -> Result<u64, &'static str>
 {
     let th = *slot.insert(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
@@ -553,7 +553,7 @@ fn move_target(ctx: &TestContext, children: &mut Children) -> TestResult
 }
 
 /// The phase's two handles, which the rounds require.
-fn handles(children: &Children) -> Result<(u32, u32), &'static str>
+fn handles(children: &Children) -> Result<(u64, u64), &'static str>
 {
     match (children.stopper, children.target)
     {
@@ -564,7 +564,7 @@ fn handles(children: &Children) -> Result<(u32, u32), &'static str>
 
 /// Restart `child`; returns whether the start committed (`Ok`). A child
 /// that is running or exited refuses it with `InvalidArgument`.
-fn restart(child: u32) -> Result<bool, &'static str>
+fn restart(child: u64) -> Result<bool, &'static str>
 {
     match thread_start(child)
     {
@@ -737,7 +737,7 @@ fn pace_on_target()
 /// are tallied, `InvalidCapability` tallied and reported as the handle
 /// having vanished, anything else recorded as bad. Returns whether the
 /// handle has vanished.
-fn stop_target(target: u32) -> bool
+fn stop_target(target: u64) -> bool
 {
     match thread_stop(target)
     {
@@ -764,7 +764,7 @@ fn stop_target(target: u32) -> bool
 /// tallied, `InvalidCapability` tallied and reported as the handle having
 /// vanished, anything else recorded as bad. Returns whether the handle has
 /// vanished.
-fn start_target(target: u32) -> bool
+fn start_target(target: u64) -> bool
 {
     match thread_start(target)
     {

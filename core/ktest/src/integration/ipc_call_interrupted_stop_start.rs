@@ -75,8 +75,8 @@ static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 #[derive(Clone, Copy)]
 struct ClientArgs
 {
-    ep: u32,
-    done: u32,
+    ep: u64,
+    done: u64,
     /// `done` bit raised before the call (0 = none).
     ready: u64,
     /// `done` bit raised when the call returns `Interrupted`.
@@ -97,9 +97,9 @@ static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, 1> = spawn::ArgBlock::new(Client
 #[derive(Clone, Copy)]
 struct ServerArgs
 {
-    ep: u32,
-    done: u32,
-    block: u32,
+    ep: u64,
+    done: u64,
+    block: u64,
 }
 
 static SERVER_ARGS: spawn::ArgBlock<ServerArgs, 1> = spawn::ArgBlock::new(ServerArgs {
@@ -241,7 +241,7 @@ fn reap(mut child: spawn::SpawnedChild, err: &'static str) -> TestResult
 }
 
 /// Accumulate `done` bits into `acc` until any bit of `mask` is present.
-fn wait_for(done: u32, acc: &mut u64, mask: u64) -> Result<(), &'static str>
+fn wait_for(done: u64, acc: &mut u64, mask: u64) -> Result<(), &'static str>
 {
     while *acc & mask == 0
     {
@@ -254,7 +254,7 @@ fn wait_for(done: u32, acc: &mut u64, mask: u64) -> Result<(), &'static str>
 }
 
 /// Publish the client's arguments and return the entry address.
-fn publish_client_args(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
+fn publish_client_args(ep: u64, done: u64, ready: u64, ok: u64, bad: u64) -> u64
 {
     // SAFETY: no client is live when this is called (see `ClientArgs`).
     unsafe {

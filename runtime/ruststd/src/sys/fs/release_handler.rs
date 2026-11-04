@@ -66,7 +66,7 @@ pub(super) struct OutstandingMapping
 {
     pub cookie: u64,
     pub range: ReservedRange,
-    pub memory_cap: u32,
+    pub memory_cap: u64,
 }
 
 /// Per-`File` registration entry held by the release handler under its
@@ -76,7 +76,7 @@ pub(super) struct FileEntry
 {
     /// The `File`'s open cap, for the process-exit `FS_CLOSE`
     /// ([`open_caps`]).
-    open_cap: u32,
+    open_cap: u64,
     outstanding: Mutex<Outstanding>,
     /// Signalled whenever a cookie leaves [`Outstanding::reading`].
     read_done: Condvar,
@@ -106,11 +106,11 @@ pub(super) struct ReleaseState
     /// derived from it would live in fs's CSpace once a delivery
     /// channel exists. Revoking this cap (which we never do) would
     /// tear down every fs-side derived child atomically.
-    release_ep: u32,
+    release_ep: u64,
     registry: Mutex<BTreeMap<u64, Arc<FileEntry>>>,
     /// Process aspace cap, captured at init for the handler's
     /// `mem_unmap` calls. Equal to `StartupInfo::self_aspace`.
-    aspace: u32,
+    aspace: u64,
 }
 
 /// Published only after the handler thread serving it has spawned.
@@ -174,7 +174,7 @@ pub(super) fn state() -> Option<&'static ReleaseState>
 }
 
 /// Unbadged endpoint cap the per-`File` SEND derivation hangs off.
-pub(super) fn release_endpoint(state: &ReleaseState) -> u32
+pub(super) fn release_endpoint(state: &ReleaseState) -> u64
 {
     state.release_ep
 }
@@ -200,7 +200,7 @@ pub(super) fn allocate_badge() -> Option<u64>
 
 /// Register a `File` and its open cap with the handler, returning its
 /// `FileEntry`.
-pub(super) fn register(state: &ReleaseState, badge: u64, open_cap: u32) -> Arc<FileEntry>
+pub(super) fn register(state: &ReleaseState, badge: u64, open_cap: u64) -> Arc<FileEntry>
 {
     let entry = Arc::new(FileEntry {
         open_cap,
@@ -222,7 +222,7 @@ pub(super) fn register(state: &ReleaseState, badge: u64, open_cap: u32) -> Arc<F
 /// The open caps of every registered `File`: those not yet dropped. Read
 /// under the registry lock and returned, so the caller's IPC runs with the
 /// lock free.
-pub(super) fn open_caps(state: &ReleaseState) -> Vec<u32>
+pub(super) fn open_caps(state: &ReleaseState) -> Vec<u64>
 {
     let reg = state
         .registry
@@ -360,7 +360,7 @@ pub(super) fn drain_mappings(entry: &FileEntry) -> Vec<OutstandingMapping>
 /// `File::read` to release the resources the read held briefly. If the
 /// handler thread already cleaned up this cookie (rare but possible
 /// during a contended eviction), this is a no-op.
-pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
+pub(super) fn release_one_local(entry: &FileEntry, aspace: u64, cookie: u64)
 {
     if let Some(m) = take_mapping(entry, cookie)
     {
@@ -372,7 +372,7 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
 /// reservation arena only once the unmap succeeds; a range still mapped
 /// stays reserved until this process exits, so no later reservation can
 /// land on the driver's page. Returns whether the unmap succeeded.
-pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32) -> bool
+pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u64) -> bool
 {
     // SAFETY: `m` owns its `ReservedRange`, arena VA that holds no Rust
     // object; the read path reads the page only through raw volatile reads,

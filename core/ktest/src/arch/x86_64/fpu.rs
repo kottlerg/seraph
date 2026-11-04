@@ -92,8 +92,8 @@ pub fn preempt_capture(pattern: u64, iters: u64) -> u64
 pub fn notification_rendezvous_capture(
     pattern: u64,
     spin: u64,
-    sig_ready: u32,
-    sig_resume: u32,
+    sig_ready: u64,
+    sig_resume: u64,
 ) -> u64
 {
     // 128-bit pattern (xmm lane width).
@@ -130,12 +130,12 @@ pub fn notification_rendezvous_capture(
             "jnz 2b",
             // Syscall SYS_NOTIFICATION_SEND(sig_ready, 0x1). rax = 3.
             "mov rax, 3",
-            "mov edi, {sig_ready:e}",
+            "mov rdi, {sig_ready}",
             "mov esi, 1",
             "syscall",
             // Syscall SYS_NOTIFICATION_WAIT(sig_resume, 0). rax = 4.
             "mov rax, 4",
-            "mov edi, {sig_resume:e}",
+            "mov rdi, {sig_resume}",
             "mov esi, 0",
             "syscall",
             // Now resumed on the migration target CPU. Capture xmm0..xmm15.
@@ -184,7 +184,7 @@ pub fn notification_rendezvous_capture(
 /// on `ep` with `msg_label` and no data or caps, then capture the registers on
 /// whichever CPU the thread resumes after the reply; returns the
 /// mismatched-lane count. The caller has registered its IPC buffer.
-pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u32, msg_label: u64) -> u64
+pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
 {
     let pat128 = [pattern, pattern];
     let mut buf = [[0u64; 2]; 16];
@@ -219,10 +219,10 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u32, msg_label: u64) -> u64
             "pause",
             "dec {it}",
             "jnz 2b",
-            // SYS_IPC_CALL(ep, msg_label, data=0, caps=0,
-            // cap_handles_lo=0, cap_handles_hi=0).
+            // SYS_IPC_CALL(ep, msg_label, data=0, caps=0); args 4-5 are
+            // unused and passed as zero.
             "xor rax, rax",
-            "mov edi, {ep:e}",
+            "mov rdi, {ep}",
             "mov rsi, {label}",
             "xor rdx, rdx",
             "xor r10, r10",

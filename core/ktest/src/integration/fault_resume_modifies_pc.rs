@@ -21,7 +21,7 @@
 //! recovery routine, which signals success — so a working test never touches the
 //! reserved VA again.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
@@ -47,7 +47,7 @@ const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 
 /// Child cap slot for the success notification, stashed so the recovery routine
 /// can read it without depending on register state across the PC redirect.
-static RECOVERY_SIG: AtomicU32 = AtomicU32::new(0);
+static RECOVERY_SIG: AtomicU64 = AtomicU64::new(0);
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

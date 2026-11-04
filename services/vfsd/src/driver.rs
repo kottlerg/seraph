@@ -42,10 +42,10 @@ pub struct FatfsDriver
     /// mount that lands keeps it, unused, for the life of vfsd, since mounts
     /// are permanent (no unmount exists), as the revocation handle an unmount
     /// would use.
-    pub endpoint: u32,
+    pub endpoint: u64,
     /// `SEND_GRANT` derivation of `endpoint`; the mount transaction probes
     /// the driver and mints its badged caps through it.
-    pub send: u32,
+    pub send: u64,
 }
 
 /// Spawn a fatfs driver instance for a partition and return its endpoint
@@ -61,9 +61,9 @@ pub struct FatfsDriver
 pub fn spawn_fatfs_driver(
     caps: &VfsdCaps,
     pool: &WorkerPool,
-    partition_ep: u32,
-    module_cap: u32,
-    system_root_cap: u32,
+    partition_ep: u64,
+    module_cap: u64,
+    system_root_cap: u64,
     ipc_buf: *mut u64,
 ) -> Option<FatfsDriver>
 {
@@ -110,7 +110,7 @@ pub fn spawn_fatfs_driver(
 /// it (the child's receive copy, vfsd's `SEND_GRANT`, and any badged cap
 /// minted from that) is invalidated, so a running driver loses its service
 /// endpoint and exits, and an unstarted spawn leaves nothing behind.
-pub fn teardown_driver(endpoint: u32)
+pub fn teardown_driver(endpoint: u64)
 {
     if let Err(code) = syscall::cap_revoke_all(endpoint)
     {
@@ -130,12 +130,12 @@ pub fn teardown_driver(endpoint: u32)
 fn start_driver(
     caps: &VfsdCaps,
     pool: &WorkerPool,
-    endpoint: u32,
-    partition_ep: u32,
-    module_cap: u32,
-    system_root_cap: u32,
+    endpoint: u64,
+    partition_ep: u64,
+    module_cap: u64,
+    system_root_cap: u64,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<u64>
 {
     let Some((bootstrap, badged_creator)) = new_bootstrap_order(caps, endpoint, partition_ep)
     else
@@ -187,9 +187,9 @@ fn start_driver(
 /// derived here is released by revoking `endpoint`.
 fn new_bootstrap_order(
     caps: &VfsdCaps,
-    endpoint: u32,
-    partition_ep: u32,
-) -> Option<(BootstrapOrder, u32)>
+    endpoint: u64,
+    partition_ep: u64,
+) -> Option<(BootstrapOrder, u64)>
 {
     let child_endpoint = syscall::cap_derive(endpoint, syscall::RIGHTS_ALL).ok()?;
 
@@ -224,7 +224,7 @@ fn new_bootstrap_order(
 /// destroyed (`DESTROY_PROCESS`) so procmgr does not keep it. Returns
 /// whether `START_PROCESS` succeeded; `false` without any call when the
 /// reply carried no process handle.
-pub fn start_and_release(reply_caps: &[u32], ipc_buf: *mut u64) -> bool
+pub fn start_and_release(reply_caps: &[u64], ipc_buf: *mut u64) -> bool
 {
     for &cap in reply_caps.iter().skip(1)
     {
@@ -262,8 +262,8 @@ fn spawn_via_module(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
-    module_cap: u32,
-    badged_creator: u32,
+    module_cap: u64,
+    badged_creator: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -354,8 +354,8 @@ fn spawn_via_vfs(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
-    badged_creator: u32,
-    system_root_cap: u32,
+    badged_creator: u64,
+    system_root_cap: u64,
 ) -> bool
 {
     let (file_cap, file_size) =

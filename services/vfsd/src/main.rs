@@ -55,16 +55,16 @@ const MAX_MOUNT_PATH_LEN: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) * 8;
 
 pub struct VfsdCaps
 {
-    pub procmgr_ep: u32,
-    pub memmgr_ep: u32,
-    pub registry_ep: u32,
-    pub service_ep: u32,
-    pub fatfs_module_cap: u32,
-    pub self_aspace: u32,
+    pub procmgr_ep: u64,
+    pub memmgr_ep: u64,
+    pub registry_ep: u64,
+    pub service_ep: u64,
+    pub fatfs_module_cap: u64,
+    pub self_aspace: u64,
     /// Worker-owned bootstrap endpoint. Populated after the bootstrap worker
     /// thread is spawned. Main derives badged SEND caps on this slot to hand
     /// to each fatfs child as its creator endpoint.
-    pub bootstrap_ep: u32,
+    pub bootstrap_ep: u64,
 }
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -280,18 +280,18 @@ pub struct VfsdRuntime
     pub pool: WorkerPool,
     /// Boot-module fatfs cap consumed (and zeroed) by the very first MOUNT.
     /// Mutex-guarded because that MOUNT may land on any handler thread.
-    pub boot_module_cap: Mutex<u32>,
+    pub boot_module_cap: Mutex<u64>,
     /// Un-badged SEND on vfsd's own namespace endpoint. Source of every
     /// node cap minted on the synthetic root (the system-root cap and
     /// any descendants that resolve to vfsd-local nodes — currently
     /// none, since the synthetic root only carries External entries).
-    pub namespace_ep: u32,
+    pub namespace_ep: u64,
     /// Badged SEND on `namespace_ep` addressing the synthetic root at
     /// full namespace rights. Vfsd's own copy of the system-root cap,
     /// minted at boot. Used by worker threads to walk the namespace
     /// (e.g. resolving `/services/fs/fatfs`) before issuing
     /// `procmgr_labels::CREATE_FROM_FILE`.
-    pub system_root_cap: u32,
+    pub system_root_cap: u64,
     /// Synthetic system-root backend. Service handlers append entries
     /// on each successful MOUNT; the namespace dispatcher reads on each
     /// `NS_*` request.
@@ -981,7 +981,7 @@ fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mo
 /// site whose failure would otherwise be operator-invisible: the kernel
 /// reports invalid-slot / table-corruption via the returned code and
 /// silent discards leak that notification.
-fn log_cap_delete(context: &str, slot: u32)
+fn log_cap_delete(context: &str, slot: u64)
 {
     if slot == 0
     {
@@ -1021,7 +1021,7 @@ pub(crate) fn do_mount(
     ipc_buf: *mut u64,
     role: MountRole,
     path: &[u8],
-) -> Result<u32, u64>
+) -> Result<u64, u64>
 {
     do_mount_internal(rt, ipc_buf, role.type_guid(), path)
 }
@@ -1043,7 +1043,7 @@ fn do_mount_internal(
     ipc_buf: *mut u64,
     type_guid: &[u8; 16],
     path: &[u8],
-) -> Result<u32, u64>
+) -> Result<u64, u64>
 {
     // The role resolves across every held disk (docs/storage.md § GPT
     // Role-GUID Discovery): a tie at the top priority is ambiguous whether
@@ -1292,14 +1292,14 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
 /// cap is dropped as the walk descends; only the final cap survives,
 /// returned to the caller. Returns `None` on any walk failure or if
 /// any intermediate is not a directory.
-fn walk_root_mount_path(root_mount_cap: u32, path: &[u8], ipc_buf: *mut u64) -> Option<u32>
+fn walk_root_mount_path(root_mount_cap: u64, path: &[u8], ipc_buf: *mut u64) -> Option<u64>
 {
     let stripped = path.strip_prefix(b"/").unwrap_or(path);
     if stripped.is_empty()
     {
         return None;
     }
-    let mut current_cap: u32 = root_mount_cap;
+    let mut current_cap: u64 = root_mount_cap;
     let mut current_owned = false;
     for component in stripped.split(|&b| b == b'/')
     {
@@ -1375,11 +1375,11 @@ fn idle_loop() -> !
 /// derivation lives server-side in virtio-blk; this call just sends the
 /// bounds and consumes the cap from the reply.
 fn derive_and_register_partition(
-    blk_ep: u32,
+    blk_ep: u64,
     base_lba: u64,
     length_lba: u64,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<u64>
 {
     let msg = IpcMessage::builder(blk_labels::REGISTER_PARTITION)
         .word(0, u64::from(ipc::BLK_LABELS_VERSION))

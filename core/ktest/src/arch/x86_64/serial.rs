@@ -25,7 +25,7 @@ const COM1_PORTS: u16 = 8;
 /// # Safety
 /// Must be called once, from the main thread, after `InitInfo` is mapped and
 /// [`super::init_io_ports`] has run.
-pub unsafe fn init(_info: &InitInfo, _aspace_cap: u32, thread_cap: u32) -> bool
+pub unsafe fn init(_info: &InitInfo, _aspace_cap: u64, thread_cap: u64) -> bool
 {
     if !super::ioport::bind_port_range(thread_cap, COM1, COM1_PORTS)
     {

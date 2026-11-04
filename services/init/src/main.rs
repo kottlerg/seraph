@@ -12,8 +12,8 @@
 #![no_std]
 #![no_main]
 // cast_possible_truncation: init targets 64-bit only; u64/usize conversions
-// are lossless. u32 casts on capability slot indices and struct offsets are
-// bounded by CSpace capacity and page size.
+// are lossless. u32 casts on struct offsets and counts are bounded by page
+// size.
 #![allow(clippy::cast_possible_truncation)]
 
 use core::panic::PanicInfo;
@@ -88,11 +88,11 @@ pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 /// rights (incl. `MemRights::RETYPE`). Read by every `cap_create_endpoint`
 /// callsite — main.rs, service.rs. The arena's front reserve bounds the total
 /// retype bump; see `bootstrap::init_retype_reserve_pages`.
-pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Read the current endpoint-slab cap. Panics in debug if unset.
-pub(crate) fn endpoint_slab() -> u32
+pub(crate) fn endpoint_slab() -> u64
 {
     ENDPOINT_SLAB.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -106,7 +106,7 @@ pub(crate) fn endpoint_slab() -> u32
 /// # Errors
 /// Returns the first error other than `Interrupted`, as `syscall::thread_start`
 /// reports it.
-pub(crate) fn start_thread(thread_cap: u32) -> Result<(), i64>
+pub(crate) fn start_thread(thread_cap: u64) -> Result<(), i64>
 {
     loop
     {
@@ -158,14 +158,14 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 /// Returns the table entry's `CSpace` slot index, or `None` if no
 /// entry carries the requested name. This is init's only module-cap
 /// lookup; modules are addressed by name through the table.
-pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u32>
+pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u64>
 {
     init_protocol::find_module_slot(info, name)
 }
 
 // dead_code: used by the x86_64 serial module but not riscv64.
 #[allow(dead_code)]
-pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u32>
+pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u64>
 {
     descriptors(info)
         .iter()
@@ -175,7 +175,7 @@ pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u32>
 
 // dead_code: used by the riscv64 serial module but not x86_64.
 #[allow(dead_code)]
-pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u32>
+pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u64>
 {
     descriptors(info)
         .iter()
@@ -198,7 +198,7 @@ const MAX_ORPHAN_MEMORY_CAPS: usize =
 
 /// Storage for `MemoryAlloc`'s orphan table: too large for init's 16 KiB
 /// stack, so it sits in BSS. `run` takes the one reference to it.
-static mut ORPHAN_SLOTS: [u32; MAX_ORPHAN_MEMORY_CAPS] = [0; MAX_ORPHAN_MEMORY_CAPS];
+static mut ORPHAN_SLOTS: [u64; MAX_ORPHAN_MEMORY_CAPS] = [0; MAX_ORPHAN_MEMORY_CAPS];
 
 /// Bump allocator over init's memory-cap pool.
 ///
@@ -207,21 +207,21 @@ static mut ORPHAN_SLOTS: [u32; MAX_ORPHAN_MEMORY_CAPS] = [0; MAX_ORPHAN_MEMORY_C
 pub(crate) struct MemoryAlloc
 {
     /// Current memory cap being split (covers remaining unallocated region).
-    current: u32,
+    current: u64,
     /// Remaining size in bytes of current memory cap.
     remaining: u64,
     /// Index into the memory-cap range for the next memory cap to use.
-    pub(crate) next_idx: u32,
+    pub(crate) next_idx: u64,
     /// [`InitInfo`] fields copied out for reference; `memory_count` is
     /// clamped to [`MAX_ORPHAN_MEMORY_CAPS`], which bounds the orphan count.
-    memory_base: u32,
-    memory_count: u32,
+    memory_base: u64,
+    memory_count: u64,
     /// Free Memory caps `advance_cap` moved off while they still held pages —
     /// `memory_split` remainders (no `InitInfo` descriptor) and whole memory caps
     /// too small for a pending multi-page request, both below the reap floor.
     /// Nothing else can reach them, so they are streamed to memmgr's pool at
     /// reap via [`orphan_memory_caps`].
-    orphan_slots: &'static mut [u32; MAX_ORPHAN_MEMORY_CAPS],
+    orphan_slots: &'static mut [u64; MAX_ORPHAN_MEMORY_CAPS],
     orphan_count: usize,
 }
 
@@ -232,11 +232,9 @@ impl MemoryAlloc
     /// the kernel's `InitInfo` bound already excludes) is clamped: the caps
     /// past it are not carved from, and reach memmgr with the rest of the
     /// unconsumed tail.
-    fn new(info: &InitInfo, orphan_slots: &'static mut [u32; MAX_ORPHAN_MEMORY_CAPS]) -> Self
+    fn new(info: &InitInfo, orphan_slots: &'static mut [u64; MAX_ORPHAN_MEMORY_CAPS]) -> Self
     {
-        // At most a few hundred, from a usize constant; fits a u32.
-        #[allow(clippy::cast_possible_truncation)]
-        let max = MAX_ORPHAN_MEMORY_CAPS as u32;
+        let max = MAX_ORPHAN_MEMORY_CAPS as u64;
         Self {
             current: 0,
             remaining: 0,
@@ -250,7 +248,7 @@ impl MemoryAlloc
 
     /// Free Memory caps abandoned during allocation, to be donated to memmgr at
     /// reap so every page of RAM reaches the pool.
-    pub(crate) fn orphan_memory_caps(&self) -> &[u32]
+    pub(crate) fn orphan_memory_caps(&self) -> &[u64]
     {
         &self.orphan_slots[..self.orphan_count]
     }
@@ -262,7 +260,7 @@ impl MemoryAlloc
     /// dropped from the table would stay in init's `CSpace` until the reap
     /// frees that `CSpace`, then free into the sealed post-handoff buddy
     /// instead of reaching memmgr's pool.
-    fn record_orphan(&mut self, slot: u32)
+    fn record_orphan(&mut self, slot: u64)
     {
         assert!(
             self.orphan_count < MAX_ORPHAN_MEMORY_CAPS,
@@ -300,7 +298,7 @@ impl MemoryAlloc
     }
 
     /// Allocate a single 4 KiB page. Returns the Memory cap slot index.
-    pub(crate) fn alloc_page(&mut self) -> Option<u32>
+    pub(crate) fn alloc_page(&mut self) -> Option<u64>
     {
         while self.remaining < PAGE_SIZE
         {
@@ -339,7 +337,7 @@ impl MemoryAlloc
     /// `aspace` must be init's own address space (the zeroing writes through
     /// `va` here), and the page at `va` must be unmapped and hold no Rust
     /// object or registered IPC page.
-    pub(crate) unsafe fn alloc_zero_page(&mut self, aspace: u32, va: u64) -> Option<u32>
+    pub(crate) unsafe fn alloc_zero_page(&mut self, aspace: u64, va: u64) -> Option<u64>
     {
         let cap = self.alloc_page()?;
         // SAFETY: the caller's contract: `va` is an unmapped page of init's
@@ -355,7 +353,7 @@ impl MemoryAlloc
     /// Carve `pages` contiguous pages off the front of the current cap and
     /// return a single Memory cap covering the whole range. Used when a
     /// caller needs a multi-page region (e.g. a Thread-retype slab).
-    pub(crate) fn alloc_pages(&mut self, pages: u64) -> Option<u32>
+    pub(crate) fn alloc_pages(&mut self, pages: u64) -> Option<u64>
     {
         if pages == 0
         {
@@ -695,8 +693,8 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
     let mm_boot_data = [
-        u64::from(mm_final.mm_memory_base),
-        u64::from(mm_final.mm_memory_count),
+        mm_final.mm_memory_base,
+        mm_final.mm_memory_count,
         mm.procmgr_badge,
     ];
     // SAFETY: ipc_buf is the registered IPC buffer page.

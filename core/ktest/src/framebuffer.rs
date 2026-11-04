@@ -62,7 +62,7 @@ struct FbState
 /// `carve_subrange` does, but unlike it discards both the prefix below `phys`
 /// and any remainder above `phys + size`, keeping only the `size`-byte
 /// head. `phys` and `size` must be page-aligned.
-fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u32>
+fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u64>
 {
     let covering = crate::init_info::descriptors(info).iter().find(|d| {
         d.cap_type == CapType::Mmio && phys >= d.aux0 && phys + size <= d.aux0 + d.aux1
@@ -102,7 +102,7 @@ fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u32>
 ///
 /// # Safety
 /// Must be called once during early ktest startup, single-threaded.
-pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
+pub unsafe fn init(info: &InitInfo, aspace_cap: u64)
 {
     // Geometry comes from InitInfo.framebuffer (the kernel forwards the
     // bootloader's GOP capture). A zeroed base means a headless boot.

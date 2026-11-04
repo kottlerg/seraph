@@ -61,7 +61,7 @@ const RESERVE_GRANTS_MAX: u64 = syscall_abi::CSPACE_IPC_RECV_RESERVE;
 /// One one-page `REQUEST_MEMORY_CAPS` call: `Some(caps carried)` for a landed
 /// grant, `None` for a reply whose cap transfer failed. Exits the process on
 /// any other outcome.
-fn request_one_page(memmgr: u32, ipc_buf: *mut u64) -> Option<usize>
+fn request_one_page(memmgr: u64, ipc_buf: *mut u64) -> Option<usize>
 {
     let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)

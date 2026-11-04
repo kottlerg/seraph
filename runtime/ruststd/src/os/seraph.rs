@@ -59,16 +59,16 @@ pub struct StartupInfo {
     pub ipc_buffer: *mut u8,
     /// Cap slot of the SEND endpoint back to the creator, or 0 when absent.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub creator_endpoint: u32,
+    pub creator_endpoint: u64,
     /// Cap slot of the caller's own Thread object.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub self_thread: u32,
+    pub self_thread: u64,
     /// Cap slot of the caller's own AddressSpace object.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub self_aspace: u32,
+    pub self_aspace: u64,
     /// Cap slot of the caller's own CSpace object.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub self_cspace: u32,
+    pub self_cspace: u64,
     /// Cap slot of a baseline `SchedControl` cap, or zero. Pass it as the
     /// `sched_cap` argument to [`crate::os::seraph::syscall`]-level
     /// `thread_set_priority` / `cap_create_thread` to set or assign a
@@ -76,7 +76,7 @@ pub struct StartupInfo {
     /// the spawner — see `CommandExt::sched_max`). Zero means no
     /// scheduling authority was delegated.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub sched_control_cap: u32,
+    pub sched_control_cap: u64,
     /// Priority level the spawner placed this process's initial thread at.
     /// Always within the band of [`Self::sched_control_cap`] when that cap
     /// is present; `std::thread::spawn` creates further threads at this
@@ -87,12 +87,12 @@ pub struct StartupInfo {
     /// reachable (the process is procmgr itself, or runs before procmgr
     /// exists). Used for process-lifecycle queries.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub procmgr_endpoint: u32,
+    pub procmgr_endpoint: u64,
     /// Cap slot of a badged SEND cap on memmgr. Zero if memmgr is not
     /// reachable (memmgr itself, init, or anything earlier in the boot
     /// chain). `_start` consumes this to bootstrap the heap.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub memmgr_endpoint: u32,
+    pub memmgr_endpoint: u64,
     /// Cap slot of a SEND cap on svcmgr's service endpoint, the
     /// system-wide service-discovery handle. Carries only the per-process
     /// badge (no `PUBLISH_AUTHORITY` verb-bit) so it can answer
@@ -102,54 +102,54 @@ pub struct StartupInfo {
     /// calls resolve names to service caps. Zero if svcmgr is not
     /// reachable.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub service_registry_cap: u32,
+    pub service_registry_cap: u64,
     /// Shmem memory cap backing `std::io::stdin`. Zero when no input
     /// pipe is attached; reads return `Ok(0)` (EOF).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_memory_cap: u32,
+    pub stdin_memory_cap: u64,
     /// Shmem memory cap backing `std::io::stdout`. Zero when no sink is
     /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_memory_cap: u32,
+    pub stdout_memory_cap: u64,
     /// Shmem memory cap backing `std::io::stderr`. Zero when no sink is
     /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_memory_cap: u32,
+    pub stderr_memory_cap: u64,
     /// Badged SEND cap on vfsd's namespace endpoint at the synthetic
     /// system root. Installed by the spawner via
     /// `procmgr_labels::CONFIGURE_NAMESPACE` between create and start.
     /// Zero when no spawner-supplied cap was delivered (or vfsd is not
     /// reachable). Reachable application-side via [`root_dir_cap`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub system_root_cap: u32,
+    pub system_root_cap: u64,
     /// Badged SEND cap on a namespace endpoint addressing the initial
     /// current working directory. Anchors relative-path resolution.
     /// Zero means relative paths are unsupported until the process
     /// installs one (e.g. via `std::env::set_current_dir`).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub current_dir_cap: u32,
+    pub current_dir_cap: u64,
     /// Wakeup notification caps for the stdio pipes. See `process_abi::ProcessInfo`
     /// for full data-vs-space and writer-vs-reader semantics. Zero when
     /// the corresponding direction is not piped.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_data_notification_cap: u32,
+    pub stdin_data_notification_cap: u64,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_space_notification_cap: u32,
+    pub stdin_space_notification_cap: u64,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_data_notification_cap: u32,
+    pub stdout_data_notification_cap: u64,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_space_notification_cap: u32,
+    pub stdout_space_notification_cap: u64,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_data_notification_cap: u32,
+    pub stderr_data_notification_cap: u64,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_space_notification_cap: u32,
+    pub stderr_space_notification_cap: u64,
     /// Badged SEND cap on the system log endpoint, pre-installed by
     /// procmgr at spawn time. Used by [`log!`] directly — no
     /// discovery roundtrip. Zero when no logger is reachable
     /// (init/memmgr/procmgr themselves, or anything earlier in the
     /// boot chain than the log endpoint); the macro silently drops.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub log_send_cap: u32,
+    pub log_send_cap: u64,
     /// Virtual address of the `PT_TLS` template in the loaded image, or 0
     /// when the binary has no TLS segment.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -201,7 +201,7 @@ pub struct StartupInfo {
     /// handler on every thread it spawns; the main thread is bound by
     /// procmgr at creation. See `process_abi::ProcessInfo::pager_endpoint_cap`.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub pager_endpoint_cap: u32,
+    pub pager_endpoint_cap: u64,
     /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel
     /// stamps on this process's fault messages. Zero when not demand-paged.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -609,7 +609,7 @@ static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 ///
 /// Returns `true` if the heap is usable after this call.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
+pub fn heap_bootstrap(memmgr_ep: u64, self_aspace: u64) -> bool {
     pal_alloc::heap_bootstrap(memmgr_ep, self_aspace)
 }
 
@@ -637,11 +637,11 @@ pub fn abort_thread() -> ! {
 // service code) reads it via [`root_dir_cap`]. Zero means "no system
 // root attached" — the reading side degrades.
 
-static ROOT_DIR_CAP: crate::sync::atomic::AtomicU32 =
-    crate::sync::atomic::AtomicU32::new(0);
+static ROOT_DIR_CAP: crate::sync::atomic::AtomicU64 =
+    crate::sync::atomic::AtomicU64::new(0);
 
-static CURRENT_DIR_CAP: crate::sync::atomic::AtomicU32 =
-    crate::sync::atomic::AtomicU32::new(0);
+static CURRENT_DIR_CAP: crate::sync::atomic::AtomicU64 =
+    crate::sync::atomic::AtomicU64::new(0);
 
 // String-form mirror of the cwd cap. Held under a Mutex so that
 // `set_current_dir` updates the cap and the path atomically (readers
@@ -659,7 +659,7 @@ static CURRENT_DIR_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// visibility because the only legitimate writer is std's own startup
 /// path; tier-2 callers must obtain a namespace cap through the spawner
 /// (`procmgr_labels::CONFIGURE_NAMESPACE`), not by overwriting this slot.
-pub(crate) fn set_root_dir_cap(cap: u32) {
+pub(crate) fn set_root_dir_cap(cap: u64) {
     ROOT_DIR_CAP.store(cap, crate::sync::atomic::Ordering::Release);
 }
 
@@ -667,7 +667,7 @@ pub(crate) fn set_root_dir_cap(cap: u32) {
 /// Used by namespace-walking code to anchor `NS_LOOKUP` walks.
 #[must_use]
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn root_dir_cap() -> u32 {
+pub fn root_dir_cap() -> u64 {
     ROOT_DIR_CAP.load(crate::sync::atomic::Ordering::Acquire)
 }
 
@@ -676,7 +676,7 @@ pub fn root_dir_cap() -> u32 {
 /// `std::env::set_current_dir`; both writers are inside std. Tier-2
 /// callers update cwd via `std::env::set_current_dir` (which performs
 /// the namespace walk and stores the result here).
-pub(crate) fn set_current_dir_cap(cap: u32) {
+pub(crate) fn set_current_dir_cap(cap: u64) {
     CURRENT_DIR_CAP.store(cap, crate::sync::atomic::Ordering::Release);
 }
 
@@ -684,7 +684,7 @@ pub(crate) fn set_current_dir_cap(cap: u32) {
 /// unset. Used by relative-path resolution in `std::fs`.
 #[must_use]
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn current_dir_cap() -> u32 {
+pub fn current_dir_cap() -> u64 {
     CURRENT_DIR_CAP.load(crate::sync::atomic::Ordering::Acquire)
 }
 
@@ -759,7 +759,7 @@ pub fn set_current_dir(path: &str) -> crate::io::Result<()> {
 /// Used by services that hold an attenuated namespace cap and need to
 /// resolve a binary path before issuing `procmgr_labels::CREATE_FROM_FILE`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u32, u64)> {
+pub fn namespace_lookup_file(root_cap: u64, path: &str) -> crate::io::Result<(u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
@@ -784,10 +784,10 @@ pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u3
 /// `InvalidInput` otherwise.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn namespace_lookup_dir(
-    root_cap: u32,
+    root_cap: u64,
     path: &str,
     requested_rights: u64,
-) -> crate::io::Result<u32> {
+) -> crate::io::Result<u64> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
@@ -859,7 +859,7 @@ pub fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64 {
 /// Returns `None` if memmgr is unreachable, refuses the request, or
 /// `retype` itself fails.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
+pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u64) -> Option<T>) -> Option<T> {
     pal_alloc::object_slab_retype(min_bytes, retype)
 }
 
@@ -891,7 +891,7 @@ pub struct ObjectGrant {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn object_slab_retype_reclaimable<T>(
     min_bytes: u64,
-    retype: impl FnOnce(u32) -> Option<T>,
+    retype: impl FnOnce(u64) -> Option<T>,
 ) -> Option<(T, Option<ObjectGrant>)> {
     pal_alloc::object_slab_retype_reclaimable(min_bytes, retype)
         .map(|(out, phys)| (out, phys.map(|phys| ObjectGrant { phys })))
@@ -937,7 +937,7 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
 /// meanwhile); the subsequent map then fails with `OutOfMemory` rather than
 /// silently drawing on the reserve.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
+pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
     pal_alloc::fund_aspace_pt_budget(self_aspace, region_pages)
 }
 
@@ -948,7 +948,7 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
 /// holds headroom above a low-water mark compares this against the mark and
 /// calls [`fund_cspace_slot_budget`] when it falls below.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn cspace_slot_headroom(self_cspace: u32) -> u64 {
+pub fn cspace_slot_headroom(self_cspace: u64) -> u64 {
     pal_alloc::cspace_general_headroom(self_cspace)
 }
 
@@ -976,7 +976,7 @@ pub fn cspace_slot_headroom(self_cspace: u32) -> u64 {
 /// unreachable, the request/augment fails, or the headroom still falls
 /// short after the funding rounds.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
+pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     pal_alloc::fund_cspace_slot_budget(self_cspace, slots)
 }
 
@@ -1041,7 +1041,7 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
 /// # Safety
 /// `ipc_buf` is the calling thread's registered IPC buffer page.
 pub(crate) unsafe fn register_rw_region(
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     ipc_buf: *mut u64,
     va: u64,
     pages: u64,
@@ -1235,7 +1235,7 @@ pub mod log {
     /// memmgr, procmgr themselves, or processes spawned before logd
     /// existed).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub fn acquire() -> u32 {
+    pub fn acquire() -> u64 {
         ::log::ensure_badged_cap(current_ipc_buf())
     }
 
@@ -1282,7 +1282,7 @@ pub mod registry {
     /// `Some(cap)` where the cap is a fresh SEND derived by svcmgr;
     /// `None` on any failure.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub fn lookup(name: &[u8]) -> Option<u32> {
+    pub fn lookup(name: &[u8]) -> Option<u64> {
         let buf = current_ipc_buf();
         if buf.is_null() {
             return None;
@@ -1294,7 +1294,7 @@ pub mod registry {
     /// Return the installed registry cap, or zero if `_start` did not
     /// seed one (e.g. process spawned before svcmgr existed).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub fn registry_cap() -> u32 {
+    pub fn registry_cap() -> u64 {
         ::registry_client::registry_cap()
     }
 }
@@ -1388,8 +1388,8 @@ pub mod fs {
 /// Seraph-specific extensions to `std::process::Command`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub mod process {
-    use crate::process::Command;
-    use crate::sys::AsInnerMut;
+    use crate::process::{Child, Command};
+    use crate::sys::{AsInner, AsInnerMut};
 
     /// Seraph-specific extensions to [`Command`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -1403,7 +1403,7 @@ pub mod process {
         /// `root_dir_cap()` by `cap_copy`. Passing `0` reverts to the
         /// parent-inherit default.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
-        fn namespace_cap(&mut self, cap: u32) -> &mut Self;
+        fn namespace_cap(&mut self, cap: u64) -> &mut Self;
 
         /// Override the cwd cap delivered to the child via
         /// `ProcessInfo.current_dir_cap`. Same lifetime contract as
@@ -1413,7 +1413,7 @@ pub mod process {
         /// `current_dir_cap()`, or zero. Passing `0` reverts to that
         /// default chain.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
-        fn cwd_dir_cap(&mut self, cap: u32) -> &mut Self;
+        fn cwd_dir_cap(&mut self, cap: u64) -> &mut Self;
 
         /// Create the child *pinned*: eager-mapped, with no system pager.
         /// By default a child is demand-paged — procmgr binds its main thread's
@@ -1449,12 +1449,12 @@ pub mod process {
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     impl CommandExt for Command {
-        fn namespace_cap(&mut self, cap: u32) -> &mut Command {
+        fn namespace_cap(&mut self, cap: u64) -> &mut Command {
             self.as_inner_mut().set_namespace_cap(cap);
             self
         }
 
-        fn cwd_dir_cap(&mut self, cap: u32) -> &mut Command {
+        fn cwd_dir_cap(&mut self, cap: u64) -> &mut Command {
             self.as_inner_mut().set_cwd_dir_cap(cap);
             self
         }
@@ -1472,6 +1472,25 @@ pub mod process {
         fn sched_max(&mut self, level: u8) -> &mut Command {
             self.as_inner_mut().set_sched_max(level);
             self
+        }
+    }
+
+    /// Seraph-specific extensions to [`Child`].
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub trait ChildExt {
+        /// The child's procmgr process-handle cap: the full capability handle
+        /// (slot index and generation) in this process's `CSpace`, for the
+        /// procmgr labels that take one (`QUERY_PROCESS`, a `cap_derive` to
+        /// delegate it). [`Child::id`] returns only its slot index, which fits
+        /// upstream's `u32` and so cannot carry the generation.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn process_handle(&self) -> u64;
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl ChildExt for Child {
+        fn process_handle(&self) -> u64 {
+            self.as_inner().process_handle()
         }
     }
 }

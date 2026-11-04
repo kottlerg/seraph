@@ -89,8 +89,8 @@ fn pager_forged_badge_phase(_: &Caps)
         unsafe {
             syscall::raw_syscall4(
                 SYS_THREAD_SET_FAULT_HANDLER,
-                u64::from(info.self_thread),
-                u64::from(info.pager_endpoint_cap),
+                info.self_thread,
+                info.pager_endpoint_cap,
                 badge,
                 FAULT_CLASS_ALL,
             )

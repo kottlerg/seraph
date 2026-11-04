@@ -79,7 +79,10 @@ use core::prelude::rust_2024::*;
 ///      `SYS_CAP_CREATE_THREAD`'s scheduling arguments. Occupies former
 ///      padding after [`ProcessInfo::sched_control_cap`]; all other field
 ///      offsets are unchanged.
-pub const PROCESS_ABI_VERSION: u32 = 22;
+/// v23: Capability handles are 64-bit (#637). Every `ProcessInfo` cap field
+///      widens from `u32` to `u64`, so every field after
+///      [`ProcessInfo::version`] moves.
+pub const PROCESS_ABI_VERSION: u32 = 23;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -240,7 +243,7 @@ pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 1 << 18;
 /// address.
 ///
 /// All slot indices refer to the process's own `CSpace`, and each cap field is
-/// a `u32`, the width of a capability handle. Only the cap slots named by
+/// a `u64`, the width of a capability handle. Only the cap slots named by
 /// this struct's fields are delivered through this page; service-specific
 /// capabilities come from the creator over IPC at startup (see
 /// `ipc::bootstrap`).
@@ -252,13 +255,13 @@ pub struct ProcessInfo
     pub version: u32,
 
     /// `CSpace` slot of the process's own Thread capability (Control right).
-    pub self_thread_cap: u32,
+    pub self_thread_cap: u64,
 
     /// `CSpace` slot of the process's own `AddressSpace` capability.
-    pub self_aspace_cap: u32,
+    pub self_aspace_cap: u64,
 
     /// `CSpace` slot of the process's own `CSpace` capability.
-    pub self_cspace_cap: u32,
+    pub self_cspace_cap: u64,
 
     /// `CSpace` slot of a baseline `SchedControl` capability, or zero.
     ///
@@ -270,7 +273,7 @@ pub struct ProcessInfo
     /// when setting a thread's priority. Zero when no scheduling authority
     /// is delegated (the process then cannot set any priority). See
     /// [capability-model.md](../../../docs/capability-model.md).
-    pub sched_control_cap: u32,
+    pub sched_control_cap: u64,
 
     /// Priority level the creator placed this process's initial thread at.
     ///
@@ -296,7 +299,7 @@ pub struct ProcessInfo
     /// The child calls `ipc::bootstrap::REQUEST` on this endpoint in a loop to
     /// receive its service-specific capability set. Zero if no creator
     /// endpoint is provided (child operates without bootstrap caps).
-    pub creator_endpoint_cap: u32,
+    pub creator_endpoint_cap: u64,
 
     /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
     ///
@@ -306,7 +309,7 @@ pub struct ProcessInfo
     ///
     /// Zero when no procmgr is reachable (procmgr itself, anything
     /// before procmgr exists). Consumers must tolerate zero.
-    pub procmgr_endpoint_cap: u32,
+    pub procmgr_endpoint_cap: u64,
 
     /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
     ///
@@ -320,7 +323,7 @@ pub struct ProcessInfo
     ///
     /// Zero when no memmgr is reachable (memmgr itself, anything
     /// before memmgr exists). Consumers must tolerate zero.
-    pub memmgr_endpoint_cap: u32,
+    pub memmgr_endpoint_cap: u64,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, used
     /// as the system-wide service-discovery handle. The cap's badge
@@ -345,7 +348,7 @@ pub struct ProcessInfo
     /// procmgr mints a nonzero cap for every child it spawns, svcmgr
     /// included. Zero for the processes init populates directly
     /// (memmgr, procmgr). Consumers must tolerate zero.
-    pub service_registry_cap: u32,
+    pub service_registry_cap: u64,
 
     /// `CSpace` slot of the shmem memory cap backing `std::io::stdin`.
     ///
@@ -358,7 +361,7 @@ pub struct ProcessInfo
     ///
     /// Zero means "no stdin attached"; reads return `Ok(0)` (EOF)
     /// immediately. The standard case for services spawned by init.
-    pub stdin_memory_cap: u32,
+    pub stdin_memory_cap: u64,
 
     /// `CSpace` slot of the shmem memory cap backing `std::io::stdout`.
     ///
@@ -367,14 +370,14 @@ pub struct ProcessInfo
     /// `stdout_data_notification_cap` / `stdout_space_notification_cap`.
     ///
     /// Zero when no sink is attached; writes are silently dropped.
-    pub stdout_memory_cap: u32,
+    pub stdout_memory_cap: u64,
 
     /// `CSpace` slot of the shmem memory cap backing `std::io::stderr`.
     ///
     /// Same shape as `stdout_memory_cap`; an independent ring so stdout and
     /// stderr stream separately. Wakeup pair is `stderr_data_notification_cap` /
     /// `stderr_space_notification_cap`. Zero means writes are silently dropped.
-    pub stderr_memory_cap: u32,
+    pub stderr_memory_cap: u64,
 
     // ── Thread-local storage template ──────────────────────────────────
     //
@@ -452,7 +455,7 @@ pub struct ProcessInfo
     /// supplied cap was delivered — the child has no namespace
     /// authority and consumers (`std::fs`, namespace-walking code)
     /// must tolerate zero by returning `Unsupported`.
-    pub system_root_cap: u32,
+    pub system_root_cap: u64,
 
     /// `CSpace` slot of a badged SEND cap on a namespace endpoint
     /// addressing the directory the process should treat as its initial
@@ -463,7 +466,7 @@ pub struct ProcessInfo
     /// kernel imposes no relationship. Zero means "no cwd attached";
     /// std treats relative paths as `Unsupported` until a non-zero cap
     /// is installed (e.g. via `std::env::set_current_dir`).
-    pub current_dir_cap: u32,
+    pub current_dir_cap: u64,
 
     /// `CSpace` slot of a badged SEND cap on the system log endpoint
     /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
@@ -489,7 +492,7 @@ pub struct ProcessInfo
     /// The log receiver itself (logd) deletes its seeded copy at startup:
     /// it must hold no SEND on the endpoint it serves, so its own panic /
     /// alloc-error output cannot self-IPC into it.
-    pub log_send_cap: u32,
+    pub log_send_cap: u64,
 
     // ── Stdio pipe wakeup notifications ──────────────────────────────────────
     //
@@ -507,17 +510,17 @@ pub struct ProcessInfo
     // with no data notification reports EOF instead of blocking, and a writer
     // with no space notification drops bytes, so neither side spins.
     /// Data-available notification for the stdin pipe. Writer-kicked.
-    pub stdin_data_notification_cap: u32,
+    pub stdin_data_notification_cap: u64,
     /// Space-available notification for the stdin pipe. Reader-kicked.
-    pub stdin_space_notification_cap: u32,
+    pub stdin_space_notification_cap: u64,
     /// Data-available notification for the stdout pipe. Writer-kicked.
-    pub stdout_data_notification_cap: u32,
+    pub stdout_data_notification_cap: u64,
     /// Space-available notification for the stdout pipe. Reader-kicked.
-    pub stdout_space_notification_cap: u32,
+    pub stdout_space_notification_cap: u64,
     /// Data-available notification for the stderr pipe. Writer-kicked.
-    pub stderr_data_notification_cap: u32,
+    pub stderr_data_notification_cap: u64,
     /// Space-available notification for the stderr pipe. Reader-kicked.
-    pub stderr_space_notification_cap: u32,
+    pub stderr_space_notification_cap: u64,
 
     // ── Main-thread stack envelope ─────────────────────────────────────
     //
@@ -546,7 +549,7 @@ pub struct ProcessInfo
     /// every thread it spawns, so demand paging covers the whole process and
     /// not just the main thread. The kernel stamps each fault with this cap's
     /// derivation badge. Consumers must tolerate zero.
-    pub pager_endpoint_cap: u32,
+    pub pager_endpoint_cap: u64,
 
     /// The derivation badge of [`Self::pager_endpoint_cap`], identifying this
     /// process to the pager: the badge the kernel stamps on this process's
@@ -579,28 +582,28 @@ pub struct StartupInfo
     pub ipc_buffer: *mut u8,
 
     /// `CSpace` slot of the creator endpoint. Zero if none.
-    pub creator_endpoint: u32,
+    pub creator_endpoint: u64,
 
     /// `CSpace` slot of own Thread capability.
-    pub self_thread: u32,
+    pub self_thread: u64,
 
     /// `CSpace` slot of own `AddressSpace` capability.
-    pub self_aspace: u32,
+    pub self_aspace: u64,
 
     /// `CSpace` slot of own `CSpace` capability.
-    pub self_cspace: u32,
+    pub self_cspace: u64,
 
     /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint,
     /// copied from [`ProcessInfo::procmgr_endpoint_cap`]. Zero for memmgr,
     /// this type's only constructor: init writes none into its `ProcessInfo`.
-    pub procmgr_endpoint: u32,
+    pub procmgr_endpoint: u64,
 
     /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint,
     /// copied from [`ProcessInfo::memmgr_endpoint_cap`]. Zero for memmgr,
     /// this type's only constructor: init delivers memmgr no badged client SEND
     /// in `ProcessInfo` (memmgr serves its endpoint through the full-rights cap
     /// its bootstrap round delivers).
-    pub memmgr_endpoint: u32,
+    pub memmgr_endpoint: u64,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the
     /// system-wide service-discovery handle. The cap's badge lacks the
@@ -608,45 +611,45 @@ pub struct StartupInfo
     /// `QUERY_ENDPOINT` only. `registry-client::lookup(name)` issues
     /// the QUERY against this cap. Zero when svcmgr is not reachable.
     /// See `ProcessInfo::service_registry_cap` for the long form.
-    pub service_registry_cap: u32,
+    pub service_registry_cap: u64,
 
     /// `CSpace` slot of the stdin shmem memory cap. Zero when no input
     /// pipe is attached.
-    pub stdin_memory_cap: u32,
+    pub stdin_memory_cap: u64,
 
     /// `CSpace` slot of the stdout shmem memory cap. Zero when no sink
     /// is attached.
-    pub stdout_memory_cap: u32,
+    pub stdout_memory_cap: u64,
 
     /// `CSpace` slot of the stderr shmem memory cap. Zero when no sink
     /// is attached.
-    pub stderr_memory_cap: u32,
+    pub stderr_memory_cap: u64,
 
     /// Badged SEND cap on vfsd's namespace endpoint addressing the
     /// synthetic system root. Zero when vfsd is not reachable. See
     /// `ProcessInfo::system_root_cap`.
-    pub system_root_cap: u32,
+    pub system_root_cap: u64,
 
     /// Badged SEND cap on a namespace endpoint addressing the initial
     /// current working directory. Zero means relative-path resolution
     /// is unsupported until the process sets one. See
     /// `ProcessInfo::current_dir_cap`.
-    pub current_dir_cap: u32,
+    pub current_dir_cap: u64,
 
     /// Wakeup notification caps for the three stdio pipes. Zero when the
     /// corresponding direction is not piped. See `ProcessInfo` for the
     /// full data-vs-space and writer-vs-reader semantics.
-    pub stdin_data_notification_cap: u32,
+    pub stdin_data_notification_cap: u64,
     /// Space-available notification for the stdin pipe.
-    pub stdin_space_notification_cap: u32,
+    pub stdin_space_notification_cap: u64,
     /// Data-available notification for the stdout pipe.
-    pub stdout_data_notification_cap: u32,
+    pub stdout_data_notification_cap: u64,
     /// Space-available notification for the stdout pipe.
-    pub stdout_space_notification_cap: u32,
+    pub stdout_space_notification_cap: u64,
     /// Data-available notification for the stderr pipe.
-    pub stderr_data_notification_cap: u32,
+    pub stderr_data_notification_cap: u64,
     /// Space-available notification for the stderr pipe.
-    pub stderr_space_notification_cap: u32,
+    pub stderr_space_notification_cap: u64,
 
     /// Virtual address of the `PT_TLS` template in the loaded image.
     /// `tls_template_memsz == 0` signals that the process has no TLS.
@@ -688,7 +691,7 @@ pub struct StartupInfo
     /// `CSpace` slot of the demand-paging pager endpoint, or zero when the
     /// process is not demand-paged. The runtime binds this onto every
     /// thread it spawns. See `ProcessInfo::pager_endpoint_cap`.
-    pub pager_endpoint_cap: u32,
+    pub pager_endpoint_cap: u64,
 
     /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel
     /// stamps on this process's fault messages. Zero when not demand-paged.

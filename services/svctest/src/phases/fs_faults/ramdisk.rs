@@ -215,7 +215,7 @@ impl RamDisk
 /// Serve the block requests fatfs sends on `ep` until a message carrying
 /// [`STOP_BADGE`]. Each request's Memory cap is mapped at a scratch page for
 /// the copy, unmapped, and moved back in the reply.
-pub fn serve(ep: u32, disk: &SharedDisk)
+pub fn serve(ep: u64, disk: &SharedDisk)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let aspace = std::os::seraph::startup_info().self_aspace;
@@ -296,9 +296,9 @@ pub fn serve(ep: u32, disk: &SharedDisk)
 /// label.
 fn transfer(
     disk: &SharedDisk,
-    aspace: u32,
+    aspace: u64,
     va: u64,
-    cap: u32,
+    cap: u64,
     lba: u64,
     count: u64,
     direction: Direction,

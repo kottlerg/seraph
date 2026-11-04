@@ -50,7 +50,8 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 22 the groups are:
+`PROCESS_ABI_VERSION` 23 the groups are (every `*_cap` field a `u64` capability
+handle):
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
   `self_cspace_cap`, `sched_control_cap`, `initial_priority` (the level the
@@ -128,7 +129,7 @@ It carries the self caps (`self_thread`, `self_aspace`, `self_cspace`), the IPC
 buffer, the creator, procmgr, memmgr, and service-registry endpoints, the stdio
 rings and their notifications, the namespace caps, the TLS template, argv/env,
 the main-thread layout including `main_tls_vaddr`, and the v18
-`pager_endpoint_cap` / `pager_badge`. Cap slots are `u32` values, and
+`pager_endpoint_cap` / `pager_badge`. Cap slots are `u64` handles, and
 `args_blob` / `env_blob` are `&[u8]` slices; memmgr's `_start`, the only
 constructor, leaves both empty, since init writes no argv or env for memmgr.
 

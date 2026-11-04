@@ -618,11 +618,11 @@ fn release_child_main() -> !
 /// `/b`'s, with a one-page frame (a read-only derivation of a page from
 /// memmgr). Each open's `FS_CLOSE` is counted and answered. Anything else is
 /// refused.
-fn fake_fs_serve(ep: u32) -> FakeFsReport
+fn fake_fs_serve(ep: u64) -> FakeFsReport
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut next_badge = 1;
-    let mut releases = [0u32; 2];
+    let mut releases = [0u64; 2];
     let mut frame_page = 0;
     let mut report = FakeFsReport::default();
     loop
@@ -729,7 +729,7 @@ fn fake_fs_serve(ep: u32) -> FakeFsReport
 const FAKE_FS_FRAME_BYTES: u64 = 64;
 
 /// One page from memmgr for the fake fs's frame.
-fn fake_fs_page() -> u32
+fn fake_fs_page() -> u64
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
@@ -754,7 +754,7 @@ fn fake_fs_page() -> u32
 /// thread so the caller's unanswered `FS_READ_MEMORY` stays pending, and
 /// return the reply's label (`u64::MAX` when the call fails) and round-trip
 /// time.
-fn release_once(release: u32, cookie: u64) -> ReleaseReply
+fn release_once(release: u64, cookie: u64) -> ReleaseReply
 {
     std::thread::spawn(move || {
         let ipc_buf = std::os::seraph::current_ipc_buf();

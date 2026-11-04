@@ -60,9 +60,9 @@ pub struct Entry
     /// Active length of `name`. At most `NAME_MAX`, so the `u8` never
     /// truncates.
     pub name_len: u8,
-    /// Capability slot index in the supervisor's `CSpace`; `u32` is the cap
+    /// Capability handle in the supervisor's `CSpace`; `u64` is the cap
     /// handle width of the syscall ABI.
-    pub cap: u32,
+    pub cap: u64,
     /// Which resolvers see this entry.
     pub visibility: Visibility,
 }
@@ -110,7 +110,7 @@ impl Registry
     /// the entry is [`Visibility::SeedOnly`] and `resolver` is
     /// [`Resolver::Query`].
     #[must_use]
-    pub fn lookup(&self, name: &[u8], resolver: Resolver) -> Option<u32>
+    pub fn lookup(&self, name: &[u8], resolver: Resolver) -> Option<u64>
     {
         if name.is_empty() || name.len() > NAME_MAX
         {
@@ -135,7 +135,7 @@ impl Registry
     // A unit error: every rejection gets the same reply on the wire
     // (`REGISTER_REJECTED`), so the cause carries no information.
     #[allow(clippy::result_unit_err)]
-    pub fn publish(&mut self, name: &[u8], cap: u32, visibility: Visibility) -> Result<(), ()>
+    pub fn publish(&mut self, name: &[u8], cap: u64, visibility: Visibility) -> Result<(), ()>
     {
         if cap == 0 || name.is_empty() || name.len() > NAME_MAX
         {
@@ -158,7 +158,7 @@ impl Registry
 
     /// Remove an entry by name. Returns the removed cap slot, or `None` if
     /// the name was not registered.
-    pub fn remove(&mut self, name: &[u8]) -> Option<u32>
+    pub fn remove(&mut self, name: &[u8]) -> Option<u64>
     {
         if name.is_empty() || name.len() > NAME_MAX
         {
@@ -256,11 +256,11 @@ mod tests
             .collect();
         for (i, name) in names.iter().enumerate()
         {
-            r.publish(name, i as u32 + 1, Visibility::Public).unwrap();
+            r.publish(name, i as u64 + 1, Visibility::Public).unwrap();
         }
         for (i, name) in names.iter().enumerate()
         {
-            assert_eq!(r.lookup(name, Resolver::Query), Some(i as u32 + 1));
+            assert_eq!(r.lookup(name, Resolver::Query), Some(i as u64 + 1));
         }
     }
 

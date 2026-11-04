@@ -88,10 +88,11 @@ const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
 /// Radix for the bound's role.
 pub const MAX_SLOTS_STRUCTURAL: usize = MAX_LEAVES * L2_SIZE;
 
-// Every slot index must fit in the cap handle's index field; the rest of the
-// handle carries the per-slot generation. If the maximum CSpace capacity ever
-// exceeds the index field, the encoding would truncate indices — trip at
-// compile time instead.
+// Every slot index must fit in the cap handle's 32-bit index field; the rest
+// of the handle carries the per-slot generation. The field is wider than the
+// directory reaches, so this ceiling is the directory's alone: a deeper
+// directory raises it with no handle change, up to the field's width, past
+// which the encoding would truncate indices — trip at compile time instead.
 const _: () = assert!(MAX_SLOTS_STRUCTURAL <= (1usize << syscall::CAP_INDEX_BITS));
 
 // The leaf cursor is a u32; the ceiling must fit it.
@@ -873,7 +874,7 @@ impl CSpace
     /// generation and packs it with the index per [`syscall::cap_handle_encode`];
     /// a never-recycled slot has generation 0, so the handle equals the bare
     /// index. Returns the bare index if the slot is somehow absent.
-    pub fn cap_handle(&self, index: NonZeroU32) -> u32
+    pub fn cap_handle(&self, index: NonZeroU32) -> u64
     {
         let generation = self
             .slot(index.get())
@@ -892,7 +893,7 @@ impl CSpace
         tag: CapTag,
         rights: Rights,
         object: NonNull<KernelObjectHeader>,
-    ) -> Result<u32, CapError>
+    ) -> Result<u64, CapError>
     {
         self.insert_cap_slot_and_handle(tag, rights, object)
             .map(|(_, handle)| handle)
@@ -908,7 +909,7 @@ impl CSpace
         tag: CapTag,
         rights: Rights,
         object: NonNull<KernelObjectHeader>,
-    ) -> Result<(NonZeroU32, u32), CapError>
+    ) -> Result<(NonZeroU32, u64), CapError>
     {
         let index = self.insert_cap(tag, rights, object)?;
         Ok((index, self.cap_handle(index)))
@@ -934,7 +935,7 @@ impl CSpace
         &mut self,
         rights: super::slot::TypedRights<K>,
         object: NonNull<KernelObjectHeader>,
-    ) -> Result<u32, CapError>
+    ) -> Result<u64, CapError>
     {
         self.insert_cap_handle(K::TAG, rights.erase(), object)
     }
@@ -1792,7 +1793,6 @@ mod tests
             (L1_DIRECT * L2_SIZE) as u32,
             (MAX_SLOTS_STRUCTURAL - 1) as u32,
             MAX_SLOTS_STRUCTURAL as u32,
-            syscall::CAP_INDEX_MASK,
             u32::MAX,
         ];
         for &i in &probes

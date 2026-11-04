@@ -57,10 +57,8 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    unsafe {
-        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-    }
-    .map_err(|_| "configure_and_start for blocking-wait test failed")?;
+    unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
+        .map_err(|_| "configure_and_start for blocking-wait test failed")?;
 
     // Block until the child sends.
     let bits = notification_wait(sig).map_err(|_| "notification_wait (blocking) failed")?;
@@ -283,12 +281,7 @@ pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
     // SAFETY: the stack is `HIGH_BIT_CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
-        crate::spawn::configure_and_start(
-            &child,
-            high_bit_sender_entry,
-            stack_top,
-            u64::from(child_sig),
-        )
+        crate::spawn::configure_and_start(&child, high_bit_sender_entry, stack_top, child_sig)
     }
     .map_err(|_| "configure_and_start for wait_high_bit_parked_wakeup failed")?;
 
@@ -329,22 +322,16 @@ pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 // ── Child thread entry ────────────────────────────────────────────────────────
 
 /// Child thread: sends 0xBEEF on `sig_slot` then exits.
-// cast_possible_truncation: sig_slot is a u32 capability handle the parent widened with
-// `u64::from`, so the cast is exact.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn sender_entry(sig_slot: u64) -> !
 {
-    notification_send(sig_slot as u32, 0xBEEF).ok();
+    notification_send(sig_slot, 0xBEEF).ok();
     thread_exit()
 }
 
 /// Child thread: sends `1u64 << 63` on `sig_slot` then exits. Used by
 /// `wait_high_bit_parked_wakeup` to drive the post-resume return path.
-// cast_possible_truncation: sig_slot is a u32 capability handle the parent widened with
-// `u64::from`, so the cast is exact.
-#[allow(clippy::cast_possible_truncation)]
 extern "C" fn high_bit_sender_entry(sig_slot: u64) -> !
 {
-    notification_send(sig_slot as u32, 1u64 << 63).ok();
+    notification_send(sig_slot, 1u64 << 63).ok();
     thread_exit()
 }

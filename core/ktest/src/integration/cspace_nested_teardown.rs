@@ -28,7 +28,7 @@ const DEPTH: usize = 256;
 /// slot each `CSpace` in the chain holds.
 const PAGES_PER_CSPACE: u64 = 2;
 
-fn available(memory: u32) -> Result<u64, &'static str>
+fn available(memory: u64) -> Result<u64, &'static str>
 {
     cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "integration::cspace_nested_teardown: cap_info(MEMORY_AVAILABLE) failed")
@@ -39,7 +39,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let memory = ctx.memory_base;
     let baseline = available(memory)?;
 
-    let mut chain = [0u32; DEPTH];
+    let mut chain = [0u64; DEPTH];
     let mut built = 0;
     while built < DEPTH
     {

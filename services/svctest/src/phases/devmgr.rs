@@ -132,7 +132,7 @@ fn shutdown_device_deny_phase(caps: &Caps)
 
 /// `QUERY_INPUT_DEVICE` on `devmgr.registry` selecting `ordinal` in
 /// `data[1]`, or sending no `data[1]` for `None`.
-fn query_input(devmgr: u32, ordinal: Option<u64>) -> ipc::IpcMessage
+fn query_input(devmgr: u64, ordinal: Option<u64>) -> ipc::IpcMessage
 {
     let mut req = ipc::IpcMessage::builder(ipc::devmgr_labels::QUERY_INPUT_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION));
@@ -191,7 +191,7 @@ fn input_instance_ordinal_phase(caps: &Caps)
 }
 
 /// Read memmgr's current free-pool total (`QUERY_POOL_STATUS` `data[3]`).
-fn free_bytes(memmgr_ep: u32, ipc_buf: *mut u64) -> u64
+fn free_bytes(memmgr_ep: u64, ipc_buf: *mut u64) -> u64
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -313,7 +313,7 @@ fn orphan_teardown_phase(caps: &Caps)
 }
 
 /// `TEST_QUERY_FAULT_DEVICE` at `ordinal` on `devmgr.test`.
-fn query_fault(devmgr: u32, ordinal: u64) -> ipc::IpcMessage
+fn query_fault(devmgr: u64, ordinal: u64) -> ipc::IpcMessage
 {
     let req = ipc::IpcMessage::builder(ipc::devmgr_labels::TEST_QUERY_FAULT_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -326,7 +326,7 @@ fn query_fault(devmgr: u32, ordinal: u64) -> ipc::IpcMessage
 }
 
 /// The SEND a `SUCCESS` reply to `TEST_QUERY_FAULT_DEVICE` carries.
-fn fault_cap(reply: &ipc::IpcMessage, what: &str) -> u32
+fn fault_cap(reply: &ipc::IpcMessage, what: &str) -> u64
 {
     assert_eq!(reply.label, ipc::devmgr_errors::SUCCESS, "{what}: status");
     let cap = reply.caps().first().copied().unwrap_or(0);
@@ -335,7 +335,7 @@ fn fault_cap(reply: &ipc::IpcMessage, what: &str) -> u32
 }
 
 /// Call a fault fixture with `label` and no data.
-fn call_fixture(cap: u32, label: u64) -> Result<ipc::IpcMessage, i64>
+fn call_fixture(cap: u64, label: u64) -> Result<ipc::IpcMessage, i64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.

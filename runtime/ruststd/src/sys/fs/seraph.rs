@@ -286,7 +286,7 @@ impl fmt::Debug for FileType
 /// owned `dir_cap` is `cap_delete`d on drop.
 pub struct ReadDir
 {
-    dir_cap: u32,
+    dir_cap: u64,
     next_idx: u64,
     parent_path: PathBuf,
     /// Set at `END_OF_DIR` or after an error that would otherwise repeat on
@@ -416,7 +416,7 @@ pub(crate) struct WalkedFile
 {
     /// Badged SEND addressing the resolved file node. Caller owns and
     /// must `cap_delete` when no longer needed.
-    pub file_cap: u32,
+    pub file_cap: u64,
     /// Size of the file as reported by the final `NS_LOOKUP`'s size hint.
     pub size: u64,
 }
@@ -426,7 +426,7 @@ pub(crate) struct WalkedDir
 {
     /// Badged SEND addressing the resolved directory node. Caller owns
     /// and must `cap_delete` when no longer needed.
-    pub dir_cap: u32,
+    pub dir_cap: u64,
 }
 
 /// Walk `path_str` from `root_cap` via per-component `NS_LOOKUP`.
@@ -440,7 +440,7 @@ pub(crate) struct WalkedDir
 /// Used by `Command::spawn` (path-based cwd resolution) and by
 /// `std::env::set_current_dir`.
 pub(crate) fn walk_path_to_dir(
-    root_cap: u32,
+    root_cap: u64,
     path_str: &str,
     ipc_buf: *mut u64,
 ) -> io::Result<WalkedDir>
@@ -453,7 +453,7 @@ pub(crate) fn walk_path_to_dir(
 /// sentinel. Used by spawners that walk-and-attenuate a subtree cap
 /// before installing it on a child via `CONFIGURE_NAMESPACE`.
 pub(crate) fn walk_path_to_dir_with_rights(
-    root_cap: u32,
+    root_cap: u64,
     path_str: &str,
     requested_rights: u64,
     ipc_buf: *mut u64,
@@ -480,7 +480,7 @@ pub(crate) fn walk_path_to_dir_with_rights(
 /// Used by `File::open` and by `Command::spawn` (binary lookup); both
 /// callers wrap the result with their own per-handle bookkeeping.
 pub(crate) fn walk_path_to_file(
-    root_cap: u32,
+    root_cap: u64,
     path_str: &str,
     ipc_buf: *mut u64,
 ) -> io::Result<WalkedFile>
@@ -506,7 +506,7 @@ enum ExpectKind
 /// Internal: result of a generic component walk.
 struct WalkedNode
 {
-    cap: u32,
+    cap: u64,
     size: u64,
     kind: NodeKind,
 }
@@ -533,7 +533,7 @@ const NS_DEFINED_RIGHTS: u64 = {
 /// [`NS_DEFINED_RIGHTS`], and `InvalidInput` otherwise, since no hop
 /// narrows the anchor; file walks reject it with `InvalidInput`.
 fn walk_components(
-    root_cap: u32,
+    root_cap: u64,
     path_str: &str,
     requested_rights: u64,
     ipc_buf: *mut u64,
@@ -746,7 +746,7 @@ fn walk_components(
 /// `File::open` write/create paths.
 pub(crate) struct SplitParent
 {
-    pub parent_cap: u32,
+    pub parent_cap: u64,
     pub parent_owned: bool,
     pub leaf: Vec<u8>,
 }
@@ -857,7 +857,7 @@ fn release_split_parent(split: &SplitParent)
 /// the server (may be short; callers iterate), or `InvalidData` when the
 /// server reports more bytes than `payload` holds.
 fn write_inline(
-    file_cap: u32,
+    file_cap: u64,
     offset: u64,
     payload: &[u8],
     ipc_buf: *mut u64,
@@ -891,7 +891,7 @@ fn write_inline(
 /// reserved VA for the length of the write.
 struct WriteFrame
 {
-    cap: u32,
+    cap: u64,
     phys: u64,
     range: crate::sys::reserve::ReservedRange,
 }
@@ -907,7 +907,7 @@ impl WriteFrame
 /// Request a source frame from memmgr, fund this address space's page
 /// tables for it, and map it. A frame that fails to map was never shown to
 /// a driver, so its cap is deleted and its run returned.
-fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
+fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
 {
     use crate::sys::alloc::seraph::{
         fund_aspace_pt_budget, slab_release_fresh, slab_request_pages,
@@ -995,7 +995,7 @@ impl Drop for ReadMark<'_>
 /// § Label 12 requires of it; revocation withdraws a derivation the driver
 /// kept but not a mapping it made. A frame whose unmap fails stays mapped,
 /// reserved, and accounted to this process until it exits.
-fn release_write_frame(frame: WriteFrame, aspace: u32)
+fn release_write_frame(frame: WriteFrame, aspace: u64)
 {
     // SAFETY: the frame owns its reserved page, which holds no Rust object;
     // the write path reaches it only through raw pointers, and consuming the
@@ -1031,9 +1031,9 @@ enum ChunkError
 /// returns their count instead, as a short write, so the caller's position
 /// stays in step with the file; the error recurs on the next call.
 fn write_memory_chunks(
-    file_cap: u32,
-    aspace: u32,
-    memmgr_ep: u32,
+    file_cap: u64,
+    aspace: u64,
+    memmgr_ep: u64,
     base_offset: u64,
     payload: &[u8],
     ipc_buf: *mut u64,
@@ -1095,7 +1095,7 @@ fn write_memory_chunks(
 /// Returns the bytes written, or `InvalidData` when the driver reports more
 /// than `chunk` holds.
 fn write_frame_chunk(
-    file_cap: u32,
+    file_cap: u64,
     frame: &WriteFrame,
     offset: u64,
     chunk: &[u8],
@@ -1188,7 +1188,7 @@ pub(crate) fn close_open_files()
 /// (this `File`'s badged SEND on the release endpoint) to the driver in
 /// `caps[0]`, and return the open cap the reply carries
 /// (fs-driver-protocol.md § Label 18). Every other reply cap is deleted.
-fn file_open(node_cap: u32, release_send: u32, ipc_buf: *mut u64) -> io::Result<u32>
+fn file_open(node_cap: u64, release_send: u64, ipc_buf: *mut u64) -> io::Result<u64>
 {
     let msg = IpcMessage::builder(fs_labels::FS_OPEN)
         .cap(release_send)
@@ -1215,7 +1215,7 @@ fn file_open(node_cap: u32, release_send: u32, ipc_buf: *mut u64) -> io::Result<
 /// Send `FS_TRUNCATE(0)` against `file_cap`. v1 only supports the
 /// truncate-to-zero shrink; the server replies `IO_ERROR` for any
 /// non-zero `new_len` and the client pre-rejects with `Unsupported`.
-fn file_truncate_zero(file_cap: u32, ipc_buf: *mut u64) -> io::Result<()>
+fn file_truncate_zero(file_cap: u64, ipc_buf: *mut u64) -> io::Result<()>
 {
     let msg = IpcMessage::builder(fs_labels::FS_TRUNCATE).word(0, 0).build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1240,7 +1240,7 @@ fn create_file_at(
     path: &Path,
     ipc_buf: *mut u64,
     allow_existing: bool,
-) -> io::Result<(u32, u64)>
+) -> io::Result<(u64, u64)>
 {
     let split = split_parent_and_leaf(path, ipc_buf)?;
 
@@ -1300,7 +1300,7 @@ pub struct File
     /// Receives every file-scoped op (FS_READ, FS_READ_MEMORY, FS_WRITE,
     /// FS_WRITE_MEMORY, FS_TRUNCATE, FS_CLOSE, synchronous
     /// client-initiated FS_RELEASE_MEMORY).
-    file_cap: u32,
+    file_cap: u64,
     /// Badge keying this `File`'s entry in the release-handler registry,
     /// so `Drop` can unregister it. It is also the badge of the release
     /// SEND the `FS_OPEN` handed the driver, so a driver
@@ -1308,10 +1308,10 @@ pub struct File
     /// (fs-driver-protocol.md § Label 8).
     badge: u64,
     /// Process aspace cap, captured at open for `mem_map` / `mem_unmap`.
-    aspace: u32,
+    aspace: u64,
     /// memmgr endpoint cap captured at open; used by the write-frame
     /// path to acquire single-page DMA source frames.
-    memmgr_ep: u32,
+    memmgr_ep: u64,
     /// Per-file outstanding-mappings registration in the handler.
     entry: Arc<FileEntry>,
     /// Current read/write offset; advanced by every successful op.
@@ -1699,7 +1699,7 @@ impl File
     /// is deleted and `cookie` released.
     fn map_frame(
         &self,
-        memory_cap: u32,
+        memory_cap: u64,
         cookie: u64,
     ) -> io::Result<crate::sys::reserve::ReservedRange>
     {
@@ -1747,7 +1747,7 @@ impl File
         &self,
         reply: &IpcMessage,
         cookie: u64,
-    ) -> io::Result<Option<(u32, usize, usize)>>
+    ) -> io::Result<Option<(u64, usize, usize)>>
     {
         let bytes_valid = reply.word(0) as usize;
         let memory_data_offset = reply.word(2) as usize;
@@ -2352,7 +2352,7 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()>
 /// subtree if it is a directory, then `FS_REMOVE`s the entry by name
 /// on `dir_cap`. After each removal the cursor restarts at zero
 /// because FAT compacts indices when an entry is freed.
-fn drain_dir_recursive(dir_cap: u32, ipc_buf: *mut u64) -> io::Result<()>
+fn drain_dir_recursive(dir_cap: u64, ipc_buf: *mut u64) -> io::Result<()>
 {
     let mut idx = 0u64;
     loop
@@ -2417,7 +2417,7 @@ struct ReaddirEntry
 /// Issue a single `NS_READDIR(idx)` against `dir_cap`. Returns
 /// `Ok(None)` on `END_OF_DIR`.
 fn ns_readdir_one(
-    dir_cap: u32,
+    dir_cap: u64,
     idx: u64,
     ipc_buf: *mut u64,
 ) -> io::Result<Option<ReaddirEntry>>

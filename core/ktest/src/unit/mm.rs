@@ -552,7 +552,7 @@ pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
     // from `aspace_cap + 1`. ktest's image has four (RODATA, TEXT, RELRO,
     // DATA/BSS); this loop probes only the first three, so the DATA/BSS cap
     // at `aspace_cap + 4` is not probed.
-    const SEG_COUNT: u32 = 3;
+    const SEG_COUNT: u64 = 3;
 
     for i in 0..SEG_COUNT
     {

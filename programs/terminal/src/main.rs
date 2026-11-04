@@ -99,7 +99,7 @@ fn main() -> !
     let kbd_tx = tx.clone();
     std::thread::spawn(move || input::keyboard_loop(input_cap, &kbd_tx));
     // Second input producer: serial RX. `serial_cap` is also the Sink's TX cap
-    // (a Copy `u32`); the driver multiplexes read and write on the one endpoint.
+    // (a Copy `u64`); the driver multiplexes read and write on the one endpoint.
     let serial_rx_tx = tx.clone();
     std::thread::spawn(move || input::serial_loop(serial_cap, &serial_rx_tx));
 
@@ -248,7 +248,7 @@ fn relay_stderr<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
 
 /// Pull the bootstrap rounds; expect slot 0 from the recipe's
 /// `seed = devmgr.registry`.
-fn bootstrap_devmgr_registry(creator_ep: u32, ipc_buf: *mut u64) -> Option<u32>
+fn bootstrap_devmgr_registry(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     if creator_ep == 0
     {
@@ -263,7 +263,7 @@ fn bootstrap_devmgr_registry(creator_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 
 /// Query devmgr for a device endpoint cap, retrying briefly while the driver's
 /// on-disk spawn completes.
-fn query_device(registry: u32, label: u64, ipc_buf: *mut u64) -> Option<u32>
+fn query_device(registry: u64, label: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     for _ in 0..100
     {

@@ -43,7 +43,7 @@ pub struct SharedRegion
 {
     /// Memory cap slot; the buffer maps it through a derived read-write cap,
     /// so the slot stays with the caller.
-    pub cap: u32,
+    pub cap: u64,
     /// Pages the cap covers, all of which are mapped.
     pub pages: u64,
 }
@@ -67,7 +67,7 @@ pub struct SharedBuffer
 {
     vaddr: u64,
     page_count: u64,
-    aspace: u32,
+    aspace: u64,
 }
 
 /// Total pages `regions` cover, or `None` when there is no region, a region
@@ -113,7 +113,7 @@ impl SharedBuffer
     /// fails (a cap covering fewer pages than its region claims among them).
     pub unsafe fn attach(
         regions: &[SharedRegion],
-        aspace: u32,
+        aspace: u64,
         vaddr: u64,
     ) -> Result<Self, ShmemError>
     {
@@ -219,7 +219,7 @@ impl Drop for SharedBuffer
 ///
 /// # Safety
 /// The contract of `syscall::mem_unmap` for the `count` pages at `vaddr`.
-unsafe fn unmap_range(aspace: u32, vaddr: u64, count: u64)
+unsafe fn unmap_range(aspace: u64, vaddr: u64, count: u64)
 {
     if count != 0
     {

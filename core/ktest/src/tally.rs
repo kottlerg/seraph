@@ -155,7 +155,7 @@ const REPORT_SLICES: u64 = 1000;
 ///
 /// `err` when the bound runs out; a fixed message when the wait on `done`
 /// itself fails.
-pub fn await_report(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
+pub fn await_report(done: u64, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
 {
     await_bits(done, acc, |bits| bits & mask != 0, err)
 }
@@ -169,7 +169,7 @@ pub fn await_report(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> T
 ///
 /// `err` when the bound runs out; a fixed message when the wait on `done`
 /// itself fails.
-pub fn await_all(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
+pub fn await_all(done: u64, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
 {
     await_bits(done, acc, |bits| bits & mask == mask, err)
 }
@@ -178,7 +178,7 @@ pub fn await_all(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> Test
 /// most [`REPORT_SLICES`] slices through [`crate::scaled_bound`]; the bound
 /// [`await_report`] and [`await_all`] share.
 fn await_bits(
-    done: u32,
+    done: u64,
     acc: &mut u64,
     reached: impl Fn(u64) -> bool,
     err: &'static str,

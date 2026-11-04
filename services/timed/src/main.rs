@@ -23,11 +23,11 @@ use syscall_abi::SystemInfoType;
 
 struct BootCaps
 {
-    service_ep: u32,
-    devmgr_registry_ep: u32,
+    service_ep: u64,
+    devmgr_registry_ep: u64,
 }
 
-fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
+fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
 {
     if creator_endpoint == 0
     {
@@ -50,7 +50,7 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
 
 // ── RTC query ──────────────────────────────────────────────────────────────
 
-fn query_rtc(rtc_cap: u32, ipc_buf: *mut u64) -> Option<u64>
+fn query_rtc(rtc_cap: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let request = IpcMessage::new(rtc_labels::RTC_GET_EPOCH_TIME);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -94,7 +94,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, offset: Option<u64>)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-fn service_loop(service_ep: u32, ipc_buf: *mut u64, offset: Option<u64>) -> !
+fn service_loop(service_ep: u64, ipc_buf: *mut u64, offset: Option<u64>) -> !
 {
     if offset.is_some()
     {
@@ -144,7 +144,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// Resolve the RTC SEND via devmgr's `QUERY_RTC_DEVICE`. Returns `0`
 /// when devmgr replies anything other than success (registry badge
 /// rejected, label-version mismatch, no RTC driver bound).
-fn resolve_rtc_cap(devmgr_registry_ep: u32, ipc_buf: *mut u64) -> u32
+fn resolve_rtc_cap(devmgr_registry_ep: u64, ipc_buf: *mut u64) -> u64
 {
     if devmgr_registry_ep == 0
     {
@@ -179,7 +179,7 @@ fn resolve_rtc_cap(devmgr_registry_ep: u32, ipc_buf: *mut u64) -> u32
 /// moment of the RTC sample is approximated as the midpoint of the
 /// roundtrip; subtracting that midpoint from the RTC value removes
 /// most of the IPC-roundtrip bias from the resulting offset.
-fn compute_offset(devmgr_registry_ep: u32, ipc_buf: *mut u64) -> Option<u64>
+fn compute_offset(devmgr_registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let rtc_cap = resolve_rtc_cap(devmgr_registry_ep, ipc_buf);
     if rtc_cap == 0

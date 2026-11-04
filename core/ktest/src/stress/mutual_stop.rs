@@ -140,7 +140,7 @@ static BAD_STARTS: BadTally = BadTally::new();
 struct ChildArgs
 {
     /// The peer's Thread cap, a handle in ktest's `CSpace`.
-    peer: u32,
+    peer: u64,
     /// This child's index into the per-child tallies.
     index: usize,
 }
@@ -307,7 +307,7 @@ fn log_tallies(tally: &Tally)
 /// round).
 fn with_children(ctx: &TestContext) -> Result<Tally, &'static str>
 {
-    let mut threads: [Option<u32>; CHILDREN] = [None, None];
+    let mut threads: [Option<u64>; CHILDREN] = [None, None];
     let result = start(ctx, &mut threads).and_then(|th| {
         let mut tally = Tally::default();
         let ran = rounds(th, &mut tally);
@@ -338,8 +338,8 @@ fn with_children(ctx: &TestContext) -> Result<Tally, &'static str>
 /// [`GO`]. Each thread is recorded in `threads` before anything can fail.
 fn start(
     ctx: &TestContext,
-    threads: &mut [Option<u32>; CHILDREN],
-) -> Result<[u32; CHILDREN], &'static str>
+    threads: &mut [Option<u64>; CHILDREN],
+) -> Result<[u64; CHILDREN], &'static str>
 {
     for slot in threads.iter_mut()
     {
@@ -382,7 +382,7 @@ fn start(
 /// Run [`CYCLES`] rounds: restart both children, wait for both to count
 /// another loop, and spin a varying delay. Records the loops counted by
 /// the end.
-fn rounds(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
+fn rounds(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
 {
     for cycle in 0..CYCLES
     {
@@ -413,7 +413,7 @@ fn rounds(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
 
 /// Restart `child`; returns whether the start committed (`Ok`). A child
 /// that is running or exited refuses it with `InvalidArgument`.
-fn restart(child: u32) -> Result<bool, &'static str>
+fn restart(child: u64) -> Result<bool, &'static str>
 {
     match thread_start(child)
     {
@@ -464,7 +464,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// Set [`QUIT`] and restart both children, bounded, until both have exited
 /// (a child stopped by its peer's last loop, or by a mutual stop, needs a
 /// restart to reach its loop top); then check both exited voluntarily.
-fn finish(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
+fn finish(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     let max_polls = crate::scaled_polls(EXIT_POLLS);
@@ -532,7 +532,7 @@ extern "C" fn child_entry(arg: u64) -> !
 
 /// Stop the peer: `Ok` is tallied, `InvalidState` (the peer is already
 /// stopped, or exited) accepted, anything else recorded as bad.
-fn stop_peer(peer: u32, index: usize)
+fn stop_peer(peer: u64, index: usize)
 {
     match thread_stop(peer)
     {
@@ -549,7 +549,7 @@ fn stop_peer(peer: u32, index: usize)
 /// Start the peer: `Ok` is tallied, `InvalidArgument` (the peer is running,
 /// or exited) accepted, `Interrupted` (this child was stopped while the
 /// start waited) tallied, anything else recorded as bad.
-fn start_peer(peer: u32, index: usize)
+fn start_peer(peer: u64, index: usize)
 {
     match thread_start(peer)
     {

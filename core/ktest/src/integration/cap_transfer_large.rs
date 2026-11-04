@@ -55,10 +55,10 @@ static mut CHILD_STACKS: [ChildStack; 2] = [ChildStack::ZERO, ChildStack::ZERO];
 #[derive(Clone, Copy)]
 struct ChildArgs
 {
-    ep: u32,
-    test_sig: u32,
-    sync_sig: u32,
-    go_sig: u32,
+    ep: u64,
+    test_sig: u64,
+    sync_sig: u64,
+    go_sig: u64,
 }
 
 static CHILD_ARGS: ArgBlock<ChildArgs, 2> = ArgBlock::new(ChildArgs {

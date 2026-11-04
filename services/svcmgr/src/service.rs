@@ -35,14 +35,14 @@ pub struct ServiceEntry
     /// `ipc::svcmgr_labels::NAME_MAX` bytes.
     pub name: String,
     /// Capability slot for the service's thread.
-    pub thread_cap: u32,
+    pub thread_cap: u64,
     /// Persistent service endpoint svcmgr created for a `provides = ...`
     /// service: the source half (the child holds a RECV derivation,
     /// consumers a published SEND). Zero for pure-consumer services. The
     /// endpoint outlives any single instance — on restart svcmgr derives a
     /// fresh RECV from this slot and re-serves it, so the published SEND
     /// stays valid across the crash and cached client caps keep resolving.
-    pub provided_endpoint: u32,
+    pub provided_endpoint: u64,
     /// VFS path used to respawn this service via svcmgr-side walk +
     /// `CREATE_FROM_FILE`. The sole restart source: every restartable
     /// service is reloaded from the filesystem.
@@ -76,7 +76,7 @@ pub struct ServiceEntry
     /// pool. Zero only for init-endowed services (which svcmgr never
     /// created — init did), so their first death cannot destroy; the
     /// restart then populates it and subsequent deaths can.
-    pub process_handle: u32,
+    pub process_handle: u64,
     /// Namespace-policy kind reconciliation recorded from the `.svc`
     /// `namespace = ...` line; one of `ipc::svcmgr_labels::NS_POLICY_*`.
     /// svcmgr re-applies this shape on every restart so attenuation
@@ -171,32 +171,32 @@ pub struct RestartRecipe
 pub struct SvcmgrCaps
 {
     /// Service protocol endpoint capability slot.
-    pub service_ep: u32,
+    pub service_ep: u64,
     /// svcmgr's own bootstrap endpoint (receives bootstrap requests from
     /// restarted children).
-    pub bootstrap_ep: u32,
+    pub bootstrap_ep: u64,
     /// SEND on the root filesystem's namespace endpoint, published as
     /// `rootfs.root`. Zero if init could not derive it.
-    pub rootfs_root: u32,
+    pub rootfs_root: u64,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
     /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and
     /// `devmgr.test` publish caps and the `SET_DRIVERS_DIR` cap
     /// (`DRIVERS_DIR_AUTHORITY`) from it. Zero if absent.
-    pub devmgr_registry: u32,
+    pub devmgr_registry: u64,
     /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint, published
     /// seed-only as `vfsd.mount`. Zero if absent.
-    pub vfsd_mount: u32,
+    pub vfsd_mount: u64,
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, published
     /// seed-only as `vfsd.deny`. Zero if absent.
-    pub vfsd_deny: u32,
+    pub vfsd_deny: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch. Holding it keeps the
     /// log endpoint object alive across a logd crash. Zero if absent.
-    pub master_log_source: u32,
+    pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch. Zero if absent.
-    pub procmgr_death_auth_source: u32,
+    pub procmgr_death_auth_source: u64,
 }
 
 /// Acquire svcmgr's initial cap set and substrate registrations from its
@@ -338,7 +338,7 @@ fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<Pe
     {
         return;
     }
-    let reject = |cap: u32| {
+    let reject = |cap: u64| {
         let _ = syscall::cap_delete(cap);
     };
     let name_len = round.data[1] as usize;

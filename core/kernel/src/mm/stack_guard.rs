@@ -156,17 +156,19 @@ mod live
     /// Halts via `crate::fatal` when the buddy cannot supply a frame.
     pub unsafe fn seed(frames: usize, allocator: &mut crate::mm::BuddyAllocator)
     {
-        RESERVE.with(|list| {
-            for _ in 0..frames
-            {
-                let frame = allocator.alloc(0).unwrap_or_else(|| {
-                    crate::fatal("Phase 4: out of memory for the guard-table reserve")
-                });
+        for _ in 0..frames
+        {
+            let frame = allocator.alloc(0).unwrap_or_else(|| {
+                crate::fatal("Phase 4: out of memory for the guard-table reserve")
+            });
+            // Each frame is pushed under its own hold, so the lock's hold is
+            // the push alone, never a buddy allocation.
+            RESERVE.with(|list| {
                 // SAFETY: the frame is fresh from the buddy, this call's
                 // alone, and reached through the direct map.
                 unsafe { list.push(frame) };
-            }
-        });
+            });
+        }
         SEEDED.store(frames, Ordering::Relaxed);
     }
 

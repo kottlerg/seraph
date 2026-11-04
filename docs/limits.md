@@ -274,7 +274,6 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | `IDT` | `core/kernel/src/arch/x86_64/idt.rs` | 256 entries | hardware spec (x86 vector space) | 4 KiB BSS | correct as is | None |
 | `GDT`, AP GDTs | `core/kernel/src/arch/x86_64/gdt.rs` | 7 descriptors | hardware spec (fixed descriptor layout) | 56 B per CPU | correct as is | None |
 | `IOPB_SIZE` (`TssWithIopb.iopb`) | `core/kernel/src/arch/x86_64/gdt.rs` | 8192 B | hardware spec (65536 ports / 8) | about 8.3 KiB per CPU | correct as is | None |
-| `OVERFLOW_STACK_BYTES` (`OVERFLOW_STACK`) | `core/kernel/src/arch/riscv64/interrupts.rs` | 16 KiB, one for all harts | stack budget for the fixed overflow report and `fatal` path, which the first overflowing hart claims (a later one parks) | 16 KiB BSS | correct as is | None |
 | `IST_STACK_SIZE` (`BSP_IST_STACKS`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 8 KiB x 2 | stack budget for the fixed NMI, #DF and #MC paths, audited: worst case under 3.7 KiB, debug and release builds | 16 KiB BSS | correct as is | None |
 | `AP_IST_PAIR_SIZE` | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 16384 | encoding artefact (two IST stacks) | `cpu_count` x 16 KiB | correct as is | Derive as `2 * IST_STACK_SIZE` |
 | Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; root table (PML4 or PML5) below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
@@ -300,6 +299,7 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | riscv64 `VLENB_SPEC_MAX` | `core/kernel/src/arch/riscv64/fpu.rs` | 8192 (VLEN 65536) | hardware spec (the V extension's largest VLEN; a larger, or non-power-of-two, `vlenb` is refused at boot) | none | correct as is | None |
 | riscv64 `V_REGS_OFFSET` | `core/kernel/src/arch/riscv64/fpu.rs` | 304 | encoding artefact (the F/D registers, `fcsr` and the vector CSRs before `v0` in the save area; the save and restore asm and the area size read it) | none | correct as is | None |
 | riscv64 `timebase_freq` check | `core/kernel/src/arch/riscv64/timer.rs` | at most `u32::MAX` Hz | encoding artefact (overflow-free tick math) | none | correct as is | None |
+| riscv64 `OVERFLOW_STACK_BYTES` (`OVERFLOW_STACK`) | `core/kernel/src/arch/riscv64/interrupts.rs` | 16 KiB, one for all harts (the first overflowing hart claims it; a later one parks) | stack budget for a fixed path, unmeasured on riscv64: `kernel_stack_overflow`'s report and `fatal`, the `fatal` the x86-64 IST paths run under their audited 3.7 KiB | 16 KiB BSS | correct as is | None |
 
 ### Kernel: entropy
 

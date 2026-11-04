@@ -257,7 +257,8 @@ pub fn thread_retype_bytes_funds_one_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "system_info(ThreadRetypeBytes) failed")?;
     // The guard page below the kernel stack, the kernel stack (four pages),
     // the wrapper and TCB page, and a save area of at least one page, all
-    // whole pages: a slot without its guard reads six.
+    // whole pages: the bound catches a slot without its guard when the save
+    // area is one page.
     if bytes % PAGE_SIZE != 0 || bytes < 7 * PAGE_SIZE
     {
         return Err("system_info(ThreadRetypeBytes) is not a slot of seven or more whole pages");

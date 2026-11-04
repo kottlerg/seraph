@@ -149,7 +149,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::fault_bind_race: pin controller failed")?;
     let mut parts = Parts::default();
-    let result = race(ctx, &mut parts, CYCLES);
+    let result = race(ctx, &mut parts);
     parts.release();
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::fault_bind_race: restore controller affinity failed");
@@ -162,8 +162,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Set up the handlers, then run `cycles` rounds.
-fn race(ctx: &TestContext, parts: &mut Parts, cycles: u32) -> TestResult
+/// Set up the handlers, then run [`CYCLES`] rounds.
+fn race(ctx: &TestContext, parts: &mut Parts) -> TestResult
 {
     MISMATCHES.store(0, Ordering::Release);
     for i in 0..2
@@ -198,7 +198,7 @@ fn race(ctx: &TestContext, parts: &mut Parts, cycles: u32) -> TestResult
         parts.badged[0].ok_or("stress::fault_bind_race: no E1 cap")?,
         parts.badged[1].ok_or("stress::fault_bind_race: no E2 cap")?,
     ];
-    for _ in 0..cycles
+    for _ in 0..CYCLES
     {
         round(ctx, parts, badged)?;
     }

@@ -234,7 +234,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
     else
     {
         std::os::seraph::log!(
-            "procmgr: load_elf_segment: VA reserve failed vaddr=0x{:x} pages={}",
+            "load_elf_segment: VA reserve failed vaddr=0x{:x} pages={}",
             first_page_vaddr,
             num_pages
         );
@@ -254,7 +254,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         else
         {
             std::os::seraph::log!(
-                "procmgr: load_elf_segment: alloc None vaddr=0x{:x}",
+                "load_elf_segment: alloc None vaddr=0x{:x}",
                 first_page_vaddr + i * PAGE_SIZE
             );
             return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -275,7 +275,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         if mapped.is_err()
         {
             std::os::seraph::log!(
-                "procmgr: load_elf_segment: scratch map failed vaddr=0x{:x}",
+                "load_elf_segment: scratch map failed vaddr=0x{:x}",
                 first_page_vaddr + i * PAGE_SIZE
             );
             return Err(procmgr_errors::MAP_FAILED);
@@ -317,7 +317,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         else
         {
             std::os::seraph::log!(
-                "procmgr: load_elf_segment: derive None vaddr=0x{:x} prot=0x{:x}",
+                "load_elf_segment: derive None vaddr=0x{:x} prot=0x{:x}",
                 page_vaddr,
                 page_prot
             );
@@ -340,7 +340,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         if let Err(e) = mapped
         {
             std::os::seraph::log!(
-                "procmgr: load_elf_segment: mem_map err={} vaddr=0x{:x}",
+                "load_elf_segment: mem_map err={} vaddr=0x{:x}",
                 e,
                 page_vaddr
             );

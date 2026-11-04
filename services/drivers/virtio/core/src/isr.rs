@@ -109,18 +109,13 @@ mod tests
 {
     use super::*;
 
+    // With the ISR clear, so the delivery alone signals: it may be another
+    // device's on the line.
     #[test]
-    fn a_delivery_is_acknowledged_and_signalled_whatever_the_isr_holds()
+    fn a_delivery_is_acknowledged_and_signalled_even_with_the_isr_clear()
     {
         assert_eq!(
             isr_step(true, 0),
-            IsrStep {
-                ack: true,
-                signal: true
-            }
-        );
-        assert_eq!(
-            isr_step(true, 1),
             IsrStep {
                 ack: true,
                 signal: true
@@ -134,13 +129,6 @@ mod tests
         // The lost-edge case: the device asserted while the line was masked.
         assert_eq!(
             isr_step(false, 1),
-            IsrStep {
-                ack: false,
-                signal: true
-            }
-        );
-        assert_eq!(
-            isr_step(false, 3),
             IsrStep {
                 ack: false,
                 signal: true

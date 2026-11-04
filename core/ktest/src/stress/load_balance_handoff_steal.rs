@@ -142,15 +142,12 @@ struct ClientArgs
     done: u32,
     /// Client index: its IPC buffer and its `done` bit.
     idx: usize,
-    /// Round-trips to issue.
-    iters: u32,
 }
 
 static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, NUM_PAIRS> = spawn::ArgBlock::new(ClientArgs {
     ep: 0,
     done: 0,
     idx: 0,
-    iters: 0,
 });
 
 /// Per-server arguments, handed to `server_entry` by address.
@@ -286,7 +283,6 @@ pub fn run(ctx: &TestContext) -> TestResult
                     ep: client_ep,
                     done: client_done,
                     idx: i,
-                    iters: ITERS,
                 },
             )
         };
@@ -383,12 +379,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 extern "C" fn client_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this client.
-    let ClientArgs {
-        ep,
-        done,
-        idx,
-        iters,
-    } = unsafe { spawn::child_args(arg) };
+    let ClientArgs { ep, done, idx } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << idx;
 
     // SAFETY: client `idx` is the sole user of IPC_BUFS[idx] this run.
@@ -405,7 +396,7 @@ extern "C" fn client_entry(arg: u64) -> !
     let msg = IpcMessage::new(0);
     let mut completed = 0u64;
     let mut cpu_mask = sample_cpu_bit();
-    for n in 0..iters
+    for n in 0..ITERS
     {
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
         if unsafe { ipc::ipc_call(ep, &msg, buf) }.is_ok()

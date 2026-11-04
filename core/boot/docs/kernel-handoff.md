@@ -101,12 +101,23 @@ unconditional jump that does not return.
 Beyond the contract, the reference bootloader enters with the stack pointer at the handoff
 stack's page-aligned top, leaves the page below the stack unmapped as its guard, and paints the
 stack with `STACK_PAINT` and marks its lowest word with `HANDOFF_STACK_BASE_MARK`
-([boot-flow.md](boot-flow.md) § Step 6). The kernel's stack depth
-report ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth)
-§ Kernel Stack Depth) relies on those properties for the handoff class only; under a
-bootloader without them, that class reads as unlocated (the error in
-[syscalls.md](../../kernel/docs/syscalls.md) § `SYS_SYSTEM_INFO`), and the kernel otherwise
-runs as the contract states.
+([boot-flow.md](boot-flow.md) § Step 6). Nothing in the kernel relies on the guard; it makes an
+overflow of the stack fault while the boot tables and the kernel's Phase 3 identity window map
+the stack. Two kernel uses rely on the page-aligned top:
+
+- The kernel's stack depth report
+  ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth) § Kernel
+  Stack Depth) relies on it, the paint, and the mark for the handoff class; under a bootloader
+  without them, that class reads as unlocated (the error in
+  [syscalls.md](../../kernel/docs/syscalls.md) § `SYS_SYSTEM_INFO`).
+- The kernel's Phase 3 identity window over the stack
+  ([initialization.md](../../kernel/docs/initialization.md#phase-3-kernel-page-tables)
+  § Phase 3) takes its floor from the same page-aligned top. Under a bootloader that enters
+  below a page boundary the window still covers at least `HANDOFF_STACK_BYTES` less 4 KiB
+  below the entry stack pointer, more than the boot phases use (the measured bound at
+  `HANDOFF_STACK_BYTES`, `boot_protocol::layout`).
+
+The kernel otherwise runs as the contract states.
 
 On x86-64 the GDT active at entry is the UEFI firmware's, which the bootloader leaves loaded,
 or, when the handoff changed the paging depth, the one the LA57 toggle trampoline loads to pass

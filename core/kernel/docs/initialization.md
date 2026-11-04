@@ -146,10 +146,12 @@ again from the recorded BootInfo address.
    addresses from the BootInfo kernel_virtual_base / kernel_physical_base offset; 4 KiB pages)
    — the identity window (VA == PA) that holds the handoff stack, used until the stack is
    rebased onto the direct map right after Phase 3 (mm::paging::handoff_stack_window: from
-   the stack's base, the stack pointer kernel_entry records rounded up to a page less
-   HANDOFF_STACK_BYTES, to HANDOFF_STACK_BYTES above that top, so it holds the entry
-   frame whatever its alignment and, under the reference bootloader, leaves out the guard
-   page below the stack), and the direct map of the
+   t - HANDOFF_STACK_BYTES to t + HANDOFF_STACK_BYTES, where t is the stack pointer
+   kernel_entry records rounded up to a page, the stack's top under the reference
+   bootloader; it holds the entry frame whatever its alignment, leaves out the reference
+   bootloader's guard page below the stack, and under a bootloader that enters below a page
+   boundary covers at least HANDOFF_STACK_BYTES less 4 KiB below the entry stack pointer),
+   and the direct map of the
    first two 2 MiB chunks covering the carve (mm::paging::carve_bootstrap_end; all of them
    when there are fewer), which hold at least 513 of its frames whenever it spans more, so
    the seed's need is fixed by the image, not by RAM.

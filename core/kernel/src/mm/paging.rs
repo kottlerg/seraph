@@ -1016,10 +1016,12 @@ fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
 /// rebases it into the direct map.
 ///
 /// The window is [`handoff_stack_window`] of the stack pointer `kernel_entry`
-/// recorded at its first statement (`stack_depth::boot_entry_sp`), or of the
-/// current one when none was recorded. It leaves out the page below the stack,
-/// which the reference bootloader keeps unmapped as the stack's guard
-/// (core/boot/docs/boot-flow.md § Step 6).
+/// recorded at its first statement (`stack_depth::boot_entry_sp`). Of that
+/// pointer, the window leaves out the page below the stack, which the reference
+/// bootloader keeps unmapped as the stack's guard (core/boot/docs/boot-flow.md
+/// § Step 6). When no pointer was recorded (never on the boot path, where
+/// recording is `kernel_entry`'s first statement) the window is that of the
+/// current stack pointer, which may map the guard.
 ///
 /// If the stack pointer is already within the kernel image mapping (unlikely
 /// but possible), this is a no-op.

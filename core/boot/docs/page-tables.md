@@ -65,8 +65,10 @@ LA57 toggle page when the handoff changes the paging depth) are identity-mapped
 read-execute, so the instruction fetch after the root-table switch resolves.
 
 **Handoff stack** — the bootloader allocates the kernel's entry stack
-(`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages`, identity-maps it with read-write,
-non-executable permissions, and switches the stack pointer to it in the
+(`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages` with one more page below it, its
+guard, identity-maps the stack with read-write, non-executable permissions while no
+identity-map region covers the guard ([boot-flow.md](boot-flow.md) § Step 6), and switches
+the stack pointer to the stack's top in the
 [handoff sequence](kernel-handoff.md#handoff-sequence) before jumping to the kernel.
 
 The firmware's own translation (a 1:1 mapping of physical memory under UEFI) stays active

@@ -552,6 +552,42 @@ impl<W: PhysWindow> BuddyAllocator<W>
         Ok(extents)
     }
 
+    /// Number of extents [`drain_coalesced`][Self::drain_coalesced] would emit
+    /// now, leaving every free block free: the blocks are sorted by address as
+    /// the drain sorts them, the maximal runs counted, and each block pushed
+    /// back onto the free list of its order, so the same blocks stay free at
+    /// the same orders and the free page count is unchanged.
+    ///
+    /// Phase 7 sizes the `InitInfo` descriptor array from this count before
+    /// it reserves the array and drains the remainder into it.
+    pub fn coalesced_extent_count(&mut self) -> usize
+    {
+        let mut cursor = self.drain_sorted();
+        let mut extents = 0usize;
+        let mut run_end = NONE;
+        while cursor != NONE
+        {
+            // SAFETY: `cursor` heads a drained block on the sorted chain; its
+            // memory has not been released to anyone.
+            let header = unsafe { W::header(cursor).read() };
+            if cursor != run_end
+            {
+                extents += 1;
+            }
+            run_end = cursor + ((PAGE_SIZE as u64) << header.order);
+            // cast_possible_truncation: a header's order is at most MAX_ORDER.
+            #[allow(clippy::cast_possible_truncation)]
+            // SAFETY: the block left its free list in `drain_sorted` and the
+            // allocator still owns it; its header was read above, so
+            // rewriting it loses nothing.
+            unsafe {
+                self.push_block(header.order as usize, cursor);
+            }
+            cursor = header.next;
+        }
+        extents
+    }
+
     // ── Free list operations ─────────────────────────────────────────────────
 
     /// Push a free block address onto the head of the free list for `order`,
@@ -1033,6 +1069,44 @@ mod tests
         assert_eq!(taken, BASE + pages(3));
         assert_eq!(extents, [(BASE + pages(4), pages(96)), (high, pages(5000))]);
         assert_eq!(alloc.free_page_count(), 0);
+    }
+
+    // Defect caught: a count that differs from what the drain then emits, or
+    // one that loses or moves free blocks, so the descriptor array sized from
+    // it is too small or the buddy afterwards hands out the wrong pages.
+    #[test]
+    fn extent_count_matches_the_drain_and_leaves_the_blocks_free()
+    {
+        let mut alloc = Alloc::new();
+        let high = BASE + pages(1 << 12);
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe {
+            alloc.add_region(high, high + pages(5000));
+            alloc.add_region(BASE + pages(3), BASE + pages(100));
+        }
+        // Page 3, the lower region's only order-0 block, so it moves that
+        // extent's base without splitting it.
+        let taken = alloc.alloc(0).expect("alloc");
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(200), BASE + pages(201)) };
+        let free_before = alloc.free_page_count();
+
+        let counted = alloc.coalesced_extent_count();
+        assert_eq!(alloc.free_page_count(), free_before);
+        // Counting twice changes nothing.
+        assert_eq!(alloc.coalesced_extent_count(), counted);
+
+        let mut out = [(0u64, 0u64); 8];
+        let n = alloc
+            .drain_coalesced(out.len(), |i, base, size| out[i] = (base, size))
+            .expect("fits");
+        assert_eq!(n, counted);
+        assert_eq!(n, 3);
+        assert_eq!(
+            out[..n].iter().map(|e| e.1).sum::<u64>(),
+            pages(free_before as u64)
+        );
+        assert!(out[..n].iter().all(|&(b, s)| taken < b || taken >= b + s));
     }
 
     #[test]

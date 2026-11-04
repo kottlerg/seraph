@@ -359,8 +359,7 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 // too_many_lines: the same rationale as `kernel_entry`, whose body this
 // continues.
 // similar_names: boot_cpu_count/boot_info_phys name the BootInfo fields they
-// come from, and info_pages/info_order the InitInfo region's sizes; the shared
-// prefixes keep that provenance visible.
+// come from; the shared prefix keeps that provenance visible.
 // needless_range_loop: each indexed loop runs to a count it keeps in view: the
 // AP-startup loop uses cpu_idx as both the hw_ids index and the CPU ID; the
 // init-segment Memory-cap loop (i < segment_count) and the InitInfo Memory-cap
@@ -368,8 +367,8 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 // map loop takes the same i < segment_count form as the cap loop after it.
 // cast_possible_truncation: every usize -> u32 cast is of a bounded value:
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
-// desc_count and info_pages are bounded by the descriptor capacity Phases 7
-// and 8 enforce (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
+// desc_count and info_pages are bounded by the InitInfo region ceiling Phase 7
+// enforces (init_protocol::INIT_INFO_MAX_PAGES, fatal past it);
 // size_of::<InitInfo>() and STACK_PAGES are small constants; the u64 -> usize
 // cast of the save-area byte count is lossless because usize is 64 bits on
 // every target.
@@ -967,16 +966,14 @@ unsafe fn kernel_entry_post_rebase(
                 },
             };
 
-            // The descriptors are already in the InitInfo block, written there
-            // in Phases 7 and 8 right after the header
-            // (cap::INIT_INFO_DESCRIPTOR_CAPACITY).
+            // The descriptors are already in the InitInfo region, written
+            // there in Phases 7 and 8 right after the header, within the
+            // capacity Phase 7 sized the region for.
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
             // SAFETY: single-threaded boot; cspace_layout produced by Phases 7
             // and 8.
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
-            let total_bytes = descriptors_offset as usize + core::mem::size_of_val(desc_slice);
-            let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
             // Allocate and map each page.
             let flags = mm::paging::PageFlags {
@@ -993,54 +990,24 @@ unsafe fn kernel_entry_post_rebase(
             // assumptions about single-allocation slices to mis-load fields of
             // descriptors that straddle page boundaries, and a contiguous
             // physical extent removes the discrepancy between virtual and
-            // physical contiguity. The region always fits the block:
-            // push_descriptor halts the boot at INIT_INFO_DESCRIPTOR_CAPACITY,
-            // the descriptors INIT_INFO_MAX_PAGES pages hold past the header.
+            // physical contiguity. Every page of the region is mapped and
+            // minted below; Phase 7 sized it for this boot's descriptors, and
+            // the region was zeroed then, before they were written into it.
+            let (block_phys, info_pages) = cap::take_init_info_block();
             debug_assert!(
-                info_pages <= init_protocol::INIT_INFO_MAX_PAGES,
-                "Phase 9: {info_pages} InitInfo pages for {desc_count} descriptors \
-                 ({total_bytes} bytes)"
+                core::mem::size_of::<InitInfo>() + core::mem::size_of_val(desc_slice)
+                    <= info_pages * mm::PAGE_SIZE,
+                "Phase 9: {desc_count} descriptors overrun the {info_pages}-page InitInfo region"
             );
-            // Round to next power of two for buddy allocation; for
-            // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
-            let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
-            let block_pages = 1usize << info_order;
-            // The block was reserved from the pristine buddy at Phase 7
-            // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
-            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES
-            // follows from the descriptor capacity Phases 7 and 8 enforce
-            // (asserted above), so it fits within the reserved extent.
-            let block_phys = cap::take_init_info_block_phys();
-            let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
-            // The block was zeroed when Phase 7 reserved it, before the
-            // descriptors were written into it.
-
-            // Sized by the init protocol's `INIT_INFO_MAX_PAGES`, which
-            // `info_pages` stays within (the descriptor capacity Phases 7 and
-            // 8 enforce).
-            let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
-                [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
-            let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =
-                [0u64; init_protocol::INIT_INFO_MAX_PAGES];
-
             for pg in 0..info_pages
             {
                 let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
-                // SAFETY: pg < block_pages by construction (info_pages <= block_pages).
-                let virt = unsafe { block_virt.add(pg * mm::PAGE_SIZE) };
                 let map_va = init_layout.init_info_va + (pg as u64) * mm::PAGE_SIZE as u64;
                 // SAFETY: init_as_ptr valid; phys is part of the contiguous extent.
                 unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
-                page_ptrs[pg] = virt;
-                page_phys[pg] = phys;
             }
-            // The block was reserved at the worst-case INIT_INFO_MAX_PAGES;
-            // the unused tail (INIT_INFO_MAX_PAGES - info_pages pages, ≤ 3)
-            // stays kernel-held — neither mapped nor minted below. Small but
-            // constant waste, bounded and accounted as kernel_reserved.
-            let _ = block_pages;
-            let info_base = page_ptrs[0];
+            let info_base = mm::paging::phys_to_virt(block_phys) as *mut u8;
 
             let info = InitInfo {
                 version: INIT_PROTOCOL_VERSION,
@@ -1092,7 +1059,7 @@ unsafe fn kernel_entry_post_rebase(
             let mut info_memory_base_slot: u32 = 0;
             for pg in 0..info_pages
             {
-                let phys = page_phys[pg];
+                let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
                 // No register_owned_range: these pages came from the buddy
                 // (reserved at Phase 7), so they are already in `total_pages`.
                 // `register_owned_range` would double-count.
@@ -1124,7 +1091,7 @@ unsafe fn kernel_entry_post_rebase(
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
-                // pg < info_pages, bounded by INIT_INFO_MAX_PAGES.
+                // pg < info_pages, at most INIT_INFO_MAX_PAGES (Phase 7).
                 #[allow(clippy::cast_possible_truncation)]
                 cap::extend_slot_run_or_fatal(
                     &mut info_memory_base_slot,

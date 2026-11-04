@@ -169,8 +169,8 @@ the thread at spawn (its slot table could not grow, or no death queue could take
 bind). The slot table and the death queues grow on demand, each further queue with twice the last
 one's observer nodes (the `ruststd-death-queues` crate), and each queue with one entry more than its
 nodes. Every queue is drained before each bind, in the same lock hold, so a queue's pending posts
-never exceed its nodes plus the one thread that hold binds, its entries, and no death post is
-dropped.
+never exceed its nodes plus the one thread bound in that same hold, which is its entries, and no
+death post is dropped.
 
 ### CSpace slot headroom
 

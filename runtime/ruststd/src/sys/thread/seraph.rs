@@ -595,8 +595,9 @@ mod reaper {
     /// still fits one 4 KiB retype class (`event_queue_retype_bytes`), since
     /// `object_slab_retype` grants that class for any queue past the
     /// sub-page classes, so a smaller first pool would cost the same two-page
-    /// grant. Each further queue has twice the last one's nodes, up to
-    /// `EVENT_QUEUE_MAX_CAPACITY` ([`DeathQueues`]).
+    /// grant. Each further queue has twice the last one's nodes
+    /// ([`DeathQueues`]), up to `EVENT_QUEUE_MAX_CAPACITY` less one
+    /// ([`create_queue`]).
     const FIRST_POOL_OBSERVERS: u32 = {
         let mut n: u64 = 1;
         while event_queue_retype_bytes(n + 2, n + 1) <= PAGE_SIZE {

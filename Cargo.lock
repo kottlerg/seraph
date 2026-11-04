@@ -307,6 +307,7 @@ dependencies = [
 name = "devmgr-firmware"
 version = "0.1.1"
 dependencies = [
+ "ipc",
  "syscall-abi",
  "virtio-core",
 ]

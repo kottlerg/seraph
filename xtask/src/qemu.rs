@@ -105,6 +105,35 @@ impl X86Paging
     }
 }
 
+/// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Iommu
+{
+    /// `intel-iommu` on q35, `riscv-iommu-pci` on `virt`, with every
+    /// `virtio-pci` device a driver of the system binds behind it
+    /// (`iommu_platform=on`) — the default.
+    Attached,
+    /// No IOMMU: the no-IOMMU variant of the release host runs, in which
+    /// devmgr runs every device unconfined.
+    Absent,
+}
+
+impl Iommu
+{
+    /// The `virtio-pci` device property that puts the device behind the
+    /// IOMMU (`iommu_platform=on`, so it offers `VIRTIO_F_ACCESS_PLATFORM`
+    /// and its DMA is translated); empty with no IOMMU. Without it QEMU's
+    /// `virtio-pci` devices reach memory directly, past the IOMMU.
+    fn virtio_property(self) -> &'static str
+    {
+        match self
+        {
+            Self::Attached => ",iommu_platform=on",
+            Self::Absent => "",
+        }
+    }
+}
+
 /// A second disk for a QEMU launch: its image, the logical block size its
 /// device presents, and whether it shares the first disk's `INTx` line.
 pub struct SecondDisk<'a>
@@ -159,6 +188,9 @@ pub struct QemuLaunchSpec<'a>
     pub riscv_mmu: RiscvMmu,
     /// Guest paging depth; `x86_64` only, ignored on riscv64.
     pub x86_paging: X86Paging,
+    /// Whether the machine's IOMMU is attached; every launch site attaches it
+    /// unless the run asks for the no-IOMMU variant (`--iommu absent`).
+    pub iommu: Iommu,
 }
 
 /// Construct the full QEMU argv for a launch spec.
@@ -199,6 +231,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "hd0",
             spec.disk_block_size,
             spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
+            spec.iommu,
         ),
     ];
 
@@ -222,6 +255,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
                         SECOND_DISK_SLOT
                     },
                 ),
+                spec.iommu,
             ),
         ]);
     }
@@ -231,13 +265,19 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         // (the riscv64 `virt` machine has a PCIe bridge, same as virtio-blk).
         // `id=kbd0` lets the QMP interactive-test harness target it.
         "-device".into(),
-        "virtio-keyboard-pci,disable-legacy=on,id=kbd0".into(),
+        format!(
+            "virtio-keyboard-pci,disable-legacy=on,id=kbd0{}",
+            spec.iommu.virtio_property()
+        ),
         // Boot-entropy source (KASLR, #252). The firmware's RNG driver binds
         // this device and exposes EFI_RNG_PROTOCOL, which the bootloader draws
         // from for the KASLR slide / direct-map base and the pool seed. On
         // riscv64 it is the only such source (EDK2 hands the bootloader ACPI,
         // not a DTB, so /chosen/rng-seed never reaches it); on x86-64 it backs
-        // OVMF's EFI_RNG_PROTOCOL alongside RDRAND.
+        // OVMF's EFI_RNG_PROTOCOL alongside RDRAND. It stays outside the
+        // IOMMU: QEMU's transitional `virtio-rng-pci` cannot take
+        // `iommu_platform=on`, and only the firmware drives it, before any
+        // driver of the system runs.
         "-device".into(),
         "virtio-rng-pci".into(),
         "-serial".into(),
@@ -299,13 +339,15 @@ const SHARED_LINE_SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 4;
 
 /// The `virtio-blk-pci` device for `drive`, presenting `block_size`-byte
 /// logical and physical blocks (QEMU requires the physical size to be at
-/// least the logical), at PCI slot `slot` when one is given.
-fn blk_device(drive: &str, block_size: u32, slot: Option<u8>) -> String
+/// least the logical), at PCI slot `slot` when one is given, behind the
+/// IOMMU when `iommu` attaches one.
+fn blk_device(drive: &str, block_size: u32, slot: Option<u8>, iommu: Iommu) -> String
 {
     let addr = slot.map_or_else(String::new, |slot| format!(",addr={slot:#04x}"));
     format!(
-        "virtio-blk-pci,drive={drive},disable-legacy=on,logical_block_size={block_size},\
-         physical_block_size={block_size}{addr}"
+        "virtio-blk-pci,drive={drive},disable-legacy=on{},logical_block_size={block_size},\
+         physical_block_size={block_size}{addr}",
+        iommu.virtio_property()
     )
 }
 
@@ -368,6 +410,14 @@ fn extend_x86(
     check_x86_paging(spec.x86_paging, accel, host_has_la57)?;
     let la57 = spec.x86_paging.cpu_la57_prop();
     args.extend(["-machine".into(), "q35".into()]);
+
+    // VT-d DMA remapping. Interrupt remapping stays off: it needs
+    // `kernel-irqchip=split` under KVM, which QEMU otherwise refuses, and
+    // message-signaled interrupts, which the system does not use yet.
+    if spec.iommu == Iommu::Attached
+    {
+        args.extend(["-device".into(), "intel-iommu,intremap=off".into()]);
+    }
 
     if let Some(guid) = spec.vmgenid_guid
     {
@@ -488,6 +538,16 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
         "-drive".into(),
         format!("if=pflash,format=raw,file={}", vars_path.display()),
     ]);
+
+    // The RISC-V IOMMU as a PCI function. `off=off` leaves it in Bare mode out
+    // of reset, passing DMA through untranslated until devmgr programs it;
+    // its default, Off mode, blocks all DMA, so the firmware could not read
+    // the boot disk. Placed after the shared devices, so it takes the next
+    // free slot and moves none of theirs.
+    if spec.iommu == Iommu::Attached
+    {
+        args.extend(["-device".into(), "riscv-iommu-pci,off=off".into()]);
+    }
 
     if !spec.headless
     {
@@ -704,6 +764,7 @@ mod tests
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
             x86_paging: X86Paging::Four,
+            iommu: Iommu::Attached,
         }
     }
 
@@ -790,6 +851,7 @@ mod tests
             incoming: Some("exec:cat state.bin"),
             riscv_mmu: RiscvMmu::Sv48,
             x86_paging: X86Paging::Four,
+            iommu: Iommu::Attached,
         };
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(argv.iter().any(|a| a == "vmgenid,guid=auto"));
@@ -815,6 +877,7 @@ mod tests
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
             x86_paging,
+            iommu: Iommu::Attached,
         }
     }
 
@@ -969,6 +1032,41 @@ mod tests
                 shared_line: false,
             });
             assert!(build_qemu_argv(&spec).is_err(), "second disk {size}");
+        }
+    }
+
+    #[test]
+    fn the_iommu_and_every_virtio_device_behind_it_follow_the_spec()
+    {
+        let virtio = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .filter(|a| a.starts_with("virtio-"))
+                .cloned()
+                .collect()
+        };
+        for (mut spec, iommu_device) in [
+            (riscv_spec(4, 512), "riscv-iommu-pci,off=off"),
+            (x86_spec(X86Paging::Four), "intel-iommu,intremap=off"),
+        ]
+        {
+            spec.second_disk = Some(SecondDisk {
+                path: Path::new("second.img"),
+                block_size: 512,
+                shared_line: false,
+            });
+            let argv = build_qemu_argv(&spec).unwrap();
+            assert!(argv.iter().any(|a| a == iommu_device));
+            // Both disks and the keyboard; the firmware-only RNG stays out.
+            let devices = virtio(&argv);
+            assert_eq!(devices.len(), 4);
+            let behind = devices.iter().filter(|d| d.contains(",iommu_platform=on"));
+            assert_eq!(behind.count(), 3);
+            assert!(devices.iter().any(|d| d == "virtio-rng-pci"));
+
+            spec.iommu = Iommu::Absent;
+            let argv = build_qemu_argv(&spec).unwrap();
+            assert!(!argv.iter().any(|a| a.contains("iommu")));
+            assert_eq!(virtio(&argv).len(), 4);
         }
     }
 

@@ -54,8 +54,9 @@ const POLL_INTERVAL_MS: u64 = 20;
 // devmgr serves the two rounds `virtio_core::bootstrap` specifies, as for
 // virtio-blk: the BAR caps with their BAR indices, then the service
 // endpoint, the IRQ (absent when devmgr could give the device no IRQ cap)
-// with its line's mode word, and the per-device devmgr query endpoint.
-// log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`.
+// with its line's mode word, the per-device devmgr query endpoint, and the
+// device's DMA capability. log_ep and procmgr_ep arrive via
+// `ProcessInfo`/`StartupInfo`.
 
 struct DriverCaps
 {
@@ -66,6 +67,9 @@ struct DriverCaps
     memmgr_ep: u64,
     service_ep: u64,
     devmgr_ep: u64,
+    /// The device's DMA capability (`virtio_core::bootstrap::SLOT_DMA`),
+    /// through which the rings and event buffers are mapped for the device.
+    dma_ep: u64,
     self_aspace: u64,
 }
 
@@ -84,6 +88,11 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     // SAFETY: same invariant.
     let round2 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
     let endpoints = DriverEndpoints::from_round(&round2)?;
+    if endpoints.dma == 0
+    {
+        std::os::seraph::log!("no DMA capability delivered");
+        return None;
+    }
 
     Some(DriverCaps {
         bars,
@@ -92,6 +101,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
         service_ep: endpoints.service,
         memmgr_ep: info.memmgr_endpoint,
         devmgr_ep: endpoints.devmgr_query,
+        dma_ep: endpoints.dma,
         self_aspace: info.self_aspace,
     })
 }
@@ -224,9 +234,9 @@ fn report_ready(devmgr_ep: u64, ipc_buf: *mut u64)
 // ── Memory-cap allocation via memmgr IPC ────────────────────────────────────
 
 /// Request a single contiguous Memory cap covering `page_count` pages from
-/// memmgr. Returns `(cap_slot, phys_base)`; the physical base is needed for
-/// DMA programming on no-IOMMU systems.
-fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Option<(u64, u64)>
+/// memmgr. Returns the cap's slot. The device reaches the pages only once
+/// they are mapped for it ([`map_for_device`]).
+fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -246,16 +256,39 @@ fn request_memory_caps(memmgr_ep: u64, page_count: u64, ipc_buf: *mut u64) -> Op
         }
         return None;
     }
-    let cap = reply.caps().first().copied()?;
-    let phys_base = reply.word(2);
-    Some((cap, phys_base))
+    reply.caps().first().copied()
+}
+
+/// Map the frames of `memory_cap` for the device ([`virtio_core::dma::map`]),
+/// which reads and writes them, and return their device address; exits when
+/// devmgr refuses, since the device cannot be driven without them.
+fn map_for_device(caps: &DriverCaps, memory_cap: u64, what: &str, ipc_buf: *mut u64) -> u64
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe {
+        virtio_core::dma::map(
+            caps.dma_ep,
+            memory_cap,
+            virtio_core::dma::DEVICE_READS_WRITES,
+            ipc_buf,
+        )
+    }
+    {
+        Ok(device_addr) => device_addr,
+        Err(e) =>
+        {
+            std::os::seraph::log!("{what} not mapped for the device ({e:?})");
+            syscall::thread_exit();
+        }
+    }
 }
 
 // ── Device + virtqueue setup ────────────────────────────────────────────────
 
 /// Initialise the device through the standard sequence (`VirtIO` 1.2 §3.1.1):
 /// reset, acknowledge, negotiate features. virtio-input exposes no feature
-/// bits the driver needs beyond `VIRTIO_F_VERSION_1`.
+/// bits the driver needs beyond `VIRTIO_F_VERSION_1`, and the driver accepts
+/// `VIRTIO_F_ACCESS_PLATFORM`, since it programs only device addresses.
 fn init_device(transport: &PciTransport)
 {
     // The reset wait is bounded on the monotonic clock
@@ -269,9 +302,14 @@ fn init_device(transport: &PciTransport)
     transport.set_status(STATUS_ACKNOWLEDGE);
     transport.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
-    // Accept only VIRTIO_F_VERSION_1 (bit 32) — required for modern devices.
+    // Accept VIRTIO_F_VERSION_1, required for modern devices, and
+    // VIRTIO_F_ACCESS_PLATFORM, since every address the driver programs is a
+    // device address devmgr returned.
     if transport
-        .negotiate_features(|device_features| device_features & (1 << 32))
+        .negotiate_features(|device_features| {
+            device_features
+                & (virtio_core::VIRTIO_F_VERSION_1 | virtio_core::VIRTIO_F_ACCESS_PLATFORM)
+        })
         .is_none()
     {
         std::os::seraph::log!("feature negotiation failed");
@@ -289,12 +327,13 @@ fn configure_queue_size(transport: &PciTransport) -> u16
     queue_size
 }
 
-/// Allocate and map the virtqueue ring DMA memory. Returns
-/// `(ring_phys, ring_va)`.
+/// Allocate the virtqueue ring DMA memory, map it into the driver's address
+/// space and for the device. Returns `(ring_addr, ring_va)`, `ring_addr` the
+/// rings' device address.
 fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64) -> (u64, u64)
 {
     let ring_pages = virtqueue::ring_pages(queue_size) as u64;
-    let Some((ring_memory, ring_phys)) = request_memory_caps(caps.memmgr_ep, ring_pages, ipc_buf)
+    let Some(ring_memory) = request_memory_caps(caps.memmgr_ep, ring_pages, ipc_buf)
     else
     {
         std::os::seraph::log!("failed to allocate ring memory caps");
@@ -329,26 +368,27 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     unsafe {
         core::ptr::write_bytes(ring_va as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
     }
-    (ring_phys, ring_va)
+    let ring_addr = map_for_device(caps, ring_memory, "ring memory", ipc_buf);
+    (ring_addr, ring_va)
 }
 
-/// Program the descriptor/avail/used ring physical addresses into the
+/// Program the descriptor/avail/used ring device addresses into the
 /// transport and mark the queue ready.
-fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_phys: u64)
+fn program_transport_rings(transport: &PciTransport, queue_size: u16, ring_addr: u64)
 {
     let desc_size = virtqueue::desc_table_size(queue_size);
     let used_off = virtqueue::used_ring_offset(queue_size);
 
-    let desc_phys = ring_phys;
-    let avail_phys = ring_phys + desc_size as u64;
-    let used_phys = ring_phys + used_off as u64;
+    let desc_addr = ring_addr;
+    let avail_addr = ring_addr + desc_size as u64;
+    let used_addr = ring_addr + used_off as u64;
 
-    transport.queue_set_desc_lo(desc_phys as u32);
-    transport.queue_set_desc_hi((desc_phys >> 32) as u32);
-    transport.queue_set_avail_lo(avail_phys as u32);
-    transport.queue_set_avail_hi((avail_phys >> 32) as u32);
-    transport.queue_set_used_lo(used_phys as u32);
-    transport.queue_set_used_hi((used_phys >> 32) as u32);
+    transport.queue_set_desc_lo(desc_addr as u32);
+    transport.queue_set_desc_hi((desc_addr >> 32) as u32);
+    transport.queue_set_avail_lo(avail_addr as u32);
+    transport.queue_set_avail_hi((avail_addr >> 32) as u32);
+    transport.queue_set_used_lo(used_addr as u32);
+    transport.queue_set_used_hi((used_addr >> 32) as u32);
 
     transport.queue_set_ready(1);
 }
@@ -362,8 +402,8 @@ fn setup_virtqueue(
 ) -> (SplitVirtqueue, u16)
 {
     let queue_size = configure_queue_size(transport);
-    let (ring_phys, ring_va) = allocate_and_map_rings(queue_size, caps, ipc_buf);
-    program_transport_rings(transport, queue_size, ring_phys);
+    let (ring_addr, ring_va) = allocate_and_map_rings(queue_size, caps, ipc_buf);
+    program_transport_rings(transport, queue_size, ring_addr);
 
     let queue_notify_off = transport.queue_notify_off();
     if !transport.doorbell_in_region(queue_notify_off)
@@ -399,10 +439,11 @@ fn setup_virtqueue(
     (vq, queue_notify_off)
 }
 
-/// Allocate and map a single DMA page to back the event receive buffers.
+/// Allocate a single DMA page to back the event receive buffers, and map it
+/// into the driver's address space and for the device.
 fn setup_event_buffers(caps: &DriverCaps, buf_count: u16, ipc_buf: *mut u64) -> EventRing
 {
-    let Some((mem, phys)) = request_memory_caps(caps.memmgr_ep, 1, ipc_buf)
+    let Some(mem) = request_memory_caps(caps.memmgr_ep, 1, ipc_buf)
     else
     {
         std::os::seraph::log!("failed to allocate event buffer cap");
@@ -429,7 +470,8 @@ fn setup_event_buffers(caps: &DriverCaps, buf_count: u16, ipc_buf: *mut u64) -> 
     unsafe {
         core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE as usize);
     }
-    EventRing::new(va, phys, buf_count)
+    let addr = map_for_device(caps, mem, "event buffer page", ipc_buf);
+    EventRing::new(va, addr, buf_count)
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────

@@ -339,7 +339,7 @@ Only a userspace access takes the fault path. A kernel copy into or out of a cal
 user buffer (the `SYS_GETRANDOM` destination, the `SYS_THREAD_READ_REGS` and
 `SYS_THREAD_WRITE_REGS` buffers) that reaches a page of a demand region the pager has not yet
 backed fails the syscall with `InvalidAddress`; the fault is not delivered to the handler. A
-caller whose buffer may lie on such a page touches it first. On a stack this needs an
+caller whose buffer may lie on such a page MUST touch it first. On a stack this needs an
 uninitialised buffer in a chunk (the `DEMAND_CHUNK_PAGES` window memmgr backs per fault) that no
 store of the thread has yet reached.
 

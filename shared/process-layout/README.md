@@ -41,6 +41,12 @@ whole fixed tier and growing with the half otherwise; see
 [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Growth Zones). Its
 zones are const-asserted disjoint and inside the address space for every supported paging mode.
 
+On the runtime side, `main_stack_growth` gives the range below a main-thread stack's committed
+pages, inside the stack reservation every layout leaves below the stack top, that ruststd's
+`_start` registers with the pager so the stack grows on demand (see
+[docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Bootstrap
+Cross-Boundary VAs).
+
 ---
 
 ## Surface
@@ -76,7 +82,8 @@ process-layout/
 └── src/
     └── lib.rs      # ProcessLayout, choose_process_layout, VaWindow and the per-surface
                     #   windows, image-bias placement, DEFAULT_* fallbacks, growth zones,
-                    #   const-asserted zone disjointness, host tests
+                    #   const-asserted zone disjointness, the main-thread stack growth
+                    #   range, host tests
 ```
 
 ---

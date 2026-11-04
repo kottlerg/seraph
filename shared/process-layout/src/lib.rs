@@ -18,7 +18,9 @@
 //! `ProcessInfo.main_tls_vaddr`, `ProcessInfo.ipc_buffer_vaddr`) and into the
 //! entry register that delivers the `ProcessInfo` page address. The created
 //! process reads them back from the struct and the register — it does not
-//! assume any fixed address.
+//! assume any fixed address. The created process's runtime also reads
+//! [`main_stack_growth`] for the demand-growth range below its main-thread
+//! stack's committed pages, inside the stack reservation every layout leaves.
 //!
 //! # Randomisation model (ASLR, #39)
 //!
@@ -495,8 +497,8 @@ pub fn choose_process_layout(entropy: Option<&[u8; LAYOUT_ENTROPY_BYTES]>) -> Pr
 /// range of at most `MAX_PROCESS_STACK_PAGES` usable pages keeps at least one
 /// page below it free of every other surface, the guard. `None` when the
 /// committed pages already cover `usable_pages`, when `usable_pages` exceeds
-/// `MAX_PROCESS_STACK_PAGES`, or when `stack_top` is not page-aligned or lies
-/// below the stack.
+/// `MAX_PROCESS_STACK_PAGES`, or when `stack_top` is not page-aligned or is
+/// lower than the `usable_pages`-page stack's size.
 #[must_use]
 pub fn main_stack_growth(
     stack_top: u64,
@@ -806,7 +808,7 @@ mod tests
     // Defect guarded: a range registered over pages the loader already maps,
     // or past the reservation the layout leaves below the stack top.
     #[test]
-    fn main_stack_growth_refuses_covered_oversized_and_misaligned_stacks()
+    fn main_stack_growth_refuses_geometry_it_cannot_place()
     {
         let top = choose_process_layout(Some(&PATTERNS[2])).stack_top;
         assert_eq!(main_stack_growth(top, 512, 512), None);

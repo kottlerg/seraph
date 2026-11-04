@@ -43,7 +43,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 /// Bytes of stack each recursion frame consumes, forcing demand faults as the
-/// worker descends. One page per frame keeps the fault count proportional to
+/// recursing thread descends. One page per frame keeps the fault count proportional to
 /// depth.
 const FRAME_BYTES: usize = 4096;
 
@@ -95,10 +95,11 @@ fn touch(buf: &[u8; FRAME_BYTES]) -> u64
 #[derive(Clone, Copy)]
 enum Direction
 {
-    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`).
+    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`
+    /// and `main-grow`).
     Down,
     /// Count `depth` up, never reaching the base case at runtime (used by
-    /// `guard` to overflow into the guard page).
+    /// `guard` and `main-guard` to overflow into the guard page).
     Up,
 }
 

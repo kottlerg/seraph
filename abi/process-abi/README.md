@@ -201,11 +201,13 @@ memmgr/procmgr; procmgr for everyone else) reads the note before
 mapping the child's stack and substitutes the declared value for
 `DEFAULT_PROCESS_STACK_PAGES`. Binaries that omit the note inherit
 the default. The declared pages are the ones the loader maps; in a
-demand-paged process std's `_start` lets the stack grow on demand below
-them to 512 pages (see
+demand-paged process std's `_start` lets the stack of an `ET_DYN` image
+grow on demand below them to 512 pages (see
 [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md)
-§ Bootstrap Cross-Boundary VAs), so a std binary declares a note only to
-commit more than the default up front or to exceed 512 pages.
+§ Bootstrap Cross-Boundary VAs), so such a binary declares a note only to
+commit more than the default up front or to exceed 512 pages. A pinned
+process (`CREATE_PINNED`) has no pager and keeps only the declared pages,
+so a binary that may run pinned declares the depth it needs.
 
 ```rust
 // In any std-built binary:

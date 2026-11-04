@@ -81,7 +81,7 @@ disjoint surfaces:
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (`GlobalAlloc` for `System`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
 | Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged spawned-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
-| Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack (with the demand-growth range `std::sys::seraph` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
+| Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
 overlap within a single address space.
@@ -244,21 +244,25 @@ quality caveat.
   declares zero pages or more than `MAX_PROCESS_STACK_PAGES`; the pool's
   available RAM is the remaining gate on the resulting
   `REQUEST_MEMORY_CAPS` calls (memmgr tracks per-process frames in a
-  RAM-bound arena, not a fixed quota). The creator leaves the
-  `1 + MAX_PROCESS_STACK_PAGES` pages below `stack_top_vaddr` to the
-  stack: it maps no other surface there, and the layout's draw windows
-  keep every other surface out of them for every draw. The process's
-  runtime may rely on this reservation.
+  RAM-bound arena, not a fixed quota). For an `ET_DYN` image the
+  creator leaves the `1 + MAX_PROCESS_STACK_PAGES` pages below
+  `stack_top_vaddr` to the stack: it maps no other surface there, the
+  layout's draw windows keep every other bootstrap surface out of them
+  for every draw, and the image's placement check keeps the image out
+  of them ([Image Placement](#image-placement)). The process's runtime
+  may rely on this reservation. An `ET_EXEC` image loads at its link
+  addresses unchecked against it, so the reservation does not hold for
+  one.
 - **Main-thread stack growth.** The mapped pages are the stack's
-  committed part. In a demand-paged process `std::os::seraph::_start`
-  registers the pages below them, down to a 512-page
+  committed part. In a demand-paged process whose image is `ET_DYN`,
+  `std::os::seraph::_start` registers the pages below them, down to a 512-page
   (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB) stack, as a read-write demand
   region with the pager (`REGISTER_REGION`), so the stack grows on
   first touch; the page below that range stays unregistered as the
   guard, and an overflow past it faults on an address the pager
   declines, killing the process. A binary whose note declares 512 pages
-  or more, a pinned process (no pager), and a process whose
-  registration fails keep the committed pages alone, the page below
+  or more, a pinned process (no pager), an `ET_EXEC` image, and a
+  process whose registration fails keep the committed pages alone, the page below
   which faults the same way. The growth range is the pager's demand
   region like any other: its frames are reclaimed at process death.
 - **Main-thread IPC buffer.** The creator picks a per-process VA and
@@ -434,6 +438,7 @@ and the main thread's grows below its committed pages
 ## Summarized By
 
 [abi/init-protocol/README.md](../abi/init-protocol/README.md),
+[abi/process-abi/README.md](../abi/process-abi/README.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
@@ -445,6 +450,7 @@ and the main thread's grows below its committed pages
 [programs/relrofault/README.md](../programs/relrofault/README.md),
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/threadchurn/README.md](../programs/threadchurn/README.md),
+[programs/threadstack/README.md](../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr Memory Pool](../services/memmgr/docs/memory-pool.md),

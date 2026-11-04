@@ -79,7 +79,9 @@ its version gating are defined in [abi/process-abi/README.md](../../abi/process-
 
 `std::sys::seraph` is the per-process owner of virtual-address policy. It
 exposes two distinct surfaces; the third (bootstrap-cross-boundary VAs) is
-chosen by the process creator and only consumed by std at `_start`. See
+chosen by the process creator and consumed by std at `_start`, which in a
+demand-paged process extends the main-thread stack below its committed pages
+([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). See
 [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) for
 the full contract.
 
@@ -208,7 +210,8 @@ Subsequent foreign mappings go through the page-reservation allocator above. See
 The main-thread stack is the one bootstrap surface std extends. The loader maps the stack's
 committed pages (`ProcessInfo.stack_pages`) ending at `ProcessInfo.stack_top_vaddr`, inside the
 reservation of `1 + MAX_PROCESS_STACK_PAGES` pages the creator's layout leaves below every stack
-top. In a demand-paged process (`ProcessInfo.pager_endpoint_cap` non-zero) `_start` funds the
+top, for every `ET_DYN` image. In a demand-paged process (`ProcessInfo.pager_endpoint_cap`
+non-zero) whose image is `ET_DYN` (read from its own ELF header, `__ehdr_start`) `_start` funds the
 address space's page-table budget for, and registers with memmgr through
 [`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), the
 pages below the committed ones down to a 512-page (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB) stack,
@@ -216,8 +219,9 @@ the range `process_layout::main_stack_growth` computes, so the main thread's sta
 touch to the size a spawned thread's has. The page below the range stays unregistered as the
 guard: an overflow past it faults on an address the pager declines and ends the whole process,
 as an overflow of a spawned thread's stack does. A binary whose `stack_pages!` note declares 512
-pages or more, a pinned process, and a process whose funding or registration fails keep the
-committed pages alone, the page below which faults the same way. The range is never
+pages or more, a pinned process, an `ET_EXEC` image (which the loaders place at its link
+addresses unchecked against the reservation), and a process whose funding or registration fails
+keep the committed pages alone, the page below which faults the same way. The range is never
 unregistered; memmgr reclaims its frames at process death.
 
 ---
@@ -311,7 +315,9 @@ primitives.
 ## Summarized By
 
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
+[Fault Handling](../../docs/fault-handling.md),
 [Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
-[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)
+[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md),
+[Userspace Memory Model](../../docs/userspace-memory-model.md)

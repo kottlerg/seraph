@@ -82,6 +82,13 @@ pub trait PageTableBuilder: Sized
     /// Step 9 records each span as one entry of `BootInfo.reclaim_ranges`; see
     /// `core/boot/docs/page-tables.md` § Page Table Frame Tracking.
     fn reclaim_spans(&self) -> &[(u64, u64)];
+
+    /// The frame pool [`new`](Self::new) allocated, as `(physical base, page
+    /// count)`: the one allocation the builder makes. A redo of steps 6 and 7
+    /// frees this span alone, since the x86-64 LA57 toggle page among
+    /// [`reclaim_spans`](Self::reclaim_spans) is an earlier step's allocation
+    /// that the handoff still runs from.
+    fn pool_span(&self) -> (u64, u64);
 }
 
 /// Most page-table frames a builder of `levels` translation levels takes to map

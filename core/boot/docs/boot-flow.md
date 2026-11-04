@@ -209,6 +209,12 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 
 W^X is verified during construction: no leaf PTE has both writable and executable permissions.
 
+Step 6 also sizes and allocates the arrays step 9 fills: the `MemoryMapEntry` array (the
+reach of the step 7 map buffer for the firmware's descriptor count plus slack,
+[memory-map.md](memory-map.md#sizing-the-entry-array)),
+the two aperture seed buffers (a count pass of the ACPI and DTB seeders,
+[firmware-parsing.md](firmware-parsing.md)), and the `MmioAperture` array from both.
+
 The handoff stack is `HANDOFF_STACK_BYTES` (`boot_protocol::layout`) of whole pages, so its
 top is page-aligned, and the kernel is entered with the stack pointer at that top
 (step 10). The bootloader fills the stack with `STACK_PAINT` and writes
@@ -236,6 +242,13 @@ query must be the last allocation-generating action before the exit call. The ra
 stays in its buffer; step 9 translates it from UEFI memory types to the `MemoryType`
 values defined in the boot protocol and sorts it by `physical_base`, per the policy in
 [memory-map.md](memory-map.md).
+
+When the final map's buffer could hold more descriptors than the entry array step 6
+sized (the buffer bounds step 8's re-query too), the bootloader frees every allocation
+of steps 6 and 7 (the page-table frame pool included) and runs both again with twice
+the slack, up to `MEM_MAP_ATTEMPTS` (3) times; a buffer that still outgrows the array
+fails the boot with `BootError::MemoryMapKeptGrowing`
+([memory-map.md](memory-map.md#sizing-the-entry-array)).
 
 Detail: [uefi-environment.md](uefi-environment.md)
 
@@ -272,12 +285,12 @@ this donated page after consuming them. The `version` field is set to
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
 | `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
-| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines), in pages allocated in step 6 and sized from the firmware's descriptor count (`memory_map::aperture_capacity`). Empty if no MMIO regions were reported. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines), in pages allocated in step 6 and sized from the entry array's capacity and the seeders' seed counts (`memory_map::aperture_capacity`). Empty if no MMIO regions were reported. |
 | `cpu_count` | Count of distinct hardware IDs among the enabled or online-capable Local APIC / Local x2APIC entries from MADT (x86-64) or the enabled RINTC entries (RISC-V), the BSP counted once whether or not the MADT lists it, capped at `MAX_CPUS`; or the DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Physical address of the per-CPU hardware identifiers, `cpu_count` `u32`s in pages of their own allocated in step 5; `cpu_ids[0] == bsp_id` |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel then halts at Phase 8 when more than one CPU is listed ([initialization.md § Phase 8](../../kernel/docs/initialization.md)). |
-| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), the CPU-id pages from step 5, the raw UEFI memory-map buffer from step 7 (zeroed after its last read here), `page_table.reclaim_spans()` (the bootloader's page-table frame pool as one range, and on x86-64 the LA57 toggle page when one is installed), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps`, which `cap::init_capability_system` calls in Phase 7 after `populate_cspace` returns ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)). |
+| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the named and heuristic aperture-seed buffers, the reclaim-array page itself, the AP trampoline page), the CPU-id pages from step 5, the raw UEFI memory-map buffer from step 7 (zeroed after its last read here), `page_table.reclaim_spans()` (the bootloader's page-table frame pool as one range, and on x86-64 the LA57 toggle page when one is installed), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps`, which `cap::init_capability_system` calls in Phase 7 after `populate_cspace` returns ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)). |
 | `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5 ([entropy.md](../../kernel/docs/entropy.md)). The separate KASLR entropy words never appear in `BootInfo`. |
 | `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
 | `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today; see [firmware-parsing.md](firmware-parsing.md)); zero when absent. |

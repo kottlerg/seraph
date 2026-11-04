@@ -299,7 +299,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
    already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE
-2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
+2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore,
+   then report the XSAVE size of the enabled components (CPUID leaf 0xD), which sizes every
+   Thread slot's save area (`sched::thread_slot`)
 3. Construct and install the permanent GDT and the BSP's TSS:
    - Null descriptor (index 0)
    - Kernel code segment (64-bit, DPL 0)
@@ -344,8 +346,9 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SPP (so sret returns to U-mode by default)
    - Clear SUM (no supervisor access to user pages)
    - Set FS and VS Off for lazy FPU/vector save-restore and cache vlenb (halts without
-     the V extension, or with `vlenb == 0`), which sizes every Thread slot's save area
-     (`sched::thread_slot`)
+     the V extension, or with a vlenb of 0, above 8192, or not a power of two), which sizes
+     every Thread slot's save area (`sched::thread_slot`); each AP checks its vlenb against it
+     at bring-up and halts the boot on a mismatch
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
 5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart

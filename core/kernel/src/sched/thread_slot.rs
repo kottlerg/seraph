@@ -9,35 +9,21 @@
 //! A Thread slot is the kernel stack ([`KERNEL_STACK_PAGES`]), one page
 //! holding the `ThreadObject` wrapper and the TCB, then the per-thread
 //! extended-state (FPU, SIMD, vector) save area, rounded up to whole pages.
-//! The area's size is a property of the hardware, so the boot CPU reports it
-//! once, before any thread is created ([`set_extended_bytes`]): on x86-64 the
-//! XSAVE size of the components XCR0 enables (CPUID leaf 0xD), on riscv64
-//! [`riscv_extended_bytes`] of the hart's `vlenb`. Every Thread retype debits
-//! [`thread_slot_bytes`] (`dispatch_for(Thread)` in `cap/retype.rs`, the
-//! Phase 9 init Thread), and userspace reads the same value through
-//! `SystemInfoType::ThreadRetypeBytes`. Harts and cores are assumed uniform
-//! (docs/platform-requirements.md).
+//! The area's size is a property of the hardware, so the boot CPU's
+//! architecture init reports it once, before any thread is created
+//! ([`set_extended_bytes`]): on x86-64 the XSAVE size of the components XCR0
+//! enables (CPUID leaf 0xD), on riscv64 the F/D and vector-CSR prefix plus 32
+//! vector registers of `vlenb` bytes (`arch::riscv64::fpu::cache_vlenb`). Every Thread
+//! retype debits [`thread_slot_bytes`] (`dispatch_for(Thread)` in
+//! `cap/retype.rs`, the Phase 9 init Thread), and userspace reads the same
+//! value through `SystemInfoType::ThreadRetypeBytes`. Every CPU must need the
+//! area the boot CPU reports (docs/platform-requirements.md § riscv64
+//! Classification; riscv64 halts the boot at a hart whose `vlenb` differs).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::KERNEL_STACK_PAGES;
 use crate::mm::PAGE_SIZE;
-
-/// Bytes of the riscv64 save area before the vector registers: the 32 F/D
-/// registers and `fcsr` (264), then `vstart`, `vl`, `vtype` and `vcsr`, padded
-/// to 304 (the layout `arch::riscv64::fpu` saves to). riscv64 builds and the
-/// host tests only.
-#[cfg(any(target_arch = "riscv64", test))]
-pub const RISCV_VECTOR_REGS_OFFSET: u64 = 304;
-
-/// Bytes of the riscv64 extended-state area for a hart whose vector
-/// registers are `vlenb` bytes each: the F/D and vector-CSR prefix, then the
-/// 32 vector registers.
-#[cfg(any(target_arch = "riscv64", test))]
-pub const fn riscv_extended_bytes(vlenb: u64) -> u64
-{
-    RISCV_VECTOR_REGS_OFFSET + 32 * vlenb
-}
 
 /// Pages the save area of `extended_bytes` takes, at least one: an area the
 /// boot has not reported yet takes the one page every supported CPU needs at
@@ -86,46 +72,28 @@ mod tests
     const PAGE: u64 = PAGE_SIZE as u64;
     const BASE: u64 = KERNEL_STACK_PAGES as u64 + 1;
 
-    // The defect caught: a save area that spills past its last page by a
-    // byte, or a page added where the area still fits (the vlenb at which
-    // the riscv64 area leaves one page: 304 + 32 * 118 = 4080, 119 = 4112).
-    #[test]
-    fn the_riscv_area_takes_a_second_page_past_vlenb_118()
-    {
-        assert_eq!(riscv_extended_bytes(118), 4080);
-        assert_eq!(extended_pages(riscv_extended_bytes(118)), 1);
-        assert_eq!(riscv_extended_bytes(119), 4112);
-        assert_eq!(extended_pages(riscv_extended_bytes(119)), 2);
-    }
-
-    #[test]
-    fn riscv_slots_at_common_and_largest_vector_lengths()
-    {
-        // VLEN 128, 512: one page; VLEN 1024: two.
-        assert_eq!(slot_bytes(riscv_extended_bytes(16)), (BASE + 1) * PAGE);
-        assert_eq!(slot_bytes(riscv_extended_bytes(64)), (BASE + 1) * PAGE);
-        assert_eq!(slot_bytes(riscv_extended_bytes(128)), (BASE + 2) * PAGE);
-        // VLEN 65536, the V specification's largest: 304 + 262144 bytes.
-        assert_eq!(riscv_extended_bytes(8192), 262_448);
-        assert_eq!(extended_pages(riscv_extended_bytes(8192)), 65);
-        assert_eq!(slot_bytes(riscv_extended_bytes(8192)), (BASE + 65) * PAGE);
-    }
-
-    #[test]
-    fn x86_xsave_sizes_round_up_to_pages()
-    {
-        // x87 + SSE + AVX (832), a full page, a byte past it, and an
-        // AMX-sized area.
-        assert_eq!(extended_pages(832), 1);
-        assert_eq!(extended_pages(4096), 1);
-        assert_eq!(extended_pages(4097), 2);
-        assert_eq!(extended_pages(11_008), 3);
-    }
-
     #[test]
     fn an_unreported_area_takes_one_page()
     {
-        assert_eq!(extended_pages(0), 1);
         assert_eq!(slot_bytes(0), (BASE + 1) * PAGE);
+    }
+
+    // The defect caught: a save area that spills past its last page by a
+    // byte, or a page added where the area still fits.
+    #[test]
+    fn an_area_one_byte_past_a_page_takes_a_second()
+    {
+        assert_eq!(extended_pages(PAGE), 1);
+        assert_eq!(extended_pages(PAGE + 1), 2);
+    }
+
+    // The riscv64 area (304 + 32 * vlenb bytes) at the `vlenb` past which it
+    // leaves one page (119: 4112 bytes) and at the V specification's largest
+    // (8192, VLEN 65536: 262448 bytes), composed into whole slots.
+    #[test]
+    fn riscv_slots_at_the_vlenb_page_edge_and_the_largest()
+    {
+        assert_eq!(slot_bytes(4112), (BASE + 2) * PAGE);
+        assert_eq!(slot_bytes(262_448), (BASE + 65) * PAGE);
     }
 }

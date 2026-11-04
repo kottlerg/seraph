@@ -299,6 +299,8 @@ The entries left open are tracked by the Issue each recommendation names: the ve
 | riscv64 ASID mask | `core/kernel/src/arch/riscv64/cpu.rs` | 16 bits | hardware spec (`satp`) | none | correct as is | None; the tag pool takes every probed ASID |
 | riscv64 `sbi_hart_mask` window | `core/kernel/src/arch/riscv64/interrupts.rs` | 64 harts per call | hardware spec (SBI `hart_mask`) | none | correct as is | None |
 | riscv64 `NAPOT_64K_PAGES` | `core/kernel/src/arch/riscv64/paging.rs` | 16 | hardware spec (Svnapot) | none | correct as is | None |
+| riscv64 `VLENB_SPEC_MAX` | `core/kernel/src/arch/riscv64/fpu.rs` | 8192 (VLEN 65536) | hardware spec (the V extension's largest VLEN; a larger, or non-power-of-two, `vlenb` is refused at boot) | none | correct as is | None |
+| riscv64 `V_REGS_OFFSET` | `core/kernel/src/arch/riscv64/fpu.rs` | 304 | encoding artefact (the F/D registers, `fcsr` and the vector CSRs before `v0` in the save area; the save and restore asm and the area size read it) | none | correct as is | None |
 | riscv64 `timebase_freq` check | `core/kernel/src/arch/riscv64/timer.rs` | at most `u32::MAX` Hz | encoding artefact (overflow-free tick math) | none | correct as is | None |
 
 ### Kernel: entropy
@@ -611,8 +613,8 @@ The entries left open are tracked by the Issue each recommendation names.
 | `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | refillable seed (augment) | 149 pages each for memmgr and procmgr | correct as is | None: both self-augment (#642, #643, #41) |
 | `thread_retype_pages` (tier-1) | `services/init/src/main.rs` | `SystemInfoType::ThreadRetypeBytes` in pages | encoding artefact (kernel stack, TCB and save-area pages) | per tier-1 service | correct as is | None |
 | `ASPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 48 | refillable seed (augment) | 48 pages per tier-1 service | correct as is | None: memmgr and procmgr both self-augment (#642) |
-| `INIT_RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 8 | provably unreachable (asserted against the fixed endpoint count) | 8 pages | correct as is | None |
-| `RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 203 | encoding artefact (sum) | per tier-1 service | correct as is | None |
+| `init_retype_reserve_pages` | `services/init/src/bootstrap.rs` | 2 + the Thread slot's pages (`thread_retype_pages`): 8 at a six-page slot | provably unreachable (asserted against the fixed endpoint count) | 8 pages at a six-page slot | correct as is | None |
+| `retype_reserve_pages` | `services/init/src/bootstrap.rs` | 197 + the Thread slot's pages (`thread_retype_pages`): 203 at a six-page slot | encoding artefact (sum) | per tier-1 service | correct as is | None |
 | `MODULE_SCRATCH_MAX_PAGES` | `services/init/src/bootstrap.rs` | 65536 (256 MiB) | encoding artefact (init VA layout) | none | correct as is | Caps one boot module at 256 MiB |
 | `MAX_APERTURE_CAPS` (`HwCaps.apertures`) | `services/init/src/service.rs` | 32 | hardware spec mirror (boot `MAX_APERTURES` = 16) | 768 B | correct as is | Pin against the boot constant with a const assert |
 | ACPI region rounds (`acpi_region_caps`) | `services/init/src/service.rs` | every cap `InitInfo` reports (`acpi_region_memory_count`), streamed four per round | provable unreachability (nothing is stored) | none | correct as is | None |

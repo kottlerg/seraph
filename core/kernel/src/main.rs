@@ -366,7 +366,8 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 // desc_count and info_pages are bounded by the descriptor capacity Phases 7
 // and 8 enforce (cap::INIT_INFO_DESCRIPTOR_CAPACITY, fatal past it);
 // size_of::<InitInfo>() and STACK_PAGES are small constants; the u64 -> usize
-// save-area byte count is a few pages, on a 64-bit target.
+// cast of the save-area byte count is lossless because usize is 64 bits on
+// every target.
 // large_types_passed_by_value: init_image (304 B) crosses the
 // by-value/by-reference threshold. The `#[inline(never)]` boundary is what
 // defeats the cross-rebase hoist; the by-value signature is incidental — the

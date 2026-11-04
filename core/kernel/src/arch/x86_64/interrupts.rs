@@ -221,7 +221,9 @@ pub unsafe fn init()
         fpu::cr0_set_ts();
     }
     // The XSAVE size of the components just enabled sizes every Thread's
-    // save area. Cores are assumed uniform, so only the BSP reports it.
+    // save area. Every CPU enables the same XCR0 components (`init_ap`), and
+    // the standard XSAVE layout of a given component set is architectural,
+    // so the BSP's size holds on every CPU and only the BSP reports it.
     crate::sched::thread_slot::set_extended_bytes(fpu::xsave_area_bytes());
 
     // 2. Carve the BSP IST stacks out of [`BSP_IST_STACKS`] (BSS).

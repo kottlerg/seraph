@@ -166,9 +166,13 @@ Each feature is classified per architecture as one of:
 ### Required
 
 - **Instruction baseline** — RV64GCV plus Zba/Zbb/Zbs. The Vector extension is a hard requirement;
-  the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0`. Any other vector length is
-  accepted: each thread's save area grows with it (`304 + 32 * vlenb` bytes, rounded up to pages;
-  `core/kernel/src/sched/thread_slot.rs`).
+  the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0`, a `vlenb` above 8192 (VLEN
+  65536, the V specification's largest), or one that is not a power of two. Any other vector
+  length is accepted: each thread's save area grows with it (`304 + 32 * vlenb` bytes, rounded up
+  to pages; `core/kernel/src/arch/riscv64/fpu.rs`, `core/kernel/src/sched/thread_slot.rs`).
+- **Uniform vector length** — every hart has the boot hart's `vlenb`. Each thread's save area is
+  sized from the boot hart's, and the save and restore paths stride by the running hart's, so each
+  secondary hart reads its own `vlenb` at bring-up and a different value halts the boot.
 - **Supervisor isolation — the U bit and `sstatus.SUM`** — S-mode never executes from user
   (U=1) pages, and the kernel keeps `SUM` clear outside its user-copy routines so supervisor
   accesses to user pages fault. See [memory-model.md](memory-model.md).
@@ -254,11 +258,12 @@ feature it halts with a message naming the specific feature, rather than failing
   calibrates the TSC against the PIT), and the vendor-specific in-silicon mitigations.
 - **riscv64**: required features are asserted where each is safely detectable from supervisor mode —
   the SBI HSM extension at the gate, and the Vector extension and the ASID-tagged TLB at their
-  initialization sites (the boot hart is refused without V, and every hart without ASIDs; emulated
-  RISC-V provides ASID, so unlike x86-64 PCID this is gated). Extension requirements introduced by
-  a subsystem (the timer, the paging extensions) are asserted by that subsystem during boot — the
-  timer, for example, refuses to boot unless the bootloader confirmed Sstc (and a timebase
-  frequency) for every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
+  initialization sites (every hart is refused without V or with a `vlenb` other than the boot
+  hart's, and every hart without ASIDs; emulated RISC-V provides ASID, so unlike x86-64 PCID this
+  is gated). Extension requirements introduced by a subsystem (the timer, the paging extensions)
+  are asserted by that subsystem during boot — the timer, for example, refuses to boot unless the
+  bootloader confirmed Sstc (and a timebase frequency) for every hart from the firmware tables
+  (ACPI RHCT, or the DTB `/cpus` nodes).
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or

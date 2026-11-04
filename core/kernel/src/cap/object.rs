@@ -4032,7 +4032,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     (*tcb).sched_lock.unlock_raw(saved);
                 }
 
-                // The per-thread XSAVE / FP-save area is page N+1 of the
+                // The per-thread XSAVE / FP-save area is pages N+1.. of the
                 // Thread retype slot (see sys_cap_create_thread layout); it
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.

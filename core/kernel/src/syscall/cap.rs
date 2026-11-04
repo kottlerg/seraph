@@ -22,7 +22,9 @@
 
 // cast_possible_truncation: all u64→u32 casts in this file extract cap slot indices
 // from 64-bit trap frame registers. Seraph runs on 64-bit only; slot indices are
-// defined as u32 and always fit. No truncation occurs in practice.
+// defined as u32 and always fit. The u64→usize cast of the Thread save-area byte
+// count (`sys_cap_create_thread`) is lossless for the same reason: usize is 64
+// bits on every target. No truncation occurs in practice.
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
@@ -919,7 +921,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
 ///
 /// arg0 = Memory capability handle (generation-checked; must have RETYPE);
-///        supplies the 6-page Thread slot.
+///        supplies the Thread slot (`sched::thread_slot::thread_slot_bytes`,
+///        `SystemInfoType::ThreadRetypeBytes`).
 /// arg1 = `AddressSpace` capability handle (generation-checked; must have MAP).
 /// arg2 = `CSpace` capability handle (generation-checked; must have INSERT).
 /// arg3 = `SchedControl` capability handle (generation-checked), or 0.
@@ -977,8 +980,9 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Memory cap; consumes 6 retype-pages (4 kstack +
-    // 1 wrapper/TCB + 1 FPU/SIMD save area).
+    // Resolve the source Memory cap; consumes the Thread slot (4 kstack pages
+    // + 1 wrapper/TCB page + the FPU/SIMD/V save-area pages,
+    // `sched::thread_slot::thread_slot_bytes`).
     // SAFETY: caller_cspace validated non-null above.
     let memory_slot_ref =
         unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::RETYPE)? };

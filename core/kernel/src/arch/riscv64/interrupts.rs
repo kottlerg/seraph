@@ -1159,8 +1159,9 @@ pub unsafe fn init()
     // Force sstatus.FS = sstatus.VS = 00 (Off). Kernel is soft-float
     // (RV64IMAC); any F/D or V instruction in U-mode now raises an illegal-
     // instruction trap, which the lazy save/restore path will use to
-    // demand-restore extended state. cache_vlenb is BSP-only because the
-    // RVA23 profile guarantees uniform VLEN across harts.
+    // demand-restore extended state. cache_vlenb runs on the BSP only and
+    // sizes every Thread's save area; each AP checks its own vlenb against
+    // it (`init_ap`) and halts the boot on a mismatch.
     // SAFETY: ring-0 boot; csrc sstatus is privileged S-mode.
     unsafe {
         super::fpu::enable_fpu_vector();
@@ -1260,6 +1261,9 @@ pub unsafe fn init_ap()
         // Force sstatus.FS = sstatus.VS = 00 (Off) on this AP, mirroring
         // the BSP invariant. Per-hart CSR; must be re-established here.
         super::fpu::enable_fpu_vector();
+        // Every save area is sized from the boot hart's vlenb; halt the boot
+        // on a hart whose vector registers are a different width.
+        super::fpu::check_ap_vlenb();
 
         // Clear sscratch so trap_entry identifies S-mode traps correctly.
         core::arch::asm!("csrw sscratch, zero", options(nostack, nomem));

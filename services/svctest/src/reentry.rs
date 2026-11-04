@@ -6,9 +6,9 @@
 //! argv-driven child-mode dispatch.
 //!
 //! Several phases respawn `/tests/svctest` with a role token as argv[1]
-//! (some roles take further arguments after it, e.g. `blobs-fill-child`'s
-//! filler token) to exercise child-side behaviour: namespace and
-//! `/programs`-subtree attenuation, cwd-cap delivery, argv/env blob packing,
+//! (some roles take further arguments after it, e.g. `blobs-large-child`'s
+//! long argv token) to exercise child-side behaviour: namespace and
+//! `/programs`-subtree attenuation, cwd-cap delivery, argv/env delivery,
 //! exit-code propagation, per-process randomness and ASLR divergence,
 //! `Child` kill and drop teardown, procmgr's teardown of a child whose create
 //! reply it cannot deliver, procmgr's death forward to logd, and the fs

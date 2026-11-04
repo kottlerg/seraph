@@ -11,11 +11,13 @@
 //! [`ArgvEnvHeader`] of four data words (see
 //! `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`).
 //! Every field and every blob byte is client input. procmgr decodes the
-//! header ([`decode_header`]), bounds the blobs by the cap and by the
-//! argv/env region ([`checked_total`]) before it maps or allocates anything,
-//! and checks each blob's strings ([`ChildArgvEnv::check`]) before the child
-//! is created and again on the child's copy, so a request it cannot deliver
-//! intact is refused with `INVALID_ARGUMENT` rather than degraded.
+//! header ([`decode_header`]) and bounds the blobs by the cap and by the
+//! argv/env region ([`checked_total`]) before it acquires anything for the
+//! child. It then copies the blobs, a window at a time, into pages only it
+//! and the child will map, and checks each blob's strings on that copy
+//! ([`ArgvEnvTally`]), so a request it cannot deliver intact is refused with
+//! `INVALID_ARGUMENT` rather than degraded, and a caller that rewrites its
+//! pages during the copy cannot change what is checked.
 
 use ipc::IpcMessage;
 use ipc::procmgr_labels::{ARGV_ENV_HEADER_WORDS, ArgvEnvHeader};
@@ -27,6 +29,8 @@ pub enum ArgvEnvRefusal
 {
     /// Fewer data words arrived than the header occupies.
     MissingHeader,
+    /// The argv/env cap is not a Memory cap procmgr can size and map.
+    NotMemory,
     /// The argv and env lengths sum past a `u64`.
     LengthOverflow,
     /// The blobs reach past the end of the cap that carries them.
@@ -67,8 +71,8 @@ pub fn decode_header(req: &IpcMessage, first_word: usize) -> Result<ArgvEnvHeade
 ///
 /// # Errors
 /// [`ArgvEnvRefusal::LengthOverflow`] when the two lengths overflow a
-/// `u64`, [`ArgvEnvRefusal::PastCap`] when the blobs reach past the cap, and
-/// [`ArgvEnvRefusal::PastRegion`] when they exceed the region.
+/// `u64`, [`ArgvEnvRefusal::PastRegion`] when they exceed the region, and
+/// [`ArgvEnvRefusal::PastCap`] when they reach past the cap.
 pub fn checked_total(
     header: ArgvEnvHeader,
     cap_bytes: u64,
@@ -87,69 +91,90 @@ pub fn checked_total(
     Ok(total)
 }
 
-/// Whether `blob` holds exactly `count` NUL-terminated strings: its NULs
-/// number `count` and, when nonempty, its last byte is one. An empty blob
-/// holds zero strings.
-fn blob_holds(blob: &[u8], count: u64) -> bool
+/// One blob's NUL count and whether its last byte, once fed, was a NUL.
+#[derive(Clone, Copy, Debug, Default)]
+struct BlobTally
 {
-    let nuls = blob.iter().fold(0u64, |n, &b| n + u64::from(b == 0));
-    nuls == count && blob.last().is_none_or(|&b| b == 0)
+    nuls: u64,
+    ends_in_nul: bool,
 }
 
-/// The argv and env a child receives: the two blobs, each a concatenation
-/// of NUL-terminated UTF-8 strings (env entries `KEY=VALUE`), and their
-/// string counts. Both empty, with zero counts, means no argv and no env.
-/// The blob format is defined by the argv section comment above
-/// `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ChildArgvEnv<'a>
+impl BlobTally
 {
-    /// The argv blob.
-    pub args: &'a [u8],
-    /// Strings in [`Self::args`].
-    pub args_count: u64,
-    /// The env blob.
-    pub env: &'a [u8],
-    /// Strings in [`Self::env`].
-    pub env_count: u64,
+    fn feed(&mut self, bytes: &[u8])
+    {
+        self.nuls += bytes.iter().fold(0u64, |n, &b| n + u64::from(b == 0));
+        if let Some(&last) = bytes.last()
+        {
+            self.ends_in_nul = last == 0;
+        }
+    }
+
+    /// Whether the blob, of `len` bytes, holds exactly `count`
+    /// NUL-terminated strings. An empty blob holds zero.
+    fn holds(self, len: u64, count: u64) -> bool
+    {
+        self.nuls == count && (len == 0 || self.ends_in_nul)
+    }
 }
 
-impl<'a> ChildArgvEnv<'a>
+/// The string check of a create request's argv and env, fed the blobs'
+/// bytes in order (argv, then env) in chunks of any size, as procmgr copies
+/// them a window at a time. [`Self::finish`] accepts only when every byte the
+/// header declares was fed and each blob holds exactly its declared count of
+/// NUL-terminated strings.
+#[derive(Clone, Copy, Debug)]
+pub struct ArgvEnvTally
 {
-    /// Split `region`, the caller's cap bytes, into the argv and env blobs
-    /// `header` declares: argv at byte 0, env directly after it. `None` when
-    /// `region` is shorter than the two lengths, which [`checked_total`]
-    /// rules out for a header it accepted.
+    header: ArgvEnvHeader,
+    fed: u64,
+    args: BlobTally,
+    env: BlobTally,
+}
+
+impl ArgvEnvTally
+{
+    /// A tally of the blobs `header` declares, none of their bytes fed yet.
     #[must_use]
-    pub fn split(region: &'a [u8], header: ArgvEnvHeader) -> Option<Self>
+    pub fn new(header: ArgvEnvHeader) -> Self
     {
-        let args_end = usize::try_from(header.args_bytes).ok()?;
-        let env_end = args_end.checked_add(usize::try_from(header.env_bytes).ok()?)?;
-        Some(Self {
-            args: region.get(..args_end)?,
-            args_count: header.args_count,
-            env: region.get(args_end..env_end)?,
-            env_count: header.env_count,
-        })
+        Self {
+            header,
+            fed: 0,
+            args: BlobTally::default(),
+            env: BlobTally::default(),
+        }
     }
 
-    /// Both blobs' combined byte length, the size of the child's argv/env
-    /// region before page rounding.
-    #[must_use]
-    pub fn total_bytes(&self) -> usize
+    /// Feed the next `chunk` of the concatenated blobs. Bytes past the
+    /// declared lengths (a window's page tail) are ignored.
+    pub fn feed(&mut self, chunk: &[u8])
     {
-        self.args.len() + self.env.len()
+        let total = self.header.args_bytes.saturating_add(self.header.env_bytes);
+        let take = usize::try_from(total.saturating_sub(self.fed))
+            .map_or(chunk.len(), |left| left.min(chunk.len()));
+        let chunk = &chunk[..take];
+        let args_left = usize::try_from(self.header.args_bytes.saturating_sub(self.fed))
+            .map_or(chunk.len(), |left| left.min(chunk.len()));
+        let (args, env) = chunk.split_at(args_left);
+        self.args.feed(args);
+        self.env.feed(env);
+        self.fed += take as u64;
     }
 
-    /// Check that each blob holds exactly its declared count of
-    /// NUL-terminated strings.
+    /// Check the fed blobs against the header.
     ///
     /// # Errors
-    /// [`ArgvEnvRefusal::Malformed`] when either blob's NULs disagree with
-    /// its count or a nonempty blob does not end in a NUL.
-    pub fn check(&self) -> Result<(), ArgvEnvRefusal>
+    /// [`ArgvEnvRefusal::Malformed`] when fewer bytes were fed than the
+    /// header declares, or either blob's NULs disagree with its count, or a
+    /// nonempty blob does not end in a NUL.
+    pub fn finish(self) -> Result<(), ArgvEnvRefusal>
     {
-        if blob_holds(self.args, self.args_count) && blob_holds(self.env, self.env_count)
+        let h = self.header;
+        let complete = Some(self.fed) == h.total_bytes();
+        if complete
+            && self.args.holds(h.args_bytes, h.args_count)
+            && self.env.holds(h.env_bytes, h.env_count)
         {
             Ok(())
         }
@@ -178,6 +203,18 @@ mod tests
             env_bytes,
             env_count,
         }
+    }
+
+    /// Run `blobs` (argv then env, concatenated) through a tally in chunks of
+    /// `chunk` bytes.
+    fn tally(blobs: &[u8], header: ArgvEnvHeader, chunk: usize) -> Result<(), ArgvEnvRefusal>
+    {
+        let mut t = ArgvEnvTally::new(header);
+        for piece in blobs.chunks(chunk)
+        {
+            t.feed(piece);
+        }
+        t.finish()
     }
 
     // Defect guarded: a sender encoding or procmgr decoding the header words
@@ -236,43 +273,37 @@ mod tests
         assert_eq!(checked_total(header(0, 0, 0, 0), 0, REGION), Ok(0));
     }
 
-    // Defect guarded: env taken from the wrong offset of the cap, or the
-    // split reading past a region shorter than the header declares.
+    // Defect guarded: a tally that splits argv from env at the wrong byte,
+    // or loses a NUL or a blob's last byte at a chunk boundary, so a
+    // well-formed request is refused only when its blobs straddle a window.
     #[test]
-    fn split_places_env_directly_after_argv()
+    fn a_well_formed_request_passes_in_any_chunking()
     {
-        let region = b"a\0bc\0K=v\0tail";
-        let blobs = ChildArgvEnv::split(region, header(5, 2, 4, 1)).expect("split fits");
-        assert_eq!(blobs.args, b"a\0bc\0");
-        assert_eq!(blobs.env, b"K=v\0");
-        assert_eq!(blobs.total_bytes(), 9);
-        assert_eq!(blobs.check(), Ok(()));
-        assert_eq!(ChildArgvEnv::split(region, header(5, 2, 9, 1)), None);
+        let blobs = b"a\0bc\0K=v\0\0\0\0";
+        let h = header(5, 2, 4, 1);
+        for chunk in 1..=blobs.len()
+        {
+            assert_eq!(tally(blobs, h, chunk), Ok(()), "chunk {chunk}");
+        }
+        assert_eq!(tally(b"", header(0, 0, 0, 0), 1), Ok(()));
     }
 
     // Defect guarded: a child started with argv or env its readers would
-    // split differently from what the spawner declared.
+    // split differently from what the spawner declared, or a copy that
+    // stopped short being accepted.
     #[test]
     fn blobs_whose_strings_disagree_with_their_counts_are_refused()
     {
-        let check = |args: &[u8], args_count, env: &[u8], env_count| {
-            ChildArgvEnv {
-                args,
-                args_count,
-                env,
-                env_count,
-            }
-            .check()
-        };
-        assert_eq!(check(b"", 0, b"", 0), Ok(()));
-        assert_eq!(check(b"a\0b\0", 1, b"", 0), Err(ArgvEnvRefusal::Malformed));
-        assert_eq!(check(b"a\0b\0", 3, b"", 0), Err(ArgvEnvRefusal::Malformed));
-        assert_eq!(check(b"a\0b", 1, b"", 0), Err(ArgvEnvRefusal::Malformed));
-        assert_eq!(check(b"", 1, b"", 0), Err(ArgvEnvRefusal::Malformed));
-        assert_eq!(check(b"a\0", 1, b"K=v", 0), Err(ArgvEnvRefusal::Malformed));
-        assert_eq!(
-            check(b"a\0", 1, b"K=v\0", 2),
-            Err(ArgvEnvRefusal::Malformed)
-        );
+        let malformed = Err(ArgvEnvRefusal::Malformed);
+        assert_eq!(tally(b"a\0b\0", header(4, 1, 0, 0), 3), malformed);
+        assert_eq!(tally(b"a\0b\0", header(4, 3, 0, 0), 3), malformed);
+        assert_eq!(tally(b"a\0b", header(3, 1, 0, 0), 2), malformed);
+        assert_eq!(tally(b"", header(0, 1, 0, 0), 1), malformed);
+        assert_eq!(tally(b"a\0K=v", header(2, 1, 3, 1), 4), malformed);
+        assert_eq!(tally(b"a\0K=v\0", header(2, 1, 4, 2), 4), malformed);
+        // The argv blob's last byte is a NUL only in the env blob's bytes.
+        assert_eq!(tally(b"ab\0", header(2, 0, 1, 1), 1), malformed);
+        // Fewer bytes fed than declared.
+        assert_eq!(tally(b"a\0", header(2, 1, 4, 1), 1), malformed);
     }
 }

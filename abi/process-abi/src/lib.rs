@@ -248,8 +248,9 @@ pub const ARGV_ENV_REGION_OFFSET: u64 = 4096;
 /// The value is the region tail `process-layout` leaves after the
 /// `ProcessInfo` draw window (`MAX_WINDOW_REGION_PAGES`, 1 GiB) less the
 /// `ProcessInfo` page itself, which that crate pins with a const assert, so
-/// the ceiling costs VA only: a creator maps the pages the spawner's blobs
-/// fill, funded by the spawner's request and the child's account. A spawner
+/// the ceiling itself costs VA only: a creator maps the pages the spawner's
+/// blobs fill, and the child's page tables for them, funded by the
+/// spawner's request and the child's account. A spawner
 /// whose blobs exceed it is refused (`ArgumentListTooLong` from
 /// `std::process::Command::spawn`, `INVALID_ARGUMENT` from procmgr).
 pub const ARGV_ENV_MAX_PAGES: u64 = (1 << 18) - 1;

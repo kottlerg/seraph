@@ -1488,6 +1488,13 @@ pub mod process {
         }
     }
 
+    /// Pages of the spawner's argv/env run [`ArgvEnvCap::new`] maps at once
+    /// while it writes the blobs: one window of this many pages, re-mapped for
+    /// every chunk. The window bounds the spawner's page-table cost to the
+    /// tables one 256 KiB span needs, whatever the blobs' size; a larger
+    /// window only saves map calls.
+    const ARGV_ENV_WRITE_WINDOW_PAGES: u64 = 64;
+
     /// A spawner's argv and env, packed into a Memory cap for a procmgr create
     /// request (`procmgr_labels::CREATE_ARGV_ENV`): one contiguous run of the
     /// pages both blobs fill, granted to this process by memmgr, holding the argv
@@ -1525,60 +1532,29 @@ pub mod process {
             env: &[u8],
             env_count: u64,
         ) -> crate::io::Result<Option<Self>> {
-            let total = args.len() + env.len();
+            let total = (args.len() + env.len()) as u64;
             if total == 0 {
                 return Ok(None);
             }
-            if total as u64 > process_abi::ARGV_ENV_MAX_BYTES {
+            if total > process_abi::ARGV_ENV_MAX_BYTES {
                 return Err(crate::io::Error::new(
                     crate::io::ErrorKind::ArgumentListTooLong,
                     "argv and env exceed the process ABI's argv/env region",
                 ));
             }
-            let info = super::try_startup_info().ok_or_else(|| {
-                crate::io::Error::new(
-                    crate::io::ErrorKind::Unsupported,
-                    "argv/env: startup info not installed",
-                )
-            })?;
-            if info.memmgr_endpoint == 0 || super::current_ipc_buf().is_null() {
-                return Err(crate::io::Error::new(
-                    crate::io::ErrorKind::Unsupported,
-                    "argv/env: spawning process has no memmgr endpoint or IPC buffer",
-                ));
-            }
-            let pages = (total as u64).div_ceil(syscall_abi::PAGE_SIZE);
+            let (memmgr_ep, aspace) = spawner_memmgr()?;
+            let pages = total.div_ceil(syscall_abi::PAGE_SIZE);
             let Some((original, _, phys)) =
-                crate::sys::alloc::seraph::slab_request_pages(info.memmgr_endpoint, pages)
+                crate::sys::alloc::seraph::slab_request_pages(memmgr_ep, pages)
             else {
                 return Err(crate::io::Error::new(
                     crate::io::ErrorKind::ArgumentListTooLong,
                     "argv and env exceed what the spawner can fund",
                 ));
             };
-            let release = |original: u64| {
-                let _ = syscall::cap_delete(original);
-                crate::sys::alloc::seraph::slab_release_fresh(phys);
-            };
-            if let Err(still_mapped) =
-                write_argv_env(info.self_aspace, original, pages, args, env)
-            {
-                // A run this process may still have mapped stays charged to it
-                // until it exits, rather than going back to memmgr's pool.
-                if still_mapped {
-                    let _ = syscall::cap_delete(original);
-                } else {
-                    release(original);
-                }
-                return Err(crate::io::Error::other("argv/env: mapping the blob pages failed"));
-            }
-            let Ok(transfer) = syscall::cap_derive(original, syscall::RIGHTS_MEM_MAP) else {
-                release(original);
-                return Err(crate::io::Error::other("argv/env: deriving the transfer cap failed"));
-            };
-            Ok(Some(Self {
+            let mut this = Self {
                 original,
-                transfer,
+                transfer: 0,
                 phys,
                 header: ipc::procmgr_labels::ArgvEnvHeader {
                     args_bytes: args.len() as u64,
@@ -1586,14 +1562,27 @@ pub mod process {
                     env_bytes: env.len() as u64,
                     env_count,
                 },
-            }))
+            };
+            if let Err(still_mapped) = write_argv_env(aspace, original, pages, args, env) {
+                if still_mapped {
+                    // A run this process may still have mapped stays charged
+                    // to it until it exits, rather than going back to
+                    // memmgr's pool.
+                    let _ = syscall::cap_delete(this.original);
+                    crate::mem::forget(this);
+                }
+                return Err(crate::io::Error::other("argv/env: mapping the blob pages failed"));
+            }
+            this.transfer = syscall::cap_derive(original, syscall::RIGHTS_MEM_MAP)
+                .map_err(|_| crate::io::Error::other("argv/env: deriving the transfer cap failed"))?;
+            Ok(Some(this))
         }
 
         /// The `ipc::procmgr_labels::ArgvEnvHeader` the request carries, as its
-        /// four data words in wire order (from word 0 for `CREATE_PROCESS`,
-        /// from word 1 for `CREATE_FROM_FILE`).
+        /// data words in wire order (from word 0 for `CREATE_PROCESS`, from
+        /// word 1 for `CREATE_FROM_FILE`).
         #[stable(feature = "seraph_ext", since = "1.0.0")]
-        pub fn header_words(&self) -> [u64; 4] {
+        pub fn header_words(&self) -> [u64; ipc::procmgr_labels::ARGV_ENV_HEADER_WORDS] {
             self.header.to_words()
         }
 
@@ -1618,18 +1607,38 @@ pub mod process {
     impl Drop for ArgvEnvCap {
         fn drop(&mut self) {
             // A call that moved the derivation left a stale handle here, whose
-            // delete the per-slot generation refuses; one that did not leaves it
-            // to delete.
-            let _ = syscall::cap_delete(self.transfer);
+            // delete the per-slot generation refuses; one that did not, or a
+            // value built before the derivation (slot 0), leaves it to delete.
+            if self.transfer != 0 {
+                let _ = syscall::cap_delete(self.transfer);
+            }
             let _ = syscall::cap_delete(self.original);
             crate::sys::alloc::seraph::slab_release_fresh(self.phys);
         }
     }
 
-    /// Map `pages` pages of `memory` writable at a fresh reservation of
-    /// `aspace`, write `args` then `env` from byte 0 and zero the tail, and
-    /// unmap them. `Err(still_mapped)` when the reservation or the map fails
-    /// (`false`) or the unmap does (`true`: the pages may still be mapped here).
+    /// The spawning process's memmgr endpoint and address space.
+    fn spawner_memmgr() -> crate::io::Result<(u64, u64)> {
+        let info = super::try_startup_info().ok_or_else(|| {
+            crate::io::Error::new(
+                crate::io::ErrorKind::Unsupported,
+                "argv/env: startup info not installed",
+            )
+        })?;
+        if info.memmgr_endpoint == 0 || super::current_ipc_buf().is_null() {
+            return Err(crate::io::Error::new(
+                crate::io::ErrorKind::Unsupported,
+                "argv/env: spawning process has no memmgr endpoint or IPC buffer",
+            ));
+        }
+        Ok((info.memmgr_endpoint, info.self_aspace))
+    }
+
+    /// Write `args` then `env` from byte 0 of `memory`'s first `pages` pages,
+    /// and zero the tail, through one [`ARGV_ENV_WRITE_WINDOW_PAGES`]-page
+    /// window of `aspace` re-mapped per chunk. `Err(still_mapped)` when the
+    /// reservation, the derivation or a map fails (`false`), or an unmap does
+    /// (`true`: a chunk may still be mapped here).
     fn write_argv_env(
         aspace: u64,
         memory: u64,
@@ -1639,47 +1648,60 @@ pub mod process {
     ) -> Result<(), bool> {
         use crate::sys::reserve::{reserve_pages, unreserve_pages};
 
-        let reserved = reserve_pages(pages).map_err(|_| false)?;
-        let va = reserved.va_start();
-        let mapped = syscall::cap_derive(memory, syscall::RIGHTS_MEM_MAP_RW).and_then(|rw| {
-            // SAFETY: `va` is the base of a `pages`-page reservation just taken
-            // from the per-process reservation arena (`sys::reserve`), which
-            // hands out VA no Rust object or IPC page occupies, and this call
-            // owns it exclusively.
-            let r = unsafe { syscall::mem_map(rw, aspace, va, 0, pages, syscall::MAP_WRITABLE) };
+        let rw = syscall::cap_derive(memory, syscall::RIGHTS_MEM_MAP_RW).map_err(|_| false)?;
+        let Ok(window) = reserve_pages(ARGV_ENV_WRITE_WINDOW_PAGES) else {
             let _ = syscall::cap_delete(rw);
-            r
-        });
-        if mapped.is_err() {
-            unreserve_pages(reserved);
             return Err(false);
-        }
-        {
-            // SAFETY: the `pages` pages at `va` are mapped writable just above,
+        };
+        let va = window.va_start();
+        let mut offset = 0;
+        let mut result = Ok(());
+        while offset < pages {
+            let chunk = (pages - offset).min(ARGV_ENV_WRITE_WINDOW_PAGES);
+            // SAFETY: `va` is the base of a window reserved just above from the
+            // per-process reservation arena (`sys::reserve`), which hands out VA
+            // no Rust object or IPC page occupies; this call owns it, and
+            // `chunk` is at most its size.
+            if unsafe { syscall::mem_map(rw, aspace, va, offset, chunk, syscall::MAP_WRITABLE) }
+                .is_err()
+            {
+                result = Err(false);
+                break;
+            }
+            let base = (offset * syscall_abi::PAGE_SIZE) as usize;
+            let len = (chunk * syscall_abi::PAGE_SIZE) as usize;
+            // SAFETY: the `chunk` pages at `va` are mapped writable just above,
             // for this process alone (no other mapping of the fresh run exists),
             // and stay mapped until the unmap below, after the slice's last use.
-            let dst = unsafe {
-                crate::slice::from_raw_parts_mut(
-                    va as *mut u8,
-                    (pages * syscall_abi::PAGE_SIZE) as usize,
-                )
-            };
-            let (dst_args, rest) = dst.split_at_mut(args.len());
-            dst_args.copy_from_slice(args);
-            let (dst_env, tail) = rest.split_at_mut(env.len());
-            dst_env.copy_from_slice(env);
-            tail.fill(0);
+            let dst = unsafe { crate::slice::from_raw_parts_mut(va as *mut u8, len) };
+            fill_window(dst, base, args, env);
+            // SAFETY: the span is this call's own window, mapped above; no slice
+            // over it outlives the fill.
+            if unsafe { syscall::mem_unmap(aspace, va, chunk) }.is_err() {
+                // The window stays reserved, so no later reservation lands on
+                // the still-mapped pages.
+                let _ = syscall::cap_delete(rw);
+                return Err(true);
+            }
+            offset += chunk;
         }
-        // SAFETY: the span is this function's own reservation, mapped above; no
-        // slice over it outlives the block above.
-        let unmapped = unsafe { syscall::mem_unmap(aspace, va, pages) }.is_ok();
-        if !unmapped {
-            // The span stays reserved, so no later reservation lands on the
-            // still-mapped pages.
-            return Err(true);
-        }
-        unreserve_pages(reserved);
-        Ok(())
+        let _ = syscall::cap_delete(rw);
+        unreserve_pages(window);
+        result
+    }
+
+    /// Fill `dst`, the window over bytes `base..base + dst.len()` of the
+    /// concatenated blobs, with those bytes of `args` then `env`, and zeros
+    /// past them.
+    fn fill_window(dst: &mut [u8], base: usize, args: &[u8], env: &[u8]) {
+        let end = base + dst.len();
+        let args_part = &args[base.min(args.len())..end.min(args.len())];
+        let env_part = &env[base.saturating_sub(args.len()).min(env.len())
+            ..end.saturating_sub(args.len()).min(env.len())];
+        let (dst_args, rest) = dst.split_at_mut(args_part.len());
+        dst_args.copy_from_slice(args_part);
+        let (dst_env, tail) = rest.split_at_mut(env_part.len());
+        dst_env.copy_from_slice(env_part);
+        tail.fill(0);
     }
 }
-

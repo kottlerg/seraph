@@ -126,24 +126,6 @@ pub fn map_module(module_memory_cap: u64, self_aspace: u64) -> Option<(ScratchMa
     None
 }
 
-/// Map the first `pages` pages of `memory_cap` read-only at a scratch VA, from
-/// a map-only derivation the returned mapping owns, so `memory_cap` itself
-/// stays the caller's. `None` when the derivation or the map fails (the cap
-/// is not a Memory cap procmgr may map, or is shorter than `pages`).
-pub fn map_memory_read_only(memory_cap: u64, self_aspace: u64, pages: u64)
--> Option<ScratchMapping>
-{
-    let ro = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
-    let Some(mut scratch) = ScratchMapping::map(self_aspace, ro, pages, syscall::MAP_FROM_CAP)
-    else
-    {
-        let _ = syscall::cap_delete(ro);
-        return None;
-    };
-    scratch.set_owns_cap(ro);
-    Some(scratch)
-}
-
 /// Derive a memory cap with the given protection rights for mapping.
 pub fn derive_memory_for_prot(memory_cap: u64, prot: u64) -> Option<u64>
 {

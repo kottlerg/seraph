@@ -103,30 +103,30 @@ holds a handle to it.
 | 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | Reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** below |
 
-**argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared
-with `CREATE_FROM_FILE`) marks a request that carries the child's argv and env
-in a Memory cap the caller sizes and funds: one run holding the argv blob at
-byte 0 and the env blob directly after it, each a concatenation of
-NUL-terminated UTF-8 strings (env entries `KEY=VALUE`), with the
-`ipc::procmgr_labels::ArgvEnvHeader` of the two blobs' byte lengths and string
-counts in four data words. The cap is the last one before the death relay
-(`CREATE_FROM_FILE`), or the last cap without one, so the creator endpoint
-stays at cap[1]. Without the flag the child gets no argv and no env, and the
-request carries neither the header nor the cap. procmgr refuses the request
-with `INVALID_ARGUMENT`, before it acquires anything for the child, when the
-flag is set without a cap of its own, a header word was not delivered, the
-blobs reach past the cap or together exceed `process_abi::ARGV_ENV_MAX_BYTES`,
-the cap cannot be mapped, or a blob's NULs disagree with its count or a
-nonempty blob does not end in a NUL. Otherwise procmgr copies the blobs into
-fresh pages on the child's account, checks the copy again (a caller that
-rewrites its pages meanwhile fails the create), and maps them read-only
-directly after the child's `ProcessInfo` page, where `ProcessInfo`'s
-`args_offset` and `env_offset` locate them
-([abi/process-abi/README.md](../../../abi/process-abi/README.md)
-§ ProcessInfo). procmgr unmaps the caller's pages and deletes its copy of the
-cap before it replies, so the caller can return the run to memmgr as soon as
-the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and
-the header for a std-built sender.
+**argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
+`CREATE_FROM_FILE`) marks a request that carries the child's argv and env in a Memory cap the caller
+sizes and funds: one run holding the argv blob at byte 0 and the env blob directly after it, each a
+concatenation of NUL-terminated UTF-8 strings (env entries `KEY=VALUE`), with the
+`ipc::procmgr_labels::ArgvEnvHeader` of the two blobs' byte lengths and string counts in four data
+words. The cap is the last one before the death relay (`CREATE_FROM_FILE`), or the last cap without
+one, so the creator endpoint stays at cap[1]. Without the flag the child gets no argv and no env,
+and the request carries neither the header nor the cap. procmgr refuses the request with
+`INVALID_ARGUMENT`, before it acquires anything for the child, when the flag is set without a cap of
+its own, a header word was not delivered, the cap is not a Memory cap, or the blobs reach past the
+cap or together exceed `process_abi::ARGV_ENV_MAX_BYTES`. Otherwise, once it has registered the
+child with memmgr and before it creates anything else, procmgr copies the blobs into fresh pages on
+the child's account, through two windows of `ARGV_ENV_COPY_WINDOW_PAGES` (64) pages re-mapped for
+each chunk, so its own page-table cost per create stays that of two 256 KiB spans whatever the
+blobs' size. It checks the strings on that copy: a blob whose NULs disagree with its count, or a
+nonempty blob that does not end in a NUL, also refuses the create with `INVALID_ARGUMENT`, and a
+caller that rewrites its pages meanwhile changes only the copy that is checked. A shortfall of
+procmgr's or the child's memory replies `OUT_OF_MEMORY`. procmgr maps the copy read-only directly
+after the child's `ProcessInfo` page, where `ProcessInfo`'s `args_offset` and `env_offset` locate it
+([abi/process-abi/README.md](../../../abi/process-abi/README.md) § argv / env region), funding the
+child's page tables for a region past one last-level table's span (512 pages) from the child's
+account. procmgr deletes its copy of the cap before it replies, so the caller can return the run to
+memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and the
+header for a std-built sender.
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via
@@ -622,6 +622,7 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 [Fault Handling](../../../docs/fault-handling.md),
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md), [services/procmgr/README.md](../README.md),

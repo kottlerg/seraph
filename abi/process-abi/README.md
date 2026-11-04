@@ -102,8 +102,9 @@ blob, each a concatenation of NUL-terminated UTF-8 strings (env entries `KEY=VAL
 has offset, length and count zero. The region holds at most `ARGV_ENV_MAX_PAGES` pages
 (`(1 << 18) - 1`, argv and env together, `ARGV_ENV_MAX_BYTES` in bytes): the region tail
 `shared/process-layout` leaves after the `ProcessInfo` draw window less the page itself, which
-that crate pins with a const assert, so the bound costs VA only. The creator maps the pages the
-blobs fill; a reader treats fields that name bytes outside the region as no blob.
+that crate pins with a const assert, so the bound itself costs VA only: the creator maps the
+pages the blobs fill, and the child's page tables for them (procmgr funds those from the child's
+account). A reader treats fields that name bytes outside the region as no blob.
 
 ### Fixed CSpace slot conventions
 
@@ -274,6 +275,8 @@ process-abi/
 ├── README.md
 └── src/
     └── lib.rs      # ProcessInfo, PROCESS_ABI_VERSION, process_info_ref / process_info_mut;
+                    # the argv/env region bounds (ARGV_ENV_REGION_OFFSET,
+                    # ARGV_ENV_MAX_PAGES, ARGV_ENV_MAX_BYTES);
                     # StartupInfo (the memmgr runtime's view); the stack-size note
                     # (StackNote, the stack_pages! macro, stack-page bounds); the
                     # main-thread TLS bound and TLS block helpers (tls_block_layout,

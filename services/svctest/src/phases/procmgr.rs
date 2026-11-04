@@ -936,6 +936,60 @@ fn argv_env_refusals()
         procmgr_errors::INVALID_ARGUMENT,
         "a create label with the former inline argv fields",
     );
+
+    create_process_argv_env_refusals();
+}
+
+/// The `CREATE_PROCESS` side of [`argv_env_refusals`]: the same split and
+/// header checks, with the header at data word 0. Each refusal comes before
+/// procmgr maps the module, so a spare cap stands in for it; svctest holds no
+/// boot-module Memory cap, so no cell here spawns a child through
+/// `CREATE_PROCESS`.
+fn create_process_argv_env_refusals()
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use std::os::seraph::process::ArgvEnvCap;
+
+    let procmgr = startup_info().procmgr_endpoint;
+    let label = procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_ARGV_ENV;
+    let blob = b"/programs/hello\0";
+    let len = blob.len() as u64;
+    let page = syscall_abi::PAGE_SIZE;
+    let cells: [(&str, [u64; 4]); 2] = [
+        (
+            "CREATE_PROCESS with a header longer than its cap",
+            [page + 1, 1, 0, 0],
+        ),
+        (
+            "CREATE_PROCESS with an argv count its NULs disagree with",
+            [len, 2, 0, 0],
+        ),
+    ];
+    for (what, header) in cells
+    {
+        let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
+            .expect("building the argv/env cap failed")
+            .expect("a nonempty argv builds a cap");
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(label)
+                .words(0, &header)
+                .cap(spare_cap())
+                .cap(argv_env.cap())
+                .build(),
+            procmgr_errors::INVALID_ARGUMENT,
+            what,
+        );
+    }
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .words(0, &[len, 1, 0, 0])
+            .cap(spare_cap())
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_PROCESS with CREATE_ARGV_ENV and only the module cap",
+    );
 }
 
 /// Sample windows [`procmgr_dma_hold_phase`] retries: memmgr's free-pool size

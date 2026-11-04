@@ -39,10 +39,10 @@ pub mod fs_reads;
 pub mod init_reap;
 pub mod request_caps;
 
-pub use create_blobs::{ArgvEnvRefusal, ChildArgvEnv, checked_total, decode_header};
+pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
 pub use dma_holds::{DmaHolds, HeldReclaim};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
-pub use request_caps::{CreateCaps, split_create_caps};
+pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
 
 extern crate alloc;
 

@@ -960,12 +960,18 @@ pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 
 /// Return the parts of page-class allocations a caller frees to `memory` as
 /// ascending runs of whole pages: `produce` hands each run to the callback it
-/// receives as `(offset, bytes)`, lowest first, and every run goes back as a
-/// [`retype_free`] of it would, through one walk of the page free list for
-/// them all. A dead `CSpace` returns each donation this way, cut around the
-/// arena pages it keeps (`cap::object::free_donation_around`), so a donation
-/// cut into `k` runs costs one pass over its Memory object's page free list
-/// and `k` insertions, not `k` walks from the list's head.
+/// receives as `(offset, bytes)`, lowest first, and the runs go back through
+/// one walk of the page free list for them all. A dead pool returns each
+/// group of its donations that share a Memory object this way, a `CSpace`'s
+/// cut around the arena pages it keeps (`cap::object::free_donation_group`),
+/// so `k` runs cost one pass over the Memory object's page free list and `k`
+/// insertions, not `k` walks from the list's head.
+///
+/// The runs end as [`retype_free`] of each, from the highest down, would leave
+/// them: the contiguous runs that end at the bump frontier roll it back to
+/// the lowest of them, and every other run goes onto the free list. As in
+/// [`retype_free`], the rollback stops at the first page the runs do not
+/// cover, so a block freed before the call stays on the free list.
 ///
 /// `produce` runs under `memory`'s allocator lock and read guard: it takes no
 /// lock and calls no retype function.
@@ -990,6 +996,10 @@ pub unsafe fn retype_free_runs(
     let mut cursor = PageCursor::new(alloc);
     let mut freed = 0;
     let mut last_end = 0;
+    // The span `[start, end)` of the contiguous runs since the last gap, held
+    // off the list until a run past a gap shows it does not end at the bump
+    // frontier: only the span the last run closes can.
+    let mut held: Option<(u64, u64)> = None;
     produce(&mut |offset, bytes| {
         debug_assert!(
             offset.is_multiple_of(p)
@@ -1001,19 +1011,35 @@ pub unsafe fn retype_free_runs(
         );
         last_end = offset + bytes;
         freed += bytes;
-        // As in retype_free: a run that ends at the bump frontier rolls it
-        // back. The runs ascend, so only the last can.
-        if offset + bytes == alloc.bump_offset.load(Ordering::Relaxed)
+        match held
         {
-            alloc.bump_offset.store(offset, Ordering::Release);
+            Some((start, end)) if end == offset => held = Some((start, offset + bytes)),
+            _ =>
+            {
+                if let Some((start, end)) = held.replace((offset, offset + bytes))
+                {
+                    // SAFETY: lock held for the cursor's life; the span is
+                    // page-aligned, ours (the contract above), and above every
+                    // span inserted before.
+                    unsafe { cursor.insert(alloc, memory, start, (end - start) / p) };
+                }
+            }
+        }
+    });
+    if let Some((start, end)) = held
+    {
+        // As in retype_free: a span that ends at the bump frontier rolls it
+        // back.
+        if end == alloc.bump_offset.load(Ordering::Relaxed)
+        {
+            alloc.bump_offset.store(start, Ordering::Release);
         }
         else
         {
-            // SAFETY: lock held for the cursor's life; the run is page-aligned,
-            // ours (the contract above), and above every run inserted before.
-            unsafe { cursor.insert(alloc, memory, offset, bytes / p) };
+            // SAFETY: as for the spans inserted above.
+            unsafe { cursor.insert(alloc, memory, start, (end - start) / p) };
         }
-    });
+    }
     credit_freed(memory, freed);
     alloc.unlock();
 }
@@ -1839,6 +1865,73 @@ mod tests
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), 3 * p);
         free(&memory, span + p, p);
         assert_eq!(retype_allocate(&memory, 4 * p), Ok(0), "the region drained");
+    }
+
+    // Defect guarded: contiguous allocations returned in one call (a dead
+    // pool's donations from one Memory object) roll the bump frontier back
+    // over the top run only, leaving the runs below it a free block that ends
+    // at the frontier, where freeing each from the highest down rolls the
+    // frontier back over them all.
+    #[test]
+    fn contiguous_runs_at_the_bump_frontier_roll_it_back_over_them_all()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(8);
+        let lo = retype_allocate(&memory, p).unwrap();
+        let a = retype_allocate(&memory, p).unwrap();
+        let b = retype_allocate(&memory, p).unwrap();
+        let c = retype_allocate(&memory, 2 * p).unwrap();
+        assert_eq!((lo, a, b, c), (0, p, 2 * p, 3 * p));
+        free_runs(&memory, |run| {
+            run(a, p);
+            run(b, p);
+            run(c, 2 * p);
+        });
+        assert_eq!(memory.allocator.bump_offset.load(Ordering::Acquire), p);
+        assert_eq!(
+            memory.allocator.page_free_head.load(Ordering::Acquire),
+            FREE_LIST_END,
+            "no run went onto the free list"
+        );
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 7 * p);
+    }
+
+    // Defect guarded: the rollback over a call's contiguous runs passes the
+    // runs and swallows a block freed before the call, which the frontier
+    // never covered (rollback does not cascade past the free lists), or a gap
+    // between two runs lets the span below it roll back too.
+    #[test]
+    fn the_rollback_stops_at_the_first_page_the_runs_do_not_cover()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(8);
+        let lo = retype_allocate(&memory, p).unwrap();
+        let early = retype_allocate(&memory, p).unwrap();
+        let a = retype_allocate(&memory, p).unwrap();
+        let held = retype_allocate(&memory, p).unwrap();
+        let b = retype_allocate(&memory, p).unwrap();
+        let c = retype_allocate(&memory, p).unwrap();
+        assert_eq!(
+            (lo, early, a, held, b, c),
+            (0, p, 2 * p, 3 * p, 4 * p, 5 * p)
+        );
+        free(&memory, early, p);
+        free_runs(&memory, |run| {
+            run(a, p);
+            run(b, p);
+            run(c, p);
+        });
+        assert_eq!(
+            memory.allocator.bump_offset.load(Ordering::Acquire),
+            b,
+            "the frontier stops at the held page"
+        );
+        assert_eq!(
+            retype_allocate(&memory, 2 * p),
+            Ok(early),
+            "the early block and the first run merged on the free list"
+        );
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 4 * p);
     }
 
     // Defect guarded: runs freed through a cursor that meets a malformed node

@@ -97,6 +97,13 @@ caller as maximal contiguous `(base, size)` extents. The extent count therefore 
 fragmentation of free RAM, not its amount; a caller capacity too small for it is reported with
 the full count.
 
+**Count:** `coalesced_extent_count` returns the number of extents `drain_coalesced` would emit
+without draining: it sorts the free blocks into the same chain, counts the maximal runs, and
+pushes every block back onto the free list of its order, so the same blocks stay free at the same
+orders and the free page count is unchanged. Phase 7 sizes the `InitInfo` region from this count
+before it reserves the region and drains the rest into it
+([initialization.md](initialization.md) § Phase 7).
+
 ### Thread Safety
 
 The allocator is protected by a single spinlock (`FRAME_ALLOC_LOCK`, taken by

@@ -1109,6 +1109,58 @@ mod tests
         assert!(out[..n].iter().all(|&(b, s)| taken < b || taken >= b + s));
     }
 
+    // Defect caught: taking a block and returning the tail past the pages
+    // kept splitting the free memory into more than two new extents, so the
+    // InitInfo region Phase 7 sizes from the count plus two is too small for
+    // the drain that follows.
+    #[test]
+    fn taking_a_block_and_returning_its_tail_adds_at_most_two_extents()
+    {
+        for (offset, len) in [(0u64, 3u64), (0, 64), (1, 100), (7, 13), (3, 5000)]
+        {
+            for (order, keep) in [(0usize, 1usize), (1, 1), (2, 3), (3, 5), (6, 40), (6, 64)]
+            {
+                let mut alloc = Alloc::new();
+                // SAFETY: SparseWindow backs every header slot.
+                unsafe {
+                    alloc.add_region(BASE + pages(offset), BASE + pages(offset + len));
+                    alloc.add_region(
+                        BASE + pages(offset + len + 9),
+                        BASE + pages(offset + len + 40),
+                    );
+                }
+                let before = alloc.coalesced_extent_count();
+                let Some(block) = alloc.alloc(order)
+                else
+                {
+                    continue;
+                };
+                let tail = (1u64 << order) - keep as u64;
+                if tail != 0
+                {
+                    // SAFETY: the tail pages are the end of the block just
+                    // taken, so this buddy allocated them.
+                    unsafe { alloc.free_range(block + pages(keep as u64), pages(tail)) };
+                }
+                let after = alloc.coalesced_extent_count();
+                assert!(
+                    after <= before + 2,
+                    "{before} -> {after}, order {order} keep {keep}"
+                );
+                let mut out = [(0u64, 0u64); 8];
+                let n = alloc
+                    .drain_coalesced(out.len(), |i, base, size| out[i] = (base, size))
+                    .expect("fits");
+                assert_eq!(n, after);
+                assert!(
+                    out[..n]
+                        .iter()
+                        .all(|&(b, s)| b + s <= block || b >= block + pages(keep as u64))
+                );
+            }
+        }
+    }
+
     #[test]
     fn drain_reports_extents_that_do_not_fit()
     {

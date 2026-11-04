@@ -9,11 +9,11 @@ Binary handover contract between the kernel and the init process.
 Defines `InitInfo` and all associated types placed in a read-only region of one or more pages
 before init runs. The kernel sizes the region from the boot's own descriptor counts, at most
 `INIT_INFO_MAX_PAGES`, and reports its page count in `init_info_memory_count`, which bounds the
-descriptor slice init reads. The kernel chooses the region's virtual
-address per-boot and delivers it to init in the entry register (`rdi`/`a0`), so the address is
-not an ABI constant (see [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md)
-§ Bootstrap Cross-Boundary VAs). Includes `INIT_PROTOCOL_VERSION`; init MUST check the version
-field before accessing any other fields.
+descriptor slice init reads. The kernel chooses the region's virtual address per-boot and
+delivers it to init in the entry register (`rdi`/`a0`), so the address is not an ABI constant
+(see [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) § Bootstrap
+Cross-Boundary VAs). Includes `INIT_PROTOCOL_VERSION`; init MUST check the version field before
+accessing any other fields.
 
 **Constraints:** `no_std`, `#[repr(C)]` structs and fixed-width integer-repr enums, no
 dependencies outside `core`. Changes that alter the `InitInfo` layout, field semantics, or

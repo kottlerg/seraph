@@ -470,14 +470,14 @@ Phase 7.
    address-space and thread slabs (the thread slab sized from the boot CPU's save area, so it grows
    with a wider vector length), and one 128-byte body for each descriptor slot and for each Memory
    capability Phase 9 mints (init segments, InitInfo pages, init stack pages), plus alignment
-   slack. Every drained extent exposed
-   to userspace (each drained extent, and the seed extent's tail past the reserve) is zeroed through
-   the direct map before step 3 mints it: free RAM still holds what firmware and the bootloader left
-   there, the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
-   reports the time the zeroing took
+   slack. Every drained extent exposed to userspace (each drained extent, and the seed extent's
+   tail past the reserve) is zeroed through the direct map before step 3 mints it: free RAM still
+   holds what firmware and the bootloader left there, the UEFI stack among it, and the buddy's
+   free-list headers. The "Phase 7: drained" line reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, `root_cspace_init_pages()`
    pages: one wrapper page plus a slot-page pool holding at least every capability the boot can
-   mint plus ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap, and
+   mint, ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace, Thread and CSpace caps)
+   and ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap, and
    ROOT_CSPACE_BODY_PAGES = 16 pages for the bodies of init's own splits) and register it as CSpace
    id 0:
    - Slot 0 is permanently null
@@ -832,7 +832,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
-| 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
+| 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
 | 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, or no Vector extension); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 

@@ -318,10 +318,17 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_HEADROOM_SLOTS: u64 = 1280;
 
-/// Slot capacity of the root `CSpace`'s initial slot-page pool: every
-/// capability the boot can mint into it ([`boot_body_bound`], from the
-/// `InitInfo` descriptor capacity Phase 7 sized from this boot's counts)
-/// plus [`ROOT_CSPACE_INIT_HEADROOM_SLOTS`] for init.
+/// Slots of the root `CSpace` the boot takes besides one per capability body:
+/// the permanently null slot 0 and the caps Phase 9 inserts over objects it
+/// does not count as bodies, init's `AddressSpace`, `Thread` and `CSpace`.
+#[cfg(not(test))]
+const ROOT_CSPACE_BOOT_EXTRA_SLOTS: u64 = 4;
+
+/// Slot capacity of the root `CSpace`'s initial slot-page pool: the boot's
+/// capability bodies ([`boot_body_bound`], from the `InitInfo` descriptor
+/// capacity Phase 7 sized from this boot's counts), the
+/// [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`], and [`ROOT_CSPACE_INIT_HEADROOM_SLOTS`]
+/// for init.
 ///
 /// A pool below the peak slot count means `pre_allocate`'s grow loop hits
 /// an exhausted pool, the syscall errors out, and the userspace caller
@@ -339,7 +346,7 @@ const ROOT_CSPACE_INIT_HEADROOM_SLOTS: u64 = 1280;
 #[cfg(not(test))]
 fn root_cspace_init_slot_capacity() -> u64
 {
-    boot_body_bound() as u64 + ROOT_CSPACE_INIT_HEADROOM_SLOTS
+    boot_body_bound() as u64 + ROOT_CSPACE_BOOT_EXTRA_SLOTS + ROOT_CSPACE_INIT_HEADROOM_SLOTS
 }
 
 /// Pool pages of the root `CSpace` beyond its slots, for the bodies its arena
@@ -357,8 +364,8 @@ const ROOT_CSPACE_BODY_PAGES: u64 = 16;
 /// pages seed the slot-page pool. Sized so the pool holds at least
 /// [`root_cspace_init_slot_capacity`] slots regardless of `L2_SIZE`
 /// (slots-per-page), plus [`ROOT_CSPACE_BODY_PAGES`] for the bodies of init's
-/// splits. The slot-0 reservation on page 0 costs one slot and is absorbed by
-/// rounding up.
+/// splits. The slot-0 reservation on page 0 is one of the
+/// [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`].
 #[cfg(not(test))]
 fn root_cspace_init_pages() -> u64
 {
@@ -437,9 +444,10 @@ const fn init_info_descriptor_bound(
 static DESCRIPTOR_CAPACITY: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Host-test stand-in for the reserved block's capacity.
+/// Host-test stand-in for the reserved block's capacity: a four-page
+/// region's, enough for the test maps.
 #[cfg(test)]
-const TEST_DESCRIPTOR_CAPACITY: usize = 535;
+const TEST_DESCRIPTOR_CAPACITY: usize = descriptors_in_pages(4);
 
 /// Descriptors the reserved `InitInfo` block holds ([`DESCRIPTOR_CAPACITY`]).
 fn descriptor_capacity() -> usize
@@ -2851,6 +2859,52 @@ mod tests
             assert_eq!(d.aux1, 0x2000);
             assert!(cspace.slot(d.slot).is_some_and(|s| s.tag == CapTag::Memory));
         }
+    }
+
+    // Defect caught: a Phase 7 capability with a descriptor that the
+    // `InitInfo` bound does not count (a new fixed cap past the spare slots, or
+    // ACPI regions counted short), so a boot sized from the bound overruns the
+    // region it reserved.
+    #[test]
+    fn the_descriptor_bound_counts_every_non_ram_phase_7_descriptor()
+    {
+        let mut mmap = Vec::new();
+        for i in 0..5u64
+        {
+            mmap.push(MemoryMapEntry {
+                physical_base: 0x1000_0000 + i * 0x10_0000,
+                size: 0x2000,
+                memory_type: MemoryType::AcpiReclaimable,
+            });
+            mmap.push(MemoryMapEntry {
+                physical_base: 0x1000_8000 + i * 0x10_0000,
+                size: 0x1000,
+                memory_type: MemoryType::Usable,
+            });
+        }
+        // SAFETY: every `BootInfo` field is an integer, a raw pointer, an
+        // array of those, or a `repr(u32)` enum with a 0 variant, so the
+        // all-zero bit pattern is a valid value.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        info.acpi_rsdp = 0xE_0010;
+        let mut cspace = CSpace::new(0);
+        let layout = populate_cspace(
+            &mut cspace,
+            0,
+            &mmap,
+            crate::platform::ValidatedApertures::empty(),
+            &info,
+        );
+        let acpi_regions = mmap
+            .iter()
+            .filter(|e| e.memory_type == MemoryType::AcpiReclaimable)
+            .count();
+        let non_ram = layout.descriptor_count - layout.memory_count as usize;
+        assert_eq!(layout.acpi_region_memory_count as usize, acpi_regions);
+        assert!(
+            non_ram <= init_info_descriptor_bound(0, acpi_regions, 0, 0, 0),
+            "{non_ram} non-RAM descriptors past the bound"
+        );
     }
 
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────

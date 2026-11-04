@@ -141,8 +141,8 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     // Take the page address as a bare integer via `.addr()` (no provenance) and
     // rebuild the pointer with `with_exposed_provenance` so the slice is not
     // bounded by the narrower `&InitInfo` provenance — descriptors may span
-    // pages beyond the first one, and a pointer derived from `info`'s
-    // 112-byte allocation would let the optimiser assume out-of-bounds reads.
+    // pages beyond the first one, and a pointer derived from the header's
+    // allocation would let the optimiser assume out-of-bounds reads.
     let base_addr = core::ptr::from_ref::<InitInfo>(info).addr() + offset;
     let ptr = core::ptr::with_exposed_provenance::<CapDescriptor>(base_addr);
     // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor bytes

@@ -362,9 +362,9 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 // come from; the shared prefix keeps that provenance visible.
 // needless_range_loop: each indexed loop runs to a count it keeps in view: the
 // AP-startup loop uses cpu_idx as both the hw_ids index and the CPU ID; the
-// init-segment Memory-cap loop (i < segment_count) and the InitInfo Memory-cap
-// loop (pg < info_pages) test the index for the first slot; the init-segment
-// map loop takes the same i < segment_count form as the cap loop after it.
+// init-segment Memory-cap loop (i < segment_count) tests the index for the
+// first slot; the init-segment map loop takes the same i < segment_count form
+// as the cap loop after it.
 // cast_possible_truncation: every usize -> u32 cast is of a bounded value:
 // cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
 // desc_count and info_pages are bounded by the InitInfo region ceiling Phase 7
@@ -975,7 +975,7 @@ unsafe fn kernel_entry_post_rebase(
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
 
-            // Allocate and map each page.
+            // Map each page read-only.
             let flags = mm::paging::PageFlags {
                 readable: true,
                 writable: false,

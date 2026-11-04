@@ -43,7 +43,8 @@ zones are const-asserted disjoint and inside the address space for every support
 
 On the runtime side, `main_stack_growth` gives the range below a main-thread stack's committed
 pages, inside the stack reservation every layout leaves below the stack top, that ruststd's
-`_start` registers with the pager so the stack grows on demand (see
+`_start` registers with the pager in a demand-paged process whose image is `ET_DYN`, so the stack
+grows on demand (see
 [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Bootstrap
 Cross-Boundary VAs).
 

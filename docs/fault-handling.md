@@ -330,9 +330,8 @@ process-death path of [Process Lifecycle](process-lifecycle.md#process-death).
 
 Stack growth is built on it: the runtime registers each spawned thread's stack, and, for an
 `ET_DYN` image, the part of the main thread's stack below the pages the loader commits, as demand
-regions above an
-unregistered guard page, so a stack costs frames only as it grows and an overflow faults on an
-address the pager declines (see
+regions above an unregistered guard page, so a stack costs frames only as it grows and an overflow
+faults on an address the pager declines (see
 [Userspace Memory Model § Bootstrap Cross-Boundary VAs](userspace-memory-model.md#bootstrap-cross-boundary-vas)
 and [ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)).
 

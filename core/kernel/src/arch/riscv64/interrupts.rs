@@ -1159,13 +1159,13 @@ pub unsafe fn init()
     // Force sstatus.FS = sstatus.VS = 00 (Off). Kernel is soft-float
     // (RV64IMAC); any F/D or V instruction in U-mode now raises an illegal-
     // instruction trap, which the lazy save/restore path will use to
-    // demand-restore extended state. cache_vlenb runs on the BSP only and
-    // sizes every Thread's save area; each AP checks its own vlenb against
-    // it (`init_ap`) and halts the boot on a mismatch.
+    // demand-restore extended state. The boot hart's vlenb, which sizes
+    // every Thread's save area, is read later in Phase 5, once the per-CPU
+    // pointer is installed (`fpu::report_save_area`); each AP checks its own
+    // against it (`init_ap`) and halts the boot on a mismatch.
     // SAFETY: ring-0 boot; csrc sstatus is privileged S-mode.
     unsafe {
         super::fpu::enable_fpu_vector();
-        super::fpu::cache_vlenb();
     }
 
     // Enable SSIP (bit 1), STIP (bit 5), and SEIP (bit 9) in sie.
@@ -1247,7 +1247,8 @@ pub unsafe fn init_ap()
     // `fpu::check_ap_vlenb` is of an unprivileged read-only CSR, which needs
     // sstatus.VS on (`fpu::read_vlenb` promotes it) and, on a hart without V,
     // traps to the fatal handler, so it runs after the stvec install and the
-    // sscratch clear. The one shared state read is the boot hart's cached
+    // sscratch clear, with tp already installed by `percpu::init_ap` (the
+    // caller runs it first). The one shared state read is the boot hart's cached
     // vlenb, written once at BSP init before any AP starts; that check may
     // halt the boot.
     unsafe {

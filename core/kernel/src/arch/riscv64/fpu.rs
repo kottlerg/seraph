@@ -390,7 +390,7 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 /// trapping instruction would re-trap forever).
 ///
 /// The V restore is skipped when [`vlenb`] is zero, which holds only before
-/// [`cache_vlenb`] runs at BSP init. Every hart is probed at boot: the boot
+/// [`cache_vlenb`] runs in Phase 5. Every hart is probed at boot: the boot
 /// hart in [`cache_vlenb`], each secondary hart in [`check_ap_vlenb`], whose
 /// `vlenb` read takes a fatal supervisor illegal-instruction trap on a hart
 /// without V and which halts on a `vlenb` other than the boot hart's
@@ -449,8 +449,9 @@ pub unsafe fn lazy_restore_fp_v(_area: *const u8, _frame: &mut super::trap_frame
 static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Return the boot hart's cached `vlenb`, which every secondary hart shares
-/// ([`check_ap_vlenb`]). Returns 0 only before [`cache_vlenb`] runs at BSP
-/// init (docs/platform-requirements.md § Boot-Time Feature Gate).
+/// ([`check_ap_vlenb`]). Returns 0 only before [`cache_vlenb`] runs in Phase
+/// 5 ([`report_save_area`]; docs/platform-requirements.md § Boot-Time Feature
+/// Gate).
 // dead_code fires only under `test`: `vlenb` is read only by non-test code
 // (`lazy_restore_fp_v`, `check_ap_vlenb`); their `#[cfg(test)]` stubs do not
 // reference it.
@@ -478,9 +479,10 @@ const VLENB_SPEC_MAX: u64 = 8192;
 /// treats as a fatal kernel exception: that is how such a hart is refused.
 ///
 /// # Safety
-/// Must execute in supervisor mode, with this hart's trap vector installed
-/// and `sscratch` zero, so a trap on a hart without V takes the S-mode path
-/// to the fatal handler.
+/// Must execute in supervisor mode, with this hart's trap vector installed,
+/// `sscratch` zero and its per-CPU pointer (`tp`) installed
+/// (`percpu::init_bsp` / `percpu::init_ap`), so a trap on a hart without V
+/// takes the S-mode path to the fatal handler, which reads `current_cpu()`.
 #[cfg(not(test))]
 unsafe fn read_vlenb() -> u64
 {
@@ -529,13 +531,12 @@ unsafe fn read_vlenb() -> u64
 /// `vlenb` is accepted: the save area grows with it.
 ///
 /// # Safety
-/// Must execute in supervisor mode.
+/// [`read_vlenb`]'s contract, on the boot hart.
 #[cfg(not(test))]
-pub unsafe fn cache_vlenb()
+unsafe fn cache_vlenb()
 {
-    // SAFETY: the caller's contract; BSP init runs this after installing the
-    // trap vector with sscratch zero, so a boot hart without V halts in the
-    // trap handler.
+    // SAFETY: the caller's contract is `read_vlenb`'s, so a boot hart without
+    // V halts in the trap handler at the read.
     let v = unsafe { read_vlenb() };
     if v == 0 || v > VLENB_SPEC_MAX || !v.is_power_of_two()
     {
@@ -549,9 +550,21 @@ pub unsafe fn cache_vlenb()
     crate::sched::thread_slot::set_extended_bytes(V_REGS_OFFSET + 32 * v);
 }
 
-/// No-op test stub.
-#[cfg(test)]
-pub unsafe fn cache_vlenb() {}
+/// Read the boot hart's `vlenb` and report the per-thread save area it
+/// needs ([`cache_vlenb`]). The arch contract's `fpu::report_save_area`,
+/// called by Phase 5 after `percpu::init_bsp`.
+///
+/// # Safety
+/// Must execute in supervisor mode on the boot hart, once, after
+/// `interrupts::init` installed the trap vector and cleared `sscratch` and
+/// `percpu::init_bsp` installed `tp` ([`read_vlenb`]), and before any Thread
+/// is created.
+#[cfg(not(test))]
+pub unsafe fn report_save_area()
+{
+    // SAFETY: the caller's contract is `cache_vlenb`'s.
+    unsafe { cache_vlenb() };
+}
 
 /// Halt the boot when this secondary hart's `vlenb` differs from the boot
 /// hart's. Every Thread's save area is sized from the boot hart's `vlenb`,
@@ -562,7 +575,7 @@ pub unsafe fn cache_vlenb() {}
 ///
 /// # Safety
 /// Must execute in supervisor mode, after this hart installed its trap
-/// vector and cleared `sscratch` ([`read_vlenb`]).
+/// vector, cleared `sscratch` and installed `tp` ([`read_vlenb`]).
 #[cfg(not(test))]
 pub unsafe fn check_ap_vlenb()
 {

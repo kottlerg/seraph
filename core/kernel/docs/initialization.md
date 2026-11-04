@@ -299,9 +299,7 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
    already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE
-2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore,
-   then report the XSAVE size of the enabled components (CPUID leaf 0xD), which sizes every
-   Thread slot's save area (`sched::thread_slot`)
+2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
 3. Construct and install the permanent GDT and the BSP's TSS:
    - Null descriptor (index 0)
    - Kernel code segment (64-bit, DPL 0)
@@ -345,10 +343,7 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SIE (interrupts stay disabled until timer::init sets SIE at the end of this phase)
    - Clear SPP (so sret returns to U-mode by default)
    - Clear SUM (no supervisor access to user pages)
-   - Set FS and VS Off for lazy FPU/vector save-restore and cache vlenb (halts without
-     the V extension, or with a vlenb of 0, above 8192, or not a power of two), which sizes
-     every Thread slot's save area (`sched::thread_slot`); each AP checks its vlenb against it
-     at bring-up and halts the boot on a mismatch
+   - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
 5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
@@ -365,6 +360,14 @@ On both architectures, right after the interrupt-controller step, the BSP alloca
 routing table from the buddy allocator, one entry per line the discovered controllers
 implement (`irq::init_table` with `interrupts::irq_line_count`: the I/O APICs' GSIs on x86-64,
 the PLIC's sources on RISC-V), before any line is routed; its failure is fatal.
+
+Right after its per-CPU install, the BSP reports its extended-state save-area size
+(`fpu::report_save_area`), which sizes every Thread slot (`sched::thread_slot`) and the
+Phase 7 seed reserve: on x86-64 the XSAVE size of the enabled components (CPUID leaf 0xD), on
+RISC-V `304 + 32 * vlenb` from the boot hart's `vlenb`, read there rather than at step 2 so
+the fatal trap a hart without V takes at the read finds its per-CPU pointer installed. A
+`vlenb` of 0, above 8192, or not a power of two halts the boot by name; each AP checks its own
+`vlenb` against the boot hart's at bring-up (Phase 8) and halts the boot on a mismatch.
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging

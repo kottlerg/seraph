@@ -523,6 +523,19 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     PANIC_DUMP_READY.store(true, core::sync::atomic::Ordering::Release);
     kprintln!("percpu ok");
+    // Report the boot CPU's extended-state save-area size, which sizes every
+    // Thread slot (`sched::thread_slot`) and so the Phase 7 seed reserve:
+    // x86-64 the XSAVE size of the components `interrupts::init` enabled,
+    // riscv64 the boot hart's vlenb. After `percpu::init_bsp`, because a
+    // riscv64 hart without V takes a fatal trap at that read, and the trap
+    // handler reads `current_cpu()`.
+    #[cfg(not(test))]
+    // SAFETY: BSP, single-threaded boot; the trap vector (and riscv64
+    // sscratch) is installed by `interrupts::init` and the per-CPU pointer
+    // by `percpu::init_bsp`, above; called once, before any Thread exists.
+    unsafe {
+        arch::current::fpu::report_save_area();
+    }
     // Assert the boot-gated paging extensions (riscv64: Svpbmt / Svinval /
     // Svnapot from the bootloader-confirmed hart caps; x86-64: no-op). The
     // paging code uses them unconditionally from here on.

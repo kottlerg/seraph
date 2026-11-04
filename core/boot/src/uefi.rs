@@ -802,6 +802,23 @@ pub unsafe fn free_pages(bs: *mut EfiBootServices, phys: u64, count: usize)
     Ok(())
 }
 
+/// Check a descriptor size the firmware reported: a stride below
+/// `EFI_MEMORY_DESCRIPTOR`'s would make every reader of the map read past each
+/// descriptor and, at the last stride, past the map.
+///
+/// # Errors
+/// [`BootError::InvalidMemoryMap`] for a size below the descriptor's.
+pub fn check_descriptor_size(descriptor_size: usize) -> Result<(), BootError>
+{
+    if descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
+    {
+        return Err(BootError::InvalidMemoryMap(
+            "descriptor size below EFI_MEMORY_DESCRIPTOR",
+        ));
+    }
+    Ok(())
+}
+
 /// The `(map_size, descriptor_size)` the firmware's memory map needs now, from
 /// the size query `GetMemoryMap` answers with a null buffer; nothing is
 /// allocated.
@@ -846,12 +863,7 @@ pub unsafe fn memory_map_descriptor_count(bs: *mut EfiBootServices) -> Result<us
 {
     // SAFETY: forwarded caller contract.
     let (map_size, descriptor_size) = unsafe { query_memory_map_size(bs)? };
-    if descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
-    {
-        return Err(BootError::InvalidMemoryMap(
-            "descriptor size below EFI_MEMORY_DESCRIPTOR",
-        ));
-    }
+    check_descriptor_size(descriptor_size)?;
     Ok(map_size / descriptor_size)
 }
 
@@ -904,12 +916,7 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     {
         return Err(BootError::UefiError(status));
     }
-    if descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
-    {
-        return Err(BootError::InvalidMemoryMap(
-            "descriptor size below EFI_MEMORY_DESCRIPTOR",
-        ));
-    }
+    check_descriptor_size(descriptor_size)?;
 
     Ok(MemoryMapResult {
         buffer_phys,
@@ -995,7 +1002,11 @@ pub unsafe fn exit_boot_services(
         {
             return Err(BootError::ExitBootServicesFailed);
         }
+        // The re-query rewrote the map body at the stride it reports, which is
+        // the one the body must be read at.
+        check_descriptor_size(descriptor_size)?;
         map.map_size = map_size;
+        map.descriptor_size = descriptor_size;
     }
 }
 
@@ -1286,4 +1297,29 @@ pub unsafe fn find_config_table(
         }
     }
     None
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::{BootError, EfiMemoryDescriptor, check_descriptor_size};
+
+    // Defect caught: a stride below the descriptor accepted, so the map
+    // readers read past each descriptor; or a conforming stride refused.
+    #[test]
+    fn only_a_stride_below_the_descriptor_is_refused()
+    {
+        let full = core::mem::size_of::<EfiMemoryDescriptor>();
+        for short in [0, 8, full - 1]
+        {
+            assert!(matches!(
+                check_descriptor_size(short),
+                Err(BootError::InvalidMemoryMap(_))
+            ));
+        }
+        assert!(check_descriptor_size(full).is_ok());
+        assert!(check_descriptor_size(full + 8).is_ok());
+    }
 }

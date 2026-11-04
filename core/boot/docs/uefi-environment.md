@@ -170,7 +170,9 @@ The call sequence:
 3. If the call returns EFI_INVALID_PARAMETER (stale map key):
    a. Call GetMemoryMap again with the existing buffer (no new allocation),
       passing the full allocated buffer capacity as the size in-param.
-   b. Update map_key from the new call.
+   b. Update map_key, the map size and the descriptor size from the new call,
+      rejecting a descriptor size below EFI_MEMORY_DESCRIPTOR's (the body it
+      rewrote is read at that stride).
    c. Retry ExitBootServices.
    d. Repeat from step 3 up to EXIT_BOOT_SERVICES_MAX_ATTEMPTS times total.
    e. If still failing after the bound: halt — the environment is unrecoverable.

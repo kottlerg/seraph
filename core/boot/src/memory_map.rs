@@ -17,6 +17,60 @@ use crate::uefi::{
 };
 use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
+// ── Raw descriptor iteration ─────────────────────────────────────────────────
+
+/// Iterator over the descriptors of a raw UEFI memory map, yielding each
+/// descriptor by value.
+///
+/// Invariant (the contract of [`RawDescriptors::new`]): the map's buffer holds
+/// valid descriptors covering `map_size` bytes at `descriptor_size` strides for
+/// the iterator's lifetime.
+#[derive(Clone)]
+struct RawDescriptors<'a>
+{
+    map: &'a crate::uefi::MemoryMapResult,
+    offset: usize,
+}
+
+impl<'a> RawDescriptors<'a>
+{
+    /// # Safety
+    /// `map.buffer_phys` must hold valid `EfiMemoryDescriptor`s covering
+    /// `map.map_size` bytes at `map.descriptor_size` strides, readable for `'a`.
+    unsafe fn new(map: &'a crate::uefi::MemoryMapResult) -> Self
+    {
+        Self { map, offset: 0 }
+    }
+}
+
+impl Iterator for RawDescriptors<'_>
+{
+    type Item = EfiMemoryDescriptor;
+
+    fn next(&mut self) -> Option<EfiMemoryDescriptor>
+    {
+        // A stride below the descriptor would read past it and, at the last
+        // stride, past `map_size`; `get_memory_map` rejects one, and the guard
+        // reads nothing from a map that carries one, a zero stride included.
+        if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
+            || self.offset + self.map.descriptor_size > self.map.map_size
+        {
+            return None;
+        }
+        // cast_possible_truncation: buffer_phys is a UEFI physical address;
+        // on all supported UEFI targets (x86_64, riscv64) usize == u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let ptr = (self.map.buffer_phys as usize + self.offset) as *const EfiMemoryDescriptor;
+        self.offset += self.map.descriptor_size;
+        // SAFETY: the type invariant (`new`'s contract) puts a valid descriptor
+        // at every stride below `map_size`; `read_unaligned` makes no alignment
+        // demand on a firmware-chosen stride.
+        Some(unsafe { core::ptr::read_unaligned(ptr) })
+    }
+}
+
+// ── Memory map translation ───────────────────────────────────────────────────
+
 /// Outcome of [`translate_memory_map`]: the entries written, and the
 /// descriptors past the output's capacity that were not, split by whether
 /// they translate to RAM.
@@ -42,7 +96,8 @@ fn is_ram(t: MemoryType) -> bool
 
 /// Translate a UEFI memory map into the boot protocol's `MemoryMapEntry` format.
 ///
-/// Iterates `uefi_map.map_size / uefi_map.descriptor_size` descriptors and
+/// Iterates `uefi_map.map_size / uefi_map.descriptor_size` descriptors (none
+/// when the descriptor size is below `EFI_MEMORY_DESCRIPTOR`'s) and
 /// converts each UEFI memory type to a [`MemoryType`]. Writes at most
 /// `max_entries` entries to `out` and counts the descriptors past that
 /// capacity, by class, in the returned [`MapTranslation`], so the caller can
@@ -51,7 +106,9 @@ fn is_ram(t: MemoryType) -> bool
 /// # Safety
 /// `out` must point to an allocation of at least `max_entries * size_of::<MemoryMapEntry>()`
 /// bytes. `uefi_map.buffer_phys` must be the UEFI raw map buffer from the most
-/// recent `GetMemoryMap` call, with valid descriptors.
+/// recent `GetMemoryMap` call, holding valid descriptors covering
+/// `uefi_map.map_size` bytes at `uefi_map.descriptor_size` strides (the contract
+/// of `RawDescriptors::new`).
 pub unsafe fn translate_memory_map(
     uefi_map: &crate::uefi::MemoryMapResult,
     out: *mut MemoryMapEntry,
@@ -61,7 +118,7 @@ pub unsafe fn translate_memory_map(
     let mut result = MapTranslation::default();
     let mut count: usize = 0;
 
-    // SAFETY: the caller's contract is `RawDescriptors::new`'s.
+    // SAFETY: this function's `# Safety` contract is `RawDescriptors::new`'s.
     for desc in unsafe { RawDescriptors::new(uefi_map) }
     {
         let memory_type = translate_memory_type(desc.memory_type);
@@ -123,56 +180,6 @@ fn translate_memory_type(uefi_type: u32) -> MemoryType
 }
 
 // ── MMIO aperture derivation ─────────────────────────────────────────────────
-
-/// Iterator over the descriptors of a raw UEFI memory map, yielding each
-/// descriptor by value.
-///
-/// Invariant (the contract of [`RawDescriptors::new`]): the map's buffer holds
-/// valid descriptors covering `map_size` bytes at `descriptor_size` strides for
-/// the iterator's lifetime.
-#[derive(Clone)]
-struct RawDescriptors<'a>
-{
-    map: &'a crate::uefi::MemoryMapResult,
-    offset: usize,
-}
-
-impl<'a> RawDescriptors<'a>
-{
-    /// # Safety
-    /// `map.buffer_phys` must hold valid `EfiMemoryDescriptor`s covering
-    /// `map.map_size` bytes at `map.descriptor_size` strides, readable for `'a`.
-    unsafe fn new(map: &'a crate::uefi::MemoryMapResult) -> Self
-    {
-        Self { map, offset: 0 }
-    }
-}
-
-impl Iterator for RawDescriptors<'_>
-{
-    type Item = EfiMemoryDescriptor;
-
-    fn next(&mut self) -> Option<EfiMemoryDescriptor>
-    {
-        // A stride below the descriptor would read past it and, at the last
-        // stride, past `map_size`; `get_memory_map` rejects one, and the guard
-        // reads nothing from a map that carries one, a zero stride included.
-        if self.map.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
-            || self.offset + self.map.descriptor_size > self.map.map_size
-        {
-            return None;
-        }
-        // cast_possible_truncation: buffer_phys is a UEFI physical address;
-        // on all supported UEFI targets (x86_64, riscv64) usize == u64.
-        #[allow(clippy::cast_possible_truncation)]
-        let ptr = (self.map.buffer_phys as usize + self.offset) as *const EfiMemoryDescriptor;
-        self.offset += self.map.descriptor_size;
-        // SAFETY: the type invariant (`new`'s contract) puts a valid descriptor
-        // at every stride below `map_size`; `read_unaligned` makes no alignment
-        // demand on a firmware-chosen stride.
-        Some(unsafe { core::ptr::read_unaligned(ptr) })
-    }
-}
 
 /// Whether a UEFI memory type is subtracted from every named aperture seed: RAM
 /// (`EfiConventionalMemory`, `EfiBootServices*`, `EfiLoader*`,

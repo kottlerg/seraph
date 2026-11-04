@@ -320,9 +320,10 @@ impl CSpaceRegistry
             .store(self.free_head.load(Ordering::Relaxed), Ordering::Relaxed);
         self.free_head.store(id, Ordering::Relaxed);
         // Every retired id was handed out by `alloc` (the pre-condition), so
-        // the count is at least one here; a double retire trips the assert.
+        // the count is at least one here; a retire with no id live trips the
+        // assert rather than wrapping the count.
         let live = self.live.load(Ordering::Relaxed);
-        debug_assert!(live > 0, "retire of an id alloc did not hand out");
+        debug_assert!(live > 0, "retire with no CSpace id live");
         self.live.store(live.wrapping_sub(1), Ordering::Relaxed);
         // SAFETY: paired with lock_raw above.
         unsafe { self.free_lock.unlock_raw(saved) };
@@ -506,6 +507,20 @@ mod tests
         reg.retire(b, 9);
         reg.retire(c, 11);
         assert_eq!(reg.live(), 0);
+    }
+
+    // Defect caught: a retire with no id live wrapping the count silently
+    // (the assert dropped, or the decrement made saturating again).
+    #[test]
+    #[should_panic(expected = "retire with no CSpace id live")]
+    fn a_retire_with_no_id_live_trips_the_count_assert()
+    {
+        let reg = registry(1);
+        let a = reg.alloc().unwrap();
+        reg.retire(a, 7);
+        // A second retire of the same id, with no id live; a distinct epoch so
+        // the epoch assert does not fire first.
+        reg.retire(a, 9);
     }
 
     // Defect caught: a failed `alloc` (the `None` arm) that still raises the

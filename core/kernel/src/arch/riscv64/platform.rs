@@ -182,8 +182,9 @@ pub fn uart_base_for_boot_info(km: &KernelMmio) -> u64
 // window selection through `boot_protocol::layout`; the riscv64 variant
 // always returns 0 (PLIC + UART lie inside the RAM direct map).
 pub use boot_protocol::layout::collect_mmio_direct_map_regions;
-// The most entries `collect_mmio_direct_map_regions` writes, which sizes the
-// Phase 3 buffer: the producer's own bound, so the two cannot disagree.
+
+/// The most entries [`collect_mmio_direct_map_regions`] writes, which sizes
+/// the Phase 3 buffer: the producer's own bound, so the two cannot disagree.
 pub use boot_protocol::layout::MAX_MMIO_DIRECT_MAP_REGIONS as MMIO_DIRECT_MAP_REGIONS;
 
 #[cfg(test)]

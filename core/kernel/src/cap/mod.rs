@@ -740,7 +740,7 @@ static INIT_STACK_PHYS: [core::sync::atomic::AtomicU64; INIT_STACK_PAGES] =
 pub(crate) struct DescriptorCounts
 {
     /// `AcpiReclaimable` memory-map entries, at most one ACPI region cap each
-    /// (none for a zero-length entry).
+    /// (none for an entry whose page-rounded span is empty).
     pub acpi_regions: usize,
     /// MMIO apertures, one `Mmio` cap each.
     pub apertures: usize,
@@ -755,8 +755,8 @@ impl DescriptorCounts
 {
     /// The counts of `mmap`'s `AcpiReclaimable` entries, `apertures` and
     /// `info`'s module and reclaim arrays: Phases 7 and 8 mint at most one
-    /// descriptor per entry of each (a zero-length ACPI entry or reclaim range
-    /// gets none).
+    /// descriptor per entry of each (an ACPI entry whose page-rounded span is
+    /// empty, or a zero-length reclaim range, gets none).
     fn of(
         mmap: &[MemoryMapEntry],
         apertures: &crate::platform::ValidatedApertures,

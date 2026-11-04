@@ -12,10 +12,10 @@
 //! RVA23 floor, defines no speculation barrier (`fence` orders memory
 //! accesses and `fence.i` synchronises instruction fetch; neither bounds
 //! speculative execution), so a data dependency is the only portable bound.
-//! The arch-neutral helpers built on the two are in `crate::arch::nospec`;
-//! the rule they serve is docs/capability-model.md § Capability Spaces, and
-//! the mechanism is core/kernel/docs/capability-internals.md
-//! § Speculative-Execution Hardening.
+//! The arch-neutral helpers built on [`index_mask`] and [`hide`] are in
+//! `crate::arch::nospec`; the rule they serve is docs/capability-model.md
+//! § Capability Spaces, and the mechanism is
+//! core/kernel/docs/capability-internals.md § Speculative-Execution Hardening.
 
 /// All-ones when `index < bound`, zero otherwise, computed without a branch.
 ///

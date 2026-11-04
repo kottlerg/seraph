@@ -142,8 +142,9 @@ RV64I, since the RVA23 floor defines no speculation barrier). It is inline assem
 compiler cannot prove the mask redundant inside the arm of the guarding branch and delete it, and
 it is not `pure`, so it is not moved into such an arm either. `hide` passes a value through an
 empty, non-`pure` assembly block, giving a copy the compiler cannot relate to the original.
-`arch::nospec` builds the arch-neutral forms on the two: `mask_index`, `mask_index_u64`, `mask_if`
-(all-ones when a condition holds), `hide`, and `select_ptr` (one of two pointers chosen by a mask).
+`arch::nospec` builds the arch-neutral forms on the two: `index_mask`, `mask_index`,
+`mask_index_u64`, `mask_if` (all-ones when a condition holds), `hide`, and `select_ptr` (one of two
+pointers chosen by a mask).
 
 A mask's output is opaque but its input is not. A condition that a dominating branch has already
 tested is a constant inside that branch's arm, so a condition mask (`mask_if`) taken there on the

@@ -937,7 +937,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 
     let mut child =
         crate::spawn::new_child(ctx).map_err(|_| "teardown_batch: spawn::new_child failed")?;
-    // Headroom for the derive burst (default child pool backs 167 slots).
+    // Headroom for the derive burst (the default child pool backs
+    // 3 × `CSPACE_SLOTS_PER_PAGE` − 1 slots).
     cap_create_cspace(ctx.memory_base, child.cs, 4)
         .map_err(|_| "teardown_batch: child cspace augment failed")?;
     let child_ep = cap_copy(ep, child.cs, syscall_abi::RIGHTS_EP_SEND)

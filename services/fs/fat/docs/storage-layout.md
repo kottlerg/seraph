@@ -52,14 +52,16 @@ in [crash-safety.md](crash-safety.md).
   always allocate distinct `NodeId`s, even when both are empty files
   at cluster 0. The table is a heap-grown `fat_parse::node_slab::NodeSlab`:
   a `NodeId` packs a 24-bit index and a 16-bit generation, and every holder
-  of an entry shares its one node. `FS_CLOSE` frees no node, since the
-  driver cannot tell which holder a close comes from; `FS_REMOVE` and
-  `FS_RENAME` free the unlinked slot's node, and its open-file slot with
-  it. A freed index is reused under the next generation and retired when
-  the generation would wrap, so a stale cap names no node.
-* **Open-file table** (`src/file.rs`): one slot per node read through
-  `FS_READ_MEMORY`, grown on demand and reused once closed; each slot's
-  outstanding-page table grows up to the cache's slot count.
+  of an entry shares its one node. `FS_CLOSE` frees an open, never a
+  node; `FS_REMOVE` and `FS_RENAME` free the unlinked slot's node, and
+  every open of it with it. A freed index is reused under the next
+  generation and retired when the generation would wrap, so a stale cap
+  names no node.
+* **Open table** (`src/file.rs`): one `OpenFile` per `FS_OPEN`, in a
+  heap-grown `fat_parse::open_slab::OpenSlab` whose generation-checked id
+  is the open cap's badge; at most 2^24 - 1 live opens, with no
+  per-client bound. Each open holds its own release SEND and an
+  outstanding-page table that grows up to the cache's slot count.
 * **Eviction worker** (`src/eviction.rs`): the read-side cooperative release. It sends
   `FS_RELEASE_MEMORY`, waits up to 100 ms for the ack, then revokes the page's caps and drops the
   slot. The send runs on a watchdog thread, which a client that never replies leaves blocked; with

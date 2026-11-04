@@ -1289,18 +1289,22 @@ pub mod ns_labels
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const FS_LABELS_VERSION: u32 = 3;
+pub const FS_LABELS_VERSION: u32 = 4;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
-    /// Read from a node cap (driver-side). Inline reply: `data[0]` =
-    /// bytes read, payload follows starting at word 1. Drivers cap
-    /// per-call payload at the IPC inline ceiling; callers iterate.
+    /// Read from a file node cap or open cap (driver-side). Inline reply:
+    /// `data[0]` = bytes read, payload follows starting at word 1. Drivers
+    /// cap per-call payload at the IPC inline ceiling; callers iterate.
     pub const FS_READ: u64 = 2;
-    /// Close a node cap, releasing any lazily-allocated driver-side
-    /// bookkeeping bound to the file (outstanding `FS_READ_MEMORY`
-    /// pages, open-file slot, etc.). The caller still cap-deletes the
-    /// node cap to drop the kernel-side reference.
+    /// Close an open cap ([`FS_OPEN`]): the driver revokes that open's
+    /// outstanding [`FS_READ_MEMORY`] pages, deletes its recorded release
+    /// SEND, and retires the open, so the open cap answers
+    /// `fs_errors::INVALID_BADGE` from then on. Other opens of the file are
+    /// untouched. A node cap is answered `fs_errors::INVALID_BADGE`. The
+    /// caller still cap-deletes the open cap to drop the kernel-side
+    /// reference. Specified in `services/fs/docs/fs-driver-protocol.md`
+    /// § Label 3: `FS_CLOSE`.
     pub const FS_CLOSE: u64 = 3;
     /// Inline write to a file node cap.
     ///
@@ -1321,14 +1325,13 @@ pub mod fs_labels
     pub const END_OF_DIR: u64 = 6;
     /// Read file content into a cached Memory cap returned in the reply.
     ///
-    /// Request: badge identifies the file (per-file cap), `data[0]` =
-    /// byte offset (no alignment requirement), `data[1]` = client-chosen
-    /// release cookie (must be non-zero; one full data word the client
-    /// picks per page, so its width bounds no count). `caps[0]` = optional
-    /// per-process release-endpoint SEND for cooperative `FS_RELEASE_MEMORY`; which
-    /// request carries it, and which carried SEND the driver records, are
-    /// specified in services/fs/docs/fs-driver-protocol.md § Label 7
-    /// (the record is per node, not per client).
+    /// Request: badge identifies the open ([`FS_OPEN`]'s open cap; a node
+    /// cap is answered `fs_errors::INVALID_BADGE`), `data[0]` = byte offset
+    /// (no alignment requirement), `data[1]` = client-chosen release cookie
+    /// (must be non-zero; one full data word the client picks per page, so
+    /// its width bounds no count). No caps: the driver deletes any the
+    /// request carries. The page is the open's until released or the open
+    /// is closed (services/fs/docs/fs-driver-protocol.md § Label 7).
     /// Reply: `data[0]` = bytes valid in the returned page starting at
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page
@@ -1344,9 +1347,8 @@ pub mod fs_labels
     /// Release of a previously-returned page, in either direction.
     ///
     /// Driver-to-client (cooperative eviction): sent on the release endpoint
-    /// cap recorded in the node's open-file slot, the first one an
-    /// [`FS_READ_MEMORY`] reaching that slot carried (shared per node, not per
-    /// client; tracked in #530); `data[0]` = the release cookie naming
+    /// SEND that the [`FS_OPEN`] of the open that read the page carried;
+    /// `data[0]` = the release cookie naming
     /// the Memory cap to unmap. The client unmaps it and replies
     /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish
     /// within the watchdog window; any other reply label is no ack (the std
@@ -1354,12 +1356,12 @@ pub mod fs_labels
     /// with none, the driver revokes the page's parent Memory cap.
     ///
     /// Client-to-driver (synchronous release after a read): sent on the
-    /// per-node badged cap the page was read through; `data[0]` = the
-    /// release cookie from the [`FS_READ_MEMORY`] reply. The driver revokes
-    /// the page's derived caps and frees its cache slot. Reply: empty body
-    /// on success (an unmatched cookie is a no-op success);
+    /// open cap the page was read through; `data[0]` = the release cookie
+    /// from the [`FS_READ_MEMORY`] reply. The driver revokes the page's
+    /// derived caps and frees its cache slot. Reply: empty body on success
+    /// (a cookie matching no page of that open is a no-op success);
     /// `fs_errors::PERMISSION_DENIED` when the badge carries no namespace
-    /// rights.
+    /// rights, `fs_errors::INVALID_BADGE` on a node cap or a closed open.
     ///
     /// See `services/fs/docs/fs-driver-protocol.md` "Label 8:
     /// `FS_RELEASE_MEMORY`" for the authoritative contract.
@@ -1446,6 +1448,21 @@ pub mod fs_labels
     /// is supported. Specified, with its errors, in
     /// `services/fs/docs/fs-driver-protocol.md` § Label 17: `FS_TRUNCATE`.
     pub const FS_TRUNCATE: u64 = 17;
+    /// Open a file: mint a per-open cap on the driver's endpoint.
+    ///
+    /// Request: badge = file-node cap (any non-empty rights), empty body,
+    /// `caps[0]` = optional release-endpoint SEND for the open's cooperative
+    /// [`FS_RELEASE_MEMORY`] (omitted to opt out). Reply (label
+    /// `fs_errors::SUCCESS`): `caps[0]` = the open cap, carrying the node
+    /// cap's rights; its badge names the open
+    /// (`namespace_protocol::OPEN_INSTANCE`). [`FS_READ_MEMORY`],
+    /// [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the open cap; the
+    /// stateless file labels accept either cap. Errors: `INVALID_BADGE` (no
+    /// such node, a directory, or an open cap), `PERMISSION_DENIED`,
+    /// `TOO_MANY_OPEN` (the driver's open table is full or cannot grow).
+    /// Specified in `services/fs/docs/fs-driver-protocol.md` § Label 18:
+    /// `FS_OPEN`.
+    pub const FS_OPEN: u64 = 18;
 }
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above

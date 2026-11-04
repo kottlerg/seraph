@@ -235,7 +235,7 @@ Authoritative wire shapes for `REGISTER_PARTITION`,
 `BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, and `BLK_GET_GEOMETRY`
 live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
-The fs-driver side — `FS_MOUNT`, `FS_READ`, `FS_READ_MEMORY`,
+The fs-driver side — `FS_MOUNT`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
 `FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,
 `FS_TRUNCATE`, `FS_CLOSE`, and the directory-mutation labels — is owned by
 [`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).

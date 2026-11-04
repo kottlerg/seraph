@@ -52,7 +52,8 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 /// direct map, and the kernel's Phase 3 identity window over the stack is
 /// derived from it. The reference bootloader allocates exactly this many bytes
 /// of stack, above one guard page its page tables leave unmapped
-/// (core/boot/docs/boot-flow.md § Step 6).
+/// (core/boot/docs/boot-flow.md § Step 6), and which the kernel's direct map
+/// leaves unmapped too when the stack's base mark confirms that layout.
 ///
 /// Measured bound (the kernel's paint report, ktest `stress::stack_depth`): debug
 /// builds peak at 15304 B of it on `x86_64` at 4, 16 and 128 CPUs, and on

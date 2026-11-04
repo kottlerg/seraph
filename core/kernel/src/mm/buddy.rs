@@ -85,8 +85,9 @@ pub unsafe trait PhysWindow
 /// The kernel's window: the direct physical map, live from Phase 3.
 pub struct DirectMap;
 
-// SAFETY: the direct map covers all RAM from Phase 3 on
-// (core/kernel/docs/initialization.md § Phase 3), the allocator is populated
+// SAFETY: the direct map covers all RAM from Phase 3 on but the kernel-stack
+// guard pages, none of them a free block (core/kernel/docs/initialization.md
+// § Phase 3; `mm::stack_guard`), the allocator is populated
 // only after it is live, and a free block is page-aligned RAM that only the
 // allocator accesses (the `add_region` and `free` contracts).
 unsafe impl PhysWindow for DirectMap

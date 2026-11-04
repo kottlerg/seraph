@@ -1178,13 +1178,16 @@ pub enum SystemInfoType
     /// `InvalidArgument`. The classes and what each counts are in
     /// core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`.
     StackHighWater = 9,
-    /// Raw retype debit of one `Thread`, in bytes: the kernel stack, one page
-    /// holding the object wrapper and the thread control block, and the
-    /// extended-state (FPU, SIMD, vector) save area, all page-granular. The
-    /// save area's size is the boot CPU's (on x86-64 the XSAVE size of the
-    /// enabled components, on riscv64 `304 + 32 * vlenb`, each rounded up to
-    /// whole pages), so it is fixed for a boot but not across machines. A
-    /// process sizes the Memory cap it retypes a thread from with it.
+    /// Raw retype debit of one `Thread`, in bytes: one guard page, the kernel
+    /// stack, one page holding the object wrapper and the thread control
+    /// block, and the extended-state (FPU, SIMD, vector) save area, all
+    /// page-granular. The guard page is the caller's memory and unusable
+    /// while the thread exists: the kernel unmaps it below the stack so an
+    /// overflow faults. The save area's size is the boot CPU's (on x86-64 the
+    /// XSAVE size of the enabled components, on riscv64 `304 + 32 * vlenb`,
+    /// each rounded up to whole pages), so it is fixed for a boot but not
+    /// across machines. A process sizes the Memory cap it retypes a thread
+    /// from with it.
     ThreadRetypeBytes = 10,
     /// Number of `CSpace` ids in use system-wide: the kernel's `CSpace`
     /// registry ids allocated and not yet returned by a `CSpace` teardown, the

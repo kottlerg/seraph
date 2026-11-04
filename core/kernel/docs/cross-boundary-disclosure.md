@@ -58,7 +58,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of the frames in a window of a Memory region | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
-| `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
+| `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
 | `SYS_SYSTEM_INFO(LiveCSpaceCount)` → the number of `CSpace` registry ids in use system-wide, every process's `CSpace`s included; a count that names no id, epoch, or kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `cap::live_cspace_count` | d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
@@ -279,8 +279,10 @@ framebuffer) prints only the opaque `kaslr_flags`. Paths that end in `fatal`, wh
 faulting CPU (so on SMP the rest of the system, userspace included, keeps running), print an
 address-free header via `kprintln!` and every value that can be a kernel VA via `kprintln_serial!`:
 the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, and the register file serial-only; the vector,
-error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL EXCEPTION` dump (`sepc`,
-`stval`, `satp`, and the register file serial-only; `scause` and `sstatus` on the console), the
+error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL STACK OVERFLOW` dump
+(`sepc`, `stval`, `sp`, and `floor` serial-only; the CPU on the console), the riscv64
+`KERNEL EXCEPTION` dump (`sepc`, `stval`, `satp`, and the register file serial-only; `scause`
+and `sstatus` on the console), the
 riscv64 unknown-interrupt path (`sepc` serial-only), and the riscv64 `BUG: ecall return sepc` path
 (`sepc`, `ra`, `sp`, and `a7` serial-only).
 

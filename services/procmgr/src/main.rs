@@ -201,8 +201,8 @@ const WS_BADGE_SERVICE: u64 = 0;
 const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
-/// retype slab: `SystemInfoType::ThreadRetypeBytes` in pages (kernel stack,
-/// wrapper/TCB, extended-state save area, which the boot CPU sizes), all
+/// retype slab: `SystemInfoType::ThreadRetypeBytes` in pages (guard page,
+/// kernel stack, wrapper/TCB, extended-state save area, which the boot CPU sizes), all
 /// consumed by the kernel. Queried once and cached; `None` if the query
 /// fails, which fails the spawn.
 pub(crate) fn thread_retype_pages() -> Option<u64>

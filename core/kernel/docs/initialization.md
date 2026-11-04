@@ -170,7 +170,11 @@ again from the recorded BootInfo address.
      — at direct_map_base() + phys, less the carve's chunks
    - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used, except that a
      2 MiB chunk holding an arch kernel MMIO page (xAPIC or I/O APIC on x86-64) is mapped as
-     4 KiB pages, the MMIO pages uncacheable
+     4 KiB pages, the MMIO pages uncacheable, and so is the chunk holding the handoff
+     stack's guard page, which is left unmapped (mm::paging::handoff_guard_phys: the page
+     below the stack base derived from the entry stack pointer, when that base holds
+     HANDOFF_STACK_BASE_MARK; [memory-internals.md](memory-internals.md) § Kernel Stack
+     Guards)
    - Permissions: readable, writable, not executable; write-back except those MMIO pages
    direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
    1 GiB-aligned base at or above the paging mode's kernel-half floor
@@ -261,13 +265,17 @@ address, the reason, and the span's end.
    is installed in Phase 7.
 2. Emit: "Phase 4: Typed-Memory Cap Surface (no kernel heap)"
 3. Cache the bootloader-discovered kernel MMIO bases from `BootInfo` for
-   Phase 5 (`platform::capture_kernel_mmio`)
+   Phase 5 (`platform::capture_kernel_mmio`), and seed the guard-table reserve, one frame
+   per 2 MiB chunk of RAM, from which the kernel-stack guard pages split the direct map
+   (`mm::stack_guard::seed`; [memory-internals.md](memory-internals.md) § Kernel Stack
+   Guards)
 4. Fix every CPU set's width at the boot's CPU count (`cpu_mask::set_boot_cpu_count`,
    `cpu_count.div_ceil(64)` words), then allocate per-CPU subsystem storage from the buddy
    allocator while it still holds large contiguous blocks (before the Phase-7 user-cap
    drain): the reschedule-pending CPU set, the scheduler
    slabs (per-CPU schedulers, idle TCBs, idle-stack tops plus one idle kernel stack per
-   CPU, watchdog ticks and breadcrumbs), the PerCpuData, APIC-ID, TLB-shootdown request
+   CPU, above a guard page the direct map leaves unmapped, watchdog ticks and
+   breadcrumbs), the PerCpuData, APIC-ID, TLB-shootdown request
    and TLB acknowledgement-set slabs, and on x86-64 the per-AP
    GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
    entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
@@ -286,11 +294,13 @@ Retype-based kernel object memory, which replaces a kernel heap, is specified in
 [memory-internals.md](memory-internals.md) § Kernel Object Memory; the entropy
 subsystem's per-CPU state is described in [entropy.md](entropy.md).
 
-**Failure mode:** a failed per-CPU storage, frame map table, or `CSpace` registry allocation
-halts the kernel.
+**Failure mode:** a failed per-CPU storage, guard-table reserve, frame map table, or `CSpace`
+registry allocation, or an idle stack's guard page the direct map cannot unmap, halts the
+kernel.
 
-**Completion criterion:** per-CPU storage, the frame map table, and the `CSpace` registry are
-allocated; there is no kernel allocator to activate.
+**Completion criterion:** the guard-table reserve, per-CPU storage (each idle stack's guard
+page unmapped), the frame map table, and the `CSpace` registry are allocated; there is no
+kernel allocator to activate.
 
 ---
 
@@ -398,7 +408,8 @@ range). See [entropy.md](entropy.md).
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
 gates only the SBI HSM extension; the boot hart's Vector extension, the ASID-tagged TLB, Sstc
 and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
-initialization sites (each secondary hart's Vector extension and `vlenb` in Phase 8). A boot
+initialization sites (each secondary hart's Vector extension, `vlenb` and ASID-tagged TLB in
+Phase 8). A boot
 hart without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
 message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
@@ -606,6 +617,10 @@ The scratch pages and bundle layout are described in
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
+8. Check that the direct map leaves out the handoff stack's guard page (when Phase 3 found
+   one) and every idle stack's guard page, and emit the guard-table reserve's use
+   ("stack guards: N of M guard tables left"; [memory-internals.md](memory-internals.md)
+   § Kernel Stack Guards).
 ```
 
 The run-queue structure, idle priority, and idle-thread loop are specified in
@@ -631,8 +646,10 @@ is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 slab, and the idle stacks come from the Phase 4 per-CPU storage, and a failure to allocate
 them halts in Phase 4. Step 7 retypes the late-reclaim Memory cap's body from `SEED_MEMORY`
 and inserts the cap into the root CSpace; a SEED or CSpace failure there halts through
-`fatal`. A rejected `start_ap` (riscv64, where SBI reports a hart it cannot start), or a zero
-`BootInfo.ap_trampoline_page` with more than one CPU listed, is fatal: every CPU the boot
+`fatal`. Step 8 halts on a mapped guard page ("Phase 8: the handoff stack's guard page is
+mapped", "Phase 8: an idle stack's guard page is mapped"). A rejected `start_ap` (riscv64,
+where SBI reports a hart it cannot start), or a zero `BootInfo.ap_trampoline_page` with more
+than one CPU listed, is fatal: every CPU the boot
 reported is assumed online from Phase 8 on (IPI targets, scheduler placement, affinity), so a
 CPU that cannot be started halts the boot with a descriptive message.
 On x86-64, a kernel root page table above 4 GiB is fatal before the first SIPI: the AP trampoline
@@ -648,8 +665,9 @@ the BSP's wait then expires the same way. On riscv64 an AP whose PLIC S-mode con
 registers lie outside the PLIC window (a firmware hart id too large for the window
 `plic_size` reports) halts itself the same way, before announcing itself, as does an AP whose
 `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot hart's"),
-or one without the Vector extension, which takes a fatal illegal-instruction trap at its
-`vlenb` read.
+one without the Vector extension, which takes a fatal illegal-instruction trap at its
+`vlenb` read, or one without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported",
+from `paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -719,7 +737,11 @@ calls `sched::enter()`.
       so init can donate the pages to memmgr on reap
    e. Guard page (unmapped) sits immediately below the stack; stack overflows fault
 5. Create init's TCB:
-   a. Allocate a kernel stack for init (KERNEL_STACK_PAGES = 4 pages = 16 KiB)
+   a. Retype init's Thread slot from SEED_MEMORY in the layout SYS_CAP_CREATE_THREAD uses
+      (`sched::thread_slot`): a guard page, unmapped from the direct map with no shootdown,
+      its guard epoch stamped in init's TCB (`mm::stack_guard::hole`), then init's kernel stack
+      (KERNEL_STACK_PAGES = 4 pages = 16 KiB), the ThreadObject and TCB page, and the
+      save area
    b. new_state(entry=init_image.entry_point, stack_top=kstack_top,
       arg=choose_init_layout().init_info_va, kind=ThreadKind::User) stores entry_point in
       saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
@@ -741,7 +763,9 @@ calls `sched::enter()`.
    zeroed last. Emit: "reclaim scrub: zeroed N pages over M ranges"
 7. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 8. Call sched::enter() — does not return:
-   a. Dequeue the highest-priority ready thread (init)
+   a. Dequeue the highest-priority ready thread (init), then, with interrupts disabled,
+      flush the BSP's whole TLB when init's guard epoch is newer than its record
+      (`mm::stack_guard::flush_before_run`, as a switch-in would)
    b. Build an initial user-mode TrapFrame on init's kernel stack:
       rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
       rflags=0x202 (IF=1)
@@ -779,7 +803,9 @@ the reap-time donation of the segment, InitInfo, and stack pages in
 failed step. Invalid init_image (zero segment_count or zero entry_point) halts with
 "Phase 9: init image missing or has no entry point". A `reclaim_ranges` count above
 `MAX_RECLAIM_RANGES` halts at step 6 with
-"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES". Init's segment, stack, or
+"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES". A guard page below init's kernel
+stack the direct map cannot unmap halts with "Phase 9: cannot unmap init's kernel stack guard
+page". Init's segment, stack, or
 InitInfo-region Memory caps not landing in consecutive slots halts with "Phase 9: init segment
 Memory caps are not in consecutive slots" (or the stack's or InitInfo's equivalent).
 
@@ -832,12 +858,12 @@ through its drain until a teardown commits `Exited` over it (see
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Free physical ranges from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map; buddy allocator populated | Halt: no free range holds the page-table carve; table frames exhausted; direct map would overlap the kernel image window; BootInfo.device_tree names no valid FDT blob |
-| 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed |
+| 4 | Typed-memory cap surface; guard-table reserve; per-CPU storage; frame map table; `CSpace` registry | Halt: guard-table reserve, per-CPU storage, frame map table, or `CSpace` registry allocation failed; an idle stack's guard page not unmapped |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, or no Vector extension); an entropy self-test FAIL is printed and the boot continues |
-| 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, no Vector extension, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
+| 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---
 

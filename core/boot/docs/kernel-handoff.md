@@ -101,9 +101,13 @@ unconditional jump that does not return.
 Beyond the contract, the reference bootloader enters with the stack pointer at the handoff
 stack's page-aligned top, leaves the page below the stack unmapped as its guard, and paints the
 stack with `STACK_PAINT` and marks its lowest word with `HANDOFF_STACK_BASE_MARK`
-([boot-flow.md](boot-flow.md) § Step 6). Nothing in the kernel relies on the guard; it makes an
-overflow of the stack fault while the boot tables and the kernel's Phase 3 identity window map
-the stack. Two kernel uses rely on the page-aligned top:
+([boot-flow.md](boot-flow.md) § Step 6). The guard makes an overflow of the stack fault while
+the boot tables and the kernel's Phase 3 identity window map the stack; when the mark confirms
+the layout, the kernel also leaves the guard frame out of its direct map, through which the
+stack runs from the end of Phase 3
+([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-guards) § Kernel Stack
+Guards), and without the mark it leaves the page below the stack mapped, since another
+bootloader may place live data there. Two kernel uses rely on the page-aligned top:
 
 - The kernel's stack depth report
   ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth) § Kernel

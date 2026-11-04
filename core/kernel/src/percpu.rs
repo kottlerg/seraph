@@ -39,12 +39,15 @@
 //! | `PERCPU_TSS_PTR_OFFSET` | 32 | `tss_ptr` |
 //! | `PERCPU_PREEMPT_COUNT_OFFSET` | 40 | `preempt_count` |
 //! | `PERCPU_FPU_OWNER_OFFSET` | 48 | `fpu_owner` |
+//! | `PERCPU_KERNEL_STACK_FLOOR_OFFSET` | 72 | `kernel_stack_floor` |
 //!
 //! ## Adding new fields
 //! Append fields at the end of the struct. If assembly reads the field, add
 //! its `PERCPU_*_OFFSET` constant, a row in the table above, and an
-//! `offset_of!` line in `tests::percpu_offsets_match_asm_constants`, and update
-//! that assembly; otherwise update only the size assertion in that test.
+//! `offset_of!` line in `tests::percpu_offsets_match_asm_constants` (none for
+//! a constant defined as `offset_of!` itself, which asm takes as a `const`
+//! operand), and update that assembly; otherwise update only the size
+//! assertion in that test.
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
@@ -145,6 +148,12 @@ pub const PERCPU_PREEMPT_COUNT_OFFSET: usize = 40;
 // Not accessed from assembly; included for layout discipline.
 #[allow(dead_code)]
 pub const PERCPU_FPU_OWNER_OFFSET: usize = 48;
+/// Byte offset of `PerCpuData::kernel_stack_floor`, `tp`-relative: the riscv64
+/// `trap_entry` and `context::switch` naked asm take it as a `const` operand.
+// Unused on x86-64, which reads no stack floor.
+#[allow(dead_code)]
+pub const PERCPU_KERNEL_STACK_FLOOR_OFFSET: usize =
+    core::mem::offset_of!(PerCpuData, kernel_stack_floor);
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
 
@@ -199,6 +208,18 @@ pub struct PerCpuData
     /// (tag reissue or switched-away unmap catch-up; see
     /// `core/kernel/docs/memory-internals.md` § TLB Management).
     pub ctxsw_flush_performed: AtomicU64,
+    /// Lowest address of the kernel stack this CPU runs on (its guard page's
+    /// top), or 0 before one is set. The riscv64 S-mode trap entry compares
+    /// the trap frame it is about to push against it and reports an overflow
+    /// instead of pushing into the guard; `context::switch` writes the
+    /// incoming thread's floor at its stack-pointer swap, and the boot sets
+    /// the handoff stack's ([`set_kernel_stack_floor`]). x86-64 reads none: a
+    /// fault on its guard escalates to a double fault on IST1.
+    pub kernel_stack_floor: u64,
+    /// The guard epoch at this CPU's last whole-TLB flush for the
+    /// kernel-stack guards (`mm::stack_guard::flush_before_run`). Written
+    /// only by this CPU, at a switch-in or in `sched::enter`.
+    pub guard_epoch_flushed: u64,
 }
 
 impl PerCpuData
@@ -217,6 +238,8 @@ impl PerCpuData
             fpu_owner: AtomicPtr::new(core::ptr::null_mut()),
             ctxsw_flush_elided: AtomicU64::new(0),
             ctxsw_flush_performed: AtomicU64::new(0),
+            kernel_stack_floor: 0,
+            guard_epoch_flushed: 0,
         }
     }
 }
@@ -356,6 +379,53 @@ pub unsafe fn init_ap(cpu_id: u32)
     unsafe {
         crate::arch::current::cpu::install_percpu(ptr as u64);
     }
+}
+
+/// Set the current CPU's kernel stack floor
+/// ([`PerCpuData::kernel_stack_floor`]) for the stack it runs on outside a
+/// context switch: the BSP's handoff stack, an AP's idle stack before its
+/// first switch.
+///
+/// # Safety
+/// The current CPU's per-CPU pointer is installed ([`init_bsp`] or
+/// [`init_ap`]), and `floor` is the base of the stack this CPU runs on now,
+/// or 0.
+#[cfg(not(test))]
+pub unsafe fn set_kernel_stack_floor(floor: u64)
+{
+    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: the entry is this CPU's own, written only by it (caller
+    // contract).
+    unsafe { (*ptr).kernel_stack_floor = floor };
+}
+
+/// The guard epoch at this CPU's last whole-TLB flush
+/// ([`PerCpuData::guard_epoch_flushed`]).
+///
+/// # Safety
+/// Interrupts disabled, so the CPU cannot change between the CPU-index read
+/// and the field read; this CPU's per-CPU pointer is installed.
+#[cfg(not(test))]
+pub unsafe fn guard_epoch_flushed() -> u64
+{
+    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: this CPU's own entry (caller contract), written only by this
+    // CPU.
+    unsafe { (*ptr).guard_epoch_flushed }
+}
+
+/// Record `epoch` as the guard epoch of this CPU's last whole-TLB flush.
+///
+/// # Safety
+/// As [`guard_epoch_flushed`]; `epoch` was read before a whole-TLB flush on
+/// this CPU.
+#[cfg(not(test))]
+pub unsafe fn set_guard_epoch_flushed(epoch: u64)
+{
+    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: this CPU's own entry (caller contract), written only by this
+    // CPU.
+    unsafe { (*ptr).guard_epoch_flushed = epoch };
 }
 
 // ── Preemption control ───────────────────────────────────────────────────────
@@ -502,6 +572,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 72);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 88);
     }
 }

@@ -103,7 +103,7 @@ pub unsafe fn lazy_enable_fp_v_initial() {}
 ///
 /// # Safety
 /// Must execute in supervisor mode. `area` must point at the thread's
-/// per-thread F/D save area (page 5 of its Thread retype slot, zeroed by
+/// per-thread F/D save area (page 6 of its Thread retype slot, zeroed by
 /// `sys_cap_create_thread`). `sstatus.FS` must be non-Off.
 #[cfg(not(test))]
 #[inline]

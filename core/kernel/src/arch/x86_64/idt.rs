@@ -1121,8 +1121,8 @@ unsafe extern "C" fn isr_nm()
 /// area (if any), clears CR0.TS, XRSTORs the trapping thread's area into
 /// the live registers, and installs the trapping thread as this CPU's
 /// new `fpu_owner`. The trapping x87/SSE/AVX instruction then proceeds
-/// on re-execution. The area is allocated as pages N+1.. of the Thread
-/// retype slot (see `sys_cap_create_thread` layout), so user threads
+/// on re-execution. The area is allocated as the pages after the wrapper page
+/// of the Thread retype slot (`sched::thread_slot::EXTENDED_OFFSET`), so user threads
 /// always have a non-null area; the slot zero-init makes the first
 /// XRSTOR restore the architected initial state.
 ///

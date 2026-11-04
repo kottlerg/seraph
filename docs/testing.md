@@ -642,9 +642,9 @@ and `extend_carve_mapped`), and the drain of RAM into Memory caps (`drain_and_in
 `reserve_init_backing`, `coalesced_extent_count`, `init_info_descriptor_bound`,
 `INIT_INFO_DESCRIPTOR_CAPACITY`, `populate_cspace`, `complete_extent_descriptors`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
-`frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
-(`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
-boundary one does:
+`frame_map::init`, `chunk_slots`, and `CHUNK_ORDER`), the `CSpace` registry arena's RAM sizing
+(`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`), and the kernel-stack
+guard-table reserve's RAM sizing (`reserve_frames`). The screen works as the boundary one does:
 
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
@@ -655,7 +655,7 @@ M="$M|drain_and_install_seed|reserve_init_backing|coalesced_extent_count"
 M="$M|init_info_descriptor_bound|complete_extent_descriptors"
 M="$M|INIT_INFO_DESCRIPTOR_CAPACITY|populate_cspace|INIT_INFO_MAX_PAGES"
 M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|chunk_slots|CHUNK_ORDER"
-M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"
+M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER|reserve_frames"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
 # Memory variation (either arch; boots the current sysroot, so a debug-profile build):

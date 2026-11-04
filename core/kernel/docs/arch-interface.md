@@ -316,6 +316,44 @@ pub fn read_stack_pointer() -> u64;
 
 /// Clear the kernel identity-map leaf for `pa` and shoot it down on every CPU.
 pub unsafe fn unmap_identity_page(pa: u64);
+
+/// Leave the direct-map page at `virt` not present (a kernel stack's guard,
+/// memory-internals.md § Kernel Stack Guards), first splitting the 2 MiB leaf
+/// that maps it into a leaf table of the same translation built in the frame
+/// `take_table` returns. `NotMapped` when the direct map does not map `virt`,
+/// `OutOfFrames` when a split finds no frame. The caller serialises every
+/// direct-map edit and flushes the TLB.
+pub unsafe fn hole_direct_map_page(
+    virt: u64,
+    take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>;
+
+/// Map the direct-map page at `virt` to `phys` again, closing a hole. The
+/// caller flushes every CPU before the page is reused when
+/// `CACHES_NOT_PRESENT_ENTRIES` holds.
+pub unsafe fn fill_direct_map_page(virt: u64, phys: u64);
+
+/// Whether a CPU may cache a not-present entry, so that a page made present
+/// again needs a flush on every CPU before another reaches it: `false` on
+/// x86-64, `true` on RISC-V (no Svvptc requirement).
+pub const CACHES_NOT_PRESENT_ENTRIES: bool;
+
+/// Whether the kernel's tables map the direct-map address `virt`.
+pub unsafe fn direct_map_page_present(virt: u64) -> bool;
+
+/// Drop this CPU's cached translations of the kernel address `virt` in every
+/// address space: RISC-V `sfence.vma virt, zero`; x86-64 `invlpg` without
+/// tagged TLBs and INVPCID's all-context form (the whole TLB) with them,
+/// since the direct map's entries are not global and no instruction drops one
+/// address from every PCID. A shootdown request on the kernel root makes each
+/// target run it (memory-internals.md § SMP TLB Shootdown).
+pub unsafe fn flush_kernel_page(virt: u64);
+
+/// Drop every translation this CPU caches, in every address space: x86-64
+/// INVPCID's all-context form with tagged TLBs and a CR3 reload without them;
+/// RISC-V `sfence.vma zero, zero`. The kernel-stack guards' switch-in flush
+/// (memory-internals.md § Kernel Stack Guards).
+pub unsafe fn flush_all_contexts();
 ```
 
 Which paging and TLB features each architecture requires, and which it uses opportunistically,
@@ -346,7 +384,8 @@ The context switch is the most performance-critical path in the kernel.
 ```rust
 /// Architecture-specific saved register state for one thread, stored in the TCB
 /// and swapped on every context switch. Methods: `entry_point(&self) -> u64`,
-/// `user_arg(&self) -> u64`.
+/// `user_arg(&self) -> u64`. On RISC-V it also holds the thread's kernel stack
+/// floor (`stack_floor`, set by `set_stack_floor`).
 pub struct SavedState { /* arch-specific */ }
 
 /// Which privilege level a new thread runs at (`User` or `Kernel`), selecting
@@ -367,6 +406,13 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> Save
 /// RISC-V, where `TrapFrame::set_tls_base` carries the user `tp`).
 pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64);
 
+/// Record the base of the thread's kernel stack in a `SavedState` before first
+/// run. RISC-V keeps it for `switch`, which installs it as the hart's stack
+/// floor (`PerCpuData::kernel_stack_floor`, the bound the S-mode trap entry
+/// checks a frame against, memory-internals.md § Kernel Stack Guards); a no-op
+/// on x86-64, where a guard-page fault escalates to a double fault on IST1.
+pub fn set_stack_floor(saved: &mut SavedState, floor: u64);
+
 /// Round a user-supplied stack pointer to the entry point's `extern "C"` ABI
 /// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`: `(sp & !0xF) - 8`, wrapping for
 /// `sp` below 16; RISC-V LP64D `sp ≡ 0 (mod 16)`: `sp & !0xF`).
@@ -375,6 +421,9 @@ pub fn align_initial_stack(sp: u64) -> u64;
 /// Switch from `current` to `next`, saving callee-saved registers into `current`
 /// and restoring them from `next`. `save_flag` is published once `current`'s
 /// state is fully saved, so another CPU may observe the thread as switched-out.
+/// On RISC-V the stack-pointer swap is followed at once by the store of
+/// `next`'s stack floor to `PerCpuData::kernel_stack_floor` (one load and one
+/// store), so no trap sees one stack with another's floor.
 ///
 /// # Safety
 /// `current` and `next` must point to valid `SavedState` for the duration of the

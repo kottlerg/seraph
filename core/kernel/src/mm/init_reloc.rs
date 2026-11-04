@@ -139,7 +139,9 @@ pub fn apply(
     let table_len = rela_size as usize;
     // SAFETY: rela_phys/rela_size describe bootloader-loaded file bytes
     // inside an init segment (resolved by the bootloader through the
-    // containing LOAD); the direct map covers all RAM since Phase 3.
+    // containing LOAD); the direct map covers all RAM since Phase 3 but the
+    // kernel-stack guard pages (`mm::stack_guard`), none of them in a
+    // segment.
     let table = unsafe {
         core::slice::from_raw_parts(
             crate::mm::paging::phys_to_virt(rela_phys) as *const u8,

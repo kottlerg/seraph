@@ -45,7 +45,10 @@ pub const IDLE_PRIORITY: u8 = 0;
 /// reaches zero. A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
-/// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total).
+/// Number of 4 KiB pages in each idle and thread kernel stack (16 KiB total),
+/// each above one guard page the direct map leaves unmapped, so a path past
+/// the bound faults and halts instead of writing below the stack
+/// (`mm::stack_guard`).
 ///
 /// Measured bound (the paint report, `crate::stack_depth`; ktest
 /// `stress::stack_depth` after Tier S), on both architectures: debug builds at
@@ -161,17 +164,30 @@ unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
     unsafe { base.add(cpu) }
 }
 
-/// Order of a single idle-thread kernel stack: smallest `2^order >=
-/// KERNEL_STACK_PAGES`. With `KERNEL_STACK_PAGES = 4` this is order 2.
+/// Order of the buddy block an idle-thread kernel stack is carved from: the
+/// smallest `2^order >= KERNEL_STACK_PAGES + 1`, the stack and its guard page.
+/// With `KERNEL_STACK_PAGES = 4` this is order 3.
 #[cfg(not(test))]
-const fn idle_stack_order() -> usize
+const fn idle_block_order() -> usize
 {
     let mut o = 0;
-    while (1usize << o) < KERNEL_STACK_PAGES
+    while (1usize << o) < KERNEL_STACK_PAGES + 1
     {
         o += 1;
     }
     o
+}
+
+/// An idle stack's place in its buddy block of `2^order` pages at `block`:
+/// `(guard, stack_base, spare_bytes)`. The stack is the block's top
+/// `KERNEL_STACK_PAGES` pages, the guard the page below it, and the
+/// `spare_bytes` below the guard, from `block`, go back to the buddy.
+const fn idle_block_layout(block: u64, order: usize) -> (u64, u64, u64)
+{
+    let page = PAGE_SIZE as u64;
+    let stack_base = block + ((1u64 << order) - KERNEL_STACK_PAGES as u64) * page;
+    let guard = stack_base - page;
+    (guard, stack_base, guard - block)
 }
 
 /// Number of CPUs, published once during boot by `init_storage` (Phase 4) and read lock-free
@@ -2448,11 +2464,15 @@ pub unsafe fn init(cpu_count: u32) -> u32
         let stack_top = unsafe { *idle_stack_top_slot(cpu) };
 
         // Build idle TCB.
-        let saved = new_state(
+        let mut saved = new_state(
             idle_thread_entry as *const () as u64,
             stack_top,
             cpu as u64,
             crate::arch::ThreadKind::Kernel,
+        );
+        crate::arch::current::context::set_stack_floor(
+            &mut saved,
+            stack_top - (KERNEL_STACK_PAGES * PAGE_SIZE) as u64,
         );
 
         // Initialise this CPU's idle TCB in place inside the dynamic slab.
@@ -2501,6 +2521,8 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,
+                    // Phase 4 made the idle guard before any other CPU ran.
+                    guard_epoch: 0,
                     trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
@@ -2656,23 +2678,34 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
 
     // Idle-stack-top slab, then one idle kernel stack per CPU drawn from the
-    // pristine buddy. Done here, in Phase 4, rather than in `init` (Phase 8):
-    // before the Phase-7 user-cap drain the buddy still holds large contiguous
-    // blocks, so each order-2 stack is a clean split. After the drain the only
-    // free blocks are the memory map's order-0/1 fragments, which cannot back
-    // an order-2 stack. `init` reads the tops back from this slab.
+    // pristine buddy, above a guard page the direct map leaves unmapped
+    // (`mm::stack_guard`), so an overflow faults. Done here, in Phase 4,
+    // rather than in `init` (Phase 8): before the Phase-7 user-cap drain the
+    // buddy still holds large contiguous blocks, so each order-3 block is a
+    // clean split, and no other CPU runs yet, so the guard's hole needs no
+    // cross-CPU flush. `init` reads the tops back from this slab.
     let tops_ptr = alloc_per_cpu_slab::<u64>(IDLE_STACK_TOPS_SLAB, n, allocator);
-    let stack_order = idle_stack_order();
+    let block_order = idle_block_order();
     for cpu in 0..n
     {
-        let stack_phys = allocator
-            .alloc(stack_order)
+        let block = allocator
+            .alloc(block_order)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
+        let (guard, stack_phys, spare) = idle_block_layout(block, block_order);
+        // SAFETY: the pages below the guard are this fresh block's, never
+        // reached, and the buddy is unsealed until Phase 7.
+        unsafe { allocator.free_range(block, spare) };
+        // SAFETY: Phase 4, only the boot CPU runs; the guard is this block's
+        // page, which nothing reaches through the direct map from here on.
+        if unsafe { crate::mm::stack_guard::hole_on_boot_cpu(guard) }.is_err()
+        {
+            crate::fatal("init_per_cpu_storage: cannot unmap an idle stack's guard page");
+        }
         // Stack grows downward; top = base + size (direct map).
         let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
         // Paint it for the depth report (crate::stack_depth).
-        // SAFETY: the fresh order-`stack_order` block is this CPU's idle stack
-        // alone, mapped through the direct map; no thread runs on it yet.
+        // SAFETY: the stack pages are this CPU's idle stack alone, mapped
+        // through the direct map; no thread runs on it yet.
         unsafe {
             crate::stack_depth::paint(phys_to_virt(stack_phys), KERNEL_STACK_PAGES * PAGE_SIZE);
         }
@@ -5958,6 +5991,13 @@ pub unsafe fn schedule(requeue: Requeue)
         crate::arch::current::cpu::set_kernel_trap_stack(trap_stack);
     }
 
+    // Drop any stale translation of the incoming thread's guard page before
+    // it runs on its stack here (`mm::stack_guard`: holes send no shootdown).
+    // SAFETY: next is a valid TCB whose guard_epoch is immutable after
+    // creation; interrupts are disabled by the scheduler lock, on this CPU
+    // with its per-CPU pointer installed.
+    unsafe { crate::mm::stack_guard::flush_before_run((*next).guard_epoch) };
+
     // Switch address space tracking and page tables.
     //
     // Three cases:
@@ -6505,9 +6545,11 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 /// Start executing the highest-priority ready thread and never return.
 ///
 /// Called once at the end of kernel boot after the init TCB has been enqueued.
-/// Dequeues the init thread, sets the kernel trap stack (`set_kernel_trap_stack`),
-/// builds an initial user-mode [`TrapFrame`] on its kernel stack, and calls
-/// `first_entry_to_user`, which loads init's address space and enters user mode.
+/// Dequeues the init thread, drops any stale translation of its guard page
+/// (`mm::stack_guard::flush_before_run`), sets the kernel trap stack
+/// (`set_kernel_trap_stack`), builds an initial user-mode [`TrapFrame`] on its
+/// kernel stack, and calls `first_entry_to_user`, which loads init's address
+/// space and enters user mode.
 ///
 /// # Panics
 /// Calls `crate::fatal` if the run queue is empty (init TCB not enqueued).
@@ -6560,6 +6602,12 @@ pub unsafe fn enter() -> !
     unsafe {
         crate::arch::current::cpu::disable_interrupts();
     }
+
+    // Init's first run here is not a schedule() switch-in, so drop any stale
+    // translation of its guard page as one would (`mm::stack_guard`).
+    // SAFETY: interrupts disabled above, on the BSP with its per-CPU pointer
+    // installed; guard_epoch is immutable after creation.
+    unsafe { crate::mm::stack_guard::flush_before_run(init_tcb.guard_epoch) };
 
     // Set the kernel trap stack pointer before entering user mode so the first
     // ring-3 → ring-0 transition lands on the correct kernel stack.
@@ -6624,6 +6672,18 @@ pub unsafe fn enter() -> !
     // leaves the stack for init's kernel stack below. Record its depth.
     crate::stack_depth::record_handoff_stack();
 
+    // From the first trap init takes, the BSP runs on init's kernel stack.
+    // Until the `sret` below no trap can come (interrupts are off, and no
+    // direct-map hole has been closed, so no spurious fault either), so the
+    // floor may move ahead of the stack.
+    // SAFETY: the BSP's per-CPU pointer is installed (Phase 5); the floor is
+    // the base of the stack this CPU runs on from the `sret` on.
+    unsafe {
+        crate::percpu::set_kernel_stack_floor(
+            kernel_stack_top - (KERNEL_STACK_PAGES * PAGE_SIZE) as u64,
+        );
+    }
+
     // Activate init's address space (tagged when tagging is enabled) and enter
     // user mode. `first_entry_to_user` handles the arch-specific sequence:
     //   x86-64: switches CR3 (root + PCID) and executes iretq from init's kernel stack.
@@ -6632,6 +6692,27 @@ pub unsafe fn enter() -> !
     // tf_ptr points to a valid, initialized TrapFrame on init's kernel stack.
     unsafe {
         crate::arch::current::context::first_entry_to_user(init_tcb.address_space, tf_ptr);
+    }
+}
+
+#[cfg(test)]
+mod idle_block_tests
+{
+    use super::{KERNEL_STACK_PAGES, idle_block_layout};
+    use crate::mm::PAGE_SIZE;
+
+    // The defect caught: a stack that does not end at the block's top, a guard
+    // that is not the page right below the stack, or spare pages that reach
+    // the guard, so an overflow writes a page the buddy hands out again.
+    #[test]
+    fn an_idle_block_is_spare_pages_then_guard_then_stack_at_the_top()
+    {
+        let page = PAGE_SIZE as u64;
+        let block = 0x8_0000u64;
+        let (guard, stack, spare) = idle_block_layout(block, 3);
+        assert_eq!(stack + KERNEL_STACK_PAGES as u64 * page, block + 8 * page);
+        assert_eq!(guard, stack - page);
+        assert_eq!(block + spare, guard);
     }
 }
 

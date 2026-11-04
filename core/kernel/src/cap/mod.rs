@@ -539,7 +539,7 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
 ///
 /// Valid once Phase 7 has reserved the `InitInfo` block, which sets the
-/// capacity. init's Thread slot adds six or more pages
+/// capacity. init's Thread slot adds seven or more pages
 /// (`sched::thread_slot::thread_slot_bytes`). Nothing draws on SEED at runtime: the
 /// bodies a syscall creates are funded by the caller's `CSpace`
 /// (core/kernel/docs/capability-internals.md § Body Arena). A boot whose
@@ -690,26 +690,32 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// named contributors:
 ///
 /// 1. `POOL_SEED_PAGES` — the kernel PT-frame pool seed.
-/// 2. Idle-thread kernel stacks — `cpu_count × KERNEL_STACK_PAGES`, one stack
-///    per online CPU (pre-allocated in Phase 4 from the pristine buddy).
-/// 3. The `InitInfo` block — sized at Phase 7 from this boot's counts.
-/// 4. Init's user stack — `INIT_STACK_PAGES`.
-/// 5. The SEED arena — `seed_reserve_bytes()`.
+/// 2. Idle-thread kernel stacks — `cpu_count × (KERNEL_STACK_PAGES + 1)`, one
+///    stack and the guard page below it per online CPU (pre-allocated in
+///    Phase 4 from the pristine buddy).
+/// 3. The guard-table reserve — `mm::stack_guard::seeded_frames()`, one leaf
+///    table per 2 MiB chunk of RAM (`mm::stack_guard::reserve_frames`),
+///    seeded in Phase 4, for the direct-map splits the kernel-stack guard
+///    pages make.
+/// 4. The `InitInfo` block — sized at Phase 7 from this boot's counts.
+/// 5. Init's user stack — `INIT_STACK_PAGES`.
+/// 6. The SEED arena — `seed_reserve_bytes()`.
 ///
 /// Every other page of RAM is drained for userspace and routes to memmgr's
 /// pool, leaving the post-handoff buddy fully empty. This value is a Phase-7
 /// diagnostic; the authoritative `kernel_reserved` is the complement of the
 /// `owns_memory` ledger computed at Phase 9 (`core/kernel/src/main.rs`, from
 /// [`owns_memory_minted_bytes`]). Valid once Phase 7 has reserved the
-/// `InitInfo` block, which sizes terms 3 and 5.
+/// `InitInfo` block, which sizes terms 4 and 6.
 #[cfg(not(test))]
 pub(crate) fn kernel_reserve_pages() -> usize
 {
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let idle_stacks = cpu_count * crate::sched::KERNEL_STACK_PAGES;
+    let idle_stacks = cpu_count * (crate::sched::KERNEL_STACK_PAGES + 1);
+    let guard_tables = crate::mm::stack_guard::seeded_frames();
     let init_info = INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed);
     let seed = (seed_reserve_bytes() / crate::mm::PAGE_SIZE as u64) as usize;
-    POOL_SEED_PAGES + idle_stacks + init_info + INIT_STACK_PAGES + seed
+    POOL_SEED_PAGES + idle_stacks + guard_tables + init_info + INIT_STACK_PAGES + seed
 }
 
 /// Number of init user-stack pages reserved ahead of the drain.
@@ -839,7 +845,8 @@ fn reserve_init_backing(counts: &DescriptorCounts)
         let block = phys_to_virt(info) as *mut u8;
         // SAFETY: the region's pages were just taken from the buddy, so
         // nothing else references them, and the direct map covers all RAM
-        // since Phase 3. Zeroed here, before the drain and the descriptors are
+        // since Phase 3 but the kernel-stack guard pages (`mm::stack_guard`), none of them
+        // a free buddy page. Zeroed here, before the drain and the descriptors are
         // written into it, so the header and every unused slot reach init as
         // zeroes.
         unsafe {
@@ -936,12 +943,13 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
     let reserve_pages = kernel_reserve_pages();
 
     crate::kprintln!(
-        "Phase 7: kernel reserve {} pages = pool {} + idle {}×{} + initinfo {} + \
-         initstack {} + seed {} KiB; draining all remaining RAM to userspace",
+        "Phase 7: kernel reserve {} pages = pool {} + idle {}×{} + guard tables {} + \
+         initinfo {} + initstack {} + seed {} KiB; draining all remaining RAM to userspace",
         reserve_pages,
         POOL_SEED_PAGES,
         cpu_count,
-        crate::sched::KERNEL_STACK_PAGES,
+        crate::sched::KERNEL_STACK_PAGES + 1,
+        crate::mm::stack_guard::seeded_frames(),
         INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed),
         INIT_STACK_PAGES,
         seed_reserve_bytes() / 1024,
@@ -1010,7 +1018,8 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
     // leftover survives anywhere in the drained RAM.
     // SAFETY: the reserve is the front of an extent just drained from the
     // buddy, and nothing has been retyped from the seed yet; the direct map
-    // covers all RAM since Phase 3; single-threaded Phase 7.
+    // covers all RAM since Phase 3 but the kernel-stack guard pages (`mm::stack_guard`), none of
+    // them a drained page; single-threaded Phase 7.
     unsafe {
         core::ptr::write_bytes(
             phys_to_virt(seed_base) as *mut u8,
@@ -1032,7 +1041,8 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
         // § Kernel state in donated memory).
         // SAFETY: the extent is free RAM just drained from the buddy (or the
         // seed extent's tail), so nothing references it; the direct map
-        // covers all RAM since Phase 3; single-threaded Phase 7.
+        // covers all RAM since Phase 3 but the kernel-stack guard pages (`mm::stack_guard`), none of
+        // them a drained page; single-threaded Phase 7.
         unsafe { core::ptr::write_bytes(phys_to_virt(base) as *mut u8, 0, size as usize) };
     }
     let zero_us = crate::arch::current::timer::elapsed_us()
@@ -2514,7 +2524,8 @@ const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = (boot_protocol::MAX_RECLAIM_RANGES
 /// page and of every recorded range, and before init is enqueued: nothing
 /// reads a recorded range after this call, and no userspace thread can yet
 /// reach the caps minted over them. `boot_info_phys` was validated in
-/// Phase 0; the direct map covers all RAM since Phase 3.
+/// Phase 0; the direct map covers all RAM since Phase 3 but the kernel-stack
+/// guard pages (`mm::stack_guard`), none of them in a reclaim range.
 #[cfg(not(test))]
 pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
 {

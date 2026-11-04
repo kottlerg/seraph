@@ -66,7 +66,10 @@ Kernel space is divided into regions:
 The physical memory direct map gives the kernel a virtual address for every physical
 page. The RAM portion is mapped with 2 MiB large pages; a framebuffer or kernel MMIO
 region above the RAM ceiling gets 4 KiB pages, and so does a 2 MiB chunk below it that holds a
-kernel MMIO page, so that page can be mapped uncacheable.
+kernel MMIO page, so that page can be mapped uncacheable. The one exception to "every page" is
+the guard page below each kernel stack, which the direct map leaves unmapped so a stack overflow
+faults; the chunk holding a guard is mapped in 4 KiB pages too
+([memory-internals.md](../core/kernel/docs/memory-internals.md) § Kernel Stack Guards).
 
 Both the kernel image base and the direct-map base are randomized at boot behind
 the boot-entropy source (KASLR,
@@ -323,8 +326,8 @@ reaches zero (its capabilities and every kernel-internal reference released); se
 objects the boot mints come from the SEED reserve pinned at the Phase 7
 handoff, after which the buddy is sealed and every page of RAM is either a
 bounded fixed kernel reserve or a userspace Memory capability. The reserves
-are the Phase 4 per-CPU storage, frame map table, and `CSpace` registry, the
-Phase 5 per-CPU tag-state slab, and the Phase 7 contributors, in the order
+are the Phase 4 guard-table reserve, per-CPU storage, frame map table, and `CSpace` registry,
+the Phase 5 per-CPU tag-state slab, and the Phase 7 contributors, in the order
 [initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
 § Phase 5, and § Phase 7 give.
 

@@ -674,7 +674,7 @@ CSpace.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, TCB, and FPU save area: `SystemInfoType::ThreadRetypeBytes` bytes |
+| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, its guard page, TCB, and FPU save area: `SystemInfoType::ThreadRetypeBytes` bytes |
 | 1 | `aspace_cap` | Address space capability (Map rights) the thread executes in |
 | 2 | `cspace_cap` | CSpace capability (Insert rights) the thread is bound to |
 | 3 | `sched_cap` | `SchedControl` capability governing the creation priority, or 0 |
@@ -700,7 +700,9 @@ address space's mappings is inherently trusted to create threads that execute wi
 **Errors:** `InvalidCapability`, `InsufficientRights` (a source cap lacks Retype/Map/Insert
 respectively, or `priority` is outside `sched_cap`'s band), `InvalidArgument` (nonzero
 `priority` without a `SchedControl` cap, or `priority` > `PRIORITY_MAX`), `OutOfMemory`
-(Memory cap region or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
+(Memory cap region or slot-page pool exhausted, or the kernel's guard-table reserve, which its
+sizing makes unreachable; [memory-internals.md](memory-internals.md) § Kernel Stack Guards),
+`QuotaExceeded` (caller's CSpace
 directory structurally full, or the Memory object's reference count is at its 2^31 ceiling).
 
 ---
@@ -2436,13 +2438,16 @@ pub enum SystemInfoType
     StackHighWater      = 9,
 
     /// Raw retype debit of one `Thread`, in bytes, and so the size of the
-    /// Memory capability `SYS_CAP_CREATE_THREAD` needs: the kernel stack, one
-    /// page holding the object wrapper and the TCB, and the extended-state
-    /// (FPU, SIMD, vector) save area, all whole pages. The save area is the
-    /// boot CPU's, sized once at Phase 5: on x86-64 the XSAVE size of the
-    /// components XCR0 enables (CPUID leaf 0xD), on riscv64 `304 + 32 * vlenb`,
-    /// each rounded up to pages, at least one. Fixed for a boot, not across
-    /// machines; ruststd, procmgr and init size every Thread slab from it.
+    /// Memory capability `SYS_CAP_CREATE_THREAD` needs: one guard page, the
+    /// kernel stack, one page holding the object wrapper and the TCB, and the
+    /// extended-state (FPU, SIMD, vector) save area, all whole pages. The guard
+    /// page is the caller's memory, debited with the rest, and unusable while
+    /// the thread exists: the kernel unmaps it below the stack so an overflow
+    /// faults. The save area is the boot CPU's, sized once at Phase 5: on
+    /// x86-64 the XSAVE size of the components XCR0 enables (CPUID leaf 0xD),
+    /// on riscv64 `304 + 32 * vlenb`, each rounded up to pages, at least one.
+    /// Fixed for a boot, not across machines; ruststd, procmgr and init size
+    /// every Thread slab from it.
     ThreadRetypeBytes   = 10,
 
     /// Number of `CSpace` ids in use system-wide: ids of the kernel's `CSpace`

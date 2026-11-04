@@ -80,6 +80,7 @@ core/kernel/
 │   │   ├── init.rs             # Boot memory-map parsing; seeds the buddy allocator
 │   │   ├── init_reloc.rs       # Phase 9 PIE init fix-ups: RELATIVE relocation + RELRO sealing
 │   │   ├── kernel_pt_pool.rs   # Cap-backed pool for intermediate PT frames
+│   │   ├── stack_guard.rs      # Kernel-stack guard pages: direct-map holes, leaf-table reserve
 │   │   ├── tag_allocator.rs    # PCID/ASID tag allocation
 │   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem

@@ -1236,12 +1236,13 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: syscall::NOTIFICATION_RETYPE_BYTES,
             split: false,
         }),
-        // Thread: KERNEL_STACK_PAGES kstack pages + 1 page holding the
-        // ThreadObject wrapper and the TCB + the per-thread extended-state
-        // save area's pages, sized at boot from the boot CPU
-        // (`sched::thread_slot`). Layout: pages 0..N are kstack
-        // (kstack_top = base + N*PAGE_SIZE); page N holds wrapper + TCB;
-        // pages N+1.. are the save area (XSAVE on x86-64; F/D and V on
+        // Thread: 1 guard page + KERNEL_STACK_PAGES kstack pages + 1 page
+        // holding the ThreadObject wrapper and the TCB + the per-thread
+        // extended-state save area's pages, sized at boot from the boot CPU
+        // (`sched::thread_slot`). Layout: page 0 is the guard, unmapped from
+        // the direct map while the thread exists; pages 1..=N are kstack
+        // (kstack_top = base + (N+1)*PAGE_SIZE); page N+1 holds wrapper +
+        // TCB; pages N+2.. are the save area (XSAVE on x86-64; F/D and V on
         // RISC-V). `sys_cap_create_thread` and the reclaim arm in
         // `dealloc_object_one` read the same size.
         ObjectType::Thread => Some(DispatchEntry {
@@ -1458,9 +1459,10 @@ mod tests
         let t = dispatch_for(ObjectType::Thread, 0).unwrap();
         assert!(t.split);
         assert_eq!(t.raw_bytes, crate::sched::thread_slot::thread_slot_bytes());
-        // No boot CPU reports a save area in a host test: KERNEL_STACK_PAGES
-        // (4) + 1 wrapper/TCB page + the one-page minimum save area.
-        assert_eq!(t.raw_bytes, 6 * PAGE_SIZE as u64);
+        // No boot CPU reports a save area in a host test: the guard page +
+        // KERNEL_STACK_PAGES (4) + 1 wrapper/TCB page + the one-page minimum
+        // save area.
+        assert_eq!(t.raw_bytes, 7 * PAGE_SIZE as u64);
     }
 
     #[test]

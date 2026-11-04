@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "ruststd-death-queues"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Dual-mode: a host-tested workspace member AND a `rustc-dep-of-std`
+# dependency of the seraph std overlay (its thread reaper). Holds the pure
+# death-queue growth policy and ruststd's thread-reaper slot registry, so
+# they get host unit-test coverage; the syscalls stay with the callers.
+# shared/death-set takes it as an ordinary path dependency for procmgr's and
+# svcmgr's `DeathSet`: std does not re-export it, since std's dependencies
+# are unstable (`rustc_private`) to std's users.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+syscall-abi = { path = "../../../abi/syscall" }
+# When std lists this crate as a dep, build-std activates
+# `rustc-dep-of-std`, so `use core::…` and `use alloc::…` resolve against
+# the build-std facades. Same pattern as shared/shmem for core.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+rustc-std-workspace-alloc = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = [
+    "rustc-std-workspace-core",
+    "rustc-std-workspace-alloc",
+    "syscall-abi/rustc-dep-of-std",
+]
+
+[lints]
+workspace = true

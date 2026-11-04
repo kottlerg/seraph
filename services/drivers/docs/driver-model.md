@@ -54,21 +54,20 @@ withdrawn.
 
 devmgr withdraws every driver it does not, or no longer, serves: one that dies, fails its device
 setup, overruns its settle bound, or that devmgr cannot record or serve. For a `VirtIO` PCI driver
-it takes the device from the driver, revoking the driver's mappings of its BARs, then resets the
-device through a BAR cap it keeps (`device_status` 0, complete once the status reads back 0), which
-stops the device's DMA and drops its pending interrupt, before it releases the device's caps. A
-driver still running is taken from its device and reset before it is destroyed, so a device that
-confirms its reset can no longer reach the driver's memory when that memory is freed. A driver that
-dies while its device asserts a shared level-triggered line leaves the line's other receivers no
-assertion to loop on once the reset lands; between the driver's death, which releases its binding,
-and the reset, they may see re-deliveries their own devices did not raise
+it takes the device from the driver in an order that frees the driver's memory only once the
+device's DMA is confirmed stopped: it clears the function's Bus Master Enable through a
+configuration-page cap it keeps and no driver holds, so the device issues no further DMA; revokes
+the driver's mappings of its BARs; resets the device through a BAR cap it keeps (`device_status` 0,
+complete once the status reads back 0, bounded by `RESET_TIMEOUT`), which drops its pending
+interrupt; and destroys the driver. Every `VirtIO` driver is created `CREATE_DMA_HOLD`, so procmgr
+holds its memory after its death, however it died, until devmgr releases it, which devmgr does
+only when the Bus Master Enable read-back and the reset both confirm the device stopped; otherwise
+the memory stays quarantined for the rest of the boot. A driver that dies while its device asserts
+a shared level-triggered line leaves the line's other receivers no assertion to loop on once the
+reset lands; between the driver's death, which releases its binding, and the reset, they may see
+re-deliveries their own devices did not raise
 ([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)
-§ Interrupt Delivery). Two windows remain until a driver can be frozen before its device is taken
-from it ([#731](https://github.com/kottlerg/seraph/issues/731)): a device that does not confirm its
-reset, whose driver is destroyed anyway, may still be writing that driver's memory as it is freed;
-and a driver can fault on its revoked BARs and be reaped before the reset lands. A driver that dies
-on its own has its memory freed by procmgr before devmgr hears of the death and resets its device,
-which #731 tracks too. The withdrawal, the reset among its steps, is specified in
+§ Interrupt Delivery). The withdrawal, the reset among its steps, is specified in
 [services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities.
 

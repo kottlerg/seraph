@@ -277,6 +277,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "death-set"
+version = "0.1.1"
+dependencies = [
+ "ruststd-death-queues",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "demandpaged"
 version = "0.1.1"
 
@@ -811,6 +820,7 @@ dependencies = [
 name = "procmgr"
 version = "0.1.1"
 dependencies = [
+ "death-set",
  "elf",
  "ipc",
  "namespace-protocol",
@@ -826,7 +836,6 @@ name = "procmgr-process-table"
 version = "0.1.1"
 dependencies = [
  "ipc",
- "syscall-abi",
 ]
 
 [[package]]
@@ -909,6 +918,12 @@ name = "relrofault"
 version = "0.1.1"
 
 [[package]]
+name = "rustc-std-workspace-alloc"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d441c3b2ebf55cebf796bfdc265d67fa09db17b7bb6bd4be75c509e1e8fec3"
+
+[[package]]
 name = "rustc-std-workspace-core"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,6 +934,15 @@ name = "ruststd-argv-env"
 version = "0.1.1"
 dependencies = [
  "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "ruststd-death-queues"
+version = "0.1.1"
+dependencies = [
+ "rustc-std-workspace-alloc",
+ "rustc-std-workspace-core",
+ "syscall-abi",
 ]
 
 [[package]]
@@ -1052,6 +1076,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 name = "svcmgr"
 version = "0.1.1"
 dependencies = [
+ "death-set",
  "ipc",
  "namespace-protocol",
  "registry",

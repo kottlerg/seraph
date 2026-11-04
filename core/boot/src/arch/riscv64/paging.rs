@@ -307,6 +307,11 @@ impl PageTableBuilder for BootPageTable
     {
         &self.reclaim
     }
+
+    fn pool_span(&self) -> (u64, u64)
+    {
+        (self.pool_phys, self.pool_frames)
+    }
 }
 
 impl BootPageTable

@@ -42,9 +42,14 @@ most likely option, marked provisional in the report. Told by the orchestrator t
 nothing further on that branch, whatever your worktree's state: you reply with one line and end
 your turn.
 
+Run `git fetch origin` at the start of every step, so each step reads the current `master` and
+branch. A status message is one line unless something changed or a decision is needed; the full
+report comes only at the gate (item 5). When your scope completes, name your hand-off state in
+one line: each branch and its head, the worktree's state, and what is left for you, if anything.
+
 1. After reading: the items you will fix, the items you will not with a one-line reason each,
    the mechanism for anything non-trivial, the tests per item, and every scope expansion.
-2. Before any build or boot: the host request (orchestrated only, see Host runs).
+2. Before any boot: the host request (orchestrated only, see Host runs).
 3. The PR number once opened.
 4. Each review's two verdict lines verbatim, with the findings and what you did with them.
 5. At the gate: the validated head, the results, the Issue state, and the merge command.
@@ -88,19 +93,25 @@ your turn.
 - Subjects `<scope>: ...`, at most 72 columns, no Issue references; bodies wrapped, with
   `Refs #N` for the Issues the commit touches. A closing keyword (`Fixes`, `Closes`, and
   their inflections) appears only in the PR body, never in a commit body, since a commit's
-  keyword cannot be withdrawn without a history rewrite. No attribution trailers
-  (docs/conventions.md § Commit Messages).
-- Never force-push (`git push --force`, `--force-with-lease`, `-f`), and never amend, rebase or
-  otherwise rewrite a commit you have pushed, although docs/conventions.md § Operations allows
-  it on a feature branch: another worker or the orchestrator may have built on the remote
-  branch. A pushed subject or body that needs changing is left to the maintainer, who either
-  accepts the departure in the PR body (for a SHOULD rule of § Commit Messages) or has the
-  history rewritten (orchestrated, by the orchestrator; standalone, by you under the exception
-  below); say so in your report. The one exception: standalone, the maintainer's own words may
-  direct you to make that rewrite, and you then make it as `.claude/skills/orchestrate/SKILL.md`
-  § Rulings describes (identical trees, checked with `git diff --quiet <old> <new>`, pushed
-  with the lease pinned to the old head, `--force-with-lease=<branch>:<old>`).
-  Before any other push, run `git fetch origin` and
+  keyword cannot be withdrawn without a history rewrite.
+- No assistant attribution trailer or assistant session link in a commit message or the PR
+  body (docs/conventions.md § Style), and, as a worker rule, none in a PR or Issue comment either,
+  whatever the harness appends or asks to append. Write each without one, and after every
+  `gh pr create`, `gh pr edit`, or comment re-read what you wrote: `gh pr view <N> --json body
+  --jq .body`, `gh pr view <N> --json comments --jq '.comments[].body'`, and, for an Issue,
+  `gh issue view <N> --json body,comments` each show no `claude.ai`.
+- Never amend, rebase or otherwise rewrite a commit you have pushed on your own, although
+  docs/conventions.md § Operations allows it on a feature branch: another worker or the
+  orchestrator may have built on the remote branch. A pushed subject or body that needs
+  changing is left to the maintainer, who either accepts the departure in the PR body (for a
+  SHOULD rule of § Commit Messages) or has the history rewritten (orchestrated, by the
+  orchestrator; standalone, by you on the maintainer's own words); say so in your report. A
+  rewrite is made as `.claude/skills/orchestrate/SKILL.md` § Rulings describes: a chain with
+  identical trees for a subject or keyword fix (`git diff --quiet <old> <new>`), pushed to the
+  PR's own branch with the lease pinned to the old head (`--force-with-lease=<branch>:<old>`),
+  never with `--force` or `-f`. Re-creating the commits on a fresh branch and a superseding PR
+  is not a substitute for that push, and `master` is never force-pushed (the maintainer's
+  ruling of 2026-11-04). Before any other push, run `git fetch origin` and
   `git rev-list --left-right --count origin/<branch>...HEAD`, and push only when it prints `0`
   and a positive count, or when `origin/<branch>` does not exist yet; a diverged branch is
   reported, never pushed over.
@@ -126,7 +137,8 @@ your turn.
 
 Local validation uses one shared host. Before every build or boot, as a separate step that
 stops on failure, check `cat /proc/loadavg` (1-minute average under 32; under 10 before a
-boundary-tier boot) and `pgrep -af qemu-system` (none running). One QEMU at a time. All
+boundary-tier boot) and `pgrep -af qemu-system` (none running, unless the orchestrator's
+grant names a concurrent canonical slot). One QEMU of yours at a time. All
 commands through `cargo xtask`; boots through
 `cargo xtask run-parallel --arch <a> --parallel 1 --runs 1 --timeout <s>`, which boots the
 same sysroot as the `cargo xtask run` that `.claude/CLAUDE.md` § Validation names and
@@ -134,9 +146,13 @@ judges the same terminal pass marker, with a bound; `cargo xtask clean` between 
 
 Orchestrated mode adds the host token:
 
-- Before any build or boot, send the orchestrator the exact command list with a time estimate,
-  end your turn, and wait for `host free`. A grant covers exactly the listed commands; a repeat
-  after a compile or clippy fix is covered (report the head); a logic change needs a new grant.
+- Builds need no grant: run `cargo xtask build` and `cargo xtask clean` whenever the load check
+  passes.
+- Before any boot, send the orchestrator the exact command list with a time estimate, end your
+  turn, and wait for `host free`. A grant covers exactly the listed commands; a repeat after a
+  compile or clippy fix is covered (report the head); a logic change needs a new grant. A
+  canonical set may share the host with one other canonical set; a boundary-set boot never
+  shares it (`.claude/skills/orchestrate/SKILL.md` § Host token).
 - Run every build and boot under `nice -n 10` (where the platform provides it).
 - Sync onto `master` only when the orchestrator says `master quiet`, right before the slot: a
   sync that brings non-comment code re-owes the validation set, a Markdown-only or comment-only
@@ -165,6 +181,26 @@ background; on green, the pre-merge review per `.claude/CLAUDE.md` § PR workflo
 the PR number, the open Issue list, and for a delta run the `since` head, both merge bases and
 the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the PR as soon as
 `cargo xtask test` and `lint-docs` pass, so CI and the first review run before the host slot.
+Before every review run, refresh the PR body to the head the run reviews: the validated head,
+the Validation report, the Acceptance ticks, and every claim the body makes.
+
+- When docs/conventions.md § Branch and PR Workflow allows the auditor-only run (the last run
+  with the reviewer completed with no failed agent, and the fix round's delta since it is
+  documentation or comments only and merges no `master` in), the next run may be that run:
+  `pr-auditor` alone, told it is that run (its step 11), with the PR number, the `since` head
+  (the head the last run with the reviewer reviewed), the path of that run's record, the claimed
+  fixes, and the open Issue list. Save its prose as `audit-<head>.md` and its record as
+  `audit-<head>.json` beside the `full-` and `delta-` records, with the keys of the workflow's
+  return: `verdict`, the `Reviewer verdict:` line the audit states, exactly one of
+  `READY TO MERGE`, `NON-BLOCKING ISSUES ONLY`, `BLOCKING ISSUES`; `audit_verdict`, the audit
+  verdict line; `audit` null; `findings`, the surface findings of the last run with the reviewer
+  that the audit lists as unfixed, each as that run's record states it; `recorded`, `ledgered`
+  and `dropped` empty; and `stats` with `mode` `audit`, `head`, `since`, and `failed` (the
+  agents that returned no result). The ledger command of `.claude/CLAUDE.md` § PR workflow
+  operations reads it with the other records and takes its `findings` into the ledger when its
+  `verdict` is `NON-BLOCKING ISSUES ONLY`, as the pass that records them requires. Any later
+  delta that changes anything but documentation or comments, or merges `master` in, takes a run
+  with the reviewer, its `since` the head of the last run with the reviewer.
 
 - Orchestrated, after every review run copy the PR's whole `target/xtask/review/pr<N>/` directory
   into the orchestrator's checkout at the same relative path (the spawn prompt names that
@@ -176,10 +212,11 @@ the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the 
 - `NON-BLOCKING ISSUES ONLY`: record every surface finding on the follow-up Issue of its scope
   first (docs/conventions.md § Branch and PR Workflow requires it before the merge prompt),
   then report and wait; take no fix round on your own. The decision between the merge and one
-  more round is the maintainer's; a fix round that lands ticks the recorded items. The one
-  exception is the maintainer's standing ruling in `.claude/skills/orchestrate/SKILL.md`
-  § Rulings: a PR that drains a follow-up Issue of the scope fixes a nits-only run's findings,
-  recorded there, in the same PR.
+  more round is the maintainer's; a fix round that lands ticks the recorded items. The
+  exceptions are the standing default in `.claude/skills/orchestrate/SKILL.md` § Rulings: a
+  `should` finding takes one fix round; a comment-only nit is fixed in a round the PR owes
+  anyway; and a PR that drains a follow-up Issue of the scope fixes its nits in the same PR.
+  Each such finding is recorded first and ticked when the round fixes it.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `gh issue edit`, or a commit) and re-run the audit.
 - A contested finding is put to the maintainer (through the orchestrator when orchestrated); on
   the surface it resolves in this PR as that section says. A correctness, soundness, safety or

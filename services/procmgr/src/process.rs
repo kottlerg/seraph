@@ -9,8 +9,8 @@
 //! from in-memory ELF images or by streaming from VFS, as well as starting
 //! suspended processes.
 
-use crate::death_queues::DeathSet;
 use crate::loader::{self, ScratchMapping};
+use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
@@ -185,8 +185,8 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 // `process::split_create_from_file_caps` call sites in the create handlers,
 // resolve through this module.
 pub use process_table::{
-    ChildArgs, ChildEnv, CreateBlobs, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
-    resolve_spawn_sched, split_create_from_file_caps,
+    ChildArgs, ChildEnv, CreateBlobs, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
+    badge_is_acceptable, resolve_spawn_sched, split_create_from_file_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -1382,6 +1382,7 @@ fn finalize_creation(
             stack_top_vaddr: layout.stack_top,
             process_info_va: layout.process_info_va,
             started: false,
+            dma_hold: false,
         })
         .is_err()
     {
@@ -1927,10 +1928,32 @@ fn vfs_read(
     Some(bytes_read)
 }
 
-/// Close an open file via its per-file capability and delete the cap.
-/// `pub(crate)` so `main.rs` request handlers can release a transferred
-/// file cap on pre-create validation failures.
-pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
+/// Open the file a caller-transferred file node cap names (`FS_OPEN`, with
+/// no release SEND: procmgr releases each page itself right after its copy,
+/// so it opts out of cooperative release), and delete the node cap. Returns
+/// the open cap every later read and the closing `FS_CLOSE` go to, so
+/// procmgr's pages and close touch no other opener's state
+/// (`fs/docs/fs-driver-protocol.md` § Label 18). `None` when the call fails
+/// or the reply carries no open cap; every other reply cap is deleted.
+fn vfs_open(node_cap: u32, ipc_buf: *mut u64) -> Option<u32>
+{
+    let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) };
+    let _ = syscall::cap_delete(node_cap);
+    let reply = reply.ok()?;
+    let (open_cap, surplus) = match reply.caps().split_first()
+    {
+        Some((&cap, rest)) if reply.label == 0 => (Some(cap), rest),
+        _ => (None, reply.caps()),
+    };
+    // The file cap is client-supplied, so its server is untrusted.
+    crate::release_caps(surplus);
+    open_cap
+}
+
+/// Close an open file via its open cap and delete the cap.
+fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1951,7 +1974,8 @@ pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 // the success path via `disarm()`. Constructed at the point of acquisition;
 // disarmed only after the caps have been moved into the final destination.
 
-/// Holds the caller-transferred file cap until the success path consumes it.
+/// Holds procmgr's open of the caller-transferred file until the success
+/// path consumes it.
 struct FileCapGuard
 {
     cap: u32,
@@ -2328,8 +2352,9 @@ fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
 ///
 /// Reads only the ELF header page, then loads each segment page-by-page
 /// directly from the file cap into target memory caps. No intermediate file
-/// buffer. Procmgr `FS_CLOSE`s and `cap_delete`s `file_cap` before
-/// return regardless of outcome — ownership transfers in. `creator_endpoint`
+/// buffer. Procmgr opens `file_cap` (`FS_OPEN`) and deletes it, then
+/// `FS_CLOSE`s and deletes its open before return regardless of outcome —
+/// ownership transfers in. `creator_endpoint`
 /// is only copied into the child, so the caller still owns and releases it;
 /// `parent_relay_cap` is consumed only on `Ok`, so on `Err` the caller
 /// releases it. Every resource acquired for the child, including memmgr's
@@ -2360,10 +2385,14 @@ pub fn create_process_from_file(
     let self_aspace = ctx.self_aspace;
     let self_endpoint = ctx.self_endpoint;
 
-    // Caller-transferred file cap: wrapped immediately so every early
-    // return between here and the success-path disarm closes the file
-    // (FS_CLOSE on the fs driver) and frees procmgr's CSpace slot.
-    let file_cap = FileCapGuard::new(file_cap, ipc_buf);
+    // Caller-transferred file node cap: opened at once, and the open
+    // wrapped, so every early return between here and the success-path
+    // disarm closes the open (FS_CLOSE on the fs driver) and frees
+    // procmgr's CSpace slot.
+    let file_cap = FileCapGuard::new(
+        vfs_open(file_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?,
+        ipc_buf,
+    );
 
     if file_size == 0
     {
@@ -2747,7 +2776,8 @@ pub fn create_process_from_file(
 /// page tables. The child's heap / stack / IPC / `ProcessInfo` pages are
 /// `owns_memory = false` derivations of memmgr's pool, so dropping them
 /// frees nothing to the sealed buddy; memmgr reclaims those pages into its
-/// pool via the process-death notification.
+/// pool via the process-death notification, which a started
+/// `CREATE_DMA_HOLD` child's teardown holds back ([`teardown_entry`]).
 ///
 /// Returns the exit reason the process is torn down with, for the caller to
 /// record in the recent-exits ring so `QUERY_PROCESS` answers `EXITED` for
@@ -2773,8 +2803,27 @@ pub fn destroy_process(
         }
         _ => EXIT_KILLED,
     };
-    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf);
+    teardown_entry(entry, exit_reason, memmgr_ep, ipc_buf, table.holds_mut());
     Some(exit_reason)
+}
+
+/// Send memmgr the held-back `PROCESS_DIED` of the torn-down
+/// `CREATE_DMA_HOLD` child `badge` (`RELEASE_HOLD`), then drop procmgr's
+/// badged memmgr SEND for it. Returns `false` when `holds` keeps no reclaim
+/// for the badge.
+pub fn release_hold(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, holds: &mut DmaHolds) -> bool
+{
+    let Some(held) = holds.release(badge)
+    else
+    {
+        return false;
+    };
+    notify_memmgr_died(memmgr_ep, held.memmgr_badge, ipc_buf);
+    if held.memmgr_send_cap != 0
+    {
+        let _ = syscall::cap_delete(held.memmgr_send_cap);
+    }
+    true
 }
 
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed
@@ -2798,13 +2847,25 @@ fn notify_memmgr_died(memmgr_ep: u32, memmgr_badge: u64, ipc_buf: *mut u64)
 /// behalf of the child, then forwards the death, with `exit_reason`, to
 /// logd ([`forward_death_to_logd`]).
 ///
+/// The memmgr reclaim of a started child created with `CREATE_DMA_HOLD` is
+/// parked in `holds` instead of sent: a device the child drove may still be
+/// writing its frames, so they return to memmgr only on the creator's
+/// `RELEASE_HOLD` ([`release_hold`]; docs/process-lifecycle.md § Process
+/// Death).
+///
 /// Note: the bound death-notification observers in the child thread's TCB
 /// and address space are released automatically when the objects are torn
 /// down by the cap-revokes below — no explicit unbind syscall is required.
 // needless_pass_by_value: consumes the entry's cap slots; passing by
 // reference would invite accidental double-free on subsequent reuse.
 #[allow(clippy::needless_pass_by_value)]
-pub fn teardown_entry(entry: ProcessEntry, exit_reason: u64, memmgr_ep: u32, ipc_buf: *mut u64)
+pub fn teardown_entry(
+    entry: ProcessEntry,
+    exit_reason: u64,
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    holds: &mut DmaHolds,
+)
 {
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
@@ -2839,11 +2900,15 @@ pub fn teardown_entry(entry: ProcessEntry, exit_reason: u64, memmgr_ep: u32, ipc
     }
 
     // Notify memmgr to reclaim every memory cap attributed to this child's
-    // memmgr badge, then drop procmgr's badged SEND copy.
-    notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
-    if entry.memmgr_send_cap != 0
+    // memmgr badge, then drop procmgr's badged SEND copy, unless the reclaim
+    // is held for the creator's `RELEASE_HOLD`.
+    if !holds.park(&entry)
     {
-        let _ = syscall::cap_delete(entry.memmgr_send_cap);
+        notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
+        if entry.memmgr_send_cap != 0
+        {
+            let _ = syscall::cap_delete(entry.memmgr_send_cap);
+        }
     }
 
     forward_death_to_logd(entry.badge, exit_reason);

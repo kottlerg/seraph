@@ -26,12 +26,11 @@ procmgr/
 │                                 table + badge logic, the create-request
 │                                 argv/env blob decoder and cap split, the
 │                                 fs-reply bounds, the init-reap state
-│                                 machine, and the death-queue bind order
-│                                 and growth, main wait set included
-│                                 (`DeathQueues`)
+│                                 machine, and the first death queue's
+│                                 size (`FIRST_POOL_OBSERVERS`)
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
-│   ├── death_queues.rs         # The death-queue set and main wait set (`DeathSet`)
+│   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
 │   ├── init_reap.rs            # Init-reap: reaps init after handover
@@ -55,7 +54,10 @@ procmgr/
   initial caps to newly created processes via `ProcessInfo`.
 - **memmgr coordination** — call `memmgr.REGISTER_PROCESS` before
   spawning a child to obtain the child's `memmgr_endpoint_cap`; call
-  `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim. See
+  `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim, or, for a
+  started child created with `CREATE_DMA_HOLD`, only once its creator sends
+  `RELEASE_HOLD` (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 3:
+  `RELEASE_HOLD`). See
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Steady-State
   Process Creation and § Process Death.
 - **Process teardown** — on exit or crash, revoke the process's
@@ -164,7 +166,8 @@ The full procmgr IPC specification is in
 - `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child `Thread` cap
 - `CREATE_FROM_FILE(file_cap, file_size, …)` → suspended process handle,
   child `Thread` cap. Caller has already walked its own namespace cap to the
-  binary; procmgr issues `FS_READ` against the supplied file cap.
+  binary; procmgr opens the supplied file cap (`FS_OPEN`) and reads the ELF
+  through its own open.
 - `START_PROCESS(process_handle)` — start a previously created process
 - `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)
   cwd caps on the child before start; the sole path that writes
@@ -210,7 +213,8 @@ once a pool reaches the kernel maximum); when memmgr refuses it, procmgr retries
 down to the first pool's size, whose request is three pages.
 
 The queues share procmgr's main wait set with its service endpoint, and procmgr's death-queue set
-(`DeathSet`, `src/death_queues.rs`) owns that wait set: it starts with room for two members (the
+(`DeathSet`, the [`shared/death-set`](../../shared/death-set/README.md) crate, following the
+`ruststd-death-queues` growth policy) owns that wait set: it starts with room for two members (the
 endpoint and the first queue), and when the queues fill it, procmgr creates one with twice the
 members, up to `WAIT_SET_MAX_MEMBERS` (1024), moves every member across, and deletes the old one;
 the main loop waits on whichever is current. The kernel queues a member that is already ready when
@@ -240,6 +244,14 @@ back; that process is reaped when its main thread exits. A reaped or destroyed
 `QUERY_PROCESS` answers `EXITED` for it, unless heap exhaustion drops or evicts
 its record first (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9:
 `QUERY_PROCESS`).
+
+The teardown of a started child created with `CREATE_DMA_HOLD` parks the child's memmgr record
+(its memmgr badge and procmgr's badged memmgr SEND) in a held list (`DmaHolds`) instead of sending
+`PROCESS_DIED`; the creator's `RELEASE_HOLD` takes the record and sends it. The room each record
+takes is reserved when the create arms the hold, so a create the heap cannot reserve it for fails
+with `OUT_OF_MEMORY`, and a teardown never has to free a held child's frames for want of a record.
+A held record keeps its badge in use, so badge minting never hands it to a new child, whose
+process handle could otherwise release it.
 
 ---
 

@@ -32,7 +32,8 @@ core/kernel/
 │   ├── uaccess.rs              # Fault-recoverable user-memory copies
 │   ├── validate.rs             # Phase 0 boot-info validation
 │   ├── arch/                   # Architecture-specific implementations
-│   │   ├── mod.rs              # Re-exports the active arch module
+│   │   ├── mod.rs              # Re-exports the active arch module; declares `nospec`
+│   │   ├── nospec.rs           # Arch-neutral speculation-safe bounds (masks, pointer select)
 │   │   ├── x86_64/             # x86-64 implementation
 │   │   │   ├── mod.rs
 │   │   │   ├── paging.rs       # Page table management (PML5/PML4/PDPT/PD/PT, depth from CR4.LA57)
@@ -49,7 +50,8 @@ core/kernel/
 │   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
 │   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │   │   ├── console.rs      # Early serial (COM1 16550, I/O-port) output
-│   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
+│   │   │   ├── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
+│   │   │   └── speculation.rs  # Branchless bound mask (cmp/sbb) and opaque identity
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── paging.rs       # Page table management (mode-parameterized)
@@ -67,7 +69,8 @@ core/kernel/
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │       ├── console.rs      # Early serial (ns16550 MMIO UART) output
-│   │       └── entropy.rs      # No S-mode hardware RNG; cycle counter for jitter
+│   │       ├── entropy.rs      # No S-mode hardware RNG; cycle counter for jitter
+│   │       └── speculation.rs  # Branchless bound mask (sltu/neg) and opaque identity
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)

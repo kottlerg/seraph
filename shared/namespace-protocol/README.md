@@ -61,6 +61,19 @@ requirement. Backends that need more
 than 2^40 distinct nodes per server lifetime MUST split into multiple
 servers; the protocol does not provide badge expansion.
 
+**Open-instance caps.** Bit 48 (bit 8 of the rights field, the lowest
+reserved one) is `OPEN_INSTANCE`, a badge-kind flag and not a right. A
+badge carrying it is an open cap a filesystem driver minted at `FS_OPEN`
+([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md)
+§ Label 18): bits 0..40 hold a server-private open id instead of a
+`NodeId`, and bits 40..64 the rights as above. `pack_open` is its encoder
+and `gate_open` its decoder. `gate` refuses such a badge
+(`GateError::WrongKind`), and `dispatch_request` answers every `NS_*` on it
+`NotSupported`, so no backend can read an open id as a node. Open ids are
+kept out of the `NodeId` space so that opens do not share the node bound,
+and so that a backend unaware of opens never acts on whichever node shares
+an open's number.
+
 ---
 
 ## NS_LOOKUP
@@ -210,7 +223,8 @@ limits, case-sensitivity rules); such restrictions surface as
 ## Rights
 
 Namespace rights are a 24-bit mask packed in badge bits 40..64. Eight
-bits are defined; sixteen are reserved.
+bits are defined, bit 8 is the `OPEN_INSTANCE` kind flag (§ Badge shape),
+and fifteen are reserved.
 
 | Bit | Constant | Meaning |
 |---:|---|---|
@@ -222,7 +236,8 @@ bits are defined; sixteen are reserved.
 | 5 | `EXEC` | File is executable (design intent; not yet implemented: no loader tests it) |
 | 6 | `MUTATE_DIR` | `FS_CREATE` / `FS_REMOVE` / `FS_MKDIR` / `FS_RENAME` (directory) |
 | 7 | `ADMIN` | Visibility-gating bit |
-| 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
+| 8 | `OPEN_INSTANCE` | Not a right: marks an open cap's badge (§ Badge shape); never part of a `NamespaceRights` value |
+| 9..23 | — | Reserved; MUST be zero on derive, ignored on read |
 
 Every node cap is a `SEND` cap from the kernel's perspective; the
 rights mask above is opaque to the kernel and inspected only by the
@@ -234,10 +249,12 @@ this through the intersection at step 5 of `NS_LOOKUP`.
 
 `gate(label, badge)` is the only public path from a badged request to its `NodeId` and rights.
 It looks the opcode up in the crate's per-label table, applies the requirement in the table above
-(`FS_RELEASE_MEMORY` and `FS_CLOSE` require only a non-empty rights mask), and returns
-`GateError::UnknownLabel` for an opcode the table does not list or `GateError::PermissionDenied`
-when the badge lacks the requirement. Unbadged service-level labels (`FS_MOUNT`) are dispatched
-outside it.
+(`FS_RELEASE_MEMORY`, `FS_CLOSE`, and `FS_OPEN` require only a non-empty rights mask), and
+returns `GateError::UnknownLabel` for an opcode the table does not list,
+`GateError::WrongKind` for an open-instance badge, or `GateError::PermissionDenied` when the
+badge lacks the requirement. `gate_open(label, badge)` applies the same table to an
+open-instance badge and returns its open id and rights, with `GateError::WrongKind` for a node
+badge. Unbadged service-level labels (`FS_MOUNT`) are dispatched outside both.
 
 ---
 

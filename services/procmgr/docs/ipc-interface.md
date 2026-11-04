@@ -23,12 +23,12 @@ Label numbers, error codes, and query states are defined in
 [`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) (`procmgr_labels`,
 `procmgr_errors`, `procmgr_process_state`).
 
-`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, and
-`CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
+`START_PROCESS`, `RELEASE_HOLD`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`,
+and `CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
 create call returns); procmgr identifies the target process by the badge
 `ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
 § `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
-§ `QUERY_LIVE_PROCESSES` below. Labels 3–7 and 10
+§ `QUERY_LIVE_PROCESSES` below. Labels 4–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see
 § Capability Transfer).
@@ -105,8 +105,8 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
-| 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, or kernel-object or memory-cap allocation |
-| 7 | `INVALID_ARGUMENT` | Reserved label bits `[28..32]` set, or the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band) |
+| 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
+| 7 | `INVALID_ARGUMENT` | Reserved label bits `[29..32]` set, or the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band) |
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via
@@ -128,9 +128,28 @@ delegation and the main thread's binding have both taken effect, so the page nev
 names a pager the child does not have; a child whose binding failed, or whose page
 procmgr could not map to advertise it, reads zero and keeps its memory eager.
 
+**DMA hold flag.** The label's bit 28 (`CREATE_DMA_HOLD`, in the window shared
+with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child
+has been started, its teardown, however it comes (its death, a death resync, or
+`DESTROY_PROCESS`), revokes and deletes its kernel objects as for any child but
+does not send memmgr `PROCESS_DIED`: procmgr parks the child's memmgr record
+until the creator sends `RELEASE_HOLD` (§ Label 3) on the child's process
+handle, and until then memmgr keeps the child's frames on that record, out of
+its free pool. Set it for a driver whose device may DMA into its frames after
+it dies: the creator releases the hold once it has confirmed the device's DMA
+stopped, and never when it cannot, which leaves the frames quarantined for the
+rest of the boot
+([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
+§ DMA-Safe Teardown). A child destroyed before
+`START_PROCESS` never ran, so it touched no device, and its teardown sends
+`PROCESS_DIED` at once. procmgr reserves the room the child's parked record
+takes before it replies to the create, so no teardown frees a held child's
+pages for want of a record; when it cannot, the create fails with
+`OUT_OF_MEMORY`.
+
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and
-`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[28..32]`
+`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[29..32]`
 remain reserved and MUST be zero (`INVALID_ARGUMENT` otherwise, which keeps a
 future field addition provably additive). Resolution, against the **creator's
 band ceiling** (badge 0 = init, ceiling `sched_policy::BASELINE_PRIORITY_MAX`;
@@ -190,13 +209,46 @@ embedded in the endpoint capability.
 | 5 | `ALREADY_STARTED` | Process was already started |
 | 6 | `THREAD_START_FAILED` | `thread_start` failed with an error other than `Interrupted`, which procmgr retries |
 
+### Label 3: `RELEASE_HOLD`
+
+Release the held memory reclaim of a torn-down child created with
+`CREATE_DMA_HOLD` (§ Label 1, **DMA hold flag**). Sent on the process handle
+with no data words or caps. procmgr sends memmgr `PROCESS_DIED` for the child's
+memmgr badge, deletes its copy of the child's badged memmgr SEND, and drops the
+held record, so memmgr returns the child's frames to its free pool.
+
+procmgr serves its requests in order, so a `DESTROY_PROCESS` the creator sends
+first has torn the child down, and parked its record, before the release is
+served, whether or not procmgr had reaped the child already. A release that
+finds no held record changes nothing: the child is live, was never started or
+never held, or was released already. procmgr cannot tell the creator's
+handle from any other SEND carrying the child's badge: the child's own procmgr
+cap carries it too, and the child may have granted a copy onward before it
+died, so any holder of such a copy can release the hold once the child is torn
+down. A dead child itself cannot. procmgr never hands a held record's badge to a
+new child.
+
+**Reply:**
+
+| Field | Value |
+|---|---|
+| label | 0 (success): the held reclaim was sent; or a nonzero error code |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_BADGE` | procmgr holds no reclaim for the handle's badge |
+
 ### Label 8: `DESTROY_PROCESS`
 
 Destroy a process. Sent on the process handle with no data words or caps.
 procmgr removes the process entry, revokes and deletes the child's `Thread`,
 `CSpace`, `AddressSpace`, `ProcessInfo` Memory cap, and TLS Memory cap, deletes
 any namespace caps never consumed by `START_PROCESS`, and sends memmgr
-`PROCESS_DIED` for the child's memmgr badge.
+`PROCESS_DIED` for the child's memmgr badge, unless the child was created with
+`CREATE_DMA_HOLD` and started, whose reclaim waits for `RELEASE_HOLD`
+(§ Label 3).
 
 **Reply:** label 0 (success), always. An unknown or already-destroyed badge is
 a no-op.
@@ -281,8 +333,8 @@ any cap past cap[1].
 
 Create a suspended process from an ELF binary the caller has already resolved:
 the caller walks its own namespace cap to the binary node and transfers the
-resulting file cap. procmgr streams the ELF with `FS_READ` / `FS_READ_MEMORY`
-against that cap and never holds a namespace cap of its own. Loading, the
+resulting file cap. procmgr opens it (`FS_OPEN`), streams the ELF with `FS_READ` /
+`FS_READ_MEMORY` against its own open, and never holds a namespace cap of its own. Loading, the
 **Pinned flag**, and the **Scheduling fields** are as for `CREATE_PROCESS`.
 
 **Request:**
@@ -298,9 +350,11 @@ against that cap and never holds a namespace cap of its own. Loading, the
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap |
 
-procmgr `FS_CLOSE`s and deletes the file cap after the load, whether it succeeds or fails, and
-deletes its copy of the creator endpoint and any cap the layout does not name. When present, the
-death-relay cap is the last cap in the message, so the creator-endpoint slot stays at cap[1]; it is
+procmgr deletes the file cap once it has opened it, `FS_CLOSE`s and deletes its open after the
+load, whether it succeeds or fails, and deletes its copy of the creator endpoint and any cap the
+layout does not name; a request refused before the open deletes the file cap unopened. When
+present, the death-relay cap is the last cap in the message, so the creator-endpoint slot stays at
+cap[1]; it is
 a cap of its own, so a request that sets `CREATE_DEATH_RELAY` carries at least two caps, and one
 whose only cap is the file cap is refused with `INVALID_ARGUMENT`. Once the child is recorded,
 procmgr binds the relay as an `AddressSpace` death observer (correlator 0) on the child, using one
@@ -318,9 +372,9 @@ child, its memmgr record included, as for `CREATE_PROCESS`.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed |
-| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` set with only the file cap, reserved label bits `[28..32]` set, or the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band) |
-| 10 | `IO_ERROR` | An `FS_READ` of the ELF header against the file cap failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
+| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
+| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` set with only the file cap, reserved label bits `[29..32]` set, or the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band) |
+| 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 
@@ -339,8 +393,8 @@ process creation and does not return it.
 Every cap a request transfers lands in procmgr's CSpace, whether or not the
 request's layout names it. procmgr deletes the caps a layout does not name
 (caps past the last named position, and every cap of a label that names none:
-`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `INIT_TEARDOWN_DONE`, and
-unknown opcodes), and every cap of a refused request, except the init-reap
+`START_PROCESS`, `RELEASE_HOLD`, `DESTROY_PROCESS`, `QUERY_PROCESS`,
+`INIT_TEARDOWN_DONE`, and unknown opcodes), and every cap of a refused request, except the init-reap
 refusals of an un-badged sender that keep caps init may still be running on
 (§ `REGISTER_INIT_TEARDOWN`). A padded or refused request from any badged sender
 therefore cannot grow procmgr's CSpace. Replies to the calls procmgr makes on a

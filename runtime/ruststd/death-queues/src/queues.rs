@@ -1,36 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/svcmgr/svc-defs/src/death_queues.rs
+// runtime/ruststd/death-queues/src/queues.rs
 
-//! Bind order and growth of svcmgr's death queues.
+//! Bind order and growth of a set of death queues.
 //!
 //! Each death-observer bind takes one node from the pool of the queue it
 //! names, and a queue's pool is fixed when the queue is created
-//! (`SYS_CAP_CREATE_EVENT_Q`). [`DeathQueues`] keeps the queues svcmgr has
+//! (`SYS_CAP_CREATE_EVENT_Q`). [`DeathQueues`] keeps the queues its user has
 //! created and decides where a bind goes: the newest queue first, then the
 //! older ones, whose nodes return as their observed threads and address
 //! spaces are destroyed, and, only when every queue refuses for want of a
 //! node, a further queue with twice the last pool. A further queue is one
 //! contiguous grant, so a refused one is retried at half the pool, down to
-//! the first pool's size. Every queue is a member of the service's main wait
+//! the first pool's size. A service's queues are members of its main wait
 //! set, beside its service endpoint; when the queues fill it, the set is
-//! replaced by one with twice the members, up to `WAIT_SET_MAX_MEMBERS`. The
-//! syscalls themselves (the bind, the create that funds a queue and adds it
-//! to the wait set, and the wait-set replacement) are the caller's closures,
-//! so the policy is host-tested here. procmgr keeps a copy of this policy
-//! (`procmgr-process-table`'s `death_queues`).
+//! replaced by one with twice the members, up to `WAIT_SET_MAX_MEMBERS`. A
+//! user with no wait set (ruststd's thread reaper) creates the set with
+//! `WAIT_SET_MAX_MEMBERS` members and a `grow_ws` that is never reached
+//! below that many queues. The syscalls themselves (the bind, the create
+//! that funds a queue, and the wait-set replacement) are the caller's
+//! closures, so the policy is host-tested here. Every user's queue sizes are
+//! its own (`DeathQueues::new`).
+
+// When this crate is compiled as a std dep via rustc-dep-of-std, the
+// crate root is `no_core` and the prelude reaches only the root module;
+// submodules import it themselves. Harmless no-op otherwise.
+#[cfg(feature = "rustc-dep-of-std")]
+#[allow(unused_imports)]
+use core::prelude::rust_2024::*;
+
+use alloc::vec::Vec;
 
 use syscall_abi::{EVENT_QUEUE_MAX_CAPACITY, SyscallError, WAIT_SET_MAX_MEMBERS};
 
-/// Members of the service's first main wait set: its service endpoint and
-/// the first death queue. Each replacement doubles it.
+/// Members of a service's first main wait set: its service endpoint and the
+/// first death queue. Each replacement doubles it.
 pub const FIRST_WAIT_SET_MEMBERS: u32 = 2;
 
 /// The error a bind or a create returns when no node or no memory is left.
 const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
 
-/// The death queues svcmgr binds its observers on, in creation order, and
+/// The death queues a user binds its observers on, in creation order, and
 /// the size of the wait set they are members of.
 pub struct DeathQueues
 {

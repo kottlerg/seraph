@@ -32,8 +32,8 @@ services/svctest/
         │                      # object-slab release; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
-        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; death queues;
-        │                      # logd death forward; init reap
+        ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
+        │                      # death queues; logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
@@ -45,6 +45,7 @@ services/svctest/
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
+        ├── fs_opens.rs        # Per-open fatfs state: close isolation, eviction routing
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
@@ -171,7 +172,7 @@ token falls through to the normal run.
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
-| `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
+| `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |
@@ -191,8 +192,9 @@ the phase waits the fault batch's settle bound (`TEST_FAULT_SETTLE_TIMEOUT_MS`, 
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases
 also read the build-synthesised `/data/svctest/large.bin` and write their scratch files under
-`/data/svctest/`; and `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
-build-synthesised `/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
+`/data/svctest/`; `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
+build-synthesised `/data/svctest/bench.bin`, which the `fs_eviction_routes_release_to_its_open`
+phase also holds open. The sysroot placement of all of these is listed in
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---

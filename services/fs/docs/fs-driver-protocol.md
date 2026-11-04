@@ -8,13 +8,14 @@ codes) is specified in
 this document covers the labels that remain fs-driver-specific:
 
 - `FS_MOUNT` — vfsd-to-driver BPB-validation probe at mount time.
-- `FS_READ` — inline read on a per-node badged cap.
+- `FS_OPEN` — mint a per-open cap on a file node cap.
+- `FS_READ` — inline read on a file node cap or open cap.
 - `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` / `FS_RELEASE_ACK` — memory-cap
-  read protocol with cooperative release.
-- `FS_CLOSE` — release driver-side per-node bookkeeping; the holder
-  still `cap_delete`s its node cap to drop the kernel reference.
+  read protocol with cooperative release, per open.
+- `FS_CLOSE` — release an open's driver-side bookkeeping; the holder
+  still `cap_delete`s its open cap to drop the kernel reference.
 - `FS_WRITE` / `FS_WRITE_MEMORY` — inline and memory-cap writes on a
-  per-node badged cap.
+  file node cap or open cap.
 - `FS_CREATE` / `FS_MKDIR` — create a file or an empty directory in a
   directory.
 - `FS_REMOVE` — unlink a file or empty directory.
@@ -27,13 +28,24 @@ driver dispatches incoming requests by their badge shape:
 
 - `badge == 0` — service-level request from vfsd (only `FS_MOUNT`
   today).
-- `badge != 0` carrying namespace rights in bits 40..64 — node-cap
-  request (badge layout per
+- `badge != 0` carrying namespace rights in bits 40..64, with the
+  `OPEN_INSTANCE` bit (48) clear — node-cap request (badge layout per
   [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
-  § Badge shape). Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_MEMORY`,
-  `FS_RELEASE_MEMORY`, `FS_CLOSE`, `FS_WRITE`, `FS_WRITE_MEMORY`,
-  `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`, `FS_TRUNCATE`) are
-  dispatched by label.
+  § Badge shape). Per-node opcodes (`NS_*`, `FS_OPEN`, `FS_READ`,
+  `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`, `FS_CREATE`, `FS_REMOVE`,
+  `FS_MKDIR`, `FS_RENAME`) are dispatched by label.
+- `badge != 0` with `OPEN_INSTANCE` set — open-cap request: the low 40
+  bits name one open the driver minted at [`FS_OPEN`](#label-18-fs_open).
+  The open's own opcodes (`FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
+  `FS_CLOSE`) and the stateless file opcodes (`FS_READ`, `FS_WRITE`,
+  `FS_WRITE_MEMORY`, `FS_TRUNCATE`) are dispatched by label, the latter on
+  the open's node.
+
+A label sent on the wrong kind of cap (an open's own label on a node cap,
+`FS_OPEN` or a directory label on an open cap) is answered
+`fs_errors::INVALID_BADGE`, as is any request on an open cap whose open is
+closed or whose node was freed. `NS_*` on an open cap is answered
+`NsError::NotSupported` by the namespace dispatch.
 
 ---
 
@@ -42,7 +54,8 @@ driver dispatches incoming requests by their badge shape:
 A filesystem driver exposes one IPC endpoint, used as both:
 
 - the un-badged **service endpoint** (vfsd holds a SEND, derives
-  per-node badged SENDs); and
+  per-node badged SENDs, and the driver derives per-open badged SENDs);
+  and
 - the un-badged **namespace endpoint** routed through
   `namespace_protocol::dispatch_request` for `NS_*` dispatch.
 
@@ -87,12 +100,79 @@ see [Bootstrap caps](#bootstrap-caps).
 
 ---
 
+## Label 18: `FS_OPEN`
+
+Open a file. The driver records a new **open** of the node the file node
+cap names and replies with an **open cap**: a badged SEND on its endpoint
+whose badge carries an open id in bits 0..40, the node cap's rights in bits
+40..64, and the `OPEN_INSTANCE` kind bit (48)
+([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+§ Badge shape). Every open is distinct: two opens of one file, by one
+client or two, are two opens, each with its own outstanding pages and
+release endpoint.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `18` |
+| body | empty (target identified by the node cap's badge) |
+| `caps[0]` | Optional release-endpoint SEND for the open's cooperative [`FS_RELEASE_MEMORY`](#driver-to-client-release) |
+
+The badge must carry a non-empty rights mask and name a file. The driver
+records the SEND in `caps[0]` on the open and deletes every cap beyond it;
+a client that omits it opts out of cooperative release for this open, and
+eviction then revokes the open's pages without the round trip.
+
+**Reply (success)**
+
+| Field | Value |
+|---|---|
+| `label` | `0` |
+| `caps[0]` | Open cap (`SEND_GRANT`, the node cap's rights) |
+
+[`FS_READ_MEMORY`](#label-7-fs_read_memory),
+[`FS_RELEASE_MEMORY`](#client-to-driver-release), and
+[`FS_CLOSE`](#label-3-fs_close) MUST be sent on the open cap. The
+stateless file labels ([`FS_READ`](#label-2-fs_read),
+[`FS_WRITE`](#label-4-fs_write), [`FS_WRITE_MEMORY`](#label-12-fs_write_memory),
+[`FS_TRUNCATE`](#label-17-fs_truncate)) accept either the node cap or the
+open cap, with the rights its badge carries.
+
+**Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (the badge
+names no node, or a directory, or is an open cap), `PERMISSION_DENIED` (the
+badge carries no rights), `TOO_MANY_OPEN` (the open table is full, or the
+heap or the driver's `CSpace` cannot grow), `IO_ERROR` (the driver could not
+mint the cap). Every refusal deletes the carried SEND.
+
+**Lifetime and bounds.** An open lives until its `FS_CLOSE`, or until an
+[`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
+frees its node, which releases every open of the node. Its id is
+generation-checked (a 24-bit index and a 16-bit generation, retired at
+wrap), so an open cap kept past its open's end is answered
+`INVALID_BADGE`, never with another open's state. The driver holds at most
+2^24 - 1 live opens and answers `TOO_MANY_OPEN` past that. No per-client
+bound is enforceable: the driver has no client identity, and an open cap
+can be delegated. The driver cannot observe a client's death or a
+`cap_delete` of an open cap. The std client sends `FS_CLOSE` for every open
+`File` when its process exits normally, through `main` returning or
+`std::process::exit` ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md)
+§ Process Entry and `StartupInfo`); a crash or a kill sends none. An open
+whose client dies without `FS_CLOSE` keeps its record and release SEND until
+its node is freed; its pages are still reclaimed by eviction. Reclaiming
+such opens is tracked in [#742](https://github.com/kottlerg/seraph/issues/742).
+The SEND keeps the client's release endpoint alive past the client's death,
+which leaves a live kernel object in a frame memmgr returns to its pool,
+tracked in [#750](https://github.com/kottlerg/seraph/issues/750).
+
+---
+
 ## Label 2: `FS_READ`
 
-Inline read against a per-node badged cap. The kernel delivers the
-node's `(NodeId, NamespaceRights)` badge to the driver via
-`ipc_recv.badge`; the driver MUST verify the `READ` rights bit and
-reject with `fs_errors::PERMISSION_DENIED` otherwise.
+Inline read against a file node cap or open cap. The kernel delivers the
+badge to the driver via `ipc_recv.badge`; the driver MUST verify the
+`READ` rights bit and reject with `fs_errors::PERMISSION_DENIED`
+otherwise.
 
 Used for short reads (≤ 504 bytes that fit within the current page);
 larger or page-straddling reads use
@@ -120,9 +200,11 @@ request for more than 504 bytes with a short read of at most 504; see
 A read at or past end of file succeeds with `data[0] = 0`.
 
 **Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
-(the badge lacks `READ`), `INVALID_BADGE` (the badge names no node, or
-a directory), `IO_ERROR` (the file's cluster chain is corrupt or a
-block read failed).
+(the badge lacks `READ`), `INVALID_BADGE` (the badge names no node, a
+directory, or a closed open), `IO_ERROR` (the file's cluster chain is
+corrupt, a block read failed, or every cache page is held; the client MAY
+retry, since the driver queues a held page for eviction whenever a request
+finds the cache full).
 
 ---
 
@@ -134,9 +216,11 @@ the cached page that contains the requested byte. The client maps the
 memory cap, reads up to `bytes_valid` bytes starting at
 `memory_data_offset`, then releases the page either synchronously after
 the read, by sending [`FS_RELEASE_MEMORY`](#client-to-driver-release)
-on the node cap, or in response to a driver-initiated
+on the open cap, or in response to a driver-initiated
 [`FS_RELEASE_MEMORY`](#driver-to-client-release) arriving on the
-per-process release endpoint.
+release endpoint the open's [`FS_OPEN`](#label-18-fs_open) carried. The
+request MUST be sent on an open cap; a node cap is answered
+`INVALID_BADGE`.
 
 The request `offset` has no alignment requirement; the driver reports
 where the file's content for `offset` lives within the returned memory cap
@@ -156,29 +240,13 @@ sentinel).
 | `label` | `7` |
 | `data[0]` | Byte offset (any) |
 | `data[1]` | Release cookie (non-zero, client-chosen) |
-| `caps[0]` | Optional per-process release-endpoint SEND (see below) |
 
-A client that takes part in cooperative release sends its per-process
-release-endpoint SEND in `caps[0]` of an `FS_READ_MEMORY` for the file,
-and MAY repeat it on later `FS_READ_MEMORY` requests until one carrying
-it gets a success reply. Clients that opt out of cooperative release
-omit the cap on every call, and eviction then revokes the page without
-the cooperative round-trip. The driver deletes every carried SEND it
-does not record, and every cap beyond `caps[0]`.
-
-The driver keeps this read-side bookkeeping (outstanding pages and the
-recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
-by node, not by (client, file) pair. Every client that opens a file
-resolves to the same node and so shares that one slot. The driver
-records the first release SEND carried by an `FS_READ_MEMORY` that
-reaches the node's slot (one refused before the slot exists has its
-SEND deleted), so the eviction worker routes cooperative
-[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) for any client's
-page to that client, and a later client is in effect opted out.
-One client's [`FS_CLOSE`](#label-3-fs_close) revokes every client's
-outstanding pages on the file. This sharing is a defect: the driver
-cannot tell the clients of one node apart, tracked in
-[#530](https://github.com/kottlerg/seraph/issues/530).
+The request carries no caps; the driver deletes any it carries. The
+returned page is an outstanding page of the open the badge names, and of
+no other: the open's own [`FS_RELEASE_MEMORY`](#client-to-driver-release)
+or [`FS_CLOSE`](#label-3-fs_close) releases it, and eviction sends its
+cooperative release to that open's release endpoint. One open holds at
+most as many outstanding pages as the cache has slots.
 
 **Reply (success)**
 
@@ -191,10 +259,10 @@ cannot tell the clients of one node apart, tracked in
 | `caps[0]` | Memory cap (`MAP` rights, single page; omitted on EOF) |
 
 **Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
-(the badge lacks `READ`), `INVALID_BADGE` (the badge names no node, or
-a directory), `BAD_MEMORY_OFFSET` (cookie zero), `TOO_MANY_OPEN` (the
-driver's open-file table, or the node's outstanding-page table, is
-full), `IO_ERROR` (the file's cluster chain is corrupt, a block read
+(the badge lacks `READ`), `INVALID_BADGE` (a node cap, a closed open, or
+an open whose node was freed), `BAD_MEMORY_OFFSET` (cookie zero),
+`TOO_MANY_OPEN` (the open's outstanding-page table is full), `IO_ERROR`
+(the file's cluster chain is corrupt, a block read
 failed, or every cache page is held; the client MAY retry, since the
 driver queues a held page for eviction).
 
@@ -276,19 +344,17 @@ synchronous release after a read.
 
 ### Driver-to-client release
 
-Sent by the driver's eviction worker on the per-process release
-endpoint cap recorded in the node's `OpenFile` slot, the first one an
-[`FS_READ_MEMORY`](#label-7-fs_read_memory) reaching that slot carried
-(per-node sharing, a defect tracked in
-[#530](https://github.com/kottlerg/seraph/issues/530)). Clients that
-delivered the SEND get the cooperative path: the driver waits up to
+Sent by the driver's eviction worker on the release endpoint SEND the
+[`FS_OPEN`](#label-18-fs_open) of the open that read the page carried, so
+each page's release reaches the client that read it. Opens that carried
+a SEND get the cooperative path: the driver waits up to
 100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack), then
 `cap_revoke`s the parent Memory cap and deletes it whether or not the
-ack came. Clients that omitted the SEND (opt-out) skip straight to the
-revoke on every eviction, and so does a client whose SEND the driver
+ack came. Opens that omitted the SEND (opt-out) skip straight to the
+revoke on every eviction, and so does an open whose SEND the driver
 cannot copy or whose watchdog it cannot start. The driver sends no
 release for a page the client's own release or `FS_CLOSE` has already
-removed from the open-file table. See
+removed from its open. See
 [`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)
 for the receive-side state machine.
 
@@ -300,9 +366,9 @@ for the receive-side state machine.
 | `data[0]` | Release cookie identifying the Memory cap |
 
 The client unmaps the matching Memory cap and replies with
-[`FS_RELEASE_ACK`](#label-9-fs_release_ack). The client matches the
-cookie among all its open files, since the release may arrive on the
-SEND of a file other than the one that read the page. If a local copy
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack). The release arrives on the
+SEND of the open that read the page, whose badge the client chose, so the
+client can match the cookie among that open's pages. If a local copy
 from the page is still in progress, the client holds its reply until
 the copy ends, within the window below and once per cookie (a repeated
 release of a cookie whose wait ran out is refused at once); this covers
@@ -313,8 +379,8 @@ the driver revokes every cap derived from the parent Memory cap,
 deletes the parent, and releases the page-cache slot, unless the
 client's [client-to-driver release](#client-to-driver-release) or
 [`FS_CLOSE`](#label-3-fs_close) has already done so: each page is
-cleaned up once, by whichever path removes it from the open-file
-table first. The ack tells the driver the client unmapped in time.
+cleaned up once, by whichever path removes it from its open first.
+The ack tells the driver the client unmapped in time.
 The revoke invalidates the client's derived cap but removes no mapping
 ([Capability Model § Revocation](../../../docs/capability-model.md#revocation)).
 The driver still never refills the page under a live client mapping. Before it
@@ -341,8 +407,8 @@ outlasts the window, replies `IO_ERROR` (2).
 
 ### Client-to-driver release
 
-Sent by the client on the per-node badged cap the page was read
-through, once it has finished reading the page and torn down its local
+Sent by the client on the open cap the page was read through, once it
+has finished reading the page and torn down its local
 mapping: a page still mapped when the driver next reuses its slot costs
 the driver a quarantined page (see [Label 8](#label-8-fs_release_memory)).
 No release endpoint and no
@@ -360,11 +426,11 @@ page's parent Memory cap, deletes that parent, and releases the
 page-cache slot.
 
 **Reply (success)**: `label = 0`, empty body. A cookie that matches
-no outstanding page on the node (including a node with no open-file
-slot) is a no-op success.
+no outstanding page of the open is a no-op success.
 
-**Reply (error)**: `label = fs_errors::PERMISSION_DENIED` when the
-badge carries no namespace rights.
+**Reply (error)**: `label = fs_errors::*`: `PERMISSION_DENIED` when the
+badge carries no namespace rights, `INVALID_BADGE` on a node cap or a
+closed open.
 
 ---
 
@@ -387,38 +453,35 @@ reply, or after the window with none, per
 
 ## Label 3: `FS_CLOSE`
 
-Release driver-side bookkeeping bound to a node cap (the lazily-
-allocated per-`OpenFile` slot, outstanding `FS_READ_MEMORY` pages,
-the recorded release endpoint). The slot is per node and shared by
-every client of the file, so one client's `FS_CLOSE` revokes every
-client's outstanding pages on it (a defect, tracked in
-[#530](https://github.com/kottlerg/seraph/issues/530); see
-[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The node itself is not
-freed: every holder of the entry shares it, so it lives until
+End the open the open cap names: the driver revokes that open's
+outstanding [`FS_READ_MEMORY`](#label-7-fs_read_memory) pages, deletes its
+recorded release endpoint, and retires its id, so the open cap answers
+`INVALID_BADGE` from then on. Other opens of the file, by this client or
+another, keep their pages. The node itself is not freed: every holder of
+the entry shares it, so it lives until
 [`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
-unlinks the entry, and a cap used after its `FS_CLOSE` still reaches its
-own file. The kernel-side cap is **not** freed here — the holder still
-`cap_delete`s its node cap to drop the kernel reference.
+unlinks the entry, and the node cap the open was made from still reaches
+its file. The kernel-side cap is **not** freed here — the holder still
+`cap_delete`s its open cap to drop the kernel reference.
 
 **Request**
 
 | Field | Value |
 |---|---|
 | `label` | `3` |
-| body | empty (target identified by badge) |
+| body | empty (target identified by the open cap's badge) |
 
 **Reply (success)**: `label = 0`, empty body.
 
-`FS_CLOSE` is best-effort cleanup. The driver MAY have already
-evicted the per-node slot under cache pressure; in that case
-`FS_CLOSE` is a no-op success.
+**Reply (error)**: `label = fs_errors::*`: `INVALID_BADGE` on a node cap,
+or on an open already closed or released with its node.
 
 ---
 
 ## Label 4: `FS_WRITE`
 
-Inline write to a file. Badge = file cap; the badge must carry the
-`WRITE` namespace right.
+Inline write to a file. Badge = file node cap or open cap; the badge must
+carry the `WRITE` namespace right.
 
 **Request**:
 
@@ -627,7 +690,7 @@ failed block access, or a corrupt directory),
 
 ## Label 17: `FS_TRUNCATE`
 
-Set a file's length. Badge = file cap with `WRITE`.
+Set a file's length. Badge = file node cap or open cap with `WRITE`.
 
 **Request**:
 
@@ -706,8 +769,9 @@ bound on every `BLK_READ_INTO_MEMORY`. See
 
 ## Summarized By
 
-[Storage](../../../docs/storage.md),
+[Namespace Model](../../../docs/namespace-model.md), [Storage](../../../docs/storage.md),
 [programs/fsbench/README.md](../../../programs/fsbench/README.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md),
 [services/vfsd/README.md](../../vfsd/README.md),
 [vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

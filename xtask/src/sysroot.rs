@@ -166,7 +166,7 @@ const SVCTEST_BENCH_BIN_SIZE: usize = 65536;
 
 /// Emit `/data/svctest/bench.bin`, a 64 KiB deterministic fixture
 /// consumed by `fsbench` (the `FS_READ` vs `FS_READ_FRAME` crossover
-/// benchmark). Filled with a byte-position-derived pattern so any
+/// benchmark) and held open by svctest's per-open eviction phase. Filled with a byte-position-derived pattern so any
 /// read-path corruption shows up as a content mismatch at the byte
 /// level. Treated as a build artifact, same pattern as `large.bin`.
 /// Returns the destination path (kept through the prune pass).

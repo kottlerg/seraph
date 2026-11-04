@@ -180,12 +180,36 @@ claims.
     Context the body gives about things outside the diff (motivation,
     history, settings outside the repository) is not checked against it.
 
+11. Auditor-only run: when the parent names this run the auditor-only
+    run `docs/conventions.md` § Branch and PR Workflow allows, it names
+    `since`, the head the last run with the reviewer reviewed, and the path
+    of that run's record. FAIL when the record lists a failed agent
+    (`stats.failed`), when `git diff <since> <head>` alters, Markdown
+    aside, anything but comment lines (judged as step 9 judges a validation
+    delta), or when a commit in `git log --merges <since>..<head>` merges
+    the base branch: each owes a run with the reviewer. Compare every
+    comment line and document statement the range changes against the code
+    it describes, citing `path:line` on both sides, and FAIL each one the
+    code contradicts. Confirm that the range makes each fix the commits
+    since `since` or the PR body claim for a finding of that run, and FAIL
+    a claimed fix the range does not make. FAIL each finding in the
+    record's `findings` that the range does not fix, and each entry of its
+    `recorded`, that no open Issue records as that section says: an item
+    stating it, either the one this PR recorded or the one an open
+    follow-up Issue of its scope already held. List each finding of the
+    record's `findings` that the range leaves unfixed, as the record states
+    it, so the parent's record of this run carries it, and the ledger takes
+    it when the run's reviewer verdict is `NON-BLOCKING ISSUES ONLY`. End
+    the section with the line `Reviewer verdict: <verdict>`, the verdict
+    that section gives the run, derived from the record and the range.
+
 ## Output
 
 A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
-unreconciled hit); test-plan honesty (FAIL on any bare tick); commit-message
-compliance; validation claim; PR-body claims. When invoked with a
+unreconciled hit); test-plan honesty (FAIL on any bare tick);
+commit-message compliance; validation claim; PR-body claims; and, in an
+auditor-only run, auditor-only checks. When invoked with a
 structured-output schema, fill it instead of the prose: one output section
 for each section named above, with its verdict and items, and the overall
 verdict; there is no final line in schema mode.

@@ -1480,9 +1480,12 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     // the new capability are withdrawn when it goes (docs/capability-model.md
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`;
-    // `dest_cs_slot` pins the destination CSpace, which funds a fresh object.
-    let new_object =
-        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, dest_cs_ptr) }?;
+    // `dest_cs_slot` pins the destination CSpace, which funds a fresh object;
+    // `src.hidden_tag()` is `src_tag` as `pin_checked` hid it when it
+    // resolved `src`.
+    let new_object = unsafe {
+        crate::cap::object::object_for_new_slot(src_tag, src.hidden_tag(), src_object, dest_cs_ptr)
+    }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (the destination's cspace.lock nested per the documented order).
@@ -1617,9 +1620,17 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     // the new capability are withdrawn when it goes (docs/capability-model.md
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
-    // caller's own CSpace receives the new slot and funds a fresh object.
-    let new_object =
-        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, caller_cspace) }?;
+    // caller's own CSpace receives the new slot and funds a fresh object;
+    // `src.hidden_tag()` is `src_tag` as `pin_checked` hid it when it
+    // resolved `src`.
+    let new_object = unsafe {
+        crate::cap::object::object_for_new_slot(
+            src_tag,
+            src.hidden_tag(),
+            src_object,
+            caller_cspace,
+        )
+    }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -1746,9 +1757,17 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // the new capability are withdrawn when it goes (docs/capability-model.md
     // § Interrupt, § Mmio, § `IoPort`).
     // SAFETY: src_object is the object `src` pins, of tag `src_tag`; the
-    // caller's own CSpace receives the new slot and funds a fresh object.
-    let new_object =
-        unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object, caller_cspace) }?;
+    // caller's own CSpace receives the new slot and funds a fresh object;
+    // `src.hidden_tag()` is `src_tag` as `pin_checked` hid it when it
+    // resolved `src`.
+    let new_object = unsafe {
+        crate::cap::object::object_for_new_slot(
+            src_tag,
+            src.hidden_tag(),
+            src_object,
+            caller_cspace,
+        )
+    }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -2760,7 +2779,15 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     let slot = unsafe { super::pin_slot(caller_cspace, slot_handle) }?;
     let tag = slot.tag;
     let rights = slot.rights;
-    let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
+    if slot.object.is_none()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // Each typed arm below casts `slot.object_of(<its tag>)`, the object
+    // selected as data by the tag hidden at resolution, so an arm a
+    // mispredicted tag test reaches casts null, never an object of another
+    // type. Architecturally the arm's tag check has passed, so `object_of`
+    // returns the pinned object, which the arms' SAFETY comments rely on.
 
     match field
     {
@@ -2788,7 +2815,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: MemoryObject (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             Ok(memory.size)
         }
         CAP_INFO_MEMORY_AVAILABLE =>
@@ -2801,7 +2828,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             Ok(memory.available_bytes.load(Ordering::Acquire))
         }
         CAP_INFO_MEMORY_HAS_RETYPE =>
@@ -2822,7 +2849,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             Ok(memory.base)
         }
         CAP_INFO_MEMORY_MAPPINGS =>
@@ -2835,7 +2862,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
             // Read-lock the region so a concurrent split cannot shrink it
             // between the window check and the walk.
             let _guard = crate::cap::object::MemoryReadGuard::acquire(memory);
@@ -2863,7 +2890,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the ThreadObject sits at the page-aligned start of page
             // KERNEL_STACK_PAGES of the Thread retype slot; header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let thr_obj = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
+            let thr_obj = unsafe { &*(slot.object_of(CapTag::Thread).cast::<ThreadObject>()) };
             let target_tcb = thr_obj.tcb;
             if target_tcb.is_null()
             {
@@ -2909,7 +2936,11 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
+            let as_obj = unsafe {
+                &*(slot
+                    .object_of(CapTag::AddressSpace)
+                    .cast::<AddressSpaceObject>())
+            };
             Ok(as_obj.pt_growth_budget_bytes.load(Ordering::Acquire))
         }
         CAP_INFO_CSPACE_CAPACITY =>
@@ -2922,7 +2953,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_obj = unsafe { &*(slot.object_of(CapTag::CSpace).cast::<CSpaceKernelObject>()) };
             let target = cs_obj.cspace;
             if target.is_null()
             {
@@ -2963,7 +2994,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_obj = unsafe { &*(slot.object_of(CapTag::CSpace).cast::<CSpaceKernelObject>()) };
             let target = cs_obj.cspace;
             if target.is_null()
             {
@@ -2990,7 +3021,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
             // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_obj = unsafe { &*(slot.object_of(CapTag::CSpace).cast::<CSpaceKernelObject>()) };
             Ok(cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire))
         }
         _ => Err(SyscallError::InvalidArgument),

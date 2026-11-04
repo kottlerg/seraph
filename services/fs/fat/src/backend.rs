@@ -46,18 +46,14 @@ const _: () =
 /// and one outside it, from a corrupt entry, is refused when the node is
 /// used as a directory. Only an empty file reports `cluster == 0`.
 ///
-/// `open_slot` tracks a lazily-allocated [`crate::file::OpenFile`]
-/// when this node has fielded a `FS_READ_MEMORY` against its node cap.
-/// The slot carries the per-file outstanding-page table so cookie
-/// release and revoke-on-close work the same as for legacy `FS_OPEN`
-/// callers. Sentinel `u32::MAX` means "no slot allocated".
+/// A node holds no open-instance state: each `FS_OPEN` of it is a
+/// [`crate::file::OpenFile`] of its own, naming the node by id.
 #[derive(Copy, Clone)]
 pub struct FatNode
 {
     pub cluster: u32,
     pub size: u32,
     pub kind: NodeKind,
-    pub open_slot: u32,
     /// On-disk position of this entry's 8.3 record. Populated by
     /// `lookup()` so write / metadata-update handlers can patch
     /// `first_cluster` and `size` in place after extending the cluster
@@ -66,13 +62,6 @@ pub struct FatNode
     /// rejects mutation requests against such nodes.
     pub loc: DirEntryLocation,
 }
-
-/// Sentinel for [`FatNode::open_slot`] meaning "no `OpenFile` slot
-/// associated yet". The slot is allocated lazily on first
-/// `FS_READ_MEMORY` against the node cap. The open-file table holds at most
-/// one slot per live node, fewer than `node_slab::MAX_ENTRIES`, so
-/// `u32::MAX` never names a real slot.
-pub const NO_OPEN_SLOT: u32 = u32::MAX;
 
 /// The on-disk slot that identifies a node: `(sector_lba, offset_in_sector)`
 /// of its 8.3 entry. Two distinct entries never share one, and repeated walks
@@ -90,8 +79,9 @@ fn node_key(loc: DirEntryLocation) -> NodeKey
 /// `NodeId(0)` is reserved as the fatfs root and never appears here. Every
 /// other `NodeId` packs a slab index and its generation. Every lookup of one
 /// on-disk entry returns its one node, which lives until `FS_REMOVE` or
-/// `FS_RENAME` unlinks the entry; `FS_CLOSE` frees no node, since the driver
-/// cannot tell which of a node's holders a close comes from. A freed index is
+/// `FS_RENAME` unlinks the entry; `FS_CLOSE` frees an open, never a node,
+/// since a node cap is not closed and `stat()`-style lookups never close
+/// anything. A freed index is
 /// reused under a new generation, so a cap kept past the removal of its file
 /// names no node rather than the one that reused the index. The heap-grown
 /// slab holds one node per distinct live entry looked up, up to
@@ -99,12 +89,12 @@ fn node_key(loc: DirEntryLocation) -> NodeKey
 pub struct NodeTable
 {
     slab: NodeSlab<NodeKey, FatNode>,
-    /// Open-file slot of the node [`Self::invalidate_for_loc`] last freed,
-    /// which the dispatch loop releases under the open-file table's lock
-    /// after the request. One request frees at most one node (its
-    /// `FS_REMOVE` or `FS_RENAME` unlinks one entry), so one slot suffices
-    /// and holding it allocates nothing.
-    orphaned_open_slot: Option<u32>,
+    /// The node [`Self::invalidate_for_loc`] last freed, whose opens the
+    /// dispatch loop releases under the open-file table's lock after the
+    /// request. One request frees at most one node (its `FS_REMOVE` or
+    /// `FS_RENAME` unlinks one entry), so one id suffices and holding it
+    /// allocates nothing.
+    orphaned_node: Option<NodeId>,
 }
 
 impl NodeTable
@@ -113,7 +103,7 @@ impl NodeTable
     {
         Self {
             slab: NodeSlab::new(),
-            orphaned_open_slot: None,
+            orphaned_node: None,
         }
     }
 
@@ -144,45 +134,33 @@ impl NodeTable
         NodeId::new(raw)
     }
 
-    /// Set or clear the lazy `OpenFile` slot index for `id`. Used by
-    /// the node-cap dispatch arms in `main.rs` when a `FS_READ_MEMORY`
-    /// against a node cap allocates an `OpenFile` slot, and on
-    /// `FS_CLOSE` to clear it back to [`NO_OPEN_SLOT`].
-    ///
-    /// No-op for the reserved root id (0) and for freed ids.
-    pub fn set_open_slot(&mut self, id: NodeId, slot: u32)
-    {
-        if let Some(node) = self.slab.get_mut(id.raw())
-        {
-            node.open_slot = slot;
-        }
-    }
-
     /// Free the node whose on-disk slot is `loc`.
     /// Called from `FS_REMOVE` / `FS_RENAME`: every cap on the unlinked entry
     /// stops resolving, and a follow-on `FS_CREATE` that lands at the same
     /// disk slot gets a fresh node rather than the stale one. The freed
-    /// node's open-file slot, if it had one, is kept for
-    /// [`Self::take_orphaned_open_slot`].
+    /// node's id is kept for [`Self::take_orphaned_node`].
     pub fn invalidate_for_loc(&mut self, loc: DirEntryLocation)
     {
-        if let Some(node) = self.slab.remove_key(&node_key(loc))
-            && node.open_slot != NO_OPEN_SLOT
+        let key = node_key(loc);
+        let id = self.slab.id_of(&key).and_then(NodeId::new);
+        if self.slab.remove_key(&key).is_some()
+            && let Some(id) = id
         {
             debug_assert!(
-                self.orphaned_open_slot.is_none(),
+                self.orphaned_node.is_none(),
                 "two nodes freed by one request"
             );
-            self.orphaned_open_slot = Some(node.open_slot);
+            self.orphaned_node = Some(id);
         }
     }
 
-    /// The open-file slot of the node a removal or rename freed since the
-    /// last call, for the dispatch loop to release: no cap resolves to the
-    /// node any more, so no `FS_CLOSE` would reach it.
-    pub fn take_orphaned_open_slot(&mut self) -> Option<u32>
+    /// The node a removal or rename freed since the last call, for the
+    /// dispatch loop to release its opens: no open cap resolves to the node
+    /// any more, so each open's pages would otherwise wait for an
+    /// `FS_CLOSE`.
+    pub fn take_orphaned_node(&mut self) -> Option<NodeId>
     {
-        self.orphaned_open_slot.take()
+        self.orphaned_node.take()
     }
 
     /// Update the cluster and size fields of a non-root node entry.
@@ -310,7 +288,6 @@ impl NamespaceBackend for FatfsBackend<'_>
                 cluster: entry.cluster,
                 size: entry.size,
                 kind,
-                open_slot: NO_OPEN_SLOT,
                 loc,
             })
             .ok_or(NsError::OutOfResources)?;

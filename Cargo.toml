@@ -43,6 +43,7 @@ members = [
     "abi/syscall",
     "shared/ansi",
     "shared/crypto",
+    "shared/death-set",
     "shared/elf",
     "shared/font",
     "shared/mmio",
@@ -78,6 +79,7 @@ members = [
     "programs/threadstack",
     "programs/threadstack/tester",
     "runtime/ruststd/argv-env",
+    "runtime/ruststd/death-queues",
     "xtask",
     "xtask/wrapper-shim",
 ]

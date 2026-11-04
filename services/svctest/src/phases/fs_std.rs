@@ -66,8 +66,8 @@ pub fn phases() -> &'static [Phase]
             run: std_open_options_invalid_phase,
         },
         Phase {
-            name: "std_release_matched_by_cookie",
-            run: std_release_matched_by_cookie_phase,
+            name: "std_release_matched_by_open",
+            run: std_release_matched_by_open_phase,
         },
     ]
 }
@@ -457,69 +457,112 @@ const RELEASE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100
 /// A driver release's reply label and round-trip time.
 type ReleaseReply = (u64, std::time::Duration);
 
-/// The std release handler matches a driver `FS_RELEASE_MEMORY` by cookie
-/// across every open `File`, waits out a read of the cookie's page for at
-/// most the driver's release window, waits once per cookie, and discards a
-/// read whose copy that wait outlasted. The phase
-/// serves a fake fs root to a `release-child`, which opens `/a` and `/b` and
-/// reads a page of each. While `/b`'s `FS_READ_MEMORY` is still unanswered,
-/// so its cookie is mid-read, the fake sends a release of that cookie on the
-/// release SEND `/a`'s first read delivered, and then sends it again. Two
-/// distinct nodes stand in for the driver's per-node SEND sharing, under
-/// which a release can arrive on another `File`'s badge. The fake refuses
-/// `/a`'s first read, which a driver may do before it records the SEND, so
-/// `/a`'s second read must carry a release SEND again.
-pub fn std_release_matched_by_cookie_phase(_: &Caps)
+/// Badge offset of the fake fs's open caps: node `n`'s open is badged
+/// `FAKE_FS_OPEN_BASE + n`.
+const FAKE_FS_OPEN_BASE: u64 = 0x100;
+
+/// What the fake fs saw of the `release-child`'s requests, and the replies
+/// to the releases it sent while `/b`'s read was unanswered.
+#[derive(Default)]
+struct FakeFsReport
+{
+    /// Caps each node's `FS_OPEN` carried, by node (1 = `/a`, 2 = `/b`).
+    open_caps: [Option<usize>; 2],
+    /// Caps `/b`'s `FS_READ_MEMORY` carried.
+    read_caps: Option<usize>,
+    /// A release of `/b`'s mid-read cookie on `/a`'s release SEND.
+    cross: Option<ReleaseReply>,
+    /// Two releases of it on `/b`'s own release SEND.
+    own: Option<(ReleaseReply, ReleaseReply)>,
+    /// `FS_CLOSE`s each open received, by node: the child's exit hook sends
+    /// one for each `File` it never drops.
+    closes: [usize; 2],
+}
+
+/// The std client hands each `File`'s release SEND to the driver on its
+/// `FS_OPEN` and none on `FS_READ_MEMORY`, and its release handler matches a
+/// driver `FS_RELEASE_MEMORY` against the pages of the `File` whose SEND it
+/// arrived on: it waits out a read of the cookie's page for at most the
+/// driver's release window, waits once per cookie, and discards a read whose
+/// copy that wait outlasted. The phase serves a fake fs root to a
+/// `release-child`, which opens `/a` and `/b` and reads a page of `/b`.
+/// While that `FS_READ_MEMORY` is still unanswered, so its cookie is
+/// mid-read, the fake sends a release of the cookie on `/a`'s SEND, which
+/// names a `File` that holds no such page and is acked at once, and then
+/// two on `/b`'s. The child exits through `std::process::exit` holding both
+/// `File`s, so its exit hook must send one `FS_CLOSE` on each open.
+pub fn std_release_matched_by_open_phase(_: &Caps)
 {
     use std::os::seraph::process::CommandExt;
 
     let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
         syscall::cap_create_endpoint(slab).ok()
     })
-    .expect("std_release_matched_by_cookie: endpoint creation failed");
+    .expect("std_release_matched_by_open: endpoint creation failed");
     let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
-        .expect("std_release_matched_by_cookie: root SEND derive failed");
+        .expect("std_release_matched_by_open: root SEND derive failed");
     let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, FAKE_FS_STOP_BADGE)
-        .expect("std_release_matched_by_cookie: stop SEND derive failed");
+        .expect("std_release_matched_by_open: stop SEND derive failed");
 
     let server = std::thread::Builder::new()
         .name("fake_fs".into())
         .spawn(move || fake_fs_serve(ep))
-        .expect("std_release_matched_by_cookie: fake fs thread spawn failed");
+        .expect("std_release_matched_by_open: fake fs thread spawn failed");
     let status = std::process::Command::new("/tests/svctest")
         .arg(RELEASE_CHILD_ROLE)
         .namespace_cap(root)
         .status()
-        .expect("std_release_matched_by_cookie: spawning release-child failed");
+        .expect("std_release_matched_by_open: spawning release-child failed");
 
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
     unsafe { ipc::ipc_call(stop, &ipc::IpcMessage::new(0), ipc_buf) }
-        .expect("std_release_matched_by_cookie: stopping the fake fs failed");
-    let (probe, a_retry_send) = server
+        .expect("std_release_matched_by_open: stopping the fake fs failed");
+    let report = server
         .join()
-        .expect("std_release_matched_by_cookie: fake fs thread panicked");
+        .expect("std_release_matched_by_open: fake fs thread panicked");
     let _ = syscall::cap_delete(stop);
     let _ = syscall::cap_delete(ep);
 
     assert!(
         status.success(),
-        "std_release_matched_by_cookie: release-child exited {status}; 1 = /a's read \
-         succeeded, 2 = an open failed, 3 = /b's stalled read did not return Interrupted, \
-         4 = /b's position moved"
+        "std_release_matched_by_open: release-child exited {status}; 2 = an open failed, \
+         3 = /b's stalled read did not return Interrupted, 4 = /b's position moved"
     );
     assert_eq!(
-        a_retry_send,
-        Some(true),
-        "/a's read after a refused first read must carry a release SEND again (None: the \
-         fake saw no second read of /a)"
+        report.open_caps,
+        [Some(1), Some(1)],
+        "each File's FS_OPEN must carry its release SEND, and only it"
     );
-    let ((first, first_rtt), (repeat, repeat_rtt)) =
-        probe.expect("std_release_matched_by_cookie: the fake fs saw no read of /b");
+    assert_eq!(
+        report.read_caps,
+        Some(0),
+        "FS_READ_MEMORY must carry no cap (None: the fake saw no read of /b)"
+    );
+    let (cross, cross_rtt) = report
+        .cross
+        .expect("std_release_matched_by_open: the fake fs saw no read of /b");
+    assert_eq!(
+        cross,
+        ipc::fs_labels::FS_RELEASE_ACK,
+        "a release on /a's SEND names a File that holds no such page and must be acked"
+    );
+    assert!(
+        cross_rtt < RELEASE_WINDOW,
+        "a release on another File's SEND waited ({cross_rtt:?}) for /b's read"
+    );
+    assert_eq!(
+        report.closes,
+        [1, 1],
+        "the exit hook must send one FS_CLOSE on each open File (counts for /a, /b)"
+    );
+    let ((first, first_rtt), (repeat, repeat_rtt)) = report
+        .own
+        .expect("std_release_matched_by_open: the fake fs sent no release on /b's SEND");
     assert_eq!(
         first,
         ipc::fs_errors::IO_ERROR,
-        "a release of /b's mid-read cookie on /a's SEND must wait out the read and be \
+        "a release of /b's mid-read cookie on /b's SEND must wait out the read and be \
          refused, not acked"
     );
     assert!(
@@ -537,30 +580,25 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
         "a repeated release of a stalled cookie waited again ({repeat_rtt:?} after \
          {first_rtt:?})"
     );
-    std::os::seraph::log!("std_release_matched_by_cookie phase passed");
+    std::os::seraph::log!("std_release_matched_by_open phase passed");
 }
 
 /// `release-child`: open `/a` and `/b` from the fake fs root its spawner
-/// delivered, then read a page of `/a` twice and of `/b` once. The fake
-/// refuses both of `/a`'s reads and answers `/b`'s with a frame only after a
-/// release of its cookie has waited out the window, so `/b`'s copy is
-/// stalled and must be discarded:
-/// the read returns `Interrupted` and the position stays at 0. Exits before
-/// the `File`s drop. Exit codes: 0 as expected, 1 a read of `/a` succeeded,
-/// 2 an open failed, 3 `/b`'s read did not return `Interrupted`, 4 `/b`'s
-/// position moved.
+/// delivered, then read a page of `/b`. The fake answers the read with a
+/// frame only after a release of its cookie on `/b`'s SEND has waited out the
+/// window, so the copy is stalled and must be discarded: the read returns
+/// `Interrupted` and the position stays at 0. Exits through
+/// `std::process::exit` before the `File`s drop, so the exit hook closes them.
+/// Exit codes: 0 as expected, 2 an open failed, 3 `/b`'s read did not return
+/// `Interrupted`, 4 `/b`'s position moved.
 fn release_child_main() -> !
 {
     use std::io::{ErrorKind, Read, Seek};
 
     let open = |path| std::fs::File::open(path).unwrap_or_else(|_| std::process::exit(2));
-    let mut a = open("/a");
+    let _a = open("/a");
     let mut b = open("/b");
     let mut buf = vec![0u8; 4096];
-    if a.read(&mut buf).is_ok() || a.read(&mut buf).is_ok()
-    {
-        std::process::exit(1);
-    }
     if !matches!(b.read(&mut buf), Err(e) if e.kind() == ErrorKind::Interrupted)
     {
         std::process::exit(3);
@@ -573,22 +611,20 @@ fn release_child_main() -> !
 }
 
 /// Serve the fake fs on `ep` until the spawner's stop message: each
-/// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order. Node 1's
-/// first `FS_READ_MEMORY` hands over its release SEND and is refused with
-/// `IO_ERROR`, as is its second, whose release SEND, if any, is deleted.
-/// Node 2's is answered, after two releases of its cookie on node 1's
-/// release SEND, with a one-page frame (a read-only derivation of a page
-/// from memmgr). Anything else is refused. Returns the two releases'
-/// replies, and whether node 1's second read carried a release SEND (`None`
-/// when there was no second read).
-fn fake_fs_serve(ep: u32) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>)
+/// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order, and each
+/// node's `FS_OPEN` an open SEND badged [`FAKE_FS_OPEN_BASE`] plus the node,
+/// keeping the release SEND it carries. `/b`'s `FS_READ_MEMORY` is answered,
+/// after one release of its cookie on `/a`'s release SEND and two on
+/// `/b`'s, with a one-page frame (a read-only derivation of a page from
+/// memmgr). Each open's `FS_CLOSE` is counted and answered. Anything else is
+/// refused.
+fn fake_fs_serve(ep: u32) -> FakeFsReport
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut next_badge = 1;
-    let mut a_release = 0;
-    let mut a_retry_send = None;
+    let mut releases = [0u32; 2];
     let mut frame_page = 0;
-    let mut probe = None;
+    let mut report = FakeFsReport::default();
     loop
     {
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
@@ -600,10 +636,8 @@ fn fake_fs_serve(ep: u32) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>
         }
         else if opcode == ipc::ns_labels::NS_LOOKUP
         {
-            // GRANT: the client's FS_READ_MEMORY on a node carries a copy of
-            // its release SEND in caps[0] until a request carrying one
-            // succeeds; the fake keeps node 1's first copy and deletes the
-            // others.
+            // GRANT: the client's FS_OPEN on a node carries its release SEND
+            // in caps[0].
             let node = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND_GRANT, next_badge)
                 .expect("fake fs: node SEND derive failed");
             next_badge += 1;
@@ -613,54 +647,80 @@ fn fake_fs_serve(ep: u32) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>
                 .cap(node)
                 .build()
         }
-        else if opcode == ipc::fs_labels::FS_READ_MEMORY
+        else if opcode == ipc::fs_labels::FS_OPEN && matches!(msg.badge, 1 | 2)
         {
-            let release = msg.caps().first().copied().unwrap_or(0);
-            match msg.badge
+            // Cast is range-safe: the badge is 1 or 2.
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = (msg.badge - 1) as usize;
+            report.open_caps[idx] = Some(msg.caps().len());
+            if let Some((&send, rest)) = msg.caps().split_first()
             {
-                1 if a_release == 0 =>
+                releases[idx] = send;
+                for &cap in rest
                 {
-                    a_release = release;
-                    ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
+                    let _ = syscall::cap_delete(cap);
                 }
-                1 =>
-                {
-                    if a_retry_send.is_none()
-                    {
-                        a_retry_send = Some(release != 0);
-                    }
-                    let _ = syscall::cap_delete(release);
-                    ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
-                }
-                2 =>
-                {
-                    let _ = syscall::cap_delete(release);
-                    let cookie = msg.word(1);
-                    probe = Some(release_twice(a_release, cookie));
-                    frame_page = fake_fs_page();
-                    let frame = syscall::cap_derive(frame_page, syscall::RIGHTS_MEM_MAP)
-                        .expect("fake fs: frame derive failed");
-                    ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
-                        .word(0, FAKE_FS_FRAME_BYTES)
-                        .word(1, cookie)
-                        .word(2, 0)
-                        .cap(frame)
-                        .build()
-                }
-                _ => ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR),
             }
+            let open = syscall::cap_derive_badge(
+                ep,
+                syscall::RIGHTS_EP_SEND,
+                FAKE_FS_OPEN_BASE + msg.badge,
+            )
+            .expect("fake fs: open SEND derive failed");
+            ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
+                .cap(open)
+                .build()
+        }
+        else if opcode == ipc::fs_labels::FS_CLOSE
+            && (msg.badge == FAKE_FS_OPEN_BASE + 1 || msg.badge == FAKE_FS_OPEN_BASE + 2)
+        {
+            // Cast is range-safe: the badge is one of the two open badges.
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = (msg.badge - FAKE_FS_OPEN_BASE - 1) as usize;
+            report.closes[idx] += 1;
+            ipc::IpcMessage::new(ipc::fs_errors::SUCCESS)
+        }
+        else if opcode == ipc::fs_labels::FS_READ_MEMORY && msg.badge == FAKE_FS_OPEN_BASE + 2
+        {
+            report.read_caps = Some(msg.caps().len());
+            for &cap in msg.caps()
+            {
+                let _ = syscall::cap_delete(cap);
+            }
+            let cookie = msg.word(1);
+            report.cross = Some(release_once(releases[0], cookie));
+            report.own = Some((
+                release_once(releases[1], cookie),
+                release_once(releases[1], cookie),
+            ));
+            frame_page = fake_fs_page();
+            let frame = syscall::cap_derive(frame_page, syscall::RIGHTS_MEM_MAP)
+                .expect("fake fs: frame derive failed");
+            ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
+                .word(0, FAKE_FS_FRAME_BYTES)
+                .word(1, cookie)
+                .word(2, 0)
+                .cap(frame)
+                .build()
         }
         else
         {
+            for &cap in msg.caps()
+            {
+                let _ = syscall::cap_delete(cap);
+            }
             ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
         };
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         if msg.badge == FAKE_FS_STOP_BADGE
         {
-            let _ = syscall::cap_delete(a_release);
+            for cap in releases
+            {
+                let _ = syscall::cap_delete(cap);
+            }
             let _ = syscall::cap_delete(frame_page);
-            return (probe, a_retry_send);
+            return report;
         }
     }
 }
@@ -690,25 +750,21 @@ fn fake_fs_page() -> u32
         .expect("fake fs: REQUEST_MEMORY_CAPS returned no cap")
 }
 
-/// Send `FS_RELEASE_MEMORY` for `cookie` on `release` twice, from a helper
+/// Send `FS_RELEASE_MEMORY` for `cookie` on `release` once, from a helper
 /// thread so the caller's unanswered `FS_READ_MEMORY` stays pending, and
-/// return each reply's label and round-trip time.
-fn release_twice(release: u32, cookie: u64) -> (ReleaseReply, ReleaseReply)
+/// return the reply's label (`u64::MAX` when the call fails) and round-trip
+/// time.
+fn release_once(release: u32, cookie: u64) -> ReleaseReply
 {
     std::thread::spawn(move || {
         let ipc_buf = std::os::seraph::current_ipc_buf();
         let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
             .word(0, cookie)
             .build();
-        let send = || {
-            let start = std::time::Instant::now();
-            // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-            let reply = unsafe { ipc::ipc_call(release, &msg, ipc_buf) }
-                .expect("fake fs: FS_RELEASE_MEMORY ipc_call failed");
-            (reply.label, start.elapsed())
-        };
-        let first = send();
-        (first, send())
+        let start = std::time::Instant::now();
+        // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+        let label = unsafe { ipc::ipc_call(release, &msg, ipc_buf) }.map_or(u64::MAX, |r| r.label);
+        (label, start.elapsed())
     })
     .join()
     .expect("fake fs: release thread panicked")

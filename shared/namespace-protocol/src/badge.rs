@@ -86,6 +86,35 @@ pub const fn pack(node_id: NodeId, rights: NamespaceRights) -> u64
     node_id.raw() | ((rights.raw() as u64) << NODE_ID_BITS)
 }
 
+/// Badge bit marking an **open-instance cap**: bit 8 of the rights field
+/// (badge bit 48), the lowest bit [`crate::rights::DEFINED_MASK`] leaves
+/// reserved. It is a badge-kind flag, not a right. On a badge that carries
+/// it the low [`NODE_ID_BITS`] hold a server-private open identifier, not a
+/// [`NodeId`], so [`crate::gate::gate`] and the `NS_*` dispatch refuse it
+/// and only [`crate::gate::gate_open`] decodes it
+/// (`shared/namespace-protocol/README.md` § Badge shape).
+pub const OPEN_INSTANCE: u64 = 1 << (NODE_ID_BITS + 8);
+
+/// Whether `badge` is an open-instance cap's ([`OPEN_INSTANCE`] set).
+#[must_use]
+pub const fn is_open_instance(badge: u64) -> bool
+{
+    badge & OPEN_INSTANCE != 0
+}
+
+/// Pack `(open_id, rights)` into an open-instance cap's badge, with
+/// [`OPEN_INSTANCE`] set. `None` when `open_id` is zero or does not fit
+/// the low [`NODE_ID_BITS`].
+#[must_use]
+pub const fn pack_open(open_id: u64, rights: NamespaceRights) -> Option<u64>
+{
+    if open_id == 0 || (open_id & !NODE_ID_MASK) != 0
+    {
+        return None;
+    }
+    Some(open_id | ((rights.raw() as u64) << NODE_ID_BITS) | OPEN_INSTANCE)
+}
+
 /// Unpack a node-cap badge into `(node_id, rights)`. `pub(crate)` —
 /// external callers go through [`crate::gate::gate`]. Bits beyond the
 /// defined fields are masked off.
@@ -155,13 +184,38 @@ mod tests
     #[test]
     fn unpack_strips_reserved_rights_bits()
     {
-        // Bits 8..23 of the rights field are reserved: they MUST be
+        // Bits 9..23 of the rights field are reserved: they MUST be
         // zero on derive and are ignored on read, so a badge carrying
         // one (set by a peer that minted it outside this crate) decodes
         // to the defined bits alone and cannot flow into a derived cap.
         let badge = (u64::from(LOOKUP | (1 << 23))) << NODE_ID_BITS;
         let (_, r) = unpack(badge);
         assert_eq!(r, NamespaceRights::from_raw(LOOKUP));
+    }
+
+    #[test]
+    fn pack_open_sets_the_kind_flag_and_keeps_the_rights()
+    {
+        let rights = NamespaceRights::from_raw(READ | STAT);
+        let badge = pack_open(0x12_3456, rights).expect("fits");
+        assert!(is_open_instance(badge));
+        assert!(!is_open_instance(pack(
+            NodeId::new(0x12_3456).unwrap(),
+            rights
+        )));
+        // The flag is not a right: decoding the field leaves it out.
+        let (id, r) = unpack(badge);
+        assert_eq!(id.raw(), 0x12_3456);
+        assert_eq!(r, rights);
+    }
+
+    #[test]
+    fn pack_open_refuses_an_identifier_outside_the_field()
+    {
+        let rights = NamespaceRights::from_raw(READ);
+        assert_eq!(pack_open(0, rights), None);
+        assert_eq!(pack_open(NODE_ID_MASK + 1, rights), None);
+        assert!(pack_open(NODE_ID_MASK, rights).is_some());
     }
 
     #[test]

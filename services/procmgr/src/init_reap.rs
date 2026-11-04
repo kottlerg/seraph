@@ -41,7 +41,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::death_queues::DeathSet;
+use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_PHYS_BASE, MSG_CAP_SLOTS_MAX};

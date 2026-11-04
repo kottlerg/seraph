@@ -336,6 +336,58 @@ fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
         })
 }
 
+// ── Deferred reclamation ─────────────────────────────────────────────────────
+
+/// Deferred runs one recheck examines ([`recheck_deferred`]): it bounds the
+/// work one request adds to the receive loop every process shares. A tuning
+/// value that bounds no capacity: a run the check refuses goes to the back
+/// of the list, so successive rechecks visit every run in turn.
+const DEFERRED_RECHECK_BATCH: u64 = 64;
+
+/// Whether no process but memmgr can still reach the frame `run` names
+/// through a kernel object or a user mapping (`docs/memory-pool.md`
+/// § Reclamation): memmgr's retained cap still covers every page it granted,
+/// no byte of the region is retyped (`available_bytes == size`), and no
+/// address space maps any page of it. A query that fails answers no, so the
+/// run waits rather than joining the pool.
+fn quiescent(run: &FreeRun) -> bool
+{
+    let Some(bytes) = run.page_count.checked_mul(PAGE_SIZE)
+    else
+    {
+        return false;
+    };
+    syscall::cap_info(run.cap_slot, syscall::CAP_INFO_MEMORY_SIZE) == Ok(bytes)
+        && syscall::cap_info(run.cap_slot, syscall::CAP_INFO_MEMORY_AVAILABLE) == Ok(bytes)
+        && unmapped(run.cap_slot, run.page_count)
+}
+
+/// Whether no address space maps any of the first `pages` pages of the
+/// Memory region `cap` names, read window by window
+/// (`CAP_INFO_MEMORY_MAPPINGS`).
+fn unmapped(cap: u64, pages: u64) -> bool
+{
+    let mut first = 0;
+    while first < pages
+    {
+        let window = (pages - first).min(syscall::CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES);
+        if syscall::cap_info_memory_mappings(cap, first, window) != Ok(0)
+        {
+            return false;
+        }
+        first += window;
+    }
+    true
+}
+
+/// Move up to [`DEFERRED_RECHECK_BATCH`] deferred runs that have become
+/// [`quiescent`] to the free pool. Returns the pages moved; the caller
+/// coalesces.
+fn recheck_deferred(l: &mut MemLedger) -> u64
+{
+    l.recheck_deferred(DEFERRED_RECHECK_BATCH, quiescent)
+}
+
 /// Free arena slots held back from every allocation but the last-resort
 /// pool returns ([`return_taken`], and [`insert_run`] when it cannot carve a
 /// page), set as the arena's reserve at boot. A growth path that takes a run
@@ -840,7 +892,17 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     {
         Fit::Contiguous
     };
-    let grant = match select(l, want_pages, fit)
+    // A failed selection first rechecks the deferred runs: one that has become
+    // quiescent since its reclaim may cover the request.
+    let selected = select(l, want_pages, fit).or_else(|code| {
+        if recheck_deferred(l) == 0
+        {
+            return Err(code);
+        }
+        coalesce(l);
+        select(l, want_pages, fit)
+    });
+    let grant = match selected
     {
         Ok(g) => g,
         Err(code) =>
@@ -940,9 +1002,10 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // double-release (a joined thread plus the detached-thread reaper) is
     // harmless. Clamp to the words actually present to stay in bounds.
     let count = (req.word(0) as usize).min(req.word_count().saturating_sub(1));
+    recheck_deferred(l);
     for i in 0..count
     {
-        let _ = l.release_frame_by_phys(rec, req.word(1 + i), FRAME_VA_UNMAPPED);
+        let _ = l.release_frame_by_phys(rec, req.word(1 + i), FRAME_VA_UNMAPPED, quiescent);
     }
     // Restore contiguity across the released runs, so a release-heavy churn
     // (ruststd returning Thread-retype slabs on join/reap) does not fragment
@@ -988,7 +1051,7 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
     else
     {
-        let _ = l.remove_process(new_badge);
+        let _ = l.remove_process(new_badge, quiescent);
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     };
@@ -1005,7 +1068,7 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         // carry this badge: drop both, or the cap stays in memmgr's CSpace and
         // the record holds a node no `PROCESS_DIED` will free.
         let _ = syscall::cap_delete(send_cap);
-        let _ = l.remove_process(new_badge);
+        let _ = l.remove_process(new_badge, quiescent);
     }
 }
 
@@ -1022,29 +1085,17 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // `dispatch`.
     let dead_badge = req.word(0);
 
-    // Auto-reclaim invariant (documented, not asserted in-line):
-    //
-    // By the time PROCESS_DIED reaches memmgr, procmgr has revoked +
-    // deleted the child's CSpace, which cascades through every derived
-    // inner Memory cap *and* every kernel object retyped from those caps.
-    // Auto-reclaim (`KernelObjectHeader.ancestor`) credits each retype's
-    // bytes back to the source `MemoryObject` — which memmgr's outer cap
-    // and the child's inner cap share. With the child gone, only the
-    // outer cap remains.
-    //
-    // We do *not* assert `available_bytes == size` here: a correct
-    // cross-check compares against the value snapshotted at grant time,
-    // which is more state than memmgr's record carries; the ktest
-    // `integration::retype_reclaim` covers the same invariant on a
-    // dedicated source cap.
-    //
-    // `remove_process` returns every backing frame to the pool (its
-    // descriptor slot becomes the run's slot, so the return cannot fail) and
-    // frees every region slot and the record. Reachability-only for the
-    // identity: these pages were already counted in pool_total at
-    // acquisition. The kernel's cspace-revoke cascade (run by procmgr before
-    // this message) already tore down the child's mappings, so no unmap is
-    // performed.
+    // By the time PROCESS_DIED reaches memmgr, procmgr has revoked and
+    // deleted the child's CSpace and AddressSpace, so every kernel object the
+    // child alone referenced has been freed (auto-reclaim credits its bytes
+    // back to the `MemoryObject` memmgr's outer cap shares) and the child's
+    // mappings are gone. An object another process still references, or a
+    // mapping another address space holds, outlives the child: `quiescent`
+    // checks each frame, and `remove_process` pools the frames it accepts and
+    // parks the rest on the deferred list (docs/memory-pool.md
+    // § Reclamation). Each descriptor slot becomes the run's slot, so neither
+    // move can fail. Reachability-only for the identity: these pages were
+    // already counted in pool_total at acquisition. No unmap is performed.
     //
     // memmgr's delegated address-space cap is NOT deleted here. It is a
     // `cap_derive` child of the child's AddressSpace cap (procmgr's
@@ -1055,7 +1106,8 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // memmgr's allocator may have reused for an unrelated cap (e.g. a pool-run
     // tail); deleting it would free that cap and corrupt the free pool.
     let l = ledger_mut();
-    if l.remove_process(dead_badge).is_some()
+    let rechecked = recheck_deferred(l);
+    if l.remove_process(dead_badge, quiescent).is_some() || rechecked != 0
     {
         // Restore contiguity across all reclaimed runs in one pass, so every
         // spawn-and-die cycle does not leave the pool more fragmented than it
@@ -1163,12 +1215,15 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 {
     let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
-    let free_bytes = ledger_mut().pool.free_pages().saturating_mul(PAGE_SIZE);
+    let l = ledger_mut();
+    let free_bytes = l.pool.free_pages().saturating_mul(PAGE_SIZE);
+    let deferred_bytes = l.deferred.pages().saturating_mul(PAGE_SIZE);
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, boot.system_ram_bytes)
         .word(1, boot.kernel_reserved_bytes)
         .word(2, pool_total_bytes)
         .word(3, free_bytes)
+        .word(4, deferred_bytes)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1262,7 +1317,8 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     // memmgr runs on.
     let _ =
         unsafe { syscall::mem_unmap_reclaim(aspace_cap, region.va_base, region.len / PAGE_SIZE) };
-    l.return_frames_in(rec, region.va_base, end, FRAME_VA_UNMAPPED);
+    recheck_deferred(l);
+    l.return_frames_in(rec, region.va_base, end, FRAME_VA_UNMAPPED, quiescent);
     // Restore contiguity across the reclaimed runs, so a register/unregister
     // churn does not drift the run (and tracking-anchor) count up.
     coalesce(l);

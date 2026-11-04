@@ -22,7 +22,8 @@ memmgr/
 ├── Cargo.toml                  # Workspace member; no_std binary
 ├── README.md
 ├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
-│                               # arena, free pool, process index, region logic
+│                               # arena, free pool, deferred list, process
+│                               # index, region logic
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
@@ -56,7 +57,9 @@ Allocation Contract").
   procmgr's `REGISTER_PROCESS`; procmgr's own is a bootstrap badge init mints
   for it; see [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
-  reclaim the dead process's memory caps into the free pool (see
+  reclaim the dead process's memory caps into the free pool, holding a frame
+  another process can still reach (a live kernel object retyped from it, or a
+  mapping of it) on a deferred list until it is unreachable (see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Reclamation"); procmgr holds
   it back for a DMA-capable driver until devmgr has confirmed the driver's
   device stopped its DMA (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
@@ -112,7 +115,8 @@ The full memmgr IPC specification is in
 - `PROCESS_DIED(badge)` (procmgr-only)
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
-- `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms and the free total
+- `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms and the free and deferred
+  totals
 - `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
@@ -141,6 +145,7 @@ The remaining constants are tuning values that bound no capacity:
 | `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table self-funding step and retries per map |
 | `MAX_LOAD` | 2 | Mean index chain length before a bucket split |
 | `ARENA_RETURN_RESERVE` | 1 slot | Arena slot kept for last-resort returns of a run to the pool |
+| `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck examines; a refused run goes to the back |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)

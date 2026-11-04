@@ -3,20 +3,24 @@
 
 // services/memmgr/free-pool/src/lib.rs
 
-//! Pure bookkeeping logic for memmgr: the metadata arena, the free pool,
-//! the process index, and the demand-region interval arithmetic.
+//! Pure bookkeeping logic for memmgr: the metadata arena, the free pool, the
+//! deferred list of reclaimed frames not yet pooled, the process index, and
+//! the demand-region interval arithmetic.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
 //! vector in host tests), and the two kernel operations the pool needs —
 //! merging two adjacent Memory caps (`memory_merge`) and splitting one
 //! (`memory_split`) — are injected as closures, so memmgr keeps the syscall
-//! surface and this logic stays host-testable. See
+//! surface and this logic stays host-testable. The quiescence check that
+//! decides whether a reclaimed frame may join the pool is injected the same
+//! way. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod arena;
+pub mod deferred;
 pub mod index;
 pub mod ledger;
 pub mod pool;
@@ -25,6 +29,7 @@ pub use arena::{
     Arena, ArenaLayout, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, SLOTS_PER_PAGE,
     SlotStore,
 };
+pub use deferred::DeferredList;
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
 pub use ledger::{Ledger, RegionError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};

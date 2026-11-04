@@ -3,9 +3,10 @@
 
 // core/kernel/src/arch/riscv64/speculation.rs
 
-//! RISC-V speculation-safe bound primitive.
+//! RISC-V speculation-safe bound primitives.
 //!
-//! [`index_mask`] turns a bounds comparison into data, so a load that a
+//! [`hide`] gives a copy of a value the compiler cannot relate to the
+//! original. [`index_mask`] turns a bounds comparison into data, so a load that a
 //! user-controlled index addresses stays inside its array on every execution
 //! path, a transiently executed one included. The ISA, under the project's
 //! RVA23 floor, defines no speculation barrier (`fence` orders memory

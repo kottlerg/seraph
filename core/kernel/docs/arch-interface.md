@@ -924,7 +924,7 @@ pub unsafe fn ap_trampoline::start_ap(
 
 **Architecture-neutral** (lives outside `arch/`, for example in `mm/`, `cap/`, `ipc/`, `sched/`,
 and `syscall/`; the one neutral module under `arch/` is `arch::nospec`, the arch-neutral forms of
-§ `speculation`, kept beside the primitive they wrap):
+§ `speculation`, kept beside the primitives they wrap):
 
 - Buddy allocator algorithm
 - Retype allocator and the page pools behind address spaces and CSpaces

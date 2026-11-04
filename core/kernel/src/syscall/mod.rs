@@ -14,9 +14,10 @@
 //! defined in core/kernel/docs/syscalls.md § Calling Convention.
 //!
 //! # Adding new syscalls
-//! 1. Add the constant to `abi/syscall/src/lib.rs`.
+//! 1. Add the constant to `abi/syscall/src/lib.rs`, and raise
+//!    `SYSCALL_NR_BOUND` there when the new number is at or above it.
 //! 2. Add a handler function in the appropriate `syscall/` submodule.
-//! 3. Add a `match` arm in `dispatch` below.
+//! 3. Add a `match` arm in `dispatch_in_range` below.
 
 pub mod cap;
 pub mod entropy;

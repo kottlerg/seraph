@@ -29,8 +29,8 @@ The CSpace has the following properties:
   structural ceiling
 - **Bounded under speculation** — no user-supplied handle reaches a load that
   depends on it before the checks of its resolution (its index bound, the
-  slot's occupancy and generation, the type the caller expects, and the rights
-  the caller requires) are enforced as data, not by a conditional branch alone:
+  slot's occupancy and generation, and the type and the rights its lookup
+  requires) are enforced as data, not by a conditional branch alone:
   a misspeculated resolution yields no object, never another slot's, an object
   of another type, or one whose slot lacks those rights (mechanism:
   [core/kernel/docs/capability-internals.md](../core/kernel/docs/capability-internals.md)

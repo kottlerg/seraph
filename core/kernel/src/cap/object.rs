@@ -3049,14 +3049,14 @@ unsafe fn release_range_object<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut 
 /// The caller releases the returned reference with [`release_ref`] if the
 /// slot is never published.
 ///
+/// `hidden_tag` is `tag` as the source's `PinnedCap::hidden_tag` holds it,
+/// the value each tag arm masks `src` by.
+///
 /// # Errors
 /// For `Mmio`, `IoPort`, and `Interrupt`: `QuotaExceeded` when the lineage
 /// already has [`RANGE_COPY_LIMIT`] live copies, and `OutOfMemory` when
 /// `dest`'s arena cannot back the copy. For every other type: `QuotaExceeded`
 /// when `src`'s reference count is at [`REF_COUNT_LIMIT`].
-///
-/// `hidden_tag` is `tag` as the source's `PinnedCap::hidden_tag` holds it,
-/// the value each tag arm masks `src` by.
 ///
 /// # Safety
 /// `src` is the live object of a slot tagged `tag`, pinned by the caller,

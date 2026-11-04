@@ -146,10 +146,13 @@ forms on the two: `mask_index`, `mask_index_u64`, `mask_if` (all-ones when a con
 `hide`, and `select_ptr` (one of two pointers chosen by a mask).
 
 A mask's output is opaque but its input is not. A condition that a dominating branch has already
-tested is a constant inside that branch's arm, so a mask taken there on the same condition is
-all-ones whatever the data. Every mask is therefore computed either ahead of the branch it backs,
-or, inside an arm of a dispatch on a slot's tag, from the tag `pin_checked` passed through `hide`
-at resolution (`PinnedCap::tag_mask`), which no later branch on the tag lets the compiler fold.
+tested is a constant inside that branch's arm, so a condition mask (`mask_if`) taken there on the
+same condition is all-ones whatever the data. Every condition mask is therefore computed either
+ahead of the branch it backs, or, inside an arm of a dispatch on a slot's tag, from the tag
+`pin_checked` passed through `hide` at resolution (`PinnedCap::tag_mask`), which no later branch
+on the tag lets the compiler fold. An index mask (`index_mask`, `mask_index`) taken inside the arm
+of the bounds branch it backs stays data, since its input is the index, whose value the branch
+does not fix.
 
 | Site | User-controlled value | Load it would steer | Hardening |
 |---|---|---|---|
@@ -175,7 +178,8 @@ handlers, the IPC transfer pre-validation, and explicit placement.
 A misspeculated use of the null object that `pin_checked` folds a failed lookup into dereferences
 null at a small offset. Userspace can map virtual page 0 (#741), and the documents do not state
 whether SMAP or a clear `SUM` stop that transient load. A rights bit a handler tests after
-resolution, beyond those its lookup requires, is a branch only; those sites, and the user-supplied
+resolution, beyond those its lookup requires, is a branch only, `sys_wait_set_add`'s member right
+aside (folded, above); those sites, and the user-supplied
 indexes that select a kernel array entry outside the capability path, are recorded on #270.
 
 ### Free Slot Tracking

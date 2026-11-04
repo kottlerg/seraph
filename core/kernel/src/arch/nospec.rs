@@ -4,7 +4,7 @@
 // core/kernel/src/arch/nospec.rs
 
 //! Arch-neutral speculation-safe bounds, built on the active architecture's
-//! `speculation::index_mask`.
+//! `speculation::index_mask` and `speculation::hide`.
 //!
 //! A bound enforced only by a conditional branch does not hold on a
 //! mispredicted path: the loads behind the branch execute transiently with the

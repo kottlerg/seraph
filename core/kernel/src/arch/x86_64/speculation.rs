@@ -3,9 +3,10 @@
 
 // core/kernel/src/arch/x86_64/speculation.rs
 
-//! x86-64 speculation-safe bound primitive.
+//! x86-64 speculation-safe bound primitives.
 //!
-//! [`index_mask`] turns a bounds comparison into data, so a load that a
+//! [`hide`] gives a copy of a value the compiler cannot relate to the
+//! original. [`index_mask`] turns a bounds comparison into data, so a load that a
 //! user-controlled index addresses stays inside its array on every execution
 //! path, a transiently executed one included. The arch-neutral helpers built
 //! on it are in `crate::arch::nospec`; the rule they serve is

@@ -88,10 +88,10 @@ mod tests
         assert_eq!(extended_pages(PAGE + 1), 2);
     }
 
-    // The largest area a CPU can report (riscv64 at VLEN 65536, 262448
-    // bytes), composed into a whole slot.
+    // The largest area a riscv64 hart can report (VLEN 65536, 262448 bytes:
+    // `VLENB_SPEC_MAX` bounds it), composed into a whole slot.
     #[test]
-    fn the_largest_area_composes_into_a_seventy_page_slot()
+    fn the_largest_riscv_area_composes_into_whole_pages()
     {
         assert_eq!(slot_bytes(262_448), (BASE + 65) * PAGE);
     }

@@ -473,10 +473,14 @@ const VLENB_SPEC_MAX: u64 = 8192;
 
 /// Read CSR `vlenb` on the running hart. The CSR access requires
 /// `sstatus.VS != Off`; this function temporarily promotes VS to Initial,
-/// reads `vlenb`, then restores VS = Off.
+/// reads `vlenb`, then restores VS = Off. On a hart without the V extension
+/// the read takes an S-mode illegal-instruction trap, which the trap handler
+/// treats as a fatal kernel exception: that is how such a hart is refused.
 ///
 /// # Safety
-/// Must execute in supervisor mode on a hart with the V extension.
+/// Must execute in supervisor mode, with this hart's trap vector installed
+/// and `sscratch` zero, so a trap on a hart without V takes the S-mode path
+/// to the fatal handler.
 #[cfg(not(test))]
 unsafe fn read_vlenb() -> u64
 {
@@ -529,7 +533,9 @@ unsafe fn read_vlenb() -> u64
 #[cfg(not(test))]
 pub unsafe fn cache_vlenb()
 {
-    // SAFETY: the caller's contract; the boot hart has V (RV64GCV).
+    // SAFETY: the caller's contract; BSP init runs this after installing the
+    // trap vector with sscratch zero, so a boot hart without V halts in the
+    // trap handler.
     let v = unsafe { read_vlenb() };
     if v == 0 || v > VLENB_SPEC_MAX || !v.is_power_of_two()
     {
@@ -555,11 +561,13 @@ pub unsafe fn cache_vlenb() {}
 /// during its early init, after [`cache_vlenb`] ran on the boot hart.
 ///
 /// # Safety
-/// Must execute in supervisor mode.
+/// Must execute in supervisor mode, after this hart installed its trap
+/// vector and cleared `sscratch` ([`read_vlenb`]).
 #[cfg(not(test))]
 pub unsafe fn check_ap_vlenb()
 {
-    // SAFETY: the caller's contract; harts are RV64GCV like the boot hart.
+    // SAFETY: the caller's contract, which `read_vlenb` needs: a hart without
+    // V halts in the trap handler at the read.
     let v = unsafe { read_vlenb() };
     if v != vlenb()
     {

@@ -1242,10 +1242,14 @@ pub unsafe fn init()
 pub unsafe fn init_ap()
 {
     // SAFETY: caller (kernel_entry_ap) ensures execution in S-mode on the AP hart;
-    // all CSR operations (stvec, sscratch, sstatus, vlenb, sie, scounteren) are
-    // S-mode privileged instructions on per-hart registers. The one shared state
-    // read is the boot hart's cached vlenb (`fpu::check_ap_vlenb`), written once
-    // at BSP init before any AP starts; that check may halt the boot.
+    // the CSR operations on stvec, sscratch, sstatus, sie and scounteren are
+    // S-mode privileged instructions on per-hart registers. The vlenb read in
+    // `fpu::check_ap_vlenb` is of an unprivileged read-only CSR, which needs
+    // sstatus.VS on (`fpu::read_vlenb` promotes it) and, on a hart without V,
+    // traps to the fatal handler, so it runs after the stvec install and the
+    // sscratch clear. The one shared state read is the boot hart's cached
+    // vlenb, written once at BSP init before any AP starts; that check may
+    // halt the boot.
     unsafe {
         // Clear SIE FIRST to prevent any stray interrupt from firing before
         // stvec and sscratch are configured. Firmware may leave SIE=1. The

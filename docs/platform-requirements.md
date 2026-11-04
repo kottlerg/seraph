@@ -258,10 +258,11 @@ feature it halts with a message naming the specific feature, rather than failing
   calibrates the TSC against the PIT), and the vendor-specific in-silicon mitigations.
 - **riscv64**: required features are asserted where each is safely detectable from supervisor mode —
   the SBI HSM extension at the gate, and the Vector extension and the ASID-tagged TLB at their
-  initialization sites (the boot hart is refused without V, a secondary hart with a `vlenb` other
-  than the boot hart's, and every hart without ASIDs; emulated RISC-V provides ASID, so unlike
-  x86-64 PCID this is gated). A secondary hart without V is stopped too, though not by a message
-  naming V: its `vlenb` read takes the kernel's fatal illegal-instruction trap. Extension
+  initialization sites (every hart without V, a secondary hart with a `vlenb` other than the boot
+  hart's, and every hart without ASIDs; emulated RISC-V provides ASID, so unlike x86-64 PCID this
+  is gated). A hart without V, the boot hart or a secondary one, is stopped by the kernel's fatal
+  illegal-instruction trap at its `vlenb` read rather than by a message naming V; the boot hart's
+  named message covers a malformed `vlenb`. Extension
   requirements introduced by a subsystem (the timer, the paging extensions) are asserted by that
   subsystem during boot — the timer, for example, refuses to boot unless the bootloader confirmed
   Sstc (and a timebase frequency) for every hart from the firmware tables (ACPI RHCT, or the DTB

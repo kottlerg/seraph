@@ -391,7 +391,9 @@ range). See [entropy.md](entropy.md).
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
 gates only the SBI HSM extension; the boot hart's Vector extension, the ASID-tagged TLB, Sstc
 and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
-initialization sites (each secondary hart's Vector extension and `vlenb` in Phase 8)
+initialization sites (each secondary hart's Vector extension and `vlenb` in Phase 8). A boot
+hart without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
+message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,

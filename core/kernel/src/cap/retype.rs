@@ -1237,14 +1237,15 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             split: false,
         }),
         // Thread: KERNEL_STACK_PAGES kstack pages + 1 page holding the
-        // ThreadObject wrapper and the TCB + 1 page for the per-thread
-        // extended-state save area. Layout: pages 0..N are kstack
+        // ThreadObject wrapper and the TCB + the per-thread extended-state
+        // save area's pages, sized at boot from the boot CPU
+        // (`sched::thread_slot`). Layout: pages 0..N are kstack
         // (kstack_top = base + N*PAGE_SIZE); page N holds wrapper + TCB;
-        // page N+1 is the save area (XSAVE on x86-64; F/D and V on RISC-V).
-        // The construction site `sys_cap_create_thread` debug-asserts equality
-        // against this dispatch entry.
+        // pages N+1.. are the save area (XSAVE on x86-64; F/D and V on
+        // RISC-V). `sys_cap_create_thread` and the reclaim arm in
+        // `dealloc_object_one` read the same size.
         ObjectType::Thread => Some(DispatchEntry {
-            raw_bytes: (crate::sched::KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64,
+            raw_bytes: crate::sched::thread_slot::thread_slot_bytes(),
             split: true,
         }),
         // AddressSpace and CSpace: `size_arg` pages, page-aligned. The slab layout
@@ -1456,7 +1457,9 @@ mod tests
     {
         let t = dispatch_for(ObjectType::Thread, 0).unwrap();
         assert!(t.split);
-        // KERNEL_STACK_PAGES (4) + 1 wrapper/TCB page + 1 FPU/SIMD/V save-area page.
+        assert_eq!(t.raw_bytes, crate::sched::thread_slot::thread_slot_bytes());
+        // No boot CPU reports a save area in a host test: KERNEL_STACK_PAGES
+        // (4) + 1 wrapper/TCB page + the one-page minimum save area.
         assert_eq!(t.raw_bytes, 6 * PAGE_SIZE as u64);
     }
 

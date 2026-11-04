@@ -8,8 +8,14 @@
 //! Covers: `SYS_SYSTEM_INFO` (all `SystemInfoType` variants and unknown
 //! discriminant).
 
-use syscall::{MAP_WRITABLE, mem_map, mem_unmap, system_info};
-use syscall_abi::{KERNEL_VERSION, PAGE_SIZE, SyscallError, SystemInfoType};
+use syscall::{
+    MAP_WRITABLE, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap, memory_merge,
+    memory_split, system_info,
+};
+use syscall_abi::{
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE, SyscallError,
+    SystemInfoType,
+};
 
 use crate::{TestContext, TestResult};
 
@@ -236,4 +242,70 @@ pub fn stack_high_water_classes(_ctx: &TestContext) -> TestResult
         return Err("sysinfo::stack_high_water: unknown class not refused");
     }
     Ok(())
+}
+
+/// `system_info(ThreadRetypeBytes)` is what one thread creation consumes: a
+/// Memory cap of exactly that many bytes funds one `cap_create_thread` and is
+/// left with nothing, and a cap one page short is refused.
+///
+/// procmgr, init and ruststd size every Thread slab from this value, and the
+/// kernel sizes the slot from the boot CPU's extended-state area, so a
+/// selector that disagreed with the slot would fail or overrun every spawn.
+pub fn thread_retype_bytes_funds_one_thread(ctx: &TestContext) -> TestResult
+{
+    let bytes = system_info(SystemInfoType::ThreadRetypeBytes as u64)
+        .map_err(|_| "system_info(ThreadRetypeBytes) failed")?;
+    // The kernel stack (four pages), the wrapper and TCB page, and a save
+    // area of at least one page, all whole pages.
+    if bytes % PAGE_SIZE != 0 || bytes < 6 * PAGE_SIZE
+    {
+        return Err("system_info(ThreadRetypeBytes) is not a slot of six or more whole pages");
+    }
+    crate::log_u64("ktest: ThreadRetypeBytes=", bytes);
+    let pages = bytes / PAGE_SIZE;
+
+    let short = split_top(ctx, pages - 1)?;
+    let refused = cap_create_thread(short, ctx.aspace_cap, ctx.cspace_cap, 0, 0);
+    if let Ok(thread) = refused
+    {
+        let _ = cap_delete(thread);
+    }
+    memory_merge(ctx.memory_base, short)
+        .map_err(|_| "sysinfo::thread_retype_bytes: memory_merge of the short grant failed")?;
+    if refused.is_ok()
+    {
+        return Err("cap_create_thread succeeded from a grant one page short of ThreadRetypeBytes");
+    }
+
+    let exact = split_top(ctx, pages)?;
+    let made = cap_create_thread(exact, ctx.aspace_cap, ctx.cspace_cap, 0, 0);
+    let left = cap_info(exact, CAP_INFO_MEMORY_AVAILABLE);
+    if let Ok(thread) = made
+    {
+        let _ = cap_delete(thread);
+    }
+    memory_merge(ctx.memory_base, exact)
+        .map_err(|_| "sysinfo::thread_retype_bytes: memory_merge of the exact grant failed")?;
+    if made.is_err()
+    {
+        return Err("cap_create_thread failed from a grant of exactly ThreadRetypeBytes");
+    }
+    if left != Ok(0)
+    {
+        return Err("a thread left bytes in a grant of exactly ThreadRetypeBytes");
+    }
+    Ok(())
+}
+
+/// Split a virgin grant of `pages` pages off the top of `ctx.memory_base`,
+/// for the caller to merge back.
+fn split_top(ctx: &TestContext, pages: u64) -> Result<u32, &'static str>
+{
+    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "sysinfo::thread_retype_bytes: cap_info(memory_base) failed")?;
+    let at = size
+        .checked_sub(pages * PAGE_SIZE)
+        .ok_or("sysinfo::thread_retype_bytes: memory_base too small")?;
+    memory_split(ctx.memory_base, at)
+        .map_err(|_| "sysinfo::thread_retype_bytes: memory_split(memory_base) failed")
 }

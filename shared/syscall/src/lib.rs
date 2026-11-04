@@ -628,9 +628,10 @@ pub fn raw_cap_create_cspace(
 /// `cspace_cap`. Returns the new Thread capability handle (slot index plus
 /// generation).
 ///
-/// `memory_cap` must carry `MemRights::RETYPE` and have at least 6 pages of
-/// `available_bytes` (4 kstack pages, 1 page for the wrapper and TCB,
-/// 1 FPU/SIMD save-area page; see `cap::retype::dispatch_for(Thread)`).
+/// `memory_cap` must carry `MemRights::RETYPE` and have at least
+/// `SystemInfoType::ThreadRetypeBytes` of `available_bytes` (4 kstack pages,
+/// 1 page for the wrapper and TCB, and the FPU/SIMD/V save-area pages the
+/// boot CPU sizes; see `cap::retype::dispatch_for(Thread)`).
 ///
 /// Creation priority: with `sched_cap == 0`, `priority` must also be 0 and
 /// the thread is created at `PRIORITY_MIN` (floor-only creation needs no

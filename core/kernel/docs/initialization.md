@@ -343,8 +343,7 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SIE (interrupts stay disabled until timer::init sets SIE at the end of this phase)
    - Clear SPP (so sret returns to U-mode by default)
    - Clear SUM (no supervisor access to user pages)
-   - Set FS and VS Off for lazy FPU/vector save-restore and cache vlenb (halts without
-     the V extension)
+   - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
 5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
@@ -361,6 +360,14 @@ On both architectures, right after the interrupt-controller step, the BSP alloca
 routing table from the buddy allocator, one entry per line the discovered controllers
 implement (`irq::init_table` with `interrupts::irq_line_count`: the I/O APICs' GSIs on x86-64,
 the PLIC's sources on RISC-V), before any line is routed; its failure is fatal.
+
+Right after its per-CPU install, the BSP reports its extended-state save-area size
+(`fpu::report_save_area`), which sizes every Thread slot (`sched::thread_slot`) and the
+Phase 7 seed reserve: on x86-64 the XSAVE size of the enabled components (CPUID leaf 0xD), on
+RISC-V `304 + 32 * vlenb` from the boot hart's `vlenb`, read there rather than at step 2 so
+the fatal trap a hart without V takes at the read finds its per-CPU pointer installed. A
+`vlenb` of 0, above 8192, or not a power of two halts the boot by name; each AP checks its own
+`vlenb` against the boot hart's at bring-up (Phase 8) and halts the boot on a mismatch.
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
@@ -385,9 +392,11 @@ range). See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures halt with a descriptive
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
-gates only the SBI HSM extension; the Vector extension, the ASID-tagged TLB, Sstc and the
-timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
-initialization sites
+gates only the SBI HSM extension; the boot hart's Vector extension, the ASID-tagged TLB, Sstc
+and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
+initialization sites (each secondary hart's Vector extension and `vlenb` in Phase 8). A boot
+hart without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
+message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
@@ -438,7 +447,7 @@ Phase 7.
 1. Reserve init's Phase 9 backing (the InitInfo block, zeroed, and INIT_STACK_PAGES stack frames)
    and seed the kernel page-table pool from the pristine buddy, then drain the remaining buddy RAM
    as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the
-   buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
+   buddy, and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the InitInfo block's
    descriptor array, the INIT_INFO_DESCRIPTOR_CAPACITY 24-byte slots past the header (about 655 at
    INIT_INFO_MAX_PAGES = 4), extent i in slot i; more extents than slots halt the boot with "FATAL:
@@ -447,8 +456,9 @@ Phase 7.
    into that array, in place, so no copy of it exists, and a boot whose capabilities outnumber the
    slots halts by name in Phase 7 or 8 ("cap: boot capabilities exceed the InitInfo descriptor
    capacity"); a memory map of more than about 640 AcpiReclaimable regions is one such boot. Phase
-   9's capabilities reach init through InitInfo header fields instead. SEED_RESERVE_BYTES is the
-   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs, and
+   9's capabilities reach init through InitInfo header fields instead. seed_reserve_bytes() is the
+   boot footprint, about 380 KiB: the root CSpace slab, init's address-space and thread slabs (the
+   thread slab sized from the boot CPU's save area, so it grows with a wider vector length), and
    one 128-byte body for each descriptor slot and for each Memory capability Phase 9 mints (init
    segments, InitInfo pages, init stack pages), plus alignment slack. Every drained extent exposed
    to userspace (each drained extent, and the seed extent's tail past the reserve) is zeroed through
@@ -463,7 +473,7 @@ Phase 7.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
       drained contiguous extent, the seed extent contributing only its tail past
-      SEED_RESERVE_BYTES. They are the first capabilities minted, in slot order (the drain's,
+      seed_reserve_bytes(). They are the first capabilities minted, in slot order (the drain's,
       the largest extent promoted to slot 0), with
       nothing between them: each extent is read whole from its slot, and its descriptor is
       written over it, so slot i holds extent i and then descriptor i, and every extent not
@@ -622,7 +632,10 @@ hardware TLB tags than the BSP configured halts itself with
 "AP provides fewer hardware TLB tags than the BSP configured" before announcing itself, so
 the BSP's wait then expires the same way. On riscv64 an AP whose PLIC S-mode context
 registers lie outside the PLIC window (a firmware hart id too large for the window
-`plic_size` reports) halts itself the same way, before announcing itself.
+`plic_size` reports) halts itself the same way, before announcing itself, as does an AP whose
+`vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot hart's"),
+or one without the Vector extension, which takes a fatal illegal-instruction trap at its
+`vlenb` read.
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -808,7 +821,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window; a riscv64 `vlenb` other than the boot hart's, or no Vector extension); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

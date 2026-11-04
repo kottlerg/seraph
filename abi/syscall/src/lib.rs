@@ -148,14 +148,6 @@ pub fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS
 // each object kind, so a change to an object's size changes them, and that is
 // an ABI-visible change by design.
 
-/// Raw retype debit of one `Thread`, in bytes: the kernel stack
-/// (`KERNEL_STACK_PAGES`, four pages), one page holding the object wrapper and
-/// the thread control block, and one page for the extended-state (FPU, SIMD,
-/// vector) save area, all page-granular (`dispatch_for(Thread)` in
-/// core/kernel/src/cap/retype.rs). A process sizes the Memory cap it retypes
-/// a thread from with it.
-pub const THREAD_RETYPE_BYTES: u64 = 6 * 4096;
-
 /// Raw retype debit of one `Endpoint`, in bytes.
 pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
 
@@ -1181,6 +1173,14 @@ pub enum SystemInfoType
     /// `InvalidArgument`. The classes and what each counts are in
     /// core/kernel/docs/syscalls.md § `SYS_SYSTEM_INFO`.
     StackHighWater = 9,
+    /// Raw retype debit of one `Thread`, in bytes: the kernel stack, one page
+    /// holding the object wrapper and the thread control block, and the
+    /// extended-state (FPU, SIMD, vector) save area, all page-granular. The
+    /// save area's size is the boot CPU's (on x86-64 the XSAVE size of the
+    /// enabled components, on riscv64 `304 + 32 * vlenb`, each rounded up to
+    /// whole pages), so it is fixed for a boot but not across machines. A
+    /// process sizes the Memory cap it retypes a thread from with it.
+    ThreadRetypeBytes = 10,
 }
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.

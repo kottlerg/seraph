@@ -105,7 +105,8 @@ pub fn current_stack_pointer() -> u64
 /// start secondary harts (`sbi_get_spec_version` is unsuitable as a presence
 /// check — a compliant SBI always returns success, and a truly absent SBI traps
 /// on the `ecall`). The remaining required features are asserted where each is
-/// safely detectable: the Vector extension at `fpu::cache_vlenb`, and the
+/// safely detectable: the Vector extension at `fpu::cache_vlenb` (the boot
+/// hart) and `fpu::check_ap_vlenb` (each secondary hart), and the
 /// ASID-tagged TLB at `paging::enable_tagged_tlb`. See
 /// `docs/platform-requirements.md` § Boot-Time Feature Gate.
 ///

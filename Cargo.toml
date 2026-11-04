@@ -43,6 +43,7 @@ members = [
     "abi/syscall",
     "shared/ansi",
     "shared/crypto",
+    "shared/death-set",
     "shared/elf",
     "shared/font",
     "shared/mmio",

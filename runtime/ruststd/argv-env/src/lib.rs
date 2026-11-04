@@ -16,7 +16,7 @@
 //! parse of spawner-supplied bytes is host-testable rather than entangled
 //! with the overlay's `OsString` glue. The crate performs no I/O and
 //! touches only `core` slice operations — see
-//! [coding-standards.md](../../../docs/coding-standards.md#d-testing-invariants).
+//! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]

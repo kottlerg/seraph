@@ -173,7 +173,8 @@ pub unsafe fn write_msr(msr: u32, val: u64)
 // owns the SMAP access window (`stac`/`clac`) and is covered by the page-fault
 // handler's user-copy fixup: a fault on an unmapped or read-only user span
 // inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
-// returns a non-zero sentinel) instead of panicking. See `crate::uaccess` for
+// returns the count of bytes not copied, `rep movsb`'s `rcx` at the fault)
+// instead of panicking. See `crate::uaccess` for
 // the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
 // for the fixup hook. Every kernel entry clears DF (SFMASK on SYSCALL, `cld`
 // in the IDT stubs), so `rep movsb` copies forward.
@@ -184,7 +185,7 @@ core::arch::global_asm!(
     ".global __copy_user_fault_start",
     ".global __copy_user_fault_end",
     ".global __copy_user_fixup",
-    // fn __copy_user(dst: rdi, src: rsi, len: rdx) -> rax (0 = ok, 1 = faulted)
+    // fn __copy_user(dst: rdi, src: rsi, len: rdx) -> rax (bytes not copied)
     "__copy_user:",
     "    stac",
     "    mov rcx, rdx",
@@ -196,25 +197,28 @@ core::arch::global_asm!(
     "    ret",
     "__copy_user_fixup:",
     "    clac",
-    "    mov eax, 1",
+    "    mov rax, rcx", // the faulting iteration's count: at least 1
     "    ret",
 );
 
 #[cfg(not(test))]
 unsafe extern "C" {
     /// Raw user-copy routine (`dst=rdi, src=rsi, len=rdx`); returns 0 on success
-    /// or 1 if a fault on the user span was recovered.
+    /// or, if a fault on the user span was recovered, the bytes not copied.
     fn __copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
     /// First byte of the faultable copy instruction.
     static __copy_user_fault_start: u8;
     /// First byte past the faultable copy instruction.
     static __copy_user_fault_end: u8;
-    /// Recovery landing pad: closes the SMAP window and returns the fault sentinel.
+    /// Recovery landing pad: closes the SMAP window and returns the bytes not
+    /// copied.
     static __copy_user_fixup: u8;
 }
 
 /// Copy `len` bytes from `src` to `dst` across the SMAP window with fault
-/// recovery. Returns 0 on success, non-zero if a user-span fault was recovered.
+/// recovery. Returns 0 on success; when a user-span fault was recovered, the
+/// bytes not copied (at least 1), so the faulting byte is at offset
+/// `len - returned`.
 ///
 /// # Safety
 /// Must execute at ring 0 with SMAP enabled. The operands must be arranged so the

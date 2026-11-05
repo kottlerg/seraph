@@ -30,6 +30,8 @@ pub mod thread;
 
 use crate::arch::current::trap_frame::TrapFrame;
 #[cfg(not(test))]
+use crate::uaccess::{RestartableError, UserCopyFault};
+#[cfg(not(test))]
 use syscall::SyscallError;
 
 #[cfg(not(test))]
@@ -178,10 +180,31 @@ impl UserFrame
     }
 }
 
+/// How [`dispatch`] leaves the syscall frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum SyscallExit
+{
+    /// The syscall completed: the frame holds its return value, and the
+    /// thread continues past the syscall instruction.
+    Complete,
+    /// The syscall is re-executed: a fault handler resumed the thread after
+    /// the syscall's user copy faulted, the frame's instruction pointer names
+    /// the syscall instruction (or the address the handler wrote), and no
+    /// return value was written (core/kernel/docs/syscalls.md § Restartable
+    /// Syscalls).
+    Restart,
+}
+
 /// Syscall dispatcher: called from the arch-specific trap/syscall entry stub.
 ///
 /// Reads the syscall number from `tf`, invokes the handler, and writes the
-/// return value (or negative error code) back into `tf`.
+/// return value (or negative error code) back into `tf`, or, when a
+/// restartable handler's user copy faulted and the thread's fault handler
+/// resumed it, leaves the frame to re-execute the syscall
+/// ([`SyscallExit::Restart`]). The riscv64 trap dispatcher reads the exit to
+/// decide whether to advance `sepc`; the x86-64 entry stub ignores it, since
+/// the frame's `rip` already says where to return.
 ///
 /// A number at or past [`SYSCALL_NR_BOUND`] is refused before the match, and
 /// the match reads the number clamped as data (`nospec::mask_index_u64`), so
@@ -194,7 +217,7 @@ impl UserFrame
 /// currently running thread. The caller must have already switched to the
 /// kernel stack.
 #[cfg(not(test))]
-pub unsafe fn dispatch(tf: *mut TrapFrame)
+pub unsafe fn dispatch(tf: *mut TrapFrame) -> SyscallExit
 {
     crate::arch::current::cpu::debug_assert_kernel_entry_flags();
     let frame = tf;
@@ -211,9 +234,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     // stack; `frame` is its live frame.
     unsafe { stamp_syscall_entry(nr, frame) };
 
-    let ret: Result<u64, SyscallError> = if nr >= SYSCALL_NR_BOUND
+    let ret = if nr >= SYSCALL_NR_BOUND
     {
-        Err(SyscallError::UnknownSyscall)
+        Err(RestartableError::Failed(SyscallError::UnknownSyscall))
     }
     else
     {
@@ -223,6 +246,21 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
         )
     };
 
+    let ret = match ret
+    {
+        Ok(v) => Ok(v),
+        Err(RestartableError::Failed(e)) => Err(e),
+        // SAFETY: `frame` is the running thread's live frame, and no lock is
+        // held: every handler has returned.
+        Err(RestartableError::Faulted(fault)) => match unsafe { deliver_copy_fault(frame, fault) }
+        {
+            // SAFETY: syscall context on the caller's kernel stack with
+            // interrupts disabled; the frame is left to re-execute.
+            SyscallExit::Restart => return unsafe { finish_syscall(SyscallExit::Restart) },
+            SyscallExit::Complete => Err(SyscallError::InvalidAddress),
+        },
+    };
+
     let ret_val = match ret
     {
         Ok(v) => v.cast_signed(),
@@ -230,7 +268,86 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     };
 
     tf.set_return(ret_val);
+    // SAFETY: syscall context on the caller's kernel stack with interrupts
+    // disabled; the frame holds the return value.
+    unsafe { finish_syscall(SyscallExit::Complete) }
+}
 
+/// Deliver the fault of a restartable syscall's user copy to the calling
+/// thread's fault handler, as the fault a user-mode access at `fault.va` would
+/// raise from the syscall instruction (docs/fault-handling.md § Kernel Copies).
+///
+/// Returns [`SyscallExit::Restart`] when the handler resumes the thread: the
+/// frame then names the syscall instruction, or the address the handler wrote,
+/// and the syscall re-executes with the frame's argument registers, which no
+/// restartable handler writes. Returns [`SyscallExit::Complete`] when the fault
+/// is unhandled — no handler bound, the handler declined, or the delivery was
+/// cancelled — and the syscall then fails with `InvalidAddress`, the outcome
+/// the copy has with no handler bound.
+///
+/// # Safety
+/// `frame` is the running thread's live syscall frame; no lock is held.
+#[cfg(not(test))]
+unsafe fn deliver_copy_fault(frame: *mut TrapFrame, fault: UserCopyFault) -> SyscallExit
+{
+    // SAFETY: syscall context; current_tcb reads this CPU's running thread.
+    let tcb = unsafe { current_tcb() };
+    // SAFETY: tcb is the running thread; has_handler only reads its atomic
+    // binding.
+    if tcb.is_null() || !unsafe { crate::ipc::fault::has_handler(tcb) }
+    {
+        return SyscallExit::Complete;
+    }
+    // SAFETY: the reference lives for this call, which cannot block.
+    let syscall_ip = unsafe { (*frame).rewind_syscall() };
+    let mut access = if fault.write
+    {
+        syscall::FAULT_ACCESS_WRITE
+    }
+    else
+    {
+        syscall::FAULT_ACCESS_READ
+    };
+    // SAFETY: kernel mode in the faulting thread's context, its tables active.
+    if unsafe { crate::arch::current::paging::copy_fault_present(fault.va) }
+    {
+        access |= syscall::FAULT_ACCESS_PRESENT;
+    }
+    let info = crate::ipc::fault::FaultInfo {
+        kind: syscall::FAULT_KIND_VM,
+        d1: fault.va,
+        d2: access,
+        ip: syscall_ip,
+    };
+    // SAFETY: tcb is the running thread; the frame it publishes is the one the
+    // handler's register syscalls act on while it is fault-blocked (the syscall
+    // entry published it already; republished as the trap paths do).
+    unsafe {
+        (*tcb)
+            .trap_frame
+            .store(frame, core::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: a handler is bound (checked; a binding cleared since is the
+    // dispatcher's own unhandled outcome), the published frame is live, and no
+    // lock is held.
+    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, &info) };
+    if outcome == crate::ipc::fault::FaultOutcome::Resume
+    {
+        return SyscallExit::Restart;
+    }
+    // SAFETY: the reference lives for this call, which cannot block.
+    unsafe { (*frame).complete_rewound_syscall(syscall_ip) };
+    SyscallExit::Complete
+}
+
+/// The dispatcher's epilogue, run after the frame holds what the thread
+/// resumes with; returns `exit`.
+///
+/// # Safety
+/// Syscall context on the caller's kernel stack with interrupts disabled.
+#[cfg(not(test))]
+unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
+{
     // Self-teardown epilogue (#341): a live thread drains this CPU's
     // deferred-reclaim stack; a thread found `Exited` (before or after the drain)
     // reschedules away and never returns to userspace. Protocol and invariants:
@@ -258,14 +375,17 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
                 .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    exit
 }
 
 /// The syscall handler table: call the handler of `nr`, which
 /// [`dispatch`] has refused past [`SYSCALL_NR_BOUND`] and clamped as data.
+/// The restartable handlers return their own error type; every other handler's
+/// error is [`RestartableError::Failed`].
 #[cfg(not(test))]
-fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, SyscallError>
+fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
 {
-    match nr
+    let ret = match nr
     {
         SYS_IPC_CALL => ipc::sys_ipc_call(tf),
         SYS_IPC_REPLY => ipc::sys_ipc_reply(tf),
@@ -292,8 +412,8 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, SyscallError>
         SYS_THREAD_STOP => thread::sys_thread_stop(tf),
         SYS_THREAD_SET_PRIORITY => thread::sys_thread_set_priority(tf),
         SYS_THREAD_SET_AFFINITY => thread::sys_thread_set_affinity(tf),
-        SYS_THREAD_READ_REGS => thread::sys_thread_read_regs(tf),
-        SYS_THREAD_WRITE_REGS => thread::sys_thread_write_regs(tf),
+        SYS_THREAD_READ_REGS => return thread::sys_thread_read_regs(tf),
+        SYS_THREAD_WRITE_REGS => return thread::sys_thread_write_regs(tf),
         SYS_THREAD_SET_FAULT_HANDLER => thread::sys_thread_set_fault_handler(tf),
         SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
         SYS_THREAD_YIELD => sys_yield(tf),
@@ -301,7 +421,7 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, SyscallError>
         SYS_PROCESS_EXIT => sys_process_exit(tf),
         SYS_SYSTEM_INFO => sysinfo::sys_system_info(tf),
         SYS_ASPACE_QUERY => sysinfo::sys_aspace_query(tf),
-        SYS_GETRANDOM => entropy::sys_getrandom(tf),
+        SYS_GETRANDOM => return entropy::sys_getrandom(tf),
         SYS_EVENT_POST => ipc::sys_event_post(tf),
         SYS_EVENT_RECV => ipc::sys_event_recv(tf),
         SYS_CAP_CREATE_EVENT_Q => cap::sys_cap_create_event_queue(tf),
@@ -324,7 +444,8 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, SyscallError>
         SYS_CAP_DERIVE_BADGE => cap::sys_cap_derive_badge(tf),
         SYS_CAP_INFO => cap::sys_cap_info(tf),
         _ => Err(SyscallError::UnknownSyscall),
-    }
+    };
+    ret.map_err(RestartableError::Failed)
 }
 
 // ── Thread syscall handlers ───────────────────────────────────────────────────

@@ -642,17 +642,16 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         let sepc_before = unsafe { (*frame).sepc };
         // SAFETY: frame is a valid TrapFrame on the kernel stack; trap_entry constructed
         // it with correct layout; pointer passed to syscall dispatcher.
-        unsafe {
-            crate::syscall::dispatch(frame);
-        }
-        // Advance sepc past the ecall instruction ONLY if dispatch did
-        // not modify sepc. SYS_THREAD_WRITE_REGS may redirect a blocked
-        // thread to a new instruction pointer; in that case sepc is
-        // already the target address and must not be incremented. The
-        // frame is re-read after the dispatch, which may have blocked.
+        let exit = unsafe { crate::syscall::dispatch(frame) };
+        // Advance sepc past the ecall instruction ONLY if the syscall
+        // completed and dispatch did not modify sepc. A restart re-executes
+        // the ecall (core/kernel/docs/syscalls.md § Restartable Syscalls), and
+        // SYS_THREAD_WRITE_REGS may redirect a blocked thread to a new
+        // instruction pointer, which must not be incremented. The frame is
+        // re-read after the dispatch, which may have blocked.
         // SAFETY: single accesses of the live frame (see the top).
         unsafe {
-            if (*frame).sepc == sepc_before
+            if exit == crate::syscall::SyscallExit::Complete && (*frame).sepc == sepc_before
             {
                 (*frame).sepc += 4;
             }
@@ -801,7 +800,7 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
             // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
             // region is an unmapped or read-only user buffer. Redirect to the fixup
-            // — which clears SUM and returns an error sentinel — instead of
+            // — which clears SUM and returns the bytes not copied — instead of
             // panicking. An S-mode trap is taken by the kernel thread itself, so
             // no other path reaches this frame; the reference lives for the
             // trap's remaining, non-blocking work.
@@ -811,6 +810,22 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             if matches!(cause_code, 12 | 13 | 15)
                 && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
             {
+                // A load or store fault the live tables already satisfy is a
+                // stale entry (a hart may cache an invalid one), as for a
+                // U-mode fault: flush it and retry the copy, so a page a fault
+                // handler has just mapped is not failed or delivered again
+                // (docs/fault-handling.md § Kernel Copies).
+                // SAFETY: S-mode in the copying thread's context; its satp is
+                // still active (SIE is clear).
+                if matches!(cause_code, 13 | 15)
+                    && unsafe {
+                        super::paging::user_fault_is_spurious(live.stval, cause_code == 15, false)
+                    }
+                {
+                    // SAFETY: S-mode; drops the stale entry for the retry.
+                    unsafe { super::paging::flush_page(live.stval) };
+                    return;
+                }
                 live.sepc = fixup;
                 return;
             }

@@ -17,9 +17,55 @@
 //! kernel-half VA, which SMAP/SUM do not protect. Fault recovery is the backstop
 //! for an in-range span that is unmapped or read-only, including a TOCTOU unmap
 //! after validation.
+//!
+//! The restartable copies ([`copy_to_user_restartable`],
+//! [`copy_from_user_restartable`]) report the faulting address instead, so the
+//! syscall dispatcher can deliver the fault to the thread's fault handler and
+//! re-execute the syscall on its resume (docs/fault-handling.md § Kernel
+//! Copies). Only a syscall with no visible effect before its copy uses them.
 
 #[cfg(not(test))]
 use syscall::SyscallError;
+
+/// A recovered fault of a restartable user copy.
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserCopyFault
+{
+    /// User VA of the first byte the copy did not move: the faulting address.
+    pub va: u64,
+    /// Whether the copy wrote user memory (`copy_to_user_restartable`) rather
+    /// than read it.
+    pub write: bool,
+}
+
+/// How a syscall handler whose user copy is restartable fails.
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartableError
+{
+    /// The syscall fails with this error.
+    Failed(SyscallError),
+    /// The user copy faulted; the dispatcher decides between delivering the
+    /// fault and failing with `InvalidAddress`.
+    Faulted(UserCopyFault),
+}
+
+#[cfg(not(test))]
+impl From<SyscallError> for RestartableError
+{
+    fn from(e: SyscallError) -> Self
+    {
+        Self::Failed(e)
+    }
+}
+
+/// The faulting VA of a copy of `len` bytes at user address `user` that the
+/// arch primitive left with `left` bytes (at least 1) not copied.
+fn fault_va(user: u64, len: usize, left: usize) -> u64
+{
+    user + (len - left) as u64
+}
 
 /// Copy `len` bytes from kernel `src` into user `dst`. Returns
 /// [`SyscallError::InvalidAddress`] if the user span faults during the copy.
@@ -67,5 +113,77 @@ pub unsafe fn copy_from_user(dst: *mut u8, src: u64, len: usize) -> Result<(), S
     else
     {
         Err(SyscallError::InvalidAddress)
+    }
+}
+
+/// [`copy_to_user`], reporting a fault on the user destination as
+/// [`RestartableError::Faulted`] with its address.
+///
+/// The caller's syscall MUST have made no change visible outside the call
+/// before the copy, since the dispatcher re-executes it from the start when
+/// the fault handler resumes the thread.
+///
+/// # Safety
+/// As [`copy_to_user`].
+#[cfg(not(test))]
+pub unsafe fn copy_to_user_restartable(
+    dst: u64,
+    src: *const u8,
+    len: usize,
+) -> Result<(), RestartableError>
+{
+    // SAFETY: forwarded to the arch primitive, which returns the bytes it did
+    // not copy (0 when the copy completed).
+    let left = unsafe { crate::arch::current::cpu::copy_user(dst as *mut u8, src, len) };
+    if left == 0
+    {
+        return Ok(());
+    }
+    Err(RestartableError::Faulted(UserCopyFault {
+        va: fault_va(dst, len, left),
+        write: true,
+    }))
+}
+
+/// [`copy_from_user`], reporting a fault on the user source as
+/// [`RestartableError::Faulted`] with its address. The caller's syscall is
+/// bound as for [`copy_to_user_restartable`].
+///
+/// # Safety
+/// As [`copy_from_user`].
+#[cfg(not(test))]
+pub unsafe fn copy_from_user_restartable(
+    dst: *mut u8,
+    src: u64,
+    len: usize,
+) -> Result<(), RestartableError>
+{
+    // SAFETY: forwarded to the arch primitive, which returns the bytes it did
+    // not copy (0 when the copy completed).
+    let left = unsafe { crate::arch::current::cpu::copy_user(dst, src as *const u8, len) };
+    if left == 0
+    {
+        return Ok(());
+    }
+    Err(RestartableError::Faulted(UserCopyFault {
+        va: fault_va(src, len, left),
+        write: false,
+    }))
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defect guarded: a faulting address taken from the wrong end of the
+    // remaining span names a page the copy never reached, so the handler
+    // backs the wrong page and the restarted syscall faults again forever.
+    #[test]
+    fn fault_va_names_the_first_byte_not_copied()
+    {
+        assert_eq!(fault_va(0x4000, 0x20, 0x20), 0x4000);
+        assert_eq!(fault_va(0x4ff0, 0x20, 0x10), 0x5000);
+        assert_eq!(fault_va(0x4000, 0x20, 1), 0x401f);
     }
 }

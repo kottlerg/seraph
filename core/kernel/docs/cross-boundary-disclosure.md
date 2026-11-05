@@ -69,7 +69,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
-| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d |
+| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for`, `syscall::deliver_copy_fault` | b/d |
 | Exit / death reason encoding + death entry `(reason, correlator)` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
@@ -95,7 +95,11 @@ Notes on the non-obvious entries:
   `CR2` is a user-half address (`page_fault_handler`): the kernel half is mapped
   supervisor-only in every user address space, so for a kernel-half `CR2` the bit would
   let a process bound as its own fault handler probe whether a kernel VA is mapped, and
-  it is reported clear there. RISC-V never sets the bit. No other word carries a kernel
+  it is reported clear there. RISC-V never sets the bit. The fault of a restartable
+  syscall's user copy (`syscall::deliver_copy_fault`) carries the same words: the user
+  faulting address, the access of the copy, the bit from a walk of the caller's own
+  tables (`copy_fault_present`, x86-64 only), and the syscall instruction as `ip`. No
+  other word carries a kernel
   VA or a value derived from one. The forwarded/readable `TrapFrame` holds only user-mode
   register state (no kernel stack pointer, kernel return address, or `CR3`/`satp`); the
   write path re-validates through `sanitize_for_user_resume`. `sys_thread_read_regs`

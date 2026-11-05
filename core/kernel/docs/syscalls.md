@@ -91,7 +91,9 @@ On `SYSCALL`:
 6. Kernel calls `syscall::dispatch(tf)` with a pointer to the saved `TrapFrame`;
    `dispatch` reads the number from `rax` and arguments 0–5 from `rdi`, `rsi`, `rdx`,
    `r10`, `r8`, `r9`
-7. Kernel writes return values into the saved register frame
+7. Kernel writes return values into the saved register frame, except for a
+   restarted syscall (§ Restartable Syscalls), whose frame `rip` it rewinds to the
+   `SYSCALL` instruction
 8. Kernel restores the user register file and switches to the user `rsp`
 9. `cli; swapgs`: the user GS base is back in place, with interrupts off until `SYSRET`
    restores the user's `IF`
@@ -126,12 +128,31 @@ On `ECALL` from U-mode:
 6. Kernel calls `syscall::dispatch(tf)` with a pointer to the saved `TrapFrame`;
    `dispatch` reads the number from `a7` and arguments 0–5 from `a0`–`a5`
 7. `dispatch` writes return values into the saved register frame (`a0`, `a1`, and for
-   the IPC calls `a2`/`a3`)
+   the IPC calls `a2`/`a3`), except for a restarted syscall (§ Restartable Syscalls)
 8. After `dispatch` returns, the trap handler advances the saved `sepc` by 4, past the
-   `ecall`, unless dispatch rewrote it (`SYS_THREAD_WRITE_REGS`)
+   `ecall`, unless the syscall is restarted or dispatch rewrote `sepc`
+   (`SYS_THREAD_WRITE_REGS`)
 9. Kernel restores the user register file
 10. `SRET` restores `pc` from `sepc`, restores `sstatus.SIE` from `sstatus.SPIE`,
     returns to U-mode (`sstatus.SPP` = 0)
+
+### Restartable Syscalls
+
+`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, and `SYS_THREAD_WRITE_REGS` are restartable: a fault
+of the kernel's copy to or from the caller's buffer is handled as
+[docs/fault-handling.md § Kernel Copies](../../../docs/fault-handling.md#kernel-copies)
+specifies. With a fault handler bound to the caller, the fault is delivered as `FAULT_KIND_VM`
+from the syscall instruction, and on `FAULT_REPLY_RESUME` the syscall re-executes from its start:
+`dispatch` writes no return value, and the frame's instruction pointer names the syscall
+instruction (x86-64 rewinds `rip` by the two bytes of `SYSCALL`; RISC-V leaves `sepc` at the
+`ecall`). An unhandled fault, and every fault with no handler bound, fails the syscall with
+`InvalidAddress`. A restartable syscall changes nothing visible outside the call before its copy
+and writes no register of the caller's frame, so the re-execution sees its argument registers as
+the first call did (on x86-64, the `rcx` and `r11` that `SYSCALL` overwrites carry no argument);
+a syscall made restartable MUST meet the same rule. A copy fault the live tables already satisfy
+(a stale TLB entry) is retried in the kernel and reaches neither the handler nor the caller. The
+IPC buffer copies are not restartable: their faults fail or lose the transfer as
+§ `SYS_IPC_BUFFER_SET` states.
 
 ---
 
@@ -1371,7 +1392,8 @@ object),
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
 handler's claiming reply was `FAULT_REPLY_KILL`, kills it as an unhandled fault, which posts its
-death and address-space observers (see
+death and address-space observers, or, for the fault of a restartable syscall's user copy, fails
+that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill).
 A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
@@ -1418,9 +1440,10 @@ the target never runs again and a later `SYS_THREAD_START` returns `InvalidArgum
 
 A fault-blocked target's fault episode, unless the handler's reply claimed it first, is cancelled
 with a kill outcome (no syscall returns) and the thread is left `Stopped`; the next
-`SYS_THREAD_START` then kills it as an unhandled fault. A thread whose handler's reply claimed the
+`SYS_THREAD_START` then kills it as an unhandled fault (for the fault of a restartable syscall's
+user copy, fails that syscall with `InvalidAddress`). A thread whose handler's reply claimed the
 fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
-`FAULT_REPLY_RESUME` and is killed on `FAULT_REPLY_KILL` (see
+`FAULT_REPLY_RESUME` and takes the unhandled outcome on `FAULT_REPLY_KILL` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker
@@ -1679,8 +1702,8 @@ that switch to finish.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
 (thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
-null pointer, or no register frame), `InvalidAddress` (buffer outside the user half or not
-writable).
+null pointer, or no register frame), `InvalidAddress` (buffer outside the user half, or a fault on
+it that is unhandled; restartable, § Restartable Syscalls).
 
 ---
 
@@ -1725,7 +1748,7 @@ that switch to finish.
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
 (thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
 null pointer, no register frame, or illegal register values), `InvalidAddress` (buffer outside
-the user half or not readable).
+the user half, or a fault on it that is unhandled; restartable, § Restartable Syscalls).
 
 ---
 
@@ -1768,7 +1791,8 @@ to it receives `FAULT_LABEL` only from the kernel; a handler that also serves cl
 endpoint attributes the message by badge, with the guarantees of an ordinary send's badge (see
 [fault-handling.md](../../../docs/fault-handling.md) § Security).
 
-Both page faults (`FAULT_KIND_VM`) and other kernel-unresolvable ring-3 exceptions
+Both page faults (`FAULT_KIND_VM`), the faults of a restartable syscall's user copy among them
+(§ Restartable Syscalls), and other kernel-unresolvable ring-3 exceptions
 (`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on
 the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle (see
 [fault-handling.md](../../../docs/fault-handling.md) § Fault-Handler Binding and
@@ -1913,6 +1937,13 @@ Block until any member of the wait set becomes ready.
 Only one ready source is returned per call (wake-one semantics). If multiple sources
 are ready simultaneously, subsequent calls return them without blocking (see
 [ipc-internals.md](ipc-internals.md) § Multiple Ready Sources).
+
+The badge names a source that was ready when the wait returned, or when its readiness
+woke the caller; a source whose readiness lapsed before the call (an endpoint whose
+queued sender was stopped or destroyed, a notification a direct wait drained) is not
+returned for it. Readiness can still lapse between the return and the caller's receive
+on the source, so that receive can find nothing (see
+[ipc-internals.md](ipc-internals.md) § Wait Path).
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
@@ -2562,8 +2593,9 @@ name no object and confer no authority; the call is draw-only and injects no
 entropy.
 
 **Errors:** `InvalidArgument` (`len > MAX_GETRANDOM_LEN`); `InvalidAddress`
-(null buffer, a span not wholly within the user half, or a span that is unmapped or
-read-only); `WouldBlock` (pool not yet seeded — unreachable in practice).
+(null buffer, a span not wholly within the user half, or a fault on the span that is
+unhandled; restartable, § Restartable Syscalls); `WouldBlock` (pool not yet seeded —
+unreachable in practice).
 
 Callers fill larger buffers by looping in `MAX_GETRANDOM_LEN`-byte chunks; the per-call
 cap bounds the per-call interrupt-off window of the kernel draw (see

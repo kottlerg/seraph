@@ -1678,6 +1678,20 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
     }
 }
 
+/// The `FAULT_ACCESS_PRESENT` bit a fault message carries for a fault at the
+/// user address `va` that no trap cause describes (a kernel copy's, delivered
+/// by the syscall dispatcher): always clear, as for every RISC-V fault
+/// message, since `scause` does not encode presence
+/// (docs/fault-handling.md § Fault Message).
+///
+/// # Safety
+/// None on RISC-V; `unsafe` for parity with the x86-64 walk.
+#[cfg(not(test))]
+pub unsafe fn copy_fault_present(_va: u64) -> bool
+{
+    false
+}
+
 // ── TLB flush operations ──────────────────────────────────────────────────────
 
 /// Flush all TLB entries for all address spaces.

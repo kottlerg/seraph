@@ -193,6 +193,22 @@ impl TrapFrame
         self.sepc
     }
 
+    /// Point a syscall frame at the `ecall` the thread entered through, so a
+    /// return to user mode re-executes it, and return that address. `sepc`
+    /// already holds the `ecall`: the trap dispatcher advances it only after a
+    /// syscall that completed (`syscall::SyscallExit::Complete`).
+    pub fn rewind_syscall(&mut self) -> u64
+    {
+        self.sepc
+    }
+
+    /// Undo [`rewind_syscall`](Self::rewind_syscall), whose result was `at`,
+    /// when the syscall completes instead of re-executing. Nothing to undo: the
+    /// trap dispatcher advances an unchanged `sepc` past the `ecall` after a
+    /// completed syscall, and leaves a rewritten one (a fault handler's
+    /// `SYS_THREAD_WRITE_REGS`) to stand.
+    pub fn complete_rewound_syscall(&mut self, _at: u64) {}
+
     /// Validate and sanitize a user-supplied register snapshot before it is
     /// resumed in user mode: reject a non-user `sepc`, clear the
     /// kernel-internal trap-cause fields, and replace `sstatus` with the value

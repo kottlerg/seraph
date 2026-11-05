@@ -112,6 +112,9 @@ const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, rsp) == syscall::REGS_X86_64_SP_OFFSET);
 };
 
+/// Length of the `syscall` instruction (`0F 05`).
+const SYSCALL_INSN_BYTES: u64 = 2;
+
 // ── Syscall / IPC accessors ───────────────────────────────────────────────────
 
 impl TrapFrame
@@ -218,6 +221,29 @@ impl TrapFrame
     pub fn instruction_pointer(&self) -> u64
     {
         self.rip
+    }
+
+    /// Point a syscall frame at the `syscall` instruction the thread entered
+    /// through, so a return to user mode re-executes it, and return that
+    /// address. `rip` holds the next instruction (SYSCALL saved it in `rcx`),
+    /// and `syscall` is two bytes (`0F 05`).
+    pub fn rewind_syscall(&mut self) -> u64
+    {
+        self.rip -= SYSCALL_INSN_BYTES;
+        self.rip
+    }
+
+    /// Undo [`rewind_syscall`](Self::rewind_syscall), whose result was `at`,
+    /// when the syscall completes instead of re-executing: the thread
+    /// continues past the instruction, unless its instruction pointer was
+    /// rewritten since (a fault handler's `SYS_THREAD_WRITE_REGS`), which
+    /// stands.
+    pub fn complete_rewound_syscall(&mut self, at: u64)
+    {
+        if self.rip == at
+        {
+            self.rip = at + SYSCALL_INSN_BYTES;
+        }
     }
 
     /// Validate and sanitize a user-supplied register snapshot before it is

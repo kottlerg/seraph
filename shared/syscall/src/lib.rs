@@ -1170,8 +1170,9 @@ pub unsafe fn thread_configure_with_tls(
 /// A `Stopped` thread whose fault episode a stop cancelled before any reply
 /// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL`, is
 /// not resumed: starting it kills it as an unhandled fault, which posts its
-/// death and address-space observers (docs/fault-handling.md § Delivery,
-/// Resume, and Kill).
+/// death and address-space observers, or, for the fault of a restartable
+/// syscall's user copy, fails that syscall with `InvalidAddress`
+/// (docs/fault-handling.md § Delivery, Resume, and Kill).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid
@@ -1936,9 +1937,12 @@ pub fn wait_set_remove(ws_cap: u64, source_cap: u64) -> Result<(), i64>
 
 /// Block until any registered source in `ws_cap` becomes ready.
 ///
-/// Returns the opaque badge chosen at `wait_set_add` time for the source that
-/// fired. The badge is delivered in the secondary return register (rdx / a1).
-/// If multiple sources are ready, each call returns one badge without re-blocking.
+/// Returns the opaque badge chosen at `wait_set_add` time for a source that
+/// was ready when the call returned. The badge is delivered in the secondary
+/// return register (rdx / a1). If multiple sources are ready, each call returns
+/// one badge without re-blocking. The source's readiness can lapse before the
+/// caller receives on it (a queued sender stopped or destroyed), so that
+/// receive can find nothing.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid or lacks
@@ -2222,8 +2226,10 @@ pub fn thread_set_fault_handler(
 /// is invalid), `InsufficientRights` (it lacks Observe), `InvalidState` (the
 /// thread is neither fault-blocked nor `Stopped` and descheduled),
 /// `InvalidArgument` (`buf` is shorter than the frame, or the thread has no
-/// register frame), or `InvalidAddress` (`buf` is not wholly in the user half
-/// or not mapped writable).
+/// register frame), or `InvalidAddress` (`buf` is not wholly in the user half,
+/// or a fault on it is unhandled: the call is restartable, and with a fault
+/// handler bound a fault on `buf` is delivered to it and the call re-executes
+/// on resume, `core/kernel/docs/syscalls.md` § Restartable Syscalls).
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
@@ -2276,22 +2282,39 @@ pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
 /// `InvalidArgument` (`buf` is shorter than the frame, the thread has no
 /// register frame, or the instruction pointer, on x86-64 also the stack
 /// pointer, is not a user address), or `InvalidAddress` (`buf` is not wholly
-/// in the user half or not mapped readable).
+/// in the user half, or a fault on it is unhandled; restartable, as
+/// [`thread_read_regs`] states).
 #[inline]
 pub unsafe fn thread_write_regs(thread_cap: u64, buf: &[u8]) -> Result<(), i64>
 {
-    // SAFETY: syscall3 issues the raw syscall; `buf` is a live slice the
-    // kernel only reads, for at most `buf.len()` bytes. The caller's contract
-    // keeps the installed frame on code and a stack dedicated to the thread,
-    // the raw-wrapper contract's thread-entry clause.
-    let ret = unsafe {
-        syscall3(
-            SYS_THREAD_WRITE_REGS,
-            thread_cap,
-            buf.as_ptr() as u64,
-            buf.len() as u64,
-        )
-    };
+    // SAFETY: `buf` is a live slice, valid for `buf.len()` bytes of reads;
+    // the frame contract is the caller's (forwarded).
+    unsafe { thread_write_regs_raw(thread_cap, buf.as_ptr(), buf.len()) }
+}
+
+/// Raw `SYS_THREAD_WRITE_REGS`: the kernel reads the `len`-byte register frame
+/// it writes into the thread through `buf`.
+///
+/// The call is restartable: a fault on the span is delivered to the calling
+/// thread's fault handler, when one is bound, and the call re-executes on its
+/// resume (`core/kernel/docs/syscalls.md` § Restartable Syscalls).
+///
+/// # Safety
+/// As [`thread_write_regs`], for the frame the kernel reads; and the span at
+/// `buf` holds no Rust object a write could disturb (the kernel only reads it).
+/// It need not be mapped: an unmapped span is backed by the caller's fault
+/// handler or refused.
+///
+/// # Errors
+/// As [`thread_write_regs`].
+#[inline]
+pub unsafe fn thread_write_regs_raw(thread_cap: u64, buf: *const u8, len: usize)
+-> Result<(), i64>
+{
+    // SAFETY: syscall3 issues the raw syscall; the kernel only reads the span,
+    // and the caller's contract keeps the installed frame on code and a stack
+    // dedicated to the thread, the raw-wrapper contract's thread-entry clause.
+    let ret = unsafe { syscall3(SYS_THREAD_WRITE_REGS, thread_cap, buf as u64, len as u64) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -2330,13 +2353,16 @@ pub fn getrandom(buf: &mut [u8]) -> Result<u64, i64>
 /// The span `[buf, buf + len)` must be valid for `len` bytes of writes and
 /// name no memory a live Rust reference covers, or the kernel must refuse the
 /// call (a `len` above `MAX_GETRANDOM_LEN`, or a span not wholly in the user
-/// half, unmapped, or read-only, is refused with nothing written).
+/// half, or one whose fault no bound fault handler resolves, is refused with
+/// nothing written). The call is restartable: with a fault handler bound, a
+/// fault on the span is delivered to it and the call re-executes on resume
+/// (`core/kernel/docs/syscalls.md` § Restartable Syscalls).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` if `len >
-/// MAX_GETRANDOM_LEN`, `InvalidAddress` if `buf` is null or the span is not
-/// wholly in the user half, unmapped, or read-only, or `WouldBlock` if the
-/// pool is not yet seeded (unreachable in practice).
+/// MAX_GETRANDOM_LEN`, `InvalidAddress` if `buf` is null, the span is not
+/// wholly in the user half, or a fault on it is unhandled, or `WouldBlock` if
+/// the pool is not yet seeded (unreachable in practice).
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]

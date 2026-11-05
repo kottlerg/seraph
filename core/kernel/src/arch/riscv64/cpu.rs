@@ -277,8 +277,8 @@ pub unsafe fn set_kernel_trap_stack(stack_top: u64)
 
 // `copy_user` implements the user-copy contract in core/kernel/docs/arch-interface.md
 // § cpu: it opens and closes the SUM window (sstatus.SUM, bit 18), and a fault inside
-// the copy redirects to `__copy_user_fixup` (which clears SUM and returns a non-zero
-// sentinel). See `crate::uaccess` for the typed wrappers and
+// the copy redirects to `__copy_user_fixup` (which clears SUM and returns the count of
+// bytes not copied, the loop's `a2` at the fault). See `crate::uaccess` for the typed wrappers and
 // `interrupts::trap_dispatch` for the fixup hook.
 #[cfg(not(test))]
 core::arch::global_asm!(
@@ -287,7 +287,7 @@ core::arch::global_asm!(
     ".global __copy_user_fault_start",
     ".global __copy_user_fault_end",
     ".global __copy_user_fixup",
-    // fn __copy_user(dst: a0, src: a1, len: a2) -> a0 (0 = ok, 1 = faulted)
+    // fn __copy_user(dst: a0, src: a1, len: a2) -> a0 (bytes not copied)
     "__copy_user:",
     "    li    t0, 0x40000",       // SUM = bit 18
     "    csrrs zero, sstatus, t0", // open the access window
@@ -308,25 +308,28 @@ core::arch::global_asm!(
     "__copy_user_fixup:",
     "    li    t0, 0x40000",
     "    csrrc zero, sstatus, t0", // close the access window (recovery path)
-    "    li    a0, 1",
+    "    mv    a0, a2",            // the faulting byte's remaining count: at least 1
     "    ret",
 );
 
 #[cfg(not(test))]
 unsafe extern "C" {
-    /// Raw user-copy routine (`dst=a0, src=a1, len=a2`); returns 0 on success or
-    /// 1 if a fault on the user span was recovered.
+    /// Raw user-copy routine (`dst=a0, src=a1, len=a2`); returns 0 on success or,
+    /// if a fault on the user span was recovered, the bytes not copied.
     fn __copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
     /// First byte of the faultable copy region (the `lb`/`sb` pair).
     static __copy_user_fault_start: u8;
     /// First byte past the faultable copy region.
     static __copy_user_fault_end: u8;
-    /// Recovery landing pad: closes the SUM window and returns the fault sentinel.
+    /// Recovery landing pad: closes the SUM window and returns the bytes not
+    /// copied.
     static __copy_user_fixup: u8;
 }
 
 /// Copy `len` bytes from `src` to `dst` across the SUM window with fault
-/// recovery. Returns 0 on success, non-zero if a user-span fault was recovered.
+/// recovery. Returns 0 on success; when a user-span fault was recovered, the
+/// bytes not copied (at least 1), so the faulting byte is at offset
+/// `len - returned`.
 ///
 /// # Safety
 /// Must execute in supervisor mode. The operands must be arranged so the user

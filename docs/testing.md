@@ -455,7 +455,8 @@ surface.
   included, each through its cells: the release host runs boot every device cell before each tag
   (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver has a
   QEMU-testable device, the standard VGA adapter `cargo xtask run` attaches to a boot that is not
-  headless, but no cell: every harness boot is headless, so svctest's framebuffer case skips.
+  headless, but no cell: every harness boot is headless, so svctest's framebuffer case skips
+  ([#798](https://github.com/kottlerg/seraph/issues/798) tracks the cell).
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.

@@ -24,7 +24,8 @@ procmgr/
 ├── README.md
 ├── process-table/              # `procmgr-process-table` crate: pure host-tested
 │                                 table + badge logic, the create-request
-│                                 argv/env blob decoder and cap split, the
+│                                 argv/env header decoder and checks and
+│                                 the create-request cap split, the
 │                                 fs-reply bounds, the init-reap state
 │                                 machine, and the first death queue's
 │                                 size (`FIRST_POOL_OBSERVERS`)

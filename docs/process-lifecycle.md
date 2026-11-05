@@ -380,7 +380,7 @@ After bootstrap, every process is created by procmgr. The flow:
    `cap_create_*` syscalls.
 5. **Procmgr → memmgr (frames).** Procmgr requests Memory caps from
    memmgr to back the child's stack, IPC buffer, `ProcessInfo` page,
-   TLS block, and ELF segments. These calls go over the child's badged
+   argv/env region, TLS block, and ELF segments. These calls go over the child's badged
    SEND cap returned by `REGISTER_PROCESS` (step 2), so memmgr accounts
    the frames against the child's per-process record from allocation.
 6. **Procmgr maps + populates the child.** Procmgr stages each ELF

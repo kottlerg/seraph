@@ -7,8 +7,8 @@
 //!
 //! Holds the plain-data recipe record ([`Definition`] and its component
 //! enums), the `key = value` parser ([`parse`]), the argv/env wire-blob
-//! encoder ([`build_blob`]) the parser validates against procmgr's
-//! `CREATE_FROM_FILE` limits, and the policies svcmgr applies at runtime:
+//! encoder ([`build_blob`]) whose output the parser bounds by the child's
+//! argv/env region, and the policies svcmgr applies at runtime:
 //! the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), and the windowed restart
 //! budget ([`RestartBudget`]). Nothing here touches a syscall, IPC, or
@@ -57,32 +57,23 @@ pub fn blob_len(tokens: &[String]) -> usize
     tokens.iter().map(|t| t.len() + 1).sum()
 }
 
-/// Build the NUL-separated, NUL-terminated wire blob procmgr's
-/// stack-envelope writer expects from a list of tokens. Returns
-/// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
-/// matching the "no argv / no env" wire shape. [`parse::parse`] bounds a
-/// recipe's blobs so the count fits the label's 8-bit field and guarantees
-/// every token is NUL-free, which this encoder relies on: the blob's NUL
-/// boundaries are then exactly the `count` token boundaries the label
-/// declares.
+/// Build the NUL-separated, NUL-terminated wire blob procmgr's create
+/// requests carry (`procmgr_labels::CREATE_ARGV_ENV`) from a list of tokens.
+/// Returns `(blob, count)`. Empty input yields an empty blob with
+/// `count = 0`, matching the "no argv / no env" wire shape. [`parse::parse`]
+/// guarantees every token is NUL-free, which this encoder relies on: the
+/// blob's NUL boundaries are then exactly the `count` token boundaries the
+/// request's header declares, which procmgr checks.
 #[must_use]
-pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
+pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u64)
 {
-    if tokens.is_empty()
-    {
-        return (Vec::new(), 0);
-    }
     let mut blob: Vec<u8> = Vec::with_capacity(blob_len(tokens));
     for tok in tokens
     {
         blob.extend_from_slice(tok.as_bytes());
         blob.push(0);
     }
-    // cast_possible_truncation: the parser bounds a recipe's token count to
-    // `u8::MAX`, so the count fits.
-    #[allow(clippy::cast_possible_truncation)]
-    let count = tokens.len() as u32;
-    (blob, count)
+    (blob, tokens.len() as u64)
 }
 
 /// Restart-policy values parsed from the `restart = ...` line.

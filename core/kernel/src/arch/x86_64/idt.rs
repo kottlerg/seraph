@@ -1323,13 +1323,36 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
 
     // In-kernel user-copy fault recovery: a fault taken at CPL 0 whose RIP lies in
     // the `copy_user` faultable region is an unmapped or read-only user buffer.
-    // Redirect to the fixup — which closes the SMAP window and returns an error
-    // sentinel — instead of panicking. A userspace fault that reaches here (no
+    // Redirect to the fixup — which closes the SMAP window and returns the bytes
+    // not copied — instead of panicking. A userspace fault that reaches here (no
     // handler, or handler declined) has a RIP outside the kernel copy region, so
     // this is a no-op for it.
     // SAFETY: tf is valid; rip is read-only here.
     if let Some(fixup) = super::cpu::user_copy_fixup(unsafe { (*tf).rip })
     {
+        // A copy fault the live tables already satisfy is a stale TLB entry,
+        // as for a user-mode fault above: flush it and retry the copy, so a
+        // page a fault handler has just mapped is not failed or delivered
+        // again (docs/fault-handling.md § Kernel Copies).
+        if error_code & ERR_RSVD == 0
+        {
+            let cr2: u64;
+            // SAFETY: CR2 holds the faulting linear address for a #PF; read-only
+            // at ring 0.
+            unsafe {
+                core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
+            }
+            let write = error_code & ERR_WRITE != 0;
+            // SAFETY: ring 0 in the copying thread's context; its CR3 is still
+            // active (the interrupt gate left IF=0).
+            if unsafe { super::paging::user_fault_is_spurious(cr2, write, false) }
+            {
+                // SAFETY: ring 0; drops the stale entry so the retried copy
+                // re-walks the satisfying mapping.
+                unsafe { super::paging::flush_page(cr2) };
+                return;
+            }
+        }
         // SAFETY: tf is the live frame; rewriting rip redirects iretq to the fixup.
         unsafe {
             (*tf).rip = fixup;

@@ -103,9 +103,8 @@ An entry an existing open Issue already names cites it in the recommendation.
   TLS block each reach 1 GiB of VA.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: the ktest mirrors of the `CSpace` directory geometry (`L1_DIRECT`, `L1_INDIRECT` and
-  `DIR_FANOUT` in `unit::cap::lookup_bounds`, `L1_DIRECT` and `DIR_FANOUT` in `unit::retype`) and
-  of `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and vfsd gpt's `MAX_BLOCK_SIZE` and
-  virtio-blk's.
+  `DIR_FANOUT`, in `cspace_geometry`) and of `MAX_IRQ_BINDINGS` and `KERNEL_STACK_PAGES`, and
+  vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
 - **Spin-count timeouts.** Several device polls are counted in loop iterations, whose wall time
   depends on CPU and MMIO speed. `wait_for_ack` and the kernel lock detectors
   (`bounded_wait::DEADLOCK_BUDGET_US`) are the time-based model.
@@ -790,10 +789,10 @@ production value is raised.
 | `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 4097 | test fixture (one past the former 4096-entry registry; funded at the ABI's `CSPACE_SLOTS_PER_PAGE` slots a page) | about 16 KiB BSS | correct as is | None |
 | `HOLDERS`, `WAKERS` | `core/ktest/src/stress/sleep_list_wide.rs` | 192 / 64 | test fixture (past the former 128-entry sleep list) | 1 MiB BSS | correct as is | None |
 | `MAX_IRQ_BINDINGS` (`Held`) | `core/ktest/src/integration/irq_shared_line.rs` | 64 | mirror of kernel `MAX_IRQ_BINDINGS` | about 540 B stack (`Held` and the bound-cap array) | correct as is | Reference the kernel constant if it moves to an ABI crate |
-| `DIRECT_LEAVES`, `DIR_FANOUT` | `core/ktest/src/unit/retype.rs` | 128 / 512 (`PAGE_SIZE` over the pointer size) | mirror of kernel `L1_DIRECT`, `DIR_FANOUT` | none | correct as is | Reference the kernel constants if they move to an ABI crate |
-| `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT` literals (`first_indirect`, `ceiling`) | `core/ktest/src/unit/cap.rs` (`lookup_bounds`) | 128 direct leaves, 128 directory pages of 512 leaves | mirror of kernel `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT` | none | correct as is | Reference the kernel constants if they move to an ABI crate |
+| `DIRECT_LEAVES`, `INDIRECT_DIRS`, `DIR_FANOUT` | `core/ktest/src/cspace_geometry.rs` (used by `unit::cap::lookup_bounds` and `unit::retype`) | 128 / 128 / 512 (`PAGE_SIZE` over the pointer size) | mirror of kernel `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT` | none | correct as is | Reference the kernel constants if they move to an ABI crate |
 | `KERNEL_STACK_BYTES` | `core/ktest/src/main.rs` | 4 pages (16 KiB) | mirror of kernel `KERNEL_STACK_PAGES` | none | correct as is | Reference the kernel constant if it moves to an ABI crate |
 | `MAX_PINNED` | `core/ktest/src/bench/tlb.rs` | 7 | test fixture | 224 KiB BSS | correct as is | None |
+| `SEED_ATTEMPTS` | `core/ktest/src/unit/retype.rs` (`pool_seeding_takes_interrupts`) | 4 | test fixture (repeats of a millisecond seeding call, so host scheduling delay alone cannot keep every probe outside the calls) | none | correct as is | None |
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |

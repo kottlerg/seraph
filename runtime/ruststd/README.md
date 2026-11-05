@@ -113,8 +113,10 @@ a grow covers the whole request, and an allocation grows again while each
 grow maps pages. The heap floor is installed by `std::os::seraph::_start`
 before `fn main()` runs: a demand region registered with memmgr in a
 demand-paged process, whose pages the allocator touches before handing them
-out, and an eager mapping otherwise. On OOM, `GlobalAlloc::alloc` returns null and the `alloc`
-crate aborts through `handle_alloc_error`; nothing unwinds. See
+out (a spawned thread's IPC buffer is a heap page, and the kernel's IPC-buffer
+copies need it backed), and an eager mapping otherwise. On OOM,
+`GlobalAlloc::alloc` returns null and the `alloc` crate aborts through
+`handle_alloc_error`; nothing unwinds. See
 [§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
 ### Page reservations

@@ -38,6 +38,7 @@ core/ktest/
     ├── main.rs             # _start, InitInfo intake, TestContext, run_test!, tier dispatch,
     │                       # summary, shutdown
     ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT)
+    ├── cspace_geometry.rs  # Mirrors of the kernel's CSpace directory geometry
     ├── serial.rs           # Direct serial output
     ├── framebuffer.rs      # Direct framebuffer output
     ├── frame_pool.rs       # Memory capability pool for tests that map memory
@@ -103,7 +104,7 @@ mirroring the kernel's own source layout.
 | `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
-| `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState`, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
+| `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState` and a ready-ring entry skipped once its endpoint's only sender is stopped, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
@@ -175,10 +176,11 @@ concurrent notification and queue events.
 | `fault_pager_roundtrip.rs` | A userspace pager resolves a page fault and resumes the thread |
 | `fault_resume_modifies_pc.rs` | A fault handler edits the fault-blocked thread's registers and resumes it at a new instruction pointer |
 | `fault_handler_declines_kills.rs` | A fault handler replying `FAULT_REPLY_KILL` terminates the faulting thread as an unhandled fault |
+| `fault_syscall_buffer.rs` | A restartable syscall's copy to (`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`) or from (`SYS_THREAD_WRITE_REGS`) an unbacked buffer faults to the caller's handler with the first unmapped byte (a straddling span names its second page), the copy's access, the present bit where the architecture reports it, and the frame's instruction pointer, and the syscall re-executes on resume; a declined fault (unmapped or read-only page) fails the call with `InvalidAddress` and the caller lives; a handler-written instruction pointer stands on a decline and on a resume, as [docs/fault-handling.md § Kernel Copies](../../docs/fault-handling.md#kernel-copies) defines |
 | `fault_exception_redirect.rs` | A non-page-fault CPU exception is redirected to a bound fault handler, which resumes the thread at a new instruction pointer |
 | `fault_exception_no_handler_kills.rs` | A non-page-fault CPU exception with no handler bound is terminal |
 | `irq_preserves_user_regs.rs` | A ring-3 thread's callee-saved registers survive a timer preemption through the frame-authoritative IRQ path |
-| `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry |
+| `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry, both a user-mode store and the kernel's `SYS_GETRANDOM` copy (the copy-region retry) |
 | `write_regs_blocked_syscall.rs` | A thread stopped while blocked in `notification_wait`, `ipc_recv`, or `thread_sleep` (the frame's syscall-number register names that syscall) has its instruction pointer and second-argument register rewritten from another CPU; on restart the blocked syscall's `Interrupted` return resumes at the new instruction pointer with the edited argument intact, every round, as the raw-pointer frame model of [core/kernel/docs/arch-interface.md § `trap_frame`](../kernel/docs/arch-interface.md#trap_frame--archcurrenttrap_frame) preserves (≥ 2 CPUs) |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
@@ -245,7 +247,8 @@ acknowledgement and exit bounds of `stop_source_delete`; the preemption budget o
 child waits of `integration::stop_read_regs_remote`; the
 probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
 `integration::cross_cspace_revoke_no_alias`, `integration::reply_binding_displaced`,
-`integration::destroyed_source_interrupts` and `wait_set::occupied_wait_refused`; the post waits of
+`integration::destroyed_source_interrupts`, `integration::fault_syscall_buffer`,
+`wait_set::occupied_wait_refused` and `wait_set::stale_endpoint_entry_skipped`; the post waits of
 `event::recv_timeout_payload_zero_wins` and `event::recv_timeout_payload_nonzero_wins`; the exit,
 event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,

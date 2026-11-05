@@ -112,6 +112,9 @@ const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, rsp) == syscall::REGS_X86_64_SP_OFFSET);
 };
 
+/// Length of the `syscall` instruction (`0F 05`).
+const SYSCALL_INSN_BYTES: u64 = 2;
+
 // ── Syscall / IPC accessors ───────────────────────────────────────────────────
 
 impl TrapFrame
@@ -220,6 +223,29 @@ impl TrapFrame
         self.rip
     }
 
+    /// Point a syscall frame at the `syscall` instruction the thread entered
+    /// through, so a return to user mode re-executes it, and return that
+    /// address. `rip` holds the next instruction (SYSCALL saved it in `rcx`),
+    /// and `syscall` is two bytes (`0F 05`).
+    pub fn rewind_syscall(&mut self) -> u64
+    {
+        self.rip -= SYSCALL_INSN_BYTES;
+        self.rip
+    }
+
+    /// Undo [`rewind_syscall`](Self::rewind_syscall), whose result was `at`,
+    /// when the syscall completes instead of re-executing: the thread
+    /// continues past the instruction, unless its instruction pointer was
+    /// rewritten since (a fault handler's `SYS_THREAD_WRITE_REGS`), which
+    /// stands.
+    pub fn complete_rewound_syscall(&mut self, at: u64)
+    {
+        if self.rip == at
+        {
+            self.rip = at + SYSCALL_INSN_BYTES;
+        }
+    }
+
     /// Validate and sanitize a user-supplied register snapshot before it is
     /// resumed in user mode: reject a non-canonical instruction or stack
     /// pointer, force ring-3 segment selectors, and clear privilege bits from
@@ -284,5 +310,40 @@ mod tests
         assert_eq!(offset_of!(TrapFrame, cs), 144);
         assert_eq!(offset_of!(TrapFrame, ss), 152);
         assert_eq!(offset_of!(TrapFrame, fs_base), 160);
+    }
+
+    /// A syscall frame whose saved `rip` (the instruction after `syscall`) is
+    /// `rip`.
+    fn syscall_frame(rip: u64) -> TrapFrame
+    {
+        // SAFETY: every field is a `u64`, for which zero is valid.
+        let mut tf: TrapFrame = unsafe { core::mem::zeroed() };
+        tf.rip = rip;
+        tf
+    }
+
+    // Defect caught: a rewind by the wrong length restarts at the wrong
+    // instruction, and an undo that misses the rewind returns into the
+    // `syscall` again, re-executing a syscall that already failed.
+    #[test]
+    fn a_rewind_names_the_syscall_instruction_and_its_undo_returns_past_it()
+    {
+        let mut tf = syscall_frame(0x40_1002);
+        assert_eq!(tf.rewind_syscall(), 0x40_1000);
+        assert_eq!(tf.rip, 0x40_1000);
+        tf.complete_rewound_syscall(0x40_1000);
+        assert_eq!(tf.rip, 0x40_1002);
+    }
+
+    // Defect caught: an undo that resets a rewritten `rip` discards the
+    // instruction pointer a fault handler wrote before declining the fault.
+    #[test]
+    fn an_undo_leaves_an_instruction_pointer_rewritten_since_the_rewind()
+    {
+        let mut tf = syscall_frame(0x40_1002);
+        let at = tf.rewind_syscall();
+        tf.rip = 0x40_5000;
+        tf.complete_rewound_syscall(at);
+        assert_eq!(tf.rip, 0x40_5000);
     }
 }

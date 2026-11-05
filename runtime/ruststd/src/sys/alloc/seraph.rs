@@ -53,7 +53,7 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 /// IPC buffer pages, typical collection workloads, and the peak of a piped
 /// `Command::spawn` without needing `grow`. In a demand-paged process the
 /// floor is a registered demand region (`REGISTER_REGION`), so it costs VA
-/// and only the frames the allocator hands out; a process with no pager
+/// and only the frames of the pages first touched; a process with no pager
 /// (pinned, or whose registration failed) maps it eagerly instead.
 const HEAP_INITIAL_PAGES: u64 = 512;
 

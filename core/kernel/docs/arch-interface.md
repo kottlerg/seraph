@@ -322,7 +322,9 @@ pub unsafe fn unmap_identity_page(pa: u64);
 /// that maps it into a leaf table of the same translation built in the frame
 /// `take_table` returns. `NotMapped` when the direct map does not map `virt`,
 /// `OutOfFrames` when a split finds no frame. The caller serialises every
-/// direct-map edit and flushes the TLB.
+/// direct-map edit and makes stale translations of the page harmless before
+/// the guard's thread runs: a local flush while only the boot CPU runs, or the
+/// guard epoch after SMP bringup (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn hole_direct_map_page(
     virt: u64,
     take_table: &mut dyn FnMut() -> Option<u64>,

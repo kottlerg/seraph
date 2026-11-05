@@ -1335,7 +1335,10 @@ pub unsafe fn unmap_identity_page(pa: u64)
 // A guard page below a kernel stack (`crate::mm::stack_guard`) is a hole in
 // the direct map: one 4 KiB entry left invalid. The 2 MiB megapage that maps
 // a guard's chunk is first split into a leaf table of the same translation.
-// `stack_guard` serialises every edit and flushes the TLB.
+// `stack_guard` serialises every edit; a hole's stale translations are
+// dropped by a local flush at boot or the guard epoch at a later switch-in,
+// and a fill's by its local flush and the guard epoch or the spurious-fault
+// retry (core/kernel/docs/memory-internals.md § Kernel Stack Guards).
 
 /// Direct-map flags of a RAM page: read-write, never executable, PMA memory
 /// type (`mm::paging::init_kernel_page_tables` maps RAM so).
@@ -1358,7 +1361,10 @@ const DIRECT_RAM: PageFlags = PageFlags {
 /// # Safety
 /// `virt` is the direct-map address of a RAM page nothing reaches through the
 /// direct map until [`fill_direct_map_page`] restores it. The caller
-/// serialises every direct-map edit and flushes the TLB afterwards.
+/// serialises every direct-map edit and makes stale translations of the page
+/// harmless before the guard's thread runs: a local flush while only the boot
+/// CPU runs, or the guard epoch (`stack_guard::flush_before_run`) after SMP
+/// bringup.
 #[cfg(not(test))]
 pub unsafe fn hole_direct_map_page(
     virt: u64,

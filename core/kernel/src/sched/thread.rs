@@ -764,10 +764,11 @@ pub struct ThreadControlBlock
     /// when the thread resumes from `BlockedOnFault`. One of
     /// [`crate::ipc::fault::FAULT_OUTCOME_PENDING`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
-    /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`]. Set to `RESUME`/`KILL` by the
-    /// single wake-claim winner (genuine reply, handler-thread destruction,
-    /// cancellation), so resume-vs-cancellation is unambiguous. See
-    /// `docs/fault-handling.md`.
+    /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`]. Set by the single
+    /// wake-claim winner: `RESUME` or `DECLINED` by a genuine reply, `KILL`
+    /// by handler-thread destruction or cancellation, so
+    /// resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 
     /// True while this thread is delivering / blocked on a fault. Written only

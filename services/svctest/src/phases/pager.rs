@@ -76,8 +76,11 @@ pub fn phases() -> &'static [Phase]
 /// Send memmgr, on this process's own memmgr cap, the fault message the
 /// kernel would for an access to `va` (memmgr attributes a fault by the
 /// cap's badge, docs/fault-handling.md § Security), and return its reply
-/// label: `FAULT_REPLY_RESUME` or `FAULT_REPLY_KILL`.
-fn forged_vm_fault(va: u64, access: u64) -> u64
+/// label, `FAULT_REPLY_RESUME` or `FAULT_REPLY_KILL`, with the decline code a
+/// `FAULT_REPLY_KILL` carries in the low half of data word 0 (zero on a
+/// resume): services/memmgr/docs/ipc-interface.md § Kernel-origin fault
+/// message tables the codes.
+fn forged_vm_fault(va: u64, access: u64) -> (u64, u64)
 {
     let info = startup_info();
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -88,15 +91,30 @@ fn forged_vm_fault(va: u64, access: u64) -> u64
         .word(3, 0)
         .build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
-        .expect("refused_access: forged fault ipc_call failed")
-        .label
+    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
+        .expect("refused_access: forged fault ipc_call failed");
+    let code = if reply.label == syscall_abi::FAULT_REPLY_KILL
+    {
+        reply.word(0) & 0xFFFF_FFFF
+    }
+    else
+    {
+        0
+    };
+    (reply.label, code)
 }
+
+/// memmgr's decline code for a fault whose access the region refuses.
+const DECLINE_ACCESS_REFUSED: u64 = 4;
+/// memmgr's decline code for a fault outside every registered region.
+const DECLINE_NO_REGION: u64 = 3;
 
 /// An instruction fetch from a read-write demand region is declined before
 /// the page is backed and after: a read of the same page is backed and
 /// resumed between the two. memmgr once resumed a fault on a backed page
-/// whatever its access, so a write to a backed read-only page looped.
+/// whatever its access, so a write to a backed read-only page looped. Each
+/// decline carries the reason the kernel's kill diagnostic prints: a refused
+/// access, then, once the region is unregistered, no region.
 fn pager_refused_access_phase(_: &Caps)
 {
     use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_READ, FAULT_REPLY_KILL, FAULT_REPLY_RESUME};
@@ -105,18 +123,18 @@ fn pager_refused_access_phase(_: &Caps)
     let va = range.va_start();
     assert_eq!(
         forged_vm_fault(va, FAULT_ACCESS_EXEC),
-        FAULT_REPLY_KILL,
-        "refused_access: a fetch from an unbacked read-write page was not declined"
+        (FAULT_REPLY_KILL, DECLINE_ACCESS_REFUSED),
+        "refused_access: a fetch from an unbacked read-write page was not declined as refused"
     );
     assert_eq!(
-        forged_vm_fault(va, FAULT_ACCESS_READ),
+        forged_vm_fault(va, FAULT_ACCESS_READ).0,
         FAULT_REPLY_RESUME,
         "refused_access: a read of a read-write page was not backed"
     );
     assert_eq!(
         forged_vm_fault(va, FAULT_ACCESS_EXEC),
-        FAULT_REPLY_KILL,
-        "refused_access: a fetch from a backed read-write page was not declined"
+        (FAULT_REPLY_KILL, DECLINE_ACCESS_REFUSED),
+        "refused_access: a fetch from a backed read-write page was not declined as refused"
     );
 
     // UNREGISTER_REGION unmaps the backed page and returns its frames.
@@ -133,6 +151,11 @@ fn pager_refused_access_phase(_: &Caps)
         reply.label,
         ipc::memmgr_errors::SUCCESS,
         "refused_access: UNREGISTER_REGION status"
+    );
+    assert_eq!(
+        forged_vm_fault(va, FAULT_ACCESS_READ),
+        (FAULT_REPLY_KILL, DECLINE_NO_REGION),
+        "refused_access: a read of an unregistered page was not declined as outside every region"
     );
     std::os::seraph::unreserve_pages(range);
     assert_ram_identity();

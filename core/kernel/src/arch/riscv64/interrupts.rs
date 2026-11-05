@@ -735,10 +735,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 unsafe { (*tcb).thread_id }
             };
 
+            // The hart printing, re-read: a declined delivery blocked above and
+            // may have resumed this thread on another hart than the trap's.
             crate::kprintln_serial!(
                 "USERSPACE FAULT: tid={} cpu={} cause={} (scause={:#x})",
                 tid,
-                cpu,
+                super::cpu::current_cpu(),
                 riscv_exception_name(cause_code),
                 scause
             );

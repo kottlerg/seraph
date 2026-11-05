@@ -560,6 +560,18 @@ pub fn stray_cap_flood_phase(_: &Caps)
             let what = format!("stray-cap call {call} with label {label:#x}");
             let reply = memmgr_call(&builder.build(), &what);
             assert_eq!(reply.label, case.expected, "memmgr reply to {what}");
+            // The forged non-VM fault's decline carries memmgr's code 1 (not
+            // a VM fault) in the low half of data word 0
+            // (services/memmgr/docs/ipc-interface.md § Kernel-origin fault
+            // message).
+            if label == syscall_abi::FAULT_LABEL
+            {
+                assert_eq!(
+                    reply.word(0) & 0xFFFF_FFFF,
+                    1,
+                    "decline code in memmgr reply to {what}"
+                );
+            }
             total_calls += 1;
         }
     }

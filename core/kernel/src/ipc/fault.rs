@@ -209,7 +209,7 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     // dequeuing `endpoint_recv` parks us `BlockedOnFault` (not `BlockedOnReply`),
     // and `fault_outcome = Pending` so a stale prior disposition cannot be
     // mistaken for this fault's. The single wake-claim winner overwrites the
-    // outcome with `Resume`/`Kill`.
+    // outcome with `Resume`, `Declined`, or `Kill`.
     // SAFETY: tcb is the running thread; these fields are owned by it until the
     // delivery below makes it wakeable.
     unsafe {

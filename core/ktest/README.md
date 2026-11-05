@@ -38,6 +38,7 @@ core/ktest/
     ├── main.rs             # _start, InitInfo intake, TestContext, run_test!, tier dispatch,
     │                       # summary, shutdown
     ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT)
+    ├── cspace_geometry.rs  # Mirrors of the kernel's CSpace directory geometry
     ├── serial.rs           # Direct serial output
     ├── framebuffer.rs      # Direct framebuffer output
     ├── frame_pool.rs       # Memory capability pool for tests that map memory

@@ -3,8 +3,8 @@
 
 // core/ktest/src/integration/priority_preemption.rs
 
-//! Integration: a runnable strict-priority (RT) thread preempts a CPU-bound
-//! fair-class one within a small time budget
+//! Integration: a runnable strict-priority (RT) thread runs ahead of a
+//! CPU-bound fair-class one within a small time budget
 //! (core/kernel/docs/scheduler.md § Scheduling Classes).
 //!
 //! Setup:
@@ -25,8 +25,9 @@
 //!
 //! The cell guards the ordering: an RT thread runs ahead of a CPU-bound fair
 //! one within a bounded wait. Its wall-clock budget does not tell the one-tick
-//! preemption apart from the fair thread's slice expiring (20 ms at most), a
-//! difference an emulated boot's timing cannot resolve; the tick decision is
+//! preemption apart from the fair thread's slice expiring
+//! (core/kernel/docs/scheduler.md § Time Slice Policy), a difference an
+//! emulated boot's timing cannot resolve; the tick decision is
 //! host-tested instead (`PerCpuScheduler::tick_outcome` and
 //! `TickOutcome::slice_and_reschedule` in `core/kernel/src/sched/run_queue.rs`).
 
@@ -42,7 +43,8 @@ use crate::{ChildStack, TestContext, TestResult};
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// Fair-class level of the hog: the highest fair level (one below the kernel's
-/// `sched::RT_PRIORITY_MIN`), whose 20-tick slice is the longest.
+/// `sched::RT_PRIORITY_MIN`), whose slice is the longest
+/// (core/kernel/docs/scheduler.md § Time Slice Policy).
 const HOG_PRIORITY: u8 = 20;
 
 /// Level of the elevated child: the lowest RT level (the kernel's

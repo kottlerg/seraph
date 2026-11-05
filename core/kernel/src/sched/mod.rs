@@ -3095,8 +3095,9 @@ pub enum StartCommit
 /// stop can cycle the thread through a run, a park and a claim between a pass
 /// and the commit. A CPU still running the target is prodded
 /// ([`prod_remote_cpu`]); it drops the `Stopped` target at its next
-/// slice-expiry `schedule(Requeue::Always)` or the target's own park or yield, where the
-/// requeue denylist leaves it unlinked.
+/// `timer_tick` reschedule (a slice expiry, or a fair-dispatched target's
+/// preemption for RT) or the target's own park or yield, where the requeue
+/// denylist leaves it unlinked.
 ///
 /// The loop ends without writing when the target is no longer `Created` or
 /// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
@@ -4370,8 +4371,9 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
 /// target whose affinity it changed. The IPI's handler does no work: the trap
 /// it forces snapshots the target's user registers and returns to user mode,
-/// and the CPU acts on the target at its next slice-expiry `schedule(Requeue::Always)` (or
-/// the target's own park or yield), where the requeue denylist drops a
+/// and the CPU acts on the target at its next `timer_tick` reschedule (a slice
+/// expiry, or a fair-dispatched target's preemption for RT) or the target's
+/// own park or yield, where the requeue denylist drops a
 /// `Stopped` or `Exited` target and the affinity check relocates a moved one.
 /// The callers' drains wait for that; the prod itself only exits a `hlt` on an
 /// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod

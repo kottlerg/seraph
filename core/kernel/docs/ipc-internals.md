@@ -841,7 +841,8 @@ send/receive runs with interrupts disabled. A timer interrupt that arrives
 meanwhile stays pending for the rest of that critical section. Syscall context
 re-enables interrupts only in preempt-disabled windows, or when the CPU returns to
 userspace or switches to the next thread, so the tick never preempts the IPC path;
-kernel-mode preemption exists only at a slice expiry with preemption enabled (see
+kernel-mode preemption exists only at a tick that decides a reschedule with preemption enabled
+([scheduler.md § Kernel-Mode Preemption Points](scheduler.md#kernel-mode-preemption-points); see
 the "Lock primitive" and "Bare spin locks" paragraphs of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
 

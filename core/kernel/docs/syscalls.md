@@ -1477,8 +1477,9 @@ notification, an event queue, or a wait set whose last capability is deleted con
 claimed either by the stop or by the object's teardown, and both stamp the same cancellation: on
 restart its syscall returns `Interrupted`, or a queued fault sender is killed. A thread running on
 another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
-CPU has descheduled it and published its register save, at its next slice expiry
-or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
+CPU has descheduled it and published its register save, at its next slice expiry, at a tick
+that preempts it for an RT thread (one dispatched at a fair level), or at the thread's own park or
+yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A thread left `current` on a CPU that
 `fatal` halted is never descheduled: a stop of it does not return through the drain until a
 teardown commits `Exited` over it, and that teardown never completes (see
@@ -1492,8 +1493,8 @@ its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-life
 § `sys_thread_stop` Cross-CPU Stop Protocol).
 
 **Latency contract:** a stop of a thread running on another CPU completes at the target's next
-slice-expiry `schedule()`, a tick that preempts it for an RT thread queued on its CPU (a fair
-target), or its own park or yield, not within the inter-processor-interrupt
+slice-expiry `schedule()`, a tick that preempts it for an RT thread queued on its CPU (a target
+dispatched at a fair level), or its own park or yield, not within the inter-processor-interrupt
 latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
 target's remaining time slice (at most the longest slice, 20 timer ticks, that of fair level 20;
 `TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see

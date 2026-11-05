@@ -194,8 +194,9 @@ CPU records at each dispatch (`PerCpuScheduler::current_level`): it may not read
 thread's `priority` without that thread's `sched_lock`. Each tick first cuts the remaining slice
 to that level's quantum, then takes the tick, and an expired slice is refilled with the quantum
 (`PerCpuScheduler::tick_outcome`). A priority change of a running thread therefore reaches its
-class at its next dispatch, and its slice at the first tick after it: a thread lowered from fair
-20 to 2 runs at most 2 more ticks, and one raised from the fair class into the RT class at most
+class at its next dispatch, and its slice at the first tick after that dispatch: until then the
+thread runs out the slice it holds, and from then on a thread lowered from fair 20 to 2 runs at
+most 2 ticks per slice, and one raised from the fair class into the RT class at most
 `TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
 
 Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
@@ -680,7 +681,8 @@ Otherwise, by target state:
   **source** CPU (where the thread is currently running). The IPI itself
   does not call `schedule()`; the running thread observes the new
   affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
-  voluntary yield, or IPC block. The re-enqueue site in `schedule()`
+  a fair-dispatched thread's preemption for RT, voluntary yield, or IPC
+  block. The re-enqueue site in `schedule()`
   checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
   linking the thread directly on the destination's run queue, setting its
   reschedule-pending flag, and IPIing it — instead of doing a local enqueue

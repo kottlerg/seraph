@@ -384,7 +384,7 @@ pub fn sys_thread_stop(tf: UserFrame) -> Result<u64, SyscallError>
         // Cancel any park (the stopped thread's blocked syscall returns
         // Interrupted on restart) and commit Stopped over it; a Ready target
         // is unlinked by the all-locks write, and a remote Running target by
-        // the drain below (its CPU's next slice-expiry schedule(Requeue::Always)). See
+        // the drain below (its CPU's next timer_tick reschedule). See
         // core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
         // Cross-CPU Stop Protocol; an `Exited` target is refused (terminal).
         let running_on = commit_stopped(target_tcb)?;
@@ -497,9 +497,10 @@ unsafe fn drain_remote_stopped(
         return;
     }
     // The IPI's trap snapshots the target's user registers; the remote CPU
-    // drops the Stopped target at its next slice-expiry schedule(Requeue::Always), whose
-    // trap leaves the snapshot sys_thread_read_regs reads once this drain
-    // completes.
+    // drops the Stopped target at its next timer_tick reschedule (a slice
+    // expiry, or a fair-dispatched target's preemption for RT) or its own
+    // park or yield, whose trap leaves the snapshot sys_thread_read_regs
+    // reads once this drain completes.
     // SAFETY: run_cpu < CPU_COUNT per contract.
     unsafe { crate::sched::prod_remote_cpu(run_cpu) };
     // SAFETY: run_cpu < CPU_COUNT; the scheduler slab is initialised.
@@ -1568,7 +1569,8 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 ///   source CPU and a wakeup IPI is delivered there. The wakeup IPI
 ///   handler does not itself call `schedule()`; the running thread
 ///   observes the new affinity at its next `schedule()` entry
-///   (slice-expiry preemption, voluntary yield, or IPC block). The
+///   (slice-expiry preemption, a fair-dispatched thread's preemption for
+///   RT, voluntary yield, or IPC block). The
 ///   affinity-vs-current-CPU check in `schedule()` then routes the
 ///   re-enqueue cross-CPU to the new target. Worst-case latency is
 ///   one time slice.

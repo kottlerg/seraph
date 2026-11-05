@@ -413,7 +413,9 @@ thread's deferred reclaim (`drain_deferred_reclaim` from
 `idle_thread_entry`), which runs with interrupts and preemption enabled and
 is sound only because the idle thread's time slice is permanently zero, so
 `timer_tick` returns before `schedule()` for it. Kernel-mode preemption
-exists only at a slice expiry with preemption enabled, and every kernel
+exists only at a tick that decides a reschedule (a slice expiry, or a fair
+thread's preemption for RT; scheduler.md § Kernel-Mode Preemption Points)
+with preemption enabled, and every kernel
 window that enables interrupts — shootdown ack-waits, the teardown gates,
 the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
 path, the `sys_thread_stop` drain and save wait (`await_stopped_save`), the `sys_thread_start`

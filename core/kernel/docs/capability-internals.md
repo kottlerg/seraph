@@ -649,7 +649,9 @@ reaches zero, the object's bytes are returned to the Memory object it was retype
 (`retype_free`). Apart from a never-published body that a failed split or a failed
 `SYS_CAP_CREATE_*` insert rolls back at its initial count, this is the only mechanism by which
 kernel objects are freed — there is no explicit "destroy" syscall (see
-[docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
+[docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim). A holder reads
+whether the count holds anything beyond its own slot with `SYS_CAP_INFO`'s
+`CAP_INFO_SOLE_REFERENCE` ([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO`).
 
 The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound of
 their own, new capability slots, retype leases, and death-observer bindings, are refused at

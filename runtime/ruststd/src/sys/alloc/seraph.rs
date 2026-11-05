@@ -1033,10 +1033,11 @@ fn slab_acquire_fresh(need: u64, want_pages: u64, withheld: u64) -> Option<SlabG
 /// base recorded in its [`SlabGrant`]. Best-effort: a failed IPC just leaves
 /// the run accounted to this process until it dies.
 ///
-/// The caller MUST have already deleted every kernel object retyped from the
-/// slab; releasing while a retype is live is correctness-safe (the kernel
-/// refuses to re-hand-out live bytes) but strands the run until the retype is
-/// freed.
+/// The caller MUST have already deleted its capability to the slab and every
+/// kernel object retyped from it; a release while either remains still
+/// succeeds, but memmgr holds the run on its deferred list, granted to no
+/// one, until both are gone (`services/memmgr/docs/memory-pool.md`
+/// § Reclamation).
 pub fn slab_release_fresh(phys: u64) {
     let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
     if ep == 0 {

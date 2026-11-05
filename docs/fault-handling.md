@@ -23,6 +23,8 @@ In scope:
 - Liveness, recursion, and security rules.
 - The asynchronous upcall: its post, delivery points, mask, interaction with blocking syscalls,
   and nesting ([Asynchronous Upcalls](#asynchronous-upcalls)).
+- How a userspace debugger uses both: breakpoints, single-step, register and memory access, and
+  asynchronous break ([Debugging](#debugging)).
 
 Out of scope (the kernel never does these):
 
@@ -541,6 +543,47 @@ alone.
 
 ---
 
+## Debugging
+
+A debugger is a userspace handler of a thread's exception class, with the thread's `CONTROL` cap
+for its registers and, for an asynchronous break, an upcall binding. The kernel adds no debugging
+interface of its own. The pieces are:
+
+- **Breakpoints.** A software breakpoint is `int3` on x86-64 and `ebreak` on RISC-V. It reaches
+  the exception handler as `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT`. The reported
+  instruction pointer is the hardware's:
+  - x86-64 `#BP` is a trap, so the pointer is the instruction after `int3`, and resuming continues
+    there;
+  - RISC-V reports the `ebreak` itself, so a handler that resumes the thread steps the pointer past
+    it: 2 bytes for `c.ebreak`, 4 for `ebreak`.
+
+  The x86-64 `#BP` gate has DPL 3 so that a user `int3` raises `#BP` rather than `#GP`.
+- **Single-step (x86-64).** A handler sets the trap flag (`X86_64_RFLAGS_TF`) in the stopped
+  thread's `rflags` (`REGS_X86_64_FLAGS_OFFSET` of the register file) with
+  `SYS_THREAD_WRITE_REGS`, and resumes it. The thread then takes `#DB` after each instruction,
+  delivered as `FAULT_EXC_DEBUG` with the next instruction's pointer, until a handler clears the
+  flag. Syscall entry clears the flag for the kernel and the return restores it, so a stepped
+  `syscall` steps past as one instruction.
+- **No single-step on RISC-V.** RISC-V has no user-mode single-step without a debug trigger. The
+  kernel programs none: an instruction-count trigger is not available through the SBI Debug
+  Triggers extension on the reference platform.
+- **Registers and memory.** A handler reads and writes a stopped thread's registers with
+  `SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` ([Modifying the faulting
+  thread](#modifying-the-faulting-thread)). A debugger thread of the debuggee's own process reaches
+  the debuggee's memory directly while it is stopped. No syscall reads or writes another address
+  space's memory.
+- **Asynchronous break.** A debugger stops a running thread with an `UPCALL_ANY_INSTRUCTION`
+  upcall ([Asynchronous Upcalls](#asynchronous-upcalls)). The thread is then upcall-blocked, with
+  its registers readable, at the instruction it was preempted at.
+- **Trap and emulate.** A handler that emulates a faulting instruction (an illegal instruction,
+  say) writes the emulated result and the next instruction's pointer into the thread's registers
+  and resumes it.
+
+The `debugger` fixture drives each piece end to end
+([programs/debugger/README.md](../programs/debugger/README.md)).
+
+---
+
 ## Security
 
 The kernel synthesizes the fault delivery on the faulting thread's behalf using the bound
@@ -642,6 +685,7 @@ svcmgr service definitions carry no paging key; see
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
 [Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
 [programs/deadline/README.md](../programs/deadline/README.md),
+[programs/debugger/README.md](../programs/debugger/README.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),

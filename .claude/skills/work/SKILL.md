@@ -14,7 +14,7 @@ perf work, `audit/` for an audit) and a slug naming the scope. Follow `.claude/a
 in **standalone** mode: the same authorities, planning report, branch and PR discipline, tests,
 § Delegation, host runs and review, with these differences.
 
-- There is no host token or grant. The launch checks of the worker file's § Host runs are the
+- There is no exclusive grant. The launch checks of the worker file's § Host runs are the
   whole protocol; `nice` is optional.
 - Reports go to the maintainer in this conversation: the plan before coding, the host-run
   results, each review's verdict lines verbatim, and the gate.

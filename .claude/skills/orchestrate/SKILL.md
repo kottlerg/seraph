@@ -1,13 +1,13 @@
 ---
 name: orchestrate
-description: Run a batch of Issues as several parallel worker agents under one orchestrator session that holds the host token, orders merges, carries rulings to the maintainer, and keeps the record.
+description: Run a batch of Issues as several parallel worker agents under one orchestrator session that holds the host's exclusive grant, orders merges, carries rulings to the maintainer, and keeps the record.
 ---
 
 # Orchestrating a batch
 
 You are the orchestrator: one session that plans a batch of Issues, spawns one `worker` agent
-(`.claude/agents/worker.md`) per scope, grants the shared host's exclusive runs through a
-token, orders merges to minimize re-validation, carries the workers' questions to the
+(`.claude/agents/worker.md`) per scope, grants the shared host's exclusive runs (the
+exclusive grant), orders merges to minimize re-validation, carries the workers' questions to the
 maintainer, files the Issues the maintainer approves, and executes merges the maintainer has
 decided. You write no project code yourself; mechanical steps a worker cannot finish (a
 validation run after its session ended, a history rewrite the maintainer asked for) are the
@@ -68,7 +68,7 @@ allows: it conditions closing, it does not require it.
    check rollup, then call `ListAgents` once, and compare both against the record. If the host
    is idle and the grant holder has not reported for longer than its runs should take, ping
    the holder for a status report; if no grant is outstanding and a queued request fits the
-   host (§ Host token), grant the next one. Liveness: compare the listing against the worker
+   host (§ Exclusive grant), grant the next one. Liveness: compare the listing against the worker
    ids the record lists as active. A worker that lists as completed is idle, not dead. A
    worker the listing omits, whose last report was not its gate, and whose scope has no open
    PR at its gate is dead: log it, send it the stand-down message and end its task where the
@@ -119,14 +119,14 @@ message (its PR and branch now belong to the new worker; it edits, commits and p
 further, per `.claude/agents/worker.md` § Reporting), and end that worker's task where the
 harness allows, so a worker presumed dead that resumes does not push over its replacement.
 
-## Host token
+## Exclusive grant
 
 The host is one machine. A boundary-set boot (the 16- and 128-CPU boots docs/testing.md
 § Coverage tiers names) saturates it, and a second QEMU beside it produces hangs that then need
 classifying; two canonical (4-CPU) boots side by side do not (the maintainer's ruling of
-2026-10-31). Builds and canonical boots therefore take no token: each worker launches them on
-the launch checks of `.claude/agents/worker.md` § Host runs. The token is the exclusive grant,
-which a boot of more than 4 vCPUs and any timing-sensitive measurement take:
+2026-10-31). Builds and canonical boots therefore take no grant: each worker launches them on
+the launch checks of `.claude/agents/worker.md` § Host runs. The exclusive grant is what
+a boot of more than 4 vCPUs and any timing-sensitive measurement take:
 
 - A worker sends the exact command list of its exclusive runs and its estimate and ends its
   turn. You answer `host free` when no other grant is outstanding and the host is quiet
@@ -186,7 +186,7 @@ Then prompt the maintainer, or merge under their standing instruction, with `gh 
 --merge --delete-branch`; fast-forward your own checkout, record it, and tell every open PR's
 worker what moved and whether the delta is Markdown-only. That message is information, and any
 sync guidance it carries (whether the move re-owes the worker's set) is advice for the worker's
-plan: `master quiet` (§ Host token) is the only instruction to sync, and the sync is the merge
+plan: `master quiet` (§ Exclusive grant) is the only instruction to sync, and the sync is the merge
 of `master`, never a rebase, that `.claude/agents/worker.md` § Host runs describes.
 
 Order merges to minimize re-validation: hold a PR at its gate, whether `CLEAN` or `BEHIND`,

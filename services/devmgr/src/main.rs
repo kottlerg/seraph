@@ -3480,15 +3480,16 @@ fn test_spawn_orphan(
 /// Halt when devmgr's own address space cap carries `RIGHTS_AS_READ`, or
 /// its rights cannot be read: procmgr mints every child's address space
 /// without the right, a phys-class child's included, so no process translates
-/// a child's pages (services/procmgr/docs/ipc-interface.md, the phys-class
-/// paragraph). devmgr is the phys-class child every boot creates, and no
-/// other process can check its address space, so a mint that kept the right
-/// stops the boot here instead of passing unseen.
+/// a child's pages (services/devmgr/docs/responsibilities.md § Capabilities
+/// Received). devmgr is the phys-class child every boot creates, and no other
+/// process checks its address space, so a mint that kept the right stops the
+/// boot here instead of passing unseen.
 fn refuse_translatable_aspace(self_aspace: u64)
 {
     match syscall::cap_info(self_aspace, syscall::CAP_INFO_TAG_RIGHTS)
     {
-        Ok(rights) if rights & syscall::RIGHTS_AS_READ == 0 => {}
+        Ok(rights) if rights & syscall::RIGHTS_AS_READ == 0 =>
+        {}
         Ok(_) =>
         {
             std::os::seraph::log!("own address space carries RIGHTS_AS_READ, halting");

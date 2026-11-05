@@ -7,14 +7,13 @@
 //! handler (docs/fault-handling.md § Debugging). The x86-64 single-step is
 //! `arch/x86_64/single_step.rs`.
 //!
-//!   1. **Software breakpoint.** A child bound to an endpoint for the
-//!      exception class executes a software breakpoint (`int3` on x86-64,
-//!      `ebreak` on riscv64). The handler receives `FAULT_KIND_EXCEPTION` with
-//!      `FAULT_EXC_BREAKPOINT` and the architecture's reported instruction
-//!      pointer (past `int3`, at `ebreak`), which the thread's registers match;
-//!      it advances the pointer past the breakpoint where the architecture
-//!      needs it and resumes the thread, which returns from the breakpoint and
-//!      reports the breakpoint's address.
+//! A child bound to an endpoint for the exception class executes a software
+//! breakpoint (`int3` on x86-64, `ebreak` on riscv64). The handler receives
+//! `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT` and the architecture's
+//! reported instruction pointer (past `int3`, at `ebreak`), which the thread's
+//! registers match; it advances the pointer past the breakpoint where the
+//! architecture needs it and resumes the thread, which returns from the
+//! breakpoint and reports the breakpoint's address.
 //!
 //! On x86-64 the breakpoint gate is DPL 3, so a user `int3` raises `#BP`; a
 //! DPL-0 gate would raise `#GP` instead and the message would carry
@@ -84,7 +83,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 }
 
-/// Phase 1: a software breakpoint is delivered as `FAULT_EXC_BREAKPOINT` and
+/// A software breakpoint is delivered as `FAULT_EXC_BREAKPOINT` and
 /// resumed past.
 fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64) -> TestResult
 {

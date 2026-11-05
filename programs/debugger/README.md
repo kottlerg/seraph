@@ -23,7 +23,8 @@ debugger/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs            # Debugger and debuggee threads; per-architecture breakpoints
+│   └── main.rs            # Debugger and debuggee threads; per-architecture breakpoint
+│                          #   and single-step (a no-op on riscv64)
 └── tester/
     ├── Cargo.toml
     └── src/

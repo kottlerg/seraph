@@ -262,7 +262,9 @@ A faulting thread with a bound handler enters a dedicated **fault-blocked** stat
 from the call-reply blocked state, so its resume semantics differ from a syscall return:
 it resumes at its reported instruction pointer, not by returning a value. For a fault that
 is the faulting instruction, which re-executes; for a trap-type exception (x86-64 `#BP` and
-`#DB`) it is the instruction after the trapping one ([Debugging](#debugging)).
+`#DB`) it is the instruction after the trapping one ([Debugging](#debugging)). An upcall, which
+is no fault, resumes as [Asynchronous Upcalls](#asynchronous-upcalls) states: on RISC-V at the
+syscall point, past the `ecall` its reported pointer names.
 
 - **Resume (genuine reply).** The handler replies (default disposition
   [`FAULT_REPLY_RESUME`](#reply)). The kernel resumes the faulting thread with its register
@@ -566,16 +568,20 @@ kernel adds no debugging interface of its own. The pieces are:
   thread's `rflags` (`REGS_X86_64_FLAGS_OFFSET` of the register file) with
   `SYS_THREAD_WRITE_REGS`, and resumes it. The thread then takes `#DB` after each instruction,
   delivered as `FAULT_EXC_DEBUG` with the next instruction's pointer, until a handler clears the
-  flag. Syscall entry clears the flag for the kernel and the syscall return restores it, and a
-  syscall return (`sysretq`) that restores the flag traps at once, before any user instruction
-  runs:
-  - a stepped `syscall` therefore steps past as one instruction, its `#DB` naming the
-    instruction after it;
-  - a thread stopped at a syscall return (an upcall at the syscall point, or a stop while it was
-    blocked in a syscall) and resumed with the flag set takes its first `#DB` at the pointer it
-    stopped at, with no instruction run, and steps from there.
-
-  A resume from a fault or an exception (`iretq`) runs one instruction before the first `#DB`.
+  flag. Syscall entry clears the flag for the kernel, and the thread's return to user mode
+  restores it. When the first `#DB` comes depends on that return's path:
+  - **Through `sysretq`** (the return of a syscall), the restored flag traps at once, before any
+    user instruction runs. So a stepped `syscall` steps past as one instruction, its `#DB` naming
+    the instruction after it. Every other resume at a syscall return takes its first `#DB` at the
+    pointer it stopped at, with no instruction run, and steps from there:
+    - an upcall at the syscall point;
+    - a stop while the thread was blocked in a syscall;
+    - a syscall restarted after a fault of its user copy ([Kernel Copies](#kernel-copies)), whose
+      `#DB` names the `syscall` instruction itself.
+  - **Through `iretq`** (the return from a user-mode fault or exception, or from an interrupt),
+    one instruction runs before the first `#DB`. That covers a resume from a fault, a breakpoint
+    or a step, from an upcall at the interrupt point, and from a stop of a thread an interrupt
+    preempted.
 - **No single-step on RISC-V.** RISC-V has no user-mode single-step without a debug trigger. The
   kernel programs none: an instruction-count trigger is not available through the SBI Debug
   Triggers extension on the reference platform.

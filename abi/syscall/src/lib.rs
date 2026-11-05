@@ -1229,12 +1229,16 @@ pub const REGS_X86_64_IP_OFFSET: usize = 120;
 pub const REGS_X86_64_SP_OFFSET: usize = 136;
 /// Byte offset of the flags register (`rflags`) in the x86-64 register file.
 pub const REGS_X86_64_FLAGS_OFFSET: usize = 128;
-/// The x86-64 trap flag in `rflags`. A thread resumed with it set from a fault
-/// or exception takes `#DB` after its next instruction, delivered to its
-/// exception handler as [`FAULT_EXC_DEBUG`], so a debugger single-steps a
-/// stopped thread by setting it with `SYS_THREAD_WRITE_REGS`. A thread resumed
-/// with it set through a syscall return takes its first `#DB` at once, before
-/// any instruction runs (`docs/fault-handling.md` § Debugging).
+/// The x86-64 trap flag in `rflags`. A debugger single-steps a stopped thread
+/// by setting it with `SYS_THREAD_WRITE_REGS`: the thread takes `#DB` after
+/// each instruction, delivered to its exception handler as
+/// [`FAULT_EXC_DEBUG`]. The first `#DB` depends on the thread's return to user
+/// mode: through an interrupt or exception return (a resume from a fault, an
+/// exception, an interrupt-point upcall, or a stop of a preempted thread) it
+/// comes after one instruction; through a syscall return (an upcall at the
+/// syscall point, a stop inside a syscall, or a syscall restarted after a
+/// fault of its user copy) it comes at once, before any instruction runs
+/// (`docs/fault-handling.md` § Debugging).
 pub const X86_64_RFLAGS_TF: u64 = 1 << 8;
 
 /// riscv64 register-file size in bytes.

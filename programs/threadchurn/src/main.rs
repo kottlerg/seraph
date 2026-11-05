@@ -59,13 +59,10 @@ const DETACH_BATCH: u64 = 128;
 /// Detached threads held bound at once in the warm-up's held burst: past 64
 /// slots and past the reaper's first death queue's 99 observer nodes, so the
 /// burst grows the slot table and binds on a second queue, and every one of
-/// them is then reaped.
+/// them is then reaped. The fixture does not fund its `CSpace` for the burst:
+/// the burst's caps outgrow the `CSpace` procmgr seeds, so the burst passes
+/// only while thread spawn tops the `CSpace` up itself.
 const HELD_BURST: usize = 128;
-/// `CSpace` slots funded per held-burst thread before the burst. A live
-/// thread holds a few caps (its Thread cap, its done notification, its stack
-/// and slab caps); thread spawn does not grow the `CSpace` itself, so a known
-/// burst is funded first, as `fund_cspace_slot_budget` documents.
-const BURST_SLOTS_PER_THREAD: u64 = 8;
 /// Allowed slot growth across the held burst once it is reaped: the reaper's
 /// second death queue and its slab, and the byte heap's growth for the slot
 /// table. A burst that leaked its threads would keep about two slots each.
@@ -116,12 +113,6 @@ fn spawn_join(i: u64)
 /// the burst passed; a failure has printed its FAIL line.
 fn held_burst(cspace: u64) -> bool
 {
-    if !std::os::seraph::fund_cspace_slot_budget(cspace, HELD_BURST as u64 * BURST_SLOTS_PER_THREAD)
-    {
-        log!("FAIL could not fund the CSpace for the held burst");
-        println!("threadchurn: FAIL CSpace funding for the held burst");
-        return false;
-    }
     let before_burst = used_slots(cspace);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(HELD_BURST + 1));
     for n in 0..HELD_BURST

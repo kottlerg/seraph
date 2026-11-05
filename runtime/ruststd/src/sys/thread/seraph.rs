@@ -62,6 +62,40 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// adjacent memory.
 const GUARD_PAGES: u64 = 1;
 
+/// General-allocation headroom of the process's `CSpace` a spawn keeps: a
+/// spawn first tops the `CSpace` up when its headroom is below this plus a
+/// page's slots (`CSPACE_SLOTS_PER_PAGE`, which
+/// `syscall_abi::cspace_topup_pages` holds for the body arena), or its growth
+/// budget below a page. One spawn takes a few slots for good (the Thread cap
+/// and its done notification) and a few more while it runs (the Thread slab,
+/// a pool-page refill, a further death queue and its grant, a heap grow's at
+/// most `MSG_CAP_SLOTS_MAX` caps), about ten in all, so the mark leaves room
+/// for a whole spawn with margin.
+const SPAWN_CSPACE_LOW_WATER: u64 = 32;
+
+/// Headroom a spawn's top-up funds. Past the low-water mark, so the next
+/// top-up comes only after a few dozen more live threads, not at every
+/// spawn.
+const SPAWN_CSPACE_TOPUP_SLOTS: u64 = 128;
+
+/// Keep the process's `CSpace` above [`SPAWN_CSPACE_LOW_WATER`] general
+/// slots, with a page of growth budget beyond them for its body arena, so a
+/// process's live thread count is bound by the RAM memmgr grants rather than
+/// by the `CSpace` its creator seeded. The check is the one memmgr's and
+/// procmgr's own low-water top-ups make (`syscall_abi::cspace_topup_pages`).
+/// Best-effort: a failed top-up leaves the spawn to fail at its own
+/// capability allocation if the headroom is truly spent.
+fn hold_cspace_headroom(self_cspace: u64) {
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    let headroom = crate::sys::alloc::seraph::cspace_general_headroom(self_cspace);
+    if syscall_abi::cspace_topup_pages(headroom, budget, SPAWN_CSPACE_LOW_WATER) != 0 {
+        let _ = crate::sys::alloc::seraph::fund_cspace_slot_budget(
+            self_cspace,
+            SPAWN_CSPACE_TOPUP_SLOTS,
+        );
+    }
+}
+
 /// Per-thread context the entry trampoline pulls off the `arg` slot of
 /// `thread_configure`. Owned by the spawning thread until the child takes
 /// it over on entry (the child drops it after extracting the pieces).
@@ -224,6 +258,7 @@ impl Thread {
         // Reap any detached threads that have since died, freeing their CSpace
         // slots and RAM before this spawn reserves its own.
         reaper::sweep();
+        hold_cspace_headroom(info.self_cspace);
 
         let stack = alloc_stack(info, stack_bytes)?;
 
@@ -580,8 +615,7 @@ impl Drop for Thread {
 /// for an already-joined or reused slot a no-op.
 mod reaper {
     use super::ThreadResources;
-    use crate::cell::UnsafeCell;
-    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sys::alloc::seraph::SpinMutex;
     use crate::vec::Vec;
     use death_queues::DeathQueues;
     use death_queues::slots::{Detached, Registry, correlator};
@@ -614,33 +648,6 @@ mod reaper {
         event_queue_retype_bytes(FIRST_POOL_OBSERVERS as u64 + 1, FIRST_POOL_OBSERVERS as u64)
             <= PAGE_SIZE
     );
-
-    /// A value its spin lock serialises; the only access is [`SpinMutex::with`].
-    struct SpinMutex<T> {
-        locked: AtomicBool,
-        value: UnsafeCell<T>,
-    }
-    // SAFETY: `value` is reached only through `with`, under `locked`.
-    unsafe impl<T: Send> Sync for SpinMutex<T> {}
-    impl<T> SpinMutex<T> {
-        const fn new(value: T) -> Self {
-            Self { locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
-        }
-        /// Run `f` on the value under the lock.
-        fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-            while self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            // SAFETY: the lock is held, so this is the only reference.
-            let out = f(unsafe { &mut *self.value.get() });
-            self.locked.store(false, Ordering::Release);
-            out
-        }
-    }
 
     // Lock order: `QUEUES` before `SLOTS`. A drain holds `QUEUES` and takes
     // `SLOTS` per post; nothing takes `QUEUES` while holding `SLOTS`. The

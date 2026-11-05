@@ -280,7 +280,7 @@ impl TableExt for ProcessTable
         let child_cspace = entry.cspace_cap;
 
         let scratch = ScratchMapping::map(self_aspace, pi_memory, 1, syscall::MAP_WRITABLE)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         let scratch_va = scratch.va();
 
         // SAFETY: scratch_va is mapped writable for one page; PI struct
@@ -1075,6 +1075,13 @@ impl ChildInfoCaps
 /// split keeps the core `CREATE_PROCESS` path stdio-agnostic and lets
 /// spawners pipe each direction independently.
 ///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY` when the page's allocation, its
+/// mapping, a capability derivation or copy into the child, or the
+/// argv/env region's funding or mapping fails: every create label names
+/// that code for these failures
+/// (`services/procmgr/docs/ipc-interface.md` § Label 1 and § Label 13).
+///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
@@ -1105,24 +1112,27 @@ unsafe fn populate_child_info(
     process_badge: u64,
     sched: ChildSched,
     layout: &ProcessLayout,
-) -> Option<ChildInfoCaps>
+) -> Result<ChildInfoCaps, u64>
 {
-    // Guarded from allocation: every early `None` below deletes the slot.
-    let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
-        universals.memmgr_endpoint,
-        ipc_buf,
-    )?);
-    let scratch = ScratchMapping::map(self_aspace, pi_memory.cap(), 1, syscall::MAP_WRITABLE)?;
+    // Guarded from allocation: every early `Err` below deletes the slot.
+    let pi_memory = CapGuard::new(
+        crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
+    );
+    let scratch = ScratchMapping::map(self_aspace, pi_memory.cap(), 1, syscall::MAP_WRITABLE)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let scratch_va = scratch.va();
     // SAFETY: scratch_va mapped writable, one page.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     let child_thread_in_child =
-        syscall::cap_copy(child_thread, child_cspace, syscall::RIGHTS_THREAD).ok()?;
-    let child_aspace_in_child =
-        syscall::cap_copy(child_aspace, child_cspace, syscall::RIGHTS_ALL).ok()?;
+        syscall::cap_copy(child_thread, child_cspace, syscall::RIGHTS_THREAD)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let child_aspace_in_child = syscall::cap_copy(child_aspace, child_cspace, syscall::RIGHTS_ALL)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let child_cspace_in_child =
-        syscall::cap_copy(child_cspace, child_cspace, syscall::RIGHTS_CS_ALL).ok()?;
+        syscall::cap_copy(child_cspace, child_cspace, syscall::RIGHTS_CS_ALL)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
 
     let creator_ep_in_child = if creator_endpoint != 0
     {
@@ -1131,7 +1141,7 @@ unsafe fn populate_child_info(
         // fall back to SEND for badged send caps used by the bootstrap protocol.
         syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_ALL)
             .or_else(|_| syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_EP_SEND))
-            .ok()?
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1162,9 +1172,10 @@ unsafe fn populate_child_info(
                 syscall::RIGHTS_EP_SEND_GRANT,
                 process_badge,
             )
-            .ok()?,
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
         );
-        syscall::cap_copy(badged.cap(), child_cspace, syscall::RIGHTS_EP_SEND_GRANT).ok()?
+        syscall::cap_copy(badged.cap(), child_cspace, syscall::RIGHTS_EP_SEND_GRANT)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1187,9 +1198,10 @@ unsafe fn populate_child_info(
                 syscall::RIGHTS_EP_SEND,
                 process_badge,
             )
-            .ok()?,
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
         );
-        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND).ok()?
+        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1210,9 +1222,10 @@ unsafe fn populate_child_info(
                 syscall::RIGHTS_EP_SEND,
                 process_badge,
             )
-            .ok()?,
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
         );
-        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND).ok()?
+        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1237,18 +1250,22 @@ unsafe fn populate_child_info(
     {
         if sched.band_max >= ipc::sched_policy::BASELINE_PRIORITY_MAX
         {
-            syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL).ok()?
+            syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
         }
         else
         {
             let own_copy = CapGuard::new(
-                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL).ok()?,
+                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL)
+                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
             );
-            let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max + 1).ok()?;
+            let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max + 1)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             // The split consumed `own_copy`; its two halves replace it.
             let _ = own_copy.disarm();
             let (low, _high) = (CapGuard::new(low), CapGuard::new(high));
-            syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL).ok()?
+            syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
         }
     }
     else
@@ -1291,7 +1308,7 @@ unsafe fn populate_child_info(
             child_cspace,
             syscall::RIGHTS_EP_SEND_GRANT,
         )
-        .ok()?
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1341,8 +1358,7 @@ unsafe fn populate_child_info(
                 &argv_env,
                 layout,
             )
-        }
-        .ok()?;
+        }?;
     }
     let h = argv_env.header;
     (pi.args_offset, pi.args_bytes, pi.args_count) = if h.args_bytes == 0
@@ -1372,7 +1388,10 @@ unsafe fn populate_child_info(
 
     drop(scratch);
 
-    let pi_ro = CapGuard::new(syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
+    let pi_ro = CapGuard::new(
+        syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
+    );
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
     unsafe {
@@ -1385,12 +1404,12 @@ unsafe fn populate_child_info(
             syscall::MAP_FROM_CAP,
         )
     }
-    .ok()?;
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     // pi_memory and argv_env_memory stay in procmgr's CSpace as the teardown
     // handles (revoke cascades to any descendants); the mappings don't need
     // the map-only derivations to outlive this call, so their guards delete
     // them on return.
-    Some(ChildInfoCaps {
+    Ok(ChildInfoCaps {
         pi_memory,
         argv_env_memory: argv_env.memory,
     })
@@ -1436,19 +1455,23 @@ impl MainTlsAlloc
 ///
 /// The block spans the pages its `PT_TLS` memsz needs
 /// ([`process_abi::tls_block_layout`]), from one contiguous Memory cap.
-/// Returns `None` when the binary has no TLS, when the block exceeds
+/// Callers write the `.tdata` template starting at the scratch VA and then
+/// call [`finalize_main_tls`] to install the TCB self-pointer and remap the
+/// memory cap into the child.
+///
+/// # Errors
+/// `INVALID_ELF` when the binary has no TLS, when the block exceeds
 /// `PROCESS_MAIN_TLS_MAX_PAGES` (the region the layout leaves after the TLS
-/// draw), when alignment demands would outrun the page mapping, or when
-/// memmgr cannot supply the pages. Callers write the `.tdata` template
-/// starting at the scratch VA and then call [`finalize_main_tls`] to install
-/// the TCB self-pointer and remap the memory cap into the child.
+/// draw), or when alignment demands would outrun the page mapping;
+/// `OUT_OF_MEMORY` when memmgr cannot supply the pages; and
+/// [`ScratchMapping::map`]'s code when the scratch mapping fails.
 fn alloc_main_tls_memory(
     self_aspace: u64,
     tls: &ChildTlsTemplate,
     child_memmgr_send: u64,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
-) -> Option<MainTlsAlloc>
+) -> Result<MainTlsAlloc, u64>
 {
     let (block_size, block_align, tls_base_offset) =
         process_abi::tls_block_layout(tls.memsz, tls.align);
@@ -1456,17 +1479,19 @@ fn alloc_main_tls_memory(
     let pages = block_size.div_ceil(PAGE_SIZE);
     if block_size == 0 || pages > PROCESS_MAIN_TLS_MAX_PAGES || block_align > PAGE_SIZE
     {
-        return None;
+        return Err(procmgr_errors::INVALID_ELF);
     }
 
     let tls_memory = CapGuard::new(
         if pages == 1
         {
-            crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?
+            crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
+                .ok_or(procmgr_errors::OUT_OF_MEMORY)?
         }
         else
         {
-            crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)?
+            crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)
+                .ok_or(procmgr_errors::OUT_OF_MEMORY)?
         },
     );
     let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), pages, syscall::MAP_WRITABLE)?;
@@ -1475,7 +1500,7 @@ fn alloc_main_tls_memory(
     // SAFETY: scratch_va is mapped writable for `pages` pages.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, (pages * PAGE_SIZE) as usize) };
 
-    Some(MainTlsAlloc {
+    Ok(MainTlsAlloc {
         scratch,
         memory: tls_memory,
         tls_base_offset,
@@ -1543,6 +1568,11 @@ unsafe fn finalize_main_tls(
 /// relocations there (the in-image template copy is relocated separately
 /// during segment loading).
 ///
+/// # Errors
+/// [`alloc_main_tls_memory`]'s codes; `INVALID_ELF` when the template is
+/// larger than the block; `OUT_OF_MEMORY` when the block cannot be mapped
+/// into the child.
+///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
@@ -1559,16 +1589,16 @@ unsafe fn prepare_main_tls_from_bytes(
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     relocate: impl FnOnce(&mut [u8]),
-) -> Option<MainTls>
+) -> Result<MainTls, u64>
 {
     if tls.memsz == 0
     {
-        return Some(MainTls::default());
+        return Ok(MainTls::default());
     }
     let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     if template_bytes.len() as u64 > alloc.scratch_bytes()
     {
-        return None;
+        return Err(procmgr_errors::INVALID_ELF);
     }
     let scratch_va = alloc.scratch_va();
     // SAFETY: scratch_va is mapped writable; length was bounded above.
@@ -1586,6 +1616,7 @@ unsafe fn prepare_main_tls_from_bytes(
     relocate(template);
     // SAFETY: the caller's contract covers `child_aspace`.
     unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
 
 /// Allocate, populate by streaming `.tdata` from an open VFS file handle,
@@ -1593,6 +1624,12 @@ unsafe fn prepare_main_tls_from_bytes(
 ///
 /// `relocate` runs over the streamed template copy before the block is
 /// finalized; see [`prepare_main_tls_from_bytes`].
+///
+/// # Errors
+/// [`alloc_main_tls_memory`]'s codes; `INVALID_ELF` when the template's file
+/// size is larger than the block; `IO_ERROR` when the template's bytes do not
+/// all arrive; `OUT_OF_MEMORY` when the block cannot be mapped into the
+/// child.
 ///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
@@ -1611,16 +1648,16 @@ unsafe fn prepare_main_tls_from_vfs(
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     relocate: impl FnOnce(&mut [u8]),
-) -> Option<MainTls>
+) -> Result<MainTls, u64>
 {
     if tls.memsz == 0
     {
-        return Some(MainTls::default());
+        return Ok(MainTls::default());
     }
     let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     if tls.filesz > alloc.scratch_bytes()
     {
-        return None;
+        return Err(procmgr_errors::INVALID_ELF);
     }
     let scratch_va = alloc.scratch_va();
 
@@ -1632,13 +1669,15 @@ unsafe fn prepare_main_tls_from_vfs(
     // `vfs_read_exact` clamps every reply to the bytes it asked for, so an
     // fs driver over-reporting `bytes_read` cannot stretch a copy past the
     // template; a short template (end of file) fails the spawn.
-    if vfs_read_exact(file_cap, ipc_buf, file_offset, template)? != template.len()
+    if vfs_read_exact(file_cap, ipc_buf, file_offset, template).ok_or(procmgr_errors::IO_ERROR)?
+        != template.len()
     {
-        return None;
+        return Err(procmgr_errors::IO_ERROR);
     }
     relocate(template);
     // SAFETY: the caller's contract covers `child_aspace`.
     unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
 
 /// Map stack and IPC buffer pages into a child address space.
@@ -1996,7 +2035,7 @@ fn bind_pager(
 /// stays eager.
 fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 {
-    let Some(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
+    let Ok(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
     else
     {
         return;
@@ -2011,6 +2050,17 @@ fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 // ── Process creation (from memory) ──────────────────────────────────────────
 
 /// Create a process from an in-memory ELF byte slice (suspended).
+///
+/// # Errors
+/// `INVALID_ELF` when the image fails validation, its relocations do not
+/// all land, its stack note is out of range, its `PT_TLS` reaches past the
+/// image, or its TLS block is oversized, overaligned, or smaller than its
+/// template ([`alloc_main_tls_memory`], [`prepare_main_tls_from_bytes`]);
+/// `OUT_OF_MEMORY` when a kernel object, memory cap, badge, page, or the
+/// table entry cannot be had; a segment load's `OUT_OF_MEMORY` (its pages),
+/// `MAP_FAILED` (a scratch or child mapping), or `INSUFFICIENT_RIGHTS` (a
+/// rights derivation) ([`loader::load_elf_segment_into_child`]); and the main
+/// TLS block's and [`populate_child_info`]'s other codes.
 // similar_names: aspace/cspace are intentionally parallel kernel object names.
 #[allow(
     clippy::similar_names,
@@ -2028,10 +2078,11 @@ fn create_process_from_bytes(
     deaths: &DeathSet,
     sched: ChildSched,
     ipc_buf: *mut u64,
-) -> Option<CreateResult>
+) -> Result<CreateResult, u64>
 {
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
-    let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    let (ehdr, kind) =
+        elf::validate_executable(module_bytes, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
     // `validate_executable` returns the header decoded; the parsers borrow it.
     let ehdr = &ehdr;
     let bias = match kind
@@ -2039,25 +2090,28 @@ fn create_process_from_bytes(
         elf::ElfKind::Exec => 0,
         elf::ElfKind::Dyn => choose_image_bias_or_default(),
     };
-    let (span_min, span_end) = elf::load_span(ehdr, module_bytes).ok()?;
+    let (span_min, span_end) =
+        elf::load_span(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
     if kind == elf::ElfKind::Dyn
     {
         if !child_image_fits(bias, span_min, span_end)
         {
-            return None;
+            return Err(procmgr_errors::INVALID_ELF);
         }
         // Load-bias observability: no ProcessInfo field carries the bias;
         // debugging correlates through this line (in-process code uses
         // __ehdr_start).
         std::os::seraph::log!("spawn image bias=0x{bias:x}");
     }
-    let entry = elf::entry_point(ehdr).checked_add(bias)?;
+    let entry = elf::entry_point(ehdr)
+        .checked_add(bias)
+        .ok_or(procmgr_errors::INVALID_ELF)?;
 
     // Locate and pre-validate the RELATIVE relocation table (ET_DYN only; an
     // ET_EXEC image is fully linked and any vestigial table is ignored).
     let rela = if kind == elf::ElfKind::Dyn
     {
-        elf::rela_table(ehdr, module_bytes).ok()?
+        elf::rela_table(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?
     }
     else
     {
@@ -2067,9 +2121,11 @@ fn create_process_from_bytes(
     {
         Some(t) =>
         {
-            let table =
-                module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
-            elf::validate_relative_relocs(table, machine, span_min, span_end).ok()?
+            let table = module_bytes
+                .get(t.file_offset as usize..(t.file_offset + t.size) as usize)
+                .ok_or(procmgr_errors::INVALID_ELF)?;
+            elf::validate_relative_relocs(table, machine, span_min, span_end)
+                .map_err(|_| procmgr_errors::INVALID_ELF)?
         }
         None => 0,
     };
@@ -2077,22 +2133,24 @@ fn create_process_from_bytes(
     // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, module_bytes)
-        .ok()?
+        .map_err(|_| procmgr_errors::INVALID_ELF)?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
     // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
-    let stack_pages = resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))?;
+    let stack_pages = resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))
+        .ok_or(procmgr_errors::INVALID_ELF)?;
     let layout = choose_child_layout();
 
     // The child's kernel objects and per-child memory caps are guarded from
-    // creation: every `None` below releases them, and only a successful
+    // creation: every early return below releases them, and only a successful
     // `finalize_creation` hands them to the table entry.
     let child_objs = create_child_kernel_objects(
         universals.memmgr_endpoint,
         universals.sched_baseline,
         sched.priority,
         ipc_buf,
-    )?;
+    )
+    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let (child_aspace, child_cspace, child_thread) = (
         child_objs.aspace(),
         child_objs.cspace(),
@@ -2104,7 +2162,7 @@ fn create_process_from_bytes(
     let mut applied_relocs = 0u64;
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
-        let seg = seg_result.ok()?;
+        let seg = seg_result.map_err(|_| procmgr_errors::INVALID_ELF)?;
         if seg.memsz == 0
         {
             continue;
@@ -2148,8 +2206,7 @@ fn create_process_from_bytes(
                     }
                 },
             )
-        }
-        .ok()?;
+        }?;
     }
     // Every pre-validated record must have landed in exactly one segment;
     // a shortfall means a target in a gap between segments.
@@ -2158,10 +2215,10 @@ fn create_process_from_bytes(
         std::os::seraph::log!(
             "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
         );
-        return None;
+        return Err(procmgr_errors::INVALID_ELF);
     }
 
-    let tls_seg = elf::tls_segment(ehdr, module_bytes).ok()?;
+    let tls_seg = elf::tls_segment(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
     let tls_template = tls_seg
         .map(|s| ChildTlsTemplate {
             vaddr: s.vaddr + bias,
@@ -2178,7 +2235,7 @@ fn create_process_from_bytes(
         let end = start + seg.filesz as usize;
         if end > module_bytes.len()
         {
-            return None;
+            return Err(procmgr_errors::INVALID_ELF);
         }
         // SAFETY: `child_aspace` is the fresh address space
         // `create_child_kernel_objects` retyped for this child above.
@@ -2213,7 +2270,7 @@ fn create_process_from_bytes(
 
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
-    let process_badge = next_process_badge(table)?;
+    let process_badge = next_process_badge(table).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let info_caps = unsafe {
@@ -2243,7 +2300,8 @@ fn create_process_from_bytes(
             stack_pages,
             &layout,
         )
-    }?;
+    }
+    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
 
     // The guards stay armed across `finalize_creation`, so its failure
     // releases every resource; on success the table entry owns them.
@@ -2269,16 +2327,24 @@ fn create_process_from_bytes(
         ipc_buf,
         &layout,
         self_aspace,
-    )?;
+    )
+    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let _ = child_objs.disarm();
     info_caps.disarm();
     let _ = main_tls_memory.disarm();
-    Some(result)
+    Ok(result)
 }
 
 /// Create a process from an ELF module memory cap (suspended).
 ///
 /// Maps the memory cap, delegates to `create_process_from_bytes`, then unmaps.
+///
+/// # Errors
+/// A `procmgr_errors` code naming the cause: [`loader::map_module`]'s
+/// (`INSUFFICIENT_RIGHTS`, `OUT_OF_MEMORY`, or `MAP_FAILED`) when the module
+/// cannot be mapped, else `create_process_from_bytes`'s. The `CREATE_PROCESS`
+/// handler answers every one `OUT_OF_MEMORY`, as § Label 1 of
+/// `services/procmgr/docs/ipc-interface.md` names it.
 #[allow(clippy::too_many_arguments)]
 pub fn create_process(
     module_memory_cap: u64,
@@ -2292,7 +2358,7 @@ pub fn create_process(
     argv_env: ChildArgvEnv,
     deaths: &DeathSet,
     sched: ChildSched,
-) -> Option<CreateResult>
+) -> Result<CreateResult, u64>
 {
     let (module_scratch, module_pages) = loader::map_module(module_memory_cap, self_aspace)?;
     let module_size = module_pages * PAGE_SIZE;
@@ -2769,18 +2835,19 @@ pub struct ElfLoadCtx
 /// request's cookie, so fs drops its cache-slot refcount; `FS_CLOSE`
 /// reclaims any release that is lost.
 ///
-/// Returns `false` when the segment's file bytes could not all be copied: a
+/// # Errors
+/// `IO_ERROR` when the segment's file bytes could not all be copied: a
 /// failed or zero-byte `FS_READ_MEMORY`, a cache page that cannot be mapped,
 /// or a reply whose `memory_data_offset + bytes_valid` runs past the one page
 /// mapped. The loader's `fill` cannot fail, so the caller records the result
-/// and fails the spawn with `IO_ERROR` once the segment load returns; the
-/// tail left unfilled is never run.
+/// and fails the spawn with it once the segment load returns; the tail left
+/// unfilled is never run.
 fn stream_segment_bytes(
     buf: &mut [u8],
     dest_offset: usize,
     seg: &elf::LoadSegment,
     ctx: &ElfLoadCtx,
-) -> bool
+) -> Result<(), u64>
 {
     let total = (seg.filesz.min(seg.memsz)) as usize;
     let mut copied = 0usize;
@@ -2792,16 +2859,16 @@ fn stream_segment_bytes(
             vfs_read_memory(ctx.file_cap, ctx.ipc_buf, cur)
         else
         {
-            return false;
+            return Err(procmgr_errors::IO_ERROR);
         };
 
-        let Some(mut mapping) =
+        let Ok(mut mapping) =
             ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_FROM_CAP)
         else
         {
             let _ = syscall::cap_delete(memory_cap);
             vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
-            return false;
+            return Err(procmgr_errors::IO_ERROR);
         };
         mapping.set_owns_cap(memory_cap);
 
@@ -2816,7 +2883,7 @@ fn stream_segment_bytes(
         {
             drop(mapping);
             vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
-            return false;
+            return Err(procmgr_errors::IO_ERROR);
         };
         let chunk_len = range.len().min(total - copied);
 
@@ -2839,7 +2906,7 @@ fn stream_segment_bytes(
         vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
         copied += chunk_len;
     }
-    true
+    Ok(())
 }
 
 /// Issue `FS_RELEASE_MEMORY` on the file-cap to drop the fs-side cache
@@ -2943,7 +3010,7 @@ pub fn create_process_from_file(
     let hdr_memory =
         crate::memmgr_alloc_page(mms.cap(), ipc_buf).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let mut hdr_scratch = ScratchMapping::map(self_aspace, hdr_memory, 1, syscall::MAP_WRITABLE)
-        .ok_or_else(|| {
+        .map_err(|_| {
             let _ = syscall::cap_delete(hdr_memory);
             procmgr_errors::OUT_OF_MEMORY
         })?;
@@ -3072,7 +3139,7 @@ pub fn create_process_from_file(
             ipc_buf,
             self_aspace,
         };
-        let mut streamed = true;
+        let mut streamed = Ok(());
 
         // SAFETY: `child_objs.aspace()` is the fresh address space
         // `create_child_kernel_objects` retyped for this child above.
@@ -3114,10 +3181,7 @@ pub fn create_process_from_file(
         }?;
         // A segment whose file bytes did not all arrive would run with a
         // zeroed tail; the spawn fails instead.
-        if !streamed
-        {
-            return Err(procmgr_errors::IO_ERROR);
-        }
+        streamed?;
     }
     // Every pre-validated record must have landed in exactly one segment;
     // a shortfall means a target in a gap between segments or a lost read.
@@ -3179,7 +3243,9 @@ pub fn create_process_from_file(
                 },
             )
         }
-        .ok_or(procmgr_errors::OUT_OF_MEMORY)?
+        // § Label 13 answers every failure of the main thread's TLS block
+        // `OUT_OF_MEMORY`, whatever cause the helper reports.
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -3222,8 +3288,7 @@ pub fn create_process_from_file(
             sched,
             &layout,
         )
-    }
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    }?;
 
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
@@ -3486,7 +3551,7 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> 
         let pi_memory = entry.pi_memory_cap;
         let child_cspace = entry.cspace_cap;
         let scratch = ScratchMapping::map(self_aspace, pi_memory, 1, syscall::MAP_WRITABLE)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         let scratch_va = scratch.va();
         // SAFETY: scratch_va is page-aligned and mapped writable; PI struct
         // lives at offset 0 per the ABI.

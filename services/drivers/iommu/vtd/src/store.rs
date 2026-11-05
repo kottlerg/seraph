@@ -94,6 +94,13 @@ impl Store
     /// it; `false`, logged, when memmgr refuses or the mapping fails.
     fn grow(&mut self) -> bool
     {
+        // Room for the chunk's record first, so no failure past the mapping
+        // has a live mapping to undo.
+        if self.chunks.try_reserve(1).is_err()
+        {
+            std::os::seraph::log!("table pages: no memory for a chunk record");
+            return false;
+        }
         let ipc_buf = std::os::seraph::current_ipc_buf();
         let arg = CHUNK_PAGES | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
         let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -138,12 +145,21 @@ impl Store
         let mapped = unsafe {
             syscall::mem_map(cap, self.aspace, va, 0, CHUNK_PAGES, syscall::MAP_WRITABLE)
         };
-        if mapped.is_err() || self.chunks.try_reserve(1).is_err()
+        if mapped.is_err()
         {
             std::os::seraph::log!("table pages: mapping failed");
-            // Deleting the cap removes its mapping too.
+            // A failed map may leave the pages it mapped before failing, and
+            // deleting a Memory cap does not unmap them, so they are unmapped
+            // first; the range returns to the arena only once nothing is
+            // mapped in it, and is kept otherwise.
+            // SAFETY: the range is this call's own reservation, and no Rust
+            // reference into it exists.
+            let unmapped = unsafe { syscall::mem_unmap(self.aspace, va, CHUNK_PAGES) }.is_ok();
             let _ = syscall::cap_delete(cap);
-            std::os::seraph::unreserve_pages(range);
+            if unmapped
+            {
+                std::os::seraph::unreserve_pages(range);
+            }
             return false;
         }
         self.chunks.push(Chunk { phys, va, used: 0 });

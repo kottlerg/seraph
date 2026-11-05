@@ -2284,11 +2284,11 @@ pub const IOMMU_LABELS_VERSION: u32 = 1;
 /// the IOMMU of one family (VT-d, the RISC-V IOMMU).
 ///
 /// devmgr and the driver hold the only caps to the endpoint (devmgr the
-/// original, the driver its receive copy), so no other process can send on
-/// it: devmgr spawns the driver, hands it each unit's register cap, and drives
-/// it from its DMA thread and its
-/// withdrawal path, keeping the drivers' `devmgr_dma_labels` contract unchanged
-/// whichever IOMMU, or none, sits behind it. devmgr chooses every IOVA; the
+/// original, the driver a full-rights copy it receives on), and neither hands
+/// one on, so no other process can send on it. devmgr spawns the driver,
+/// hands it each unit's register cap, and drives it from its registry, DMA,
+/// and fault-log threads, keeping the drivers' `devmgr_dma_labels` contract
+/// unchanged whichever IOMMU, or none, sits behind it. devmgr chooses every IOVA; the
 /// IOMMU driver installs and withdraws what devmgr asks and reports faults.
 /// No reply arrives before the hardware does what it states: a mapping
 /// withdrawn, or a device blocked, is unreachable by the device when the reply

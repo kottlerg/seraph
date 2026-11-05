@@ -39,7 +39,7 @@
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
 use std::os::seraph::thread::BuilderExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use firmware::dma::{Confinement, EDU_ID, iova_limit};
@@ -76,18 +76,45 @@ pub struct IommuClient
     /// Each unit's IOVA width (`QUERY_UNIT`), by unit index; set once the
     /// driver is ready.
     widths: OnceLock<Vec<u8>>,
-    failed: AtomicBool,
-    /// Whether the driver reported ready, after which its death leaves the
-    /// units translating.
-    ready: AtomicBool,
+    /// [`STATE_READY`] once the driver reported ready, after which its death
+    /// leaves the units translating, and [`STATE_FAILED`] once it died. One
+    /// atomic, so of the two threads that set them (the bring-up and the
+    /// death watch), exactly the one that sets the second bit sees both.
+    state: AtomicU8,
 }
+
+/// [`IommuClient::state`]: the driver reported ready.
+const STATE_READY: u8 = 1 << 0;
+/// [`IommuClient::state`]: the driver died.
+const STATE_FAILED: u8 = 1 << 1;
 
 impl IommuClient
 {
     /// Whether the driver has failed: every call is refused from then on.
     pub fn failed(&self) -> bool
     {
-        self.failed.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & STATE_FAILED != 0
+    }
+
+    /// Record that the driver reported ready, logging the fail-closed state
+    /// when it has already died.
+    fn mark_ready(&self)
+    {
+        let before = self.state.fetch_or(STATE_READY, Ordering::AcqRel);
+        if before & STATE_FAILED != 0
+        {
+            Self::log_failed();
+        }
+    }
+
+    /// Log the fail-closed state a death after the ready report leaves; the
+    /// one log line it gets.
+    fn log_failed()
+    {
+        std::os::seraph::log!(
+            "IOMMU driver died with translation enabled: every later DMA_MAP refused, \
+             confined devices withdrawn, no restart (#262)"
+        );
     }
 
     /// Call the driver with `msg` from the calling thread. `Err` with the
@@ -210,7 +237,8 @@ impl IommuClient
     }
 
     /// The driver has died: refuse every later call, log it once when the
-    /// driver had reported ready, and answer every call still queued on its
+    /// driver had reported ready (when the ready report is recorded after
+    /// this, [`Self::mark_ready`] logs it instead), and answer every call still queued on its
     /// endpoint with an error from a thread of devmgr's own, so no devmgr
     /// thread waits on a driver that will never receive. Called by the death
     /// watch ([`start_death_watch`]) as soon as the death posts, and again,
@@ -218,11 +246,12 @@ impl IommuClient
     /// whether this call was the first.
     pub fn fail(&self) -> bool
     {
-        if self.failed.swap(true, Ordering::AcqRel)
+        let before = self.state.fetch_or(STATE_FAILED, Ordering::AcqRel);
+        if before & STATE_FAILED != 0
         {
             return false;
         }
-        if self.ready.load(Ordering::Acquire)
+        if before & STATE_READY != 0
         {
             Self::log_failed();
         }
@@ -235,18 +264,6 @@ impl IommuClient
             std::os::seraph::log!("IOMMU drain thread not started; a queued IOMMU call may hang");
         }
         true
-    }
-}
-
-impl IommuClient
-{
-    /// Log the fail-closed state a death after the ready report leaves.
-    fn log_failed()
-    {
-        std::os::seraph::log!(
-            "IOMMU driver died with translation enabled: every later DMA_MAP refused, \
-             confined devices withdrawn, no restart (#262)"
-        );
     }
 }
 
@@ -598,7 +615,9 @@ fn unit_rounds(
 
 /// Discover the remapping units, spawn the IOMMU driver over them, and
 /// settle it; the [`Iommu`] once the driver reports ready, else `None`,
-/// logged once, and every device then runs unconfined.
+/// logged once, and every device then runs unconfined, except, when the
+/// driver was started but did not report ready, those behind a unit it
+/// turned translation on for before it failed, which that unit blocks.
 pub fn bring_up(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
@@ -665,6 +684,10 @@ pub fn bring_up(
         }
         Settled::NotReady =>
         {
+            // Wake the death watch: a spawn that failed before its observer
+            // bind leaves it no death to post. A queued death post, received
+            // first, ends it all the same.
+            let _ = syscall::event_post(death_eq, 0);
             std::os::seraph::log!(
                 "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
                  unconfined, except those behind a unit it turned translation on for \
@@ -673,13 +696,7 @@ pub fn bring_up(
             return None;
         }
     }
-    client.ready.store(true, Ordering::Release);
-    if client.failed()
-    {
-        // It died between its ready report and here: the death watch
-        // failed the client without the fail-closed line.
-        IommuClient::log_failed();
-    }
+    client.mark_ready();
     let handed = units.unit_index.iter().flatten().count();
     let _ = client.widths.set(query_widths(&client, handed));
     served.set_iommu(Arc::clone(&client));
@@ -773,8 +790,7 @@ fn start_death_watch() -> Option<(Arc<IommuClient>, u64)>
     let client = Arc::new(IommuClient {
         ep,
         widths: OnceLock::new(),
-        failed: AtomicBool::new(false),
-        ready: AtomicBool::new(false),
+        state: AtomicU8::new(0),
     });
     let watched = Arc::clone(&client);
     let started = std::thread::Builder::new()
@@ -813,8 +829,9 @@ enum Settled
     Ready,
     /// It was never started, so it turned no translation on.
     NotStarted,
-    /// It was started with every unit but did not report ready: dead, or
-    /// destroyed at the settle bound.
+    /// It was started but did not report ready: dead, destroyed at the
+    /// settle bound, or destroyed when a bootstrap round or an observer bind
+    /// failed after its start; it may have turned a unit's translation on.
     NotReady,
 }
 

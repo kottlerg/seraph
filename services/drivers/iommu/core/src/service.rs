@@ -20,11 +20,12 @@
 //! [`serve`] receives on the service endpoint for the rest of the driver's
 //! life and [`poll_faults`] polls the units' fault records on a thread of the
 //! driver's own; both reach the one [`Service`] through a [`Lock`] the
-//! driver supplies, held for one request or one poll. The lock is held
-//! across one IPC only: a request that needs table pages the backend's store
-//! lacks takes them from memmgr under it. The one other thread the lock
-//! serializes against is the fault poll, which then waits out that one
-//! memmgr round trip; no call into devmgr is ever made under it.
+//! driver supplies, held for one request or one poll. Two kinds of IPC are
+//! made under it: a request that needs table pages the backend's store
+//! lacks takes them from memmgr, and a backend failure path may log (a call
+//! to the log service). The one other thread the lock serializes against is
+//! the fault poll, which then waits those calls out; no call into devmgr is
+//! ever made under it.
 
 use alloc::vec::Vec;
 

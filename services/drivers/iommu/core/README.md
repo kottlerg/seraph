@@ -30,8 +30,8 @@ family's driver is its `main` and its `Backend`; VT-d's is
 
 The receive loop and the poll loop reach the one service through a lock the driver supplies, held
 for one request or one poll. A request that needs table pages the store lacks takes them from memmgr
-under it, the one IPC made under the lock, which the poll then waits out. Everything but the two
-loops is host-tested over a fake backend.
+under it, and a failure path may log under it; the poll waits those calls out, and no call into
+devmgr is made under the lock. Everything but the two loops is host-tested over a fake backend.
 
 ---
 

@@ -56,7 +56,8 @@ iommu/vtd/
     ├── main.rs          # Driver binary: bootstrap, register mapping, setup, the two loops
     ├── backend.rs       # The VT-d Backend: unit setup, attach, map, unmap, block, fault poll
     ├── store.rs         # Table pages from memmgr, mapped, with their physical addresses
-    └── arch/            # Cache-line flushing for a unit that does not snoop (x86_64)
+    └── arch/            # Cache-line flushing for a unit that does not snoop (x86_64; a
+                         #   documented no-op on riscv64, which builds no VT-d driver)
 ```
 
 ---

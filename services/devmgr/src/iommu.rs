@@ -531,9 +531,9 @@ impl Iommu
         }
     }
 
-    /// Whether `pci_dev` would be confined: a programmed unit translates it,
-    /// no RMRR names it, and the driver has not failed. No IPC;
-    /// [`Self::confine`] decides.
+    /// Whether `pci_dev` would be confined: a programmed unit translates it
+    /// by its own requester ID, no RMRR names it, and the driver has not
+    /// failed. No IPC; [`Self::confine`] decides.
     pub fn would_confine(&self, pci_dev: &pci::PciDevice) -> bool
     {
         matches!(self.placement(pci_dev), Placement::Unit(_)) && !self.client.failed()
@@ -542,8 +542,8 @@ impl Iommu
     /// Attach `pci_dev` to a domain of its own before its DMA grant, so its
     /// driver's mappings are confined to it: its confinement, unconfined
     /// when no unit translates it. Logged `Err` when it is refused: an RMRR
-    /// names it, its unit is not programmed, the driver has failed, or the
-    /// `ATTACH` fails.
+    /// names it, the RIMT renames its device ID, its unit is not programmed,
+    /// the driver has failed, or the `ATTACH` fails.
     pub fn confine(&self, name: &str, pci_dev: &pci::PciDevice) -> Result<Confinement, Refused>
     {
         let Some(unit) = self.unit_of(name, pci_dev)?

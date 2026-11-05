@@ -370,16 +370,19 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
 /// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES`), and each case's own splits
 /// and copies, which it deletes again. 16 pages hold the binding table and 13
 /// arena pages, 403 bodies (`syscall_abi::CSPACE_BODIES_PER_PAGE` a page), far
-/// above that peak; a shortfall fails the case that meets it with
-/// `OutOfMemory`.
+/// above that peak. A shortfall meets the serial port's binding first on
+/// x86-64: the binding fails, serial stays silent, and the boot ends as a
+/// `run-parallel` HANG with no ktest line; elsewhere it fails the case that
+/// meets it with `OutOfMemory`.
 const CSPACE_FUND_PAGES: u64 = 16;
 
 /// Donate [`CSPACE_FUND_PAGES`] to ktest's own `CSpace` (augment-mode
 /// `cap_create_cspace`) from spare RAM caps, as [`fund_boot_aspace_pt`] funds
 /// the address space and for the same reason: every inherited RAM cap except
 /// `memory_base`, which `frame_pool` splits and the retype-heavy cases draw
-/// on. Best-effort, accumulating across several caps; a short fund surfaces
-/// in the cases.
+/// on. Best-effort, accumulating across several caps; it runs before
+/// [`fund_boot_aspace_pt`], so the spare caps fund it first, and a short fund
+/// fails as [`CSPACE_FUND_PAGES`] describes.
 fn fund_own_cspace(info: &init_protocol::InitInfo)
 {
     let mut left = CSPACE_FUND_PAGES;
@@ -419,14 +422,16 @@ extern "C" fn run(info_ptr: u64) -> !
         halt();
     }
 
+    // Fund ktest's own CSpace's body arena before the first split or port
+    // binding (the I/O-port subdivider and `serial::init` below), and before
+    // the address-space top-up, so the spare caps fund the CSpace first: its
+    // shortfall silences serial, the top-up's only fails cases.
+    fund_own_cspace(info);
+
     // Fund extra PT growth budget on ktest's own (boot) AddressSpace before
     // anything maps MMIO into it (serial/framebuffer below, the hw::mmio_map
     // aperture later). Must precede `serial::init`/`framebuffer::init`.
     fund_boot_aspace_pt(info);
-
-    // Fund ktest's own CSpace's body arena before the first split or port
-    // binding (the I/O-port subdivider and `serial::init` below).
-    fund_own_cspace(info);
 
     // Seed the I/O port subdivider (x86-64) with the root IoPort cap so
     // `serial::init` and `arch::shutdown` can each carve only the ports

@@ -2053,11 +2053,14 @@ fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 ///
 /// # Errors
 /// `INVALID_ELF` when the image fails validation, its relocations do not
-/// all land, its stack note is out of range, or its TLS block does;
+/// all land, its stack note is out of range, its `PT_TLS` reaches past the
+/// image, or its TLS block is oversized, overaligned, or smaller than its
+/// template ([`alloc_main_tls_memory`], [`prepare_main_tls_from_bytes`]);
 /// `OUT_OF_MEMORY` when a kernel object, memory cap, badge, page, or the
-/// table entry cannot be had; a segment load's own code
-/// ([`loader::load_elf_segment_into_child`]); and the main TLS block's and
-/// [`populate_child_info`]'s codes.
+/// table entry cannot be had; a segment load's `OUT_OF_MEMORY` (its pages),
+/// `MAP_FAILED` (a scratch or child mapping), or `INSUFFICIENT_RIGHTS` (a
+/// rights derivation) ([`loader::load_elf_segment_into_child`]); and the main
+/// TLS block's and [`populate_child_info`]'s other codes.
 // similar_names: aspace/cspace are intentionally parallel kernel object names.
 #[allow(
     clippy::similar_names,

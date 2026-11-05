@@ -45,11 +45,8 @@ use process_abi::{PROCESS_ABI_VERSION, process_info_ref};
 /// A std-local type rather than a re-export of `process_abi::StackNote`, for
 /// the reason the retype-constant block below gives: an item reached through
 /// the sysroot-private ABI crate is unstable (`rustc_private`) to std's
-/// users. svctest declares its own stack through this type
-/// (`std::os::seraph::stack_pages!`), and its `stack_note_refused` phase has
-/// the loader refuse that note patched past `MAX_PROCESS_STACK_PAGES` and
-/// accept it restored, so a copy that parts from the ABI layout or values
-/// fails that harness.
+/// users. svctest's `stack_note_refused` phase guards this copy's layout
+/// (`abi/process-abi/README.md` § Stack-size note).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 #[repr(C)]
 pub struct StackNote {

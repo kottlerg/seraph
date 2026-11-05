@@ -14,7 +14,7 @@
 use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
-use iommu_core::{Backend, BackendError, Fault, UnitInfo};
+use iommu_core::{Access, Backend, BackendError, Fault, UnitInfo};
 use iommu_vtd::regs::{self, Capability};
 use iommu_vtd::tables::{
     SL_READ, SL_WRITE, SecondLevel, TableError, TableStore, context_entry, context_index,
@@ -360,10 +360,14 @@ impl Backend for Vtd
         iova: u64,
         phys: u64,
         len: u64,
-        write: bool,
+        access: Access,
     ) -> Result<(), BackendError>
     {
-        let rights = if write { SL_READ | SL_WRITE } else { SL_READ };
+        let rights = match access
+        {
+            Access::Read => SL_READ,
+            Access::ReadWrite => SL_READ | SL_WRITE,
+        };
         let mapped = domain.tables.map(&mut self.store, iova, phys, len, rights);
         let u = &self.units[domain.unit];
         u.flush_write_buffer()?;

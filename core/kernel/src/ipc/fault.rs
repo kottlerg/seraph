@@ -265,7 +265,8 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
 }
 
 /// Make one delivery of `info` through `tcb`'s binding and block until it is
-/// given a disposition, which is returned as a `fault_outcome` value.
+/// given a disposition, which is returned as its `fault_outcome` value, or
+/// return [`DELIVERY_UNBOUND`] when no binding was found.
 ///
 /// Mirrors [`crate::syscall::ipc::sys_ipc_call`] but commits the
 /// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from

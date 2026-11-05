@@ -5,7 +5,7 @@
 
 //! Pure bookkeeping logic for memmgr: the metadata arena, the free pool, the
 //! deferred list of reclaimed frames not yet pooled, the process index, and
-//! the demand-region interval arithmetic.
+//! the demand-region interval arithmetic and protection check.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a

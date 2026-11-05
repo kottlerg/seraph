@@ -437,9 +437,10 @@ ignore them.
 ### Label 7: `REGISTER_REGION`
 
 A demand-paged process registers an anonymous region it has reserved (but
-not backed). A later page fault inside the region is backed on demand by
-the fault arm below; a fault outside every registered region is declined
-(the thread is killed), preserving segfault semantics. Privilege:
+not backed). A later page fault inside the region that its protection permits
+is backed on demand by the fault arm below; a fault outside every registered
+region, or one its protection refuses, is declined (the thread is killed),
+preserving segfault semantics. Privilege:
 universal — attributed to the caller by `recv.badge`.
 
 **Request:**

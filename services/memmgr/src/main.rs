@@ -1537,9 +1537,9 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
-    // Already backed by an earlier chunk, the access granted: a fault another
-    // thread's fault on the same chunk raced, which the mapping now
-    // satisfies. Resume.
+    // Already backed by an earlier chunk: another thread's fault on the same
+    // chunk was served first, and its mapping satisfies this granted access.
+    // Resume.
     if l.frame_covering(rec, page_base, FRAME_VA_UNMAPPED)
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);

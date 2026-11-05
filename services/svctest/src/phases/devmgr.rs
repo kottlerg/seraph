@@ -38,7 +38,7 @@
 //! the hung fixture held, which only its destruction returns.
 //!
 //! The DMA confinement phase drives devmgr's `TEST_SPAWN_DMA_DRIVER` shim,
-//! which binds QEMU's `edu` device (attached on `x86_64` only) to the
+//! which binds QEMU's `edu` device (attached on both architectures) to the
 //! `test-dma` fixture, and asks the fixture to probe: a copy through a page
 //! its driver mapped (`DMA_MAP`) must arrive, and, where an IOMMU confines
 //! the device, a copy to the same device address after its `DMA_UNMAP` must

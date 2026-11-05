@@ -57,7 +57,7 @@ setup, overruns its settle bound, or that devmgr cannot record or serve. For a `
 it takes the device from the driver in an order that frees the driver's memory only once the
 device's DMA is confirmed stopped or blocked: it first withdraws the device's DMA capability,
 revoking every copy and dropping the device's mappings, which also blocks the device where an
-IOMMU confines it (the IOMMU driver's `BLOCK`, on x86-64); then it clears the function's Bus Master
+IOMMU confines it (the IOMMU driver's `BLOCK`); then it clears the function's Bus Master
 Enable through a configuration-page cap it keeps and no driver holds, so the device issues no
 further DMA; revokes the driver's mappings of its BARs; resets the device through a BAR cap it
 keeps (`device_status` 0, complete once the status reads back 0, bounded by `RESET_TIMEOUT`),

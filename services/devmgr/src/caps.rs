@@ -62,17 +62,17 @@ pub mod kind
 /// Only bootstrap-essential drivers ship as bundle modules — those
 /// needed to read anything off the disk in the first place (virtio-blk,
 /// fatfs, and the IOMMU driver that must confine the disk before its driver
-/// maps a ring; `iommu-vtd` on x86-64) plus the pre-vfsd console pair
-/// (serial, framebuffer). The
-/// per-arch RTC driver lives on the rootfs disk and is loaded lazily by
-/// devmgr through its `SET_DRIVERS_DIR` subtree cap; no `RTC` module is
-/// delivered.
+/// maps a ring: `iommu-vtd` on x86-64, `iommu-riscv` on riscv64) plus the
+/// pre-vfsd console pair (serial, framebuffer). The per-arch RTC driver
+/// lives on the rootfs disk and is loaded lazily by devmgr through its
+/// `SET_DRIVERS_DIR` subtree cap; no `RTC` module is delivered.
 pub mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
-    /// The IOMMU driver of the architecture's IOMMU family (`iommu-vtd`).
+    /// The IOMMU driver of the architecture's IOMMU family (`iommu-vtd`,
+    /// `iommu-riscv`).
     pub const IOMMU: u64 = 4;
     /// Number of module kinds: the tags run `1..=COUNT`, one module each.
     pub const COUNT: usize = 4;

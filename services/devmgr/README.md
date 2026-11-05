@@ -16,7 +16,8 @@ devmgr/
 │                                   #   served-driver ordinal table (tombstones),
 │                                   #   held interrupt-line table, DMA mapping table and
 │                                   #   IOVA allocator, DMA Remapping table (VT-d units,
-│                                   #   scopes, RMRRs)
+│                                   #   scopes, RMRRs), RISC-V IO Mapping Table (PCI
+│                                   #   IOMMUs, ID mappings)
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown

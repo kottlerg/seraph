@@ -65,10 +65,10 @@ pub use syscall_abi::{
     RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
     RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
     RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
-    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP,
-    RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC,
-    RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD,
-    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
+    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
+    RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
+    RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
+    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -1611,6 +1611,34 @@ pub fn cap_info(slot: u64, field: u64) -> Result<u64, i64>
     // for tag-specific fields, selector recognition) and returns the requested
     // field value.
     let ret = unsafe { syscall4(SYS_CAP_INFO, slot, field, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Read the physical base of `memory_cap` (`CAP_INFO_MEMORY_PHYS_BASE`),
+/// presenting `credential`, a Memory cap of the caller's carrying
+/// `RIGHTS_MEM_PHYS`, for a `memory_cap` that lacks the right itself
+/// (`0` presents none).
+///
+/// # Errors
+/// The kernel's negative error code: `InsufficientRights` when neither cap
+/// carries `RIGHTS_MEM_PHYS`, `InvalidCapability` when `credential` is not a
+/// live Memory cap, `InvalidArgument` when `memory_cap` is not a Memory cap.
+// cast_sign_loss: ret is checked non-negative before the cast.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn cap_info_phys_base(memory_cap: u64, credential: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall4 issues raw syscall instruction; the arguments are two
+    // cap handles and the selector, all validated by the kernel.
+    let ret = unsafe {
+        syscall4(
+            SYS_CAP_INFO,
+            memory_cap,
+            CAP_INFO_MEMORY_PHYS_BASE,
+            credential,
+            0,
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 

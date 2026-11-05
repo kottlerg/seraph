@@ -1658,6 +1658,27 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
     })
 }
 
+/// The `FAULT_ACCESS_PRESENT` bit a fault message carries for a fault at the
+/// user address `va` that no `#PF` error code describes (a kernel copy's,
+/// delivered by the syscall dispatcher): whether the live tables map `va`, as
+/// the error code's P bit would report for the same access from user mode.
+///
+/// # Safety
+/// Must run at ring 0 in the faulting thread's context, with its CR3 active.
+#[cfg(not(test))]
+pub unsafe fn copy_fault_present(va: u64) -> bool
+{
+    if va >= user_va_top()
+    {
+        return false;
+    }
+    // SAFETY: ring 0; reads CR3 to recover the active page-table root.
+    let root_phys = unsafe { read_root_phys() };
+    let root_virt = crate::mm::paging::phys_to_virt(root_phys);
+    // SAFETY: root_virt is the direct-map VA of the active root.
+    unsafe { translate_user_page(root_virt, va) }.is_some()
+}
+
 /// The decision of [`user_fault_is_spurious`], with the live leaf PTE of a `va`
 /// below [`user_va_top`] supplied by `live_leaf` (`None` when `va` is
 /// unmapped). `live_leaf` is not called for a `va` at or above it.

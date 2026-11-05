@@ -55,6 +55,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 mod arch;
 mod bench;
 mod cmdline;
+mod cspace_geometry;
 mod frame_pool;
 mod framebuffer;
 mod init_info;

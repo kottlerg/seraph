@@ -434,7 +434,9 @@ A process dies when:
   and never returns from it, unless another thread's syscall still pins the object, or an Mmio
   capability's object records a mapping into that `AddressSpace`: the delete then returns, and the
   stop follows when that syscall releases the object or that Mmio object is freed.
-- An unhandled fault terminates its threads.
+- An unhandled fault of a thread's own access terminates its threads; an unhandled fault of a
+  restartable syscall's copy of a user buffer fails that syscall instead (see
+  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
 
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent
 syscall is still using is freed only once that syscall is done with it, and a stopped thread's

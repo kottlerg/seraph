@@ -30,6 +30,13 @@
 //! hardware), where a broken spurious-fault classifier kills the child and fails
 //! the test. The companion `fault_kills_thread` test covers the genuine-fault
 //! kill side.
+//!
+//! The test runs twice: once with the child's step-4 write a store, and once
+//! with it the kernel's own copy, a `SYS_GETRANDOM` into the page with no
+//! fault handler bound. The copy's stale-TLB fault is retried by the trap
+//! handler's copy-region check (docs/fault-handling.md § Kernel Copies), so the
+//! call fills the page; a missing check fails it with `InvalidAddress`. The
+//! same TCG caveat applies.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -50,10 +57,16 @@ const SENTINEL: u64 = 0xCAFE_F00D;
 const PHASE_MAPPED: u32 = 1; // parent: page mapped read-only
 const PHASE_CACHED: u32 = 2; // child: read the page, TLB entry now cached
 const PHASE_WIDENED: u32 = 3; // parent: widened to read-write (shootdown elided)
-const PHASE_WROTE: u32 = 4; // child: store completed (retry succeeded)
+const PHASE_WROTE: u32 = 4; // child: store or copy completed (retry succeeded)
 
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static RESULT: AtomicU64 = AtomicU64::new(0);
+/// How the child makes its step-4 write: [`WRITE_STORE`] or [`WRITE_COPY`].
+static WRITE_MODE: AtomicU32 = AtomicU32::new(WRITE_STORE);
+/// Step 4 is a user-mode store.
+const WRITE_STORE: u32 = 0;
+/// Step 4 is a `SYS_GETRANDOM` the kernel copies into the page.
+const WRITE_COPY: u32 = 1;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
@@ -80,9 +93,16 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: integration::tlb_widen_retry SKIP (need 2+ CPUs)");
         return Ok(());
     }
+    run_mode(ctx, WRITE_STORE)?;
+    run_mode(ctx, WRITE_COPY)
+}
 
+/// One round of the test, the child's step-4 write made as `mode` says.
+fn run_mode(ctx: &TestContext, mode: u32) -> TestResult
+{
     PHASE.store(0, Ordering::Release);
     RESULT.store(0, Ordering::Release);
+    WRITE_MODE.store(mode, Ordering::Release);
 
     let memory_cap =
         crate::frame_pool::alloc().ok_or("integration::tlb_widen_retry: frame pool exhausted")?;
@@ -163,7 +183,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     if RESULT.load(Ordering::Acquire) != SENTINEL
     {
         cleanup(ctx, Some(&mut child), memory_cap);
-        return Err("integration::tlb_widen_retry: widened write produced the wrong value");
+        return Err(
+            if mode == WRITE_COPY
+            {
+                "integration::tlb_widen_retry: the kernel's copy into the widened mapping failed"
+            }
+            else
+            {
+                "integration::tlb_widen_retry: widened write produced the wrong value"
+            },
+        );
     }
 
     cleanup(ctx, Some(&mut child), memory_cap);
@@ -254,9 +283,11 @@ fn cleanup(ctx: &TestContext, child: Option<&mut crate::spawn::SpawnedChild>, me
 }
 
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then
-/// store through it. The store completes via the kernel's spurious-fault retry
-/// when a hardware TLB faults on the stale read-only entry. `spin_bound` is the
-/// stretched [`SPIN_BOUND`] each wait spins at most.
+/// write through it, by a store or by the kernel's `SYS_GETRANDOM` copy as
+/// [`WRITE_MODE`] says. The write completes via the kernel's spurious-fault
+/// retry (the user-mode one, or the copy-region one) when a hardware TLB faults
+/// on the stale read-only entry. `spin_bound` is the stretched [`SPIN_BOUND`]
+/// each wait spins at most.
 extern "C" fn widen_child(spin_bound: u64) -> !
 {
     let p = WIDEN_VA as *mut u64;
@@ -274,14 +305,30 @@ extern "C" fn widen_child(spin_bound: u64) -> !
     {
         syscall::thread_exit();
     }
-    // Store through the now-widened mapping. A stale read-only TLB entry faults;
-    // the kernel re-walks the live RW PTE and retries, so the store completes.
-    // SAFETY: WIDEN_VA is mapped read-write; any fault is resolved by the kernel.
-    unsafe {
-        p.write_volatile(SENTINEL);
+    let got = if WRITE_MODE.load(Ordering::Acquire) == WRITE_COPY
+    {
+        // The kernel copies into the now-widened mapping. A stale read-only
+        // TLB entry faults inside the copy; the trap handler re-walks the live
+        // RW PTE and retries the copy, so the call fills the page instead of
+        // failing with InvalidAddress (no fault handler is bound).
+        // SAFETY: WIDEN_VA is a scratch page mapped read-write that holds no
+        // Rust object; the kernel writes 8 bytes of it.
+        let filled = unsafe { syscall::getrandom_raw(p.cast::<u8>(), 8) };
+        if filled == Ok(8) { SENTINEL } else { 0 }
     }
-    // SAFETY: read back the value just written through the same mapping.
-    let got = unsafe { p.read_volatile() };
+    else
+    {
+        // Store through the now-widened mapping. A stale read-only TLB entry
+        // faults; the kernel re-walks the live RW PTE and retries, so the
+        // store completes.
+        // SAFETY: WIDEN_VA is mapped read-write; any fault is resolved by the
+        // kernel.
+        unsafe {
+            p.write_volatile(SENTINEL);
+        }
+        // SAFETY: read back the value just written through the same mapping.
+        unsafe { p.read_volatile() }
+    };
     RESULT.store(got, Ordering::Release);
     PHASE.store(PHASE_WROTE, Ordering::Release);
 

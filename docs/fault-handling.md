@@ -17,6 +17,8 @@ In scope:
 - The per-thread fault-handler binding and the syscall that sets it.
 - The fault taxonomy and the fault-message contract delivered to the handler.
 - The suspend / deliver / resume / kill state machine.
+- The faults a syscall's copy of a caller-supplied buffer takes, and the restart of
+  that syscall.
 - Liveness, recursion, and security rules.
 
 Out of scope (the kernel never does these):
@@ -42,9 +44,11 @@ fault kinds: `SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler bindin
 (every other kernel-unresolvable ring-3 exception — illegal instruction, breakpoint,
 alignment, divide, …), and the [resume and kill](#delivery-resume-and-kill) state machine —
 including register inspection and modification of a fault-blocked thread via
-[`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread). A thread with
-no handler bound is still terminated, the behavior for all faults absent this mechanism. One
-x86-64 kernel check is terminal even with a handler bound: a syscall return RIP that is not
+[`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread) — and the
+restart of a syscall whose copy of a user buffer faults ([Kernel Copies](#kernel-copies)). A
+thread with no handler bound is still terminated on a fault of its own access, the behavior for
+all faults absent this mechanism (a kernel copy's fault fails its syscall instead). One x86-64
+kernel check is terminal even with a handler bound: a syscall return RIP that is not
 canonical, which no user action can produce (the top user page is unmappable) and which the
 exit path kills as a user `#GP` without delivery, since no handler edit could make that return
 valid (see
@@ -105,13 +109,15 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
    continues from a handler-modified instruction pointer).
 
 If the thread has **no** fault handler bound, the fault is terminal: the thread is killed with exit
-reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. On
-x86-64, `#DF`, `#MC`, and a hardware NMI that finds no watchdog backtrace request pending are not
-the thread's faults: they are never delivered to a handler, record no exit reason, and halt the CPU
-they arrive on whatever ring they interrupt, leaving the interrupted thread `current` there with no
-death event posted. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
-(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit
-code can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
+reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. A fault
+of a restartable syscall's copy of a user buffer is the exception: it fails that syscall with
+`InvalidAddress` instead (see [Kernel Copies](#kernel-copies)). On x86-64, `#DF`, `#MC`, and a
+hardware NMI that finds no watchdog backtrace request pending are not the thread's faults: they
+are never delivered to a handler, record no exit reason, and halt the CPU they arrive on whatever
+ring they interrupt, leaving the interrupted thread `current` there with no death event posted.
+Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it (see
+[Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit code
+can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
 
 Fault delivery reuses the synchronous IPC machinery of [IPC Design](ipc-design.md): the
 suspended thread occupies the same role as a caller blocked awaiting a reply, and the
@@ -150,12 +156,12 @@ holds the endpoint, and releases it before the faulting thread parks; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)).
 A delivery therefore carries the badge bound with the endpoint it reaches, and a rebind or
 unbind concurrent with a fault never frees the endpoint mid-delivery. A fault whose delivery
-finds the binding already cleared is unhandled: the thread is killed.
+finds the binding already cleared is unhandled (see [Reply](#reply)).
 
 A thread has a single fault handler covering all fault classes it is bound for. The
 handler dispatches on the fault kind (see [Fault Message](#fault-message)) and replies
-[`FAULT_REPLY_KILL`](#reply) for kinds it does not handle, recovering the default
-terminal behavior for those kinds.
+[`FAULT_REPLY_KILL`](#reply) for kinds it does not handle, recovering for those kinds
+the outcome they have with no handler bound.
 
 ### Inheritance is userspace policy
 
@@ -225,13 +231,16 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   implemented, #242), the handler thread receives again while the fault reply is still pending, with
   a receive that passes its capability and headroom checks ([Liveness](#liveness) rule 2), or the
   handler endpoint is destroyed while the fault is still queued on it ([Liveness](#liveness) rule 3)
-  — the faulting thread is killed, exactly as an unhandled fault. A stop of the faulting thread
-  before any reply claims the fault also cancels the episode, but kills nothing at once: it gives
-  the episode a kill outcome and leaves the thread `Stopped`; when next started, the thread is
-  killed as an unhandled fault. A stop after the handler's reply claimed the fault leaves that
-  reply's disposition: when next started, the thread resumes on a `FAULT_REPLY_RESUME` reply and is
-  killed on a `FAULT_REPLY_KILL` reply. Destroying it while stopped ends it as for any stopped
-  thread. A cancelled fault-blocked thread is never resumed.
+  — the fault is unhandled ([Reply](#reply)): the faulting thread is killed, or, for a kernel
+  copy's fault, its syscall fails ([Kernel Copies](#kernel-copies)). A stop of the faulting thread
+  before any reply claims the fault also cancels the episode, but acts on nothing at once: it gives
+  the episode a kill outcome and leaves the thread `Stopped`; when next started, the fault is
+  unhandled. A stop after the handler's reply claimed the fault leaves that reply's disposition:
+  when next started, the thread resumes on a `FAULT_REPLY_RESUME` reply, and the fault is unhandled
+  on a `FAULT_REPLY_KILL` reply. Destroying it while stopped ends it as for any stopped
+  thread. A cancelled fault-blocked thread is never resumed at its faulting instruction: a thread
+  whose own access faulted is killed (a stopped one when next started), and one whose kernel
+  copy faulted has that syscall fail.
 
 ### Modifying the faulting thread
 
@@ -249,8 +258,56 @@ take effect on resume. A handler that cannot make progress replies
 The kernel ignores reply data words. The reply **label** conveys disposition:
 
 - `FAULT_REPLY_RESUME` — resume the faulting thread (the default).
-- `FAULT_REPLY_KILL` — the handler declines; the kernel kills the faulting thread as an
-  unhandled fault.
+- `FAULT_REPLY_KILL` — the handler declines.
+
+A declined fault, like every other unhandled one (the binding cleared before delivery, or the
+delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the outcome it
+has with no handler bound: a fault of a user-mode access kills the thread, and a fault of a
+kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
+has this one meaning whatever raised the fault. The message is the same for both, and the handler
+never chooses between the outcomes; binding a handler never changes the outcome of a fault it
+declines. A handler that wants a thread ended whose kernel-copy fault it declines stops or
+destroys it through its Thread capability.
+
+---
+
+## Kernel Copies
+
+A syscall that copies to or from a caller-supplied user buffer can fault on that buffer inside the
+kernel: the buffer lies on a page the pager has not backed (a demand region no access has reached,
+or a page the pager has since reclaimed), or on a page whose mapping forbids the access. The
+restartable syscalls, `SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, and `SYS_THREAD_WRITE_REGS`
+([syscalls.md § Restartable Syscalls](../core/kernel/docs/syscalls.md#restartable-syscalls)), take
+the fault path for such a fault:
+
+- **Delivery.** With a handler bound, the kernel delivers `FAULT_KIND_VM` as for a user-mode access
+  to the same address from the syscall instruction: the faulting address, the access (write for a
+  copy to the buffer, read for a copy from it; bit 3 under the rules of
+  [Fault Message](#fault-message)), and the syscall instruction as the faulting instruction
+  pointer. The thread is fault-blocked with its register frame at that instruction, and the handler
+  reads and edits it as for any fault.
+- **Restart.** On `FAULT_REPLY_RESUME` the thread re-executes the syscall instruction: the syscall
+  runs again from its start, with the frame's argument registers (as the handler left them), or the
+  thread continues from an instruction pointer the handler wrote. A restartable syscall changes
+  nothing visible outside the call before its copy and writes no register of the caller's frame,
+  so its re-execution is a first call; a syscall MUST meet that rule to copy through this path.
+- **No progress.** A handler that resumes without making the access satisfiable takes the same
+  fault again on the re-execution, as a user-mode access would: each round is a full delivery to
+  the handler, never a kernel retry, and ending the loop is the handler's policy.
+- **Unhandled.** A fault the handler declines, or that is otherwise unhandled ([Reply](#reply)),
+  fails the syscall with `InvalidAddress`; the thread continues past the syscall instruction, or
+  from an instruction pointer the handler wrote. With no handler bound the syscall fails with
+  `InvalidAddress` at once.
+- **Stale entries.** A copy fault the live page tables already satisfy (a stale TLB entry, which a
+  mapping the handler just installed can leave on another CPU) is retried in the kernel, as a
+  user-mode fault is, and reaches neither the handler nor the caller.
+
+The kernel cannot tell an address the pager registered from one it did not; the handler's reply
+decides, as for a user-mode access. The registered IPC buffer page
+([syscalls.md § `SYS_IPC_BUFFER_SET`](../core/kernel/docs/syscalls.md#sys_ipc_buffer_set-42)) is
+not a caller-supplied buffer here: the kernel reads and writes it during IPC, around effects the
+operation has committed, so it MUST stay mapped while IPC uses it, and a fault on it never reaches
+the handler.
 
 ---
 
@@ -264,12 +321,12 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
    [Fault-Handler Binding](#fault-handler-binding)), so a release that drops the endpoint's
    last reference while a fault is queued on it destroys the endpoint under rule 3.
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
-   releases any fault-blocked thread awaiting that handler, killing it (the
-   [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread while
-   the fault-blocked thread's reply is still pending (a receive that passes its capability and
-   headroom checks; see [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that
-   only exits, or is stopped `Exited` by an object teardown, keeps its pending fault reply until
-   it is destroyed.
+   releases any fault-blocked thread awaiting that handler, leaving its fault unhandled (the
+   [Kill](#delivery-resume-and-kill) path: the thread is killed, or its kernel copy's syscall
+   fails), as does a later receive on the handler thread while the fault-blocked thread's reply
+   is still pending (a receive that passes its capability and headroom checks; see
+   [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that only exits, or is
+   stopped `Exited` by an object teardown, keeps its pending fault reply until it is destroyed.
 3. A faulting thread blocked on a handler endpoint that has not yet received is released if
    that endpoint is destroyed.
 4. Handler death is a system-level failure. Clients block on their next fault until a
@@ -282,10 +339,10 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
 
 Fault delivery for a thread is itself an operation that may fault — a handler thread can
 take a fault while servicing one. Resolution is per-thread chaining: a handler's own faults
-go to *its* handler, and a thread with no handler is killed, terminating the chain. A
-handler-bearing subsystem (e.g. a pager) MUST be reachable without itself depending on the
-fault path — its own threads have no handler bound, or are eager-mapped — so the chain is
-finite.
+go to *its* handler, and a fault of a thread with no handler is unhandled ([Reply](#reply)),
+which terminates the chain. A handler-bearing subsystem (e.g. a pager) MUST be reachable without
+itself depending on the fault path — its own threads have no handler bound, or are eager-mapped —
+so the chain is finite.
 
 A thread MUST NOT be bound to a fault-handler endpoint that only it receives on; such a
 thread would block on its own fault endpoint indefinitely.
@@ -335,13 +392,10 @@ faults on an address the pager declines (see
 [Userspace Memory Model § Bootstrap Cross-Boundary VAs](userspace-memory-model.md#bootstrap-cross-boundary-vas)
 and [ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)).
 
-Only a userspace access takes the fault path. A kernel copy into or out of a caller-supplied
-user buffer (the `SYS_GETRANDOM` destination, the `SYS_THREAD_READ_REGS` and
-`SYS_THREAD_WRITE_REGS` buffers) that reaches a page of a demand region the pager has not yet
-backed fails the syscall with `InvalidAddress`; the fault is not delivered to the handler. A
-caller whose buffer may lie on such a page MUST touch it first. On a stack this needs an
-uninitialised buffer in a chunk (the `DEMAND_CHUNK_PAGES` window memmgr backs per fault) that no
-store of the thread has yet reached.
+A kernel copy into or out of a caller-supplied buffer on a page of a demand region the pager has
+not yet backed takes the same path through the restartable syscalls: the pager backs the page and
+the syscall re-executes ([Kernel Copies](#kernel-copies)), so a caller need not touch its buffer
+first.
 
 ### Default System Pager
 

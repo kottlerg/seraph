@@ -7,13 +7,16 @@
 //! the thread's bound fault-handler endpoint and block until it is resolved.
 //!
 //! This is the shared, architecture-independent core of the fault-handler
-//! protocol (`docs/fault-handling.md`). The architecture trap handlers (x86-64
-//! `#PF` and the other user exception vectors; RISC-V page-fault and other
-//! U-mode exception causes) build a [`FaultInfo`] of kind `FAULT_KIND_VM` or
-//! `FAULT_KIND_EXCEPTION`, marshal their register frame into the canonical
-//! [`TrapFrame`] the handler will read/edit, then call [`fault_dispatch`]; the
-//! disposition it returns tells the arch handler whether to resume
-//! (re-execute the faulting instruction) or kill.
+//! protocol (`docs/fault-handling.md`). Two callers build a [`FaultInfo`] and
+//! call [`fault_dispatch`] with the canonical [`TrapFrame`] the handler will
+//! read/edit published: the architecture trap handlers (x86-64 `#PF` and the
+//! other user exception vectors; RISC-V page-fault and other U-mode exception
+//! causes), for `FAULT_KIND_VM` or `FAULT_KIND_EXCEPTION`, and the syscall
+//! dispatcher (`syscall::deliver_copy_fault`), for the `FAULT_KIND_VM` of a
+//! restartable syscall's user copy. The disposition it returns tells the
+//! caller whether to resume (re-execute the faulting instruction, or the
+//! syscall) or to take the unhandled outcome: a kill for a trap, the
+//! syscall's `InvalidAddress` for a copy.
 //!
 //! Delivery reuses the synchronous-IPC machinery: the faulting thread takes the
 //! caller role (parked in [`IpcThreadState::BlockedOnFault`] rather than
@@ -32,8 +35,9 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 pub const FAULT_OUTCOME_PENDING: u8 = 0;
 /// [`ThreadControlBlock::fault_outcome`] value: resume (re-execute / continue).
 pub const FAULT_OUTCOME_RESUME: u8 = 1;
-/// [`ThreadControlBlock::fault_outcome`] value: kill (handler declined, handler
-/// thread destroyed, binding severed, or thread cancelled).
+/// [`ThreadControlBlock::fault_outcome`] value: unhandled (handler declined,
+/// handler thread destroyed, binding severed, or thread cancelled): the
+/// faulting thread is killed, or its restartable syscall fails.
 pub const FAULT_OUTCOME_KILL: u8 = 2;
 
 /// Architecture-neutral description of a fault, marshalled into the fault
@@ -51,23 +55,26 @@ pub struct FaultInfo
     pub ip: u64,
 }
 
-/// Disposition returned by [`fault_dispatch`] to the architecture fault handler.
+/// Disposition returned by [`fault_dispatch`] to its caller, the architecture
+/// fault handler or the syscall dispatcher.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FaultOutcome
 {
-    /// Resume the faulting thread (re-execute the faulting instruction, or
-    /// continue from a handler-modified instruction pointer).
+    /// Resume the faulting thread (re-execute the faulting instruction or
+    /// syscall, or continue from a handler-modified instruction pointer).
     Resume,
-    /// Kill the faulting thread as an unhandled fault.
+    /// The fault is unhandled: the architecture handler kills the faulting
+    /// thread, and the syscall dispatcher fails the restartable syscall with
+    /// `InvalidAddress` (docs/fault-handling.md § Reply).
     Kill,
 }
 
 /// True iff `tcb` has a fault handler bound at the moment of the load.
 ///
-/// A lock-free pre-check for the architecture handlers only: a concurrent
-/// unbind may clear the binding before [`fault_dispatch`] runs, so the
-/// dispatcher's own load under `sched_lock` decides, and a binding found
-/// cleared there takes the unhandled-fault kill.
+/// A lock-free pre-check for the architecture handlers and the syscall
+/// dispatcher: a concurrent unbind may clear the binding before
+/// [`fault_dispatch`] runs, so its own load under `sched_lock` decides, and a
+/// binding found cleared there takes the unhandled outcome.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer.

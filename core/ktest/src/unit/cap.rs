@@ -760,20 +760,26 @@ pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
 /// Hardening).
 pub fn lookup_bounds(ctx: &TestContext) -> TestResult
 {
+    use crate::cspace_geometry::{DIR_FANOUT, DIRECT_LEAVES, INDIRECT_DIRS};
     use syscall_abi::{
-        CAP_GEN_MASK, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_TAG_RIGHTS, cap_handle_encode,
+        CAP_GEN_MASK, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_TAG_RIGHTS, CSPACE_SLOTS_PER_PAGE,
+        cap_handle_encode,
     };
 
+    // The kernel's leaf layout (crate::cspace_geometry): DIRECT_LEAVES direct
+    // leaves, then INDIRECT_DIRS directory pages of DIR_FANOUT leaves, each
+    // leaf CSPACE_SLOTS_PER_PAGE slots. `FIRST_INDIRECT` is the first slot of
+    // the indirect region, `CEILING` the structural slot ceiling.
+    const FIRST_INDIRECT: u64 = DIRECT_LEAVES * CSPACE_SLOTS_PER_PAGE;
+    const CEILING: u64 = (DIRECT_LEAVES + INDIRECT_DIRS * DIR_FANOUT) * CSPACE_SLOTS_PER_PAGE;
+    // A handle's slot index is its low 32 bits, so the probes past the ceiling
+    // (`CEILING + 1` the largest derived one) must fit them.
+    const _: () = assert!(CEILING < u32::MAX as u64 - 1);
+
     let invalid = SyscallError::InvalidCapability as i64;
-    // The kernel's leaf layout (core/kernel/src/cap/cspace.rs): 128 direct
-    // leaves, then 128 directory pages of 512 leaves, each leaf
-    // CSPACE_SLOTS_PER_PAGE slots. `first_indirect` is the first slot of the
-    // indirect region, `ceiling` the structural slot ceiling.
-    // cast_possible_truncation: CSPACE_SLOTS_PER_PAGE is 56.
+    // cast_possible_truncation: the assert above keeps both values within u32.
     #[allow(clippy::cast_possible_truncation)]
-    let per_leaf = syscall_abi::CSPACE_SLOTS_PER_PAGE as u32;
-    let first_indirect = 128 * per_leaf;
-    let ceiling = (128 + 128 * 512) * per_leaf;
+    let (first_indirect, ceiling) = (FIRST_INDIRECT as u32, CEILING as u32);
     let below_ceiling = [
         1,
         first_indirect - 1,

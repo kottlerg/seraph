@@ -219,7 +219,8 @@ impl Heap {
     /// Touch every demand-floor page below `end` not yet touched, so the
     /// pager backs it before the allocator hands it out.
     fn back_floor_to(&mut self, end: usize) {
-        // Kernel user copies fail on an unbacked page rather than fault to the pager.
+        // A spawned thread's IPC buffer is a heap page, and the kernel's IPC-buffer
+        // copies fail on an unbacked page rather than fault to the pager.
         let end = end.min(self.floor_end);
         let page = PAGE_SIZE as usize;
         let mut va = self.floor_backed_end;

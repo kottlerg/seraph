@@ -280,7 +280,7 @@ impl TableExt for ProcessTable
         let child_cspace = entry.cspace_cap;
 
         let scratch = ScratchMapping::map(self_aspace, pi_memory, 1, syscall::MAP_WRITABLE)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         let scratch_va = scratch.va();
 
         // SAFETY: scratch_va is mapped writable for one page; PI struct
@@ -1075,6 +1075,13 @@ impl ChildInfoCaps
 /// split keeps the core `CREATE_PROCESS` path stdio-agnostic and lets
 /// spawners pipe each direction independently.
 ///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY` when the page's allocation, its
+/// mapping, a capability derivation or copy into the child, or the
+/// argv/env region's funding or mapping fails: every create label names
+/// that code for these failures
+/// (`services/procmgr/docs/ipc-interface.md` § Label 1 and § Label 13).
+///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
@@ -1105,24 +1112,27 @@ unsafe fn populate_child_info(
     process_badge: u64,
     sched: ChildSched,
     layout: &ProcessLayout,
-) -> Option<ChildInfoCaps>
+) -> Result<ChildInfoCaps, u64>
 {
-    // Guarded from allocation: every early `None` below deletes the slot.
-    let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
-        universals.memmgr_endpoint,
-        ipc_buf,
-    )?);
-    let scratch = ScratchMapping::map(self_aspace, pi_memory.cap(), 1, syscall::MAP_WRITABLE)?;
+    // Guarded from allocation: every early `Err` below deletes the slot.
+    let pi_memory = CapGuard::new(
+        crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
+    );
+    let scratch = ScratchMapping::map(self_aspace, pi_memory.cap(), 1, syscall::MAP_WRITABLE)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let scratch_va = scratch.va();
     // SAFETY: scratch_va mapped writable, one page.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     let child_thread_in_child =
-        syscall::cap_copy(child_thread, child_cspace, syscall::RIGHTS_THREAD).ok()?;
-    let child_aspace_in_child =
-        syscall::cap_copy(child_aspace, child_cspace, syscall::RIGHTS_ALL).ok()?;
+        syscall::cap_copy(child_thread, child_cspace, syscall::RIGHTS_THREAD)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let child_aspace_in_child = syscall::cap_copy(child_aspace, child_cspace, syscall::RIGHTS_ALL)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let child_cspace_in_child =
-        syscall::cap_copy(child_cspace, child_cspace, syscall::RIGHTS_CS_ALL).ok()?;
+        syscall::cap_copy(child_cspace, child_cspace, syscall::RIGHTS_CS_ALL)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
 
     let creator_ep_in_child = if creator_endpoint != 0
     {
@@ -1131,7 +1141,7 @@ unsafe fn populate_child_info(
         // fall back to SEND for badged send caps used by the bootstrap protocol.
         syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_ALL)
             .or_else(|_| syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_EP_SEND))
-            .ok()?
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1162,9 +1172,10 @@ unsafe fn populate_child_info(
                 syscall::RIGHTS_EP_SEND_GRANT,
                 process_badge,
             )
-            .ok()?,
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
         );
-        syscall::cap_copy(badged.cap(), child_cspace, syscall::RIGHTS_EP_SEND_GRANT).ok()?
+        syscall::cap_copy(badged.cap(), child_cspace, syscall::RIGHTS_EP_SEND_GRANT)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1187,9 +1198,10 @@ unsafe fn populate_child_info(
                 syscall::RIGHTS_EP_SEND,
                 process_badge,
             )
-            .ok()?,
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
         );
-        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND).ok()?
+        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1210,9 +1222,10 @@ unsafe fn populate_child_info(
                 syscall::RIGHTS_EP_SEND,
                 process_badge,
             )
-            .ok()?,
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
         );
-        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND).ok()?
+        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1237,18 +1250,22 @@ unsafe fn populate_child_info(
     {
         if sched.band_max >= ipc::sched_policy::BASELINE_PRIORITY_MAX
         {
-            syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL).ok()?
+            syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
         }
         else
         {
             let own_copy = CapGuard::new(
-                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL).ok()?,
+                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL)
+                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
             );
-            let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max + 1).ok()?;
+            let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max + 1)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             // The split consumed `own_copy`; its two halves replace it.
             let _ = own_copy.disarm();
             let (low, _high) = (CapGuard::new(low), CapGuard::new(high));
-            syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL).ok()?
+            syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
         }
     }
     else
@@ -1291,7 +1308,7 @@ unsafe fn populate_child_info(
             child_cspace,
             syscall::RIGHTS_EP_SEND_GRANT,
         )
-        .ok()?
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {
@@ -1341,8 +1358,7 @@ unsafe fn populate_child_info(
                 &argv_env,
                 layout,
             )
-        }
-        .ok()?;
+        }?;
     }
     let h = argv_env.header;
     (pi.args_offset, pi.args_bytes, pi.args_count) = if h.args_bytes == 0
@@ -1372,7 +1388,10 @@ unsafe fn populate_child_info(
 
     drop(scratch);
 
-    let pi_ro = CapGuard::new(syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
+    let pi_ro = CapGuard::new(
+        syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
+    );
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
     unsafe {
@@ -1385,12 +1404,12 @@ unsafe fn populate_child_info(
             syscall::MAP_FROM_CAP,
         )
     }
-    .ok()?;
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     // pi_memory and argv_env_memory stay in procmgr's CSpace as the teardown
     // handles (revoke cascades to any descendants); the mappings don't need
     // the map-only derivations to outlive this call, so their guards delete
     // them on return.
-    Some(ChildInfoCaps {
+    Ok(ChildInfoCaps {
         pi_memory,
         argv_env_memory: argv_env.memory,
     })
@@ -1469,7 +1488,8 @@ fn alloc_main_tls_memory(
             crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)?
         },
     );
-    let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), pages, syscall::MAP_WRITABLE)?;
+    let scratch =
+        ScratchMapping::map(self_aspace, tls_memory.cap(), pages, syscall::MAP_WRITABLE).ok()?;
     let scratch_va = scratch.va();
 
     // SAFETY: scratch_va is mapped writable for `pages` pages.
@@ -1996,7 +2016,7 @@ fn bind_pager(
 /// stays eager.
 fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 {
-    let Some(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
+    let Ok(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)
     else
     {
         return;
@@ -2232,7 +2252,8 @@ fn create_process_from_bytes(
             sched,
             &layout,
         )
-    }?;
+    }
+    .ok()?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     unsafe {
@@ -2294,7 +2315,7 @@ pub fn create_process(
     sched: ChildSched,
 ) -> Option<CreateResult>
 {
-    let (module_scratch, module_pages) = loader::map_module(module_memory_cap, self_aspace)?;
+    let (module_scratch, module_pages) = loader::map_module(module_memory_cap, self_aspace).ok()?;
     let module_size = module_pages * PAGE_SIZE;
     let module_va = module_scratch.va();
 
@@ -2779,7 +2800,7 @@ fn stream_segment_bytes(
             return false;
         };
 
-        let Some(mut mapping) =
+        let Ok(mut mapping) =
             ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_FROM_CAP)
         else
         {
@@ -2927,7 +2948,7 @@ pub fn create_process_from_file(
     let hdr_memory =
         crate::memmgr_alloc_page(mms.cap(), ipc_buf).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let mut hdr_scratch = ScratchMapping::map(self_aspace, hdr_memory, 1, syscall::MAP_WRITABLE)
-        .ok_or_else(|| {
+        .map_err(|_| {
             let _ = syscall::cap_delete(hdr_memory);
             procmgr_errors::OUT_OF_MEMORY
         })?;
@@ -3206,8 +3227,7 @@ pub fn create_process_from_file(
             sched,
             &layout,
         )
-    }
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    }?;
 
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
@@ -3470,7 +3490,7 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> 
         let pi_memory = entry.pi_memory_cap;
         let child_cspace = entry.cspace_cap;
         let scratch = ScratchMapping::map(self_aspace, pi_memory, 1, syscall::MAP_WRITABLE)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         let scratch_va = scratch.va();
         // SAFETY: scratch_va is page-aligned and mapped writable; PI struct
         // lives at offset 0 per the ABI.

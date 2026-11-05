@@ -36,11 +36,16 @@ pub struct ScratchMapping
 impl ScratchMapping
 {
     /// Reserve `pages` VA pages, then `mem_map` the memory cap at the reserved
-    /// base with the given protection flags. Returns `None` on either
-    /// reservation or mapping failure.
-    pub fn map(self_aspace: u64, memory_cap: u64, pages: u64, prot: u64) -> Option<Self>
+    /// base with the given protection flags.
+    ///
+    /// # Errors
+    /// `procmgr_errors::OUT_OF_MEMORY` when the reservation arena has no run
+    /// of `pages` free pages (or `pages` is zero), and
+    /// `procmgr_errors::MAP_FAILED` when the `mem_map` fails. A caller
+    /// replies whatever code its label's wire contract names for the failure.
+    pub fn map(self_aspace: u64, memory_cap: u64, pages: u64, prot: u64) -> Result<Self, u64>
     {
-        let range = reserve_pages(pages).ok()?;
+        let range = reserve_pages(pages).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         let va = range.va_start();
         // SAFETY: the span is the `pages`-page reservation just taken from the
         // per-process arena, owned by this mapping: VA no Rust object or IPC
@@ -59,9 +64,9 @@ impl ScratchMapping
             {
                 unreserve_pages(range);
             }
-            return None;
+            return Err(procmgr_errors::MAP_FAILED);
         }
-        Some(Self {
+        Ok(Self {
             range: Some(range),
             self_aspace,
             pages,
@@ -119,22 +124,32 @@ impl Drop for ScratchMapping
 /// mapping; otherwise `mem_map`'s derive-from-cap path produces a
 /// writable+executable mapping that violates W^X. The derived cap is owned by
 /// the returned [`ScratchMapping`] and dropped alongside the unmap.
-pub fn map_module(module_memory_cap: u64, self_aspace: u64) -> Option<(ScratchMapping, u64)>
+///
+/// # Errors
+/// `procmgr_errors::INSUFFICIENT_RIGHTS` when the read-only derivation
+/// fails, and the last probe's [`ScratchMapping::map`] code when no page
+/// count from 128 down to one maps.
+pub fn map_module(module_memory_cap: u64, self_aspace: u64) -> Result<(ScratchMapping, u64), u64>
 {
-    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP)
+        .map_err(|_| procmgr_errors::INSUFFICIENT_RIGHTS)?;
     let mut pages: u64 = 128;
+    let mut last = procmgr_errors::MAP_FAILED;
     while pages > 0
     {
-        if let Some(mut scratch) =
-            ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_FROM_CAP)
+        match ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_FROM_CAP)
         {
-            scratch.set_owns_cap(module_ro);
-            return Some((scratch, pages));
+            Ok(mut scratch) =>
+            {
+                scratch.set_owns_cap(module_ro);
+                return Ok((scratch, pages));
+            }
+            Err(code) => last = code,
         }
         pages -= 1;
     }
     let _ = syscall::cap_delete(module_ro);
-    None
+    Err(last)
 }
 
 /// Derive a memory cap with the given protection rights for mapping.

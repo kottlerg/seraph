@@ -77,7 +77,7 @@ SPDX-License-Identifier: GPL-2.0-only
 Copyright (C) <year> <name> <email>
 ```
 
-Comment syntax follows the file type: `//` for Rust and assembly, `#` for shell. Files
+Comment syntax follows the file type: `//` for Rust and assembly, `#` for shell and YAML. Files
 using block comments use the `/* * ... */` style throughout, headers included.
 
 #### Description in Rust Files

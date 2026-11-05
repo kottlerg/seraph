@@ -370,10 +370,10 @@ stated explicitly.
 19. Close the slot's guard page (`mm::stack_guard::close`): map it back into
     the direct map before the slot returns to its Memory capability. On
     riscv64, whose harts may cache the not-present entry, the close flushes
-    this hart's translation and broadcasts a kernel-root single-VA TLB
-    shootdown, waiting for every acknowledgement preempt-disabled with
-    interrupts enabled, so this CPU serves a peer's shootdown IPI meanwhile;
-    x86-64 caches no not-present entry and sends none.
+    this hart's translation alone (`flush_kernel_page`), with no shootdown
+    and nothing to wait for; another hart that kept the entry is covered as
+    memory-internals.md § Kernel Stack Guards states. x86-64 caches no
+    not-present entry and flushes nothing.
 20. retype_free + ancestor dec_ref + cascade (the dealloc cascade stack,
     `CascadeStack`, that dealloc_object drains; step 13's orphaned endpoint
     and event queues, if any, are torn down from it after this arm returns).

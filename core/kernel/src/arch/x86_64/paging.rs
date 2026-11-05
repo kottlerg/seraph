@@ -1242,7 +1242,9 @@ pub unsafe fn unmap_identity_page(pa: u64)
 // A guard page below a kernel stack (`crate::mm::stack_guard`) is a hole in
 // the direct map: one 4 KiB entry left not present. The 2 MiB leaf that maps
 // a guard's chunk is first split into a leaf table of the same translation.
-// `stack_guard` serialises every edit and flushes the TLB.
+// `stack_guard` serialises every edit; a hole's stale translations are
+// dropped by a local flush at boot or the guard epoch at a later switch-in
+// (core/kernel/docs/memory-internals.md § Kernel Stack Guards).
 
 /// Direct-map flags of a RAM page: read-write, never executable, write-back
 /// (`mm::paging::init_kernel_page_tables` maps RAM so).
@@ -1274,7 +1276,10 @@ fn split_chunk_entries(table: &mut [PageTableEntry; 512], chunk: u64)
 /// # Safety
 /// `virt` is the direct-map address of a RAM page nothing reaches through the
 /// direct map until [`fill_direct_map_page`] restores it. The caller
-/// serialises every direct-map edit and flushes the TLB afterwards.
+/// serialises every direct-map edit and makes stale translations of the page
+/// harmless before the guard's thread runs: a local flush while only the boot
+/// CPU runs, or the guard epoch (`stack_guard::flush_before_run`) after SMP
+/// bringup.
 #[cfg(not(test))]
 pub unsafe fn hole_direct_map_page(
     virt: u64,
@@ -1359,7 +1364,8 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
 }
 
 /// Whether a CPU may cache a not-present entry, so that a page made present
-/// again needs a flush on every CPU: never on x86-64.
+/// again can fault on a CPU that kept it until that CPU flushes: never on
+/// x86-64.
 pub const CACHES_NOT_PRESENT_ENTRIES: bool = false;
 
 /// Invalidate every translation this CPU caches, in every address space:
@@ -1650,6 +1656,27 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
         // SAFETY: root_virt is the direct-map VA of the active root.
         unsafe { translate_user_page(root_virt, va) }.map(|(_pa, pte)| pte)
     })
+}
+
+/// The `FAULT_ACCESS_PRESENT` bit a fault message carries for a fault at the
+/// user address `va` that no `#PF` error code describes (a kernel copy's,
+/// delivered by the syscall dispatcher): whether the live tables map `va`, as
+/// the error code's P bit would report for the same access from user mode.
+///
+/// # Safety
+/// Must run at ring 0 in the faulting thread's context, with its CR3 active.
+#[cfg(not(test))]
+pub unsafe fn copy_fault_present(va: u64) -> bool
+{
+    if va >= user_va_top()
+    {
+        return false;
+    }
+    // SAFETY: ring 0; reads CR3 to recover the active page-table root.
+    let root_phys = unsafe { read_root_phys() };
+    let root_virt = crate::mm::paging::phys_to_virt(root_phys);
+    // SAFETY: root_virt is the direct-map VA of the active root.
+    unsafe { translate_user_page(root_virt, va) }.is_some()
 }
 
 /// The decision of [`user_fault_is_spurious`], with the live leaf PTE of a `va`

@@ -50,7 +50,7 @@ core/kernel/src/arch/
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-    └── encoding.rs # PLIC map, SBI hart mask, F/D/V opcode decode; no arch-module deps
+    └── encoding.rs # PLIC, SBI mask, F/D/V, page rounding, PTE permissions; no arch-module deps
 ```
 
 `arch/mod.rs` performs the conditional compilation, and also defines the one type it holds
@@ -281,8 +281,16 @@ pub unsafe fn verify_paging_extensions();
 /// access — a stale entry the handler resolves by retrying) versus a real fault.
 /// Only a user-accessible leaf can make a fault spurious, so a kernel-half `va`
 /// never is (x86-64 refuses one before walking). Called only by each
-/// architecture's own page-fault handler, not by neutral code.
+/// architecture's own page-fault handler, for a user-mode fault and for a
+/// fault inside `cpu::copy_user`, not by neutral code.
 pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool;
+
+/// The `FAULT_ACCESS_PRESENT` bit of the fault message the syscall dispatcher
+/// builds for a restartable syscall's user-copy fault at `va`
+/// (`syscall::deliver_copy_fault`): on x86-64, whether the caller's live
+/// tables map `va`, as `#PF`'s P bit reports a user-mode fault; on RISC-V
+/// always false, as for every RISC-V fault message.
+pub unsafe fn copy_fault_present(va: u64) -> bool;
 
 /// Rebase the boot stack from its identity mapping into the direct map during
 /// early paging setup, by adding `direct_map_base` to the stack pointer
@@ -322,19 +330,23 @@ pub unsafe fn unmap_identity_page(pa: u64);
 /// that maps it into a leaf table of the same translation built in the frame
 /// `take_table` returns. `NotMapped` when the direct map does not map `virt`,
 /// `OutOfFrames` when a split finds no frame. The caller serialises every
-/// direct-map edit and flushes the TLB.
+/// direct-map edit and makes stale translations of the page harmless before
+/// the guard's thread runs: a local flush while only the boot CPU runs, or the
+/// guard epoch after SMP bringup (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn hole_direct_map_page(
     virt: u64,
     take_table: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(), PagingError>;
 
-/// Map the direct-map page at `virt` to `phys` again, closing a hole. The
-/// caller flushes every CPU before the page is reused when
-/// `CACHES_NOT_PRESENT_ENTRIES` holds.
+/// Map the direct-map page at `virt` to `phys` again, closing a hole. When
+/// `CACHES_NOT_PRESENT_ENTRIES` holds, the caller flushes this CPU; another
+/// CPU that kept the not-present entry flushes before it runs a thread whose
+/// stack the page becomes, or takes the riscv64 S-mode spurious-fault retry
+/// on any other use (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64);
 
 /// Whether a CPU may cache a not-present entry, so that a page made present
-/// again needs a flush on every CPU before another reaches it: `false` on
+/// again can fault on a CPU that kept it until that CPU flushes: `false` on
 /// x86-64, `true` on RISC-V (no Svvptc requirement).
 pub const CACHES_NOT_PRESENT_ENTRIES: bool;
 
@@ -650,14 +662,18 @@ pub fn halt_loop() -> !;
 
 /// Copy `len` bytes between kernel and user memory across the SMAP/SUM access
 /// window with in-kernel fault recovery: a fault on an unmapped or read-only
-/// user span returns a non-zero sentinel (recovered by the page-fault handler's
-/// user-copy fixup) instead of panicking. The sole sanctioned path for kernel
-/// access to user pointers; the typed `crate::uaccess::copy_to_user` /
-/// `copy_from_user` wrappers turn the sentinel into `SyscallError::InvalidAddress`.
+/// user span returns the count of bytes not copied (at least 1; recovered by
+/// the page-fault handler's user-copy fixup) instead of panicking, and 0 means
+/// the copy completed. The sole sanctioned path for kernel access to user
+/// pointers; the typed `crate::uaccess::copy_to_user` / `copy_from_user`
+/// wrappers turn a fault into `SyscallError::InvalidAddress`, and the
+/// restartable ones into the faulting address (`len - returned` bytes in).
 pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
 
 /// Map a faulting PC to the `copy_user` recovery fixup, or `None`. Consulted by
-/// the page-fault handler on a kernel-mode fault to redirect into the fixup.
+/// the page-fault handler on a kernel-mode fault to redirect into the fixup,
+/// after it retries a fault the live tables already satisfy
+/// (`paging::user_fault_is_spurious`).
 pub fn user_copy_fixup(pc: u64) -> Option<u64>;
 
 /// Debug-build check that the user-controlled privileged state a kernel entry
@@ -790,6 +806,17 @@ impl TrapFrame {
 
     /// User-mode instruction pointer (rip / sepc).
     pub fn instruction_pointer(&self) -> u64;
+
+    /// Restart support for a syscall frame (core/kernel/docs/syscalls.md
+    /// § Restartable Syscalls). `rewind_syscall` points the frame at the
+    /// syscall instruction and returns its address (x86-64 `rip -= 2`; RISC-V
+    /// `sepc` already names the `ecall`, which the trap dispatcher advances only
+    /// after `syscall::SyscallExit::Complete`). `complete_rewound_syscall(at)`
+    /// undoes it when the syscall completes instead, unless the instruction
+    /// pointer was rewritten since (x86-64 `rip = at + 2` when `rip == at`;
+    /// RISC-V nothing).
+    pub fn rewind_syscall(&mut self) -> u64;
+    pub fn complete_rewound_syscall(&mut self, at: u64);
 
     /// Validate and sanitize a user-supplied register snapshot before resuming
     /// it in user mode. x86-64 rejects a non-user `rip` or `rsp`, forces ring-3

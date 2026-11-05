@@ -567,14 +567,18 @@ INVPCID's all-context form (no instruction drops one non-global address from eve
 a CR3 reload without tags, and `sfence.vma zero, zero` on riscv64. The cost is a compare
 per switch and at most one local flush per CPU per run of newer threads, with no IPI.
 
-Filling a hole, before the slab returns to its Memory capability, drops the not-present
-entry wherever a CPU may cache one (`CACHES_NOT_PRESENT_ENTRIES`): riscv64, without
-Svvptc, broadcasts a single-VA shootdown on the kernel root (§ SMP TLB Shootdown), which
-each target serves with `flush_kernel_page` (`sfence.vma va, zero`), since a hart that
-kept the invalid entry would fault on the page's next use, and if that use is a kernel
-stack the fault's trap frame lands on the same page and faults again before the first trap
-has saved its state, a use no switch-in bounds; x86-64 caches no not-present entry and
-needs none.
+Filling a hole, before the slab returns to its Memory capability, sends no shootdown
+either. Where a CPU may cache the not-present entry (`CACHES_NOT_PRESENT_ENTRIES`:
+riscv64, without Svvptc), the filling hart drops its own (`flush_kernel_page`,
+`sfence.vma va, zero`), and another hart that kept the entry reaches the page in one of
+two ways. As a kernel stack, the page belongs to a new Thread slot whose creation holes
+that slot's guard and advances the guard epoch after this fill, so the hart flushes its
+whole TLB before it first runs that thread (`flush_before_run`, above); a hart that faulted
+on its own kernel stack would nest a trap frame on the same page before the first trap
+saved its state, and this flush keeps that from happening. Any other use faults on a
+different stack, and the S-mode spurious-fault retry (`paging::kernel_fault_is_spurious`)
+finds the live entry valid for the load or store, flushes it locally, and re-executes.
+x86-64 caches no not-present entry and needs neither.
 
 An overflow halts the overflowing CPU with a diagnostic (`fatal`). On x86-64 the fault on
 the guard cannot push its frame on the overflowed stack and escalates to a double fault,

@@ -133,13 +133,13 @@ pub fn user_va_top() -> u64
 // ── PTE bit constants ─────────────────────────────────────────────────────────
 
 /// Entry is valid.
-const VALID: u64 = 1 << 0;
+const VALID: u64 = super::encoding::PTE_VALID;
 /// Read permission.
-const READ: u64 = 1 << 1;
+const READ: u64 = super::encoding::PTE_READ;
 /// Write permission.
-const WRITE: u64 = 1 << 2;
+const WRITE: u64 = super::encoding::PTE_WRITE;
 /// Execute permission.
-const EXECUTE: u64 = 1 << 3;
+const EXECUTE: u64 = super::encoding::PTE_EXECUTE;
 /// Accessed — must be pre-set in leaf PTEs.
 ///
 /// Per RISC-V Privileged Spec §5.4.1, an implementation may either update
@@ -1335,7 +1335,10 @@ pub unsafe fn unmap_identity_page(pa: u64)
 // A guard page below a kernel stack (`crate::mm::stack_guard`) is a hole in
 // the direct map: one 4 KiB entry left invalid. The 2 MiB megapage that maps
 // a guard's chunk is first split into a leaf table of the same translation.
-// `stack_guard` serialises every edit and flushes the TLB.
+// `stack_guard` serialises every edit; a hole's stale translations are
+// dropped by a local flush at boot or the guard epoch at a later switch-in,
+// and a fill's by its local flush and the guard epoch or the spurious-fault
+// retry (core/kernel/docs/memory-internals.md § Kernel Stack Guards).
 
 /// Direct-map flags of a RAM page: read-write, never executable, PMA memory
 /// type (`mm::paging::init_kernel_page_tables` maps RAM so).
@@ -1358,7 +1361,10 @@ const DIRECT_RAM: PageFlags = PageFlags {
 /// # Safety
 /// `virt` is the direct-map address of a RAM page nothing reaches through the
 /// direct map until [`fill_direct_map_page`] restores it. The caller
-/// serialises every direct-map edit and flushes the TLB afterwards.
+/// serialises every direct-map edit and makes stale translations of the page
+/// harmless before the guard's thread runs: a local flush while only the boot
+/// CPU runs, or the guard epoch (`stack_guard::flush_before_run`) after SMP
+/// bringup.
 #[cfg(not(test))]
 pub unsafe fn hole_direct_map_page(
     virt: u64,
@@ -1404,8 +1410,11 @@ pub unsafe fn hole_direct_map_page(
 
 /// Map the direct-map page at `virt` to `phys` again, closing a hole
 /// [`hole_direct_map_page`] left. A hart may have cached the invalid entry
-/// ([`CACHES_NOT_PRESENT_ENTRIES`]), so the caller flushes every hart before
-/// the page is used.
+/// ([`CACHES_NOT_PRESENT_ENTRIES`]): the caller flushes this hart, and another
+/// hart that kept it either flushes before it runs a thread whose kernel stack
+/// the page becomes or takes the spurious-fault retry
+/// ([`kernel_fault_is_spurious`]) on its first other use of the page
+/// (core/kernel/docs/memory-internals.md § Kernel Stack Guards).
 ///
 /// # Safety
 /// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`];
@@ -1451,6 +1460,41 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     l0[vpn_index(0, virt)].is_present()
 }
 
+pub use super::encoding::KernelAccess;
+
+/// Whether an S-mode load or store page fault at the kernel address `va` is
+/// stale: the kernel's tables map `va` with a 4 KiB leaf that permits the
+/// access, so the hart cached the invalid entry a closed direct-map hole
+/// ([`fill_direct_map_page`]) left, and resolves it on retry after a local
+/// `sfence.vma`.
+///
+/// A megapage leaf is never stale this way (no megapage of the direct map is
+/// ever invalid), so only a leaf table is consulted.
+///
+/// # Safety
+/// Must run in S-mode.
+#[cfg(not(test))]
+pub unsafe fn kernel_fault_is_spurious(va: u64, access: KernelAccess) -> bool
+{
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
+
+    let root_pa = kernel_root_table_pa();
+    if root_pa == 0 || va >> 63 == 0
+    {
+        return false;
+    }
+    let top = paging_mode().levels() - 1;
+    // SAFETY: the kernel root and its tables are live frames reached through
+    // the direct map; a racing edit at worst makes this read report a stale
+    // answer, and a wrong `true` re-faults on retry into the same check.
+    let Some(l0) = (unsafe { descend_existing(phys_to_virt(root_pa), va, top, 0, phys_to_virt) })
+    else
+    {
+        return false;
+    };
+    super::encoding::kernel_leaf_permits(l0[vpn_index(0, va)].0, access)
+}
+
 /// Invalidate every translation this hart caches, in every address space
 /// (`sfence.vma zero, zero`).
 ///
@@ -1464,7 +1508,7 @@ pub unsafe fn flush_all_contexts()
 }
 
 /// Whether a hart may cache an invalid entry, so that a page made valid again
-/// needs a flush on every hart before another one reaches it: true on RISC-V
+/// can fault on a hart that kept it until that hart flushes: true on RISC-V
 /// without Svvptc, which the kernel does not require.
 pub const CACHES_NOT_PRESENT_ENTRIES: bool = true;
 
@@ -1676,6 +1720,20 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
         Some((_pa, pte)) => pte_permits_user_access(pte, write, instr),
         None => false,
     }
+}
+
+/// The `FAULT_ACCESS_PRESENT` bit a fault message carries for a fault at the
+/// user address `va` that no trap cause describes (a kernel copy's, delivered
+/// by the syscall dispatcher): always clear, as for every RISC-V fault
+/// message, since `scause` does not encode presence
+/// (docs/fault-handling.md § Fault Message).
+///
+/// # Safety
+/// None on RISC-V; `unsafe` for parity with the x86-64 walk.
+#[cfg(not(test))]
+pub unsafe fn copy_fault_present(_va: u64) -> bool
+{
+    false
 }
 
 // ── TLB flush operations ──────────────────────────────────────────────────────

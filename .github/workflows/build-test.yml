@@ -1,3 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/workflows/build-test.yml
+
+# The canonical CI tier: host tests and the architecture x profile x harness
+# boots every push and pull request runs (docs/build-system.md
+# § Continuous Integration).
+
 name: build-test
 
 on:

@@ -46,6 +46,16 @@ pub enum BackendError
     Timeout,
 }
 
+/// How a mapping lets the device reach its frames ([`Backend::map`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access
+{
+    /// The device may read the frames only.
+    Read,
+    /// The device may read and write the frames.
+    ReadWrite,
+}
+
 /// The translation limits of one unit ([`Backend::query`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitInfo
@@ -94,7 +104,7 @@ pub trait Backend
     fn attach(&mut self, unit: usize, bdf: u16, did: u32) -> Result<Self::Domain, BackendError>;
 
     /// Install `len` bytes from the physical address `phys` at `iova` in
-    /// `domain`, readable by the device and, when `write`, writable.
+    /// `domain`, reachable by the device as `access` allows.
     ///
     /// # Errors
     /// As [`Self::init_unit`]; nothing is installed on an error.
@@ -104,7 +114,7 @@ pub trait Backend
         iova: u64,
         phys: u64,
         len: u64,
-        write: bool,
+        access: Access,
     ) -> Result<(), BackendError>;
 
     /// Remove the `len` bytes at `iova` from `domain`.

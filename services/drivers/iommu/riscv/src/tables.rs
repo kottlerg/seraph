@@ -19,6 +19,7 @@ extern crate alloc;
 #[cfg(test)]
 use alloc::vec::Vec;
 
+use iommu_core::Access;
 use iommu_core::table::TableStore;
 
 use crate::regs::{ContextFormat, FirstStageMode, device_id_bits};
@@ -189,16 +190,6 @@ pub const fn device_context(table_phys: u64, mode: FirstStageMode, pscid: u32) -
 }
 
 // ── First-stage page tables ───────────────────────────────────────────
-
-/// How a mapping lets the device reach its pages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access
-{
-    /// Read only.
-    Read,
-    /// Read and write.
-    ReadWrite,
-}
 
 /// One domain's first-stage page tables, mapping 4 KiB pages only.
 pub struct FirstStage

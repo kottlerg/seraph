@@ -50,6 +50,8 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    refuse_translatable_aspace(info.self_aspace);
+
     let Some(mut caps) = caps::bootstrap_caps(info, ipc_buf)
     else
     {
@@ -1617,20 +1619,20 @@ impl VirtioDeviceCaps
     /// before the driver's frames, and the frames its mappings reach, are
     /// freed: withdraw its DMA grant ([`dma::DmaGrant::withdraw`]), so the
     /// driver maps nothing more and an IOMMU, where one confines the device,
-    /// blocks it; clear the function's
-    /// Bus Master Enable ([`FunctionConfig::clear_bus_master`]), so the
-    /// device issues no further DMA whatever its driver does; then revoke
-    /// every cap derived from the BAR caps devmgr keeps (the driver's copies,
-    /// whose mappings the revocation removes before it returns), so the
-    /// driver can no longer reach the device; then reset the device and wait,
-    /// bounded by `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
+    /// blocks it; clear the function's Bus Master Enable
+    /// ([`FunctionConfig::clear_bus_master`]), so the device issues no
+    /// further DMA whatever its driver does; then revoke every cap derived
+    /// from the BAR caps devmgr keeps (the driver's copies, whose mappings
+    /// the revocation removes before it returns), so the driver can no longer
+    /// reach the device; then reset the device and wait, bounded by
+    /// `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
     /// ([`DeviceReset::reset`]). Returns whether the device can no longer
     /// reach the driver's memory: an IOMMU blocks it, or it is known to be
     /// quiet (Bus Master Enable read back clear, every BAR copy revoked, and
     /// the reset confirmed). Only then does it delete the Memory caps it kept
     /// for the device's mappings ([`dma::Withdrawal::release`];
-    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means the
-    /// device may still be accessing the driver's memory and the mapped
+    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means
+    /// the device may still be accessing the driver's memory and the mapped
     /// frames, and those caps stay for the boot
     /// ([`dma::Withdrawal::quarantine`]).
     fn take_from_driver(&self) -> bool
@@ -3473,6 +3475,32 @@ fn test_spawn_orphan(
         spawn::destroy_child(process_handle, ipc_buf);
     }
     Some(spawned.is_some())
+}
+
+/// Halt when devmgr's own address space cap carries `RIGHTS_AS_READ`, or
+/// its rights cannot be read: procmgr mints every child's address space
+/// without the right, a phys-class child's included, so no process translates
+/// a child's pages (services/devmgr/docs/responsibilities.md § Capabilities
+/// Received). devmgr is the phys-class child every boot creates, and no other
+/// process checks its address space, so a mint that kept the right stops the
+/// boot here instead of passing unseen.
+fn refuse_translatable_aspace(self_aspace: u64)
+{
+    match syscall::cap_info(self_aspace, syscall::CAP_INFO_TAG_RIGHTS)
+    {
+        Ok(rights) if rights & syscall::RIGHTS_AS_READ == 0 =>
+        {}
+        Ok(_) =>
+        {
+            std::os::seraph::log!("own address space carries RIGHTS_AS_READ, halting");
+            halt_loop();
+        }
+        Err(e) =>
+        {
+            std::os::seraph::log!("own address space rights unreadable ({e}), halting");
+            halt_loop();
+        }
+    }
 }
 
 fn halt_loop() -> !

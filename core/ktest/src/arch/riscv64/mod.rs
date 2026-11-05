@@ -112,6 +112,11 @@ pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_RISCV64_SIZE as u64;
 /// field a register-file edit redirects.
 pub const IP_OFFSET: usize = syscall_abi::REGS_RISCV64_IP_OFFSET;
 
+/// Whether a `FAULT_KIND_VM` message reports a fault on a present page with
+/// `FAULT_ACCESS_PRESENT` (docs/fault-handling.md § Fault Message): RISC-V
+/// never sets the bit, since `scause` does not encode presence.
+pub const FAULT_REPORTS_PRESENT: bool = false;
+
 /// End of the window the framebuffer is mapped into from `FB_VA`: the UART
 /// window at `serial::SERIAL_VA`, the next fixed device mapping above it.
 pub const FB_WINDOW_END: u64 = serial::SERIAL_VA;

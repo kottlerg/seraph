@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/workflows/qemu-debs.yml
+
+# The QEMU and firmware package download the boot jobs install from.
+
 name: qemu-debs
 
 # Called by build-test.yml and burnin.yml; see docs/build-system.md

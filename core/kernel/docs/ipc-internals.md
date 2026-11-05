@@ -680,7 +680,8 @@ waitset_notify(wait_set, member_idx):
    InvalidState (a wait set takes one waiter)
 2. while ready_ring is non-empty:
    a. member_idx = ready_ring.pop()
-   b. if members[member_idx] is vacant (removed): skip it
+   b. if members[member_idx] is vacant (removed), or its source is not
+      source_is_ready right now: skip it
    c. Release lock; return members[member_idx].badge
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
@@ -695,6 +696,19 @@ waitset_notify(wait_set, member_idx):
       Interrupted if the park is INTERRUPTED (a stop, or the wait set
       destroyed under the waiter), else return wakeup_value
 ```
+
+**What a returned badge means.** A ring entry is a hint that the member became
+ready, not a reservation of what made it ready: the queued sender that pushed an
+endpoint's entry can be stopped or destroyed before the waiter runs, which
+leaves the send queue empty, and a direct `SYS_NOTIFICATION_WAIT` can drain the
+bits that pushed a notification's. Step 2b therefore re-checks the source as it
+pops the entry, with the same lockless reads as step 3, and skips an entry whose
+readiness lapsed. An entry is pushed only after its source's readiness signal is
+stored, and the push and the pop both hold the wait set's lock, so the re-check
+never drops a live edge. A returned badge names a source that was ready when the wait
+returned (step 2 or 3), or when its readiness woke the waiter. That readiness can
+still lapse before the caller's own receive on the source, for the same reasons,
+so that receive can find nothing to take.
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness
 notifications (`waitset_notify`) are *edge-triggered*: `event_queue_post` fires
@@ -765,7 +779,8 @@ If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ri
 buffers their member indices in arrival order, up to the set's capacity in
 entries; it does not deduplicate, and a push to a full ring is dropped.
 Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it is
-empty, per [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
+empty, skipping an entry whose source is no longer ready (§ Wait Path step 2b), per
+[syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
 An edge lost to a full ring is recovered by the level-readiness self-heal
 (§ Wait Path step 3), which returns any member whose source is still ready.
 

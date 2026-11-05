@@ -188,11 +188,14 @@ the physical bases of the Memory caps it holds
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 3).
 procmgr retypes every child's address space, a phys-class child's included, through a
 derivation of its slab without `RIGHTS_MEM_PHYS`, so no child's address space carries
-`RIGHTS_AS_READ` and procmgr, which keeps it for the child's life, cannot translate its pages.
-procmgr honours it only from a creator that is phys-class itself: an un-badged one
-(badge 0: init, or svcmgr's mint source) or one whose memmgr badge carries
-`memmgr_labels::PHYS_CLASS_BADGE_BIT`; from any other it replies `INVALID_ARGUMENT` before any
-resource is acquired. init sets it for devmgr and devmgr for the IOMMU driver, the processes
+`RIGHTS_AS_READ` and procmgr, which keeps it for the child's life, cannot translate its pages;
+devmgr, the phys-class child every boot creates, checks its own at startup
+([services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md)
+§ Capabilities Received). procmgr honours `CREATE_PHYS_ACCESS` only from a creator that is
+phys-class itself: an un-badged one (badge 0: init, or svcmgr's mint source) or one whose memmgr
+badge carries `memmgr_labels::PHYS_CLASS_BADGE_BIT`; from any other it replies
+`INVALID_ARGUMENT` before any resource is acquired. init sets it for devmgr and devmgr for the
+IOMMU driver, the processes
 [docs/device-management.md](../../../docs/device-management.md#dma-authorisation) § DMA
 Authorisation names; every other process, every device driver included, is created without it.
 
@@ -666,6 +669,7 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md),

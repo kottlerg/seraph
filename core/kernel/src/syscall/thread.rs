@@ -19,6 +19,8 @@
 
 #[cfg(not(test))]
 use super::UserFrame;
+#[cfg(not(test))]
+use crate::uaccess::RestartableError;
 // The host-test stubs keep the arch frame type in their signatures.
 #[cfg(test)]
 use crate::arch::current::trap_frame::TrapFrame;
@@ -1752,8 +1754,11 @@ unsafe fn set_affinity_locked(
 ///   register frame.
 /// - `InvalidAddress`: the buffer lies outside the user half or is not
 ///   writable.
+/// - A [`RestartableError::Faulted`] copy, which the dispatcher delivers to the
+///   caller's fault handler (re-executing the call on resume) or fails with
+///   `InvalidAddress` (core/kernel/docs/syscalls.md § Restartable Syscalls).
 #[cfg(not(test))]
-pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
+pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
@@ -1769,7 +1774,7 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let caller_tcb = unsafe { current_tcb() };
     if caller_tcb.is_null()
     {
-        return Err(SyscallError::InvalidCapability);
+        return Err(SyscallError::InvalidCapability.into());
     }
     // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
     let caller_cspace = unsafe { (*caller_tcb).cspace };
@@ -1790,7 +1795,7 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
 
     if target_tcb.is_null()
     {
-        return Err(SyscallError::InvalidCapability);
+        return Err(SyscallError::InvalidCapability.into());
     }
 
     // Snapshot the frame while the target is held still, so the copy never
@@ -1822,15 +1827,15 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let snapshot = unsafe { crate::sched::with_held_frame(target_tcb, take_snapshot) };
     match snapshot
     {
-        None => return Err(SyscallError::InvalidState),
-        Some(false) => return Err(SyscallError::InvalidArgument),
+        None => return Err(SyscallError::InvalidState.into()),
+        Some(false) => return Err(SyscallError::InvalidArgument.into()),
         Some(true) =>
         {}
     }
 
     if buf_size < copy_size || buf_ptr == 0
     {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     // The destination must lie wholly in the user half: SMAP/SUM gate only
     // accesses to user pages, so without this a kernel-half buf_ptr would let the
@@ -1840,15 +1845,17 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let user_va_top = crate::mm::user_va_top();
     if buf_ptr >= user_va_top || buf_ptr + copy_size as u64 > user_va_top
     {
-        return Err(SyscallError::InvalidAddress);
+        return Err(SyscallError::InvalidAddress.into());
     }
 
-    // Copy the snapshot to the user buffer with fault recovery: an unmapped or
-    // read-only buffer returns InvalidAddress instead of faulting.
+    // Copy the snapshot to the user buffer with fault recovery: an unbacked or
+    // read-only buffer reaches the dispatcher as a restartable fault instead of
+    // faulting the kernel. Nothing before the copy changed anything visible
+    // outside the call, so a re-execution reads the target afresh.
     // SAFETY: frame holds copy_size initialised bytes; buf_ptr is the
     //         validated user destination span.
     unsafe {
-        crate::uaccess::copy_to_user(buf_ptr, frame.as_ptr().cast::<u8>(), copy_size)?;
+        crate::uaccess::copy_to_user_restartable(buf_ptr, frame.as_ptr().cast::<u8>(), copy_size)?;
     }
 
     Ok(copy_size as u64)
@@ -1876,8 +1883,10 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, SyscallError>
 ///   register frame, or the frame carries illegal register values.
 /// - `InvalidAddress`: the buffer lies outside the user half or is not
 ///   readable.
+/// - A [`RestartableError::Faulted`] copy, handled as for
+///   [`sys_thread_read_regs`].
 #[cfg(not(test))]
-pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
+pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
@@ -1893,7 +1902,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let caller_tcb = unsafe { current_tcb() };
     if caller_tcb.is_null()
     {
-        return Err(SyscallError::InvalidCapability);
+        return Err(SyscallError::InvalidCapability.into());
     }
     // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
     let caller_cspace = unsafe { (*caller_tcb).cspace };
@@ -1913,7 +1922,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
 
     if target_tcb.is_null()
     {
-        return Err(SyscallError::InvalidCapability);
+        return Err(SyscallError::InvalidCapability.into());
     }
 
     // A fault-blocked thread (Blocked + BlockedOnFault) exposes its faulting
@@ -1926,7 +1935,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let copy_size = size_of::<ArchTF>();
     if buf_size < copy_size || buf_ptr == 0
     {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     // The source must lie wholly in the user half: SMAP/SUM gate only accesses to
     // user pages, so without this a kernel-half buf_ptr would let the copy read
@@ -1934,17 +1943,22 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let user_va_top = crate::mm::user_va_top();
     if buf_ptr >= user_va_top || buf_ptr + copy_size as u64 > user_va_top
     {
-        return Err(SyscallError::InvalidAddress);
+        return Err(SyscallError::InvalidAddress.into());
     }
 
     // Copy from user into a stack-local TrapFrame, then validate. Never write
     // directly to the target's trap_frame before validation. The copy is
-    // fault-recovered: an unmapped or read-only source returns InvalidAddress.
+    // fault-recovered: an unbacked source reaches the dispatcher as a
+    // restartable fault, and the target is untouched until after the copy.
     let mut tmp: MaybeUninit<ArchTF> = MaybeUninit::zeroed();
     // SAFETY: tmp is valid for copy_size writes; buf_ptr is the validated user
     //         source span.
     unsafe {
-        crate::uaccess::copy_from_user(tmp.as_mut_ptr().cast::<u8>(), buf_ptr, copy_size)?;
+        crate::uaccess::copy_from_user_restartable(
+            tmp.as_mut_ptr().cast::<u8>(),
+            buf_ptr,
+            copy_size,
+        )?;
     }
 
     // SAFETY: tmp was zero-initialized, so every byte is a valid bit pattern for
@@ -1973,8 +1987,8 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, SyscallError>
     let written = unsafe { crate::sched::with_held_frame(target_tcb, write_frame) };
     match written
     {
-        None => Err(SyscallError::InvalidState),
-        Some(false) => Err(SyscallError::InvalidArgument),
+        None => Err(SyscallError::InvalidState.into()),
+        Some(false) => Err(SyscallError::InvalidArgument.into()),
         Some(true) => Ok(0),
     }
 }

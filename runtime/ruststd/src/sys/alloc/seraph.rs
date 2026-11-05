@@ -53,7 +53,7 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 /// IPC buffer pages, typical collection workloads, and the peak of a piped
 /// `Command::spawn` without needing `grow`. In a demand-paged process the
 /// floor is a registered demand region (`REGISTER_REGION`), so it costs VA
-/// and only the frames the allocator hands out; a process with no pager
+/// and only the frames of the pages first touched; a process with no pager
 /// (pinned, or whose registration failed) maps it eagerly instead.
 const HEAP_INITIAL_PAGES: u64 = 512;
 
@@ -190,12 +190,6 @@ struct Heap {
     memmgr_ep: u64,
     /// Cached aspace cap for mapping grow-path pages. Zero before bootstrap.
     self_aspace: u64,
-    /// Exclusive end of the demand-backed floor, or zero when the floor was
-    /// mapped eagerly. Pages above it are always mapped eagerly by `grow`.
-    floor_end: usize,
-    /// Every floor page below this address has been touched, so the pager
-    /// has backed it. Advanced by [`Self::back_floor_to`].
-    floor_backed_end: usize,
 }
 
 // SAFETY: the free-list pointers address free blocks in the process's own
@@ -211,26 +205,7 @@ impl Heap {
             max: 0,
             memmgr_ep: 0,
             self_aspace: 0,
-            floor_end: 0,
-            floor_backed_end: 0,
         }
-    }
-
-    /// Touch every demand-floor page below `end` not yet touched, so the
-    /// pager backs it before the allocator hands it out.
-    fn back_floor_to(&mut self, end: usize) {
-        // Kernel user copies fail on an unbacked page rather than fault to the pager.
-        let end = end.min(self.floor_end);
-        let page = PAGE_SIZE as usize;
-        let mut va = self.floor_backed_end;
-        while va < end {
-            // SAFETY: `va` is a page of the registered RW floor region, which
-            // only this heap uses; a read leaves its contents (possibly a free
-            // node) unchanged and makes the pager back the page.
-            let _ = unsafe { core::ptr::read_volatile(va as *const u8) };
-            va += page;
-        }
-        self.floor_backed_end = self.floor_backed_end.max(va);
     }
 
     /// # Safety
@@ -318,7 +293,6 @@ impl Heap {
                         None => self.head = node_next,
                     }
                 }
-                self.back_floor_to(payload + want);
                 return payload as *mut u8;
             }
             prev = Some(c);
@@ -616,8 +590,6 @@ fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
     let floor_end = heap_base + HEAP_INITIAL_PAGES * PAGE_SIZE;
     let ok = if demand_floor {
         heap.mapped_end = floor_end as usize;
-        heap.floor_end = floor_end as usize;
-        heap.floor_backed_end = heap_base as usize;
         // SAFETY: `[heap_base, floor_end)` is this heap's registered demand
         // floor, which nothing else uses; the node write below faults its
         // first page in.

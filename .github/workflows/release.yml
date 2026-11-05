@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/workflows/release.yml
+
+# Release production on a tag push: the preflight checks, the release
+# images, and the draft Release (docs/conventions.md § Release Production).
+
 name: release
 
 on:

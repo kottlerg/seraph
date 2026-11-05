@@ -636,12 +636,12 @@ pub enum ArgvEnvCopyError
     /// The create fails with this `procmgr_errors` code; everything
     /// [`copy_argv_env`] acquired is released.
     Reply(u64),
-    /// A copy window's unmap failed, so pages of the child's run (and of the
-    /// caller's) may still be mapped in procmgr. The window's VA stays
-    /// reserved, and the caller withholds the child's memmgr record (it does
-    /// not send `PROCESS_DIED`), so memmgr keeps those frames out of its pool
-    /// rather than re-granting pages procmgr still maps. The create fails
-    /// with `OUT_OF_MEMORY`.
+    /// A copy window's unmap failed, so pages of the child's run (writable)
+    /// and of the caller's (read-only) may still be mapped in procmgr. The
+    /// window's VA stays reserved; the handler withholds the child's memmgr
+    /// record (it sends no `PROCESS_DIED`) and replies
+    /// `ARGV_ENV_STILL_MAPPED`, on which the caller withholds its run, so
+    /// memmgr re-grants no frame procmgr may still map.
     StillMapped,
 }
 
@@ -653,7 +653,7 @@ impl ArgvEnvCopyError
         match self
         {
             Self::Reply(code) => code,
-            Self::StillMapped => procmgr_errors::OUT_OF_MEMORY,
+            Self::StillMapped => procmgr_errors::ARGV_ENV_STILL_MAPPED,
         }
     }
 }
@@ -739,19 +739,26 @@ impl CopyWindows
     {
         self.unmap();
         let (aspace, src_va, dst_va) = (self.self_aspace, self.src_va(), self.dst_va());
-        // SAFETY: each window is a reservation from procmgr's arena that this
+        self.mapped = pages;
+        // SAFETY: the window is a reservation from procmgr's arena that this
         // value owns, `pages` is at most its size, and no Rust object or IPC
         // page lies in it; the only accesses to it are the raw-pointer reads
-        // and writes of `copy_argv_chunk`, while the windows are mapped.
-        let mapped = unsafe {
-            syscall::mem_map(src, aspace, src_va, offset, pages, syscall::MAP_FROM_CAP)
-                .map_err(WindowMapError::Src)
-                .and_then(|()| {
-                    syscall::mem_map(dst, aspace, dst_va, offset, pages, syscall::MAP_WRITABLE)
-                        .map_err(|_| WindowMapError::Dst)
-                })
+        // of `copy_argv_chunk`, while it is mapped.
+        let src_mapped =
+            unsafe { syscall::mem_map(src, aspace, src_va, offset, pages, syscall::MAP_FROM_CAP) };
+        let mapped = if let Err(code) = src_mapped
+        {
+            Err(WindowMapError::Src(code))
+        }
+        else
+        {
+            // SAFETY: as for the source window, with the raw-pointer writes
+            // of `copy_argv_chunk`.
+            let dst_mapped = unsafe {
+                syscall::mem_map(dst, aspace, dst_va, offset, pages, syscall::MAP_WRITABLE)
+            };
+            dst_mapped.map_err(|_| WindowMapError::Dst)
         };
-        self.mapped = pages;
         if mapped.is_err()
         {
             self.unmap();
@@ -769,12 +776,13 @@ impl CopyWindows
         }
         // SAFETY: the windows are this value's own reservations, each mapped
         // at most `mapped` pages by `map`; nothing references them.
-        let unmapped = unsafe {
-            let src = syscall::mem_unmap(self.self_aspace, self.src_va(), self.mapped);
-            let dst = syscall::mem_unmap(self.self_aspace, self.dst_va(), self.mapped);
-            src.is_ok() && dst.is_ok()
+        let (src, dst) = unsafe {
+            (
+                syscall::mem_unmap(self.self_aspace, self.src_va(), self.mapped),
+                syscall::mem_unmap(self.self_aspace, self.dst_va(), self.mapped),
+            )
         };
-        self.stuck |= !unmapped;
+        self.stuck |= src.is_err() || dst.is_err();
         self.mapped = 0;
     }
 }
@@ -811,9 +819,10 @@ impl Drop for CopyWindows
 ///
 /// # Errors
 /// [`ArgvEnvCopyError::Reply`] with `INVALID_ARGUMENT` when the copy fails
-/// its string check or the caller's cap cannot be mapped (no map right,
-/// retyped bytes in its range), and with `OUT_OF_MEMORY` when memmgr cannot
-/// supply the pages or procmgr cannot reserve or map its windows;
+/// its string check or the kernel refuses the caller's pages for a reason
+/// other than procmgr's memory (no map right, retyped bytes in the range),
+/// and with `OUT_OF_MEMORY` when memmgr cannot supply the pages or procmgr
+/// cannot derive its caps or reserve or map its windows;
 /// [`ArgvEnvCopyError::StillMapped`] when a window's unmap failed.
 pub fn copy_argv_env(
     self_aspace: u64,
@@ -829,18 +838,7 @@ pub fn copy_argv_env(
         return Ok(ChildArgvEnv::empty());
     }
     let pages = request.total.div_ceil(PAGE_SIZE);
-    let memory = CapGuard::new(
-        crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)
-            .ok_or(Reply(procmgr_errors::OUT_OF_MEMORY))?,
-    );
-    let src = CapGuard::new(
-        syscall::cap_derive(request.cap, syscall::RIGHTS_MEM_MAP)
-            .map_err(|_| Reply(procmgr_errors::INVALID_ARGUMENT))?,
-    );
-    let dst = CapGuard::new(
-        syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW)
-            .map_err(|_| Reply(procmgr_errors::OUT_OF_MEMORY))?,
-    );
+    let (memory, src, dst) = copy_caps(child_memmgr_send, ipc_buf, request.cap, pages)?;
     let mut windows = CopyWindows::reserve(self_aspace)?;
     let mut tally = process_table::ArgvEnvTally::new(request.header);
     let mut offset = 0;
@@ -875,6 +873,35 @@ pub fn copy_argv_env(
         pages,
         header: request.header,
     })
+}
+
+/// The caps [`copy_argv_env`] copies through: the child's fresh run of
+/// `pages` pages on its memmgr account, a map-only derivation of the
+/// caller's `request_cap`, and a writable derivation of the child's run.
+///
+/// # Errors
+/// [`ArgvEnvCopyError::Reply`] with `OUT_OF_MEMORY` when memmgr cannot
+/// supply the run or a derivation fails. A derivation masks rights the
+/// source lacks rather than refusing them, so its failure is procmgr's own
+/// slot shortfall; a caller's cap without the map right is refused when its
+/// window is mapped.
+fn copy_caps(
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    request_cap: u64,
+    pages: u64,
+) -> Result<(CapGuard, CapGuard, CapGuard), ArgvEnvCopyError>
+{
+    let oom = ArgvEnvCopyError::Reply(procmgr_errors::OUT_OF_MEMORY);
+    let memory = CapGuard::new(
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf).ok_or(oom)?,
+    );
+    let src =
+        CapGuard::new(syscall::cap_derive(request_cap, syscall::RIGHTS_MEM_MAP).map_err(|_| oom)?);
+    let dst = CapGuard::new(
+        syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).map_err(|_| oom)?,
+    );
+    Ok((memory, src, dst))
 }
 
 /// Copy the `chunk_pages` pages of the blobs from page `offset` through

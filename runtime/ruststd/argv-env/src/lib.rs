@@ -3,7 +3,7 @@
 
 // runtime/ruststd/argv-env/src/lib.rs
 
-//! Pure argv / env blob parsers for the seraph std overlay.
+//! Pure argv / env blob parsers, and the spawner's window fill, for the seraph std overlay.
 //!
 //! procmgr writes the argv and env blobs into a process's read-only argv/env
 //! region, the pages after its `ProcessInfo` page, at spawn time: each is a

@@ -19,8 +19,9 @@ use syscall_abi::PAGE_SIZE;
 ///
 /// [`ScratchMapping::map`] reserves a contiguous unmapped VA range, calls
 /// `mem_map` against `memory_cap` with the requested rights, and stores the
-/// range so `Drop` can mirror the cleanup. Forgets the range on map-failure (allocator
-/// only tracks VA — the failed map leaves no kernel-side state).
+/// range so `Drop` can mirror the cleanup. A failed map may leave the pages before the
+/// failing one mapped, so `map` unmaps the whole span before it releases the range, and keeps
+/// the range reserved if that unmap fails, so no later reservation lands on a mapped page.
 pub struct ScratchMapping
 {
     range: Option<ReservedRange>,

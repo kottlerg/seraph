@@ -474,9 +474,11 @@ impl Command {
         // procmgr via the IPC; procmgr cap_deletes the file cap and the
         // argv/env cap before it replies, and binds-then-deletes the relay.
         let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) };
-        // procmgr holds no copy of the argv/env pages now, so their run goes
-        // back to memmgr whatever the outcome.
-        drop(argv_env);
+        // procmgr holds no copy of the argv/env cap now; the run goes back
+        // to memmgr unless procmgr may still map its pages.
+        if let Some(argv_env) = argv_env {
+            argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
+        }
         let reply = reply.map_err(|_| {
             let _ = syscall::cap_delete(death_eq);
             io::Error::other("CREATE_FROM_FILE syscall failed")
@@ -1449,6 +1451,9 @@ fn map_procmgr_error(code: u64) -> io::Error {
         procmgr_errors::MAP_FAILED => io::Error::other("MAP_FAILED"),
         procmgr_errors::INSUFFICIENT_RIGHTS => {
             io::Error::new(io::ErrorKind::PermissionDenied, "INSUFFICIENT_RIGHTS")
+        }
+        procmgr_errors::ARGV_ENV_STILL_MAPPED => {
+            io::Error::new(io::ErrorKind::OutOfMemory, "ARGV_ENV_STILL_MAPPED")
         }
         procmgr_errors::UNKNOWN_OPCODE => io::Error::other("UNKNOWN_OPCODE"),
         other => io::Error::other(format!("procmgr error {other}")),

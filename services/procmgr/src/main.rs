@@ -1151,7 +1151,9 @@ fn handle_create(
     //   - sends the badge in `PROCESS_DIED` at child teardown.
     // The guard owns the registration until the child's table entry does:
     // on a failed create it retires memmgr's record (PROCESS_DIED, which
-    // returns every page already billed to the child) and drops the slot.
+    // returns every page already billed to the child) and drops the slot,
+    // except after an argv/env copy window that would not unmap, whose
+    // record `settle_failed_argv_env` withholds.
     let (memmgr_send, memmgr_badge) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
     let mms = process::MemmgrSendGuard::new(memmgr_send, memmgr_badge, ctx.memmgr_ep, ipc_buf);
 

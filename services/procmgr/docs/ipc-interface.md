@@ -102,6 +102,7 @@ holds a handle to it.
 | 1 | `INVALID_ELF` | No module capability was transferred |
 | 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | Reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** below |
+| 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
 `CREATE_FROM_FILE`) marks a request that carries the child's argv and env in a Memory cap the caller
@@ -122,15 +123,17 @@ be mapped (it lacks the map right, or the kernel refuses its pages for a reason 
 memory), and when, on the copy, a blob's NULs disagree with its count or a nonempty blob does not
 end in a NUL; a caller that rewrites its pages meanwhile changes only the copy that is checked. A
 shortfall of procmgr's or the child's memory replies `OUT_OF_MEMORY`. Should procmgr fail to unmap a
-copy window, it also replies `OUT_OF_MEMORY`, keeps the window's VA reserved, and withholds the
-child's memmgr record (sends no `PROCESS_DIED` for it), so memmgr keeps the child's frames out of
-its pool rather than re-granting pages procmgr may still map. procmgr maps the copy read-only
-directly after the child's `ProcessInfo` page, where `ProcessInfo`'s `args_offset` and `env_offset`
-locate it ([abi/process-abi/README.md](../../../abi/process-abi/README.md) § argv / env region),
-funding the child's page tables for a region past one last-level table's span (512 pages) from the
-child's account. procmgr deletes its copy of the cap before it replies, so the caller can return the
-run to memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and
-the header for a std-built sender.
+copy window, which may then still map the caller's pages read-only and the child's writable, it
+replies `ARGV_ENV_STILL_MAPPED` (14), keeps the window's VA reserved, and withholds the child's
+memmgr record (sends no `PROCESS_DIED` for it); the caller MUST then withhold its run too (not
+return it to memmgr), so memmgr re-grants no frame procmgr may still map. `ArgvEnvCap::settle` does
+so. procmgr maps the copy read-only directly after the child's `ProcessInfo` page, where
+`ProcessInfo`'s `args_offset` and `env_offset` locate it
+([abi/process-abi/README.md](../../../abi/process-abi/README.md) § argv / env region), funding the
+child's page tables for a region past one last-level table's span (512 pages) from the child's
+account. procmgr deletes its copy of the cap before it replies, so the caller can return the run to
+memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and the
+header for a std-built sender.
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via
@@ -399,6 +402,7 @@ child, its memmgr record included, as for `CREATE_PROCESS`.
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
+| 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |

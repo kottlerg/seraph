@@ -208,10 +208,14 @@ pub mod procmgr_labels
     /// `CREATE_FROM_FILE`). The cap is the last cap before the death relay,
     /// or the last cap without one. procmgr copies the blobs into the child's
     /// argv/env region through fixed windows and deletes its copy of the cap
-    /// before it replies; the caller then returns the cap's run to memmgr.
-    /// Neither side returns pages a failed unmap may leave mapped: a spawner
-    /// that cannot unmap its write window withholds its run, and procmgr,
-    /// failing to unmap a copy window, withholds the child's memmgr record.
+    /// before it replies; the caller then returns the cap's run to memmgr,
+    /// unless the reply is `procmgr_errors::ARGV_ENV_STILL_MAPPED`. procmgr
+    /// replies that when it cannot unmap a copy window, which may then still
+    /// map the caller's pages read-only and the child's writable: it keeps
+    /// the window's VA reserved and withholds the child's memmgr record, and
+    /// the caller withholds its run, so memmgr re-grants no frame procmgr may
+    /// still map. A spawner that cannot unmap its own write window withholds
+    /// its run the same way.
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
     /// `CREATE_PROCESS` (**argv and env**).
     pub const CREATE_ARGV_ENV: u64 = 1 << 29;
@@ -2813,6 +2817,14 @@ pub mod procmgr_errors
     /// Caller's cap lacks the required authority badge for a gated
     /// label (e.g. `REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`).
     pub const UNAUTHORIZED: u64 = 13;
+    /// A create with `procmgr_labels::CREATE_ARGV_ENV` failed because procmgr
+    /// could not unmap a window it copied the argv and env through, so it may
+    /// still map pages of the caller's argv/env run. The caller MUST NOT
+    /// return that run to memmgr (`RELEASE_MEMORY_CAPS`); it stays charged to
+    /// the caller until it exits. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+    /// (**argv and env**).
+    pub const ARGV_ENV_STILL_MAPPED: u64 = 14;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

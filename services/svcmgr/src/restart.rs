@@ -195,7 +195,10 @@ pub fn walk_and_create_from_file(
     // kernel already transferred is a generation-checked no-op.
     // SAFETY: `ipc_buf` is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
-    drop(argv_env);
+    if let Some(argv_env) = argv_env
+    {
+        argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
+    }
     let reply = match reply
     {
         Ok(r) => r,

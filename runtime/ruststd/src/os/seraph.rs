@@ -1573,10 +1573,11 @@ pub mod process {
     /// procmgr, which deletes its copy before it replies. Dropping the value,
     /// once the create call has returned, deletes the derivation if the call
     /// did not move it, deletes this process's cap on the run, and returns the
-    /// run to memmgr (`RELEASE_MEMORY_CAPS`). A [`Self::new`] whose write
-    /// window it cannot unmap withholds the run instead: it stays charged to
-    /// this process until it exits, rather than going back to memmgr's pool
-    /// while pages of it may still be mapped here.
+    /// run to memmgr (`RELEASE_MEMORY_CAPS`). Two cases withhold the run
+    /// instead, so that it stays charged to this process until it exits
+    /// rather than going back to memmgr's pool while pages of it may still be
+    /// mapped: a [`Self::new`] whose write window it cannot unmap, and a
+    /// create procmgr answers `ARGV_ENV_STILL_MAPPED` ([`Self::settle`]).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub struct ArgvEnvCap {
         original: u64,
@@ -1652,6 +1653,23 @@ pub mod process {
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         pub fn cap(&self) -> u64 {
             self.transfer
+        }
+
+        /// Settle the run after the create call returned `reply_label`:
+        /// withhold it when procmgr replied
+        /// `procmgr_errors::ARGV_ENV_STILL_MAPPED` (procmgr may still map its
+        /// pages, so it stays charged to this process until it exits and
+        /// never returns to memmgr's pool), and otherwise drop it, returning
+        /// the run to memmgr.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn settle(self, reply_label: u64) {
+            if reply_label == ipc::procmgr_errors::ARGV_ENV_STILL_MAPPED {
+                if self.transfer != 0 {
+                    let _ = syscall::cap_delete(self.transfer);
+                }
+                let _ = syscall::cap_delete(self.original);
+                crate::mem::forget(self);
+            }
         }
     }
 

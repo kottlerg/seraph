@@ -879,8 +879,9 @@ pub fn procmgr_refusals_phase(_: &Caps)
 /// **argv and env**). Before it acquires anything for the child: a header
 /// longer than its cap, an argv/env cap that is not a Memory cap, the flag
 /// without the cap, and a label still carrying the former inline argv fields
-/// in bits `[32..64]`. On the child's copy, after it registers the child with
-/// memmgr: a blob whose NULs disagree with its count or that lacks its final
+/// in bits `[32..64]`. During the copy, after it registers the child with
+/// memmgr: a Memory cap the kernel will not map for it, and, on the child's
+/// copy, a blob whose NULs disagree with its count or that lacks its final
 /// NUL. [`create_process_argv_env_refusals`] covers the `CREATE_PROCESS`
 /// side. A spawn afterwards in [`procmgr_refusals_phase`] shows procmgr still
 /// serves.
@@ -941,6 +942,26 @@ fn argv_env_refusals()
             .build(),
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with an endpoint cap as the argv/env cap",
+    );
+
+    // A Memory cap with no rights passes the size check (`cap_info` needs
+    // none), and the kernel then refuses procmgr's map of it.
+    let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
+        .expect("building the argv/env cap failed")
+        .expect("a nonempty argv builds a cap");
+    let no_rights =
+        syscall::cap_derive(argv_env.cap(), 0).expect("deriving a rights-free argv/env cap failed");
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(label)
+            .word(0, size)
+            .words(1, &[len, 1, 0, 0])
+            .cap(file)
+            .cap(no_rights)
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_ARGV_ENV with a Memory cap that has no map right",
     );
 
     let (file, size) = hello_file();

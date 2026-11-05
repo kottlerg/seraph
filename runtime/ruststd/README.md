@@ -27,7 +27,8 @@ rather than `restricted_std`-gated. Downstream seraph bins therefore consume
 ruststd/
 ├── README.md
 ├── argv-env/                   # `ruststd-argv-env` crate: pure, host-tested argv/env
-│   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
+│   └── src/lib.rs              #   blob parsers and the spawner's window fill; also a
+│                               #   rustc-dep-of-std dep of overlaid std
 ├── death-queues/               # `ruststd-death-queues` crate: pure, host-tested death-queue
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),

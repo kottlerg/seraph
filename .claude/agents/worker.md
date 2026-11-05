@@ -208,11 +208,11 @@ before the validation runs.
 The validation set: `cargo xtask test`, `cargo xtask lint-docs`, then on both architectures
 `cargo xtask build` and the boots the change sits on (ktest for `core/` and `shared/`; svctest
 and usertest for services and runtimes; the harness recipes are in docs/testing.md § Gating
-and xtask/README.md). Run the two coverage screens of docs/testing.md § Coverage tiers on your
+and xtask/README.md). Run the three coverage screens of docs/testing.md § Coverage tiers on your
 own diff and state exactly which local host runs they owe (boundary CPU counts, the memory
-variation), at `--runs 1` unless the PR states a concurrency-fix purpose. An owed run that
-fails or hangs blocks; apart from the one re-run alone above, report it with the log before any
-re-run. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only.
+variation, the device cells), at `--runs 1` unless the PR states a concurrency-fix purpose. An
+owed run that fails or hangs blocks; apart from the one re-run alone above, report it with the log
+before any re-run. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only.
 
 ## Review
 

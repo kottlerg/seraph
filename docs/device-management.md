@@ -145,10 +145,10 @@ its own or devmgr withdrew it:
    device, waiting for the reset to be confirmed for at most `RESET_TIMEOUT` (5 s).
 3. **Memory freed.** procmgr holds back the `PROCESS_DIED` of a driver devmgr created with
    `CREATE_DMA_HOLD`, however the driver died, so memmgr keeps its frames on the driver's record,
-   out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only once the Bus Master Enable
-   read-back and the reset both confirm the device stopped; a device that does not confirm both
-   leaves the frames quarantined on that record, counted and never handed out again, for the
-   rest of the boot.
+   out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only when the IOMMU blocked the
+   device, or when the Bus Master Enable read-back is clear, every BAR copy is revoked and the
+   reset is confirmed; a device that meets neither leaves the frames quarantined on that record,
+   counted and never handed out again, for the rest of the boot.
 
 The hold rests on the driver not having handed its procmgr capability onward. procmgr cannot tell
 devmgr's `RELEASE_HOLD` from one sent on a copy of the driver's own procmgr capability, which
@@ -170,13 +170,13 @@ stopped, and a dead driver's capabilities go with its `CSpace`, so a lent frame 
 to the pool while the device may write it
 ([#749](https://github.com/kottlerg/seraph/issues/749)).
 
-Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to
-withdraw the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the
-IOMMU before Bus Master Enable is cleared. A device the IOMMU blocks can no longer reach the
-driver's frames, so devmgr releases the hold once the block is in place, whether or not the Bus
-Master Enable read-back and the reset confirm; with no IOMMU confining the device, the release
-waits on both confirmations as step 3 states. No IOMMU is programmed yet (design intent; not
-yet implemented), so today every release waits on both.
+Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to withdraw
+the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the IOMMU before
+Bus Master Enable is cleared. A device the IOMMU blocks can no longer reach the driver's frames,
+so devmgr releases the hold once the block is in place, whether or not the Bus Master Enable
+read-back, the BAR revocation and the reset confirm; with no IOMMU confining the device, the
+release waits on all three as step 3 states. No IOMMU is programmed yet (design intent; not yet
+implemented), so today every release waits on all three.
 
 The steps, their owners, and their bounds are specified in
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
@@ -215,15 +215,16 @@ none, the device can reach memory only at physical addresses, so the address dev
 the frames' physical address and the mapping is bookkeeping alone. The protocol and the
 driver's code are the same in both modes.
 
-devmgr serves the DMA endpoint on a thread of its own, placed at the boot drivers' level
-(`ipc::sched_policy::BOOT_DRIVER_PRIORITY`, above devmgr's own) because the block driver blocks
-on it, so a mapping never waits on its registry loop, which makes nested calls (a driver spawn
-from the root filesystem reads the binary through the block driver, which maps the read's buffer)
-and settles batches whose drivers map their rings before they report ready. The two threads share
-the table of devices and mappings under one lock, held only around table operations and never
-across IPC. A device holds at most `MAX_MAPPINGS_PER_DEVICE` mappings ([limits.md](limits.md)).
-When devmgr withdraws a driver it revokes every copy of the device's DMA capability and drops the
-device's mappings, so a request still queued is refused.
+devmgr serves the DMA endpoint on a thread of its own, apart from the registry loop, because that
+loop makes nested calls (a driver spawn from the root filesystem reads the binary through the
+block driver, which maps the read's buffer) and settles batches whose drivers map their rings
+before they report ready, and a mapping must never wait on it. The thread runs at the boot
+drivers' level (`ipc::sched_policy::BOOT_DRIVER_PRIORITY`, above devmgr's own) because the block
+driver blocks on it. The two threads share the table of devices and mappings under one lock, held
+only around table operations and never across IPC. A device holds at most
+`MAX_MAPPINGS_PER_DEVICE` mappings ([limits.md](limits.md)). When devmgr withdraws a driver it
+revokes every copy of the device's DMA capability and drops the device's mappings, so a request
+still queued is refused.
 
 ---
 

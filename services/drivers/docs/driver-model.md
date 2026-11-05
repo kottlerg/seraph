@@ -58,16 +58,15 @@ it takes the device from the driver in an order that frees the driver's memory o
 device's DMA is confirmed stopped or blocked: it first withdraws the device's DMA capability,
 revoking every copy and dropping the device's mappings, which also blocks the device where an
 IOMMU confines it (design intent; not yet implemented); then it clears the function's Bus Master
-Enable through a
-configuration-page cap it keeps and no driver holds, so the device issues no further DMA; revokes
-the driver's mappings of its BARs; resets the device through a BAR cap it keeps (`device_status` 0,
-complete once the status reads back 0, bounded by `RESET_TIMEOUT`), which drops its pending
-interrupt; and destroys the driver. Every `VirtIO` driver is created `CREATE_DMA_HOLD`, so procmgr
-holds its memory after its death, however it died, until devmgr releases it, which devmgr does
-only when the IOMMU blocked the device or the Bus Master Enable read-back and the reset both
-confirm the device stopped; otherwise
-the memory stays quarantined for the rest of the boot. A driver that dies while its device asserts
-a shared level-triggered line leaves the line's other receivers no assertion to loop on once the
+Enable through a configuration-page cap it keeps and no driver holds, so the device issues no
+further DMA; revokes the driver's mappings of its BARs; resets the device through a BAR cap it
+keeps (`device_status` 0, complete once the status reads back 0, bounded by `RESET_TIMEOUT`),
+which drops its pending interrupt; and destroys the driver. Every `VirtIO` driver is created
+`CREATE_DMA_HOLD`, so procmgr holds its memory after its death, however it died, until devmgr
+releases it, which devmgr does only when the IOMMU blocked the device, or when the Bus Master
+Enable read-back is clear, every BAR copy is revoked and the reset is confirmed; otherwise the
+memory stays quarantined for the rest of the boot. A driver that dies while its device asserts a
+shared level-triggered line leaves the line's other receivers no assertion to loop on once the
 reset lands; between the driver's death, which releases its binding, and the reset, they may see
 re-deliveries their own devices did not raise
 ([docs/device-management.md](../../../docs/device-management.md#interrupt-delivery)

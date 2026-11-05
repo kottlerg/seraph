@@ -53,8 +53,8 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 1 |
-| label bits `[16..30]` | Create flags and scheduling fields (see **Pinned flag**, **Scheduling fields**, and **argv and env** below) |
-| label bits `[30..64]` | Reserved, zero |
+| label bits `[16..31]` | Create flags and scheduling fields (see **Pinned flag**, **Scheduling fields**, **argv and env**, and **Physical-address flag** below) |
+| label bits `[31..64]` | Reserved, zero |
 | data[0..4] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, `args_bytes`, `args_count`, `env_bytes`, `env_count`, one `u64` each |
 | cap[0] | Memory capability for the ELF module image |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
@@ -103,7 +103,7 @@ holds a handle to it.
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
 | 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | Reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** below |
+| 7 | `INVALID_ARGUMENT` | Reserved label bits `[31..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, or `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below) |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
@@ -146,7 +146,7 @@ and `pager_badge` (that badge) so the runtime inherits the handler onto spawned
 threads. The
 child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
-in the `[16..30]` window shared with `CREATE_FROM_FILE`) opts out: the
+in the `[16..31]` window shared with `CREATE_FROM_FILE`) opts out: the
 child is left eager-mapped with no pager. Set it only for a process that cannot
 depend on the fault path — a DMA driver. init, memmgr, and procmgr are pre-pager
 and never routed through this path, so they are pinned by construction. See
@@ -181,9 +181,24 @@ the create, so no teardown frees a held child's pages for want of a record;
 when it cannot, or cannot derive the token, the create fails with
 `OUT_OF_MEMORY`.
 
+**Physical-address flag.** The label's bit 30 (`CREATE_PHYS_ACCESS`, in the window shared with
+`CREATE_FROM_FILE`) creates the child phys-class: procmgr registers it with memmgr with
+`REGISTER_PHYS_CLASS`, so memmgr's grants to it keep `RIGHTS_MEM_PHYS` and the child can read
+the physical bases of the Memory caps it holds
+([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 3).
+procmgr retypes every child's address space, a phys-class child's included, through a
+derivation of its slab without `RIGHTS_MEM_PHYS`, so no child's address space carries
+`RIGHTS_AS_READ` and procmgr, which keeps it for the child's life, cannot translate its pages.
+procmgr honours it only from a creator that is phys-class itself: an un-badged one
+(badge 0: init, or svcmgr's mint source) or one whose memmgr badge carries
+`memmgr_labels::PHYS_CLASS_BADGE_BIT`; from any other it replies `INVALID_ARGUMENT` before any
+resource is acquired. init sets it for devmgr and devmgr for the IOMMU driver, the processes
+[docs/device-management.md](../../../docs/device-management.md#dma-authorisation) § DMA
+Authorisation names; every other process, every device driver included, is created without it.
+
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and
-`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[30..64]`
+`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[31..64]`
 remain reserved and MUST be zero (`INVALID_ARGUMENT` otherwise, which keeps a
 future field addition provably additive). Resolution, against the **creator's
 band ceiling** (badge 0 = init, ceiling `sched_policy::BASELINE_PRIORITY_MAX`;
@@ -385,8 +400,8 @@ resulting file cap. procmgr opens it (`FS_OPEN`), streams the ELF with `FS_READ`
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 13 |
-| label bits `[16..30]` | As for `CREATE_PROCESS`; bit 17 (`CREATE_DEATH_RELAY`) marks a trailing death-relay cap |
-| label bits `[30..64]` | Reserved, zero |
+| label bits `[16..31]` | As for `CREATE_PROCESS`; bit 17 (`CREATE_DEATH_RELAY`) marks a trailing death-relay cap |
+| label bits `[31..64]` | Reserved, zero |
 | data[0] | `file_size` in bytes, from the caller's `NS_LOOKUP` size hint |
 | data[1..5] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, as for `CREATE_PROCESS` |
 | cap[0] | File cap for the binary |
@@ -418,7 +433,7 @@ included, as for `CREATE_PROCESS`.
 |---|---|---|
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (the TLS block's checks aside; see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
+| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[31..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
@@ -643,8 +658,10 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
 ## Summarized By
 
+[Kernel Cross-Boundary Disclosure Inventory](../../../core/kernel/docs/cross-boundary-disclosure.md),
 [Scheduler Internals](../../../core/kernel/docs/scheduler.md),
 [Capability Model](../../../docs/capability-model.md),
+[Device Management](../../../docs/device-management.md),
 [Fault Handling](../../../docs/fault-handling.md),
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),

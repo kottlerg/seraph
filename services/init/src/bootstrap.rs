@@ -952,8 +952,17 @@ pub fn bootstrap_memmgr(
 
     // Mint procmgr's badged SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this badge as authorised for the
-    // procmgr-only labels.
-    let procmgr_badge_on_mm = mint_bootstrap_badge()?;
+    // procmgr-only labels. The badge is in memmgr's process-badge space, whose
+    // phys-class bit procmgr must not carry (memmgr refuses the bootstrap
+    // otherwise), and stays nonzero with it cleared.
+    let procmgr_badge_on_mm = loop
+    {
+        let b = mint_bootstrap_badge()? & !ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT;
+        if b != 0
+        {
+            break b;
+        }
+    };
     let procmgr_send_cap = syscall::cap_derive_badge(
         mm_service_ep,
         syscall::RIGHTS_EP_SEND_GRANT,
@@ -1343,7 +1352,16 @@ unsafe fn populate_procmgr_info(
 {
     let pm_thread_in_pm =
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
-    let pm_aspace_in_pm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
+    // procmgr's own address space without `RIGHTS_AS_READ`: init retyped it
+    // from a `PHYS` arena, so it was minted with READ, which would let procmgr
+    // translate every page it maps (its children's frames included) with
+    // `SYS_ASPACE_QUERY`. procmgr never queries a mapping.
+    let pm_aspace_in_pm = syscall::cap_copy(
+        caps.aspace,
+        caps.cspace,
+        syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_READ,
+    )
+    .ok()?;
     let pm_cspace_in_pm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CS_ALL).ok()?;
     // Baseline SchedControl: procmgr's own scheduling authority and the

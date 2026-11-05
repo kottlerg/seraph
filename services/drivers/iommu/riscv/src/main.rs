@@ -120,7 +120,14 @@ fn main() -> !
     // The IOMMU reads its structures coherently with the caches (the
     // `backend` module doc): no table write needs writing back.
     let store = Store::new(info.memmgr_endpoint, info.self_aspace, Flush::Coherent);
-    let Some(mut svc) = Service::new(Riscv::new(units, store), KernelCaps, boot.units)
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    let Some(caps) = (unsafe { KernelCaps::new(info.memmgr_endpoint, ipc_buf) })
+    else
+    {
+        std::os::seraph::log!("no physical-address credential");
+        syscall::thread_exit();
+    };
+    let Some(mut svc) = Service::new(Riscv::new(units, store), caps, boot.units)
     else
     {
         std::os::seraph::log!("no memory for the service");

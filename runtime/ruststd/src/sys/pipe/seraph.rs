@@ -78,7 +78,7 @@ const RING_RELEASED: u8 = 4;
 ///
 /// The ring page is granted to the spawner via `REQUEST_MEMORY_CAPS` and
 /// stays in memmgr's per-process accounting until returned with
-/// `RELEASE_MEMORY_CAPS` (named by phys base) or until the spawner dies.
+/// `RELEASE_MEMORY_CAPS` (named by its region id) or until the spawner dies.
 /// Without the return, every piped spawn strands one grant in memmgr;
 /// a few hundred spawns by one long-lived process exhaust memmgr's
 /// CSpace and wedge every memmgr client system-wide.
@@ -95,21 +95,21 @@ const RING_RELEASED: u8 = 4;
 /// whose ring unmap fails never reports, so its grant stays accounted to
 /// the spawner until exit.
 pub struct RingRelease {
-    phys: u64,
+    region_id: u64,
     state: AtomicU8,
 }
 
 impl RingRelease {
-    fn new(phys: u64) -> Self {
+    fn new(region_id: u64) -> Self {
         Self {
-            phys,
+            region_id,
             state: AtomicU8::new(RING_NO_PEER),
         }
     }
 
-    /// Ring page physical base, for the `RELEASE_MEMORY_CAPS` sender.
-    pub fn phys(&self) -> u64 {
-        self.phys
+    /// Ring page grant's region id, for the `RELEASE_MEMORY_CAPS` sender.
+    pub fn region_id(&self) -> u64 {
+        self.region_id
     }
 
     /// A live child observer now exists; defer release to the two-party
@@ -284,11 +284,11 @@ impl Pipe {
             .map_err(|_| io::Error::other("seraph pipe: parent ring VA reservation failed"))?;
         let parent_va = reserved.va_start();
 
-        // Request one page from memmgr, keeping the phys base so the grant
+        // Request one page from memmgr, keeping the grant's region id so it
         // can be returned via RELEASE_MEMORY_CAPS when the pipe ends its
         // life (see `RingRelease`). want_pages=1 returns exactly one cap
         // covering one page.
-        let Some((memory_cap, _pages, ring_phys)) =
+        let Some((memory_cap, _pages, ring_region_id)) =
             crate::sys::alloc::seraph::slab_request_pages(memmgr_ep, 1)
         else {
             unreserve_pages(reserved);
@@ -313,7 +313,7 @@ impl Pipe {
             });
         if map_result.is_err() {
             let _ = syscall::cap_delete(memory_cap);
-            crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
+            crate::sys::alloc::seraph::slab_release_fresh(ring_region_id);
             unreserve_pages(reserved);
             return Err(io::Error::other("seraph pipe: ring page map failed"));
         }
@@ -337,7 +337,7 @@ impl Pipe {
             Err(e) => {
                 // SAFETY: `reserved` holds the ring page mapped above, and
                 // no Pipe has been built over it yet.
-                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_region_id, reserved) };
                 return Err(e);
             }
         };
@@ -352,7 +352,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 // SAFETY: `reserved` holds the ring page mapped above, and
                 // no Pipe has been built over it yet.
-                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_region_id, reserved) };
                 return Err(e);
             }
         };
@@ -369,7 +369,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 // SAFETY: `reserved` holds the ring page mapped above, and
                 // no Pipe has been built over it yet.
-                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_region_id, reserved) };
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (memory handoff) failed",
                 ));
@@ -383,7 +383,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 // SAFETY: `reserved` holds the ring page mapped above, and
                 // no Pipe has been built over it yet.
-                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_region_id, reserved) };
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
                 ));
@@ -398,7 +398,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 // SAFETY: `reserved` holds the ring page mapped above, and
                 // no Pipe has been built over it yet.
-                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_region_id, reserved) };
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
                 ));
@@ -415,7 +415,7 @@ impl Pipe {
                 aspace,
                 reserved_va: Some(reserved),
                 peer_dead: None,
-                ring_release: Some(Arc::new(RingRelease::new(ring_phys))),
+                ring_release: Some(Arc::new(RingRelease::new(ring_region_id))),
             },
             PipeCaps {
                 memory: memory_handoff,
@@ -490,7 +490,7 @@ impl Pipe {
     pub fn mark_peer_never_ran(&self) {
         if let Some(rr) = &self.ring_release {
             if rr.on_peer_death() {
-                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+                crate::sys::alloc::seraph::slab_release_fresh(rr.region_id());
             }
         }
     }
@@ -744,7 +744,7 @@ impl Drop for Pipe {
         // this side is done; release now if the child is too.
         if let Some(rr) = &self.ring_release {
             if rr.on_parent_drop() {
-                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+                crate::sys::alloc::seraph::slab_release_fresh(rr.region_id());
             }
         }
     }
@@ -761,7 +761,7 @@ impl Drop for Pipe {
 unsafe fn discard_mapped_ring(
     aspace: u64,
     memory_cap: u64,
-    ring_phys: u64,
+    ring_region_id: u64,
     reserved: ReservedRange,
 ) {
     // SAFETY: the caller's contract: `reserved` is the ring page's own arena
@@ -769,7 +769,7 @@ unsafe fn discard_mapped_ring(
     let unmapped = unsafe { syscall::mem_unmap(aspace, reserved.va_start(), 1) }.is_ok();
     let _ = syscall::cap_delete(memory_cap);
     if unmapped {
-        crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
+        crate::sys::alloc::seraph::slab_release_fresh(ring_region_id);
         unreserve_pages(reserved);
     }
 }

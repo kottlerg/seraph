@@ -918,8 +918,7 @@ unsafe fn kernel_entry_post_rebase(
                 // segment. A narrower cap donates a non-writable frame that
                 // fails downstream writable maps. Mirrors the boot-module and
                 // reclaim-scratch mints (`core/kernel/src/cap/mod.rs`).
-                let rights =
-                    MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE;
+                let rights = MemRights::BOOT_RAM;
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
                 // `phys & 0xFFF == virt & 0xFFF`. The Memory cap exposed
@@ -1131,10 +1130,7 @@ unsafe fn kernel_entry_post_rebase(
                 // donates a frame that cannot satisfy a downstream RW/RX map and
                 // fails the consumer's fault.
                 let slot = cs
-                    .insert_cap_typed(
-                        MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
-                        fo_nn,
-                    )
+                    .insert_cap_typed(MemRights::BOOT_RAM, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 // pg < info_pages, at most INIT_INFO_MAX_PAGES (Phase 7).
@@ -1239,10 +1235,7 @@ unsafe fn kernel_entry_post_rebase(
                 // stack executable. A narrower cap donates a frame that cannot
                 // satisfy a downstream RX map and fails the consumer's fault.
                 let slot = cs
-                    .insert_cap_typed(
-                        MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
-                        fo_nn,
-                    )
+                    .insert_cap_typed(MemRights::BOOT_RAM, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 // i < STACK_PAGES, a small constant.

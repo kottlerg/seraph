@@ -35,7 +35,16 @@ pub struct FrameDesc
     pub page_count: u32,
     pub phys_base: u64,
     pub va: u64,
+    /// The opaque id `REQUEST_MEMORY_CAPS` returned for this grant and
+    /// `RELEASE_MEMORY_CAPS` names it by ([`crate::Ledger::push_grant`]), or
+    /// [`NO_REGION_ID`] for a frame no caller can release (a demand chunk, a
+    /// bootstrap arena).
+    pub region_id: u64,
 }
+
+/// [`FrameDesc::region_id`] of a frame no release names. No grant takes it:
+/// a record's ids start at 1.
+pub const NO_REGION_ID: u64 = 0;
 
 /// One tracked process: its badge and the heads of its frame and region
 /// lists. The record's own slot `next` link chains it in its
@@ -48,6 +57,10 @@ pub struct ProcessRecord
     pub region_head: NodeIdx,
     /// Delegated child `AddressSpace` cap, or `0` when not demand-paged.
     pub aspace_cap: u64,
+    /// The region id the record's next grant takes: a per-process sequence
+    /// from 1, so an id names one grant of this process for the record's
+    /// life and reveals nothing the process does not already know.
+    pub next_region_id: u64,
 }
 
 /// The payload of one arena slot.

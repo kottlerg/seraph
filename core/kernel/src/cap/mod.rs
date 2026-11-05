@@ -9,7 +9,8 @@
 //! (id 0) populated with initial capabilities for all boot-provided hardware
 //! resources:
 //!
-//! - Usable physical memory → [`CapTag::Memory`] caps (MAP | WRITE | EXECUTE | RETYPE)
+//! - Usable physical memory → [`CapTag::Memory`] caps
+//!   ([`MemRights::BOOT_RAM`]: MAP | WRITE | EXECUTE | RETYPE | PHYS)
 //! - MMIO apertures (coarse non-RAM ranges from the boot protocol)
 //!   → [`CapTag::Mmio`] caps (MAP | WRITE)
 //! - One root [`CapTag::Interrupt`] range cap covering every valid IRQ id
@@ -1724,8 +1725,9 @@ fn populate_cspace(
     // overwrite extents not yet read.
     let mut desc_count: usize = 0;
 
-    // Usable physical memory → Memory caps with MAP | WRITE | EXECUTE | RETYPE
-    // (rights policy and the mapping-time W^X rule: docs/capability-model.md § Memory).
+    // Usable physical memory → Memory caps with `MemRights::BOOT_RAM`
+    // (MAP | WRITE | EXECUTE | RETYPE | PHYS; rights policy and the mapping-time
+    // W^X rule: docs/capability-model.md § Memory).
     //
     // Memory caps are allocated FROM the buddy allocator so the same
     // physical pages are not double-booked between the kernel's internal
@@ -1775,7 +1777,7 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+                MemRights::BOOT_RAM,
                 ptr,
                 "Phase 7: cannot allocate Memory capability for usable memory",
             );
@@ -1833,7 +1835,7 @@ fn populate_cspace(
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+            MemRights::BOOT_RAM,
             ptr,
             "Phase 7: cannot allocate Memory capability for usable memory",
         );
@@ -2216,7 +2218,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // lacks WRITE and EXECUTE.
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+            MemRights::BOOT_RAM,
             ptr,
             "Phase 7: cannot allocate Memory capability for boot module",
         );
@@ -2458,7 +2460,7 @@ fn mint_reclaim_pass(
         });
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
+            MemRights::BOOT_RAM,
             ptr,
             if late
             {

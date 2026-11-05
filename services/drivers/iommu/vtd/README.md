@@ -34,8 +34,11 @@ chunks (`REQUIRE_CONTIGUOUS`) and maps into itself, through the page store it sh
 RISC-V IOMMU driver ([`iommu-store`](../store/README.md)), which writes each table store back from
 the caches when a unit does not snoop them. It reads their physical bases, and those of
 the frames each `MAP` installs, with `CAP_INFO_MEMORY_PHYS_BASE`: the units are programmed with
-physical addresses, which makes the IOMMU driver the one driver class that reads them
-([#767](https://github.com/kottlerg/seraph/issues/767)'s named exception). No table page is
+physical addresses, which makes the IOMMU driver the one driver class that reads them. devmgr
+spawns it phys-class, so its grants carry the Memory `Phys` right, and it reads a driver's frames,
+whose caps lack it, presenting a page of its own as the credential (`iommu_core::KernelCaps`; see
+[docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
+§ Physical Addresses). No table page is
 ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases it (it deletes the
 hold's release token at the spawn), since a unit may walk any of them while translation stays on.
 

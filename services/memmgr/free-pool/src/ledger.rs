@@ -20,7 +20,9 @@
 //! [`DeferredList`] until a later [`Ledger::recheck_deferred`] accepts it
 //! (`services/memmgr/docs/memory-pool.md` § Reclamation).
 
-use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, Slot, SlotStore};
+use crate::arena::{
+    Arena, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord, Slot, SlotStore,
+};
 use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
@@ -107,6 +109,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 frame_head: NODE_NULL,
                 region_head: NODE_NULL,
                 aspace_cap: 0,
+                next_region_id: 1,
             }),
             NODE_NULL,
         )?;
@@ -161,6 +164,38 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         r.frame_head = idx;
         self.set_record(rec, r);
         true
+    }
+
+    /// Account a caller-owned grant of `page_count` pages at `phys_base`,
+    /// held by memmgr's `cap_slot`, to `rec`, marked with `va` (the service's
+    /// caller-owned-mapping marker) and the record's next region id, which
+    /// it returns for the grant reply. `None` when the arena has no free slot
+    /// outside its reserve or the record's id sequence is spent; the record
+    /// is unchanged then.
+    pub fn push_grant(
+        &mut self,
+        rec: NodeIdx,
+        cap_slot: u64,
+        page_count: u32,
+        phys_base: u64,
+        va: u64,
+    ) -> Option<u64>
+    {
+        let mut r = self.record(rec)?;
+        let region_id = r.next_region_id;
+        let next_region_id = region_id.checked_add(1)?;
+        let frame = FrameDesc {
+            cap_slot,
+            page_count,
+            phys_base,
+            va,
+            region_id,
+        };
+        let idx = self.arena.alloc(Node::Frame(frame), r.frame_head)?;
+        r.frame_head = idx;
+        r.next_region_id = next_region_id;
+        self.set_record(rec, r);
+        Some(region_id)
     }
 
     /// Undo the most recent [`Ledger::push_frame`] on `rec`, returning the
@@ -349,23 +384,19 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         moved
     }
 
-    /// Take back the caller-owned grant of `rec` (a frame with `va ==
-    /// unmapped`) based at `phys`, pooled or deferred as `quiescent` decides.
-    /// Returns whether one matched.
-    pub fn release_frame_by_phys(
+    /// Take back the grant of `rec` that [`Ledger::push_grant`] gave
+    /// `region_id`, pooled or deferred as `quiescent` decides. Returns
+    /// whether one matched; [`NO_REGION_ID`] matches none.
+    pub fn release_frame_by_region(
         &mut self,
         rec: NodeIdx,
-        phys: u64,
-        unmapped: u64,
+        region_id: u64,
         quiescent: impl FnMut(&FreeRun) -> bool,
     ) -> bool
     {
-        self.return_frames_where(
-            rec,
-            |f| f.va == unmapped && f.phys_base == phys,
-            Take::First,
-            quiescent,
-        ) == 1
+        region_id != NO_REGION_ID
+            && self.return_frames_where(rec, |f| f.region_id == region_id, Take::First, quiescent)
+                == 1
     }
 
     /// Take back every frame of `rec` memmgr mapped at a page base in `[base,
@@ -476,6 +507,7 @@ mod tests
             page_count,
             phys_base,
             va,
+            region_id: NO_REGION_ID,
         }
     }
 
@@ -528,11 +560,11 @@ mod tests
         let rec = l.insert_process(7).unwrap();
         assert!(l.push_frame(rec, frame(1, 2, 0x1000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 3, 0x8000, UNMAPPED)));
-        assert!(l.push_frame(rec, frame(3, 4, 0x20000, UNMAPPED)));
+        let id = l.push_grant(rec, 3, 4, 0x20000, UNMAPPED).unwrap();
         // A live process's release of a frame the check refuses leaves the
         // record and parks the frame, out of the pool.
-        assert!(l.release_frame_by_phys(rec, 0x20000, UNMAPPED, |_| false));
-        assert!(!l.release_frame_by_phys(rec, 0x20000, UNMAPPED, pool_all));
+        assert!(l.release_frame_by_region(rec, id, |_| false));
+        assert!(!l.release_frame_by_region(rec, id, pool_all));
         // At death, the frame the check refuses joins it there.
         l.remove_process(7, |r| r.cap_slot != 2).unwrap();
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (2, 1));
@@ -561,26 +593,65 @@ mod tests
     {
         let mut l = ledger();
         let rec = l.insert_process(1).unwrap();
-        assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
-        assert!(l.push_frame(rec, frame(2, 1, 0x2000, UNMAPPED)));
+        let first = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
+        assert!(l.push_grant(rec, 2, 1, 0x2000, UNMAPPED).is_some());
         assert_eq!(l.pop_frame(rec).map(|f| f.cap_slot), Some(2));
-        assert!(l.release_frame_by_phys(rec, 0x1000, UNMAPPED, pool_all));
+        assert!(l.release_frame_by_region(rec, first, pool_all));
         assert!(l.pop_frame(rec).is_none());
     }
 
     #[test]
-    fn release_frame_by_phys_takes_only_a_matching_caller_owned_grant()
+    fn release_frame_by_region_takes_only_the_named_grant_of_the_caller()
     {
         let mut l = ledger();
         let rec = l.insert_process(1).unwrap();
-        assert!(l.push_frame(rec, frame(1, 4, 0x8000, UNMAPPED)));
+        let other = l.insert_process(2).unwrap();
+        let id = l.push_grant(rec, 1, 4, 0x8000, UNMAPPED).unwrap();
+        // Records number their grants independently: the same id names
+        // another process's grant there.
+        assert_eq!(l.push_grant(other, 3, 8, 0xA000, UNMAPPED), Some(id));
         assert!(l.push_frame(rec, frame(2, 16, 0x9000, 0x50_0000)));
-        // A demand chunk is never released by phys base.
-        assert!(!l.release_frame_by_phys(rec, 0x9000, UNMAPPED, pool_all));
-        assert!(!l.release_frame_by_phys(rec, 0x1234, UNMAPPED, pool_all));
-        assert!(l.release_frame_by_phys(rec, 0x8000, UNMAPPED, pool_all));
-        assert!(!l.release_frame_by_phys(rec, 0x8000, UNMAPPED, pool_all));
+        // A demand chunk carries no id, so no release names it.
+        assert!(!l.release_frame_by_region(rec, NO_REGION_ID, pool_all));
+        assert!(!l.release_frame_by_region(rec, id + 1, pool_all));
+        assert!(l.release_frame_by_region(rec, id, pool_all));
+        assert!(!l.release_frame_by_region(rec, id, pool_all));
         assert_eq!(l.pool.free_pages(), 4);
+        assert!(l.release_frame_by_region(other, id, pool_all));
+        assert_eq!(l.pool.free_pages(), 12);
+    }
+
+    #[test]
+    fn a_record_never_reissues_a_region_id()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1).unwrap();
+        let first = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
+        assert!(l.release_frame_by_region(rec, first, pool_all));
+        // The same run granted again is a new grant with a new id, so a stale
+        // release of the first id leaves it in place.
+        let second = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
+        assert_ne!(first, second);
+        assert!(!l.release_frame_by_region(rec, first, pool_all));
+        assert!(l.release_frame_by_region(rec, second, pool_all));
+    }
+
+    #[test]
+    fn push_grant_refuses_a_spent_id_sequence_and_a_full_arena_unchanged()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1).unwrap();
+        let mut r = l.record(rec).unwrap();
+        r.next_region_id = u64::MAX;
+        l.set_record(rec, r);
+        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED), None);
+        assert_eq!(l.record(rec), Some(r));
+        r.next_region_id = 1;
+        l.set_record(rec, r);
+        fill_arena(&mut l);
+        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED), None);
+        assert_eq!(l.record(rec), Some(r));
+        assert_eq!(l.push_grant(NODE_NULL, 1, 1, 0x1000, UNMAPPED), None);
     }
 
     #[test]

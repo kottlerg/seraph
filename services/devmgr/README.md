@@ -28,6 +28,7 @@ devmgr/
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
 │   ├── iommu.rs                    # IOMMU units, driver spawn, device attach, fail-closed client
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
+│   ├── phys.rs                     # Physical-address credential (a memmgr page with `Phys`)
 │   ├── settle.rs                   # Driver death watch; batch settle: ready, deaths, bound
 │   ├── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
 │   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup

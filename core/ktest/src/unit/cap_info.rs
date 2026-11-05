@@ -22,13 +22,15 @@
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
 //! - The `InitInfo` RAM Memory descriptors against their caps
 //!   (`ram_descriptors_match_caps`).
+//! - The `RIGHTS_MEM_PHYS` gate on `CAP_INFO_MEMORY_PHYS_BASE` and on the
+//!   `RIGHTS_AS_READ` an address-space retype mints (`phys_base_needs_the_right`).
 //! - Negative paths: null slot index (`InvalidCapability`) and tag-mismatched
 //!   selector (`InvalidArgument`).
 
 use syscall::{
     MAP_WRITABLE, RIGHTS_ALL, cap_create_aspace, cap_create_cspace, cap_create_endpoint,
-    cap_create_notification, cap_delete, cap_derive, cap_info, cap_info_memory_mappings, mem_map,
-    mem_unmap,
+    cap_create_notification, cap_delete, cap_derive, cap_info, cap_info_memory_mappings,
+    cap_info_phys_base, mem_map, mem_unmap,
 };
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
@@ -503,6 +505,73 @@ fn check_mask(cap: u64, expected: u64, what: &'static str) -> TestResult
     if rights != expected32
     {
         return Err(what);
+    }
+    Ok(())
+}
+
+/// `CAP_INFO_MEMORY_PHYS_BASE` answers only a holder of `RIGHTS_MEM_PHYS`
+/// (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`): a boot RAM cap, which
+/// carries the right, answers; a derivation without it is refused
+/// `InsufficientRights`, alone and with itself as the credential, answers
+/// with the RAM cap as its credential, and a credential that is not a Memory
+/// cap is refused `InvalidCapability`. An `AddressSpace` retyped through the
+/// derivation is minted without `RIGHTS_AS_READ`, so `SYS_ASPACE_QUERY`
+/// cannot translate its pages; one retyped from the RAM cap carries it
+/// (`creation_masks_match_abi`).
+pub fn phys_base_needs_the_right(ctx: &TestContext) -> TestResult
+{
+    let memory = ctx.memory_base;
+    let base = cap_info(memory, CAP_INFO_MEMORY_PHYS_BASE)
+        .map_err(|_| "phys_base_needs_the_right: a RAM cap's physical base was refused")?;
+    let child = cap_derive(memory, RIGHTS_ALL & !syscall_abi::RIGHTS_MEM_PHYS)
+        .map_err(|_| "phys_base_needs_the_right: cap_derive without PHYS failed")?;
+    let r = phys_gate_on(child, memory, base, ctx.aspace_cap)
+        .and_then(|()| aspace_read_follows_phys(child));
+    cap_delete(child).map_err(|_| "phys_base_needs_the_right: cap_delete of the derivation")?;
+    r
+}
+
+/// [`phys_base_needs_the_right`]'s selector checks on `child`, a derivation
+/// of `memory` without `RIGHTS_MEM_PHYS` whose base is `base`; `other` is a
+/// cap of another type.
+fn phys_gate_on(child: u64, memory: u64, base: u64, other: u64) -> TestResult
+{
+    let refused = Err(SyscallError::InsufficientRights as i64);
+    if cap_info(child, CAP_INFO_MEMORY_PHYS_BASE) != refused
+    {
+        return Err("phys_base_needs_the_right: a cap without PHYS was not refused");
+    }
+    if cap_info_phys_base(child, child) != refused
+    {
+        return Err("phys_base_needs_the_right: a credential without PHYS was accepted");
+    }
+    if cap_info_phys_base(child, memory) != Ok(base)
+    {
+        return Err("phys_base_needs_the_right: a PHYS credential did not answer the base");
+    }
+    if cap_info_phys_base(child, other) != Err(SyscallError::InvalidCapability as i64)
+    {
+        return Err("phys_base_needs_the_right: a non-Memory credential was not refused");
+    }
+    Ok(())
+}
+
+/// [`phys_base_needs_the_right`]'s address-space check: a retype through
+/// `child`, which lacks `RIGHTS_MEM_PHYS`, mints no `RIGHTS_AS_READ`.
+fn aspace_read_follows_phys(child: u64) -> TestResult
+{
+    let aspace = cap_create_aspace(child, 0, 4)
+        .map_err(|_| "phys_base_needs_the_right: cap_create_aspace through the derivation")?;
+    let rights = cap_info(aspace, CAP_INFO_TAG_RIGHTS).map(|v| unpack_tag_rights(v).1);
+    cap_delete(aspace).map_err(|_| "phys_base_needs_the_right: cap_delete of the aspace")?;
+    let rights = rights.map_err(|_| "phys_base_needs_the_right: TAG_RIGHTS of the aspace")?;
+    if u64::from(rights) & syscall_abi::RIGHTS_AS_READ != 0
+    {
+        return Err("phys_base_needs_the_right: an aspace retyped without PHYS carries READ");
+    }
+    if u64::from(rights) & syscall_abi::RIGHTS_AS_MAP == 0
+    {
+        return Err("phys_base_needs_the_right: an aspace retyped without PHYS lacks MAP");
     }
     Ok(())
 }

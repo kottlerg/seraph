@@ -3,23 +3,33 @@
 
 // core/ktest/src/integration/priority_preemption.rs
 
-//! Integration: a higher-priority runnable thread preempts a CPU-bound lower
-//! priority one within a small time budget.
+//! Integration: a runnable strict-priority (RT) thread runs ahead of a
+//! CPU-bound fair-class one within a small time budget
+//! (core/kernel/docs/scheduler.md § Scheduling Classes).
 //!
 //! Setup:
 //!
 //! - Both children pinned to CPU 0 so the test measures preemption, not
 //!   parallelism. Both are created at explicit levels via the
 //!   `SYS_CAP_CREATE_THREAD` priority args.
-//! - Child A (low priority, 5): tight spin loop, posts a "finished" bit only
-//!   at the end.
-//! - Child B (elevated priority, 20): signals "ran" immediately and exits.
+//! - Child A (fair class, the highest fair level, whose slice is the longest):
+//!   tight spin loop, posts a "finished" bit only at the end.
+//! - Child B (RT class, the lowest RT level): signals "ran" immediately and
+//!   exits.
 //!
 //! Verification: the parent unblocks on B's "ran" notification well before A's
 //! spinner finishes. Slack: B must arrive within `PREEMPT_BUDGET_US` of wall
 //! time of being made runnable, stretched past 16 CPUs by the width's
 //! oversubscription factor ([`crate::scaled_bound`]). Skipped if no
 //! `SchedControl` cap exists in the initial cap set (no elevation path).
+//!
+//! The cell guards the ordering: an RT thread runs ahead of a CPU-bound fair
+//! one within a bounded wait. Its wall-clock budget does not tell the one-tick
+//! preemption apart from the fair thread's slice expiring
+//! (core/kernel/docs/scheduler.md § Time Slice Policy), a difference an
+//! emulated boot's timing cannot resolve; the tick decision is
+//! host-tested instead (`PerCpuScheduler::tick_outcome` and
+//! `TickOutcome::slice_and_reschedule` in `core/kernel/src/sched/run_queue.rs`).
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
@@ -31,6 +41,15 @@ use crate::{ChildStack, TestContext, TestResult};
 
 /// NOTIFY right (send) only.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+
+/// Fair-class level of the hog: the highest fair level (one below the kernel's
+/// `sched::RT_PRIORITY_MIN`), whose slice is the longest
+/// (core/kernel/docs/scheduler.md § Time Slice Policy).
+const HOG_PRIORITY: u8 = 20;
+
+/// Level of the elevated child: the lowest RT level (the kernel's
+/// `sched::RT_PRIORITY_MIN`), so the test fails if any fair level ran first.
+const RT_PRIORITY: u8 = 21;
 
 /// Spin iterations for the low-priority hog. Large enough that, absent
 /// preemption, the hog dominates the CPU for tens of ms.
@@ -98,8 +117,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "priority_preemption: cap_create_notification (done) failed")?;
 
-    // ── Hog: spawn at low priority (5), pin to CPU 0. ─────────────────────────
-    let mut hog = crate::spawn::new_child_at(ctx, sched_cap, 5)
+    // ── Hog: spawn at a fair level, pin to CPU 0. ─────────────────────────────
+    let mut hog = crate::spawn::new_child_at(ctx, sched_cap, HOG_PRIORITY)
         .map_err(|_| "priority_preemption: spawn::new_child_at (hog) failed")?;
     let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
@@ -113,8 +132,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // CPU 0 and is mid-spin before the elevated child exists.
     thread_sleep(20).map_err(|_| "priority_preemption: sleep after hog failed")?;
 
-    // ── Elevated: spawn at elevated priority (20), pin to CPU 0. ─────────────
-    let mut elevated = crate::spawn::new_child_at(ctx, sched_cap, 20)
+    // ── Elevated: spawn at the lowest RT level, pin to CPU 0. ────────────────
+    let mut elevated = crate::spawn::new_child_at(ctx, sched_cap, RT_PRIORITY)
         .map_err(|_| "priority_preemption: spawn::new_child_at (elevated) failed")?;
     let elevated_done = cap_copy(done, elevated.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy elevated_done failed")?;

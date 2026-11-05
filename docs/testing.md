@@ -522,7 +522,7 @@ changed line that names one of these items as a whole identifier or lies within 
   set, and the RAM-sized chunk
   tables of `frame_map::init` and `init_cspace_registry`). A change that alters an element type's
   size is on the surface whether it edits the type's own fields or a type or constant the element
-  holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or
+  holds by value (for example `RunQueue` and `NUM_RUN_QUEUES` inside `PerCpuScheduler`, or
   `Prng` inside `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation
   (`KERNEL_STACK_PAGES` for the idle stacks, and `TAG_STATE_BYTES`, the tag-state slab's element
   size);

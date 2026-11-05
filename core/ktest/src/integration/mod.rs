@@ -24,6 +24,7 @@ pub mod cspace_nested_teardown;
 pub mod death_notification_late_bind;
 pub mod death_observer_outlives_queue_caps;
 pub mod destroyed_source_interrupts;
+pub mod fair_share_progress;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
@@ -151,6 +152,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::priority_preemption",
         priority_preemption::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fair_share_progress",
+        fair_share_progress::run(ctx)
     );
     run_integration_test!(
         "integration::shared_memory_two_aspaces",

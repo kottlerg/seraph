@@ -591,7 +591,12 @@ impl Iommu
 /// `counts` stays locked from before the take until every fault taken is
 /// recorded, so a caller that reads `counts` after its own take sees every
 /// fault another thread's take has handed devmgr (`TEST_DMA_FAULTS` reads
-/// it beside the fault-log thread).
+/// it beside the fault-log thread). The lock is held across the
+/// `TAKE_FAULTS` IPC, which `docs/coding-standards.md` § Concurrency advises
+/// against: only the fault-log thread and `TEST_DMA_FAULTS` take it, so the
+/// one waiter waits no longer than its own call to the driver would, and a
+/// dead driver's calls are answered (`IommuClient::fail`), so the holder
+/// does not block for good.
 fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
 {
     let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);

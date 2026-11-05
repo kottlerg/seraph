@@ -203,9 +203,10 @@ confinement phase has devmgr bind QEMU's `edu` device, which xtask attaches on b
 to the [`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a
 mapped page must arrive, and where an IOMMU confines the device a copy to the page's device address
 after its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at
-that address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) every 10 ms until
-it reports one, for at most 300 polls (3 s, `FAULT_RECORD_POLLS`), so a fault the IOMMU reports to
-its driver after the probe's reply still counts; a missing fault fails only at that bound. Without
+that address. The phase asks devmgr for the device's faults (`TEST_DMA_FAULTS`) once, then again
+every 10 ms until it reports one, at most 300 times more (3 s, `FAULT_RECORD_POLLS`), so a fault the
+IOMMU reports to its driver after the probe's reply still counts; a missing fault fails only at that
+bound. Without
 an IOMMU it checks the mapped copies only, and a machine without the device skips it. The
 `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down

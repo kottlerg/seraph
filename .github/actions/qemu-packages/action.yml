@@ -3,6 +3,9 @@
 
 # .github/actions/qemu-packages/action.yml
 
+# The composite action behind every CI job that boots under QEMU; its
+# `description` below states what it provides.
+
 name: QEMU packages
 description: >-
   QEMU and firmware packages for the CI jobs that boot under QEMU: the

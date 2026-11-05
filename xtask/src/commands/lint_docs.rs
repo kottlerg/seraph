@@ -197,7 +197,9 @@ fn is_markdown(path: &str) -> bool
 
 fn is_source(path: &str) -> bool
 {
-    ["rs", "ld", "S", "sh"].iter().any(|ext| has_ext(path, ext))
+    ["rs", "ld", "S", "sh", "yml"]
+        .iter()
+        .any(|ext| has_ext(path, ext))
 }
 
 /// Authoritative documents carry a `## Summarized By` section and must be
@@ -348,7 +350,7 @@ enum CommentStyle
     Line,
     /// `/* ... */` block; header lines are ` * ...`.
     Block,
-    /// `# ...` lines, after an optional shebang.
+    /// `# ...` lines, after an optional shebang (shell) or none (YAML).
     Hash,
 }
 
@@ -358,7 +360,7 @@ fn comment_style(path: &str) -> CommentStyle
     {
         CommentStyle::Block
     }
-    else if has_ext(path, "sh")
+    else if has_ext(path, "sh") || has_ext(path, "yml")
     {
         CommentStyle::Hash
     }
@@ -1433,12 +1435,18 @@ mod tests
     }
 
     #[test]
-    fn header_handles_block_comments_and_shebangs()
+    fn header_is_checked_in_every_comment_style()
     {
         let ld = "/*\n * SPDX-License-Identifier: GPL-2.0-only\n * (C)\n *\n * k/x.ld\n */\n";
         assert_eq!(header_violation("k/x.ld", ld), None);
         let sh = "#!/bin/sh\n# SPDX-License-Identifier: GPL-2.0-only\n# (C)\n\n# t/run.sh\n";
         assert_eq!(header_violation("t/run.sh", sh), None);
+        let yml = "# SPDX-License-Identifier: GPL-2.0-only\n# (C)\n\n# .github/x.yml\n\nname: x\n";
+        assert_eq!(header_violation(".github/x.yml", yml), None);
+        assert_eq!(
+            header_violation(".github/x.yml", "name: x\n").map(|v| v.0),
+            Some(1)
+        );
     }
 
     #[test]

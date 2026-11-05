@@ -90,18 +90,13 @@ pub enum KillCause
     Declined(Option<u64>),
 }
 
-/// Print, on the kernel serial console, why `tcb`'s user-mode fault went
-/// unhandled; the architecture kill path's `USERSPACE FAULT` diagnostic
-/// follows it. The decline reason is the handler's own value, printed
-/// verbatim; it is not interpreted here.
-///
-/// # Safety
-/// `tcb` must be a valid TCB pointer.
+/// Print, on the kernel serial console, why the user-mode fault of the thread
+/// whose id is `tid` went unhandled; the architecture kill path's
+/// `USERSPACE FAULT` diagnostic follows it. The decline reason is the
+/// handler's own value, printed verbatim; it is not interpreted here.
 #[cfg(not(test))]
-pub unsafe fn report_user_kill(tcb: *mut ThreadControlBlock, cause: KillCause)
+pub fn report_user_kill(tid: u32, cause: KillCause)
 {
-    // SAFETY: tcb validated by caller; thread_id is fixed at creation.
-    let tid = unsafe { (*tcb).thread_id };
     match cause
     {
         KillCause::BindingCleared =>

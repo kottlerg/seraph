@@ -1527,8 +1527,9 @@ unsafe fn redirect_user_fault(
         crate::ipc::fault::FaultOutcome::Resume => true,
         crate::ipc::fault::FaultOutcome::Kill(cause) =>
         {
-            // SAFETY: tcb valid (this fn's contract).
-            unsafe { crate::ipc::fault::report_user_kill(tcb, cause) };
+            // SAFETY: tcb valid (this fn's contract); thread_id is fixed at
+            // creation.
+            crate::ipc::fault::report_user_kill(unsafe { (*tcb).thread_id }, cause);
             false
         }
     }

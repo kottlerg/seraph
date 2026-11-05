@@ -175,16 +175,18 @@ impl Drop for ChildGuard
 #[derive(Clone, Copy)]
 pub struct HeldChild
 {
+    /// devmgr's slot of the child's badged process handle.
     pub process_handle: u64,
+    /// devmgr's slot of the child's release token, the only cap procmgr
+    /// serves `RELEASE_HOLD` on.
     pub release_token: u64,
 }
 
 /// Destroy a child through its badged `process_handle` (`DESTROY_PROCESS`:
 /// procmgr tears down its thread, `CSpace`, and address space, which drops
 /// every capability it holds and returns its pages, unless the child was
-/// created with `CREATE_DMA_HOLD` and started, whose threads procmgr stops
-/// but whose `CSpace` and pages it holds until a `RELEASE_HOLD` this function
-/// never sends) and release the handle. A child that has already died is a
+/// created with `CREATE_DMA_HOLD` and started, whose pages procmgr then holds
+/// until a `RELEASE_HOLD` this function never sends) and release the handle. A child that has already died is a
 /// no-op for procmgr.
 pub fn destroy_child(process_handle: u64, ipc_buf: *mut u64)
 {
@@ -194,7 +196,7 @@ pub fn destroy_child(process_handle: u64, ipc_buf: *mut u64)
 
 /// Destroy a held child as [`destroy_child`] does and delete its release
 /// token without sending the release: its device is not confirmed stopped,
-/// so procmgr keeps its `CSpace` and pages held for the rest of the boot.
+/// so procmgr keeps its pages held for the rest of the boot.
 pub fn destroy_held(child: HeldChild, ipc_buf: *mut u64)
 {
     destroy_child(child.process_handle, ipc_buf);
@@ -202,7 +204,7 @@ pub fn destroy_held(child: HeldChild, ipc_buf: *mut u64)
 }
 
 /// Destroy a `CREATE_DMA_HOLD` child as [`destroy_child`] does, then release
-/// its held `CSpace` and pages (`RELEASE_HOLD` on its release token), and
+/// its held pages to memmgr (`RELEASE_HOLD` on its release token), and
 /// release both caps. Called only once the child's device is confirmed quiet;
 /// procmgr's teardown of the child, by this destroy or by its own reap of a
 /// dead child, precedes the release, since procmgr serves both calls in
@@ -341,8 +343,8 @@ pub enum DriverSpawn<H = u64>
 ///     `irq_cap` is `None`.
 ///
 /// log + procmgr endpoints arrive via `ProcessInfo`. The child is created
-/// `CREATE_DMA_HOLD`, so procmgr holds its `CSpace` and pages after it is
-/// torn down until devmgr releases them on its release token
+/// `CREATE_DMA_HOLD`, so procmgr holds its pages after it is torn down until
+/// devmgr releases them on its release token
 /// ([`destroy_and_release`]). Returns [`DriverSpawn::Bootstrapped`] with the
 /// child's badged process handle and release token ([`HeldChild`]), which
 /// the caller keeps for the rest of the boot, to withdraw the driver through;

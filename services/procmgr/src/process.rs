@@ -2977,7 +2977,13 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
 ///   or the stack or IPC-buffer pages could not be mapped;
 /// - `procmgr_errors::MAP_FAILED` (11) — mapping failed during segment load;
 /// - `procmgr_errors::INSUFFICIENT_RIGHTS` (12) — a rights derivation failed
-///   during segment load.
+///   during segment load;
+/// - `procmgr_errors::INVALID_ARGUMENT` (7) — the copy of `argv_env` refused
+///   it: the caller's cap could not be mapped, or a blob's NULs disagree with
+///   its count or a nonempty blob does not end in a NUL ([`copy_argv_env`]);
+/// - `procmgr_errors::ARGV_ENV_STILL_MAPPED` (14) — a window the argv and env
+///   were copied through would not unmap, so the child's memmgr record is
+///   withheld.
 // clippy::too_many_lines: file-cap-based process creation is one transaction
 // that owns the lifetime of the ELF-header scratch memory cap, the child's kernel
 // objects, and the per-page streaming loop.
@@ -3437,12 +3443,9 @@ pub fn destroy_process(
     Some(exit_reason)
 }
 
-/// Release the held reclaim of the torn-down `CREATE_DMA_HOLD` child the
-/// release token `sender` names (`RELEASE_HOLD`): delete procmgr's cap on the
-/// child's `CSpace`, the last one, so every capability the dead child still
-/// held (a Memory cap a client lent it among them) goes, then send memmgr the
-/// held-back `PROCESS_DIED`, whose recheck finds those frames unreachable,
-/// and drop procmgr's badged memmgr SEND for it.
+/// Send memmgr the held-back `PROCESS_DIED` of the torn-down
+/// `CREATE_DMA_HOLD` child the release token `sender` names (`RELEASE_HOLD`),
+/// then drop procmgr's badged memmgr SEND for it.
 ///
 /// # Errors
 /// [`ReleaseRefusal::Unauthorized`] when `sender` is not a release token, the
@@ -3456,9 +3459,6 @@ pub fn release_hold(
 ) -> Result<(), ReleaseRefusal>
 {
     let held = holds.release(sender)?;
-    // The teardown revoked every derivation of the cap, so this delete frees
-    // the `CSpace` and releases what it holds.
-    let _ = syscall::cap_delete(held.cspace_cap);
     notify_memmgr_died(memmgr_ep, held.memmgr_badge, ipc_buf);
     if held.memmgr_send_cap != 0
     {
@@ -3489,16 +3489,13 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 /// logd ([`forward_death_to_logd`]).
 ///
 /// The memmgr reclaim of a started child created with `CREATE_DMA_HOLD` is
-/// parked in `holds` instead of sent, together with procmgr's cap on the
-/// child's `CSpace`, which the teardown revokes the derivations of but does
-/// not delete: a device the child drove may still be writing its frames, and
-/// the frames a client lent it, whose caps the `CSpace` still holds, so they
-/// return to memmgr only on the creator's `RELEASE_HOLD` ([`release_hold`];
-/// docs/process-lifecycle.md § Process Death). Deleting the thread and
-/// `AddressSpace` caps stops the child's threads all the same: no other
-/// capability to the `AddressSpace` survives the revocation, and the kernel
-/// stops every thread bound to it when it is freed
-/// (docs/capability-model.md § "Kill process" pattern).
+/// parked in `holds` instead of sent: a device the child drove may still be
+/// writing its frames, so they return to memmgr only on the creator's
+/// `RELEASE_HOLD` on the child's release token ([`release_hold`];
+/// docs/process-lifecycle.md § Process Death). Its `CSpace` goes as any
+/// child's: a frame a client lent the child for its device stays out of
+/// memmgr's pool through devmgr's DMA-mapping capability instead
+/// (docs/device-management.md § DMA-Safe Teardown).
 ///
 /// Note: the bound death-notification observers in the child thread's TCB
 /// and address space are released automatically when the objects are torn
@@ -3514,23 +3511,15 @@ pub fn teardown_entry(
     holds: &mut DmaHolds,
 )
 {
-    // Settled before any cap goes: a held reclaim keeps the CSpace.
-    let held = holds.park(&entry);
-
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
     // owns every cap the child held) before aspace (whose dealloc walks the
-    // page tables); the revoke removes the child's self-cap, so a held
-    // CSpace's one remaining reference is procmgr's slot. pi_memory and the
-    // argv/env region last — leaf resources the child used read-only; no
-    // other object references them.
+    // page tables). pi_memory and the argv/env region last — leaf resources
+    // the child used read-only; no other object references them.
     let _ = syscall::cap_revoke_all(entry.thread_cap);
     let _ = syscall::cap_delete(entry.thread_cap);
     let _ = syscall::cap_revoke_all(entry.cspace_cap);
-    if !held
-    {
-        let _ = syscall::cap_delete(entry.cspace_cap);
-    }
+    let _ = syscall::cap_delete(entry.cspace_cap);
     let _ = syscall::cap_revoke_all(entry.aspace_cap);
     let _ = syscall::cap_delete(entry.aspace_cap);
     let _ = syscall::cap_revoke_all(entry.pi_memory_cap);
@@ -3562,7 +3551,7 @@ pub fn teardown_entry(
     // Notify memmgr to reclaim every memory cap attributed to this child's
     // memmgr badge, then drop procmgr's badged SEND copy, unless the reclaim
     // is held for the creator's `RELEASE_HOLD`.
-    if !held
+    if !holds.park(&entry)
     {
         notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
         if entry.memmgr_send_cap != 0

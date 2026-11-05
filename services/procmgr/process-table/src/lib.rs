@@ -85,9 +85,8 @@ pub struct ProcessEntry
     /// Slot in procmgr's `CSpace` of the child's `AddressSpace` cap, the
     /// root its self-cap and memmgr's delegation derive from.
     pub aspace_cap: u64,
-    /// Slot in procmgr's `CSpace` of the child's `CSpace` cap. A started
-    /// `CREATE_DMA_HOLD` child's teardown keeps it in the held reclaim
-    /// ([`HeldReclaim::cspace_cap`]) until the release.
+    /// Slot in procmgr's `CSpace` of the child's `CSpace` cap, the root its
+    /// self-cap derives from.
     pub cspace_cap: u64,
     /// Slot in procmgr's `CSpace` of the child's main-thread cap.
     pub thread_cap: u64,

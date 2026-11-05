@@ -149,11 +149,10 @@ its own or devmgr withdrew it:
    device, waiting for the reset to be confirmed for at most `RESET_TIMEOUT` (5 s).
 3. **Memory freed.** procmgr holds back the `PROCESS_DIED` of a driver devmgr created with
    `CREATE_DMA_HOLD`, however the driver died, so memmgr keeps its frames on the driver's record,
-   out of the pool, and procmgr keeps the driver's `CSpace` with every capability the driver
-   held, while it stops the driver's threads. devmgr releases the hold (`RELEASE_HOLD`) only when
-   the IOMMU blocked the device, or when the Bus Master Enable read-back is clear, every BAR copy
-   is revoked and the reset is confirmed; a device that meets neither leaves the frames
-   quarantined on that record, counted and never handed out again, for the rest of the boot.
+   out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only when the IOMMU blocked the
+   device, or when the Bus Master Enable read-back is clear, every BAR copy is revoked and the
+   reset is confirmed; a device that meets neither leaves the frames quarantined on that record,
+   counted and never handed out again, for the rest of the boot.
 
 Only devmgr can release the hold. procmgr serves `RELEASE_HOLD` only on the release token the
 driver's create reply carries, a capability badged with the driver's process badge and a verb bit
@@ -168,17 +167,19 @@ supplies) is on the client's memmgr record, which no hold covers. memmgr pools i
 other process holds a capability to it
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
 § Reclamation), so it stays out of the pool, even after the client releases it or dies, while
-either reference to it lives, and both live until the device can no longer write it:
+devmgr's reference to it lives, and that one lives until the device can no longer write it.
+A driver programs its device only with the device address of a DMA mapping of the frame
+(§ DMA Authorisation), and devmgr keeps a capability to the frame for each standing mapping:
 
-- **The driver's.** The driver holds the lent capability for the transfer and moves it back in
-  its reply once the transfer completed or the device acknowledged its reset; a reply that fails
-  (the client is gone) has it delete the capability, the transfer being over. A driver that dies
-  with the capability, mid-transfer or after an unacknowledged reset, leaves it in its `CSpace`,
-  which procmgr keeps until devmgr's `RELEASE_HOLD`.
-- **devmgr's.** devmgr keeps a capability for each standing DMA mapping (§ DMA Authorisation).
-  When it withdraws the device it deletes them once the IOMMU blocks the device, or once the Bus
-  Master Enable read-back, the BAR revocation and the reset all confirm; otherwise it keeps them
-  for the rest of the boot, beside the driver's quarantined record.
+- **While the driver lives.** The driver maps the frame for the transfer and unmaps it only once
+  the transfer completed or the device acknowledged its reset, and it holds the lent capability
+  until then too. It moves the capability back in its reply; a reply that fails (the client is
+  gone) has it delete the capability, the transfer being over.
+- **When the driver is gone.** A driver that dies mid-transfer, or exits after an unacknowledged
+  reset, leaves the mapping standing, and its own capability goes with its `CSpace`. When devmgr
+  withdraws the device it deletes its mapping capabilities only once the IOMMU blocks the device,
+  or once the Bus Master Enable read-back, the BAR revocation and the reset all confirm; otherwise
+  it keeps them for the rest of the boot, beside the driver's quarantined record.
 
 Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to withdraw
 the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the IOMMU (the

@@ -190,9 +190,8 @@ pub mod procmgr_labels
     pub const CREATE_SCHED_FIELD_MASK: u64 = 0x1F;
     /// Label flag (bit 28) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// once the child has been started, hold back its memory reclaim at its
-    /// teardown. procmgr stops the child's threads at its teardown, but keeps
-    /// its `CSpace`, and with it every capability the child held, and sends
-    /// memmgr its `memmgr_labels::PROCESS_DIED` only when the creator sends
+    /// teardown. procmgr tears the child down as any other, but sends memmgr
+    /// its `memmgr_labels::PROCESS_DIED` only when the creator sends
     /// [`RELEASE_HOLD`] on the release token, a third cap of the create reply
     /// badged with [`HOLD_RELEASE_AUTHORITY`]; until then memmgr keeps the
     /// child's frames on its record, out of the free pool. Set it for a driver
@@ -298,8 +297,7 @@ pub mod procmgr_labels
     /// Release the held memory reclaim of a child created with
     /// [`CREATE_DMA_HOLD`], sent on the child's release token (the create
     /// reply's third cap, badged with [`HOLD_RELEASE_AUTHORITY`]) once the
-    /// child is torn down: procmgr deletes the child's `CSpace` and sends
-    /// memmgr `PROCESS_DIED` for it. Replies `SUCCESS`; `UNAUTHORIZED` when
+    /// child is torn down: procmgr sends memmgr `PROCESS_DIED` for it. Replies `SUCCESS`; `UNAUTHORIZED` when
     /// the sender's badge lacks [`HOLD_RELEASE_AUTHORITY`] (the process
     /// handle, or the child's own procmgr cap), the hold staying; or
     /// `INVALID_BADGE` when procmgr holds no reclaim for the token (the child

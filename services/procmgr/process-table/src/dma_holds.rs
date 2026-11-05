@@ -6,13 +6,12 @@
 //! The memory reclaims procmgr holds back for the children created with
 //! `procmgr_labels::CREATE_DMA_HOLD`.
 //!
-//! A started child whose creator set the flag has its threads stopped at its
-//! teardown as every child has, but procmgr keeps its `CSpace`, and its
-//! `memmgr_labels::PROCESS_DIED` waits, until the creator sends
+//! A started child whose creator set the flag is torn down as every child is,
+//! but its `memmgr_labels::PROCESS_DIED` waits until the creator sends
 //! `procmgr_labels::RELEASE_HOLD` on the child's release token: a device the
-//! child drove may still be writing the child's frames, and the frames a
-//! client lent it, until the creator has confirmed its DMA stopped
-//! (`docs/process-lifecycle.md` § Process Death). [`DmaHolds`] keeps the held
+//! child drove may still be writing the child's frames until the creator has
+//! confirmed its DMA stopped (`docs/process-lifecycle.md` § Process Death).
+//! [`DmaHolds`] keeps the held
 //! records and reserves the room for each when its child is armed, so the
 //! teardown that parks a record never allocates; [`release_target`] is the
 //! token's authority check.
@@ -77,11 +76,6 @@ pub struct HeldReclaim
     /// procmgr's slot of the child's badged memmgr SEND, deleted after the
     /// `PROCESS_DIED` round trip; zero when there is none.
     pub memmgr_send_cap: u64,
-    /// procmgr's slot of the child's `CSpace`, kept from the teardown to the
-    /// release so every capability the dead child held, a Memory cap a client
-    /// lent it among them, keeps its reference until the device is confirmed
-    /// stopped; deleted at the release, before the `PROCESS_DIED`.
-    pub cspace_cap: u64,
 }
 
 /// The held reclaims, with room reserved for every armed child's.
@@ -122,12 +116,10 @@ impl DmaHolds
     }
 
     /// Settle the reclaim of `entry`, a child just taken out of the table
-    /// for its teardown, before the teardown deletes any of its caps. Returns
-    /// `true` when the reclaim is held: the entry was armed and its child
-    /// started, so a device it drove may still reach its frames, and its
-    /// record, its `CSpace` slot included, is parked until [`Self::release`];
-    /// the teardown then keeps that slot. Returns `false` when procmgr
-    /// deletes the `CSpace` and sends `PROCESS_DIED` now: the entry was not
+    /// for its teardown. Returns `true` when the reclaim is held: the entry
+    /// was armed and its child started, so a device it drove may still reach
+    /// its frames, and its record is parked until [`Self::release`]. Returns
+    /// `false` when procmgr sends `PROCESS_DIED` now: the entry was not
     /// armed, or its child never ran and so never touched a device.
     pub fn park(&mut self, entry: &ProcessEntry) -> bool
     {
@@ -145,13 +137,12 @@ impl DmaHolds
             badge: entry.badge,
             memmgr_badge: entry.memmgr_badge,
             memmgr_send_cap: entry.memmgr_send_cap,
-            cspace_cap: entry.cspace_cap,
         });
         true
     }
 
     /// Take the held record a `RELEASE_HOLD` received with badge `sender`
-    /// names, for its `CSpace` deletion and `PROCESS_DIED`.
+    /// names, for its `PROCESS_DIED`.
     ///
     /// # Errors
     /// [`ReleaseRefusal::Unauthorized`] when `sender` is no release token
@@ -208,7 +199,7 @@ mod tests
         ProcessEntry {
             badge,
             aspace_cap: 0,
-            cspace_cap: 43,
+            cspace_cap: 0,
             thread_cap: 0,
             pi_memory_cap: 0,
             tls_memory_cap: 0,
@@ -252,7 +243,6 @@ mod tests
                 badge: 7,
                 memmgr_badge: 7 ^ 0xFF,
                 memmgr_send_cap: 41,
-                cspace_cap: 43,
             })
         );
         assert!(!holds.holds(7));

@@ -316,12 +316,10 @@ driver's own record that such a device may still write
 § DMA-Safe Teardown). A frame a client lends the driver for a transfer is on
 the client's record, which the hold does not cover. memmgr keeps it out of the
 pool, on its deferred list once the client releases it or dies, while the
-driver, or devmgr's DMA mapping of it, still holds a capability to it; devmgr
-deletes its own only once the device is confirmed stopped or blocked, and
-procmgr keeps a held driver's `CSpace`, with the driver's capability in it,
-until the release, which deletes the `CSpace` before this `PROCESS_DIED`, so
-the recheck it opens with finds the frame unreachable. memmgr itself treats a
-held-back `PROCESS_DIED` like any other.
+driver, or devmgr's DMA mapping of it, still holds a capability to it; the
+device reaches the frame only through that mapping, and devmgr deletes its
+capability only once the device is confirmed stopped or blocked. memmgr
+itself treats a held-back `PROCESS_DIED` like any other.
 
 procmgr also never sends `PROCESS_DIED` for a child whose create failed because procmgr could
 not unmap a window it copied the child's argv and env through (it replies

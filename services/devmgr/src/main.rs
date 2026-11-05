@@ -1626,28 +1626,20 @@ impl VirtioDeviceCaps
     /// reach the driver's memory: an IOMMU blocks it, or it is known to be
     /// quiet (Bus Master Enable read back clear, every BAR copy revoked, and
     /// the reset confirmed). Only then does it delete the Memory caps it kept
-    /// for the device's mappings ([`dma::Withdrawal::release`]); a blocked
-    /// device's go at once. `false`, logged, means the device may still be
-    /// accessing the driver's memory and the mapped frames, and those caps
-    /// stay for the boot ([`dma::Withdrawal::quarantine`]).
+    /// for the device's mappings ([`dma::Withdrawal::release`];
+    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means the
+    /// device may still be accessing the driver's memory and the mapped
+    /// frames, and those caps stay for the boot
+    /// ([`dma::Withdrawal::quarantine`]).
     fn take_from_driver(&self) -> bool
     {
         let withdrawal = self.dma.withdraw();
-        if withdrawal.blocked()
+        let (quiet, mappings) =
+            firmware::dma::settle_withdrawal(withdrawal.blocked(), || self.stop_and_reset());
+        match mappings
         {
-            // The IOMMU confines the device: it reaches no mapped frame.
-            withdrawal.release();
-            self.stop_and_reset();
-            return true;
-        }
-        let quiet = self.stop_and_reset();
-        if quiet
-        {
-            withdrawal.release();
-        }
-        else
-        {
-            withdrawal.quarantine();
+            firmware::dma::WithdrawnMappings::Release => withdrawal.release(),
+            firmware::dma::WithdrawnMappings::Quarantine => withdrawal.quarantine(),
         }
         quiet
     }
@@ -1897,10 +1889,10 @@ impl ServedDriver
 /// the BAR caps are taken, then the reset), so it neither DMAs nor holds its
 /// line asserted with no driver to clear it; then destroy the driver, a no-op
 /// for one procmgr has reaped, and only when the device is confirmed quiet
-/// release the driver's held `CSpace` and memory on its release token
-/// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves them
+/// release the driver's held memory on its release token
+/// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves it
 /// held for the rest of the boot ([`spawn::destroy_held`]), since the device
-/// may still be writing the driver's memory or a frame a client lent it. One
+/// may still be writing it. One
 /// reset per withdrawal; both caps of `child` are consumed.
 fn withdraw_device(dev_caps: &VirtioDeviceCaps, child: spawn::HeldChild, ipc_buf: *mut u64)
 {

@@ -160,18 +160,14 @@ procmgr could not map to advertise it, reads zero and keeps its memory eager.
 **DMA hold flag.** The label's bit 28 (`CREATE_DMA_HOLD`, in the window shared
 with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child
 has been started, its teardown, however it comes (its death, a death resync, or
-`DESTROY_PROCESS`), revokes and deletes its `Thread` and `AddressSpace`
-capabilities as for any child, which stops every thread of the child, and
-revokes every derivation of its `CSpace` capability, but keeps procmgr's own
-`CSpace` capability, so every capability the child held keeps its reference,
-and does not send memmgr `PROCESS_DIED`: procmgr parks the child's memmgr
-record and its `CSpace` until the creator sends `RELEASE_HOLD` (§ Label 3) on
-the child's release token, and until then memmgr keeps the child's frames on
-that record, out of its free pool, and a frame the child held a capability to
-on its deferred list. Set it for a driver whose device may DMA into its frames,
-or into a frame a client lent it, after it dies: the creator releases the hold
-once it has confirmed the device's DMA stopped, and never when it cannot, which
-leaves the frames quarantined for the rest of the boot
+`DESTROY_PROCESS`), revokes and deletes its kernel objects as for any child but
+does not send memmgr `PROCESS_DIED`: procmgr parks the child's memmgr record
+until the creator sends `RELEASE_HOLD` (§ Label 3) on the child's release
+token, and until then memmgr keeps the child's frames on that record, out of
+its free pool. Set it for a driver whose device may DMA into its frames after
+it dies: the creator releases the hold once it has confirmed the device's DMA
+stopped, and never when it cannot, which leaves the frames quarantined for the
+rest of the boot
 ([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
 § DMA-Safe Teardown). The release token is the create reply's cap[2], a SEND
 badged with the child's process badge and `procmgr_labels::HOLD_RELEASE_AUTHORITY`,
@@ -253,13 +249,10 @@ embedded in the endpoint capability.
 
 Release the held memory reclaim of a torn-down child created with
 `CREATE_DMA_HOLD` (§ Label 1, **DMA hold flag**). Sent on the child's release
-token, the create reply's cap[2], with no data words or caps. procmgr deletes
-its capability on the child's `CSpace`, the last one, so every capability the
-dead child still held goes, then sends memmgr `PROCESS_DIED` for the child's
-memmgr badge, deletes its copy of the child's badged memmgr SEND, and drops the
-held record, so memmgr returns the child's frames to its free pool, and a frame
-the child held a capability to leaves memmgr's deferred list at that
-`PROCESS_DIED`'s recheck.
+token, the create reply's cap[2], with no data words or caps. procmgr sends
+memmgr `PROCESS_DIED` for the child's memmgr badge, deletes its copy of the
+child's badged memmgr SEND, and drops the held record, so memmgr returns the
+child's frames to its free pool.
 
 procmgr serves the label only when the sender's badge carries
 `procmgr_labels::HOLD_RELEASE_AUTHORITY`, and looks the child up by the badge
@@ -297,8 +290,8 @@ procmgr removes the process entry, revokes and deletes the child's `Thread`,
 `CSpace`, `AddressSpace`, `ProcessInfo` Memory cap, and TLS Memory cap, deletes
 any namespace caps never consumed by `START_PROCESS`, and sends memmgr
 `PROCESS_DIED` for the child's memmgr badge, unless the child was created with
-`CREATE_DMA_HOLD` and started, whose `CSpace` procmgr keeps, after revoking its
-derivations, and whose reclaim waits for `RELEASE_HOLD` (§ Label 3).
+`CREATE_DMA_HOLD` and started, whose reclaim waits for `RELEASE_HOLD`
+(§ Label 3).
 
 **Reply:** label 0 (success), always. An unknown or already-destroyed badge is
 a no-op.

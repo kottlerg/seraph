@@ -175,14 +175,14 @@ devmgr's responsibilities are:
      keeps for the rest of the boot; procmgr tears a live driver down, and a
      dead one it has reaped already is a no-op. Every `VirtIO` driver is
      created `CREATE_DMA_HOLD`, so procmgr holds the driver's memory on its
-     memmgr record, out of the free pool, and keeps the driver's `CSpace`,
-     whether the driver died on its own or was destroyed. Only when the IOMMU
+     memmgr record, out of the free pool, whether the driver died on its own
+     or was destroyed. Only when the IOMMU
      blocked the device at step 0, or Bus Master Enable read back clear, every
      BAR copy was revoked, and the reset confirmed, does devmgr send
      `RELEASE_HOLD` on the driver's release token, the third cap of the
      driver's create reply, which devmgr keeps with the device's caps and
-     hands to no one; procmgr then deletes the driver's `CSpace`, sends memmgr
-     `PROCESS_DIED`, and the memory returns to the pool
+     hands to no one; procmgr then sends memmgr `PROCESS_DIED`, and the memory
+     returns to the pool
      ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-3-release_hold)
      § Label 3). Otherwise the device may still be writing that memory:
      devmgr logs the device, deletes the token, and never releases the hold,
@@ -193,9 +193,10 @@ devmgr's responsibilities are:
      while the driver, or devmgr's DMA mapping, still holds a capability to
      them
      ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#reclamation)
-     § Reclamation). devmgr's go only as step 0 says, and a dead driver's stay
-     in its held `CSpace`, so such a frame too returns only once the device is
-     confirmed stopped or blocked. A status byte past the span its BAR cap was
+     § Reclamation). A dead driver's go with its `CSpace`, but the device
+     reaches such a frame only through a standing mapping, whose cap devmgr
+     deletes only as step 0 says, so such a frame too returns only once the
+     device is confirmed stopped or blocked. A status byte past the span its BAR cap was
      carved to is not written, and a BAR copy whose revocation fails leaves the
      driver its mapping; either counts as an unconfirmed reset.
 
@@ -230,11 +231,14 @@ devmgr's responsibilities are:
   window; the configuration page itself is mapped only on a withdrawal. The
   Command register arithmetic is host-tested in the devmgr firmware crate, and
   svctest's `procmgr_dma_hold` phase checks the held reclaim the order rests
-  on: a started held child's pages, and a frame it kept a capability to, stay
-  out of memmgr's pool after its teardown until the release on its token, which
-  its process handle cannot send. Neither the deletion of a lent cap in a
-  virtio-blk reply that fails nor the order in which devmgr deletes its mapping
-  caps at a withdrawal has a boot, for the same reasons.
+  on: a started held child's pages stay out of memmgr's pool after its
+  teardown until the release on its token, which its process handle cannot
+  send. The order in which devmgr deletes its mapping caps at a withdrawal has
+  no boot, for the same reasons. Nor has the deletion of a lent cap in a
+  virtio-blk reply that fails: it needs the driver's client to die, or run out
+  of slots, mid-request, and no test process can call the driver, since only
+  vfsd and fatfs hold a SEND on it (svctest's devmgr phase checks that svctest
+  holds no `BLOCK_DEVICE_AUTHORITY`).
 
   The catalog entry of a withdrawn driver, or of one that failed to spawn,
   stays, so a badge is never reused. No `QUERY_*` reply hands out the endpoint

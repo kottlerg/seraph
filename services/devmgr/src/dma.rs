@@ -31,7 +31,8 @@
 //! holds its lock only around table operations, never across an IPC of its
 //! own (a table operation's heap growth may call memmgr), and a mapping is
 //! pending in the table while its IOMMU call is in flight, so a withdrawal
-//! meanwhile neither races the commit nor deletes the cap the call carries. See `docs/device-management.md` § DMA Authorisation.
+//! meanwhile neither races the commit nor deletes the cap the call carries.
+//! See `docs/device-management.md` § DMA Authorisation.
 
 use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};

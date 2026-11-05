@@ -30,12 +30,37 @@ services/drivers/
 │   ├── README.md
 │   └── src/
 │       └── main.rs
+├── iommu/
+│   ├── core/                       # Family-independent IOMMU driver logic (library)
+│   │   ├── Cargo.toml
+│   │   ├── README.md
+│   │   └── src/
+│   │       ├── lib.rs              # The Backend trait each family implements
+│   │       ├── bootstrap.rs        # Unit rounds and scopes (host-tested)
+│   │       ├── faults.rs           # Polled fault queue (host-tested)
+│   │       └── service.rs          # iommu_labels service, domain records (host-tested)
+│   └── vtd/                        # VT-d IOMMU driver for devmgr (binary + lib; x86-64)
+│       ├── Cargo.toml
+│       ├── README.md
+│       └── src/
+│           ├── lib.rs              # Register and table logic (host-tested)
+│           ├── regs.rs             # Register offsets and fields
+│           ├── tables.rs           # Root, context, and second-level tables
+│           ├── main.rs
+│           ├── backend.rs          # The VT-d Backend
+│           ├── store.rs            # Table pages from memmgr
+│           └── arch/               # Cache-line flushing (x86_64)
 ├── serial/                         # Serial (UART) device driver (binary)
 │   ├── Cargo.toml
 │   ├── README.md                   # Serial-driver IPC interface (SERIAL_WRITE_BYTES)
 │   └── src/
 │       ├── main.rs
 │       └── arch/                   # Per-arch UART access (x86_64 COM1, riscv64 NS16550)
+├── test-dma/                       # Test-only driver for QEMU's edu DMA device (binary)
+│   ├── Cargo.toml
+│   ├── README.md
+│   └── src/
+│       └── main.rs
 ├── test-fault/                     # Test-only fault-injection driver for devmgr settle (binary)
 │   ├── Cargo.toml
 │   ├── README.md
@@ -81,15 +106,16 @@ services/drivers/
 
 Each driver is a separate userspace process with its own address space. Drivers
 receive only the capabilities for the specific device they manage (see
-[docs/architecture.md](../../docs/architecture.md)); device DMA is the exception,
-unconfined until IOMMU support lands (see
+[docs/architecture.md](../../docs/architecture.md)); device DMA is confined to what
+their driver mapped where an IOMMU translates the device (VT-d on x86-64), and
+unconfined elsewhere (see
 [docs/device-management.md](../../docs/device-management.md#dma-safety-model)).
 The full driver lifecycle is specified in
 [docs/device-management.md](../../docs/device-management.md); the key points are:
 
 - **Isolation** — every driver runs in its own address space. A driver crash
-  cannot corrupt another driver's or the kernel's memory through the CPU; device
-  DMA is unconfined until IOMMU support lands (see
+  cannot corrupt another driver's or the kernel's memory through the CPU, nor
+  through its device's DMA where an IOMMU confines the device (see
   [docs/device-management.md](../../docs/device-management.md#dma-safety-model)
   § DMA Safety Model and [docs/architecture.md](../../docs/architecture.md)).
 - **Per-device capabilities** —
@@ -120,7 +146,8 @@ The full driver lifecycle is specified in
   `CREATE_DMA_HOLD`, so its memory is freed only once devmgr has confirmed its
   device's DMA stopped
   ([docs/device-management.md](../../docs/device-management.md#dma-safe-teardown)
-  § DMA-Safe Teardown), and DMA is unconfined until IOMMU support lands. The
+  § DMA-Safe Teardown). On x86-64 devmgr attaches each such device to a VT-d
+  domain of its own before its grant, through the `iommu-vtd` driver (below). The
   IOMMU-isolated vs DMA-unsafe model is
   specified in [docs/device-management.md](../../docs/device-management.md#dma-safety-model)
   § DMA Safety Model.
@@ -138,6 +165,9 @@ The full driver lifecycle is specified in
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
+| [`iommu/core/`](iommu/core/README.md) | Library | Family-independent IOMMU driver logic: the bootstrap devmgr serves, the `iommu_labels` service and its per-domain checks, the polled fault queue, and the `Backend` trait |
+| [`iommu/vtd/`](iommu/vtd/README.md) | Binary + library | VT-d IOMMU driver (x86-64) — devmgr-spawned at boot; programs the remapping units' tables and confines each DMA-capable device to its own domain |
+| [`test-dma/`](test-dma/README.md) | Binary | Test-only driver for QEMU's `edu` device — svctest checks a mapped DMA copy arrives and one to an unmapped IOVA is stopped |
 | [`test-fault/`](test-fault/README.md) | Binary | Test-only fault-injection driver — reports ready and dies on request, or never reports ready, so svctest exercises devmgr's settle bound and driver withdrawal |
 | [`test-orphan/`](test-orphan/README.md) | Binary | Test-only fault-injection driver — forces a mid-bootstrap spawn failure so svctest exercises devmgr's orphan-teardown path |
 

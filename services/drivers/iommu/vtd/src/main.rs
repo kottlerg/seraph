@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// services/drivers/iommu/vtd/src/main.rs
+
+//! The VT-d IOMMU driver (`iommu-vtd`).
+//!
+//! devmgr spawns it first at boot, before any DMA-capable driver, with one
+//! register cap per VT-d remapping unit it found in the ACPI DMAR
+//! (`iommu_core::bootstrap`). The driver maps each unit's registers,
+//! programs every unit with an empty root table and turns translation on
+//! ([`backend::Vtd`]), so every function a unit translates reaches nothing
+//! until devmgr attaches it; then it reports ready and serves
+//! `ipc::iommu_labels` for devmgr ([`iommu_core::service`]), with a second
+//! thread polling the units' fault records. A unit that cannot be set up
+//! turns every unit off again and the driver exits without reporting ready,
+//! so devmgr runs DMA unconfined. See `docs/device-management.md`
+//! § IOMMU Discovery and Programming.
+
+mod arch;
+mod backend;
+mod store;
+
+use std::sync::{Arc, Mutex, PoisonError};
+
+use iommu_core::bootstrap::Registers;
+use iommu_core::service::{self, KernelCaps, Lock, Service};
+use iommu_vtd::regs;
+use std::os::seraph::{reserve_pages, startup_info};
+use syscall_abi::PAGE_SIZE;
+
+use backend::{Unit, Vtd};
+use store::Store;
+
+/// The driver's one [`Service`], shared by the service loop and the fault
+/// poll thread.
+struct Shared(Mutex<Service<Vtd, KernelCaps>>);
+
+impl Lock<Service<Vtd, KernelCaps>> for Shared
+{
+    fn with<R>(&self, f: impl FnOnce(&mut Service<Vtd, KernelCaps>) -> R) -> R
+    {
+        // A poisoned lock means the other thread panicked mid-request; the
+        // service is used as it stands, since the hardware keeps translating
+        // whatever its tables hold.
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut guard)
+    }
+}
+
+/// Map `registers` into the driver's own address space; the base of the
+/// mapping, or `None`, logged, when it cannot be mapped.
+fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
+{
+    let Ok(range) = reserve_pages(registers.pages)
+    else
+    {
+        std::os::seraph::log!("register window: no VA");
+        return None;
+    };
+    let va = range.va_start();
+    if !std::os::seraph::fund_aspace_pt_budget(aspace, registers.pages)
+    {
+        std::os::seraph::log!("register window: page-table funding failed");
+        return None;
+    }
+    // SAFETY: `range` is a fresh reservation of the cap's pages from the
+    // per-process arena, never returned, so the VA stays the registers' for
+    // the driver's life; the backend reaches them only through raw volatile
+    // accesses (`mmio_map` § Safety).
+    if unsafe { syscall::mmio_map(aspace, registers.cap, va, 0) }.is_err()
+    {
+        std::os::seraph::log!("register window: mmio_map failed");
+        return None;
+    }
+    Some(va)
+}
+
+/// Whether every unit's page walks snoop the processor caches, read from
+/// each unit's `ECAP` through its mapping at `regs`.
+fn all_coherent(regs: &[u64]) -> bool
+{
+    regs.iter().all(|&va| {
+        // SAFETY: `va` maps a unit's register set, whose `ECAP` (8 bytes at
+        // 0x10) lies in its first page; reached only through a raw volatile
+        // access.
+        let ecap = unsafe { core::ptr::read_volatile((va + regs::ECAP as u64) as *const u64) };
+        regs::coherent(ecap)
+    })
+}
+
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    std::os::seraph::log!("service receive failing ({:?}, err={})", stage, err);
+}
+
+fn faults_dropped(count: u64)
+{
+    std::os::seraph::log!("fault queue full: {} faults dropped", count);
+}
+
+fn main() -> !
+{
+    std::os::seraph::log::register_name(b"iommu-vtd");
+    let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    let boot = match unsafe { iommu_core::bootstrap::receive(info.creator_endpoint, ipc_buf) }
+    {
+        Ok(boot) => boot,
+        Err(e) =>
+        {
+            std::os::seraph::log!("bootstrap failed ({:?})", e);
+            syscall::thread_exit();
+        }
+    };
+    let mut mapped = Vec::new();
+    for &r in &boot.registers
+    {
+        let Some(va) = map_registers(info.self_aspace, r)
+        else
+        {
+            syscall::thread_exit();
+        };
+        mapped.push(va);
+    }
+    let units = boot
+        .registers
+        .iter()
+        .zip(&mapped)
+        .map(|(r, &va)| Unit::new(va, r.pages * PAGE_SIZE))
+        .collect();
+    let store = Store::new(
+        info.memmgr_endpoint,
+        info.self_aspace,
+        all_coherent(&mapped),
+    );
+    let Some(mut svc) = Service::new(Vtd::new(units, store), KernelCaps, boot.units)
+    else
+    {
+        std::os::seraph::log!("no memory for the service");
+        syscall::thread_exit();
+    };
+    if let Err((unit, e)) = svc.init()
+    {
+        std::os::seraph::log!("unit {} not set up ({:?}); translation left off", unit, e);
+        syscall::thread_exit();
+    }
+    std::os::seraph::log!("{} units translating", mapped.len() as u64);
+
+    let shared = Arc::new(Shared(Mutex::new(svc)));
+    let poller = Arc::clone(&shared);
+    if std::thread::Builder::new()
+        .name("faults".into())
+        .spawn(move || service::poll_faults(&*poller, faults_dropped))
+        .is_err()
+    {
+        std::os::seraph::log!(
+            "fault poll thread not started; faults are polled only when devmgr takes them"
+        );
+    }
+
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    if let Err(e) = unsafe { ipc::report_driver_ready(boot.devmgr_query, ipc_buf) }
+    {
+        std::os::seraph::log!("DRIVER_READY failed ({:?}); translation left off", e);
+        shared.with(Service::disable);
+        syscall::thread_exit();
+    }
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    unsafe { service::serve(boot.service_ep, ipc_buf, &*shared, recv_diag) }
+}

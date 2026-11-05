@@ -71,7 +71,10 @@ then ordered by segment, bus, device, and function.
    - Read device ID (offset 0x02).
    - For a type-0 header, read class (0x0B) and subclass (0x0A), which
      exempt a host bridge from the decode toggle below, and size the BARs
-     (offsets 0x10-0x24).
+     (offsets 0x10-0x24). For a type-1 (PCI-to-PCI bridge) header, read the
+     secondary (0x19) and subordinate (0x1A) bus numbers, the buses behind
+     the bridge, against which devmgr resolves the device scopes of the ACPI
+     DMAR.
    - Read interrupt line (0x3C) and interrupt pin (0x3D).
 
 ### BAR Discovery
@@ -148,11 +151,17 @@ For each matched device, devmgr:
    [responsibilities.md](responsibilities.md#responsibilities)
    § Responsibilities). A function no kept window decodes, or whose carve
    fails, refuses the device, logged, with its BAR caps released. devmgr
-   then gives the device DMA: it registers the device in its DMA table and
-   derives the device's DMA capability, a SEND badged with the device badge
-   on its DMA endpoint ([responsibilities.md](responsibilities.md)
-   § Responsibilities). A device that cannot be given DMA is refused, logged,
-   with its BAR and configuration-page caps released.
+   then gives the device DMA. Where a VT-d unit translates the device, it
+   first attaches the device to an IOMMU domain of its own through the IOMMU
+   driver, and refuses a device an RMRR names, whose unit it could not hand
+   over, or whose attach fails (see
+   [docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
+   § IOMMU Discovery and Programming). It registers the device in its DMA
+   table with that confinement and derives the device's DMA capability, a
+   SEND badged with the device badge on its DMA endpoint
+   ([responsibilities.md](responsibilities.md) § Responsibilities). A device
+   that cannot be given DMA is refused, logged, with its BAR and
+   configuration-page caps released.
 4. Gives the device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its

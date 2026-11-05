@@ -98,9 +98,8 @@ sysroot/
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # iommu-vtd on x86_64, and the test-only
-│   │                         # test-orphan, test-fault, and, on x86_64,
-│   │                         # test-dma)
+│   │                         # iommu-vtd | iommu-riscv, and the test-only
+│   │                         # test-orphan, test-fault, and test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn
@@ -365,9 +364,9 @@ not on every push.
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial, the machine's IOMMU with the
-virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` on
-riscv64 — plus, on x86_64, `vmgenid,guid=auto` and QEMU's `edu` DMA test device, which svctest's
-DMA confinement phase drives; CI boots headless, so no framebuffer; the
+virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` at
+00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA confinement phase
+drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no framebuffer; the
 no-IOMMU boot, `--iommu absent`, runs in the release host runs, see Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`

@@ -177,8 +177,9 @@ live in the component scope:
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
 Boot modules (the eight entries of `xtask/src/bundle.rs::MODULES`: procmgr,
-memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and on x86-64 the
-`ARCH_MODULES` entry iommu-vtd) are packed into
+memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and the
+`ARCH_MODULES` entry of the architecture's IOMMU driver, iommu-vtd on x86-64
+and iommu-riscv on riscv64) are packed into
 `\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
 [`abi/boot-protocol`](../abi/boot-protocol/README.md)'s
@@ -268,7 +269,10 @@ touch it. See
 [device-management.md](device-management.md#iommu-discovery-and-programming).
 
 **RISC‑V**
-Embedded or non-standard configurations are not targeted.
+Embedded or non-standard configurations are not targeted. The RISC-V IOMMU,
+when present as a PCI function, is discovered by devmgr through the ACPI
+RIMT and programmed by its `iommu-riscv` driver in userspace; the kernel
+does not touch it.
 
 Per-arch kernel and userspace target specifications (soft-float / FP
 profile, psABI feature floor, microarchitecture pins) are in

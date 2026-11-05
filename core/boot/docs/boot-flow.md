@@ -102,7 +102,7 @@ The bootloader does not inspect module content; what each module does
 and in what order init spawns them is init's concern
 ([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)). Typical
 modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer,
-fatfs, and on x86-64 iommu-vtd (the authoritative lists are
+fatfs, and iommu-vtd on x86-64 or iommu-riscv on riscv64 (the authoritative lists are
 `xtask/src/bundle.rs::MODULES` and `ARCH_MODULES`).
 
 Only the whole bundle allocation is identity-mapped; module bodies are

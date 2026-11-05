@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "iommu-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The table-page store every IOMMU driver binary builds its translation
+# structures in. It calls memmgr and maps pages through the Seraph std
+# runtime, so it builds for the Seraph targets only, as a dependency of the
+# driver binaries, and has no host tests (the walks over it are host-tested
+# against heap stores in iommu-core's TableStore).
+[lib]
+name = "iommu_store"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+iommu-core = { path = "../core" }
+ipc = { path = "../../../../shared/ipc" }
+syscall = { path = "../../../../shared/syscall" }
+syscall-abi = { path = "../../../../abi/syscall" }
+
+[lints]
+workspace = true

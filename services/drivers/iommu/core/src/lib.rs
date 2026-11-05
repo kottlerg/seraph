@@ -13,8 +13,9 @@
 //! request handling with its version check, reply framing, and per-domain
 //! bookkeeping, which bounds each request and catches overlap and misuse
 //! before the family's code runs ([`service`]), the queue of polled faults
-//! ([`faults`]), and the [`Backend`] trait each family implements. A family
-//! binary is its `main` and its [`Backend`]. See
+//! ([`faults`]), the [`TableStore`] each family's translation structures are
+//! built in ([`table`]), and the [`Backend`] trait each family implements. A
+//! family binary is its `main` and its [`Backend`]. See
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
 #![cfg_attr(not(test), no_std)]
@@ -24,10 +25,12 @@ extern crate alloc;
 pub mod bootstrap;
 pub mod faults;
 pub mod service;
+pub mod table;
 
 pub use bootstrap::{Bootstrap, Registers, Scope, Units};
 pub use faults::{Fault, FaultQueue};
 pub use service::{CapOps, KernelCaps, Lock, MemoryCap, Service};
+pub use table::TableStore;
 
 /// Why a [`Backend`] operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

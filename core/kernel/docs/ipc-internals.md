@@ -417,8 +417,7 @@ between deliveries.
 8. Block current thread; return when woken
 9. On wakeup: if the park is INTERRUPTED (a stop, an upcall, or the
    notification destroyed under the waiter), return Interrupted. Otherwise the
-   sender has
-   already performed bits.swap(0) and stored the result in
+   sender has already performed bits.swap(0) and stored the result in
    current_tcb.wakeup_value (0 for a timer wake);
    tf.set_ipc_return(primary = 0, secondary = wakeup_value); return Ok(0)
 ```

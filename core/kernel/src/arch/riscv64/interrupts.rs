@@ -815,12 +815,13 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 // U-mode fault: flush it and retry the copy, so a page a fault
                 // handler has just mapped is not failed or delivered again
                 // (docs/fault-handling.md § Kernel Copies).
-                // SAFETY: S-mode in the copying thread's context; its satp is
-                // still active (SIE is clear).
-                if matches!(cause_code, 13 | 15)
-                    && unsafe {
-                        super::paging::user_fault_is_spurious(live.stval, cause_code == 15, false)
-                    }
+                let write = cause_code == 15;
+                let spurious = matches!(cause_code, 13 | 15) && {
+                    // SAFETY: S-mode in the copying thread's context; its satp
+                    // is still active (SIE is clear).
+                    unsafe { super::paging::user_fault_is_spurious(live.stval, write, false) }
+                };
+                if spurious
                 {
                     // SAFETY: S-mode; drops the stale entry for the retry.
                     unsafe { super::paging::flush_page(live.stval) };

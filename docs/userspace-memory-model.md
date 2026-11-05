@@ -81,7 +81,7 @@ disjoint surfaces:
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (`GlobalAlloc` for `System`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
 | Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged spawned-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
-| Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
+| Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo` page and `InitInfo` region, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
 overlap within a single address space.
@@ -228,9 +228,11 @@ quality caveat.
   that address to the child in its entry register (`rdi`/`a0`). The
   child's `_start` takes the address as its argument — it cannot read the
   address from the struct, since the address is what locates the struct.
-- **`InitInfo` page.** The kernel maps a read-only page at its chosen
-  `init_info_va` for init only, and delivers the address in init's entry
-  register the same way.
+- **`InitInfo` region.** The kernel maps a read-only region at its chosen
+  `init_info_va` for init only, one or more pages sized from the boot's
+  descriptor counts (`init_info_memory_count` pages, at most
+  `INIT_INFO_MAX_PAGES`), and delivers the address in init's entry register
+  the same way.
 - **Main-thread stack.** The loader (procmgr or, for memmgr/procmgr,
   init) maps `ProcessInfo.stack_pages` pages ending at the chosen
   `ProcessInfo.stack_top_vaddr` and leaves the pages below them

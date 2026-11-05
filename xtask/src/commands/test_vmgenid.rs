@@ -40,6 +40,7 @@ use crate::arch::Arch;
 use crate::cli::TestVmgenidArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
+use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, X86Paging, build_qemu_argv,
     validate_sysroot_for_launch,
@@ -186,7 +187,7 @@ impl Guest
             firmware_vars_path: None,
             cpus: args.cpus,
             mem_mib: args.mem,
-            display: crate::qemu::QemuDisplay::Headless,
+            display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: Some(sock_path),
             vmgenid_guid: Some(guid),

@@ -361,11 +361,6 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         "-no-reboot".into(),
     ]);
 
-    if spec.display != QemuDisplay::Window
-    {
-        args.extend(["-display".into(), "none".into()]);
-    }
-
     if let Some(sock) = spec.qmp_socket
     {
         args.extend([
@@ -568,13 +563,7 @@ fn extend_x86(
         ),
     ]);
 
-    // A launch with the adapter keeps the q35 default adapter (QEMU std
-    // VGA), the same device riscv64 selects explicitly via `-device VGA`;
-    // a headless one drops it so no framebuffer is advertised.
-    if spec.display == QemuDisplay::Headless
-    {
-        args.extend(["-vga".into(), "none".into()]);
-    }
+    args.extend(display_args(spec));
     Ok(())
 }
 
@@ -625,12 +614,41 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // otherwise. No production driver binds it.
     args.extend(["-device".into(), EDU_DEVICE.into()]);
 
-    // The virt machine has no built-in display. Use QEMU std VGA, the same
-    // adapter q35 gives x86-64 by default, so both arches present an
-    // identical UEFI GOP (`QemuVideoDxe`, same mode table).
-    match spec.display
+    // After the `edu` device, so the adapter's auto-placed PCI slot follows
+    // the devices above.
+    args.extend(display_args(spec));
+
+    Ok(())
+}
+
+/// The display adapter and display arguments of a launch, for the
+/// framebuffer device cell's surface (docs/testing.md "Coverage tiers").
+///
+/// Both machines present QEMU std VGA, so both arches show an identical
+/// UEFI GOP (`QemuVideoDxe`, same mode table): q35's default adapter on
+/// `x86_64`, which a headless launch drops with `-vga none`, and on riscv64,
+/// whose `virt` machine has no built-in display, `-device VGA`. Every launch
+/// without a window passes `-display none`, which needs no graphical
+/// backend. A riscv64 window adds the adapter only with the `gtk` or `sdl`
+/// backend, since with neither QEMU falls back to VNC.
+fn display_args(spec: &QemuLaunchSpec) -> Vec<String>
+{
+    let mut args: Vec<String> = Vec::new();
+    if spec.display != QemuDisplay::Window
     {
-        QemuDisplay::Window =>
+        args.extend(["-display".into(), "none".into()]);
+    }
+    match (spec.arch, spec.display)
+    {
+        (Arch::X86_64, QemuDisplay::Headless) => args.extend(["-vga".into(), "none".into()]),
+        (Arch::X86_64, QemuDisplay::Window | QemuDisplay::Framebuffer)
+        | (Arch::Riscv64, QemuDisplay::Headless) =>
+        {}
+        (Arch::Riscv64, QemuDisplay::Framebuffer) =>
+        {
+            args.extend(["-device".into(), "VGA".into()]);
+        }
+        (Arch::Riscv64, QemuDisplay::Window) =>
         {
             if let Some(backend) = preferred_display_backend(spec.arch.qemu_binary())
             {
@@ -646,14 +664,8 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
                 ]);
             }
         }
-        // `build_qemu_argv` has already passed `-display none`, which needs
-        // no graphical backend.
-        QemuDisplay::Framebuffer => args.extend(["-device".into(), "VGA".into()]),
-        QemuDisplay::Headless =>
-        {}
     }
-
-    Ok(())
+    args
 }
 
 /// Resolve and cache riscv64 firmware.

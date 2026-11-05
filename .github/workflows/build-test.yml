@@ -71,7 +71,10 @@ jobs:
 
       - name: Install QEMU and firmware
         # See docs/build-system.md § Continuous Integration.
-        run: .github/scripts/qemu-packages.sh install qemu-debs
+        uses: ./.github/actions/qemu-packages
+        with:
+          mode: install
+          dir: qemu-debs
 
       - name: Log QEMU versions
         # A missing binary fails here rather than at the first boot. The

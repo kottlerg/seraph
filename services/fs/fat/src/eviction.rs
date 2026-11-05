@@ -12,8 +12,11 @@
 //! queued, and enqueues an [`EvictReq`] for it (`relieve_pressure`); the
 //! request is answered `IO_ERROR` and the client retries. The eviction worker
 //! pops the request and first checks that the page is still
-//! outstanding, skipping it if the client's synchronous release or
-//! `FS_CLOSE` already cleaned it up. When the open that read the page
+//! outstanding, skipping it if the client's synchronous release or the
+//! release of its open already cleaned it up. An open is released, its
+//! pages with it, by `release_open_file`, which `FS_CLOSE`, the removal of
+//! the open's node, the sweep of opens whose client is gone, and an
+//! `FS_OPEN` whose reply failed call. When the open that read the page
 //! carried a release SEND on its `FS_OPEN`, the worker sends
 //! `FS_RELEASE_MEMORY` on its own derived copy of that open's SEND, so
 //! each page's release reaches the client that read it, and waits up to
@@ -26,10 +29,10 @@
 //! the client has already unmapped the page. The revoke invalidates
 //! the client's derived cap but unmaps nothing.
 //!
-//! Releasing the slot does not make it refillable. All three paths that
-//! drop a handed-out page's slot reference revoke the per-cookie ancestor
-//! first: this worker, the client's synchronous `FS_RELEASE_MEMORY`, and
-//! `FS_CLOSE`. The order before reuse is revoke, then count, then reuse.
+//! Releasing the slot does not make it refillable. Every path that drops a
+//! handed-out page's slot reference revokes the per-cookie ancestor first:
+//! this worker, the client's synchronous `FS_RELEASE_MEMORY`, and the
+//! release of the page's open. The order before reuse is revoke, then count, then reuse.
 //! The cache's victim pick revokes every derivation of the slot's cap
 //! again, so no holder can map the page anew, and only then reads the
 //! page's mapping count. It refills the page only when the cache's own
@@ -153,8 +156,8 @@ pub fn worker_loop(state: &EvictionState, files: &Mutex<OpenTable>, cache: &'sta
     loop
     {
         let req = pop_blocking(state);
-        // The client's synchronous FS_RELEASE_MEMORY and FS_CLOSE clean an
-        // outstanding page up on the main thread, before or during the
+        // The client's synchronous FS_RELEASE_MEMORY and the release of its
+        // open clean an outstanding page up on the main thread, before or during the
         // cooperative round-trip. A page already gone is skipped.
         let Some(endpoint) = live_release_endpoint(files, &req)
         else
@@ -196,7 +199,8 @@ fn pop_blocking(state: &EvictionState) -> EvictReq
 }
 
 /// Log a non-ack release outcome, and whether the worker revoked the page
-/// or found it already cleaned up by the client's release or `FS_CLOSE`.
+/// or found it already cleaned up by the client's release or its open's
+/// release.
 fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
 {
     let what = match outcome
@@ -359,7 +363,7 @@ enum Endpoint
 /// Under the open-file lock, check that `req`'s outstanding page is still
 /// in the table (same open, cookie, cache slot, and ancestor cap) and return
 /// a derived copy of its open's release SEND. The copy is the worker's own,
-/// so an `FS_CLOSE` that deletes the slot's SEND meanwhile cannot free or
+/// so an open's release that deletes the slot's SEND meanwhile cannot free or
 /// reuse the slot the worker calls on. `None` means the page was already
 /// cleaned up.
 fn live_release_endpoint(files: &Mutex<OpenTable>, req: &EvictReq) -> Option<Endpoint>

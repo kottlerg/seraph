@@ -60,7 +60,10 @@
 //! this `File`; the driver keeps it on the open, and its eviction worker
 //! sends each cooperative [`fs_labels::FS_RELEASE_MEMORY`] for this
 //! `File`'s pages on it, then revokes the page's caps whether or not the
-//! reply is an ack.
+//! reply is an ack. The reply's `caps[1]`, the open's liveness cap, is kept
+//! for the `File`'s life and deleted after its `FS_CLOSE`: the driver
+//! releases an open once no copy of that cap is left, so a process that dies
+//! without closing a `File` loses its opens with its `CSpace`.
 //!
 //! ## Path anchoring
 //! Absolute paths walk from `root_dir_cap()`; relative paths walk
@@ -1162,8 +1165,10 @@ fn write_frame_chunk(
 /// and by `std::process::exit`, before the exit syscall. A `File` the
 /// process never drops would otherwise leave its open, and the release
 /// SEND it handed the driver, in the fs driver past the process's death
-/// (fs-driver-protocol.md § Label 18). The caps are left for the exit to
-/// free. A crash or a kill runs no exit hook and sends no `FS_CLOSE`.
+/// (fs-driver-protocol.md § Label 18) until the driver next finds the open's
+/// liveness cap gone with the process. The caps are left for the exit to
+/// free. A crash or a kill runs no exit hook and sends no `FS_CLOSE`; the
+/// driver releases such an open once it finds its liveness cap gone.
 pub(crate) fn close_open_files()
 {
     let Some(state) = release_handler::state()
@@ -1186,9 +1191,9 @@ pub(crate) fn close_open_files()
 
 /// Send `FS_OPEN` on the file node cap `node_cap`, moving `release_send`
 /// (this `File`'s badged SEND on the release endpoint) to the driver in
-/// `caps[0]`, and return the open cap the reply carries
+/// `caps[0]`, and return the open cap and the liveness cap the reply carries
 /// (fs-driver-protocol.md § Label 18). Every other reply cap is deleted.
-fn file_open(node_cap: u64, release_send: u64, ipc_buf: *mut u64) -> io::Result<u64>
+fn file_open(node_cap: u64, release_send: u64, ipc_buf: *mut u64) -> io::Result<(u64, u64)>
 {
     let msg = IpcMessage::builder(fs_labels::FS_OPEN)
         .cap(release_send)
@@ -1196,9 +1201,12 @@ fn file_open(node_cap: u64, release_send: u64, ipc_buf: *mut u64) -> io::Result<
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }
         .map_err(|_| io::Error::other("seraph fs: FS_OPEN ipc_call failed"))?;
-    let (open_cap, surplus) = match reply.caps().split_first()
+    let (opened, surplus) = match *reply.caps()
     {
-        Some((&cap, rest)) if reply.label == fs_errors::SUCCESS => (Some(cap), rest),
+        [open, liveness, ref rest @ ..] if reply.label == fs_errors::SUCCESS =>
+        {
+            (Some((open, liveness)), rest)
+        }
         _ => (None, reply.caps()),
     };
     for &cap in surplus
@@ -1209,7 +1217,9 @@ fn file_open(node_cap: u64, release_send: u64, ipc_buf: *mut u64) -> io::Result<
     {
         return Err(map_fs_error(reply.label));
     }
-    open_cap.ok_or_else(|| io::Error::other("seraph fs: FS_OPEN reply carries no open cap"))
+    opened.ok_or_else(|| {
+        io::Error::other("seraph fs: FS_OPEN reply carries no open cap and liveness cap")
+    })
 }
 
 /// Send `FS_TRUNCATE(0)` against `file_cap`. v1 only supports the
@@ -1301,6 +1311,11 @@ pub struct File
     /// FS_WRITE_MEMORY, FS_TRUNCATE, FS_CLOSE, synchronous
     /// client-initiated FS_RELEASE_MEMORY).
     file_cap: u64,
+    /// The open's liveness cap, the `FS_OPEN` reply's `caps[1]`: the driver
+    /// keeps the open only while a copy of it lives, so it is held until the
+    /// `FS_CLOSE` in `Drop` and deleted after it (fs-driver-protocol.md
+    /// § Label 18).
+    liveness_cap: u64,
     /// Badge keying this `File`'s entry in the release-handler registry,
     /// so `Drop` can unregister it. It is also the badge of the release
     /// SEND the `FS_OPEN` handed the driver, so a driver
@@ -1475,7 +1490,7 @@ impl File
         // request goes to the open cap, so the node cap goes too.
         let _ = syscall::cap_delete(release_send);
         let _ = syscall::cap_delete(file_cap);
-        let file_cap = opened?;
+        let (file_cap, liveness_cap) = opened?;
         // Registered once the open exists, so the exit hook
         // (`close_open_files`) closes it; no driver release can name one of
         // its pages before its first read.
@@ -1486,6 +1501,7 @@ impl File
 
         Ok(File {
             file_cap,
+            liveness_cap,
             badge,
             aspace: info.self_aspace,
             memmgr_ep: info.memmgr_endpoint,
@@ -1931,7 +1947,10 @@ impl Drop for File
         // FS_CLOSE: fs walks this open's outstanding-page table and
         // revokes every per-cookie ancestor cap, decrementing each
         // cache-slot refcount, and deletes the release SEND the open
-        // kept; other opens of the file keep theirs. The revoke
+        // kept, and revokes the liveness cap; other opens of the file keep
+        // theirs. The liveness cap is deleted after the close, so a close
+        // that never reached the driver still lets it release the open once
+        // it finds the cap gone. The revoke
         // invalidates our derived caps but leaves
         // their mappings in place; fs refills none of those pages while we
         // map it, but each held page shrinks its cache, so each VA must
@@ -1943,6 +1962,7 @@ impl Drop for File
             let _ = unsafe { ipc::ipc_call(self.file_cap, &close, ipc_buf) };
         }
         let _ = syscall::cap_delete(self.file_cap);
+        let _ = syscall::cap_delete(self.liveness_cap);
 
         // Drain the registry entry. A driver release that arrives after
         // unregister, on whichever badge, finds no entry and is acked

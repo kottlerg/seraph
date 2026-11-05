@@ -139,8 +139,17 @@ pub fn fs_read_bytes(
 
 /// `FS_OPEN` on file node cap `node_cap`, carrying `release` (a release
 /// endpoint SEND, moved to fatfs) in `caps[0]` when it is non-zero. Returns
-/// the open cap, or the wire error code.
+/// the open cap, or the wire error code. The open's liveness cap stays in
+/// svctest's `CSpace`, keeping the open alive, until the open's `FS_CLOSE`
+/// (or its node's removal) revokes it; [`fs_open_live`] returns it too.
 pub fn fs_open(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<u64, u64>
+{
+    fs_open_live(node_cap, release, ipc_buf).map(|(open, _liveness)| open)
+}
+
+/// [`fs_open`], returning `(open cap, liveness cap)`: the reply's `caps[0]`
+/// and `caps[1]` (services/fs/docs/fs-driver-protocol.md § Label 18).
+pub fn fs_open_live(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<(u64, u64), u64>
 {
     let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN);
     if release != 0
@@ -154,10 +163,11 @@ pub fn fs_open(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<u64, u6
     {
         return Err(reply.label);
     }
-    Ok(*reply
-        .caps()
-        .first()
-        .expect("FS_OPEN success without an open cap"))
+    match *reply.caps()
+    {
+        [open, liveness] => Ok((open, liveness)),
+        _ => panic!("FS_OPEN success without an open cap and a liveness cap"),
+    }
 }
 
 /// `FS_CLOSE` on `cap`; returns the reply label (`u64::MAX` when the call

@@ -57,6 +57,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   Checked on every request (`data[0]`):
 //     DEVMGR_LABELS_VERSION     — every devmgr_labels request
 //     DEVMGR_DMA_LABELS_VERSION — every devmgr_dma_labels request
+//     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -2102,6 +2103,115 @@ pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Res
     }
 }
 
+/// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
+/// above the label modules describes, which also lists its runtime check.
+pub const IOMMU_LABELS_VERSION: u32 = 1;
+/// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
+/// the IOMMU of one family (VT-d, the RISC-V IOMMU).
+///
+/// devmgr holds the only SEND to the endpoint: it spawns the driver, hands it
+/// each unit's register cap, and drives it from its DMA thread and its
+/// withdrawal path, keeping the drivers' `devmgr_dma_labels` contract unchanged
+/// whichever IOMMU, or none, sits behind it. devmgr chooses every IOVA; the
+/// IOMMU driver installs and withdraws what devmgr asks and reports faults.
+/// No reply arrives before the hardware does what it states: a mapping
+/// withdrawn, or a device blocked, is unreachable by the device when the reply
+/// is sent. Every request carries the caller's compiled
+/// [`IOMMU_LABELS_VERSION`] in `data[0]`; the driver replies
+/// [`iommu_errors::LABEL_VERSION_MISMATCH`] when it differs. Specified in
+/// `docs/device-management.md` § IOMMU Discovery and Programming.
+pub mod iommu_labels
+{
+    /// Give a PCI function its own translation domain, in which it reaches
+    /// nothing until [`MAP`] installs a range.
+    ///
+    /// Request: `data[1]` = the unit index, in the order the driver's
+    /// bootstrap delivered the units; `data[2]` = the function's requester
+    /// ID ([`requester_id`]). Reply: label `SUCCESS` with `data[0]` = the
+    /// domain handle every later request for the function names; or an
+    /// error code. A function attached twice keeps its first domain.
+    pub const ATTACH: u64 = 1;
+    /// Make the frames of a Memory cap reachable by a domain's function at an
+    /// IOVA devmgr chose.
+    ///
+    /// Request: `data[1]` = domain, `data[2]` = IOVA of the cap's first byte,
+    /// page-aligned, `data[3]` = access (`devmgr_dma_labels::ACCESS_*`);
+    /// `caps[0]` = a derivation of the Memory cap devmgr keeps for the
+    /// mapping, moved to the driver, which keeps it while the range is
+    /// installed and deletes it at its [`UNMAP`] or the domain's [`BLOCK`].
+    /// The whole cap is installed. Reply: empty body, label `SUCCESS`, or an
+    /// error code with the cap deleted.
+    pub const MAP: u64 = 2;
+    /// Withdraw the range [`MAP`] installed at an IOVA of a domain.
+    ///
+    /// Request: `data[1]` = domain, `data[2]` = the IOVA. Reply: empty body,
+    /// label `SUCCESS` once the range is removed and the invalidation it
+    /// needs has completed, or an error code.
+    pub const UNMAP: u64 = 3;
+    /// Block a domain's function: it reaches no frame from the reply on.
+    /// Every range of the domain is withdrawn with it.
+    ///
+    /// Request: `data[1]` = domain. Reply: empty body, label `SUCCESS` once
+    /// the block and its invalidation have completed, or an error code.
+    pub const BLOCK: u64 = 4;
+    /// Report a unit's translation limits, which devmgr's IOVA allocator
+    /// keeps within.
+    ///
+    /// Request: `data[1]` = unit index. Reply: label `SUCCESS` with
+    /// `data[0]` = the widest IOVA the unit translates, in bits; or an error
+    /// code.
+    pub const QUERY_UNIT: u64 = 5;
+    /// Take the faults the driver has recorded since the last call.
+    ///
+    /// Request: no further words. Reply: label `SUCCESS` with `data[0]` =
+    /// the number of faults that follow, at most [`MAX_FAULTS_PER_REPLY`],
+    /// then two words per fault: the requester ID in the low 32 bits and
+    /// the unit's fault reason in bits 32..40, and the faulting IOVA. A
+    /// fault past the bound stays for the next call.
+    pub const TAKE_FAULTS: u64 = 6;
+
+    /// Faults one [`TAKE_FAULTS`] reply carries: two words each after the
+    /// count, within the message's data words.
+    pub const MAX_FAULTS_PER_REPLY: usize = (crate::MSG_DATA_WORDS_MAX - 1) / 2;
+
+    /// The requester ID of a PCI function: segment in bits 16..32, bus in
+    /// bits 8..16, device in bits 3..8, function in bits 0..3.
+    #[must_use]
+    pub const fn requester_id(segment: u16, bus: u8, device: u8, function: u8) -> u64
+    {
+        ((segment as u64) << 16)
+            | ((bus as u64) << 8)
+            | (((device & 0x1f) as u64) << 3)
+            | ((function & 0x7) as u64)
+    }
+}
+
+/// Error replies on an IOMMU driver's endpoint ([`iommu_labels`]).
+pub mod iommu_errors
+{
+    /// Request handled.
+    pub const SUCCESS: u64 = 0;
+    /// The request is malformed: an unknown unit or domain, a requester ID
+    /// outside the unit's scope, an IOVA that is unaligned or past the
+    /// unit's width, a missing or non-Memory cap, or an access word outside
+    /// `devmgr_dma_labels::ACCESS_MASK`.
+    pub const INVALID_REQUEST: u64 = 1;
+    /// Caller's compiled `IOMMU_LABELS_VERSION`, carried in `data[0]`,
+    /// does not match the driver's.
+    pub const LABEL_VERSION_MISMATCH: u64 = 2;
+    /// The range overlaps one already installed in the domain.
+    pub const ADDRESS_IN_USE: u64 = 3;
+    /// `UNMAP` names no installed range of the domain.
+    pub const NO_MAPPING: u64 = 4;
+    /// The driver could not take the memory or domain the request needs.
+    pub const OUT_OF_RESOURCES: u64 = 5;
+    /// The unit did not complete an invalidation within the driver's bound;
+    /// the unit is treated as failed and the request is refused.
+    pub const HARDWARE_TIMEOUT: u64 = 6;
+    /// Unknown opcode on the IOMMU endpoint.
+    pub const UNKNOWN_OPCODE: u64 = 0xFF;
+}
+
 /// Wire-protocol version of [`blk_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
 pub const BLK_LABELS_VERSION: u32 = 3;
@@ -3459,6 +3569,21 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_requester_id_packs_segment_bus_device_and_function()
+    {
+        assert_eq!(iommu_labels::requester_id(0, 0, 3, 0), 0x18);
+        assert_eq!(iommu_labels::requester_id(1, 2, 0x1f, 7), 0x1_02ff);
+        // Out-of-range device and function bits are masked off.
+        assert_eq!(iommu_labels::requester_id(0, 0, 0x20, 8), 0);
+    }
+
+    #[test]
+    fn a_fault_reply_fits_its_count_and_two_words_per_fault()
+    {
+        assert!(1 + 2 * iommu_labels::MAX_FAULTS_PER_REPLY <= MSG_DATA_WORDS_MAX);
+    }
 
     /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one
     /// transferred cap per entry of `caps`.

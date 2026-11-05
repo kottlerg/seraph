@@ -1047,9 +1047,14 @@ the answer stays `1` until the caller itself takes a further reference through t
 derivation, copy, retype, donation, binding, wait-set add, or a syscall of its own in flight), since
 no other process holds a capability through which to add one. A user mapping is not a reference
 (`CAP_INFO_MEMORY_MAPPINGS` counts those). memmgr reads it before it returns a reclaimed frame to
-its pool
-([services/memmgr/docs/memory-pool.md](../../../services/memmgr/docs/memory-pool.md#reclamation) §
-Reclamation).
+its pool ([memory-pool.md § Reclamation](../../../services/memmgr/docs/memory-pool.md#reclamation)).
+
+`CAP_INFO_ASPACE_TERMINAL_FAULT` (14) returns, for an AddressSpace cap, `0` while no thread of the
+address space has taken a terminal fault, and otherwise the retained reason of the first one
+(`EXIT_FAULT_BASE` plus the fault vector or cause; never `0`), which later faults do not overwrite.
+It is the reason a `SYS_ASPACE_BIND_NOTIFICATION` observer of the space receives, read under the
+same lock that serialises the post and the bind, so a holder that missed the post reads the outcome
+back here.
 
 **Capability requirement:** None — `cap_info` reads the slot without a rights check.
 

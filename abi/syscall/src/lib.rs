@@ -411,6 +411,17 @@ pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
 /// frame to its pool (services/memmgr/docs/memory-pool.md § Reclamation).
 pub const CAP_INFO_SOLE_REFERENCE: u64 = 13;
 
+/// `AddressSpace` only — the retained terminal-fault reason, or `0`.
+///
+/// Returns `0` while no thread of the address space has taken a terminal
+/// fault, and otherwise the reason of the first one
+/// ([`EXIT_FAULT_BASE`] + vector or cause; never `0`), which later faults do
+/// not overwrite. It is the reason an `SYS_ASPACE_BIND_NOTIFICATION` observer
+/// receives, so a holder that missed the event post reads it back here.
+/// Calling on a non-`AddressSpace` slot returns
+/// [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_ASPACE_TERMINAL_FAULT: u64 = 14;
+
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
 // Userspace constants matching the kernel `CapTag` enum, for callers that

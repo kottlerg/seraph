@@ -540,9 +540,10 @@ pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
 Not a callable label. When a demand-paged process's thread takes a page
 fault the kernel cannot resolve, it synthesises an IPC to memmgr's
 endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the derivation
-badge of the Endpoint cap bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr and
-the runtime bind the process's own badged memmgr cap, so this is the process's
-memmgr badge), and data words `[kind, faulting_va, access, ip]`
+badge of the Endpoint cap bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr binds
+the process's own badged memmgr cap on its main thread, and the runtime copies
+that binding onto each thread it spawns with `SYS_THREAD_INHERIT_FAULT_HANDLER`,
+so this is the process's memmgr badge), and data words `[kind, faulting_va, access, ip]`
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
 process with a delegated address space, and whose `access` the region's

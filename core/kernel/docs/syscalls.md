@@ -200,7 +200,7 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  57  SYS_THREAD_INHERIT_FAULT_HANDLER
 ```
 
-**Implementation status.** Every number 0–55 has a handler; unallocated numbers
+**Implementation status.** Every number 0–57 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---

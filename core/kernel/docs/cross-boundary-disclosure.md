@@ -66,7 +66,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page, to a holder of `AsRights::READ`, which init's kernel-created address space and an address space retyped from a `PHYS` source alone carry | `sysinfo::sys_aspace_query`, `AddressSpace::query_page`, `cap::sys_cap_create_aspace` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
-| `SYS_THREAD_GET_FAULT_HANDLER` → whether a fault class of a thread the caller holds `CONTROL` on is bound (`0` or `1`), and the bound badge (a derivation badge of a cap a binder held, or its copy); no endpoint, capability, or kernel address | `thread::sys_thread_get_fault_handler` | d |
+| `SYS_THREAD_GET_FAULT_HANDLER` → whether a fault class of a thread the caller holds `CONTROL` on is bound (`0` or `1`), and the bound badge (a derivation badge of a cap a binder held, or its copy); no endpoint, capability, or kernel address | `thread::sys_thread_get_fault_handler` | c/d |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |

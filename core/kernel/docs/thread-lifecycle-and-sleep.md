@@ -345,11 +345,11 @@ stated explicitly.
 12. Clear tcb.blocked_on_object = null under tcb's sched_lock: the abort arm
     of a wake that claimed tcb before its Exited mark writes the same pair
     under that lock.
-13. Release tcb's fault-handler binding, if any: atomically swap
-    tcb.fault_handler to null and dec_ref the prior EndpointObject; if its
-    refcount reaches 0, push the orphaned endpoint header onto the dealloc
-    cascade stack (`CascadeStack`, step 20's mechanism) rather than recursing
-    into dealloc_object.
+13. Release tcb's fault-handler bindings, one per fault class: for each
+    class, atomically swap tcb.fault_handlers[class] to null and dec_ref the
+    prior EndpointObject, if any; if its refcount reaches 0, push the orphaned
+    endpoint header onto the dealloc cascade stack (`CascadeStack`, step 20's
+    mechanism) rather than recursing into dealloc_object.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
     thread still on its send queue. Then take the death_observers chain and,
     for each node, return it to its queue's pool under that queue's lock and
@@ -592,8 +592,9 @@ domains:
    is never overwritten (the contract of [ipc-design.md](../../../docs/ipc-design.md) § The
    Call/Reply Model).
 9. **Fault-handler binder via `ipc::fault::claim_fault_park`** — for a `BlockedOnFault` client
-   only: a `SYS_THREAD_SET_FAULT_HANDLER` that changes the binding of a thread with a delivery in
-   flight (`redeliver_in_flight`) runs `compare_exchange(this_client, null, AcqRel, Acquire)` under
+   only: a `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` that changes the
+   binding of the class of a thread's in-flight delivery (`apply_bindings`, then
+   `redeliver_in_flight`) runs `compare_exchange(this_client, null, AcqRel, Acquire)` under
    the client's per-TCB `sched_lock`, behind the same `blocked_on_object` re-read as actor 4 (the
    CLOSURE LEMMA pins the server alive for the CAS). On a win it records
    `fault_outcome = Redeliver`, clears the client's binding in the same hold, as actor 4 does, and

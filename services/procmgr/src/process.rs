@@ -2059,8 +2059,10 @@ fn bind_pager(
 }
 
 /// Advertise the pager in a child's `ProcessInfo` (still writable through
-/// `pi_memory_cap` until the child starts), so the runtime inherits it onto
-/// spawned threads and backs its heap floor on demand. The child's badged
+/// `pi_memory_cap` until the child starts), so the runtime knows the process
+/// is demand-paged and backs its heap floor on demand; the runtime copies the
+/// main thread's binding onto the threads it spawns
+/// (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The child's badged
 /// memmgr endpoint is the pager endpoint: the kernel stamps each fault with
 /// that cap's derivation badge, `memmgr_badge`, so the fault is attributed to
 /// the right memmgr record, and `pager_badge` records the same value for the

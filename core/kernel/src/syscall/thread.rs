@@ -1252,9 +1252,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 ///
 /// Each selected class's binding takes its own reference on the endpoint
 /// object for the binding's lifetime (see `docs/fault-handling.md`
-/// § Liveness); rebinding / unbinding / thread destruction releases it. The target Thread and the endpoint are pinned for
-/// the call (`lookup_cap`), so a concurrent delete of either one's last
-/// capability frees it only after the binding is published. The endpoint and
+/// § Liveness); rebinding / unbinding / thread destruction releases it. The
+/// target Thread and the endpoint are pinned for the call (`lookup_cap`), so
+/// a concurrent delete of either one's last capability frees it only after
+/// the binding is published. The endpoint and
 /// its badge are published as one unit per class under the target's
 /// `sched_lock`, the lock `ipc::fault::fault_dispatch` reads them under.
 ///

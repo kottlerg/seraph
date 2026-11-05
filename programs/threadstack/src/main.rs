@@ -9,12 +9,16 @@
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
 //! usable region with an unregistered guard page below it, and its main thread's
 //! stack grows on demand below the pages the loader mapped, above a guard page
-//! of its own. Five modes, by argv:
+//! of its own. Six modes, by argv:
 //!
 //!   * `grow` — spawn a worker that recurses deep enough to fault in many
 //!     demand-paged stack pages (but stays inside the usable region), `join`
 //!     it, and print `PASS`. Exercises the real `Thread::new`/`join` demand
 //!     path and join-time `UNREGISTER_REGION` reclamation. Exits `SUCCESS`.
+//!   * `nested-grow` — as `grow`, but the recursing thread is spawned by a
+//!     spawned thread, so its pager binding reaches it through two runtime
+//!     copies of the spawning thread's bindings, not from the main thread.
+//!     Exits `SUCCESS`.
 //!   * `guard` — spawn a worker that recurses unbounded, past the usable
 //!     region into the guard page. The pager declines the unregistered fault,
 //!     the kernel kills the worker, and (via the address-space death-observer)
@@ -74,6 +78,10 @@ fn main() -> ExitCode
     else if std::env::args().any(|a| a == "bigframe")
     {
         bigframe()
+    }
+    else if std::env::args().any(|a| a == "nested-grow")
+    {
+        nested_grow()
     }
     else
     {
@@ -146,6 +154,23 @@ fn grow() -> ExitCode
     };
     // Use the checksum so the recursion is not dead code.
     println!("grow checksum {}", std::hint::black_box(checksum));
+    println!("PASS");
+    ExitCode::SUCCESS
+}
+
+fn nested_grow() -> ExitCode
+{
+    // The middle thread spawns the recursing one: the grandchild's binding is
+    // the middle thread's copy, not the main thread's.
+    let middle =
+        std::thread::spawn(|| std::thread::spawn(|| recurse(GROW_DEPTH, Direction::Down)).join());
+    let Ok(Ok(checksum)) = middle.join()
+    else
+    {
+        println!("nested-grow worker panicked");
+        return ExitCode::from(3);
+    };
+    println!("nested-grow checksum {}", std::hint::black_box(checksum));
     println!("PASS");
     ExitCode::SUCCESS
 }

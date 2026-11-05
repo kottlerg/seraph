@@ -229,9 +229,12 @@ pub struct StartupInfo {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stack_pages: u32,
     /// `Endpoint` cap on the process's demand-paging pager, or zero when
-    /// the process is not demand-paged. The runtime binds this as the fault
-    /// handler on every thread it spawns; the main thread is bound by
-    /// procmgr at creation. See `process_abi::ProcessInfo::pager_endpoint_cap`.
+    /// the process is not demand-paged. procmgr binds it as the main thread's
+    /// fault handler at creation, and the runtime copies the spawning thread's
+    /// bindings onto every thread it spawns
+    /// (`SYS_THREAD_INHERIT_FAULT_HANDLER`), which carries it on; the runtime
+    /// reads this field to tell that the process is demand-paged. See
+    /// `process_abi::ProcessInfo::pager_endpoint_cap`.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub pager_endpoint_cap: u64,
     /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel

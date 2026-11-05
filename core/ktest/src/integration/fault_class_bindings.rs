@@ -25,22 +25,25 @@
 //!      class as it was; a copy of every class then unbinds the exception
 //!      class, which the source has unbound. A page fault of the destination
 //!      reaches the source's endpoint with the source's badge.
-//!   5. **Argument checks.** A mask of zero or with an undefined bit is
-//!      refused by both binders, and a class argument that is not one class
-//!      bit by the query.
+//!   5. **Argument and rights checks.** A mask of zero or with an undefined
+//!      bit is refused by both binders, and a class argument that is not one
+//!      class bit by the query. A Thread cap without `CONTROL` is refused
+//!      (`InsufficientRights`) by the query and as either thread of the copy,
+//!      and a handle that names no capability (`InvalidCapability`) likewise.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_wait_timeout,
-    thread_get_fault_handler, thread_inherit_fault_handler, thread_read_regs,
-    thread_set_fault_handler, thread_write_regs, wait_set_add, wait_set_create, wait_set_wait,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_derive,
+    notification_wait_timeout, thread_get_fault_handler, thread_inherit_fault_handler,
+    thread_read_regs, thread_set_fault_handler, thread_write_regs, wait_set_add, wait_set_create,
+    wait_set_wait,
 };
 use syscall_abi::{
     EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_CLASS_EXCEPTION, FAULT_CLASS_VM, FAULT_KIND_EXCEPTION,
     FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL, FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY,
-    SyscallError,
+    RIGHTS_THREAD_OBSERVE, SyscallError,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -162,7 +165,8 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
     partial_unbind(ctx, parts, &objects)?;
     per_class_rebind(ctx, parts, &objects)?;
     inheritance(ctx, parts, &objects)?;
-    argument_checks(parts)
+    argument_checks(parts)?;
+    rights_checks(parts)
 }
 
 /// Phase 1: a page fault and an illegal instruction reach their own classes'
@@ -262,6 +266,39 @@ fn argument_checks(parts: &Parts) -> TestResult
         {
             return Err("integration::fault_class_bindings: a refused class was accepted");
         }
+    }
+    Ok(())
+}
+
+/// Phase 5, rights: a Thread cap without `CONTROL`, and a handle naming no
+/// capability, are refused by the query and as either thread of the copy.
+fn rights_checks(parts: &Parts) -> TestResult
+{
+    let th = parts.children[4]
+        .as_ref()
+        .ok_or("integration::fault_class_bindings: no source thread")?
+        .th;
+    let observe = cap_derive(th, RIGHTS_THREAD_OBSERVE)
+        .map_err(|_| "integration::fault_class_bindings: cap_derive (observe) failed")?;
+    let rights = check_refusals(th, observe, SyscallError::InsufficientRights);
+    let deleted = cap_delete(observe)
+        .map_err(|_| "integration::fault_class_bindings: cap_delete (observe) failed");
+    rights?;
+    deleted?;
+    // A handle whose slot is empty: the observe cap just deleted.
+    check_refusals(th, observe, SyscallError::InvalidCapability)
+}
+
+/// Check that `bad`, used with the `CONTROL` cap `th`, is refused with
+/// `error` by the query, as the copy's destination, and as its source.
+fn check_refusals(th: u64, bad: u64, error: SyscallError) -> TestResult
+{
+    let refused = Err(error as i64);
+    if thread_get_fault_handler(bad, FAULT_CLASS_VM).map(|_| ()) != refused
+        || thread_inherit_fault_handler(bad, th, FAULT_CLASS_ALL) != refused
+        || thread_inherit_fault_handler(th, bad, FAULT_CLASS_ALL) != refused
+    {
+        return Err("integration::fault_class_bindings: a refused thread cap was accepted");
     }
     Ok(())
 }

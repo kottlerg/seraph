@@ -3,7 +3,7 @@
 
 // programs/threadstack/tester/src/main.rs
 
-//! Per-program tester for `/programs/threadstack`. Spawns it in five modes
+//! Per-program tester for `/programs/threadstack`. Spawns it in six modes
 //! (demand-paged by the system default) and asserts, capability-natively
 //! (stdout marker is the verdict;
 //! the kernel's fault-class exit reason is corroborating mechanism only):
@@ -17,6 +17,8 @@
 //!   * `bigframe` — a worker calls a function whose one frame is larger than
 //!     its usable stack and writes only the frame's lowest byte, past the
 //!     guard page; same verdict as `guard`, which only stack probes deliver.
+//!   * `nested-grow` — a thread spawned by a spawned thread recurses deep into
+//!     its demand-paged stack and joins; same verdict as `grow`.
 //!   * `main-grow` — the main thread recurses far past the stack pages the
 //!     loader mapped for it; same verdict as `grow`.
 //!   * `main-guard` — the main thread overflows past its demand growth range
@@ -60,7 +62,7 @@ fn run(mode: &str) -> (String, std::process::ExitStatus)
     (String::from_utf8_lossy(&bytes).into_owned(), status)
 }
 
-/// Run a growth `mode` (`grow` or `main-grow`), whose fixture must recurse
+/// Run a growth `mode` (`grow`, `nested-grow`, or `main-grow`), whose fixture must recurse
 /// deep into a demand stack and exit cleanly.
 fn check_grow(mode: &str)
 {
@@ -122,6 +124,7 @@ fn main()
     check_grow("grow");
     check_overflow("guard");
     check_overflow("bigframe");
+    check_grow("nested-grow");
     check_grow("main-grow");
     check_overflow("main-guard");
     println!("[threadstack-tester] PASS");

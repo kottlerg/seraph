@@ -85,8 +85,9 @@ first touch faults, memmgr maps a frame and resumes. See
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)
 (`REGISTER_REGION`, `DELEGATE_ASPACE`, and the fault arm).
 
-A change of the binding while a fault is in flight cancels that delivery and delivers the fault
-again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both architectures.
+A change of the binding of an in-flight fault's class cancels that delivery and delivers the
+fault again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both
+architectures.
 
 ---
 
@@ -262,23 +263,24 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   reply. Destroying it while stopped ends it as for any stopped thread. A cancelled fault-blocked
   thread is never resumed at its faulting instruction: a thread whose own access faulted is killed
   (a stopped one when next started), and one whose kernel copy faulted has that syscall fail.
-- **Rebind (redelivery).** A change of the binding by `SYS_THREAD_SET_FAULT_HANDLER` (an unbind,
-  or a bind to another endpoint or with another badge) while a fault is in flight, before any reply
-  or other cancellation claims it, cancels that delivery: the queued fault message is withdrawn, or
-  a handler that received it finds no pending reply (its `SYS_IPC_REPLY` fails with
-  `InvalidCapability`). The fault is then delivered again, by the kernel, under the binding current
-  when the faulting thread next runs, as a new delivery: the handler bound then receives the fault
-  message with the badge of the cap bound then. With no handler bound then, the fault is
-  unhandled, as a fault whose delivery finds the binding cleared ([Reply](#reply)): clearing the
-  binding mid-fault kills the thread, or fails its kernel copy's syscall. A bind to the same
-  endpoint with the same badge cancels nothing. A fault in flight is one whose delivery read the
-  binding before the change; one that reads the binding after it is delivered under the new binding
-  at once. A delivery made under the new binding can, in a narrow race, be cancelled and made again
-  under that same binding, which the handler sees as one more fault message for the fault; the
-  outcome is unchanged. A stop after the change claimed the fault leaves the redelivery: when next
-  started, the thread delivers the fault again. Redelivery runs in the kernel, not by resuming the
-  thread at its faulting instruction, so it holds for a trap-type exception whose instruction
-  pointer is already past the trapping instruction.
+- **Rebind (redelivery).** A change of the binding of the fault's class, by
+  `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` (an unbind, or a bind to
+  another endpoint or with another badge), while a fault is in flight, before any reply or other
+  cancellation claims it, cancels that delivery; a change of another class's binding leaves it
+  alone. The cancellation: the queued fault message is withdrawn, or a handler that received it
+  finds no pending reply (its `SYS_IPC_REPLY` fails with `InvalidCapability`). The fault is then
+  delivered again, by the kernel, under the binding current when the faulting thread next runs, as a
+  new delivery: the handler bound then receives the fault message with the badge of the cap bound
+  then. With no handler bound then, the fault is unhandled, as a fault whose delivery finds the
+  binding cleared ([Reply](#reply)): clearing the binding mid-fault kills the thread, or fails its
+  kernel copy's syscall. A bind to the same endpoint with the same badge cancels nothing. A fault in
+  flight is one whose delivery read the binding before the change; one that reads the binding after
+  it is delivered under the new binding at once. A delivery made under the new binding can, in a
+  narrow race, be cancelled and made again under that same binding, which the handler sees as one
+  more fault message for the fault; the outcome is unchanged. A stop after the change claimed the
+  fault leaves the redelivery: when next started, the thread delivers the fault again. Redelivery
+  runs in the kernel, not by resuming the thread at its faulting instruction, so it holds for a
+  trap-type exception whose instruction pointer is already past the trapping instruction.
 
 ### Modifying the faulting thread
 
@@ -446,7 +448,8 @@ The broadly useful memory policies — lazy and guard-page stack growth, zero-fi
 anonymous memory, copy-on-write sharing, swap and overcommit, working-set tracking,
 snapshotting — exist only if a manager sits on the fault path of most processes. Binding a
 default pager to all ordinary processes is a userspace policy decision (a creator default
-plus runtime propagation via `ProcessInfo`), not a kernel one.
+plus the runtime's copy of the spawning thread's bindings onto each thread it spawns), not a
+kernel one.
 
 Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
 fault handler on every process it creates and advertises it in

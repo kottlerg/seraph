@@ -18,11 +18,12 @@
 //! syscall) or to take the unhandled outcome: a kill for a trap, the
 //! syscall's `InvalidAddress` for a copy.
 //!
-//! A change of the binding while a delivery is in flight
-//! ([`redeliver_in_flight`], run by `SYS_THREAD_SET_FAULT_HANDLER`) cancels
-//! that delivery, and [`fault_dispatch`] makes it again under the binding
-//! current when the faulting thread next runs; with none bound then, the fault
-//! takes the unhandled outcome.
+//! A change of the binding of an in-flight delivery's class
+//! ([`publish_bindings`], then [`redeliver_in_flight`], run by
+//! `SYS_THREAD_SET_FAULT_HANDLER` and `SYS_THREAD_INHERIT_FAULT_HANDLER`)
+//! cancels that delivery, and [`fault_dispatch`] makes it again under the
+//! binding current when the faulting thread next runs; with none bound then,
+//! the fault takes the unhandled outcome.
 //!
 //! Delivery reuses the synchronous-IPC machinery: the faulting thread takes the
 //! caller role (parked in [`IpcThreadState::BlockedOnFault`] rather than
@@ -163,8 +164,8 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock, kind: u64) -> bool
 ///
 /// Returns the bound `EndpointObject`, with a reference the caller owns and
 /// MUST release, and the badge bound with it; `None` when no handler is bound.
-/// The pair is read under `tcb`'s `sched_lock`, the lock
-/// `sys_thread_set_fault_handler` publishes it under, so the badge is the one
+/// The pair is read under `tcb`'s `sched_lock`, the lock [`publish_bindings`]
+/// publishes it under for both binders, so the badge is the one
 /// bound with this endpoint, and the reference is taken while the binding's
 /// own reference still holds the object: the binder releases the old binding's
 /// reference only after it unlocks.
@@ -188,8 +189,9 @@ unsafe fn pin_binding(
 ) -> Option<(core::ptr::NonNull<EndpointObject>, u64)>
 {
     // SAFETY: tcb is the running thread (contract); lock_raw is paired with
-    // the unlock_raw below. A non-null fault_handler read under sched_lock
-    // names an endpoint the binding references, so it is live for inc_ref.
+    // the unlock_raw below. A non-null fault_handlers entry read under
+    // sched_lock names an endpoint the binding references, so it is live for
+    // inc_ref.
     // The markers are this thread's own until its delivery makes it
     // wakeable.
     unsafe {
@@ -491,11 +493,12 @@ unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
 }
 
 /// Cancel the fault delivery of `class` in flight on `tcb` for a change of
-/// that class's binding, so the
-/// faulting thread delivers it again under the binding current when it next
-/// runs ([`FAULT_OUTCOME_REDELIVER`]); `SYS_THREAD_SET_FAULT_HANDLER` calls it
-/// after a change whose own hold found a delivery in flight
-/// ([`delivery_in_flight`]).
+/// that class's binding, so the faulting thread delivers it again under the
+/// binding current when it next runs ([`FAULT_OUTCOME_REDELIVER`]). Both
+/// binders (`SYS_THREAD_SET_FAULT_HANDLER` and
+/// `SYS_THREAD_INHERIT_FAULT_HANDLER`, through `apply_bindings`) call it after
+/// a change whose own [`publish_bindings`] hold found a delivery of that class
+/// in flight ([`delivery_in_flight`]).
 ///
 /// Each pass re-reads the delivery under `tcb`'s `sched_lock` and ends when
 /// none is in flight: a wake claim gave it a disposition first (a handler's

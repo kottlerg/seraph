@@ -165,9 +165,10 @@ delivery, and the fault is delivered again under the new binding (see
 [Delivery, Resume, and Kill](#delivery-resume-and-kill), Rebind); a change of another class's
 binding leaves it alone.
 
-A handler bound for several classes (`FAULT_CLASS_ALL`, the binding procmgr makes) dispatches on
-the fault kind (see [Fault Message](#fault-message)) and replies [`FAULT_REPLY_KILL`](#reply) for
-kinds it does not handle, recovering for those kinds the outcome they have with no handler bound.
+A handler bound for several classes (`FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION`, the binding procmgr
+makes) dispatches on the fault kind (see [Fault Message](#fault-message)) and replies
+[`FAULT_REPLY_KILL`](#reply) for kinds it does not handle, recovering for those kinds the outcome
+they have with no handler bound.
 
 `SYS_THREAD_GET_FAULT_HANDLER(thread_cap, class)` reads one class's binding: `thread_cap` MUST
 carry `CONTROL`, and `class` MUST be exactly one class bit (`InvalidArgument` otherwise). It

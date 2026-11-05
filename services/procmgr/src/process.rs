@@ -15,7 +15,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
-use syscall_abi::{EXIT_KILLED, FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
+use syscall_abi::{EXIT_KILLED, FAULT_CLASS_EXCEPTION, FAULT_CLASS_VM, PAGE_SIZE, SyscallError};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 /// The reply's `MSG_DATA_WORDS_MAX` words less the count word fix it, and
@@ -2054,8 +2054,15 @@ fn bind_pager(
     }
     // Bind only after the AS is delegated, so memmgr can service the first
     // fault. The kernel stamps each fault with the derivation badge of
-    // memmgr_send_cap, which memmgr minted as the child's memmgr badge.
-    syscall::thread_set_fault_handler(child_thread, memmgr_send_cap, FAULT_CLASS_ALL).is_ok()
+    // memmgr_send_cap, which memmgr minted as the child's memmgr badge. The
+    // fault classes alone: memmgr is no upcall handler, so the upcall class
+    // stays unbound and a post to the child's thread is refused.
+    syscall::thread_set_fault_handler(
+        child_thread,
+        memmgr_send_cap,
+        FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION,
+    )
+    .is_ok()
 }
 
 /// Advertise the pager in a child's `ProcessInfo` (still writable through

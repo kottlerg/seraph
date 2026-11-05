@@ -599,7 +599,7 @@ pub fn create_devmgr_with_caps(
             // A failed derive skips the module, as `serve_region_rounds` skips
             // a region: returning here would leave devmgr blocked in
             // `request_round` without the terminal round.
-            let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
+            let Ok(module_copy) = syscall::cap_derive(module_cap, MODULE_COPY_RIGHTS)
             else
             {
                 log("devmgr: driver module cap derive failed; module skipped");
@@ -868,7 +868,7 @@ pub fn create_vfsd_with_caps(
     // mount root) instead of failing on a reply error.
     let fatfs_cap = match crate::find_module_by_name(info, b"fatfs")
     {
-        Some(slot) => syscall::cap_derive(slot, syscall::RIGHTS_ALL).unwrap_or(0),
+        Some(slot) => syscall::cap_derive(slot, MODULE_COPY_RIGHTS).unwrap_or(0),
         None => 0,
     };
     let fatfs_slot = [fatfs_cap];
@@ -1453,15 +1453,23 @@ unsafe fn send_teardown_round(procmgr_ep: u64, slots: &[u64], ipc_buf: *mut u64)
     }
 }
 
-/// Derive a transient full-rights copy of a boot-module Memory cap for a
-/// `CREATE_PROCESS` spawn. Init retains the original — it is the sole owner
-/// of the module-source `MemoryObject` and donates it to memmgr at reap. The
-/// loader borrows this copy (deriving a read-only child for the load-time
-/// mapping) and deletes it once the ELF is loaded.
+/// Derive a transient copy of a boot-module Memory cap for a `CREATE_PROCESS`
+/// spawn, with [`MODULE_COPY_RIGHTS`]. Init retains the original — it is the
+/// sole owner of the module-source `MemoryObject` and donates it to memmgr at
+/// reap. The loader borrows this copy (deriving a read-only child for the
+/// load-time mapping) and deletes it once the ELF is loaded.
 fn module_spawn_copy(module_memory_cap: u64) -> Option<u64>
 {
-    syscall::cap_derive(module_memory_cap, syscall::RIGHTS_ALL).ok()
+    syscall::cap_derive(module_memory_cap, MODULE_COPY_RIGHTS).ok()
 }
+
+/// Rights of every boot-module copy init hands another process (procmgr for a
+/// spawn, devmgr and vfsd for the drivers they spawn): every right of the
+/// boot-minted cap but `RIGHTS_MEM_PHYS`. No loader reads a module's physical
+/// base, and a `Phys` cap is the credential that reads the base of any Memory
+/// cap its holder holds (core/kernel/docs/cross-boundary-disclosure.md
+/// § Physical-address surfaces), so a module copy carries none.
+const MODULE_COPY_RIGHTS: u64 = syscall::RIGHTS_ALL & !syscall::RIGHTS_MEM_PHYS;
 
 /// Round 1 of the reap handoff: transfer init's four kernel-object caps
 /// (aspace, cspace, main thread, init-logd thread) to procmgr, which binds a

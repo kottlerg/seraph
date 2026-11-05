@@ -99,14 +99,17 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 /// Rights every pool frame MUST carry. A pool frame is general anonymous RAM:
 /// memmgr derives an R / RW / RX inner from it on demand (`cap_derive`, which
 /// only narrows), so the outer must hold `RIGHTS_MEM_WRITE` and
-/// `RIGHTS_MEM_EXECUTE`, plus RETYPE so a consumer can still retype the frame.
-/// MAP is omitted from the check: the kernel grants read at every map
+/// `RIGHTS_MEM_EXECUTE`, plus RETYPE so a consumer can still retype the frame,
+/// and PHYS so memmgr can read the run's physical base and a phys-class
+/// consumer's grant keeps it (`grant_rights`). MAP is omitted from the check: the kernel grants read at every map
 /// (`sys_mem_map`) and the bulk usable-RAM caps carry it anyway. Enforced
 /// at both pool entry points (`ingest_pool`, `handle_donate_memory_caps`) so a
 /// kernel mint-rights regression fails loudly instead of surfacing as an
 /// intermittent consumer fault.
-const POOL_FRAME_RIGHTS: u64 =
-    syscall::RIGHTS_MEM_WRITE | syscall::RIGHTS_MEM_EXECUTE | syscall::RIGHTS_MEM_RETYPE;
+const POOL_FRAME_RIGHTS: u64 = syscall::RIGHTS_MEM_WRITE
+    | syscall::RIGHTS_MEM_EXECUTE
+    | syscall::RIGHTS_MEM_RETYPE
+    | syscall::RIGHTS_MEM_PHYS;
 
 /// `va` stamped on a frame descriptor memmgr did **not** map itself
 /// (`REQUEST_MEMORY_CAPS` grants and bootstrap arenas): the caller owns the
@@ -1719,7 +1722,7 @@ fn ingest_pool(boot: &InitBootstrap)
     {
         let cap_slot = boot.memory_base + i;
         // Every RAM Memory cap memmgr ingests from init MUST carry the full
-        // pool-frame rights ([`POOL_FRAME_RIGHTS`]: WRITE | EXECUTE | RETYPE).
+        // pool-frame rights ([`POOL_FRAME_RIGHTS`]: WRITE | EXECUTE | RETYPE | PHYS).
         // The kernel stamps these on usable RAM at Phase-7 mint
         // (`core/kernel/src/cap/mod.rs`), and init's `finalize_memmgr` forwards
         // caps through `cap_derive(_, RIGHTS_ALL)` which preserves them. If the

@@ -63,7 +63,7 @@ core/kernel/
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
 │   │       ├── syscall.rs      # No-op syscall init; ecall is routed by interrupts.rs trap_dispatch
 │   │       ├── cpu.rs          # Baseline gate, ASID probe, tp per-hart pointer, user copy
-│   │       ├── encoding.rs     # PLIC, SBI mask, F/D/V decode, page rounding, PTE bits; host-tested
+│   │       ├── encoding.rs     # PLIC, SBI mask, F/D/V, page rounding, PTE permissions; host-tested
 │   │       ├── gdt.rs          # GDT stub
 │   │       ├── fpu.rs          # Extended-state (F/D/V) control
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)

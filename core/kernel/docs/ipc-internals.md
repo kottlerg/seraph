@@ -162,7 +162,7 @@ syscall on either side. Nothing is allocated on the path.
    a. Append current_tcb to the endpoint's recv queue
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnRecv, ep); on a
       refusal, unlink current_tcb from the recv queue, and stamp INTERRUPTED
-      if the refusal was a stop (RefusedStop)
+      if the refusal was a stop or a pending upcall (RefusedStop)
    c. Release endpoint lock
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
@@ -255,6 +255,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink means one of: a caller already deposited into `ipc_msg` (its delivery stands); the endpoint's dealloc drain stamped the park `INTERRUPTED`; a concurrent cancel already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | INTERRUPTED |
 | `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | removal of the snapshotted park (`park_seq` equal to the cancel's snapshot) from the source's waiter queue under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
 | `cancel_ipc_block` plain-sleep cleanup | `sleep_list_remove` returning `true` under the target's `sched_lock` (the deadline was still pending; the timer pop clears it under the same `SLEEP_LIST_LOCK`, and a commit→add window cancel makes the later add refuse) | INTERRUPTED |
+| `cancel_for_upcall` (a posted upcall, `ipc::upcall::post`): the `cancel_ipc_block` arms but BlockedOnFault and a fault sender's BlockedOnSend, which its snapshot refuses, as does a masked or delivering thread | the claim of the same arm, the BlockedOnReply arm's gated for an upcall on the snapshotted `park_seq` as the source arms' are | episode + INTERRUPTED, with `wake_in_flight = 1` set in the claim's hold (kept, on the BlockedOnReply arm) for the poster's own `enqueue_and_wake`; the woken syscall returns `Interrupted` ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake Protocol) |
 | `dealloc_object(Notification)` wake of every waiter (`interrupt_all_waiters`) | removal from the waiter queue under `sig.lock` | INTERRUPTED |
 | `event_queue_drop` (`dealloc_object(EventQueue)`) wake of every waiter | removal from the waiter queue under `eq.lock` | INTERRUPTED |
 | `wait_set_drop` (`dealloc_object(WaitSet)`) wake of every waiter | removal from the waiter queue under `ws.lock` | INTERRUPTED |
@@ -414,9 +415,9 @@ between deliveries.
    Invariants, invariant 4)
 7. Release sig.lock
 8. Block current thread; return when woken
-9. On wakeup: if the park is INTERRUPTED (a stop, or the notification
-   destroyed under the waiter), return Interrupted. Otherwise the sender has
-   already performed bits.swap(0) and stored the result in
+9. On wakeup: if the park is INTERRUPTED (a stop, an upcall, or the
+   notification destroyed under the waiter), return Interrupted. Otherwise the
+   sender has already performed bits.swap(0) and stored the result in
    current_tcb.wakeup_value (0 for a timer wake);
    tf.set_ipc_return(primary = 0, secondary = wakeup_value); return Ok(0)
 ```
@@ -559,8 +560,8 @@ level-readiness witness.
       deadline): set sleep_deadline and sleep_list_add, still under eq.lock
    d. Release eq.lock
 5. schedule(); on resume:
-   if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
-                                 destroyed under the waiter),
+   if the park is INTERRUPTED -> return Interrupted (a stop, an upcall, or
+                                 the queue destroyed under the waiter),
    else if tcb.timed_out      -> return WouldBlock,
    else                       -> return the entry from wakeup_value and
                                  wakeup_tag
@@ -695,12 +696,12 @@ waitset_notify(wait_set, member_idx):
    a. context_saved = 0; waiters.push(current_tcb)
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnWaitSet, ws);
       on a refusal, remove current_tcb from waiters, and stamp INTERRUPTED
-      if the refusal was a stop (RefusedStop)
+      if the refusal was a stop or a pending upcall (RefusedStop)
    c. Release lock
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then return
-      Interrupted if the park is INTERRUPTED (a stop, or the wait set
-      destroyed under the waiter), else return wakeup_value
+      Interrupted if the park is INTERRUPTED (a stop, an upcall, or the wait
+      set destroyed under the waiter), else return wakeup_value
 ```
 
 **What a returned badge means.** A ring entry is a hint that the member became

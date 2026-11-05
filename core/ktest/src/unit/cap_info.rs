@@ -629,7 +629,7 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
     };
     let r = check_mask(
         thread,
-        syscall_abi::RIGHTS_THREAD_CONTROL | syscall_abi::RIGHTS_THREAD_OBSERVE,
+        syscall_abi::RIGHTS_THREAD,
         "creation_masks: thread mint mask mismatch",
     );
     cap_delete(thread).map_err(|_| "creation_masks: cap_delete(thread) failed")?;

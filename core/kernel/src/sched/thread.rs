@@ -744,10 +744,11 @@ pub struct ThreadControlBlock
     /// queue) could be stranded by the endpoint being freed. See
     /// `docs/fault-handling.md` § Liveness.
     ///
-    /// Each fault class (`ipc::fault::CLASS_VM`, `ipc::fault::CLASS_EXCEPTION`)
-    /// has its own binding: a fault of a class is delivered through that
-    /// class's endpoint, and each class's binding holds its own reference on
-    /// its endpoint, the same endpoint bound for both classes holding two.
+    /// Each fault class (`ipc::fault::CLASS_VM`, `ipc::fault::CLASS_EXCEPTION`,
+    /// `ipc::fault::CLASS_UPCALL`) has its own binding: a fault or upcall of a
+    /// class is delivered through that class's endpoint, and each class's
+    /// binding holds its own reference on its endpoint, the same endpoint
+    /// bound for several classes holding one per class.
     ///
     /// A class's binding is the pair (`fault_handlers[class]`,
     /// [`fault_badges[class]`](Self::fault_badges)), published as one unit: the
@@ -809,6 +810,35 @@ pub struct ThreadControlBlock
     /// class's binding cancels only a delivery of that class. Meaningful only
     /// while `in_fault_delivery` is set.
     pub fault_delivery_class: u8,
+
+    // === Asynchronous upcall ===
+    /// An upcall is posted and not yet delivered (`docs/fault-handling.md`
+    /// § Asynchronous Upcalls). Set by `SYS_THREAD_POST_UPCALL` and cleared by
+    /// the delivery that takes it ([`crate::ipc::upcall`]), both under this
+    /// thread's [`sched_lock`](Self::sched_lock), with
+    /// [`upcall_cookie`](Self::upcall_cookie) and
+    /// [`upcall_any_instruction`](Self::upcall_any_instruction). An atomic for
+    /// the lock-free check each delivery point makes first, which decides
+    /// nothing: the take re-reads it under the lock.
+    pub upcall_pending: core::sync::atomic::AtomicBool,
+
+    /// The poster's cookie of the pending upcall, delivered uninterpreted as
+    /// the message's data word 1. Written by the post with
+    /// [`upcall_pending`](Self::upcall_pending) and read by the take, under
+    /// [`sched_lock`](Self::sched_lock).
+    pub upcall_cookie: core::sync::atomic::AtomicU64,
+
+    /// The pending upcall was posted with `UPCALL_ANY_INSTRUCTION`, so an
+    /// interrupt's return to user mode delivers it too. Written and read as
+    /// [`upcall_cookie`](Self::upcall_cookie) is.
+    pub upcall_any_instruction: core::sync::atomic::AtomicBool,
+
+    /// The thread's upcall mask: while set, a pending upcall is not delivered
+    /// and a post does not cancel the thread's block. Written only by the
+    /// thread itself (`SYS_THREAD_SET_UPCALL_MASK`) under its
+    /// [`sched_lock`](Self::sched_lock); read under that lock by a post, and
+    /// lock-free by the thread at its own delivery points.
+    pub upcall_masked: core::sync::atomic::AtomicBool,
 
     // === Context ===
     /// Whether this thread executes in user mode (ring 3 / U-mode). Immutable
@@ -985,8 +1015,10 @@ pub struct ThreadControlBlock
     /// endpoint, event queue, or wait set) under that object's lock; by the
     /// sleep timer when it pops a plain sleeper, under `SLEEP_LIST_LOCK`; by
     /// `endpoint_call` / `endpoint_recv` before they publish a reply binding
-    /// to it; and by a server's `dealloc_object(Thread)` when it claims a
-    /// reply-bound or fault-bound client.
+    /// to it; by a server's `dealloc_object(Thread)` when it claims a
+    /// reply-bound or fault-bound client; and by an upcall's cancel
+    /// (`syscall::thread::cancel_for_upcall`) inside the `sched_lock` hold of
+    /// the claim it won, for the wake its poster makes.
     ///
     /// Cleared by `enqueue_and_wake` when the owed wake lands: before it
     /// releases `sched_lock`, except on a thread already `Exited`, where the

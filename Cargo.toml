@@ -65,6 +65,8 @@ members = [
     "programs/demandpaged",
     "programs/capexhaust",
     "programs/fb-charset",
+    "programs/deadline",
+    "programs/deadline/tester",
     "programs/fsbench",
     "programs/hello",
     "programs/hello/tester",

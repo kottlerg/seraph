@@ -252,7 +252,7 @@ fn argument_checks(parts: &Parts) -> TestResult
         .ok_or("integration::fault_class_bindings: no source thread")?
         .th;
     let invalid = Err(SyscallError::InvalidArgument as i64);
-    for mask in [0, 1 << 2, FAULT_CLASS_VM | (1 << 63)]
+    for mask in [0, 1 << 3, FAULT_CLASS_VM | (1 << 63)]
     {
         if thread_set_fault_handler(th, 0, mask) != invalid
             || thread_inherit_fault_handler(th, th, mask) != invalid

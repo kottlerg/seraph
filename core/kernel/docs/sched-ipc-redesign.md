@@ -159,20 +159,18 @@ which the `enqueue_and_wake` gate and its callers preserve:
    spurious-zero/garbage wake. (`wake_pending` is set inside `enqueue_and_wake`,
    strictly after the upstream deposit — made under the source lock, or, for the reply
    wake, after the `reply_tcb` CAS win.)
-2. In each IPC primitive both refusals dequeue the waiter and restore
-   `context_saved`, and the thread then passes through `schedule()`, which
-   REQUEUES a runnable thread
-   (`ParkCommit::RefusedWake`: still `Running`) and DRAINS a Stopped/Exited
-   one (`ParkCommit::RefusedStop`); either way it resumes at the line after
-   `schedule()` and reads its park disposition. The variant decides that
-   disposition: a `RefusedStop` rollback owns the episode (no waker saw the
-   registration) and stamps it `INTERRUPTED`, so the restarted thread reports
-   the cancellation; a `RefusedWake` rollback leaves the coalesced deposit
-   for the resume to deliver. `endpoint_call` stamps the episode cancelled on
-   either refusal (a coalesced wake there is a stray that cancels the call),
-   and `sys_thread_sleep`, which registers on no source, returns at once on
-   `RefusedWake` (the zero-length sleep is done) and deschedules in place
-   before returning `Interrupted` on `RefusedStop`.
+2. In each IPC primitive both refusals dequeue the waiter and restore `context_saved`, and the
+   thread then passes through `schedule()`, which REQUEUES a runnable thread
+   (`ParkCommit::RefusedWake`: still `Running`) and DRAINS a Stopped/Exited one
+   (`ParkCommit::RefusedStop`; a `RefusedStop` for a pending upcall the thread does not mask leaves
+   it `Running`, and requeues it); either way it resumes at the line after `schedule()` and reads
+   its park disposition. The variant decides that disposition: a `RefusedStop` rollback owns the
+   episode (no waker saw the registration) and stamps it `INTERRUPTED`, so the restarted thread
+   reports the cancellation; a `RefusedWake` rollback leaves the coalesced deposit for the resume to
+   deliver. `endpoint_call` stamps the episode cancelled on either refusal (a coalesced wake there
+   is a stray that cancels the call), and `sys_thread_sleep`, which registers on no source, returns
+   at once on `RefusedWake` (the zero-length sleep is done) and deschedules in place before
+   returning `Interrupted` on `RefusedStop`.
 3. A `RefusedWake` rollback MUST NOT clobber the deposited field (it may clear
    only the waiter-queue entry and restore `context_saved`). This holds for
    `notification_wait`, `event_queue_recv`, `waitset_wait`, and `endpoint_recv`

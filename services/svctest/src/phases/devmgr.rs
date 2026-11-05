@@ -471,6 +471,10 @@ fn dma_confinement_phase(caps: &Caps)
     };
     use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
 
+    // A test wait bound: it limits only how long the phase polls devmgr,
+    // 10 ms apart (3 s), for the fault before it fails.
+    const FAULT_RECORD_POLLS: u32 = 300;
+
     let devmgr = caps.devmgr_test;
     assert!(devmgr != 0, "devmgr_dma: no devmgr.test cap seeded");
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -529,7 +533,18 @@ fn dma_confinement_phase(caps: &Caps)
         !landed,
         "devmgr_dma: a copy to IOVA {iova:#x} after its unmap reached the page"
     );
-    let faults = call(TEST_DMA_FAULTS);
+    // A guard: a fault an IOMMU reports to its driver only after the probe's
+    // reply still counts once devmgr takes it.
+    let mut faults = call(TEST_DMA_FAULTS);
+    for _ in 0..FAULT_RECORD_POLLS
+    {
+        if faults.label != ipc::devmgr_errors::SUCCESS || faults.word(0) >= 1
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        faults = call(TEST_DMA_FAULTS);
+    }
     assert_eq!(faults.label, ipc::devmgr_errors::SUCCESS, "TEST_DMA_FAULTS");
     assert!(
         faults.word(0) >= 1,

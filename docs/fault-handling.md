@@ -1,7 +1,8 @@
 # Fault Handling
 
 Redirection of kernel-unresolvable userspace thread faults to a userspace handler,
-the mechanism on which demand paging, swap, mmap, and similar policies are built.
+the mechanism on which demand paging, swap, mmap, and similar policies are built, and its
+asynchronous dual, the capability-triggered upcall.
 
 ---
 
@@ -20,6 +21,8 @@ In scope:
 - The faults a syscall's copy of a caller-supplied buffer takes, and the restart of
   that syscall.
 - Liveness, recursion, and security rules.
+- The asynchronous upcall: its post, delivery points, mask, interaction with blocking syscalls,
+  and nesting ([Asynchronous Upcalls](#asynchronous-upcalls)).
 
 Out of scope (the kernel never does these):
 
@@ -89,6 +92,13 @@ A change of the binding of an in-flight fault's class cancels that delivery and 
 fault again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both
 architectures.
 
+The asynchronous upcall ([Asynchronous Upcalls](#asynchronous-upcalls)) is implemented on both
+architectures: `SYS_THREAD_POST_UPCALL`, the third class `FAULT_CLASS_UPCALL`, delivery at a
+syscall's return and, for an `UPCALL_ANY_INSTRUCTION` post, at an interrupt's return to user mode,
+the cancel of a blocking syscall, and `SYS_THREAD_SET_UPCALL_MASK`. Its end-to-end consumer is the
+`deadline` fixture's supervisor, which cancels a spinning worker at a deadline
+([programs/deadline/README.md](../programs/deadline/README.md)).
+
 ---
 
 ## Mechanism Overview
@@ -129,11 +139,12 @@ The fault handler is bound **per thread and per fault class**. The handler is an
 [`Endpoint`](capability-model.md#ipc-endpoint); there is no distinct fault-endpoint
 capability type. The binding is per-thread kernel state, one per class: the bound endpoint and
 its badge. The classes are `FAULT_CLASS_VM`, the virtual-memory faults (`FAULT_KIND_VM`, the
-faults of a restartable syscall's user copy among them), and `FAULT_CLASS_EXCEPTION`, every
-other kernel-unresolvable user exception (`FAULT_KIND_EXCEPTION`). A fault is delivered through
-its class's binding alone, so distinct services can own a thread's classes (a pager its virtual-
-memory faults, a debugger its exceptions); with no handler bound for its class, a fault takes the
-outcome it has with no handler bound at all.
+faults of a restartable syscall's user copy among them), `FAULT_CLASS_EXCEPTION`, every
+other kernel-unresolvable user exception (`FAULT_KIND_EXCEPTION`), and `FAULT_CLASS_UPCALL`, the
+asynchronous upcalls (`FAULT_KIND_UPCALL`; [Asynchronous Upcalls](#asynchronous-upcalls)). A fault
+is delivered through its class's binding alone, so distinct services can own a thread's classes (a
+pager its virtual-memory faults, a debugger its exceptions, a supervisor its upcalls); with no
+handler bound for its class, a fault takes the outcome it has with no handler bound at all.
 
 `SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, reserved, fault_class_mask)`:
 
@@ -147,10 +158,10 @@ outcome it has with no handler bound at all.
   ([Capability Model § Badges](capability-model.md#badges)), `0` for an unbadged cap: the binder
   chooses which of its caps to bind, never the badge value; see [Security](#security).
 - `reserved` MUST be `0`; any other value fails with `InvalidArgument`.
-- `fault_class_mask` selects the classes the call binds or unbinds: `FAULT_CLASS_ALL`, every
-  class, or any nonzero combination of `FAULT_CLASS_VM` and `FAULT_CLASS_EXCEPTION`. The
-  classes it leaves out keep their bindings. A mask of zero or with a bit no class defines
-  fails with `InvalidArgument`.
+- `fault_class_mask` selects the classes the call binds or unbinds: `FAULT_CLASS_ALL`, every class,
+  or any nonzero combination of `FAULT_CLASS_VM`, `FAULT_CLASS_EXCEPTION`, and `FAULT_CLASS_UPCALL`.
+  The classes it leaves out keep their bindings. A mask of zero or with a bit no class defines fails
+  with `InvalidArgument`.
 
 A class's endpoint and badge are published as one unit: the binder writes both under the target
 thread's scheduler lock, and fault delivery reads both once under the same lock and pins the
@@ -165,9 +176,10 @@ delivery, and the fault is delivered again under the new binding (see
 [Delivery, Resume, and Kill](#delivery-resume-and-kill), Rebind); a change of another class's
 binding leaves it alone.
 
-A handler bound for several classes (`FAULT_CLASS_ALL`, the binding procmgr makes) dispatches on
-the fault kind (see [Fault Message](#fault-message)) and replies [`FAULT_REPLY_KILL`](#reply) for
-kinds it does not handle, recovering for those kinds the outcome they have with no handler bound.
+A handler bound for several classes (`FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION`, the binding procmgr
+makes) dispatches on the fault kind (see [Fault Message](#fault-message)) and replies
+[`FAULT_REPLY_KILL`](#reply) for kinds it does not handle, recovering for those kinds the outcome
+they have with no handler bound.
 
 `SYS_THREAD_GET_FAULT_HANDLER(thread_cap, class)` reads one class's binding: `thread_cap` MUST
 carry `CONTROL`, and `class` MUST be exactly one class bit (`InvalidArgument` otherwise). It
@@ -216,6 +228,8 @@ thread's behalf. Its format is a stable cross-boundary contract.
   - `FAULT_KIND_VM` — a virtual-memory (page) fault.
   - `FAULT_KIND_EXCEPTION` — a CPU exception with no kernel resolution (illegal
     instruction, alignment, divide error, and similar).
+  - `FAULT_KIND_UPCALL` — an asynchronous upcall, not a fault
+    ([Asynchronous Upcalls](#asynchronous-upcalls)).
   - Remaining values are reserved for future kinds (e.g. capability faults).
 - **Data words 1–3** — kind-specific:
   - `FAULT_KIND_VM`: faulting virtual address; access flags (bit 0 read, bit 1 write,
@@ -232,6 +246,8 @@ thread's behalf. Its format is a stable cross-boundary contract.
     kernel maps each architecture's raw vector/cause to a normalized class
     (`normalize_x86_exception` in `core/kernel/src/arch/x86_64/idt.rs`,
     `normalize_riscv_exception` in `core/kernel/src/arch/riscv64/interrupts.rs`).
+  - `FAULT_KIND_UPCALL`: the poster's cookie; the delivery point (`UPCALL_POINT_SYSCALL` or
+    `UPCALL_POINT_INTERRUPT`); the thread's instruction pointer.
 
 The faulting thread's full register state is not embedded; a handler that needs it reads
 it with [`SYS_THREAD_READ_REGS`](capability-model.md#thread) on the faulting thread.
@@ -316,8 +332,10 @@ outcome it has with no handler bound: a fault of a user-mode access kills the th
 a kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
 has this one meaning whatever raised the fault. The message is the same for both, and the handler
 never chooses between the outcomes; binding a handler never changes the outcome of a fault it
-declines. A handler that wants a thread ended whose kernel-copy fault it declines stops or
-destroys it through its Thread capability.
+declines. A handler that wants a thread ended whose kernel-copy fault it declines stops or destroys
+it through its Thread capability. An upcall has no fault to leave unhandled: with no handler bound
+it is not delivered, so a declined upcall is dropped and the thread continues
+([Asynchronous Upcalls](#asynchronous-upcalls)).
 
 ---
 
@@ -396,6 +414,130 @@ so the chain is finite.
 
 A thread MUST NOT be bound to a fault-handler endpoint that only it receives on; such a
 thread would block on its own fault endpoint indefinitely.
+
+---
+
+## Asynchronous Upcalls
+
+An upcall is the asynchronous, capability-triggered dual of fault delivery: a holder of a thread's
+capability transfers the thread's control to the handler bound for its upcall class, at the
+thread's next delivery point, and the thread then resumes. The upcall is delivered through the
+fault machinery above, as a fault delivery of `FAULT_KIND_UPCALL` through the
+`FAULT_CLASS_UPCALL` binding. The kernel adds no policy: no global upcall numbers, no default
+action, and no ambient authority. A thread whose upcall class is unbound cannot be posted to.
+
+### Posting
+
+`SYS_THREAD_POST_UPCALL(thread_cap, cookie, flags)`:
+
+- `thread_cap` MUST carry `UPCALL`, and also `CONTROL` when `flags` holds `UPCALL_ANY_INSTRUCTION`.
+- `cookie` is the poster's word. The kernel delivers it uninterpreted and gives it no meaning.
+- `flags` is `0` or `UPCALL_ANY_INSTRUCTION`. Any other bit fails with `InvalidArgument`.
+- The post fails with `InvalidState` when the thread is `Created` or `Exited`, or has no handler
+  bound for `FAULT_CLASS_UPCALL`. A right with no handler bound is inert.
+- One upcall is pending on a thread at a time. A post while one is pending fails with `QueueFull`,
+  and the pending upcall keeps its cookie.
+
+### Delivery points
+
+A pending upcall is delivered at the first delivery point the thread reaches after the post:
+
+- **Syscall point** (`UPCALL_POINT_SYSCALL`): the return of any syscall of the thread, with the
+  syscall's result already in its registers. A restartable syscall that re-executes after a fault
+  of its user copy ([Kernel Copies](#kernel-copies)) has no return to deliver at until its
+  re-execution returns.
+- **Interrupt point** (`UPCALL_POINT_INTERRUPT`): only for an `UPCALL_ANY_INSTRUCTION` post. This
+  is the return to user mode of an interrupt that preempted the thread, so it reaches a thread
+  that makes no syscall. The post prods a CPU running the thread, so the thread takes an
+  interrupt.
+
+A thread at neither point keeps the upcall pending. Such a thread spins without syscalls, or was
+posted to without `UPCALL_ANY_INSTRUCTION`.
+
+Delivery suspends the thread fault-blocked and sends the [fault message](#fault-message) to the
+receiver of the upcall class's endpoint. The message carries `FAULT_LABEL` and the binding's badge,
+and its data words are `FAULT_KIND_UPCALL`, the cookie, the delivery point, and the thread's
+instruction pointer as `SYS_THREAD_READ_REGS` reads it. On RISC-V at the syscall point, that
+pointer names the `ecall`; the kernel steps past it on resume unless the handler wrote another
+`pc`. The handler reads and edits the thread's registers as for a fault
+([Modifying the faulting thread](#modifying-the-faulting-thread)).
+
+Every disposition resumes the thread at its registers:
+
+- A `FAULT_REPLY_RESUME` reply.
+- A `FAULT_REPLY_KILL` reply. This declines the upcall, which drops it.
+- A cancellation that drops the upcall. The cancellations are those of a fault
+  ([Delivery, Resume, and Kill](#delivery-resume-and-kill)):
+  - a stop of the thread before a reply (the thread resumes when next started);
+  - the handler thread's destruction;
+  - the handler thread receiving again;
+  - the handler endpoint's destruction while the message is queued;
+  - a binding found cleared at delivery.
+
+A change of the upcall class's binding during a delivery delivers the upcall again under the new
+binding, as for a fault. The [Liveness](#liveness) rules hold unchanged.
+
+### Blocking syscalls
+
+A post to a thread blocked in a syscall that can block cancels the block as a stop cancels it, and
+wakes the thread. Those syscalls are listed in
+[syscalls.md § Atomicity and Preemption Guarantees](../core/kernel/docs/syscalls.md#atomicity-and-preemption-guarantees)
+(Blocking syscalls are interruptible).
+The syscall returns `Interrupted`, unless a genuine wake or a sleep's elapsed deadline claimed it
+first, and the upcall is delivered at that return. A blocking syscall that the thread enters with an
+upcall pending returns `Interrupted` at once instead of blocking. The kernel restarts nothing;
+whether to retry is the program's choice. For `SYS_IPC_CALL`, `Interrupted` does not mean that the
+request went undelivered: a server that already received the message finds no reply pending, so a
+program that retries a call may repeat its request, as after a stop.
+
+A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
+the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is
+about to block is
+[thread-lifecycle-and-sleep.md § Upcall Cancel-and-Wake Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#upcall-cancel-and-wake-protocol).
+
+### Mask
+
+`SYS_THREAD_SET_UPCALL_MASK(masked)` sets (`1`) or clears (`0`) the calling thread's upcall mask and
+returns the previous one. A thread starts unmasked. While the mask is set:
+
+- a post is accepted, and its upcall stays pending;
+- no upcall is delivered;
+- no block of the thread is cancelled.
+
+Clearing the mask delivers a pending upcall at that syscall's own return. The mask is local to the
+thread and takes no lock beyond the thread's own scheduler lock, so it brackets a critical section
+without disturbing other threads.
+
+### Nesting
+
+- **Upcall during a fault.** An upcall posted to a fault-blocked thread stays pending and is
+  delivered at the first delivery point after the fault resolves.
+- **Upcall during an upcall.** Delivery takes the pending upcall, so a post during a delivery is
+  accepted. It is delivered after the current one resolves, at the same delivery point when that
+  point delivers it: a post without `UPCALL_ANY_INSTRUCTION` made during a delivery at the
+  interrupt point waits for the thread's next syscall return.
+- **The handler's own upcalls.** These go to the handler thread's own upcall binding, and its faults
+  to its own fault handlers: per-thread chaining, as for faults
+  ([Recursion and Escalation](#recursion-and-escalation)). A thread MUST NOT bind its upcall class
+  to an endpoint that only it receives on.
+- **A stopped thread** keeps a pending upcall, which is delivered at a delivery point after the
+  thread is started. That includes one whose stop has committed while it still runs: it takes no
+  upcall at the delivery points it passes before it leaves its CPU.
+- **After a resume**, a fault the thread then takes (at an instruction pointer the handler wrote,
+  for example) is an ordinary fault of its own class.
+
+### Upcall security
+
+A post needs `UPCALL` on the thread, a right a holder can keep while giving up `CONTROL` and
+`OBSERVE`. Such a poster chooses only when the upcall happens and what its cookie is. What the
+thread then does is decided by the handler that the holder of `CONTROL` bound, and only that
+handler can edit the thread's registers, which `SYS_THREAD_WRITE_REGS` gates on `CONTROL`. A post
+that may stop the thread at any instruction also needs `CONTROL`, which already lets its holder stop
+the thread anywhere (`SYS_THREAD_STOP`).
+
+The message's badge attributes the binding, not the poster. The cookie is the poster's own word, so
+a handler that serves several posters cannot attribute an upcall to one of them by the message
+alone.
 
 ---
 
@@ -499,6 +641,7 @@ svcmgr service definitions carry no paging key; see
 [core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
 [Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
+[programs/deadline/README.md](../programs/deadline/README.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),

@@ -537,16 +537,16 @@ impl Thread {
         // without spinning since the child has already exited), and frees the
         // memory. A spurious early wake only makes the cap delete briefly spin
         // in the kernel drain protocol — correct, never a use-after-free.
-        // `Interrupted` (this thread was stopped and restarted) and a zero-bit
-        // return wait again: the child may still be running. Any other error
-        // means the private done-notification cap is gone and no wait can
-        // succeed; the child is then handed to the reaper as if detached, so
-        // its kernel death notification reclaims it, rather than reclaimed
-        // under a child that may still be in user mode. Its done-notification
-        // index is first set to the permanently null slot 0, so the later
-        // `reclaim` deletes nothing there rather than an unrelated cap that
-        // has since taken the freed slot. Without a reaper slot its resources
-        // are leaked until process death.
+        // `Interrupted` (this thread was stopped and restarted, or interrupted
+        // by an upcall) and a zero-bit return wait again: the child may still
+        // be running. Any other error means the private done-notification cap
+        // is gone and no wait can succeed; the child is then handed to the
+        // reaper as if detached, so its kernel death notification reclaims it,
+        // rather than reclaimed under a child that may still be in user mode.
+        // Its done-notification index is first set to the permanently null slot
+        // 0, so the later `reclaim` deletes nothing there rather than an
+        // unrelated cap that has since taken the freed slot. Without a reaper
+        // slot its resources are leaked until process death.
         let signalled = loop {
             match syscall::notification_wait(res.done_notification) {
                 Ok(0) => {}
@@ -945,12 +945,12 @@ pub fn set_name(_name: &CStr) {
 
 pub fn sleep(dur: Duration) {
     // `thread_sleep` can end before `dur` elapses: a stop and restart of this
-    // thread returns `Interrupted`, and a park refused by a coalesced wake
-    // returns `Ok` without sleeping. `sleep` cannot report either and must
-    // never sleep less than `dur`, so every return, `Ok` included, retries for
-    // whatever remains; any other error yields first rather than spinning on
-    // the syscall. The loop returns only once `dur` has elapsed since the
-    // first call.
+    // thread, or an upcall to it, returns `Interrupted`, and a park refused by
+    // a coalesced wake returns `Ok` without sleeping. `sleep` cannot report
+    // either and must never sleep less than `dur`, so every return, `Ok`
+    // included, retries for whatever remains; any other error yields first
+    // rather than spinning on the syscall. The loop returns only once `dur` has
+    // elapsed since the first call.
     let start = crate::time::Instant::now();
     let mut left = dur;
     loop {

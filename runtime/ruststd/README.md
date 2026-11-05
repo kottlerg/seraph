@@ -375,6 +375,18 @@ process with no `SchedControl` cap, or a level outside the band fails the spawn.
 
 ---
 
+## Thread capability
+
+`std::os::seraph::thread::current_thread_cap` returns the calling thread's own Thread capability:
+the cap the spawn created a spawned thread with, carrying `RIGHTS_THREAD`, or the initial thread's
+`StartupInfo::self_thread`. A thread hands it to another thread of the process to have that thread
+bind its fault or upcall handlers, read its registers, or post it an upcall
+([fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls));
+the `deadline` fixture's supervisor bounds a spinning worker this way
+([programs/deadline/README.md](../../programs/deadline/README.md)).
+
+---
+
 ## Implementation order
 
 ruststd is implemented before [`libc/`](../libc/README.md), which is design intent and not

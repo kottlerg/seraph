@@ -1422,6 +1422,18 @@ pub mod thread {
         SPAWN_PRIORITY.get()
     }
 
+    /// The calling thread's own Thread capability, in the process's `CSpace`:
+    /// the cap the runtime created a spawned thread with (`RIGHTS_THREAD`),
+    /// or the process's initial thread's (`StartupInfo::self_thread`). 0
+    /// before `_start` has read the startup info. A thread hands it to
+    /// another of the process's threads to have that thread bind its fault
+    /// or upcall handlers, read its registers, or post it an upcall
+    /// (`docs/fault-handling.md` § Asynchronous Upcalls).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn current_thread_cap() -> u64 {
+        super::current_thread_cap()
+    }
+
     /// Seraph-specific extensions to [`Builder`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub trait BuilderExt {

@@ -141,7 +141,7 @@ outcome it has with no handler bound at all.
   class's binding takes its own reference on the endpoint object for the lifetime of that binding
   (see [Liveness](#liveness)); unbinding releases it. Both lookups pin their object for the call, so
   neither the thread nor the endpoint can be freed while the binding is written (see
-  [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
+  [capability-internals.md § Storage: Hybrid Radix Directory](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)).
   The binding's badge is the derivation badge of `endpoint_cap`
   ([Capability Model § Badges](capability-model.md#badges)), `0` for an unbadged cap: the binder
   chooses which of its caps to bind, never the badge value; see [Security](#security).

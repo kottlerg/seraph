@@ -19,7 +19,7 @@
 //! reused retype memory, undone by a decrement on the revalidation's refusal.
 //! The source is now pinned for the call (`syscall::pin_slot`, through
 //! `resolve_src_cap` in core/kernel/src/syscall/cap.rs;
-//! core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix),
+//! core/kernel/docs/capability-internals.md § Storage: Hybrid Radix Directory),
 //! so the object is freed only once the call drops its pin.
 //!
 //! ## How this exercises it

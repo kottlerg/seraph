@@ -74,10 +74,10 @@ runs:
       run: |
         if ls "$DIR"/*.deb > /dev/null 2>&1 &&
             sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb; then
-            echo ok=true
+            echo ok=true >> "$GITHUB_OUTPUT"
         else
-            echo ok=false
-        fi >> "$GITHUB_OUTPUT"
+            echo ok=false >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Fall back to the network
       if: inputs.mode == 'install' && steps.offline.outputs.ok == 'false'

@@ -22,7 +22,8 @@
 //! - U-mode ecall (scause = 8) → `crate::syscall::dispatch`
 //! - Other U-mode exceptions → spurious-TLB retry, the bound fault handler, or thread
 //!   termination
-//! - Other S-mode exceptions → `copy_user` fixup, else diagnostics + `fatal()`
+//! - Other S-mode exceptions → the kernel spurious-TLB retry (load/store), the
+//!   `copy_user` fixup, else diagnostics + `fatal()`
 //!
 //! # PLIC layout
 //! Base physical address is supplied by the bootloader through
@@ -808,17 +809,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             // SAFETY: frame is the live frame (see the top); nothing below
             // blocks before `fatal` or the return.
             let live = unsafe { &mut *frame };
-            if matches!(cause_code, 12 | 13 | 15)
-                && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
-            {
-                live.sepc = fixup;
-                return;
-            }
-
             // Spurious stale-TLB retry for the kernel: a load or store fault
             // the kernel's tables already satisfy is an invalid entry this hart
             // cached before a closed direct-map hole (`mm::stack_guard`).
-            // Flush it locally and re-execute.
+            // Flush it locally and re-execute. It runs before the user-copy
+            // fixup, so a stale entry for a copy's kernel-side buffer retries
+            // too; a user-half `stval` is never a kernel spurious fault.
             let access = match cause_code
             {
                 13 => Some(super::paging::KernelAccess::Load),
@@ -834,6 +830,13 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                     unsafe { super::paging::flush_page(live.stval) };
                     return;
                 }
+            }
+
+            if matches!(cause_code, 12 | 13 | 15)
+                && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
+            {
+                live.sepc = fixup;
+                return;
             }
 
             crate::kprintln!(

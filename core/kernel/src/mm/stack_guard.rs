@@ -160,7 +160,9 @@ mod live
     /// Thread-guard holes made so far: [`hole`] advances it after each edit
     /// and stamps the new value in the thread's TCB. A CPU whose last flush
     /// read an epoch at or past a thread's stamp holds no stale translation
-    /// of that thread's guard ([`flush_before_run`]).
+    /// of that thread's guard, nor a stale not-present entry for a page a
+    /// [`close`] filled before that hole (both edits are made under the
+    /// reserve's lock, so the fill precedes the advance; [`flush_before_run`]).
     static GUARD_EPOCH: AtomicU64 = AtomicU64::new(0);
 
     /// Seed the reserve with `frames` frames from the buddy.
@@ -271,6 +273,13 @@ mod live
     /// outlives the switch-in. Called by `schedule()` on every switch-in and
     /// by `sched::enter` before init's first run.
     ///
+    /// The flush also drops every stale not-present entry this CPU kept for a
+    /// page a [`close`] filled before the thread's hole, which [`close`]
+    /// relies on instead of a shootdown: such a page may now be the incoming
+    /// thread's kernel stack, where a fault would nest its trap frame on the
+    /// faulting page. That is why the flush is the whole TLB, not the guard
+    /// page alone.
+    ///
     /// The flush is `flush_all_contexts`: INVPCID's all-context form on
     /// x86-64 with tagged TLBs, a CR3 reload without them, and
     /// `sfence.vma zero, zero` on riscv64.
@@ -311,12 +320,11 @@ mod live
     /// (`core/kernel/docs/memory-internals.md` § Kernel Stack Guards).
     ///
     /// # Safety
-    /// After SMP bringup, with no lock held. `phys` was holed by [`hole`] and
-    /// is not holed again until this returns.
+    /// With no lock held. `phys` was holed by [`hole`] and is not holed again
+    /// until this returns.
     pub unsafe fn close(phys: u64)
     {
         let virt = phys_to_virt(phys);
-        crate::percpu::preempt_disable();
         RESERVE.with(|_| {
             // SAFETY: the reserve's lock serialises the edit; the hole left a
             // leaf table.
@@ -324,11 +332,12 @@ mod live
         });
         if crate::arch::current::paging::CACHES_NOT_PRESENT_ENTRIES
         {
+            // A migration between the fill and this flush is harmless: the
+            // CPU left behind is covered as every other one is (above).
             // SAFETY: ring 0 / S-mode; dropping this CPU's cached entry for
             // `virt` is always safe.
             unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
         }
-        crate::percpu::preempt_enable();
     }
 
     /// Whether the direct map maps the page at `phys`.

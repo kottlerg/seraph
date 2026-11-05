@@ -5,7 +5,8 @@
 
 //! RISC-V register-map and instruction-encoding arithmetic: the PLIC context
 //! layout, the PLIC source-count clamp, the SBI hart-mask window, page
-//! rounding, and the F/D/V opcode decode the lazy extended-state trap uses.
+//! rounding, the F/D/V opcode decode the lazy extended-state trap uses, and
+//! the PTE permission test of the kernel's spurious-fault retry.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module. `arch/mod.rs` also compiles this file into host test builds
@@ -166,6 +167,38 @@ pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Sv39/Sv48/Sv57 PTE bit V: the entry is valid.
+pub(super) const PTE_VALID: u64 = 1 << 0;
+/// PTE bit R: read permission.
+pub(super) const PTE_READ: u64 = 1 << 1;
+/// PTE bit W: write permission.
+pub(super) const PTE_WRITE: u64 = 1 << 2;
+
+/// The access an S-mode page fault made, for the kernel's spurious-fault
+/// retry (`paging::kernel_fault_is_spurious`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelAccess
+{
+    /// A load (`scause` 13).
+    Load,
+    /// A store or AMO (`scause` 15).
+    Store,
+}
+
+/// Whether the kernel leaf PTE `pte` is valid and grants `access`, so that a
+/// fault of that access on its page is a stale TLB entry the hart resolves on
+/// retry: the decision of `paging::kernel_fault_is_spurious` once its walk
+/// found the leaf.
+pub(super) fn kernel_leaf_permits(pte: u64, access: KernelAccess) -> bool
+{
+    let permits = match access
+    {
+        KernelAccess::Load => pte & PTE_READ != 0,
+        KernelAccess::Store => pte & PTE_WRITE != 0,
+    };
+    pte & PTE_VALID != 0 && permits
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -293,5 +326,27 @@ mod tests
         assert!(!is_fp_or_v_opcode(0x0001)); // c.nop / c.addi (C1)
         assert!(!is_fp_or_v_opcode(0x4000)); // C0 funct3=010 (c.lw)
         assert!(!is_fp_or_v_opcode(0x4002)); // C2 funct3=010 (c.lwsp)
+    }
+
+    // Defect caught: a test that swapped R and W, or ignored V, would retry a
+    // genuine kernel store to a read-only page forever, or retry a fault on an
+    // invalid entry, instead of reporting the kernel exception.
+    #[test]
+    fn a_kernel_leaf_permits_a_load_when_readable_and_a_store_when_writable()
+    {
+        let ro = PTE_VALID | PTE_READ;
+        let rw = PTE_VALID | PTE_READ | PTE_WRITE;
+        assert!(kernel_leaf_permits(ro, KernelAccess::Load));
+        assert!(!kernel_leaf_permits(ro, KernelAccess::Store));
+        assert!(kernel_leaf_permits(rw, KernelAccess::Store));
+    }
+
+    // Defect caught: a retry of a fault on an invalid leaf loops forever.
+    #[test]
+    fn an_invalid_kernel_leaf_permits_nothing()
+    {
+        let invalid = PTE_READ | PTE_WRITE;
+        assert!(!kernel_leaf_permits(invalid, KernelAccess::Load));
+        assert!(!kernel_leaf_permits(invalid, KernelAccess::Store));
     }
 }

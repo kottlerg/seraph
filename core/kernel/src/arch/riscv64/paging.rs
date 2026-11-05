@@ -133,11 +133,11 @@ pub fn user_va_top() -> u64
 // ── PTE bit constants ─────────────────────────────────────────────────────────
 
 /// Entry is valid.
-const VALID: u64 = 1 << 0;
+const VALID: u64 = super::encoding::PTE_VALID;
 /// Read permission.
-const READ: u64 = 1 << 1;
+const READ: u64 = super::encoding::PTE_READ;
 /// Write permission.
-const WRITE: u64 = 1 << 2;
+const WRITE: u64 = super::encoding::PTE_WRITE;
 /// Execute permission.
 const EXECUTE: u64 = 1 << 3;
 /// Accessed — must be pre-set in leaf PTEs.
@@ -1454,15 +1454,7 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     l0[vpn_index(0, virt)].is_present()
 }
 
-/// The access an S-mode page fault made, for [`kernel_fault_is_spurious`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum KernelAccess
-{
-    /// A load (`scause` 13).
-    Load,
-    /// A store or AMO (`scause` 15).
-    Store,
-}
+pub use super::encoding::KernelAccess;
 
 /// Whether an S-mode load or store page fault at the kernel address `va` is
 /// stale: the kernel's tables map `va` with a 4 KiB leaf that permits the
@@ -1494,13 +1486,7 @@ pub unsafe fn kernel_fault_is_spurious(va: u64, access: KernelAccess) -> bool
     {
         return false;
     };
-    let leaf = l0[vpn_index(0, va)];
-    let permits = match access
-    {
-        KernelAccess::Load => leaf.0 & READ != 0,
-        KernelAccess::Store => leaf.0 & WRITE != 0,
-    };
-    leaf.is_present() && permits
+    super::encoding::kernel_leaf_permits(l0[vpn_index(0, va)].0, access)
 }
 
 /// Invalidate every translation this hart caches, in every address space

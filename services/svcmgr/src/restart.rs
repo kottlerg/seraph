@@ -127,9 +127,10 @@ pub fn walk_and_create_from_file(
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
-    // The argv/env cap holds both blobs; dropping it once the create call
-    // returns gives its run back to memmgr (procmgr has copied the blobs by
-    // then, or refused the request).
+    // The argv/env cap holds both blobs; `ArgvEnvCap::settle` once the
+    // create call returns gives its run back to memmgr (procmgr has copied
+    // the blobs by then, or refused the request), or withholds it on
+    // `ARGV_ENV_STILL_MAPPED`.
     let argv_env = match ArgvEnvCap::new(blobs.argv, blobs.argv_count, blobs.env, blobs.env_count)
     {
         Ok(cap) => cap,

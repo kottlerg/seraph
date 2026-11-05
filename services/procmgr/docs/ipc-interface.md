@@ -402,10 +402,10 @@ child, its memmgr record included, as for `CREATE_PROCESS`.
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
-| 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
+| 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 
 ---
 
@@ -633,6 +633,8 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
-[logd IPC interface](../../logd/docs/ipc-interface.md), [services/procmgr/README.md](../README.md),
+[logd IPC interface](../../logd/docs/ipc-interface.md),
+[memmgr IPC Interface](../../memmgr/docs/ipc-interface.md),
+[services/procmgr/README.md](../README.md),
 [Restart Protocol](../../svcmgr/docs/restart-protocol.md),
 [`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

@@ -377,8 +377,9 @@ impl Command {
 
         // Fund the argv/env cap before the binary is looked up or any cap is
         // minted: a spawner that cannot fund it gets `ArgumentListTooLong`
-        // with nothing to unwind. Dropping it after the create call returns
-        // its run to memmgr; procmgr has copied the blobs by then.
+        // with nothing to unwind. `ArgvEnvCap::settle` after the create call
+        // returns its run to memmgr (procmgr has copied the blobs by then),
+        // or withholds it on `ARGV_ENV_STILL_MAPPED`.
         let argv_env = crate::os::seraph::process::ArgvEnvCap::new(
             &args_blob, args_count, &env_blob, env_count,
         )?;

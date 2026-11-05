@@ -455,6 +455,9 @@ pub struct ChildSched
     /// Upper bound of the baseline `SchedControl` band minted into the
     /// child (`[1, band_max]`).
     pub band_max: u8,
+    /// The `memmgr_labels::REGISTER_PROCESS` flags the child registers with
+    /// (`process_table::child_memmgr_flags`): its physical-address class.
+    pub memmgr_flags: u64,
 }
 
 // ── Child setup helpers ─────────────────────────────────────────────────────
@@ -2965,7 +2968,8 @@ pub fn create_process_from_file(
     // front; the header scratch memory cap, the per-segment memory caps, and all
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
-    let (mms_cap, mms_badge) = crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    let (mms_cap, mms_badge) =
+        crate::register_with_memmgr(ctx.memmgr_ep, sched.memmgr_flags, ipc_buf);
     let mms = MemmgrSendGuard::new(mms_cap, mms_badge, ctx.memmgr_ep, ipc_buf);
     if mms.cap() == 0
     {

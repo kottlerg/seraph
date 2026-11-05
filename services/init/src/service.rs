@@ -416,9 +416,13 @@ pub fn create_devmgr_with_caps(
     // caps: [module, creator]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
     // Band ceiling deliberately above devmgr's own level so it can place
-    // the drivers it spawns at the boot/aux driver levels.
+    // the drivers it spawns at the boot/aux driver levels. Phys-class
+    // (`CREATE_PHYS_ACCESS`): devmgr reads the physical bases of the frames
+    // it maps for unconfined devices, and spawns the IOMMU driver phys-class
+    // (docs/device-management.md § DMA Authorisation).
     let create_msg = IpcMessage::builder(
         procmgr_labels::CREATE_PROCESS
+            | procmgr_labels::CREATE_PHYS_ACCESS
             | procmgr_labels::create_sched_bits(
                 ipc::sched_policy::DEVMGR_PRIORITY,
                 ipc::sched_policy::DEVMGR_BAND_MAX,

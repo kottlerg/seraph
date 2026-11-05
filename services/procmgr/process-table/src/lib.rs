@@ -415,6 +415,16 @@ impl ProcessTable
         Some((e.started, e.thread_cap))
     }
 
+    /// memmgr badge of the live entry whose badge matches, for the
+    /// creator-class check of [`child_memmgr_flags`]. `None` if the badge is
+    /// unknown.
+    #[must_use]
+    pub fn memmgr_badge_by_badge(&self, badge: u64) -> Option<u64>
+    {
+        let idx = self.index_of_badge(badge)?;
+        Some(self.entries[idx].memmgr_badge)
+    }
+
     /// Band ceiling of the live entry whose badge matches, for
     /// creator-band resolution on nested spawns. `None` if the badge is
     /// unknown (already reaped, or a badge minted outside the table).
@@ -424,6 +434,35 @@ impl ProcessTable
         let idx = self.index_of_badge(badge)?;
         Some(self.entries[idx].band_max)
     }
+}
+
+// ── Spawn physical-address class ─────────────────────────────────────────────
+
+/// The `memmgr_labels::REGISTER_PROCESS` flags of a child a create request
+/// labelled `label` makes, for the creator badged `creator_badge` on
+/// procmgr, whose memmgr badge is `creator_memmgr_badge` (`None` when the
+/// table holds no entry for it).
+///
+/// `procmgr_labels::CREATE_PHYS_ACCESS` asks for a phys-class child
+/// (`memmgr_labels::REGISTER_PHYS_CLASS`). Only a creator that may read
+/// physical addresses itself may ask: an un-badged one (badge `0`: init, or
+/// svcmgr's mint source) or one memmgr registered phys-class, whose memmgr
+/// badge carries `memmgr_labels::PHYS_CLASS_BADGE_BIT`. Returns `None` when
+/// any other creator asks, which procmgr refuses with `INVALID_ARGUMENT`.
+#[must_use]
+pub fn child_memmgr_flags(
+    label: u64,
+    creator_badge: u64,
+    creator_memmgr_badge: Option<u64>,
+) -> Option<u64>
+{
+    if label & ipc::procmgr_labels::CREATE_PHYS_ACCESS == 0
+    {
+        return Some(0);
+    }
+    let creator_is_phys = creator_badge == 0
+        || creator_memmgr_badge.is_some_and(|b| b & ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT != 0);
+    creator_is_phys.then_some(ipc::memmgr_labels::REGISTER_PHYS_CLASS)
 }
 
 // ── Spawn scheduling resolution ──────────────────────────────────────────────
@@ -730,6 +769,36 @@ mod tests
         recent.record(16, 42, 1_000);
         assert_eq!(recent.find(16, 2_000), Some(42));
         assert_eq!(recent.find(17, 2_000), None);
+    }
+
+    #[test]
+    fn a_phys_class_child_needs_an_unbadged_or_phys_class_creator()
+    {
+        use ipc::memmgr_labels::{PHYS_CLASS_BADGE_BIT, REGISTER_PHYS_CLASS};
+        use ipc::procmgr_labels::{CREATE_PHYS_ACCESS, CREATE_PINNED};
+        let phys = CREATE_PHYS_ACCESS | CREATE_PINNED;
+        // No phys flag: an ordinary child for any creator.
+        assert_eq!(child_memmgr_flags(CREATE_PINNED, 16, Some(5)), Some(0));
+        // Un-badged creator (init) and a phys-class creator (devmgr).
+        assert_eq!(child_memmgr_flags(phys, 0, None), Some(REGISTER_PHYS_CLASS));
+        assert_eq!(
+            child_memmgr_flags(phys, 16, Some(PHYS_CLASS_BADGE_BIT | 5)),
+            Some(REGISTER_PHYS_CLASS)
+        );
+        // An ordinary creator, and a badge the table does not hold.
+        assert_eq!(child_memmgr_flags(phys, 16, Some(5)), None);
+        assert_eq!(child_memmgr_flags(phys, 16, None), None);
+    }
+
+    #[test]
+    fn memmgr_badge_by_badge_reports_the_entry_and_absence()
+    {
+        let mut table = ProcessTable::new();
+        let mut entry = entry_with_badge(16);
+        entry.memmgr_badge = 0x77;
+        assert_eq!(table.insert(entry), Ok(()));
+        assert_eq!(table.memmgr_badge_by_badge(16), Some(0x77));
+        assert_eq!(table.memmgr_badge_by_badge(99), None);
     }
 
     #[test]

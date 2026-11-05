@@ -952,8 +952,17 @@ pub fn bootstrap_memmgr(
 
     // Mint procmgr's badged SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this badge as authorised for the
-    // procmgr-only labels.
-    let procmgr_badge_on_mm = mint_bootstrap_badge()?;
+    // procmgr-only labels. The badge is in memmgr's process-badge space, whose
+    // phys-class bit procmgr must not carry (memmgr refuses the bootstrap
+    // otherwise), and stays nonzero with it cleared.
+    let procmgr_badge_on_mm = loop
+    {
+        let b = mint_bootstrap_badge()? & !ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT;
+        if b != 0
+        {
+            break b;
+        }
+    };
     let procmgr_send_cap = syscall::cap_derive_badge(
         mm_service_ep,
         syscall::RIGHTS_EP_SEND_GRANT,

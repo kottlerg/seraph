@@ -17,9 +17,9 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use free_pool::{
-    ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NODE_NULL,
-    Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore, WordStore, arena::Slot,
-    chunk_for,
+    ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
+    NO_REGION_ID, NODE_NULL, Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore,
+    WordStore, arena::Slot, chunk_for,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -705,26 +705,34 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
     }
 }
 
-/// Mint a fresh memmgr-minted process-identity badge: a random `u64` from the
-/// kernel entropy pool, redrawn off the reserved values a live record must
-/// never alias — the well-known reserved records `MEMMGR_SELF_BADGE` /
-/// `INIT_SELF_BADGE` — and off `0`, which no badged cap carries. Random
-/// rather than monotonic so the process-registration count it would otherwise
-/// leak across the `REGISTER_PROCESS` boundary stays unguessable. Returns
-/// `None` if the entropy draw fails (a kernel-contract violation). The `u64`
-/// width is the kernel badge word `cap_derive_badge` stamps, so the space
-/// never runs out; a draw that aliases a live badge is redrawn.
-fn mint_process_badge(l: &MemLedger) -> Option<u64>
+/// Mint a fresh memmgr-minted process-identity badge: 63 random bits from the
+/// kernel entropy pool, with `PHYS_CLASS_BADGE_BIT` as `class_bit` gives it
+/// (set for a phys-class process, clear for every other), redrawn off the reserved values a live
+/// record must never alias — the well-known reserved records
+/// `MEMMGR_SELF_BADGE` / `INIT_SELF_BADGE` — and off `0`, which no badged cap
+/// carries. Random rather than monotonic so the process-registration count it
+/// would otherwise leak across the `REGISTER_PROCESS` boundary stays
+/// unguessable. Returns `None` if the entropy draw fails (a kernel-contract
+/// violation). The `u64` width is the kernel badge word `cap_derive_badge`
+/// stamps, so 63 bits per class never run out; a draw that aliases a live
+/// badge is redrawn.
+fn mint_process_badge(l: &MemLedger, class_bit: u64) -> Option<u64>
 {
     loop
     {
-        let b = syscall::random_u64().ok()?;
+        let b = (syscall::random_u64().ok()? & !PHYS_CLASS_BADGE_BIT) | class_bit;
         if b != 0 && b != MEMMGR_SELF_BADGE && b != INIT_SELF_BADGE && l.find(b).is_none()
         {
             return Some(b);
         }
     }
 }
+
+/// The badge bit that marks a phys-class process: one `REGISTER_PROCESS`
+/// registered with `memmgr_labels::REGISTER_PHYS_CLASS` (devmgr and the IOMMU
+/// drivers). Its grants keep `RIGHTS_MEM_PHYS` (`grant_rights`). The kernel
+/// stamps the badge on the caller's SEND cap, so no caller can set it.
+const PHYS_CLASS_BADGE_BIT: u64 = memmgr_labels::PHYS_CLASS_BADGE_BIT;
 
 // ── Bootstrap protocol ───────────────────────────────────────────────────────
 //
@@ -867,6 +875,15 @@ fn bootstrap_from_init(
     let _ = unsafe { syscall::mem_unmap(self_aspace_cap, phys_table_va, 1) };
     let _ = syscall::cap_delete(phys_table_cap);
 
+    // procmgr is not phys-class: a badge carrying the class bit would keep
+    // `RIGHTS_MEM_PHYS` on procmgr's own grants (`grant_rights`), so init
+    // mints it clear (`memmgr_labels::PHYS_CLASS_BADGE_BIT`) and memmgr
+    // refuses the bootstrap otherwise.
+    if round.data[2] & PHYS_CLASS_BADGE_BIT != 0
+    {
+        return None;
+    }
+
     Some(InitBootstrap {
         service_ep: round.caps[0],
         procmgr_badge: round.data[2],
@@ -881,18 +898,35 @@ fn bootstrap_from_init(
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
 
-/// Derive an inner copy of the outer cap to hand to the caller. The outer
-/// cap (`outer_slot`) stays in memmgr's `CSpace` as the per-process tracking
-/// anchor; the inner derivation (returned) is what gets transferred via
-/// `ipc_reply`.
+/// Derive an inner copy of the outer cap to hand to the caller badged
+/// `badge`. The outer cap (`outer_slot`) stays in memmgr's `CSpace` as the
+/// per-process tracking anchor; the inner derivation (returned) is what gets
+/// transferred via `ipc_reply`.
 ///
-/// `RIGHTS_ALL` is required so the caller can in turn derive RW/RX/R-only
-/// variants for distinct page mappings (procmgr's ELF loader covers all
-/// three). Restricting to `RIGHTS_MEM_MAP_RW` here would silently break
-/// executable-segment maps, since `cap_derive` only narrows rights.
-fn derive_for_caller(outer_slot: u64) -> Option<u64>
+/// Every right but `RIGHTS_MEM_PHYS` passes, so the caller can in turn derive
+/// RW/RX/R-only variants for distinct page mappings (procmgr's ELF loader
+/// covers all three); restricting to `RIGHTS_MEM_MAP_RW` here would silently
+/// break executable-segment maps, since `cap_derive` only narrows rights.
+/// `RIGHTS_MEM_PHYS` passes only to a phys-class caller (devmgr and the IOMMU
+/// drivers, `grant_rights`).
+fn derive_for_caller(outer_slot: u64, badge: u64) -> Option<u64>
 {
-    syscall::cap_derive(outer_slot, syscall::RIGHTS_ALL).ok()
+    syscall::cap_derive(outer_slot, grant_rights(badge)).ok()
+}
+
+/// The rights mask of a grant to the caller badged `badge`: everything for a
+/// phys-class badge, everything but `RIGHTS_MEM_PHYS` otherwise
+/// (services/memmgr/docs/ipc-interface.md § Label 1).
+fn grant_rights(badge: u64) -> u64
+{
+    if badge & PHYS_CLASS_BADGE_BIT == 0
+    {
+        syscall::RIGHTS_ALL & !syscall::RIGHTS_MEM_PHYS
+    }
+    else
+    {
+        syscall::RIGHTS_ALL
+    }
 }
 
 /// Roll back a grant: return its first `entries` runs to the pool and delete
@@ -979,19 +1013,15 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         }
     };
 
-    // Account each peeled outer to the caller's record, then derive the
-    // inner copy that ships in the reply. On any failure, roll the entire
-    // grant back to the pool.
+    // Account each peeled outer to the caller's record under a fresh region
+    // id, then derive the inner copy that ships in the reply. On any failure,
+    // roll the entire grant back to the pool.
     let mut inner = [0u64; MAX_GRANT_RUNS];
+    let mut region_ids = [0u64; MAX_GRANT_RUNS];
     for (i, &(outer, pages, phys)) in grant.entries().iter().enumerate()
     {
-        let frame = FrameDesc {
-            cap_slot: outer,
-            page_count: pages,
-            phys_base: phys,
-            va: FRAME_VA_UNMAPPED,
-        };
-        if !l.push_frame(rec, frame)
+        let Some(region_id) = l.push_grant(rec, outer, pages, phys, FRAME_VA_UNMAPPED)
+        else
         {
             // Entries before `i` already have frame descriptors on the record;
             // their outers go back to the pool below, so the descriptors must
@@ -1000,8 +1030,9 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
             rollback_grant(l, &grant, &inner[..i]);
             reply_label(ipc_buf, memmgr_errors::QUOTA);
             return;
-        }
-        let Some(d) = derive_for_caller(outer)
+        };
+        region_ids[i] = region_id;
+        let Some(d) = derive_for_caller(outer, req.badge)
         else
         {
             pop_frames(l, rec, i + 1);
@@ -1015,16 +1046,16 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // Build the reply:
     //   data[0]                  = cap_count
     //   data[1..1+count]         = page_count_for_cap_i (u32 in low half)
-    //   data[1+count..1+2*count] = phys_base_for_cap_i (u64)
-    //   caps[0..count]           = Memory caps (RIGHTS_ALL derivations)
+    //   data[1+count..1+2*count] = region_id_for_cap_i (u64, opaque)
+    //   caps[0..count]           = Memory caps (`grant_rights` derivations)
     // A best-effort grant MAY cover fewer pages than asked (a partial grant);
     // the caller requests the rest.
     let count = grant.count;
     let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, count as u64);
-    for (i, &(_, pages, phys)) in grant.entries().iter().enumerate()
+    for (i, &(_, pages, _)) in grant.entries().iter().enumerate()
     {
         builder = builder.word(1 + i, u64::from(pages));
-        builder = builder.word(1 + count + i, phys);
+        builder = builder.word(1 + count + i, region_ids[i]);
     }
     for &slot in &inner[..count]
     {
@@ -1048,7 +1079,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     // Any inner caps the caller handed back were deleted by `dispatch`: a
-    // release names regions by `phys_base`, never by cap.
+    // release names regions by the region id of their grant, never by cap.
     let l = ledger_mut();
     let Some(rec) = l.find(req.badge)
     else
@@ -1057,17 +1088,18 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     };
 
-    // Each word names a previously-granted region by physical base (the value
-    // memmgr reported in the grant reply). Take every match back, into the
-    // pool or onto the deferred list as `quiescent` decides; unmatched bases
-    // are ignored, so release is idempotent and a racing double-release (a
-    // joined thread plus the detached-thread reaper) is harmless. Clamp to
-    // the words actually present to stay in bounds.
+    // Each word names a previously-granted region by the region id memmgr
+    // reported in the grant reply. Take every match back, into the pool or
+    // onto the deferred list as `quiescent` decides; unmatched ids are
+    // ignored, so release is idempotent and a racing double-release (a
+    // joined thread plus the detached-thread reaper) is harmless, and a
+    // record never reissues an id, so a late duplicate cannot take a later
+    // grant. Clamp to the words actually present to stay in bounds.
     let count = (req.word(0) as usize).min(req.word_count().saturating_sub(1));
     recheck_deferred(l);
     for i in 0..count
     {
-        let _ = l.release_frame_by_phys(rec, req.word(1 + i), FRAME_VA_UNMAPPED, quiescent);
+        let _ = l.release_frame_by_region(rec, req.word(1 + i), quiescent);
     }
     // Restore contiguity across the released runs, so a release-heavy churn
     // (ruststd returning Thread-retype slabs on join/reap) does not fragment
@@ -1089,9 +1121,23 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         reply_label(ipc_buf, memmgr_errors::LABEL_VERSION_MISMATCH);
         return;
     }
+    let flags = req.word(1);
+    if flags & !memmgr_labels::REGISTER_PHYS_CLASS != 0
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
 
     let l = ledger_mut();
-    let Some(new_badge) = mint_process_badge(l)
+    let class_bit = if flags & memmgr_labels::REGISTER_PHYS_CLASS == 0
+    {
+        0
+    }
+    else
+    {
+        PHYS_CLASS_BADGE_BIT
+    };
+    let Some(new_badge) = mint_process_badge(l, class_bit)
     else
     {
         // Unreachable: the entropy pool is seeded before any userspace runs.
@@ -1514,6 +1560,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         page_count: pages,
         phys_base: phys,
         va: chunk_base,
+        region_id: NO_REGION_ID,
     };
     if !l.push_frame(rec, frame)
     {
@@ -1730,6 +1777,7 @@ fn ingest_in_use(boot: &InitBootstrap)
                     page_count: entry.page_count,
                     phys_base: entry.phys_base,
                     va: FRAME_VA_UNMAPPED,
+                    region_id: NO_REGION_ID,
                 },
             );
         }

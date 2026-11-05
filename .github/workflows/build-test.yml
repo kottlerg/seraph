@@ -189,6 +189,11 @@ jobs:
             # (it must observe the layout differing across separate boots),
             # so it cannot ride run-parallel; both arches.
             cargo xtask test-kaslr --arch ${{ matrix.arch }}
+            # Extra boot: the steps 6 and 7 redo test (#754). Stages the
+            # mapredo knob, so the bootloader redoes its first page-table and
+            # memory-map attempt, and boots the ktest bundle to its pass
+            # marker under the cell's budget; the knob is removed afterwards.
+            cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
           fi
           if [ "${{ matrix.tester }}" = "usertest" ]; then
             # Second boot: the terminal interactive test (keyboard input

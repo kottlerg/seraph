@@ -162,6 +162,13 @@ includes what the firmware itself allocated during the first window. After
 the boot with `BootError::MemoryMapKeptGrowing`; only firmware that outgrows twice
 the slack in the second window reaches a third.
 
+QEMU's firmware never outgrows the first attempt's slack, so a test knob runs the
+redo: when the presence-only `\EFI\seraph\mapredo` file is on the ESP (read before
+step 6's size query, a failed open reading as absent), the first attempt is redone
+whether its buffer fits or not, logging `mapredo knob present; redoing steps 6 and 7`,
+and later attempts are checked as above. `cargo xtask test-map-redo` stages the knob
+and boots with it ([testing.md](../../../docs/testing.md#steps-6-and-7-redo-test-map-redo)).
+
 The check bounds the buffer, not the map in it, because a map can still grow after
 step 7: when `ExitBootServices` refuses a stale key, step 8 re-queries the map into
 the same buffer, and a map past the buffer fails that re-query. Translation reads

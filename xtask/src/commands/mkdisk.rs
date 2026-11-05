@@ -40,6 +40,9 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
         sysroot::install_rootfs(ctx)?;
     }
     stage_nokaslr_knob(ctx, args.no_kaslr)?;
+    // The mapredo knob is `test-map-redo`'s alone, which removes it after its
+    // boot; a repack never keeps one a stopped run left behind.
+    stage_map_redo_knob(ctx, false)?;
     let layout = disk::DiskLayout {
         block_size: args.block_size,
         data: if args.split_data
@@ -61,8 +64,24 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 /// absent file re-enables randomization, a present (empty) file disables it.
 pub fn stage_nokaslr_knob(ctx: &BuildContext, disable: bool) -> Result<()>
 {
-    let path = ctx.sysroot_efi_seraph().join("nokaslr");
-    if disable
+    stage_knob(ctx, "nokaslr", disable)
+}
+
+/// Stage or remove the `\EFI\seraph\mapredo` test knob in the ESP tree so
+/// the next `disk.img` reflects it. Idempotent: a present (empty) file makes
+/// the bootloader redo the first attempt of its steps 6 and 7, an absent one
+/// leaves the redo to a map that outgrows its entry array.
+pub fn stage_map_redo_knob(ctx: &BuildContext, force: bool) -> Result<()>
+{
+    stage_knob(ctx, "mapredo", force)
+}
+
+/// Stage (`present`) or remove the presence-only knob file `name` in the ESP
+/// tree's `\EFI\seraph\` directory.
+fn stage_knob(ctx: &BuildContext, name: &str, present: bool) -> Result<()>
+{
+    let path = ctx.sysroot_efi_seraph().join(name);
+    if present
     {
         std::fs::create_dir_all(ctx.sysroot_efi_seraph())?;
         std::fs::write(&path, b"")?;

@@ -28,6 +28,9 @@ named above, the optional presence-only `\EFI\seraph\nokaslr` KASLR
 override knob
 ([boot-flow.md § Step 5d](../core/boot/docs/boot-flow.md#step-5d-apply-the-kaslr-slide),
 [elf-loading.md § File Paths](../core/boot/docs/elf-loading.md#file-paths)),
+the optional presence-only `\EFI\seraph\mapredo` test knob, which makes the
+first memory-map attempt redo
+([memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)),
 and the bootloader binary itself, installed both at `\EFI\seraph\boot.efi`
 and at the EFI fallback path
 ([build-system.md § Build Output: the Sysroot](build-system.md#build-output-the-sysroot)).

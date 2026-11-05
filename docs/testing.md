@@ -292,6 +292,25 @@ through the kernel's serial-only console class (see
 In CI it runs as extra boots inside each `ktest` cell (both arches, both
 profiles), after the `ktest` run-parallel boot.
 
+### Steps 6 and 7 redo (`test-map-redo`)
+
+The bootloader redoes its steps 6 and 7 (frees every allocation of both and
+runs them again with twice the slack) only when the final memory map's buffer
+outgrows the entry array step 6 sized, which QEMU's firmware never makes it do (see
+[memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)).
+`cargo xtask test-map-redo [--arch]` (both arches) stages the
+`\EFI\seraph\mapredo` test knob, which makes the first attempt redo whatever
+its map's size, repacks `disk.img`, and boots the current sysroot once through
+`run-parallel`. It passes when the boot reaches its harness's pass marker and
+the bootloader logged the knob's redo exactly once; the knob is always removed
+and `disk.img` repacked afterward. See
+[xtask/README.md § test-map-redo](../xtask/README.md#cargo-xtask-test-map-redo)
+for the command.
+
+In CI it runs as an extra boot inside each `ktest` cell (both arches, both
+profiles), after `test-kaslr`, on the ktest bundle the cell composed and under
+the cell's `run-parallel` budget.
+
 ### Death forward to logd (`test-logd-reclaim`)
 
 Once logd has registered its death queue with procmgr, procmgr posts the death

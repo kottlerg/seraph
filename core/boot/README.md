@@ -165,9 +165,10 @@ The CPU state established at the kernel entry point is specified in
   IRQ descriptors, no PCI enumeration. Namespace evaluation and
   device-level assignment are userspace's responsibility. Extraction scope is in
   [core/boot/docs/firmware-parsing.md](docs/firmware-parsing.md).
-- **No boot menu or interactive UI.** The kernel, bundle, and `nokaslr` knob
-  ESP paths are hardcoded and are the only files the bootloader opens, so
-  there is no boot configuration file beyond the presence-only knob
+- **No boot menu or interactive UI.** The kernel, bundle, `nokaslr` knob, and
+  `mapredo` test knob ESP paths are hardcoded and are the only files the
+  bootloader opens, so there is no boot configuration file beyond the two
+  presence-only knobs
   ([core/boot/docs/elf-loading.md](docs/elf-loading.md) § File Paths). There is no
   kernel command line: `BootInfo` carries no command-line field
   ([abi/boot-protocol/src/lib.rs](../../abi/boot-protocol/src/lib.rs)).

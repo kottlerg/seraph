@@ -76,7 +76,7 @@ pages already allocated to the child return to memmgr's pool.
 |---|---|
 | label | 0 (success) |
 | cap[0] | Process handle (badged endpoint identifying this process) |
-| cap[1] | Child `Thread` capability (Control and Observe rights, `RIGHTS_THREAD`) |
+| cap[1] | Child `Thread` capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`) |
 | cap[2] | With `CREATE_DMA_HOLD` only: the release token (a SEND on procmgr's endpoint badged with the child's process badge and `procmgr_labels::HOLD_RELEASE_AUTHORITY`; **DMA hold flag** below) |
 
 The process handle is a badged endpoint capability. The caller uses it for the
@@ -469,7 +469,7 @@ cap it does not use.
 
 On a create reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations), a derived copy of the child's `Thread`
-capability (Control and Observe rights, `RIGHTS_THREAD`), and, for a
+capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`), and, for a
 `CREATE_DMA_HOLD` child, its release token to the caller. procmgr retains the
 original caps for process lifecycle management.
 

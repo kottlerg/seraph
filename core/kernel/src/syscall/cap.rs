@@ -947,8 +947,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 /// with one): `core/kernel/docs/syscalls.md` § `SYS_CAP_CREATE_THREAD`.
 ///
 /// Allocates a kernel stack and a TCB in `Created` state, bound to the
-/// provided address space and `CSpace`. Inserts a cap with `CONTROL | OBSERVE`
-/// rights into the caller's `CSpace`. Returns the Thread cap handle.
+/// provided address space and `CSpace`. Inserts a cap with
+/// `CONTROL | OBSERVE | UPCALL` rights into the caller's `CSpace`. Returns the
+/// Thread cap handle.
 #[cfg(not(test))]
 // too_many_lines: the TCB is constructed field by field in place, and the
 // registration, revalidation, and rollback must stay in one sequence.
@@ -1275,8 +1276,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
         unsafe {
             let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace)
-                .insert_cap_handle_typed(ThreadRights::CONTROL | ThreadRights::OBSERVE, nonnull);
+            let r = (*caller_cspace).insert_cap_handle_typed(
+                ThreadRights::CONTROL | ThreadRights::OBSERVE | ThreadRights::UPCALL,
+                nonnull,
+            );
             (*caller_cspace).lock.unlock_raw(saved);
             r
         }

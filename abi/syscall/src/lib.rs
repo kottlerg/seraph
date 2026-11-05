@@ -485,11 +485,19 @@ pub const SYS_THREAD_GET_FAULT_HANDLER: u64 = 56;
 /// Thread: copy one thread's fault-handler bindings, per class, onto another.
 /// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_INHERIT_FAULT_HANDLER` (57).
 pub const SYS_THREAD_INHERIT_FAULT_HANDLER: u64 = 57;
+/// Thread: post an asynchronous upcall to a thread, delivered to its
+/// [`FAULT_CLASS_UPCALL`] handler at its next delivery point. See
+/// `core/kernel/docs/syscalls.md` § `SYS_THREAD_POST_UPCALL` (58).
+pub const SYS_THREAD_POST_UPCALL: u64 = 58;
+/// Thread: set or clear the calling thread's upcall mask, which defers
+/// delivery of a posted upcall. See `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_SET_UPCALL_MASK` (59).
+pub const SYS_THREAD_SET_UPCALL_MASK: u64 = 59;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_INHERIT_FAULT_HANDLER + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_SET_UPCALL_MASK + 1;
 
 // ── getrandom constants ───────────────────────────────────────────────────────
 
@@ -908,8 +916,13 @@ pub const RIGHTS_THREAD_CONTROL: u64 = 1 << 0;
 /// Thread: may read thread register state.
 pub const RIGHTS_THREAD_OBSERVE: u64 = 1 << 1;
 
-/// Thread: full control (start, stop, configure, observe).
-pub const RIGHTS_THREAD: u64 = RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE;
+/// Thread: may post an upcall to the thread (`SYS_THREAD_POST_UPCALL`). A post
+/// with [`UPCALL_ANY_INSTRUCTION`] also needs [`RIGHTS_THREAD_CONTROL`].
+pub const RIGHTS_THREAD_UPCALL: u64 = 1 << 2;
+
+/// Thread: full control (start, stop, configure, observe, post an upcall).
+pub const RIGHTS_THREAD: u64 =
+    RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_UPCALL;
 
 // CSpace ──
 
@@ -1078,6 +1091,35 @@ pub const FAULT_KIND_VM: u64 = 0;
 ///   instruction bits for an illegal instruction).
 pub const FAULT_KIND_EXCEPTION: u64 = 1;
 
+/// Fault kind (data word 0): an asynchronous upcall that
+/// `SYS_THREAD_POST_UPCALL` posted, delivered through the
+/// [`FAULT_CLASS_UPCALL`] binding. Data words 1–3 are
+/// `[cookie, point, ip]`:
+/// - `cookie` is the poster's word, carried uninterpreted.
+/// - `point` is the delivery point: [`UPCALL_POINT_SYSCALL`] or
+///   [`UPCALL_POINT_INTERRUPT`].
+/// - `ip` is the instruction pointer the thread resumes at.
+///
+/// The thread is not faulting: it resumes at `ip` (or where the handler wrote
+/// its registers) on any reply, and a [`FAULT_REPLY_KILL`] drops the upcall
+/// (`docs/fault-handling.md` § Asynchronous Upcalls).
+pub const FAULT_KIND_UPCALL: u64 = 2;
+
+/// Upcall delivery point (`FAULT_KIND_UPCALL` data word 2): the return of a
+/// syscall of the thread, a blocking syscall that the post interrupted among
+/// them. The thread's registers hold that syscall's result.
+pub const UPCALL_POINT_SYSCALL: u64 = 0;
+
+/// Upcall delivery point (`FAULT_KIND_UPCALL` data word 2): the return to user
+/// mode from an interrupt that preempted the thread, which only a post with
+/// [`UPCALL_ANY_INSTRUCTION`] delivers at.
+pub const UPCALL_POINT_INTERRUPT: u64 = 1;
+
+/// `SYS_THREAD_POST_UPCALL` flag: deliver at any return to user mode, an
+/// interrupt's as well as a syscall's, so a thread that makes no syscall is
+/// reached. Needs [`RIGHTS_THREAD_CONTROL`] beside [`RIGHTS_THREAD_UPCALL`].
+pub const UPCALL_ANY_INSTRUCTION: u64 = 1 << 0;
+
 /// `FAULT_KIND_VM` access flag: the access was a read.
 pub const FAULT_ACCESS_READ: u64 = 1 << 0;
 /// `FAULT_KIND_VM` access flag: the access was a write.
@@ -1136,8 +1178,9 @@ pub const FAULT_REPLY_RESUME: u64 = 0;
 
 /// Fault reply label: the handler declines, and the fault takes the outcome it
 /// has with no handler bound: the kernel kills a thread whose user-mode access
-/// faulted, as an unhandled fault, and fails a syscall whose user copy faulted
-/// with `InvalidAddress` (docs/fault-handling.md § Reply). Data word 0, when
+/// faulted, as an unhandled fault, fails a syscall whose user copy faulted
+/// with `InvalidAddress`, and drops an upcall, the thread continuing
+/// (docs/fault-handling.md § Reply). Data word 0, when
 /// the reply carries one, is the handler's decline reason, which the kernel
 /// prints uninterpreted in its kill diagnostic; caps and other words are
 /// ignored.
@@ -1151,6 +1194,10 @@ pub const FAULT_CLASS_VM: u64 = 1 << 0;
 /// Fault class bit: every other kernel-unresolvable user exception
 /// ([`FAULT_KIND_EXCEPTION`]).
 pub const FAULT_CLASS_EXCEPTION: u64 = 1 << 1;
+
+/// Fault class bit: asynchronous upcalls ([`FAULT_KIND_UPCALL`]), posted by
+/// `SYS_THREAD_POST_UPCALL`.
+pub const FAULT_CLASS_UPCALL: u64 = 1 << 2;
 
 /// `fault_class_mask` value covering every fault class, present and future.
 /// `SYS_THREAD_SET_FAULT_HANDLER` and `SYS_THREAD_INHERIT_FAULT_HANDLER`

@@ -198,9 +198,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  55  SYS_GETRANDOM
                                  56  SYS_THREAD_GET_FAULT_HANDLER
                                  57  SYS_THREAD_INHERIT_FAULT_HANDLER
+                                 58  SYS_THREAD_POST_UPCALL
+                                 59  SYS_THREAD_SET_UPCALL_MASK
 ```
 
-**Implementation status.** Every number 0–57 has a handler; unallocated numbers
+**Implementation status.** Every number 0–59 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -711,7 +713,7 @@ CSpace.
 | 3 | `sched_cap` | `SchedControl` capability governing the creation priority, or 0 |
 | 4 | `priority` | Initial priority, or 0 |
 
-**Return:** `rax`/`a0`: new thread capability (Control + Observe rights) on success;
+**Return:** `rax`/`a0`: new thread capability (Control + Observe + Upcall rights) on success;
 `SyscallError` on failure.
 
 The thread is created in the `Created` state; it does not begin execution until

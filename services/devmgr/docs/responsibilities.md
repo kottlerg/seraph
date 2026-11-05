@@ -152,9 +152,9 @@ devmgr's responsibilities are:
      range of its domain), so the driver maps nothing more and a confined
      device reaches nothing. It keeps the Memory caps it kept for the mappings,
      each a reference that keeps its frame out of memmgr's pool, and deletes
-     them once the block is in place, or else only after step 3 confirms the
-     reset with steps 1 and 2 confirmed; a device that meets neither leaves
-     them kept for the rest of the boot.
+     them only after steps 1 to 3 have run, when the block is in place or all
+     three confirm; a device that meets neither leaves them kept for the rest
+     of the boot.
   1. devmgr clears the function's Bus Master Enable through the `Mmio` cap of
      the function's configuration page, which it carves at enumeration and
      delegates to no driver ([`docs/pci-enumeration.md`](pci-enumeration.md)
@@ -176,13 +176,12 @@ devmgr's responsibilities are:
      dead one it has reaped already is a no-op. Every `VirtIO` driver is
      created `CREATE_DMA_HOLD`, so procmgr holds the driver's memory on its
      memmgr record, out of the free pool, whether the driver died on its own
-     or was destroyed. Only when the IOMMU
-     blocked the device at step 0, or Bus Master Enable read back clear, every
-     BAR copy was revoked, and the reset confirmed, does devmgr send
-     `RELEASE_HOLD` on the driver's release token, the third cap of the
-     driver's create reply, which devmgr keeps with the device's caps and
-     hands to no one; procmgr then sends memmgr `PROCESS_DIED`, and the memory
-     returns to the pool
+     or was destroyed. Only when the IOMMU blocked the device at step 0, or
+     Bus Master Enable read back clear, every BAR copy was revoked, and the
+     reset confirmed, does devmgr send `RELEASE_HOLD` on the driver's release
+     token, the third cap of the driver's create reply, which devmgr keeps
+     with the device's caps and hands to no one; procmgr then sends memmgr
+     `PROCESS_DIED`, and the memory returns to the pool
      ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-3-release_hold)
      § Label 3). Otherwise the device may still be writing that memory:
      devmgr logs the device, deletes the token, and never releases the hold,
@@ -196,9 +195,10 @@ devmgr's responsibilities are:
      § Reclamation). A dead driver's go with its `CSpace`, but the device
      reaches such a frame only through a standing mapping, whose cap devmgr
      deletes only as step 0 says, so such a frame too returns only once the
-     device is confirmed stopped or blocked. A status byte past the span its BAR cap was
-     carved to is not written, and a BAR copy whose revocation fails leaves the
-     driver its mapping; either counts as an unconfirmed reset.
+     device is confirmed stopped or blocked. A status byte past the span its
+     BAR cap was carved to is not written, and a BAR copy whose revocation
+     fails leaves the driver its mapping; either counts as an unconfirmed
+     reset.
 
   Each withdrawal resets once, and the wait for the confirmation holds
   devmgr's thread (the settle, or the registry loop) for up to `RESET_TIMEOUT`

@@ -273,24 +273,31 @@ pub enum WithdrawnMappings
     Quarantine,
 }
 
-/// Settle the withdrawal of a device whose DMA grant was withdrawn, `blocked`
+/// Whether the IOMMU blocks a withdrawn device's DMA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IommuBlock
+{
+    /// The IOMMU driver completed the device's `BLOCK`: the device reaches
+    /// no frame.
+    Blocked,
+    /// The device is unconfined, or its `BLOCK` did not complete.
+    NotBlocked,
+}
+
+/// Settle the withdrawal of a device whose DMA grant was withdrawn, `block`
 /// telling whether the IOMMU now blocks it: run `stop`, devmgr's stop of the
 /// device (Bus Master Enable cleared, its driver's BAR copies revoked, the
 /// device reset), which reports whether every step confirmed, whatever
-/// `blocked` is. Returns whether the device can no longer reach its driver's
-/// frames, blocked or confirmed stopped, and what becomes of the mappings'
-/// caps: deleted only then, else kept (`docs/device-management.md`
-/// § DMA-Safe Teardown).
-pub fn settle_withdrawal(blocked: bool, stop: impl FnOnce() -> bool) -> (bool, WithdrawnMappings)
+/// `block` is. Returns what becomes of the mappings' caps: deleted when the
+/// device can no longer reach its driver's frames, blocked or confirmed
+/// stopped, else kept (`docs/device-management.md` § DMA-Safe Teardown).
+pub fn settle_withdrawal(block: IommuBlock, stop: impl FnOnce() -> bool) -> WithdrawnMappings
 {
     let stopped = stop();
-    if blocked || stopped
+    match (block, stopped)
     {
-        (true, WithdrawnMappings::Release)
-    }
-    else
-    {
-        (false, WithdrawnMappings::Quarantine)
+        (IommuBlock::Blocked, _) | (IommuBlock::NotBlocked, true) => WithdrawnMappings::Release,
+        (IommuBlock::NotBlocked, false) => WithdrawnMappings::Quarantine,
     }
 }
 
@@ -532,16 +539,21 @@ mod tests
     {
         let mut stopped = false;
         assert_eq!(
-            settle_withdrawal(false, || {
+            settle_withdrawal(IommuBlock::NotBlocked, || {
                 stopped = true;
                 false
             }),
-            (false, WithdrawnMappings::Quarantine)
+            WithdrawnMappings::Quarantine
         );
         assert!(stopped, "the stop runs before the caps are settled");
+    }
+
+    #[test]
+    fn an_unblocked_device_confirmed_stopped_releases_its_mapping_caps()
+    {
         assert_eq!(
-            settle_withdrawal(false, || true),
-            (true, WithdrawnMappings::Release)
+            settle_withdrawal(IommuBlock::NotBlocked, || true),
+            WithdrawnMappings::Release
         );
     }
 
@@ -550,11 +562,11 @@ mod tests
     {
         let mut stopped = false;
         assert_eq!(
-            settle_withdrawal(true, || {
+            settle_withdrawal(IommuBlock::Blocked, || {
                 stopped = true;
                 false
             }),
-            (true, WithdrawnMappings::Release)
+            WithdrawnMappings::Release
         );
         assert!(
             stopped,

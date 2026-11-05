@@ -1634,14 +1634,19 @@ impl VirtioDeviceCaps
     fn take_from_driver(&self) -> bool
     {
         let withdrawal = self.dma.withdraw();
-        let (quiet, mappings) =
-            firmware::dma::settle_withdrawal(withdrawal.blocked(), || self.stop_and_reset());
-        match mappings
+        match firmware::dma::settle_withdrawal(withdrawal.block(), || self.stop_and_reset())
         {
-            firmware::dma::WithdrawnMappings::Release => withdrawal.release(),
-            firmware::dma::WithdrawnMappings::Quarantine => withdrawal.quarantine(),
+            firmware::dma::WithdrawnMappings::Release =>
+            {
+                withdrawal.release();
+                true
+            }
+            firmware::dma::WithdrawnMappings::Quarantine =>
+            {
+                withdrawal.quarantine();
+                false
+            }
         }
-        quiet
     }
 
     /// Clear the function's Bus Master Enable, revoke every cap derived from
@@ -1892,8 +1897,8 @@ impl ServedDriver
 /// release the driver's held memory on its release token
 /// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves it
 /// held for the rest of the boot ([`spawn::destroy_held`]), since the device
-/// may still be writing it. One
-/// reset per withdrawal; both caps of `child` are consumed.
+/// may still be writing it. One reset per withdrawal; both caps of `child`
+/// are consumed.
 fn withdraw_device(dev_caps: &VirtioDeviceCaps, child: spawn::HeldChild, ipc_buf: *mut u64)
 {
     let quiet = dev_caps.take_from_driver();

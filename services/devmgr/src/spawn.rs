@@ -186,8 +186,8 @@ pub struct HeldChild
 /// procmgr tears down its thread, `CSpace`, and address space, which drops
 /// every capability it holds and returns its pages, unless the child was
 /// created with `CREATE_DMA_HOLD` and started, whose pages procmgr then holds
-/// until a `RELEASE_HOLD` this function never sends) and release the handle. A child that has already died is a
-/// no-op for procmgr.
+/// until a `RELEASE_HOLD` this function never sends) and release the handle.
+/// A child that has already died is a no-op for procmgr.
 pub fn destroy_child(process_handle: u64, ipc_buf: *mut u64)
 {
     send_destroy(process_handle, ipc_buf);

@@ -11,10 +11,9 @@
 //! `procmgr_labels::RELEASE_HOLD` on the child's release token: a device the
 //! child drove may still be writing the child's frames until the creator has
 //! confirmed its DMA stopped (`docs/process-lifecycle.md` § Process Death).
-//! [`DmaHolds`] keeps the held
-//! records and reserves the room for each when its child is armed, so the
-//! teardown that parks a record never allocates; [`release_target`] is the
-//! token's authority check.
+//! [`DmaHolds`] keeps the held records and reserves the room for each when
+//! its child is armed, so the teardown that parks a record never allocates;
+//! [`release_target`] is the token's authority check.
 
 extern crate alloc;
 

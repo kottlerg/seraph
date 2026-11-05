@@ -1131,14 +1131,13 @@ fn arm_and_reply_create(
 /// Reply with a successful process creation result, or destroy the child
 /// when the reply cannot deliver it.
 ///
-/// Reply caps: `[process_handle, thread, release_token?]`, the token only
-/// for a `CREATE_DMA_HOLD` child. The reply's
-/// cap transfer is all-or-nothing: when the caller's `CSpace` cannot take
-/// every cap (or the caller is gone), the caller resumes with
-/// `IPC_REPLY_TRANSFER_FAILED` and no caps, and every cap stays in procmgr's
-/// `CSpace`. No one then holds the handle that could start or destroy the
-/// suspended child, so procmgr deletes the caps and tears the child down as
-/// `DESTROY_PROCESS` does.
+/// Reply caps: `[process_handle, thread, release_token?]`, the token only for a
+/// `CREATE_DMA_HOLD` child. The reply's cap transfer is all-or-nothing: when
+/// the caller's `CSpace` cannot take every cap (or the caller is gone), the
+/// caller resumes with `IPC_REPLY_TRANSFER_FAILED` and no caps, and every cap
+/// stays in procmgr's `CSpace`. No one then holds the handle that could start
+/// or destroy the suspended child, so procmgr deletes the caps and tears the
+/// child down as `DESTROY_PROCESS` does.
 fn reply_create_result(
     result: &process::CreateResult,
     release_token: Option<u64>,

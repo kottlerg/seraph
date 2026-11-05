@@ -37,7 +37,9 @@
 use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use firmware::dma::{Confinement, DmaTable, MapError, Mapping, UnmapError, check_access};
+use firmware::dma::{
+    Confinement, DmaTable, IommuBlock, MapError, Mapping, UnmapError, check_access,
+};
 use ipc::recv_guard::RecvGuard;
 use ipc::{IpcMessage, devmgr_dma_errors, devmgr_dma_labels, iommu_errors};
 
@@ -245,9 +247,16 @@ pub struct Withdrawal
 impl Withdrawal
 {
     /// Whether the IOMMU now blocks the device's DMA.
-    pub fn blocked(&self) -> bool
+    pub fn block(&self) -> IommuBlock
     {
-        self.blocked
+        if self.blocked
+        {
+            IommuBlock::Blocked
+        }
+        else
+        {
+            IommuBlock::NotBlocked
+        }
     }
 
     /// Delete the kept Memory caps: the device can no longer reach the

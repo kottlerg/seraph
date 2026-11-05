@@ -34,8 +34,10 @@ use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 
 // ── Queue map ─────────────────────────────────────────────────────────────────
 
-/// Run queue of the idle level (never linked in practice: `dequeue_highest`
-/// returns the idle TCB when every queue is empty).
+/// Run queue of the idle level. It links only the CPU's idle thread: the idle
+/// loop leaves the idle thread through `schedule(Requeue::Always)`, which links
+/// it here, and `dequeue_highest` takes it back when every other queue is empty
+/// (or returns the idle TCB unlinked, when it was never linked).
 const IDLE_QUEUE: usize = 0;
 
 /// Run queue every fair level shares, above the idle queue and below every RT
@@ -402,19 +404,22 @@ pub struct PerCpuScheduler
     pub lock: crate::sync::Spinlock,
 
     /// Approximate load counter (number of threads linked on this CPU's run
-    /// queues; the running thread is not counted). Relaxed-updated; advisory
-    /// for load balancing. Lives in the
+    /// queues; the running thread is not counted, and the idle thread is
+    /// counted while [`IDLE_QUEUE`] links it, so a CPU that left its idle
+    /// thread for another reads one more than its queued threads). Relaxed-
+    /// updated; advisory for load balancing. Lives in the
     /// scheduler rather than a `MAX_CPUS`-wide global so it scales with the
     /// CPU count. A `u32` cannot overflow: each thread costs at least
     /// `KERNEL_STACK_PAGES + 2` pages, so 2^32 threads would need 96 TiB.
     load: AtomicU32,
 
-    /// The other CPU this CPU found with a queued thread at its previous idle
-    /// balance tick, or [`NO_IDLE_PULL_CANDIDATE`]: the confirmation sample of
-    /// the idle pull (core/kernel/docs/scheduler.md § Load Balancing), which
-    /// pulls a backlog below the imbalance threshold only once it has outlived
-    /// one tick. Written and read only by this CPU's `timer_tick`, so Relaxed
-    /// suffices; atomic only so a shared reference can reach it.
+    /// The other CPU this CPU found with a queued thread other than its idle
+    /// thread at its previous idle balance tick, or [`NO_IDLE_PULL_CANDIDATE`]:
+    /// the confirmation sample of the idle pull
+    /// (core/kernel/docs/scheduler.md § Load Balancing), which pulls a backlog
+    /// below the imbalance threshold only once it has outlived one tick.
+    /// Written and read only by this CPU's `timer_tick`, so Relaxed suffices;
+    /// atomic only so a shared reference can reach it.
     idle_pull_candidate: AtomicUsize,
 
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
@@ -623,7 +628,9 @@ impl PerCpuScheduler
     /// queues are empty.
     ///
     /// Clears the `non_empty` bit if that queue becomes empty.
-    /// Decrements load counter when a non-idle thread is dequeued.
+    /// Decrements the load counter when it dequeues a linked TCB, the idle
+    /// thread included when [`IDLE_QUEUE`] links it; returning the unlinked idle
+    /// TCB leaves the counter as it is.
     ///
     /// Does not gate on `context_saved`, per
     /// `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership
@@ -801,6 +808,16 @@ impl PerCpuScheduler
         self.non_empty.load(Ordering::Relaxed)
     }
 
+    /// Whether a run queue other than [`IDLE_QUEUE`] links a thread: a thread
+    /// other than the idle thread is queued. Lockless and Relaxed, a snapshot
+    /// for the idle pull (`sched::try_pull_idle`), which decides only whether
+    /// to try a pull; the pull itself re-finds a thread under the lock.
+    #[cfg(not(test))]
+    pub fn has_queued_thread(&self) -> bool
+    {
+        self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE) != 0
+    }
+
     /// Remove `tcb` from the run queue of level `priority`. No-op if not found.
     ///
     /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`,
@@ -896,7 +913,8 @@ impl PerCpuScheduler
         self.load.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Get current load (number of runnable threads).
+    /// Get current load (number of threads linked on the run queues, the idle
+    /// thread included while linked; see the `load` field).
     ///
     /// Relaxed ordering is sufficient: load balancing reads are advisory only.
     #[cfg(not(test))]

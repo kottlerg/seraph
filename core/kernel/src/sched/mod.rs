@@ -4791,6 +4791,20 @@ static LOAD_BALANCE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// pull leaves it busy and so cannot start such a trade.
 const LOAD_BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
 
+/// What an idle CPU's scan of the other CPUs found (see [`idle_scan`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct IdleScan
+{
+    /// The most-loaded other CPU and its `current_load`, or `None` when every
+    /// other CPU's is zero.
+    heaviest: Option<(usize, u32)>,
+    /// The most-loaded other CPU with a queued thread other than its idle
+    /// thread, or `None` when no other CPU has one. A busy CPU's `current_load`
+    /// counts its idle thread too, which stays linked on its idle queue while
+    /// the CPU runs another thread, so the load alone does not tell a backlog.
+    backlogged: Option<usize>,
+}
+
 /// What an idle CPU's balance step does, decided by [`idle_pull_step`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IdlePullStep
@@ -4805,28 +4819,33 @@ enum IdlePullStep
 }
 
 /// The idle pull's decision (core/kernel/docs/scheduler.md § Load Balancing)
-/// from the loads an idle CPU read this tick: `heaviest`, the most-loaded other
-/// CPU and its queued load (`None` when every other CPU's queue is empty), and
-/// `candidate`, the CPU this CPU recorded at its previous idle tick and that
-/// CPU's queued load now (`None` when none is recorded).
+/// from what an idle CPU read this tick: `scan`, its scan of the other CPUs,
+/// and `candidate`, the CPU it recorded at its previous idle tick with whether
+/// that CPU still has a queued thread other than its idle thread (`None` when
+/// none is recorded).
 ///
 /// A load above [`LOAD_BALANCE_IMBALANCE_THRESHOLD`] is pulled at once. A
 /// smaller backlog (a thread queued behind a running one, which a running
 /// thread that never blocks or yields would starve for good) is pulled only
-/// once it has outlived one tick: from the candidate, when its queue is still
-/// non-empty; otherwise the heaviest CPU becomes the candidate. A backlog that
-/// clears between two idle ticks is so left to the CPU whose caches hold it.
-fn idle_pull_step(heaviest: Option<(usize, u32)>, candidate: Option<(usize, u32)>) -> IdlePullStep
+/// once it has outlived one tick: from the candidate, when it still has one;
+/// otherwise the most-loaded backlogged CPU becomes the candidate. A backlog
+/// that clears between two idle ticks is so left to the CPU whose caches hold
+/// it.
+fn idle_pull_step(scan: IdleScan, candidate: Option<(usize, bool)>) -> IdlePullStep
 {
-    match (heaviest, candidate)
+    if let Some((cpu, load)) = scan.heaviest
+        && load > LOAD_BALANCE_IMBALANCE_THRESHOLD
     {
-        (None, _) => IdlePullStep::Forget,
-        (Some((cpu, load)), _) if load > LOAD_BALANCE_IMBALANCE_THRESHOLD =>
-        {
-            IdlePullStep::Pull(cpu)
-        }
-        (_, Some((cpu, load))) if load > 0 => IdlePullStep::Pull(cpu),
-        (Some((cpu, _)), _) => IdlePullStep::Remember(cpu),
+        return IdlePullStep::Pull(cpu);
+    }
+    if let Some((cpu, true)) = candidate
+    {
+        return IdlePullStep::Pull(cpu);
+    }
+    match scan.backlogged
+    {
+        Some(cpu) => IdlePullStep::Remember(cpu),
+        None => IdlePullStep::Forget,
     }
 }
 
@@ -4858,6 +4877,51 @@ unsafe fn heaviest_other_cpu(this_cpu: usize, cpu_count: usize) -> Option<(usize
         }
     }
     heaviest
+}
+
+/// Scan every CPU but `this_cpu` for the most-loaded one and the most-loaded
+/// one with a queued thread other than its idle thread: one Relaxed load of
+/// `current_load` per CPU, and one of the run-queue mask per CPU whose load is
+/// non-zero. Ties go to the lowest index.
+///
+/// # Safety
+/// `cpu_count` is `CPU_COUNT` and the scheduler slab is initialised.
+#[cfg(not(test))]
+unsafe fn idle_scan(this_cpu: usize, cpu_count: usize) -> IdleScan
+{
+    let mut scan = IdleScan {
+        heaviest: None,
+        backlogged: None,
+    };
+    let mut max_load = 0u32;
+    let mut max_backlogged_load = 0u32;
+    // needless_range_loop: scheduler_ptr requires raw indexing.
+    #[allow(clippy::needless_range_loop)]
+    for cpu in 0..cpu_count
+    {
+        if cpu == this_cpu
+        {
+            continue;
+        }
+        // SAFETY: cpu < cpu_count; slab initialised (caller's contract).
+        let sched = unsafe { &*scheduler_ptr(cpu) };
+        let load = sched.current_load();
+        if load == 0
+        {
+            continue;
+        }
+        if load > max_load
+        {
+            max_load = load;
+            scan.heaviest = Some((cpu, load));
+        }
+        if load > max_backlogged_load && sched.has_queued_thread()
+        {
+            max_backlogged_load = load;
+            scan.backlogged = Some(cpu);
+        }
+    }
+    scan
 }
 
 /// Per-tick load-balance step of a CPU running a thread other than its idle
@@ -4952,19 +5016,22 @@ unsafe fn try_pull_balance(_this_cpu: usize) {}
 /// architectures re-arm the timer in its interrupt handler, idle or not).
 ///
 /// The idle CPU pulls an unpinned `Ready` thread from another CPU whose queue
-/// holds one, whatever its load, as [`idle_pull_step`] decides: at once above
-/// `LOAD_BALANCE_IMBALANCE_THRESHOLD`, otherwise once the backlog has outlived
-/// one tick. So a thread queued behind a running thread that never blocks or
-/// yields, as a higher-level thread spinning on a lock its holder needs, is not
-/// starved while a CPU idles. The pull stays bounded: only an idle CPU pulls
-/// below the threshold, and a pull leaves it busy, so no two busy CPUs trade
-/// threads; and the candidate is cleared after every attempt, so a backlog of
-/// pinned threads draws at most one futile try-lock attempt per idle CPU every
-/// two ticks.
+/// holds one besides its idle thread, whatever its load, as [`idle_pull_step`]
+/// decides: at once above `LOAD_BALANCE_IMBALANCE_THRESHOLD`, otherwise once
+/// the backlog has outlived one tick. So a thread queued behind a running
+/// thread that never blocks or yields, as a higher-level thread spinning on a
+/// lock its holder needs, is not starved while a CPU idles. The pull stays
+/// bounded: only an idle CPU pulls below the threshold, and a pull leaves it
+/// busy, so no two busy CPUs trade threads; a busy CPU whose queue holds only
+/// its idle thread is never a candidate; and the candidate is cleared after
+/// every attempt, so a backlog of pinned threads draws at most one futile
+/// try-lock attempt per idle CPU every two ticks.
 ///
 /// Hot path cost: the idle scan the threshold rule already made (one Relaxed
-/// load per remote CPU), plus a Relaxed load of the own candidate, one of the
-/// candidate's load, and a store of the candidate when it changes.
+/// load of `current_load` per remote CPU), plus one Relaxed load of the
+/// run-queue mask per remote CPU whose load is non-zero, a Relaxed load of the
+/// own candidate and one of the candidate's run-queue mask, and a store of the
+/// candidate when it changes.
 ///
 /// # Safety
 /// Must be called with no scheduler lock held, from `timer_tick` after the
@@ -4990,16 +5057,16 @@ unsafe fn try_pull_idle(this_cpu: usize)
     }
 
     // SAFETY: cpu_count is CPU_COUNT; slab initialised.
-    let heaviest = unsafe { heaviest_other_cpu(this_cpu, cpu_count) };
+    let scan = unsafe { idle_scan(this_cpu, cpu_count) };
     let candidate = sched
         .idle_pull_candidate()
         .filter(|&cpu| cpu < cpu_count && cpu != this_cpu)
         .map(|cpu| {
             // SAFETY: cpu < cpu_count; slab initialised.
-            (cpu, unsafe { (*scheduler_ptr(cpu)).current_load() })
+            (cpu, unsafe { (*scheduler_ptr(cpu)).has_queued_thread() })
         });
 
-    match idle_pull_step(heaviest, candidate)
+    match idle_pull_step(scan, candidate)
     {
         IdlePullStep::Pull(src) =>
         {
@@ -6928,7 +6995,17 @@ mod class_tests
 #[cfg(test)]
 mod idle_pull_tests
 {
-    use super::{IdlePullStep, LOAD_BALANCE_IMBALANCE_THRESHOLD, idle_pull_step};
+    use super::{IdlePullStep, IdleScan, LOAD_BALANCE_IMBALANCE_THRESHOLD, idle_pull_step};
+
+    /// A scan whose most-loaded CPU is `heaviest` and whose most-loaded CPU with
+    /// a queued thread other than its idle thread is `backlogged`.
+    fn scan(heaviest: Option<(usize, u32)>, backlogged: Option<usize>) -> IdleScan
+    {
+        IdleScan {
+            heaviest,
+            backlogged,
+        }
+    }
 
     // The defect caught: a backlog at or below the threshold left on its CPU
     // for good once confirmed (the starvation of a thread queued behind a
@@ -6937,19 +7014,35 @@ mod idle_pull_tests
     #[test]
     fn a_backlog_below_the_threshold_is_pulled_once_it_has_outlived_one_tick()
     {
+        // A queued thread beside the idle thread: load 2, at the threshold.
+        let backlog = scan(Some((3, 2)), Some(3));
+        assert_eq!(idle_pull_step(backlog, None), IdlePullStep::Remember(3));
         assert_eq!(
-            idle_pull_step(Some((3, 1)), None),
-            IdlePullStep::Remember(3)
-        );
-        assert_eq!(
-            idle_pull_step(Some((3, 1)), Some((3, 1))),
+            idle_pull_step(backlog, Some((3, true))),
             IdlePullStep::Pull(3)
         );
         // The candidate drained but another CPU holds a backlog: that one is
         // sampled afresh rather than pulled unconfirmed.
         assert_eq!(
-            idle_pull_step(Some((5, 1)), Some((3, 0))),
+            idle_pull_step(scan(Some((5, 2)), Some(5)), Some((3, false))),
             IdlePullStep::Remember(5)
+        );
+    }
+
+    // The defect caught: a busy CPU whose queue holds only its idle thread
+    // (load 1) taken for a backlog, so every idle CPU try-locks every busy CPU
+    // every other tick for a pull that finds nothing.
+    #[test]
+    fn a_queue_holding_only_the_idle_thread_is_no_backlog()
+    {
+        assert_eq!(
+            idle_pull_step(scan(Some((2, 1)), None), None),
+            IdlePullStep::Forget
+        );
+        // The scan names the backlogged CPU, not the most-loaded one.
+        assert_eq!(
+            idle_pull_step(scan(Some((2, 2)), Some(4)), None),
+            IdlePullStep::Remember(4)
         );
     }
 
@@ -6961,16 +7054,12 @@ mod idle_pull_tests
     {
         let heavy = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
         assert_eq!(
-            idle_pull_step(Some((2, heavy)), None),
+            idle_pull_step(scan(Some((2, heavy)), Some(2)), None),
             IdlePullStep::Pull(2)
         );
         assert_eq!(
-            idle_pull_step(Some((2, heavy)), Some((4, 1))),
+            idle_pull_step(scan(Some((2, heavy)), Some(2)), Some((4, true))),
             IdlePullStep::Pull(2)
-        );
-        assert_eq!(
-            idle_pull_step(Some((2, LOAD_BALANCE_IMBALANCE_THRESHOLD)), None),
-            IdlePullStep::Remember(2)
         );
     }
 
@@ -6980,8 +7069,11 @@ mod idle_pull_tests
     #[test]
     fn no_queued_thread_anywhere_clears_the_candidate()
     {
-        assert_eq!(idle_pull_step(None, Some((3, 0))), IdlePullStep::Forget);
-        assert_eq!(idle_pull_step(None, None), IdlePullStep::Forget);
+        assert_eq!(
+            idle_pull_step(scan(None, None), Some((3, false))),
+            IdlePullStep::Forget
+        );
+        assert_eq!(idle_pull_step(scan(None, None), None), IdlePullStep::Forget);
     }
 }
 

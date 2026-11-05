@@ -145,6 +145,7 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("cap_info::memory_fields", cap_info::memory_fields(ctx));
     run_test!("cap_info::memory_mappings", cap_info::memory_mappings(ctx));
+    run_test!("cap_info::sole_reference", cap_info::sole_reference(ctx));
     run_test!(
         "cap_info::memory_caps_carry_retype_right",
         cap_info::memory_caps_carry_retype_right(ctx)

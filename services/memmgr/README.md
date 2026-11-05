@@ -58,8 +58,9 @@ Allocation Contract").
   for it; see [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's memory caps into the free pool, holding a frame
-  another process can still reach (a live kernel object retyped from it, or a
-  mapping of it) on a deferred list until it is unreachable (see
+  another process can still reach (a capability to it, a live kernel object
+  retyped from it, or a mapping of it) on a deferred list until it is
+  unreachable (see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Reclamation"); procmgr holds
   it back for a DMA-capable driver until devmgr has confirmed the driver's
   device stopped its DMA (see [`docs/ipc-interface.md`](docs/ipc-interface.md)

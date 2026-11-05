@@ -388,6 +388,25 @@ pub const CAP_INFO_MEMORY_MAPPINGS: u64 = 12;
 /// A batch size: a larger region is read in more queries.
 pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
 
+/// Universal field — `1` if the queried slot is the only reference to the
+/// object it names, otherwise `0`.
+///
+/// "Only reference" counts every capability slot naming the object, in every
+/// `CSpace`, and every kernel-internal reference to it (a retype lease of an
+/// object retyped from a Memory object, a page-pool donation, a wait-set
+/// membership, a fault-handler or death-observer binding, a syscall in flight
+/// on it). The inquiry's own pin on the object is not counted. Derivations of
+/// a Memory capability name one object, so a Memory cap with a live
+/// derivation, a live retyped object, or a donation is never sole; a split
+/// child or a range-capability copy is an object of its own.
+///
+/// Once `1`, the answer stays `1` until the caller itself derives, copies, or
+/// retypes from the slot: no other process holds a capability through which
+/// to add a reference. A user mapping is not a reference; read it with
+/// [`CAP_INFO_MEMORY_MAPPINGS`]. Used by memmgr before it returns a reclaimed
+/// frame to its pool (services/memmgr/docs/memory-pool.md § Reclamation).
+pub const CAP_INFO_SOLE_REFERENCE: u64 = 13;
+
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
 // Userspace constants matching the kernel `CapTag` enum, for callers that

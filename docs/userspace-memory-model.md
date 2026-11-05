@@ -381,8 +381,9 @@ memmgr serves frame requests over IPC. The contract:
 - **Caller releases.** `RELEASE_MEMORY_CAPS` returns a granted region to the
   pool mid-life, named by the `phys_base` memmgr reported at grant (the caller
   need not still hold the cap — it may have retyped the region, deleted the
-  objects, and dropped its copy; a region released with a live object or a
-  mapping is held out of the pool until both are gone). This keeps a
+  objects, and dropped its copy; a region released while a capability to
+  it, a live object, or a mapping remains is held out of the pool until all
+  are gone). This keeps a
   per-unit-of-work retype loop (e.g. ruststd's Thread slab per spawn) at a
   bounded pool footprint; ruststd's pooled object-slab
   pages likewise recycle auto-reclaimed bytes in place and release a retired

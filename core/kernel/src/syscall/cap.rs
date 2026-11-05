@@ -2764,8 +2764,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
         CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
         CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
-        CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED,
-        CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+        CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
+        CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED,
+        THREAD_STATE_EXITED,
     };
 
     use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, MemoryObject, ThreadObject};
@@ -2816,6 +2817,19 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // the rights bitmask in the low 32 bits with no overlap.
             let packed = (u64::from(tag as u8) << 32) | u64::from(rights.0);
             Ok(packed)
+        }
+        CAP_INFO_SOLE_REFERENCE =>
+        {
+            // The object's count holds one reference for the queried slot and
+            // one for this inquiry's pin (`pin_slot` above); any further
+            // reference is another slot or a kernel-internal owner
+            // (core/kernel/docs/capability-internals.md § Kernel Object
+            // Reference Counting). The pin keeps the count from reaching 0
+            // while it is read.
+            let header = slot.object.ok_or(SyscallError::InvalidCapability)?;
+            // SAFETY: `header` is the object the pin holds live.
+            let count = unsafe { header.as_ref() }.ref_count.load(Ordering::Acquire);
+            Ok(u64::from(count == 2))
         }
         CAP_INFO_TLB_ELIDED =>
         {

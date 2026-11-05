@@ -504,8 +504,9 @@ The death-notification flow:
    § Label 3).
 3. **Memmgr reclaims.** Memmgr walks the per-process frame list and
    inserts each Memory cap back into its free pool, except a frame another
-   process can still reach (a kernel object retyped from it that another
-   process still references, or another address space's mapping of it),
+   process can still reach (a capability to it, a kernel object retyped
+   from it that another process still references, or another address space's
+   mapping of it),
    which waits on memmgr's deferred list until a later recheck finds it
    unreachable (see
    [`memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md#reclamation)

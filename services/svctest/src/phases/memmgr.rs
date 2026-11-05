@@ -56,6 +56,10 @@ pub fn phases() -> &'static [Phase]
             name: "frame_reclaim_mapped_release",
             run: frame_reclaim_mapped_release_phase,
         },
+        Phase {
+            name: "frame_reclaim_held_cap_release",
+            run: frame_reclaim_held_cap_release_phase,
+        },
     ]
 }
 
@@ -973,5 +977,54 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     std::os::seraph::log!(
         "frame_reclaim_mapped_release: mapped released page held ({baseline} -> {held} deferred \
          bytes), then pooled once unmapped"
+    );
+}
+
+/// A released frame that another capability still names stays out of
+/// memmgr's free pool, and joins it once that capability goes
+/// (services/memmgr/docs/memory-pool.md § Reclamation). svctest derives a
+/// second, never-mapped cap from a one-page grant, deletes the grant and
+/// releases the page: the page must be on memmgr's deferred list and none of
+/// the next one-page grants may be that page, and it must leave the deferred
+/// list at the first recheck after svctest deletes the derived cap.
+pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
+{
+    /// One-page grants drawn while the released page is held.
+    const DRAWS: usize = 4;
+
+    let (grant, phys_base) = request_one_page();
+    let kept = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP_RW)
+        .expect("frame_reclaim_held_cap_release: cap_derive of the grant failed");
+    let baseline = settled_deferred_bytes();
+    // `release_one_page` deletes the grant itself; the derived cap stays.
+    release_one_page(grant, phys_base);
+    let held = deferred_bytes();
+    assert!(
+        held >= baseline + syscall_abi::PAGE_SIZE,
+        "frame_reclaim_held_cap_release: a released page another cap still names was pooled \
+         (deferred {baseline} -> {held} bytes)"
+    );
+
+    let draws: Vec<(u64, u64)> = (0..DRAWS).map(|_| request_one_page()).collect();
+    for &(_, phys) in &draws
+    {
+        assert_ne!(
+            phys, phys_base,
+            "frame_reclaim_held_cap_release: memmgr granted a released page a live cap still names"
+        );
+    }
+    for (cap, phys) in draws
+    {
+        release_one_page(cap, phys);
+    }
+
+    syscall::cap_delete(kept).expect("frame_reclaim_held_cap_release: cap_delete of the kept cap");
+    await_deferred_at_most(
+        held - syscall_abi::PAGE_SIZE,
+        "frame_reclaim_held_cap_release: released page after its last other cap went",
+    );
+    std::os::seraph::log!(
+        "frame_reclaim_held_cap_release: released page held by a live cap ({baseline} -> {held} \
+         deferred bytes), then pooled once the cap went"
     );
 }

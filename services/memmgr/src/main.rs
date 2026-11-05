@@ -374,12 +374,15 @@ const DEFERRED_RECHECK_BATCH: u64 = 64;
 const DEFERRED_RECHECK_WINDOWS: u64 = 256;
 
 /// Whether no process but memmgr can still reach the frame `run` names
-/// through a kernel object or a user mapping
+/// through a capability, a kernel object, or a user mapping
 /// (services/memmgr/docs/memory-pool.md § Reclamation): memmgr's retained
-/// cap still covers every page it granted, no byte of the region is retyped
-/// (`available_bytes == size`), and no address space maps any page of it. A
-/// query that fails answers no, so the run waits rather than joining the
-/// pool.
+/// cap is the only reference to its Memory object (no other capability to
+/// it, no retype lease, no donation), still covers every page memmgr granted,
+/// has no byte retyped (`available_bytes == size`), and no address space maps
+/// any page of it. The sole-reference answer is read first: once true it stays
+/// true, since no one else holds a capability through which to add a
+/// reference or a mapping, so the later reads cannot be raced. A query that
+/// fails answers no, so the run waits rather than joining the pool.
 fn quiescent(run: &FreeRun) -> bool
 {
     let Some(bytes) = run.page_count.checked_mul(PAGE_SIZE)
@@ -387,7 +390,8 @@ fn quiescent(run: &FreeRun) -> bool
     {
         return false;
     };
-    syscall::cap_info(run.cap_slot, syscall::CAP_INFO_MEMORY_SIZE) == Ok(bytes)
+    syscall::cap_info(run.cap_slot, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
+        && syscall::cap_info(run.cap_slot, syscall::CAP_INFO_MEMORY_SIZE) == Ok(bytes)
         && syscall::cap_info(run.cap_slot, syscall::CAP_INFO_MEMORY_AVAILABLE) == Ok(bytes)
         && unmapped(run.cap_slot, run.page_count)
 }
@@ -1147,8 +1151,9 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // deleted the child's CSpace and AddressSpace, so every kernel object the
     // child alone referenced has been freed (auto-reclaim credits its bytes
     // back to the `MemoryObject` memmgr's outer cap shares) and the child's
-    // mappings are gone. An object another process still references, or a
-    // mapping another address space holds, outlives the child: `quiescent`
+    // mappings are gone. An object another process still references, a
+    // capability to the frame another process holds, or a mapping another
+    // address space holds, outlives the child: `quiescent`
     // checks each frame, and `remove_process` pools the frames it accepts and
     // parks the rest on the deferred list (services/memmgr/docs/memory-pool.md
     // § Reclamation). Each descriptor slot becomes the run's slot, so neither

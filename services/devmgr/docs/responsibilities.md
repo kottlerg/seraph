@@ -153,9 +153,12 @@ devmgr's responsibilities are:
      quarantined on the dead driver's memmgr record, counted and never handed
      out again, for the rest of the boot. The hold covers the driver's own
      memory only: the frames a client lends a virtio-blk driver for a transfer
-     are on the client's memmgr record, which no hold covers, so they return to
-     the pool when the client releases them or dies, whatever the device's
-     state ([#749](https://github.com/kottlerg/seraph/issues/749)). A status
+     are on the client's memmgr record, which no hold covers. memmgr keeps them
+     out of the pool while the driver or devmgr's DMA mapping still holds a
+     capability to them, but devmgr deletes its own at the withdrawal and the
+     driver's go with its `CSpace`, so they can return to the pool before the
+     device is confirmed stopped
+     ([#749](https://github.com/kottlerg/seraph/issues/749)). A status
      byte past the span its BAR cap was carved to is not written, and a BAR
      copy whose revocation fails leaves the driver its mapping; either counts
      as an unconfirmed reset.

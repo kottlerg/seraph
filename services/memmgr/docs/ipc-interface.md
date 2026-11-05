@@ -437,10 +437,13 @@ ignore them.
 ### Label 7: `REGISTER_REGION`
 
 A demand-paged process registers an anonymous region it has reserved (but
-not backed). A later page fault inside the region is backed on demand by
-the fault arm below; a fault outside every registered region is declined
-(the thread is killed), preserving segfault semantics. Privilege:
-universal — attributed to the caller by `recv.badge`.
+not backed). A later page fault inside the region that its protection permits
+is backed on demand by the fault arm below; a fault outside every registered
+region, or one its protection refuses, is declined, preserving segfault
+semantics: a user-mode access kills the thread, and a restartable syscall's
+kernel copy fails its syscall with `InvalidAddress`
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Kernel Copies).
+Privilege: universal — attributed to the caller by `recv.badge`.
 
 **Request:**
 
@@ -542,18 +545,23 @@ the runtime bind the process's own badged memmgr cap, so this is the process's
 memmgr badge), and data words `[kind, faulting_va, access, ip]`
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
-process with a delegated address space, memmgr backs the contiguous chunk of
-the region containing the page — one Memory cap mapped across up to
-`DEMAND_CHUNK_PAGES` pages — with the region's protection, and replies
-`FAULT_REPLY_RESUME` to retry the access. Backing a chunk rather than a single
-page keeps cap-slot consumption to one cap per chunk, so a deep demand stack
-cannot exhaust memmgr's CSpace; stacks grow contiguously, so a chunk's pages are
-consumed as the stack descends. Every other case — non-VM fault, unknown
-process, address outside every region, no delegated AS, or any allocation/map
-failure — replies `FAULT_REPLY_KILL`. Demand chunks are tracked exactly like
-`REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED` / `UNREGISTER_REGION`
-reclaim them and the all-RAM-accounted identity is unaffected (the pages move
-from a free run to the process record; they were already owned).
+process with a delegated address space, and whose `access` the region's
+protection grants, memmgr backs the contiguous chunk of the region containing
+the page — one Memory cap mapped across up to `DEMAND_CHUNK_PAGES` pages —
+with the region's protection, and replies `FAULT_REPLY_RESUME` to retry the
+access; a fault on a page an earlier chunk already backed (another thread's
+fault on the same chunk, delivered before the mapping) is resumed without
+backing. Backing a chunk rather than a single page keeps cap-slot consumption
+to one cap per chunk, so a deep demand stack cannot exhaust memmgr's CSpace;
+stacks grow contiguously, so a chunk's pages are consumed as the stack
+descends. Every other case — non-VM fault, unknown process, address outside
+every region, a write to a region without `MAP_WRITABLE` or an instruction
+fetch from one without `MAP_EXECUTABLE` (which no backing satisfies), no
+delegated AS, or any allocation/map failure — replies `FAULT_REPLY_KILL`.
+Demand chunks are tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so
+`PROCESS_DIED` / `UNREGISTER_REGION` reclaim them and the all-RAM-accounted
+identity is unaffected (the pages move from a free run to the process record;
+they were already owned).
 
 ---
 

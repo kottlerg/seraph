@@ -275,6 +275,13 @@ impl Thread {
             free_stack(stack);
             return Err(io::Error::other("seraph: ipc buffer allocation failed"));
         }
+        // The kernel's IPC-buffer copies fail on an unbacked page instead of
+        // faulting to the pager, and in a demand-paged process this heap page
+        // may not be backed yet: touch it so the pager backs it now
+        // (core/kernel/docs/syscalls.md § `SYS_IPC_BUFFER_SET`).
+        // SAFETY: `ipc_buf_base` is a fresh, page-aligned, page-sized
+        // allocation this function owns; nothing else references it.
+        unsafe { core::ptr::write_volatile(ipc_buf_base, 0) };
 
         // Allocate + populate the TLS block. Processes without a PT_TLS
         // segment have `tls_template_memsz == 0` and skip allocation —

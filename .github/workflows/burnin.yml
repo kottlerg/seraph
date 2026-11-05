@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/workflows/burnin.yml
+
+# The burn-in tier: each canonical boot repeated, on a tag push or a manual
+# dispatch (docs/testing.md § Coverage tiers).
+
 name: burn-in
 
 on:

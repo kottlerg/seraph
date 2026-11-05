@@ -38,7 +38,7 @@ use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 
 use crate::bootstrap::Units;
 use crate::faults::{Fault, FaultQueue};
-use crate::{Backend, BackendError};
+use crate::{Access, Backend, BackendError};
 
 /// Domains one driver holds at once, over all its units: one per PCI
 /// function devmgr attaches, which it does once per function per boot.
@@ -418,15 +418,19 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return Err(invalid);
         }
-        let write = access & ACCESS_DEVICE_WRITE != 0;
-        let mem = self.caps.memory(cap).ok_or(invalid)?;
-        let needed = if write
+        let access = if access & ACCESS_DEVICE_WRITE != 0
         {
-            RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE
+            Access::ReadWrite
         }
         else
         {
-            RIGHTS_MEM_MAP
+            Access::Read
+        };
+        let mem = self.caps.memory(cap).ok_or(invalid)?;
+        let needed = match access
+        {
+            Access::ReadWrite => RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE,
+            Access::Read => RIGHTS_MEM_MAP,
         };
         let unit = self.domains[index].unit;
         let width = self.backend.query(unit).width_bits;
@@ -457,7 +461,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
             iova,
             mem.phys,
             mem.len,
-            write,
+            access,
         );
         mapped.map_err(|e| self.backend_failure(unit, e))?;
         self.domains[index].ranges.push(Range {
@@ -638,7 +642,7 @@ mod tests
     struct FakeDomain
     {
         did: u32,
-        ranges: Vec<(u64, u64, u64, bool)>,
+        ranges: Vec<(u64, u64, u64, Access)>,
     }
 
     impl Fake
@@ -685,11 +689,11 @@ mod tests
             iova: u64,
             phys: u64,
             len: u64,
-            write: bool,
+            access: Access,
         ) -> Result<(), BackendError>
         {
             self.fail()?;
-            d.ranges.push((iova, phys, len, write));
+            d.ranges.push((iova, phys, len, access));
             Ok(())
         }
 
@@ -887,7 +891,7 @@ mod tests
         assert_eq!(map(&mut s, d, 0x10_0000, RW, 3), iommu_errors::SUCCESS);
         assert_eq!(
             s.domains[0].domain.ranges,
-            [(0x10_0000, 3 << 20, 2 * PAGE_SIZE, true)]
+            [(0x10_0000, 3 << 20, 2 * PAGE_SIZE, Access::ReadWrite)]
         );
         assert!(deleted(&s).is_empty());
         let unmap = req(iommu_labels::UNMAP, &[d, 0x10_0000], &[]);
@@ -935,6 +939,21 @@ mod tests
         assert!(s.domains[0].domain.ranges.is_empty());
         assert_eq!(deleted(&s), [3, 3, 3, 3, 3, 9, 13]);
         assert_eq!(map(&mut s, d, 0x10_0000, ACCESS_DEVICE_READ, 9), 0);
+    }
+
+    #[test]
+    fn a_read_only_map_reaches_the_backend_read_only()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(
+            map(&mut s, d, 0x10_0000, ACCESS_DEVICE_READ, 3),
+            iommu_errors::SUCCESS
+        );
+        assert_eq!(
+            s.domains[0].domain.ranges,
+            [(0x10_0000, 3 << 20, 2 * PAGE_SIZE, Access::Read)]
+        );
     }
 
     #[test]

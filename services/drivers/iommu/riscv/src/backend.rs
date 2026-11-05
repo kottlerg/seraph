@@ -29,12 +29,12 @@
 use std::time::{Duration, Instant};
 
 use iommu_core::table::TableStore;
-use iommu_core::{Backend, BackendError, Fault, UnitInfo};
+use iommu_core::{Access, Backend, BackendError, Fault, UnitInfo};
 use iommu_riscv::regs::{
     self, COMMAND_WORDS, CQ_ENTRIES, Capability, Command, DdtMode, Directory, FAULT_RECORD_WORDS,
     FQ_ENTRIES, Fence, FirstStageMode, Translations,
 };
-use iommu_riscv::tables::{Access, DeviceDirectory, FirstStage, PAGE, TableError, device_context};
+use iommu_riscv::tables::{DeviceDirectory, FirstStage, PAGE, TableError, device_context};
 use iommu_store::Store;
 
 /// How long an IOMMU may take to complete one command batch, a mode change
@@ -436,17 +436,9 @@ impl Backend for Riscv
         iova: u64,
         phys: u64,
         len: u64,
-        write: bool,
+        access: Access,
     ) -> Result<(), BackendError>
     {
-        let access = if write
-        {
-            Access::ReadWrite
-        }
-        else
-        {
-            Access::Read
-        };
         let mapped = domain.tables.map(&mut self.store, iova, phys, len, access);
         // A new valid entry needs no invalidation, since the IOMMU caches no
         // invalid one; a map that failed part-way undid the entries it wrote,

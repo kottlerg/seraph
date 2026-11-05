@@ -835,7 +835,7 @@ fn resync_deaths(
     recent: &mut process::RecentExits,
 )
 {
-    let mut exited: Vec<(u64, u64)> = Vec::new();
+    let mut dead: Vec<(u64, u64)> = Vec::new();
     let mut short = false;
     table.for_each(|entry| {
         let main_thread =
@@ -854,9 +854,9 @@ fn resync_deaths(
         {
             return;
         };
-        if exited.try_reserve(1).is_ok()
+        if dead.try_reserve(1).is_ok()
         {
-            exited.push((entry.badge(), exit_reason));
+            dead.push((entry.badge(), exit_reason));
         }
         else
         {
@@ -865,9 +865,9 @@ fn resync_deaths(
     });
     if short
     {
-        std::os::seraph::log!("death resync could not list every exited process");
+        std::os::seraph::log!("death resync could not list every dead process");
     }
-    for (badge, exit_reason) in exited
+    for (badge, exit_reason) in dead
     {
         if let Some(entry) = table.take_by_badge(badge)
         {

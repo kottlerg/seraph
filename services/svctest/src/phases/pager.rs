@@ -36,6 +36,10 @@
 //! is the refusal's cause (docs/fault-handling.md § Security). The fault badge
 //! is therefore always the derivation badge of a cap the binder holds, and a
 //! process holding only its own memmgr cap cannot back another's region.
+//!
+//! A fifth phase, **refused access**, shows memmgr declines a fault whose
+//! access the region's protection refuses, whether or not the page is backed:
+//! no backing satisfies such an access, so a resume would fault again forever.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
@@ -62,7 +66,77 @@ pub fn phases() -> &'static [Phase]
             name: "pager_forged_badge_refused",
             run: pager_forged_badge_phase,
         },
+        Phase {
+            name: "pager_refused_access_declined",
+            run: pager_refused_access_phase,
+        },
     ]
+}
+
+/// Send memmgr, on this process's own memmgr cap, the fault message the
+/// kernel would for an access to `va` (memmgr attributes a fault by the
+/// cap's badge, docs/fault-handling.md § Security), and return its reply
+/// label: `FAULT_REPLY_RESUME` or `FAULT_REPLY_KILL`.
+fn forged_vm_fault(va: u64, access: u64) -> u64
+{
+    let info = startup_info();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = ipc::IpcMessage::builder(syscall_abi::FAULT_LABEL)
+        .word(0, syscall_abi::FAULT_KIND_VM)
+        .word(1, va)
+        .word(2, access)
+        .word(3, 0)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
+        .expect("refused_access: forged fault ipc_call failed")
+        .label
+}
+
+/// An instruction fetch from a read-write demand region is declined before
+/// the page is backed and after: a read of the same page is backed and
+/// resumed between the two. memmgr once resumed a fault on a backed page
+/// whatever its access, so a write to a backed read-only page looped.
+fn pager_refused_access_phase(_: &Caps)
+{
+    use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_READ, FAULT_REPLY_KILL, FAULT_REPLY_RESUME};
+
+    let range = std::os::seraph::register_demand_paged(1).expect("refused_access: register");
+    let va = range.va_start();
+    assert_eq!(
+        forged_vm_fault(va, FAULT_ACCESS_EXEC),
+        FAULT_REPLY_KILL,
+        "refused_access: a fetch from an unbacked read-write page was not declined"
+    );
+    assert_eq!(
+        forged_vm_fault(va, FAULT_ACCESS_READ),
+        FAULT_REPLY_RESUME,
+        "refused_access: a read of a read-write page was not backed"
+    );
+    assert_eq!(
+        forged_vm_fault(va, FAULT_ACCESS_EXEC),
+        FAULT_REPLY_KILL,
+        "refused_access: a fetch from a backed read-write page was not declined"
+    );
+
+    // UNREGISTER_REGION unmaps the backed page and returns its frames.
+    let info = startup_info();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::UNREGISTER_REGION)
+        .word(0, va)
+        .word(1, syscall_abi::PAGE_SIZE)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
+        .expect("refused_access: UNREGISTER_REGION ipc_call failed");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "refused_access: UNREGISTER_REGION status"
+    );
+    std::os::seraph::unreserve_pages(range);
+    assert_ram_identity();
+    std::os::seraph::log!("pager_refused_access_declined phase passed");
 }
 
 /// Bind this thread to its pager cap with a forged badge word, then with the

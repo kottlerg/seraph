@@ -8,12 +8,12 @@ codes) is specified in
 this document covers the labels that remain fs-driver-specific:
 
 - `FS_MOUNT` — vfsd-to-driver BPB-validation probe at mount time.
-- `FS_OPEN` — mint a per-open cap on a file node cap.
+- `FS_OPEN` — mint a per-open cap and its liveness cap on a file node cap.
 - `FS_READ` — inline read on a file node cap or open cap.
 - `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` / `FS_RELEASE_ACK` — memory-cap
   read protocol with cooperative release, per open.
-- `FS_CLOSE` — release an open's driver-side bookkeeping; the holder
-  still `cap_delete`s its open cap to drop the kernel reference.
+- `FS_CLOSE` — release an open's driver-side bookkeeping and revoke its
+  liveness cap; the holder still `cap_delete`s its open cap.
 - `FS_WRITE` / `FS_WRITE_MEMORY` — inline and memory-cap writes on a
   file node cap or open cap.
 - `FS_CREATE` / `FS_MKDIR` — create a file or an empty directory in a
@@ -107,9 +107,10 @@ cap names and replies with an **open cap**: a badged SEND on its endpoint
 whose badge carries an open id in bits 0..40, the node cap's rights in bits
 40..64, and the `OPEN_INSTANCE` kind bit (48)
 ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
-§ Badge shape). Every open is distinct: two opens of one file, by one
-client or two, are two opens, each with its own outstanding pages and
-release endpoint.
+§ Badge shape), and with a **liveness cap**, which keeps the open alive
+(§ Lifetime and bounds below). Every open is distinct: two opens of one file,
+by one client or two, are two opens, each with its own outstanding pages,
+release endpoint, and liveness cap.
 
 **Request**
 
@@ -130,6 +131,7 @@ eviction then revokes the open's pages without the round trip.
 |---|---|
 | `label` | `0` |
 | `caps[0]` | Open cap (`SEND_GRANT`, the node cap's rights) |
+| `caps[1]` | Liveness cap (a Notification cap with no rights) |
 
 [`FS_READ_MEMORY`](#label-7-fs_read_memory),
 [`FS_RELEASE_MEMORY`](#client-to-driver-release), and
@@ -142,28 +144,58 @@ open cap, with the rights its badge carries.
 **Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (the badge
 names no node, or a directory, or is an open cap), `PERMISSION_DENIED` (the
 badge carries no rights), `TOO_MANY_OPEN` (the open table is full, or the
-heap or the driver's `CSpace` cannot grow), `IO_ERROR` (the driver could not
-mint the cap). Every refusal deletes the carried SEND.
+heap or the driver's `CSpace` cannot grow, or the driver cannot create the
+open's liveness object), `IO_ERROR` (the driver could not mint the cap).
+Every refusal deletes the carried SEND.
 
-**Lifetime and bounds.** An open lives until its `FS_CLOSE`, or until an
+**Lifetime and bounds.** An open lives until its `FS_CLOSE`, until an
 [`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
-frees its node, which releases every open of the node. Its id is
-generation-checked (a 24-bit index and a 16-bit generation, retired at
-wrap), so an open cap kept past its open's end is answered
-`INVALID_BADGE`, never with another open's state. The driver holds at most
-2^24 - 1 live opens and answers `TOO_MANY_OPEN` past that. No per-client
-bound is enforceable: the driver has no client identity, and an open cap
-can be delegated. The driver cannot observe a client's death or a
-`cap_delete` of an open cap. The std client sends `FS_CLOSE` for every open
-`File` when its process exits normally, through `main` returning or
-`std::process::exit` ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md)
-§ Process Entry and `StartupInfo`); a crash or a kill sends none. An open
-whose client dies without `FS_CLOSE` keeps its record and release SEND until
-its node is freed; its pages are still reclaimed by eviction. Reclaiming
-such opens is tracked in [#742](https://github.com/kottlerg/seraph/issues/742).
-The SEND keeps the client's release endpoint alive past the client's death,
-so memmgr holds the frame the endpoint lives in out of its pool until the
-SEND goes ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#reclamation)
+frees its node, which releases every open of the node, or until no copy of
+its liveness cap is left outside the driver. Its id is generation-checked (a
+24-bit index and a 16-bit generation, retired at wrap), so an open cap kept
+past its open's end is answered `INVALID_BADGE`, never with another open's
+state. The driver holds at most 2^24 - 1 live opens and answers
+`TOO_MANY_OPEN` past that. No per-client bound is enforceable: the driver
+has no client identity, and an open cap can be delegated.
+
+**Liveness cap.** For each open the driver retypes one Notification from its
+own memory, so the driver funds the object, keeps a capability to it, and
+hands the client a derivation of that capability with no rights, which can
+neither signal nor wait. The open lives while any copy of the liveness cap
+lives outside the driver. The holder keeps it for the open's life and deletes
+it after the open's `FS_CLOSE`; a client that dies takes its copy with its
+`CSpace`. Releasing an open, by `FS_CLOSE`, by its node's removal, or by the
+sweep below, revokes every copy of the liveness cap and frees the object, so
+a copy dies exactly when the open does, and no copy keeps the driver's memory
+past it. A delegated open cap alone does not keep the open alive: a holder
+other than the client keeps it alive only by also holding a copy of the
+liveness cap, which the delegator hands over beside the open cap (a copy or
+an IPC transfer; each is a derivation the release revokes).
+
+The driver finds the opens whose client is gone by asking the kernel whether
+its own capability is the only reference left to the open's Notification
+(`SYS_CAP_INFO` `CAP_INFO_SOLE_REFERENCE`,
+[core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md#sys_cap_info-36)
+§ `SYS_CAP_INFO`); once it is, it stays so, since only the driver holds a
+capability through which to add a reference. A **sweep** reads every open so
+and releases each one whose client is gone as `FS_CLOSE` would: its
+outstanding pages, its release SEND, and its record. The driver sweeps on
+`FS_OPEN` once the opens made since its last sweep reach the larger of 64 and
+the live opens that sweep left, so a sweep costs at most two inquiries per
+open made and the table holds at most twice that interval of opens, live and
+dead, between sweeps; it sweeps again, and retries once, when an `FS_OPEN`
+finds the open table full or its `CSpace` unable to grow. An `FS_OPEN` whose
+reply cannot reach the client (it died mid-call, or its `CSpace` cannot take
+the reply's two caps) moves no cap, and the driver releases that open at once.
+
+The std client sends `FS_CLOSE` for every open `File` when its process exits
+normally, through `main` returning or `std::process::exit`
+([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Process
+Entry and `StartupInfo`); a crash or a kill sends none, and the open goes at
+the next sweep after the process's `CSpace` does. Until then its release SEND
+keeps the client's release endpoint alive past the client's death, so memmgr
+holds the frame the endpoint lives in out of its pool until the SEND goes
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#reclamation)
 § Reclamation).
 
 ---
@@ -456,14 +488,16 @@ reply, or after the window with none, per
 
 End the open the open cap names: the driver revokes that open's
 outstanding [`FS_READ_MEMORY`](#label-7-fs_read_memory) pages, deletes its
-recorded release endpoint, and retires its id, so the open cap answers
+recorded release endpoint, revokes every copy of its liveness cap
+([§ Label 18](#label-18-fs_open)), and retires its id, so the open cap answers
 `INVALID_BADGE` from then on. Other opens of the file, by this client or
 another, keep their pages. The node itself is not freed: every holder of
 the entry shares it, so it lives until
 [`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
 unlinks the entry, and the node cap the open was made from still reaches
-its file. The kernel-side cap is **not** freed here — the holder still
-`cap_delete`s its open cap to drop the kernel reference.
+its file. The open cap is **not** freed here — the holder still
+`cap_delete`s its open cap to free its slot, and deletes its liveness cap,
+which the close revoked.
 
 **Request**
 

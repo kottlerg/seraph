@@ -15,6 +15,9 @@
 //! `FS_CLOSE` names no open, never the open that later reuses the index. An
 //! index whose generation would wrap is retired instead of reused. The table
 //! grows on the heap with the live entries, every growth fallible.
+//!
+//! [`SweepSchedule`] decides when `fatfs` sweeps the table for opens whose
+//! client is gone (fs-driver-protocol.md § Label 18).
 
 use alloc::vec::Vec;
 
@@ -200,10 +203,93 @@ impl<T> OpenSlab<T>
     }
 }
 
+/// Fewest opens between two sweeps of the open table for opens whose client
+/// is gone. It bounds no capacity: past it the interval follows the opens a
+/// sweep leaves live ([`SweepSchedule`]). Below that it sets what a small
+/// table holds dead before a sweep, at most twice it: 128 records, each with
+/// two `CSpace` slots and a Notification, about 40 KiB in fatfs, against one
+/// sweep's lock hold per 64 opens.
+pub const SWEEP_FLOOR: usize = 64;
+
+/// When the next sweep of the open table falls due: once the opens made since
+/// the last sweep reach the larger of [`SWEEP_FLOOR`] and the live opens that
+/// sweep left. A sweep reads every live open once: at most the opens the last
+/// sweep left plus those made since, each count at most the interval, so a
+/// sweep costs at most two reads per open made since the last, and the table
+/// holds at most twice the interval, live and dead, until the next sweep.
+pub struct SweepSchedule
+{
+    /// Opens made since the last sweep.
+    since: usize,
+    /// Opens after which the next sweep is due.
+    interval: usize,
+}
+
+impl Default for SweepSchedule
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
+impl SweepSchedule
+{
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            since: 0,
+            interval: SWEEP_FLOOR,
+        }
+    }
+
+    /// Count one open; `true` when a sweep is due before it is recorded.
+    pub fn note_open(&mut self) -> bool
+    {
+        self.since = self.since.saturating_add(1);
+        self.since >= self.interval
+    }
+
+    /// Record a sweep that left `live` opens: the next falls due after the
+    /// larger of [`SWEEP_FLOOR`] and `live` further opens.
+    pub fn swept(&mut self, live: usize)
+    {
+        self.since = 0;
+        self.interval = live.max(SWEEP_FLOOR);
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    /// Opens counted until `schedule` reports a sweep due, at most `bound`.
+    fn opens_until_due(schedule: &mut SweepSchedule, bound: usize) -> Option<usize>
+    {
+        (1..=bound).find(|_| schedule.note_open())
+    }
+
+    #[test]
+    fn a_sweep_falls_due_after_the_floor_while_few_opens_live()
+    {
+        let mut schedule = SweepSchedule::new();
+        assert_eq!(opens_until_due(&mut schedule, 1000), Some(SWEEP_FLOOR));
+        schedule.swept(3);
+        assert_eq!(opens_until_due(&mut schedule, 1000), Some(SWEEP_FLOOR));
+    }
+
+    #[test]
+    fn a_sweep_that_leaves_many_live_opens_waits_for_as_many_more()
+    {
+        let mut schedule = SweepSchedule::new();
+        schedule.swept(SWEEP_FLOOR * 5);
+        assert_eq!(
+            opens_until_due(&mut schedule, SWEEP_FLOOR * 10),
+            Some(SWEEP_FLOOR * 5)
+        );
+    }
 
     #[test]
     fn two_inserts_of_equal_values_get_distinct_identifiers()

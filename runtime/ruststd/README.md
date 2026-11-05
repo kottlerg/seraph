@@ -74,10 +74,11 @@ closes the stdio pipes, and exits the process with its return code. `std::proces
 the same two steps before its exit syscall, so the fs driver drops the opens, and the release
 SENDs they hold, of `File`s the process never drops
 ([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md)
-§ Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`: the driver keeps such an
-open until its node is freed (reclaim tracked in
-[#742](https://github.com/kottlerg/seraph/issues/742)), and the endpoint its release SEND names
-outlives the process, so memmgr holds the frame it lives in out of its pool until that SEND goes
+§ Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`. Each `File` holds its open's
+liveness cap until its close, and the process's `CSpace` takes the cap with it, so the driver
+releases such an open, with its release SEND, at its next sweep. Until then the endpoint that SEND
+names outlives the process, and memmgr holds the frame it lives in out of its pool until the SEND
+goes
 ([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#reclamation)
 § Reclamation).
 

@@ -649,10 +649,10 @@ consistency window as for any other `enqueue_and_wake` racing
 **Enqueue-chokepoint enforcement (issues #244, #289).** Every run-queue
 insertion — `enqueue_and_wake`, `enqueue_ready_thread` (`sys_thread_start`),
 `schedule()`'s outgoing requeue, `schedule()`'s deferred-dispatch re-link (under
-`next.sched_lock`, at the head of the level), `relocate_ready_priority`'s re-enqueue
+`next.sched_lock`, at the head of its run queue), `relocate_ready_priority`'s re-enqueue
 (`sys_thread_set_priority`), and `relocate_ready_thread`'s destination link
 (`migrate_ready_thread` and the load balancer's `pull_unpinned_ready`) — funnels through
-`PerCpuScheduler::enqueue` (the deferred re-link through its head-of-level form,
+`PerCpuScheduler::enqueue` (the deferred re-link through its head-of-queue form,
 `enqueue_at_head`). That chokepoint refuses a
 double-link via the per-TCB `queued_on` tag: the priority level the TCB is
 currently linked at (the level its linker passed, which names its run queue; a

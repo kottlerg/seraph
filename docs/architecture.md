@@ -38,9 +38,8 @@ capabilities and does not interpret message contents.
 Preemptive, priority‑based scheduling across all CPUs, in two classes: the top
 levels by strict fixed priority (RT), the lower ones fairly, weighted by level
 (see [core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md#scheduling-classes)).
-Assigning a thread's
-priority requires a SchedControl capability whose `[min, max]` band covers the
-requested level; there is no ambient priority authority. The normal/elevated
+Assigning a thread's priority requires a SchedControl capability whose `[min, max]`
+band covers the requested level; there is no ambient priority authority. The normal/elevated
 partition is userspace policy expressed through capability distribution, not a
 kernel boundary — see [capability-model.md](capability-model.md#schedcontrol).
 

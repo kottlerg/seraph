@@ -1492,10 +1492,11 @@ its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-life
 § `sys_thread_stop` Cross-CPU Stop Protocol).
 
 **Latency contract:** a stop of a thread running on another CPU completes at the target's next
-slice-expiry `schedule()` or its own park or yield, not within the inter-processor-interrupt
+slice-expiry `schedule()`, a tick that preempts it for an RT thread queued on its CPU (a fair
+target), or its own park or yield, not within the inter-processor-interrupt
 latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
 target's remaining time slice (at most the longest slice, 20 timer ticks, that of fair level 20;
-`TIME_SLICE_TICKS`, 10, for an RT target; see
+`TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts
 enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
@@ -1600,7 +1601,8 @@ are scheduled by strict priority and levels 1–20 fairly, at a weight of the le
 ([scheduler.md § Scheduling Classes](scheduler.md#scheduling-classes)); that split is the
 kernel's scheduling discipline, not an authority boundary. The change takes effect at the next
 scheduler invocation: a `Ready` thread is re-linked at the new level at once, and a running
-thread's slice length and class follow the new level from its next dispatch.
+thread's class follows the new level from its next dispatch and its slice length from the first
+timer tick after it ([scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)).
 
 **Capability requirements:** `thread_cap` (Control rights); `sched_cap` (a
 `SchedControl` whose band covers `priority`).

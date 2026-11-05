@@ -7,9 +7,8 @@ wake), it selects the highest-level runnable RT thread, else the next thread of 
 wake does not preempt a running thread, with one exception: a running fair thread is preempted at
 the next timer tick while an RT thread is queued on its CPU. Otherwise a newly runnable thread
 waits until the running thread blocks or yields or its slice expires. Using SMT topology to
-spread threads across physical cores rather than
-packing them onto one is design intent, not yet implemented
-([#267](https://github.com/kottlerg/seraph/issues/267)).
+spread threads across physical cores rather than packing them onto one is design intent, not
+yet implemented ([#267](https://github.com/kottlerg/seraph/issues/267)).
 
 The scheduler interacts with two subsystems:
 
@@ -60,8 +59,9 @@ covers the level. There is no ambient authority — a process holding no
 Lowering is not special-cased; every assignment is checked against the band. See
 [syscalls.md](syscalls.md) § `SYS_THREAD_SET_PRIORITY` for the band check and its errors.
 
-The kernel does **not** define a normal/elevated boundary. The numeric level
-space is uniform; any partition into tiers is userspace policy, expressed by how
+The kernel does **not** define a normal/elevated boundary. For authority the numeric
+level space is uniform (how a level is scheduled is a separate matter, § Scheduling
+Classes); any partition into tiers of authority is userspace policy, expressed by how
 `SchedControl` bands are distributed:
 
 - The root `SchedControl` spans `[1, PRIORITY_MAX]`, is created at boot, and is
@@ -155,7 +155,7 @@ pub struct PerCpuScheduler
     idle: AtomicPtr<ThreadControlBlock>,
 
     /// Level of `current` as of its dispatch, which `timer_tick` reads for the slice
-    /// refill and the RT-over-fair preemption.
+    /// bound and refill and the RT-over-fair preemption.
     current_level: AtomicU8,
 
     /// Lock protecting the run queues. Held briefly during enqueue/dequeue.
@@ -189,11 +189,14 @@ a fair thread is its level (§ Scheduling Classes), so the longest slice is 20 t
 20. With the 1 ms tick, an RT slice is 10 ms. The slice lengths and the timer period are
 implementation constants, not part of the ABI.
 
-`timer_tick` takes the refill from the level the running thread was dispatched at, which the CPU
-records at each dispatch (`PerCpuScheduler::current_level`): it may not read the running
-thread's `priority` without that thread's `sched_lock`. A priority change of a running thread
-therefore reaches its slice length and its class at its next dispatch. A new thread's first
-slice is its creation level's.
+`timer_tick` measures the slice by the level the running thread was dispatched at, which the
+CPU records at each dispatch (`PerCpuScheduler::current_level`): it may not read the running
+thread's `priority` without that thread's `sched_lock`. Each tick first cuts the remaining slice
+to that level's quantum, then takes the tick, and an expired slice is refilled with the quantum
+(`PerCpuScheduler::tick_outcome`). A priority change of a running thread therefore reaches its
+class at its next dispatch, and its slice at the first tick after it: a thread lowered from fair
+20 to 2 runs at most 2 more ticks, and one raised from the fair class into the RT class at most
+`TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
 
 Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
 expiring thread is requeued at its run queue's tail and the highest non-empty queue runs next.
@@ -639,7 +642,8 @@ Spinlock-hold intervals are bounded by policy
 
 If priority inversion is observed in practice at the userspace IPC level (a
 high-priority thread blocked waiting for a low-priority server), the correct fix is
-to use a higher-priority server thread, not to add kernel priority inheritance.
+to place the server in the RT class, at a level above its clients (within the fair class a higher
+level grants no precedence), not to add kernel priority inheritance.
 
 ---
 
@@ -682,8 +686,9 @@ Otherwise, by target state:
   reschedule-pending flag, and IPIing it — instead of doing a local enqueue
   (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice of the thread (its slice
-  length × tick period: `TIME_SLICE_TICKS` for an RT thread, its level, at
-  most 20, for a fair one), not one tick.
+  length × tick period: `TIME_SLICE_TICKS` for a thread dispatched at an
+  RT level, its level, at most 20, for one dispatched at a fair level; see
+  § Time Slice Policy), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next enqueue (a wake, or `SYS_THREAD_START` on start or resume) via
   `select_target_cpu`; no migration work is needed.
@@ -718,6 +723,6 @@ optimisation.
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
-[Architecture Overview](../../../docs/architecture.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[Syscall Interface Specification](syscalls.md)
+[Syscall Interface Specification](syscalls.md),
+[Architecture Overview](../../../docs/architecture.md)

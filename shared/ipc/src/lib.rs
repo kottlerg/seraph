@@ -482,10 +482,12 @@ pub mod procmgr_labels
 }
 
 /// System-wide scheduling-policy constants: the per-service priority level
-/// map. Pure userspace policy — the kernel defines only the level space
-/// (`[PRIORITY_MIN, PRIORITY_MAX]`, level 31 reserved) and the
-/// `SchedControl` band mechanism; every number here is a placement choice
-/// and can change without touching the kernel.
+/// map. Pure userspace policy — the kernel defines the level space
+/// (`[PRIORITY_MIN, PRIORITY_MAX]`, level 31 reserved), the `SchedControl`
+/// band mechanism, and how each level is scheduled (strict priority above its
+/// RT/fair boundary, weighted fair below it; `core/kernel/docs/scheduler.md`
+/// § Scheduling Classes); every number here is a placement choice and can
+/// change without touching the kernel.
 ///
 /// Level map (30 = init, kernel-assigned; 31 reserved):
 ///

@@ -565,8 +565,8 @@ pub const PRIORITY_MIN: u8 = 1;
 ///
 /// The span is an ABI width: the kernel has 32 levels
 /// (`NUM_PRIORITY_LEVELS`), whose level 0 is the idle band and whose level 31
-/// is reserved above this one. The kernel schedules levels 21 to this one by
-/// strict priority and the levels below fairly (`sched::RT_PRIORITY_MIN`).
+/// is reserved above this one. How the kernel schedules each settable level is
+/// specified in `core/kernel/docs/scheduler.md` § Scheduling Classes.
 pub const PRIORITY_MAX: u8 = 30;
 
 // ── Event Queue constants ─────────────────────────────────────────────────────

@@ -1317,7 +1317,8 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
 /// priority. There is no ambient priority authority.
 ///
 /// The change takes effect at the next scheduler invocation. If the thread is
-/// currently in the Ready state, it is moved to the new priority queue immediately.
+/// currently in the Ready state, it is re-linked on the new level's run queue
+/// immediately (at its tail, even when both levels share the fair queue).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]

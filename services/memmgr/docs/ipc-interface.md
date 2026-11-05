@@ -201,7 +201,12 @@ reaper) is harmless. The caller MUST have already deleted every capability to
 the region and every kernel object retyped from it, and unmapped it from every
 address space. A region released while any of them remains is held on memmgr's
 deferred list, granted to no one, until all are gone; the release still
-succeeds and the region is no longer the caller's. Every release first
+succeeds and the region is no longer the caller's. A region the caller lent a
+DMA-capable driver for a transfer is such a region: the driver's capability,
+and devmgr's for the region's DMA mapping, keep it deferred until the transfer
+completed or the device is confirmed stopped
+([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
+§ DMA-Safe Teardown). Every release first
 rechecks the deferred list, so a release naming no grant (`count` 0) only
 rechecks. See [`memory-pool.md`](memory-pool.md) §"Reclamation".
 

@@ -62,8 +62,9 @@ devmgr's responsibilities are:
   `Mmio` cap carved from the apertures and moved to it (devmgr keeps no copy),
   the unit's segment, and its DMAR scope resolved against the PCI scan's
   bridges. The driver is created `CREATE_PINNED` and `CREATE_DMA_HOLD` at
-  `BOOT_DRIVER_PRIORITY`, and its hold is never released, so its table pages
-  stay quarantined for the boot. Once it is ready devmgr attaches every
+  `BOOT_DRIVER_PRIORITY`, and its hold is never released: devmgr deletes the
+  release token of its create reply at the spawn, so its table pages stay
+  quarantined for the boot. Once it is ready devmgr attaches every
   DMA-capable device it binds to a domain of its own (`iommu_labels::ATTACH`)
   before the device's DMA grant, refusing, with a log line, a device an RMRR
   names ([#773](https://github.com/kottlerg/seraph/issues/773)), one whose unit

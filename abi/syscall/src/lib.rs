@@ -575,7 +575,7 @@ pub const PRIORITY_MAX: u8 = 30;
 /// nothing until a later `SYS_THREAD_START` without the flag resumes it at
 /// its configured entry; meanwhile its register file is readable and
 /// writable with `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`. Valid only
-/// for a `Created` target. Every other bit of the flags word is reserved and
+/// for a configured `Created` target. Every other bit of the flags word is reserved and
 /// MUST be clear. See `core/kernel/docs/syscalls.md` § `SYS_THREAD_START`.
 pub const THREAD_START_SUSPENDED: u64 = 1 << 0;
 

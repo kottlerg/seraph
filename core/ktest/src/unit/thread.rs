@@ -375,15 +375,18 @@ pub fn start_self_invalid_argument(ctx: &TestContext) -> TestResult
 /// child's report. Applied through [`crate::scaled_bound`].
 const SUSPENDED_REPORT_MS: u64 = 5_000;
 
-/// Bits the suspended child sends once it runs.
+/// Bits the suspended child sends if it runs from its configured entry, and
+/// from the entry the parent writes into its frame.
 const SUSPENDED_RAN_BITS: u64 = 0x5EED;
+const SUSPENDED_REDIRECT_BITS: u64 = 0xD1CE;
 
-/// Set by [`suspended_entry`] as its first act: a nonzero value before the
-/// resume means the suspended child executed user code.
+/// Set by [`suspended_entry`] and [`suspended_redirect_entry`] as their first
+/// act: a nonzero value before the resume means the suspended child executed
+/// user code.
 static SUSPENDED_RAN: AtomicU32 = AtomicU32::new(0);
 
 /// A suspended start leaves a configured `Created` thread `Stopped` without
-/// running it, and a plain start then resumes it at its configured entry.
+/// running it, and a plain start then resumes it from its register file.
 ///
 /// Before the configure, a suspended start is refused (`InvalidArgument`: not
 /// configured); a reserved flag bit is refused (`InvalidArgument`) and leaves
@@ -391,7 +394,8 @@ static SUSPENDED_RAN: AtomicU32 = AtomicU32::new(0);
 /// (`thread_stop` returns `InvalidState`), no longer `Created` (a configure and
 /// a second suspended start are refused), its register file holds the entry
 /// as its instruction pointer, and it has run no user instruction across the
-/// parent's sleep. The resume runs it once at that entry.
+/// parent's sleep. A register write then points the never-run frame at a
+/// second entry, and the resume runs it once there.
 pub fn start_suspended_resume(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -447,12 +451,30 @@ fn start_suspended_resume_body(
         .map_err(|_| "thread_start_suspended of a configured thread failed")?;
     check_suspended(child.th, entry, child_sig)?;
 
+    // Point the never-run frame at a second entry: the edit must take effect
+    // on resume, the debugger's use of the suspended state. The frame's first
+    // argument register still holds the configured argument, `child_sig`.
+    let mut reg_buf = [0u8; BUF_SIZE];
+    thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
+        .map_err(|_| "thread_read_regs for the suspended redirect failed")?;
+    crate::spawn::redirect_to_entry(
+        &mut reg_buf[..],
+        suspended_redirect_entry as *const () as u64,
+    );
+    // SAFETY: the frame was read from this child, so its stack pointer lies on
+    // the child's own `ChildStack`; `redirect_to_entry` pointed it at
+    // `suspended_redirect_entry`, an `extern "C"` entry that never returns,
+    // with the stack pointer moved down to the entry ABI's alignment on that
+    // same stack.
+    unsafe { thread_write_regs(child.th, &reg_buf[..BUF_SIZE]) }
+        .map_err(|_| "thread_write_regs of a suspended thread failed")?;
+
     thread_start(child.th).map_err(|_| "thread_start (resume) of a suspended thread failed")?;
     let bits = notification_wait_timeout(sig, crate::scaled_bound(SUSPENDED_REPORT_MS))
         .map_err(|_| "notification_wait for start_suspended_resume failed")?;
-    if bits != SUSPENDED_RAN_BITS
+    if bits != SUSPENDED_REDIRECT_BITS
     {
-        return Err("resumed suspended thread did not report from its entry");
+        return Err("resumed suspended thread did not run from its written instruction pointer");
     }
     Ok(())
 }
@@ -505,6 +527,15 @@ extern "C" fn suspended_entry(sig_slot: u64) -> !
 {
     SUSPENDED_RAN.store(1, Ordering::Release);
     notification_send(sig_slot, SUSPENDED_RAN_BITS).ok();
+    thread_exit()
+}
+
+/// Entry the parent writes into the suspended child's frame before its
+/// resume: records that it ran and sends [`SUSPENDED_REDIRECT_BITS`].
+extern "C" fn suspended_redirect_entry(sig_slot: u64) -> !
+{
+    SUSPENDED_RAN.store(1, Ordering::Release);
+    notification_send(sig_slot, SUSPENDED_REDIRECT_BITS).ok();
     thread_exit()
 }
 

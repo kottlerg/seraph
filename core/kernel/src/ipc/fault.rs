@@ -35,7 +35,7 @@
 use core::sync::atomic::Ordering;
 
 use crate::cap::object::{EndpointObject, KernelObjectHeader};
-use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
+use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 /// [`ThreadControlBlock::fault_outcome`] value: no disposition committed yet.
 pub const FAULT_OUTCOME_PENDING: u8 = 0;
@@ -343,36 +343,22 @@ unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
 #[cfg(not(test))]
 pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock)
 {
-    use crate::sched::thread::ThreadState;
     let mut spinning: Option<u64> = None;
     loop
     {
-        // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw;
-        // the Scheduling fields are read under sched_lock, their owner.
-        let (in_flight, state, ipc_state, blocked_on, park_seq) = unsafe {
-            let saved = (*tcb).sched_lock.lock_raw();
-            let snap = (
-                delivery_in_flight(tcb),
-                (*tcb).state,
-                (*tcb).ipc_state,
-                (*tcb).blocked_on_object,
-                (*tcb).park_seq.load(Ordering::Relaxed),
-            );
-            (*tcb).sched_lock.unlock_raw(saved);
-            snap
-        };
-        let done = !in_flight
-            || match state
+        // SAFETY: tcb valid per contract; no lock held.
+        let done = match unsafe { in_flight_park(tcb) }
+        {
+            Some((ThreadState::Blocked, ipc_state, blocked_on, park_seq)) =>
             {
-                ThreadState::Blocked =>
-                {
-                    // SAFETY: tcb valid; no lock held.
-                    unsafe { claim_fault_park(tcb, ipc_state, blocked_on, park_seq) }
-                }
-                // Opened but not yet parked: wait for the park's commit.
-                ThreadState::Running => false,
-                _ => true,
-            };
+                // SAFETY: tcb valid; no lock held.
+                unsafe { claim_fault_park(tcb, ipc_state, blocked_on, park_seq) }
+            }
+            // Opened but not yet parked: wait for the park's commit.
+            Some((ThreadState::Running, ..)) => false,
+            // None in flight, or a stop or teardown gave it its disposition.
+            _ => true,
+        };
         if done
         {
             break;
@@ -397,25 +383,50 @@ pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock)
     }
 }
 
+/// Snapshot `tcb`'s `(state, ipc_state, blocked_on_object, park_seq)` under
+/// its `sched_lock` while a fault delivery is in flight on it
+/// ([`delivery_in_flight`]); `None` when none is.
+///
+/// # Safety
+/// `tcb` must be a valid TCB; the caller holds no lock.
+#[cfg(not(test))]
+unsafe fn in_flight_park(
+    tcb: *mut ThreadControlBlock,
+) -> Option<(ThreadState, IpcThreadState, *mut u8, u32)>
+{
+    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw; the
+    // Scheduling fields are read under sched_lock, their owner.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let snap = delivery_in_flight(tcb).then(|| {
+            (
+                (*tcb).state,
+                (*tcb).ipc_state,
+                (*tcb).blocked_on_object,
+                (*tcb).park_seq.load(Ordering::Relaxed),
+            )
+        });
+        (*tcb).sched_lock.unlock_raw(saved);
+        snap
+    }
+}
+
 /// Claim `tcb`'s fault park, snapshotted as `(ipc_state, blocked_on,
 /// park_seq)`, for a redelivery, and wake the thread on a win. Returns `true`
 /// when the claim was won, or when the park is not one this claim can take
 /// (nothing to cancel); `false` when the park changed or the claim was lost,
 /// for the caller's next pass to re-read.
 ///
-/// A queued delivery (`BlockedOnSend`) is claimed by its send-queue unlink
-/// under the endpoint's lock, reached through [`crate::ipc::lock_bound_source`]
-/// gated on `park_seq`; a received one (`BlockedOnFault`) by the CAS of the
-/// handler's `reply_tcb`, under this thread's `sched_lock` with a
-/// `blocked_on_object` re-read (the CLOSURE LEMMA of
-/// core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership). Both
-/// are the claims `cancel_ipc_block` takes, so this claim and every other
-/// claimant of the park exclude one another. A won claim stamps
-/// [`FAULT_OUTCOME_REDELIVER`] and the episode, clears the park binding inside
-/// the same hold (rule 7 of § Lock Hierarchy: no later reader of the binding
-/// may reach the endpoint or the handler once neither holds the thread), and
-/// wakes the thread through its `wake_in_flight` pin: the one the reply
-/// binding set, or, for a queued delivery, one taken here inside the claim.
+/// A queued delivery is claimed by [`claim_queued_fault`], a received one by
+/// [`claim_received_fault`]: the claims `cancel_ipc_block` takes, so this
+/// claim and every other claimant of the park exclude one another. A won
+/// claim stamps [`FAULT_OUTCOME_REDELIVER`] and the episode, clears the park
+/// binding inside the same hold (rule 7 of
+/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy: no later reader
+/// of the binding may reach the endpoint or the handler once neither holds
+/// the thread), and wakes the thread through its `wake_in_flight` pin: the
+/// one the reply binding set, or, for a queued delivery, one taken inside the
+/// claim.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
@@ -432,66 +443,12 @@ unsafe fn claim_fault_park(
         IpcThreadState::BlockedOnSend =>
         {
             // SAFETY: tcb valid; no lock held (contract).
-            let held = unsafe {
-                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
-            };
-            let Some(held) = held
-            else
-            {
-                return false;
-            };
-            // cast_ptr_alignment: blocked_on_object stores a type-erased
-            // pointer; the original allocation guarantees alignment.
-            #[allow(clippy::cast_ptr_alignment)]
-            let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
-            // SAFETY: `held` holds ep.lock on the live endpoint the binding
-            // names, and tcb's sched_lock.
-            unsafe {
-                let unlinked = crate::ipc::endpoint::unlink_from_wait_queue(
-                    tcb,
-                    &mut (*ep).send_head,
-                    &mut (*ep).send_tail,
-                );
-                if unlinked
-                {
-                    (*ep).refresh_send_ready();
-                    stamp_redeliver(tcb);
-                    (*tcb).wake_in_flight.store(1, Ordering::Release);
-                }
-                held.unlock();
-                unlinked
-            }
+            unsafe { claim_queued_fault(tcb, blocked_on, park_seq) }
         }
         IpcThreadState::BlockedOnFault if !blocked_on.is_null() =>
         {
-            // cast_ptr_alignment: blocked_on_object stores a type-erased
-            // pointer; the original allocation guarantees alignment.
-            #[allow(clippy::cast_ptr_alignment)]
-            let server = blocked_on.cast::<ThreadControlBlock>();
-            // SAFETY: tcb valid; lock_raw paired with unlock_raw. The server
-            // is live for the CAS by the CLOSURE LEMMA, behind the re-read of
-            // the binding under this client's sched_lock.
-            unsafe {
-                let saved = (*tcb).sched_lock.lock_raw();
-                let won = (*tcb).state == crate::sched::thread::ThreadState::Blocked
-                    && (*tcb).ipc_state == IpcThreadState::BlockedOnFault
-                    && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
-                    && (*server)
-                        .reply_tcb
-                        .compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok();
-                if won
-                {
-                    stamp_redeliver(tcb);
-                }
-                (*tcb).sched_lock.unlock_raw(saved);
-                won
-            }
+            // SAFETY: tcb valid; no lock held (contract); blocked_on non-null.
+            unsafe { claim_received_fault(tcb, blocked_on) }
         }
         // Not a fault park: nothing to cancel.
         _ => return true,
@@ -506,6 +463,101 @@ unsafe fn claim_fault_park(
         }
     }
     won
+}
+
+/// Claim a queued fault delivery (`BlockedOnSend` on the endpoint
+/// `blocked_on`) by its send-queue unlink under the endpoint's lock, reached
+/// through [`crate::ipc::lock_bound_source`] gated on `park_seq`. On a win,
+/// stamp the redelivery and take the `wake_in_flight` pin for the caller's
+/// wake. Returns whether the claim was won.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
+#[cfg(not(test))]
+unsafe fn claim_queued_fault(
+    tcb: *mut ThreadControlBlock,
+    blocked_on: *mut u8,
+    park_seq: u32,
+) -> bool
+{
+    // SAFETY: tcb valid; no lock held (contract).
+    let held = unsafe {
+        crate::ipc::lock_bound_source(
+            tcb,
+            IpcThreadState::BlockedOnSend,
+            blocked_on,
+            Some(park_seq),
+        )
+    };
+    let Some(held) = held
+    else
+    {
+        return false;
+    };
+    // cast_ptr_alignment: blocked_on_object stores a type-erased pointer; the
+    // original allocation guarantees alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+    // SAFETY: `held` holds ep.lock on the live endpoint the binding names, and
+    // tcb's sched_lock.
+    unsafe {
+        let unlinked = crate::ipc::endpoint::unlink_from_wait_queue(
+            tcb,
+            &mut (*ep).send_head,
+            &mut (*ep).send_tail,
+        );
+        if unlinked
+        {
+            (*ep).refresh_send_ready();
+            stamp_redeliver(tcb);
+            (*tcb).wake_in_flight.store(1, Ordering::Release);
+        }
+        held.unlock();
+        unlinked
+    }
+}
+
+/// Claim a received fault delivery (`BlockedOnFault` on the handler TCB
+/// `blocked_on`) by the CAS of the handler's `reply_tcb`, under `tcb`'s
+/// `sched_lock` with a `blocked_on_object` re-read (the CLOSURE LEMMA of
+/// core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership). On a
+/// win, stamp the redelivery; the `wake_in_flight` pin the reply binding set
+/// stands for the caller's wake. Returns whether the claim was won.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; the caller holds no lock;
+/// `blocked_on` is non-null.
+#[cfg(not(test))]
+unsafe fn claim_received_fault(tcb: *mut ThreadControlBlock, blocked_on: *mut u8) -> bool
+{
+    // cast_ptr_alignment: blocked_on_object stores a type-erased pointer; the
+    // original allocation guarantees alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let server = blocked_on.cast::<ThreadControlBlock>();
+    // SAFETY: tcb valid; lock_raw paired with unlock_raw. The server is live
+    // for the CAS by the CLOSURE LEMMA, behind the re-read of the binding under
+    // this client's sched_lock.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let won = (*tcb).state == ThreadState::Blocked
+            && (*tcb).ipc_state == IpcThreadState::BlockedOnFault
+            && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
+            && (*server)
+                .reply_tcb
+                .compare_exchange(
+                    tcb,
+                    core::ptr::null_mut(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        if won
+        {
+            stamp_redeliver(tcb);
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
+        won
+    }
 }
 
 /// Stamp a won fault-park claim for redelivery and retire the park binding.

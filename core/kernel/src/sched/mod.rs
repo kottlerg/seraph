@@ -4229,7 +4229,10 @@ pub unsafe fn commit_blocked_under_local_lock(
                     // A posted upcall interrupts the block before it begins,
                     // as its cancel would interrupt it after (the post wrote
                     // upcall_pending under this lock, before its cancel read
-                    // the state).
+                    // the state). The predicate is
+                    // syscall::thread::upcall_may_cancel's, restated here, and
+                    // MUST stay identical to it: the post's retry ends because
+                    // a park the thread commits is refused under it.
                     ParkCommit::RefusedStop
                 }
                 else

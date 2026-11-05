@@ -1042,7 +1042,8 @@ impl Process {
             // Bridge raises `completion_notification` exactly once after
             // publishing `exit_reason`. An untimed wait always returns
             // non-zero bits; the zero-bit retry is defensive. `Interrupted`
-            // (this thread was stopped and restarted) waits again.
+            // (this thread was stopped and restarted, or interrupted by an
+            // upcall) waits again.
             loop {
                 match syscall::notification_wait(b.completion_notification) {
                     Ok(0) => {}

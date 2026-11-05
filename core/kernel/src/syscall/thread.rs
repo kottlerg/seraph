@@ -869,6 +869,8 @@ pub(crate) unsafe fn cancel_for_upcall(tcb: *mut crate::sched::thread::ThreadCon
 
 /// Whether a posted upcall may cancel `tcb`'s block now: one is pending, the
 /// thread does not mask upcalls, and it is in no fault or upcall delivery.
+/// `sched::commit_blocked_under_local_lock` refuses a park under the same
+/// predicate, restated there, which MUST stay identical to this one.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB whose `sched_lock` the caller holds.

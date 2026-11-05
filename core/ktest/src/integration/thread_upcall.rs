@@ -13,40 +13,38 @@
 //!      at a syscall's return: the handler receives `FAULT_KIND_UPCALL` with
 //!      the binding's badge, the poster's cookie, and the syscall point, and
 //!      its reply resumes the thread, which yields on.
-//!   3. **Pending.** A thread that makes no syscall keeps a syscall-point
+//!   3. **Nesting and stop.** A post during a delivery is accepted and
+//!      delivered after the reply, at the same syscall return; a post to a
+//!      stopped thread is kept (a second is `QueueFull`) and delivered once
+//!      the thread is started.
+//!   4. **Pending.** A thread that makes no syscall keeps a syscall-point
 //!      upcall pending, so a second post is refused with `QueueFull`.
-//!   4. **Any-instruction delivery.** A thread spinning with no syscall takes
+//!   5. **Any-instruction delivery.** A thread spinning with no syscall takes
 //!      an `UPCALL_ANY_INSTRUCTION` upcall at an interrupt's return; the
 //!      handler redirects it into a recovery routine, which reports.
-//!   5. **Mask.** A thread that masks upcalls sleeps through a post
+//!   6. **Mask.** A thread that masks upcalls sleeps through a post
 //!      uninterrupted and takes the upcall at its unmask's return.
-//!   6. **Cancel during block.** A thread blocked in a notification wait, and
+//!   7. **Cancel during block.** A thread blocked in a notification wait, and
 //!      one in a sleep, has the wait return `Interrupted` and takes the upcall
 //!      at that return.
-//!   7. **Recursion.** An upcall posted while the thread's page fault is held
+//!   8. **Recursion.** An upcall posted while the thread's page fault is held
 //!      waits for the fault: it is delivered after the fault's reply, at the
 //!      thread's next syscall. A stop of the thread during an upcall delivery
 //!      drops the upcall: the handler's late reply finds no pending reply, and
 //!      after a restart the thread takes a new post.
-//!   8. **Rights.** A Thread cap without `UPCALL` is refused
-//!      (`InsufficientRights`), an `UPCALL`-only cap posts at the syscall point
-//!      but not with `UPCALL_ANY_INSTRUCTION`, and an undefined flag bit is
-//!      refused (`InvalidArgument`).
-//!   9. **Nesting and stop.** A post during a delivery is accepted and
-//!      delivered after the reply, at the same syscall return; a post to a
-//!      stopped thread is kept (a second is `QueueFull`) and delivered once
-//!      the thread is started.
-//!  10. **IPC arms.** A call queued on an endpoint no one receives on returns
+//!   9. **IPC arms.** A call queued on an endpoint no one receives on returns
 //!      `Interrupted` and takes the upcall. So does a call whose message the
 //!      controller received and has not replied to: the post claims the
 //!      pending reply, so the controller's reply then fails.
-//!  11. **Refused park.** A thread that a post reaches while it spins with no
+//!  10. **Refused park.** A thread that a post reaches while it spins with no
 //!      syscall has its next blocking syscall, a notification wait, refused:
 //!      the wait returns `Interrupted` at once, and the upcall is delivered at
 //!      its return.
-//!
-//! `SYS_THREAD_SET_UPCALL_MASK`'s `InvalidArgument` is not exercised: the
-//! typed wrapper passes only 0 or 1.
+//!  11. **Rights.** A Thread cap without `UPCALL` is refused
+//!      (`InsufficientRights`), an `UPCALL`-only cap posts at the syscall point
+//!      but not with `UPCALL_ANY_INSTRUCTION`, and an undefined flag bit is
+//!      refused (`InvalidArgument`), as is a mask argument other than 0 or 1,
+//!      which leaves the mask unchanged.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,8 +58,8 @@ use syscall::{
 use syscall_abi::{
     FAULT_CLASS_UPCALL, FAULT_CLASS_VM, FAULT_KIND_UPCALL, FAULT_KIND_VM, FAULT_LABEL,
     FAULT_REPLY_RESUME, RIGHTS_EP_SEND, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_THREAD_CONTROL,
-    RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, SyscallError, UPCALL_ANY_INSTRUCTION,
-    UPCALL_POINT_INTERRUPT, UPCALL_POINT_SYSCALL,
+    RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, SYS_THREAD_SET_UPCALL_MASK, SyscallError,
+    UPCALL_ANY_INSTRUCTION, UPCALL_POINT_INTERRUPT, UPCALL_POINT_SYSCALL,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -226,96 +224,6 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
     rights(ctx, yielder, ep_up)
 }
 
-/// Phase 9: a post during a delivery, and a post to a stopped thread.
-fn nesting_and_stop(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
-{
-    thread_post_upcall(th, 0x5150_0011, 0)
-        .map_err(|_| "integration::thread_upcall: post (first) failed")?;
-    expect_upcall(ctx, ep_up, 0x5150_0011, UPCALL_POINT_SYSCALL)?;
-    thread_post_upcall(th, 0x5150_0012, 0)
-        .map_err(|_| "integration::thread_upcall: a post during a delivery was refused")?;
-    reply_resume(ctx)?;
-    expect_upcall(ctx, ep_up, 0x5150_0012, UPCALL_POINT_SYSCALL)?;
-    reply_resume(ctx)?;
-
-    thread_stop(th).map_err(|_| "integration::thread_upcall: thread_stop (yielder) failed")?;
-    let posted = thread_post_upcall(th, 0x5150_0013, 0);
-    let second = thread_post_upcall(th, 0x5150_0014, 0);
-    thread_start(th).map_err(|_| "integration::thread_upcall: thread_start (yielder) failed")?;
-    if posted.is_err() || second != Err(SyscallError::QueueFull as i64)
-    {
-        return Err("integration::thread_upcall: a stopped thread did not keep its upcall");
-    }
-    expect_upcall(ctx, ep_up, 0x5150_0013, UPCALL_POINT_SYSCALL)?;
-    reply_resume(ctx)
-}
-
-/// Phase 10: a call queued on an endpoint (`eps[0]`), and a call awaiting its
-/// reply (`eps[1]`, whose message the controller receives).
-fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> TestResult
-{
-    for (k, ep) in eps.into_iter().enumerate()
-    {
-        let index = 8 + k;
-        let cookie = 0x5150_0020 + k as u64;
-        let th = spawn_child(ctx, parts, index)?;
-        bind_upcall(th, ep_up)?;
-        let slot = cap_copy(ep, child_cs(parts, index)?, RIGHTS_EP_SEND)
-            .map_err(|_| "integration::thread_upcall: cap_copy endpoint failed")?;
-        CALL_EP[k].store(slot, Ordering::Release);
-        start_child(parts, index, call_entry, k as u64)?;
-        wait_for(&CALL_STAGE[k], 1)?;
-        if k == 1
-        {
-            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-            unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-                .map_err(|_| "integration::thread_upcall: ipc_recv (call) failed")?;
-        }
-        else
-        {
-            let _ = thread_sleep(SETTLE_MS);
-        }
-        thread_post_upcall(th, cookie, 0)
-            .map_err(|_| "integration::thread_upcall: post (caller) failed")?;
-        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-        if k == 1 && unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }.is_ok()
-        {
-            return Err("integration::thread_upcall: the post left the call's reply pending");
-        }
-        expect_upcall(ctx, ep_up, cookie, UPCALL_POINT_SYSCALL)?;
-        reply_resume(ctx)?;
-        wait_for(&CALL_STAGE[k], 2)?;
-        if CALL_RESULT[k].load(Ordering::Acquire) != RESULT_INTERRUPTED
-        {
-            return Err("integration::thread_upcall: an interrupted call did not fail Interrupted");
-        }
-    }
-    Ok(())
-}
-
-/// Phase 11: a post that finds the thread running refuses its next park.
-fn refused_park(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: u64) -> TestResult
-{
-    let th = spawn_child(ctx, parts, 10)?;
-    bind_upcall(th, ep_up)?;
-    let slot = cap_copy(never, child_cs(parts, 10)?, RIGHTS_NTF_WAIT)
-        .map_err(|_| "integration::thread_upcall: cap_copy notification failed")?;
-    REFUSE_NEVER.store(slot, Ordering::Release);
-    start_child(parts, 10, refuse_entry, 0)?;
-    wait_for(&REFUSE_STAGE, 1)?;
-    thread_post_upcall(th, 0x5150_0030, 0)
-        .map_err(|_| "integration::thread_upcall: post (spinning) failed")?;
-    REFUSE_GO.store(1, Ordering::Release);
-    expect_upcall(ctx, ep_up, 0x5150_0030, UPCALL_POINT_SYSCALL)?;
-    reply_resume(ctx)?;
-    wait_for(&REFUSE_STAGE, 2)?;
-    if REFUSE_RESULT.load(Ordering::Acquire) != RESULT_INTERRUPTED
-    {
-        return Err("integration::thread_upcall: a refused park did not fail Interrupted");
-    }
-    Ok(())
-}
-
 /// Phase 1: no handler bound, or a thread not yet started.
 fn no_handler(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
 {
@@ -347,7 +255,31 @@ fn syscall_delivery(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
     wait_for(&YIELDS, before + 1)
 }
 
-/// Phase 3: a syscall-point upcall stays pending on a thread that makes no
+/// Phase 3: a post during a delivery, and a post to a stopped thread.
+fn nesting_and_stop(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
+{
+    thread_post_upcall(th, 0x5150_0011, 0)
+        .map_err(|_| "integration::thread_upcall: post (first) failed")?;
+    expect_upcall(ctx, ep_up, 0x5150_0011, UPCALL_POINT_SYSCALL)?;
+    thread_post_upcall(th, 0x5150_0012, 0)
+        .map_err(|_| "integration::thread_upcall: a post during a delivery was refused")?;
+    reply_resume(ctx)?;
+    expect_upcall(ctx, ep_up, 0x5150_0012, UPCALL_POINT_SYSCALL)?;
+    reply_resume(ctx)?;
+
+    thread_stop(th).map_err(|_| "integration::thread_upcall: thread_stop (yielder) failed")?;
+    let posted = thread_post_upcall(th, 0x5150_0013, 0);
+    let second = thread_post_upcall(th, 0x5150_0014, 0);
+    thread_start(th).map_err(|_| "integration::thread_upcall: thread_start (yielder) failed")?;
+    if posted.is_err() || second != Err(SyscallError::QueueFull as i64)
+    {
+        return Err("integration::thread_upcall: a stopped thread did not keep its upcall");
+    }
+    expect_upcall(ctx, ep_up, 0x5150_0013, UPCALL_POINT_SYSCALL)?;
+    reply_resume(ctx)
+}
+
+/// Phase 4: a syscall-point upcall stays pending on a thread that makes no
 /// syscall, and a second post is refused.
 fn pending(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
 {
@@ -363,7 +295,7 @@ fn pending(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
     Ok(())
 }
 
-/// Phase 4: delivery at an interrupt's return to a thread that spins, and a
+/// Phase 5: delivery at an interrupt's return to a thread that spins, and a
 /// redirect into the recovery routine.
 fn any_instruction(ctx: &TestContext, parts: &mut Parts, ep_up: u64, sig: u64) -> TestResult
 {
@@ -396,7 +328,7 @@ fn any_instruction(ctx: &TestContext, parts: &mut Parts, ep_up: u64, sig: u64) -
     Ok(())
 }
 
-/// Phase 5: a masked thread's sleep is not interrupted, and the upcall is
+/// Phase 6: a masked thread's sleep is not interrupted, and the upcall is
 /// delivered at the unmask's return.
 fn mask(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
 {
@@ -415,7 +347,7 @@ fn mask(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
     wait_for(&MASK_STAGE, 3)
 }
 
-/// Phase 6: a notification wait and a sleep return `Interrupted`, and the
+/// Phase 7: a notification wait and a sleep return `Interrupted`, and the
 /// upcall is delivered at that return.
 fn cancel_during_block(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: u64) -> TestResult
 {
@@ -451,7 +383,7 @@ fn cancel_during_block(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: 
     Ok(())
 }
 
-/// Phase 7: an upcall waits for a held fault, and a stop during an upcall
+/// Phase 8: an upcall waits for a held fault, and a stop during an upcall
 /// delivery drops the upcall.
 fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> TestResult
 {
@@ -500,7 +432,73 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
     reply_resume(ctx)
 }
 
-/// Phase 8: the rights a post needs, and its flag check.
+/// Phase 9: a call queued on an endpoint (`eps[0]`), and a call awaiting its
+/// reply (`eps[1]`, whose message the controller receives).
+fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> TestResult
+{
+    for (k, ep) in eps.into_iter().enumerate()
+    {
+        let index = 8 + k;
+        let cookie = 0x5150_0020 + k as u64;
+        let th = spawn_child(ctx, parts, index)?;
+        bind_upcall(th, ep_up)?;
+        let slot = cap_copy(ep, child_cs(parts, index)?, RIGHTS_EP_SEND)
+            .map_err(|_| "integration::thread_upcall: cap_copy endpoint failed")?;
+        CALL_EP[k].store(slot, Ordering::Release);
+        start_child(parts, index, call_entry, k as u64)?;
+        wait_for(&CALL_STAGE[k], 1)?;
+        if k == 1
+        {
+            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+            unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+                .map_err(|_| "integration::thread_upcall: ipc_recv (call) failed")?;
+        }
+        else
+        {
+            let _ = thread_sleep(SETTLE_MS);
+        }
+        thread_post_upcall(th, cookie, 0)
+            .map_err(|_| "integration::thread_upcall: post (caller) failed")?;
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        if k == 1 && unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }.is_ok()
+        {
+            return Err("integration::thread_upcall: the post left the call's reply pending");
+        }
+        expect_upcall(ctx, ep_up, cookie, UPCALL_POINT_SYSCALL)?;
+        reply_resume(ctx)?;
+        wait_for(&CALL_STAGE[k], 2)?;
+        if CALL_RESULT[k].load(Ordering::Acquire) != RESULT_INTERRUPTED
+        {
+            return Err("integration::thread_upcall: an interrupted call did not fail Interrupted");
+        }
+    }
+    Ok(())
+}
+
+/// Phase 10: a post that finds the thread running refuses its next park.
+fn refused_park(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: u64) -> TestResult
+{
+    let th = spawn_child(ctx, parts, 10)?;
+    bind_upcall(th, ep_up)?;
+    let slot = cap_copy(never, child_cs(parts, 10)?, RIGHTS_NTF_WAIT)
+        .map_err(|_| "integration::thread_upcall: cap_copy notification failed")?;
+    REFUSE_NEVER.store(slot, Ordering::Release);
+    start_child(parts, 10, refuse_entry, 0)?;
+    wait_for(&REFUSE_STAGE, 1)?;
+    thread_post_upcall(th, 0x5150_0030, 0)
+        .map_err(|_| "integration::thread_upcall: post (spinning) failed")?;
+    REFUSE_GO.store(1, Ordering::Release);
+    expect_upcall(ctx, ep_up, 0x5150_0030, UPCALL_POINT_SYSCALL)?;
+    reply_resume(ctx)?;
+    wait_for(&REFUSE_STAGE, 2)?;
+    if REFUSE_RESULT.load(Ordering::Acquire) != RESULT_INTERRUPTED
+    {
+        return Err("integration::thread_upcall: a refused park did not fail Interrupted");
+    }
+    Ok(())
+}
+
+/// Phase 11: the rights a post needs, and its flag check.
 fn rights(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
 {
     let observe = cap_derive(th, RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_CONTROL)
@@ -514,6 +512,16 @@ fn rights(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
     if thread_post_upcall(th, 1, 1 << 1) != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("integration::thread_upcall: an undefined flag was accepted");
+    }
+    // SAFETY: raw_syscall3's four conditions hold: SYS_THREAD_SET_UPCALL_MASK
+    // takes no pointer and uses no IPC buffer, changes no mapping and no
+    // CSpace slot, and acts only on the calling thread, whose mask a refused
+    // argument leaves unchanged.
+    let refused = unsafe { syscall::raw_syscall3(SYS_THREAD_SET_UPCALL_MASK, 2, 0, 0) };
+    let unchanged = thread_set_upcall_mask(false);
+    if refused != SyscallError::InvalidArgument as i64 || unchanged != Ok(false)
+    {
+        return Err("integration::thread_upcall: a mask argument other than 0 or 1 was accepted");
     }
     let upcall_only = cap_derive(th, RIGHTS_THREAD_UPCALL)
         .map_err(|_| "integration::thread_upcall: cap_derive (upcall) failed")?;

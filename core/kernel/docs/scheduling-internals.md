@@ -281,12 +281,11 @@ skipping levels, risks deadlock.
    park in two cases: `ParkCommit::RefusedStop`, when a concurrent all-locks `Stopped`/`Exited`
    commit already won (then `schedule()` drains the thread), or when an upcall is pending that the
    thread does not mask outside a fault or upcall delivery (the thread stays `Running`, and
-   `schedule()` requeues it;
-   [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake
-   Protocol), and `ParkCommit::RefusedWake`, when
-   `wake_pending` is set (a waker raced ahead, found the thread still live, coalesced its link, and
-   recorded the wake under `sched_lock`; the helper consumes the flag and leaves the thread
-   `Running`, and `schedule()` requeues the runnable thread so it resumes and consumes the
+   `schedule()` requeues it; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall
+   Cancel-and-Wake Protocol), and `ParkCommit::RefusedWake`, when `wake_pending` is set (a waker
+   raced ahead, found the thread still live, coalesced its link, and recorded the wake under
+   `sched_lock`; the helper consumes the flag and leaves the thread `Running`, and `schedule()`
+   requeues the runnable thread so it resumes and consumes the
    already-deposited payload). On either refusal the caller MUST roll back the source-side waiter
    registration. A `RefusedStop` rollback stamps the park episode cancelled (no waker saw the
    registration, so the rollback owns the episode); a `RefusedWake` rollback MUST NOT clobber the

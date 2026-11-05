@@ -10,6 +10,7 @@ Defines the `SYS_*` syscall numbers and `SYSCALL_NR_BOUND`, one past the highest
 `SyscallError` enum, and the constants that cross the kernel/userspace boundary: the
 capability-handle encoding, the `CAP_INFO_*` selectors and `CAP_TAG_*` discriminants, the `MAP_*`
 protection and unmap flags, the `SYS_THREAD_START` flags (`THREAD_START_SUSPENDED`), the
+`SYS_THREAD_POST_UPCALL` flag (`UPCALL_ANY_INSTRUCTION`), the
 `IRQ_MODE_*` interrupt-line mode bits, the per-type `RIGHTS_*` masks, the per-object retype costs
 (`*_RETYPE_BYTES`, `event_queue_retype_bytes`, `wait_set_retype_bytes`), the `CSpace` funding
 constants (`CSPACE_SLOTS_PER_PAGE`, `CSPACE_BODIES_PER_PAGE`, `IOPORT_BINDING_TABLE_PAGES`), the

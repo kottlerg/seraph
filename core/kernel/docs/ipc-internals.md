@@ -162,7 +162,7 @@ syscall on either side. Nothing is allocated on the path.
    a. Append current_tcb to the endpoint's recv queue
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnRecv, ep); on a
       refusal, unlink current_tcb from the recv queue, and stamp INTERRUPTED
-      if the refusal was a stop (RefusedStop)
+      if the refusal was a stop or a pending upcall (RefusedStop)
    c. Release endpoint lock
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
@@ -415,7 +415,7 @@ between deliveries.
    Invariants, invariant 4)
 7. Release sig.lock
 8. Block current thread; return when woken
-9. On wakeup: if the park is INTERRUPTED (a stop, or the notification
+9. On wakeup: if the park is INTERRUPTED (a stop, an upcall, or the notification
    destroyed under the waiter), return Interrupted. Otherwise the sender has
    already performed bits.swap(0) and stored the result in
    current_tcb.wakeup_value (0 for a timer wake);
@@ -696,11 +696,11 @@ waitset_notify(wait_set, member_idx):
    a. context_saved = 0; waiters.push(current_tcb)
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnWaitSet, ws);
       on a refusal, remove current_tcb from waiters, and stamp INTERRUPTED
-      if the refusal was a stop (RefusedStop)
+      if the refusal was a stop or a pending upcall (RefusedStop)
    c. Release lock
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then return
-      Interrupted if the park is INTERRUPTED (a stop, or the wait set
+      Interrupted if the park is INTERRUPTED (a stop, an upcall, or the wait set
       destroyed under the waiter), else return wakeup_value
 ```
 

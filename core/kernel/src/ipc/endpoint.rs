@@ -344,8 +344,8 @@ pub unsafe fn endpoint_call(
         if committed != crate::sched::ParkCommit::Committed
         {
             // Refused park (stop won, a pending upcall, or a stray coalesced
-            // wake); tear down
-            // the reply linkage. Either refusal cancels the call.
+            // wake); tear down the reply linkage. Every refusal cancels the
+            // call.
             // SAFETY: caller / server validated; ep.lock held.
             unsafe { rollback_uncommitted_call(server, caller, parked_state) };
         }
@@ -388,8 +388,7 @@ pub unsafe fn endpoint_call(
     if committed != crate::sched::ParkCommit::Committed
     {
         // Refused park (stop won, a pending upcall, or a stray coalesced wake
-        // — each cancels
-        // the call); unlink from the send queue.
+        // — each cancels the call); unlink from the send queue.
         // SAFETY: ep.lock held.
         unsafe {
             let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);

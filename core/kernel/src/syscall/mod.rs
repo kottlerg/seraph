@@ -645,8 +645,9 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Commit Running→Blocked under the per-TCB sched_lock (the authoritative
     // serializer for the Scheduling field group). A sleep has no IPC source, so
-    // ipc_state stays None. A refusal means a concurrent stop/exit won or a
-    // wake was deposited (refuse-to-park): abandon the sleep.
+    // ipc_state stays None. A refusal means a concurrent stop/exit won, a
+    // pending upcall the thread does not mask refused the park, or a wake was
+    // deposited (refuse-to-park): abandon the sleep.
     // SAFETY: tcb is this CPU's current (running) thread.
     let committed = unsafe {
         crate::sched::commit_blocked_under_local_lock(
@@ -693,8 +694,10 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 
     // A refusal means a stop or teardown cancelled the park between the
     // commit and the add, stamped it INTERRUPTED, and commits Stopped or
-    // Exited; schedule() below deschedules the thread and the resume takes
-    // that stamp. The list has no capacity, so no other refusal exists.
+    // Exited, or an upcall's cancel did, whose poster then wakes the thread
+    // Ready; schedule() below deschedules the thread (or finds it woken) and
+    // the resume takes that stamp. The list has no capacity, so no other
+    // refusal exists.
     // SAFETY: tcb is this CPU's running thread.
     let _ = unsafe { crate::sched::sleep_list_add(tcb) };
 

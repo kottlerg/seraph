@@ -295,8 +295,8 @@ pub fn raw_ipc_call(
 /// (this thread's `CSpace` directory is structurally full for an incoming
 /// cap transfer), `OutOfMemory` (the `CSpace` slot-page pool is exhausted),
 /// or `Interrupted` (this thread was stopped or interrupted by an upcall, or
-/// the endpoint destroyed, while the receive was blocked). The first four refuse the receive before
-/// any pending reply is released.
+/// the endpoint destroyed, while the receive was blocked). The first four
+/// refuse the receive before any pending reply is released.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_recv(ep: u64) -> Result<(u64, u64, usize), i64>
@@ -2644,9 +2644,9 @@ pub fn sbi_call(
 ///
 /// # Errors
 /// Returns `-16` (`Interrupted`) if the thread is stopped (and restarted), or
-/// interrupted by an upcall, before or during the sleep, unless the timer had already claimed the
-/// elapsed deadline (the sleep returns `Ok`), or another negative `i64` error
-/// code on failure.
+/// interrupted by an upcall, before or during the sleep, unless the timer had
+/// already claimed the elapsed deadline (the sleep returns `Ok`), or another
+/// negative `i64` error code on failure.
 #[inline]
 pub fn thread_sleep(ms: u64) -> Result<(), i64>
 {

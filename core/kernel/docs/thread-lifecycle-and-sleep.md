@@ -937,7 +937,9 @@ requeue. The syscall then returns `Interrupted`.
    delivery point after it takes the upcall.
 3. **A mask keeps its blocks.** The thread writes `upcall_masked` only for itself, under its
    `sched_lock` (`SYS_THREAD_SET_UPCALL_MASK`), and never while it is blocked. The cancel's snapshot
-   and the park commit read it under that lock, so a block entered masked is never cancelled for an
+   and the park commit read it under that lock. An arm that claims after the snapshot claims only
+   the snapshotted park: the source arms gate on `park_seq`, and the `BlockedOnReply` arm on
+   `park_seq` and `upcall_may_cancel` (step 2). So a block entered masked is never cancelled for an
    upcall.
 4. **One wake per won claim.** A claim is exclusive (each arm's claim is the one a stop's cancel
    takes), and the poster that won it makes the wake. `wake_in_flight`, set inside the claim's hold,

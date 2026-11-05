@@ -1568,6 +1568,11 @@ unsafe fn finalize_main_tls(
 /// relocations there (the in-image template copy is relocated separately
 /// during segment loading).
 ///
+/// # Errors
+/// [`alloc_main_tls_memory`]'s codes; `INVALID_ELF` when the template is
+/// larger than the block; `OUT_OF_MEMORY` when the block cannot be mapped
+/// into the child.
+///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
@@ -1619,6 +1624,12 @@ unsafe fn prepare_main_tls_from_bytes(
 ///
 /// `relocate` runs over the streamed template copy before the block is
 /// finalized; see [`prepare_main_tls_from_bytes`].
+///
+/// # Errors
+/// [`alloc_main_tls_memory`]'s codes; `INVALID_ELF` when the template's file
+/// size is larger than the block; `IO_ERROR` when the template's bytes do not
+/// all arrive; `OUT_OF_MEMORY` when the block cannot be mapped into the
+/// child.
 ///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
@@ -2039,6 +2050,14 @@ fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 // ── Process creation (from memory) ──────────────────────────────────────────
 
 /// Create a process from an in-memory ELF byte slice (suspended).
+///
+/// # Errors
+/// `INVALID_ELF` when the image fails validation, its relocations do not
+/// all land, its stack note is out of range, or its TLS block does;
+/// `OUT_OF_MEMORY` when a kernel object, memory cap, badge, page, or the
+/// table entry cannot be had; a segment load's own code
+/// ([`loader::load_elf_segment_into_child`]); and the main TLS block's and
+/// [`populate_child_info`]'s codes.
 // similar_names: aspace/cspace are intentionally parallel kernel object names.
 #[allow(
     clippy::similar_names,
@@ -2316,6 +2335,13 @@ fn create_process_from_bytes(
 /// Create a process from an ELF module memory cap (suspended).
 ///
 /// Maps the memory cap, delegates to `create_process_from_bytes`, then unmaps.
+///
+/// # Errors
+/// A `procmgr_errors` code naming the cause: [`loader::map_module`]'s
+/// (`INSUFFICIENT_RIGHTS`, `OUT_OF_MEMORY`, or `MAP_FAILED`) when the module
+/// cannot be mapped, else `create_process_from_bytes`'s. The `CREATE_PROCESS`
+/// handler answers every one `OUT_OF_MEMORY`, as § Label 1 of
+/// `services/procmgr/docs/ipc-interface.md` names it.
 #[allow(clippy::too_many_arguments)]
 pub fn create_process(
     module_memory_cap: u64,
@@ -3198,9 +3224,8 @@ pub fn create_process_from_file(
                 },
             )
         }
-        // A failure of the TLS block is answered `OUT_OF_MEMORY`, the code
-        // § Label 13 gives a memory-cap allocation failure, whatever cause
-        // the helper reports.
+        // § Label 13 answers every failure of the main thread's TLS block
+        // `OUT_OF_MEMORY`, whatever cause the helper reports.
         .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else

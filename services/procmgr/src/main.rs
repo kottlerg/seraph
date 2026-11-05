@@ -1050,7 +1050,7 @@ fn arm_held_reclaim_or_refuse(
         }
         Err(process_table::ArmError::NotFound) =>
         {
-            std::os::seraph::log!("held-reclaim child missing from the table; destroying it");
+            std::os::seraph::log!("held-reclaim child missing from the table; refusing the create");
         }
     }
     let _ = syscall::cap_delete(result.thread_for_caller);

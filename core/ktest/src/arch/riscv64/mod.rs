@@ -162,6 +162,46 @@ pub fn illegal_instruction() -> !
     }
 }
 
+/// What a resumed software breakpoint's handler sees: the instruction pointer
+/// the fault message reports for a breakpoint at `addr`. `ebreak` faults at
+/// the breakpoint itself.
+#[must_use]
+pub const fn breakpoint_reported_ip(addr: u64) -> u64
+{
+    addr
+}
+
+/// Bytes a handler advances the instruction pointer by to resume past the
+/// breakpoint: the 4-byte `ebreak` [`software_breakpoint`] emits.
+pub const BREAKPOINT_RESUME_ADVANCE: u64 = 4;
+
+/// Execute a software breakpoint (a 4-byte `ebreak`, never `c.ebreak`) and
+/// return its address. With a fault handler bound for the exception class,
+/// the thread takes a `FAULT_EXC_BREAKPOINT` fault here and returns once the
+/// handler resumes it past the breakpoint (the reported pointer advanced by
+/// [`BREAKPOINT_RESUME_ADVANCE`]); with none, the kernel kills the thread in
+/// the trap.
+#[must_use]
+pub fn software_breakpoint() -> u64
+{
+    let addr: u64;
+    // SAFETY: `lla` writes only `addr`; the word `0x0010_0073` is `ebreak`,
+    // spelled out so the assembler cannot compress it, and raises a
+    // breakpoint exception and does nothing else (no memory or register
+    // access). The trap is the intended effect, and a resuming handler
+    // returns the thread to the next instruction with its registers as they
+    // were, so nothing is clobbered beyond `addr`.
+    unsafe {
+        core::arch::asm!(
+            "lla {addr}, 2f",
+            "2: .4byte 0x00100073",
+            addr = out(reg) addr,
+            options(nostack),
+        );
+    }
+    addr
+}
+
 /// No-op: RISC-V has no I/O port space, so there is no `IoPort` cap to seed;
 /// the UART and every device are memory-mapped.
 pub fn init_io_ports(_info: &InitInfo) {}

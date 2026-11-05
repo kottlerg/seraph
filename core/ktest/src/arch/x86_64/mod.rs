@@ -155,6 +155,44 @@ pub fn illegal_instruction() -> !
     }
 }
 
+/// What a resumed software breakpoint's handler sees: the instruction pointer
+/// the fault message reports for a breakpoint at `addr`. `#BP` is a trap, so
+/// the reported pointer is the next instruction, one byte past `int3`.
+#[must_use]
+pub const fn breakpoint_reported_ip(addr: u64) -> u64
+{
+    addr + 1
+}
+
+/// Bytes a handler advances the instruction pointer by to resume past the
+/// breakpoint: none, since the reported pointer is already past `int3`.
+pub const BREAKPOINT_RESUME_ADVANCE: u64 = 0;
+
+/// Execute a software breakpoint (`int3`) and return its address. With a
+/// fault handler bound for the exception class, the thread takes a
+/// `FAULT_EXC_BREAKPOINT` fault here and returns once the handler resumes it
+/// at the reported pointer (advanced by [`BREAKPOINT_RESUME_ADVANCE`]); with
+/// none, the kernel kills the thread in the trap.
+#[must_use]
+pub fn software_breakpoint() -> u64
+{
+    let addr: u64;
+    // SAFETY: `lea` writes only `addr`; `int3` raises #BP and does nothing
+    // else (no memory or register access, no flag change before the trap).
+    // The trap is the intended effect, and a resuming handler returns the
+    // thread to the next instruction with its registers as they were, so
+    // nothing is clobbered beyond `addr`.
+    unsafe {
+        core::arch::asm!(
+            "lea {addr}, [rip + 2f]",
+            "2: int3",
+            addr = out(reg) addr,
+            options(nostack, preserves_flags),
+        );
+    }
+    addr
+}
+
 /// A fresh range-capability lineage root for `integration::range_copy_lineage`:
 /// an `IoPort` cap for two otherwise unused ports, split off the wide cap.
 ///

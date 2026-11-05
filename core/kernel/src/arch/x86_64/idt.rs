@@ -1756,7 +1756,7 @@ pub unsafe fn init()
     // NMI — IST2. Dedicated stub: distinguishes watchdog backtrace
     // requests from real hardware NMIs (see ipi_nmi_backtrace_handler).
     set(2, ipi_nmi_backtrace_stub, 2);
-    set(3, isr3, 0);
+    // Vector 3 (#BP) is installed below with DPL 3.
     set(4, isr4, 0);
     set(5, isr5, 0);
     set(6, isr6, 0);
@@ -1814,6 +1814,15 @@ pub unsafe fn init()
         let vector = usize::from(super::ioapic::DEVICE_VECTOR_BASE) + i;
         idt[vector] = IdtEntry::new((stubs + i * DEVICE_STUB_STRIDE) as u64, 0, 0);
     }
+
+    // #BP with DPL 3: `int3` checks the gate's DPL against the CPL and raises
+    // #GP(vector * 8 + 2) when it is lower (Intel SDM Vol. 3A § 6.12.1.1), so a
+    // DPL-0 gate would turn a user breakpoint into a protection fault. With DPL
+    // 3 a user `int3` raises #BP, which reaches a fault handler as
+    // `FAULT_EXC_BREAKPOINT` (docs/fault-handling.md § Fault Message). Every
+    // other exception gate keeps DPL 0: the CPU raises those itself, whatever
+    // the gate's DPL, and no user `int n` may reach them.
+    idt[3] = IdtEntry::new(isr3 as *const () as u64, 0, 3);
 
     // Load IDTR.
     let idtr = Idtr {

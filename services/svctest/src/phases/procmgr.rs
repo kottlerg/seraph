@@ -788,8 +788,9 @@ fn hello_file() -> (u64, u64)
 /// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap, a
 /// `CREATE_FROM_FILE` asking `CREATE_PHYS_ACCESS` (a phys-class child) from
 /// svctest, which is not phys-class, and a `CONFIGURE_PIPE` with an unknown
-/// direction or for a direction already configured. Each refused request carries caps. procmgr's slot count is not
-/// observable from a client, so each cell asserts the refusal reply, and a
+/// direction or for a direction already configured. Each refused request
+/// carries caps. procmgr's slot count is not observable from a client, so
+/// each cell asserts the refusal reply, and a
 /// spawn afterwards shows procmgr still serves. The phase then checks that
 /// procmgr destroys a child whose create reply it cannot deliver
 /// ([`undeliverable_reply_child_main`]).

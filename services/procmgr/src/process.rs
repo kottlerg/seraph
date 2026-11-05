@@ -2735,9 +2735,18 @@ fn create_child_kernel_objects(
         crate::ASPACE_RETYPE_PAGES,
         ipc_buf,
     )?);
-    let aspace =
-        CapGuard::new(syscall::cap_create_aspace(slab.cap(), 0, crate::ASPACE_RETYPE_PAGES).ok()?);
-    // The retype keeps its own reference on the region; drop the slab slot.
+    // Retype through a derivation without `RIGHTS_MEM_PHYS`, so the address
+    // space is minted without `RIGHTS_AS_READ` even for a phys-class child,
+    // whose slab carries `PHYS`: procmgr keeps this cap for the child's life,
+    // and no process translates a child's pages (`SYS_ASPACE_QUERY`).
+    let narrowed = CapGuard::new(
+        syscall::cap_derive(slab.cap(), syscall::RIGHTS_ALL & !syscall::RIGHTS_MEM_PHYS).ok()?,
+    );
+    let aspace = CapGuard::new(
+        syscall::cap_create_aspace(narrowed.cap(), 0, crate::ASPACE_RETYPE_PAGES).ok()?,
+    );
+    // The retype keeps its own reference on the region; drop the slab slots.
+    drop(narrowed);
     drop(slab);
     let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
         memmgr_send,

@@ -178,8 +178,11 @@ the two a process can reach answer only a holder of the Memory `Phys` right
   addresses traversed during the walk are not returned. `SYS_CAP_CREATE_ASPACE` mints
   `READ` only when its retype source carries `Phys` (init's kernel-created address space
   carries it too), and `READ` gates nothing else, so the query answers only a process that
-  could read the frames' bases through the selector above. init hands procmgr its own
-  address space without `READ`.
+  could read the frames' bases through the selector above. The address spaces that carry
+  `READ` are init's own and memmgr's, which init retypes from its `Phys` arena: init hands
+  procmgr its own address space without `READ`, and procmgr retypes every child's,
+  devmgr's and the IOMMU driver's included, through a derivation without `Phys`, so no
+  child's address space carries it.
 - The `InitInfo` handover publishes physical bases for the resources it hands init:
   `CapDescriptor::aux0` (Memory / Mmio physical base) and
   `InitFramebufferInfo::physical_base`. Each describes a resource init receives a
@@ -209,8 +212,9 @@ Who holds `Phys`, and why:
 - **procmgr, transiently.** procmgr allocates a child's memory against the child's memmgr
   account, so while it builds devmgr or an IOMMU driver it holds those children's `Phys`
   grants, and at init's reap it holds init's reclaimable boot caps until it donates them
-  to memmgr. procmgr's own grants lack `Phys`: init mints procmgr's memmgr badge without
-  the phys-class bit, and memmgr refuses a bootstrap that carries it.
+  to memmgr, and init's own `READ` address space until the reap tears it down. procmgr's
+  own grants lack `Phys`: init mints procmgr's memmgr badge without the phys-class bit,
+  and memmgr refuses a bootstrap that carries it.
 
 Every other process, every device driver included, holds no `Phys` cap: its grants lack
 the right, its address spaces lack `READ`, and memmgr's grant reply names its runs by

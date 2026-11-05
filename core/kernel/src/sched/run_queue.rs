@@ -28,9 +28,9 @@
 //! held simultaneously.
 
 use super::thread::ThreadControlBlock;
-use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN, TIME_SLICE_TICKS};
+use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 // ── Queue map ─────────────────────────────────────────────────────────────────
 
@@ -354,6 +354,18 @@ pub struct PerCpuScheduler
     /// before the CPU schedules.
     idle: AtomicPtr<ThreadControlBlock>,
 
+    /// Level of `current` as of its dispatch. Written only by this CPU, with
+    /// interrupts masked, where it dispatches a thread: `schedule()`'s dispatch
+    /// flip under the incoming thread's `sched_lock`, its same-thread re-mark
+    /// under the running thread's, `IDLE_PRIORITY` when it switches to idle, and
+    /// `sched::enter`'s boot dispatch of init. Read only by this CPU's
+    /// `timer_tick`, through [`tick_outcome`](Self::tick_outcome). It stands in
+    /// for `(*current).priority`, which `timer_tick` may not read without the
+    /// thread's `sched_lock`, so a priority change of a running thread reaches
+    /// its slice at its next dispatch. Atomic only so a shared reference can
+    /// reach it; Relaxed, since one CPU both writes and reads it.
+    current_level: AtomicU8,
+
     /// Lock protecting the run queues.
     ///
     /// Acquire before any `enqueue`/`enqueue_at_head`/`dequeue_highest`/
@@ -411,6 +423,7 @@ impl PerCpuScheduler
             non_empty: AtomicU32::new(0),
             current: AtomicPtr::new(core::ptr::null_mut()),
             idle: AtomicPtr::new(core::ptr::null_mut()),
+            current_level: AtomicU8::new(IDLE_PRIORITY),
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
             saved_lock_flags: AtomicU64::new(0),
@@ -650,11 +663,20 @@ impl PerCpuScheduler
         self.current.store(tcb, Ordering::Relaxed);
     }
 
+    /// Record `level` as the level of the thread this CPU is dispatching, for
+    /// [`tick_outcome`](Self::tick_outcome). Called only by this CPU, with
+    /// interrupts masked, at a dispatch (see the `current_level` field).
+    pub fn set_current_level(&self, level: u8)
+    {
+        self.current_level.store(level, Ordering::Relaxed);
+    }
+
     /// Decide what a timer tick does to the running thread, whose slice holds
     /// `slice_remaining` ticks before the tick: a zero slice is the idle
-    /// thread's; a slice that reaches zero expires and is refilled; any other
-    /// slice goes on.
-    pub fn tick_outcome(slice_remaining: u32) -> TickOutcome
+    /// thread's; a slice that reaches zero expires and is refilled with the
+    /// [`quantum_ticks`](super::quantum_ticks) of the level `current` was
+    /// dispatched at; any other slice goes on.
+    pub fn tick_outcome(&self, slice_remaining: u32) -> TickOutcome
     {
         if slice_remaining == 0
         {
@@ -664,7 +686,7 @@ impl PerCpuScheduler
         if remaining == 0
         {
             TickOutcome::Expired {
-                quantum: TIME_SLICE_TICKS,
+                quantum: super::quantum_ticks(self.current_level.load(Ordering::Relaxed)),
             }
         }
         else
@@ -1009,7 +1031,8 @@ mod tests
     #[test]
     fn a_zero_slice_is_the_idle_threads_and_is_left_alone()
     {
-        assert_eq!(PerCpuScheduler::tick_outcome(0), TickOutcome::Idle);
+        let sched = PerCpuScheduler::new();
+        assert_eq!(sched.tick_outcome(0), TickOutcome::Idle);
     }
 
     // Defect caught: a slice that expires a tick late or early, or one that
@@ -1017,14 +1040,38 @@ mod tests
     #[test]
     fn a_slice_expires_on_the_tick_that_takes_its_last_tick()
     {
+        let sched = PerCpuScheduler::new();
         assert_eq!(
-            PerCpuScheduler::tick_outcome(2),
+            sched.tick_outcome(2),
             TickOutcome::Continue { remaining: 1 }
         );
-        assert!(matches!(
-            PerCpuScheduler::tick_outcome(1),
-            TickOutcome::Expired { .. }
-        ));
+        assert!(matches!(sched.tick_outcome(1), TickOutcome::Expired { .. }));
+    }
+
+    // Defect caught: an expired slice refilled with another level's quantum
+    // than the running thread's (a fair thread's weight lost, or an RT thread
+    // given a fair quantum).
+    #[test]
+    fn an_expired_slice_is_refilled_with_the_running_levels_quantum()
+    {
+        let sched = PerCpuScheduler::new();
+        for level in [
+            syscall::PRIORITY_MIN,
+            7,
+            RT_PRIORITY_MIN - 1,
+            RT_PRIORITY_MIN,
+            30,
+        ]
+        {
+            sched.set_current_level(level);
+            assert_eq!(
+                sched.tick_outcome(1),
+                TickOutcome::Expired {
+                    quantum: crate::sched::quantum_ticks(level)
+                },
+                "level {level}"
+            );
+        }
     }
 
     // ── RunQueue tests (exercised through PerCpuScheduler at priority 0) ──────

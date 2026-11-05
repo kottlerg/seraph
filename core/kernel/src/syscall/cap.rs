@@ -967,7 +967,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::sched::alloc_thread_id;
     use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
     use crate::sched::thread_slot::{EXTENDED_OFFSET, STACK_OFFSET, WRAPPER_OFFSET};
-    use crate::sched::{AFFINITY_ANY, KERNEL_STACK_PAGES, TIME_SLICE_TICKS};
+    use crate::sched::{AFFINITY_ANY, KERNEL_STACK_PAGES, quantum_ticks};
     use core::ptr::NonNull;
     use syscall::{PRIORITY_MAX, PRIORITY_MIN};
 
@@ -1170,7 +1170,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
             ThreadControlBlock {
                 state: ThreadState::Created,
                 priority: creation_priority,
-                slice_remaining: TIME_SLICE_TICKS,
+                slice_remaining: quantum_ticks(creation_priority),
                 cpu_affinity: AFFINITY_ANY,
                 preferred_cpu: 0,
                 run_queue_next: None,

@@ -185,8 +185,33 @@ pub fn memory_split_after_cspace_teardown(ctx: &TestContext) -> TestResult
     let piece = split_shared_piece(ctx, CASE)?;
     let cs = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| CASE)?;
     let copied = cap_copy(piece, cs, RIGHTS_ALL);
-    let shared = copied.is_ok() && syscall::memory_split(piece, PAGE_SIZE).is_ok();
+    let shared_split = copied
+        .as_ref()
+        .map(|_| syscall::memory_split(piece, PAGE_SIZE));
     cap_delete(cs).map_err(|_| CASE)?;
+    match shared_split
+    {
+        // No copy was made: the piece is still sole, so it merges back.
+        Err(_) =>
+        {
+            syscall::memory_merge(ctx.memory_base, piece).ok();
+            return Err(CASE);
+        }
+        // A split while the copy lived is the defect itself; the halves are
+        // merged back as far as the kernel lets them.
+        Ok(Ok(probe_tail)) =>
+        {
+            if syscall::memory_merge(piece, probe_tail).is_ok()
+            {
+                syscall::memory_merge(ctx.memory_base, piece).ok();
+            }
+            return Err(
+                "mm::memory_split_after_cspace_teardown: a piece with a live copy was split",
+            );
+        }
+        Ok(Err(_)) =>
+        {}
+    }
 
     let mut tail = None;
     for _ in 0..crate::scaled_polls(CSPACE_RELEASE_POLLS)
@@ -209,14 +234,7 @@ pub fn memory_split_after_cspace_teardown(ctx: &TestContext) -> TestResult
         );
     };
     syscall::memory_merge(piece, tail).map_err(|_| CASE)?;
-    syscall::memory_merge(ctx.memory_base, piece).map_err(|_| CASE)?;
-
-    copied.map_err(|_| CASE)?;
-    if shared
-    {
-        return Err("mm::memory_split_after_cspace_teardown: a piece with a live copy was split");
-    }
-    Ok(())
+    syscall::memory_merge(ctx.memory_base, piece).map_err(|_| CASE)
 }
 
 /// `SYS_MEMORY_MERGE` refuses a parent or a tail whose object another slot also

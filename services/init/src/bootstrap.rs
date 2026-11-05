@@ -1000,12 +1000,11 @@ fn forward_arena(arena_cap: u64, mm_cspace: u64, kind: u64) -> Option<InUseArena
 /// into `mm_cspace`, so that once any derivation init took from it is gone
 /// memmgr's slot is the only one naming the run and memmgr can split and
 /// merge it. Count the run in `count`, recording `base` on the first. Used
-/// for the
-/// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
-/// products with no `InitInfo` descriptor, which the reap donation walk does
-/// not reach, so unforwarded they would stay in init's `CSpace` until the reap
-/// frees it and then free into the sealed post-handoff buddy, tripping the
-/// kernel's post-seal `debug_assert` in a debug build.
+/// for the `MemoryAlloc` tail and the transient phys-table page — both
+/// `memory_split` products with no `InitInfo` descriptor, which the reap
+/// donation walk does not reach, so unforwarded they would stay in init's
+/// `CSpace` until the reap frees it and then free into the sealed post-handoff
+/// buddy, tripping the kernel's post-seal `debug_assert` in a debug build.
 fn push_free_run(src_cap: u64, mm_cspace: u64, base: &mut u64, count: &mut u64)
 {
     if let Ok(dst_slot) = syscall::cap_move(src_cap, mm_cspace, 0)

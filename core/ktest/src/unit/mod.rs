@@ -252,6 +252,14 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Memory management syscalls ────────────────────────────────────────────
     run_test!("mm::memory_split_merge", mm::memory_split_merge(ctx));
+    run_test!(
+        "mm::memory_split_shared_object_refused",
+        mm::memory_split_shared_object_refused(ctx)
+    );
+    run_test!(
+        "mm::memory_merge_shared_object_refused",
+        mm::memory_merge_shared_object_refused(ctx)
+    );
     run_test!("mm::mem_map_unmap", mm::mem_map_unmap(ctx));
     run_test!("mm::mem_protect", mm::mem_protect(ctx));
     run_test!(

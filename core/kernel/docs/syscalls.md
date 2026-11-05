@@ -1196,7 +1196,16 @@ The parent's `size` shrinks to `split_offset`; when it carries `RETYPE`, its
 rights and ownership flag and is linked as a derivation sibling of the parent
 (a child of the parent's derivation parent; a root when the parent is one).
 Live retypes against the parent always sit below its bump offset, so the tail
-is virgin. A parent that has derivation children cannot be split.
+is virgin.
+
+A Memory object is split only through the one capability slot that names it. A derivation or
+copy of a Memory cap names the source's object, so shrinking that object in place would shrink
+what every other slot naming it reaches; the call refuses `memory_cap` while any other slot, in
+any `CSpace`, names its object: a derivation parent, a sibling, a child, or a slot that still
+shares the object once the derivation edge between them is gone (a deleted parent leaves its
+children as unlinked roots). The kernel counts the slots that name each Memory object
+(`MemoryObject::slot_count`, exact under the derivation lock the call holds). Retype leases,
+donations, and other syscalls' pins are not slots and do not refuse the split.
 
 The parent is revalidated under the derivation lock before its object is
 touched and the tail is linked beside it (see
@@ -1208,8 +1217,8 @@ with `InvalidState`.
 **Capability requirement:** `memory_cap` must have Map rights.
 
 **Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`,
-leaving fewer than one page on the upper side, below the bump boundary, or the
-parent has derivation children), `InvalidCapability`, `InvalidState` (per
+leaving fewer than one page on the upper side, below the bump boundary, or another
+slot names the parent's object), `InvalidCapability`, `InvalidState` (per
 above), `InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's
 `CSpace` pool cannot back the tail's body or its slot; see
 [capability-internals.md](capability-internals.md) § Body Arena), `QuotaExceeded` (caller's CSpace
@@ -1333,8 +1342,10 @@ The two capabilities must be derivation siblings with identical rights, be physi
 contiguous (`parent.base + parent.size == tail.base`), and the tail must be virgin
 (no live retypes: its retype bump cursor is at its base and its `available_bytes` equals
 its size when it carries `RETYPE`, zero otherwise; a tail whose retyped objects have all
-been freed qualifies). Both must carry the same memory-ownership flag, and neither may
-have derivation children.
+been freed qualifies). Both must carry the same memory-ownership flag, and each object must be
+named by its own slot alone, under the rule of § `SYS_MEMORY_SPLIT`: growing the parent would
+grow what another slot naming it reaches, and consuming the tail would leave another slot
+naming it over a range the parent then owns.
 
 **Capability requirements:** `parent_cap` (Map), `tail_cap` (Map); rights must match.
 
@@ -1346,7 +1357,8 @@ with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight wi
 `InvalidState`.
 
 **Errors:** `InvalidArgument` (same slot/object, rights mismatch, ownership-flag
-mismatch, not contiguous, tail not virgin, not siblings, or either has children),
+mismatch, not contiguous, tail not virgin, not siblings, or another slot names either
+object),
 `InvalidCapability`,
 `InvalidState` (per above), `InsufficientRights` (either cap lacks Map).
 

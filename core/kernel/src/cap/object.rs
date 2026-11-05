@@ -352,6 +352,19 @@ pub struct MemoryObject
     /// mutated. Lock order: see core/kernel/docs/scheduling-internals.md
     /// § Lock Hierarchy, "Bare spin locks".
     pub lock: AtomicU32,
+    /// Number of capability slots, in every `CSpace`, that name this object:
+    /// raised when a slot is filled with it ([`MemoryObject::note_slot_filled`])
+    /// and lowered when such a slot is freed or its dying `CSpace` releases it
+    /// ([`MemoryObject::note_slot_released`]). Unlike `header.ref_count` it
+    /// counts no retype lease, donation, or syscall pin. A slot that names an
+    /// existing object is filled, and an occupied slot freed, only under
+    /// `DERIVATION_LOCK` for writing (core/kernel/docs/capability-internals.md
+    /// § Global Derivation Lock), so a reader holding that lock sees a count
+    /// no other path can raise; a dying `CSpace`'s release, the one decrement
+    /// outside it, can only lower it. `sys_memory_split` and
+    /// `sys_memory_merge` refuse an object whose count is above one, since
+    /// resizing it would change what another slot names.
+    pub slot_count: AtomicU32,
 }
 
 /// Sentinel encoding a held write lock in [`MemoryObject::lock`]. Matches
@@ -362,6 +375,47 @@ const FRAME_WRITE_LOCKED: u32 = u32::MAX;
 
 impl MemoryObject
 {
+    /// Count a capability slot just filled with the Memory object `object`
+    /// ([`MemoryObject::slot_count`]).
+    ///
+    /// # Safety
+    /// `object` must be the header of a live `MemoryObject` that the filled
+    /// slot now names.
+    pub unsafe fn note_slot_filled(object: NonNull<KernelObjectHeader>)
+    {
+        // SAFETY: caller contract; the header is at offset 0 of MemoryObject.
+        // cast_ptr_alignment: a MemoryObject is 8-byte aligned wherever it is
+        // placed, and holds the header at offset 0.
+        #[allow(clippy::cast_ptr_alignment)]
+        let memory = unsafe { &*object.as_ptr().cast::<MemoryObject>() };
+        memory.slot_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Uncount a capability slot that named the Memory object `object` and is
+    /// being freed, or whose dying `CSpace` releases it
+    /// ([`MemoryObject::slot_count`]).
+    ///
+    /// # Safety
+    /// `object` must be the header of a live `MemoryObject` that the released
+    /// slot names, counted by [`Self::note_slot_filled`] when it was filled.
+    pub unsafe fn note_slot_released(object: NonNull<KernelObjectHeader>)
+    {
+        // SAFETY: caller contract; the header is at offset 0 of MemoryObject.
+        // cast_ptr_alignment: as in `note_slot_filled`.
+        #[allow(clippy::cast_ptr_alignment)]
+        let memory = unsafe { &*object.as_ptr().cast::<MemoryObject>() };
+        let before = memory.slot_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(before > 0, "MemoryObject slot_count underflow");
+    }
+
+    /// Whether no capability slot but the caller's names this object
+    /// ([`MemoryObject::slot_count`]). Exact while the caller holds
+    /// `DERIVATION_LOCK` for writing and its own slot is revalidated under it.
+    pub fn named_by_one_slot(&self) -> bool
+    {
+        self.slot_count.load(Ordering::Acquire) == 1
+    }
+
     /// Acquire a shared read lock. Spins while a writer holds the lock.
     ///
     /// A contended wait is recorded in the calling CPU's lock-wait
@@ -4434,13 +4488,21 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // holding the last reference to the next is torn down
                 // iteratively, not one recursion per level.
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration;
-                // each slot's reference is released once, and one that was
+                // each slot's object is live until its reference is released,
+                // so a Memory object is uncounted while live and once, as its
+                // fill counted it; each slot's reference is released once, and one that was
                 // its object's last leaves the object referenced by no slot,
                 // pin, or kernel owner and on no stack; a nested `CSpace`
                 // wrapper among them stays reachable only through its arena
                 // pages' `owner`, which `CascadeStack::push` allows.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
+                        // The slot stops naming its object here, as a freed
+                        // slot does in `CSpace::free_slot`.
+                        if obj_ptr.as_ref().obj_type == ObjectType::Memory
+                        {
+                            MemoryObject::note_slot_released(obj_ptr);
+                        }
                         if obj_ptr.as_ref().dec_ref() == 0
                         {
                             stack.push(obj_ptr);

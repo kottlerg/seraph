@@ -69,16 +69,17 @@ RAM into the fewest contiguous extents and places the largest at `memory_base`,
 so the first cap is the largest; consumers that take the whole range read each
 cap's size individually and do not depend on the order of the rest.
 
-Init forwards Memory into memmgr's CSpace with the "derive twice" pattern in
-[`capability-internals.md`](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern):
-it keeps a full-rights intermediary and copies that, so it can revoke memmgr's copy.
-devmgr's hardware caps are single derivations of init's roots moved over IPC,
-revocable only through the root; the per-service detail is in
+Init moves the RAM it forwards into memmgr's CSpace, so from the handover memmgr is the sole
+holder of each free run, the authority
+[userspace-memory-model.md § Ownership Boundaries](userspace-memory-model.md#ownership-boundaries)
+assigns it; the bootstrap arenas it forwards as in-use runs are copies of a derived intermediary,
+since init's arena caps carry the arenas' retypes. devmgr's hardware caps are single derivations
+of init's roots moved over IPC, revocable only through the root; the per-service detail is in
 [services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md#per-stage-authority-transfers)
 § Per-stage authority transfers. At the
 init-reap handoff init moves only its kernel-object caps and the reclaimable
 Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
-root caps stay in init's CSpace: the RAM roots of memory forwarded to memmgr; the firmware caps;
+root caps stay in init's CSpace: the firmware caps;
 the `Interrupt`, `IoPort`, `SbiControl`, and `Mmio` roots; and both halves of the split
 `SchedControl` root (the baseline band init delegated and the elevated remainder it keeps). The
 kernel keeps no reference on that CSpace once init runs: it is an ordinary CSpace held by its
@@ -92,11 +93,10 @@ so procmgr's deletion of the last one at the reap frees it and releases those ca
 Init creates memmgr's `AddressSpace`, `CSpace`, and `Thread` via raw
 syscalls. It loads memmgr's ELF (from a boot module Memory cap), maps
 the segments into memmgr's address space, populates memmgr's
-`ProcessInfo`, copies the RAM Memory caps left after init's own
-bootstrap allocations into memmgr's CSpace using derive-twice (every one
-while memmgr's CSpace and init's own keep the headroom the caps that
-must ride the round, and init's later bootstrap, need; the remainder
-reaches memmgr via the init-reap donation), forwards the
+`ProcessInfo`, moves the RAM Memory caps left after init's own
+bootstrap allocations into memmgr's CSpace (every one while memmgr's
+CSpace keeps the headroom the caps that must ride the round need; the
+remainder reaches memmgr via the init-reap donation), forwards the
 memmgr/procmgr/init bootstrap arenas as in-use runs, and starts memmgr's
 thread (`finalize_memmgr`).
 
@@ -225,8 +225,9 @@ holds: the remaining root caps (see [Kernel → init](#kernel--init)), the endpo
 its caps on the kernel objects it created for memmgr and procmgr, the intermediate caps it derived,
 and the bootstrap-arena Memory caps it forwarded to memmgr. Releasing a cap is a delete, not a
 revoke: what other processes derived from it is reparented and survives, and an object another
-holder still references (memmgr's RAM and arena copies, devmgr's hardware derivations, the
-memmgr and procmgr kernel objects) stays alive. An `owns_memory` Memory object whose last
+holder still references (memmgr's arena copies, devmgr's hardware derivations, the memmgr and
+procmgr kernel objects) stays alive; the RAM runs init moved to memmgr hold no slot in init's
+CSpace. An `owns_memory` Memory object whose last
 reference sat in init's CSpace would free into the sealed buddy; none does, since init forwards or
 donates every page it owns to memmgr's pool, which holds an `owns_memory` cap on each (the
 all-RAM-accounted identity of

@@ -58,11 +58,11 @@ process creation to procmgr IPC.
   the memmgr SEND cap so its std heap reaches memmgr on the first
   allocation (`bootstrap::bootstrap_procmgr` in
   `../src/bootstrap.rs`, called from `run()` in `../src/main.rs`).
-- Delegate the remaining RAM Memory caps to memmgr's CSpace via
+- Move the remaining RAM Memory caps into memmgr's CSpace via
   `finalize_memmgr`, up to the forwarding stop, which ends the forwarded
   prefix at the first cap that has no `InitInfo` descriptor, that comes
-  once memmgr's or init's `CSpace` headroom is already below its limit, or
-  whose derive or copy is refused. The descriptor-bearing caps from the
+  once memmgr's `CSpace` headroom is already below its limit, or whose
+  move is refused. The descriptor-bearing caps from the
   stop on reach memmgr's pool through the reap donation
   ([Handover](#handover)) instead; a cap with no descriptor is not
   donated (the kernel halts the boot rather than truncate the
@@ -253,8 +253,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   ranges, the AP-trampoline memory cap, the boot-module ELF sources, the
   descriptor-bearing usable-RAM caps the bootstrap round did not forward
   (from the forwarding stop on: the first cap with no `InitInfo`
-  descriptor, headroom of memmgr's or init's `CSpace` already below its
-  limit, or a refused derive or copy; see [Raw bootstrap](#raw-bootstrap)),
+  descriptor, headroom of memmgr's `CSpace` already below its limit, or a
+  refused move; see [Raw bootstrap](#raw-bootstrap)),
   and `MemoryAlloc`'s orphaned remainders) to procmgr in further
   `REGISTER_INIT_TEARDOWN` rounds, then send `INIT_TEARDOWN_DONE`
   (`finish_init_reap_handoff` in `../src/service.rs`). The usable-RAM
@@ -318,11 +318,12 @@ init's CSpace (the list is in
 [Process Lifecycle](../../../docs/process-lifecycle.md#kernel--init)
 § Kernel → init); at the reap handoff init moves only its kernel-object
 caps and the reclaimable Memory caps it solely owns to procmgr (see
-[Handover](#handover)). Memory forwarded into memmgr's CSpace uses the
-**derive-twice** pattern documented in
-[`../../../docs/capability-model.md`](../../../docs/capability-model.md):
-init derives a full-rights intermediary from the source cap and copies
-that into memmgr's CSpace, keeping the intermediary. devmgr's hardware
+[Handover](#handover)). RAM forwarded to memmgr is moved into memmgr's
+CSpace, so from the handover memmgr is the sole holder of each free run, the
+authority [Userspace Memory Model](../../../docs/userspace-memory-model.md#ownership-boundaries)
+§ Ownership Boundaries assigns it; the in-use bootstrap arenas are copied
+from a derived intermediary, since init's arena caps carry the arenas'
+retypes. devmgr's hardware
 caps are single derivations of init's roots moved over IPC, revocable
 only through the root (derivation-tree mechanics in
 [capability internals](../../../core/kernel/docs/capability-internals.md)).

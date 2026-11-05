@@ -33,7 +33,11 @@
 //! `memory_merge` only (never `cap_delete`), and `init_segment_caps_aligned`
 //! maps segment caps read-only through `mem_map`.
 
-use syscall::{MAP_READ, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
+use syscall::{
+    MAP_READ, MAP_WRITABLE, RIGHTS_ALL, aspace_query, cap_delete, cap_derive, cap_info, mem_map,
+    mem_unmap,
+};
+use syscall_abi::{CAP_INFO_MEMORY_SIZE, PAGE_SIZE};
 
 use crate::{TestContext, TestResult};
 
@@ -100,6 +104,114 @@ pub fn memory_split_merge(ctx: &TestContext) -> TestResult
     // the TEXT segment's VA; the dealloc path would buddy-free pages live
     // in ktest's own page tables.
     syscall::memory_merge(rodata_cap, tail2).map_err(|_| "final memory_merge failed")?;
+    Ok(())
+}
+
+/// Pages of the piece the shared-object cases split off `memory_base`.
+const SHARED_PIECE_PAGES: u64 = 4;
+
+/// Split [`SHARED_PIECE_PAGES`] pages off the top of `memory_base`; the piece is
+/// a derivation root, as `memory_base` is.
+fn split_shared_piece(ctx: &TestContext, case: &'static str) -> Result<u64, &'static str>
+{
+    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE).map_err(|_| case)?;
+    syscall::memory_split(ctx.memory_base, size - SHARED_PIECE_PAGES * PAGE_SIZE).map_err(|_| case)
+}
+
+/// The size of the Memory object `cap` names, or 0 when the query fails.
+fn memory_size(cap: u64) -> u64
+{
+    cap_info(cap, CAP_INFO_MEMORY_SIZE).unwrap_or(0)
+}
+
+/// `SYS_MEMORY_SPLIT` refuses a Memory cap whose object another slot also
+/// names, and leaves the object's size unchanged (core/kernel/docs/syscalls.md
+/// § `SYS_MEMORY_SPLIT`).
+///
+/// Three holders of a shared object are refused: a derivation of the piece,
+/// the piece itself while that derivation lives, and a derivation that a
+/// delete of its parent left an unlinked root beside a sibling of the same
+/// object. Once the last other slot goes, the split succeeds, and the halves
+/// merge back into `memory_base`.
+pub fn memory_split_shared_object_refused(ctx: &TestContext) -> TestResult
+{
+    const CASE: &str = "mm::memory_split_shared_object_refused: setup failed";
+    let piece = split_shared_piece(ctx, CASE)?;
+    let full = SHARED_PIECE_PAGES * PAGE_SIZE;
+
+    let derived = cap_derive(piece, RIGHTS_ALL).map_err(|_| CASE)?;
+    let by_child = syscall::memory_split(derived, PAGE_SIZE);
+    let by_parent = syscall::memory_split(piece, PAGE_SIZE);
+    let size_after = memory_size(piece);
+
+    // A second derivation, then the piece's delete: both derivations become
+    // roots that share the object with no derivation edge between them.
+    let sibling = cap_derive(piece, RIGHTS_ALL).map_err(|_| CASE)?;
+    cap_delete(piece).map_err(|_| CASE)?;
+    let by_unlinked = syscall::memory_split(derived, PAGE_SIZE);
+    let unlinked_size = memory_size(derived);
+    cap_delete(sibling).map_err(|_| CASE)?;
+
+    let tail = syscall::memory_split(derived, PAGE_SIZE)
+        .map_err(|_| "mm::memory_split_shared_object_refused: split of the sole slot failed")?;
+    syscall::memory_merge(derived, tail).map_err(|_| CASE)?;
+    syscall::memory_merge(ctx.memory_base, derived).map_err(|_| CASE)?;
+
+    if by_child.is_ok() || by_parent.is_ok() || by_unlinked.is_ok()
+    {
+        return Err("mm::memory_split_shared_object_refused: a shared Memory object was split");
+    }
+    if size_after != full || unlinked_size != full
+    {
+        return Err("mm::memory_split_shared_object_refused: a refused split changed the size");
+    }
+    Ok(())
+}
+
+/// `SYS_MEMORY_MERGE` refuses a parent or a tail whose object another slot also
+/// names, and leaves both sizes unchanged (core/kernel/docs/syscalls.md
+/// § `SYS_MEMORY_MERGE`).
+///
+/// The other slot is an unlinked root: each case derives two caps from one
+/// half and deletes that half, so the derivations are roots, siblings of the
+/// other half, that share one object. A merge through either half fails until
+/// the extra root is deleted; the halves then merge and return to
+/// `memory_base`.
+pub fn memory_merge_shared_object_refused(ctx: &TestContext) -> TestResult
+{
+    const CASE: &str = "mm::memory_merge_shared_object_refused: setup failed";
+    let piece = split_shared_piece(ctx, CASE)?;
+    let tail = syscall::memory_split(piece, PAGE_SIZE).map_err(|_| CASE)?;
+
+    // Parent shared: `head` and `head_extra` both name the parent's object.
+    let head = cap_derive(piece, RIGHTS_ALL).map_err(|_| CASE)?;
+    let head_extra = cap_derive(piece, RIGHTS_ALL).map_err(|_| CASE)?;
+    cap_delete(piece).map_err(|_| CASE)?;
+    let parent_shared = syscall::memory_merge(head, tail);
+    let sizes_parent_case = (memory_size(head), memory_size(tail));
+    cap_delete(head_extra).map_err(|_| CASE)?;
+
+    // Tail shared: `rest` and `rest_extra` both name the tail's object.
+    let rest = cap_derive(tail, RIGHTS_ALL).map_err(|_| CASE)?;
+    let rest_extra = cap_derive(tail, RIGHTS_ALL).map_err(|_| CASE)?;
+    cap_delete(tail).map_err(|_| CASE)?;
+    let tail_shared = syscall::memory_merge(head, rest);
+    let sizes_tail_case = (memory_size(head), memory_size(rest));
+    cap_delete(rest_extra).map_err(|_| CASE)?;
+
+    syscall::memory_merge(head, rest)
+        .map_err(|_| "mm::memory_merge_shared_object_refused: merge of sole slots failed")?;
+    syscall::memory_merge(ctx.memory_base, head).map_err(|_| CASE)?;
+
+    if parent_shared.is_ok() || tail_shared.is_ok()
+    {
+        return Err("mm::memory_merge_shared_object_refused: a shared Memory object was merged");
+    }
+    let halves = (PAGE_SIZE, (SHARED_PIECE_PAGES - 1) * PAGE_SIZE);
+    if sizes_parent_case != halves || sizes_tail_case != halves
+    {
+        return Err("mm::memory_merge_shared_object_refused: a refused merge changed a size");
+    }
     Ok(())
 }
 

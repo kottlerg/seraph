@@ -837,11 +837,14 @@ pub unsafe fn mem_protect(
 /// child cap covering `[base + split_offset, base + orig_size)` is
 /// inserted in the caller's `CSpace` as a derivation sibling of the
 /// parent. Returns the tail's capability handle (slot index plus generation).
+/// The parent's object must be named by `memory_cap`'s slot alone: no
+/// derivation or copy of it, in any `CSpace`, may be live
+/// (core/kernel/docs/syscalls.md § `SYS_MEMORY_SPLIT`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (`split_offset`
-/// not page-aligned, out of range, inside the cap's bump region, or the
-/// parent has derivation children), `InvalidCapability` (also a parent a
+/// not page-aligned, out of range, inside the cap's bump region, or another
+/// slot names the parent's object), `InvalidCapability` (also a parent a
 /// concurrent delete freed before the tail was linked), `InvalidState` (a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's
@@ -865,8 +868,9 @@ pub fn memory_split(memory_cap: u64, split_offset: u64) -> Result<u64, i64>
 /// Inverse of [`memory_split`]. `parent_cap` covers the
 /// physically-lower half and `tail_cap` the upper;
 /// `parent.base + parent.size == tail.base` is required. Both caps must
-/// share the same rights, `owns_memory` state, derivation parent, and
-/// have no derivation children. The tail must be virgin (no live
+/// share the same rights, `owns_memory` state, and derivation parent, and
+/// each object must be named by its own slot alone (no live derivation or
+/// copy of either, in any `CSpace`). The tail must be virgin (no live
 /// retypes against it).
 ///
 /// `parent_cap`'s slot stays valid; its `size` and `available_bytes`
@@ -880,8 +884,9 @@ pub fn memory_split(memory_cap: u64, split_offset: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (same slot or
 /// object, rights or ownership-flag mismatch, not contiguous, tail not
-/// virgin, not siblings, or either has children), `InvalidCapability` (also a
-/// cap a concurrent delete freed before the merge took the derivation lock),
+/// virgin, not siblings, or another slot names either object),
+/// `InvalidCapability` (also a cap a concurrent delete freed before the
+/// merge took the derivation lock),
 /// `InvalidState` (a `cap_revoke`, `cap_move`, or IPC capability transfer is
 /// in flight on either cap), or `InsufficientRights` (either cap lacks Map).
 #[inline]

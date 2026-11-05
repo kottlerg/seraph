@@ -18,10 +18,15 @@ total RAM (see
 Capability Distribution" and
 [`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#ownership-boundaries)
 §"Ownership Boundaries"). Memory cap sizes vary — they reflect the firmware
-memory map and may span many MiB each. Init copies the RAM caps left after its
-own bootstrap allocations into memmgr's CSpace via the derive-twice pattern
-(every one while both memmgr's CSpace and init's own keep the headroom init
-reserves in each), forwards
+memory map and may span many MiB each. Init moves the RAM caps left after its
+own bootstrap allocations into memmgr's CSpace (every one while memmgr's CSpace
+keeps the headroom init reserves in it), so from the handover memmgr's slot is
+the only one naming each run, which the kernel requires of a run memmgr splits
+or merges (see
+[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
+§"`SYS_MEMORY_SPLIT`"). The phys-table page is one of these runs: memmgr reads it
+through the read-only derivation the bootstrap round carries, and once memmgr
+deletes that derivation the page is a splittable run like any other. Init forwards
 the memmgr/procmgr/init bootstrap arenas as in-use runs, and transfers the slot
 range `(memory_base, memory_count)` to memmgr in its bootstrap IPC round; any
 RAM caps init did not forward join the pool through the init-reap donation
@@ -295,9 +300,7 @@ another in three ways:
   process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
   out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
   map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
-  device still writing it. Init's own derive-twice intermediaries of the RAM caps it forwarded at
-  boot count too: a frame of such a bootstrap extent's original object that memmgr reclaims before
-  init's reap waits until the reap frees them.
+  device still writing it.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
 Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
@@ -413,8 +416,8 @@ cap. Eligibility:
 - The kernel's `memory_merge` accepts the operation (see
   [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
   §"`SYS_MEMORY_MERGE`"): the caps must be derivation siblings with identical
-  rights, the tail must be virgin (never retyped or sub-allocated), and neither
-  may have derivation children.
+  rights, the tail must be virgin (never retyped or sub-allocated), and no
+  other slot may name either cap's object (no derivation of either is live).
 
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins

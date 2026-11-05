@@ -1617,20 +1617,20 @@ impl VirtioDeviceCaps
     /// before the driver's frames, and the frames its mappings reach, are
     /// freed: withdraw its DMA grant ([`dma::DmaGrant::withdraw`]), so the
     /// driver maps nothing more and an IOMMU, where one confines the device,
-    /// blocks it; clear the function's
-    /// Bus Master Enable ([`FunctionConfig::clear_bus_master`]), so the
-    /// device issues no further DMA whatever its driver does; then revoke
-    /// every cap derived from the BAR caps devmgr keeps (the driver's copies,
-    /// whose mappings the revocation removes before it returns), so the
-    /// driver can no longer reach the device; then reset the device and wait,
-    /// bounded by `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
+    /// blocks it; clear the function's Bus Master Enable
+    /// ([`FunctionConfig::clear_bus_master`]), so the device issues no
+    /// further DMA whatever its driver does; then revoke every cap derived
+    /// from the BAR caps devmgr keeps (the driver's copies, whose mappings
+    /// the revocation removes before it returns), so the driver can no longer
+    /// reach the device; then reset the device and wait, bounded by
+    /// `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
     /// ([`DeviceReset::reset`]). Returns whether the device can no longer
     /// reach the driver's memory: an IOMMU blocks it, or it is known to be
     /// quiet (Bus Master Enable read back clear, every BAR copy revoked, and
     /// the reset confirmed). Only then does it delete the Memory caps it kept
     /// for the device's mappings ([`dma::Withdrawal::release`];
-    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means the
-    /// device may still be accessing the driver's memory and the mapped
+    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means
+    /// the device may still be accessing the driver's memory and the mapped
     /// frames, and those caps stay for the boot
     /// ([`dma::Withdrawal::quarantine`]).
     fn take_from_driver(&self) -> bool

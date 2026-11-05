@@ -22,7 +22,8 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
   barriers ordering the writes.
 - **Lifetime.** No page is ever returned: a unit may walk any of them while translation stays on,
   so they stay with the driver for the boot, and past its death, since devmgr spawns the driver
-  `CREATE_DMA_HOLD` and never releases the hold (docs/device-management.md
+  `CREATE_DMA_HOLD` and never releases the hold, deleting its release token at the spawn
+  (docs/device-management.md
   [§ IOMMU Discovery and Programming](../../../../docs/device-management.md#iommu-discovery-and-programming)).
 
 The crate calls memmgr and maps pages through the Seraph std runtime, so it builds only for the

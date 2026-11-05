@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 7;
+pub const PROCMGR_LABELS_VERSION: u32 = 8;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -192,12 +192,13 @@ pub mod procmgr_labels
     /// once the child has been started, hold back its memory reclaim at its
     /// teardown. procmgr tears the child down as any other, but sends memmgr
     /// its `memmgr_labels::PROCESS_DIED` only when the creator sends
-    /// [`RELEASE_HOLD`] on the child's process handle; until then memmgr
-    /// keeps the child's frames on its record, out of the free pool. Set it
-    /// for a driver whose device may DMA into its frames: the creator
-    /// releases the hold once it has confirmed the device's DMA stopped,
-    /// and never when it cannot. A child destroyed before
-    /// [`START_PROCESS`] never ran and is reclaimed at once. Specified in
+    /// [`RELEASE_HOLD`] on the release token, a third cap of the create reply
+    /// badged with [`HOLD_RELEASE_AUTHORITY`]; until then memmgr keeps the
+    /// child's frames on its record, out of the free pool. Set it for a driver
+    /// whose device may DMA into its frames: the creator releases the hold
+    /// once it has confirmed the device's DMA stopped, and never when it
+    /// cannot. A child destroyed before [`START_PROCESS`] never ran and is
+    /// reclaimed at once. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
     /// (**DMA hold flag**). Occupies bit 28 of the `[16..30]` label window.
     pub const CREATE_DMA_HOLD: u64 = 1 << 28;
@@ -294,13 +295,30 @@ pub mod procmgr_labels
     }
 
     /// Release the held memory reclaim of a child created with
-    /// [`CREATE_DMA_HOLD`], sent on its badged `process_handle` once the
-    /// child is torn down: procmgr sends memmgr `PROCESS_DIED` for it. Replies
-    /// `SUCCESS`, or `INVALID_BADGE` when procmgr holds no reclaim for the
-    /// handle (the child is live, was never held, or was released already).
-    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 3:
-    /// `RELEASE_HOLD`.
+    /// [`CREATE_DMA_HOLD`], sent on the child's release token (the create
+    /// reply's third cap, badged with [`HOLD_RELEASE_AUTHORITY`]) once the
+    /// child is torn down: procmgr sends memmgr `PROCESS_DIED` for it.
+    /// Replies `SUCCESS`; `UNAUTHORIZED` when the sender's badge lacks
+    /// [`HOLD_RELEASE_AUTHORITY`] (the process handle, or the child's own
+    /// procmgr cap), the hold staying; or `INVALID_BADGE` when procmgr holds
+    /// no reclaim for the token (the child is live, was never held, or was
+    /// released already). Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 3: `RELEASE_HOLD`.
     pub const RELEASE_HOLD: u64 = 3;
+
+    /// Badge bit of a release token, the SEND on procmgr's endpoint the
+    /// create reply of a [`CREATE_DMA_HOLD`] child carries as its third cap,
+    /// badged with the child's process badge and this bit: procmgr serves
+    /// [`RELEASE_HOLD`] only on a badge carrying it, so only the creator can
+    /// release the hold. No process badge carries a
+    /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) bit, so the token names no
+    /// live process for any other label. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 3: `RELEASE_HOLD`.
+    pub const HOLD_RELEASE_AUTHORITY: u64 = 1u64 << 61;
+    const _: () = core::assert!(
+        HOLD_RELEASE_AUTHORITY & crate::VERB_BIT_MASK != 0
+            && HOLD_RELEASE_AUTHORITY != DEATH_EQ_AUTHORITY
+    );
 
     /// Destroy a process, sent on its badged `process_handle`; procmgr
     /// deletes its kernel objects and sends memmgr `PROCESS_DIED` for it,
@@ -3029,7 +3047,8 @@ pub mod procmgr_errors
     /// during ELF page load.
     pub const INSUFFICIENT_RIGHTS: u64 = 12;
     /// Caller's cap lacks the required authority badge for a gated
-    /// label (e.g. `REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`).
+    /// label (`REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`,
+    /// `RELEASE_HOLD` requires `HOLD_RELEASE_AUTHORITY`).
     pub const UNAUTHORIZED: u64 = 13;
     /// A create with `procmgr_labels::CREATE_ARGV_ENV` failed because procmgr
     /// could not unmap a window it copied the argv and env through, so it may

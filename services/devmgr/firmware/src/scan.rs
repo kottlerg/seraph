@@ -22,7 +22,7 @@ use virtio_core::{
     VIRTIO_PCI_CAP_NOTIFY_CFG, VirtioCapLocation, VirtioPciStartupInfo,
 };
 
-use crate::pci::{io_bar_size, mmio_bar_size};
+use crate::pci::{COMMAND, io_bar_size, mmio_bar_size};
 
 /// BAR registers in a PCI type-0 configuration header (offsets 0x10 to 0x24).
 pub const MAX_BARS: usize = 6;
@@ -32,9 +32,8 @@ pub const MAX_BARS: usize = 6;
 /// list longer than (256 - 64) / 4 entries must loop.
 const MAX_CAPABILITIES: u32 = 48;
 
-/// PCI Command register offset ([`crate::pci::COMMAND`]) and its I/O- and
-/// Memory-space decode enables.
-const PCI_COMMAND: u16 = crate::pci::COMMAND;
+/// The Command register's I/O- and Memory-space decode enables
+/// ([`crate::pci::COMMAND`] is the register's offset).
 const PCI_COMMAND_DECODE: u16 = 0x3;
 /// Class-code register offsets (base class at 0x0B, subclass at 0x0A).
 const PCI_CLASS: u16 = 0x0B;
@@ -211,16 +210,16 @@ fn probe_bars(cfg: &impl ConfigSpace, dev: &mut PciDevice)
     let (b, d, f) = (dev.bus, dev.dev, dev.func);
     let host_bridge =
         cfg.read8(b, d, f, PCI_CLASS) == 0x06 && cfg.read8(b, d, f, PCI_SUBCLASS) == 0;
-    let command = cfg.read16(b, d, f, PCI_COMMAND);
+    let command = cfg.read16(b, d, f, COMMAND);
     let toggle = !host_bridge && command & PCI_COMMAND_DECODE != 0;
     if toggle
     {
-        cfg.write16(b, d, f, PCI_COMMAND, command & !PCI_COMMAND_DECODE);
+        cfg.write16(b, d, f, COMMAND, command & !PCI_COMMAND_DECODE);
     }
     probe_bar_registers(cfg, dev);
     if toggle
     {
-        cfg.write16(b, d, f, PCI_COMMAND, command);
+        cfg.write16(b, d, f, COMMAND, command);
     }
 }
 
@@ -489,7 +488,7 @@ mod tests
         }
         fn write16(&self, bus: u8, dev: u8, func: u8, reg: u16, val: u16)
         {
-            if reg == PCI_COMMAND
+            if reg == COMMAND
             {
                 self.command_writes.set(self.command_writes.get() + 1);
             }

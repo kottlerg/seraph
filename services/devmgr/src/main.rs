@@ -1422,6 +1422,11 @@ struct VirtioDeviceCaps
     /// The device's `device_status` byte, through the BAR cap devmgr keeps;
     /// `None` when the device's layout gives none ([`DeviceReset`]).
     reset: Option<DeviceReset>,
+    /// The release token of the driver devmgr spawned for the device
+    /// ([`spawn::HeldChild`]), on which alone procmgr releases the driver's
+    /// held memory once the device is confirmed stopped; 0 before a spawn
+    /// bootstraps. [`withdraw_device`] consumes it.
+    release_token: u64,
 }
 
 /// Where devmgr writes a `VirtIO` device's `device_status` byte to reset it:
@@ -1608,9 +1613,10 @@ impl VirtioDeviceCaps
     }
 
     /// Take the device from its driver, live or dead, so its DMA is stopped
-    /// before the driver's frames are freed: withdraw its DMA grant
-    /// ([`dma::DmaGrant::withdraw`]), so the driver maps nothing more and an
-    /// IOMMU, where one confines the device, blocks it; clear the function's
+    /// before the driver's frames, and the frames its mappings reach, are
+    /// freed: withdraw its DMA grant ([`dma::DmaGrant::withdraw`]), so the
+    /// driver maps nothing more and an IOMMU, where one confines the device,
+    /// blocks it; clear the function's
     /// Bus Master Enable ([`FunctionConfig::clear_bus_master`]), so the
     /// device issues no further DMA whatever its driver does; then revoke
     /// every cap derived from the BAR caps devmgr keeps (the driver's copies,
@@ -1620,11 +1626,35 @@ impl VirtioDeviceCaps
     /// ([`DeviceReset::reset`]). Returns whether the device can no longer
     /// reach the driver's memory: an IOMMU blocks it, or it is known to be
     /// quiet (Bus Master Enable read back clear, every BAR copy revoked, and
-    /// the reset confirmed). `false`, logged, means the device may still be
-    /// accessing the driver's memory.
+    /// the reset confirmed). Only then does it delete the Memory caps it kept
+    /// for the device's mappings ([`dma::Withdrawal::release`];
+    /// `firmware::dma::settle_withdrawal` decides). `false`, logged, means the
+    /// device may still be accessing the driver's memory and the mapped
+    /// frames, and those caps stay for the boot
+    /// ([`dma::Withdrawal::quarantine`]).
     fn take_from_driver(&self) -> bool
     {
-        let blocked = self.dma.withdraw();
+        let withdrawal = self.dma.withdraw();
+        match firmware::dma::settle_withdrawal(withdrawal.block(), || self.stop_and_reset())
+        {
+            firmware::dma::WithdrawnMappings::Release =>
+            {
+                withdrawal.release();
+                true
+            }
+            firmware::dma::WithdrawnMappings::Quarantine =>
+            {
+                withdrawal.quarantine();
+                false
+            }
+        }
+    }
+
+    /// Clear the function's Bus Master Enable, revoke every cap derived from
+    /// the BAR caps devmgr keeps, and reset the device, in that order
+    /// ([`Self::take_from_driver`]). Returns whether all three are confirmed.
+    fn stop_and_reset(&self) -> bool
+    {
         let bus_master_clear = self.config.clear_bus_master();
         let mut revoked = true;
         for bar in self.bars.as_slice()
@@ -1647,7 +1677,7 @@ impl VirtioDeviceCaps
             std::os::seraph::log!("device reset: the device has no reset target; not reset");
             false
         };
-        blocked || (bus_master_clear && revoked && reset)
+        bus_master_clear && revoked && reset
     }
 }
 
@@ -1727,6 +1757,7 @@ fn carve_virtio_device(
         irq_mode,
         device_badge,
         reset,
+        release_token: 0,
     })
 }
 
@@ -1826,7 +1857,14 @@ impl ServedDriver
     {
         match &self.dev_caps
         {
-            Some(dev_caps) => withdraw_device(dev_caps, self.process_handle, ipc_buf),
+            Some(dev_caps) => withdraw_device(
+                dev_caps,
+                spawn::HeldChild {
+                    process_handle: self.process_handle,
+                    release_token: dev_caps.release_token,
+                },
+                ipc_buf,
+            ),
             None if self.process_handle != 0 => spawn::destroy_child(self.process_handle, ipc_buf),
             None =>
             {}
@@ -1850,27 +1888,28 @@ impl ServedDriver
     }
 }
 
-/// Withdraw the `VirtIO` driver `process_handle` names, live or dead, from
-/// the device `dev_caps` holds, in the order
-/// services/devmgr/docs/responsibilities.md § Responsibilities states: take
-/// the device from the driver ([`VirtioDeviceCaps::take_from_driver`]: Bus
-/// Master Enable cleared before the BAR caps are taken, then the reset), so it
-/// neither DMAs nor holds its line asserted with no driver to clear it; then
-/// destroy the driver, a no-op for one procmgr has reaped, and only when the
-/// device is confirmed quiet release the driver's held memory to memmgr
-/// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves that
-/// memory on the driver's memmgr record for the rest of the boot, since the
-/// device may still be writing it. One reset per withdrawal.
-fn withdraw_device(dev_caps: &VirtioDeviceCaps, process_handle: u64, ipc_buf: *mut u64)
+/// Withdraw the `VirtIO` driver `child` names, live or dead, from the device
+/// `dev_caps` holds, in the order services/devmgr/docs/responsibilities.md
+/// § Responsibilities states: take the device from the driver
+/// ([`VirtioDeviceCaps::take_from_driver`]: Bus Master Enable cleared before
+/// the BAR caps are taken, then the reset), so it neither DMAs nor holds its
+/// line asserted with no driver to clear it; then destroy the driver, a no-op
+/// for one procmgr has reaped, and only when the device is confirmed quiet
+/// release the driver's held memory on its release token
+/// ([`spawn::destroy_and_release`]). A device not confirmed quiet leaves it
+/// held for the rest of the boot ([`spawn::destroy_held`]), since the device
+/// may still be writing it. One reset per withdrawal; both caps of `child`
+/// are consumed.
+fn withdraw_device(dev_caps: &VirtioDeviceCaps, child: spawn::HeldChild, ipc_buf: *mut u64)
 {
     let quiet = dev_caps.take_from_driver();
-    if process_handle == 0
+    if child.process_handle == 0
     {
         return;
     }
     if quiet
     {
-        spawn::destroy_and_release(process_handle, ipc_buf);
+        spawn::destroy_and_release(child, ipc_buf);
     }
     else
     {
@@ -1878,7 +1917,7 @@ fn withdraw_device(dev_caps: &VirtioDeviceCaps, process_handle: u64, ipc_buf: *m
             "device {} not confirmed quiet; its driver's memory stays held for the boot",
             dev_caps.device_badge
         );
-        spawn::destroy_child(process_handle, ipc_buf);
+        spawn::destroy_held(child, ipc_buf);
     }
 }
 
@@ -2270,16 +2309,18 @@ fn spawn_virtio_blk_all(
         {
             continue;
         };
-        if let Some((ep, process_handle)) =
+        if let Some((ep, child)) =
             spawn_one_virtio_blk(caps, module_cap, &dev_caps, batch, death_eq, ipc_buf)
         {
+            let mut dev_caps = dev_caps;
+            dev_caps.release_token = child.release_token;
             let spawned = SpawnedDriver {
                 class: DriverClass::Block,
                 badge: dev_caps.device_badge,
                 driver: ServedDriver {
                     ep,
                     dev_caps: Some(dev_caps),
-                    process_handle,
+                    process_handle: child.process_handle,
                 },
             };
             record_spawned(roster, spawned, ipc_buf);
@@ -2293,8 +2334,9 @@ fn spawn_virtio_blk_all(
 
 /// Spawn one virtio-blk driver for the carved `dev_caps` from a copy of
 /// `module_cap`, with a fresh service endpoint, into the settle `batch`.
-/// Returns that endpoint and the driver's process handle when the driver
-/// completed its bootstrap; on `None` the caller releases `dev_caps`.
+/// Returns that endpoint and the driver's process handle and release token
+/// when the driver completed its bootstrap; on `None` the caller releases
+/// `dev_caps`.
 fn spawn_one_virtio_blk(
     caps: &caps::DevmgrCaps,
     module_cap: u64,
@@ -2302,7 +2344,7 @@ fn spawn_one_virtio_blk(
     batch: &settle::SettleBatch,
     death_eq: u64,
     ipc_buf: *mut u64,
-) -> Option<(u64, u64)>
+) -> Option<(u64, spawn::HeldChild)>
 {
     // virtio-blk requires an IRQ: delivered an absent IRQ slot, it exits
     // after its bootstrap, which would leave the device registered with no
@@ -2351,14 +2393,14 @@ fn spawn_one_virtio_blk(
     // CREATE_PROCESS, or released on failure).
     match spawn::spawn_driver(&config, ipc_buf)
     {
-        spawn::DriverSpawn::Bootstrapped(process_handle) =>
+        spawn::DriverSpawn::Bootstrapped(child) =>
         {
             std::os::seraph::log!("devmgr: virtio-blk driver spawned");
-            Some((blk_ep, process_handle))
+            Some((blk_ep, child))
         }
-        spawn::DriverSpawn::Unbootstrapped(process_handle) =>
+        spawn::DriverSpawn::Unbootstrapped(child) =>
         {
-            withdraw_device(dev_caps, process_handle, ipc_buf);
+            withdraw_device(dev_caps, child, ipc_buf);
             let _ = syscall::cap_delete(blk_ep);
             None
         }
@@ -2577,7 +2619,7 @@ fn spawn_on_disk_drivers(
             dev_caps.release();
             continue;
         }
-        if let Some((ep, process_handle)) = spawn_virtio_input_from_disk(
+        if let Some((ep, child)) = spawn_virtio_input_from_disk(
             caps,
             &dev_caps,
             &batch,
@@ -2586,13 +2628,15 @@ fn spawn_on_disk_drivers(
             ipc_buf,
         )
         {
+            let mut dev_caps = dev_caps;
+            dev_caps.release_token = child.release_token;
             let spawned = SpawnedDriver {
                 class: DriverClass::Input,
                 badge: dev_caps.device_badge,
                 driver: ServedDriver {
                     ep,
                     dev_caps: Some(dev_caps),
-                    process_handle,
+                    process_handle: child.process_handle,
                 },
             };
             record_spawned(&mut roster, spawned, ipc_buf);
@@ -2613,7 +2657,8 @@ fn spawn_on_disk_drivers(
 /// settle `batch`. Walks `/services/drivers/virtio-input` through the
 /// `SET_DRIVERS_DIR` subtree cap, then hands the carved BAR/IRQ caps (stashed
 /// at enumeration) to the file-source PCI spawn path. Returns the freshly
-/// created service endpoint and the driver's process handle on success.
+/// created service endpoint and the driver's process handle and release token
+/// on success.
 /// Mirrors [`spawn_rtc_from_disk`], but uses [`spawn::spawn_driver`] (BAR +
 /// IRQ + device-info) rather than the simple-device path. On failure it
 /// returns `None` and releases the stashed BAR and IRQ caps.
@@ -2624,7 +2669,7 @@ fn spawn_virtio_input_from_disk(
     death_eq: u64,
     drivers_dir_cap: u64,
     ipc_buf: *mut u64,
-) -> Option<(u64, u64)>
+) -> Option<(u64, spawn::HeldChild)>
 {
     let requested_rights = u64::from(namespace_protocol::rights::READ);
     // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
@@ -2671,14 +2716,14 @@ fn spawn_virtio_input_from_disk(
     // CREATE_FROM_FILE, or released on failure).
     match spawn::spawn_driver(&config, ipc_buf)
     {
-        spawn::DriverSpawn::Bootstrapped(process_handle) =>
+        spawn::DriverSpawn::Bootstrapped(child) =>
         {
             std::os::seraph::log!("devmgr: virtio-input driver spawned from disk");
-            Some((input_ep, process_handle))
+            Some((input_ep, child))
         }
-        spawn::DriverSpawn::Unbootstrapped(process_handle) =>
+        spawn::DriverSpawn::Unbootstrapped(child) =>
         {
-            withdraw_device(pending, process_handle, ipc_buf);
+            withdraw_device(pending, child, ipc_buf);
             let _ = syscall::cap_delete(input_ep);
             pending.release();
             None
@@ -3161,22 +3206,24 @@ fn spawn_test_dma_driver(
     };
     match spawn::spawn_driver(&config, ipc_buf)
     {
-        spawn::DriverSpawn::Bootstrapped(process_handle) =>
+        spawn::DriverSpawn::Bootstrapped(child) =>
         {
+            let mut dev_caps = dev_caps;
+            dev_caps.release_token = child.release_token;
             let spawned = SpawnedDriver {
                 class: DriverClass::TestDma,
                 badge: dev_caps.device_badge,
                 driver: ServedDriver {
                     ep,
                     dev_caps: Some(dev_caps),
-                    process_handle,
+                    process_handle: child.process_handle,
                 },
             };
             record_spawned(&mut roster, spawned, ipc_buf);
         }
-        spawn::DriverSpawn::Unbootstrapped(process_handle) =>
+        spawn::DriverSpawn::Unbootstrapped(child) =>
         {
-            withdraw_device(&dev_caps, process_handle, ipc_buf);
+            withdraw_device(&dev_caps, child, ipc_buf);
             let _ = syscall::cap_delete(ep);
             dev_caps.release();
         }
@@ -3261,6 +3308,7 @@ fn carve_test_dma_device(
         irq_mode: 0,
         device_badge,
         reset: None,
+        release_token: 0,
     };
     if !dev_caps.config.enable_memory_and_bus_master()
     {

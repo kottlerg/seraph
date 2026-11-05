@@ -857,10 +857,10 @@ effect, and is posted, only if the thread is started again (see
 
 procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
 just the main thread — drives procmgr's teardown of the whole process. A worker's fault fails to
-drive that teardown at once only when a full procmgr death queue drops its post: procmgr recovers
-the main-thread deaths it missed from the kernel's thread states, but no kernel state reports an
-address space's terminal fault, so that process is torn down when its main thread exits
-([#666](https://github.com/kottlerg/seraph/issues/666); see
+drive that teardown at once only when a full procmgr death queue drops its post, and then
+procmgr's next drain recovers it: it reads the main-thread deaths it missed from the kernel's
+thread states, and the terminal faults from each address space's retained terminal-fault reason
+(`CAP_INFO_ASPACE_TERMINAL_FAULT`; see
 [services/procmgr/README.md](../services/procmgr/README.md) § Process table and death queues).
 Normal thread exit does not fire these observers.
 

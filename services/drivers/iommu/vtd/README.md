@@ -36,8 +36,8 @@ the caches when a unit does not snoop them. It reads their physical bases, and t
 the frames each `MAP` installs, with `CAP_INFO_MEMORY_PHYS_BASE`: the units are programmed with
 physical addresses, which makes the IOMMU driver the one driver class that reads them
 ([#767](https://github.com/kottlerg/seraph/issues/767)'s named exception). No table page is
-ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases it, since a unit
-may walk any of them while translation stays on.
+ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases it (it deletes the
+hold's release token at the spawn), since a unit may walk any of them while translation stays on.
 
 The library (`iommu_vtd`) holds the register fields, the translation-structure encodings, and the
 page-table walk. They are host-tested, the walk over a heap-backed `iommu_core::TableStore`.

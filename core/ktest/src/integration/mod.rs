@@ -53,6 +53,7 @@ pub mod retype_reclaim;
 pub mod shared_memory_two_aspaces;
 pub mod stop_read_regs_remote;
 pub mod thread_lifecycle;
+pub mod thread_upcall;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
 pub mod wait_concurrency;
@@ -210,6 +211,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_syscall_buffer",
         fault_syscall_buffer::run(ctx)
     );
+    run_integration_test!("integration::thread_upcall", thread_upcall::run(ctx));
     run_integration_test!(
         "integration::fault_exception_redirect",
         fault_exception_redirect::run(ctx)

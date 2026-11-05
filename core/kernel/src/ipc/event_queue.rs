@@ -424,8 +424,8 @@ pub unsafe fn event_queue_recv(
     {
         // Refused park; dequeue the caller again. eq.lock has been held
         // across publish/commit/rollback, so the rollback owns the episode.
-        // A stop-won refusal stamps INTERRUPTED; a coalesced-wake refusal
-        // leaves the deposit for the resume to deliver.
+        // A stop-won or upcall refusal stamps INTERRUPTED; a coalesced-wake
+        // refusal leaves the deposit for the resume to deliver.
         // SAFETY: caller was pushed above; eq.lock held throughout.
         unsafe { eq.waiters.remove(caller) };
         if committed == crate::sched::ParkCommit::RefusedStop

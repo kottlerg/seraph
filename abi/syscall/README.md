@@ -10,13 +10,14 @@ Defines the `SYS_*` syscall numbers and `SYSCALL_NR_BOUND`, one past the highest
 `SyscallError` enum, and the constants that cross the kernel/userspace boundary: the
 capability-handle encoding, the `CAP_INFO_*` selectors and `CAP_TAG_*` discriminants, the `MAP_*`
 protection and unmap flags, the `SYS_THREAD_START` flags (`THREAD_START_SUSPENDED`), the
-`IRQ_MODE_*` interrupt-line mode bits, the per-type `RIGHTS_*` masks, the per-object retype costs
-(`*_RETYPE_BYTES`, `event_queue_retype_bytes`, `wait_set_retype_bytes`), the `CSpace` funding
-constants (`CSPACE_SLOTS_PER_PAGE`, `CSPACE_BODIES_PER_PAGE`, `IOPORT_BINDING_TABLE_PAGES`), the
-scheduling, message, event-queue, and wait-set limits, the exit-reason and fault-protocol
-constants, the register-file layout, `KERNEL_VERSION`, and `SystemInfoType`, and one helper over
-them: `cspace_topup_pages`, the donation that leaves a `CSpace` a given slot headroom and a page of
-growth budget beyond it for its body arena.
+`SYS_THREAD_POST_UPCALL` flag (`UPCALL_ANY_INSTRUCTION`), the `IRQ_MODE_*` interrupt-line mode bits,
+the per-type `RIGHTS_*` masks, the per-object retype costs (`*_RETYPE_BYTES`,
+`event_queue_retype_bytes`, `wait_set_retype_bytes`), the `CSpace` funding constants
+(`CSPACE_SLOTS_PER_PAGE`, `CSPACE_BODIES_PER_PAGE`, `IOPORT_BINDING_TABLE_PAGES`), the scheduling,
+message, event-queue, and wait-set limits, the exit-reason and fault-protocol constants, the
+register-file layout, `KERNEL_VERSION`, and `SystemInfoType`, and one helper over them:
+`cspace_topup_pages`, the donation that leaves a `CSpace` a given slot headroom and a page of growth
+budget beyond it for its body arena.
 
 **Constraints:** `no_std`; each cross-boundary type carries an explicit stable repr
 (`#[repr(C)]` structs, fixed-width integer-repr enums); no dependencies outside `core` (the

@@ -560,11 +560,11 @@ impl Pipe {
                 // rather than spin (silent-drop init path).
                 return Ok(0);
             }
-            // Block until writer kicks the data notification, peer closes,
-            // or the death bridge fires. `Interrupted` (this thread was
-            // stopped and restarted) re-checks the ring. Any other wait error
-            // means the notification cap itself is gone (teardown raced us);
-            // surface EOF rather than spin on a dead cap.
+            // Block until writer kicks the data notification, peer closes, or
+            // the death bridge fires. `Interrupted` (this thread was stopped
+            // and restarted, or interrupted by an upcall) re-checks the ring.
+            // Any other wait error means the notification cap itself is gone
+            // (teardown raced us); surface EOF rather than spin on a dead cap.
             match syscall::notification_wait(self.data_notification) {
                 Ok(_) => {}
                 Err(e) if e == SyscallError::Interrupted as i64 => {}
@@ -645,11 +645,11 @@ impl Pipe {
                 // No wakeup notification — drop bytes silently to avoid spin.
                 return Ok(buf.len());
             }
-            // Block until reader kicks the space notification, peer closes,
-            // or the death bridge fires. `Interrupted` (this thread was
-            // stopped and restarted) re-checks the ring. Any other wait error
-            // means the notification cap itself is gone; report the pipe as
-            // broken rather than spin on a dead cap.
+            // Block until reader kicks the space notification, peer closes, or
+            // the death bridge fires. `Interrupted` (this thread was stopped
+            // and restarted, or interrupted by an upcall) re-checks the ring.
+            // Any other wait error means the notification cap itself is gone;
+            // report the pipe as broken rather than spin on a dead cap.
             match syscall::notification_wait(self.space_notification) {
                 Ok(_) => {}
                 Err(e) if e == SyscallError::Interrupted as i64 => {}

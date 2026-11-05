@@ -129,7 +129,7 @@ fault-injection drivers, and [`test-dma`](../services/drivers/test-dma/README.md
 driver of the `edu` DMA test device, installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
 them. Under `/programs/` are the test fixtures the harnesses and per-program
-testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
+testers spawn: `capexhaust`, `deadline`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
 `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which
 consumer spawns or drives each one is owned by
 [services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for
@@ -1067,6 +1067,7 @@ note in full.
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[programs/deadline/README.md](../programs/deadline/README.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
 [programs/fsbench/README.md](../programs/fsbench/README.md),
 [programs/hello/README.md](../programs/hello/README.md),

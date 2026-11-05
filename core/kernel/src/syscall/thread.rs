@@ -838,11 +838,95 @@ unsafe fn clear_park_binding(tcb: *mut crate::sched::thread::ThreadControlBlock)
 /// hold any IPC source lock or `SLEEP_LIST_LOCK` either. The caller MAY hold
 /// `THREAD_REGISTRY_LOCK` (ordered before every lock taken here; the
 /// object-teardown walk does), which keeps `tcb` from being freed meanwhile.
+#[cfg(not(test))]
+pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    // SAFETY: this fn's contract is cancel_park's.
+    let _ = unsafe { cancel_park(tcb, false) };
+}
+
+/// Cancel the block of `tcb` for a posted upcall
+/// (`docs/fault-handling.md` § Asynchronous Upcalls), as [`cancel_ipc_block`]
+/// cancels it for a stop, and keep the wake the cancel's claim owes: returns
+/// true when this call won the park's claim, with `wake_in_flight` set inside
+/// the claim's hold, and the caller MUST then wake the thread
+/// (`enqueue_and_wake`), whose interrupted syscall returns `Interrupted`.
+/// Nothing is cancelled, and false is returned, when the thread is not
+/// `Blocked`, is in a fault or upcall delivery (`in_fault_delivery`: the
+/// upcall waits for it to resolve), has masked upcalls, or has no upcall
+/// pending, each read under its `sched_lock` with the park's snapshot
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Upcall Cancel-and-Wake
+/// Protocol).
+///
+/// # Safety
+/// As for [`cancel_ipc_block`].
+#[cfg(not(test))]
+pub(crate) unsafe fn cancel_for_upcall(tcb: *mut crate::sched::thread::ThreadControlBlock) -> bool
+{
+    // SAFETY: this fn's contract is cancel_park's.
+    unsafe { cancel_park(tcb, true) }
+}
+
+/// Whether a posted upcall may cancel `tcb`'s block now: one is pending, the
+/// thread does not mask upcalls, and it is in no fault or upcall delivery.
+/// `sched::commit_blocked_under_local_lock` refuses a park under the same
+/// predicate, restated there, which MUST stay identical to this one.
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
+#[cfg(not(test))]
+pub(crate) unsafe fn upcall_may_cancel(tcb: *mut crate::sched::thread::ThreadControlBlock) -> bool
+{
+    // SAFETY: caller holds tcb.sched_lock, under which these are written.
+    unsafe {
+        !(*tcb).in_fault_delivery
+            && (*tcb)
+                .upcall_pending
+                .load(core::sync::atomic::Ordering::Relaxed)
+            && !(*tcb)
+                .upcall_masked
+                .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Keep the wake a won cancel claim owes when the cancel is an upcall's: set
+/// `wake_in_flight` inside the claim's `sched_lock` hold, as every waker's
+/// claim does, so a restart waits for the wake ([`cancel_for_upcall`]'s
+/// caller makes it) rather than starting the thread under it, and return
+/// whether the claim was won for an upcall.
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds, inside the
+/// hold of a claim it just won.
+#[cfg(not(test))]
+unsafe fn keep_upcall_wake(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    for_upcall: bool,
+) -> bool
+{
+    if for_upcall
+    {
+        // SAFETY: caller holds tcb.sched_lock inside the won claim.
+        unsafe {
+            (*tcb)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+    for_upcall
+}
+
+/// The cancel of [`cancel_ipc_block`] and [`cancel_for_upcall`]; returns
+/// whether an upcall's cancel won the park's claim (always false for a stop's).
+///
+/// # Safety
+/// As for [`cancel_ipc_block`].
 // too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
+unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, for_upcall: bool)
+-> bool
 {
     use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
     use crate::ipc::event_queue::EventQueueState;
@@ -867,6 +951,13 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // whose add then refuses). The timer pop clears the deadline under the same
     // lock, so a pop that won leaves the episode to its wake. Its claim deposits
     // nothing, so a cancellation stamp is the only deposit.
+    //
+    // An upcall's cancel also requires, in the same hold, a pending upcall, no
+    // mask, and no fault or upcall delivery: a fault park is never cancelled
+    // for an upcall, which waits for the fault to resolve, and the mask is
+    // written under this lock, so a thread that masked before it parked keeps
+    // its block.
+    let mut claimed = false;
     // SAFETY: tcb validated by caller; fields read/written under sched_lock;
     // SLEEP_LIST_LOCK is a leaf, nested under sched_lock.
     let (ipc_state, blocked_on, park_seq) = unsafe {
@@ -877,17 +968,22 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed),
         );
         let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
-        if blocked && snap.0 == IpcThreadState::None && crate::sched::sleep_list_remove(tcb)
+        let refused = for_upcall && !upcall_may_cancel(tcb);
+        if blocked
+            && !refused
+            && snap.0 == IpcThreadState::None
+            && crate::sched::sleep_list_remove(tcb)
         {
             crate::sched::thread::stamp_park_deposit(
                 tcb,
                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
             );
+            claimed = keep_upcall_wake(tcb, for_upcall);
         }
         (*tcb).sched_lock.unlock_raw(saved);
-        if !blocked
+        if !blocked || refused
         {
-            return;
+            return false;
         }
         snap
     };
@@ -967,6 +1063,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             );
                         }
                         clear_park_binding(tcb);
+                        claimed = keep_upcall_wake(tcb, for_upcall);
                     }
                     held.unlock();
                 }
@@ -1002,6 +1099,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         clear_park_binding(tcb);
+                        claimed = keep_upcall_wake(tcb, for_upcall);
                     }
                     held.unlock();
                 }
@@ -1023,9 +1121,17 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // the CAS by the CLOSURE LEMMA.
                 unsafe {
                     let saved = (*tcb).sched_lock.lock_raw();
+                    // An upcall's cancel claims only the snapshotted park, and
+                    // only while the upcall may still cancel it: the thread
+                    // may since have run, taken the upcall, masked, and called
+                    // the same server again, a park this cancel must leave.
                     if (*tcb).state == crate::sched::thread::ThreadState::Blocked
                         && (*tcb).ipc_state == IpcThreadState::BlockedOnReply
                         && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
+                        && (!for_upcall
+                            || ((*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
+                                == park_seq
+                                && upcall_may_cancel(tcb)))
                     {
                         let cancelled = (*server)
                             .reply_tcb
@@ -1050,9 +1156,15 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                             );
                             clear_park_binding(tcb);
-                            (*tcb)
-                                .wake_in_flight
-                                .store(0, core::sync::atomic::Ordering::Release);
+                            // An upcall's cancel keeps the claim the reply
+                            // binding set, for the wake its caller makes.
+                            claimed = for_upcall;
+                            if !for_upcall
+                            {
+                                (*tcb)
+                                    .wake_in_flight
+                                    .store(0, core::sync::atomic::Ordering::Release);
+                            }
                         }
                     }
                     (*tcb).sched_lock.unlock_raw(saved);
@@ -1152,6 +1264,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         clear_park_binding(tcb);
+                        claimed = keep_upcall_wake(tcb, for_upcall);
                     }
                     held.unlock();
                 }
@@ -1194,6 +1307,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         clear_park_binding(tcb);
+                        claimed = keep_upcall_wake(tcb, for_upcall);
                     }
                     held.unlock();
                 }
@@ -1226,6 +1340,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         clear_park_binding(tcb);
+                        claimed = keep_upcall_wake(tcb, for_upcall);
                     }
                     held.unlock();
                 }
@@ -1236,6 +1351,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         IpcThreadState::None =>
         {}
     }
+    claimed
 }
 
 /// `SYS_THREAD_SET_FAULT_HANDLER` (32): bind or clear a thread's fault-handler
@@ -1435,10 +1551,35 @@ unsafe fn control_thread(
     SyscallError,
 >
 {
+    // SAFETY: this fn's contract is thread_with_rights's.
+    unsafe { thread_with_rights(cspace, idx, crate::cap::slot::ThreadRights::CONTROL) }
+}
+
+/// The TCB of the Thread cap `idx` in `cspace`, which must carry `rights`,
+/// with the pin that keeps its object live while the returned pin is held.
+///
+/// # Errors
+/// `InvalidCapability` for a slot that names no live Thread; the errors of
+/// `lookup_cap` (`InsufficientRights` without `rights`).
+///
+/// # Safety
+/// `cspace` must be the calling thread's `CSpace`; no lock is held.
+#[cfg(not(test))]
+unsafe fn thread_with_rights(
+    cspace: *mut crate::cap::cspace::CSpace,
+    idx: u64,
+    rights: crate::cap::slot::ThreadRights,
+) -> Result<
+    (
+        super::PinnedCap,
+        *mut crate::sched::thread::ThreadControlBlock,
+    ),
+    SyscallError,
+>
+{
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::ThreadRights;
     // SAFETY: cspace valid per contract; lookup_cap checks tag and rights.
-    let pin = unsafe { super::lookup_cap(cspace, idx, ThreadRights::CONTROL) }?;
+    let pin = unsafe { super::lookup_cap(cspace, idx, rights) }?;
     let obj = pin.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
     // SAFETY: tag confirmed Thread; `pin` keeps the ThreadObject live.
@@ -1552,6 +1693,84 @@ pub fn sys_thread_inherit_fault_handler(tf: UserFrame) -> Result<u64, SyscallErr
     // selected non-null endpoint; no lock is held.
     unsafe { apply_bindings(dst, selected, new) };
     Ok(0)
+}
+
+/// `SYS_THREAD_POST_UPCALL` (58): post an asynchronous upcall to a thread.
+///
+/// arg0 = Thread cap index (must have UPCALL, and CONTROL beside it for
+/// `UPCALL_ANY_INSTRUCTION`).
+/// arg1 = cookie, delivered uninterpreted as the upcall message's data word 1.
+/// arg2 = flags: `UPCALL_ANY_INSTRUCTION` or 0.
+///
+/// The upcall is delivered through the thread's `FAULT_CLASS_UPCALL` binding
+/// at its next delivery point (`docs/fault-handling.md` § Asynchronous
+/// Upcalls; [`crate::ipc::upcall::post`]).
+///
+/// # Errors
+/// `InvalidArgument` for an undefined flag bit; `InvalidCapability` for a slot
+/// that names no live Thread; `InsufficientRights` without the rights above;
+/// `InvalidState` for a `Created` or `Exited` thread or one with no upcall
+/// handler bound; `QueueFull` while an upcall is pending on the thread.
+#[cfg(not(test))]
+pub fn sys_thread_post_upcall(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::slot::ThreadRights;
+    let flags = tf.arg(2);
+    if flags & !syscall::UPCALL_ANY_INSTRUCTION != 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    let any_instruction = flags & syscall::UPCALL_ANY_INSTRUCTION != 0;
+    let rights = if any_instruction
+    {
+        ThreadRights::UPCALL | ThreadRights::CONTROL
+    }
+    else
+    {
+        ThreadRights::UPCALL
+    };
+    // SAFETY: current_tcb() returns current thread; valid in syscall context.
+    let caller_tcb = unsafe { crate::syscall::current_tcb() };
+    if caller_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller_tcb validated non-null; cspace set at thread creation;
+    // no lock is held.
+    let (_pin, tcb) = unsafe { thread_with_rights((*caller_tcb).cspace, tf.arg(0), rights) }?;
+    // SAFETY: tcb is pinned by `_pin`; syscall context, no lock held.
+    unsafe { crate::ipc::upcall::post(tcb, tf.arg(1), any_instruction) }?;
+    Ok(0)
+}
+
+/// `SYS_THREAD_SET_UPCALL_MASK` (59): set or clear the calling thread's upcall
+/// mask.
+///
+/// arg0 = 1 to mask upcalls, 0 to unmask them.
+///
+/// Returns the previous mask (0 or 1). A pending upcall that the unmask
+/// releases is delivered at this syscall's return.
+///
+/// # Errors
+/// `InvalidArgument` for an argument other than 0 or 1.
+#[cfg(not(test))]
+pub fn sys_thread_set_upcall_mask(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    let masked = match tf.arg(0)
+    {
+        0 => false,
+        1 => true,
+        _ => return Err(SyscallError::InvalidArgument),
+    };
+    // SAFETY: current_tcb() returns current thread; valid in syscall context.
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidState);
+    }
+    // SAFETY: tcb is the calling thread; no lock held.
+    let previous = unsafe { crate::ipc::upcall::set_mask(tcb, masked) };
+    Ok(u64::from(previous))
 }
 
 /// `SYS_THREAD_SET_PRIORITY` (37): change a thread's scheduling priority.

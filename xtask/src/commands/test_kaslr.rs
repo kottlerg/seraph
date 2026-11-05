@@ -37,7 +37,8 @@ use crate::commands::mkdisk::stage_nokaslr_knob;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, Iommu, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware,
+    validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
 
@@ -105,6 +106,7 @@ impl Guest
             incoming: None,
             riscv_mmu: args.riscv_mmu,
             x86_paging: args.x86_paging,
+            iommu: Iommu::Attached,
         };
         let qemu_args = build_qemu_argv(&spec)?;
 

@@ -300,11 +300,15 @@ impl Thread {
                     return Err(io::Error::other("seraph: thread retype slab alloc failed"));
                 }
             };
-        // Place the new thread at the process's assigned level under its
-        // own baseline band. A process with no scheduling authority passes
-        // (0, 0) and its workers land at the floor.
+        // Place the new thread at the process's assigned level, or the one a
+        // `spawn_at_priority` on this thread asked for, under the process's
+        // own baseline band; the kernel refuses a level outside the band. A
+        // process with no scheduling authority passes (0, 0) and its workers
+        // land at the floor.
         let (spawn_sched_cap, spawn_priority) = if info.sched_control_cap != 0 {
-            (info.sched_control_cap, info.initial_priority)
+            let requested = crate::os::seraph::thread::requested_spawn_priority();
+            let level = if requested != 0 { requested } else { info.initial_priority };
+            (info.sched_control_cap, level)
         } else {
             (0, 0)
         };

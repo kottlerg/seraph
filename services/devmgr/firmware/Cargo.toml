@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 # `VirtioPciStartupInfo`, filled in by the configuration-space walk.
 virtio-core = { path = "../../drivers/virtio/core" }
+# The `DMA_MAP` access bits the DMA table checks.
+ipc = { path = "../../../shared/ipc" }
 # The `SYS_IRQ_REGISTER` mode bits a MADT override maps to.
 syscall-abi = { path = "../../../abi/syscall" }
 

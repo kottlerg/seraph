@@ -92,16 +92,17 @@ The full driver lifecycle is specified in
   DMA is unconfined until IOMMU support lands (see
   [docs/device-management.md](../../docs/device-management.md#dma-safety-model)
   § DMA Safety Model and [docs/architecture.md](../../docs/architecture.md)).
-- **Per-device capabilities** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
-  delegates the minimum capability set for each device: MMIO region, optional
-  interrupt line, the service endpoint, IoPort (x86-64) where applicable, and a
-  devmgr query cap: a badged SEND on the private endpoint of the driver's spawn
-  batch, on which a driver that fetches runtime metadata (the framebuffer, the
-  VirtIO PCI drivers) sends device-info queries, and every driver reports
-  `DRIVER_READY` once its device is set up (devmgr serves a driver only after that
-  report, and revokes the private endpoint once the batch settles). See
-  [docs/capability-model.md](../../docs/capability-model.md) for capability types
-  and rights.
+- **Per-device capabilities** —
+  [devmgr](../devmgr/docs/responsibilities.md#responsibilities) delegates the
+  minimum capability set for each device: MMIO region, optional interrupt line, the
+  service endpoint, IoPort (x86-64) where applicable, the DMA capability of a
+  DMA-capable device (below), and a devmgr query cap: a badged SEND on the private
+  endpoint of the driver's spawn batch, on which a driver that fetches runtime
+  metadata (the framebuffer, the VirtIO PCI drivers) sends device-info queries, and
+  every driver reports `DRIVER_READY` once its device is set up (devmgr serves a
+  driver only after that report, and revokes the private endpoint once the batch
+  settles). See [docs/capability-model.md](../../docs/capability-model.md) for
+  capability types and rights.
 - **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
   discovers devices (PCI enumeration, firmware tables), matches them to driver
   binaries, and requests procmgr to create driver processes. devmgr then delegates
@@ -110,15 +111,17 @@ The full driver lifecycle is specified in
   block driver exposes a read/write endpoint consumed by filesystem drivers via
   vfsd; see [docs/storage.md](../../docs/storage.md)). See
   [docs/ipc-design.md](../../docs/ipc-design.md) for IPC semantics.
-- **DMA** — no DMA-authorising capability type exists. devmgr spawns each
-  DMA-capable (PCI BAR + IRQ) driver `CREATE_PINNED` and `CREATE_DMA_HOLD`, so
-  its memory is freed only once devmgr has confirmed its device's DMA stopped
+- **DMA** — devmgr gives each DMA-capable (PCI BAR + IRQ) driver a DMA
+  capability, a SEND badged with its device on devmgr's DMA endpoint. The driver
+  maps every buffer its device reaches through it (`DMA_MAP`) and programs the
+  device only with the device addresses it returns, never with a physical
+  address ([docs/device-management.md](../../docs/device-management.md#dma-authorisation)
+  § DMA Authorisation). devmgr spawns each such driver `CREATE_PINNED` and
+  `CREATE_DMA_HOLD`, so its memory is freed only once devmgr has confirmed its
+  device's DMA stopped
   ([docs/device-management.md](../../docs/device-management.md#dma-safe-teardown)
-  § DMA-Safe Teardown), and DMA is unconfined
-  until IOMMU support lands. DMA targets are Memory caps whose physical base the
-  driver reads from memmgr's `REQUEST_MEMORY_CAPS` reply or via `SYS_CAP_INFO`
-  (see [docs/device-management.md](../../docs/device-management.md#iommu-discovery-and-programming)
-  § IOMMU Discovery and Programming). The IOMMU-isolated vs DMA-unsafe model is
+  § DMA-Safe Teardown), and DMA is unconfined until IOMMU support lands. The
+  IOMMU-isolated vs DMA-unsafe model is
   specified in [docs/device-management.md](../../docs/device-management.md#dma-safety-model)
   § DMA Safety Model.
 

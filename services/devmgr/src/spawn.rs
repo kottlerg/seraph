@@ -12,7 +12,7 @@
 
 use ipc::{IpcMessage, procmgr_labels};
 use virtio_core::MAX_VIRTIO_BARS;
-use virtio_core::bootstrap::{ROUND2_SLOTS, SLOT_DEVMGR_QUERY, SLOT_IRQ, SLOT_SERVICE};
+use virtio_core::bootstrap::{ROUND2_SLOTS, SLOT_DEVMGR_QUERY, SLOT_DMA, SLOT_IRQ, SLOT_SERVICE};
 
 /// Source the child's ELF binary is loaded from. Selected per spawn site:
 /// boot-bundle modules (the bootstrap-essential drivers virtio-blk,
@@ -231,6 +231,10 @@ pub struct DriverSpawnConfig<'a>
     /// regions name, in ascending BAR index
     /// ([`virtio_core::RegisterLayout::bars`]); 1 to [`MAX_VIRTIO_BARS`].
     pub bars: &'a [BarSpec],
+    /// devmgr's copy of the device's DMA capability
+    /// ([`crate::dma::DmaGrant::cap`]), from which the driver's copy is
+    /// derived.
+    pub dma_cap: u64,
     pub irq_cap: Option<u64>,
     /// The `SYS_IRQ_REGISTER` mode of `irq_cap`'s line, delivered as round 2's
     /// mode word ([`virtio_core::bootstrap::DATA_IRQ_MODE`]); 0 without an IRQ.
@@ -281,8 +285,9 @@ pub enum DriverSpawn
 /// virtio-blk and virtio-input drivers decode:
 ///   Round 1: one `Mmio` cap per entry of `bars`, in its order, with that
 ///     entry's BAR index as the matching data word.
-///   Round 2 (terminal): the positional slots service endpoint, IRQ, and
-///     devmgr query endpoint, packed with [`ipc::bootstrap::pack_slots`],
+///   Round 2 (terminal): the positional slots service endpoint, IRQ,
+///     devmgr query endpoint, and DMA capability, packed with
+///     [`ipc::bootstrap::pack_slots`],
 ///     the presence word, then `irq_mode`; the IRQ slot is absent when
 ///     `irq_cap` is `None`.
 ///
@@ -467,6 +472,17 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
         return DriverSpawn::Failed;
     };
 
+    let Ok(dma_copy) = syscall::cap_derive(config.dma_cap, syscall::RIGHTS_EP_SEND_GRANT)
+    else
+    {
+        std::os::seraph::log!("driver DMA cap derivation failed");
+        drop_bars(bar_copies);
+        let _ = syscall::cap_delete(irq_copy);
+        let _ = syscall::cap_delete(service_copy);
+        let _ = syscall::cap_delete(devmgr_copy);
+        return DriverSpawn::Failed;
+    };
+
     // Best-effort release of every derived per-child cap. Deleting a slot a
     // serve_round transfer already consumed is a no-op, so it is safe on any
     // post-derive failure arm.
@@ -475,6 +491,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
         let _ = syscall::cap_delete(irq_copy);
         let _ = syscall::cap_delete(service_copy);
         let _ = syscall::cap_delete(devmgr_copy);
+        let _ = syscall::cap_delete(dma_copy);
     };
 
     // START_PROCESS.
@@ -510,14 +527,15 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
         return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
 
-    // Round 2: [service, irq, devmgr_query] as positional slots, then the
-    // IRQ line's mode, done. A null slot cannot be transferred, so an absent
-    // IRQ (devmgr could give the device none) is named absent in the
+    // Round 2: [service, irq, devmgr_query, dma] as positional slots, then
+    // the IRQ line's mode, done. A null slot cannot be transferred, so an
+    // absent IRQ (devmgr could give the device none) is named absent in the
     // presence word instead.
     let mut slots = [0u64; ROUND2_SLOTS];
     slots[SLOT_SERVICE] = service_copy;
     slots[SLOT_IRQ] = irq_copy;
     slots[SLOT_DEVMGR_QUERY] = devmgr_copy;
+    slots[SLOT_DMA] = dma_copy;
     let round2 = ipc::bootstrap::pack_slots(&slots);
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {

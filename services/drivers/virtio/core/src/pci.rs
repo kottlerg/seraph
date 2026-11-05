@@ -203,37 +203,37 @@ impl PciTransport
         )
     }
 
-    /// Set descriptor table physical address (low 32 bits).
+    /// Set descriptor table device address (low 32 bits), as `DMA_MAP` returned it.
     pub fn queue_set_desc_lo(&self, addr: u32)
     {
         self.write_common_u32(0x20, addr);
     }
 
-    /// Set descriptor table physical address (high 32 bits).
+    /// Set descriptor table device address (high 32 bits), as `DMA_MAP` returned it.
     pub fn queue_set_desc_hi(&self, addr: u32)
     {
         self.write_common_u32(0x24, addr);
     }
 
-    /// Set available ring physical address (low 32 bits).
+    /// Set available ring device address (low 32 bits), as `DMA_MAP` returned it.
     pub fn queue_set_avail_lo(&self, addr: u32)
     {
         self.write_common_u32(0x28, addr);
     }
 
-    /// Set available ring physical address (high 32 bits).
+    /// Set available ring device address (high 32 bits), as `DMA_MAP` returned it.
     pub fn queue_set_avail_hi(&self, addr: u32)
     {
         self.write_common_u32(0x2C, addr);
     }
 
-    /// Set used ring physical address (low 32 bits).
+    /// Set used ring device address (low 32 bits), as `DMA_MAP` returned it.
     pub fn queue_set_used_lo(&self, addr: u32)
     {
         self.write_common_u32(0x30, addr);
     }
 
-    /// Set used ring physical address (high 32 bits).
+    /// Set used ring device address (high 32 bits), as `DMA_MAP` returned it.
     pub fn queue_set_used_hi(&self, addr: u32)
     {
         self.write_common_u32(0x34, addr);

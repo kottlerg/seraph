@@ -1347,6 +1347,75 @@ macro_rules! __seraph_stack_pages {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use crate::__seraph_stack_pages as stack_pages;
 
+// ── Spawned-thread priority (BuilderExt) ────────────────────────────────────
+
+/// Seraph-specific extensions to `std::thread`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod thread {
+    use crate::cell::Cell;
+    use crate::io;
+    use crate::thread::{Builder, JoinHandle};
+
+    /// The level the next spawn from the current thread places its child at,
+    /// set for the length of one [`BuilderExt::spawn_at_priority`] call; 0
+    /// when no spawn of this thread asks for one, and the child takes the
+    /// process's `initial_priority`. Thread-local, since [`Builder::spawn`]
+    /// creates the kernel thread (`sys::thread::Thread::new`) on the spawning
+    /// thread before it returns.
+    #[thread_local]
+    static SPAWN_PRIORITY: Cell<u8> = Cell::new(0);
+
+    /// The level a [`BuilderExt::spawn_at_priority`] in progress on the
+    /// current thread asks for, or 0; read by `sys::thread::Thread::new`.
+    pub(crate) fn requested_spawn_priority() -> u8 {
+        SPAWN_PRIORITY.get()
+    }
+
+    /// Seraph-specific extensions to [`Builder`].
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub trait BuilderExt {
+        /// Spawn `f` as [`Builder::spawn`] does, with the new thread placed
+        /// at scheduling level `level` instead of the process's
+        /// `initial_priority`, within the band of the process's
+        /// `SchedControl` cap (`StartupInfo::sched_control_cap`). A server
+        /// thread that a higher-level client blocks on is placed at that
+        /// client's level this way (`core/kernel/docs/scheduler.md`
+        /// § Priority Inversion Mitigation).
+        ///
+        /// # Errors
+        /// `InvalidInput` for a `level` of 0 or a process with no
+        /// `SchedControl` cap; otherwise [`Builder::spawn`]'s errors, which
+        /// include the kernel's refusal of a level outside the band.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn spawn_at_priority<F, T>(self, level: u8, f: F) -> io::Result<JoinHandle<T>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static;
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl BuilderExt for Builder {
+        fn spawn_at_priority<F, T>(self, level: u8, f: F) -> io::Result<JoinHandle<T>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            let has_sched =
+                super::try_startup_info().is_some_and(|i| i.sched_control_cap != 0);
+            if level == 0 || !has_sched {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "seraph: no priority level or no scheduling authority",
+                ));
+            }
+            let previous = SPAWN_PRIORITY.replace(level);
+            let spawned = self.spawn(f);
+            SPAWN_PRIORITY.set(previous);
+            spawned
+        }
+    }
+}
+
 // ── Directory entries (DirEntryExt) ─────────────────────────────────────────
 
 /// Seraph-specific extensions to `std::fs`.

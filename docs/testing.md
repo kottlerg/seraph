@@ -362,8 +362,11 @@ not on every push.
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
-(virtio-blk + virtio-keyboard + virtio-rng + serial, plus `vmgenid,guid=auto`
-on x86_64; CI boots headless, so no framebuffer), filesystem (FAT), riscv64
+(virtio-blk + virtio-keyboard + virtio-rng + serial, the machine's IOMMU with the
+virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` on
+riscv64 — plus `vmgenid,guid=auto` on x86_64; CI boots headless, so no framebuffer; the
+no-IOMMU boot, `--iommu absent`, runs in the release host runs, see Release host runs below),
+filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
 5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
@@ -385,7 +388,7 @@ cells automatically; variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and the disk variations once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation, the disk variations, and the no-IOMMU variant once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -740,12 +743,19 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
 (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
 (`--runs 3`) in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command at
-`--runs 1`, per the boundary commands above), and the memory variation and the disk variations
-once each, so every tag boots at each boundary CPU count in both profiles (CI boots release builds
-only at 4 CPUs), from a 4Kn disk, and from two disks, and runs the timing report on the boundary
-logs, which is reported and blocks nothing. A run whose outcome is not a pass, as When the runs
-are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the
-release's PRs.
+`--runs 1`, per the boundary commands above), and the memory variation, the disk variations, and
+the no-IOMMU variant once each, so every tag boots at each boundary CPU count in both profiles (CI
+boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, and with no IOMMU, and runs
+the timing report on the boundary logs, which is reported and blocks nothing. The no-IOMMU
+variant boots svctest once on each architecture with the machine's IOMMU detached, so devmgr's
+unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on a
+debug-profile sysroot). A run whose outcome is not a pass, as When the runs are owed classifies
+outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+
+```sh
+# No-IOMMU variant, each architecture (svctest staged, debug profile):
+cargo xtask run-parallel --arch <arch> --iommu absent --parallel 1 --runs 1 --timeout 540
+```
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

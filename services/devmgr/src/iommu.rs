@@ -587,8 +587,14 @@ impl Iommu
 }
 
 /// Take `client`'s recorded faults and log each, recording it in `counts`.
+///
+/// `counts` stays locked from before the take until every fault taken is
+/// recorded, so a caller that reads `counts` after its own take sees every
+/// fault another thread's take has handed devmgr (`TEST_DMA_FAULTS` reads
+/// it beside the fault-log thread).
 fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
 {
+    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
     let mut taken = Vec::new();
     let _ = client.take_faults(|rid, reason, iova| {
         if taken.try_reserve(1).is_ok()
@@ -596,7 +602,6 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
             taken.push((rid, reason, iova));
         }
     });
-    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
     for (rid, reason, iova) in taken
     {
         std::os::seraph::log!(

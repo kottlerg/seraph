@@ -990,6 +990,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruststd-spin-wait"
+version = "0.1.2"
+dependencies = [
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"

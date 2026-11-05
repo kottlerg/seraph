@@ -10,7 +10,9 @@
 //! wakes for several queued readers and its non-blocking paths, `Condvar`
 //! `notify_all` and `Once` completion waking every queued waiter, a timed
 //! `Condvar` waiter leaving the middle of the queue, `Condvar::wait_timeout`,
-//! and spawn-time placement through `BuilderExt::spawn_at_priority`.
+//! spawn-time placement through `BuilderExt::spawn_at_priority`, and the
+//! byte heap's lock contended by a strict-priority thread against a
+//! fair-class holder on the same CPU.
 
 use std::cell::Cell;
 use std::io;
@@ -74,6 +76,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "spawn_at_priority",
             run: spawn_at_priority_phase,
+        },
+        Phase {
+            name: "heap_lock_priority_contention",
+            run: heap_lock_priority_contention_phase,
         },
     ]
 }
@@ -583,16 +589,17 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
 /// band spawns and runs.
 pub fn spawn_at_priority_phase(_: &Caps)
 {
-    // svctest.svc gives svctest `priority = 10` and `sched_max = 10`: the band
-    // is [1, 10] and its initial thread runs at its top.
-    const BAND_MAX: u8 = 10;
+    // svctest.svc gives svctest `priority = 10` and `sched_max = 21`: the band
+    // is [1, 21] and its initial thread runs at 10.
+    const INITIAL_LEVEL: u8 = 10;
+    const BAND_MAX: u8 = 21;
     let info = std::os::seraph::startup_info();
     assert_ne!(
         info.sched_control_cap, 0,
         "svctest holds no SchedControl cap"
     );
     assert_eq!(
-        info.initial_priority, BAND_MAX,
+        info.initial_priority, INITIAL_LEVEL,
         "svctest's initial level is not its recipe's"
     );
 
@@ -623,6 +630,100 @@ pub fn spawn_at_priority_phase(_: &Caps)
         .expect("spawn_at_priority(5) within the band failed");
     assert_eq!(within.join().expect("level-5 child panicked"), 5);
     std::os::seraph::log!("spawn_at_priority phase passed");
+}
+
+/// Pin the calling thread to `cpu` and yield, so the pin takes effect before
+/// the caller goes on (a running thread moves at its next schedule).
+fn pin_self(cpu: u32)
+{
+    let cap = std::os::seraph::current_thread_cap();
+    assert_ne!(cap, 0, "no Thread cap for the calling thread");
+    syscall::thread_set_affinity(cap, cpu)
+        .unwrap_or_else(|e| panic!("thread_set_affinity({cpu}) failed: {e}"));
+    thread::yield_now();
+}
+
+/// A strict-priority thread contending for the byte heap's lock with a
+/// fair-class thread that allocates in a loop on the same CPU still finishes,
+/// and the allocating thread still runs.
+///
+/// The kernel runs a CPU's strict-priority thread before any fair one
+/// (core/kernel/docs/scheduler.md § Scheduling Classes). Each time the
+/// waiter wakes from its sleep, it preempts the allocating thread at the
+/// next tick, often while that thread holds the heap lock. The holder can
+/// release the lock only if the waiter leaves the CPU, which std's
+/// `SpinMutex` does by sleeping once its spin bound is spent. A waiter that
+/// only spun would hold the CPU forever, and this phase would never end.
+pub fn heap_lock_priority_contention_phase(_: &Caps)
+{
+    // The floor of the strict-priority class, and the top of svctest's band
+    // (svctest.svc's `sched_max`); the allocating thread runs at svctest's
+    // initial level, 10, in the fair class.
+    const WAITER_LEVEL: u8 = 21;
+    // Wake-and-allocate rounds of the waiter.
+    const ROUNDS: u32 = 100;
+    // Generous over the phase's time, a few seconds on slow TCG.
+    const BOUND: Duration = Duration::from_mins(1);
+
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
+        .expect("CPU count query failed");
+    // The highest CPU: away from CPU 0, which the boot's own threads favour.
+    let cpu = u32::try_from(cpus.saturating_sub(1)).expect("CPU index above u32");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
+    let holder = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            pin_self(cpu);
+            pinned_tx.send(()).expect("pinned signal lost");
+            let mut allocations = 0u64;
+            while !stop.load(Ordering::Relaxed)
+            {
+                // Sizes vary so the first-fit walk does real work under the
+                // lock.
+                let v: Vec<u8> = Vec::with_capacity(64 + (allocations % 1024) as usize);
+                std::hint::black_box(&v);
+                drop(v);
+                allocations += 1;
+            }
+            allocations
+        })
+    };
+    pinned_rx
+        .recv()
+        .expect("allocating thread ended before pinning");
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let waiter = thread::Builder::new()
+        .spawn_at_priority(WAITER_LEVEL, move || {
+            pin_self(cpu);
+            for round in 0..ROUNDS
+            {
+                let _ = syscall::thread_sleep(1);
+                let b = Box::new(round);
+                std::hint::black_box(&b);
+            }
+            done_tx.send(()).expect("done signal lost");
+        })
+        .expect("spawn_at_priority(21) failed");
+
+    let finished = done_rx.recv_timeout(BOUND);
+    stop.store(true, Ordering::Relaxed);
+    assert!(
+        finished.is_ok(),
+        "level-21 waiter did not finish {ROUNDS} heap allocations against a \
+         same-CPU fair-class allocator within {BOUND:?}"
+    );
+    waiter.join().expect("waiter panicked");
+    let allocations = holder.join().expect("allocating thread panicked");
+    std::os::seraph::log!(
+        "heap_lock_priority_contention: cpu {} waiter rounds {} holder allocations {:#x}",
+        u64::from(cpu),
+        u64::from(ROUNDS),
+        allocations
+    );
+    std::os::seraph::log!("heap_lock_priority_contention phase passed");
 }
 
 pub fn timeout_phase(_: &Caps)

@@ -310,11 +310,15 @@ pub(crate) fn set_current_thread_cap(cap: u64) {
     SELF_THREAD_TLS.set(cap);
 }
 
-/// The current thread's own Thread capability: the one recorded by
-/// [`set_current_thread_cap`] for a spawned thread, else the process's
-/// initial thread ([`StartupInfo::self_thread`]), or 0 before `_start` has
-/// read the startup info.
-pub(crate) fn current_thread_cap() -> u64 {
+/// The current thread's own Thread capability: for a spawned thread, the cap
+/// its spawner created, which the thread trampoline records; else the
+/// process's initial thread ([`StartupInfo::self_thread`]); or 0 before
+/// `_start` has read the startup info. Either cap carries the Control right,
+/// so a thread can, for example, pin itself to a CPU
+/// (`SYS_THREAD_SET_AFFINITY`).
+#[must_use]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn current_thread_cap() -> u64 {
     let cap = SELF_THREAD_TLS.get();
     if cap != 0 { cap } else { try_startup_info().map_or(0, |info| info.self_thread) }
 }

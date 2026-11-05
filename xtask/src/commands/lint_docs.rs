@@ -1244,11 +1244,11 @@ fn unresolved(name: &ListedName, code: &Code, tracked: &[String]) -> Option<Stri
         }
         NameKind::Dir =>
         {
-            (!dir_resolves(&name.pattern, tracked))
-                .then(|| "names no tracked directory".to_owned())
+            (!dir_resolves(&name.pattern, tracked)).then(|| "names no tracked directory".to_owned())
         }
-        NameKind::Symbol => match symbol_resolves(&name.pattern, &code.outside_xtask).and_then(
-            |found| {
+        NameKind::Symbol =>
+        {
+            match symbol_resolves(&name.pattern, &code.outside_xtask).and_then(|found| {
                 if found || !name.xtask
                 {
                     Ok(found)
@@ -1257,21 +1257,22 @@ fn unresolved(name: &ListedName, code: &Code, tracked: &[String]) -> Option<Stri
                 {
                     symbol_resolves(&name.pattern, &code.xtask)
                 }
-            },
-        )
-        {
-            Ok(true) => None,
-            Ok(false) if name.xtask => Some(
-                "names nothing in the code of a tracked Rust source (xtask's included)".to_owned(),
-            ),
-            Ok(false) => Some("names nothing in the code of a tracked Rust source".to_owned()),
-            // A syntax error renders as the pattern, a caret line, and the
-            // reason; the reason is the last line.
-            Err(err) => Some(format!(
-                "is not a valid regular expression ({})",
-                err.to_string().lines().last().unwrap_or_default().trim()
-            )),
-        },
+            })
+            {
+                Ok(true) => None,
+                Ok(false) if name.xtask => Some(
+                    "names nothing in the code of a tracked Rust source (xtask's included)"
+                        .to_owned(),
+                ),
+                Ok(false) => Some("names nothing in the code of a tracked Rust source".to_owned()),
+                // A syntax error renders as the pattern, a caret line, and the
+                // reason; the reason is the last line.
+                Err(err) => Some(format!(
+                    "is not a valid regular expression ({})",
+                    err.to_string().lines().last().unwrap_or_default().trim()
+                )),
+            }
+        }
     }
 }
 
@@ -1965,11 +1966,16 @@ mod tests
         let shown: Vec<&str> = diags.iter().map(|d| d.1.as_str()).collect();
         assert_eq!(shown.len(), 3, "{shown:?}");
         assert!(
-            shown[0].contains("`services/gone/`") && shown[0].contains("names no tracked directory"),
+            shown[0].contains("`services/gone/`")
+                && shown[0].contains("names no tracked directory"),
             "{}",
             shown[0]
         );
-        assert!(shown[1].contains("`services/blk/src/main.rs/`"), "{}", shown[1]);
+        assert!(
+            shown[1].contains("`services/blk/src/main.rs/`"),
+            "{}",
+            shown[1]
+        );
         assert!(shown[2].contains("`core/moved/`"), "{}", shown[2]);
     }
 }

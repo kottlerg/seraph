@@ -5,9 +5,11 @@
 
 //! Per-CPU run queue and scheduler state.
 //!
-//! [`PerCpuScheduler`] owns 32 priority queues (one per level), a bitmask of
-//! non-empty queues for O(1) highest-priority selection, and pointers to the
-//! currently running and idle TCBs.
+//! [`PerCpuScheduler`] owns one run queue per strict-priority (RT) level, one
+//! shared by every fair level, and one for the idle level, a bitmask of
+//! non-empty queues for O(1) selection of the highest, and pointers to the
+//! currently running and idle TCBs. The two scheduling classes are specified
+//! in core/kernel/docs/scheduler.md § Scheduling Classes.
 //!
 //! Locking. The `lock` field is a `crate::sync::Spinlock` that disables
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
@@ -25,10 +27,88 @@
 //! ascending-CPU-order rule that applies whenever two scheduler locks are
 //! held simultaneously.
 
-use super::NUM_PRIORITY_LEVELS;
 use super::thread::ThreadControlBlock;
+use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN, TIME_SLICE_TICKS};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+// ── Queue map ─────────────────────────────────────────────────────────────────
+
+/// Run queue of the idle level (never linked in practice: `dequeue_highest`
+/// returns the idle TCB when every queue is empty).
+const IDLE_QUEUE: usize = 0;
+
+/// Run queue every fair level shares, above the idle queue and below every RT
+/// queue, so the highest non-empty queue is an RT one whenever an RT thread is
+/// ready.
+const FAIR_QUEUE: usize = 1;
+
+/// Run queues per CPU: the idle queue, the fair queue, and one per level from
+/// [`RT_PRIORITY_MIN`] to the reserved top level.
+const NUM_RUN_QUEUES: usize = FAIR_QUEUE + 1 + (NUM_PRIORITY_LEVELS - RT_PRIORITY_MIN as usize);
+
+// `non_empty` holds one bit per run queue in a `u32`.
+const _: () = assert!(NUM_RUN_QUEUES <= u32::BITS as usize);
+
+/// The run queue threads at `level` link on. Monotone in `level`, so the
+/// highest non-empty queue holds the highest-class ready thread.
+const fn queue_index(level: u8) -> usize
+{
+    if level == IDLE_PRIORITY
+    {
+        IDLE_QUEUE
+    }
+    else if level < RT_PRIORITY_MIN
+    {
+        FAIR_QUEUE
+    }
+    else
+    {
+        FAIR_QUEUE + 1 + (level - RT_PRIORITY_MIN) as usize
+    }
+}
+
+/// A level whose threads link on run queue `index`: the inverse of
+/// [`queue_index`], giving the lowest fair level for the fair queue.
+/// [`PerCpuScheduler::find_runnable`] reports it, so the caller's
+/// `remove_from_queue` and re-`enqueue` resolve to the queue the TCB is on.
+const fn queue_level(index: usize) -> u8
+{
+    if index == IDLE_QUEUE
+    {
+        IDLE_PRIORITY
+    }
+    else if index == FAIR_QUEUE
+    {
+        syscall::PRIORITY_MIN
+    }
+    else
+    {
+        // index < NUM_RUN_QUEUES <= 32, so the narrowing is lossless.
+        RT_PRIORITY_MIN + (index - FAIR_QUEUE - 1) as u8
+    }
+}
+
+/// What a timer tick does to the running thread's slice, decided by
+/// [`PerCpuScheduler::tick_outcome`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TickOutcome
+{
+    /// The idle thread (a zero slice): no slice accounting.
+    Idle,
+    /// The slice goes on with `remaining` ticks.
+    Continue
+    {
+        /// Ticks left in the slice.
+        remaining: u32,
+    },
+    /// The slice expired: refill it with `quantum` ticks and reschedule.
+    Expired
+    {
+        /// The running thread's next slice.
+        quantum: u32,
+    },
+}
 
 // ── RunQueue ──────────────────────────────────────────────────────────────────
 
@@ -42,9 +122,10 @@ enum QueueEnd
     Head,
 }
 
-/// Intrusive FIFO queue of ready TCBs at a single priority level, except that
-/// a TCB just dequeued and handed back undispatched returns to the head
-/// ([`enqueue_head`](Self::enqueue_head)), keeping its turn.
+/// Intrusive FIFO queue of the ready TCBs of one run queue (a single RT level,
+/// or every fair level together), except that a TCB just dequeued and handed
+/// back undispatched returns to the head ([`enqueue_head`](Self::enqueue_head)),
+/// keeping its turn.
 struct RunQueue
 {
     head: Option<*mut ThreadControlBlock>,
@@ -61,7 +142,7 @@ impl RunQueue
         }
     }
 
-    /// Append `tcb` to the tail of the queue (FIFO scheduling within a priority).
+    /// Append `tcb` to the tail of the queue (FIFO scheduling within the queue).
     ///
     /// A non-`None` `tcb.run_queue_next` on entry or `tail == Some(tcb)`
     /// indicates the caller is attempting a double-enqueue of a thread
@@ -247,14 +328,15 @@ impl RunQueue
 /// owner of each field). Every other field is atomic or the lock itself.
 pub struct PerCpuScheduler
 {
-    /// One FIFO run queue per priority level (0 = lowest/idle, 31 = highest);
-    /// see [`RunQueue`] for the head re-link that keeps a deferred TCB's turn.
+    /// The FIFO run queues, indexed by `queue_index` of a level: the idle
+    /// queue, the fair queue, then one per RT level, lowest first; see
+    /// [`RunQueue`] for the head re-link that keeps a deferred TCB's turn.
     /// Owned by `lock`.
-    queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
+    queues: UnsafeCell<[RunQueue; NUM_RUN_QUEUES]>,
 
     /// Bitmask: bit N is set iff `queues[N]` is non-empty.
-    /// Enables O(1) selection of the highest non-empty priority queue. A `u32`
-    /// holds one bit per level: `NUM_PRIORITY_LEVELS` is 32.
+    /// Enables O(1) selection of the highest non-empty queue. A `u32` holds
+    /// one bit per run queue (`NUM_RUN_QUEUES` is 13).
     ///
     /// Atomic so the idle loop can read it without acquiring the lock; the
     /// Release/Acquire pairing is specified in
@@ -325,7 +407,7 @@ impl PerCpuScheduler
     pub const fn new() -> Self
     {
         Self {
-            queues: UnsafeCell::new([const { RunQueue::new() }; NUM_PRIORITY_LEVELS]),
+            queues: UnsafeCell::new([const { RunQueue::new() }; NUM_RUN_QUEUES]),
             non_empty: AtomicU32::new(0),
             current: AtomicPtr::new(core::ptr::null_mut()),
             idle: AtomicPtr::new(core::ptr::null_mut()),
@@ -336,9 +418,11 @@ impl PerCpuScheduler
         }
     }
 
-    /// Enqueue `tcb` at the given `priority` level.
+    /// Enqueue `tcb` at the given `priority` level, at the tail of that level's
+    /// run queue (its own for an RT level, the shared fair queue for a fair
+    /// level).
     ///
-    /// Sets bit `priority` in `non_empty` and increments the load counter.
+    /// Sets the queue's bit in `non_empty` and increments the load counter.
     ///
     /// Enforces the "Ready ⇒ linked on exactly one queue" invariant at this
     /// chokepoint (core/kernel/docs/scheduling-internals.md § `ThreadState`
@@ -390,6 +474,7 @@ impl PerCpuScheduler
     unsafe fn link(&self, tcb: *mut ThreadControlBlock, priority: u8, end: QueueEnd) -> bool
     {
         let p = priority as usize;
+        let q = queue_index(priority);
         // Debug: detect use-after-free via magic cookie.
         // SAFETY: tcb is guaranteed valid by the caller; magic and thread_id are always readable.
         // undocumented_unsafe_blocks: the unsafe blocks sit inside `debug_assert!`
@@ -452,8 +537,8 @@ impl PerCpuScheduler
         let queues = unsafe { &mut *self.queues.get() };
         match end
         {
-            QueueEnd::Tail => queues[p].enqueue(tcb),
-            QueueEnd::Head => queues[p].enqueue_head(tcb),
+            QueueEnd::Tail => queues[q].enqueue(tcb),
+            QueueEnd::Head => queues[q].enqueue_head(tcb),
         }
         // Tag the link under the owning scheduler.lock so any subsequent enqueue
         // (this or another CPU) observes it via the guard above. `priority` is a
@@ -479,14 +564,15 @@ impl PerCpuScheduler
         // Release: publishes the queue write and the increment_load store to the
         // lockless `has_runnable` Acquire (core/kernel/docs/scheduling-internals.md
         // § Atomic Ordering Invariants).
-        self.non_empty.fetch_or(1 << p, Ordering::Release);
+        self.non_empty.fetch_or(1 << q, Ordering::Release);
         true
     }
 
-    /// Dequeue the highest-priority ready TCB, or return `idle` if all queues
-    /// are empty.
+    /// Dequeue the head TCB of the highest non-empty run queue (the highest RT
+    /// level with a ready thread, else the fair queue), or return `idle` if all
+    /// queues are empty.
     ///
-    /// Clears the `non_empty` bit if the queue at that priority becomes empty.
+    /// Clears the `non_empty` bit if that queue becomes empty.
     /// Decrements load counter when a non-idle thread is dequeued.
     ///
     /// Does not gate on `context_saved`, per
@@ -503,20 +589,19 @@ impl PerCpuScheduler
         {
             return self.idle();
         }
-        // Highest set bit gives the highest non-empty priority level.
-        let priority = 31 - ne.leading_zeros() as usize;
+        // Highest set bit gives the highest non-empty run queue.
+        let q = 31 - ne.leading_zeros() as usize;
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        let Some(tcb) = queues[priority].dequeue()
+        let Some(tcb) = queues[q].dequeue()
         else
         {
             // Invariant: the `non_empty` bit is set iff the queue is
             // non-empty. If desynchronised, heal the stale bit and fall back
             // to idle rather than panicking the whole kernel.
-            debug_assert!(false, "non_empty bit set but queue {priority} is empty");
-            self.non_empty
-                .fetch_and(!(1 << priority), Ordering::Relaxed);
+            debug_assert!(false, "non_empty bit set but queue {q} is empty");
+            self.non_empty.fetch_and(!(1 << q), Ordering::Relaxed);
             return self.idle();
         };
         // Debug: detect use-after-free via magic cookie.
@@ -527,15 +612,14 @@ impl PerCpuScheduler
         {
             debug_assert!(
                 unsafe { (*tcb).magic == super::thread::TCB_MAGIC },
-                "dequeue: TCB magic corrupt at {tcb:?} (prio={priority}) — use-after-free?",
+                "dequeue: TCB magic corrupt at {tcb:?} (queue={q}) — use-after-free?",
             );
         }
-        if queues[priority].is_empty()
+        if queues[q].is_empty()
         {
             // Release: a later Acquire load that sees this bit cleared has
             // also seen the dequeue store above.
-            self.non_empty
-                .fetch_and(!(1 << priority), Ordering::Release);
+            self.non_empty.fetch_and(!(1 << q), Ordering::Release);
         }
         // Clear the single-link tag: the TCB is no longer on any queue.
         // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
@@ -564,6 +648,29 @@ impl PerCpuScheduler
     pub fn set_current(&self, tcb: *mut ThreadControlBlock)
     {
         self.current.store(tcb, Ordering::Relaxed);
+    }
+
+    /// Decide what a timer tick does to the running thread, whose slice holds
+    /// `slice_remaining` ticks before the tick: a zero slice is the idle
+    /// thread's; a slice that reaches zero expires and is refilled; any other
+    /// slice goes on.
+    pub fn tick_outcome(slice_remaining: u32) -> TickOutcome
+    {
+        if slice_remaining == 0
+        {
+            return TickOutcome::Idle;
+        }
+        let remaining = slice_remaining - 1;
+        if remaining == 0
+        {
+            TickOutcome::Expired {
+                quantum: TIME_SLICE_TICKS,
+            }
+        }
+        else
+        {
+            TickOutcome::Continue { remaining }
+        }
     }
 
     /// The thread running on this CPU (null before `init`). A read without
@@ -616,13 +723,14 @@ impl PerCpuScheduler
         self.non_empty.load(Ordering::Acquire) != 0
     }
 
-    /// Diagnostic: snapshot of the per-priority `non_empty` bitmask.
+    /// Diagnostic: snapshot of the per-run-queue `non_empty` bitmask (bit 0 the
+    /// idle queue, bit 1 the fair queue, bit 2 + N level `RT_PRIORITY_MIN` + N).
     pub fn non_empty_mask(&self) -> u32
     {
         self.non_empty.load(Ordering::Relaxed)
     }
 
-    /// Remove `tcb` from its priority queue. No-op if not found.
+    /// Remove `tcb` from the run queue of level `priority`. No-op if not found.
     ///
     /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`,
     /// `relocate_ready_priority`, and `relocate_ready_thread` (for
@@ -642,31 +750,33 @@ impl PerCpuScheduler
     /// The caller holds `self.lock`; `tcb` is a valid TCB.
     pub unsafe fn remove_from_queue(&self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
-        let p = priority as usize;
-        if p >= NUM_PRIORITY_LEVELS
+        if priority as usize >= NUM_PRIORITY_LEVELS
         {
             return false;
         }
+        let q = queue_index(priority);
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        let removed = queues[p].remove(tcb);
+        let removed = queues[q].remove(tcb);
         if removed
         {
             // Clear the single-link tag: the TCB is no longer on any queue.
             // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
             unsafe { (*tcb).queued_on.store(-1, Ordering::Relaxed) };
             self.decrement_load();
-            if queues[p].is_empty()
+            if queues[q].is_empty()
             {
-                self.non_empty.fetch_and(!(1 << p), Ordering::Release);
+                self.non_empty.fetch_and(!(1 << q), Ordering::Release);
             }
         }
         removed
     }
 
-    /// Scan all priority queues from highest to lowest and return the first
-    /// queued TCB whose pointer satisfies `pred`, along with its priority.
+    /// Scan all run queues from highest to lowest and return the first queued
+    /// TCB whose pointer satisfies `pred`, along with a level of the queue it
+    /// is on: its RT level, or the lowest fair level for a fair thread, which
+    /// `remove_from_queue` and `enqueue` resolve to the same fair queue.
     ///
     /// Used by the cross-CPU load balancer to pick a migratable (unpinned)
     /// thread from a busier CPU's queue.
@@ -683,12 +793,12 @@ impl PerCpuScheduler
         let mut ne = self.non_empty.load(Ordering::Relaxed);
         while ne != 0
         {
-            let priority = 31 - ne.leading_zeros() as usize;
-            if let Some(tcb) = queues[priority].find_first_where(&mut pred)
+            let q = 31 - ne.leading_zeros() as usize;
+            if let Some(tcb) = queues[q].find_first_where(&mut pred)
             {
-                return Some((tcb, priority as u8));
+                return Some((tcb, queue_level(q)));
             }
-            ne &= !(1 << priority);
+            ne &= !(1 << q);
         }
         None
     }
@@ -782,6 +892,139 @@ mod tests
     {
         // SAFETY: single-threaded test; tcb is a live boxed TCB.
         unsafe { s.remove_from_queue(tcb, prio) }
+    }
+
+    /// The `non_empty` bit of the run queue threads at `level` link on.
+    fn bit(level: u8) -> u32
+    {
+        1 << queue_index(level)
+    }
+
+    // ── Queue map ─────────────────────────────────────────────────────────────
+
+    // Defect caught: a map that sends a level past the queue array, sends two
+    // RT levels to one queue, orders a fair or idle queue above an RT one, or an
+    // inverse whose level re-resolves to another queue (so a balancer pull
+    // would unlink from one queue and link on another).
+    #[test]
+    fn every_level_maps_to_its_class_queue_and_back()
+    {
+        let mut last = 0;
+        for level in 0..NUM_PRIORITY_LEVELS as u8
+        {
+            let q = queue_index(level);
+            assert!(q < NUM_RUN_QUEUES, "level {level} -> queue {q}");
+            assert_eq!(queue_index(queue_level(q)), q, "level {level}");
+            assert!(q >= last, "queue map not monotone at level {level}");
+            if level > RT_PRIORITY_MIN
+            {
+                assert_eq!(q, last + 1, "RT level {level} shares a queue");
+            }
+            last = q;
+        }
+        assert_eq!(queue_index(IDLE_PRIORITY), IDLE_QUEUE);
+        assert_eq!(queue_index(syscall::PRIORITY_MIN), FAIR_QUEUE);
+        assert_eq!(queue_index(RT_PRIORITY_MIN - 1), FAIR_QUEUE);
+        assert!(queue_index(RT_PRIORITY_MIN) > FAIR_QUEUE);
+        assert_eq!(last, NUM_RUN_QUEUES - 1);
+    }
+
+    // ── Classes ───────────────────────────────────────────────────────────────
+
+    // Defect caught: fair levels still selected by strict priority, so a lower
+    // fair level waits behind every higher one.
+    #[test]
+    fn fair_levels_share_one_fifo_whatever_their_level()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut a = make_tcb();
+        let mut b = make_tcb();
+        let mut c = make_tcb();
+        let mut idle_tcb = make_tcb();
+        let pa = &mut *a as *mut _;
+        let pb = &mut *b as *mut _;
+        let pc = &mut *c as *mut _;
+        sched.set_idle(&mut *idle_tcb);
+
+        assert!(enq(&sched, pa, RT_PRIORITY_MIN - 1));
+        assert!(enq(&sched, pb, syscall::PRIORITY_MIN));
+        assert!(enq(&sched, pc, 10));
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(deq(&sched), pc);
+    }
+
+    // Defect caught: an RT thread queued behind a fair one, or the fair queue
+    // placed above the RT levels.
+    #[test]
+    fn an_rt_thread_dequeues_before_every_fair_thread()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut fair = make_tcb();
+        let mut rt = make_tcb();
+        let mut idle_tcb = make_tcb();
+        let pf = &mut *fair as *mut _;
+        let pr = &mut *rt as *mut _;
+        sched.set_idle(&mut *idle_tcb);
+
+        assert!(enq(&sched, pf, RT_PRIORITY_MIN - 1));
+        assert!(enq(&sched, pr, RT_PRIORITY_MIN));
+        assert_eq!(deq(&sched), pr);
+        assert_eq!(deq(&sched), pf);
+    }
+
+    // Defect caught: `find_runnable` reporting a level that resolves to
+    // another queue than the TCB's, so the balancer's `remove_from_queue`
+    // misses and the pull is lost (or unlinks from the wrong list).
+    #[test]
+    fn find_runnable_reports_a_level_whose_queue_holds_the_thread()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut fair = make_tcb();
+        let mut rt = make_tcb();
+        let pf = &mut *fair as *mut _;
+        let pr = &mut *rt as *mut _;
+
+        assert!(enq(&sched, pf, 12));
+        assert!(enq(&sched, pr, 23));
+        // SAFETY: single-threaded test.
+        let found = unsafe { sched.find_runnable(|t| core::ptr::eq(t, pf)) };
+        let Some((tcb, level)) = found
+        else
+        {
+            panic!("fair thread not found");
+        };
+        assert_eq!(tcb, pf);
+        assert!(rm(&sched, pf, level));
+        // SAFETY: single-threaded test.
+        let found = unsafe { sched.find_runnable(|t| core::ptr::eq(t, pr)) };
+        assert_eq!(found, Some((pr, 23)));
+        assert!(rm(&sched, pr, 23));
+        assert_eq!(sched.non_empty_mask(), 0);
+    }
+
+    // ── Tick decision ─────────────────────────────────────────────────────────
+
+    // Defect caught: an idle (zero) slice decremented, or treated as expiring.
+    #[test]
+    fn a_zero_slice_is_the_idle_threads_and_is_left_alone()
+    {
+        assert_eq!(PerCpuScheduler::tick_outcome(0), TickOutcome::Idle);
+    }
+
+    // Defect caught: a slice that expires a tick late or early, or one that
+    // goes on without being decremented.
+    #[test]
+    fn a_slice_expires_on_the_tick_that_takes_its_last_tick()
+    {
+        assert_eq!(
+            PerCpuScheduler::tick_outcome(2),
+            TickOutcome::Continue { remaining: 1 }
+        );
+        assert!(matches!(
+            PerCpuScheduler::tick_outcome(1),
+            TickOutcome::Expired { .. }
+        ));
     }
 
     // ── RunQueue tests (exercised through PerCpuScheduler at priority 0) ──────
@@ -879,16 +1122,13 @@ mod tests
 
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
         assert!(enq(&sched, pa, 7));
-        assert_eq!(sched.non_empty.load(Ordering::Relaxed), 1 << 7);
-        assert!(enq(&sched, pb, 15));
-        assert_eq!(
-            sched.non_empty.load(Ordering::Relaxed),
-            (1 << 7) | (1 << 15)
-        );
+        assert_eq!(sched.non_empty.load(Ordering::Relaxed), bit(7));
+        assert!(enq(&sched, pb, 25));
+        assert_eq!(sched.non_empty.load(Ordering::Relaxed), bit(7) | bit(25));
     }
 
     #[test]
-    fn dequeue_highest_selects_max_priority()
+    fn dequeue_highest_selects_the_highest_rt_level()
     {
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
@@ -898,10 +1138,10 @@ mod tests
         let pb = &mut *b as *mut _;
         let pc = &mut *c as *mut _;
 
-        // Enqueue at priorities 0, 5, 15 — expect 15 first, then 5, then 0.
+        // Enqueue at priorities 0, 22, 28 — expect 28 first, then 22, then 0.
         assert!(enq(&sched, pa, 0));
-        assert!(enq(&sched, pb, 5));
-        assert!(enq(&sched, pc, 15));
+        assert!(enq(&sched, pb, 22));
+        assert!(enq(&sched, pc, 28));
         sched.set_idle(pa);
 
         assert_eq!(deq(&sched), pc);
@@ -917,11 +1157,11 @@ mod tests
         let pa = &mut *a as *mut _;
 
         assert!(enq(&sched, pa, 3));
-        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 3), 0);
+        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & bit(3), 0);
         sched.set_idle(pa);
         deq(&sched);
-        // Queue at priority 3 is now empty; bit must be cleared.
-        assert_eq!(sched.non_empty.load(Ordering::Relaxed) & (1 << 3), 0);
+        // The queue of priority 3 is now empty; its bit must be cleared.
+        assert_eq!(sched.non_empty.load(Ordering::Relaxed) & bit(3), 0);
     }
 
     #[test]
@@ -932,9 +1172,9 @@ mod tests
         let pa = &mut *a as *mut _;
 
         assert!(enq(&sched, pa, 10));
-        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 10), 0);
+        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & bit(10), 0);
         rm(&sched, pa, 10);
-        assert_eq!(sched.non_empty.load(Ordering::Relaxed) & (1 << 10), 0);
+        assert_eq!(sched.non_empty.load(Ordering::Relaxed) & bit(10), 0);
     }
 
     #[test]
@@ -994,10 +1234,10 @@ mod tests
     }
 
     #[test]
-    fn interleaved_priority_always_dequeues_highest()
+    fn interleaved_rt_levels_always_dequeue_highest()
     {
-        // Interleave P=5 and P=10 enqueues; every dequeue must return P=10 until
-        // that queue is empty, then P=5 threads in their enqueue order.
+        // Interleave P=22 and P=27 enqueues; every dequeue must return P=27
+        // until that queue is empty, then P=22 threads in their enqueue order.
         let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let mut b = make_tcb();
@@ -1008,16 +1248,16 @@ mod tests
         let pc = &mut *c as *mut _;
         let pd = &mut *d as *mut _;
 
-        assert!(enq(&sched, pa, 5));
-        assert!(enq(&sched, pb, 10));
-        assert!(enq(&sched, pc, 5));
-        assert!(enq(&sched, pd, 10));
+        assert!(enq(&sched, pa, 22));
+        assert!(enq(&sched, pb, 27));
+        assert!(enq(&sched, pc, 22));
+        assert!(enq(&sched, pd, 27));
         sched.set_idle(pa);
 
-        // P=10 threads come out first (FIFO within their priority).
+        // P=27 threads come out first (FIFO within their priority).
         assert_eq!(deq(&sched), pb);
         assert_eq!(deq(&sched), pd);
-        // Then P=5 threads in original enqueue order.
+        // Then P=22 threads in original enqueue order.
         assert_eq!(deq(&sched), pa);
         assert_eq!(deq(&sched), pc);
     }
@@ -1040,7 +1280,7 @@ mod tests
         assert!(enq(&sched, pa, 4));
         assert!(rm(&sched, pa, 4));
         assert!(enq(&sched, pa, 9));
-        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 9), 0);
+        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & bit(9), 0);
     }
 
     // ── Locate-and-relocate (relocate_ready_priority) ────────────────────────
@@ -1099,7 +1339,7 @@ mod tests
         assert_eq!(locate_relocate(&scheds, pt, 4, 9, 1), Some(1));
         // Re-linked at the new priority on the same scheduler; cpu 0 untouched.
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
-        assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 1 << 9);
+        assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), bit(9));
         // SAFETY: pt valid.
         assert_eq!(unsafe { (*pt).queued_on.load(Ordering::Relaxed) }, 9);
     }
@@ -1122,7 +1362,7 @@ mod tests
         // Relinked at new prio on cpu 2; cpus 0 and 1 untouched.
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
         assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
-        assert_eq!(scheds[2].non_empty.load(Ordering::Relaxed), 1 << 3);
+        assert_eq!(scheds[2].non_empty.load(Ordering::Relaxed), bit(3));
         // Stale hint self-healed to the located CPU.
         // SAFETY: pt valid.
         assert_eq!(unsafe { (*pt).preferred_cpu }, 2);

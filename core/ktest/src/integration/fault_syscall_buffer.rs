@@ -330,7 +330,9 @@ impl Case
         if flags & MAP_WRITABLE != 0
         {
             // SAFETY: the page at `va` is mapped writable just above and holds
-            // no Rust object; no other thread reaches it until the reply.
+            // no Rust object; no other thread touches it during the write: the
+            // case's child is not yet started (a premap) or is fault-blocked
+            // until the reply (a Resume).
             unsafe { core::ptr::write_bytes(va as *mut u8, 0, PAGE_BYTES) };
         }
         Ok(mem)

@@ -101,12 +101,11 @@ Notes on the non-obvious entries:
   tables (`copy_fault_present`, x86-64 only), and the syscall instruction as `ip`. No
   other word carries a kernel VA or a value derived from one. The forwarded/readable
   `TrapFrame` holds only user-mode register state (no kernel stack pointer, kernel return
-  address, or `CR3`/`satp`); the write path re-validates through
-  `sanitize_for_user_resume`. `sys_thread_read_regs` pins the Thread it resolves through
-  `lookup_cap` for the call, so a sibling's concurrent
-  delete or revoke of the last Thread capability cannot free the thread slab while
-  `sched::with_held_frame` snapshots its trap frame: the snapshot `copy_to_user` returns
-  is the target's user register state.
+  address, or `CR3`/`satp`); the write path re-validates through `sanitize_for_user_resume`.
+  `sys_thread_read_regs` pins the Thread it resolves through `lookup_cap` for the call, so a
+  sibling's concurrent delete or revoke of the last Thread capability cannot free the thread
+  slab while `sched::with_held_frame` snapshots its trap frame: the snapshot `copy_to_user`
+  returns is the target's user register state.
 - **Descriptor-table registers** are a hardware output, not a value the kernel emits:
   with `CR4.UMIP` clear, `SIDT` and `SGDT` execute at CPL 3 and return the IDTR and GDTR.
   The IDT and the BSP's GDT are statics in the kernel image, so on any CPU `SIDT`, and

@@ -8,11 +8,12 @@
 //!
 //! A waiter that finds the lock held spins through [`SPIN_ATTEMPTS`] failed
 //! acquisitions, then sleeps [`SLEEP_MS`] before each further attempt.
-//! Under the kernel's strict-priority class (core/kernel/docs/scheduler.md
-//! § Scheduling Classes), a CPU always runs its highest-level runnable
-//! thread. A waiter that only spins never lets a lower-level holder queued
-//! on its CPU run, so it would wait forever. The sleep blocks the waiter,
-//! and the holder gets the CPU and releases the lock. The spins keep the
+//! A waiter in the strict-priority class runs before every fair thread, and
+//! before every lower-level strict-priority thread, on its CPU
+//! (core/kernel/docs/scheduler.md § Scheduling Classes). Such a waiter that
+//! only spun would never let a holder below it, queued on that CPU, run, and
+//! would wait forever. The sleep blocks the waiter, so the holder gets the
+//! CPU and releases the lock. The spins keep the
 //! common case cheap, a holder that is running on another CPU and releases
 //! within a short critical section. [`Backoff`] decides each step. The
 //! acquisition and the sleep syscall stay with the caller. See
@@ -39,14 +40,14 @@ pub const SPIN_ATTEMPTS: u32 = 1024;
 
 /// Milliseconds a waiter sleeps before each attempt past
 /// [`SPIN_ATTEMPTS`]: the shortest `SYS_THREAD_SLEEP` that blocks. A
-/// tuning value that bounds no capacity. Any blocking sleep lets a
-/// lower-level holder on the waiter's CPU run, so a longer one only adds
-/// latency.
+/// tuning value that bounds no capacity. Any blocking sleep lets a holder
+/// below a strict-priority waiter run on the waiter's CPU, so a longer one
+/// only adds latency.
 pub const SLEEP_MS: u64 = 1;
 
 // `SYS_THREAD_SLEEP` of 0 ms returns at once without blocking, and a sleep
-// that does not block leaves a lower-level holder on the waiter's CPU
-// starved.
+// that does not block leaves a holder below a strict-priority waiter, on the
+// waiter's CPU, starved.
 const _: () = assert!(SLEEP_MS > 0);
 
 /// What a waiter does after a failed acquisition.

@@ -5,8 +5,8 @@
 
 //! RISC-V register-map and instruction-encoding arithmetic: the PLIC context
 //! layout, the PLIC source-count clamp, the SBI hart-mask window, page
-//! rounding, the F/D/V opcode decode the lazy extended-state trap uses, and
-//! the PTE permission test of the kernel's spurious-fault retry.
+//! rounding, the F/D/V opcode decode the lazy extended-state trap uses, the
+//! PTE permission bits, and their test in the kernel's spurious-fault retry.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module. `arch/mod.rs` also compiles this file into host test builds

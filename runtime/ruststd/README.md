@@ -127,10 +127,10 @@ One spin mutex (`SpinMutex`, `src/sys/alloc/seraph.rs`) guards the byte heap.
 The same type guards the object slabs, the page-reservation arena, and the thread reaper's
 tables. A thread that finds it held spins through a bounded number of failed attempts, then
 sleeps between attempts (the `ruststd-spin-wait` crate's `SPIN_ATTEMPTS` and `SLEEP_MS`). The
-sleep is what lets a holder at a lower level on the waiter's CPU run: the kernel always runs a
-CPU's highest-level runnable thread
-([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Scheduling Classes), so a
-waiter that only spun would starve the holder and wait forever.
+sleep lets a holder below the waiter run on the waiter's CPU. A waiter in the strict-priority
+class runs before every fair thread, and before every lower-level strict-priority thread, on its
+CPU ([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Scheduling Classes).
+Such a waiter that only spun would starve a holder below it there and wait forever.
 
 ### Page reservations
 

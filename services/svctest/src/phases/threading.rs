@@ -656,12 +656,6 @@ fn pin_self(cpu: u32)
 /// only spun would hold the CPU forever, and this phase would never end.
 pub fn heap_lock_priority_contention_phase(_: &Caps)
 {
-    // The floor of the strict-priority class, and the top of svctest's band
-    // (svctest.svc's `sched_max`); the allocating thread runs at svctest's
-    // initial level, 10, in the fair class.
-    const WAITER_LEVEL: u8 = 21;
-    // Wake-and-allocate rounds of the waiter.
-    const ROUNDS: u32 = 100;
     // Generous over the phase's time, a few seconds on slow TCG.
     const BOUND: Duration = Duration::from_mins(1);
 
@@ -671,59 +665,78 @@ pub fn heap_lock_priority_contention_phase(_: &Caps)
     let cpu = u32::try_from(cpus.saturating_sub(1)).expect("CPU index above u32");
 
     let stop = Arc::new(AtomicBool::new(false));
-    let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
-    let holder = {
-        let stop = Arc::clone(&stop);
-        thread::spawn(move || {
-            pin_self(cpu);
-            pinned_tx.send(()).expect("pinned signal lost");
-            let mut allocations = 0u64;
-            while !stop.load(Ordering::Relaxed)
-            {
-                // Sizes vary so the first-fit walk does real work under the
-                // lock.
-                let v: Vec<u8> = Vec::with_capacity(64 + (allocations % 1024) as usize);
-                std::hint::black_box(&v);
-                drop(v);
-                allocations += 1;
-            }
-            allocations
-        })
-    };
-    pinned_rx
-        .recv()
-        .expect("allocating thread ended before pinning");
-
+    let holder = spawn_allocating_holder(cpu, Arc::clone(&stop));
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    let waiter = thread::Builder::new()
-        .spawn_at_priority(WAITER_LEVEL, move || {
-            pin_self(cpu);
-            for round in 0..ROUNDS
-            {
-                let _ = syscall::thread_sleep(1);
-                let b = Box::new(round);
-                std::hint::black_box(&b);
-            }
-            done_tx.send(()).expect("done signal lost");
-        })
-        .expect("spawn_at_priority(21) failed");
+    let waiter = spawn_contending_waiter(cpu, done_tx);
 
     let finished = done_rx.recv_timeout(BOUND);
     stop.store(true, Ordering::Relaxed);
     assert!(
         finished.is_ok(),
-        "level-21 waiter did not finish {ROUNDS} heap allocations against a \
-         same-CPU fair-class allocator within {BOUND:?}"
+        "level-{CONTENDER_LEVEL} waiter did not finish {CONTENDER_ROUNDS} heap allocations \
+         against a same-CPU fair-class allocator within {BOUND:?}"
     );
     waiter.join().expect("waiter panicked");
     let allocations = holder.join().expect("allocating thread panicked");
     std::os::seraph::log!(
         "heap_lock_priority_contention: cpu {} waiter rounds {} holder allocations {:#x}",
         u64::from(cpu),
-        u64::from(ROUNDS),
+        u64::from(CONTENDER_ROUNDS),
         allocations
     );
     std::os::seraph::log!("heap_lock_priority_contention phase passed");
+}
+
+/// The contending waiter's level: the floor of the strict-priority class, and
+/// the top of svctest's band (svctest.svc's `sched_max`). The allocating
+/// thread runs at svctest's initial level, 10, in the fair class.
+const CONTENDER_LEVEL: u8 = 21;
+
+/// Wake-and-allocate rounds of the contending waiter.
+const CONTENDER_ROUNDS: u32 = 100;
+
+/// Spawn the fair-class thread that allocates and frees in a loop on `cpu`
+/// until `stop` is set, returning its allocation count; returns once it is
+/// pinned.
+fn spawn_allocating_holder(cpu: u32, stop: Arc<AtomicBool>) -> thread::JoinHandle<u64>
+{
+    let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
+    let holder = thread::spawn(move || {
+        pin_self(cpu);
+        pinned_tx.send(()).expect("pinned signal lost");
+        let mut allocations = 0u64;
+        while !stop.load(Ordering::Relaxed)
+        {
+            // Sizes vary so the first-fit walk does real work under the lock.
+            let v: Vec<u8> = Vec::with_capacity(64 + (allocations % 1024) as usize);
+            std::hint::black_box(&v);
+            drop(v);
+            allocations += 1;
+        }
+        allocations
+    });
+    pinned_rx
+        .recv()
+        .expect("allocating thread ended before pinning");
+    holder
+}
+
+/// Spawn the [`CONTENDER_LEVEL`] thread that, pinned to `cpu`, sleeps 1 ms
+/// and allocates [`CONTENDER_ROUNDS`] times, then signals `done`.
+fn spawn_contending_waiter(cpu: u32, done: mpsc::Sender<()>) -> thread::JoinHandle<()>
+{
+    thread::Builder::new()
+        .spawn_at_priority(CONTENDER_LEVEL, move || {
+            pin_self(cpu);
+            for round in 0..CONTENDER_ROUNDS
+            {
+                let _ = syscall::thread_sleep(1);
+                let b = Box::new(round);
+                std::hint::black_box(&b);
+            }
+            done.send(()).expect("done signal lost");
+        })
+        .expect("spawn_at_priority of the contending waiter failed")
 }
 
 pub fn timeout_phase(_: &Caps)

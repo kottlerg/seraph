@@ -95,10 +95,11 @@ const CSPACE_FUND_ROUNDS: u32 = 2;
 ///
 /// A contended [`Self::lock`] does not spin without bound. It spins a
 /// bounded number of attempts and then sleeps between attempts, as the
-/// `ruststd-spin-wait` policy decides. The kernel always runs a CPU's
-/// highest-level runnable thread (core/kernel/docs/scheduler.md § Scheduling
-/// Classes), so a waiter that only spun would never let a lower-level holder
-/// queued on its CPU run, and neither thread would progress.
+/// `ruststd-spin-wait` policy decides. A strict-priority waiter runs before
+/// every fair thread and every lower-level strict-priority thread on its CPU
+/// (core/kernel/docs/scheduler.md § Scheduling Classes). Such a waiter that
+/// only spun would never let a holder below it, queued on that CPU, run, and
+/// neither thread would progress.
 pub(crate) struct SpinMutex<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,

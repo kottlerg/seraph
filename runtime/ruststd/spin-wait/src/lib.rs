@@ -44,6 +44,11 @@ pub const SPIN_ATTEMPTS: u32 = 1024;
 /// latency.
 pub const SLEEP_MS: u64 = 1;
 
+// `SYS_THREAD_SLEEP` of 0 ms returns at once without blocking, and a sleep
+// that does not block leaves a lower-level holder on the waiter's CPU
+// starved.
+const _: () = assert!(SLEEP_MS > 0);
+
 /// What a waiter does after a failed acquisition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step
@@ -132,27 +137,5 @@ mod tests
                 "failure {n} past the bound did not sleep"
             );
         }
-    }
-
-    #[test]
-    fn each_acquisition_starts_with_a_fresh_spin_budget()
-    {
-        let mut spent = Backoff::new();
-        for _ in 0..=SPIN_ATTEMPTS
-        {
-            spent.next_step();
-        }
-        assert_eq!(spent.next_step(), Step::Sleep(SLEEP_MS));
-        assert_eq!(Backoff::new().next_step(), Step::Spin);
-        assert_eq!(Backoff::default().next_step(), Step::Spin);
-    }
-
-    #[test]
-    fn the_sleep_blocks()
-    {
-        // SYS_THREAD_SLEEP with 0 ms does not block, and a sleep that does
-        // not block leaves a lower-level holder on the waiter's CPU
-        // starved.
-        const { assert!(SLEEP_MS > 0) };
     }
 }

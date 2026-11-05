@@ -729,4 +729,5 @@ optimisation.
 [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
-[Architecture Overview](../../../docs/architecture.md)
+[Architecture Overview](../../../docs/architecture.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md)

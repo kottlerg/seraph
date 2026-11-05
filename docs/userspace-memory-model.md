@@ -169,8 +169,8 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   release always finds a slot and freed VA is never lost. A reservation
   that cannot grow the table fails with `OutOfSpace`.
 - **Concurrency.** Reservations are independent across threads; the
-  allocator serialises on a spinlock as needed, the byte heap's spin
-  mutex type, whose waiters sleep past a bounded spin (§ Byte Heap).
+  allocator serialises as needed on the byte heap's spin-mutex type, whose
+  waiters sleep past a bounded spin ([Byte Heap](#byte-heap)).
 
 The page-reservation allocator is a `std::sys::seraph` concern and is
 not exposed to non-std runtimes. `init` and `memmgr` carry small

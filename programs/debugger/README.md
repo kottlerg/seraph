@@ -57,6 +57,17 @@ fixture, a non-clean exit. riscv64 has no user-mode single-step, so step 2 runs 
 
 ---
 
+## Relevant Design Documents
+
+| Document | Covers |
+|---|---|
+| [docs/fault-handling.md](../../docs/fault-handling.md) | § Debugging, § Asynchronous Upcalls, § Fault Message |
+| [docs/capability-model.md](../../docs/capability-model.md) | § Thread: the Observe, Control, and Upcall rights |
+| [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) | `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_POST_UPCALL` |
+| [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol |
+
+---
+
 ## Summarized By
 
 None

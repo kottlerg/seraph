@@ -50,7 +50,8 @@
 //!   routing assigned it.
 //! - To change IST assignments: change the `ist` argument of that vector's
 //!   `set(vector, stub, ist)` call in `init()` and ensure the matching IST stack
-//!   is configured in the TSS.
+//!   is configured in the TSS. Vector 3 (`#BP`) has no `set` call: `init()`
+//!   installs it directly, with DPL 3, so a user `int3` reaches it.
 
 // cast_possible_truncation: every narrowing cast here is bounded — the IDTR limit
 // (256 * 16 - 1 fits u16), the masked/shifted handler-offset splits in
@@ -547,8 +548,9 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 ///
 /// A userspace exception whose thread has a bound fault handler is redirected to
 /// it ([`redirect_user_exception`]); on a resume reply this returns and the
-/// trampoline's `iretq` re-executes the faulting instruction (or continues from a
-/// handler-modified PC). Every other case — no/declined handler, the
+/// trampoline's `iretq` resumes at the reported pointer: it re-executes a
+/// faulting instruction, continues after a trapping one (`#BP`, `#DB`), or
+/// continues from a handler-modified PC. Every other case — no/declined handler, the
 /// non-restartable abort vectors, or any kernel exception — is handed to the
 /// diverging [`common_exception_handler`], so this returns only on a
 /// resolved-and-resumed userspace fault.

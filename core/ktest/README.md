@@ -184,7 +184,7 @@ concurrent notification and queue events.
 | `fault_handler_rebind.rs` | A binding change while a fault is in flight cancels the delivery, as [docs/fault-handling.md § Delivery, Resume, and Kill](../../docs/fault-handling.md#delivery-resume-and-kill) defines: a clear kills the faulter whether its fault was received or still queued (a wait set confirms the queued message), and fails a queued kernel copy's `SYS_GETRANDOM` with `InvalidAddress`; a rebind, of a received or a queued fault, delivers the fault again to the new endpoint with its badge, the old handler's late reply finding no pending reply; and a rebind to the same endpoint and badge cancels nothing |
 | `fault_syscall_buffer.rs` | A restartable syscall's copy to (`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`) or from (`SYS_THREAD_WRITE_REGS`) an unbacked buffer faults to the caller's handler with the first unmapped byte (a straddling span names its second page), the copy's access, the present bit where the architecture reports it, and the frame's instruction pointer, and the syscall re-executes on resume; a declined fault (unmapped or read-only page) fails the call with `InvalidAddress` and the caller lives; a handler-written instruction pointer stands on a decline and on a resume, as [docs/fault-handling.md § Kernel Copies](../../docs/fault-handling.md#kernel-copies) defines |
 | `fault_exception_redirect.rs` | A non-page-fault CPU exception is redirected to a bound fault handler, which resumes the thread at a new instruction pointer |
-| `fault_debug.rs` | A software breakpoint (`int3`, or a 4-byte `ebreak`) under a bound exception handler arrives as `FAULT_EXC_BREAKPOINT` with the architecture's reported instruction pointer (past `int3`, at `ebreak`), and the handler resumes the thread past it; on x86-64, a thread resumed with the trap flag set takes one `FAULT_EXC_DEBUG` per instruction of a three-`nop` block, each reporting the next instruction, as [docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines |
+| `fault_debug.rs` | A software breakpoint (`int3`, or a 4-byte `ebreak`) under a bound exception handler arrives as `FAULT_EXC_BREAKPOINT` with the architecture's reported instruction pointer (past `int3`, at `ebreak`), and the handler resumes the thread past it, as [docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines |
 | `fault_exception_no_handler_kills.rs` | A non-page-fault CPU exception with no handler bound is terminal |
 | `irq_preserves_user_regs.rs` | A ring-3 thread's callee-saved registers survive a timer preemption through the frame-authoritative IRQ path |
 | `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry, both a user-mode store and the kernel's `SYS_GETRANDOM` copy (the copy-region retry) |
@@ -204,7 +204,11 @@ an `IoPort` cap withdraws the port access bound through its descendant from a re
 whose next port read raises `#GP`. `src/arch/x86_64/trap_redelivery.rs` checks that a fault-handler
 rebind redelivers a single-step `#DB`, a trap whose saved instruction pointer is past the stepped
 instruction, from the kernel: the second endpoint's message names the same instruction pointer, and
-the thread, its TF cleared, resumes into a recovery routine. On RISC-V,
+the thread, its TF cleared, resumes into a recovery routine. `src/arch/x86_64/single_step.rs`
+checks that a handler that resumes a thread from `int3` with the trap flag set receives one
+`FAULT_EXC_DEBUG` per instruction of a `mov`, a `syscall`, and a `nop`, each naming the next
+instruction (the stepped `syscall` stepping as one), as
+[docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines. On RISC-V,
 `src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions
 and sanctioned ones the cap lacks the right for.
 

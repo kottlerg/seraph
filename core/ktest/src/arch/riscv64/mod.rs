@@ -21,6 +21,10 @@
 //! Tier 2 scenarios:
 //! - `sbi_gating.rs` — `SYS_SBI_CALL` refuses kernel-reserved extensions and
 //!   sanctioned ones the cap lacks the right for
+//!
+//! No single-step scenario: x86-64 runs `single_step.rs` here, but RISC-V has
+//! no user-mode single-step without a debug trigger, which the kernel does not
+//! program (docs/fault-handling.md § Debugging; #820).
 
 pub mod callee_saved;
 pub mod code_stub;
@@ -253,4 +257,6 @@ pub fn run_unit(ctx: &TestContext)
 pub fn run_integration(ctx: &TestContext)
 {
     crate::run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
+    // No `integration::single_step`: RISC-V has no user-mode single-step
+    // (docs/fault-handling.md § Debugging; #820).
 }

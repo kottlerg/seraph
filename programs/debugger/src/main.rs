@@ -84,8 +84,8 @@ mod arch
         addr + 1
     }
 
-    /// Hit a breakpoint followed by three one-byte `nop`s; returns the
-    /// breakpoint's address.
+    /// Hit a breakpoint followed by three one-byte `nop`s, the instructions
+    /// [`single_step`] steps; returns the breakpoint's address.
     pub fn breakpoint() -> u64
     {
         let at: u64;
@@ -105,6 +105,47 @@ mod arch
             );
         }
         at
+    }
+
+    /// Arm a single-step in the breakpoint's register file: set the trap
+    /// flag, so the resumed debuggee traps after each instruction.
+    pub fn arm_step(regs: &mut [u8])
+    {
+        let flags = super::read_word(regs, syscall_abi::REGS_X86_64_FLAGS_OFFSET);
+        super::write_word(
+            regs,
+            syscall_abi::REGS_X86_64_FLAGS_OFFSET,
+            flags | syscall_abi::X86_64_RFLAGS_TF,
+        );
+    }
+
+    /// Step 2: single-step the three `nop`s after the breakpoint that reported
+    /// `reported`, one `FAULT_EXC_DEBUG` each, clearing the trap flag at the
+    /// last.
+    pub fn single_step(ep: u64, ipc_buf: *mut u64, th: u64, reported: u64)
+    {
+        for k in 1..=3
+        {
+            let ip = super::recv_exception(ep, ipc_buf, syscall_abi::FAULT_EXC_DEBUG);
+            assert_eq!(ip, reported + k, "a step reported the wrong instruction");
+            if k == 3
+            {
+                let mut regs = [0u8; super::REGS_BYTES];
+                syscall::thread_read_regs(th, &mut regs).expect("read the stepped registers");
+                let flags = super::read_word(&regs, syscall_abi::REGS_X86_64_FLAGS_OFFSET);
+                super::write_word(
+                    &mut regs,
+                    syscall_abi::REGS_X86_64_FLAGS_OFFSET,
+                    flags & !syscall_abi::X86_64_RFLAGS_TF,
+                );
+                // SAFETY: the frame was read from the debuggee, fault-blocked at its
+                // last step; only its trap flag is cleared.
+                unsafe { syscall::thread_write_regs(th, &regs) }
+                    .expect("clear the debuggee's trap flag");
+            }
+            super::reply(ipc_buf);
+        }
+        println!("debugger: single-stepped 3 instructions");
     }
 }
 
@@ -141,6 +182,16 @@ mod arch
         }
         at
     }
+
+    /// Arm a single-step: nothing to arm. RISC-V has no user-mode single-step
+    /// without a debug trigger, which the kernel does not program
+    /// (docs/fault-handling.md § Debugging; #820), so the register file is
+    /// left as it is.
+    pub fn arm_step(_regs: &mut [u8]) {}
+
+    /// Step 2: no single-step on RISC-V (see [`arm_step`]); the debuggee runs
+    /// on from its breakpoint.
+    pub fn single_step(_ep: u64, _ipc_buf: *mut u64, _th: u64, _reported: u64) {}
 }
 
 fn main()
@@ -177,15 +228,7 @@ fn main()
     );
     PEEK.store(POKED, Ordering::Release);
     write_word(&mut regs, arch::IP, reported + arch::RESUME_ADVANCE);
-    #[cfg(target_arch = "x86_64")]
-    {
-        let flags = read_word(&regs, syscall_abi::REGS_X86_64_FLAGS_OFFSET);
-        write_word(
-            &mut regs,
-            syscall_abi::REGS_X86_64_FLAGS_OFFSET,
-            flags | syscall_abi::X86_64_RFLAGS_TF,
-        );
-    }
+    arch::arm_step(&mut regs);
     // SAFETY: the frame was read from the debuggee, fault-blocked at its
     // breakpoint; only its instruction pointer (to the next instruction) and,
     // on x86-64, its trap flag change.
@@ -193,9 +236,8 @@ fn main()
     reply(ipc_buf);
     println!("debugger: breakpoint reported at {reported:#x}, memory inspected and modified");
 
-    // 2. Single-step (x86-64).
-    #[cfg(target_arch = "x86_64")]
-    single_step(ep, ipc_buf, th, reported);
+    // 2. Single-step (x86-64; nothing on RISC-V).
+    arch::single_step(ep, ipc_buf, th, reported);
 
     // 3. Async-break of the spinning debuggee.
     let stopped_at = async_break(ep, ipc_buf, th);
@@ -212,35 +254,6 @@ fn main()
     );
     println!("debugger: async break after {stopped_at} spins");
     println!("PASS");
-}
-
-/// Step 2 (x86-64): single-step the three `nop`s after the breakpoint at
-/// `reported`, clearing the trap flag at the last.
-#[cfg(target_arch = "x86_64")]
-fn single_step(ep: u64, ipc_buf: *mut u64, th: u64, reported: u64)
-{
-    for k in 1..=3
-    {
-        let ip = recv_exception(ep, ipc_buf, syscall_abi::FAULT_EXC_DEBUG);
-        assert_eq!(ip, reported + k, "a step reported the wrong instruction");
-        if k == 3
-        {
-            let mut regs = [0u8; REGS_BYTES];
-            syscall::thread_read_regs(th, &mut regs).expect("read the stepped registers");
-            let flags = read_word(&regs, syscall_abi::REGS_X86_64_FLAGS_OFFSET);
-            write_word(
-                &mut regs,
-                syscall_abi::REGS_X86_64_FLAGS_OFFSET,
-                flags & !syscall_abi::X86_64_RFLAGS_TF,
-            );
-            // SAFETY: the frame was read from the debuggee, fault-blocked at its
-            // last step; only its trap flag is cleared.
-            unsafe { syscall::thread_write_regs(th, &regs) }
-                .expect("clear the debuggee's trap flag");
-        }
-        reply(ipc_buf);
-    }
-    println!("debugger: single-stepped 3 instructions");
 }
 
 /// Step 3: async-break the spinning debuggee, check that it does not run

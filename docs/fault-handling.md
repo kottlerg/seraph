@@ -260,12 +260,15 @@ it with [`SYS_THREAD_READ_REGS`](capability-model.md#thread) on the faulting thr
 
 A faulting thread with a bound handler enters a dedicated **fault-blocked** state distinct
 from the call-reply blocked state, so its resume semantics differ from a syscall return:
-it resumes by re-executing its faulting instruction, not by returning a value.
+it resumes at its reported instruction pointer, not by returning a value. For a fault that
+is the faulting instruction, which re-executes; for a trap-type exception (x86-64 `#BP` and
+`#DB`) it is the instruction after the trapping one ([Debugging](#debugging)).
 
 - **Resume (genuine reply).** The handler replies (default disposition
   [`FAULT_REPLY_RESUME`](#reply)). The kernel resumes the faulting thread with its register
-  state preserved (or as modified by the handler; see below) and re-executes the faulting
-  instruction. For a page fault whose handler has installed a satisfying mapping, the
+  state preserved (or as modified by the handler; see below) at its reported instruction
+  pointer: it re-executes the faulting instruction, or, after a trap-type exception, continues
+  after the trapping one. For a page fault whose handler has installed a satisfying mapping, the
   instruction now succeeds.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread is
   destroyed (its last Thread capability deleted), the handler thread receives again while the fault
@@ -545,9 +548,10 @@ alone.
 
 ## Debugging
 
-A debugger is a userspace handler of a thread's exception class, with the thread's `CONTROL` cap
-for its registers and, for an asynchronous break, an upcall binding. The kernel adds no debugging
-interface of its own. The pieces are:
+A debugger is a userspace handler of a thread's exception class. It holds a Thread cap with
+`OBSERVE`, to read the thread's registers, and `CONTROL`, to write them and to bind its handlers.
+An asynchronous break also needs the upcall binding, and `UPCALL` beside `CONTROL` on the cap. The
+kernel adds no debugging interface of its own. The pieces are:
 
 - **Breakpoints.** A software breakpoint is `int3` on x86-64 and `ebreak` on RISC-V. It reaches
   the exception handler as `FAULT_KIND_EXCEPTION` with `FAULT_EXC_BREAKPOINT`. The reported
@@ -562,8 +566,16 @@ interface of its own. The pieces are:
   thread's `rflags` (`REGS_X86_64_FLAGS_OFFSET` of the register file) with
   `SYS_THREAD_WRITE_REGS`, and resumes it. The thread then takes `#DB` after each instruction,
   delivered as `FAULT_EXC_DEBUG` with the next instruction's pointer, until a handler clears the
-  flag. Syscall entry clears the flag for the kernel and the return restores it, so a stepped
-  `syscall` steps past as one instruction.
+  flag. Syscall entry clears the flag for the kernel and the syscall return restores it, and a
+  syscall return (`sysretq`) that restores the flag traps at once, before any user instruction
+  runs:
+  - a stepped `syscall` therefore steps past as one instruction, its `#DB` naming the
+    instruction after it;
+  - a thread stopped at a syscall return (an upcall at the syscall point, or a stop while it was
+    blocked in a syscall) and resumed with the flag set takes its first `#DB` at the pointer it
+    stopped at, with no instruction run, and steps from there.
+
+  A resume from a fault or an exception (`iretq`) runs one instruction before the first `#DB`.
 - **No single-step on RISC-V.** RISC-V has no user-mode single-step without a debug trigger. The
   kernel programs none: an instruction-count trigger is not available through the SBI Debug
   Triggers extension on the reference platform.
@@ -573,14 +585,18 @@ interface of its own. The pieces are:
   the debuggee's memory directly while it is stopped. No syscall reads or writes another address
   space's memory.
 - **Asynchronous break.** A debugger stops a running thread with an `UPCALL_ANY_INSTRUCTION`
-  upcall ([Asynchronous Upcalls](#asynchronous-upcalls)). The thread is then upcall-blocked, with
-  its registers readable, at the instruction it was preempted at.
+  upcall ([Asynchronous Upcalls](#asynchronous-upcalls)). The thread is then fault-blocked, with
+  its registers readable, at the delivery point the message's data word 2 names: the instruction
+  an interrupt preempted, or a syscall's return.
 - **Trap and emulate.** A handler that emulates a faulting instruction (an illegal instruction,
   say) writes the emulated result and the next instruction's pointer into the thread's registers
   and resumes it.
 
-The `debugger` fixture drives each piece end to end
-([programs/debugger/README.md](../programs/debugger/README.md)).
+The `debugger` fixture drives the breakpoint, the x86-64 single-step, register and same-process
+memory access, and the asynchronous break end to end
+([programs/debugger/README.md](../programs/debugger/README.md)). ktest
+`integration::fault_exception_redirect` drives a resume at a handler-written instruction pointer
+after an illegal instruction, and `integration::single_step` steps a `syscall`.
 
 ---
 

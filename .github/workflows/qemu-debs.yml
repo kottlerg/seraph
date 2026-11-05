@@ -22,9 +22,9 @@ jobs:
 
       - name: Compute cache key
         id: key
-        run: |
-          key=$(.github/scripts/qemu-packages.sh key)
-          echo "key=$key" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/qemu-packages
+        with:
+          mode: key
 
       - name: Look up cached packages
         id: cache
@@ -36,7 +36,10 @@ jobs:
 
       - name: Download QEMU and firmware packages
         if: steps.cache.outputs.cache-hit != 'true'
-        run: .github/scripts/qemu-packages.sh download qemu-debs
+        uses: ./.github/actions/qemu-packages
+        with:
+          mode: download
+          dir: qemu-debs
 
       - name: Save packages
         if: steps.cache.outputs.cache-hit != 'true'

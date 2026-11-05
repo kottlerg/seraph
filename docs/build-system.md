@@ -392,13 +392,17 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
-package (QEMU 10.2). `.github/scripts/qemu-packages.sh` holds the install
-list and the apt flags (no recommends). Every booting cell `needs:` its
+package (QEMU 10.2). The composite action
+`.github/actions/qemu-packages/action.yml` holds the install list and the
+apt flags (no recommends) once; its `mode` input selects the cache key, the
+download, or the install, and each workflow's steps call it with the
+package directory as its `dir` input. Every booting cell `needs:` its
 workflow's `qemu-debs` job, which runs on the same pinned image because the
 downloaded set is resolved against that image's installed packages. The job
 downloads the list's resolved `.deb` set once into an `actions/cache` entry
-keyed `qemu-debs-<ImageOS>-<ImageVersion>-<script hash>` (the runner
-image's version variables and a hash of the script), and downloads nothing
+keyed `qemu-debs-<ImageOS>-<ImageVersion>-<action hash>` (the runner
+image's version variables and the first 16 hex digits of the action file's
+`hashFiles` digest), and downloads nothing
 when the entry exists. A download whose fetch from the image's apt mirror
 fails or exceeds 120 s rewrites the apt sources, the image's
 `/etc/apt/apt-mirrors.txt` mirror list included, from
@@ -411,7 +415,7 @@ download itself and installs offline from it. When the `qemu-debs` job
 fails, the booting cells are skipped and the run fails. An entry saved on
 `master` is readable from every branch and tag, so both workflows and later
 runs share one entry per key. The pin, the install list and the cache key
-move together: the key derives from the image version and the script, so a
+move together: the key derives from the image version and the action, so a
 change to the list, the flags or the pinned image yields a new entry.
 
 The `build-image` job of `release.yml` boots nothing (its one `cargo xtask`

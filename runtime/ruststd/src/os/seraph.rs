@@ -229,9 +229,12 @@ pub struct StartupInfo {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stack_pages: u32,
     /// `Endpoint` cap on the process's demand-paging pager, or zero when
-    /// the process is not demand-paged. The runtime binds this as the fault
-    /// handler on every thread it spawns; the main thread is bound by
-    /// procmgr at creation. See `process_abi::ProcessInfo::pager_endpoint_cap`.
+    /// the process is not demand-paged. procmgr binds it as the main thread's
+    /// fault handler at creation, and the runtime copies the spawning thread's
+    /// bindings onto every thread it spawns
+    /// (`SYS_THREAD_INHERIT_FAULT_HANDLER`), which carries it on; the runtime
+    /// reads this field to tell that the process is demand-paged. See
+    /// `process_abi::ProcessInfo::pager_endpoint_cap`.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub pager_endpoint_cap: u64,
     /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel
@@ -296,6 +299,24 @@ pub unsafe fn set_current_ipc_buf(buf: *mut u64) {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn current_ipc_buf() -> *mut u64 {
     IPC_BUF_TLS.get()
+}
+
+#[thread_local]
+static SELF_THREAD_TLS: Cell<u64> = Cell::new(0);
+
+/// Record the current thread's own Thread capability. Called by the thread
+/// trampoline of a spawned thread with the cap its spawner created.
+pub(crate) fn set_current_thread_cap(cap: u64) {
+    SELF_THREAD_TLS.set(cap);
+}
+
+/// The current thread's own Thread capability: the one recorded by
+/// [`set_current_thread_cap`] for a spawned thread, else the process's
+/// initial thread ([`StartupInfo::self_thread`]), or 0 before `_start` has
+/// read the startup info.
+pub(crate) fn current_thread_cap() -> u64 {
+    let cap = SELF_THREAD_TLS.get();
+    if cap != 0 { cap } else { try_startup_info().map_or(0, |info| info.self_thread) }
 }
 
 /// Register a process-global panic-output sink. When set, std's panic

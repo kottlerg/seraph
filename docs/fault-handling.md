@@ -39,7 +39,8 @@ checks) is owned by the [memory model](memory-model.md) and the
 ## Implementation Status
 
 The fault-redirection mechanism is implemented on both x86-64 and RISC-V for **both**
-fault kinds: `SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler binding, the
+fault kinds: `SYS_THREAD_SET_FAULT_HANDLER`, the per-thread, per-class fault-handler binding
+and its query and copy (`SYS_THREAD_GET_FAULT_HANDLER`, `SYS_THREAD_INHERIT_FAULT_HANDLER`), the
 [fault message](#fault-message) for `FAULT_KIND_VM` (page faults) and `FAULT_KIND_EXCEPTION`
 (every other kernel-unresolvable ring-3 exception — illegal instruction, breakpoint,
 alignment, divide, …), and the [resume and kill](#delivery-resume-and-kill) state machine —
@@ -74,17 +75,19 @@ watchdog's `fatal` instead; see
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the
-`CREATE_PINNED` flag) and delegates the child address space, and the `ProcessInfo` pager
-field (`pager_endpoint_cap` / `pager_badge`) advertises it so the runtime inherits the
-handler onto spawned threads. See
+`CREATE_PINNED` flag) and delegates the child address space, the runtime copies the spawning
+thread's bindings onto each thread it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`), and the
+`ProcessInfo` pager field (`pager_endpoint_cap` / `pager_badge`) tells the runtime that the
+process is demand-paged. See
 [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md).
 Userspace reserves unbacked VA and registers it via `std::os::seraph::register_demand_paged`;
 first touch faults, memmgr maps a frame and resumes. See
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)
 (`REGISTER_REGION`, `DELEGATE_ASPACE`, and the fault arm).
 
-A change of the binding while a fault is in flight cancels that delivery and delivers the fault
-again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both architectures.
+A change of the binding of an in-flight fault's class cancels that delivery and delivers the
+fault again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both
+architectures.
 
 ---
 
@@ -122,42 +125,63 @@ exhaust the kernel stack.
 
 ## Fault-Handler Binding
 
-The fault handler is bound **per thread**. The handler is an ordinary
+The fault handler is bound **per thread and per fault class**. The handler is an ordinary
 [`Endpoint`](capability-model.md#ipc-endpoint); there is no distinct fault-endpoint
-capability type. The binding is per-thread kernel state: the bound endpoint and its badge.
+capability type. The binding is per-thread kernel state, one per class: the bound endpoint and
+its badge. The classes are `FAULT_CLASS_VM`, the virtual-memory faults (`FAULT_KIND_VM`, the
+faults of a restartable syscall's user copy among them), and `FAULT_CLASS_EXCEPTION`, every
+other kernel-unresolvable user exception (`FAULT_KIND_EXCEPTION`). A fault is delivered through
+its class's binding alone, so distinct services can own a thread's classes (a pager its virtual-
+memory faults, a debugger its exceptions); with no handler bound for its class, a fault takes the
+outcome it has with no handler bound at all.
 
 `SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, reserved, fault_class_mask)`:
 
 - `thread_cap` MUST carry `CONTROL`. It selects the thread whose handler is set.
-- `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**.
-  Binding takes a reference on the endpoint object for the lifetime of the binding (see
-  [Liveness](#liveness)); unbinding releases it. Both lookups pin their object for the call,
-  so neither the thread nor the endpoint can be freed while the binding is written (see
+- `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**. Each selected
+  class's binding takes its own reference on the endpoint object for the lifetime of that binding
+  (see [Liveness](#liveness)); unbinding releases it. Both lookups pin their object for the call, so
+  neither the thread nor the endpoint can be freed while the binding is written (see
   [capability-internals.md § Storage: Hybrid Radix Directory](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)).
   The binding's badge is the derivation badge of `endpoint_cap`
-  ([Capability Model § Badges](capability-model.md#badges)), `0` for an unbadged cap: the
-  binder chooses which of its caps to bind, never the badge value; see [Security](#security).
+  ([Capability Model § Badges](capability-model.md#badges)), `0` for an unbadged cap: the binder
+  chooses which of its caps to bind, never the badge value; see [Security](#security).
 - `reserved` MUST be `0`; any other value fails with `InvalidArgument`.
-- `fault_class_mask` selects which fault classes this handler covers. The defined value
-  is the all-classes mask; it reserves the encoding for future per-class handlers without
-  a new syscall.
+- `fault_class_mask` selects the classes the call binds or unbinds: `FAULT_CLASS_ALL`, every
+  class, or any nonzero combination of `FAULT_CLASS_VM` and `FAULT_CLASS_EXCEPTION`. The
+  classes it leaves out keep their bindings. A mask of zero or with a bit no class defines
+  fails with `InvalidArgument`.
 
-The endpoint and its badge are published as one unit: the binder writes both under the target
+A class's endpoint and badge are published as one unit: the binder writes both under the target
 thread's scheduler lock, and fault delivery reads both once under the same lock and pins the
 endpoint for the delivery (it takes its own reference there, while the binding's reference still
 holds the endpoint, and releases it before the faulting thread parks; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)).
 A delivery therefore carries the badge bound with the endpoint it reaches, and a rebind or
 unbind concurrent with a fault never frees the endpoint mid-delivery. A fault whose delivery
-finds the binding already cleared is unhandled (see [Reply](#reply)). A change of the binding
-while a delivery made under the old one is in flight cancels that delivery, and the fault is
-delivered again under the new binding (see [Delivery, Resume, and Kill](#delivery-resume-and-kill),
-Rebind).
+finds its class's binding already cleared is unhandled (see [Reply](#reply)). A change of a
+class's binding while a delivery of that class made under the old one is in flight cancels that
+delivery, and the fault is delivered again under the new binding (see
+[Delivery, Resume, and Kill](#delivery-resume-and-kill), Rebind); a change of another class's
+binding leaves it alone.
 
-A thread has a single fault handler covering all fault classes it is bound for. The
-handler dispatches on the fault kind (see [Fault Message](#fault-message)) and replies
-[`FAULT_REPLY_KILL`](#reply) for kinds it does not handle, recovering for those kinds
-the outcome they have with no handler bound.
+A handler bound for several classes (`FAULT_CLASS_ALL`, the binding procmgr makes) dispatches on
+the fault kind (see [Fault Message](#fault-message)) and replies [`FAULT_REPLY_KILL`](#reply) for
+kinds it does not handle, recovering for those kinds the outcome they have with no handler bound.
+
+`SYS_THREAD_GET_FAULT_HANDLER(thread_cap, class)` reads one class's binding: `thread_cap` MUST
+carry `CONTROL`, and `class` MUST be exactly one class bit (`InvalidArgument` otherwise). It
+returns whether the class is bound and, when it is, the badge bound with it, read once under the
+same lock as one unit; it discloses no endpoint and creates no capability.
+
+`SYS_THREAD_INHERIT_FAULT_HANDLER(dst_thread_cap, src_thread_cap, fault_class_mask)` copies, for
+each class the mask selects, the source thread's binding onto the destination: both caps MUST
+carry `CONTROL`, and the mask follows `SYS_THREAD_SET_FAULT_HANDLER`'s rules. The destination's
+class is bound to the source's endpoint with the source's badge, its binding taking its own
+reference on the endpoint, or unbound where the source has none. The source's bindings are read
+once under its lock, and the destination's are published as `SYS_THREAD_SET_FAULT_HANDLER`
+publishes them, with the same cancellation of a delivery in flight under a changed binding. The
+binder needs no capability to the endpoint, and the badge is copied, never chosen.
 
 ### Inheritance is userspace policy
 
@@ -166,10 +190,13 @@ only `CONTROL` on the target thread, propagation is expressed by whoever holds t
 authority:
 
 - A process creator (procmgr) MAY bind a handler on each process's initial thread.
-- A process runtime MAY bind its own handler onto each thread it spawns. The process's
-  page-fault pager is advertised to the runtime through
-  [`ProcessInfo`](process-lifecycle.md#processinfo--initinfo-handover-discipline) for this
-  purpose.
+- A process runtime MAY bind a handler onto each thread it spawns. The Seraph runtime copies
+  the spawning thread's bindings, every class, onto the new thread before starting it
+  (`SYS_THREAD_INHERIT_FAULT_HANDLER`), so the pager procmgr binds on the initial thread
+  reaches every thread of the process, and so does any other handler bound on a spawning
+  thread. The process's page-fault pager is also advertised to the runtime through
+  [`ProcessInfo`](process-lifecycle.md#processinfo--initinfo-handover-discipline), which tells
+  it that the process is demand-paged.
 
 This makes a system-wide default pager (see [Default System Pager](#default-system-pager))
 a policy decision, not a kernel change.
@@ -236,23 +263,24 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   reply. Destroying it while stopped ends it as for any stopped thread. A cancelled fault-blocked
   thread is never resumed at its faulting instruction: a thread whose own access faulted is killed
   (a stopped one when next started), and one whose kernel copy faulted has that syscall fail.
-- **Rebind (redelivery).** A change of the binding by `SYS_THREAD_SET_FAULT_HANDLER` (an unbind,
-  or a bind to another endpoint or with another badge) while a fault is in flight, before any reply
-  or other cancellation claims it, cancels that delivery: the queued fault message is withdrawn, or
-  a handler that received it finds no pending reply (its `SYS_IPC_REPLY` fails with
-  `InvalidCapability`). The fault is then delivered again, by the kernel, under the binding current
-  when the faulting thread next runs, as a new delivery: the handler bound then receives the fault
-  message with the badge of the cap bound then. With no handler bound then, the fault is
-  unhandled, as a fault whose delivery finds the binding cleared ([Reply](#reply)): clearing the
-  binding mid-fault kills the thread, or fails its kernel copy's syscall. A bind to the same
-  endpoint with the same badge cancels nothing. A fault in flight is one whose delivery read the
-  binding before the change; one that reads the binding after it is delivered under the new binding
-  at once. A delivery made under the new binding can, in a narrow race, be cancelled and made again
-  under that same binding, which the handler sees as one more fault message for the fault; the
-  outcome is unchanged. A stop after the change claimed the fault leaves the redelivery: when next
-  started, the thread delivers the fault again. Redelivery runs in the kernel, not by resuming the
-  thread at its faulting instruction, so it holds for a trap-type exception whose instruction
-  pointer is already past the trapping instruction.
+- **Rebind (redelivery).** A change of the binding of the fault's class, by
+  `SYS_THREAD_SET_FAULT_HANDLER` or `SYS_THREAD_INHERIT_FAULT_HANDLER` (an unbind, or a bind to
+  another endpoint or with another badge), while a fault is in flight, before any reply or other
+  cancellation claims it, cancels that delivery; a change of another class's binding leaves it
+  alone. The cancellation: the queued fault message is withdrawn, or a handler that received it
+  finds no pending reply (its `SYS_IPC_REPLY` fails with `InvalidCapability`). The fault is then
+  delivered again, by the kernel, under the binding current when the faulting thread next runs, as a
+  new delivery: the handler bound then receives the fault message with the badge of the cap bound
+  then. With no handler bound then, the fault is unhandled, as a fault whose delivery finds the
+  binding cleared ([Reply](#reply)): clearing the binding mid-fault kills the thread, or fails its
+  kernel copy's syscall. A bind to the same endpoint with the same badge cancels nothing. A fault in
+  flight is one whose delivery read the binding before the change; one that reads the binding after
+  it is delivered under the new binding at once. A delivery made under the new binding can, in a
+  narrow race, be cancelled and made again under that same binding, which the handler sees as one
+  more fault message for the fault; the outcome is unchanged. A stop after the change claimed the
+  fault leaves the redelivery: when next started, the thread delivers the fault again. Redelivery
+  runs in the kernel, not by resuming the thread at its faulting instruction, so it holds for a
+  trap-type exception whose instruction pointer is already past the trapping instruction.
 
 ### Modifying the faulting thread
 
@@ -276,16 +304,16 @@ The kernel ignores reply capabilities, and every data word but one: data word 0 
 `FAULT_REPLY_KILL` reply, when the reply carries data words, is the handler's decline reason. The
 kernel does not interpret it. When the decline kills a thread whose user-mode access faulted, the
 kernel prints it on its serial console, on a `fault unhandled` line ahead of the `USERSPACE FAULT`
-diagnostic; that line also names the kernel's own unhandled causes (the binding found cleared at
-delivery, or the delivery cancelled before a reply), and its absence before a `USERSPACE FAULT`
-line means no handler was bound. A decline with no data words prints no reason. memmgr's reasons
-are tabled in
+diagnostic; that line also names the kernel's own unhandled causes (the binding of the fault's class
+found cleared at delivery, or the delivery cancelled before a reply), and its absence before a
+`USERSPACE FAULT` line means no handler was bound for the fault's class. A decline with no data
+words prints no reason. memmgr's reasons are tabled in
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label).
 
-A declined fault, like every other unhandled one (the binding cleared before delivery, or the
-delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the outcome it
-has with no handler bound: a fault of a user-mode access kills the thread, and a fault of a
-kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
+A declined fault, like every other unhandled one (the binding of its class cleared before delivery,
+or the delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the
+outcome it has with no handler bound: a fault of a user-mode access kills the thread, and a fault of
+a kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
 has this one meaning whatever raised the fault. The message is the same for both, and the handler
 never chooses between the outcomes; binding a handler never changes the outcome of a fault it
 declines. A handler that wants a thread ended whose kernel-copy fault it declines stops or
@@ -335,13 +363,13 @@ the handler.
 
 ## Liveness
 
-1. The binding holds a reference on the handler endpoint object, so a fault-blocked thread
-   — which is queued on neither the endpoint's send nor receive queue — cannot be stranded
-   by the endpoint being destroyed while it is bound. The reference is released on unbind,
-   rebind, or thread destruction. The binder pins both the thread and the endpoint while it
+1. Each class's binding holds its own reference on the handler endpoint object, so a fault-blocked
+   thread — which is queued on neither the endpoint's send nor receive queue — cannot be stranded by
+   the endpoint being destroyed while it is bound. The reference is released on that class's unbind
+   or rebind, or on thread destruction. The binder pins both the thread and the endpoint while it
    writes the binding, and a delivery pins the endpoint it read until it parks (see
-   [Fault-Handler Binding](#fault-handler-binding)), so a release that drops the endpoint's
-   last reference while a fault is queued on it destroys the endpoint under rule 3.
+   [Fault-Handler Binding](#fault-handler-binding)), so a release that drops the endpoint's last
+   reference while a fault is queued on it destroys the endpoint under rule 3.
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
    releases any fault-blocked thread awaiting that handler, leaving its fault unhandled (the
    [Kill](#delivery-resume-and-kill) path: the thread is killed, or its kernel copy's syscall
@@ -394,7 +422,12 @@ it holds, the same badge its own sends carry. memmgr mints one badged cap per pr
 hands each process only its own, so a process that faults through `pager_endpoint_cap`
 identifies itself, and its faults can back only its own registered regions; attributing a
 fault to another process would need a cap bearing that process's badge, which memmgr never
-gives it. Whether a badge value is guessable plays no part.
+gives it, or a copy of the binding of one of that process's threads
+(`SYS_THREAD_INHERIT_FAULT_HANDLER`), which needs `CONTROL` on that thread. `CONTROL` on a
+thread already lets its holder rewrite the thread's registers and so make it fault at any
+address under its own binding, so the copy adds no authority over the faults attributed to that
+process. `SYS_THREAD_GET_FAULT_HANDLER` discloses a binding's badge to a holder of `CONTROL`,
+not a capability to its endpoint. Whether a badge value is guessable plays no part.
 
 ---
 
@@ -425,12 +458,14 @@ The broadly useful memory policies — lazy and guard-page stack growth, zero-fi
 anonymous memory, copy-on-write sharing, swap and overcommit, working-set tracking,
 snapshotting — exist only if a manager sits on the fault path of most processes. Binding a
 default pager to all ordinary processes is a userspace policy decision (a creator default
-plus runtime propagation via `ProcessInfo`), not a kernel one.
+plus the runtime's copy of the spawning thread's bindings onto each thread it spawns), not a
+kernel one.
 
 Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
 fault handler on every process it creates and advertises it in
 [`ProcessInfo`](process-lifecycle.md#processinfo--initinfo-handover-discipline)
-(`pager_endpoint_cap` / `pager_badge`), and the runtime inherits it onto spawned threads.
+(`pager_endpoint_cap` / `pager_badge`), and the runtime copies it onto spawned threads with the
+spawning thread's bindings.
 It is not a per-tier or per-service decision; a process is demand-paged simply because it is
 a process.
 

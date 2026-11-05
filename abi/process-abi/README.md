@@ -87,8 +87,9 @@ handle):
   [docs/fault-handling.md](../../docs/fault-handling.md)), so these are nonzero for ordinary
   processes and zero only for pinned ones (`procmgr_labels::CREATE_PINNED`, e.g.
   DMA drivers) and the pre-pager bootstrap. procmgr binds the main thread's fault
-  handler to this endpoint at creation, and the runtime inherits it onto every
-  thread it spawns. Consumers must tolerate zero.
+  handler to this endpoint at creation, and the runtime copies the spawning thread's
+  bindings onto every thread it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`), which
+  carries it on. Consumers must tolerate zero.
 
 Every cap field names a `CSpace` slot (`0` = absent); `*_vaddr` / size / count
 fields are plain values.

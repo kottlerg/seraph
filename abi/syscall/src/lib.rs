@@ -478,11 +478,18 @@ pub const SYS_PROCESS_EXIT: u64 = 54;
 /// (ambient; no capability). See `core/kernel/docs/syscalls.md` § `SYS_GETRANDOM` (55) and
 /// `core/kernel/docs/entropy.md`.
 pub const SYS_GETRANDOM: u64 = 55;
+/// Thread: read a thread's fault-handler binding for one fault class (bound
+/// or not, and the bound badge). See `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_GET_FAULT_HANDLER` (56).
+pub const SYS_THREAD_GET_FAULT_HANDLER: u64 = 56;
+/// Thread: copy one thread's fault-handler bindings, per class, onto another.
+/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_INHERIT_FAULT_HANDLER` (57).
+pub const SYS_THREAD_INHERIT_FAULT_HANDLER: u64 = 57;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_GETRANDOM + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_INHERIT_FAULT_HANDLER + 1;
 
 // ── getrandom constants ───────────────────────────────────────────────────────
 
@@ -1136,9 +1143,19 @@ pub const FAULT_REPLY_RESUME: u64 = 0;
 /// ignored.
 pub const FAULT_REPLY_KILL: u64 = 1;
 
-/// `fault_class_mask` value covering all fault classes — the only value v1 of
-/// `SYS_THREAD_SET_FAULT_HANDLER` accepts. Reserves the encoding for future
-/// per-class handlers.
+/// Fault class bit: virtual-memory faults ([`FAULT_KIND_VM`]), the faults of a
+/// restartable syscall's user copy among them. A `fault_class_mask` selects
+/// classes by these bits (`docs/fault-handling.md` § Fault-Handler Binding).
+pub const FAULT_CLASS_VM: u64 = 1 << 0;
+
+/// Fault class bit: every other kernel-unresolvable user exception
+/// ([`FAULT_KIND_EXCEPTION`]).
+pub const FAULT_CLASS_EXCEPTION: u64 = 1 << 1;
+
+/// `fault_class_mask` value covering every fault class, present and future.
+/// `SYS_THREAD_SET_FAULT_HANDLER` and `SYS_THREAD_INHERIT_FAULT_HANDLER`
+/// accept it beside any nonzero combination of the class bits; any other mask
+/// is refused with `InvalidArgument`.
 pub const FAULT_CLASS_ALL: u64 = !0u64;
 
 // ── Register file (SYS_THREAD_READ_REGS / SYS_THREAD_WRITE_REGS) ──────────────

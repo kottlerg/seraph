@@ -142,8 +142,9 @@ child's main thread fault handler to memmgr (the system pager) via
 `SYS_THREAD_SET_FAULT_HANDLER`, delegates the child `AddressSpace` to memmgr via
 `memmgr_labels::DELEGATE_ASPACE`, and then sets `ProcessInfo.pager_endpoint_cap` (the
 child's badged memmgr cap, whose derivation badge the kernel stamps on each fault)
-and `pager_badge` (that badge) so the runtime inherits the handler onto spawned
-threads. The
+and `pager_badge` (that badge), which tell the runtime the process is demand-paged; the
+runtime copies the spawning thread's bindings, this one among them, onto each thread it
+spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The
 child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
 in the `[16..31]` window shared with `CREATE_FROM_FILE`) opts out: the

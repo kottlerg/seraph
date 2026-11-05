@@ -1239,26 +1239,30 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 }
 
 /// `SYS_THREAD_SET_FAULT_HANDLER` (32): bind or clear a thread's fault-handler
-/// endpoint.
+/// endpoint for the fault classes a mask selects.
 ///
 /// arg0 = Thread cap index (must have CONTROL) — the thread whose handler is set.
 /// arg1 = Endpoint cap index, or `0` to **unbind**.
 /// arg2 = reserved; MUST be `0`. The fault message badge is the derivation
 ///        badge of the arg1 cap, never a binder-supplied value
 ///        (`docs/fault-handling.md` § Security).
-/// arg3 = `fault_class_mask`; v1 accepts only [`syscall::FAULT_CLASS_ALL`].
+/// arg3 = `fault_class_mask`: [`syscall::FAULT_CLASS_ALL`], or a nonzero
+///        combination of [`syscall::FAULT_CLASS_VM`] and
+///        [`syscall::FAULT_CLASS_EXCEPTION`]; the classes it leaves out keep
+///        their bindings.
 ///
-/// Binding takes a reference on the endpoint object for the binding's lifetime
-/// (see `docs/fault-handling.md` § Liveness); rebinding / unbinding / thread
-/// destruction releases it. The target Thread and the endpoint are pinned for
-/// the call (`lookup_cap`), so a concurrent delete of either one's last
-/// capability frees it only after the binding is published. The endpoint and
-/// its badge are published as one unit under the target's `sched_lock`, the
-/// lock `ipc::fault::fault_dispatch` reads them under.
+/// Each selected class's binding takes its own reference on the endpoint object
+/// for the binding's lifetime (see `docs/fault-handling.md` § Liveness);
+/// rebinding / unbinding / thread destruction releases it. The target Thread
+/// and the endpoint are pinned for the call (`lookup_cap`), so a concurrent
+/// delete of either one's last capability frees it only after the binding is
+/// published. The endpoint and its badge are published as one unit per class
+/// under the target's `sched_lock`, the lock `ipc::fault::fault_dispatch` reads
+/// them under.
 ///
-/// A change of the binding (another endpoint, another badge, or an unbind)
-/// cancels the fault delivery in flight on the target through the binding it
-/// replaces, unless a reply or another cancellation gave that delivery its
+/// A change of a class's binding (another endpoint, another badge, or an
+/// unbind) cancels the fault delivery of that class in flight on the target
+/// through the binding it replaces, unless a reply or another cancellation gave that delivery its
 /// disposition first; the faulting thread then delivers the fault again under
 /// the binding current when it next runs, and with none bound the fault is
 /// unhandled (`ipc::fault::redeliver_in_flight`; `docs/fault-handling.md`
@@ -1270,29 +1274,28 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 /// kernel-unresolvable faults are delivered and, by its badge, how they are
 /// attributed.
 ///
-/// Returns 0 on success; `InvalidArgument` for a nonzero arg2 or an
-/// unsupported arg3.
+/// Returns 0 on success; `InvalidArgument` for a nonzero arg2 or a mask
+/// `ipc::fault::classes_of_mask` refuses (zero, or a bit no class defines).
 #[cfg(not(test))]
 pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{EndpointObject, KernelObjectHeader, ThreadObject};
+    use crate::cap::object::{EndpointObject, ThreadObject};
     use crate::cap::slot::{EpRights, ThreadRights};
     use crate::syscall::current_tcb;
-    use core::sync::atomic::Ordering;
 
     let thread_idx = tf.arg(0);
     let endpoint_idx = tf.arg(1);
     let reserved = tf.arg(2);
     let fault_class_mask = tf.arg(3);
 
-    // v1 supports only the all-classes mask; the argument reserves the encoding
-    // for future per-class handlers without a new syscall. arg2 once carried a
-    // binder-chosen badge; it is reserved so a caller still passing one fails
-    // loudly instead of having its value ignored.
-    if reserved != 0 || fault_class_mask != syscall::FAULT_CLASS_ALL
+    // arg2 once carried a binder-chosen badge; it is reserved so a caller still
+    // passing one fails loudly instead of having its value ignored.
+    if reserved != 0
     {
         return Err(SyscallError::InvalidArgument);
     }
+    let selected = crate::ipc::fault::classes_of_mask(fault_class_mask)
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // SAFETY: current_tcb() returns current thread; valid in syscall context.
     let caller_tcb = unsafe { current_tcb() };
@@ -1343,59 +1346,211 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Take the new binding's reference before publishing it, so the object
-    // cannot be freed between publish and a faulter's load.
-    if !new_ep.is_null()
+    // Take one reference per selected class before publishing, so the object
+    // cannot be freed between publish and a faulter's load: each class's
+    // binding holds its own.
+    let mut new = [(core::ptr::null_mut(), 0); crate::ipc::fault::FAULT_CLASSES];
+    for (class, binding) in new.iter_mut().enumerate()
     {
-        // SAFETY: new_ep is the EndpointObject `ep_slot` pins.
-        unsafe { (*new_ep).header.inc_ref() };
+        if selected[class]
+        {
+            if !new_ep.is_null()
+            {
+                // SAFETY: new_ep is the EndpointObject `ep_slot` pins.
+                unsafe { (*new_ep).header.inc_ref() };
+            }
+            *binding = (new_ep, new_badge);
+        }
     }
 
-    // Publish (endpoint, badge) as one unit under the target's sched_lock.
-    // `fault_dispatch` reads the pair under the same lock and takes its own
-    // reference on the endpoint before unlocking, so the release of the old
-    // binding below cannot free an endpoint a delivery still uses, and no
-    // faulter pairs one binding's endpoint with another's badge.
-    // The same hold decides whether the change cancels a delivery in flight:
-    // one `ipc::fault::pin_binding` opened under the binding replaced here
-    // (it opens a delivery under this lock), when the binding changed.
-    // SAFETY: target_tcb is the TCB of the Thread object `thread_slot` pins;
-    // lock_raw is paired with the unlock_raw below.
-    let (old_ep, redeliver) = unsafe {
-        let saved = (*target_tcb).sched_lock.lock_raw();
-        let old_badge = (*target_tcb).fault_badge.swap(new_badge, Ordering::Relaxed);
-        let old = (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel);
-        let changed = !core::ptr::eq(old, new_ep) || old_badge != new_badge;
-        let redeliver = changed && crate::ipc::fault::delivery_in_flight(target_tcb);
-        (*target_tcb).sched_lock.unlock_raw(saved);
-        (old, redeliver)
+    // SAFETY: target_tcb is the TCB of the Thread object `thread_slot` pins,
+    // and no lock is held; `new` carries one reference per selected non-null
+    // endpoint.
+    unsafe { apply_bindings(target_tcb, selected, new) };
+    Ok(0)
+}
+
+/// Publish `new` as `tcb`'s binding for each `selected` class, cancel a
+/// delivery the change makes stale, and release the replaced bindings'
+/// references.
+///
+/// The bindings are published as one unit per class under the target's
+/// `sched_lock` (`ipc::fault::publish_bindings`): `fault_dispatch` reads a
+/// class's pair under the same lock and takes its own reference on the
+/// endpoint before unlocking, so the release of a replaced binding cannot
+/// free an endpoint a delivery still uses, and no faulter pairs one
+/// binding's endpoint with another's badge. The same hold decides whether
+/// the change cancels a delivery in flight: one `pin_binding` opened under a
+/// replaced binding of the same class (it opens a delivery under this lock),
+/// when that binding changed. That delivery is cancelled so the faulting
+/// thread makes it again under the new binding (with none, the fault is
+/// unhandled), before the replaced references go: a release that destroys
+/// an old endpoint would otherwise claim a still-queued delivery with a kill
+/// outcome (docs/fault-handling.md § Delivery, Resume, and Kill). A rebind
+/// to the same endpoint nets to no reference change.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins, other than the calling
+/// thread's when a delivery may be in flight on it (a thread inside a syscall
+/// has none); each non-null endpoint of a selected class in `new` carries a
+/// reference the caller passes to the binding; no lock is held.
+#[cfg(not(test))]
+unsafe fn apply_bindings(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    selected: [bool; crate::ipc::fault::FAULT_CLASSES],
+    new: [crate::ipc::fault::Binding; crate::ipc::fault::FAULT_CLASSES],
+)
+{
+    // SAFETY: caller contract.
+    let (old, redeliver) = unsafe { crate::ipc::fault::publish_bindings(tcb, selected, new) };
+    if let Some(class) = redeliver
+    {
+        // SAFETY: tcb is pinned and has a delivery in flight, so it is not
+        // the caller; class < FAULT_CLASSES; no lock is held.
+        unsafe { crate::ipc::fault::redeliver_in_flight(tcb, class) };
+    }
+    // SAFETY: each replaced endpoint's reference passed to this call; syscall
+    // context with interrupts disabled and no lock held.
+    unsafe { crate::ipc::fault::release_endpoints(old) };
+}
+
+/// The TCB of the Thread cap `idx` in `cspace`, which must carry `CONTROL`,
+/// with the pin that keeps its object live while the returned pin is held.
+///
+/// # Errors
+/// `InvalidCapability` for a slot that names no live Thread; the errors of
+/// `lookup_cap` (`InsufficientRights` without `CONTROL`).
+///
+/// # Safety
+/// `cspace` must be the calling thread's `CSpace`; no lock is held.
+#[cfg(not(test))]
+unsafe fn control_thread(
+    cspace: *mut crate::cap::cspace::CSpace,
+    idx: u64,
+) -> Result<
+    (
+        super::PinnedCap,
+        *mut crate::sched::thread::ThreadControlBlock,
+    ),
+    SyscallError,
+>
+{
+    use crate::cap::object::ThreadObject;
+    use crate::cap::slot::ThreadRights;
+    // SAFETY: cspace valid per contract; lookup_cap checks tag and rights.
+    let pin = unsafe { super::lookup_cap(cspace, idx, ThreadRights::CONTROL) }?;
+    let obj = pin.object.ok_or(SyscallError::InvalidCapability)?;
+    // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
+    // SAFETY: tag confirmed Thread; `pin` keeps the ThreadObject live.
+    #[allow(clippy::cast_ptr_alignment)]
+    let tcb = unsafe { (*obj.as_ptr().cast::<ThreadObject>()).tcb };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    Ok((pin, tcb))
+}
+
+/// `SYS_THREAD_GET_FAULT_HANDLER` (56): read a thread's fault-handler binding
+/// for one fault class.
+///
+/// arg0 = Thread cap index (must have CONTROL).
+/// arg1 = the class, exactly one class bit ([`syscall::FAULT_CLASS_VM`] or
+///        [`syscall::FAULT_CLASS_EXCEPTION`]).
+///
+/// Returns `1` when the class is bound and `0` when it is not, with the bound
+/// badge in the secondary return register (`0` when unbound). The pair is
+/// read once under the target's `sched_lock`, where binders publish it, so
+/// the badge is the one bound with the endpoint the flag reports. No
+/// endpoint, capability, or kernel address crosses: the badge is the
+/// derivation badge of a cap the binder held (`docs/fault-handling.md`
+/// § Fault-Handler Binding; `core/kernel/docs/cross-boundary-disclosure.md`).
+///
+/// # Errors
+/// `InvalidArgument` for any other arg1 (checked first); `InvalidCapability`
+/// and `InsufficientRights` for the thread cap.
+#[cfg(not(test))]
+pub fn sys_thread_get_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use core::sync::atomic::Ordering;
+    let class = crate::ipc::fault::class_of_bit(tf.arg(1)).ok_or(SyscallError::InvalidArgument)?;
+    // SAFETY: current_tcb() returns current thread; valid in syscall context.
+    let caller_tcb = unsafe { crate::syscall::current_tcb() };
+    if caller_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller_tcb validated non-null; cspace set at thread creation;
+    // no lock is held.
+    let (_pin, tcb) = unsafe { control_thread((*caller_tcb).cspace, tf.arg(0)) }?;
+    // SAFETY: tcb is pinned by `_pin`; lock_raw paired with unlock_raw; the
+    // binding pair is published under this lock.
+    let (bound, badge) = unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let bound = !(*tcb).fault_handlers[class]
+            .load(Ordering::Acquire)
+            .is_null();
+        let badge = if bound
+        {
+            (*tcb).fault_badges[class].load(Ordering::Relaxed)
+        }
+        else
+        {
+            0
+        };
+        (*tcb).sched_lock.unlock_raw(saved);
+        (bound, badge)
     };
+    let flag = u64::from(bound);
+    tf.set_ipc_return(flag, badge);
+    Ok(flag)
+}
 
-    // Cancel that delivery so the faulting thread makes it again under the
-    // new binding (with none, the fault is unhandled), before the old
-    // binding's reference goes: a release that destroys the old endpoint
-    // would otherwise claim a still-queued delivery with a kill outcome.
-    // docs/fault-handling.md § Delivery, Resume, and Kill.
-    if redeliver
+/// `SYS_THREAD_INHERIT_FAULT_HANDLER` (57): copy one thread's fault-handler
+/// bindings, per class, onto another.
+///
+/// arg0 = destination Thread cap index (must have CONTROL).
+/// arg1 = source Thread cap index (must have CONTROL).
+/// arg2 = `fault_class_mask`, as for `SYS_THREAD_SET_FAULT_HANDLER`.
+///
+/// For each selected class the destination is bound to the source's endpoint
+/// with the source's badge, or unbound where the source has none. The
+/// source's pairs are read once under its `sched_lock`, each endpoint pinned
+/// by a reference that becomes the destination binding's own
+/// (`ipc::fault::pin_bindings`), then published on the destination as
+/// `SYS_THREAD_SET_FAULT_HANDLER` publishes, with the same cancellation of a
+/// delivery in flight under a changed binding (`apply_bindings`). No
+/// capability to the endpoint is created: the binder needs none to copy a
+/// binding, only `CONTROL` on both threads (`docs/fault-handling.md`
+/// § Inheritance is userspace policy).
+///
+/// Returns 0 on success.
+///
+/// # Errors
+/// `InvalidArgument` for a refused mask (checked first); `InvalidCapability`
+/// and `InsufficientRights` for either thread cap.
+#[cfg(not(test))]
+pub fn sys_thread_inherit_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    let selected =
+        crate::ipc::fault::classes_of_mask(tf.arg(2)).ok_or(SyscallError::InvalidArgument)?;
+    // SAFETY: current_tcb() returns current thread; valid in syscall context.
+    let caller_tcb = unsafe { crate::syscall::current_tcb() };
+    if caller_tcb.is_null()
     {
-        // SAFETY: target_tcb is pinned by `thread_slot` and is not the
-        // caller's (a thread inside a syscall has no delivery in flight); no
-        // lock is held.
-        unsafe { crate::ipc::fault::redeliver_in_flight(target_tcb) };
+        return Err(SyscallError::InvalidCapability);
     }
-
-    // Release the previous binding's reference, freeing the object if this was
-    // its last reference, outside every lock (release_ref's precondition).
-    // Rebinding to the same endpoint nets to a no-op (the inc above balances
-    // this release).
-    if let Some(old) = core::ptr::NonNull::new(old_ep)
-    {
-        // SAFETY: old was a live EndpointObject referenced by this binding,
-        // whose reference this call now owns; the header is at offset 0;
-        // syscall context with interrupts disabled and no lock held.
-        unsafe { crate::cap::object::release_ref(old.cast::<KernelObjectHeader>()) };
-    }
-
+    // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
+    let cspace = unsafe { (*caller_tcb).cspace };
+    // SAFETY: cspace is the caller's; no lock is held.
+    let (_dst_pin, dst) = unsafe { control_thread(cspace, tf.arg(0)) }?;
+    // SAFETY: as above.
+    let (_src_pin, src) = unsafe { control_thread(cspace, tf.arg(1)) }?;
+    // SAFETY: src is pinned by `_src_pin`; no lock is held.
+    let new = unsafe { crate::ipc::fault::pin_bindings(src, selected) };
+    // SAFETY: dst is pinned by `_dst_pin`; `new` carries one reference per
+    // selected non-null endpoint; no lock is held.
+    unsafe { apply_bindings(dst, selected, new) };
     Ok(0)
 }
 

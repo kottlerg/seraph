@@ -573,10 +573,11 @@ pub struct ProcessInfo
     /// that backs this process's demand faults.
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
-    /// creation; the runtime reads this slot to bind the same handler onto
-    /// every thread it spawns, so demand paging covers the whole process and
-    /// not just the main thread. The kernel stamps each fault with this cap's
-    /// derivation badge. Consumers must tolerate zero.
+    /// creation; the runtime copies the spawning thread's bindings onto every
+    /// thread it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`), so demand paging
+    /// covers the whole process and not just the main thread, and reads this
+    /// slot to tell that the process is demand-paged. The kernel stamps each
+    /// fault with this cap's derivation badge. Consumers must tolerate zero.
     pub pager_endpoint_cap: u64,
 
     /// The derivation badge of [`Self::pager_endpoint_cap`], identifying this
@@ -721,8 +722,9 @@ pub struct StartupInfo
     pub stack_pages: u32,
 
     /// `CSpace` slot of the demand-paging pager endpoint, or zero when the
-    /// process is not demand-paged. The runtime binds this onto every
-    /// thread it spawns. See `ProcessInfo::pager_endpoint_cap`.
+    /// process is not demand-paged. The runtime reads it to tell that the
+    /// process is demand-paged; the binding itself reaches every thread it
+    /// spawns by copy. See `ProcessInfo::pager_endpoint_cap`.
     pub pager_endpoint_cap: u64,
 
     /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel

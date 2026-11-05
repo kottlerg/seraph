@@ -594,8 +594,9 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
         // in exception context (the kill path uses it too).
         let tcb = unsafe { crate::syscall::current_tcb() };
         // SAFETY: tcb is the running user thread; has_handler only reads the
-        // atomic fault_handler field.
-        let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
+        // atomic binding of the exception class.
+        let handler_bound = !tcb.is_null()
+            && unsafe { crate::ipc::fault::has_handler(tcb, syscall::FAULT_KIND_EXCEPTION) };
         if handler_bound
         {
             // SAFETY: tf is the live TrapFrame; the redirect points the TCB at it
@@ -1300,8 +1301,9 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         // in exception context (the kill path uses it too).
         let tcb = unsafe { crate::syscall::current_tcb() };
         // SAFETY: tcb is the running user thread; has_handler only reads the
-        // atomic fault_handler field.
-        let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
+        // atomic binding of the VM class.
+        let handler_bound = !tcb.is_null()
+            && unsafe { crate::ipc::fault::has_handler(tcb, syscall::FAULT_KIND_VM) };
         if handler_bound
         {
             // The hardware P bit is reported only for a user-half CR2. The

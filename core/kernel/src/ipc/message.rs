@@ -35,8 +35,9 @@ pub struct Message
     pub label: u64,
     /// Badge from the sender's endpoint capability slot. Zero if unbadged.
     /// Set by `sys_ipc_call` from the caller's endpoint cap, or by
-    /// `fault_dispatch` from the faulting thread's `fault_badge`; delivered to the
-    /// receiver via the third return register of `ipc_recv`.
+    /// `fault_dispatch` from the faulting thread's `fault_badges` entry of the
+    /// fault's class; delivered to the receiver via the third return register
+    /// of `ipc_recv`.
     pub badge: u64,
     /// Inline data words. The width is the IPC buffer layout's
     /// `MSG_DATA_WORDS_MAX`; bulk data moves through Memory caps instead.

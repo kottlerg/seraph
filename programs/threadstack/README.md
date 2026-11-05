@@ -7,7 +7,7 @@ demand growth of the main thread's stack.
 
 ## Role
 
-The fixture's per-program tester, `threadstack-tester`, drives it in three modes, and the
+The fixture's per-program tester, `threadstack-tester`, drives it in six modes, and the
 `usertest` orchestrator discovers and runs that tester. The fixture installs at
 `/programs/threadstack` and the tester at `/tests/programs/threadstack`, per
 [docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
@@ -22,8 +22,8 @@ threadstack/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs            # grow, guard, bigframe, main-grow, and main-guard modes; the
-│                          #   stack-growing recursion
+│   └── main.rs            # grow, nested-grow, guard, bigframe, main-grow, and main-guard
+│                          #   modes; the stack-growing recursion
 └── tester/
     ├── Cargo.toml
     └── src/
@@ -46,22 +46,23 @@ above a demand-growth range that reaches 512 pages, with an unregistered guard p
 [docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas)
 specifies.
 
-In `grow` and `guard`, the worker thread recurses through `recurse`, and each level fills and
-sums a 4096-byte stack buffer, so the stack grows by about one page per level. The recursive
-call goes through a `black_box`'d function pointer so the optimiser cannot fold the recursion
-into a loop. `main-grow` and `main-guard` run the same recursion on the main thread. `bigframe`
-uses one oversized frame instead, as § Modes describes.
+In `grow`, `nested-grow`, and `guard`, the worker thread recurses through `recurse`, and each level
+fills and sums a 4096-byte stack buffer, so the stack grows by about one page per level. The
+recursive call goes through a `black_box`'d function pointer so the optimiser cannot fold the
+recursion into a loop. `main-grow` and `main-guard` run the same recursion on the main thread.
+`bigframe` uses one oversized frame instead, as § Modes describes.
 
 ---
 
 ## Modes
 
-The mode is the first of `main-guard`, `main-grow`, `guard`, and `bigframe` that some argv
-entry equals; otherwise it is `grow`.
+The mode is the first of `main-guard`, `main-grow`, `guard`, `bigframe`, and `nested-grow` that
+some argv entry equals; otherwise it is `grow`.
 
 | Mode | Behavior | Stdout and exit |
 |---|---|---|
 | `grow` | A worker recurses `GROW_DEPTH` (200) levels, inside the default 2 MiB usable stack, and is joined | `grow checksum <n>`, then `PASS`; exits `ExitCode::SUCCESS`. A panicked worker prints `grow worker panicked` and exits with code 3 |
+| `nested-grow` | A worker spawns a second worker, which recurses `GROW_DEPTH` (200) levels and is joined by the first, which is joined in turn. The second worker's spawn copies the first worker's bindings ([Fault Handling § Inheritance is userspace policy](../../docs/fault-handling.md#inheritance-is-userspace-policy)), so the mode runs the copy from a spawned thread; both workers and the main thread carry the same pager binding, so a pass shows the second worker's demand stack is served, not which thread's binding was copied | `nested-grow checksum <n>`, then `PASS`; exits `ExitCode::SUCCESS`. A panicked worker prints `nested-grow worker panicked` and exits with code 3 |
 | `guard` | The main thread prints and flushes `about to overflow`, then a worker recurses without bound into the guard page | No clean exit: the guard fault is terminal and procmgr tears down the whole process. If `join` returns, prints `SURVIVED (BUG)` and exits `ExitCode::SUCCESS` so the tester fails |
 | `main-grow` | The main thread recurses `GROW_DEPTH` (200) levels, 25 times its 8 committed pages and inside its 512-page stack | `main-grow checksum <n>`, then `PASS`; exits `ExitCode::SUCCESS` |
 | `main-guard` | The main thread prints and flushes `about to overflow`, then recurses without bound through its demand-growth range into the guard page below it | No clean exit: the guard fault is terminal and procmgr tears down the whole process. If the recursion returns, prints `SURVIVED (BUG)` and exits `ExitCode::SUCCESS` so the tester fails |
@@ -77,19 +78,19 @@ describes.
 ## Tester Checks
 
 `threadstack-tester` runs `/programs/threadstack` in the modes `grow`, `guard`, `bigframe`,
-`main-grow`, and `main-guard`, in that order, through `std::process::Command`. For each run it
-pipes stdout, reads it to the end, and waits for the exit status. It fails, printing
+`nested-grow`, `main-grow`, and `main-guard`, in that order, through `std::process::Command`. For
+each run it pipes stdout, reads it to the end, and waits for the exit status. It fails, printing
 `[threadstack-tester] FAIL <reason>` and exiting with code 1, when any of these holds:
 
-- `grow` and `main-grow`: a stdout line is `SURVIVED (BUG)`, no line is `PASS`, or the exit is
-  not a success.
+- `grow`, `nested-grow`, and `main-grow`: a stdout line is `SURVIVED (BUG)`, no line is `PASS`,
+  or the exit is not a success.
 - `guard`, `bigframe`, and `main-guard`: a stdout line is `SURVIVED (BUG)`, no line contains
   `about to overflow`, the exit is a success, or the exit code is below `EXIT_FAULT_BASE`
   (`0x1000`), the base of the Fault range in
   [Process Lifecycle § Exit reason](../../docs/process-lifecycle.md#exit-reason) (so a Fault or
   Killed reason passes).
 
-If all five runs pass, it prints `[threadstack-tester] PASS` and exits with code 0.
+If all six runs pass, it prints `[threadstack-tester] PASS` and exits with code 0.
 
 ---
 

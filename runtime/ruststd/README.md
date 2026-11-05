@@ -161,27 +161,27 @@ allocator only manages VA space, and a release never loses freed VA. See
 
 `std::thread::spawn` gives each spawned thread its own stack, allocated by `sys/thread` as a
 consumer of the page-reservation surface above. In a demand-paged process
-(`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page reservation of one guard page
-below the usable pages. Only the usable pages are registered with memmgr through
-[`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), so
-memmgr backs each on first touch; the guard page stays unregistered. An overflow whose first
-touch lands in the guard page faults on an address the pager declines, and the fault ends the
-whole process, per [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
+(`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page reservation of one guard page below
+the usable pages. Only the usable pages are registered with memmgr through
+[`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), so memmgr
+backs each on first touch; the guard page stays unregistered. An overflow whose first touch lands in
+the guard page faults on an address the pager declines, and the fault ends the whole process, per
+[docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
 [docs/process-lifecycle.md § Process Death](../../docs/process-lifecycle.md#process-death), and
 [Capability Model § "Kill process" pattern](../../docs/capability-model.md#kill-process-pattern).
 The std userspace targets emit inline stack probes
 ([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)), so a frame
 larger than one page touches each of its pages in turn and faults on the guard page rather than
-skipping it into an adjacent registered region, such as another thread's stack, which memmgr
-would back without a fault. The usable size is the larger of the requested stack size (at least
+skipping it into an adjacent registered region, such as another thread's stack, which memmgr would
+back without a fault. The usable size is the larger of the requested stack size (at least
 `DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the
-reservation, the page-table funding, or the registration fails, or the process is not
-demand-paged, the stack is instead an eager byte-heap allocation of the requested size (at least
-64 KiB, rounded up to whole pages) with no guard page. In a demand-paged process the spawn binds
-the pager as the thread's fault handler before starting it, and a refused bind fails the spawn
-with the error rather than starting a thread whose demand faults (its stack's, when the stack is
-demand-backed) no pager would serve. `join` frees the stack once the thread has left user mode:
-a demand stack through
+reservation, the page-table funding, or the registration fails, or the process is not demand-paged,
+the stack is instead an eager byte-heap allocation of the requested size (at least 64 KiB, rounded
+up to whole pages) with no guard page. Before starting the thread, the spawn copies the spawning
+thread's fault-handler bindings onto it (`SYS_THREAD_INHERIT_FAULT_HANDLER`), the pager of a
+demand-paged process among them, and a refused copy fails the spawn with the error rather than
+starting a thread whose demand faults (its stack's, when the stack is demand-backed) no pager would
+serve. `join` frees the stack once the thread has left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and
 release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or that
 of a joined thread whose join wait failed with an error other than `Interrupted` (its private

@@ -463,9 +463,10 @@ changed after the fact, and is locked to whichever derivation chain the cap belo
 to.
 
 Kernel-synthesized fault messages carry the same guarantee: their badge is the derivation
-badge of the Endpoint cap bound by `SYS_THREAD_SET_FAULT_HANDLER`, so a binder can make the
-kernel stamp a fault only with the badge of a cap it holds; see
-[fault-handling.md § Security](fault-handling.md#security).
+badge of the Endpoint cap bound by `SYS_THREAD_SET_FAULT_HANDLER`, or a copy of another
+thread's binding (`SYS_THREAD_INHERIT_FAULT_HANDLER`), so a binder can make the kernel stamp a
+fault only with the badge of a cap it holds or of a binding of a thread it holds `CONTROL` on;
+see [fault-handling.md § Security](fault-handling.md#security).
 
 ### What the kernel does NOT guarantee
 

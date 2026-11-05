@@ -707,14 +707,15 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             // trap returns and `sret` re-executes the faulting instruction (sepc
             // is not advanced for faults) or continues from a handler-modified
             // sepc.
+            // SAFETY: the shared reference lives only for the call, which reads
+            // the frame and cannot block.
+            let info = fault_info_for(cause_code, unsafe { &*frame });
             // SAFETY: tcb is the running user thread; has_handler only reads the
-            // atomic fault_handler field.
-            let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
+            // atomic binding of the fault's class.
+            let handler_bound =
+                !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb, info.kind) };
             if handler_bound
             {
-                // SAFETY: the shared reference lives only for the call, which
-                // reads the frame and cannot block.
-                let info = fault_info_for(cause_code, unsafe { &*frame });
                 // SAFETY: frame is the live trap frame on this kernel stack; the
                 // redirect points trap_frame at it for the handler's reg access
                 // and returns whether to resume.

@@ -1097,10 +1097,12 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         let outcome = if label == syscall::FAULT_REPLY_KILL
         {
             let mut reply = Message::new(label);
-            // SAFETY: tcb is the calling thread's valid TCB; its IPC buffer
-            // is read through copy_from_user.
-            if data_count > 0
-                && unsafe { read_ipc_buf((*tcb).ipc_buffer, 1, &mut reply.data) }.is_ok()
+            // SAFETY: tcb is the calling thread's valid TCB; ipc_buffer is
+            // written only by its own SYS_IPC_BUFFER_SET.
+            let buf = unsafe { (*tcb).ipc_buffer };
+            // SAFETY: buf is a user IPC buffer VA or 0, read through
+            // copy_from_user (read_ipc_buf's contract).
+            if data_count > 0 && unsafe { read_ipc_buf(buf, 1, &mut reply.data) }.is_ok()
             {
                 reply.data_count = 1;
             }

@@ -177,8 +177,11 @@ would back without a fault. The usable size is the larger of the requested stack
 `DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the
 reservation, the page-table funding, or the registration fails, or the process is not
 demand-paged, the stack is instead an eager byte-heap allocation of the requested size (at least
-64 KiB, rounded up to whole pages) with no guard page. `join` frees the stack once the thread has
-left user mode: a demand stack through
+64 KiB, rounded up to whole pages) with no guard page. In a demand-paged process the spawn binds
+the pager as the thread's fault handler before starting it, and a refused bind fails the spawn
+with the error rather than starting a thread whose demand faults (its stack's, when the stack is
+demand-backed) no pager would serve. `join` frees the stack once the thread has left user mode:
+a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and
 release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or that
 of a joined thread whose join wait failed with an error other than `Interrupted` (its private

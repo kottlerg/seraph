@@ -322,9 +322,10 @@ register-dump, watchdog, and `KERNEL EXCEPTION` paths do format kernel pointers 
 serial-only class ([docs/console-model.md](../../../docs/console-model.md) § Ownership
 across the boot lifecycle) is not userspace-readable. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
-registers, not kernel addresses. Every kernel VA outside the low-VA identity mappings
-(the boot-stack mapping and, until Phase 8, the AP trampoline page, whose VAs equal
-their physical addresses) lies in one of the two regions KASLR randomizes (the image
+registers, not kernel addresses, and the `fault unhandled` line ahead of one prints only the
+thread id and the fault handler's own decline-reason word. Every kernel VA outside the low-VA
+identity mappings (the boot-stack mapping and, until Phase 8, the AP trampoline page, whose VAs
+equal their physical addresses) lies in one of the two regions KASLR randomizes (the image
 or the direct map; see
 [docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout), so
 kernel-pointer console output is governed by the serial-only rule below; it must not be

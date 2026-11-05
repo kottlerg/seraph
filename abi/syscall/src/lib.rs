@@ -1123,13 +1123,16 @@ pub const FAULT_EXC_FP: u64 = 10;
 /// Fault reply label: resume the faulting thread (re-execute the faulting
 /// instruction, or the syscall whose user copy faulted, or continue from a
 /// handler-modified instruction pointer). The default disposition; the kernel
-/// ignores reply data words and caps.
+/// ignores its data words and caps.
 pub const FAULT_REPLY_RESUME: u64 = 0;
 
 /// Fault reply label: the handler declines, and the fault takes the outcome it
 /// has with no handler bound: the kernel kills a thread whose user-mode access
 /// faulted, as an unhandled fault, and fails a syscall whose user copy faulted
-/// with `InvalidAddress` (docs/fault-handling.md § Reply).
+/// with `InvalidAddress` (docs/fault-handling.md § Reply). Data word 0, when
+/// the reply carries one, is the handler's decline reason, which the kernel
+/// prints uninterpreted in its kill diagnostic; caps and other words are
+/// ignored.
 pub const FAULT_REPLY_KILL: u64 = 1;
 
 /// `fault_class_mask` value covering all fault classes — the only value v1 of

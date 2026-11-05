@@ -19,7 +19,7 @@
 use free_pool::{
     ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
     NO_REGION_ID, NODE_NULL, Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore,
-    WordStore, arena::Slot, chunk_for,
+    WordStore, arena::Slot, chunk_for, region_grants,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -1490,9 +1490,11 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
 /// delegated address space, memmgr backs the [`chunk_for`] chunk containing
 /// the faulting page — one contiguous Memory cap mapped across up to
 /// `DEMAND_CHUNK_PAGES` pages — and replies
-/// [`syscall_abi::FAULT_REPLY_RESUME`]. Backing a chunk rather than a single
+/// [`syscall_abi::FAULT_REPLY_RESUME`]; a fault on a page an earlier chunk
+/// backed is resumed without backing. Backing a chunk rather than a single
 /// page bounds cap-slot consumption (one cap per chunk). Every other case —
-/// non-VM fault, unknown process, address outside every region, no delegated
+/// non-VM fault, unknown process, address outside every region, an access
+/// the region's protection does not grant ([`region_grants`]), no delegated
 /// AS, or any allocation/map failure — replies
 /// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics.
 ///
@@ -1522,13 +1524,22 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     };
+    // A write or fetch the region's protection refuses faults again on every
+    // resume, backed or not: decline it.
+    if !region_grants(&region, req.word(2))
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    }
     let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
     if aspace_cap == 0
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
-    // Already backed by an earlier chunk (stale-TLB redelivery): resume.
+    // Already backed by an earlier chunk, the access granted: a fault another
+    // thread's fault on the same chunk raced, which the mapping now
+    // satisfies. Resume.
     if l.frame_covering(rec, page_base, FRAME_VA_UNMAPPED)
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);

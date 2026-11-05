@@ -34,7 +34,7 @@ pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
 pub use ledger::{Ledger, RegionError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRITABLE, PAGE_SIZE};
 
 /// Pages backed per demand fault: memmgr maps a contiguous chunk of up to this
 /// many pages (clamped to the region) on each fault rather than a single page.
@@ -62,6 +62,21 @@ pub struct DemandRegion
     pub va_base: u64,
     pub len: u64,
     pub prot: u64,
+}
+
+/// Whether `region`'s protection grants a fault's `access`, the
+/// `FAULT_ACCESS_*` flags of a `FAULT_KIND_VM` message
+/// (docs/fault-handling.md § Fault Message): a write needs `MAP_WRITABLE`
+/// and an instruction fetch `MAP_EXECUTABLE`, while a read needs nothing, the
+/// kernel granting read at every map. A fault the region does not grant is
+/// never satisfiable by backing the page, since memmgr maps every chunk with
+/// the region's protection.
+#[must_use]
+pub fn region_grants(region: &DemandRegion, access: u64) -> bool
+{
+    let write_refused = access & FAULT_ACCESS_WRITE != 0 && region.prot & MAP_WRITABLE == 0;
+    let fetch_refused = access & FAULT_ACCESS_EXEC != 0 && region.prot & MAP_EXECUTABLE == 0;
+    !write_refused && !fetch_refused
 }
 
 /// Whether `[base, base + len)` contains `va` (half-open, saturating at the
@@ -107,6 +122,29 @@ pub fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn region_grants_refuses_only_an_access_the_protection_lacks()
+    {
+        use syscall_abi::{FAULT_ACCESS_PRESENT, FAULT_ACCESS_READ, MAP_READ};
+        let region = |prot| DemandRegion {
+            va_base: 0x1000,
+            len: 0x1000,
+            prot,
+        };
+        let ro = region(MAP_READ);
+        let rw = region(MAP_READ | MAP_WRITABLE);
+        let rx = region(MAP_READ | MAP_EXECUTABLE);
+        let write = FAULT_ACCESS_WRITE | FAULT_ACCESS_PRESENT;
+
+        assert!(region_grants(&ro, FAULT_ACCESS_READ));
+        assert!(!region_grants(&ro, write));
+        assert!(!region_grants(&ro, FAULT_ACCESS_EXEC));
+        assert!(region_grants(&rw, write));
+        assert!(!region_grants(&rw, FAULT_ACCESS_EXEC));
+        assert!(region_grants(&rx, FAULT_ACCESS_EXEC));
+        assert!(!region_grants(&rx, FAULT_ACCESS_WRITE));
+    }
 
     #[test]
     fn region_contains_is_half_open_at_both_bounds()

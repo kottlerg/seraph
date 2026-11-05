@@ -337,13 +337,14 @@ const ROOT_CSPACE_BOOT_EXTRA_SLOTS: u64 = 4;
 /// either retries indefinitely (e.g. `request_round` in a child) or
 /// surfaces an unexpected `OutOfMemory`.
 ///
-/// Backing the directory's full structural ceiling would cost about 65,800
-/// SEED pages (~257 MiB: 65,664 leaves plus 128 directory pages) for a
-/// `CSpace` whose occupancy peaks at boot and is bounded in steady state.
-/// Growth past the seeded pool returns the refillable `OutOfMemory`. init
-/// never augments this `CSpace`; its own use fits inside the pool, since its
-/// forward of RAM caps to memmgr moves them out and takes none of its slots
-/// (services/init/src/bootstrap.rs).
+/// Backing the directory's full structural ceiling would cost the whole
+/// index field's slot pages for a `CSpace` whose occupancy peaks at boot and
+/// is bounded in steady state. Growth past the seeded pool returns the
+/// refillable `OutOfMemory`. init's own use of slots fits inside the pool,
+/// since its forward of RAM caps to memmgr moves them out and takes none of
+/// its slots (services/init/src/bootstrap.rs); init's one augment of this
+/// `CSpace` funds its bodies and port-binding tables
+/// (`init_cspace_fund_pages` there).
 #[cfg(not(test))]
 fn root_cspace_init_slot_capacity() -> u64
 {
@@ -351,22 +352,23 @@ fn root_cspace_init_slot_capacity() -> u64
 }
 
 /// Pool pages of the root `CSpace` beyond its slots, for the bodies its arena
-/// funds: init's bootstrap allocator splits a Memory cap once per page it hands
-/// out, and each split's tail body takes a 128-byte chunk of init's own
-/// `CSpace` (core/kernel/docs/capability-internals.md § Body Arena), which init
-/// never augments. 16 pages hold 496 bodies (31 per page after its header),
-/// about twice the splits init makes before it hands memory to memmgr; a
-/// shortfall is the refillable `OutOfMemory` of the split that meets it.
+/// funds before init funds them itself: one arena page
+/// (core/kernel/docs/capability-internals.md § Body Arena), for the tail body
+/// of the split that carves init's bootstrap arena. init's next act is to
+/// donate part of that arena to this `CSpace`, sized from its `InitInfo` for
+/// every body and port-binding table it makes after
+/// (`init_cspace_fund_pages`, services/init/src/bootstrap.rs), so the seed
+/// holds only that one page whatever the hardware.
 #[cfg(not(test))]
-const ROOT_CSPACE_BODY_PAGES: u64 = 16;
+const ROOT_CSPACE_BODY_PAGES: u64 = 1;
 
 /// Pages carved from `SEED_MEMORY` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
 /// pages seed the slot-page pool. Sized so the pool holds at least
 /// [`root_cspace_init_slot_capacity`] slots regardless of `L2_SIZE`
-/// (slots-per-page), plus [`ROOT_CSPACE_BODY_PAGES`] for the bodies of init's
-/// splits. The slot-0 reservation, on the pool's first slot page, is one of the
-/// [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`].
+/// (slots-per-page), plus [`ROOT_CSPACE_BODY_PAGES`] for the body of init's
+/// first split. The slot-0 reservation, on the pool's first slot page, is one
+/// of the [`ROOT_CSPACE_BOOT_EXTRA_SLOTS`].
 #[cfg(not(test))]
 fn root_cspace_init_pages() -> u64
 {

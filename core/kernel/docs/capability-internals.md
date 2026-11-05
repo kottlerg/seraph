@@ -34,18 +34,22 @@ From [docs/capability-model.md](../../../docs/capability-model.md) § Capability
 
 ### Storage: Hybrid Radix Directory
 
-The CSpace is a hybrid radix: an inline root of leaf pointers plus
-pool-allocated directory pages fanning out to further leaves (similar to a
-page table with a large root):
+The CSpace is a hybrid radix: an inline root of 256 pointers, split into four regions, plus
+pool-allocated directory pages fanning out to further leaves (similar to a page table with a
+large root). The direct region's root entries name leaves; each later region's entries name
+directory pages one level deeper than the region before it:
 
 ```rust
 pub struct CSpace
 {
     /// Direct region: inline pointers to the first L1_DIRECT leaf pages.
     direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
-    /// Indirect region: inline pointers to pool-allocated directory pages,
-    /// each fanning out to DIR_FANOUT further leaves.
-    indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
+    /// Indirect region: inline pointers to level-1 directory pages.
+    indirect: [AtomicPtr<DirPage<CSpacePage>>; L1_INDIRECT],
+    /// Double-indirect region: inline pointers to level-2 directory pages.
+    double: [AtomicPtr<DirPage<DirPage<CSpacePage>>>; L1_DOUBLE],
+    /// Triple-indirect region: inline pointers to level-3 directory pages.
+    triple: [AtomicPtr<DirPage<DirPage<DirPage<CSpacePage>>>>; L1_TRIPLE],
     /// Grow cursor: leaves 0..next_leaf are allocated, contiguously.
     next_leaf: u32,
     /// Total number of slots currently allocated (not necessarily in use).
@@ -58,39 +62,50 @@ struct CSpacePage
     slots: [CapabilitySlot; L2_SIZE],
 }
 
-/// One pool-allocated directory page: DIR_FANOUT leaf pointers.
-struct CSpaceDirPage
+/// One pool-allocated directory page: DIR_FANOUT pointers to the level below.
+struct DirPage<T>
 {
-    entries: [AtomicPtr<CSpacePage>; DIR_FANOUT],
+    entries: [AtomicPtr<T>; DIR_FANOUT],
 }
 ```
 
-The concrete values of `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT`, and
-`L2_SIZE` are implementation constants chosen so that one `CSpacePage` fits
-a single pool page, one `CSpaceDirPage` is exactly one pool page, and every
-slot index fits the cap handle's index field. They are established at
-implementation time; `L1_DIRECT`, `L1_INDIRECT`, and `DIR_FANOUT` are not part of the public
-ABI, while `L2_SIZE` is published as `CSPACE_SLOTS_PER_PAGE` (userspace funding arithmetic
-depends on it, and a const assert pins the two together), so changing it is an ABI change.
-`(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
-structural ceiling — the only slot bound a CSpace has; capacity below it is
-whatever the owner-funded slot-page pool backs (see
+| Region | Root entries | Leaves per entry | Slots | Directory loads |
+|---|---|---|---|---|
+| direct | `L1_DIRECT` (128) | 1 | 0 to 7,167 | 0 |
+| indirect | `L1_INDIRECT` (64) | `DIR_FANOUT` (512) | 7,168 to 1,842,175 | 1 |
+| double-indirect | `L1_DOUBLE` (63) | 512² | 1,842,176 to 926,686,207 | 2 |
+| triple-indirect | `L1_TRIPLE` (1) | 512³, used up to the ceiling | 926,686,208 to 4,294,967,263 | 3 |
+
+The concrete values of `L1_DIRECT`, `L1_INDIRECT`, `L1_DOUBLE`, `L1_TRIPLE`, `DIR_FANOUT`, and
+`L2_SIZE` are implementation constants chosen so that one `CSpacePage` fits a single pool page,
+one `DirPage` of any level is exactly one pool page, the root keeps 256 entries (a const assert
+holds the sum), and the regions reach the cap handle's index field. `L1_DIRECT`, `L1_INDIRECT`,
+`L1_DOUBLE`, `L1_TRIPLE`, and `DIR_FANOUT` are not part of the public ABI, while `L2_SIZE` is
+published as `CSPACE_SLOTS_PER_PAGE` (userspace funding arithmetic depends on it, and a const
+assert pins the two together), so changing it is an ABI change. The directory's structural
+ceiling, `MAX_SLOTS_STRUCTURAL`, is the whole leaves the 32-bit index field addresses:
+`MAX_LEAVES`, 2^32 / `L2_SIZE` (76,695,844) leaves of `L2_SIZE` slots, 4,294,967,264 slots; the
+last 32 indices of the field, which a whole leaf cannot hold, resolve nothing. It is the only slot
+bound a CSpace has, set by the handle's ABI width rather than by the directory; capacity below it
+is whatever the owner-funded slot-page pool backs (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Address-space and
 CSpace growth budgets).
 
-**Lookup is O(1):** A descriptor `d` selects leaf `d / L2_SIZE` and slot
-`d % L2_SIZE`. Leaves below `L1_DIRECT` resolve through the inline root
-(two dereferences); higher leaves resolve through one directory page
-(three dereferences). No hash, no search.
+**Lookup is O(1):** A descriptor `d` selects leaf `d / L2_SIZE` and slot `d % L2_SIZE`. A leaf of
+the direct region resolves through the inline root alone; a leaf of each later region through one
+more directory page than the region before it, so a lookup makes at most three dependent
+directory loads before the slot read, three only past slot 926,686,207. No hash, no search.
 
 **Growth is O(1) and strictly ordered:** leaves are materialised in index
 order behind the `next_leaf` cursor, so allocated leaves are always the
-contiguous range `0..next_leaf`. A grow into the indirect region first
-materialises the covering directory page from the same owner-funded pool
-(roughly one extra pool page per `DIR_FANOUT` leaves); a directory page
-that outlives a failed leaf allocation stays published — already paid for,
-it serves the next grow. Pages are never freed while the CSpace is live
-(slot indices must remain stable).
+contiguous range `0..next_leaf`. A grow past the direct region first materialises every missing
+directory page above the new leaf, top level first, from the same owner-funded pool (roughly one
+extra pool page per `DIR_FANOUT` leaves, and one per `DIR_FANOUT` pages of the level below); a
+directory page that outlives a failed lower-level or leaf allocation stays published — already
+paid for, it serves the next grow. Pages are never freed while the CSpace is live (slot indices
+must remain stable). Because growth is contiguous, over a span of leaves still to grow only the
+directory pages above its first leaf can already exist, so `pages_to_cover`, the
+explicit-placement path's fast-fail count, is arithmetic per level with one probe each.
 
 **Memory ordering and lock domains:** directory and leaf pointers are write-once while the CSpace is
 live, published with Release after full initialisation, and read with Acquire by the lock-free
@@ -158,23 +173,25 @@ the branch does not fix.
 | Site | User-controlled value | Load it would steer | Hardening |
 |---|---|---|---|
 | `CSpace::leaf_ptr`, direct arm | handle index | `direct[leaf]` past the inline root | the leaf index is masked against `L1_DIRECT`; a failed bound selects `SENTINEL_LEAF` |
-| `CSpace::leaf_ptr`, indirect arm | handle index | `indirect[..]` past the inline root, then the directory entry | the region-relative index is masked against `L1_INDIRECT × DIR_FANOUT`; a failed bound selects `SENTINEL_LEAF` |
-| Leaf and directory pointers | handle index | a null leaf or directory dereferenced at an offset below one page | no pointer is null: unallocated entries name `SENTINEL_LEAF` and `SENTINEL_DIR`, so the path has no null test |
+| `CSpace::leaf_ptr`, indirect, double-indirect, and triple-indirect arms | handle index | the region's root array past the inline root, then each directory entry | the region-relative index is masked against the region's span (`L1_INDIRECT × DIR_FANOUT`, `L1_DOUBLE × DIR_FANOUT²`, or, in the triple region, the leaves below `MAX_LEAVES`) before any load, and each directory index is reduced below `DIR_FANOUT`; a failed bound selects `SENTINEL_LEAF` |
+| Leaf and directory pointers | handle index | a null leaf or directory dereferenced at an offset below one page | no pointer is null: unallocated entries name `SENTINEL_LEAF`, `SENTINEL_DIR`, `SENTINEL_DIR2`, or `SENTINEL_DIR3`, so the path has no null test |
 | `syscall::pin_checked` (`pin_slot`, `lookup_cap`) | handle | the handler's typed accesses of a slot's object | occupancy, generation, type, and the rights the lookup requires are computed as values and folded into the object through `mask_if`, ahead of the branches that refuse them: on a path past a failed check, the object is null |
 | `sys_cap_info`, `wait_set_source`, the `sys_wait_set_add` and `sys_wait_set_remove` source dispatch, `object_for_new_slot` | the slot's tag | a cast to the wrong object or state type | each tag arm casts the pointer selected by its own tag against the hidden tag (`PinnedCap::object_of`, `PinnedCap::tag_mask`, or `object_for_new_slot`'s `hidden_tag`) |
 | `sys_wait_set_add` member right | the source's rights | the source's state and header, locked and written | the member right is folded into the source pointers through `mask_if` ahead of the refusal |
 | `syscall::dispatch` | syscall number | a jump-table entry past the table | a number at or past `SYSCALL_NR_BOUND` (abi/syscall) is refused, and the table reads the number through `mask_index_u64` |
 
-The sentinels are two statics in `cap/cspace.rs`. `SENTINEL_LEAF` is an all-`Null` `CSpacePage`
+The sentinels are four statics in `cap/cspace.rs`. `SENTINEL_LEAF` is an all-`Null` `CSpacePage`
 (4032 bytes) with no interior mutability, so it is placed in read-only data. `SENTINEL_DIR` is one
-page of directory entries, each naming `SENTINEL_LEAF`. A `CSpace` starts with every inline entry
-naming a sentinel, and a grow fills a new directory page's entries with `SENTINEL_LEAF` before
-publishing it. `slot` and `slot_mut` refuse the sentinel after the loads, so architecturally an
-unallocated index still resolves nothing, and `slot_mut` never hands out the shared page. The
-masked fallback of either `leaf_ptr` arm is the sentinel, never leaf 0, so a mispredicted bound
-reads only `Null` slots and never aliases a live slot of the caller's `CSpace`. Every resolution
-of a handle passes through `slot` or `slot_mut`: `pin_slot`, `lookup_cap`, the capability-tree
-handlers, the IPC transfer pre-validation, and explicit placement.
+page of level-1 directory entries, each naming `SENTINEL_LEAF`; `SENTINEL_DIR2`'s entries name
+`SENTINEL_DIR`, and `SENTINEL_DIR3`'s name `SENTINEL_DIR2`, so a walk through any unallocated
+entry reaches `SENTINEL_LEAF`. A `CSpace` starts with every inline entry naming its region's
+sentinel, and a grow fills a new directory page's entries with the sentinel of the level below
+before publishing it. `slot` and `slot_mut` refuse the sentinel leaf after the loads, so
+architecturally an unallocated index still resolves nothing, and `slot_mut` never hands out the
+shared page. The masked fallback of every `leaf_ptr` arm is the sentinel, never leaf 0, so a
+mispredicted bound reads only `Null` slots and never aliases a live slot of the caller's `CSpace`.
+Every resolution of a handle passes through `slot` or `slot_mut`: `pin_slot`, `lookup_cap`, the
+capability-tree handlers, the IPC transfer pre-validation, and explicit placement.
 
 A misspeculated use of the null object that `pin_checked` folds a failed lookup into dereferences
 null at a small offset. Userspace can map virtual page 0 (#741), and the documents do not state
@@ -432,11 +449,15 @@ debits the growth budget like a slot page, so `CAP_INFO_CSPACE_CAPACITY` and
 `CAP_INFO_CSPACE_BUDGET` count it, and an empty pool fails the call with the refillable
 `OutOfMemory`, which an augment-mode `SYS_CAP_CREATE_CSPACE` lifts. Since a call may need a page
 for its body when slot headroom is ample, a funder holds a page of budget beyond the slots it funds
-(`syscall_abi::cspace_topup_pages`). A port-binding table takes three whole pool pages instead, and
+(`syscall_abi::cspace_topup_pages`); a funder that knows its bodies in advance sizes its donation
+with `CSPACE_BODIES_PER_PAGE` and `IOPORT_BINDING_TABLE_PAGES`, which the ABI publishes and the
+kernel asserts, as init funds its own `CSpace` (services/init/docs/bootstrap.md). A port-binding
+table takes three whole pool pages instead, and
 never outlives its pool: the thread's dealloc returns it, or, when the thread's `CSpace` dies
 first, that teardown does, under the thread's `sched_lock` in both cases, and a bind allocates and
-installs it under the same lock only while the thread is not `Exited`. No runtime body comes from
-the kernel's SEED reserve, which holds only the boot footprint (initialization.md § Phase 7).
+installs it under the same lock only while the thread is not `Exited`. The kernel's SEED reserve
+holds only the boot footprint (initialization.md § Phase 7); the one runtime body page it backs is
+the root `CSpace`'s arena page for init's first split, before init funds its `CSpace` itself.
 
 A chunk body can outlive its funder: a capability moved to another `CSpace` (`SYS_CAP_MOVE`, an IPC
 transfer) keeps its body in the funder's arena. The teardown keeps only the pages such bodies sit

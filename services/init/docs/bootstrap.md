@@ -21,16 +21,30 @@ process creation to procmgr IPC.
 
 - Version-check `InitInfo` against `INIT_PROTOCOL_VERSION` and exit
   on mismatch (`INIT_PROTOCOL_VERSION` check in `run()`, `../src/main.rs`).
-- Initialise the per-arch serial path used for FATAL pre-IPC errors
-  (`arch::current::serial_init`, `../src/main.rs`).
 - Build the `MemoryAlloc` bump allocator over the kernel-provided
   memory pool (`MemoryAlloc::new`, `../src/main.rs`).
 - Carve init's bootstrap arena (`bootstrap::BootArena::carve_reserve`,
   `../src/main.rs`): one contiguous Memory cap whose front reserve
-  absorbs init's endpoint and init-logd thread retypes and whose backing
-  is offset-mapped as init's IPC buffer, the init-logd stack, and the
-  init-logd IPC buffer. `finalize_memmgr` forwards it to memmgr as an
-  in-use run.
+  absorbs init's own `CSpace` fund and its endpoint and init-logd thread
+  retypes, and whose backing is offset-mapped as init's IPC buffer, the
+  init-logd stack, and the init-logd IPC buffer. `finalize_memmgr`
+  forwards it to memmgr as an in-use run.
+- Fund init's own `CSpace` from the arena's front in one augment-mode
+  `cap_create_cspace` (`bootstrap::fund_own_cspace`, `../src/bootstrap.rs`).
+  The donation, `bootstrap::init_cspace_fund_pages`, is sized from this
+  boot's `InitInfo`: an arena page per `syscall_abi::CSPACE_BODIES_PER_PAGE`
+  of the bodies init's `CSpace` backs from here on (the split tails of its
+  later `MemoryAlloc` carves, the `SchedControl` split's children, and the
+  `Interrupt`, `IoPort`, and per-aperture `Mmio` derivations it serves
+  devmgr), the port-binding tables of init's two threads where an `IoPort`
+  cap exists (`syscall_abi::IOPORT_BINDING_TABLE_PAGES` each), and a page
+  for a directory page. The kernel seeds only the arena page of the carve's
+  own split ([core/kernel/docs/initialization.md](../../../core/kernel/docs/initialization.md)
+  § Phase 7). The fund's pages stay accounted with the arena, parked in
+  memmgr's pool after init's reap returns them.
+- Initialise the per-arch serial path used for FATAL pre-IPC errors
+  (`arch::current::serial_init`, `../src/main.rs`); a carve or fund
+  failure is reported FATAL once it is up.
 - Register the arena-backed IPC buffer page at `INIT_IPC_BUF_VA` with
   the kernel (`syscall::ipc_buffer_set`, `../src/main.rs`).
 - Mint endpoint objects: init's bootstrap endpoint, procmgr's

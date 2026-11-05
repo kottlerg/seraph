@@ -49,9 +49,9 @@ pub const PAGE_SIZE: u64 = 0x1000;
 ///
 /// A handle is a `u64`: the slot index in bits `0..CAP_INDEX_BITS` and the
 /// per-slot generation (see [`cap_handle_gen`]) in the bits above it. The
-/// index field is wider than any `CSpace` the kernel can build; the kernel
-/// static-asserts that its structural slot ceiling fits it, so the ceiling is
-/// set by the kernel's directory, not by the handle.
+/// kernel's directory reaches the index field: its structural slot ceiling is
+/// the field's whole leaves of [`CSPACE_SLOTS_PER_PAGE`] slots, which the
+/// kernel static-asserts fit it, so the handle sets the ceiling.
 pub const CAP_INDEX_BITS: u32 = 32;
 
 /// Mask selecting the slot-index bits of a capability handle.

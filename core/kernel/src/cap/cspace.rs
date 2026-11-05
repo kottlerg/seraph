@@ -111,7 +111,14 @@ const GEOMETRY_LEAVES: usize = TRIPLE_BASE + L1_TRIPLE * DIR_FANOUT * DIR_FANOUT
 /// fewer.
 const MAX_LEAVES: usize = {
     let field_leaves = (1usize << syscall::CAP_INDEX_BITS) / L2_SIZE;
-    if GEOMETRY_LEAVES < field_leaves { GEOMETRY_LEAVES } else { field_leaves }
+    if GEOMETRY_LEAVES < field_leaves
+    {
+        GEOMETRY_LEAVES
+    }
+    else
+    {
+        field_leaves
+    }
 };
 
 /// The directory's structural slot ceiling; see
@@ -902,15 +909,18 @@ impl CSpace
         match leaf_dir
         {
             None => self.direct[leaf_idx].store(page_nn.as_ptr(), Ordering::Release),
-            // The leaf's entry in its level-1 page is its region-relative
-            // index modulo the fan-out (`region_of`).
-            // SAFETY: a real level-1 directory page, ensured above under the
-            // same lock (never a sentinel); directory pages are write-once and
-            // never freed while the CSpace lives.
-            Some(dir) => unsafe {
+            Some(dir) =>
+            {
+                // The leaf's entry in its level-1 page is its region-relative
+                // index modulo the fan-out (`region_of`).
                 let (_, rel) = region_of(leaf_idx);
-                (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
-            },
+                // SAFETY: a real level-1 directory page, ensured above under
+                // the same lock (never a sentinel); directory pages are
+                // write-once and never freed while the CSpace lives.
+                unsafe {
+                    (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
+                }
+            }
         }
 
         self.next_leaf += 1;
@@ -2354,7 +2364,10 @@ mod tests
         let slot = |leaf: usize| (leaf * L2_SIZE) as u32;
         let cases = [
             // Within the indirect region, across a level-1 page boundary.
-            (INDIRECT_BASE + DIR_FANOUT - 2, slot(INDIRECT_BASE + DIR_FANOUT + 1)),
+            (
+                INDIRECT_BASE + DIR_FANOUT - 2,
+                slot(INDIRECT_BASE + DIR_FANOUT + 1),
+            ),
             // Into the double region: its level-2 and level-1 pages.
             (DOUBLE_BASE - 2, slot(DOUBLE_BASE + 1)),
             // Within the double region, across a level-1 page boundary.
@@ -2388,7 +2401,10 @@ mod tests
             cs.insert_cap_at(index, CapTag::Memory, MemRights::MAP.erase(), obj)
                 .unwrap_or_else(|e| panic!("placement at leaf {base} failed: {e:?}"));
             assert_eq!(cs.slot(index).and_then(|s| s.object), Some(obj));
-            assert!(cs.slot(index - 6).is_none(), "the leaf below {base} resolved");
+            assert!(
+                cs.slot(index - 6).is_none(),
+                "the leaf below {base} resolved"
+            );
             assert!(
                 cs.slot(((base + 1) * L2_SIZE) as u32).is_none(),
                 "the leaf above {base} resolved"
@@ -2415,7 +2431,10 @@ mod tests
                 cs.insert_cap_at(past, CapTag::Memory, MemRights::MAP.erase(), obj),
                 Err(CapError::InvalidIndex)
             );
-            assert!(cs.slot(past).is_none(), "index {past} past the ceiling resolved");
+            assert!(
+                cs.slot(past).is_none(),
+                "index {past} past the ceiling resolved"
+            );
         }
         // The last leaf's other slots are free; past them the directory is
         // structurally full.
@@ -2436,7 +2455,11 @@ mod tests
         assert_eq!(cs.pages_to_cover(index), 4);
         cs.set_test_page_budget(3);
         assert_eq!(cs.grow_toward(index, 1), Err(CapError::PoolExhausted));
-        assert_eq!(cs.pages_to_cover(index), 1, "a published directory page was re-counted");
+        assert_eq!(
+            cs.pages_to_cover(index),
+            1,
+            "a published directory page was re-counted"
+        );
         assert!(cs.slot(index).is_none());
         cs.set_test_page_budget(1);
         assert_eq!(cs.grow_toward(index, 1), Ok(true));

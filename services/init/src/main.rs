@@ -423,34 +423,49 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
-    // Set up serial output (FATAL pre-IPC errors fall back to this).
-    arch::current::serial_init(info, info.thread_cap);
-
     // SAFETY: `run` executes once, on init's main thread, and nothing else
     // names ORPHAN_SLOTS, so this is the only reference to it.
     let orphan_slots = unsafe { &mut *core::ptr::addr_of_mut!(ORPHAN_SLOTS) };
     let mut alloc = MemoryAlloc::new(info, orphan_slots);
 
     // Carve init's own bootstrap arena: one contiguous Memory cap backing every
-    // page init allocates for itself. Its front reserve absorbs init's
-    // endpoint and log-thread retypes; its backing region is offset-mapped as
-    // init's IPC buffer, the log-thread stack, and the log-thread IPC buffer.
-    // The whole arena is forwarded to memmgr as an in-use run at
-    // `finalize_memmgr`, so init's own backing is accounted in memmgr's pool
-    // and — pinned by memmgr's copy — never frees into the post-handoff buddy
-    // when init reaps. Mirrors the memmgr/procmgr arenas.
+    // page init allocates for itself. Its front reserve absorbs init's own
+    // `CSpace` fund and its endpoint and log-thread retypes; its backing region
+    // is offset-mapped as init's IPC buffer, the log-thread stack, and the
+    // log-thread IPC buffer. The whole arena is forwarded to memmgr as an
+    // in-use run at `finalize_memmgr`, so init's own backing is accounted in
+    // memmgr's pool and — pinned by memmgr's copy — never frees into the
+    // post-handoff buddy when init reaps. Mirrors the memmgr/procmgr arenas.
+    //
+    // The carve and the fund come before serial output: the carve's split is
+    // the one body init's `CSpace` backs from the kernel's seed, and the fund
+    // pays for every later body and port-binding table, the serial port's
+    // binding on x86-64 among them (`bootstrap::fund_own_cspace`).
     let backing_pages = 1 + logging::LOG_THREAD_STACK_PAGES + 1;
-    let Some(mut init_arena) = bootstrap::BootArena::carve_reserve(
+    let init_arena = bootstrap::BootArena::carve_reserve(
         &mut alloc,
         info.aspace_cap,
-        bootstrap::init_retype_reserve_pages(),
+        bootstrap::init_retype_reserve_pages(info),
         backing_pages,
-    )
+    );
+    let funded = init_arena
+        .as_ref()
+        .is_some_and(|arena| bootstrap::fund_own_cspace(info, arena.cap));
+
+    // Set up serial output (FATAL pre-IPC errors fall back to this).
+    arch::current::serial_init(info, info.thread_cap);
+
+    let Some(mut init_arena) = init_arena
     else
     {
         logging::log("init: FATAL: cannot carve init bootstrap arena");
         syscall::thread_exit();
     };
+    if !funded
+    {
+        logging::log("init: FATAL: cannot fund init's own CSpace");
+        syscall::thread_exit();
+    }
     // Every `cap_create_endpoint` retypes from the arena front.
     ENDPOINT_SLAB.store(init_arena.cap, core::sync::atomic::Ordering::Relaxed);
 

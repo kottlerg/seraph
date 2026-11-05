@@ -31,9 +31,10 @@
 //! the spinner spins, so the bit means an idle CPU pulled it. A pull gated on a
 //! queued load above the imbalance threshold does not take it at that load (Low
 //! and the CPU's linked idle thread); it can take it only on a transient, a
-//! lock-free scan that sees the spinner's slice-expiry requeue before the
-//! dequeue, which comes tens of milliseconds in, so repeating the round makes a
-//! pass by that path unlikely. Skipped below 2 CPUs, and if no `SchedControl`
+//! lock-free scan that sees the spinner's slice-expiry requeue (every RT slice,
+//! 10 ms at the 1 ms tick) before the dequeue, and wins the try-lock just after;
+//! that takes Low within a round's budget only some of the time, so repeating
+//! the round makes a pass by that path unlikely. Skipped below 2 CPUs, and if no `SchedControl`
 //! cap exists in the initial cap set (no path to the children's levels).
 
 use core::sync::atomic::{AtomicBool, Ordering};

@@ -252,8 +252,8 @@ polls of `thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU 
 `stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
 acknowledgement and exit bounds of `stop_source_delete`; the preemption budget of
 `integration::priority_preemption`; the progress budget of `integration::fair_share_progress`;
-the expiry and report bounds of `integration::queued_waiters_fifo`; the observation window and
-finish wait of
+the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the expiry and
+report bounds of `integration::queued_waiters_fifo`; the observation window and finish wait of
 `integration::irq_preserves_user_regs`; the delivery waits of `integration::irq_shared_line`; the
 child waits of `integration::stop_read_regs_remote`; the
 probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of

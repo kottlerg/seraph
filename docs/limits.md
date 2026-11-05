@@ -804,6 +804,7 @@ production value is raised.
 | `SEED_ATTEMPTS` | `core/ktest/src/unit/retype.rs` (`pool_seeding_takes_interrupts`) | 4 | test fixture (repeats of a millisecond seeding call, so host scheduling delay alone cannot keep every probe outside the calls) | none | correct as is | None |
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |
+| `ROUNDS`, `PULL_BUDGET_US`, `LOW_EXIT_POLLS`, `SPINNER_START_MS`, `SPINNER_DRAIN_WINDOWS` | `core/ktest/src/integration/idle_pull_starved_ready.rs` | 8 / 50 ms, scaled / 1000 x 1 ms, scaled / 5 s / 4 x 5 s | test fixture (rounds enough that a pull by the threshold rule's transient alone passes them all rarely; budgets far past the idle pull's few ms) | none | correct as is | None |
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |
 | `DEPTH` | `core/ktest/src/integration/cspace_nested_teardown.rs` | 256 | test fixture (past the kernel-stack recursion depth) | none | correct as is | None |
 | `CHILDREN` | `core/ktest/src/integration/cap_transfer_large.rs` | 300 | test fixture (more than one reparent batch) | none | correct as is | None |

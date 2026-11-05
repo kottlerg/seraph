@@ -127,8 +127,8 @@ pub enum Iommu
     /// `virtio-pci` device a driver of the system binds behind it
     /// (`iommu_platform=on`) — the default.
     Attached,
-    /// No IOMMU: the no-IOMMU variant of the release host runs, in which
-    /// devmgr runs every device unconfined.
+    /// No IOMMU: the no-IOMMU variant, the no-iommu device cell of the local
+    /// and release host runs, in which devmgr runs every device unconfined.
     Absent,
 }
 

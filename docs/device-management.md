@@ -283,8 +283,9 @@ settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units 
 pages, and `CREATE_DMA_HOLD`, at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
 every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
-functions no driver binds included. devmgr never releases the driver's hold: a unit may walk any
-of its table pages while translation is on, so they stay quarantined for the boot. For each
+functions no driver binds included. devmgr never releases the driver's hold, and deletes its
+release token at the spawn: a unit may walk any of its table pages while translation is on, so
+they stay quarantined for the boot. For each
 DMA-capable device devmgr then decides, before it grants the device DMA:
 
 - **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`) and grants it DMA in

@@ -5916,7 +5916,7 @@ pub unsafe fn schedule(requeue: Requeue)
         let dispatchable = ready && !deferred;
         if deferred
         {
-            // Re-link `next` here, still `Ready`, at the head of its level so
+            // Re-link `next` here, still `Ready`, at the head of its run queue so
             // it keeps its turn, and claim idle. Lock order: `next.sched_lock`
             // (held) → this CPU's run-queue lock. IRQs stay disabled across the
             // relock/release.
@@ -6492,22 +6492,17 @@ pub unsafe fn timer_tick()
 
     // SAFETY: current validated non-null above; slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
-    let (slice, reschedule) = match sched.tick_outcome(remaining)
+    let Some((slice, reschedule)) = sched.tick_outcome(remaining).slice_and_reschedule()
+    else
     {
-        run_queue::TickOutcome::Idle =>
-        {
-            // Idle threads have slice_remaining = 0 and are not preempted.
-            // Still run the load balancer so idle CPUs can pull work from busy
-            // ones (the whole point of pull-based balancing).
-            // SAFETY: Paired with lock_raw above.
-            unsafe { sched.lock.unlock_raw(saved) };
-            // SAFETY: cpu validated against cpu_count above; no lock held.
-            unsafe { try_pull_balance(cpu) };
-            return;
-        }
-        run_queue::TickOutcome::Continue { remaining } => (remaining, false),
-        run_queue::TickOutcome::PreemptForRt { remaining } => (remaining, true),
-        run_queue::TickOutcome::Expired { quantum } => (quantum, true),
+        // Idle threads have slice_remaining = 0 and are not preempted.
+        // Still run the load balancer so idle CPUs can pull work from busy
+        // ones (the whole point of pull-based balancing).
+        // SAFETY: Paired with lock_raw above.
+        unsafe { sched.lock.unlock_raw(saved) };
+        // SAFETY: cpu validated against cpu_count above; no lock held.
+        unsafe { try_pull_balance(cpu) };
+        return;
     };
     // SAFETY: current is a valid TCB; slice_remaining is written by this CPU's
     // timer_tick under this CPU's scheduler lock, held here.

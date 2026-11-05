@@ -257,7 +257,10 @@ pub fn drhd_units(dmar: &[u8]) -> impl Iterator<Item = DrhdUnit> + '_
 {
     structures(dmar).filter_map(|s| match s
     {
-        Structure::Drhd(u) if u.register_base != 0 && u.register_base & 0xfff == 0 => Some(u),
+        Structure::Drhd(u) if u.register_base != 0 && u.register_base.trailing_zeros() >= 12 =>
+        {
+            Some(u)
+        }
         _ => None,
     })
 }
@@ -296,7 +299,7 @@ fn pci_scopes(dmar: &[u8], scopes: (usize, usize)) -> impl Iterator<Item = PciSc
             let path_bytes = len - SCOPE_PATH_OFF;
             let hops = path_bytes / 2;
             if !matches!(kind, SCOPE_PCI_ENDPOINT | SCOPE_PCI_SUB_HIERARCHY)
-                || path_bytes % 2 != 0
+                || !path_bytes.is_multiple_of(2)
                 || hops == 0
                 || hops > MAX_SCOPE_PATH
             {
@@ -451,7 +454,13 @@ mod tests
     /// A device scope of `kind` from `start_bus` along `path`.
     fn scope(kind: u8, start_bus: u8, path: &[(u8, u8)]) -> Vec<u8>
     {
-        let mut s = vec![kind, u8::try_from(SCOPE_PATH_OFF + 2 * path.len()).unwrap(), 0, 0, 0];
+        let mut s = vec![
+            kind,
+            u8::try_from(SCOPE_PATH_OFF + 2 * path.len()).unwrap(),
+            0,
+            0,
+            0,
+        ];
         s.push(start_bus);
         for &(d, f) in path
         {
@@ -519,13 +528,19 @@ mod tests
     fn a_q35_style_catch_all_unit_is_found_with_its_register_range()
     {
         // q35's intel-iommu: one INCLUDE_PCI_ALL unit at 0xfed90000.
-        let table = dmar(39, &[drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[])]);
+        let table = dmar(
+            39,
+            &[drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[])],
+        );
         let units: Vec<_> = drhd_units(&table).collect();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].register_base, 0xfed9_0000);
         assert_eq!(units[0].register_pages, 1);
         assert!(units[0].include_pci_all);
-        assert_eq!(unit_for(&table, 0, bdf(0, 3, 0), no_bridges, no_ranges), Some(0));
+        assert_eq!(
+            unit_for(&table, 0, bdf(0, 3, 0), no_bridges, no_ranges),
+            Some(0)
+        );
     }
 
     #[test]
@@ -561,15 +576,27 @@ mod tests
                 drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_1000, &[]),
             ],
         );
-        assert_eq!(unit_for(&table, 0, bdf(0, 2, 0), no_bridges, no_ranges), Some(0));
-        assert_eq!(unit_for(&table, 0, bdf(0, 3, 0), no_bridges, no_ranges), Some(1));
+        assert_eq!(
+            unit_for(&table, 0, bdf(0, 2, 0), no_bridges, no_ranges),
+            Some(0)
+        );
+        assert_eq!(
+            unit_for(&table, 0, bdf(0, 3, 0), no_bridges, no_ranges),
+            Some(1)
+        );
     }
 
     #[test]
     fn a_function_of_another_segment_gets_no_unit()
     {
-        let table = dmar(39, &[drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[])]);
-        assert_eq!(unit_for(&table, 1, bdf(0, 3, 0), no_bridges, no_ranges), None);
+        let table = dmar(
+            39,
+            &[drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[])],
+        );
+        assert_eq!(
+            unit_for(&table, 1, bdf(0, 3, 0), no_bridges, no_ranges),
+            None
+        );
     }
 
     #[test]
@@ -579,9 +606,15 @@ mod tests
         let ep = scope(SCOPE_PCI_ENDPOINT, 0, &[(0x1c, 0), (0, 0)]);
         let table = dmar(39, &[drhd(0, 0, 0, 0xfed9_0000, &[ep])]);
         let secondary = |b: Bdf| (b == bdf(0, 0x1c, 0)).then_some(2);
-        assert_eq!(unit_for(&table, 0, bdf(2, 0, 0), secondary, no_ranges), Some(0));
+        assert_eq!(
+            unit_for(&table, 0, bdf(2, 0, 0), secondary, no_ranges),
+            Some(0)
+        );
         // With the bridge unreadable the scope does not resolve.
-        assert_eq!(unit_for(&table, 0, bdf(2, 0, 0), no_bridges, no_ranges), None);
+        assert_eq!(
+            unit_for(&table, 0, bdf(2, 0, 0), no_bridges, no_ranges),
+            None
+        );
     }
 
     #[test]
@@ -590,7 +623,10 @@ mod tests
         let tree = scope(SCOPE_PCI_SUB_HIERARCHY, 0, &[(0x1c, 0)]);
         let table = dmar(39, &[drhd(0, 0, 0, 0xfed9_0000, &[tree])]);
         let range = |b: Bdf| (b == bdf(0, 0x1c, 0)).then_some((2, 4));
-        assert_eq!(unit_for(&table, 0, bdf(3, 0, 0), no_bridges, range), Some(0));
+        assert_eq!(
+            unit_for(&table, 0, bdf(3, 0, 0), no_bridges, range),
+            Some(0)
+        );
         assert_eq!(unit_for(&table, 0, bdf(5, 0, 0), no_bridges, range), None);
     }
 
@@ -601,7 +637,10 @@ mod tests
         let empty = scope(SCOPE_PCI_ENDPOINT, 0, &[]);
         let deep = scope(SCOPE_PCI_ENDPOINT, 0, &[(1, 0); MAX_SCOPE_PATH + 1]);
         let ep = scope(SCOPE_PCI_ENDPOINT, 0, &[(4, 0)]);
-        let table = dmar(39, &[drhd(0, 0, 0, 0xfed9_0000, &[ioapic, empty, deep, ep])]);
+        let table = dmar(
+            39,
+            &[drhd(0, 0, 0, 0xfed9_0000, &[ioapic, empty, deep, ep])],
+        );
         let unit = drhd_units(&table).next().unwrap();
         let found: Vec<_> = unit.scopes(&table).map(|s| s.path().to_vec()).collect();
         assert_eq!(found, vec![vec![(4, 0)]]);
@@ -618,9 +657,27 @@ mod tests
                 rmrr(0, 0x7c00_0000, 0x7c0f_ffff, &[usb]),
             ],
         );
-        assert!(has_reserved_region(&table, 0, bdf(0, 0x14, 0), no_bridges, no_ranges));
-        assert!(!has_reserved_region(&table, 0, bdf(0, 3, 0), no_bridges, no_ranges));
-        assert!(!has_reserved_region(&table, 1, bdf(0, 0x14, 0), no_bridges, no_ranges));
+        assert!(has_reserved_region(
+            &table,
+            0,
+            bdf(0, 0x14, 0),
+            no_bridges,
+            no_ranges
+        ));
+        assert!(!has_reserved_region(
+            &table,
+            0,
+            bdf(0, 3, 0),
+            no_bridges,
+            no_ranges
+        ));
+        assert!(!has_reserved_region(
+            &table,
+            1,
+            bdf(0, 0x14, 0),
+            no_bridges,
+            no_ranges
+        ));
     }
 
     #[test]
@@ -645,7 +702,10 @@ mod tests
     #[test]
     fn a_table_that_is_not_a_dmar_yields_nothing()
     {
-        let mut table = dmar(39, &[drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[])]);
+        let mut table = dmar(
+            39,
+            &[drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[])],
+        );
         table[0..4].copy_from_slice(b"APIC");
         assert_eq!(drhd_units(&table).count(), 0);
     }

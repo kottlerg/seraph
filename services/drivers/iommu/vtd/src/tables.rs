@@ -48,7 +48,10 @@ pub const fn root_entry(context_phys: u64) -> [u64; 2]
 pub const fn context_entry(table_phys: u64, levels: u32, did: u16) -> [u64; 2]
 {
     let aw = (levels as u64) - 2;
-    [(table_phys & ADDR_MASK) | CTX_PRESENT, aw | ((did as u64) << 8)]
+    [
+        (table_phys & ADDR_MASK) | CTX_PRESENT,
+        aw | ((did as u64) << 8),
+    ]
 }
 
 /// The word index of function `devfn`'s context entry in its bus's context
@@ -140,7 +143,9 @@ impl SecondLevel
         if len == 0
             || (iova | phys | len) & (PAGE - 1) != 0
             || end > self.width()
-            || phys.checked_add(len).is_none_or(|e| e - 1 > ADDR_MASK | 0xfff)
+            || phys
+                .checked_add(len)
+                .is_none_or(|e| e - 1 > ADDR_MASK | 0xfff)
         {
             return Err(TableError::Invalid);
         }
@@ -234,7 +239,12 @@ impl SecondLevel
     /// # Errors
     /// [`TableError::Invalid`], or [`TableError::NotMapped`] when a page of
     /// the range is not mapped; the pages before it are unmapped.
-    pub fn unmap(&mut self, store: &mut impl TableStore, iova: u64, len: u64) -> Result<(), TableError>
+    pub fn unmap(
+        &mut self,
+        store: &mut impl TableStore,
+        iova: u64,
+        len: u64,
+    ) -> Result<(), TableError>
     {
         self.check(iova, 0, len)?;
         let mut done = 0;
@@ -260,7 +270,10 @@ impl SecondLevel
         }
         let (table, i) = self.leaf(store, iova & !(PAGE - 1), false).ok()?;
         let e = store.table(table)[i];
-        (e != 0).then_some(((e & ADDR_MASK) | (iova & (PAGE - 1)), e & (SL_READ | SL_WRITE)))
+        (e != 0).then_some((
+            (e & ADDR_MASK) | (iova & (PAGE - 1)),
+            e & (SL_READ | SL_WRITE),
+        ))
     }
 
     /// Every table page the domain holds, top level first, so the driver
@@ -341,7 +354,8 @@ mod tests
     {
         let mut s = Heap::default();
         let mut d = SecondLevel::new(&mut s, 3).unwrap();
-        d.map(&mut s, 0x20_0000, 0x8000_0000, 2 * PAGE, SL_READ).unwrap();
+        d.map(&mut s, 0x20_0000, 0x8000_0000, 2 * PAGE, SL_READ)
+            .unwrap();
         assert_eq!(d.translate(&mut s, 0x20_0010), Some((0x8000_0010, SL_READ)));
         assert_eq!(d.translate(&mut s, 0x20_1000), Some((0x8000_1000, SL_READ)));
         assert_eq!(d.translate(&mut s, 0x20_2000), None);
@@ -352,10 +366,17 @@ mod tests
     {
         let mut s = Heap::default();
         let mut d = SecondLevel::new(&mut s, 3).unwrap();
-        d.map(&mut s, 0x1000, 0x9000, PAGE, SL_READ | SL_WRITE).unwrap();
-        assert_eq!(d.map(&mut s, 0, 0xa000, 2 * PAGE, SL_READ), Err(TableError::InUse));
+        d.map(&mut s, 0x1000, 0x9000, PAGE, SL_READ | SL_WRITE)
+            .unwrap();
+        assert_eq!(
+            d.map(&mut s, 0, 0xa000, 2 * PAGE, SL_READ),
+            Err(TableError::InUse)
+        );
         assert_eq!(d.translate(&mut s, 0), None);
-        assert_eq!(d.translate(&mut s, 0x1000), Some((0x9000, SL_READ | SL_WRITE)));
+        assert_eq!(
+            d.translate(&mut s, 0x1000),
+            Some((0x9000, SL_READ | SL_WRITE))
+        );
     }
 
     #[test]
@@ -363,10 +384,14 @@ mod tests
     {
         let mut s = Heap::default();
         let mut d = SecondLevel::new(&mut s, 4).unwrap();
-        d.map(&mut s, 0x4000_0000, 0x1_0000_0000, PAGE, SL_WRITE).unwrap();
+        d.map(&mut s, 0x4000_0000, 0x1_0000_0000, PAGE, SL_WRITE)
+            .unwrap();
         d.unmap(&mut s, 0x4000_0000, PAGE).unwrap();
         assert_eq!(d.translate(&mut s, 0x4000_0000), None);
-        assert_eq!(d.unmap(&mut s, 0x4000_0000, PAGE), Err(TableError::NotMapped));
+        assert_eq!(
+            d.unmap(&mut s, 0x4000_0000, PAGE),
+            Err(TableError::NotMapped)
+        );
     }
 
     #[test]
@@ -374,9 +399,18 @@ mod tests
     {
         let mut s = Heap::default();
         let mut d = SecondLevel::new(&mut s, 3).unwrap();
-        assert_eq!(d.map(&mut s, 0x10, 0x1000, PAGE, SL_READ), Err(TableError::Invalid));
-        assert_eq!(d.map(&mut s, 0, 0x1000, 0, SL_READ), Err(TableError::Invalid));
-        assert_eq!(d.map(&mut s, 1 << 39, 0x1000, PAGE, SL_READ), Err(TableError::Invalid));
+        assert_eq!(
+            d.map(&mut s, 0x10, 0x1000, PAGE, SL_READ),
+            Err(TableError::Invalid)
+        );
+        assert_eq!(
+            d.map(&mut s, 0, 0x1000, 0, SL_READ),
+            Err(TableError::Invalid)
+        );
+        assert_eq!(
+            d.map(&mut s, 1 << 39, 0x1000, PAGE, SL_READ),
+            Err(TableError::Invalid)
+        );
         assert_eq!(d.map(&mut s, 0, 0x1000, PAGE, 0), Err(TableError::Invalid));
     }
 

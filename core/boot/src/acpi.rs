@@ -938,8 +938,10 @@ unsafe fn walk_aperture_seed(
             while off + 4 <= table.len()
             {
                 let kind = u16::from_le_bytes([read_u8(table, off), read_u8(table, off + 1)]);
-                let len =
-                    usize::from(u16::from_le_bytes([read_u8(table, off + 2), read_u8(table, off + 3)]));
+                let len = usize::from(u16::from_le_bytes([
+                    read_u8(table, off + 2),
+                    read_u8(table, off + 3),
+                ]));
                 if len < 4 || off + len > table.len()
                 {
                     break;

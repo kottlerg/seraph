@@ -684,8 +684,8 @@ membership) is not destroyed: it lives on until its last reference goes,
 its bytes stay debited from its source Memory object, and a capability to
 it keeps working as before. memmgr returns the child's frames to its pool
 when procmgr sends `PROCESS_DIED`, except a frame such an object still
-occupies or another address space still maps, which memmgr holds out of
-the pool until neither holds (see
+occupies, another process still holds a capability to, or another address
+space still maps, which memmgr holds out of the pool until none holds (see
 [services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
 § Reclamation and [userspace-memory-model.md](userspace-memory-model.md)).
 
@@ -778,8 +778,9 @@ a held capability: tag and rights for any cap; size, available-bytes,
 retype-rights flag, physical base, and the number of user mappings of its pages (for a
 window of at most 512 pages per query) for Memory caps; lifecycle state and
 exit reason for Thread caps; PT growth budget for AddressSpace caps; backed
-slot capacity, slots used, and growth budget for CSpace caps; plus two
-system-wide tagged-TLB diagnostic counters.
+slot capacity, slots used, and growth budget for CSpace caps; whether the
+queried slot is the only reference to its object, for a cap of any type; plus
+two system-wide tagged-TLB diagnostic counters.
 The syscall enables defensive ledger checks (e.g. memmgr can verify a
 returning cap's available-bytes), and lets receivers of a cap from a
 less-trusted source validate its shape before relying on it.

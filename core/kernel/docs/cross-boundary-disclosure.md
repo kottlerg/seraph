@@ -56,6 +56,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory / address-space page-table budget counts, memory has-retype flag | `cap::sys_cap_info` | c/d |
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of the frames in a window of a Memory region | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
+| `CAP_INFO_SOLE_REFERENCE` → whether the queried slot is the only reference to its object (a boolean of `KernelObjectHeader::ref_count`) | `cap::sys_cap_info`, `cap::object::KernelObjectHeader` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
 | `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
@@ -142,6 +143,14 @@ Notes on the non-obvious entries:
   mappings is how many leaves other holders of the same frames map, a coarse activity signal about
   those holders. A server that hands pages out needs exactly that signal: it reuses a page only once
   a client's mapping of it is gone.
+- **`CAP_INFO_SOLE_REFERENCE`** returns one bit (**d**): whether any reference to the queried
+  object exists besides the caller's slot. It carries no address and no count, needs no right
+  beyond holding the slot, and answers only for an object the caller already holds. What it
+  discloses is whether some other holder, or a kernel-internal owner, still references that
+  object: for a Memory cap, whether another process can still reach the frames; for an endpoint
+  or notification, whether any other party still holds it. memmgr needs exactly that answer
+  before it reuses a frame. It reveals neither which process holds the other reference nor how
+  many there are.
 
 ## Physical-address surfaces
 

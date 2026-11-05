@@ -17,6 +17,8 @@
 //!   per-type rights constants (`creation_masks_match_abi`).
 //! - `CAP_INFO_MEMORY_*` against a Memory cap, including `CAP_INFO_MEMORY_MAPPINGS`
 //!   following a frame's mappings into two address spaces and out again.
+//! - `CAP_INFO_SOLE_REFERENCE` following a Memory cap's references through a
+//!   derivation and a retyped object (`sole_reference`).
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
 //! - The `InitInfo` RAM Memory descriptors against their caps
 //!   (`ram_descriptors_match_caps`).
@@ -24,14 +26,15 @@
 //!   selector (`InvalidArgument`).
 
 use syscall::{
-    MAP_WRITABLE, cap_create_aspace, cap_create_cspace, cap_create_notification, cap_delete,
-    cap_info, cap_info_memory_mappings, mem_map, mem_unmap,
+    MAP_WRITABLE, RIGHTS_ALL, cap_create_aspace, cap_create_cspace, cap_create_endpoint,
+    cap_create_notification, cap_delete, cap_derive, cap_info, cap_info_memory_mappings, mem_map,
+    mem_unmap,
 };
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
-    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CSPACE_SLOTS_PER_PAGE,
-    SyscallError,
+    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS,
+    CSPACE_SLOTS_PER_PAGE, SyscallError,
 };
 
 use crate::{TestContext, TestResult};
@@ -222,6 +225,66 @@ fn mappings_probe(ctx: &TestContext, memory_cap: u64) -> TestResult
     if both? != 2 || one? != 1 || none? != 0
     {
         return Err("cap_info::memory_mappings: the count did not follow the mappings (2, 1, 0)");
+    }
+    Ok(())
+}
+
+/// `CAP_INFO_SOLE_REFERENCE` reports whether the queried slot is the only
+/// reference to its object: a fresh frame's cap is sole; a derivation of it
+/// shares its Memory object, so neither is sole while both live; an object
+/// retyped from it holds a lease on that object, so the cap is not sole while
+/// the object lives, and the object's own cap is sole; each answer returns to
+/// sole once the other reference is deleted.
+pub fn sole_reference(_ctx: &TestContext) -> TestResult
+{
+    let memory_cap =
+        crate::frame_pool::alloc().ok_or("cap_info::sole_reference: frame pool exhausted")?;
+    let result = sole_probe(memory_cap);
+    // A failed cleanup can leave a derivation or a retyped object; the frame
+    // then stays out of the pool rather than break `free`'s precondition.
+    if cap_info(memory_cap, CAP_INFO_SOLE_REFERENCE) == Ok(1)
+    {
+        // SAFETY: the kernel reports no other reference to the frame's object,
+        // so the probe's derivation and endpoint are gone, and it never mapped
+        // the frame.
+        unsafe { crate::frame_pool::free(memory_cap) };
+    }
+    result
+}
+
+/// The sole-reference answers on `memory_cap` through a derivation and a
+/// retyped endpoint, in order: alone, derived (both sides), derivation
+/// deleted, endpoint live (Memory cap and endpoint), endpoint deleted.
+fn sole_probe(memory_cap: u64) -> TestResult
+{
+    let sole = |cap| {
+        cap_info(cap, CAP_INFO_SOLE_REFERENCE)
+            .map_err(|_| "cap_info::sole_reference: cap_info(SOLE_REFERENCE) failed")
+    };
+    let alone = sole(memory_cap)?;
+    let copy = cap_derive(memory_cap, RIGHTS_ALL)
+        .map_err(|_| "cap_info::sole_reference: cap_derive failed")?;
+    let derived = (sole(memory_cap), sole(copy));
+    cap_delete(copy).map_err(|_| "cap_info::sole_reference: cap_delete(copy) failed")?;
+    let underived = sole(memory_cap)?;
+    let ep = cap_create_endpoint(memory_cap)
+        .map_err(|_| "cap_info::sole_reference: cap_create_endpoint failed")?;
+    let leased = (sole(memory_cap), sole(ep));
+    cap_delete(ep).map_err(|_| "cap_info::sole_reference: cap_delete(endpoint) failed")?;
+    let released = sole(memory_cap)?;
+    if alone != 1 || underived != 1 || released != 1
+    {
+        return Err("cap_info::sole_reference: a cap with no other reference was not sole");
+    }
+    if derived.0? != 0 || derived.1? != 0
+    {
+        return Err("cap_info::sole_reference: a derived Memory cap or its source reported sole");
+    }
+    if leased.0? != 0 || leased.1? != 1
+    {
+        return Err(
+            "cap_info::sole_reference: a retype lease was not counted, or the object's cap",
+        );
     }
     Ok(())
 }

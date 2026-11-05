@@ -382,34 +382,36 @@ not on every push.
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
-(virtio-blk + virtio-keyboard + virtio-rng + serial, the machine's IOMMU with the
-virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` at
-00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA confinement phase
-drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no framebuffer; the
-no-IOMMU boot, `--iommu absent`, runs in the release host runs, see Release host runs below),
+(virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
+with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64,
+`riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
+confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
+framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`, is
+a device cell, see Device surfaces and Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
 5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
 host whose CPU lacks LA57, are manual, same posture), disk logical block size (512 bytes —
-the 4Kn boot, a 4096-byte-block image on a 4096-byte-block device, runs in the release host
-runs, see Disk variations below), and disk count (one — the second-disk boots run there
-too). The `virtio-rng` device is
+the 4Kn boot, a 4096-byte-block image on a 4096-byte-block device, is a storage cell, see
+Device surfaces and Disk variations below), and disk count (one — the second-disk boots are
+storage cells too). The `virtio-rng` device is
 a boot-entropy source for the pool seed and KASLR: the firmware's RNG driver
 binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF
 also backs the protocol with RDRAND on x86_64; on riscv64 the device is the
 only firmware source under the EDK2 firmware CI boots, and the pool mixes
 jitter besides; see
 [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
-A device or filesystem joining the default boot set joins the canonical
-cells automatically; variants belong to the tiers below.
+A driver or filesystem joins the default boot set, and with it the canonical cells, only by
+replacing the main device of its type (Driver coverage below); any other driver adds cells to
+its own device surface, and variants belong to the tiers below.
 
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation, the disk variations, and the no-IOMMU variant once, whatever the release's PRs touched (see Release host runs below) |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations and the no-IOMMU variant) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -419,8 +421,51 @@ release host runs for each tag — binding the same way the
 [pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
 surface.
 
-**Inert changes.** A change that alters only the following cannot change behaviour at any CPU count
-or memory size, and owes no local host run, whatever file it is in:
+**Driver coverage.** Every driver is covered in one of three tiers.
+
+- **Main set.** The devices of the QEMU machine the canonical and boundary boots use (`q35` on
+  x86_64, `virt` on riscv64), one per device type a boot needs, each the device of that type with
+  the broadest QEMU support on both machines that the system or its firmware drives (a VirtIO PCI
+  device where the system has a VirtIO driver of the type, or, for a type only the firmware
+  drives, where the firmware has one; else the machine's built-in device), and the filesystem the
+  boots mount. Each entry names the cells that exercise
+  it, all of them canonical:
+  - block: `virtio-blk-pci`, through the virtio-blk driver, which every svctest and usertest cell
+    reads its disk through;
+  - console: the machine's 16550-compatible UART (COM1 on `q35`, the NS16550 on `virt`), through
+    the serial driver: the output of every svctest and usertest boot, and the serial receive round
+    of `test-terminal`;
+  - input: `virtio-keyboard-pci`, through the virtio-input driver: the keyboard round of
+    `test-terminal`, and svctest's input checks (the drivers phase's input case and the devmgr
+    phase's input ordinal);
+  - entropy: `virtio-rng-pci`, which the firmware's RNG driver drives; the bootloader draws the
+    pool seed and the KASLR words from its `EFI_RNG_PROTOCOL`: the `test-kaslr` boots of the ktest
+    cells, and svctest's random phase;
+  - DMA confinement: the machine's IOMMU (`intel-iommu` on `q35`, `riscv-iommu-pci` on `virt`),
+    through the iommu-vtd and iommu-riscv drivers: svctest's DMA confinement phase;
+  - clock: the machine's RTC (the CMOS RTC on `q35`, the Goldfish RTC on `virt`), through the
+    cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
+  - filesystem: FAT, through the fatfs driver, on every partition `mkdisk` writes: svctest's
+    filesystem phases;
+  - and the devices the harnesses drive: QEMU's `edu`, which the test-only test-dma driver drives
+    in svctest's DMA confinement phase, and, on x86_64, `vmgenid`, the generation source the
+    kernel's snapshot detection reads: `test-vmgenid`.
+
+  The canonical boots are headless, so the main set holds no framebuffer. Every code PR's CI cells
+  boot the main set. A driver joins it only by replacing the main device of its type; any other
+  driver adds cells to its own device surface (Device surfaces below), not to the main set.
+- **Tag set.** The main set and every driver with a QEMU-testable device, filesystem drivers
+  included, each through its cells: the release host runs boot every device cell before each tag
+  (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver has a
+  QEMU-testable device, the standard VGA adapter `cargo xtask run` attaches to a boot that is not
+  headless, but no cell: every harness boot is headless, so svctest's framebuffer case skips
+  ([#798](https://github.com/kottlerg/seraph/issues/798) tracks the cell).
+- **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
+  README documents a hardware test procedure, and it is exercised on real hardware by that
+  procedure. No in-tree driver is in this tier.
+
+**Inert changes.** A change that alters only the following cannot change behaviour at any CPU count,
+memory size, or device set, and owes no local host run, whatever file it is in:
 
 - Markdown, and comment lines in source files, build scripts, and linker scripts;
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
@@ -505,10 +550,10 @@ changed line that names one of these items as a whole identifier or lies within 
 
 A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
 that adds an item of the kinds above that names none of the listed items MUST add it to this list.
-`cargo xtask lint-docs` fails when a name this list, the memory surface's list, or their screens
-state no longer names code or a tracked file (its `md-coverage-symbols` rule,
-[xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR that renames or deletes a
-listed item updates the list in the same change.
+`cargo xtask lint-docs` fails when a name this list, the memory and device surfaces' lists, or
+their screens state no longer names code, a tracked file, or a tracked directory (its
+`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR
+that renames or deletes a listed item updates the list in the same change.
 The commands below screen a diff for the surface. The first lists the whole-surface files the diff
 changes. The second prints every file header of the diff and every line, changed or context, that
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
@@ -686,6 +731,67 @@ git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
+**Device surfaces.** The device cells, the boots of the system's devices that the canonical cells
+do not make, are owed when, and only when, the PR's own diff makes a non-inert change to a device
+surface that owes them. They are the storage cells of Disk variations below, each on each
+architecture (4kn, the 4Kn disk; second-disk, the data partition on a second disk; shared-line,
+that disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second
+disk), and no-iommu, the no-IOMMU variant of Release host runs below, on each architecture. A
+driver's device surface is that driver's code, with the harness check that drives that driver
+alone where its row names one; the storage-wide surface is the code every storage cell runs beside
+its drivers; and the shared surface is what every driver shares, the launchers' attachment of the
+IOMMU in front of every device included. Each surface is
+the files and directories its row lists, as a whole, and, in any other file, a changed line that
+names one of its listed items as a whole identifier or lies within one's definition; a protocol
+module of `shared/ipc`, and an item the row lists by its definition alone, is on a surface only by
+a changed line within that definition. A PR owes the cells of every surface a non-inert line of its
+own diff is on.
+
+| Surface | Files, directories, and items | Cells it owes |
+|---|---|---|
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, and `core/kernel/src/arch/x86_64/ioapic.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 PLIC and its external-interrupt dispatch (`plic_*`, `PLIC_*`, `DEFAULT_PLIC_*`, `CACHED_PLIC_*`, `require_plic_context`, `dispatch_external`, `SOURCE_TARGET`, and `source_target`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE`) | every device cell |
+| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_shared_line`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
+| virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
+| fatfs | `services/fs/fat/` | 4kn |
+| virtio-input | `services/drivers/virtio/input/` | no-iommu |
+| test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
+| serial, framebuffer, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/framebuffer/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), the no-iommu cell runs no IOMMU driver, and the framebuffer has no cell |
+| The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
+
+The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
+shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies
+what fatfs reads. The no-iommu cell boots devmgr, the test-dma driver, and svctest's DMA
+confinement check unconfined, and every VirtIO driver without `VIRTIO_F_ACCESS_PLATFORM`, which the
+launchers have a device offer only with the IOMMU attached, so the shared surface (the launchers'
+IOMMU attachment among it), virtio-blk, virtio-input, and test-dma owe it. A PR that adds a driver
+adds its row, with its directory and the cells that exercise its device, and a PR that adds a cell
+names the surfaces that owe it.
+`cargo xtask lint-docs` checks this list as it checks the two above, its directories (written with
+a trailing `/`) included, and resolves its items in xtask's own sources too. The screen works as
+the boundary one does: the first command lists the changed files on a surface as a whole, and the
+other two print every candidate, which the PR owes the surface's cells for when a non-inert changed
+line names the item or lies within its definition (within it alone for a protocol module and for
+an item listed by definition alone), read in that file's hunk.
+
+```sh
+git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
+    core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs services/vfsd/ \
+    xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
+    services/drivers/virtio/input/ services/drivers/test-dma/
+D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
+D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
+D="$D|InterruptObject|dispatch_external|SOURCE_TARGET|source_target"
+D="$D|plic_[a-z_]+|[A-Z_]*PLIC_[A-Z_]+|require_plic_context|devmgr_(dma_)?(labels|errors)"
+D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
+D="$D|test_dma_labels|dma_confinement_phase"
+D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
+D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
+D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
+git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($D)\b"
+git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
+    grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
+```
+
 **Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when
 its body states that its purpose is the fix of a concurrency defect in the scheduling, wake, or
 cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
@@ -702,25 +808,26 @@ host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` coun
 PR's own diff at a head is the diff from that head's merge base with the fetched `master` to the
 head (after `git fetch origin`, `git diff $(git merge-base <head> origin/master) <head>`), so it
 excludes what a merge or rebase from `master` brings in. A run's surface is the surface that owes
-it: the CPU-count surface for the boundary set, the memory surface for the memory variation, and,
-for the runs a concurrency-fix purpose owes, every non-inert line of the PR's own diff. A run at
-head H covers a later head M when the PR's own diff makes the same non-inert changes to that run's
-surface at H and at M. An update from `master` that leaves those changes as they were therefore owes
-no run; one whose conflict resolution alters them does. A fix round that alters them breaks the
+it: the CPU-count surface for the boundary set, the memory surface for the memory variation, the
+device surfaces that owe a device cell for that cell, and, for the runs a concurrency-fix purpose
+owes, every non-inert line of the PR's own diff. A run at head H covers a later head M when the
+PR's own diff makes the same non-inert changes to that run's surface at H and at M. An update from
+`master` that leaves those changes as they were therefore owes no run; one whose conflict
+resolution alters them does. A fix round that alters them breaks the
 coverage of the runs that surface owes, and those runs MUST be run again at a head after it. The PR
 body MUST report each run it owes with its `--runs` count, its outcome, and the head it ran at, or
 state that none is owed and why: that its changes outside Markdown are all inert, or that its
-non-inert lines change neither surface and it states no concurrency-fix purpose as Repeat count
-defines it.
+non-inert lines change none of the CPU-count, memory, and device surfaces and it states no
+concurrency-fix purpose as Repeat count defines it.
 
 **Hangs at oversubscription.** A boundary run the PR does not owe, that is, one whose surface the
 PR's own diff does not change, that HANGs (outlives its `--timeout` budget) or fails with a defect
 an open Issue for that boundary already names is not the PR's defect: the preserved log is recorded
 on the open Issue for that boundary, or on a new Issue when that boundary has none, and the run
 does not block the PR. The PR body reports such a run as HANG or FAIL with a link to that record.
-Any other HANG or failure of a run the PR does not owe (a memory-variation HANG or failure, or a
-boundary failure no open Issue for that boundary names), and any HANG or failure of a run the PR
-owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
+Any other HANG or failure of a run the PR does not owe (a memory-variation or device-cell HANG or
+failure, or a boundary failure no open Issue for that boundary names), and any HANG or failure of a
+run the PR owes, blocks the PR. A flagged row of the timing report is neither a HANG nor a failure.
 
 **Disk variations.** Four svctest boots, on each architecture, vary the disk: a 4Kn disk (`mkdisk
 --block-size 4096`), booted from a 4096-byte-block ESP with its root and data partitions at
@@ -737,7 +844,10 @@ Delivery), and [xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the o
 staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is
 the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
 boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
-follow; a change to these boots' times re-derives it.
+follow; a change to these boots' times re-derives it. Each boot is a storage cell (Device surfaces
+above): in the commands below, 4kn is the first `run-parallel` boot, second-disk the second,
+shared-line the third, and oversize-block the fourth, each after the `mkdisk` before it; a PR that
+owes some of the cells runs those boots, and the release host runs run all four.
 
 ```sh
 # Disk variations, per architecture (clean between architectures):
@@ -764,14 +874,15 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
 (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) three times each
 (`--runs 3`) in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command at
-`--runs 1`, per the boundary commands above), and the memory variation, the disk variations, and
-the no-IOMMU variant once each, so every tag boots at each boundary CPU count in both profiles (CI
-boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, and with no IOMMU, and runs
-the timing report on the boundary logs, which is reported and blocks nothing. The no-IOMMU
-variant boots svctest once on each architecture with the machine's IOMMU detached, so devmgr's
-unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on a
-debug-profile sysroot). A run whose outcome is not a pass, as When the runs are owed classifies
-outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+`--runs 1`, per the boundary commands above), and the memory variation and every device cell (the
+disk variations and the no-IOMMU variant) once each, so every tag boots at each boundary CPU count
+in both profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, and
+with no IOMMU, and runs the timing report on the boundary logs, which is reported and blocks
+nothing. The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
+with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
+staged as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a
+pass, as When the runs are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and
+is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):

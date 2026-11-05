@@ -56,10 +56,11 @@ devmgr's responsibilities are:
   devmgr returns from `DMA_MAP` on the driver's DMA capability, never with a
   physical address (below, and
   [docs/device-management.md § DMA Authorisation](../../../docs/device-management.md#dma-authorisation)).
-  devmgr programs no IOMMU, so it logs at startup that DMA runs unconfined and
-  every DMA-capable driver runs DMA-unsafe; DMA isolation programmed by
-  devmgr through IOMMU hardware it acquires via the `Mmio` cap flow is design
-  intent; not yet implemented (see
+  No IOMMU is programmed, so devmgr logs at startup that DMA runs unconfined
+  and every DMA-capable driver runs DMA-unsafe; DMA isolation, programmed by a
+  separate IOMMU driver per IOMMU family to which devmgr delegates the unit's
+  `Mmio` cap and which devmgr reaches over IPC behind its DMA endpoint, is
+  design intent; not yet implemented (see
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
   devmgr spawns one driver for every virtio-input device and for every
@@ -360,9 +361,9 @@ how devmgr uses them.
 
 IOMMU register regions are not pre-minted as distinct capabilities.
 Design intent; not yet implemented: `devmgr` will discover IOMMU units
-from the firmware passthrough (DMAR or DTB) and acquire `Mmio` caps for
+from the firmware passthrough (DMAR or DTB), acquire `Mmio` caps for
 their register ranges through the same aperture-carving flow as any
-other device (see
+other device, and delegate each to its family's IOMMU driver (see
 [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
 ---

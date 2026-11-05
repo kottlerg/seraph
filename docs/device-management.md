@@ -88,29 +88,29 @@ shutdown.
 ## DMA Safety Model
 
 DMA access in Seraph operates in one of two modes, distinguished by whether an
-IOMMU is present and whether devmgr has programmed it to scope DMA for a given
-device:
+IOMMU is present and whether it has been programmed, at devmgr's direction, to scope DMA for a
+given device:
 
-**IOMMU-isolated (safe):** When an IOMMU is present and devmgr has configured
-it for the target device, DMA transactions initiated by that device are
+**IOMMU-isolated (safe):** When an IOMMU is present and has been configured for
+the target device, DMA transactions initiated by that device are
 confined by the IOMMU's translation tables to the physical frames devmgr has
 explicitly mapped. A driver cannot DMA outside its authorised regions even if
 its process is compromised. This is the expected mode on modern x86-64
 hardware and on RISC-V platforms that implement the IOMMU extension.
 
-**DMA-unsafe:** When no IOMMU is present, or when devmgr chooses not to
-configure an available IOMMU for a device, unconfined DMA is physically
+**DMA-unsafe:** When no IOMMU is present, or when devmgr chooses not to have
+an available IOMMU configured for a device, unconfined DMA is physically
 possible. A driver may still be authorised by devmgr to DMA in this mode,
 but no hardware enforcement constrains the device; a compromised driver
 can reach any physical address the device can address.
 
-devmgr is responsible for detecting the platform IOMMU situation,
-deciding per-device policy, and programming the IOMMU itself when
-present. The IOMMU is preferred but not required
+devmgr is responsible for detecting the platform IOMMU situation and deciding per-device policy;
+the IOMMU itself is programmed by a separate IOMMU driver devmgr directs (§ IOMMU Discovery and
+Programming). The IOMMU is preferred but not required
 ([platform-requirements.md](platform-requirements.md#iommu-and-dma-confinement)): when none is
-present, or devmgr cannot program the one present, devmgr logs once that DMA runs unconfined and
-spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. devmgr
-programs no IOMMU yet (design intent; not yet implemented), so every boot runs in that mode.
+present, or the one present cannot be programmed, devmgr logs once that DMA runs unconfined and
+spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. No IOMMU
+is programmed yet (design intent; not yet implemented), so every boot runs in that mode.
 
 The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
@@ -169,7 +169,7 @@ withdraw the device's DMA authorisation (§ DMA Authorisation), which blocks the
 IOMMU before Bus Master Enable is cleared. A device the IOMMU blocks can no longer reach the
 driver's frames, so devmgr releases the hold once the block is in place, whether or not the Bus
 Master Enable read-back and the reset confirm; with no IOMMU confining the device, the release
-waits on both confirmations as step 3 states. devmgr programs no IOMMU yet (design intent; not
+waits on both confirmations as step 3 states. No IOMMU is programmed yet (design intent; not
 yet implemented), so today every release waits on both.
 
 The steps, their owners, and their bounds are specified in
@@ -201,8 +201,9 @@ and rings. `DMA_UNMAP` withdraws a mapping by that address, and devmgr deletes t
 A driver maps its own rings and buffers once at setup; a block driver maps each client-lent
 buffer for the duration of the one request that uses it.
 
-devmgr chooses every device address. With an IOMMU confining the device, the address is an IOVA
-devmgr allocates in the device's domain and the mapping is installed in the IOMMU's tables, so
+devmgr returns every device address; no driver chooses one. With an IOMMU confining the device,
+the address is an IOVA in the device's domain and the mapping is installed in the IOMMU's tables,
+through the IOMMU driver (§ IOMMU Discovery and Programming), so
 the device reaches exactly the frames mapped for it (design intent; not yet implemented). With
 none, the device can reach memory only at physical addresses, so the address devmgr returns is
 the frames' physical address and the mapping is bookkeeping alone. The protocol and the
@@ -228,11 +229,17 @@ descriptor; ACPI and DTB reach userspace only as the opaque
 Firmware Passthrough), over which the kernel mints read-only Memory caps,
 and `devmgr` is to perform the IOMMU-topology walk itself.
 
-Once implemented, for each IOMMU discovered `devmgr` will acquire an `Mmio`
-cap for that IOMMU's register range through the same aperture-carving flow
-as any other device and program the translation tables directly; no IOMMU
-support exists today. The kernel does not read or write IOMMU registers and
-holds no per-IOMMU state.
+The IOMMU's arch-specific logic (its registers, translation tables, cache invalidation, and fault
+reporting) runs in a separate IOMMU driver process, one per IOMMU family (VT-d on x86-64, the
+RISC-V IOMMU), not in devmgr. For each IOMMU it discovers, devmgr acquires an `Mmio` cap for the
+unit's register range through the same aperture-carving flow as any other device and delegates
+it to that family's IOMMU driver, as it delegates a device to its driver. devmgr keeps the DMA
+endpoint, its `devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver
+over IPC to install and withdraw mappings and to block a device, so drivers see the same protocol
+whichever IOMMU, or none, sits behind it. This is design intent; not yet implemented: no IOMMU
+support exists today, and the driver's design is specified with
+[#37](https://github.com/kottlerg/seraph/issues/37). The kernel does not read or write IOMMU
+registers and holds no per-IOMMU state.
 
 When devmgr binds a DMA-capable (PCI BAR + IRQ) driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,

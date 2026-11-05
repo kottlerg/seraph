@@ -15,8 +15,9 @@
 //! caps devmgr then deletes. A device
 //! holds at most [`MAX_MAPPINGS_PER_DEVICE`] mappings, and no two of a
 //! device's mappings overlap in device-address space. The table never reads
-//! or writes IOMMU state: devmgr programs the IOMMU, when one confines the
-//! device, from what the table accepts and returns. See
+//! or writes IOMMU state: when an IOMMU confines the device, devmgr has the
+//! IOMMU driver install what the table accepts and withdraw what it returns.
+//! See
 //! `docs/device-management.md` § DMA Authorisation.
 
 extern crate alloc;
@@ -51,7 +52,7 @@ pub struct Mapping
     pub device_addr: u64,
     /// The physical address of the first byte. Equal to `device_addr` while
     /// no IOMMU is programmed, and read by nothing until one is: it is what
-    /// an IOMMU backend writes into the device's translation tables for
+    /// the IOMMU driver writes into the device's translation tables for
     /// `device_addr`.
     pub phys: u64,
     /// Bytes mapped; nonzero.

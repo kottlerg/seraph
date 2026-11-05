@@ -214,8 +214,9 @@ RISC‑V does not support port I/O.
 
 **DMA**
 DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
-hardware (via firmware-table passthrough), programs the translation tables
-itself, and authorises DMA on a per-device basis: each DMA-capable driver maps
+hardware (via firmware-table passthrough), has a separate IOMMU driver process
+per IOMMU family program the translation tables (design intent), and authorises
+DMA on a per-device basis: each DMA-capable driver maps
 the buffers its device reaches through a DMA capability devmgr gives it and
 programs the device only with the device addresses devmgr returns. No IOMMU
 programming is implemented yet (design intent), so DMA is unconfined and those

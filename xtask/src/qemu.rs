@@ -540,7 +540,7 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     ]);
 
     // The RISC-V IOMMU as a PCI function. `off=off` leaves it in Bare mode out
-    // of reset, passing DMA through untranslated until devmgr programs it;
+    // of reset, passing DMA through untranslated until it is programmed;
     // its default, Off mode, blocks all DMA, so the firmware could not read
     // the boot disk. Placed after the shared devices, so it takes the next
     // free slot and moves none of theirs.

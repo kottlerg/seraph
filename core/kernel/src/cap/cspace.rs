@@ -47,7 +47,7 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use super::object::{CSpaceKernelObject, KernelObjectHeader};
+use super::object::{CSpaceKernelObject, KernelObjectHeader, MemoryObject};
 use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 use crate::arch::nospec;
 
@@ -796,6 +796,13 @@ impl CSpace
             );
             return;
         }
+        if slot.tag == CapTag::Memory
+            && let Some(object) = slot.object
+        {
+            // SAFETY: an occupied slot holds a reference on its object, so the
+            // Memory object it names is live, and its fill counted it.
+            unsafe { MemoryObject::note_slot_released(object) };
+        }
         // Bump the per-slot generation before returning the slot to the free
         // list (the legitimate-free path only — the double-free guard above
         // returns without bumping). Every outstanding handle to the prior
@@ -846,7 +853,11 @@ impl CSpace
         Ok(index)
     }
 
-    /// Populate the just-allocated slot `index` with a fresh, unlinked cap.
+    /// Populate the just-allocated slot `index` with a fresh, unlinked cap,
+    /// counting it on a Memory object ([`MemoryObject::slot_count`]).
+    ///
+    /// `object` is the live object the caller hands the slot's reference to,
+    /// as for every insert.
     fn fill_slot(
         &mut self,
         index: NonZeroU32,
@@ -864,6 +875,12 @@ impl CSpace
         slot.deriv_first_child = None;
         slot.deriv_next_sibling = None;
         slot.deriv_prev_sibling = None;
+        if tag == CapTag::Memory
+        {
+            // SAFETY: the inserting caller hands this slot a reference on the
+            // live object, which a Memory tag names as a MemoryObject.
+            unsafe { MemoryObject::note_slot_filled(object) };
+        }
         Ok(())
     }
 
@@ -1076,18 +1093,8 @@ impl CSpace
         // Remove from free list (may or may not be on it if page was just grown).
         self.remove_from_free_list(index);
 
-        // Populate the slot.
-        let slot = self.slot_mut(index).ok_or(CapError::InvalidIndex)?;
-        slot.tag = tag;
-        slot.rights = rights;
-        slot.badge = 0;
-        slot.object = Some(object);
-        slot.deriv_parent = None;
-        slot.deriv_first_child = None;
-        slot.deriv_next_sibling = None;
-        slot.deriv_prev_sibling = None;
-
-        Ok(())
+        let index = NonZeroU32::new(index).ok_or(CapError::InvalidIndex)?;
+        self.fill_slot(index, tag, rights, object)
     }
 
     /// Count the number of non-null (occupied) slots.
@@ -1198,7 +1205,7 @@ impl Drop for CSpace
 mod tests
 {
     use super::*;
-    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
+    use crate::cap::object::{KernelObjectHeader, ObjectType};
     use crate::cap::slot::MemRights;
     use core::ptr::NonNull;
 
@@ -1214,6 +1221,7 @@ mod tests
             owns_memory: core::sync::atomic::AtomicBool::new(false),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
+            slot_count: core::sync::atomic::AtomicU32::new(0),
         });
         let raw = Box::into_raw(obj) as *mut KernelObjectHeader;
         // SAFETY: Box::into_raw never returns null.
@@ -1391,6 +1399,46 @@ mod tests
         // Pages 0..=3 allocated: 55 + 3 * 56 usable slots.
         assert_eq!(cs.allocated_slots, (L2_SIZE - 1) + 3 * L2_SIZE);
         assert_eq!(cs.populated_count(), 1);
+    }
+
+    #[test]
+    fn memory_slot_count_follows_every_fill_and_free()
+    {
+        // Every insert path fills through one helper that counts the slots
+        // naming a Memory object, and a free uncounts it, so a split can tell
+        // whether another slot shares the object; a refused insert counts
+        // nothing.
+        let count = |obj: NonNull<KernelObjectHeader>| {
+            // SAFETY: dummy_object leaks a live MemoryObject with the header
+            // at offset 0.
+            unsafe {
+                (*obj.as_ptr().cast::<MemoryObject>())
+                    .slot_count
+                    .load(Ordering::Relaxed)
+            }
+        };
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        let a = cs
+            .insert_cap(CapTag::Memory, MemRights::MAP.erase(), obj)
+            .unwrap();
+        cs.insert_cap_at(9, CapTag::Memory, MemRights::MAP.erase(), obj)
+            .unwrap();
+        let c = cs
+            .insert_cap_transfer(CapTag::Memory, MemRights::MAP.erase(), obj)
+            .unwrap();
+        assert!(
+            cs.insert_cap_at(9, CapTag::Memory, MemRights::MAP.erase(), obj)
+                .is_err()
+        );
+        assert_eq!(count(obj), 3);
+        cs.free_slot(a.get());
+        cs.free_slot(9);
+        assert_eq!(count(obj), 1);
+        cs.free_slot(9);
+        assert_eq!(count(obj), 1, "a double free must not uncount");
+        cs.free_slot(c.get());
+        assert_eq!(count(obj), 0);
     }
 
     #[test]

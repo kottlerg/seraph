@@ -4,12 +4,14 @@
 // core/ktest/src/integration/aspace_fault_notification_late_bind.rs
 
 //! Integration: an address-space terminal-fault observer bound *after* a thread
-//! in that space already faulted still receives the retained fault reason.
+//! in that space already faulted still receives the retained fault reason, and
+//! `CAP_INFO_ASPACE_TERMINAL_FAULT` reads the same retained reason back.
 //!
 //! The address-space analogue of `death_notification_late_bind`: it exercises
 //! the retained-reason delivery of `core/kernel/docs/syscalls.md`
 //! § `SYS_ASPACE_BIND_NOTIFICATION` (kernel side: `post_aspace_death_notification`
-//! and `AddressSpace::bind_or_retained`).
+//! and `AddressSpace::bind_or_retained`) and its read-back through
+//! § `SYS_CAP_INFO` (`AddressSpace::retained_terminal_fault`).
 //!
 //! Isolation: the faulting thread runs in a *dedicated* address space (not the
 //! test's), so recording its terminal fault never touches shared state. The
@@ -18,9 +20,10 @@
 
 use syscall::{
     aspace_bind_notification, cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete,
-    event_queue_create, event_try_recv, event_try_recv_death, thread_configure, thread_start,
+    cap_info, event_queue_create, event_try_recv, event_try_recv_death, thread_configure,
+    thread_start,
 };
-use syscall_abi::{EXIT_FAULT_BASE, SyscallError};
+use syscall_abi::{CAP_INFO_ASPACE_TERMINAL_FAULT, EXIT_FAULT_BASE, SyscallError};
 
 use crate::{TestContext, TestResult};
 
@@ -51,6 +54,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     let thread = cap_create_thread(ctx.memory_base, aspace, cspace, 0, 0)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_thread failed")?;
 
+    // No thread of the fresh space has faulted, so nothing is retained.
+    if cap_info(aspace, CAP_INFO_ASPACE_TERMINAL_FAULT) != Ok(0)
+    {
+        return Err("aspace_fault_notification_late_bind: a fresh aspace read a retained fault");
+    }
+
     // Entry PC is unmapped: the thread terminal-faults on its first instruction
     // fetch (no fault handler bound) with no aspace observer bound yet.
     // SAFETY: the thread is bound to the dedicated `aspace` created above, not
@@ -65,6 +74,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     if fault_reason < EXIT_FAULT_BASE
     {
         return Err("aspace_fault_notification_late_bind: thread did not terminal-fault");
+    }
+    // The space retains the fault's reason for a holder that bound no observer.
+    if cap_info(aspace, CAP_INFO_ASPACE_TERMINAL_FAULT) != Ok(fault_reason)
+    {
+        return Err(
+            "aspace_fault_notification_late_bind: CAP_INFO_ASPACE_TERMINAL_FAULT did not read \
+             the retained reason",
+        );
     }
 
     // Bind an aspace observer AFTER the fault; the retained reason must already

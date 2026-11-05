@@ -136,6 +136,21 @@ impl<T> Served<T>
             .find(|s| s.badge == badge)
             .and_then(|s| s.driver.take())
     }
+
+    /// Withdraw every served driver `matches` holds for, leaving a tombstone
+    /// at each ordinal, and pass each record to `out` for the caller to
+    /// release.
+    pub fn withdraw_matching(&mut self, mut matches: impl FnMut(&T) -> bool, mut out: impl FnMut(T))
+    {
+        for slot in &mut self.slots
+        {
+            if slot.driver.as_ref().is_some_and(&mut matches)
+                && let Some(driver) = slot.driver.take()
+            {
+                out(driver);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +206,19 @@ mod tests
         assert_eq!(s.withdraw(2), None);
         assert_eq!(s.get(0), Lookup::Live(&1));
         assert_eq!(s.get(1), Lookup::Withdrawn);
+    }
+
+    #[test]
+    fn withdrawing_the_matching_drivers_tombstones_only_them()
+    {
+        let mut s = serving(&[1, 2, 3, 4]);
+        s.withdraw(4);
+        let mut out = Vec::new();
+        s.withdraw_matching(|&d| d % 2 == 0 || d == 1, |d| out.push(d));
+        assert_eq!(out, [1, 2]);
+        assert_eq!(s.get(0), Lookup::Withdrawn);
+        assert_eq!(s.get(1), Lookup::Withdrawn);
+        assert_eq!(s.get(2), Lookup::Live(&3));
     }
 
     #[test]

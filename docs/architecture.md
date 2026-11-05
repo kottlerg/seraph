@@ -177,7 +177,8 @@ live in the component scope:
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
 Boot modules (the eight entries of `xtask/src/bundle.rs::MODULES`: procmgr,
-memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs) are packed into
+memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and on x86-64 the
+`ARCH_MODULES` entry iommu-vtd) are packed into
 `\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
 [`abi/boot-protocol`](../abi/boot-protocol/README.md)'s
@@ -215,12 +216,13 @@ RISC‑V does not support port I/O.
 **DMA**
 DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
 hardware (via firmware-table passthrough), has a separate IOMMU driver process
-per IOMMU family program the translation tables (design intent), and authorises
+per IOMMU family program the translation tables (VT-d on x86-64; the RISC-V
+IOMMU is design intent), and authorises
 DMA on a per-device basis: each DMA-capable driver maps
 the buffers its device reaches through a DMA capability devmgr gives it and
-programs the device only with the device addresses devmgr returns. No IOMMU
-programming is implemented yet (design intent), so DMA is unconfined and those
-addresses are physical. The kernel reads no IOMMU registers, holds no
+programs the device only with the device addresses devmgr returns: IOVAs in the
+device's own domain where an IOMMU confines it, physical addresses where none does
+(every device on RISC-V today). The kernel reads no IOMMU registers, holds no
 per-device DMA state, and exposes no DMA-grant syscall. See
 [device-management.md](device-management.md#dma-authorisation).
 
@@ -260,8 +262,8 @@ a capability; threads MUST hold a valid capability to access any resource.
 Seraph targets 64‑bit architectures with modern MMU and privilege support.
 
 **x86‑64**
-Uses APIC. IOMMU hardware, when present, is discovered and
-programmed by devmgr in userspace (design intent; not yet implemented); the kernel does not
+Uses APIC. VT-d IOMMU hardware, when present, is discovered by devmgr and
+programmed by its `iommu-vtd` driver in userspace; the kernel does not
 touch it. See
 [device-management.md](device-management.md#iommu-discovery-and-programming).
 

@@ -39,7 +39,7 @@ pub unsafe fn map(
 {
     let rights = if access & ACCESS_DEVICE_WRITE != 0
     {
-        syscall::RIGHTS_MEM_MAP | syscall::RIGHTS_MEM_WRITE
+        syscall::RIGHTS_MEM_MAP_RW
     }
     else
     {
@@ -59,7 +59,7 @@ pub unsafe fn map(
 /// Map the frames of `memory_cap` for the device to read and write
 /// ([`map`] with [`DEVICE_READS_WRITES`]), as a driver maps its rings and
 /// fixed buffers at setup, and return their device address. A device cannot
-/// be driven without them, so when devmgr refuses, `on_refusal` is called
+/// be driven without them, so when the mapping fails, `on_failure` is called
 /// with the error (to log it) and the calling thread exits.
 ///
 /// # Safety
@@ -68,7 +68,7 @@ pub unsafe fn map_or_exit(
     dma_ep: u64,
     memory_cap: u64,
     ipc_buf: *mut u64,
-    on_refusal: impl FnOnce(ipc::DmaError),
+    on_failure: impl FnOnce(ipc::DmaError),
 ) -> u64
 {
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
@@ -77,7 +77,7 @@ pub unsafe fn map_or_exit(
         Ok(device_addr) => device_addr,
         Err(e) =>
         {
-            on_refusal(e);
+            on_failure(e);
             syscall::thread_exit();
         }
     }

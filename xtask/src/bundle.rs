@@ -12,8 +12,8 @@
 //!
 //! - [`Harness::Init`] — default. Pulls `init`, `procmgr`, `memmgr`,
 //!   `devmgr`, `vfsd`, `virtio-blk`, `serial`, `framebuffer`, `fatfs`
-//!   into the bundle. `init` is named `"init"`; modules carry their
-//!   service name. Sources span
+//!   into the bundle, and on x86-64 the VT-d IOMMU driver `iommu-vtd`.
+//!   `init` is named `"init"`; modules carry their service name. Sources span
 //!   `sysroot/services/`, `sysroot/services/drivers/`, and
 //!   `sysroot/services/fs/` per each component's install destination.
 //! - [`Harness::Ktest`] — pulls `ktest` only, named `"init"`, from
@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use boot_protocol::bundle as fmt;
 
+use crate::arch::Arch;
 use crate::context::Context as BuildContext;
 use crate::util::step;
 
@@ -93,14 +94,23 @@ const MODULES: &[(&str, &str)] = &[
     ("memmgr", "services/memmgr"),
 ];
 
+/// Modules that ship in a default-init bundle on one architecture only, as
+/// `(architecture, bundle_entry_name, sysroot_relative_source_path)`, under
+/// the same rules as [`MODULES`]: the IOMMU driver of the architecture's
+/// IOMMU family, which devmgr spawns before the first DMA-capable driver
+/// maps a ring, so before the root filesystem can be read.
+const ARCH_MODULES: &[(Arch, &str, &str)] =
+    &[(Arch::X86_64, "iommu-vtd", "services/drivers/iommu-vtd")];
+
 /// Compose a bundle for the chosen harness and write it to
 /// `sysroot/esp/EFI/seraph/bootstrap.bundle`, overwriting any existing
 /// file. Source binaries are read from per-component sysroot paths
 /// driven by each component's [`crate::commands::build::InstallDest`].
 ///
-/// `Harness::Init` bundles `init` plus every entry in [`MODULES`].
-/// `Harness::Ktest` bundles only `ktest` as the `init` entry.
-pub fn compose(ctx: &BuildContext, harness: Harness) -> Result<()>
+/// `Harness::Init` bundles `init` plus every entry in [`MODULES`] and every
+/// entry of [`ARCH_MODULES`] for `arch`. `Harness::Ktest` bundles only
+/// `ktest` as the `init` entry.
+pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
 {
     let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
 
@@ -118,7 +128,11 @@ pub fn compose(ctx: &BuildContext, harness: Harness) -> Result<()>
     entries.push(("init".to_owned(), init_src));
     if harness == Harness::Init
     {
-        for (name, source) in MODULES
+        let arch_modules = ARCH_MODULES
+            .iter()
+            .filter(|(a, _, _)| *a == arch)
+            .map(|(_, name, source)| (name, source));
+        for (name, source) in MODULES.iter().map(|(n, s)| (n, s)).chain(arch_modules)
         {
             let p = ctx.sysroot.join(source);
             if !p.exists()

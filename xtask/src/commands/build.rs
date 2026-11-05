@@ -232,6 +232,26 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: None,
     },
+    // TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    // driver for QEMU's `edu` DMA device, which only the x86-64 machine
+    // attaches; it ships on the rootfs and is spawned only by devmgr's
+    // TEST_SPAWN_DMA_DRIVER shim under svctest.
+    Spec {
+        name: "test-dma",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: Some(Arch::X86_64),
+    },
+    // The VT-d IOMMU driver: a boot-bundle module (`bundle::ARCH_MODULES`)
+    // devmgr spawns before any DMA-capable driver.
+    Spec {
+        name: "iommu-vtd",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: Some(Arch::X86_64),
+    },
     Spec {
         name: "fatfs",
         install_name: None,
@@ -501,7 +521,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             // `build` is an authoring step: always (re)compose the default-
             // init bundle. Operators who want ktest run
             // `cargo xtask compose-bundle --harness ktest` after `build`.
-            crate::bundle::compose(ctx, crate::bundle::Harness::Init)?;
+            crate::bundle::compose(ctx, args.arch, crate::bundle::Harness::Init)?;
             crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())?;
         }
         c =>

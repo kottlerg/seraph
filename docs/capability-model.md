@@ -129,9 +129,7 @@ capability either fails or is counted (see
 to the server's own mappings once the client's are gone, so the server reuses the
 page only then.
 
-Init transfers RAM Memory caps (via the
-[derive-twice pattern](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))
-to memmgr, which
+Init moves its RAM Memory caps to memmgr, which holds each one alone and
 thereafter owns userspace RAM frame allocation and answers `REQUEST_MEMORY_CAPS`
 for every std-built service. See
 [`userspace-memory-model.md`](userspace-memory-model.md) and

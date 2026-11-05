@@ -98,8 +98,9 @@ sysroot/
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # and the test-only test-orphan and
-│   │                         # test-fault)
+│   │                         # iommu-vtd on x86_64, and the test-only
+│   │                         # test-orphan, test-fault, and, on x86_64,
+│   │                         # test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn
@@ -125,7 +126,8 @@ give a non-test distro, because test-only artifacts also install under
 Under `/services/drivers/` are
 [`test-orphan`](../services/drivers/test-orphan/README.md) and
 [`test-fault`](../services/drivers/test-fault/README.md), test-only
-fault-injection drivers installed there until the devmgr enumeration
+fault-injection drivers, and [`test-dma`](../services/drivers/test-dma/README.md), the test-only
+driver of the `edu` DMA test device, installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
 them. Under `/programs/` are the test fixtures the harnesses and per-program
 testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
@@ -292,6 +294,25 @@ through the kernel's serial-only console class (see
 In CI it runs as extra boots inside each `ktest` cell (both arches, both
 profiles), after the `ktest` run-parallel boot.
 
+### Steps 6 and 7 redo (`test-map-redo`)
+
+The bootloader redoes its steps 6 and 7 (frees every allocation of both and
+runs them again with twice the slack) only when the final memory map's buffer
+outgrows the entry array step 6 sized, which QEMU's firmware never makes it do (see
+[memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)).
+`cargo xtask test-map-redo [--arch]` (both arches) stages the
+`\EFI\seraph\mapredo` test knob, which makes the first attempt redo whatever
+its map's size, repacks `disk.img`, and boots the current sysroot once through
+`run-parallel`. It passes when the boot reaches its harness's pass marker and
+the bootloader logged the knob's redo exactly once; the knob is always removed
+and `disk.img` repacked afterward. See
+[xtask/README.md § test-map-redo](../xtask/README.md#cargo-xtask-test-map-redo)
+for the command.
+
+In CI it runs as an extra boot inside each `ktest` cell (both arches, both
+profiles), after `test-kaslr`, on the ktest bundle the cell composed and under
+the cell's `run-parallel` budget.
+
 ### Death forward to logd (`test-logd-reclaim`)
 
 Once logd has registered its death queue with procmgr, procmgr posts the death
@@ -364,7 +385,8 @@ riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial, the machine's IOMMU with the
 virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` on
-riscv64 — plus `vmgenid,guid=auto` on x86_64; CI boots headless, so no framebuffer; the
+riscv64 — plus, on x86_64, `vmgenid,guid=auto` and QEMU's `edu` DMA test device, which svctest's
+DMA confinement phase drives; CI boots headless, so no framebuffer; the
 no-IOMMU boot, `--iommu absent`, runs in the release host runs, see Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`

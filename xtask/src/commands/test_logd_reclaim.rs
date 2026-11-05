@@ -29,9 +29,8 @@ use crate::cli::{
     DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
     TestLogdReclaimArgs,
 };
-use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file};
+use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
-use crate::timing::TRAILER_PREFIX;
 use crate::util::step;
 
 /// The log name svctest's `logd_death_forward` child registers
@@ -106,23 +105,10 @@ fn parse_reclaim(line: &str) -> Option<Reclaim<'_>>
     })
 }
 
-/// The `outcome=` field of the log's `run-parallel` trailer, when it has one.
-/// `--save-logs` appends the trailer as the log's last line, so only that
-/// line is read: a guest line with the same prefix cannot stand in for it.
-fn trailer_outcome(log: &str) -> Option<&str>
-{
-    log.lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())?
-        .strip_prefix(TRAILER_PREFIX)?
-        .split_whitespace()
-        .find_map(|kv| kv.strip_prefix("outcome="))
-}
-
 /// Check one svctest boot's serial log.
 fn check_log(log: &str) -> Result<Verdict>
 {
-    if let Some(outcome) = trailer_outcome(log)
+    if let Some(outcome) = saved_log_outcome(log)
         && outcome.starts_with(QEMU_CRASH_LABEL)
     {
         return Ok(Verdict::Skipped(outcome.to_string()));

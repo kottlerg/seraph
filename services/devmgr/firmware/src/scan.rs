@@ -39,6 +39,9 @@ const PCI_COMMAND_DECODE: u16 = 0x3;
 /// Class-code register offsets (base class at 0x0B, subclass at 0x0A).
 const PCI_CLASS: u16 = 0x0B;
 const PCI_SUBCLASS: u16 = 0x0A;
+/// A type-1 (bridge) header's secondary and subordinate bus numbers.
+const PCI_SECONDARY_BUS: u16 = 0x19;
+const PCI_SUBORDINATE_BUS: u16 = 0x1A;
 /// `VirtIO` PCI vendor ID.
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 
@@ -81,6 +84,9 @@ pub struct PciDevice
     pub irq_pin: u8,
     /// `VirtIO` PCI startup info (populated for `VirtIO` devices only).
     pub virtio_info: VirtioPciStartupInfo,
+    /// The secondary and subordinate bus of a PCI-to-PCI bridge (a type-1
+    /// header): the buses behind it. `None` for every other function.
+    pub bridge_buses: Option<(u8, u8)>,
 }
 
 /// The walk stopped because the device list could not grow; the functions
@@ -170,6 +176,7 @@ fn read_function(
         irq_line: cfg.read8(bus, dev, func, 0x3C),
         irq_pin: cfg.read8(bus, dev, func, 0x3D),
         virtio_info: VirtioPciStartupInfo::default(),
+        bridge_buses: None,
     };
     // Header layout (header type without its multi-function bit); BARs are
     // probed for a type-0 header only.
@@ -177,6 +184,13 @@ fn read_function(
     if header_layout == 0
     {
         probe_bars(cfg, &mut pci_dev);
+    }
+    else if header_layout == 1
+    {
+        pci_dev.bridge_buses = Some((
+            cfg.read8(bus, dev, func, PCI_SECONDARY_BUS),
+            cfg.read8(bus, dev, func, PCI_SUBORDINATE_BUS),
+        ));
     }
     if vendor_id == VIRTIO_VENDOR
     {
@@ -586,6 +600,20 @@ mod tests
         space.add(bdf, 0x8086, 1, 0x01);
         space.set_bar(bdf, 0, 0xFEB0_0000, !0xFFF & !0xF);
         assert_eq!(scan_all(&space, 0, 0)[0].bar_count, 0);
+    }
+
+    #[test]
+    fn a_bridge_records_the_buses_behind_it_and_an_endpoint_none()
+    {
+        let space = FakeSpace::default();
+        let bridge = (0, 2, 0);
+        space.add(bridge, 0x8086, 1, 0x01);
+        // Primary bus 0, secondary 3, subordinate 5.
+        space.set32(bridge, 0x18, 0x0005_0300);
+        space.add((0, 3, 0), 0x8086, 2, 0x00);
+        let found = scan_all(&space, 0, 0);
+        assert_eq!(found[0].bridge_buses, Some((3, 5)));
+        assert_eq!(found[1].bridge_buses, None);
     }
 
     /// Add a VirtIO function whose capability list holds the given

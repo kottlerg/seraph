@@ -1132,12 +1132,19 @@ pub fn fs_write_size_bound_phase(_: &Caps)
 /// fill its `CSpace` and break every later cap derivation.
 pub fn fs_carried_caps_dropped_phase(_: &Caps)
 {
-    // Well past fatfs's whole CSpace: procmgr seeds a child CSpace with
-    // CSPACE_RETYPE_PAGES (7) pages, the first the CSpace's own wrapper, so
-    // six slot pages of 56 slots (335 usable), and fatfs never augments it.
-    const REQUESTS: usize = 1024;
-
     let ipc_buf = std::os::seraph::current_ipc_buf();
+    // More caps than fatfs's `CSpace` has free slots for. The `CSpace` grows
+    // only when fatfs funds it: at cache init, to a page cap and a per-read
+    // cap for every slot, the quarantine's replacements, the scratch page and
+    // 64 more, and before each `FS_OPEN`, to the same funding less the pages
+    // the cache already holds. This phase opens nothing before its requests,
+    // so the slots free when they start are at most that funding (about twice
+    // the slot ceiling) plus the few slot pages a funding rounds up to and the
+    // release SENDs of the opens earlier phases held and closed
+    // (`fs_opens::HELD_FILES` of them). Four times the ceiling and 512 more
+    // clears that at every RAM size.
+    let requests = 4 * fatfs_slot_ceiling(ipc_buf) + 512;
+
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"capdrop.bin";
@@ -1145,7 +1152,7 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE capdrop failed");
     fs_write_inline(cap, 0, b"carried caps", ipc_buf).expect("FS_WRITE capdrop failed");
 
-    for i in 0..REQUESTS
+    for i in 0..requests
     {
         let extra =
             syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND).expect("derive a cap to carry");

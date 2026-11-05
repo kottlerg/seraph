@@ -61,7 +61,9 @@ pub mod kind
 ///
 /// Only bootstrap-essential drivers ship as bundle modules — those
 /// needed to read anything off the disk in the first place (virtio-blk,
-/// fatfs) plus the pre-vfsd console pair (serial, framebuffer). The
+/// fatfs, and the IOMMU driver that must confine the disk before its driver
+/// maps a ring; `iommu-vtd` on x86-64) plus the pre-vfsd console pair
+/// (serial, framebuffer). The
 /// per-arch RTC driver lives on the rootfs disk and is loaded lazily by
 /// devmgr through its `SET_DRIVERS_DIR` subtree cap; no `RTC` module is
 /// delivered.
@@ -70,8 +72,10 @@ pub mod module_kind
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
+    /// The IOMMU driver of the architecture's IOMMU family (`iommu-vtd`).
+    pub const IOMMU: u64 = 4;
     /// Number of module kinds: the tags run `1..=COUNT`, one module each.
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 4;
 
     /// Slot of `kind` in a per-kind table, or `None` for an unknown tag.
     pub fn index(kind: u64) -> Option<usize>
@@ -149,6 +153,11 @@ pub struct DevmgrCaps
     /// DMA-capable device's driver is given its DMA capability; `None` until
     /// `main` starts it, before the first driver spawn.
     pub dma: Option<crate::dma::DmaService>,
+
+    /// The remapping units the IOMMU driver programs and the client devmgr
+    /// calls it through; `None` when DMA runs unconfined (no unit, no driver
+    /// module, or a driver that did not report ready).
+    pub iommu: Option<crate::iommu::Iommu>,
 }
 
 impl DevmgrCaps
@@ -175,6 +184,7 @@ impl DevmgrCaps
             arch: crate::arch::current::ArchCaps::empty(),
             fb_info: None,
             dma: None,
+            iommu: None,
         }
     }
 

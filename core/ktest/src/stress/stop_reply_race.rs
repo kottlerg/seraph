@@ -92,8 +92,9 @@
 //! The offset sweep crosses zero offset on any host, so the check does not
 //! depend on the host's speed. The controller starts its stop only once it
 //! has seen the stopper's handshake, unless [`SEEN_PROBES`] runs out first.
-//! In a stop-first cycle at an offset that does not delay the stopper, the
-//! stopper therefore enters `thread_stop` no later than the controller does.
+//! In a stop-first cycle where the controller saw the handshake, at an offset
+//! that does not delay the stopper, the stopper therefore enters
+//! `thread_stop` no later than the controller does.
 //! Both run the same path to `thread_stop`'s state precheck, and past that
 //! precheck the controller must still cancel the client's park and take every
 //! CPU's scheduler lock before it commits `Stopped`. So in those cycles the
@@ -575,8 +576,8 @@ fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stops: Sto
         controller_lead_in(cycle);
     }
     // The stop's outcome depends on which teardown reached the client first
-    // (`Ok`, `InvalidState`, or an error for a client already exited); the
-    // race, not its return, is what the cell exercises.
+    // (`Ok`, or `InvalidState` once another stop committed or the client
+    // exited); the race, not its return, is what the cell exercises.
     if cycle.is_multiple_of(2)
     {
         let _ = thread_stop(client_th);
@@ -833,11 +834,12 @@ extern "C" fn stopper_entry(arg: u64) -> !
     // Ok: this stop's unlocked state precheck read the client before any
     // `Stopped` commit landed (two stops past that precheck both commit
     // `Stopped` and both return Ok), or, in a delete-first cycle, read a
-    // client the server's death already woke and that had not yet exited.
-    // InvalidState: a `Stopped` commit, or the client's exit, came before
-    // this stop's precheck. Only an Ok in a stop-first cycle (`race` stops before it deletes on even cycles, the
-    // odd rounds), where the client is reply-blocked until a stop cancels it,
-    // is tallied.
+    // client the server's death already woke and that did not exit before
+    // this stop's commit. InvalidState: a `Stopped` commit came before this
+    // stop's precheck, or the client exited before this stop's commit. Only
+    // an Ok in a stop-first cycle (`race` stops before it deletes on even
+    // cycles, the odd rounds), where the client is reply-blocked until a
+    // stop cancels it, is tallied.
     if thread_stop(target).is_ok() && round % 2 == 1
     {
         SECOND_STOPS_OK.fetch_add(1, Ordering::AcqRel);

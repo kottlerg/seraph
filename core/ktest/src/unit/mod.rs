@@ -214,6 +214,10 @@ pub fn run_all(ctx: &TestContext)
         retype::cspace_indirect_region(ctx)
     );
     run_test!(
+        "retype::cspace_double_indirect_region",
+        retype::cspace_double_indirect_region(ctx)
+    );
+    run_test!(
         "retype::cspace_explicit_placement_fast_fail",
         retype::cspace_explicit_placement_fast_fail(ctx)
     );

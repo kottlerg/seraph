@@ -49,9 +49,9 @@ pub const PAGE_SIZE: u64 = 0x1000;
 ///
 /// A handle is a `u64`: the slot index in bits `0..CAP_INDEX_BITS` and the
 /// per-slot generation (see [`cap_handle_gen`]) in the bits above it. The
-/// index field is wider than any `CSpace` the kernel can build; the kernel
-/// static-asserts that its structural slot ceiling fits it, so the ceiling is
-/// set by the kernel's directory, not by the handle.
+/// kernel's directory reaches the index field: its structural slot ceiling is
+/// the field's whole leaves of [`CSPACE_SLOTS_PER_PAGE`] slots, which the
+/// kernel static-asserts fit it, so the handle sets the ceiling.
 pub const CAP_INDEX_BITS: u32 = 32;
 
 /// Mask selecting the slot-index bits of a capability handle.
@@ -640,6 +640,20 @@ pub const CSPACE_IPC_RECV_RESERVE: u64 = MSG_CAP_SLOTS_MAX as u64;
 /// [`CAP_INFO_CSPACE_CAPACITY`] (less an occasional page spent on a
 /// directory page past the direct region).
 pub const CSPACE_SLOTS_PER_PAGE: u64 = 56;
+
+/// Capability bodies one page of a `CSpace`'s body arena holds: the objects a
+/// split, an `Mmio`, `IoPort`, or `Interrupt` copy or derivation, or a spilled
+/// `Mmio` mapping record funded by the `CSpace` needs, one 128-byte chunk
+/// each, past the page's header chunk. Each arena page spends one page of
+/// [`CAP_INFO_CSPACE_BUDGET`]; a funder that knows how many bodies it will
+/// make sizes its donation with this.
+pub const CSPACE_BODIES_PER_PAGE: u64 = 31;
+
+/// Most pages of a `CSpace`'s growth budget ([`CAP_INFO_CSPACE_BUDGET`]) a
+/// thread's first `ioport_bind` takes for its port-binding table: the table's
+/// page and the two pages of the x86-64 I/O permission bitmap. No thread binds
+/// on RISC-V.
+pub const IOPORT_BINDING_TABLE_PAGES: u64 = 3;
 
 /// Pages to donate to a `CSpace` (augment-mode `cap_create_cspace`) so that it
 /// holds `slots` general slots of headroom and, beyond them, one page of growth

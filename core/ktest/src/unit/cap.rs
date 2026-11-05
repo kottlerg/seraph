@@ -760,31 +760,40 @@ pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
 /// Hardening).
 pub fn lookup_bounds(ctx: &TestContext) -> TestResult
 {
-    use crate::cspace_geometry::{DIR_FANOUT, DIRECT_LEAVES, INDIRECT_DIRS};
+    use crate::cspace_geometry::{DIRECT_LEAVES, DOUBLE_BASE, SLOT_CEILING, TRIPLE_BASE};
     use syscall_abi::{
         CAP_GEN_MASK, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_TAG_RIGHTS, CSPACE_SLOTS_PER_PAGE,
         cap_handle_encode,
     };
 
-    // The kernel's leaf layout (crate::cspace_geometry): DIRECT_LEAVES direct
-    // leaves, then INDIRECT_DIRS directory pages of DIR_FANOUT leaves, each
-    // leaf CSPACE_SLOTS_PER_PAGE slots. `FIRST_INDIRECT` is the first slot of
-    // the indirect region, `CEILING` the structural slot ceiling.
+    // The kernel's leaf layout (crate::cspace_geometry): the first slot of the
+    // indirect, double-indirect and triple-indirect regions, and the
+    // structural slot ceiling.
     const FIRST_INDIRECT: u64 = DIRECT_LEAVES * CSPACE_SLOTS_PER_PAGE;
-    const CEILING: u64 = (DIRECT_LEAVES + INDIRECT_DIRS * DIR_FANOUT) * CSPACE_SLOTS_PER_PAGE;
+    const FIRST_DOUBLE: u64 = DOUBLE_BASE * CSPACE_SLOTS_PER_PAGE;
+    const FIRST_TRIPLE: u64 = TRIPLE_BASE * CSPACE_SLOTS_PER_PAGE;
     // A handle's slot index is its low 32 bits, so the probes past the ceiling
-    // (`CEILING + 1` the largest derived one) must fit them.
-    const _: () = assert!(CEILING < u32::MAX as u64 - 1);
+    // (`SLOT_CEILING + 1` the largest derived one) must fit them.
+    const _: () = assert!(SLOT_CEILING < u32::MAX as u64 - 1);
 
     let invalid = SyscallError::InvalidCapability as i64;
-    // cast_possible_truncation: the assert above keeps both values within u32.
+    // cast_possible_truncation: the assert above keeps every value within u32.
     #[allow(clippy::cast_possible_truncation)]
-    let (first_indirect, ceiling) = (FIRST_INDIRECT as u32, CEILING as u32);
+    let (first_indirect, first_double, first_triple, ceiling) = (
+        FIRST_INDIRECT as u32,
+        FIRST_DOUBLE as u32,
+        FIRST_TRIPLE as u32,
+        SLOT_CEILING as u32,
+    );
     let below_ceiling = [
         1,
         first_indirect - 1,
         first_indirect,
         first_indirect + 1,
+        first_double - 1,
+        first_double,
+        first_triple - 1,
+        first_triple,
         ceiling - 1,
     ];
     // The index field is the handle's low 32 bits, so `u32::MAX` is its top.

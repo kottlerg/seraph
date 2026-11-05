@@ -426,8 +426,9 @@ surface.
 - **Main set.** The devices of the QEMU machine the canonical and boundary boots use (`q35` on
   x86_64, `virt` on riscv64), one per device type a boot needs, each the device of that type with
   the broadest QEMU support on both machines that the system or its firmware drives (a VirtIO PCI
-  device where the system or the firmware has a VirtIO driver of the type, else the machine's
-  built-in device), and the filesystem the boots mount. Each entry names the cells that exercise
+  device where the system has a VirtIO driver of the type, or, for a type only the firmware
+  drives, where the firmware has one; else the machine's built-in device), and the filesystem the
+  boots mount. Each entry names the cells that exercise
   it, all of them canonical:
   - block: `virtio-blk-pci`, through the virtio-blk driver, which every svctest and usertest cell
     reads its disk through;
@@ -736,8 +737,10 @@ surface that owes them. They are the storage cells of Disk variations below, eac
 architecture (4kn, the 4Kn disk; second-disk, the data partition on a second disk; shared-line,
 that disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second
 disk), and no-iommu, the no-IOMMU variant of Release host runs below, on each architecture. A
-driver's device surface is that driver's code, the storage-wide surface is the code every storage
-cell runs beside its drivers, and the shared surface is what every driver shares. Each surface is
+driver's device surface is that driver's code, with the harness check that drives that driver
+alone where its row names one; the storage-wide surface is the code every storage cell runs beside
+its drivers; and the shared surface is what every driver shares, the launchers' attachment of the
+IOMMU in front of every device included. Each surface is
 the files and directories its row lists, as a whole, and, in any other file, a changed line that
 names one of its listed items as a whole identifier or lies within one's definition; a protocol
 module of `shared/ipc`, and an item the row lists by its definition alone, is on a surface only by
@@ -746,22 +749,23 @@ own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
-| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, and `core/kernel/src/arch/x86_64/ioapic.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 PLIC and its external-interrupt dispatch (`plic_*`, `PLIC_*`, `DEFAULT_PLIC_*`, `CACHED_PLIC_*`, `require_plic_context`, `dispatch_external`, `SOURCE_TARGET`, and `source_target`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`) | every device cell |
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, and `core/kernel/src/arch/x86_64/ioapic.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 PLIC and its external-interrupt dispatch (`plic_*`, `PLIC_*`, `DEFAULT_PLIC_*`, `CACHED_PLIC_*`, `require_plic_context`, `dispatch_external`, `SOURCE_TARGET`, and `source_target`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE`) | every device cell |
 | Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_shared_line`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
-| virtio-input and test-dma | `services/drivers/virtio/input/` and `services/drivers/test-dma/` | no-iommu |
-| The launchers' IOMMU attachment | `Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE` | no-iommu |
+| virtio-input | `services/drivers/virtio/input/` | no-iommu |
+| test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
 | serial, framebuffer, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/framebuffer/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), the no-iommu cell runs no IOMMU driver, and the framebuffer has no cell |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies
-what fatfs reads. The no-iommu cell boots devmgr and the test-dma driver unconfined and every
-VirtIO driver without `VIRTIO_F_ACCESS_PLATFORM`, which the launchers have a device offer only
-with the IOMMU attached, so the shared surface, virtio-blk, virtio-input, test-dma, and the
-launchers' IOMMU attachment owe it. A PR that adds a driver adds its row, with its directory and
-the cells that exercise its device, and a PR that adds a cell names the surfaces that owe it.
+what fatfs reads. The no-iommu cell boots devmgr, the test-dma driver, and svctest's DMA
+confinement check unconfined, and every VirtIO driver without `VIRTIO_F_ACCESS_PLATFORM`, which the
+launchers have a device offer only with the IOMMU attached, so the shared surface (the launchers'
+IOMMU attachment among it), virtio-blk, virtio-input, and test-dma owe it. A PR that adds a driver
+adds its row, with its directory and the cells that exercise its device, and a PR that adds a cell
+names the surfaces that owe it.
 `cargo xtask lint-docs` checks this list as it checks the two above, its directories (written with
 a trailing `/`) included, and resolves its items in xtask's own sources too. The screen works as
 the boundary one does: the first command lists the changed files on a surface as a whole, and the
@@ -779,6 +783,7 @@ D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_io
 D="$D|InterruptObject|dispatch_external|SOURCE_TARGET|source_target"
 D="$D|plic_[a-z_]+|[A-Z_]*PLIC_[A-Z_]+|require_plic_context|devmgr_(dma_)?(labels|errors)"
 D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
+D="$D|test_dma_labels|dma_confinement_phase"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"

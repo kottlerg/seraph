@@ -369,7 +369,26 @@ define_typed_rights! {
         /// every retype-consuming syscall requires it. Which boot-minted caps
         /// carry it is defined in docs/capability-model.md § Memory.
         RETYPE = syscall::RIGHTS_MEM_RETYPE;
+        /// Authority to read this region's physical base
+        /// (`CAP_INFO_MEMORY_PHYS_BASE`). Which caps carry it is defined in
+        /// docs/capability-model.md § Memory.
+        PHYS = syscall::RIGHTS_MEM_PHYS;
     }
+}
+
+impl MemRights
+{
+    /// The rights of every boot-minted Memory cap over RAM: usable RAM, boot
+    /// modules, init's segments, `InitInfo` pages and stack, and reclaimed
+    /// boot scratch. All of them reach memmgr's pool, whose frames need every
+    /// right a consumer may narrow from (docs/capability-model.md § Memory).
+    pub const BOOT_RAM: MemRights = MemRights::from_abi(
+        syscall::RIGHTS_MEM_MAP
+            | syscall::RIGHTS_MEM_WRITE
+            | syscall::RIGHTS_MEM_EXECUTE
+            | syscall::RIGHTS_MEM_RETYPE
+            | syscall::RIGHTS_MEM_PHYS,
+    );
 }
 
 define_typed_rights! {

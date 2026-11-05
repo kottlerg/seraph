@@ -60,6 +60,10 @@ pub fn phases() -> &'static [Phase]
             name: "frame_reclaim_held_cap_release",
             run: frame_reclaim_held_cap_release_phase,
         },
+        Phase {
+            name: "phys_base_withheld",
+            run: phys_base_withheld_phase,
+        },
     ]
 }
 
@@ -225,7 +229,7 @@ fn memmgr_call(msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
         .unwrap_or_else(|e| panic!("memmgr {what} ipc_call failed: {e:?}"))
 }
 
-/// Request a one-page grant from memmgr: `(grant cap, physical base)`.
+/// Request a one-page grant from memmgr: `(grant cap, region id)`.
 fn request_one_page() -> (u64, u64)
 {
     let want = 1 | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
@@ -242,17 +246,17 @@ fn request_one_page() -> (u64, u64)
         .caps()
         .first()
         .expect("REQUEST_MEMORY_CAPS returned no cap");
-    // One cap: data[1] is its page count, data[2] its physical base.
+    // One cap: data[1] is its page count, data[2] its region id.
     (grant, reply.word(2))
 }
 
 /// Drop the grant cap and hand its region back to memmgr.
-fn release_one_page(grant: u64, phys_base: u64)
+fn release_one_page(grant: u64, region_id: u64)
 {
     syscall::cap_delete(grant).expect("cap_delete of grant");
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
         .word(0, 1)
-        .word(1, phys_base)
+        .word(1, region_id)
         .build();
     let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS");
     assert_eq!(
@@ -268,7 +272,7 @@ fn release_one_page(grant: u64, phys_base: u64)
 /// otherwise put a frame it lent to svctest back into its free pool.
 pub fn donate_unauthorized_phase(_: &Caps)
 {
-    let (grant, phys_base) = request_one_page();
+    let (grant, region_id) = request_one_page();
 
     let alias = syscall::cap_derive(grant, syscall::RIGHTS_ALL).expect("cap_derive of grant");
     let donate = ipc::IpcMessage::builder(ipc::memmgr_labels::DONATE_MEMORY_CAPS)
@@ -284,7 +288,7 @@ pub fn donate_unauthorized_phase(_: &Caps)
         reply.word(1)
     );
 
-    release_one_page(grant, phys_base);
+    release_one_page(grant, region_id);
     std::os::seraph::log!("non-procmgr donation refused with UNAUTHORIZED");
 }
 
@@ -359,7 +363,7 @@ pub fn grant_retyped_unmappable_phase(_: &Caps)
     use syscall::{MAP_READ, MAP_WRITABLE};
 
     let info = startup_info();
-    let (grant, _phys_base) = request_one_page();
+    let (grant, _region_id) = request_one_page();
     syscall::cap_create_cspace(grant, info.self_cspace, 1)
         .expect("augment of svctest's CSpace from the grant failed");
 
@@ -914,9 +918,9 @@ pub fn frame_reclaim_live_object_phase(_: &Caps)
 /// pool, and joins it once the mapping goes
 /// (services/memmgr/docs/memory-pool.md § Reclamation). svctest maps a
 /// one-page grant and releases it while mapped: the page must be on memmgr's
-/// deferred list, none of the next one-page grants may be that page, and the
-/// page must leave the deferred list at the first recheck after svctest
-/// unmaps it and deletes its cap.
+/// deferred list, none of the next one-page grants may be that page
+/// ([`assert_draws_avoid`]), and the page must leave the deferred list at the
+/// first recheck after svctest unmaps it and deletes its cap.
 pub fn frame_reclaim_mapped_release_phase(_: &Caps)
 {
     use syscall::{MAP_READ, MAP_WRITABLE};
@@ -925,7 +929,7 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     const DRAWS: usize = 4;
 
     let info = startup_info();
-    let (grant, phys_base) = request_one_page();
+    let (grant, region_id) = request_one_page();
     let range = std::os::seraph::reserve_pages(1).expect("frame_reclaim_mapped_release: reserve");
     let va = range.va_start();
     // SAFETY: `range` is a fresh page reservation from the per-process arena,
@@ -936,7 +940,7 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     let baseline = settled_deferred_bytes();
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
         .word(0, 1)
-        .word(1, phys_base)
+        .word(1, region_id)
         .build();
     let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS (mapped)");
     assert_eq!(
@@ -952,16 +956,14 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     );
 
     let draws: Vec<(u64, u64)> = (0..DRAWS).map(|_| request_one_page()).collect();
-    for &(_, phys) in &draws
+    assert_draws_avoid(
+        grant,
+        &draws,
+        "frame_reclaim_mapped_release: memmgr granted a released page its releaser still maps",
+    );
+    for (cap, id) in draws
     {
-        assert_ne!(
-            phys, phys_base,
-            "frame_reclaim_mapped_release: memmgr granted a released page its releaser still maps"
-        );
-    }
-    for (cap, phys) in draws
-    {
-        release_one_page(cap, phys);
+        release_one_page(cap, id);
     }
 
     // SAFETY: `va` is the page mapped above, in this process's own address
@@ -985,19 +987,20 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
 /// (services/memmgr/docs/memory-pool.md § Reclamation). svctest derives a
 /// second, never-mapped cap from a one-page grant, deletes the grant and
 /// releases the page: the page must be on memmgr's deferred list and none of
-/// the next one-page grants may be that page, and it must leave the deferred
-/// list at the first recheck after svctest deletes the derived cap.
+/// the next one-page grants may be that page ([`assert_draws_avoid`]), and it
+/// must leave the deferred list at the first recheck after svctest deletes the
+/// derived cap.
 pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
 {
     /// One-page grants drawn while the released page is held.
     const DRAWS: usize = 4;
 
-    let (grant, phys_base) = request_one_page();
+    let (grant, region_id) = request_one_page();
     let kept = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP_RW)
         .expect("frame_reclaim_held_cap_release: cap_derive of the grant failed");
     let baseline = settled_deferred_bytes();
     // `release_one_page` deletes the grant itself; the derived cap stays.
-    release_one_page(grant, phys_base);
+    release_one_page(grant, region_id);
     let held = deferred_bytes();
     assert!(
         held >= baseline + syscall_abi::PAGE_SIZE,
@@ -1006,16 +1009,14 @@ pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
     );
 
     let draws: Vec<(u64, u64)> = (0..DRAWS).map(|_| request_one_page()).collect();
-    for &(_, phys) in &draws
+    assert_draws_avoid(
+        kept,
+        &draws,
+        "frame_reclaim_held_cap_release: memmgr granted a released page a live cap still names",
+    );
+    for (cap, id) in draws
     {
-        assert_ne!(
-            phys, phys_base,
-            "frame_reclaim_held_cap_release: memmgr granted a released page a live cap still names"
-        );
-    }
-    for (cap, phys) in draws
-    {
-        release_one_page(cap, phys);
+        release_one_page(cap, id);
     }
 
     syscall::cap_delete(kept).expect("frame_reclaim_held_cap_release: cap_delete of the kept cap");
@@ -1026,5 +1027,119 @@ pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
     std::os::seraph::log!(
         "frame_reclaim_held_cap_release: released page held by a live cap ({baseline} -> {held} \
          deferred bytes), then pooled once the cap went"
+    );
+}
+
+/// Assert that no one-page grant of `draws` is the page `held` names, without
+/// reading a physical address, which svctest's grants do not let it read:
+/// each draw is mapped in turn, and the user mappings of `held`'s page must
+/// not rise while it is, which they would by one if the draw were that page
+/// (`CAP_INFO_MEMORY_MAPPINGS`).
+fn assert_draws_avoid(held: u64, draws: &[(u64, u64)], what: &str)
+{
+    let info = startup_info();
+    let range = std::os::seraph::reserve_pages(1).expect("assert_draws_avoid: reserve");
+    let va = range.va_start();
+    let before =
+        syscall::cap_info_memory_mappings(held, 0, 1).expect("assert_draws_avoid: held mappings");
+    for &(cap, _) in draws
+    {
+        // SAFETY: `range` is a fresh page reservation from the per-process
+        // arena, owned here: VA no Rust object or IPC page occupies.
+        unsafe { syscall::mem_map(cap, info.self_aspace, va, 0, 1, syscall::MAP_READ) }
+            .expect("assert_draws_avoid: mem_map of a draw failed");
+        let during = syscall::cap_info_memory_mappings(held, 0, 1)
+            .expect("assert_draws_avoid: held mappings");
+        // SAFETY: `va` is the page mapped just above, in this process's own
+        // address space, and no Rust reference points into it.
+        unsafe { syscall::mem_unmap(info.self_aspace, va, 1) }
+            .expect("assert_draws_avoid: mem_unmap of a draw failed");
+        assert_eq!(during, before, "{what}");
+    }
+    std::os::seraph::unreserve_pages(range);
+}
+
+/// A process memmgr did not register phys-class, as every device driver is,
+/// cannot read a physical address (core/kernel/docs/cross-boundary-disclosure.md
+/// § Physical-address surfaces): memmgr's grant reply carries a region id in
+/// place of the physical base, and the grant itself lacks `RIGHTS_MEM_PHYS`,
+/// so `CAP_INFO_MEMORY_PHYS_BASE` refuses it, alone and with the grant
+/// presented as its own credential. svctest's own `AddressSpace` cap lacks
+/// `RIGHTS_AS_READ`, so `SYS_ASPACE_QUERY` refuses to translate a page it
+/// maps, and an address space it creates from a grant is minted without that
+/// right either. The grant still maps, and its region id still releases it.
+pub fn phys_base_withheld_phase(_: &Caps)
+{
+    let info = startup_info();
+    let (grant, region_id) = request_one_page();
+    let rights = syscall::cap_info(grant, syscall::CAP_INFO_TAG_RIGHTS)
+        .expect("phys_base_withheld: TAG_RIGHTS of the grant")
+        & 0xFFFF_FFFF;
+    assert_eq!(
+        rights & syscall::RIGHTS_MEM_PHYS,
+        0,
+        "phys_base_withheld: memmgr granted RIGHTS_MEM_PHYS (rights {rights:#x})"
+    );
+    let refused = syscall_abi::SyscallError::InsufficientRights as i64;
+    assert_eq!(
+        syscall::cap_info(grant, syscall::CAP_INFO_MEMORY_PHYS_BASE),
+        Err(refused),
+        "phys_base_withheld: the physical base of a grant was not refused"
+    );
+    assert_eq!(
+        syscall::cap_info_phys_base(grant, grant),
+        Err(refused),
+        "phys_base_withheld: a credential without RIGHTS_MEM_PHYS was accepted"
+    );
+
+    let range = std::os::seraph::reserve_pages(1).expect("phys_base_withheld: reserve");
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh page reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    unsafe {
+        syscall::mem_map(
+            grant,
+            info.self_aspace,
+            va,
+            0,
+            1,
+            syscall::MAP_READ | syscall::MAP_WRITABLE,
+        )
+    }
+    .expect("phys_base_withheld: mem_map of the grant failed");
+    assert_eq!(
+        syscall::aspace_query(info.self_aspace, va),
+        Err(refused),
+        "phys_base_withheld: SYS_ASPACE_QUERY translated a page for a process without the right"
+    );
+    // SAFETY: `va` is the page mapped just above, in this process's own
+    // address space, and no Rust reference points into it.
+    unsafe { syscall::mem_unmap(info.self_aspace, va, 1) }
+        .expect("phys_base_withheld: mem_unmap of the grant failed");
+    std::os::seraph::unreserve_pages(range);
+
+    let aspace_grant =
+        std::os::seraph::object_slab_retype_reclaimable(2 * syscall_abi::PAGE_SIZE, |slab| {
+            syscall::cap_create_aspace(slab, 0, 2).ok()
+        })
+        .expect("phys_base_withheld: cap_create_aspace from a grant failed");
+    let (aspace, slab_grant) = aspace_grant;
+    let aspace_rights = syscall::cap_info(aspace, syscall::CAP_INFO_TAG_RIGHTS)
+        .expect("phys_base_withheld: TAG_RIGHTS of the created address space")
+        & 0xFFFF_FFFF;
+    assert_eq!(
+        aspace_rights & syscall::RIGHTS_AS_READ,
+        0,
+        "phys_base_withheld: an address space created from a grant carries RIGHTS_AS_READ"
+    );
+    syscall::cap_delete(aspace).expect("phys_base_withheld: cap_delete of the address space");
+    if let Some(slab_grant) = slab_grant
+    {
+        std::os::seraph::object_slab_release(slab_grant);
+    }
+
+    release_one_page(grant, region_id);
+    std::os::seraph::log!(
+        "phys_base_withheld: grant carries a region id, PHYS_BASE and ASPACE_QUERY refused"
     );
 }

@@ -257,11 +257,13 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 ///  * copies it into the child's `ProcessInfo.memmgr_endpoint_cap` so the
 ///    child's std heap-bootstrap can call `REQUEST_MEMORY_CAPS` on it.
 ///
-/// The badge is opaque to procmgr but is sent back in the
+/// `flags` are the `REGISTER_PROCESS` flags (`ChildSched::memmgr_flags`).
+/// The badge is opaque to procmgr, apart from the phys-class bit
+/// `process_table::child_memmgr_flags` reads, and is sent back in the
 /// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
 /// right record.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn register_with_memmgr(memmgr_ep: u64, ipc_buf: *mut u64) -> (u64, u64)
+pub fn register_with_memmgr(memmgr_ep: u64, flags: u64, ipc_buf: *mut u64) -> (u64, u64)
 {
     if memmgr_ep == 0
     {
@@ -269,6 +271,7 @@ pub fn register_with_memmgr(memmgr_ep: u64, ipc_buf: *mut u64) -> (u64, u64)
     }
     let msg = IpcMessage::builder(memmgr_labels::REGISTER_PROCESS)
         .word(0, u64::from(ipc::MEMMGR_LABELS_VERSION))
+        .word(1, flags)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
@@ -343,13 +346,29 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
 /// `None` on any failure (memmgr unwired, OOM, malformed reply).
 ///
 /// Used to back kernel-object retypes whose source Memory cap must be
-/// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`). The request sets
-/// `REQUIRE_CONTIGUOUS`, so memmgr answers with one cap of exactly `pages`
-/// pages or an error. A reply of any other shape is refused, and every cap
-/// it carried is returned to memmgr's pool ([`release_grant`]) rather than
-/// left billed to the account behind `memmgr_send`.
+/// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`); as
+/// [`memmgr_alloc_contig_grant`], without the region id.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64) -> Option<u64>
+{
+    memmgr_alloc_contig_grant(memmgr_send, pages, ipc_buf).map(|(cap, _)| cap)
+}
+
+/// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
+/// single Memory cap. Returns the cap slot in procmgr's `CSpace` and the
+/// grant's region id, which names the run to `RELEASE_MEMORY_CAPS`, or
+/// `None` on any failure (memmgr unwired, OOM, malformed reply).
+///
+/// The request sets `REQUIRE_CONTIGUOUS`, so memmgr answers with one cap of
+/// exactly `pages` pages or an error. A reply of any other shape is refused,
+/// and every cap it carried is returned to memmgr's pool ([`release_grant`])
+/// rather than left billed to the account behind `memmgr_send`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn memmgr_alloc_contig_grant(
+    memmgr_send: u64,
+    pages: u64,
+    ipc_buf: *mut u64,
+) -> Option<(u64, u64)>
 {
     if memmgr_send == 0 || pages == 0 || pages > u64::from(u32::MAX)
     {
@@ -367,35 +386,35 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64
         return None;
     }
     let caps = reply.caps();
-    if caps.len() == 1
+    if let Some((_, &[region_id])) = ipc::memmgr_grant_layout(&reply)
         && syscall::cap_info(caps[0], syscall_abi::CAP_INFO_MEMORY_SIZE)
             .is_ok_and(|size| size == pages * 4096)
     {
-        return Some(caps[0]);
+        return Some((caps[0], region_id));
     }
     release_grant(memmgr_send, &reply, ipc_buf);
     None
 }
 
 /// Return every cap of a `REQUEST_MEMORY_CAPS` success reply procmgr does not
-/// keep: delete procmgr's slots and name each run to memmgr by its phys base
+/// keep: delete procmgr's slots and name each run to memmgr by its region id
 /// (`RELEASE_MEMORY_CAPS`), so the pages go back to the pool instead of
 /// staying billed until the account's `PROCESS_DIED`. A reply whose layout
-/// does not decode names no base; its slots are deleted only.
+/// does not decode names no id; its slots are deleted only.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn release_grant(memmgr_send: u64, reply: &IpcMessage, ipc_buf: *mut u64)
 {
     release_caps(reply.caps());
-    let Some((_, bases)) = ipc::memmgr_grant_layout(reply)
+    let Some((_, region_ids)) = ipc::memmgr_grant_layout(reply)
     else
     {
         return;
     };
     let mut msg =
-        IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS).word(0, bases.len() as u64);
-    for (i, &base) in bases.iter().enumerate()
+        IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS).word(0, region_ids.len() as u64);
+    for (i, &id) in region_ids.iter().enumerate()
     {
-        msg = msg.word(1 + i, base);
+        msg = msg.word(1 + i, id);
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_call(memmgr_send, &msg.build(), ipc_buf) };
@@ -983,11 +1002,12 @@ fn check_create_request(
     }
 }
 
-/// Resolve the scheduling fields of a create label against the caller's
-/// spawn ceiling. `None` means the request must be rejected with
-/// `INVALID_ARGUMENT`: still-reserved label bits are set, the requested
-/// band exceeds the creator's, or the requested priority falls outside the
-/// resolved band.
+/// Resolve the scheduling fields and the physical-address class of a create
+/// label against the caller's spawn ceiling and class. `None` means the
+/// request must be rejected with `INVALID_ARGUMENT`: still-reserved label bits
+/// are set, the requested band exceeds the creator's, the requested priority
+/// falls outside the resolved band, or `CREATE_PHYS_ACCESS` comes from a
+/// creator that is not phys-class (`process_table::child_memmgr_flags`).
 ///
 /// Creator ceiling: badge `0` is init (the unbadged service-endpoint
 /// holder) with the full baseline ceiling. A nonzero badge is a
@@ -1024,7 +1044,13 @@ fn resolve_create_sched(
         creator_band_max,
         ipc::sched_policy::DEFAULT_SPAWN_PRIORITY,
     )?;
-    Some(process::ChildSched { priority, band_max })
+    let memmgr_flags =
+        process_table::child_memmgr_flags(label, badge, table.memmgr_badge_by_badge(badge))?;
+    Some(process::ChildSched {
+        priority,
+        band_max,
+        memmgr_flags,
+    })
 }
 
 /// Why [`arm_held_reclaim`] armed no hold.
@@ -1184,7 +1210,8 @@ fn reply_create_result(
 ///   bits [23..28] = `CREATE_BAND_MAX` (0 = copy of the creator's band)
 ///   bit  28       = `CREATE_DMA_HOLD` (hold the reclaim for `RELEASE_HOLD`)
 ///   bit  29       = `CREATE_ARGV_ENV` (argv and env in a Memory cap)
-///   bits [30..64] = reserved (must be zero)
+///   bit  30       = `CREATE_PHYS_ACCESS` (a phys-class child)
+///   bits [31..64] = reserved (must be zero)
 ///
 /// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
 /// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`.
@@ -1249,7 +1276,8 @@ fn handle_create(
     // returns every page already billed to the child) and drops the slot,
     // except after an argv/env copy window that would not unmap, whose
     // record `settle_failed_argv_env` withholds.
-    let (memmgr_send, memmgr_badge) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    let (memmgr_send, memmgr_badge) =
+        register_with_memmgr(ctx.memmgr_ep, sched.memmgr_flags, ipc_buf);
     let mms = process::MemmgrSendGuard::new(memmgr_send, memmgr_badge, ctx.memmgr_ep, ipc_buf);
 
     // The child's checked copy of the argv and env, on its account. The

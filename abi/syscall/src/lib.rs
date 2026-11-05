@@ -328,10 +328,16 @@ pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 
 /// `Memory` only — physical base address of the memory region.
 ///
-/// Returns `MemoryObject::base`. Calling on a non-Memory slot returns
-/// [`SyscallError::InvalidArgument`]. Used by memmgr to track contiguity
-/// when ingesting Memory caps it did not itself mint (e.g., boot-module
-/// caps donated through `memmgr_labels::DONATE_MEMORY_CAPS`).
+/// Returns `MemoryObject::base` to a holder of [`RIGHTS_MEM_PHYS`]: the
+/// queried cap carries it, or the third argument names a Memory cap in the
+/// caller's `CSpace` that does (the credential; `0` names none). Calling on
+/// a non-Memory slot returns [`SyscallError::InvalidArgument`]; a queried cap
+/// without the right and no credential returns
+/// [`SyscallError::InsufficientRights`], as does a credential without it; a
+/// credential that is not a live Memory cap returns
+/// [`SyscallError::InvalidCapability`]. init reads it for its arena, memmgr
+/// to track contiguity, devmgr and the IOMMU driver to program devices with
+/// physical addresses.
 pub const CAP_INFO_MEMORY_PHYS_BASE: u64 = 8;
 
 /// `Thread` only — kernel-authoritative lifecycle snapshot.
@@ -781,6 +787,16 @@ pub const RIGHTS_MEM_EXECUTE: u64 = 1 << 2;
 /// consuming syscall.
 pub const RIGHTS_MEM_RETYPE: u64 = 1 << 3;
 
+/// Memory: authority to read this region's physical base
+/// (`CAP_INFO_MEMORY_PHYS_BASE`).
+///
+/// Held by every boot-minted RAM, boot-module, init-segment, `InitInfo`,
+/// init-stack, and reclaimed boot-scratch Memory cap, and so by memmgr's pool;
+/// never by firmware-table Memory caps, whose physical bases `InitInfo`'s
+/// descriptors already carry. memmgr strips it from every grant except to the
+/// processes docs/capability-model.md § Memory names.
+pub const RIGHTS_MEM_PHYS: u64 = 1 << 4;
+
 /// Memory: map read-write.
 pub const RIGHTS_MEM_MAP_RW: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE;
 
@@ -792,7 +808,9 @@ pub const RIGHTS_MEM_MAP_RX: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_EXECUTE;
 /// `AddressSpace`: may map into this address space.
 pub const RIGHTS_AS_MAP: u64 = 1 << 0;
 
-/// `AddressSpace`: may read/inspect mappings (`SYS_ASPACE_QUERY`).
+/// `AddressSpace`: may read/inspect mappings (`SYS_ASPACE_QUERY`, which
+/// returns physical addresses). `SYS_CAP_CREATE_ASPACE` mints it only from a
+/// source Memory cap carrying [`RIGHTS_MEM_PHYS`].
 pub const RIGHTS_AS_READ: u64 = 1 << 1;
 
 /// `AddressSpace`: control authority — permits registering terminal-fault
@@ -1298,6 +1316,7 @@ mod tests
                 RIGHTS_MEM_WRITE,
                 RIGHTS_MEM_EXECUTE,
                 RIGHTS_MEM_RETYPE,
+                RIGHTS_MEM_PHYS,
             ],
             // AddressSpace
             &[RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_AS_CONTROL],

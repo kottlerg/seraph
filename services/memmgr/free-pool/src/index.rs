@@ -336,6 +336,7 @@ mod tests
             frame_head: NODE_NULL,
             region_head: NODE_NULL,
             aspace_cap: 0,
+            next_region_id: 1,
         })
     }
 

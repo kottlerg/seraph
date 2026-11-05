@@ -899,7 +899,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u64) -> Option<
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 #[derive(Debug, PartialEq, Eq)]
 pub struct ObjectGrant {
-    phys: u64,
+    region_id: u64,
 }
 
 /// [`object_slab_retype`] for an object the caller deletes mid-life: also
@@ -920,7 +920,7 @@ pub fn object_slab_retype_reclaimable<T>(
     retype: impl FnOnce(u64) -> Option<T>,
 ) -> Option<(T, Option<ObjectGrant>)> {
     pal_alloc::object_slab_retype_reclaimable(min_bytes, retype)
-        .map(|(out, phys)| (out, phys.map(|phys| ObjectGrant { phys })))
+        .map(|(out, region_id)| (out, region_id.map(|region_id| ObjectGrant { region_id })))
 }
 
 /// Return `grant`'s run to memmgr's pool. The caller MUST have deleted the
@@ -932,7 +932,7 @@ pub fn object_slab_retype_reclaimable<T>(
 /// dies.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn object_slab_release(grant: ObjectGrant) {
-    pal_alloc::slab_release_fresh(grant.phys);
+    pal_alloc::slab_release_fresh(grant.region_id);
 }
 
 /// memmgr's current free-pool size in bytes, or `None` if memmgr is
@@ -1612,7 +1612,7 @@ pub mod process {
     pub struct ArgvEnvCap {
         original: u64,
         transfer: u64,
-        phys: u64,
+        region_id: u64,
         header: ipc::procmgr_labels::ArgvEnvHeader,
     }
 
@@ -1645,7 +1645,7 @@ pub mod process {
             }
             let (memmgr_ep, aspace) = spawner_memmgr()?;
             let pages = total.div_ceil(syscall_abi::PAGE_SIZE);
-            let (original, _, phys) =
+            let (original, _, region_id) =
                 crate::sys::alloc::seraph::slab_request_pages(memmgr_ep, pages)
                     .ok_or_else(|| too_long("argv and env exceed what the spawner can fund"))?;
             let header = ipc::procmgr_labels::ArgvEnvHeader {
@@ -1654,7 +1654,7 @@ pub mod process {
                 env_bytes: env.len() as u64,
                 env_count,
             };
-            let mut this = Self { original, transfer: 0, phys, header };
+            let mut this = Self { original, transfer: 0, region_id, header };
             if let Err(still_mapped) = write_argv_env(aspace, original, pages, args, env) {
                 if still_mapped {
                     // A run this process may still have mapped stays charged
@@ -1722,7 +1722,7 @@ pub mod process {
                 let _ = syscall::cap_delete(self.transfer);
             }
             let _ = syscall::cap_delete(self.original);
-            crate::sys::alloc::seraph::slab_release_fresh(self.phys);
+            crate::sys::alloc::seraph::slab_release_fresh(self.region_id);
         }
     }
 

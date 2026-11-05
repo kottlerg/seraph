@@ -76,7 +76,49 @@ pub trait CapOps
 }
 
 /// [`CapOps`] through the kernel's `SYS_CAP_INFO` and `SYS_CAP_DELETE`.
-pub struct KernelCaps;
+///
+/// The frames a `MAP` request carries are a driver's, whose caps lack
+/// `RIGHTS_MEM_PHYS`, so their physical bases are read presenting
+/// `credential`, a Memory cap of the IOMMU driver's own that carries it: the
+/// driver is phys-class, so memmgr's grants to it keep the right
+/// (core/kernel/docs/cross-boundary-disclosure.md § Physical-address
+/// surfaces).
+pub struct KernelCaps
+{
+    credential: u64,
+}
+
+impl KernelCaps
+{
+    /// Take a one-page grant from memmgr on `memmgr_ep` as the credential,
+    /// held for the driver's life and never mapped. `None` when memmgr
+    /// refuses it; a reply of any other shape is deleted.
+    ///
+    /// # Safety
+    /// `ipc_buf` MUST be the calling thread's registered IPC buffer.
+    #[must_use]
+    pub unsafe fn new(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<Self>
+    {
+        let req = IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, 1)
+            .build();
+        // SAFETY: the caller's contract makes `ipc_buf` this thread's
+        // registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }.ok()?;
+        let caps = reply.caps();
+        if reply.label == ipc::memmgr_errors::SUCCESS && caps.len() == 1
+        {
+            return Some(Self {
+                credential: caps[0],
+            });
+        }
+        for &c in caps
+        {
+            let _ = syscall::cap_delete(c);
+        }
+        None
+    }
+}
 
 impl CapOps for KernelCaps
 {
@@ -89,7 +131,7 @@ impl CapOps for KernelCaps
             return None;
         }
         Some(MemoryCap {
-            phys: syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).ok()?,
+            phys: syscall::cap_info_phys_base(cap, self.credential).ok()?,
             len: syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_SIZE).ok()?,
             rights: tag_rights & 0xFFFF_FFFF,
         })

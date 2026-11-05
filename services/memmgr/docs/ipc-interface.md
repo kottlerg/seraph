@@ -108,8 +108,8 @@ for a best-effort partial grant, fewer. Privilege: universal.
 | label | 0 (success) |
 | data[0] | `returned_cap_count` (u32) |
 | data[1 + i] | `page_count_for_cap_i` (u32) for each returned cap, `i ∈ [0, count)` |
-| data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous page run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
-| cap[0..returned_cap_count] | Memory capabilities carrying every right of their pool frames (derived with `RIGHTS_ALL`; pool frames carry WRITE, EXECUTE, and RETYPE, see [`memory-pool.md`](memory-pool.md) §"Pool Ingest") |
+| data[1 + count + i] | `region_id_for_cap_i` (u64) — opaque id of the grant of the contiguous page run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
+| cap[0..returned_cap_count] | Memory capabilities carrying every right of their pool frames but `RIGHTS_MEM_PHYS`, which only a phys-class caller's keep (pool frames carry WRITE, EXECUTE, RETYPE, and PHYS, see [`memory-pool.md`](memory-pool.md) §"Pool Ingest") |
 
 With `REQUIRE_CONTIGUOUS` the reply always carries exactly one cap with
 `page_count_for_cap_0 == want_pages`. A best-effort reply has
@@ -120,17 +120,22 @@ and when those fall short while the pool's free pages still cover
 with `want_pages` and request the remainder (see
 [`memory-pool.md`](memory-pool.md) §"Allocation").
 
-The `phys_base_for_cap_i` field is the host physical address of the
-first page of the i-th returned cap, and the name `RELEASE_MEMORY_CAPS`
-takes for the region. No DMA-issuing driver programs it into its device:
-drivers program the device addresses devmgr returns when it maps a cap for
-the driver's device (see
+The `region_id_for_cap_i` field is the name `RELEASE_MEMORY_CAPS` takes
+for the i-th returned cap's run. It is a per-process sequence number from 1:
+memmgr gives each grant to a process the next id of that process's record and
+never reissues one while the record lives, so an id names one grant of its
+caller and carries no address, no count of other processes' grants, and
+nothing about memmgr's layout. The reply carries no physical address, and
+the returned caps lack `RIGHTS_MEM_PHYS`, so `CAP_INFO_MEMORY_PHYS_BASE`
+refuses them, except to a phys-class caller (devmgr and the IOMMU drivers,
+[Label 3](#label-3-register_process)), whose caps keep the right. A
+DMA-issuing driver programs the device addresses devmgr returns when it maps
+a cap for the driver's device (see
 [docs/device-management.md](../../../docs/device-management.md#dma-authorisation)
-§ DMA Authorisation), and withdrawing the field from drivers is
-[#767](https://github.com/kottlerg/seraph/issues/767). DMA isolation,
-when present, is established through devmgr-managed IOMMU policy
-outside the kernel surface; memmgr exposes only the addresses, not the
-isolation policy.
+§ DMA Authorisation); the surfaces that still carry physical addresses are
+classified in
+[core/kernel/docs/cross-boundary-disclosure.md](../../../core/kernel/docs/cross-boundary-disclosure.md)
+§ Physical-address surfaces.
 
 There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).
@@ -149,7 +154,7 @@ Best-effort replies may use the full reply-side capacity.
 |---|---|---|
 | 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, or deriving the caller's copy failed |
-| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
+| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
@@ -159,11 +164,11 @@ Privilege: universal. Called by a long-lived process pruning its working
 set — e.g. ruststd releasing a reclaimed thread's Thread-retype slab so a
 bounded thread-churn loop holds a bounded pool footprint.
 
-The caller names each region by the `phys_base` memmgr reported in the
+The caller names each region by the region id memmgr reported in the
 granting `REQUEST_MEMORY_CAPS` reply, *not* by transferring the cap: a
 caller that has retyped the region (e.g. into a Thread) and dropped the
 inner cap no longer holds a cap to send back. memmgr keeps the outer cap
-as the per-process tracking anchor and uses `phys_base` to find it.
+as the per-process tracking anchor and uses the region id to find it.
 
 **Request:**
 
@@ -171,7 +176,7 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 |---|---|
 | label | 2 |
 | data[0] | `count` (u32) |
-| data[1+i] | `phys_base_i` (u64) — physical base of region `i` to release |
+| data[1+i] | `region_id_i` (u64) — region id of region `i` to release |
 | cap[..] | none; memmgr deletes any cap attached (see [Capability Transfer](#capability-transfer)) |
 
 **Reply (success):**
@@ -192,12 +197,14 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | caller's badge is unknown |
 
-For each `phys_base`, memmgr finds the matching caller-owned grant
-(`FRAME_VA_UNMAPPED`) in the per-process tracking entry, takes it off the
-entry, and returns its run to the free pool (coalescing where possible), the
-tracking node becoming the run's node. Bases that match no outstanding grant
-are ignored — release is idempotent, so a racing double-release (join plus
-reaper) is harmless. The caller MUST have already deleted every capability to
+For each region id, memmgr finds the caller's grant that carries it in the
+per-process tracking entry, takes it off the entry, and returns its run to the
+free pool (coalescing where possible), the tracking node becoming the run's
+node. Ids that match no outstanding grant of the caller are ignored — release
+is idempotent, so a racing double-release (join plus reaper) is harmless, and
+since a record never reissues an id, a late duplicate never takes a later
+grant of the same run. Bootstrap arenas and demand-paged chunks carry no id,
+so no release names them. The caller MUST have already deleted every capability to
 the region and every kernel object retyped from it, and unmapped it from every
 address space. A region released while any of them remains is held on memmgr's
 deferred list, granted to no one, until all are gone; the release still
@@ -223,10 +230,22 @@ that procmgr will install in the new process's
 |---|---|
 | label | 3 |
 | data[0] | Caller's `MEMMGR_LABELS_VERSION` |
+| data[1] | Flags: bit 0 `REGISTER_PHYS_CLASS` registers the process phys-class; other bits reserved, zero |
 
 The badge of the requesting endpoint identifies procmgr; memmgr verifies
 this and rejects the call otherwise. memmgr mints a fresh badge for the
-new process internally — procmgr does not supply it.
+new process internally — procmgr does not supply it: 63 random bits, and bit
+63 (`PHYS_CLASS_BADGE_BIT`) set for a phys-class process and clear for every
+other. A phys-class process's grants keep `RIGHTS_MEM_PHYS`
+([Label 1](#label-1-request_memory_caps)); the kernel stamps the badge on the
+process's SEND cap, so no process can claim the class. procmgr sets the flag
+only for a child created with `CREATE_PHYS_ACCESS`, which it accepts only from
+an un-badged or phys-class creator: init creates devmgr with it and devmgr the
+IOMMU driver (see the
+[procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)).
+init clears the bit in the badge it mints for procmgr on memmgr's endpoint,
+and memmgr refuses a bootstrap whose procmgr badge carries it, so procmgr's
+own grants lack the right.
 
 **Reply (success):**
 
@@ -251,6 +270,7 @@ the eventual `PROCESS_DIED`.
 
 | Code | Name | Meaning |
 |---|---|---|
+| 4 | `INVALID_ARGUMENT` | Reserved `data[1]` flag bits set |
 | 5 | `UNAUTHORIZED` | Caller is not procmgr |
 | 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry (its record node could not be allocated: system RAM exhausted), the badge draw failed, or the reply cap could not be derived |
 | 7 | `LABEL_VERSION_MISMATCH` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
@@ -346,7 +366,7 @@ frame, and boot-module ELF sources. See
 | Field | Value |
 |---|---|
 | label | 5 |
-| cap[..] | Memory caps to donate; each MUST carry WRITE, EXECUTE, and RETYPE rights |
+| cap[..] | Memory caps to donate; each MUST carry WRITE, EXECUTE, RETYPE, and PHYS rights |
 
 **Reply (success):**
 
@@ -546,7 +566,7 @@ after the caller's CSpace is torn down. See [`memory-pool.md`](memory-pool.md)
 §"Allocation".
 
 Neither `RELEASE_MEMORY_CAPS` nor `PROCESS_DIED` transfers the caps it
-reclaims. `RELEASE_MEMORY_CAPS` names each region by `phys_base`, and
+reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 `PROCESS_DIED` names the dead process by badge. Reclamation returns memmgr's
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
@@ -595,6 +615,8 @@ reply-then-death ordering is therefore enforced by the kernel.
 
 ## Summarized By
 
+[Kernel Cross-Boundary Disclosure Inventory](../../../core/kernel/docs/cross-boundary-disclosure.md),
+[Capability Model](../../../docs/capability-model.md),
 [Device Management](../../../docs/device-management.md),
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
@@ -605,4 +627,5 @@ reply-then-death ordering is therefore enforced by the kernel.
 [programs/threadchurn/README.md](../../../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../../../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
-[services/memmgr/README.md](../README.md)
+[services/memmgr/README.md](../README.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md)

@@ -109,8 +109,10 @@ Allocation Contract").
 The full memmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
-- `REQUEST_MEMORY_CAPS(want_pages, flags) → memory_caps[..]`
-- `RELEASE_MEMORY_CAPS(phys_base[..])` — return granted regions mid-life
+- `REQUEST_MEMORY_CAPS(want_pages, flags) → memory_caps[..], region_ids[..]` (no physical
+  address; `RIGHTS_MEM_PHYS` only for a phys-class caller)
+- `RELEASE_MEMORY_CAPS(region_id[..])` — return granted regions mid-life, named by the
+  opaque region ids the grant returned
 - `REGISTER_PROCESS(...) → badged_endpoint_cap` (procmgr-only)
 - `PROCESS_DIED(badge)` (procmgr-only)
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool

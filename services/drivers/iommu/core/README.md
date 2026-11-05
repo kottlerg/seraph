@@ -31,6 +31,12 @@ its `Backend`: VT-d's is [`iommu-vtd`](../vtd/README.md) and the RISC-V IOMMU's 
 - **Table pages.** Every family's tables are 4 KiB pages of 64-bit words a unit reads by physical
   address. The family's walks run over a `TableStore`: the driver's is `iommu-store`, the host
   tests' a heap store.
+- **Physical bases.** A `MAP` request carries a driver's frames, whose caps lack the Memory `Phys`
+  right, so `KernelCaps` reads their physical bases presenting a credential: a page the driver
+  takes from memmgr at startup (`KernelCaps::new`), which keeps the right because devmgr spawns
+  the driver phys-class
+  ([docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
+  § Physical Addresses).
 - **Setup.** The driver programs every unit empty and turns translation on before it reports
   ready; a unit that fails turns every unit's translation off again (VT-d's translation enable
   cleared, a RISC-V IOMMU returned to Bare), so a driver whose setup fails leaves no device

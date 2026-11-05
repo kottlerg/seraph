@@ -895,7 +895,7 @@ fn write_inline(
 struct WriteFrame
 {
     cap: u64,
-    phys: u64,
+    region_id: u64,
     range: crate::sys::reserve::ReservedRange,
 }
 
@@ -916,11 +916,11 @@ fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
         fund_aspace_pt_budget, slab_release_fresh, slab_request_pages,
     };
 
-    let (cap, _, phys) = slab_request_pages(memmgr_ep, 1)
+    let (cap, _, region_id) = slab_request_pages(memmgr_ep, 1)
         .ok_or_else(|| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"))?;
     let range = crate::sys::reserve::reserve_pages(1).map_err(|_| {
         let _ = syscall::cap_delete(cap);
-        slab_release_fresh(phys);
+        slab_release_fresh(region_id);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
     let failure = if !fund_aspace_pt_budget(aspace, 1)
@@ -939,10 +939,10 @@ fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
     {
         crate::sys::reserve::unreserve_pages(range);
         let _ = syscall::cap_delete(cap);
-        slab_release_fresh(phys);
+        slab_release_fresh(region_id);
         return Err(io::Error::other(msg));
     }
-    Ok(WriteFrame { cap, phys, range })
+    Ok(WriteFrame { cap, region_id, range })
 }
 
 /// A cookie's read-in-progress mark in the release registry, from before
@@ -993,7 +993,7 @@ impl Drop for ReadMark<'_>
 
 /// Tear a write frame down and return its run to memmgr: unmap it, revoke
 /// the derivations lent to the driver, delete the cap, and release the run
-/// by its phys base. The release relies on the driver holding no mapping
+/// by its region id. The release relies on the driver holding no mapping
 /// of the frame past the copy, which services/fs/docs/fs-driver-protocol.md
 /// § Label 12 requires of it; revocation withdraws a derivation the driver
 /// kept but not a mapping it made. A frame whose unmap fails stays mapped,
@@ -1010,7 +1010,7 @@ fn release_write_frame(frame: WriteFrame, aspace: u64)
     crate::sys::reserve::unreserve_pages(frame.range);
     let _ = syscall::cap_revoke(frame.cap);
     let _ = syscall::cap_delete(frame.cap);
-    crate::sys::alloc::seraph::slab_release_fresh(frame.phys);
+    crate::sys::alloc::seraph::slab_release_fresh(frame.region_id);
 }
 
 /// How one `FS_WRITE_MEMORY` chunk failed.

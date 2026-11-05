@@ -178,11 +178,12 @@ the two a process can reach answer only a holder of the Memory `Phys` right
   addresses traversed during the walk are not returned. `SYS_CAP_CREATE_ASPACE` mints
   `READ` only when its retype source carries `Phys` (init's kernel-created address space
   carries it too), and `READ` gates nothing else, so the query answers only a process that
-  could read the frames' bases through the selector above. The address spaces that carry
-  `READ` are init's own and memmgr's, which init retypes from its `Phys` arena: init hands
-  procmgr its own address space without `READ`, and procmgr retypes every child's,
-  devmgr's and the IOMMU driver's included, through a derivation without `Phys`, so no
-  child's address space carries it.
+  could read the frames' bases through the selector above. The `READ` caps are init's,
+  on its own address space and on the memmgr and procmgr address spaces it retypes from
+  its `Phys` arena, and memmgr's copy of its own: init hands procmgr its copy of
+  procmgr's address space without `READ`, and procmgr retypes every child's, devmgr's and
+  the IOMMU driver's included, through a derivation without `Phys`, so no child's address
+  space carries it.
 - The `InitInfo` handover publishes physical bases for the resources it hands init:
   `CapDescriptor::aux0` (Memory / Mmio physical base) and
   `InitFramebufferInfo::physical_base`. Each describes a resource init receives a

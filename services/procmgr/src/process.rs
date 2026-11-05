@@ -2757,6 +2757,7 @@ impl Drop for ChildKernelObjects
 ///
 /// # Errors
 /// `procmgr_errors::OUT_OF_MEMORY` when memmgr grants no retype slab, the
+/// address-space slab's derivation without `RIGHTS_MEM_PHYS` fails, the
 /// thread-retype size cannot be read, or a retype fails: § Label 1 and
 /// § Label 13 of `services/procmgr/docs/ipc-interface.md` name every
 /// kernel-object allocation failure so.

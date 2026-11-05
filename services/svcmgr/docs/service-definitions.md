@@ -75,20 +75,20 @@ first pinned svcmgr-launched service exists.
 
 ## `argv` / `env`
 
-Both lists are packed as NUL-separated, NUL-terminated bytes into svcmgr's
-`CREATE_FROM_FILE` message to procmgr (see
-[procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)) and replayed
-on every restart. The parser rejects a recipe whose packing would not fit
-that message:
+Both lists are packed as NUL-separated, NUL-terminated bytes into the
+argv/env Memory cap svcmgr's `CREATE_FROM_FILE` to procmgr carries (see
+[procmgr's IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
+§ Label 1, **argv and env**) and replayed on every restart. The parser
+rejects a recipe whose packing the child could not receive:
 
-* each blob is at most `ipc::ARGS_BLOB_MAX` (256) bytes, counting one NUL
-  per token, and holds at most 255 tokens (the label's 8-bit count fields);
-* together, the message body — one file-size word, the argv words, one
-  env-length word, and the env words — is at most `MSG_DATA_WORDS_MAX` (64)
-  eight-byte words, so argv and env cannot both fill `ARGS_BLOB_MAX`;
+* the two blobs together, counting one NUL per token, are at most
+  `process_abi::ARGV_ENV_MAX_BYTES` (just under 1 GiB), the child's argv/env
+  region ([abi/process-abi/README.md](../../../abi/process-abi/README.md)
+  § argv / env region); no token count or per-blob bound applies below it
+  (`TooLarge`);
 * no token contains a NUL byte: the blob is NUL-delimited, so an embedded
-  NUL would add a string boundary the label's count does not carry and the
-  child would see a different split. The parser rejects such a line as
+  NUL would add a string boundary the header's count does not carry, and
+  procmgr would refuse the create. The parser rejects such a line as
   `InvalidValue`.
 
 ## `restart`

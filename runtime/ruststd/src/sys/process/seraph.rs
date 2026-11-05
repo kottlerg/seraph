@@ -47,14 +47,15 @@
 //!
 //! Argv/env:
 //!   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`
-//!     tracks into `CommandEnv`. Both are serialised at `spawn` time into the
-//!     label + data of `CREATE_FROM_FILE` (same encoding as `CREATE_PROCESS`
-//!     and end up in the child's `ProcessInfo` page, surfaced via
-//!     `std::env::{args, vars}` on the child side. Each blob is bounded by
-//!     `ipc::ARGS_BLOB_MAX` and an 8-bit count, and the packed message
-//!     (file-size word, argv words, env-length word, env words) by
-//!     `MSG_DATA_WORDS_MAX`, so argv and env cannot both fill
-//!     `ARGS_BLOB_MAX`; oversize returns `ArgumentListTooLong`.
+//!     tracks into `CommandEnv`. Both are packed at `spawn` time into a
+//!     Memory cap the spawner funds
+//!     (`std::os::seraph::process::ArgvEnvCap`), which
+//!     `CREATE_FROM_FILE` transfers with `CREATE_ARGV_ENV` set, and end up
+//!     in the child's argv/env region after its `ProcessInfo` page, surfaced
+//!     via `std::env::{args, vars}` on the child side. `spawn` returns
+//!     `ArgumentListTooLong` only when the blobs together exceed
+//!     `process_abi::ARGV_ENV_MAX_BYTES` or memmgr refuses the spawner the
+//!     run they fill.
 
 use crate::ffi::{OsStr, OsString};
 pub use crate::ffi::OsString as EnvKey;
@@ -80,7 +81,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
 use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
-use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
+use syscall_abi::SyscallError;
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -334,18 +335,12 @@ impl Command {
             args_blob.extend_from_slice(bytes);
             args_blob.push(0);
         }
-        if args_blob.len() > ipc::ARGS_BLOB_MAX || self.args.len() > u8::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::ArgumentListTooLong,
-                "argv exceeds procmgr limits",
-            ));
-        }
-        let args_count: u32 = self.args.len() as u32;
+        let args_count = self.args.len() as u64;
 
         // Pack env (NUL-terminated KEY=VALUE concatenation of CommandEnv.capture()),
         // UTF-8 like argv.
         let mut env_blob: Vec<u8> = Vec::new();
-        let mut env_count_usize: usize = 0;
+        let mut env_count: u64 = 0;
         for (key, val) in self.env.capture() {
             let (Some(key_str), Some(val_str)) = (key.to_str(), val.to_str()) else {
                 return Err(io::Error::new(
@@ -367,37 +362,7 @@ impl Command {
             env_blob.push(b'=');
             env_blob.extend_from_slice(val_bytes);
             env_blob.push(0);
-            env_count_usize += 1;
-        }
-        if env_blob.len() > ipc::ARGS_BLOB_MAX || env_count_usize > u8::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::ArgumentListTooLong,
-                "env exceeds procmgr limits",
-            ));
-        }
-        let env_count: u32 = env_count_usize as u32;
-
-        // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
-        // env header, env. Both blobs fit `ARGS_BLOB_MAX` on their own, but
-        // together they can exceed the message's data area; reject that
-        // here, before any cap is minted, instead of letting the builder
-        // assert on it.
-        let argv_words = if args_blob.is_empty() {
-            0
-        } else {
-            args_blob.len().div_ceil(8)
-        };
-        let env_header_words = if env_count > 0 && !env_blob.is_empty() {
-            1 + env_blob.len().div_ceil(8)
-        } else {
-            0
-        };
-        let total_words = 1 + argv_words + env_header_words;
-        if total_words > MSG_DATA_WORDS_MAX {
-            return Err(io::Error::new(
-                io::ErrorKind::ArgumentListTooLong,
-                "argv and env together exceed the CREATE_FROM_FILE message size",
-            ));
+            env_count += 1;
         }
 
         // The calling thread's registered IPC buffer: `_start` installs the
@@ -409,6 +374,15 @@ impl Command {
                 "Command::spawn: calling thread has no registered IPC buffer",
             ));
         }
+
+        // Fund the argv/env cap before the binary is looked up or any cap is
+        // minted: a spawner that cannot fund it gets `ArgumentListTooLong`
+        // with nothing to unwind. `ArgvEnvCap::settle` after the create call
+        // returns its run to memmgr (procmgr has copied the blobs by then),
+        // or withholds it on `ARGV_ENV_STILL_MAPPED`.
+        let argv_env = crate::os::seraph::process::ArgvEnvCap::new(
+            &args_blob, args_count, &env_blob, env_count,
+        )?;
 
         // Walk the spawner's namespace cap to the binary node. The
         // resulting badged SEND on the owning fs driver's namespace
@@ -471,13 +445,10 @@ impl Command {
             }
         };
 
-        // Caps: [file_cap, death_relay]. Command-spawned children skip the
-        // creator endpoint slot; the death relay is the trailing cap
-        // (flagged by `CREATE_DEATH_RELAY`).
-        let argv_word_offset: usize = 1;
-        let env_len_word_offset = argv_word_offset + argv_words;
-        let env_blob_word_offset = env_len_word_offset + 1;
-
+        // Caps: [file_cap, argv_env?, death_relay]. Command-spawned children
+        // skip the creator endpoint slot; the argv/env cap (flagged by
+        // `CREATE_ARGV_ENV`) and the death relay (flagged by
+        // `CREATE_DEATH_RELAY`) are the trailing caps, the relay last.
         let pinned_flag = if self.pinned {
             procmgr_labels::CREATE_PINNED
         } else {
@@ -487,35 +458,32 @@ impl Command {
             | pinned_flag
             | procmgr_labels::CREATE_DEATH_RELAY
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
-            | ((args_blob.len() as u64) << 32)
-            | ((u64::from(args_count)) << 48)
-            | ((u64::from(env_count)) << 56))
+            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 })
             .word(0, file_size)
             .cap(file_cap);
-        let builder = if !args_blob.is_empty() {
-            builder.bytes(argv_word_offset, &args_blob)
-        } else {
-            builder
-        };
-        let builder = if env_count > 0 && !env_blob.is_empty() {
-            builder
-                .word(env_len_word_offset, env_blob.len() as u64)
-                .bytes(env_blob_word_offset, &env_blob)
-        } else {
-            builder
+        let builder = match &argv_env {
+            Some(memory) => builder
+                .words(1, &memory.header_words())
+                .cap(memory.cap()),
+            None => builder,
         };
         // Death relay is the trailing cap (peeled off the tail procmgr-side).
-        let builder = builder.cap(death_relay);
-        let msg = builder.word_count(total_words).build();
+        let msg = builder.cap(death_relay).build();
 
         // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-        // file_cap and death_relay ownership transfer to procmgr via the IPC;
-        // procmgr cap_deletes the file cap and binds-then-deletes the relay.
-        let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) }
-            .map_err(|_| {
-                let _ = syscall::cap_delete(death_eq);
-                io::Error::other("CREATE_FROM_FILE syscall failed")
-            })?;
+        // file_cap, the argv/env cap and death_relay ownership transfer to
+        // procmgr via the IPC; procmgr cap_deletes the file cap and the
+        // argv/env cap before it replies, and binds-then-deletes the relay.
+        let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) };
+        // procmgr holds no copy of the argv/env cap now; the run goes back
+        // to memmgr unless procmgr may still map its pages.
+        if let Some(argv_env) = argv_env {
+            argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
+        }
+        let reply = reply.map_err(|_| {
+            let _ = syscall::cap_delete(death_eq);
+            io::Error::other("CREATE_FROM_FILE syscall failed")
+        })?;
         if reply.label != procmgr_errors::SUCCESS {
             let _ = syscall::cap_delete(death_eq);
             return Err(map_procmgr_error(reply.label));
@@ -1484,6 +1452,9 @@ fn map_procmgr_error(code: u64) -> io::Error {
         procmgr_errors::MAP_FAILED => io::Error::other("MAP_FAILED"),
         procmgr_errors::INSUFFICIENT_RIGHTS => {
             io::Error::new(io::ErrorKind::PermissionDenied, "INSUFFICIENT_RIGHTS")
+        }
+        procmgr_errors::ARGV_ENV_STILL_MAPPED => {
+            io::Error::new(io::ErrorKind::OutOfMemory, "ARGV_ENV_STILL_MAPPED")
         }
         procmgr_errors::UNKNOWN_OPCODE => io::Error::other("UNKNOWN_OPCODE"),
         other => io::Error::other(format!("procmgr error {other}")),

@@ -315,6 +315,13 @@ pool when the client releases it or dies, whatever the device's state
 ([#749](https://github.com/kottlerg/seraph/issues/749)). memmgr itself treats a
 held-back `PROCESS_DIED` like any other.
 
+procmgr also never sends `PROCESS_DIED` for a child whose create failed because procmgr could
+not unmap a window it copied the child's argv and env through (it replies
+`procmgr_errors::ARGV_ENV_STILL_MAPPED`;
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-1-create_process) § Label 1,
+**argv and env**). That window may still map the child's frames, so memmgr keeps the child's
+record, and every frame on it out of the free pool, for the rest of the boot.
+
 ### Label 5: `DONATE_MEMORY_CAPS`
 
 Permanently transfer Memory caps into memmgr's pool. Privilege: procmgr-only.

@@ -152,13 +152,14 @@ identical across both code paths:
   bootstrap badge + badged SEND on svcmgr's `bootstrap_ep`.
 * [`walk_and_create_from_file`](../src/restart.rs) — walk svcmgr's
   universal `root_dir_cap` for the binary path, then call
-  `procmgr_labels::CREATE_FROM_FILE` with argv / env blobs. Both paths
-  build the blobs from the recipe: launch from the parsed `Definition`,
-  restart from the stored [`RestartRecipe`](../src/service.rs). Before
-  minting any cap the primitive refuses (logged, returns `None`) argv / env
-  whose packed layout exceeds `MSG_DATA_WORDS_MAX`, a backstop behind the
-  parser's `TooLarge` rejection; on restart that `None` fails the attempt
-  and is routed through `permanent_death_outcome`.
+  `procmgr_labels::CREATE_FROM_FILE` with argv / env blobs in an argv/env
+  Memory cap (`std::os::seraph::process::ArgvEnvCap`). Both paths build
+  the blobs from the recipe: launch from the parsed `Definition`, restart
+  from the stored [`RestartRecipe`](../src/service.rs). Before minting any
+  cap the primitive returns `None` (logged) when it cannot build that cap:
+  blobs past the argv/env region, a backstop behind the parser's
+  `TooLarge` rejection, or a run memmgr will not fund; on restart that
+  `None` fails the attempt and is routed through `permanent_death_outcome`.
 * [`configure_namespace_caps`](../src/restart.rs) — walk the optional
   `cwd` from svcmgr's universal root, then install the namespace cap and
   the `cwd` cap on the child via `procmgr_labels::CONFIGURE_NAMESPACE`.

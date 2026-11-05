@@ -61,7 +61,7 @@ Cross-Boundary VAs).
 | `INIT_INFO_WINDOW`, `INIT_STACK_GUARD_WINDOW` | Kernel-side windows for init's per-boot layout. |
 | `IMAGE_WINDOW`, `IMAGE_MAX_SPAN`, `choose_image_bias`, `validate_image_placement` | ET_DYN load-bias window and fixed-tier placement validation (`IMAGE_MAX_SPAN` derived, 28 GiB). |
 | `FIXED_IMAGE_ZONE_END`, `image_max_span`, `validate_image_placement_below` | Image-zone end of the fixed tier, the span an image zone holds, and validation against any zone end. |
-| `MAX_WINDOW_REGION_PAGES` | Largest region hanging off a window draw (1 GiB stride gap); bounds the stack reservation and the main TLS block. |
+| `MAX_WINDOW_REGION_PAGES` | Largest region hanging off a window draw (1 GiB stride gap); bounds the stack reservation, the main TLS block, and the `ProcessInfo` page with the argv/env region after it. |
 | `GrowthZone`, `AddressSpaceZones`, `SV39_ZONES`, `growth_zones(u64) -> AddressSpaceZones` | Heap, arena, and image zones sized to a user half; the Sv39 zones also serve an unknown size. |
 | `LAYOUT_ENTROPY_BYTES` | Entropy bytes one layout draw consumes. |
 | `main_stack_growth(u64, u64, u64) -> Option<(u64, u64)>` | The demand-growth range below a main-thread stack's committed pages, inside the stack reservation; ruststd's `_start` registers it with the pager. |

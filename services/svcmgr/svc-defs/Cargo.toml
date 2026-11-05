@@ -8,12 +8,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-# `ipc::ARGS_BLOB_MAX` bounds the argv/env wire blobs the parser validates;
 # `ipc::MAX_PATH_LEN` bounds the `binary` and `subtree:<path>` values, and
 # `ipc::svcmgr_labels::NAME_MAX` the service and `provides` names;
 # `ipc::svcmgr_labels::HANDOVER_AUTHORITY` is the bit `handover_permitted` tests.
 ipc = { path = "../../../shared/ipc" }
 namespace-protocol = { path = "../../../shared/namespace-protocol" }
+# `process_abi::ARGV_ENV_MAX_BYTES` bounds a recipe's argv and env together.
+process-abi = { path = "../../../abi/process-abi" }
 syscall-abi = { path = "../../../abi/syscall" }
 
 [lints]

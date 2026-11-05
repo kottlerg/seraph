@@ -4,8 +4,8 @@
 // runtime/ruststd/src/sys/args/seraph.rs
 
 //! Iterator backing for `std::env::args` / `std::env::args_os`. Reads the
-//! argv blob that procmgr wrote into the read-only `ProcessInfo` page at
-//! spawn time, surfaced by `std::os::seraph::startup_info().args_blob`.
+//! argv blob that procmgr wrote into the read-only argv/env region after the
+//! `ProcessInfo` page at spawn time, surfaced by `std::os::seraph::startup_info().args_blob`.
 //!
 //! The blob format is defined by the argv section comment above
 //! `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`; the field walks

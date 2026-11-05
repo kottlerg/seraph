@@ -203,7 +203,8 @@ stride spacing makes region ordering, pairwise disjointness, and the
 unmapped guard page below every stack hold for all possible draws, so
 no collision checking or redraw is ever needed. Each window's 8 GiB draw
 span leaves a 1 GiB region tail in its stride (`MAX_WINDOW_REGION_PAGES`),
-which bounds the largest stack reservation and TLS block a loader accepts.
+which bounds the largest stack reservation and TLS block a loader accepts and
+the largest argv/env region a creator maps after the `ProcessInfo` page.
 Every creator-placed surface ends below `LAYOUT_VA_CEILING` (2³⁸, the
 smallest user half among the supported paging modes, riscv64 Sv39), since
 the creator places them without knowing the paging mode, so one static
@@ -228,6 +229,11 @@ quality caveat.
   that address to the child in its entry register (`rdi`/`a0`). The
   child's `_start` takes the address as its argument — it cannot read the
   address from the struct, since the address is what locates the struct.
+  When the child receives argv or env, procmgr maps their pages read-only
+  directly after the page, the argv/env region, inside the window's region
+  tail (`process_abi::ARGV_ENV_MAX_PAGES`, see
+  [abi/process-abi/README.md](../abi/process-abi/README.md) § argv / env
+  region); the struct's offsets locate the two blobs.
 - **`InitInfo` region.** The kernel maps a read-only region at its chosen
   `init_info_va` for init only, one or more pages sized from the boot's
   descriptor counts (`init_info_memory_count` pages, at most

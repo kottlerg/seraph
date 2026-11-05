@@ -121,7 +121,7 @@ impl Store
     /// is not page-aligned or that no chunk's handed-out pages hold.
     fn va(&self, phys: u64) -> Option<u64>
     {
-        if phys % PAGE_SIZE != 0
+        if !phys.is_multiple_of(PAGE_SIZE)
         {
             return None;
         }

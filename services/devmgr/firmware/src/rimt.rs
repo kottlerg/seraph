@@ -601,7 +601,10 @@ mod tests
         let t = rimt(&[
             pci_iommu(0, 0x0008),
             pci_iommu(0, 0x0010),
-            root_complex(0, &[(0x0500, 0x8, 0x0500, 88), (0x0009, 0xfff7, 0x0009, 48)]),
+            root_complex(
+                0,
+                &[(0x0500, 0x8, 0x0500, 88), (0x0009, 0xfff7, 0x0009, 48)],
+            ),
         ]);
         let scanned = [bdf(5, 0, 1), bdf(5, 1, 0)];
         let mut out = Vec::new();

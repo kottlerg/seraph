@@ -1518,10 +1518,12 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 slice expires while the target runs a preemption-disabled kernel section with interrupts
 enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
 batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling,
-and `preempt_enable` does not reschedule, so the stop completes at the first tick that decides a
-reschedule with preemption enabled (a slice expiry, or, for a target dispatched at a fair level,
-a tick that finds an RT thread queued), a further slice later at the least. Callers that need a
-bounded stop latency MUST budget a slice for each expiry the target can spend in such a section.
+and `preempt_enable` does not reschedule, so the stop completes at the first later tick that
+decides a reschedule with preemption enabled: a slice expiry, a further slice later at the least,
+or, for a target dispatched at a fair level, a tick that finds an RT thread queued, which can be
+the next tick. Callers that need a bounded stop latency MUST budget a slice for each slice expiry
+the target can spend in such a section; a tick that decides a preemption for RT and finds
+preemption disabled leaves the slice running and adds nothing to that budget.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 

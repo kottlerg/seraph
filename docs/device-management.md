@@ -152,25 +152,32 @@ its own or devmgr withdrew it:
    reset is confirmed; a device that meets neither leaves the frames quarantined on that record,
    counted and never handed out again, for the rest of the boot.
 
-The hold rests on the driver not having handed its procmgr capability onward. procmgr cannot tell
-devmgr's `RELEASE_HOLD` from one sent on a copy of the driver's own procmgr capability, which
-carries the same badge (procmgr's
-[§ Label 3](../services/procmgr/docs/ipc-interface.md#label-3-release_hold)), so a compromised
-driver that granted a copy onward before it died can have its frames freed early. In the
-DMA-unsafe mode that gains it nothing, since such a driver can already DMA anywhere; a mode that
-confines a device with an IOMMU needs a release only the creator can send
-([#763](https://github.com/kottlerg/seraph/issues/763)).
+Only devmgr can release the hold. procmgr serves `RELEASE_HOLD` only on the release token the
+driver's create reply carries, a capability badged with the driver's process badge and a verb bit
+no process badge carries, and refuses it on the driver's process handle and on every copy of the
+driver's own procmgr capability (procmgr's
+[§ Label 3](../services/procmgr/docs/ipc-interface.md#label-3-release_hold)). devmgr keeps the
+token with the device and passes it to no one, so a compromised driver that granted its procmgr
+capability onward before it died cannot have its frames freed early.
 
-The hold covers the driver's own frames only. A frame a client lends a driver for one transfer
-(the memory capability a virtio-blk caller supplies) is on the client's memmgr record, which no
-hold covers. memmgr pools it only once no other process holds a capability to it
+A frame a client lends a driver for one transfer (the memory capability a virtio-blk caller
+supplies) is on the client's memmgr record, which no hold covers. memmgr pools it only once no
+other process holds a capability to it
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
-§ Reclamation), so while the driver holds the lent capability for the transfer, and devmgr holds
-one for the frame's DMA mapping, the frame stays out of the pool even after the client releases
-it or dies. devmgr deletes its own when it withdraws the device, before the device is confirmed
-stopped, and a dead driver's capabilities go with its `CSpace`, so a lent frame can still return
-to the pool while the device may write it
-([#749](https://github.com/kottlerg/seraph/issues/749)).
+§ Reclamation), so it stays out of the pool, even after the client releases it or dies, while
+devmgr's reference to it lives, and that one lives until the device can no longer write it.
+A driver programs its device only with the device address of a DMA mapping of the frame
+(§ DMA Authorisation), and devmgr keeps a capability to the frame for each standing mapping:
+
+- **While the driver lives.** The driver maps the frame for the transfer and unmaps it only once
+  the transfer completed or the device acknowledged its reset, and it holds the lent capability
+  until then too. It moves the capability back in its reply; a reply that fails (the client is
+  gone) has it delete the capability, the transfer being over.
+- **When the driver is gone.** A driver that dies mid-transfer, or exits after an unacknowledged
+  reset, leaves the mapping standing, and its own capability goes with its `CSpace`. When devmgr
+  withdraws the device it deletes its mapping capabilities only once the IOMMU blocks the device,
+  or once the Bus Master Enable read-back, the BAR revocation and the reset all confirm; otherwise
+  it keeps them for the rest of the boot, beside the driver's quarantined record.
 
 Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to withdraw
 the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the IOMMU (the
@@ -277,8 +284,9 @@ pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programm
 addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
 every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
-functions no driver binds included. devmgr never releases the driver's hold: a unit may walk any
-of its table pages while translation is on, so they stay quarantined for the boot. For each
+functions no driver binds included. devmgr never releases the driver's hold, and deletes its
+release token at the spawn: a unit may walk any of its table pages while translation is on, so
+they stay quarantined for the boot. For each
 DMA-capable device devmgr then decides, before it grants the device DMA:
 
 - **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`) and grants it DMA in

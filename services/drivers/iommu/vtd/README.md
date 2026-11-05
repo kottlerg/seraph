@@ -39,8 +39,8 @@ spawns it phys-class, so its grants carry the Memory `Phys` right, and it reads 
 whose caps lack it, presenting a page of its own as the credential (`iommu_core::KernelCaps`; see
 [docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
 § Physical Addresses). No table page is
-ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases it, since a unit
-may walk any of them while translation stays on.
+ever returned, and devmgr spawns the driver `CREATE_DMA_HOLD` and never releases it (it deletes the
+hold's release token at the spawn), since a unit may walk any of them while translation stays on.
 
 The library (`iommu_vtd`) holds the register fields, the translation-structure encodings, and the
 page-table walk. They are host-tested, the walk over a heap-backed `iommu_core::TableStore`.

@@ -33,6 +33,10 @@ pub const CHUNK_BYTES: usize = 128;
 /// Chunks one page holds, the header's chunk 0 included.
 pub const CHUNKS_PER_PAGE: usize = crate::mm::PAGE_SIZE / CHUNK_BYTES;
 
+// The ABI publishes the bodies an arena page holds for userspace funding
+// arithmetic (`CSPACE_BODIES_PER_PAGE`); the page layout must match it.
+const _: () = assert!((CHUNKS_PER_PAGE - 1) as u64 == syscall::CSPACE_BODIES_PER_PAGE);
+
 /// Link every chunk of the page at `page` but chunk 0, which holds the page's
 /// header, onto the list headed by `head`, lowest address first.
 ///

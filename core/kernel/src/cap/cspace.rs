@@ -5,12 +5,13 @@
 
 //! Capability space implementation.
 //!
-//! A [`CSpace`] is a hybrid two-level radix of [`CapabilitySlot`]s: an inline
-//! root of leaf [`CSpacePage`] pointers (`direct`) plus pool-allocated
-//! [`CSpaceDirPage`]s (`indirect`), capped at [`MAX_SLOTS_STRUCTURAL`]. The
-//! layout, lookup cost, and capacity bounds are specified in
-//! core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix
-//! and docs/capability-model.md § Address-space and `CSpace` growth budgets.
+//! A [`CSpace`] is a hybrid radix of [`CapabilitySlot`]s: an inline root of
+//! leaf [`CSpacePage`] pointers (`direct`) plus root pointers to one, two, or
+//! three levels of pool-allocated [`DirPage`]s (`indirect`, `double`,
+//! `triple`), capped at [`MAX_SLOTS_STRUCTURAL`]. The layout, lookup cost, and
+//! capacity bounds are specified in core/kernel/docs/capability-internals.md
+//! § Storage: Hybrid Radix Directory and docs/capability-model.md
+//! § Address-space and `CSpace` growth budgets.
 //!
 //! ## Free list
 //!
@@ -28,9 +29,9 @@
 //! ## Growth
 //!
 //! Leaves are allocated on demand by [`CSpace::grow`] behind the `next_leaf`
-//! cursor; growth order and the indirect-region directory pages are specified
-//! in core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-//! Radix.
+//! cursor; growth order and the directory pages are specified in
+//! core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
+//! Directory.
 
 // cast_possible_truncation: usize→u32 slot index bounded by MAX_SLOTS_STRUCTURAL.
 #![allow(clippy::cast_possible_truncation)]
@@ -55,7 +56,7 @@ use crate::arch::nospec;
 
 /// Slots per `CSpace` leaf page (56 × 72 B = 4032 B, fitting one 4 KiB pool
 /// page); see core/kernel/docs/capability-internals.md § Storage: Hybrid
-/// Two-Level Radix for the sizing constraints.
+/// Radix Directory for the sizing constraints.
 pub const L2_SIZE: usize = 56;
 
 /// Free slots kept back from general allocations for IPC capability
@@ -68,32 +69,72 @@ pub const IPC_RECV_RESERVE: usize = syscall::CSPACE_IPC_RECV_RESERVE as usize;
 // arithmetic (`CSPACE_SLOTS_PER_PAGE`); the leaf layout must match it.
 const _: () = assert!(L2_SIZE as u64 == syscall::CSPACE_SLOTS_PER_PAGE);
 
-/// Inline root pointers to leaf pages (the direct region). Both inline regions
-/// are fixed by the two-level directory embedded in `CSpace`; `MAX_SLOTS_STRUCTURAL`
-/// derives from them and is the only capacity they set.
+/// Inline root pointers to leaf pages (the direct region). The four inline
+/// regions together are the `CSpace`'s fixed root of 256 pointers; each
+/// region past the direct one reaches its leaves through one more level of
+/// pool-allocated directory pages
+/// (core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
+/// Directory).
 const L1_DIRECT: usize = 128;
 
-/// Inline root pointers to directory pages (the indirect region).
-const L1_INDIRECT: usize = 128;
+/// Inline root pointers to level-1 directory pages (the indirect region),
+/// each naming `DIR_FANOUT` leaves.
+const L1_INDIRECT: usize = 64;
 
-/// Leaf pointers per pool-allocated directory page (one 4 KiB page of
-/// 8-byte pointers).
+/// Inline root pointers to level-2 directory pages (the double-indirect
+/// region), each naming `DIR_FANOUT` level-1 directory pages.
+const L1_DOUBLE: usize = 63;
+
+/// Inline root pointers to level-3 directory pages (the triple-indirect
+/// region), each naming `DIR_FANOUT` level-2 directory pages. One entry
+/// carries the ceiling to the handle's index field.
+const L1_TRIPLE: usize = 1;
+
+/// Pointers per pool-allocated directory page (one 4 KiB page of 8-byte
+/// pointers).
 const DIR_FANOUT: usize = crate::mm::PAGE_SIZE / core::mem::size_of::<*mut CSpacePage>();
 
-/// Maximum leaf pages a `CSpace` can ever hold.
-const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
+/// First leaf of the indirect region.
+const INDIRECT_BASE: usize = L1_DIRECT;
+
+/// First leaf of the double-indirect region.
+const DOUBLE_BASE: usize = INDIRECT_BASE + L1_INDIRECT * DIR_FANOUT;
+
+/// First leaf of the triple-indirect region.
+const TRIPLE_BASE: usize = DOUBLE_BASE + L1_DOUBLE * DIR_FANOUT * DIR_FANOUT;
+
+/// Leaves the root's four regions can address.
+const GEOMETRY_LEAVES: usize = TRIPLE_BASE + L1_TRIPLE * DIR_FANOUT * DIR_FANOUT * DIR_FANOUT;
+
+/// Leaf pages a `CSpace` can ever hold: the whole leaves the cap handle's
+/// 32-bit index field addresses, or fewer if the root's regions address
+/// fewer.
+const MAX_LEAVES: usize = {
+    let field_leaves = (1usize << syscall::CAP_INDEX_BITS) / L2_SIZE;
+    if GEOMETRY_LEAVES < field_leaves
+    {
+        GEOMETRY_LEAVES
+    }
+    else
+    {
+        field_leaves
+    }
+};
 
 /// The directory's structural slot ceiling; see
-/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-/// Radix for the bound's role.
+/// core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
+/// Directory for the bound's role.
 pub const MAX_SLOTS_STRUCTURAL: usize = MAX_LEAVES * L2_SIZE;
 
 // Every slot index must fit in the cap handle's 32-bit index field; the rest
-// of the handle carries the per-slot generation. The field is wider than the
-// directory reaches, so this ceiling is the directory's alone: a deeper
-// directory raises it with no handle change, up to the field's width, past
-// which the encoding would truncate indices — trip at compile time instead.
+// of the handle carries the per-slot generation. The directory reaches the
+// field, so the field, not the directory, bounds a `CSpace`; a ceiling past
+// the field would truncate indices — trip at compile time instead.
 const _: () = assert!(MAX_SLOTS_STRUCTURAL <= (1usize << syscall::CAP_INDEX_BITS));
+
+// The root of 256 pointers is the `CSpace`'s inline size; a region split that
+// grows it would grow every `CSpace` wrapper.
+const _: () = assert!(L1_DIRECT + L1_INDIRECT + L1_DOUBLE + L1_TRIPLE == 256);
 
 // The leaf cursor is a u32; the ceiling must fit it.
 const _: () = assert!(MAX_LEAVES <= u32::MAX as usize);
@@ -158,23 +199,34 @@ const _: () = assert!(
     "CSpacePage exceeds PAGE_SIZE — reduce L2_SIZE or shrink CapabilitySlot"
 );
 
-// ── CSpaceDirPage ─────────────────────────────────────────────────────────────
+// ── Directory pages ───────────────────────────────────────────────────────────
 
-/// One pool-allocated directory page of the indirect region: `DIR_FANOUT`
-/// leaf-page pointers. Every entry names [`SENTINEL_LEAF`] in the initial
-/// state, set by [`CSpace::grow`] before the page is published; no entry is
-/// null. Entries are write-once while the `CSpace` is live: published with
-/// Release by [`CSpace::grow`], read with Acquire by the lock-free lookup
-/// path.
+/// One pool-allocated directory page: `DIR_FANOUT` pointers to the next level
+/// down, leaf pages for a [`DirLeaves`] page, directory pages for the levels
+/// above it. Every entry names that level's sentinel in the initial state,
+/// set by [`CSpace::grow`] before the page is published; no entry is null.
+/// Entries are write-once while the `CSpace` is live: published with Release
+/// by [`CSpace::grow`], read with Acquire by the lock-free lookup path.
 #[repr(C)]
-struct CSpaceDirPage
+struct DirPage<T>
 {
-    entries: [AtomicPtr<CSpacePage>; DIR_FANOUT],
+    entries: [AtomicPtr<T>; DIR_FANOUT],
 }
 
-// A CSpaceDirPage occupies exactly one page — `grow` pops one pool page per
-// directory page and casts it wholesale.
-const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_SIZE);
+/// A level-1 directory page: `DIR_FANOUT` leaf pointers.
+type DirLeaves = DirPage<CSpacePage>;
+/// A level-2 directory page: `DIR_FANOUT` level-1 directory pointers.
+type DirLevel2 = DirPage<DirLeaves>;
+/// A level-3 directory page: `DIR_FANOUT` level-2 directory pointers.
+type DirLevel3 = DirPage<DirLevel2>;
+
+// A directory page occupies exactly one page — `grow` pops one pool page per
+// directory page and casts it wholesale. Every level has the same layout.
+const _: () = assert!(core::mem::size_of::<DirLeaves>() == crate::mm::PAGE_SIZE);
+
+// The triple region's root entries cover the leaves up to the ceiling, so
+// the masked lookup's root index stays inside `triple`.
+const _: () = assert!(MAX_LEAVES <= GEOMETRY_LEAVES && MAX_LEAVES > TRIPLE_BASE);
 
 // ── Sentinel pages ────────────────────────────────────────────────────────────
 
@@ -192,11 +244,23 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 // has.
 static SENTINEL_LEAF: CSpacePage = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
 
-/// The directory every unallocated indirect-region pointer names: each entry
+/// The level-1 directory every unallocated level-1 pointer names: each entry
 /// names [`SENTINEL_LEAF`]. Never written; its entries are atomics only
 /// because a live directory page's are.
-static SENTINEL_DIR: CSpaceDirPage = CSpaceDirPage {
+static SENTINEL_DIR: DirLeaves = DirPage {
     entries: [const { AtomicPtr::new(sentinel_leaf()) }; DIR_FANOUT],
+};
+
+/// The level-2 directory every unallocated level-2 pointer names: each entry
+/// names [`SENTINEL_DIR`]. Never written.
+static SENTINEL_DIR2: DirLevel2 = DirPage {
+    entries: [const { AtomicPtr::new(sentinel_dir()) }; DIR_FANOUT],
+};
+
+/// The level-3 directory every unallocated level-3 pointer names: each entry
+/// names [`SENTINEL_DIR2`]. Never written.
+static SENTINEL_DIR3: DirLevel3 = DirPage {
+    entries: [const { AtomicPtr::new(sentinel_dir2()) }; DIR_FANOUT],
 };
 
 /// [`SENTINEL_LEAF`] as the pointer type a leaf entry holds. Nothing writes
@@ -207,13 +271,84 @@ const fn sentinel_leaf() -> *mut CSpacePage
     (&raw const SENTINEL_LEAF).cast_mut()
 }
 
-/// [`SENTINEL_DIR`] as the pointer type an indirect entry holds. Its entries
-/// are never stored to: a grow into the indirect region publishes a fresh
-/// directory page first.
-const fn sentinel_dir() -> *mut CSpaceDirPage
+/// [`SENTINEL_DIR`] as the pointer type a level-1 entry holds. Its entries
+/// are never stored to: a grow under it publishes a fresh directory page
+/// first.
+const fn sentinel_dir() -> *mut DirLeaves
 {
     (&raw const SENTINEL_DIR).cast_mut()
 }
+
+/// [`SENTINEL_DIR2`] as the pointer type a level-2 entry holds; never stored
+/// to, as [`sentinel_dir`].
+const fn sentinel_dir2() -> *mut DirLevel2
+{
+    (&raw const SENTINEL_DIR2).cast_mut()
+}
+
+/// [`SENTINEL_DIR3`] as the pointer type a level-3 entry holds; never stored
+/// to, as [`sentinel_dir`].
+const fn sentinel_dir3() -> *mut DirLevel3
+{
+    (&raw const SENTINEL_DIR3).cast_mut()
+}
+
+/// Load entry `i` of directory page `dir` with Acquire, pairing with the
+/// Release publication in [`CSpace::grow`].
+///
+/// # Safety
+/// `dir` names a live directory page of a `CSpace` or a static sentinel, and
+/// `i < DIR_FANOUT`.
+unsafe fn load_entry<T>(dir: *mut DirPage<T>, i: usize) -> *mut T
+{
+    // SAFETY: the caller's contract.
+    unsafe { (*dir).entries[i].load(Ordering::Acquire) }
+}
+
+/// The regions of a `CSpace` root, in leaf order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Region
+{
+    /// Leaves named by the root itself.
+    Direct,
+    /// Leaves under one level of directory pages.
+    Indirect,
+    /// Leaves under two levels of directory pages.
+    Double,
+    /// Leaves under three levels of directory pages.
+    Triple,
+}
+
+/// The region holding `leaf`, and the leaf's index relative to the region's
+/// first leaf. A leaf past the ceiling falls in the triple region; callers
+/// bound it by `MAX_LEAVES`.
+const fn region_of(leaf: usize) -> (Region, usize)
+{
+    if leaf < INDIRECT_BASE
+    {
+        (Region::Direct, leaf)
+    }
+    else if leaf < DOUBLE_BASE
+    {
+        (Region::Indirect, leaf - INDIRECT_BASE)
+    }
+    else if leaf < TRIPLE_BASE
+    {
+        (Region::Double, leaf - DOUBLE_BASE)
+    }
+    else
+    {
+        (Region::Triple, leaf - TRIPLE_BASE)
+    }
+}
+
+/// The regions past the direct one as `(first leaf, end leaf, directory
+/// levels)`, the end clamped to the ceiling.
+const DEEP_REGIONS: [(usize, usize, u32); 3] = [
+    (INDIRECT_BASE, DOUBLE_BASE, 1),
+    (DOUBLE_BASE, TRIPLE_BASE, 2),
+    (TRIPLE_BASE, MAX_LEAVES, 3),
+];
 
 // ── CSpace ────────────────────────────────────────────────────────────────────
 
@@ -235,7 +370,7 @@ const fn sentinel_dir() -> *mut CSpaceDirPage
 /// a handle names reads the slot under this `CSpace`'s lock instead, and pins
 /// the object there (`syscall::pin_slot`). The full
 /// contract is in core/kernel/docs/capability-internals.md § Storage: Hybrid
-/// Two-Level Radix.
+/// Radix Directory.
 pub struct CSpace
 {
     id: CSpaceId,
@@ -246,10 +381,16 @@ pub struct CSpace
     /// heap, Drop Box-frees each page; non-null = retype pool,
     /// `dealloc_object(CSpaceObj)` reclaims donations wholesale).
     direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
-    /// Indirect region: inline pointers to pool-allocated directory pages,
-    /// each fanning out to `DIR_FANOUT` further leaves. [`SENTINEL_DIR`] =
-    /// unallocated; never null.
-    indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
+    /// Indirect region: inline pointers to pool-allocated level-1 directory
+    /// pages, each fanning out to `DIR_FANOUT` further leaves.
+    /// [`SENTINEL_DIR`] = unallocated; never null.
+    indirect: [AtomicPtr<DirLeaves>; L1_INDIRECT],
+    /// Double-indirect region: inline pointers to level-2 directory pages.
+    /// [`SENTINEL_DIR2`] = unallocated; never null.
+    double: [AtomicPtr<DirLevel2>; L1_DOUBLE],
+    /// Triple-indirect region: inline pointers to level-3 directory pages.
+    /// [`SENTINEL_DIR3`] = unallocated; never null.
+    triple: [AtomicPtr<DirLevel3>; L1_TRIPLE],
     /// Grow cursor: leaves `0..next_leaf` are allocated (contiguously);
     /// `next_leaf` is the next leaf `grow` will materialise. A `u32` holds it:
     /// a compile-time assert bounds `MAX_LEAVES` by `u32::MAX`.
@@ -275,8 +416,8 @@ pub struct CSpace
     /// Protects concurrent access to all `CSpace` state: the grow cursor, the
     /// counters, and the free list above are bare fields owned by this lock,
     /// under the exception of docs/coding-standards.md § Concurrency
-    /// (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-    /// Radix records it).
+    /// (core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
+    /// Directory records it).
     pub(crate) lock: crate::sync::Spinlock,
     /// Pool source for new slot and directory pages (pop from
     /// `CSpaceKernelObject::alloc_slot_page`); null only in the host-test
@@ -308,6 +449,8 @@ impl CSpace
             id,
             direct: core::array::from_fn(|_| AtomicPtr::new(sentinel_leaf())),
             indirect: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir())),
+            double: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir2())),
+            triple: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir3())),
             next_leaf: 0,
             allocated_slots: 0,
             pool_exhaustions: 0,
@@ -428,7 +571,7 @@ impl CSpace
     /// `boot_retype_cspace`, userspace via `sys_cap_create_cspace`) and pop
     /// from the wrapper's pool; the host-test stub allocates from the heap.
     /// `T` must be a page-sized-or-smaller type whose all-zeros bit pattern
-    /// is a valid value (both `CSpacePage` and `CSpaceDirPage` are).
+    /// is a valid value (both `CSpacePage` and every `DirPage` are).
     fn alloc_zeroed_page<T>(&mut self) -> Result<NonNull<T>, CapError>
     {
         const {
@@ -498,13 +641,190 @@ impl CSpace
         }
     }
 
+    /// Allocate a directory page whose every entry names `child` (the empty
+    /// state; no entry is ever null), not yet published.
+    fn new_dir<T>(&mut self, child: *mut T) -> Result<*mut DirPage<T>, CapError>
+    {
+        let dir: NonNull<DirPage<T>> = self.alloc_zeroed_page()?;
+        // SAFETY: dir points at an exclusively-owned page not yet published
+        // to any reader.
+        for entry in unsafe { &dir.as_ref().entries }
+        {
+            entry.store(child, Ordering::Relaxed);
+        }
+        Ok(dir.as_ptr())
+    }
+
+    /// The directory page root entry `i` of the region `root` picks names,
+    /// materialised and published first when the entry names `sentinel`.
+    /// The Release publication pairs with the lookup path's Acquire, so a
+    /// lock-free reader never observes an entry before its initialisation.
+    fn root_dir<T>(
+        &mut self,
+        root: fn(&Self, usize) -> &AtomicPtr<DirPage<T>>,
+        i: usize,
+        sentinel: *mut DirPage<T>,
+        child: *mut T,
+    ) -> Result<*mut DirPage<T>, CapError>
+    {
+        let current = root(self, i).load(Ordering::Relaxed);
+        if current != sentinel
+        {
+            return Ok(current);
+        }
+        let dir = self.new_dir(child)?;
+        root(self, i).store(dir, Ordering::Release);
+        Ok(dir)
+    }
+
+    /// The directory page entry `i` of `parent` names, materialised and
+    /// published first when the entry names `sentinel`, as [`Self::root_dir`].
+    ///
+    /// # Safety
+    /// `parent` is a live, published directory page of this `CSpace` (never a
+    /// sentinel), `i < DIR_FANOUT`, and the caller holds this `CSpace`'s lock.
+    unsafe fn child_dir<T>(
+        &mut self,
+        parent: *mut DirPage<DirPage<T>>,
+        i: usize,
+        sentinel: *mut DirPage<T>,
+        child: *mut T,
+    ) -> Result<*mut DirPage<T>, CapError>
+    {
+        // SAFETY: the caller's contract; the page is pool memory, not part of
+        // `self`, so the borrow of `self` below does not alias it.
+        let entry = unsafe { &(*parent).entries[i] };
+        let current = entry.load(Ordering::Relaxed);
+        if current != sentinel
+        {
+            return Ok(current);
+        }
+        let dir = self.new_dir(child)?;
+        entry.store(dir, Ordering::Release);
+        Ok(dir)
+    }
+
+    /// The level-1 directory page above `leaf`, a leaf past the direct
+    /// region, with every missing directory page above it materialised top
+    /// level first. A page materialised here stays published if a lower one,
+    /// or the leaf, then fails to allocate: already paid for, it serves the
+    /// next grow.
+    fn ensure_leaf_dir(&mut self, leaf: usize) -> Result<*mut DirLeaves, CapError>
+    {
+        const F2: usize = DIR_FANOUT * DIR_FANOUT;
+        const F3: usize = F2 * DIR_FANOUT;
+        let (region, rel) = region_of(leaf);
+        match region
+        {
+            Region::Direct => Err(CapError::InvalidIndex),
+            Region::Indirect => self.root_dir(
+                |cs, i| &cs.indirect[i],
+                rel / DIR_FANOUT,
+                sentinel_dir(),
+                sentinel_leaf(),
+            ),
+            Region::Double =>
+            {
+                let dir2 = self.root_dir(
+                    |cs, i| &cs.double[i],
+                    rel / F2,
+                    sentinel_dir2(),
+                    sentinel_dir(),
+                )?;
+                // SAFETY: dir2 is the live level-2 page just ensured, under
+                // this CSpace's lock (grow's caller holds it).
+                unsafe {
+                    self.child_dir(
+                        dir2,
+                        (rel / DIR_FANOUT) % DIR_FANOUT,
+                        sentinel_dir(),
+                        sentinel_leaf(),
+                    )
+                }
+            }
+            Region::Triple =>
+            {
+                let dir3 = self.root_dir(
+                    |cs, i| &cs.triple[i],
+                    rel / F3,
+                    sentinel_dir3(),
+                    sentinel_dir2(),
+                )?;
+                // SAFETY: dir3, then dir2, are the live pages just ensured,
+                // under this CSpace's lock (grow's caller holds it).
+                unsafe {
+                    let dir2 = self.child_dir(
+                        dir3,
+                        (rel / F2) % DIR_FANOUT,
+                        sentinel_dir2(),
+                        sentinel_dir(),
+                    )?;
+                    self.child_dir(
+                        dir2,
+                        (rel / DIR_FANOUT) % DIR_FANOUT,
+                        sentinel_dir(),
+                        sentinel_leaf(),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Whether the level-`level` directory page above `leaf` (1 the page of
+    /// leaf pointers, up to the region's depth) is materialised. `leaf` is
+    /// below `MAX_LEAVES`.
+    fn dir_exists(&self, leaf: usize, level: u32) -> bool
+    {
+        const F2: usize = DIR_FANOUT * DIR_FANOUT;
+        const F3: usize = F2 * DIR_FANOUT;
+        let (region, rel) = region_of(leaf);
+        // SAFETY (each `load_entry`): every entry names a live directory page
+        // of the next level or that level's sentinel, and each index is
+        // reduced below DIR_FANOUT; a walk through a sentinel reads only
+        // sentinels.
+        match region
+        {
+            Region::Direct => false,
+            Region::Indirect =>
+            {
+                self.indirect[rel / DIR_FANOUT].load(Ordering::Relaxed) != sentinel_dir()
+            }
+            Region::Double =>
+            {
+                let dir2 = self.double[rel / F2].load(Ordering::Relaxed);
+                if level >= 2
+                {
+                    return dir2 != sentinel_dir2();
+                }
+                // SAFETY: see above.
+                unsafe { load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT) != sentinel_dir() }
+            }
+            Region::Triple =>
+            {
+                let dir3 = self.triple[rel / F3].load(Ordering::Relaxed);
+                if level >= 3
+                {
+                    return dir3 != sentinel_dir3();
+                }
+                // SAFETY: see above.
+                let dir2 = unsafe { load_entry(dir3, (rel / F2) % DIR_FANOUT) };
+                if level == 2
+                {
+                    return dir2 != sentinel_dir2();
+                }
+                // SAFETY: see above.
+                unsafe { load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT) != sentinel_dir() }
+            }
+        }
+    }
+
     /// Grow the `CSpace` by one leaf page.
     ///
-    /// Materialises leaf `next_leaf` (and, in the indirect region, its covering
-    /// directory page), threads its slots onto the free list, publishes it, and
-    /// advances the cursor; slot 0 in the first leaf is skipped. Failure behaviour
-    /// follows core/kernel/docs/capability-internals.md § Storage: Hybrid
-    /// Two-Level Radix.
+    /// Materialises leaf `next_leaf` (and, past the direct region, every
+    /// missing directory page above it), threads its slots onto the free list,
+    /// publishes it, and advances the cursor; slot 0 in the first leaf is
+    /// skipped. Failure behaviour follows core/kernel/docs/capability-internals.md
+    /// § Storage: Hybrid Radix Directory.
     fn grow(&mut self) -> Result<(), CapError>
     {
         let leaf_idx = self.next_leaf as usize;
@@ -513,26 +833,16 @@ impl CSpace
             return Err(CapError::OutOfSlots);
         }
 
-        // Indirect region: ensure the covering directory page exists.
-        if leaf_idx >= L1_DIRECT
+        // Past the direct region: ensure every directory page above the leaf
+        // exists, top level first.
+        let leaf_dir = if leaf_idx < INDIRECT_BASE
         {
-            let dir_idx = (leaf_idx - L1_DIRECT) / DIR_FANOUT;
-            if self.indirect[dir_idx].load(Ordering::Relaxed) == sentinel_dir()
-            {
-                let dir_nn: NonNull<CSpaceDirPage> = self.alloc_zeroed_page()?;
-                // Every entry names the sentinel leaf before publication (the
-                // empty state; no entry is ever null). The Release publication
-                // pairs with the lookup path's Acquire so a lock-free reader
-                // never observes an entry before this initialisation.
-                // SAFETY: dir_nn points at an exclusively-owned page not yet
-                // published to any reader.
-                for entry in unsafe { &dir_nn.as_ref().entries }
-                {
-                    entry.store(sentinel_leaf(), Ordering::Relaxed);
-                }
-                self.indirect[dir_idx].store(dir_nn.as_ptr(), Ordering::Release);
-            }
+            None
         }
+        else
+        {
+            Some(self.ensure_leaf_dir(leaf_idx)?)
+        };
 
         let mut page_nn: NonNull<CSpacePage> = self.alloc_zeroed_page()?;
         // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage
@@ -596,19 +906,20 @@ impl CSpace
         self.free_tail = prev;
 
         // Publish.
-        if leaf_idx < L1_DIRECT
+        match leaf_dir
         {
-            self.direct[leaf_idx].store(page_nn.as_ptr(), Ordering::Release);
-        }
-        else
-        {
-            let rel = leaf_idx - L1_DIRECT;
-            let dir = self.indirect[rel / DIR_FANOUT].load(Ordering::Relaxed);
-            // SAFETY: a real directory page, ensured above under the same lock
-            // (never the sentinel); directory pages are write-once and never
-            // freed while the CSpace lives.
-            unsafe {
-                (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
+            None => self.direct[leaf_idx].store(page_nn.as_ptr(), Ordering::Release),
+            Some(dir) =>
+            {
+                // The leaf's entry in its level-1 page is its region-relative
+                // index modulo the fan-out (`region_of`).
+                let (_, rel) = region_of(leaf_idx);
+                // SAFETY: a real level-1 directory page, ensured above under
+                // the same lock (never a sentinel); directory pages are
+                // write-once and never freed while the CSpace lives.
+                unsafe {
+                    (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
+                }
             }
         }
 
@@ -621,35 +932,73 @@ impl CSpace
     /// Resolve a leaf index to its page pointer: the leaf's page when it is
     /// allocated, [`SENTINEL_LEAF`] when it is unallocated or out of range.
     ///
-    /// The region branch chooses between the direct and indirect loads, and
-    /// each arm bounds its own array index as data (`nospec::index_mask`) and
-    /// selects the sentinel when that bound fails, so no misprediction of the
-    /// region branch addresses an entry past its array, and the masked
-    /// fallback reaches no leaf but the sentinel. The loaded pointers are
-    /// never null (unallocated entries name the sentinels), so no null test
-    /// sits on the path.
+    /// The region branches choose among the four regions' walks, and each
+    /// walk bounds its own region-relative index as data
+    /// (`nospec::index_mask`) before any load and selects the sentinel when
+    /// that bound fails, so no misprediction of a region branch addresses an
+    /// entry past its array, and the masked fallback reaches no leaf but the
+    /// sentinel. The loaded pointers are never null (unallocated entries name
+    /// the sentinels), so no null test sits on the path. The deepest walk,
+    /// the triple-indirect region's, makes three dependent directory loads
+    /// before the leaf.
     ///
     /// Acquire loads at each level pair with [`grow`][Self::grow]'s Release
     /// publications, so a non-sentinel result points at a fully-initialised
     /// page (see the struct's memory-ordering contract).
     fn leaf_ptr(&self, leaf_idx: usize) -> *mut CSpacePage
     {
-        if leaf_idx < L1_DIRECT
+        const F2: usize = DIR_FANOUT * DIR_FANOUT;
+        const F3: usize = F2 * DIR_FANOUT;
+        // SAFETY (every `load_entry` below): a root or directory entry is
+        // never null: it names a directory page of the next level down
+        // (write-once, Release-published after its entries were set, never
+        // freed while the CSpace is live) or that level's static sentinel,
+        // and each entry index is reduced below `DIR_FANOUT` or masked below
+        // its region's span.
+        if leaf_idx < INDIRECT_BASE
         {
             let in_range = nospec::index_mask(leaf_idx, L1_DIRECT);
             let page = self.direct[leaf_idx & in_range].load(Ordering::Acquire);
             nospec::select_ptr(in_range, page, sentinel_leaf())
         }
-        else
+        else if leaf_idx < DOUBLE_BASE
         {
-            let rel = leaf_idx.wrapping_sub(L1_DIRECT);
+            let rel = leaf_idx.wrapping_sub(INDIRECT_BASE);
             let in_range = nospec::index_mask(rel, L1_INDIRECT * DIR_FANOUT);
             let rel = rel & in_range;
             let dir = self.indirect[rel / DIR_FANOUT].load(Ordering::Acquire);
-            // SAFETY: an indirect entry is never null: it names a directory
-            // page (write-once, Release-published after its entries were set,
-            // never freed while the CSpace is live) or the static sentinel.
-            let page = unsafe { (*dir).entries[rel % DIR_FANOUT].load(Ordering::Acquire) };
+            // SAFETY: see above.
+            let page = unsafe { load_entry(dir, rel % DIR_FANOUT) };
+            nospec::select_ptr(in_range, page, sentinel_leaf())
+        }
+        else if leaf_idx < TRIPLE_BASE
+        {
+            let rel = leaf_idx.wrapping_sub(DOUBLE_BASE);
+            let in_range = nospec::index_mask(rel, L1_DOUBLE * F2);
+            let rel = rel & in_range;
+            let dir2 = self.double[rel / F2].load(Ordering::Acquire);
+            // SAFETY: see above.
+            let page = unsafe {
+                let dir = load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT);
+                load_entry(dir, rel % DIR_FANOUT)
+            };
+            nospec::select_ptr(in_range, page, sentinel_leaf())
+        }
+        else
+        {
+            // Bounded by the ceiling, not the region's span: no leaf at or
+            // past MAX_LEAVES is ever grown, and the const assert beside
+            // `DirPage` keeps the root index inside `triple`.
+            let rel = leaf_idx.wrapping_sub(TRIPLE_BASE);
+            let in_range = nospec::index_mask(rel, MAX_LEAVES - TRIPLE_BASE);
+            let rel = rel & in_range;
+            let dir3 = self.triple[rel / F3].load(Ordering::Acquire);
+            // SAFETY: see above.
+            let page = unsafe {
+                let dir2 = load_entry(dir3, (rel / F2) % DIR_FANOUT);
+                let dir = load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT);
+                load_entry(dir, rel % DIR_FANOUT)
+            };
             nospec::select_ptr(in_range, page, sentinel_leaf())
         }
     }
@@ -706,9 +1055,13 @@ impl CSpace
     }
 
     /// Pool pages a grow to cover `index`'s leaf would consume: the
-    /// missing leaves plus the missing directory pages over that span.
-    /// Zero when the covering leaf already exists; also zero for an
-    /// out-of-range index (the placement path rejects it instead).
+    /// missing leaves plus the missing directory pages over that span, at
+    /// every level. Zero when the covering leaf already exists; also zero for
+    /// an out-of-range index (the placement path rejects it instead).
+    ///
+    /// Growth is contiguous, so over the span only the directory pages above
+    /// the next leaf can already exist (published by a grow that then failed
+    /// lower down); the count is arithmetic per level, with one probe each.
     ///
     /// Callers use this to fail a doomed explicit placement fast, before
     /// any pool page is consumed.
@@ -720,21 +1073,24 @@ impl CSpace
         {
             return 0;
         }
-        let leaves = (target_leaf + 1 - next) as u64;
-        let mut dirs = 0u64;
-        if target_leaf >= L1_DIRECT
+        let mut pages = (target_leaf + 1 - next) as u64;
+        for (base, end, depth) in DEEP_REGIONS
         {
-            let first = (next.max(L1_DIRECT) - L1_DIRECT) / DIR_FANOUT;
-            let last = (target_leaf - L1_DIRECT) / DIR_FANOUT;
-            for d in first..=last
+            let first = next.max(base);
+            let last = target_leaf.min(end - 1);
+            if first > last
             {
-                if self.indirect[d].load(Ordering::Relaxed) == sentinel_dir()
-                {
-                    dirs += 1;
-                }
+                continue;
+            }
+            for level in 1..=depth
+            {
+                let span = DIR_FANOUT.pow(level);
+                let spanned = (last - base) / span - (first - base) / span + 1;
+                let present = usize::from(self.dir_exists(first, level));
+                pages += (spanned - present) as u64;
             }
         }
-        leaves + dirs
+        pages
     }
 
     /// Grow toward covering `index`'s leaf, materialising at most
@@ -1173,29 +1529,85 @@ impl Drop for CSpace
                         unsafe { drop(Box::from_raw(p)) };
                     }
                 }
+                // Every non-sentinel entry came from Box::into_raw via
+                // alloc_zeroed_page's heap branch (the `free_*` contract).
                 for entry in &self.indirect
                 {
-                    let dir = entry.swap(sentinel_dir(), Ordering::AcqRel);
-                    if dir == sentinel_dir()
+                    // SAFETY: see above.
+                    unsafe { free_dir_leaves(entry.swap(sentinel_dir(), Ordering::AcqRel)) };
+                }
+                for entry in &self.double
+                {
+                    // SAFETY: see above.
+                    unsafe { free_dir_level2(entry.swap(sentinel_dir2(), Ordering::AcqRel)) };
+                }
+                for entry in &self.triple
+                {
+                    let dir3 = entry.swap(sentinel_dir3(), Ordering::AcqRel);
+                    if dir3 == sentinel_dir3()
                     {
                         continue;
                     }
-                    // SAFETY: dir came from Box::into_raw; its entries hold
-                    // leaf pages from the same heap branch.
+                    // SAFETY: see above.
                     unsafe {
-                        for leaf in &(*dir).entries
+                        for e in &(*dir3).entries
                         {
-                            let p = leaf.swap(sentinel_leaf(), Ordering::AcqRel);
-                            if p != sentinel_leaf()
-                            {
-                                drop(Box::from_raw(p));
-                            }
+                            free_dir_level2(e.swap(sentinel_dir2(), Ordering::AcqRel));
                         }
-                        drop(Box::from_raw(dir));
+                        drop(Box::from_raw(dir3));
                     }
                 }
             }
         }
+    }
+}
+
+/// Host-test heap reclaim of a level-1 directory page and its leaves; a
+/// sentinel is left alone.
+///
+/// # Safety
+/// `dir` and every non-sentinel entry came from `Box::into_raw` and are
+/// owned by the dropping `CSpace`.
+#[cfg(test)]
+unsafe fn free_dir_leaves(dir: *mut DirLeaves)
+{
+    if dir == sentinel_dir()
+    {
+        return;
+    }
+    // SAFETY: the caller's contract.
+    unsafe {
+        for leaf in &(*dir).entries
+        {
+            let p = leaf.swap(sentinel_leaf(), Ordering::AcqRel);
+            if p != sentinel_leaf()
+            {
+                drop(Box::from_raw(p));
+            }
+        }
+        drop(Box::from_raw(dir));
+    }
+}
+
+/// Host-test heap reclaim of a level-2 directory page and everything under
+/// it; a sentinel is left alone.
+///
+/// # Safety
+/// As [`free_dir_leaves`].
+#[cfg(test)]
+unsafe fn free_dir_level2(dir: *mut DirLevel2)
+{
+    if dir == sentinel_dir2()
+    {
+        return;
+    }
+    // SAFETY: the caller's contract.
+    unsafe {
+        for e in &(*dir).entries
+        {
+            free_dir_leaves(e.swap(sentinel_dir(), Ordering::AcqRel));
+        }
+        drop(Box::from_raw(dir));
     }
 }
 
@@ -1479,7 +1891,7 @@ mod tests
     #[test]
     fn structural_ceiling_returns_out_of_slots()
     {
-        // Filling all 3.6M slots is not host-viable (~257 MiB of pages);
+        // Filling all 4.29G slots is not host-viable (~290 GiB of pages);
         // force the grow cursor to the ceiling instead — with an empty free
         // list, the next allocation's grow must fail with the structural
         // OutOfSlots, not PoolExhausted.
@@ -1828,6 +2240,20 @@ mod tests
                 .all(|e| e.load(Ordering::Relaxed) == sentinel_leaf()),
             "sentinel directory written"
         );
+        assert!(
+            SENTINEL_DIR2
+                .entries
+                .iter()
+                .all(|e| e.load(Ordering::Relaxed) == sentinel_dir()),
+            "level-2 sentinel directory written"
+        );
+        assert!(
+            SENTINEL_DIR3
+                .entries
+                .iter()
+                .all(|e| e.load(Ordering::Relaxed) == sentinel_dir2()),
+            "level-3 sentinel directory written"
+        );
     }
 
     #[test]
@@ -1899,9 +2325,170 @@ mod tests
         let mut cs = CSpace::new(0);
         cs.allocate_slot().unwrap();
         assert_ne!(cs.leaf_ptr(0), sentinel_leaf());
-        for leaf in [1, L1_DIRECT, MAX_LEAVES, MAX_LEAVES + 1, usize::MAX]
+        for leaf in [
+            1,
+            L1_DIRECT,
+            DOUBLE_BASE - 1,
+            DOUBLE_BASE,
+            TRIPLE_BASE - 1,
+            TRIPLE_BASE,
+            MAX_LEAVES - 1,
+            MAX_LEAVES,
+            MAX_LEAVES + 1,
+            GEOMETRY_LEAVES,
+            usize::MAX,
+        ]
         {
             assert_eq!(cs.leaf_ptr(leaf), sentinel_leaf(), "leaf {leaf}");
         }
+    }
+
+    /// Pool pages a grow from leaf `from` (the cursor forced there, as if
+    /// every leaf below it existed) to cover `index` consumes, read from the
+    /// host stub's page budget, and the `pages_to_cover` taken before it.
+    fn measured_cover(from: usize, index: u32) -> (u64, u64)
+    {
+        let mut cs = CSpace::new(0);
+        cs.next_leaf = from as u32;
+        let budget = 1 << 20;
+        cs.set_test_page_budget(budget);
+        let predicted = cs.pages_to_cover(index);
+        assert_eq!(cs.grow_toward(index, usize::MAX), Ok(true));
+        let left = cs.test_page_budget.unwrap();
+        (predicted, (budget - left) as u64)
+    }
+
+    #[test]
+    fn pages_to_cover_matches_the_pages_every_region_crossing_spends()
+    {
+        let slot = |leaf: usize| (leaf * L2_SIZE) as u32;
+        let cases = [
+            // Within the indirect region, across a level-1 page boundary.
+            (
+                INDIRECT_BASE + DIR_FANOUT - 2,
+                slot(INDIRECT_BASE + DIR_FANOUT + 1),
+            ),
+            // Into the double region: its level-2 and level-1 pages.
+            (DOUBLE_BASE - 2, slot(DOUBLE_BASE + 1)),
+            // Within the double region, across a level-1 page boundary.
+            (DOUBLE_BASE + DIR_FANOUT - 1, slot(DOUBLE_BASE + DIR_FANOUT)),
+            // Across a level-2 page boundary of the double region.
+            (
+                DOUBLE_BASE + DIR_FANOUT * DIR_FANOUT - 1,
+                slot(DOUBLE_BASE + DIR_FANOUT * DIR_FANOUT),
+            ),
+            // Into the triple region: all three of its levels.
+            (TRIPLE_BASE - 2, slot(TRIPLE_BASE + DIR_FANOUT + 2)),
+            // The last leaf under the ceiling.
+            (MAX_LEAVES - 3, (MAX_SLOTS_STRUCTURAL - 1) as u32),
+        ];
+        for (from, index) in cases
+        {
+            let (predicted, spent) = measured_cover(from, index);
+            assert_eq!(predicted, spent, "grow from leaf {from} to index {index}");
+        }
+    }
+
+    #[test]
+    fn deep_region_slots_round_trip_and_lookups_stay_in_their_leaf()
+    {
+        let obj = dummy_object();
+        for base in [DOUBLE_BASE, TRIPLE_BASE, MAX_LEAVES - 1]
+        {
+            let mut cs = CSpace::new(0);
+            cs.next_leaf = base as u32;
+            let index = (base * L2_SIZE + 5) as u32;
+            cs.insert_cap_at(index, CapTag::Memory, MemRights::MAP.erase(), obj)
+                .unwrap_or_else(|e| panic!("placement at leaf {base} failed: {e:?}"));
+            assert_eq!(cs.slot(index).and_then(|s| s.object), Some(obj));
+            assert!(
+                cs.slot(index - 6).is_none(),
+                "the leaf below {base} resolved"
+            );
+            assert!(
+                cs.slot(((base + 1) * L2_SIZE) as u32).is_none(),
+                "the leaf above {base} resolved"
+            );
+            assert_eq!(cs.populated_count(), 1);
+        }
+        assert_sentinels_pristine();
+    }
+
+    #[test]
+    fn the_ceiling_is_the_last_whole_leaf_of_the_index_field()
+    {
+        let obj = dummy_object();
+        let mut cs = CSpace::new(0);
+        cs.next_leaf = (MAX_LEAVES - 1) as u32;
+        let last = (MAX_SLOTS_STRUCTURAL - 1) as u32;
+        assert_eq!(
+            cs.insert_cap_at(last, CapTag::Memory, MemRights::MAP.erase(), obj),
+            Ok(())
+        );
+        for past in [MAX_SLOTS_STRUCTURAL as u32, u32::MAX]
+        {
+            assert_eq!(
+                cs.insert_cap_at(past, CapTag::Memory, MemRights::MAP.erase(), obj),
+                Err(CapError::InvalidIndex)
+            );
+            assert!(
+                cs.slot(past).is_none(),
+                "index {past} past the ceiling resolved"
+            );
+        }
+        // The last leaf's other slots are free; past them the directory is
+        // structurally full.
+        while cs.allocate_transfer_slot().is_ok()
+        {}
+        assert_eq!(cs.allocate_transfer_slot(), Err(CapError::OutOfSlots));
+    }
+
+    #[test]
+    fn pages_to_cover_counts_published_double_region_directories_once()
+    {
+        // A grow at the double region's first leaf that runs out after the
+        // level-2 page leaves it published: the next cover counts only the
+        // level-1 page and the leaf.
+        let mut cs = CSpace::new(0);
+        cs.next_leaf = DOUBLE_BASE as u32;
+        let index = (DOUBLE_BASE * L2_SIZE) as u32;
+        assert_eq!(cs.pages_to_cover(index), 3);
+        cs.set_test_page_budget(1);
+        assert_eq!(cs.grow_toward(index, 1), Err(CapError::PoolExhausted));
+        assert_eq!(cs.pages_to_cover(index), 2);
+        cs.set_test_page_budget(2);
+        assert_eq!(cs.grow_toward(index, 1), Ok(true));
+        // From under live level-1 and level-2 pages, a span into the next
+        // level-1 page counts its leaves and that one page, as the grow spends.
+        let far = ((DOUBLE_BASE + DIR_FANOUT + 1) * L2_SIZE) as u32;
+        let predicted = cs.pages_to_cover(far);
+        assert_eq!(predicted, (DIR_FANOUT + 2) as u64);
+        let budget = 1 << 20;
+        cs.set_test_page_budget(budget);
+        assert_eq!(cs.grow_toward(far, usize::MAX), Ok(true));
+        assert_eq!(predicted, (budget - cs.test_page_budget.unwrap()) as u64);
+    }
+
+    #[test]
+    fn deep_directory_pages_survive_a_failed_leaf_and_are_not_recharged()
+    {
+        // At the first triple-region leaf a grow buys three directory pages
+        // and the leaf. With only the three, the leaf fails; the pages stay
+        // published, so one more page completes the grow.
+        let mut cs = CSpace::new(0);
+        cs.next_leaf = TRIPLE_BASE as u32;
+        let index = (TRIPLE_BASE * L2_SIZE) as u32;
+        assert_eq!(cs.pages_to_cover(index), 4);
+        cs.set_test_page_budget(3);
+        assert_eq!(cs.grow_toward(index, 1), Err(CapError::PoolExhausted));
+        assert_eq!(
+            cs.pages_to_cover(index),
+            1,
+            "a published directory page was re-counted"
+        );
+        assert!(cs.slot(index).is_none());
+        cs.set_test_page_budget(1);
+        assert_eq!(cs.grow_toward(index, 1), Ok(true));
+        assert!(cs.slot(index).is_some());
     }
 }

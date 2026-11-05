@@ -89,7 +89,7 @@ fn choose_image_bias_or_default() -> u64
 /// plain `&str`; no `core::fmt` in the `no_std` bootstrap path). The 96-byte
 /// buffer is a diagnostic output cap: a longer prefix truncates and nothing
 /// else is bounded.
-fn log_hex(prefix: &str, value: u64)
+pub(crate) fn log_hex(prefix: &str, value: u64)
 {
     let mut buf = [0u8; 96];
     let prefix_len = prefix.len().min(buf.len() - 18);
@@ -144,12 +144,77 @@ fn retype_reserve_pages() -> u64
     crate::ASPACE_RETYPE_PAGES + crate::CSPACE_RETYPE_PAGES + crate::thread_retype_pages()
 }
 
+/// Bodies init's own `CSpace` arena backs after [`fund_own_cspace`] besides
+/// one per MMIO aperture: the split tails of the three `MemoryAlloc` carves
+/// that follow init's own arena's (memmgr's and procmgr's arenas and the
+/// phys-table page), the two children of the `SchedControl` split, and the
+/// derivations of the root `Interrupt` cap and, on x86-64, of the root
+/// `IoPort` cap that init serves devmgr. Fixed by init's own code; the
+/// aperture derivations scale with the hardware and are counted from
+/// `InitInfo` ([`init_cspace_fund_pages`]).
+const INIT_FIXED_BODIES: u64 = 3 + 2 + 2;
+
+/// Pool pages init donates to its own `CSpace` before it makes any body or
+/// binds any port (core/kernel/docs/capability-internals.md § Body Arena):
+///
+/// * one arena page per [`syscall_abi::CSPACE_BODIES_PER_PAGE`] bodies: one
+///   per `Mmio` descriptor, each derived for devmgr, plus
+///   [`INIT_FIXED_BODIES`];
+/// * when the kernel minted an `IoPort` cap (x86-64), the port-binding tables
+///   of init's main thread (its serial output) and of init-logd,
+///   [`syscall_abi::IOPORT_BINDING_TABLE_PAGES`] each;
+/// * one page for a directory page the `CSpace`'s slot growth may spend, as
+///   `syscall_abi::cspace_topup_pages` counts one.
+///
+/// The kernel seeds the root `CSpace` with the slots init uses and only the
+/// one arena page its arena carve's split spends before this donation
+/// (`ROOT_CSPACE_BODY_PAGES`, core/kernel/src/cap/mod.rs), so these counts
+/// come from this boot's `InitInfo`, not from a fixed seed.
+pub(crate) fn init_cspace_fund_pages(info: &InitInfo) -> u64
+{
+    let apertures = crate::descriptors(info)
+        .iter()
+        .filter(|d| d.cap_type == init_protocol::CapType::Mmio)
+        .count() as u64;
+    let body_pages = (apertures + INIT_FIXED_BODIES).div_ceil(syscall_abi::CSPACE_BODIES_PER_PAGE);
+    let binding_pages = if crate::find_cap_by_type(info, init_protocol::CapType::IoPort).is_some()
+    {
+        2 * syscall_abi::IOPORT_BINDING_TABLE_PAGES
+    }
+    else
+    {
+        0
+    };
+    body_pages + binding_pages + 1
+}
+
+/// Donate [`init_cspace_fund_pages`] pages of `arena_cap`'s front to init's
+/// own `CSpace` (augment-mode `cap_create_cspace`). The pages come out of the
+/// arena's front reserve ([`init_retype_reserve_pages`]), so they are
+/// accounted with the arena that `finalize_memmgr` forwards to memmgr as an
+/// in-use run and stay parked there after init's reap returns them, as no
+/// other donation source would be: a split-off run donated here would reach
+/// memmgr's pool through the reap donation while its pages were still retyped
+/// into this `CSpace`.
+///
+/// # Errors
+/// The kernel's refusal of the augment, as `cap_create_cspace` returns it:
+/// `OutOfMemory` when the arena's front cannot back the pages (a reserve too
+/// small for them), or the error of a bad cap or `CSpace` handle.
+pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> Result<(), i64>
+{
+    syscall::cap_create_cspace(arena_cap, info.cspace_cap, init_cspace_fund_pages(info)).map(|_| ())
+}
+
 /// Front region of init's own arena reserved for its kernel-object retypes.
 ///
 /// Unlike a tier-1 service, init retypes only endpoints (byte-granular) and
-/// one log thread from this arena; it reuses the kernel-supplied
-/// `AddressSpace`/`CSpace` rather than creating its own. The reserve is:
+/// one log thread from this arena, besides its own `CSpace`'s fund; it reuses
+/// the kernel-supplied `AddressSpace`/`CSpace` rather than creating its own.
+/// The reserve is:
 ///
+/// * [`init_cspace_fund_pages`] for the donation [`fund_own_cspace`] makes
+///   first, page-granular,
 /// * 1 page for endpoints created before the log-thread retype (the retype
 ///   allocator packs ~32 endpoints per page; init creates well under that),
 /// * [`crate::thread_retype_pages`] (seven or more) for the log thread, which
@@ -162,9 +227,9 @@ fn retype_reserve_pages() -> u64
 /// Sound for up to ~32 endpoints on each side of the log-thread retype; init
 /// creates roughly a dozen total. [`finalize_memmgr`] asserts the front bump
 /// never crossed this bound before forwarding the arena.
-pub(crate) fn init_retype_reserve_pages() -> u64
+pub(crate) fn init_retype_reserve_pages(info: &InitInfo) -> u64
 {
-    1 + crate::thread_retype_pages() + 1
+    init_cspace_fund_pages(info) + 1 + crate::thread_retype_pages() + 1
 }
 
 /// A service's contiguous backing arena: one Memory cap plus a page cursor
@@ -1047,11 +1112,12 @@ fn cspace_general_headroom(cspace: u64) -> u64
 /// Assert init's arena retype front never crossed its reserve into the
 /// offset-mapped backing region. init's endpoint and log-thread retypes bump a
 /// monotonic cursor through the front; the backing was offset-mapped at
-/// `init_retype_reserve_pages()`. `available` is the arena's un-retyped byte
-/// count, so a front bump past the reserve shows up as a consumed span larger
-/// than the reserve. Endpoints created after `finalize_memmgr` (devmgr/vfsd
-/// registries, phase 3) stay within the reserve's documented headroom.
-fn assert_init_arena_front_bounded(init_arena_cap: u64)
+/// `init_retype_reserve_pages(info)`. `available` is the arena's un-retyped
+/// byte count, so a front bump past the reserve shows up as a consumed span
+/// larger than the reserve. Endpoints created after `finalize_memmgr`
+/// (devmgr/vfsd registries, phase 3) stay within the reserve's documented
+/// headroom.
+fn assert_init_arena_front_bounded(info: &InitInfo, init_arena_cap: u64)
 {
     if let (Ok(size), Ok(available)) = (
         syscall::cap_info(init_arena_cap, syscall::CAP_INFO_MEMORY_SIZE),
@@ -1060,7 +1126,7 @@ fn assert_init_arena_front_bounded(init_arena_cap: u64)
     {
         let front_bump = size.saturating_sub(available);
         assert!(
-            front_bump <= init_retype_reserve_pages() * PAGE_SIZE,
+            front_bump <= init_retype_reserve_pages(info) * PAGE_SIZE,
             "init: arena retype front overran its reserve into backing",
         );
     }
@@ -1227,7 +1293,7 @@ pub fn finalize_memmgr(
         }
     }
 
-    assert_init_arena_front_bounded(init_arena_cap);
+    assert_init_arena_front_bounded(info, init_arena_cap);
 
     // SAFETY: the thread is bound to the service's own address space, never
     // init's, so its entry state touches nothing init runs on.

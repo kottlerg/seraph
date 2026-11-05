@@ -206,8 +206,9 @@ boot-module ELF sources) in further `REGISTER_INIT_TEARDOWN` rounds, sends
 (RSDP/ACPI/DTB) are excluded; the usable-RAM tail init did not forward in
 memmgr's bootstrap round and the free remainders `MemoryAlloc` abandoned while
 carving bootstrap arenas are donated with the set above. init's own
-bootstrap backing — its endpoint and log-thread retype slabs plus the
-offset-mapped IPC buffer and log-thread stack/IPC — is not in this set:
+bootstrap backing — its own `CSpace`'s fund, its endpoint and log-thread
+retype slabs, and the offset-mapped IPC buffer and log-thread stack/IPC — is
+not in this set:
 it lives in a single contiguous arena Memory cap that init forwards to
 memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
 are already accounted in memmgr's pool and never reach the reap route.
@@ -441,8 +442,8 @@ A process dies when:
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent
 syscall is still using is freed only once that syscall is done with it, and a stopped thread's
 teardown reaches the IPC source it was parked on only while that source is live (see
-[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix and
+[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
+§ Storage: Hybrid Radix Directory and
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
 § `dealloc_object(Thread)` Drain Protocol, step 11); a waker that claimed the thread (device IRQ
 delivery, fault delivery, a death post) keeps that source live until its wake completes.

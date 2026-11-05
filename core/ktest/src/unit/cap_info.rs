@@ -650,7 +650,7 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
 /// settles at `3 × S − 1` (slot 0 reserved) with `used == 1`. An
 /// augment-mode donation of 2 pages raises capacity by `2 × S`. The page
 /// and slot arithmetic follows core/kernel/docs/capability-internals.md
-/// § Page Pools, § Representation, and § Storage: Hybrid Two-Level Radix.
+/// § Page Pools, § Representation, and § Storage: Hybrid Radix Directory.
 pub fn cspace_fields(ctx: &TestContext) -> TestResult
 {
     // Slots per leaf page: the kernel's `L2_SIZE`, published in the ABI.

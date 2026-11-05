@@ -69,22 +69,11 @@ const _: () = assert!(INDIRECT_SLOT_INDEX >> 32 == 0);
 #[allow(clippy::cast_possible_truncation)]
 const INDIRECT_SLOT: u32 = INDIRECT_SLOT_INDEX as u32;
 
-/// Pool pages a `CSpace` with no grown leaf spends to cover slot `index`:
-/// every leaf through the covering one (`CSPACE_SLOTS_PER_PAGE` slots each,
-/// the kernel's `L2_SIZE`), plus the directory pages above the direct
-/// region. Mirrors the kernel's `CSpace::pages_to_cover` from leaf 0.
+/// Pool pages a `CSpace` with no grown leaf spends to cover slot `index`
+/// (`crate::cspace_geometry::pages_to_cover`).
 fn pages_to_cover(index: u32) -> u64
 {
-    let leaf = u64::from(index) / syscall_abi::CSPACE_SLOTS_PER_PAGE;
-    let dirs = if leaf >= DIRECT_LEAVES
-    {
-        (leaf - DIRECT_LEAVES) / DIR_FANOUT + 1
-    }
-    else
-    {
-        0
-    };
-    leaf + 1 + dirs
+    crate::cspace_geometry::pages_to_cover(u64::from(index))
 }
 
 /// VA of the machine-code stub inside each dedicated child address space.
@@ -1019,6 +1008,81 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     if after != baseline
     {
         return Err("retype::indirect: slab not fully reclaimed on delete");
+    }
+    Ok(())
+}
+
+/// The double-indirect region works end to end, memory permitting: an
+/// explicit placement at slot 4,000,000, past 3,677,184 slots and past the
+/// region's first level-1 directory page, grows every leaf below it and the
+/// directory pages above them at every level, spending
+/// exactly `pages_to_cover` pages of a pool funded with that many; a second
+/// placement there is refused as occupied; and the wholesale delete returns
+/// the source Memory to its baseline. A source cap without the headroom
+/// (about 280 MiB) skip-passes.
+pub fn cspace_double_indirect_region(ctx: &TestContext) -> TestResult
+{
+    const PAGE: u64 = syscall_abi::PAGE_SIZE;
+    const DEEP_SLOT: u32 = 4_000_000;
+    const _: () = assert!(
+        DEEP_SLOT as u64 / syscall_abi::CSPACE_SLOTS_PER_PAGE
+            >= crate::cspace_geometry::DOUBLE_BASE + crate::cspace_geometry::DIR_FANOUT
+    );
+    const _: () = assert!(
+        (DEEP_SLOT as u64)
+            < crate::cspace_geometry::TRIPLE_BASE * syscall_abi::CSPACE_SLOTS_PER_PAGE
+    );
+    let pool_pages = pages_to_cover(DEEP_SLOT);
+
+    let memory = ctx.memory_base;
+    let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::double: cap_info(baseline) failed")?;
+    if baseline <= (pool_pages + 4096) * PAGE
+    {
+        crate::log("ktest: retype::cspace_double_indirect_region SKIP (low memory)");
+        return Ok(());
+    }
+    let probe = cap_create_notification(memory)
+        .map_err(|_| "retype::double: cap_create_notification failed")?;
+    // init_pages = 1: the wrapper alone, so the pool is exactly the donation.
+    let Ok(cspace) = cap_create_cspace(memory, 0, 1)
+    else
+    {
+        cap_delete(probe).ok();
+        return Err("retype::double: cap_create_cspace failed");
+    };
+    let placed = cap_create_cspace(memory, cspace, pool_pages)
+        .map_err(|_| "retype::double: augment failed")
+        .and_then(|_| {
+            cap_insert(probe, cspace, DEEP_SLOT, RIGHTS_NTF_NOTIFY)
+                .map_err(|_| "retype::double: cap_insert(DEEP_SLOT) failed")
+        });
+    let used = cap_info(cspace, CAP_INFO_CSPACE_USED);
+    let budget = cap_info(cspace, CAP_INFO_CSPACE_BUDGET);
+    let occupied = cap_insert(probe, cspace, DEEP_SLOT, RIGHTS_NTF_NOTIFY).is_err();
+
+    let cspace_deleted = cap_delete(cspace);
+    let probe_deleted = cap_delete(probe);
+    placed?;
+    cspace_deleted.map_err(|_| "retype::double: cap_delete(cspace) failed")?;
+    probe_deleted.map_err(|_| "retype::double: cap_delete(probe) failed")?;
+    if used != Ok(1)
+    {
+        return Err("retype::double: CSPACE_USED is not the one placement");
+    }
+    if budget != Ok(0)
+    {
+        return Err("retype::double: the placement did not spend exactly pages_to_cover pages");
+    }
+    if !occupied
+    {
+        return Err("retype::double: re-placement at an occupied deep slot succeeded");
+    }
+    let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::double: cap_info(after) failed")?;
+    if after != baseline
+    {
+        return Err("retype::double: slab not fully reclaimed on delete");
     }
     Ok(())
 }

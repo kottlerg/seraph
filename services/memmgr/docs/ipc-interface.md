@@ -554,10 +554,11 @@ stacks grow contiguously, so a chunk's pages are consumed as the stack
 descends. Every other case — non-VM fault, unknown process, address outside
 every region, a write to a region without `MAP_WRITABLE` or an instruction
 fetch from one without `MAP_EXECUTABLE` (which no backing satisfies), no
-delegated AS, or any allocation/map failure — replies `FAULT_REPLY_KILL`. Demand chunks are tracked exactly like
-`REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED` / `UNREGISTER_REGION`
-reclaim them and the all-RAM-accounted identity is unaffected (the pages move
-from a free run to the process record; they were already owned).
+delegated AS, or any allocation/map failure — replies `FAULT_REPLY_KILL`.
+Demand chunks are tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so
+`PROCESS_DIED` / `UNREGISTER_REGION` reclaim them and the all-RAM-accounted
+identity is unaffected (the pages move from a free run to the process record;
+they were already owned).
 
 ---
 

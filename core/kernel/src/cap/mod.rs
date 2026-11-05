@@ -339,10 +339,9 @@ const ROOT_CSPACE_BOOT_EXTRA_SLOTS: u64 = 4;
 /// SEED pages (~257 MiB: 65,664 leaves plus 128 directory pages) for a
 /// `CSpace` whose occupancy peaks at boot and is bounded in steady state.
 /// Growth past the seeded pool returns the refillable `OutOfMemory`. init
-/// never augments this `CSpace`; it budgets its own use inside the pool: it
-/// stops its forward of RAM caps to memmgr at `INIT_FORWARD_HEADROOM` general
-/// slots, a reserve sized for what it mints after the forward
-/// (services/init/src/bootstrap.rs), and hands the rest over at its reap.
+/// never augments this `CSpace`; its own use fits inside the pool, since its
+/// forward of RAM caps to memmgr moves them out and takes none of its slots
+/// (services/init/src/bootstrap.rs).
 #[cfg(not(test))]
 fn root_cspace_init_slot_capacity() -> u64
 {

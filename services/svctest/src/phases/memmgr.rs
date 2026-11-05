@@ -226,7 +226,7 @@ fn memmgr_call(msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
 }
 
 /// Request a one-page grant from memmgr: `(grant cap, physical base)`.
-fn request_one_page() -> (u64, u64)
+pub(crate) fn request_one_page() -> (u64, u64)
 {
     let want = 1 | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -247,7 +247,7 @@ fn request_one_page() -> (u64, u64)
 }
 
 /// Drop the grant cap and hand its region back to memmgr.
-fn release_one_page(grant: u64, phys_base: u64)
+pub(crate) fn release_one_page(grant: u64, phys_base: u64)
 {
     syscall::cap_delete(grant).expect("cap_delete of grant");
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
@@ -644,7 +644,7 @@ const RECLAIM_HAND_BADGE: u64 = 0x5702;
 const RECLAIM_STOP_BADGE: u64 = 0x5701;
 
 /// memmgr's deferred total (`QUERY_POOL_STATUS` `data[4]`), in bytes.
-fn deferred_bytes() -> u64
+pub(crate) fn deferred_bytes() -> u64
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
     let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
@@ -658,7 +658,7 @@ fn deferred_bytes() -> u64
 
 /// Make memmgr recheck its deferred list: a `RELEASE_MEMORY_CAPS` naming no
 /// grant releases nothing and only rechecks.
-fn recheck_deferred()
+pub(crate) fn recheck_deferred()
 {
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
         .word(0, 0)
@@ -679,7 +679,7 @@ fn recheck_deferred()
 /// the total counts as settled only after [`SETTLE_QUIET`] rechecks in a row
 /// leave it unlowered: enough to cycle a list of `SETTLE_QUIET` batches of
 /// runs, far past what a svctest boot defers.
-fn settled_deferred_bytes() -> u64
+pub(crate) fn settled_deferred_bytes() -> u64
 {
     // A test wait bound: it limits only how many rechecks the settle takes.
     const MAX_SETTLE: u32 = 256;
@@ -705,7 +705,7 @@ const SETTLE_QUIET: u32 = 8;
 
 /// Trigger rechecks until memmgr's deferred total falls to `target` bytes or
 /// below; panics with `what` when it does not within the poll bound.
-fn await_deferred_at_most(target: u64, what: &str)
+pub(crate) fn await_deferred_at_most(target: u64, what: &str)
 {
     // A test wait bound: it limits only how long the phase polls before it
     // fails. One recheck examines every run of a short deferred list.

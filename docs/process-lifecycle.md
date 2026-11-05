@@ -466,8 +466,9 @@ away immediately after the post; it does **not** post to the address-space death
 for terminal faults), because doing so on every clean exit would dereference the address space after
 procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
 sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
-the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
-wherever their thread caps are held) and reaped
+the process's `CSpace` or `AddressSpace` (every thread bound to either is stopped before its
+storage is reclaimed, wherever their thread caps are held; for a held child, which keeps its
+`CSpace` until the release in step 2, the `AddressSpace` deletion stops them) and reaped
 through their own thread caps.
 `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
 encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
@@ -493,11 +494,16 @@ The death-notification flow:
    [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)
    § Label 4). For a child created with `CREATE_DMA_HOLD` that was started,
    procmgr holds this step back after the teardown, however the child died,
-   until the creator sends `RELEASE_HOLD` on the child's process handle; until
-   then memmgr keeps the child's frames on its record, out of the free pool,
-   and a creator that never releases leaves them there for the rest of the
-   boot. devmgr creates every DMA-capable driver so, and releases the hold only
-   once it has confirmed the driver's device stopped its DMA (see
+   and keeps the child's `CSpace`, with every capability the child held, while
+   the teardown stops the child's threads, until the creator sends
+   `RELEASE_HOLD` on the child's release token, the create reply's third cap,
+   on which alone procmgr serves it; the release deletes the `CSpace`, then
+   sends `PROCESS_DIED`. Until then memmgr keeps the child's frames on its
+   record, out of the free pool, and a frame the child held a capability to
+   (one a client lent it) on its deferred list; a creator that never releases
+   leaves them there for the rest of the boot. devmgr creates every
+   DMA-capable driver so, and releases the hold only once it has confirmed the
+   driver's device stopped its DMA (see
    [device-management.md](device-management.md#dma-safe-teardown)
    § DMA-Safe Teardown and
    [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#label-3-release_hold)
@@ -525,8 +531,9 @@ The death-notification flow:
    § `REGISTER_DEATH_EQ`).
 
 Memory caps the dead process held in its CSpace become unreachable when
-procmgr's teardown revokes and deletes the child's `CSpace`; a copy the
-process moved or derived into another `CSpace` outlives it. Memmgr's
+procmgr's teardown revokes and deletes the child's `CSpace`, or, for a held
+child, when the release deletes it; a copy the process moved or derived into
+another `CSpace` outlives it. Memmgr's
 intermediary derivations (retained at allocation time
 per the derive-twice pattern) are unaffected and are what the
 reclamation step inserts back into the free pool.

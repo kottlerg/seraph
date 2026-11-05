@@ -212,7 +212,13 @@ address devmgr returned, and unmaps it once the request completed or, for a
 lost request, once the device is quiesced, before it replies. Each transfer
 therefore makes two calls to devmgr's DMA thread besides the device's own
 work. The Memory cap is moved back to the caller in every reply, so it never
-accumulates in the driver's `CSpace`.
+accumulates in the driver's `CSpace`; a reply the caller cannot take (the caller
+died, or its `CSpace` is full) leaves the cap with the driver, which then deletes
+it, since the transfer is over and the reference would otherwise keep the frame
+out of memmgr's pool for the boot. While the driver holds the cap, memmgr keeps
+the frame out of its pool even when the client releases it or dies
+([docs/device-management.md](../../../../docs/device-management.md#dma-safe-teardown)
+§ DMA-Safe Teardown).
 
 The driver keeps one request in flight and waits for the completion of
 that chain, polling and parking on the completion notification, for at most
@@ -237,8 +243,10 @@ buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies `DEVICE_FAULT` with
 and fails stop: every later read or write is answered `DEVICE_FAULT` with its cap moved back, so
 clients see an error rather than block on an endpoint nobody serves. A device that does not
 acknowledge the reset within a bounded poll may still be transferring (the driver waits up to five
-seconds on the monotonic clock), so the driver logs and exits without replying; the cap is destroyed
-with the driver's `CSpace` instead of returning to a caller who could reuse the memory.
+seconds on the monotonic clock), so the driver logs and exits without replying; the cap stays in the
+driver's `CSpace`, which procmgr keeps for the dead driver until devmgr has confirmed the device
+stopped and released the driver's hold, instead of returning to a caller who could reuse the
+memory, so memmgr returns the frame to its pool only after that release.
 
 The notify-after-avail-update memory-ordering pair (release fence on the
 producer, the device's implicit load-acquire on the doorbell MMIO)

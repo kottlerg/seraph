@@ -66,8 +66,9 @@ spawn target:
   `undeliverable-reply-child`, ones whose reply cannot be delivered), and spawns it to check
   that procmgr still serves after the refusals.
 - `procmgr_dma_hold_phase` creates it through raw `CREATE_FROM_FILE` with `CREATE_DMA_HOLD`,
-  destroys one child before its start and starts another to its exit, and checks that procmgr
-  holds the started child's pages until `RELEASE_HOLD`.
+  destroys one child before its start and starts others to their exit, one lent a frame as its
+  root cap, and checks that procmgr holds the started child's pages, and the lent frame, until
+  `RELEASE_HOLD` on the child's release token.
 - `pipes_phase` (`services/svctest/src/phases/pipes.rs`) captures its stdout through a pipe
   and through `Command::output()`, and expects bytes and a clean exit.
 

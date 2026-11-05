@@ -25,11 +25,13 @@
 //! withdraw it (`UNMAP`) before it deletes the cap; an unconfined device's
 //! device address is its frames' physical address. The table is shared with
 //! the registry loop, which withdraws a device's grant
-//! ([`DmaGrant::withdraw`], which blocks a confined device in the IOMMU);
-//! either thread holds its lock only around table operations, never across
-//! IPC, and a mapping is pending in the table while its IOMMU call is in
-//! flight, so a withdrawal meanwhile neither races the commit nor deletes the
-//! cap the call carries. See `docs/device-management.md` § DMA Authorisation.
+//! ([`DmaGrant::withdraw`], which blocks a confined device in the IOMMU and
+//! hands back the Memory caps of the device's standing mappings, deleted only
+//! once the device can no longer reach them: [`Withdrawal`]). Either thread
+//! holds its lock only around table operations, never across an IPC of its
+//! own (a table operation's heap growth may call memmgr), and a mapping is
+//! pending in the table while its IOMMU call is in flight, so a withdrawal
+//! meanwhile neither races the commit nor deletes the cap the call carries. See `docs/device-management.md` § DMA Authorisation.
 
 use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -84,7 +86,13 @@ impl DmaService
         // At the boot drivers' level, above devmgr's own: virtio-blk, the
         // root-disk path, blocks on this thread twice per transfer, so a
         // thread below it would let any runnable thread between the two
-        // levels delay that path (`ipc::sched_policy`).
+        // levels delay that path (`ipc::sched_policy`). One inversion stays,
+        // bounded: the thread shares the table's lock with the registry loop
+        // (24), and while the loop holds it in a `grant` or `withdraw` (a
+        // table operation, which may grow the table through memmgr) a thread
+        // at 25 can preempt the loop and so delay this one, for at most that
+        // operation (core/kernel/docs/scheduler.md § Priority Inversion
+        // Mitigation).
         if std::thread::Builder::new()
             .name("dma".into())
             .spawn_at_priority(ipc::sched_policy::BOOT_DRIVER_PRIORITY, move || {
@@ -163,15 +171,16 @@ impl DmaGrant
 
     /// Withdraw the device's DMA: revoke every copy of its DMA capability
     /// derived from devmgr's (the driver's), remove the device and its
-    /// mappings from the table, so a request already queued is refused,
-    /// block a confined device in the IOMMU (`BLOCK`), and then delete the
-    /// Memory cap kept for each standing mapping. A second withdrawal finds
-    /// nothing. Returns whether the IOMMU now blocks the device's DMA, which
+    /// mappings from the table, so a request already queued is refused, and
+    /// block a confined device in the IOMMU (`BLOCK`). Returns the
+    /// [`Withdrawal`]: whether the IOMMU now blocks the device's DMA, which
     /// lets its driver's frames be released without the device confirmed
-    /// quiet (`docs/device-management.md` § DMA-Safe Teardown): `false` for
-    /// an unconfined device, one already withdrawn, and one whose block the
-    /// IOMMU driver did not complete.
-    pub fn withdraw(&self) -> bool
+    /// quiet (`docs/device-management.md` § DMA-Safe Teardown), `false` for an
+    /// unconfined device, one already withdrawn, and one whose block the
+    /// IOMMU driver did not complete; and the Memory cap devmgr kept for each
+    /// standing mapping, which keeps the mapped frames out of memmgr's pool
+    /// until the caller settles it. A second withdrawal finds nothing.
+    pub fn withdraw(&self) -> Withdrawal
     {
         if syscall::cap_revoke_all(self.cap).is_err()
         {
@@ -183,7 +192,11 @@ impl DmaGrant
         let Some(withdrawn) = lock(&self.shared.table).withdraw(self.device_badge)
         else
         {
-            return false;
+            return Withdrawal {
+                device_badge: self.device_badge,
+                blocked: false,
+                mappings: Vec::new(),
+            };
         };
         let blocked = match (withdrawn.confinement, self.shared.iommu.get())
         {
@@ -194,16 +207,68 @@ impl DmaGrant
         {
             std::os::seraph::log!("device {} not blocked in the IOMMU", self.device_badge);
         }
-        release_mappings(withdrawn.mappings);
-        blocked
+        Withdrawal {
+            device_badge: self.device_badge,
+            blocked,
+            mappings: withdrawn.mappings,
+        }
     }
 
-    /// Withdraw the device's DMA ([`Self::withdraw`]) and delete devmgr's copy
-    /// of its capability.
+    /// Withdraw the device's DMA ([`Self::withdraw`]), delete the mappings'
+    /// Memory caps, and delete devmgr's copy of its capability. For a device
+    /// whose driver never ran, or one a withdrawal has settled already, so
+    /// the withdrawal finds no mapping a device may still reach.
     pub fn release(&self)
     {
-        self.withdraw();
+        self.withdraw().release();
         let _ = syscall::cap_delete(self.cap);
+    }
+}
+
+/// What [`DmaGrant::withdraw`] took from a device: whether the IOMMU blocks
+/// it, and the Memory caps devmgr kept for its standing mappings. Each cap is
+/// a reference to a mapped frame, so while devmgr keeps it memmgr keeps the
+/// frame out of its pool (services/memmgr/docs/memory-pool.md
+/// § Reclamation), whoever else releases it; devmgr deletes the caps only
+/// once the device can no longer reach the frames
+/// (`docs/device-management.md` § DMA-Safe Teardown). Dropping a withdrawal
+/// unsettled keeps its caps, as [`Self::quarantine`] does.
+#[must_use]
+pub struct Withdrawal
+{
+    device_badge: u64,
+    blocked: bool,
+    mappings: Vec<Mapping>,
+}
+
+impl Withdrawal
+{
+    /// Whether the IOMMU now blocks the device's DMA.
+    pub fn blocked(&self) -> bool
+    {
+        self.blocked
+    }
+
+    /// Delete the kept Memory caps: the device can no longer reach the
+    /// frames, since the IOMMU blocks it or it is confirmed stopped.
+    pub fn release(self)
+    {
+        release_mappings(self.mappings);
+    }
+
+    /// Keep the Memory caps for the rest of the boot: the device was not
+    /// confirmed stopped and may still write the frames, so they stay out of
+    /// memmgr's pool beside the driver's quarantined memory.
+    pub fn quarantine(self)
+    {
+        if !self.mappings.is_empty()
+        {
+            std::os::seraph::log!(
+                "device {}: {} DMA mappings' frames kept for the boot",
+                self.device_badge,
+                self.mappings.len()
+            );
+        }
     }
 }
 

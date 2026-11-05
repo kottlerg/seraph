@@ -823,7 +823,10 @@ Since there is no Process kernel object, terminating a process is a userspace (p
 a single kernel operation. procmgr revokes and deletes the capabilities it holds to the process's
 main thread, `CSpace`, and `AddressSpace`; a thread stops and leaves the run queues when the last
 capability to it is deleted, and the process's other threads stop when the `CSpace` or
-`AddressSpace` they are bound to is reclaimed. The kernel never terminates threads by policy of its
+`AddressSpace` they are bound to is reclaimed. For a started `CREATE_DMA_HOLD` child procmgr keeps
+the `CSpace` until the creator releases the hold, so the `AddressSpace`'s reclaim stops its threads
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md#label-1-create_process)
+§ Label 1). The kernel never terminates threads by policy of its
 own; the one thing it enforces is that a thread cannot outlive the `CSpace` or `AddressSpace` it is
 bound to: when the last capability to either object is deleted, every thread bound to it is stopped
 before the object's storage is reclaimed, wherever those threads' own capabilities are held —

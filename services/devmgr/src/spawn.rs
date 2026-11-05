@@ -87,8 +87,10 @@ impl Drop for ModuleCapGuard
 
 /// RAII guard for a child created via `CREATE_PROCESS` whose bootstrap has not
 /// yet reached its final `done` round. `Drop` releases the caller-side
-/// `thread_cap` slot delivered in the `CREATE_PROCESS` reply, and the
-/// `process_handle` slot unless [`keep_handle`](Self::keep_handle) took it.
+/// `thread_cap` slot delivered in the `CREATE_PROCESS` reply, the
+/// `process_handle` slot unless [`keep_handle`](Self::keep_handle) or
+/// [`keep_held`](Self::keep_held) took it, and the `release_token` slot (a
+/// `CREATE_DMA_HOLD` child's) unless [`keep_held`](Self::keep_held) took it.
 /// While still armed, `Drop` additionally sends `DESTROY_PROCESS` over the
 /// badged `process_handle` first ([`destroy_child`]), so procmgr reaps the
 /// orphan (thread, cspace, aspace torn down; pages returned to memmgr) instead
@@ -97,18 +99,21 @@ struct ChildGuard
 {
     process_handle: u64,
     thread_cap: u64,
+    release_token: u64,
     ipc_buf: *mut u64,
     destroy: bool,
 }
 
 impl ChildGuard
 {
-    /// Arm a guard over a freshly-created child's reply caps.
-    fn new(process_handle: u64, thread_cap: u64, ipc_buf: *mut u64) -> Self
+    /// Arm a guard over a freshly-created child's reply caps; `release_token`
+    /// is 0 for a child created without `CREATE_DMA_HOLD`.
+    fn new(process_handle: u64, thread_cap: u64, release_token: u64, ipc_buf: *mut u64) -> Self
     {
         Self {
             process_handle,
             thread_cap,
+            release_token,
             ipc_buf,
             destroy: true,
         }
@@ -118,11 +123,24 @@ impl ChildGuard
     /// the caller, which keeps it at least until the driver's settle batch
     /// settles (to destroy a driver that never reports ready) or withdraws
     /// the started driver at once when its bootstrap failed. `Drop` still
-    /// frees the thread cap.
+    /// frees the thread cap, and the release token, so a `CREATE_DMA_HOLD`
+    /// child kept this way has its hold never released.
     fn keep_handle(mut self) -> u64
     {
         self.destroy = false;
         core::mem::take(&mut self.process_handle)
+    }
+
+    /// As [`Self::keep_handle`], for a `CREATE_DMA_HOLD` child whose hold the
+    /// caller releases once its device is confirmed stopped: hand it the
+    /// release token too.
+    fn keep_held(mut self) -> HeldChild
+    {
+        self.destroy = false;
+        HeldChild {
+            process_handle: core::mem::take(&mut self.process_handle),
+            release_token: core::mem::take(&mut self.release_token),
+        }
     }
 }
 
@@ -142,37 +160,65 @@ impl Drop for ChildGuard
         {
             let _ = syscall::cap_delete(self.thread_cap);
         }
+        if self.release_token != 0
+        {
+            let _ = syscall::cap_delete(self.release_token);
+        }
     }
+}
+
+/// The two procmgr caps devmgr keeps for a started `CREATE_DMA_HOLD` driver:
+/// its badged process handle, and its release token, the third cap of the
+/// create reply, on which alone procmgr serves `RELEASE_HOLD`
+/// (`services/procmgr/docs/ipc-interface.md` § Label 3), so no copy of the
+/// driver's own procmgr cap can release its memory early.
+#[derive(Clone, Copy)]
+pub struct HeldChild
+{
+    pub process_handle: u64,
+    pub release_token: u64,
 }
 
 /// Destroy a child through its badged `process_handle` (`DESTROY_PROCESS`:
 /// procmgr tears down its thread, `CSpace`, and address space, which drops
 /// every capability it holds and returns its pages, unless the child was
-/// created with `CREATE_DMA_HOLD` and started, whose pages procmgr then holds
-/// until a `RELEASE_HOLD` this function never sends) and release the handle.
-/// A child that has already died is a no-op for procmgr.
+/// created with `CREATE_DMA_HOLD` and started, whose threads procmgr stops
+/// but whose `CSpace` and pages it holds until a `RELEASE_HOLD` this function
+/// never sends) and release the handle. A child that has already died is a
+/// no-op for procmgr.
 pub fn destroy_child(process_handle: u64, ipc_buf: *mut u64)
 {
     send_destroy(process_handle, ipc_buf);
     let _ = syscall::cap_delete(process_handle);
 }
 
-/// Destroy a `CREATE_DMA_HOLD` child as [`destroy_child`] does, then release
-/// its held pages to memmgr (`RELEASE_HOLD`), and release the handle. Called
-/// only once the child's device is confirmed quiet; procmgr's teardown of the
-/// child, by this destroy or by its own reap of a dead child, precedes the
-/// release, since procmgr serves both calls in order.
-pub fn destroy_and_release(process_handle: u64, ipc_buf: *mut u64)
+/// Destroy a held child as [`destroy_child`] does and delete its release
+/// token without sending the release: its device is not confirmed stopped,
+/// so procmgr keeps its `CSpace` and pages held for the rest of the boot.
+pub fn destroy_held(child: HeldChild, ipc_buf: *mut u64)
 {
-    send_destroy(process_handle, ipc_buf);
+    destroy_child(child.process_handle, ipc_buf);
+    let _ = syscall::cap_delete(child.release_token);
+}
+
+/// Destroy a `CREATE_DMA_HOLD` child as [`destroy_child`] does, then release
+/// its held `CSpace` and pages (`RELEASE_HOLD` on its release token), and
+/// release both caps. Called only once the child's device is confirmed quiet;
+/// procmgr's teardown of the child, by this destroy or by its own reap of a
+/// dead child, precedes the release, since procmgr serves both calls in
+/// order.
+pub fn destroy_and_release(child: HeldChild, ipc_buf: *mut u64)
+{
+    send_destroy(child.process_handle, ipc_buf);
     let release_msg = IpcMessage::new(procmgr_labels::RELEASE_HOLD);
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let released = unsafe { ipc::ipc_call(process_handle, &release_msg, ipc_buf) };
+    let released = unsafe { ipc::ipc_call(child.release_token, &release_msg, ipc_buf) };
     if !matches!(released, Ok(r) if r.label == 0)
     {
         std::os::seraph::log!("driver memory hold not released");
     }
-    let _ = syscall::cap_delete(process_handle);
+    let _ = syscall::cap_delete(child.process_handle);
+    let _ = syscall::cap_delete(child.release_token);
 }
 
 /// Send `DESTROY_PROCESS` on `process_handle`; procmgr replies success
@@ -257,15 +303,18 @@ pub struct DriverSpawnConfig<'a>
     pub priority: u8,
 }
 
-/// How [`spawn_driver`] ended.
-pub enum DriverSpawn
+/// How a driver spawn ended. `H` is what the caller keeps of the started
+/// driver: its badged process handle ([`spawn_iommu_driver`]), or that and
+/// its release token ([`spawn_driver`], [`HeldChild`]).
+pub enum DriverSpawn<H = u64>
 {
-    /// The driver completed its bootstrap: its badged process handle.
-    Bootstrapped(u64),
+    /// The driver completed its bootstrap: what the caller keeps of it.
+    Bootstrapped(H),
     /// The driver was started but its bootstrap failed after it, so it may
-    /// hold the device's BAR caps: its process handle, through which the
-    /// caller withdraws it from the device and destroys it as a live driver.
-    Unbootstrapped(u64),
+    /// hold the device's BAR caps: what the caller keeps of it, through which
+    /// it withdraws the driver from the device and destroys it as a live
+    /// driver.
+    Unbootstrapped(H),
     /// The spawn failed before the driver started; the child, if created,
     /// is torn down and its pages returned.
     Failed,
@@ -292,11 +341,12 @@ pub enum DriverSpawn
 ///     `irq_cap` is `None`.
 ///
 /// log + procmgr endpoints arrive via `ProcessInfo`. The child is created
-/// `CREATE_DMA_HOLD`, so procmgr holds its pages after it is torn down until
-/// devmgr releases them ([`destroy_and_release`]). Returns
-/// [`DriverSpawn::Bootstrapped`] with the child's badged process handle, which
+/// `CREATE_DMA_HOLD`, so procmgr holds its `CSpace` and pages after it is
+/// torn down until devmgr releases them on its release token
+/// ([`destroy_and_release`]). Returns [`DriverSpawn::Bootstrapped`] with the
+/// child's badged process handle and release token ([`HeldChild`]), which
 /// the caller keeps for the rest of the boot, to withdraw the driver through;
-/// [`DriverSpawn::Unbootstrapped`] with it when a bootstrap round or the death
+/// [`DriverSpawn::Unbootstrapped`] with them when a bootstrap round or the death
 /// observer's bind failed after the start; and [`DriverSpawn::Failed`], the
 /// child torn down, on any failure before the start, including a service
 /// endpoint that cannot be copied (a driver delivered none would never report
@@ -308,7 +358,7 @@ pub enum DriverSpawn
 // requires passing the same `DriverSpawnConfig` to each. The linear
 // presentation matches the bootstrap protocol one-to-one.
 #[allow(clippy::too_many_lines)]
-pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
+pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn<HeldChild>
 {
     // Release the source ELF cap on every exit before the create call consumes
     // it (missing BAR/IRQ, badge-derive failure, ipc_call failure). Disarmed
@@ -396,17 +446,21 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
         return DriverSpawn::Failed;
     }
 
+    // `CREATE_DMA_HOLD`: [process handle, thread, release token].
     let reply_caps = reply.caps();
-    if reply_caps.len() < 2
+    let &[process_handle, thread_cap, release_token] = reply_caps
+    else
     {
         std::os::seraph::log!("driver CREATE_PROCESS reply missing caps");
+        for &c in reply_caps
+        {
+            let _ = syscall::cap_delete(c);
+        }
         return DriverSpawn::Failed;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
+    };
     // Tear down the child (and free its reply-cap slots) on any failure before
     // the final bootstrap round completes; disarmed on success.
-    let child_guard = ChildGuard::new(process_handle, thread_cap, ipc_buf);
+    let child_guard = ChildGuard::new(process_handle, thread_cap, release_token, ipc_buf);
 
     // Derive all per-child caps for delivery via bootstrap. Each derivation
     // owns a devmgr slot that must be released on later failure paths so devmgr
@@ -524,7 +578,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
     {
         std::os::seraph::log!("driver bootstrap round 1 failed");
         drop_derived();
-        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
+        return DriverSpawn::Unbootstrapped(child_guard.keep_held());
     }
 
     // Round 2: [service, irq, devmgr_query, dma] as positional slots, then
@@ -552,7 +606,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
     {
         std::os::seraph::log!("driver bootstrap round 2 failed");
         drop_derived();
-        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
+        return DriverSpawn::Unbootstrapped(child_guard.keep_held());
     }
 
     // Observe the driver's death from here on. Bound only once every round
@@ -561,12 +615,12 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
     if syscall::thread_bind_notification(thread_cap, config.death_eq, device_badge).is_err()
     {
         std::os::seraph::log!("driver death observer bind failed");
-        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
+        return DriverSpawn::Unbootstrapped(child_guard.keep_held());
     }
 
     // Child owns its full cap set: keep it alive, and its process handle.
     std::os::seraph::log!("driver started");
-    DriverSpawn::Bootstrapped(child_guard.keep_handle())
+    DriverSpawn::Bootstrapped(child_guard.keep_held())
 }
 
 /// One remapping unit handed to the IOMMU driver: its register `Mmio` cap,
@@ -610,8 +664,9 @@ pub struct IommuSpawnConfig<'a>
 /// on `death_eq` and `watch_eq`. Created `CREATE_PINNED`, since the units
 /// walk its table pages and they must never fault, and `CREATE_DMA_HOLD`,
 /// since the units can walk those pages after it dies: devmgr never releases
-/// the hold, so they stay quarantined for the boot. Both observers carry the
-/// correlator `device_badge`. Returns as [`spawn_driver`] does.
+/// the hold, so it deletes the release token and the pages stay quarantined
+/// for the boot. Both observers carry the correlator `device_badge`. Returns
+/// as [`spawn_driver`] does, with the process handle alone.
 // too_many_lines: one spawn transaction, as `spawn_driver`: every derived
 // cap owns a slot released on a later failure, and the rounds follow the
 // bootstrap protocol one to one.
@@ -657,8 +712,10 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
     };
     // The call transferred the module cap to procmgr whatever its reply.
     module_guard.disarm();
+    // `CREATE_DMA_HOLD`: [process handle, thread, release token].
     let reply_caps = reply.caps();
-    if reply.label != 0 || reply_caps.len() < 2
+    let (0, &[process_handle, thread_cap, release_token]) = (reply.label, reply_caps)
+    else
     {
         std::os::seraph::log!("IOMMU driver create failed");
         for &c in reply_caps
@@ -667,10 +724,8 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
         }
         release_units(0);
         return DriverSpawn::Failed;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
-    let child_guard = ChildGuard::new(process_handle, thread_cap, ipc_buf);
+    };
+    let child_guard = ChildGuard::new(process_handle, thread_cap, release_token, ipc_buf);
     let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
     else
     {
@@ -922,7 +977,7 @@ pub fn spawn_simple_device(config: &SimpleSpawnConfig, ipc_buf: *mut u64) -> Opt
     let thread_cap = reply_caps[1];
     // Tear down the child (and free its reply-cap slots) on any failure before
     // the death observer is bound; on success the caller keeps the handle.
-    let child_guard = ChildGuard::new(process_handle, thread_cap, ipc_buf);
+    let child_guard = ChildGuard::new(process_handle, thread_cap, 0, ipc_buf);
 
     // Copy of the service endpoint for the child; devmgr keeps the original
     // to mint client SEND caps on query.

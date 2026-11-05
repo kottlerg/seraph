@@ -40,7 +40,7 @@ pub mod init_reap;
 pub mod request_caps;
 
 pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
-pub use dma_holds::{DmaHolds, HeldReclaim};
+pub use dma_holds::{DmaHolds, HeldReclaim, ReleaseRefusal, release_target, release_token_badge};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
 
@@ -76,11 +76,26 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 /// serialisation to keep the install-once contract.
 pub struct ProcessEntry
 {
+    /// The child's process badge: the table key, the correlator of its death
+    /// observers, the badge of its process handle and of the procmgr,
+    /// registry, and log SENDs procmgr mints for it, and the source badge
+    /// logd keys its stream by. Minted at random and accepted only by
+    /// [`badge_is_acceptable`], so it carries no verb bit.
     pub badge: u64,
+    /// Slot in procmgr's `CSpace` of the child's `AddressSpace` cap, the
+    /// root its self-cap and memmgr's delegation derive from.
     pub aspace_cap: u64,
+    /// Slot in procmgr's `CSpace` of the child's `CSpace` cap. A started
+    /// `CREATE_DMA_HOLD` child's teardown keeps it in the held reclaim
+    /// ([`HeldReclaim::cspace_cap`]) until the release.
     pub cspace_cap: u64,
+    /// Slot in procmgr's `CSpace` of the child's main-thread cap.
     pub thread_cap: u64,
+    /// Slot in procmgr's `CSpace` of the Memory cap behind the child's
+    /// `ProcessInfo` page.
     pub pi_memory_cap: u64,
+    /// Slot in procmgr's `CSpace` of the Memory cap behind the main thread's
+    /// TLS block. Zero when the child's ELF has no TLS segment.
     pub tls_memory_cap: u64,
     /// Slot in procmgr's `CSpace` of the Memory cap behind the child's
     /// argv/env region, the pages mapped after its `ProcessInfo` page. Zero
@@ -114,7 +129,11 @@ pub struct ProcessEntry
     /// request's scheduling fields against this value (see
     /// [`resolve_spawn_sched`]).
     pub band_max: u8,
+    /// The child's entry point, its ELF entry relocated by the load bias,
+    /// where `start_process` starts the main thread.
     pub entry_point: u64,
+    /// The main thread's TLS base (its thread pointer) in the child, passed
+    /// to `thread_configure_with_tls` at start; zero without a TLS block.
     pub tls_base_va: u64,
     /// Top of the main-thread stack (SP at entry) the loader chose and mapped
     /// for this child. Passed to `thread_configure_with_tls` at start so the
@@ -124,6 +143,8 @@ pub struct ProcessEntry
     /// Delivered to the child in its entry register at start, so the child reads
     /// its handover struct from the address the loader chose.
     pub process_info_va: u64,
+    /// Set by `start_process` once the main thread has started; a held
+    /// reclaim is parked only for a started child ([`DmaHolds::park`]).
     pub started: bool,
     /// Set by `CREATE_DMA_HOLD`: once started, the child's teardown holds
     /// its memmgr reclaim back until its creator's `RELEASE_HOLD`
@@ -133,6 +154,7 @@ pub struct ProcessEntry
 
 impl ProcessEntry
 {
+    /// The child's process badge, the `badge` field.
     #[must_use]
     pub fn badge(&self) -> u64
     {
@@ -849,7 +871,7 @@ mod tests
         taken.started = true;
         assert!(table.holds_mut().park(&taken));
         assert!(table.badge_in_use(16));
-        assert!(table.holds_mut().release(16).is_some());
+        assert!(table.holds_mut().release(release_token_badge(16)).is_ok());
         assert!(!table.badge_in_use(16));
     }
 }

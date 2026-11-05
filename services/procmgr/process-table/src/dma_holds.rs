@@ -6,13 +6,16 @@
 //! The memory reclaims procmgr holds back for the children created with
 //! `procmgr_labels::CREATE_DMA_HOLD`.
 //!
-//! A started child whose creator set the flag is torn down as every child is,
-//! but its `memmgr_labels::PROCESS_DIED` waits until the creator sends
-//! `procmgr_labels::RELEASE_HOLD` on the child's process handle: a device the
-//! child drove may still be writing the child's frames until the creator has
-//! confirmed its DMA stopped (`docs/process-lifecycle.md` § Process Death).
-//! [`DmaHolds`] keeps the held records and reserves the room for each when its
-//! child is armed, so the teardown that parks a record never allocates.
+//! A started child whose creator set the flag has its threads stopped at its
+//! teardown as every child has, but procmgr keeps its `CSpace`, and its
+//! `memmgr_labels::PROCESS_DIED` waits, until the creator sends
+//! `procmgr_labels::RELEASE_HOLD` on the child's release token: a device the
+//! child drove may still be writing the child's frames, and the frames a
+//! client lent it, until the creator has confirmed its DMA stopped
+//! (`docs/process-lifecycle.md` § Process Death). [`DmaHolds`] keeps the held
+//! records and reserves the room for each when its child is armed, so the
+//! teardown that parks a record never allocates; [`release_target`] is the
+//! token's authority check.
 
 extern crate alloc;
 
@@ -20,6 +23,47 @@ use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
 use crate::ProcessEntry;
+
+/// The badge of the release token procmgr derives for the held child
+/// `badge`: the child's process badge with
+/// `procmgr_labels::HOLD_RELEASE_AUTHORITY` set. A process badge carries no
+/// verb bit (`crate::badge_is_acceptable`), so the token's badge names no
+/// live process.
+#[must_use]
+pub const fn release_token_badge(badge: u64) -> u64
+{
+    badge | ipc::procmgr_labels::HOLD_RELEASE_AUTHORITY
+}
+
+/// The child whose held reclaim a `RELEASE_HOLD` received with badge
+/// `sender` may release: the badge with every verb bit cleared, when it
+/// carries `procmgr_labels::HOLD_RELEASE_AUTHORITY`. `None` for any other
+/// sender (the child's process handle, the child's own procmgr cap, or any
+/// other SEND), which procmgr refuses `UNAUTHORIZED`.
+#[must_use]
+pub const fn release_target(sender: u64) -> Option<u64>
+{
+    if sender & ipc::procmgr_labels::HOLD_RELEASE_AUTHORITY == 0
+    {
+        None
+    }
+    else
+    {
+        Some(sender & !ipc::VERB_BIT_MASK)
+    }
+}
+
+/// Why a `RELEASE_HOLD` released nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseRefusal
+{
+    /// The sender's badge lacks `procmgr_labels::HOLD_RELEASE_AUTHORITY`
+    /// ([`release_target`]); any hold stays.
+    Unauthorized,
+    /// No record is held for the token's child: it is live, was never armed,
+    /// was released already, or never existed.
+    NotHeld,
+}
 
 /// The memmgr record of a torn-down child whose reclaim is held back: what
 /// procmgr needs to send its `PROCESS_DIED` once the creator releases it.
@@ -33,6 +77,11 @@ pub struct HeldReclaim
     /// procmgr's slot of the child's badged memmgr SEND, deleted after the
     /// `PROCESS_DIED` round trip; zero when there is none.
     pub memmgr_send_cap: u64,
+    /// procmgr's slot of the child's `CSpace`, kept from the teardown to the
+    /// release so every capability the dead child held, a Memory cap a client
+    /// lent it among them, keeps its reference until the device is confirmed
+    /// stopped; deleted at the release, before the `PROCESS_DIED`.
+    pub cspace_cap: u64,
 }
 
 /// The held reclaims, with room reserved for every armed child's.
@@ -73,10 +122,12 @@ impl DmaHolds
     }
 
     /// Settle the reclaim of `entry`, a child just taken out of the table
-    /// for its teardown. Returns `true` when the reclaim is held: the entry
-    /// was armed and its child started, so a device it drove may still reach
-    /// its frames, and its record is parked until [`Self::release`]. Returns
-    /// `false` when procmgr sends `PROCESS_DIED` now: the entry was not
+    /// for its teardown, before the teardown deletes any of its caps. Returns
+    /// `true` when the reclaim is held: the entry was armed and its child
+    /// started, so a device it drove may still reach its frames, and its
+    /// record, its `CSpace` slot included, is parked until [`Self::release`];
+    /// the teardown then keeps that slot. Returns `false` when procmgr
+    /// deletes the `CSpace` and sends `PROCESS_DIED` now: the entry was not
     /// armed, or its child never ran and so never touched a device.
     pub fn park(&mut self, entry: &ProcessEntry) -> bool
     {
@@ -94,17 +145,28 @@ impl DmaHolds
             badge: entry.badge,
             memmgr_badge: entry.memmgr_badge,
             memmgr_send_cap: entry.memmgr_send_cap,
+            cspace_cap: entry.cspace_cap,
         });
         true
     }
 
-    /// Take the held record of `badge`, for its `PROCESS_DIED`. `None` when
-    /// no record is held for it: the child is live, was never armed, was
-    /// released already, or never existed.
-    pub fn release(&mut self, badge: u64) -> Option<HeldReclaim>
+    /// Take the held record a `RELEASE_HOLD` received with badge `sender`
+    /// names, for its `CSpace` deletion and `PROCESS_DIED`.
+    ///
+    /// # Errors
+    /// [`ReleaseRefusal::Unauthorized`] when `sender` is no release token
+    /// ([`release_target`]), every record left held;
+    /// [`ReleaseRefusal::NotHeld`] when no record is held for the token's
+    /// child.
+    pub fn release(&mut self, sender: u64) -> Result<HeldReclaim, ReleaseRefusal>
     {
-        let at = self.held.iter().position(|r| r.badge == badge)?;
-        Some(self.held.swap_remove(at))
+        let badge = release_target(sender).ok_or(ReleaseRefusal::Unauthorized)?;
+        let at = self
+            .held
+            .iter()
+            .position(|r| r.badge == badge)
+            .ok_or(ReleaseRefusal::NotHeld)?;
+        Ok(self.held.swap_remove(at))
     }
 
     /// Whether a record is held for `badge`.
@@ -146,7 +208,7 @@ mod tests
         ProcessEntry {
             badge,
             aspace_cap: 0,
-            cspace_cap: 0,
+            cspace_cap: 43,
             thread_cap: 0,
             pi_memory_cap: 0,
             tls_memory_cap: 0,
@@ -171,7 +233,10 @@ mod tests
         let mut holds = DmaHolds::new();
         assert!(!holds.park(&entry(7, false, true)));
         assert!(holds.is_empty());
-        assert_eq!(holds.release(7), None);
+        assert_eq!(
+            holds.release(release_token_badge(7)),
+            Err(ReleaseRefusal::NotHeld)
+        );
     }
 
     #[test]
@@ -182,15 +247,65 @@ mod tests
         assert!(holds.park(&entry(7, true, true)));
         assert!(holds.holds(7));
         assert_eq!(
-            holds.release(7),
-            Some(HeldReclaim {
+            holds.release(release_token_badge(7)),
+            Ok(HeldReclaim {
                 badge: 7,
                 memmgr_badge: 7 ^ 0xFF,
                 memmgr_send_cap: 41,
+                cspace_cap: 43,
             })
         );
         assert!(!holds.holds(7));
-        assert_eq!(holds.release(7), None);
+        assert_eq!(
+            holds.release(release_token_badge(7)),
+            Err(ReleaseRefusal::NotHeld)
+        );
+    }
+
+    #[test]
+    fn a_release_without_the_token_bit_is_refused_and_the_hold_stays()
+    {
+        // The process handle and the child's own procmgr cap carry the plain
+        // process badge; logd's cap carries another verb bit; an un-badged
+        // SEND carries 0. None of them may release the hold.
+        let badge = 0x0000_0123_0000_0040;
+        let mut holds = DmaHolds::new();
+        holds.arm().unwrap();
+        assert!(holds.park(&entry(badge, true, true)));
+        for sender in [
+            badge,
+            badge | ipc::procmgr_labels::DEATH_EQ_AUTHORITY,
+            ipc::procmgr_labels::DEATH_EQ_AUTHORITY,
+            0,
+        ]
+        {
+            assert_eq!(holds.release(sender), Err(ReleaseRefusal::Unauthorized));
+            assert!(holds.holds(badge));
+        }
+        assert_eq!(
+            holds.release(release_token_badge(badge)).map(|r| r.badge),
+            Ok(badge)
+        );
+    }
+
+    #[test]
+    fn a_token_names_exactly_the_child_it_was_derived_for()
+    {
+        // Every bit a process badge may carry survives the split, and no
+        // verb bit leaks into the child the token names.
+        let verbs = ipc::VERB_BIT_MASK;
+        for badge in [16, 0x0000_0001_0000_0010, !verbs, !verbs & !0xF]
+        {
+            let token = release_token_badge(badge);
+            assert_ne!(token, badge);
+            assert_eq!(release_target(token), Some(badge));
+        }
+        assert_eq!(release_target(16), None);
+        // A token minted with further verb bits still names only its child.
+        assert_eq!(
+            release_target(release_token_badge(16) | ipc::procmgr_labels::DEATH_EQ_AUTHORITY),
+            Some(16)
+        );
     }
 
     #[test]
@@ -209,9 +324,12 @@ mod tests
         // must not let the reap free the frames.
         let mut holds = DmaHolds::new();
         holds.arm().unwrap();
-        assert_eq!(holds.release(7), None);
+        assert_eq!(
+            holds.release(release_token_badge(7)),
+            Err(ReleaseRefusal::NotHeld)
+        );
         assert!(holds.park(&entry(7, true, true)));
-        assert!(holds.release(7).is_some());
+        assert!(holds.release(release_token_badge(7)).is_ok());
     }
 
     #[test]
@@ -241,7 +359,10 @@ mod tests
             holds.arm().unwrap();
             assert!(holds.park(&entry(badge, true, true)));
         }
-        assert_eq!(holds.release(2).map(|r| r.badge), Some(2));
+        assert_eq!(
+            holds.release(release_token_badge(2)).map(|r| r.badge),
+            Ok(2)
+        );
         for badge in [1, 3, 4, 5]
         {
             assert!(holds.holds(badge));

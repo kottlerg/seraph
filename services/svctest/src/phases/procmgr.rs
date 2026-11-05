@@ -1042,9 +1042,30 @@ const DMA_HOLD_POLLS: u32 = 256;
 /// `QUERY_PROCESS` polls for the held child's exit. A test wait bound.
 const DMA_HOLD_EXIT_POLLS: u32 = 100_000;
 
+/// The caps the create reply of a `CREATE_DMA_HOLD` child carries.
+struct HeldHello
+{
+    handle: u64,
+    thread: u64,
+    /// The release token, the only cap `RELEASE_HOLD` releases on.
+    token: u64,
+}
+
+impl HeldHello
+{
+    /// Delete the three caps.
+    fn delete(&self)
+    {
+        for cap in [self.thread, self.handle, self.token]
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+}
+
 /// Create `/programs/hello` through raw `CREATE_FROM_FILE` with
-/// `CREATE_DMA_HOLD` and return its `(process_handle, thread)`.
-fn create_held_hello() -> (u64, u64)
+/// `CREATE_DMA_HOLD` and return its reply caps, the release token among them.
+fn create_held_hello() -> HeldHello
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
@@ -1070,8 +1091,15 @@ fn create_held_hello() -> (u64, u64)
     );
     match reply.caps()
     {
-        &[handle, thread] => (handle, thread),
-        other => panic!("CREATE_FROM_FILE replied {} caps", other.len()),
+        &[handle, thread, token] => HeldHello {
+            handle,
+            thread,
+            token,
+        },
+        other => panic!(
+            "CREATE_FROM_FILE with CREATE_DMA_HOLD replied {} caps",
+            other.len()
+        ),
     }
 }
 
@@ -1125,15 +1153,19 @@ fn run_held_child_to_teardown(handle: u64)
 }
 
 /// procmgr's held reclaim (`CREATE_DMA_HOLD`, `RELEASE_HOLD`;
-/// `services/procmgr/docs/ipc-interface.md` § Label 3): a held child that was
-/// started keeps its pages out of memmgr's free pool after its teardown,
-/// until its creator's `RELEASE_HOLD`, which returns them, and a second
-/// release finds nothing; `RELEASE_HOLD` on a live child, or on one never
-/// started, finds nothing to release; and a held child destroyed before its
-/// start is reclaimed at once. This is the procmgr side of devmgr's order for
-/// a DMA-capable driver (docs/process-lifecycle.md § Process Death); no boot
-/// can kill a `VirtIO` driver with a request in flight and observe its frames
-/// reused (services/devmgr/docs/responsibilities.md § Responsibilities).
+/// `services/procmgr/docs/ipc-interface.md` § Label 1 and § Label 3): a held
+/// child that was started keeps its pages out of memmgr's free pool after its
+/// teardown, until its creator's `RELEASE_HOLD` on the release token, which
+/// returns them, and a second release finds nothing; `RELEASE_HOLD` on the
+/// process handle, a plain-badge SEND as every copy of the child's own
+/// procmgr cap is, is refused and the hold stays; `RELEASE_HOLD` on a live
+/// child, or on one never started, finds nothing to release; and a held child
+/// destroyed before its start is reclaimed at once. [`dma_hold_lend_cell`]
+/// checks the frame a held child keeps a capability to. This is the procmgr
+/// side of devmgr's order for a DMA-capable driver (docs/process-lifecycle.md
+/// § Process Death); no boot can kill a `VirtIO` driver with a request in
+/// flight and observe its frames reused
+/// (services/devmgr/docs/responsibilities.md § Responsibilities).
 pub fn procmgr_dma_hold_phase(_: &Caps)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -1143,27 +1175,26 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
     // Never started: no hold, reclaimed at its destroy.
     let unstarted = (0..DMA_HOLD_WINDOWS).any(|_| {
         let before = pool_free();
-        let (handle, thread) = create_held_hello();
+        let child = create_held_hello();
         expect_reply(
-            handle,
+            child.token,
             &release,
             procmgr_errors::INVALID_BADGE,
             "RELEASE_HOLD on a live held child",
         );
         expect_reply(
-            handle,
+            child.handle,
             &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
             procmgr_errors::SUCCESS,
             "DESTROY_PROCESS of the never-started held child",
         );
         expect_reply(
-            handle,
+            child.token,
             &release,
             procmgr_errors::INVALID_BADGE,
             "RELEASE_HOLD on a never-started held child",
         );
-        let _ = syscall::cap_delete(thread);
-        let _ = syscall::cap_delete(handle);
+        child.delete();
         pool_returns_to(before)
     });
     assert!(
@@ -1171,40 +1202,120 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
         "a held child destroyed before its start was not reclaimed in {DMA_HOLD_WINDOWS} windows"
     );
 
-    // Started: held across the teardown until the release.
+    // Started: held across the teardown until the release on the token.
     let mut held_seen = false;
     let started = (0..DMA_HOLD_WINDOWS).any(|_| {
         let before = pool_free();
-        let (handle, thread) = create_held_hello();
-        run_held_child_to_teardown(handle);
+        let child = create_held_hello();
+        run_held_child_to_teardown(child.handle);
         let held = !pool_returns_to(before);
         expect_reply(
-            handle,
+            child.handle,
+            &release,
+            procmgr_errors::UNAUTHORIZED,
+            "RELEASE_HOLD on the held child's process handle",
+        );
+        let still_held = !pool_returns_to(before);
+        expect_reply(
+            child.token,
             &release,
             procmgr_errors::SUCCESS,
-            "RELEASE_HOLD on the torn-down held child",
+            "RELEASE_HOLD on the torn-down held child's token",
         );
         expect_reply(
-            handle,
+            child.token,
             &release,
             procmgr_errors::INVALID_BADGE,
-            "second RELEASE_HOLD on the released child",
+            "second RELEASE_HOLD on the released child's token",
         );
-        let _ = syscall::cap_delete(thread);
-        let _ = syscall::cap_delete(handle);
-        held_seen |= held;
-        held && pool_returns_to(before)
+        child.delete();
+        held_seen |= held && still_held;
+        held && still_held && pool_returns_to(before)
     });
     assert!(
         held_seen,
-        "a started held child's pages returned to the pool before RELEASE_HOLD in every window"
+        "a started held child's pages returned to the pool before the release on its token in \
+         every window"
     );
     assert!(
         started,
         "a held child's pages were not back in the pool after RELEASE_HOLD in any of \
          {DMA_HOLD_WINDOWS} windows"
     );
+    dma_hold_lend_cell();
     std::os::seraph::log!("procmgr_dma_hold phase passed");
+}
+
+/// A frame lent to a held child stays out of memmgr's pool until the
+/// release (docs/device-management.md § DMA-Safe Teardown): svctest lends a
+/// held child a capability to a one-page grant (procmgr copies it into the
+/// child's `CSpace` at its start, as `CONFIGURE_NAMESPACE`'s root cap), lets
+/// the child exit, destroys it, and releases its own grant. The child's
+/// `CSpace`, which procmgr keeps until the release, still holds the lent cap,
+/// so the page must be on memmgr's deferred list, and stay there across a
+/// refused release on the process handle; the release on the token deletes
+/// the `CSpace`, and the page must leave the list.
+fn dma_hold_lend_cell()
+{
+    use super::memmgr::{
+        await_deferred_at_most, deferred_bytes, recheck_deferred, release_one_page,
+        request_one_page, settled_deferred_bytes,
+    };
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let release = IpcMessage::new(procmgr_labels::RELEASE_HOLD);
+    let baseline = settled_deferred_bytes();
+    let (grant, phys) = request_one_page();
+    let lent = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP_RW)
+        .expect("procmgr_dma_hold: deriving the lent cap failed");
+    let child = create_held_hello();
+    expect_reply(
+        child.handle,
+        &IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
+            .cap(lent)
+            .build(),
+        procmgr_errors::SUCCESS,
+        "CONFIGURE_NAMESPACE lending the held child a frame",
+    );
+    run_held_child_to_teardown(child.handle);
+    release_one_page(grant, phys);
+    let page = syscall_abi::PAGE_SIZE;
+    let held = deferred_bytes();
+    assert!(
+        held >= baseline + page,
+        "procmgr_dma_hold: the frame a dead held child kept was pooled before the release \
+         (deferred {baseline} -> {held} bytes)"
+    );
+    expect_reply(
+        child.handle,
+        &release,
+        procmgr_errors::UNAUTHORIZED,
+        "RELEASE_HOLD of the lending child on its process handle",
+    );
+    recheck_deferred();
+    let refused = deferred_bytes();
+    assert!(
+        refused >= baseline + page,
+        "procmgr_dma_hold: a refused release pooled the lent frame \
+         (deferred {baseline} -> {refused} bytes)"
+    );
+    expect_reply(
+        child.token,
+        &release,
+        procmgr_errors::SUCCESS,
+        "RELEASE_HOLD of the lending child on its token",
+    );
+    await_deferred_at_most(
+        baseline,
+        "procmgr_dma_hold: the lent frame after the release",
+    );
+    expect_reply(
+        child.token,
+        &release,
+        procmgr_errors::INVALID_BADGE,
+        "second RELEASE_HOLD of the lending child on its token",
+    );
+    child.delete();
 }
 
 /// `CONFIGURE_PIPE` cells on a child created (and never started) through raw

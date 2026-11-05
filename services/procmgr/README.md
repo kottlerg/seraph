@@ -57,13 +57,14 @@ procmgr/
   spawning a child to obtain the child's `memmgr_endpoint_cap`; call
   `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim, or, for a
   started child created with `CREATE_DMA_HOLD`, only once its creator sends
-  `RELEASE_HOLD` (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 3:
-  `RELEASE_HOLD`). See
+  `RELEASE_HOLD` on the child's release token (see
+  [docs/ipc-interface.md](docs/ipc-interface.md) § Label 3: `RELEASE_HOLD`). See
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Steady-State
   Process Creation and § Process Death.
 - **Process teardown** — on exit or crash, revoke the process's
   `AddressSpace` capability (which stops all threads bound to it) and
-  notify memmgr. See
+  notify memmgr; a started `CREATE_DMA_HOLD` child's `CSpace` is kept until
+  its release. See
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Process Death.
 - **Process registry** — maintain a table of running processes; answer
   queries from svcmgr and other services.
@@ -247,12 +248,16 @@ its record first (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9:
 `QUERY_PROCESS`).
 
 The teardown of a started child created with `CREATE_DMA_HOLD` parks the child's memmgr record
-(its memmgr badge and procmgr's badged memmgr SEND) in a held list (`DmaHolds`) instead of sending
-`PROCESS_DIED`; the creator's `RELEASE_HOLD` takes the record and sends it. The room each record
-takes is reserved when the create arms the hold, so a create the heap cannot reserve it for fails
-with `OUT_OF_MEMORY`, and a teardown never has to free a held child's frames for want of a record.
-A held record keeps its badge in use, so badge minting never hands it to a new child, whose
-process handle could otherwise release it.
+(its memmgr badge and procmgr's badged memmgr SEND) and procmgr's cap on its `CSpace`, whose
+derivations the teardown revokes but which it does not delete, in a held list (`DmaHolds`) instead
+of sending `PROCESS_DIED`; the creator's `RELEASE_HOLD` on the release token takes the record,
+deletes the `CSpace`, and sends it. The token is the create reply's third cap, badged with the
+child's badge and `HOLD_RELEASE_AUTHORITY`; `release_target` in the process-table crate is the
+check that refuses any other sender. The room each record takes is reserved when the create arms
+the hold, so a create the heap cannot reserve it for fails with `OUT_OF_MEMORY`, and a teardown
+never has to free a held child's frames for want of a record. A held record keeps its badge in
+use, so badge minting never hands it to a new child, whose release token would otherwise release
+it.
 
 ---
 

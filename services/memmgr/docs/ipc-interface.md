@@ -298,25 +298,25 @@ success. Reclamation is idempotent.
 **When procmgr sends it.** procmgr sends `PROCESS_DIED` after its teardown of
 the process, except for a started process created with
 `procmgr_labels::CREATE_DMA_HOLD`, whose `PROCESS_DIED` procmgr sends only when
-the creator releases the hold (`procmgr_labels::RELEASE_HOLD`,
+the creator releases the hold (`procmgr_labels::RELEASE_HOLD`, which procmgr
+serves only on the release token of the process's create reply,
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md#label-3-release_hold)
 § Label 3). Until then memmgr keeps the process's record, and every frame on it
 stays out of the free pool and counted, as for a live process; a hold that is
 never released keeps them so for the rest of the boot. devmgr creates every
 DMA-capable driver so and releases the hold only once the driver's device is
 confirmed to have stopped its DMA, so memmgr never hands out a frame of the
-driver's own record that such a device may still write, unless the driver
-handed a copy of its procmgr capability onward, through which its hold can be
-released early
+driver's own record that such a device may still write
 ([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
-§ DMA-Safe Teardown). The hold covers that record only: a frame a client lends
-the driver for a transfer is on the client's record. memmgr keeps it out of
-the pool while the driver, or devmgr's DMA mapping of it, still holds a
-capability to it, but devmgr deletes its own when it withdraws the device and
-a dead driver's go with its `CSpace`, so the frame can return to the pool
-before the device is confirmed stopped
-([#749](https://github.com/kottlerg/seraph/issues/749)). memmgr itself treats
-a held-back `PROCESS_DIED` like any other.
+§ DMA-Safe Teardown). A frame a client lends the driver for a transfer is on
+the client's record, which the hold does not cover. memmgr keeps it out of the
+pool, on its deferred list once the client releases it or dies, while the
+driver, or devmgr's DMA mapping of it, still holds a capability to it; devmgr
+deletes its own only once the device is confirmed stopped or blocked, and
+procmgr keeps a held driver's `CSpace`, with the driver's capability in it,
+until the release, which deletes the `CSpace` before this `PROCESS_DIED`, so
+the recheck it opens with finds the frame unreachable. memmgr itself treats a
+held-back `PROCESS_DIED` like any other.
 
 procmgr also never sends `PROCESS_DIED` for a child whose create failed because procmgr could
 not unmap a window it copied the child's argv and env through (it replies

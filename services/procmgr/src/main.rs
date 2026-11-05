@@ -523,15 +523,13 @@ fn dispatch_ipc(
         procmgr_labels::RELEASE_HOLD =>
         {
             release_caps(req.caps());
-            // Badge from ipc_recv names the torn-down child whose held
-            // reclaim the creator releases.
-            let code = if process::release_hold(badge, ctx.memmgr_ep, ipc_buf, table.holds_mut())
+            // Badge from ipc_recv: the release token of the torn-down child
+            // whose held reclaim the creator releases.
+            let code = match process::release_hold(badge, ctx.memmgr_ep, ipc_buf, table.holds_mut())
             {
-                procmgr_errors::SUCCESS
-            }
-            else
-            {
-                procmgr_errors::INVALID_BADGE
+                Ok(()) => procmgr_errors::SUCCESS,
+                Err(process_table::ReleaseRefusal::Unauthorized) => procmgr_errors::UNAUTHORIZED,
+                Err(process_table::ReleaseRefusal::NotHeld) => procmgr_errors::INVALID_BADGE,
             };
             reply_empty(ipc_buf, code);
         }
@@ -1026,24 +1024,38 @@ fn resolve_create_sched(
 
 /// Arm the held reclaim of a child created with `CREATE_DMA_HOLD`, reserving
 /// its record's room, so its teardown never has to free its frames for want
-/// of a record, or refuse the create. Returns `true` when the hold is armed.
-/// Returns `false` when [`process::ProcessTable::arm_dma_hold`] refuses: with
+/// of a record, and derive the child's release token, the SEND on procmgr's
+/// endpoint badged `badge | HOLD_RELEASE_AUTHORITY` on which alone
+/// `RELEASE_HOLD` releases the hold; or refuse the create. Returns the
+/// token's slot when the hold is armed. Returns `None` when
+/// [`process::ProcessTable::arm_dma_hold`] refuses, with
 /// `ArmError::OutOfMemory` when the heap cannot reserve the room, or with
 /// `ArmError::NotFound`, which the child's insertion just before rules out
-/// unless the table lost it. Either way both reply caps are deleted and the
-/// create is answered `OUT_OF_MEMORY`; on `OutOfMemory` the child, which has
-/// not run, is also destroyed, while on `NotFound` the table holds no entry
-/// for the teardown to take, so nothing more is released.
+/// unless the table lost it, or when the token cannot be derived. Every time
+/// both reply caps are deleted and the create is answered `OUT_OF_MEMORY`,
+/// and the child, which has not run, is destroyed (on `NotFound` the table
+/// holds no entry for the teardown to take, so nothing more is released).
 fn arm_held_reclaim_or_refuse(
     result: &process::CreateResult,
     ipc_buf: *mut u64,
-    memmgr_ep: u64,
+    ctx: &ProcmgrCtx,
     table: &mut process::ProcessTable,
-) -> bool
+) -> Option<u64>
 {
     match table.arm_dma_hold(result.badge)
     {
-        Ok(()) => return true,
+        Ok(()) => match syscall::cap_derive_badge(
+            ctx.self_endpoint,
+            syscall::RIGHTS_EP_SEND,
+            process::release_token_badge(result.badge),
+        )
+        {
+            Ok(token) => return Some(token),
+            Err(_) =>
+            {
+                std::os::seraph::log!("release token not derived; destroying the child");
+            }
+        },
         Err(process_table::ArmError::OutOfMemory) =>
         {
             std::os::seraph::log!("no room for a held reclaim; destroying the child");
@@ -1055,37 +1067,73 @@ fn arm_held_reclaim_or_refuse(
     }
     let _ = syscall::cap_delete(result.thread_for_caller);
     let _ = syscall::cap_delete(result.process_handle);
-    let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
+    let _ = process::destroy_process(result.badge, ctx.memmgr_ep, ipc_buf, table);
     reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-    false
+    None
+}
+
+/// Arm the held reclaim of a created child when its create `label` carries
+/// `CREATE_DMA_HOLD` ([`arm_held_reclaim_or_refuse`]), then reply the
+/// creation ([`reply_create_result`]); a refused arm has replied already.
+fn arm_and_reply_create(
+    label: u64,
+    result: &process::CreateResult,
+    ipc_buf: *mut u64,
+    ctx: &ProcmgrCtx,
+    table: &mut process::ProcessTable,
+)
+{
+    let token = if label & procmgr_labels::CREATE_DMA_HOLD == 0
+    {
+        Some(0)
+    }
+    else
+    {
+        arm_held_reclaim_or_refuse(result, ipc_buf, ctx, table)
+    };
+    if let Some(token) = token
+    {
+        reply_create_result(result, token, ipc_buf, ctx.memmgr_ep, table);
+    }
 }
 
 /// Reply with a successful process creation result, or destroy the child
 /// when the reply cannot deliver it.
 ///
-/// Reply caps: `[process_handle, thread]`. The reply's cap transfer is
-/// all-or-nothing: when the caller's `CSpace` cannot take both caps (or the
-/// caller is gone), the caller resumes with `IPC_REPLY_TRANSFER_FAILED` and
-/// no caps, and both caps stay in procmgr's `CSpace`. No one then holds the
-/// handle that could start or destroy the suspended child, so procmgr deletes
-/// both caps and tears the child down as `DESTROY_PROCESS` does.
+/// Reply caps: `[process_handle, thread, release_token?]`, the token (a
+/// nonzero `release_token`) only for a `CREATE_DMA_HOLD` child. The reply's
+/// cap transfer is all-or-nothing: when the caller's `CSpace` cannot take
+/// every cap (or the caller is gone), the caller resumes with
+/// `IPC_REPLY_TRANSFER_FAILED` and no caps, and every cap stays in procmgr's
+/// `CSpace`. No one then holds the handle that could start or destroy the
+/// suspended child, so procmgr deletes the caps and tears the child down as
+/// `DESTROY_PROCESS` does.
 fn reply_create_result(
     result: &process::CreateResult,
+    release_token: u64,
     ipc_buf: *mut u64,
     memmgr_ep: u64,
     table: &mut process::ProcessTable,
 )
 {
-    let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
+    let mut msg = IpcMessage::builder(procmgr_errors::SUCCESS)
         .cap(result.process_handle)
-        .cap(result.thread_for_caller)
-        .build();
+        .cap(result.thread_for_caller);
+    if release_token != 0
+    {
+        msg = msg.cap(release_token);
+    }
+    let msg = msg.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
     {
         std::os::seraph::log!("create reply undeliverable; destroying the child");
         let _ = syscall::cap_delete(result.thread_for_caller);
         let _ = syscall::cap_delete(result.process_handle);
+        if release_token != 0
+        {
+            let _ = syscall::cap_delete(release_token);
+        }
         // No handle to this child survives, so nothing can query its exit.
         let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
     }
@@ -1251,11 +1299,7 @@ fn handle_create(
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            if label & procmgr_labels::CREATE_DMA_HOLD == 0
-                || arm_held_reclaim_or_refuse(&result, ipc_buf, ctx.memmgr_ep, table)
-            {
-                reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
-            }
+            arm_and_reply_create(label, &result, ipc_buf, ctx, table);
         }
         // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
         // request's own checks, whatever the cause `create_process` reports.
@@ -1399,11 +1443,7 @@ fn handle_create_from_file(
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            if label & procmgr_labels::CREATE_DMA_HOLD == 0
-                || arm_held_reclaim_or_refuse(&result, ipc_buf, ctx.memmgr_ep, table)
-            {
-                reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
-            }
+            arm_and_reply_create(label, &result, ipc_buf, ctx, table);
         }
         Err(code) =>
         {

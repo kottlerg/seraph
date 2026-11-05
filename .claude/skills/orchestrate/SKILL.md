@@ -39,8 +39,12 @@ Until an answer arrives, each case below is a prompt to the maintainer when it c
 
 Three rules the maintainer has stated stand without a question: an Issue moves to a later
 milestone only on a clear and hard dependency on another Issue; a deferral that needs real
-hardware is filed as an Issue without a milestone; and a rolling Issue stays open (a PR carries
-`Refs` for it, never a closing keyword).
+hardware is filed as an Issue without a milestone; and a PR references a rolling
+`<scope>: defects found by review` Issue with `Refs`, never a closing keyword, and you keep the
+rolling Issue open as the scope's recording sink even when every item is ticked, which
+docs/conventions.md § Branch and PR Workflow allows (it conditions closing, it does not require
+it). An earlier-pattern `<scope>: defects found by PR #N's review` Issue closes under that
+section's condition.
 
 ## Plan
 

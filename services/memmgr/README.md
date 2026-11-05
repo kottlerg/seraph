@@ -160,9 +160,9 @@ memmgr is created by init. At init's entry, the kernel has placed Memory
 caps for all usable physical RAM in init's CSpace (see
 [`docs/capability-model.md`](../../docs/capability-model.md) §"Initial
 Capability Distribution"). Init parses the memmgr ELF from its boot
-module, creates memmgr's AddressSpace, CSpace, and Thread, and copies the
-RAM Memory caps into memmgr's CSpace using the derive-twice pattern. Init
-then starts memmgr's thread and proceeds to spawn procmgr — installing
+module, creates memmgr's AddressSpace, CSpace, and Thread, and moves the
+RAM Memory caps into memmgr's CSpace, so memmgr is the sole holder of each
+run. Init then starts memmgr's thread and proceeds to spawn procmgr — installing
 a SEND cap on memmgr's service endpoint into procmgr's `ProcessInfo`
 so procmgr's heap-bootstrap path reaches memmgr on its first IPC.
 
@@ -174,11 +174,11 @@ ProcessInfo handover lives in [`docs/process-lifecycle.md`](../../docs/process-l
 Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round that
 names them by slot range only (`ipc::memmgr_bootstrap`); memmgr reads each
 cap's size and physical base from the kernel (`cap_info`), so the round bounds
-neither the cap count nor a cap's size. Init forwards every remaining RAM cap
-while memmgr's `CSpace` and init's own keep the headroom the `MemoryAlloc`
-tail, the phys-table page, and the in-use arenas need (they have no
-`InitInfo` descriptor and must ride this round), and, in init's, the rest of
-init's bootstrap. Any RAM caps beyond that are not lost:
+neither the cap count nor a cap's size. Init moves every remaining RAM cap
+into memmgr's `CSpace`, which leaves memmgr the sole holder of each run, while
+that `CSpace` keeps the headroom the `MemoryAlloc` tail, the phys-table page,
+and the in-use arenas need (they have no `InitInfo` descriptor and must ride
+this round). Any RAM caps beyond that are not lost:
 init donates them at its reap, and procmgr forwards them to memmgr's pool via
 `DONATE_MEMORY_CAPS`, which has no per-round cap. The round's place in the
 boot sequence is described in

@@ -765,6 +765,20 @@ pub(crate) fn saved_log_file(arch: Arch, cpus: u32, run: u32) -> String
     format!("{arch}-{cpus}cpu-{run}.log")
 }
 
+/// The `outcome=` field of a saved log's `run-parallel` trailer, when it has
+/// one. `--save-logs` appends the trailer as the log's last line, so only
+/// that line is read: a guest line with the same prefix cannot stand in for
+/// it.
+pub(crate) fn saved_log_outcome(log: &str) -> Option<&str>
+{
+    log.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())?
+        .strip_prefix(crate::timing::TRAILER_PREFIX)?
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("outcome="))
+}
+
 /// The trailer line `--save-logs` appends, in the `key=value` shape
 /// `crate::timing` reads.
 fn trailer_line(saved: &SavedRun, outcome: &RunOutcome) -> String

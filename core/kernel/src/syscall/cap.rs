@@ -2761,12 +2761,12 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     use core::sync::atomic::Ordering;
 
     use syscall::{
-        CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
-        CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
-        CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
-        CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
-        CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED,
-        THREAD_STATE_EXITED,
+        CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
+        CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE,
+        CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
+        CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE,
+        CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED,
+        THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
     };
 
     use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, MemoryObject, ThreadObject};
@@ -2994,6 +2994,32 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
                     .cast::<AddressSpaceObject>())
             };
             Ok(as_obj.pt_growth_budget_bytes.load(Ordering::Acquire))
+        }
+        CAP_INFO_ASPACE_TERMINAL_FAULT =>
+        {
+            if tag != CapTag::AddressSpace
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed AddressSpace.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
+            #[allow(clippy::cast_ptr_alignment)]
+            let as_obj = unsafe {
+                &*(slot
+                    .object_of(CapTag::AddressSpace)
+                    .cast::<AddressSpaceObject>())
+            };
+            let as_ptr = as_obj.address_space;
+            if as_ptr.is_null()
+            {
+                return Err(SyscallError::InvalidCapability);
+            }
+            // SAFETY: as_ptr is the AddressSpace the pinned wrapper holds, live
+            // while the pin holds the wrapper; no lock is held.
+            let retained =
+                unsafe { crate::mm::address_space::AddressSpace::retained_terminal_fault(as_ptr) };
+            Ok(retained.unwrap_or(0))
         }
         CAP_INFO_CSPACE_CAPACITY =>
         {

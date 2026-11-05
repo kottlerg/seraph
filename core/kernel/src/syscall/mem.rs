@@ -597,18 +597,11 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
         .owns_memory
         .load(core::sync::atomic::Ordering::Acquire);
 
-    // Refuse split when the parent has cap-derivation children. Their
-    // MemoryObject pointer would still alias the (shrunken) parent and could
-    // observe a region the parent no longer owns. memmgr / init / ktest's
-    // split callers never derive before splitting.
-    // SAFETY: caller_cspace validated; memory_idx within CSpace bounds;
-    // DERIVATION_LOCK held.
-    let parent_first_child = unsafe {
-        (*caller_cspace)
-            .slot(memory_idx)
-            .and_then(|s| s.deriv_first_child)
-    };
-    if parent_first_child.is_some()
+    // Refuse a split of an object another capability slot names (a
+    // derivation, a copy, or a slot that shares it unlinked): shrinking it
+    // in place would shrink what that slot names too. The count is exact
+    // under DERIVATION_LOCK, and the caller's slot was revalidated above.
+    if !parent_ref.named_by_one_slot()
     {
         parent_ref.write_unlock();
         DERIVATION_LOCK.write_unlock();
@@ -667,6 +660,7 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
             owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
+            slot_count: core::sync::atomic::AtomicU32::new(0),
         })
         .inspect_err(|_| {
             parent_ref.write_unlock();
@@ -736,8 +730,8 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     //
     // Shrink size; debit the carved bytes from `available_bytes` (only when
     // the cap is retypable — non-RETYPE caps already have available = 0).
-    // The parent's allocator state, derivation children (none — refused
-    // above), and slot identity all stay intact. Live retypes against the
+    // The parent's allocator state and slot identity stay intact, and no
+    // other slot names it (refused above). Live retypes against the
     // parent (`ancestor` pointers) continue to refer to the same
     // `KernelObjectHeader` — no re-ancestoring required.
     //
@@ -918,8 +912,16 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    // ── Derivation-tree validation: parent and tail must be siblings, and
-    //    neither may have derivation children. ────────────────────────────────
+    // ── Each object must be named by its slot alone: growing the parent would
+    //    grow what another slot naming it reaches, and consuming the tail
+    //    would leave another slot naming it on a range the parent now owns. ─
+    if !parent_ref.named_by_one_slot() || !tail_ref.named_by_one_slot()
+    {
+        release_locks();
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // ── Derivation-tree validation: parent and tail must be siblings. ───────
     let Some(tail_idx_nz) = core::num::NonZeroU32::new(tail_idx)
     else
     {
@@ -942,18 +944,18 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
             .slot(tail_idx)
             .ok_or(SyscallError::InvalidCapability)
     };
-    let (parent_dp, parent_fc) = match parent_deriv
+    let parent_dp = match parent_deriv
     {
-        Ok(s) => (s.deriv_parent, s.deriv_first_child),
+        Ok(s) => s.deriv_parent,
         Err(e) =>
         {
             release_locks();
             return Err(e);
         }
     };
-    let (tail_dp, tail_fc) = match tail_deriv
+    let tail_dp = match tail_deriv
     {
-        Ok(s) => (s.deriv_parent, s.deriv_first_child),
+        Ok(s) => s.deriv_parent,
         Err(e) =>
         {
             release_locks();
@@ -962,11 +964,6 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
     };
 
     if parent_dp != tail_dp
-    {
-        release_locks();
-        return Err(SyscallError::InvalidArgument);
-    }
-    if parent_fc.is_some() || tail_fc.is_some()
     {
         release_locks();
         return Err(SyscallError::InvalidArgument);

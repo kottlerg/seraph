@@ -1,1 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/ISSUE_TEMPLATE/config.yml
+
+# Issue template chooser: every Issue is opened from a template.
+
 blank_issues_enabled: false

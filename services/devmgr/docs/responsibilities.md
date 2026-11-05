@@ -427,6 +427,13 @@ how devmgr uses them.
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (serial/virtio-blk/the IOMMU driver at 26, framebuffer/RTC/virtio-input at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 
+devmgr's own `AddressSpace` cap, which procmgr installs, carries no `RIGHTS_AS_READ`: procmgr
+mints every child's address space without it, a phys-class child's included
+([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1:
+`CREATE_PROCESS`). devmgr reads that cap's rights at startup, before its bootstrap rounds, and
+halts, logged, when the right is present or the rights cannot be read: it is the phys-class child
+every boot creates, so a mint that kept the right fails the boot instead of passing unseen.
+
 IOMMU register regions are not pre-minted as distinct capabilities.
 `devmgr` discovers VT-d units from the DMAR, carves an `Mmio` cap for each
 unit's register range through the same aperture-carving flow as any other
@@ -466,5 +473,6 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/drivers/virtio/input/README.md](../../drivers/virtio/input/README.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md),
 [Restart Protocol](../../svcmgr/docs/restart-protocol.md)

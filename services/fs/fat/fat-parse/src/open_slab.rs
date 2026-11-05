@@ -53,6 +53,9 @@ impl<T> Default for OpenSlab<T>
 
 impl<T> OpenSlab<T>
 {
+    /// An empty slab that grows to at most [`MAX_ENTRIES`] slots, every
+    /// index the identifier can name. Allocates nothing until the first
+    /// [`Self::insert`].
     #[must_use]
     pub const fn new() -> Self
     {

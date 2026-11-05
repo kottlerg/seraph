@@ -43,7 +43,8 @@ services/svctest/
         ├── devmgr.rs          # Block, shutdown, label deny; input ordinal; orphan, withdrawal,
         │                      #   DMA confinement
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny
-        ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind
+        ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
+        │                      #   refused access
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd

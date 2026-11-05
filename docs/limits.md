@@ -413,7 +413,7 @@ Every entry here is `correct as is`; none is tracked.
 | `ProcessInfo.initial_priority` | `abi/process-abi/src/lib.rs` | `u8` | ABI width (`PRIORITY_MAX` 30) | none | correct as is | None |
 | `ProcessInfo` cap fields | `abi/process-abi/src/lib.rs` | `u64` | ABI width (cap handle) | embedded | correct as is | None |
 | Growth-zone window `slots_log2` | `shared/process-layout/src/lib.rs` | Sv39: 19 (heap), 23 (arena); user half `H` above 2^38: `log2(H) - 18` | encoding artefact (ASLR window) | none | correct as is | None |
-| `HEAP_INITIAL_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 512 (2 MiB) | default (a floor that avoids early grows) | demand-paged process: VA, and frames as the allocator hands them out; pinned process: 2 MiB eager | correct as is | None |
+| `HEAP_INITIAL_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 512 (2 MiB) | default (a floor that avoids early grows) | demand-paged process: VA, and frames as its pages are first touched; pinned process: 2 MiB eager | correct as is | None |
 | `GROW_MIN_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | tuning | none | correct as is | None |
 | `MAX_ROUNDS` (`grow_exact`) | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | tuning (anti-wedge bound; a partial grant takes another round, so one grow spans up to 64 runs and keeps what it mapped past that) | none | correct as is | None |
 | `PT_FUND_ROUNDS` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 2 | provably unreachable (record-page argument) | none | correct as is | None |

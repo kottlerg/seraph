@@ -1443,8 +1443,10 @@ mod tests
         assert_eq!(header_violation("t/run.sh", sh), None);
         let yml = "# SPDX-License-Identifier: GPL-2.0-only\n# (C)\n\n# .github/x.yml\n\nname: x\n";
         assert_eq!(header_violation(".github/x.yml", yml), None);
+        // A `//` header is the Rust style, not YAML's.
+        let slashed = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// .github/x.yml\n";
         assert_eq!(
-            header_violation(".github/x.yml", "name: x\n").map(|v| v.0),
+            header_violation(".github/x.yml", slashed).map(|v| v.0),
             Some(1)
         );
     }

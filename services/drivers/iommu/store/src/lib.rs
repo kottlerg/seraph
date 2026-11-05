@@ -62,7 +62,8 @@ pub struct Store
     flush: Flush,
     chunks: Vec<Chunk>,
     /// The table [`TableStore::table`] returns for an address no chunk
-    /// holds, which the walks never pass: no unit reads it.
+    /// holds or that is not page-aligned, which the walks never pass: no
+    /// unit reads it.
     sink: Box<[u64; TABLE_WORDS]>,
 }
 
@@ -110,7 +111,7 @@ impl Store
     /// writes (a queue the unit produces into): such a page may be reached
     /// only through raw accesses, never through a reference, since the unit
     /// writes it behind the compiler's back. `None` for an address no chunk
-    /// holds.
+    /// holds or that is not page-aligned.
     #[must_use]
     pub fn page_ptr(&self, phys: u64) -> Option<*const u64>
     {

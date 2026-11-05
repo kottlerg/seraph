@@ -76,8 +76,9 @@ fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
 }
 
 /// How table writes reach the units whose registers are mapped at `regs`:
-/// with the store's fence alone when every unit's page walks snoop the
-/// processor caches, read from each unit's `ECAP`, and written back with
+/// with no write-back when every unit's page walks snoop the processor
+/// caches, read from each unit's `ECAP` (the store's fence and the fence
+/// before each register write order them), and written back with
 /// [`arch::current::flush`] otherwise.
 fn table_flush(regs: &[u64]) -> Flush
 {

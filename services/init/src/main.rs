@@ -463,8 +463,8 @@ fn run(info_ptr: u64) -> !
     };
     if let Some(Err(err)) = funded
     {
-        // The syscall error is the negated `SyscallError` code; its
-        // magnitude is the code.
+        // The syscall error is the negative `SyscallError` code; its
+        // magnitude is logged.
         bootstrap::log_hex(
             "init: FATAL: cannot fund init's own CSpace, error ",
             err.unsigned_abs(),

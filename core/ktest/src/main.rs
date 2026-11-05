@@ -370,10 +370,10 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
 /// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES`), and each case's own splits
 /// and copies, which it deletes again. 16 pages hold the binding table and 13
 /// arena pages, 403 bodies (`syscall_abi::CSPACE_BODIES_PER_PAGE` a page), far
-/// above that peak. A shortfall meets the serial port's binding first on
-/// x86-64: the binding fails, serial stays silent, and the boot ends as a
-/// `run-parallel` HANG with no ktest line; elsewhere it fails the case that
-/// meets it with `OutOfMemory`.
+/// above that peak. Bodies and binding tables draw on the same pool pages as
+/// slots, so a shortfall is first absorbed by the slot pages the kernel seeds
+/// for init (`ROOT_CSPACE_INIT_HEADROOM_SLOTS`), and then fails the case that
+/// exhausts the pool with `OutOfMemory`.
 const CSPACE_FUND_PAGES: u64 = 16;
 
 /// Donate [`CSPACE_FUND_PAGES`] to ktest's own `CSpace` (augment-mode
@@ -381,8 +381,7 @@ const CSPACE_FUND_PAGES: u64 = 16;
 /// the address space and for the same reason: every inherited RAM cap except
 /// `memory_base`, which `frame_pool` splits and the retype-heavy cases draw
 /// on. Best-effort, accumulating across several caps; it runs before
-/// [`fund_boot_aspace_pt`], so the spare caps fund it first, and a short fund
-/// fails as [`CSPACE_FUND_PAGES`] describes.
+/// [`fund_boot_aspace_pt`], so the spare caps fund it first.
 fn fund_own_cspace(info: &init_protocol::InitInfo)
 {
     let mut left = CSPACE_FUND_PAGES;
@@ -424,8 +423,7 @@ extern "C" fn run(info_ptr: u64) -> !
 
     // Fund ktest's own CSpace's body arena before the first split or port
     // binding (the I/O-port subdivider and `serial::init` below), and before
-    // the address-space top-up, so the spare caps fund the CSpace first: its
-    // shortfall silences serial, the top-up's only fails cases.
+    // the address-space top-up, so the spare caps fund the CSpace first.
     fund_own_cspace(info);
 
     // Fund extra PT growth budget on ktest's own (boot) AddressSpace before

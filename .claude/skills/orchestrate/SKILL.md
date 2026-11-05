@@ -274,21 +274,49 @@ an item one already holds is recorded nowhere else. Close an Issue only through 
 or when you have verified its acceptance yourself and the maintainer agrees (record the
 evidence in the closing comment).
 
+## Worktree removal
+
+A worker's worktree carries a built `target/` (several GiB), and the harness removes only a
+worktree that never changed (§ Failure modes), so every other worktree persists until you
+remove it. Removal is the orchestrator's mechanic, in two places.
+
+- **At a worker's retirement:** after its last PR merges (or its gate report, when it has no
+  PR left to merge) and nothing is left for it (§ Merge order and the gate), remove its
+  worktree. Precondition, checked first: `target/xtask/review/pr<N>/` exists in your checkout
+  for each of the worker's PRs and holds the records of every run the worker reported, since
+  those records exist nowhere else once the worktree is gone (§ Failure modes); copy any that
+  are missing from the worktree, or ask the worker to, before removing. A worktree parked on a
+  `park/<name>` branch for a possible resume (§ Merge order and the gate) is removed when the
+  worker is no longer resumable, not before.
+- **At wind-down:** sweep every worktree whose branch no longer exists on `origin`
+  (`git fetch --prune origin`, then compare `git worktree list --porcelain` against
+  `git ls-remote --heads origin`), under the same precondition, and also any detached
+  worktree. Never remove the worktree of a worker the record lists as active.
+
+Removal is `git worktree remove --force <path>` (`--force` because the build tree is untracked;
+the harness locks agent worktrees, and a locked one needs `--force` given twice), followed by
+`git worktree prune` once the sweep is done; record each removal in the record file with the
+worktree's size (`du -sh <path>`, taken before it). This is a documented `git worktree`
+procedure, not an `xtask` command: the worktrees sit under `.claude/`, outside the sysroot and
+`target/` that `cargo xtask clean` owns, and no script is added for it.
+
 ## Hand-off and wind-down
 
 When the maintainer stops the batch: workers finish the PRs whose code is committed and start
 nothing else; every deferred plan goes as a comment on the Issue it belongs to (the approved
 mechanism, the PR grouping, the call sites), so the next batch starts from the Issues, not from
-this session. Cancel the watchdog. Close the record with the open-Issue count by class.
+this session. Sweep the worktrees (§ Worktree removal). Cancel the watchdog. Close the record
+with the open-Issue count by class.
 
 ## Failure modes
 
 - A worker that ends its turn on an unchanged worktree is gone: the harness removes the
-  worktree, and a later message does not resume it. The worker's turn-ending rule
+  worktree (it removes only such a worktree, § Worktree removal), and a later message does not
+  resume it. The worker's turn-ending rule
   (`.claude/agents/worker.md` § Reporting) prevents it; the watchdog's liveness check (§ Plan
   step 4) and the respawn prompt (§ Spawn) recover from it.
-- A finished worker's worktree, and every record in it, is gone before you can read it, so a
-  record that exists only there is no record.
+- A finished worker's worktree persists until you remove it (§ Worktree removal), and its
+  records go with it, so a record that exists only there is no record: copy it first.
 - A worker's provider limit ends its session mid-run: complete the mechanical steps yourself
   in its worktree (the drivers are plain shell: gate, build, boot, log), then resume the worker
   with the results so it writes the body and runs the review with its own context.

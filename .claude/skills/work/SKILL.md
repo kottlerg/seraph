@@ -31,5 +31,12 @@ in **standalone** mode: the same authorities, planning report, branch and PR dis
   run's record, save `audit-<head>.md` and `audit-<head>.json` in the shape that section
   gives, and surface the reviewer verdict the audit states beside the audit line.
 
+This session's worktree, when the session runs in one, holds a built `target/` that nothing
+removes by itself, and the harness removes only a worktree that never changed. The review
+records of the PR sit under `target/xtask/review/pr<N>/` in the checkout the session works in,
+which is the only copy: after the merge, and not before, the maintainer removes the worktree
+(`git worktree remove --force <path>` from the main checkout, then `git worktree prune`), or
+the session does so when the maintainer asks it to; the gate report names the worktree's path.
+
 At the gate, surface both verdict lines verbatim and prompt for the merge decision per
 `.claude/CLAUDE.md` § PR workflow operations; merge only on the maintainer's instruction.

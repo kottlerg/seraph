@@ -38,9 +38,9 @@ in [crash-safety.md](crash-safety.md).
   slot page, the quarantine's replacements, a per-read ancestor cap for every slot (each outstanding
   page holds one), the scratch page, and 64 more (`std::os::seraph::fund_cspace_slot_budget`), so
   growing the cache, or holding every slot outstanding, never meets an exhausted `CSpace`; a failed
-  funding fails cache init. Before it records an open's release SEND, each `FS_OPEN` tops the
-  `CSpace` up so the same funding stays free, less the slot pages and scratch page the cache
-  already holds, so the opens' SENDs grow it rather than starve reads.
+  funding fails cache init. Before it records an open's release SEND and liveness cap, each
+  `FS_OPEN` tops the `CSpace` up so the same funding stays free, less the slot pages and scratch
+  page the cache already holds, so the opens' caps grow it rather than starve reads.
   Write-through: the cached page is updated in place before the on-disk write so any outstanding
   `FS_READ_MEMORY` cap aliasing the page observes new bytes immediately, and the sector is put back
   when the write fails. `reload_sector` reads one sector from the device past the cache and
@@ -64,8 +64,12 @@ in [crash-safety.md](crash-safety.md).
 * **Open table** (`src/file.rs`): one `OpenFile` per `FS_OPEN`, in a
   heap-grown `fat_parse::open_slab::OpenSlab` whose generation-checked id
   is the open cap's badge; at most 2^24 - 1 live opens, with no
-  per-client bound. Each open holds its own release SEND and an
-  outstanding-page table that grows up to the cache's slot count.
+  per-client bound. Each open holds its own release SEND, the parent of
+  its liveness cap, and an outstanding-page table that grows up to the
+  cache's slot count. A sweep on the schedule
+  `fat_parse::open_slab::SweepSchedule` sets releases the opens whose
+  liveness cap has no copy left outside the driver
+  ([fs-driver-protocol.md § Label 18](../../docs/fs-driver-protocol.md#label-18-fs_open)).
 * **Eviction worker** (`src/eviction.rs`): the read-side cooperative release. It sends
   `FS_RELEASE_MEMORY`, waits up to 100 ms for the ack, then revokes the page's caps and drops the
   slot. The send runs on a watchdog thread, which a client that never replies leaves blocked; with

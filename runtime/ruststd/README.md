@@ -216,6 +216,15 @@ this way. A long-lived service calls it when the headroom drops below a low-wate
 procmgr does ([services/procmgr/README.md](../../services/procmgr/README.md) § CSpace
 headroom).
 
+`std::thread::spawn` holds the headroom for the threads it creates itself. Before each spawn,
+when the headroom is below `SPAWN_CSPACE_LOW_WATER` (32 slots, about a spawn's worth of caps
+with margin) plus a page's slots, or the growth budget below a page
+(`syscall_abi::cspace_topup_pages`), it calls `fund_cspace_slot_budget` for
+`SPAWN_CSPACE_TOPUP_SLOTS` (128), so a process's live thread count is bound by the RAM memmgr
+grants rather than by the `CSpace` its creator seeded, and a process that spawns no thread funds
+nothing. A failed top-up does not fail the spawn, which then fails only if a capability
+allocation it makes finds the headroom spent.
+
 ### Bootstrap-cross-boundary VAs
 
 `_start` reads `ProcessInfo` to learn the IPC-buffer VA, the memmgr/procmgr
@@ -376,7 +385,9 @@ primitives.
 [Fault Handling](../../docs/fault-handling.md),
 [Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
+[programs/threadchurn/README.md](../../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
+[procmgr IPC Interface](../../services/procmgr/docs/ipc-interface.md),
 [`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

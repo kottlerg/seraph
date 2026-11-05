@@ -100,7 +100,7 @@ pub const PROCESS_ABI_VERSION: u32 = 24;
 /// the `.note.seraph.stack` ELF note. Binaries with deeper stack
 /// pressure (memmgr's bootstrap parser, future fs-cache workers)
 /// declare a larger value through the `process_abi::stack_pages!` macro
-/// (`seraph::stack_pages!` in std-built binaries).
+/// (`std::os::seraph::stack_pages!` in std-built binaries).
 pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
 /// Hard cap on the declared main-thread stack size, in 4 KiB pages.
@@ -216,8 +216,9 @@ impl StackNote
 ///
 /// Usable from any crate that depends on `process-abi` (every Seraph
 /// userspace component already does, directly or indirectly through
-/// std). std re-exports it as `seraph::stack_pages!` for ergonomic use
-/// from std-built binaries.
+/// std). std-built binaries use `std::os::seraph::stack_pages!`, which
+/// emits the same bytes through std's own copy of [`StackNote`]'s layout,
+/// since this crate's items are `rustc_private`-unstable to std's users.
 #[macro_export]
 macro_rules! stack_pages {
     ($pages:expr) => {
@@ -305,9 +306,11 @@ pub struct ProcessInfo
     /// Priority level the creator placed this process's initial thread at.
     ///
     /// Always within the band of [`Self::sched_control_cap`] when that cap
-    /// is present. The runtime passes `(sched_control_cap,
+    /// is present. By default the runtime passes `(sched_control_cap,
     /// initial_priority)` to `SYS_CAP_CREATE_THREAD` so spawned threads
-    /// land at the same level as the main thread. Zero only for pre-policy
+    /// land at the same level as the main thread; std's
+    /// `BuilderExt::spawn_at_priority` passes another level within the band
+    /// in its place for the thread it spawns. Zero only for pre-policy
     /// bootstrap processes; consumers must then fall back to floor
     /// creation (`(0, 0)` when no `SchedControl` is delegated). A `u8`
     /// holds every level up to the syscall ABI's `PRIORITY_MAX` (30).

@@ -39,7 +39,8 @@ versions](../../docs/conventions.md#abi--wire-protocol-versions), on any breakin
 added, removed, or repurposed, or a payload shape changed. The constants fall into four categories.
 Handshake-checked namespaces carry the version in their first-contact handshake, and the receiver
 rejects a mismatch; `devmgr_labels` and `devmgr_dma_labels` instead carry it in `data[0]` of every
-request, which devmgr checks each time. Only `ns_labels` is implicitly covered: its caps descend
+request, which devmgr checks each time, and `iommu_labels` does the same, checked by the IOMMU
+driver. Only `ns_labels` is implicitly covered: its caps descend
 from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT` handshakes, so the parent
 channel stands in for the version check. The remaining constants are markers that exist for the bump
 discipline. `STREAM_LABELS_VERSION` and `LOG_LABELS_VERSION` are in practice marker-only: no caller

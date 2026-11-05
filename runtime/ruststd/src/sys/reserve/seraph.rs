@@ -29,9 +29,8 @@
 //! Concurrency: a single spin-lock guards the arena.
 
 use crate::alloc::{Layout, alloc, dealloc};
-use crate::cell::UnsafeCell;
 use crate::ptr;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sys::alloc::seraph::SpinMutex;
 
 use syscall_abi::PAGE_SIZE;
 
@@ -246,46 +245,17 @@ impl Arena {
     }
 }
 
-// ── Spinlock ───────────────────────────────────────────────────────────────
+// ── Global arena ───────────────────────────────────────────────────────────
 
-struct SpinLock {
-    locked: AtomicBool,
-}
+// SAFETY: `runs` points at the arena's own `inline` table or at a byte-heap
+// table the arena owns, which no thread owns apart from it, and the arena is
+// reached only through `ARENA`'s lock, so any thread holding that lock may
+// follow it.
+unsafe impl Send for Arena {}
 
-impl SpinLock {
-    const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
-}
-
-struct GlobalArena {
-    inner: UnsafeCell<Arena>,
-    lock: SpinLock,
-}
-
-// SAFETY: all access to `inner` is serialised by `lock`.
-unsafe impl Sync for GlobalArena {}
-
-static ARENA: GlobalArena = GlobalArena {
-    inner: UnsafeCell::new(Arena::new()),
-    lock: SpinLock::new(),
-};
+/// The process's arena, under the byte heap's spin mutex type. Nothing
+/// under it blocks or allocates: the table grows with the lock released.
+static ARENA: SpinMutex<Arena> = SpinMutex::new(Arena::new());
 
 /// Reserve `n` contiguous pages of unmapped VA from the per-process
 /// arena. The returned range is exclusively owned until passed back to
@@ -300,16 +270,12 @@ pub fn reserve_pages(n: u64) -> Result<ReservedRange, ReserveError> {
         return Err(ReserveError::InvalidArgument);
     }
     loop {
-        ARENA.lock.lock();
-        // SAFETY: lock held; single mutator.
-        let arena = unsafe { &mut *ARENA.inner.get() };
+        let mut arena = ARENA.lock();
         arena.ensure_init();
         let Some(capacity) = arena.capacity_needed() else {
-            let result = arena.alloc(n);
-            ARENA.lock.unlock();
-            return result.ok_or(ReserveError::OutOfSpace);
+            return arena.alloc(n).ok_or(ReserveError::OutOfSpace);
         };
-        ARENA.lock.unlock();
+        drop(arena);
         // Grow the table with the lock released: the byte heap takes its own
         // lock and may IPC to memmgr, neither of which may nest inside this
         // spinlock.
@@ -321,10 +287,10 @@ pub fn reserve_pages(n: u64) -> Result<ReservedRange, ReserveError> {
         if fresh.is_null() {
             return Err(ReserveError::OutOfSpace);
         }
-        ARENA.lock.lock();
-        // SAFETY: lock held; `fresh` is the allocation of `layout` above.
-        let spare = unsafe { (*ARENA.inner.get()).install_table(fresh, capacity) };
-        ARENA.lock.unlock();
+        let mut arena = ARENA.lock();
+        // SAFETY: `fresh` is the allocation of `layout` above.
+        let spare = unsafe { arena.install_table(fresh, capacity) };
+        drop(arena);
         if let Some((table, table_capacity)) = spare {
             if let Ok(old) = Layout::array::<Run>(table_capacity) {
                 // SAFETY: `table` is a heap table of `table_capacity` runs
@@ -342,10 +308,5 @@ pub fn reserve_pages(n: u64) -> Result<ReservedRange, ReserveError> {
 pub fn unreserve_pages(range: ReservedRange) {
     let va = range.va_start;
     let pages = range.page_count;
-    ARENA.lock.lock();
-    // SAFETY: lock held; single mutator.
-    unsafe {
-        (*ARENA.inner.get()).free(va, pages);
-    }
-    ARENA.lock.unlock();
+    ARENA.lock().free(va, pages);
 }

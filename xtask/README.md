@@ -86,7 +86,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--mem` | Guest memory size in MiB (default: `512`) |
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 | `--x86-paging` | Guest x86-64 paging depth (default: `4`; x86_64 only, ignored on riscv64). Appends `la57=off` (`4`) or `la57=on` (`5`) to the QEMU `-cpu` model on every accelerator, which sets the CPUID LA57 bit the bootloader negotiates the depth from ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57`, per [docs/memory-model.md](../docs/memory-model.md) § x86-64. The default pins `4` because TCG's `-cpu max` otherwise advertises LA57. `5` on a native accelerator (KVM, HVF, WHPX, NVMM) whose host CPU lacks LA57 fails before launch, naming the TCG route (`SERAPH_ACCEL=tcg`), since QEMU would drop the property with a warning and boot 4-level |
-| `--iommu` | Whether the machine's IOMMU is attached (default: `attached`): `intel-iommu` with interrupt remapping off on x86-64, `riscv-iommu-pci` in Bare mode (`off=off`) on riscv64, with the `virtio-pci` devices a driver of the system binds behind it (`iommu_platform=on`). `absent` boots the no-IOMMU variant of the release host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), which keeps devmgr's unconfined path covered once the attached IOMMU is programmed; today none is, so both modes run every device unconfined ([docs/device-management.md](../docs/device-management.md#dma-safety-model) § DMA Safety Model) |
+| `--iommu` | Whether the machine's IOMMU is attached (default: `attached`): `intel-iommu` with interrupt remapping off on x86-64, `riscv-iommu-pci` in Bare mode (`off=off`) on riscv64, with the `virtio-pci` devices a driver of the system binds behind it (`iommu_platform=on`). `absent` boots the no-IOMMU variant of the release host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), which keeps devmgr's unconfined path covered while the attached IOMMU is programmed: on x86-64 the attached `intel-iommu` confines every device a driver binds, and on riscv64 no IOMMU is programmed yet, so both modes run every device unconfined there ([docs/device-management.md](../docs/device-management.md#dma-safety-model) § DMA Safety Model) |
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
@@ -113,17 +113,20 @@ is a superset that `xtask` does not expose (see
 #### Attached devices
 
 Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci` (drive `hd0`), a
-`virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over
-QMP), a `virtio-rng-pci` boot-entropy source, the guest UART on `-serial stdio`, and, unless
-`--iommu absent`, the machine's IOMMU: `intel-iommu` (interrupt remapping off) on x86-64 and
+`virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over QMP), a
+`virtio-rng-pci` boot-entropy source, the guest UART on `-serial stdio`, and, unless `--iommu
+absent`, the machine's IOMMU: `intel-iommu` (interrupt remapping off) on x86-64 and
 `riscv-iommu-pci` in Bare mode on riscv64, with the disks and the keyboard behind it
-(`iommu_platform=on`); the RNG, which only the firmware drives, stays outside it. On
-x86-64 it also attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
+(`iommu_platform=on`); the RNG, which only the firmware drives, stays outside it. On x86-64 it also
+attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
 ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
-(VMGENID)); QEMU's riscv64 `virt` machine has none. A non-headless run adds QEMU std VGA: the
-q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair,
-added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
-adapter, so no framebuffer is advertised.
+(VMGENID)), and `-device edu`, QEMU's DMA test device, behind the IOMMU when one is attached, which
+only svctest's DMA confinement phase drives
+([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)); QEMU's riscv64
+`virt` machine has no VMGENID, and xtask attaches no `edu` device to it while no riscv64 IOMMU is
+programmed. A non-headless run adds QEMU std VGA: the q35 default adapter on x86-64, and on riscv64
+`-device VGA` with a `qemu-xhci`/`usb-kbd` pair, added only when a `gtk` or `sdl` display backend is
+available. `--headless` drops the display adapter, so no framebuffer is advertised.
 
 The disk device presents the logical block size of the image it boots, 512 or 4096 bytes
 (`logical_block_size` and `physical_block_size`), read from the LBA its GPT header sits at, so a
@@ -265,8 +268,10 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
-`--harness init` produces a 9-entry bundle (`init` + the 8 boot modules
-listed in `xtask/src/bundle.rs::MODULES`; the bootloader and init
+`--harness init` produces a 9-entry bundle on riscv64 and a 10-entry one on
+x86-64 (`init` + the 8 boot modules listed in `xtask/src/bundle.rs::MODULES`,
+and on x86-64 the VT-d IOMMU driver `iommu-vtd` from `ARCH_MODULES`; the
+bootloader and init
 address entries by name, so order is not significant). `--harness ktest`
 produces a single-entry bundle (`ktest` as the `init` entry, zero
 modules); ktest is monolithic and does not spawn userspace.

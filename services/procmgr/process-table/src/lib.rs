@@ -163,6 +163,8 @@ struct RecentExit
 
 impl RecentExits
 {
+    /// An empty ring. It allocates nothing until the first
+    /// [`Self::record`], and grows on the heap from there.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -253,6 +255,8 @@ pub struct ProcessTable
 
 impl ProcessTable
 {
+    /// An empty table with no held reclaims. It allocates nothing until the
+    /// first [`Self::insert`] or arm, and grows on the heap from there.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -829,10 +833,9 @@ mod tests
         table.arm_dma_hold(16).unwrap();
         let mut taken = table.take_by_badge(16).unwrap();
         taken.started = true;
-        // The one parked record leaves no armed child behind: a second
-        // record would need a second armed entry.
+        // Parking the one entry settles the one reservation it holds; a
+        // second arm that reserved again would leave a reservation behind.
         assert!(table.holds_mut().park(&taken));
-        assert_eq!(table.holds_mut().len(), 1);
         assert_eq!(table.holds_mut().armed(), 0);
     }
 

@@ -33,6 +33,7 @@
 
 use crate::alloc::{GlobalAlloc, Layout, System};
 use crate::cell::UnsafeCell;
+use crate::marker::PhantomData;
 use crate::mem::{align_of, size_of};
 use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
@@ -81,18 +82,33 @@ const PT_FUND_ROUNDS: u32 = 2;
 /// in between; the trailing headroom check decides either way.
 const CSPACE_FUND_ROUNDS: u32 = 2;
 
-// ── Spinlock ────────────────────────────────────────────────────────────────
+// ── Spin mutex ──────────────────────────────────────────────────────────────
 
-struct SpinLock {
+/// A spinlock that owns the state it serialises: the state is reachable only
+/// through the [`SpinGuard`] [`Self::lock`] returns, and the guard releases
+/// the lock when it drops, so the type system keeps every access under the
+/// lock (docs/coding-standards.md § Concurrency). The byte heap, the object
+/// slabs, the page-reservation arena (`sys::reserve`), and the thread
+/// reaper's slot table and death queues (`sys::thread`) use it rather than
+/// std's `Mutex`, which may park and allocate: the allocator runs beneath
+/// both, and the reaper runs inside a spawn.
+pub(crate) struct SpinMutex<T> {
     locked: AtomicBool,
+    value: UnsafeCell<T>,
 }
 
-impl SpinLock {
-    const fn new() -> Self {
-        Self { locked: AtomicBool::new(false) }
+// SAFETY: `value` is reached only through a `SpinGuard`, and `lock` hands out
+// one guard at a time, so threads sharing the mutex take exclusive access in
+// turn; `T: Send` lets the value pass between those threads.
+unsafe impl<T: Send> Sync for SpinMutex<T> {}
+
+impl<T> SpinMutex<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self { locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
     }
 
-    fn lock(&self) {
+    /// Spin until the lock is free, then hold it until the guard drops.
+    pub(crate) fn lock(&self) -> SpinGuard<'_, T> {
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -100,10 +116,46 @@ impl SpinLock {
         {
             core::hint::spin_loop();
         }
+        SpinGuard { mutex: self, _exclusive: PhantomData }
     }
 
-    fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
+    /// Run `f` on the value under the lock, released when `f` returns.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut self.lock())
+    }
+}
+
+/// Exclusive access to a [`SpinMutex`]'s value; dropping it releases the lock.
+///
+/// The marker gives the guard the auto traits of `&mut T`: it is `Sync` only
+/// when `T` is, as std's `MutexGuard` is, so a guard shared by reference
+/// never hands two threads a `&T` of a value that is `Send` but not `Sync`.
+pub(crate) struct SpinGuard<'a, T> {
+    mutex: &'a SpinMutex<T>,
+    _exclusive: PhantomData<&'a mut T>,
+}
+
+impl<T> crate::ops::Deref for SpinGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: this guard holds the lock, so no other reference to the
+        // value exists.
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> crate::ops::DerefMut for SpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: this guard holds the lock, so no other reference to the
+        // value exists.
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for SpinGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
     }
 }
 
@@ -145,6 +197,11 @@ struct Heap {
     /// has backed it. Advanced by [`Self::back_floor_to`].
     floor_backed_end: usize,
 }
+
+// SAFETY: the free-list pointers address free blocks in the process's own
+// heap pages, which no thread owns, and the heap is reached only through
+// `HEAP`'s lock, so any thread holding that lock may follow them.
+unsafe impl Send for Heap {}
 
 impl Heap {
     const fn new() -> Self {
@@ -491,18 +548,7 @@ impl Heap {
 
 // ── Global heap ─────────────────────────────────────────────────────────────
 
-struct GlobalHeap {
-    inner: UnsafeCell<Heap>,
-    lock: SpinLock,
-}
-
-// SAFETY: all access to `inner` is serialised by `lock`.
-unsafe impl Sync for GlobalHeap {}
-
-static HEAP: GlobalHeap = GlobalHeap {
-    inner: UnsafeCell::new(Heap::new()),
-    lock: SpinLock::new(),
-};
+static HEAP: SpinMutex<Heap> = SpinMutex::new(Heap::new());
 
 /// [`heap_bootstrap`] progress: unclaimed, claimed by the first call and
 /// running, or finished with the heap installed or not.
@@ -561,10 +607,8 @@ fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
     let heap_base = zone.base(drawn);
     let demand_floor = register_demand_floor(memmgr_ep, self_aspace, heap_base);
 
-    HEAP.lock.lock();
-    // SAFETY: lock held; the heap is unbootstrapped, so no allocation holds
-    // a pointer into it.
-    let heap = unsafe { &mut *HEAP.inner.get() };
+    // The heap is unbootstrapped, so no allocation holds a pointer into it.
+    let mut heap = HEAP.lock();
     heap.mapped_end = heap_base as usize;
     heap.max = (heap_base + zone.span) as usize;
     heap.memmgr_ep = memmgr_ep;
@@ -588,7 +632,6 @@ fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
     if !ok {
         *heap = Heap::new();
     }
-    HEAP.lock.unlock();
     ok
 }
 
@@ -629,7 +672,7 @@ pub fn heap_is_initialized() -> bool {
 // class — plus a no-cache fresh-grant path for page-aligned requests. Lazily
 // acquired from memmgr on first use.
 //
-// All pool state is guarded by a per-pool spinlock, and the retype syscall
+// All pool state lives in a per-pool `SpinMutex`, and the retype syscall
 // itself runs under that lock (the [`object_slab_retype`] closure contract).
 // That discipline is what makes the cap lifecycle below sound: no caller can
 // hold an acquired-but-unretyped slot once the lock is released, so the pool
@@ -678,37 +721,31 @@ struct ShelfEntry {
     size: u64,
 }
 
-/// Page-identity state for one pool: the current page's grant identity plus
-/// the shelf of displaced pages, oldest first.
-struct SlabPages {
+/// One pool's state: the current page's cap, its ledger mirror, and its
+/// grant identity, plus the shelf of displaced pages, oldest first.
+struct SlabPool {
+    /// The current pool page's Memory cap, or 0 before the first refill.
+    cap: u64,
+    /// The ledger mirror of `cap`'s `available_bytes`.
+    local_avail: u64,
     cur_phys: u64,
     cur_size: u64,
     shelf: [ShelfEntry; SLAB_SHELF_SIZE],
     shelf_len: usize,
 }
 
-struct ObjectSlab {
-    cap: crate::sync::atomic::AtomicU64,
-    local_avail: crate::sync::atomic::AtomicU64,
-    pages: UnsafeCell<SlabPages>,
-    lock: SpinLock,
-}
-
-// SAFETY: all access to `pages` is serialised by `lock`.
-unsafe impl Sync for ObjectSlab {}
+/// One size class's pool, under the lock its retypes run under.
+type ObjectSlab = SpinMutex<SlabPool>;
 
 const fn empty_slab() -> ObjectSlab {
-    ObjectSlab {
-        cap: crate::sync::atomic::AtomicU64::new(0),
-        local_avail: crate::sync::atomic::AtomicU64::new(0),
-        pages: UnsafeCell::new(SlabPages {
-            cur_phys: 0,
-            cur_size: 0,
-            shelf: [ShelfEntry { cap: 0, phys: 0, size: 0 }; SLAB_SHELF_SIZE],
-            shelf_len: 0,
-        }),
-        lock: SpinLock::new(),
-    }
+    SpinMutex::new(SlabPool {
+        cap: 0,
+        local_avail: 0,
+        cur_phys: 0,
+        cur_size: 0,
+        shelf: [ShelfEntry { cap: 0, phys: 0, size: 0 }; SLAB_SHELF_SIZE],
+        shelf_len: 0,
+    })
 }
 
 /// Slab serving sub-page requests `<= 128 B` (Endpoint, Notification).
@@ -868,129 +905,123 @@ fn slab_retype_pooled<T>(
     want_pages: u64,
     retype: impl FnOnce(u64) -> Option<T>,
 ) -> Option<T> {
-    pool.lock.lock();
-    let res = (|| -> Option<T> {
-        // Fast path: the local ledger says the current page has room.
-        let cur = pool.cap.load(Ordering::Acquire);
-        let avail = pool.local_avail.load(Ordering::Relaxed);
-        if cur != 0 && avail >= need {
+    let mut guard = pool.lock();
+    let pool: &mut SlabPool = &mut guard;
+    // Fast path: the local ledger says the current page has room.
+    let cur = pool.cap;
+    let avail = pool.local_avail;
+    if cur != 0 && avail >= need {
+        let out = retype(cur)?;
+        pool.local_avail = avail - need;
+        return Some(out);
+    }
+
+    // Resync: the kernel credits auto-reclaimed bytes back to the cap
+    // when retyped objects die; the mirror only debits. Re-read the
+    // authoritative ledger before paying for a refill. Sound because
+    // every debit against a pool cap happens under this lock and
+    // concurrent deletions only credit.
+    if cur != 0 {
+        let avail =
+            syscall::cap_info(cur, syscall_abi::CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
+        pool.local_avail = avail;
+        if avail >= need {
             let out = retype(cur)?;
-            pool.local_avail.store(avail - need, Ordering::Relaxed);
+            pool.local_avail = avail - need;
             return Some(out);
         }
+    }
 
-        // SAFETY: `pages` is only accessed under `pool.lock`, held here.
-        let pages = unsafe { &mut *pool.pages.get() };
+    // Shelf scan: release fully-drained retired pages back to memmgr and
+    // pick the first entry with room as a promotion candidate (a drained
+    // candidate is reused rather than released — strictly cheaper than
+    // releasing it and requesting a fresh grant). A failed probe reads
+    // as 0: the entry defers (kept, not promoted, never mis-freed).
+    let mut avails = [0u64; SLAB_SHELF_SIZE];
+    for (i, slot) in avails.iter_mut().enumerate().take(pool.shelf_len) {
+        *slot = syscall::cap_info(pool.shelf[i].cap, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+            .unwrap_or(0);
+    }
+    let mut promote: Option<(ShelfEntry, u64)> = None;
+    let mut keep = 0;
+    for i in 0..pool.shelf_len {
+        let entry = pool.shelf[i];
+        if promote.is_none() && avails[i] >= need {
+            promote = Some((entry, avails[i]));
+            continue;
+        }
+        if avails[i] == entry.size {
+            // Fully drained: no live retype remains, so the run can go
+            // back to memmgr's pool. Delete the cap first per the
+            // RELEASE_MEMORY_CAPS contract.
+            let _ = syscall::cap_delete(entry.cap);
+            slab_release_fresh(entry.phys);
+            continue;
+        }
+        pool.shelf[keep] = entry;
+        keep += 1;
+    }
+    pool.shelf_len = keep;
 
-        // Resync: the kernel credits auto-reclaimed bytes back to the cap
-        // when retyped objects die; the mirror only debits. Re-read the
-        // authoritative ledger before paying for a refill. Sound because
-        // every debit against a pool cap happens under this lock and
-        // concurrent deletions only credit.
+    if let Some((entry, entry_avail)) = promote {
+        // Swap: park the displaced current page in the slot the
+        // candidate vacated (it is pinned by live retypes — a drained
+        // current page would have served at resync) and serve from the
+        // promoted page.
         if cur != 0 {
-            let avail =
-                syscall::cap_info(cur, syscall_abi::CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0);
-            pool.local_avail.store(avail, Ordering::Relaxed);
-            if avail >= need {
-                let out = retype(cur)?;
-                pool.local_avail.store(avail - need, Ordering::Relaxed);
-                return Some(out);
-            }
+            pool.shelf[pool.shelf_len] =
+                ShelfEntry { cap: cur, phys: pool.cur_phys, size: pool.cur_size };
+            pool.shelf_len += 1;
         }
+        pool.cap = entry.cap;
+        pool.cur_phys = entry.phys;
+        pool.cur_size = entry.size;
+        pool.local_avail = entry_avail;
+        let out = retype(entry.cap)?;
+        pool.local_avail = entry_avail - need;
+        return Some(out);
+    }
 
-        // Shelf scan: release fully-drained retired pages back to memmgr and
-        // pick the first entry with room as a promotion candidate (a drained
-        // candidate is reused rather than released — strictly cheaper than
-        // releasing it and requesting a fresh grant). A failed probe reads
-        // as 0: the entry defers (kept, not promoted, never mis-freed).
-        let mut avails = [0u64; SLAB_SHELF_SIZE];
-        for (i, slot) in avails.iter_mut().enumerate().take(pages.shelf_len) {
-            *slot = syscall::cap_info(pages.shelf[i].cap, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
-                .unwrap_or(0);
+    // Refill: request a fresh contiguous cap from memmgr. One attempt —
+    // propagate failure rather than retry.
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    if ep == 0 {
+        return None;
+    }
+    let (new_cap, cap_pages, new_phys) = slab_request_pages(ep, want_pages)?;
+    let total = cap_pages.saturating_mul(PAGE_SIZE);
+    let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
+    if usable < need {
+        // memmgr returned a cap too small for this request. The grant is
+        // virgin — reclaim the slot and return the run rather than
+        // stranding it in memmgr's per-process accounting.
+        let _ = syscall::cap_delete(new_cap);
+        slab_release_fresh(new_phys);
+        return None;
+    }
+    // Retire the displaced current page. It is pinned by live retypes
+    // (see above), so it cannot be released here; the shelf scan frees
+    // it once its objects die. On overflow evict the oldest entry by
+    // cap-delete alone: its run stays accounted to this process until
+    // process death — the bounded residual strand.
+    if cur != 0 {
+        if pool.shelf_len == SLAB_SHELF_SIZE {
+            let evicted = pool.shelf[0];
+            let _ = syscall::cap_delete(evicted.cap);
+            pool.shelf.copy_within(1.., 0);
+            pool.shelf_len -= 1;
         }
-        let mut promote: Option<(ShelfEntry, u64)> = None;
-        let mut keep = 0;
-        for i in 0..pages.shelf_len {
-            let entry = pages.shelf[i];
-            if promote.is_none() && avails[i] >= need {
-                promote = Some((entry, avails[i]));
-                continue;
-            }
-            if avails[i] == entry.size {
-                // Fully drained: no live retype remains, so the run can go
-                // back to memmgr's pool. Delete the cap first per the
-                // RELEASE_MEMORY_CAPS contract.
-                let _ = syscall::cap_delete(entry.cap);
-                slab_release_fresh(entry.phys);
-                continue;
-            }
-            pages.shelf[keep] = entry;
-            keep += 1;
-        }
-        pages.shelf_len = keep;
-
-        if let Some((entry, entry_avail)) = promote {
-            // Swap: park the displaced current page in the slot the
-            // candidate vacated (it is pinned by live retypes — a drained
-            // current page would have served at resync) and serve from the
-            // promoted page.
-            if cur != 0 {
-                pages.shelf[pages.shelf_len] =
-                    ShelfEntry { cap: cur, phys: pages.cur_phys, size: pages.cur_size };
-                pages.shelf_len += 1;
-            }
-            pool.cap.store(entry.cap, Ordering::Release);
-            pages.cur_phys = entry.phys;
-            pages.cur_size = entry.size;
-            pool.local_avail.store(entry_avail, Ordering::Relaxed);
-            let out = retype(entry.cap)?;
-            pool.local_avail.store(entry_avail - need, Ordering::Relaxed);
-            return Some(out);
-        }
-
-        // Refill: request a fresh contiguous cap from memmgr. One attempt —
-        // propagate failure rather than retry.
-        let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
-        if ep == 0 {
-            return None;
-        }
-        let (new_cap, cap_pages, new_phys) = slab_request_pages(ep, want_pages)?;
-        let total = cap_pages.saturating_mul(PAGE_SIZE);
-        let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
-        if usable < need {
-            // memmgr returned a cap too small for this request. The grant is
-            // virgin — reclaim the slot and return the run rather than
-            // stranding it in memmgr's per-process accounting.
-            let _ = syscall::cap_delete(new_cap);
-            slab_release_fresh(new_phys);
-            return None;
-        }
-        // Retire the displaced current page. It is pinned by live retypes
-        // (see above), so it cannot be released here; the shelf scan frees
-        // it once its objects die. On overflow evict the oldest entry by
-        // cap-delete alone: its run stays accounted to this process until
-        // process death — the bounded residual strand.
-        if cur != 0 {
-            if pages.shelf_len == SLAB_SHELF_SIZE {
-                let evicted = pages.shelf[0];
-                let _ = syscall::cap_delete(evicted.cap);
-                pages.shelf.copy_within(1.., 0);
-                pages.shelf_len -= 1;
-            }
-            pages.shelf[pages.shelf_len] =
-                ShelfEntry { cap: cur, phys: pages.cur_phys, size: pages.cur_size };
-            pages.shelf_len += 1;
-        }
-        pool.cap.store(new_cap, Ordering::Release);
-        pages.cur_phys = new_phys;
-        pages.cur_size = total;
-        pool.local_avail.store(usable, Ordering::Relaxed);
-        let out = retype(new_cap)?;
-        pool.local_avail.store(usable - need, Ordering::Relaxed);
-        Some(out)
-    })();
-    pool.lock.unlock();
-    res
+        pool.shelf[pool.shelf_len] =
+            ShelfEntry { cap: cur, phys: pool.cur_phys, size: pool.cur_size };
+        pool.shelf_len += 1;
+    }
+    pool.cap = new_cap;
+    pool.cur_phys = new_phys;
+    pool.cur_size = total;
+    pool.local_avail = usable;
+    let out = retype(new_cap)?;
+    pool.local_avail = usable - need;
+    Some(out)
 }
 
 /// A freshly-acquired dedicated Memory cap plus the identity memmgr needs to
@@ -1276,9 +1307,7 @@ pub fn abort_thread() -> ! {
 unsafe impl GlobalAlloc for System {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        HEAP.lock.lock();
-        // SAFETY: lock held, single mutator.
-        let heap = unsafe { &mut *HEAP.inner.get() };
+        let mut heap = HEAP.lock();
         let mut ptr = heap.alloc(layout);
         // Grow to fit and retry, for as long as each grow maps at least one
         // page: `grow` sizes itself to the request beyond the free block at
@@ -1296,7 +1325,6 @@ unsafe impl GlobalAlloc for System {
         while ptr.is_null() && heap.grow(want) {
             ptr = heap.alloc(layout);
         }
-        HEAP.lock.unlock();
         ptr
     }
 
@@ -1323,10 +1351,9 @@ unsafe impl GlobalAlloc for System {
         // a `NODE_ALIGN`-aligned address, every block size is a
         // `NODE_ALIGN` multiple) holds.
         let size = align_up(layout.size().max(MIN_BLOCK), NODE_ALIGN);
-        HEAP.lock.lock();
-        // SAFETY: lock held; caller guarantees ptr/layout match a prior alloc.
-        unsafe { (*HEAP.inner.get()).insert(ptr as usize, size) };
-        HEAP.lock.unlock();
+        let mut heap = HEAP.lock();
+        // SAFETY: the caller guarantees ptr/layout match a prior alloc.
+        unsafe { heap.insert(ptr as usize, size) };
     }
 
     #[inline]

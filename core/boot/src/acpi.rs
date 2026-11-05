@@ -22,7 +22,7 @@
 //!   the hardware IDs `BootInfo.cpu_ids` names.
 //! - [`count_aperture_seed`]: the aperture-seed walk counting the register
 //!   and heuristic-window seeds, which sizes the seed buffers.
-//! - [`parse_aperture_seed`]: MADT + MCFG walk, plus the arch's
+//! - [`parse_aperture_seed`]: MADT + MCFG + DMAR walk, plus the arch's
 //!   platform-default MMIO apertures and PCI windows
 //!   (`core/boot/docs/acpi.md` § Tables Consumed), producing the register
 //!   and heuristic-window MMIO aperture seeds fed into
@@ -675,6 +675,8 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// - Each RISC-V PLIC register window (MADT type 0x1B, present on
 ///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
 /// - Each MCFG ECAM window.
+/// - Each VT-d remapping unit's register set (DMAR DRHD), which no other
+///   table names.
 /// - The arch's platform-default register windows from
 ///   `crate::arch::current::default_mmio_apertures` (empty on x86-64),
 ///   appended once the RSDP and XSDT validate.
@@ -700,7 +702,7 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// # Safety
 /// `rsdp_addr` must be the physical address of a valid, identity-mapped
 /// ACPI RSDP. A zero `rsdp_addr` returns zero counts without reading.
-// too_many_lines: linear walk over MADT and MCFG with per-entry push dispatch;
+// too_many_lines: linear walk over MADT, MCFG, and DMAR with per-entry push dispatch;
 // the cases are flat and inline-local, splitting them loses the walk's shape.
 #[allow(clippy::too_many_lines)]
 unsafe fn walk_aperture_seed(
@@ -928,6 +930,29 @@ unsafe fn walk_aperture_seed(
                 off += MCFG_ENTRY_SIZE;
             }
         }
+        else if &sig == b"DMAR"
+        {
+            // Each VT-d remapping unit's register set: no other table names
+            // it, and devmgr hands it to the IOMMU driver as an `Mmio` cap.
+            let mut off = DMAR_STRUCTURES_OFF;
+            while off + 4 <= table.len()
+            {
+                let kind = u16::from_le_bytes([read_u8(table, off), read_u8(table, off + 1)]);
+                let len = usize::from(u16::from_le_bytes([
+                    read_u8(table, off + 2),
+                    read_u8(table, off + 3),
+                ]));
+                if len < 4 || off + len > table.len()
+                {
+                    break;
+                }
+                if let Some((base, size)) = drhd_register_window(&table[off..off + len], kind)
+                {
+                    push!(base, size);
+                }
+                off += len;
+            }
+        }
     }
 
     // Per-arch platform-default MMIO apertures; the early returns above
@@ -953,6 +978,33 @@ unsafe fn walk_aperture_seed(
     }
 }
 
+/// First DMAR remapping structure: after the header, the host address width
+/// (u8), the flags (u8), and 10 reserved bytes (Intel VT-d specification,
+/// section 8.1).
+const DMAR_STRUCTURES_OFF: usize = SDT_HDR_LEN + 12;
+
+/// Register window `(phys_base, size)` of one DMAR remapping structure
+/// `entry` of type `kind`, when it is a DMA Remapping Hardware Unit
+/// Definition (type 0, VT-d section 8.3): its register base (u64 at 8) and
+/// `2^size` pages (the low nibble of the u8 at 5). Returns `None` for any
+/// other structure, one shorter than a DRHD's 16 fixed bytes, or a base that
+/// is zero, not page-aligned, or whose window overflows.
+fn drhd_register_window(entry: &[u8], kind: u16) -> Option<(u64, u64)>
+{
+    if kind != 0 || entry.len() < 16
+    {
+        return None;
+    }
+    let base = read_u64(entry, 8);
+    let size = 0x1000u64 << (read_u8(entry, 5) & 0x0f);
+    if base == 0 || base & 0xfff != 0
+    {
+        return None;
+    }
+    base.checked_add(size)?;
+    Some((base, size))
+}
+
 /// ECAM window `(phys_base, size)` of one MCFG allocation entry: the MCFG
 /// base is where bus 0 would decode, so the window starts `start_bus` MiB
 /// above it and spans 1 MiB per bus through `end_bus`. Returns `None` for a
@@ -975,6 +1027,39 @@ mod tests
 {
     use super::*;
     use boot_protocol::MAX_CPUS;
+
+    /// A DRHD of `size` (log2 pages) at register `base`, with no scopes.
+    fn drhd(size: u8, base: u64) -> [u8; 16]
+    {
+        let mut e = [0u8; 16];
+        e[2] = 16;
+        e[5] = size;
+        e[8..16].copy_from_slice(&base.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn a_drhd_seeds_its_register_window()
+    {
+        assert_eq!(
+            drhd_register_window(&drhd(0, 0xfed9_0000), 0),
+            Some((0xfed9_0000, 0x1000))
+        );
+        assert_eq!(
+            drhd_register_window(&drhd(2, 0xfed9_0000), 0),
+            Some((0xfed9_0000, 0x4000))
+        );
+    }
+
+    #[test]
+    fn a_non_drhd_or_malformed_drhd_seeds_nothing()
+    {
+        assert_eq!(drhd_register_window(&drhd(0, 0xfed9_0000), 1), None);
+        assert_eq!(drhd_register_window(&drhd(0, 0xfed9_0000)[..12], 0), None);
+        assert_eq!(drhd_register_window(&drhd(0, 0), 0), None);
+        assert_eq!(drhd_register_window(&drhd(0, 0xfed9_0010), 0), None);
+        assert_eq!(drhd_register_window(&drhd(0, u64::MAX & !0xfff), 0), None);
+    }
 
     #[test]
     fn mcfg_window_from_bus_zero_starts_at_the_base()

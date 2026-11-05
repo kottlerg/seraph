@@ -295,6 +295,7 @@ version = "0.1.1"
 dependencies = [
  "boot-protocol",
  "devmgr-firmware",
+ "iommu-core",
  "ipc",
  "namespace-protocol",
  "ns-client",
@@ -556,6 +557,25 @@ name = "init-sender-table"
 version = "0.1.1"
 dependencies = [
  "logd-codec",
+]
+
+[[package]]
+name = "iommu-core"
+version = "0.1.1"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "iommu-vtd"
+version = "0.1.1"
+dependencies = [
+ "iommu-core",
+ "ipc",
+ "syscall",
+ "syscall-abi",
 ]
 
 [[package]]
@@ -1153,6 +1173,16 @@ dependencies = [
  "ansi",
  "ipc",
  "syscall",
+]
+
+[[package]]
+name = "test-dma"
+version = "0.1.1"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+ "virtio-core",
 ]
 
 [[package]]

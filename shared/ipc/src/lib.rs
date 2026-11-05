@@ -57,6 +57,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   Checked on every request (`data[0]`):
 //     DEVMGR_LABELS_VERSION     — every devmgr_labels request
 //     DEVMGR_DMA_LABELS_VERSION — every devmgr_dma_labels request
+//     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -464,9 +465,9 @@ pub mod procmgr_labels
 /// | 30 | init (kernel-assigned `INIT_PRIORITY`) |
 /// | 28 | memmgr |
 /// | 27 | procmgr |
-/// | 26 | init-logd, serial, virtio-blk |
+/// | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
 /// | 25 | framebuffer, rtc, virtio-input |
-/// | 24 | devmgr |
+/// | 24 | devmgr, every thread but its DMA thread |
 /// | 23 | vfsd, fs drivers (fatfs) |
 /// | 21 | svcmgr |
 /// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
@@ -516,7 +517,8 @@ pub mod sched_policy
 
     /// devmgr's band ceiling. Deliberately above its own level so it can
     /// place the drivers it spawns at [`BOOT_DRIVER_PRIORITY`] /
-    /// [`AUX_DRIVER_PRIORITY`].
+    /// [`AUX_DRIVER_PRIORITY`], and its own DMA thread, which virtio-blk
+    /// blocks on, at [`BOOT_DRIVER_PRIORITY`].
     pub const DEVMGR_BAND_MAX: u8 = 26;
 
     /// vfsd — the namespace/VFS authority.
@@ -1588,7 +1590,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 13;
+pub const DEVMGR_LABELS_VERSION: u32 = 14;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1889,6 +1891,48 @@ pub mod devmgr_labels
     /// one fault batch spawns, which devmgr's driver death queue reserves
     /// room for.
     pub const TEST_FAULT_DRIVERS: usize = 3;
+    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    /// label: bind the DMA test device (QEMU's `edu`, PCI `1234:11e8`) to
+    /// the `test-dma` fixture driver from `/services/drivers/` in a settle
+    /// batch of its own: devmgr attaches the device to its IOMMU domain where
+    /// an IOMMU confines it, grants it DMA, turns on its memory decode and
+    /// bus mastering, and spawns the driver, which reports ready once it has
+    /// found the device. The handler replies before it binds (the bind does
+    /// nested `ipc_call`s), and the driver is then queried with
+    /// [`TEST_QUERY_DMA_DEVICE`], which waits in the registry queue until the
+    /// settle has ended. Reply: `SUCCESS` with `data[0]` =
+    /// [`TEST_DMA_CONFINED`] when an IOMMU confines the device or
+    /// [`TEST_DMA_UNCONFINED`] when none does; `NO_DEVICE` when the machine
+    /// has no such device; `INVALID_REQUEST` for a repeated request (at most
+    /// once per boot) or one before [`SET_DRIVERS_DIR`]. Request: `data[0]` =
+    /// caller's compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
+    /// [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_SPAWN_DMA_DRIVER: u64 = 16;
+    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
+    /// mint a `SEND_GRANT` cap badged [`TEST_DENY_BADGE`] on the served
+    /// `test-dma` driver's service endpoint (the driver checks no badge).
+    /// Reply: `SUCCESS` with the cap in `caps[0]`; `WITHDRAWN` once the
+    /// driver is withdrawn; `NO_DEVICE` when none is served;
+    /// `INVALID_REQUEST` for a failed derive. Request: `data[0]` = caller's
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Gate as
+    /// [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_QUERY_DMA_DEVICE: u64 = 17;
+    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Test-only label:
+    /// the IOMMU faults devmgr has taken for the DMA test device, after it
+    /// takes the IOMMU driver's pending ones (`iommu_labels::TAKE_FAULTS`)
+    /// and logs them. Reply: `SUCCESS` with `data[0]` = the faults taken for
+    /// the device over the boot and `data[1]` = the IOVA of the latest, page
+    /// aligned (0 with none); `NO_DEVICE` when no DMA test device is bound.
+    /// Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Gate as [`TEST_SPAWN_ORPHAN`].
+    pub const TEST_DMA_FAULTS: u64 = 18;
+    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: an
+    /// IOMMU confines the DMA test device.
+    pub const TEST_DMA_CONFINED: u64 = 1;
+    /// TODO(#165): remove with [`TEST_SPAWN_DMA_DRIVER`]. Its reply word: no
+    /// IOMMU confines the DMA test device, so its device addresses are
+    /// physical.
+    pub const TEST_DMA_UNCONFINED: u64 = 2;
 
     /// Driver-only: report that the driver has set its device up and is
     /// entering its service loop, so devmgr may serve its endpoint.
@@ -1935,8 +1979,9 @@ pub mod devmgr_labels
     pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
     /// TODO(#165): remove with the test labels. Authority bit gating
     /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`],
-    /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`], and
-    /// [`TEST_QUERY_FAULT_DEVICE`]. svcmgr mints it,
+    /// [`TEST_QUERY_DENY_DEVICE`], [`TEST_SPAWN_FAULT_DRIVERS`],
+    /// [`TEST_QUERY_FAULT_DEVICE`], [`TEST_SPAWN_DMA_DRIVER`],
+    /// [`TEST_QUERY_DMA_DEVICE`], and [`TEST_DMA_FAULTS`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
@@ -1979,6 +2024,37 @@ pub mod test_fault_labels
     /// How long the fixture waits between its `FAULT_EXIT` reply and its
     /// exit, so the caller's next call is queued before the fixture dies.
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
+}
+
+/// TODO(#165): remove with `devmgr_labels::TEST_SPAWN_DMA_DRIVER`. The
+/// `test-dma` fixture driver's service label.
+///
+/// The fixture drives QEMU's `edu` device, whose DMA engine copies between
+/// a 4 KiB buffer inside the device and a device address the driver
+/// programs. No badge bit is checked.
+pub mod test_dma_labels
+{
+    /// Run the DMA probe: map one page of the driver's memory for the
+    /// device (`devmgr_dma_labels::DMA_MAP`), copy a pattern from it into
+    /// the device's buffer and back to the page's second half, unmap the
+    /// page (`DMA_UNMAP`), and copy the buffer to the page's second half once
+    /// more at the withdrawn device address. Request: no data. Reply:
+    /// `SUCCESS` with `data[0]` = [`PROBE_PASSED`] when the mapped copies
+    /// arrived, [`PROBE_SKIPPED`] when the device address lies past the
+    /// device's 28-bit DMA reach (no IOMMU, and the page above 256 MiB), or
+    /// [`PROBE_FAILED`] when a mapped copy did not arrive or the device did
+    /// not complete a transfer; `data[1]` = whether the copy after the unmap
+    /// reached the page (1) or not (0); `data[2]` = the device address the
+    /// page was mapped at. Any other reply label is a setup failure.
+    pub const DMA_PROBE: u64 = 1;
+    /// [`DMA_PROBE`] outcome: the mapped copies arrived.
+    pub const PROBE_PASSED: u64 = 0;
+    /// [`DMA_PROBE`] outcome: a mapped copy did not arrive, or the device did
+    /// not complete a transfer within the driver's bound.
+    pub const PROBE_FAILED: u64 = 1;
+    /// [`DMA_PROBE`] outcome: the device address lies past the device's DMA
+    /// reach, so no transfer was made.
+    pub const PROBE_SKIPPED: u64 = 2;
 }
 
 /// Why [`report_driver_ready`] failed.
@@ -2040,7 +2116,7 @@ pub mod device_info_kind
 
 /// Wire-protocol version of [`devmgr_dma_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const DEVMGR_DMA_LABELS_VERSION: u32 = 1;
+pub const DEVMGR_DMA_LABELS_VERSION: u32 = 2;
 /// IPC labels for devmgr's DMA endpoint: the DMA-authorising capability of a
 /// DMA-capable driver.
 ///
@@ -2077,7 +2153,9 @@ pub mod devmgr_dma_labels
     /// returned. Reply: empty body, label `SUCCESS`,
     /// `devmgr_dma_errors::NO_MAPPING` (no mapping of the device at that
     /// address), `devmgr_dma_errors::UNAUTHORIZED` (the device is withdrawn
-    /// or was never given DMA), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
+    /// or was never given DMA), `devmgr_dma_errors::IOMMU_FAILED` (the IOMMU
+    /// driver that confines the device did not remove the mapping, which
+    /// stays standing), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
     pub const DMA_UNMAP: u64 = 2;
     /// [`DMA_MAP`] access bit: the device reads the frames.
     pub const ACCESS_DEVICE_READ: u64 = 1 << 0;
@@ -2110,8 +2188,15 @@ pub mod devmgr_dma_errors
     /// The device address devmgr would give the frames is in use by another
     /// mapping of the device: with no IOMMU, the same frames mapped twice.
     pub const ADDRESS_IN_USE: u64 = 6;
-    /// devmgr could not make the frames reachable (an allocation failed).
+    /// devmgr could not make the frames reachable: an allocation failed, or
+    /// the device's IOVA space holds no free range of the cap's length.
     pub const OUT_OF_RESOURCES: u64 = 7;
+    /// The IOMMU driver that confines the device did not complete the
+    /// request: it refused it, it timed out, or it is dead. A refused
+    /// `DMA_MAP` installs nothing; a refused `DMA_UNMAP` leaves the mapping
+    /// standing. Once the IOMMU driver is dead devmgr refuses every later
+    /// `DMA_MAP` of every device it confined.
+    pub const IOMMU_FAILED: u64 = 8;
     /// Unknown opcode on the DMA endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -2172,7 +2257,8 @@ pub unsafe fn dma_map(
 /// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
 /// devmgr's reply label when devmgr refuses: `NO_MAPPING` when `device_addr`
 /// names no mapping of the device, `UNAUTHORIZED` when the device is
-/// withdrawn or was never given DMA, or `LABEL_VERSION_MISMATCH`
+/// withdrawn or was never given DMA, `IOMMU_FAILED` when the IOMMU driver did
+/// not remove the mapping, which stays standing, or `LABEL_VERSION_MISMATCH`
 /// ([`devmgr_dma_labels::DMA_UNMAP`]).
 pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Result<(), DmaError>
 {
@@ -2190,6 +2276,117 @@ pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Res
     {
         Err(DmaError::Refused(reply.label))
     }
+}
+
+/// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
+/// above the label modules describes, which also lists its runtime check.
+pub const IOMMU_LABELS_VERSION: u32 = 1;
+/// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
+/// the IOMMU of one family (VT-d, the RISC-V IOMMU).
+///
+/// devmgr and the driver hold the only caps to the endpoint (devmgr the
+/// original, the driver a full-rights copy it receives on), and neither hands
+/// one on, so no other process can send on it. devmgr spawns the driver,
+/// hands it each unit's register cap, and drives it from its registry, DMA,
+/// and fault-log threads, keeping the drivers' `devmgr_dma_labels` contract
+/// unchanged whichever IOMMU, or none, sits behind it. devmgr chooses every IOVA; the
+/// IOMMU driver installs and withdraws what devmgr asks and reports faults.
+/// No reply arrives before the hardware does what it states: a mapping
+/// withdrawn, or a device blocked, is unreachable by the device when the reply
+/// is sent. Every request carries the caller's compiled
+/// [`IOMMU_LABELS_VERSION`] in `data[0]`; the driver replies
+/// [`iommu_errors::LABEL_VERSION_MISMATCH`] when it differs. Specified in
+/// `docs/device-management.md` § IOMMU Discovery and Programming.
+pub mod iommu_labels
+{
+    /// Give a PCI function its own translation domain, in which it reaches
+    /// nothing until [`MAP`] installs a range.
+    ///
+    /// Request: `data[1]` = the unit index, in the order the driver's
+    /// bootstrap delivered the units; `data[2]` = the function's requester
+    /// ID ([`requester_id`]). Reply: label `SUCCESS` with `data[0]` = the
+    /// domain handle every later request for the function names; or an
+    /// error code. A function attached twice keeps its first domain.
+    pub const ATTACH: u64 = 1;
+    /// Make the frames of a Memory cap reachable by a domain's function at an
+    /// IOVA devmgr chose.
+    ///
+    /// Request: `data[1]` = domain, `data[2]` = IOVA of the cap's first byte,
+    /// page-aligned, `data[3]` = access (`devmgr_dma_labels::ACCESS_*`);
+    /// `caps[0]` = a derivation of the Memory cap devmgr keeps for the
+    /// mapping, moved to the driver, which keeps it while the range is
+    /// installed and deletes it at its [`UNMAP`] or the domain's [`BLOCK`].
+    /// The whole cap is installed. Reply: empty body, label `SUCCESS`, or an
+    /// error code with the cap deleted.
+    pub const MAP: u64 = 2;
+    /// Withdraw the range [`MAP`] installed at an IOVA of a domain.
+    ///
+    /// Request: `data[1]` = domain, `data[2]` = the IOVA. Reply: empty body,
+    /// label `SUCCESS` once the range is removed and the invalidation it
+    /// needs has completed, or an error code.
+    pub const UNMAP: u64 = 3;
+    /// Block a domain's function: it reaches no frame from the reply on.
+    /// Every range of the domain is withdrawn with it.
+    ///
+    /// Request: `data[1]` = domain. Reply: empty body, label `SUCCESS` once
+    /// the block and its invalidation have completed, or an error code.
+    pub const BLOCK: u64 = 4;
+    /// Report a unit's translation limits, which devmgr's IOVA allocator
+    /// keeps within.
+    ///
+    /// Request: `data[1]` = unit index. Reply: label `SUCCESS` with
+    /// `data[0]` = the widest IOVA the unit translates, in bits; or an error
+    /// code.
+    pub const QUERY_UNIT: u64 = 5;
+    /// Take the faults the driver has recorded since the last call.
+    ///
+    /// Request: no further words. Reply: label `SUCCESS` with `data[0]` =
+    /// the number of faults that follow, at most [`MAX_FAULTS_PER_REPLY`],
+    /// then two words per fault: the requester ID in the low 32 bits and
+    /// the unit's fault reason in bits 32..40, and the faulting IOVA. A
+    /// fault past the bound stays for the next call.
+    pub const TAKE_FAULTS: u64 = 6;
+
+    /// Faults one [`TAKE_FAULTS`] reply carries: two words each after the
+    /// count, within the message's data words.
+    pub const MAX_FAULTS_PER_REPLY: usize = (crate::MSG_DATA_WORDS_MAX - 1) / 2;
+
+    /// The requester ID of a PCI function: segment in bits 16..32, bus in
+    /// bits 8..16, device in bits 3..8, function in bits 0..3.
+    #[must_use]
+    pub const fn requester_id(segment: u16, bus: u8, device: u8, function: u8) -> u64
+    {
+        ((segment as u64) << 16)
+            | ((bus as u64) << 8)
+            | (((device & 0x1f) as u64) << 3)
+            | ((function & 0x7) as u64)
+    }
+}
+
+/// Error replies on an IOMMU driver's endpoint ([`iommu_labels`]).
+pub mod iommu_errors
+{
+    /// Request handled.
+    pub const SUCCESS: u64 = 0;
+    /// The request is malformed: an unknown unit or domain, a requester ID
+    /// outside the unit's scope, an IOVA that is unaligned or past the
+    /// unit's width, a missing or non-Memory cap, or an access word outside
+    /// `devmgr_dma_labels::ACCESS_MASK`.
+    pub const INVALID_REQUEST: u64 = 1;
+    /// Caller's compiled `IOMMU_LABELS_VERSION`, carried in `data[0]`,
+    /// does not match the driver's.
+    pub const LABEL_VERSION_MISMATCH: u64 = 2;
+    /// The range overlaps one already installed in the domain.
+    pub const ADDRESS_IN_USE: u64 = 3;
+    /// `UNMAP` names no installed range of the domain.
+    pub const NO_MAPPING: u64 = 4;
+    /// The driver could not take the memory or domain the request needs.
+    pub const OUT_OF_RESOURCES: u64 = 5;
+    /// The unit did not complete an invalidation within the driver's bound;
+    /// the unit is treated as failed and the request is refused.
+    pub const HARDWARE_TIMEOUT: u64 = 6;
+    /// Unknown opcode on the IOMMU endpoint.
+    pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
 /// Wire-protocol version of [`blk_labels`]; bumped as the block comment above
@@ -3549,6 +3746,21 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_requester_id_packs_segment_bus_device_and_function()
+    {
+        assert_eq!(iommu_labels::requester_id(0, 0, 3, 0), 0x18);
+        assert_eq!(iommu_labels::requester_id(1, 2, 0x1f, 7), 0x1_02ff);
+        // Out-of-range device and function bits are masked off.
+        assert_eq!(iommu_labels::requester_id(0, 0, 0x20, 8), 0);
+    }
+
+    #[test]
+    fn a_fault_reply_fits_its_count_and_two_words_per_fault()
+    {
+        assert!(1 + 2 * iommu_labels::MAX_FAULTS_PER_REPLY <= MSG_DATA_WORDS_MAX);
+    }
 
     /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one
     /// transferred cap per entry of `caps`.

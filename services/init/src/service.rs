@@ -301,15 +301,20 @@ mod kind
 /// devmgr resolves a driver module by class rather than delivery position.
 /// Mirrors `devmgr/src/caps.rs::module_kind`.
 ///
-/// Only bootstrap-essential drivers ship as bundle modules. The per-arch
-/// RTC binary lives on the rootfs disk and is loaded lazily by devmgr
-/// after init delivers a `/services/drivers/` subtree cap via
-/// `devmgr_labels::SET_DRIVERS_DIR`; no RTC `module_kind` is delivered.
+/// Only bootstrap-essential drivers ship as bundle modules, the IOMMU
+/// driver of the architecture's IOMMU family among them (`iommu-vtd` on
+/// x86-64; none on riscv64 yet). The per-arch RTC binary lives on the rootfs
+/// disk and is loaded lazily by devmgr after init delivers a
+/// `/services/drivers/` subtree cap via `devmgr_labels::SET_DRIVERS_DIR`; no
+/// RTC `module_kind` is delivered.
 mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
+    pub const IOMMU: u64 = 4;
+    /// Module kinds init delivers at most one module of each.
+    pub const COUNT: usize = 4;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
@@ -568,9 +573,10 @@ pub fn create_devmgr_with_caps(
     // `SET_DRIVERS_DIR` handshake (Phase 3, below).
     let serial_module = crate::find_module_by_name(info, b"serial");
     let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
+    let iommu_module = crate::find_module_by_name(info, b"iommu-vtd");
     {
-        let mut module_caps = [0u64; 3];
-        let mut module_data = [0u64; 2 + 3];
+        let mut module_caps = [0u64; module_kind::COUNT];
+        let mut module_data = [0u64; 2 + module_kind::COUNT];
         module_data[0] = kind::MODULE;
         let mut n = 0usize;
 
@@ -578,6 +584,7 @@ pub fn create_devmgr_with_caps(
             (virtio_blk_module, module_kind::VIRTIO_BLK),
             (serial_module, module_kind::SERIAL),
             (framebuffer_module, module_kind::FRAMEBUFFER),
+            (iommu_module, module_kind::IOMMU),
         ]
         {
             let Some(module_cap) = source

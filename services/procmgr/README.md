@@ -236,14 +236,13 @@ procmgr drains every queue on each death wakeup. The kernel drops a post to a
 full queue, so a drain that takes a full queue's worth of events or more from
 one queue rescans the table and reaps every entry whose main thread the kernel
 reports exited (`CAP_INFO_THREAD_STATE`), or whose address space it reports took
-a terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`, a worker thread's fault while
-the main thread runs). Any dropped post leaves a full queue of events behind it
-for that drain or the next, so the rescan runs after the drop and recovers
-either death. A reaped or destroyed
-(`DESTROY_PROCESS`) child stays in a recent-exits record for 30 s, so
-`QUERY_PROCESS` answers `EXITED` for it, unless heap exhaustion drops or evicts
-its record first (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9:
-`QUERY_PROCESS`).
+a terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`, a worker thread's fault
+while the main thread runs). Any dropped post leaves a full queue of events
+behind it for that drain or the next, so the rescan runs after the drop and
+recovers either death. A reaped or destroyed (`DESTROY_PROCESS`) child stays in
+a recent-exits record for 30 s, so `QUERY_PROCESS` answers `EXITED` for it,
+unless heap exhaustion drops or evicts its record first (see
+[docs/ipc-interface.md](docs/ipc-interface.md) § Label 9: `QUERY_PROCESS`).
 
 The teardown of a started child created with `CREATE_DMA_HOLD` parks the child's memmgr record (its
 memmgr badge and procmgr's badged memmgr SEND) in a held list (`DmaHolds`) instead of sending

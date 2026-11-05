@@ -545,7 +545,7 @@ Every entry here is `correct as is`; none is tracked.
 
 ### procmgr
 
-Tracked by [#666](https://github.com/kottlerg/seraph/issues/666) (address-space fault read-back).
+Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|

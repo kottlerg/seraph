@@ -217,8 +217,10 @@ use the disposition only as a cancellation channel (fail-open, below).
 `sys_ipc_call` via `open_call_episode` (which also bumps `park_episode`), the non-call surfaces via
 `open_park_episode` (no bump: their genuine wakers deliberately do not stamp, so the open/stamp
 counter pairing holds only for call/fault episodes). Until that publication the parking thread
-exclusively owns its wake fields, so the reset cannot race a deposit. `fault_dispatch` bumps the
-episode the same way next to its `fault_outcome = Pending` reset.
+exclusively owns its wake fields, so the reset cannot race a deposit. Each fault delivery
+(`deliver_once` in `ipc::fault`) bumps the episode the same way, after its `fault_outcome =
+Pending` reset, which `pin_binding` makes under the thread's `sched_lock` with the binding read
+that opens the delivery.
 
 **Claim-then-stamp rule.** A site may stamp the episode only after winning
 the episode's exclusive wake claim. Per the DEPOSIT model
@@ -240,6 +242,8 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `sys_ipc_reply` fault-RESUME arm | same CAS | episode only (`fault_outcome` carries RESUME/KILL) |
 | `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
+| `ipc::fault::claim_fault_park` (a fault-handler binding change, `redeliver_in_flight`), received arm | `reply_tcb` CAS under the faulter's `sched_lock` behind a `blocked_on_object` re-read | episode only (`fault_outcome` carries REDELIVER) |
+| `ipc::fault::claim_fault_park`, queued arm | send-queue unlink of the snapshotted park (`park_seq` equal to the binder's snapshot) under `ep.lock` | episode only (`fault_outcome` carries REDELIVER) |
 | `cancel_ipc_block` BlockedOnSend arm | send-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink hands the episode to the racing rebind chain, to the endpoint's dealloc drain, or to a concurrent cancel that already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Thread)` reply-bound wake | `reply_tcb` CAS under all-CPU locks | episode + INTERRUPTED (faulter: episode + KILL) |
 | `endpoint_call` rendezvous commit-fail teardown | teardown `reply_tcb` CAS win | episode + INTERRUPTED / KILL — without it a legitimate stop→start resume has no deposit |
@@ -262,9 +266,9 @@ touching `ipc_msg`; NONE is a protocol violation: debug builds assert (naming
 tid/park-episode/deposit-episode — the #352-class spurious-resume tripwire,
 also checked in `fault_dispatch`'s resume), release builds fail closed with
 `Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
-`fault_dispatch`'s resume fails closed the same way: any `fault_outcome` other
-than RESUME, a PENDING left by an unstamped wake included, kills the thread
-(the `fault_outcome` row of
+`fault_dispatch`'s resume fails closed the same way: REDELIVER makes the delivery again under the
+binding current then, and any other `fault_outcome` than RESUME, a PENDING left by an unstamped
+wake included, kills the thread (the `fault_outcome` row of
 [scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Resume (non-call parks — fail-open).** Each non-call parking syscall
@@ -755,7 +759,7 @@ removes the member, clears the back-pointer, and `dec_ref`s the source's
 prevents a concurrent notification from referencing a removed member. Both handlers
 resolve the source capability through `syscall::pin_slot`, which pins the source for
 the call (see
-[capability-internals.md § Storage: Hybrid Two-Level Radix](capability-internals.md#storage-hybrid-two-level-radix)),
+[capability-internals.md § Storage: Hybrid Radix Directory](capability-internals.md#storage-hybrid-radix-directory)),
 so a concurrent delete or ancestor revoke of that capability mid-call never makes the
 membership's `dec_ref` the last: the source is freed, if at all, when the handler drops
 its pin after releasing the locks.

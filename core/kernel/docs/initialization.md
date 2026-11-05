@@ -478,7 +478,7 @@ Phase 7.
    boot whose capabilities outnumber the slots halts by name in Phase 7 or 8 ("cap: boot
    capabilities exceed the InitInfo descriptor capacity"). Phase 9's capabilities reach init
    through InitInfo header fields instead. seed_reserve_bytes() is the boot footprint, sized with
-   the region (about 320 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's
+   the region (about 250 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's
    address-space and thread slabs (the thread slab sized from the boot CPU's save area, so it grows
    with a wider vector length), and one 128-byte body for each descriptor slot and for each Memory
    capability Phase 9 mints (init segments, InitInfo pages, init stack pages), plus alignment
@@ -490,8 +490,8 @@ Phase 7.
    pages: one wrapper page plus a slot-page pool holding at least every capability body the boot
    mints (`boot_body_bound`), ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace,
    Thread and CSpace caps), and ROOT_CSPACE_INIT_HEADROOM_SLOTS = 1280 slots for init's bootstrap,
-   and ROOT_CSPACE_BODY_PAGES = 16 pages for the bodies of init's own splits) and register it as
-   CSpace id 0:
+   and ROOT_CSPACE_BODY_PAGES = 1 page for the body of init's first split, after which init funds
+   its own bodies) and register it as CSpace id 0:
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
@@ -885,4 +885,5 @@ through its drain until a teardown commits `Exited` over it (see
 [Device Management](../../../docs/device-management.md),
 [Memory Model](../../../docs/memory-model.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[init Bootstrap Stages](../../../services/init/docs/bootstrap.md),
 [shared/elf/README.md](../../../shared/elf/README.md)

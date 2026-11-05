@@ -214,6 +214,10 @@ pub fn run_all(ctx: &TestContext)
         retype::cspace_indirect_region(ctx)
     );
     run_test!(
+        "retype::cspace_double_indirect_region",
+        retype::cspace_double_indirect_region(ctx)
+    );
+    run_test!(
         "retype::cspace_explicit_placement_fast_fail",
         retype::cspace_explicit_placement_fast_fail(ctx)
     );
@@ -508,6 +512,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "thread::start_self_invalid_argument",
         thread::start_self_invalid_argument(ctx)
+    );
+    run_test!(
+        "thread::start_suspended_resume",
+        thread::start_suspended_resume(ctx)
     );
     run_test!("thread::write_regs_resume", thread::write_regs_resume(ctx));
     run_test!(

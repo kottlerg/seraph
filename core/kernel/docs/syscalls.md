@@ -996,8 +996,8 @@ with such a thread bound (see [scheduling-internals.md](scheduling-internals.md)
 the call does not return, or, when the deleter is itself stopped and the teardown is deferred, the
 deferred drain on its CPU never completes. An object another thread's syscall is still using is not
 freed under it: the syscall holds a pin on it until it drops it (see
-[capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
-Two-Level Radix), and a stopped thread's teardown reaches the IPC source it was parked on only
+[capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage: Hybrid
+Radix Directory), and a stopped thread's teardown reaches the IPC source it was parked on only
 through a binding that proves the source live (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
 `dealloc_object(Thread)` Drain Protocol, step 11); a waker that claimed the thread holds the source
@@ -1411,7 +1411,8 @@ object),
 
 ### `SYS_THREAD_START` (19)
 
-Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
+Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling,
+or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
 handler's claiming reply was `FAULT_REPLY_KILL`, kills it as an unhandled fault, which posts its
 death and address-space observers, or, for the fault of a restartable syscall's user copy, fails
@@ -1428,16 +1429,31 @@ Protocol, invariant 4).
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `flags` | `THREAD_START_SUSPENDED`, or `0`; every other bit is reserved and MUST be clear |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
+**Suspended start.** With `THREAD_START_SUSPENDED`, a configured `Created` thread becomes `Stopped`
+instead of `Ready`: it is linked on no run queue and executes no user instruction. Its register
+file is the one `SYS_THREAD_CONFIGURE` built (the entry as its instruction pointer), which
+`SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` read and write as for any `Stopped` thread, and
+a later `SYS_THREAD_START` without the flag resumes it; `SYS_THREAD_STOP` of it returns
+`InvalidState`, as for any `Stopped` thread. The flag is valid only for a `Created` target: the
+state and the configured frame are decided under the target's `sched_lock`, which
+`SYS_THREAD_CONFIGURE` and every start and teardown commit also take, so a start or teardown that
+lands first leaves the target other than `Created` and the suspended start is refused (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Lifecycle State Machine).
+
 **Capability requirement:** `thread_cap` must have Control rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
+**Errors:** `InvalidArgument` (`flags` sets a reserved bit; checked before the capability),
+`InvalidCapability`, `InsufficientRights` (cap lacks Control),
 `InvalidArgument` (the target is the caller, is not yet configured, or is not in Created/Stopped
 state under the locked commit — including one a concurrent start already resumed, or one that
-exited or was killed by an object teardown after the first check), `Interrupted` (the caller was
-itself stopped while the start waited for the target to leave its CPU or for an owed wake). Each
+exited or was killed by an object teardown after the first check — or, for a suspended start, is
+not `Created` when it commits), `Interrupted` (the caller was itself stopped while the start waited
+for the target to leave its CPU or for an owed wake; never for a suspended start, which waits for
+nothing). Each
 stop admits at most one start commit: absent an intervening stop, exactly one of several
 concurrent starts of one stopped thread succeeds. A start that a concurrent `SYS_THREAD_STOP`
 overtakes after its commit succeeds and leaves the thread `Stopped`, and a later start can then
@@ -1684,8 +1700,8 @@ If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 The call writes `cpu_affinity`, reads the target's `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, so the decision cannot race another CPU's scheduler
 path. The target Thread is pinned for the call
-([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix), so a concurrent delete of its last capability frees it only after the call
+([capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage:
+Hybrid Radix Directory), so a concurrent delete of its last capability frees it only after the call
 returns.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
@@ -1806,8 +1822,8 @@ handler bound the fault is terminal. See
 Binding takes a reference on the endpoint object for the binding's lifetime; rebinding, unbinding,
 or thread destruction releases it (see [fault-handling.md](../../../docs/fault-handling.md) §
 Liveness). The target Thread and the endpoint are pinned for the call
-([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix), so a concurrent delete of either one's last capability frees it only
+([capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage:
+Hybrid Radix Directory), so a concurrent delete of either one's last capability frees it only
 after the binding is published. The endpoint and its badge are published as one unit under the
 target thread's `sched_lock`; fault delivery reads them once under the same lock and pins the
 endpoint until the faulting thread parks, so a concurrent rebind or unbind neither pairs one
@@ -1815,12 +1831,21 @@ binding's endpoint with another's badge nor frees the endpoint mid-delivery, and
 finds the binding cleared leaves the fault unhandled (the thread is killed, or a restartable
 syscall's copy fault fails the syscall with `InvalidAddress`; § Restartable Syscalls)
 ([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
-Object Reference Counting). Binding requires only a valid `Endpoint` cap — `Control` on the
-thread is the authority; the endpoint cap names where the thread's faults are delivered and, by
-its derivation badge (`0` for an unbadged cap), how they are attributed: the fault message
-carries that badge, which the binder cannot choose. The kernel synthesizes fault delivery via the
-binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND`
-to it receives `FAULT_LABEL` only from the kernel; a handler that also serves clients on that
+Object Reference Counting). A change of the binding (an unbind, or a bind to another endpoint or
+with another badge) cancels the fault delivery in flight through the binding it replaces, unless a
+reply or another cancellation claimed it first: a queued fault message is withdrawn, a handler that
+received it finds no pending reply (`SYS_IPC_REPLY` fails with `InvalidCapability`), and the
+faulting thread delivers the fault again under the binding current when it next runs, the fault
+being unhandled when none is bound. The call returns once the delivery is cancelled, waiting, with
+interrupts enabled, for a faulting thread that read the old binding to commit its park. A bind to
+the same endpoint with the same badge cancels nothing (see
+[fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). Binding requires
+only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap names where
+the thread's faults are delivered and, by its derivation badge (`0` for an unbadged cap), how they
+are attributed: the fault message carries that badge, which the binder cannot choose. The kernel
+synthesizes fault delivery via the binding and distributes no send capability to the endpoint, so a
+handler that hands out no `SEND` to it receives `FAULT_LABEL` only from the kernel; a handler that
+also serves clients on that
 endpoint attributes the message by badge, with the guarantees of an ordinary send's badge (see
 [fault-handling.md](../../../docs/fault-handling.md) § Security).
 
@@ -2277,7 +2302,7 @@ pool page. Leaves grown for a placement that then fails — the target slot
 turns out to be occupied, or a concurrent pool consumer starves the final
 grow — stay behind as ordinary free capacity, and the pool pages they
 consumed stay spent (see [capability-internals.md](capability-internals.md) § Storage:
-Hybrid Two-Level Radix).
+Hybrid Radix Directory).
 
 **Capability requirements:** `src_cap` (any non-null capability; no right is checked),
 `dst_cspace_cap` (Insert).
@@ -2721,6 +2746,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
 | `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
+| `CSPACE_BODIES_PER_PAGE` | 31 | Capability bodies one page of a CSpace's body arena holds |
+| `IOPORT_BINDING_TABLE_PAGES` | 3 | Most CSpace growth-budget pages a thread's first `ioport_bind` takes for its port-binding table |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |

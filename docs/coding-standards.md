@@ -239,7 +239,7 @@ let value = unsafe { ptr.read() };
     [scheduling-internals.md § Lock Hierarchy](../core/kernel/docs/scheduling-internals.md#lock-hierarchy)
     records;
   - a field of a `CSpace` that its spinlock serialises, as
-    [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
+    [capability-internals.md § Storage: Hybrid Radix Directory](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
     records;
   - an address space's terminal-fault observer state, which its `death_lock` serialises, as
     [memory-internals.md § Address Space Objects](../core/kernel/docs/memory-internals.md#address-space-objects-mmaddress_spacers)

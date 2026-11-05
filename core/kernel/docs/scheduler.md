@@ -313,6 +313,7 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                 Ready
 
 Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
+Created ──(SYS_THREAD_START, THREAD_START_SUSPENDED)──► Stopped
 Stopped ──(SYS_THREAD_START)──► Ready
 Running ──(SYS_THREAD_EXIT / SYS_PROCESS_EXIT)──► Exited (TCB freed at its last cap delete)
 any state ──(object teardown / terminal fault)──► Exited
@@ -698,7 +699,7 @@ Otherwise, by target state:
 The syscall writes `cpu_affinity`, reads `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, and prods the acting CPU after releasing it.
 `lookup_cap` pins the target Thread for the call (see
-[capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix), so a
+[capability-internals.md](capability-internals.md) § Storage: Hybrid Radix Directory), so a
 concurrent delete of its last capability frees it only after the call returns.
 
 ### Soft Affinity

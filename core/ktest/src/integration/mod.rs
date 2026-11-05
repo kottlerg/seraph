@@ -28,6 +28,7 @@ pub mod fair_share_progress;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
+pub mod fault_handler_rebind;
 pub mod fault_kills_thread;
 pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
@@ -195,6 +196,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_handler_declines_kills",
         fault_handler_declines_kills::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_handler_rebind",
+        fault_handler_rebind::run(ctx)
     );
     run_integration_test!(
         "integration::fault_syscall_buffer",

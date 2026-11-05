@@ -617,7 +617,7 @@ pub struct CapabilitySlot
 // counts under the sender's CSpace spinlock; the remaining lock-free readers,
 // the capability-tree syscalls' unlocked pre-checks, read only the tag,
 // generation, and pin bits and dereference no object (see
-// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix).
+// core/kernel/docs/capability-internals.md § Storage: Hybrid Radix Directory).
 unsafe impl Send for CapabilitySlot {}
 // SAFETY: see the Send impl above; shared access follows the same lock
 // domains.

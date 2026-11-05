@@ -83,15 +83,8 @@ first touch faults, memmgr maps a frame and resumes. See
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)
 (`REGISTER_REGION`, `DELEGATE_ASPACE`, and the fault arm).
 
-Not yet implemented (this section is narrowed as each part lands):
-
-- **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future* faults; it
-  does not yet actively cancel a fault already in flight on the affected thread. An in-flight fault
-  is still resolved by the handler's reply, the handler thread's destruction, a later receive on the
-  handler thread while the fault reply is pending (a receive that passes its capability and headroom
-  checks; [Liveness](#liveness) rule 2), the faulting thread being stopped or destroyed, or the
-  handler endpoint being destroyed (all implemented). The remaining trigger — the binding being
-  cleared mid-fault — is the only [Kill](#delivery-resume-and-kill) path not yet wired.
+A change of the binding while a fault is in flight cancels that delivery and delivers the fault
+again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both architectures.
 
 ---
 
@@ -140,7 +133,7 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
   [Liveness](#liveness)); unbinding releases it. Both lookups pin their object for the call,
   so neither the thread nor the endpoint can be freed while the binding is written (see
-  [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
+  [capability-internals.md § Storage: Hybrid Radix Directory](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)).
   The binding's badge is the derivation badge of `endpoint_cap`
   ([Capability Model § Badges](capability-model.md#badges)), `0` for an unbadged cap: the
   binder chooses which of its caps to bind, never the badge value; see [Security](#security).
@@ -156,7 +149,10 @@ holds the endpoint, and releases it before the faulting thread parks; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)).
 A delivery therefore carries the badge bound with the endpoint it reaches, and a rebind or
 unbind concurrent with a fault never frees the endpoint mid-delivery. A fault whose delivery
-finds the binding already cleared is unhandled (see [Reply](#reply)).
+finds the binding already cleared is unhandled (see [Reply](#reply)). A change of the binding
+while a delivery made under the old one is in flight cancels that delivery, and the fault is
+delivered again under the new binding (see [Delivery, Resume, and Kill](#delivery-resume-and-kill),
+Rebind).
 
 A thread has a single fault handler covering all fault classes it is bound for. The
 handler dispatches on the fault kind (see [Fault Message](#fault-message)) and replies
@@ -227,20 +223,36 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   instruction. For a page fault whose handler has installed a satisfying mapping, the
   instruction now succeeds.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread is
-  destroyed (its last Thread capability deleted), the binding is cleared (design intent; not yet
-  implemented, #242), the handler thread receives again while the fault reply is still pending, with
-  a receive that passes its capability and headroom checks ([Liveness](#liveness) rule 2), or the
-  handler endpoint is destroyed while the fault is still queued on it ([Liveness](#liveness) rule 3)
-  — the fault is unhandled ([Reply](#reply)): the faulting thread is killed, or, for a kernel
-  copy's fault, its syscall fails ([Kernel Copies](#kernel-copies)). A stop of the faulting thread
-  before any reply claims the fault also cancels the episode, but acts on nothing at once: it gives
-  the episode a kill outcome and leaves the thread `Stopped`; when next started, the fault is
-  unhandled. A stop after the handler's reply claimed the fault leaves that reply's disposition:
-  when next started, the thread resumes on a `FAULT_REPLY_RESUME` reply, and the fault is unhandled
-  on a `FAULT_REPLY_KILL` reply. Destroying it while stopped ends it as for any stopped
-  thread. A cancelled fault-blocked thread is never resumed at its faulting instruction: a thread
-  whose own access faulted is killed (a stopped one when next started), and one whose kernel
-  copy faulted has that syscall fail.
+  destroyed (its last Thread capability deleted), the handler thread receives again while the fault
+  reply is still pending, with a receive that passes its capability and headroom checks
+  ([Liveness](#liveness) rule 2), or the handler endpoint is destroyed while the fault is still
+  queued on it ([Liveness](#liveness) rule 3) — the fault is unhandled ([Reply](#reply)): the
+  faulting thread is killed, or, for a kernel copy's fault, its syscall fails
+  ([Kernel Copies](#kernel-copies)). A stop of the faulting thread before any reply claims the
+  fault also cancels the episode, but acts on nothing at once: it gives the episode a kill outcome
+  and leaves the thread `Stopped`; when next started, the fault is unhandled. A stop after the
+  handler's reply claimed the fault leaves that reply's disposition: when next started, the thread
+  resumes on a `FAULT_REPLY_RESUME` reply, and the fault is unhandled on a `FAULT_REPLY_KILL`
+  reply. Destroying it while stopped ends it as for any stopped thread. A cancelled fault-blocked
+  thread is never resumed at its faulting instruction: a thread whose own access faulted is killed
+  (a stopped one when next started), and one whose kernel copy faulted has that syscall fail.
+- **Rebind (redelivery).** A change of the binding by `SYS_THREAD_SET_FAULT_HANDLER` (an unbind,
+  or a bind to another endpoint or with another badge) while a fault is in flight, before any reply
+  or other cancellation claims it, cancels that delivery: the queued fault message is withdrawn, or
+  a handler that received it finds no pending reply (its `SYS_IPC_REPLY` fails with
+  `InvalidCapability`). The fault is then delivered again, by the kernel, under the binding current
+  when the faulting thread next runs, as a new delivery: the handler bound then receives the fault
+  message with the badge of the cap bound then. With no handler bound then, the fault is
+  unhandled, as a fault whose delivery finds the binding cleared ([Reply](#reply)): clearing the
+  binding mid-fault kills the thread, or fails its kernel copy's syscall. A bind to the same
+  endpoint with the same badge cancels nothing. A fault in flight is one whose delivery read the
+  binding before the change; one that reads the binding after it is delivered under the new binding
+  at once. A delivery made under the new binding can, in a narrow race, be cancelled and made again
+  under that same binding, which the handler sees as one more fault message for the fault; the
+  outcome is unchanged. A stop after the change claimed the fault leaves the redelivery: when next
+  started, the thread delivers the fault again. Redelivery runs in the kernel, not by resuming the
+  thread at its faulting instruction, so it holds for a trap-type exception whose instruction
+  pointer is already past the trapping instruction.
 
 ### Modifying the faulting thread
 

@@ -162,9 +162,12 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
 
 /// `SYS_THREAD_START` (19): move a configured `Created` thread, or a
 /// `Stopped` one (resume), to `Ready` and link it on the CPU
-/// `select_target_cpu` chooses.
+/// `select_target_cpu` chooses; with [`syscall::THREAD_START_SUSPENDED`],
+/// move a configured `Created` thread to `Stopped` instead, linked nowhere.
 ///
 /// arg0 = Thread cap index (must have CONTROL).
+/// arg1 = flags: [`syscall::THREAD_START_SUSPENDED`] or `0`; every other bit
+///        is reserved.
 ///
 /// The thread must have been configured via `SYS_THREAD_CONFIGURE` first
 /// (`trap_frame` must be non-null). Returns 0 on success, including a start
@@ -172,11 +175,13 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
 /// is then left `Stopped`, unlinked).
 ///
 /// # Errors
+/// - `InvalidArgument`: arg1 sets a reserved bit (checked first).
 /// - `InvalidCapability`: the cap is invalid or not a Thread.
 /// - `InsufficientRights`: the cap lacks CONTROL.
 /// - `InvalidArgument`: the target is the caller, is not configured, or is not
 ///   `Created`/`Stopped` when the start commits (a concurrent start resumed it,
-///   or it exited or was killed).
+///   or it exited or was killed); for a suspended start, is not `Created` when
+///   it commits.
 /// - `Interrupted`: the caller was itself stopped while the start waited for
 ///   the target to settle.
 #[cfg(not(test))]
@@ -188,6 +193,11 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
 
     let thread_idx = tf.arg(0);
+    let flags = tf.arg(1);
+    if flags & !syscall::THREAD_START_SUSPENDED != 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
 
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let caller_tcb = unsafe { current_tcb() };
@@ -214,6 +224,15 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     if target_tcb.is_null()
     {
         return Err(SyscallError::InvalidCapability);
+    }
+
+    if flags & syscall::THREAD_START_SUSPENDED != 0
+    {
+        // The caller is running, never `Created`, so the commit refuses a
+        // self-start without a separate check.
+        // SAFETY: target_tcb is the TCB of the Thread object `thread_slot`
+        // pins; no lock is held.
+        return unsafe { commit_suspended_start(target_tcb) };
     }
 
     // Thread must be in Created or Stopped state with a configured trap_frame.
@@ -281,6 +300,55 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     }
 
     Ok(0)
+}
+
+/// Commit a suspended start: `Created → Stopped` for a configured `tcb`,
+/// linked on no run queue.
+///
+/// The state and the configured frame are decided under `tcb`'s `sched_lock`,
+/// the owner of `state` (core/kernel/docs/scheduling-internals.md
+/// § Cross-CPU TCB Ownership), which `SYS_THREAD_CONFIGURE` holds across its
+/// frame writes and every start and teardown commit takes; a start or
+/// teardown that lands first leaves the thread other than `Created`, and this
+/// commit is refused. A `Created` thread has never run: it is `current` on no CPU, its
+/// save flag is set, no waker owes it a wake, and it is on no run queue, so
+/// the `Stopped` it leaves is settled for `SYS_THREAD_READ_REGS` and a later
+/// resume at once, and no queue drain or CPU scan is owed.
+///
+/// # Errors
+/// `InvalidArgument` when `tcb` is not `Created` or not configured.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
+#[cfg(not(test))]
+unsafe fn commit_suspended_start(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+) -> Result<u64, SyscallError>
+{
+    use crate::sched::thread::ThreadState;
+    // SAFETY: tcb valid per contract; lock_raw paired with the unlock_raw
+    // below; state and trap_frame are written under this lock.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let startable = (*tcb).state == ThreadState::Created
+            && !(*tcb)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .is_null();
+        if startable
+        {
+            (*tcb).state = ThreadState::Stopped;
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
+        if startable
+        {
+            Ok(0)
+        }
+        else
+        {
+            Err(SyscallError::InvalidArgument)
+        }
+    }
 }
 
 /// Commit `Stopped` for `tcb` over any park it holds, cancelling that park
@@ -1187,6 +1255,16 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 /// capability frees it only after the binding is published. The endpoint and
 /// its badge are published as one unit under the target's `sched_lock`, the
 /// lock `ipc::fault::fault_dispatch` reads them under.
+///
+/// A change of the binding (another endpoint, another badge, or an unbind)
+/// cancels the fault delivery in flight on the target through the binding it
+/// replaces, unless a reply or another cancellation gave that delivery its
+/// disposition first; the faulting thread then delivers the fault again under
+/// the binding current when it next runs, and with none bound the fault is
+/// unhandled (`ipc::fault::redeliver_in_flight`; `docs/fault-handling.md`
+/// § Delivery, Resume, and Kill). A rebind to the same endpoint and badge
+/// cancels nothing.
+///
 /// Binding requires only a valid `Endpoint` cap — `CONTROL` on the thread is
 /// the authority; the endpoint cap names where this thread's
 /// kernel-unresolvable faults are delivered and, by its badge, how they are
@@ -1278,17 +1356,33 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
     // reference on the endpoint before unlocking, so the release of the old
     // binding below cannot free an endpoint a delivery still uses, and no
     // faulter pairs one binding's endpoint with another's badge.
+    // The same hold decides whether the change cancels a delivery in flight:
+    // one `ipc::fault::pin_binding` opened under the binding replaced here
+    // (it opens a delivery under this lock), when the binding changed.
     // SAFETY: target_tcb is the TCB of the Thread object `thread_slot` pins;
     // lock_raw is paired with the unlock_raw below.
-    let old_ep = unsafe {
+    let (old_ep, redeliver) = unsafe {
         let saved = (*target_tcb).sched_lock.lock_raw();
-        (*target_tcb)
-            .fault_badge
-            .store(new_badge, Ordering::Relaxed);
+        let old_badge = (*target_tcb).fault_badge.swap(new_badge, Ordering::Relaxed);
         let old = (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel);
+        let changed = !core::ptr::eq(old, new_ep) || old_badge != new_badge;
+        let redeliver = changed && crate::ipc::fault::delivery_in_flight(target_tcb);
         (*target_tcb).sched_lock.unlock_raw(saved);
-        old
+        (old, redeliver)
     };
+
+    // Cancel that delivery so the faulting thread makes it again under the
+    // new binding (with none, the fault is unhandled), before the old
+    // binding's reference goes: a release that destroys the old endpoint
+    // would otherwise claim a still-queued delivery with a kill outcome.
+    // docs/fault-handling.md § Delivery, Resume, and Kill.
+    if redeliver
+    {
+        // SAFETY: target_tcb is pinned by `thread_slot` and is not the
+        // caller's (a thread inside a syscall has no delivery in flight); no
+        // lock is held.
+        unsafe { crate::ipc::fault::redeliver_in_flight(target_tcb) };
+    }
 
     // Release the previous binding's reference, freeing the object if this was
     // its last reference, outside every lock (release_ref's precondition).

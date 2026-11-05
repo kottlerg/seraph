@@ -543,6 +543,9 @@ pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 /// has finished (`irq::register`, `irq::unregister`, and the
 /// Notification dealloc arm's `irq::unregister_notification`).
 pub const SPIN_SITE_IRQ_ROUTE_DRAIN: u32 = 10;
+/// Fault-handler rebind (`ipc::fault::redeliver_in_flight`): spinning until a
+/// faulting thread whose delivery a binding change cancels commits its park.
+pub const SPIN_SITE_FAULT_REBIND: u32 = 11;
 
 /// Record that the current CPU has entered bounded protocol-spin `site`. The
 /// gates that call this run preempt-disabled, so the CPU index is stable across
@@ -586,6 +589,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_REGS_SETTLE => "regs:settle",
         SPIN_SITE_STOP_SAVE => "stop:save",
         SPIN_SITE_IRQ_ROUTE_DRAIN => "irq:route-drain",
+        SPIN_SITE_FAULT_REBIND => "fault:rebind",
         _ => "none",
     }
 }

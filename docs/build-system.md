@@ -395,7 +395,7 @@ image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
 package (QEMU 10.2). The composite action
 `.github/actions/qemu-packages/action.yml` holds the install list and the
 apt flags (no recommends) once; its `mode` input selects the cache key, the
-download, or the install, and each workflow's steps call it with the
+download, or the install, and the download and install calls pass the
 package directory as its `dir` input. Every booting cell `needs:` its
 workflow's `qemu-debs` job, which runs on the same pinned image because the
 downloaded set is resolved against that image's installed packages. The job

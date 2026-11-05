@@ -63,18 +63,24 @@ runs:
     - name: Install offline
       id: offline
       if: inputs.mode == 'install'
-      continue-on-error: true
       shell: sh
       env:
         DIR: ${{ inputs.dir }}
         FLAGS: ${{ steps.apt.outputs.flags }}
         OFFLINE: ${{ steps.apt.outputs.offline }}
+      # The same install as the last step's, which must stay in step with
+      # it. Its failure is recorded in the `ok` output, not as a failed step,
+      # so a run the fallback recovers carries only the warning.
       run: |
-        ls "$DIR"/*.deb > /dev/null 2>&1
-        sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb
+        if ls "$DIR"/*.deb > /dev/null 2>&1 &&
+            sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb; then
+            echo ok=true
+        else
+            echo ok=false
+        fi >> "$GITHUB_OUTPUT"
 
     - name: Fall back to the network
-      if: inputs.mode == 'install' && steps.offline.outcome == 'failure'
+      if: inputs.mode == 'install' && steps.offline.outputs.ok == 'false'
       shell: sh
       env:
         DIR: ${{ inputs.dir }}
@@ -83,7 +89,7 @@ runs:
         sudo rm -rf "$DIR"
 
     - name: Download
-      if: inputs.mode == 'download' || steps.offline.outcome == 'failure'
+      if: inputs.mode == 'download' || steps.offline.outputs.ok == 'false'
       shell: sh
       env:
         DIR: ${{ inputs.dir }}
@@ -106,12 +112,13 @@ runs:
         ls -l "$debs"/*.deb
 
     - name: Install offline after the download
-      if: steps.offline.outcome == 'failure'
+      if: steps.offline.outputs.ok == 'false'
       shell: sh
       env:
         DIR: ${{ inputs.dir }}
         FLAGS: ${{ steps.apt.outputs.flags }}
         OFFLINE: ${{ steps.apt.outputs.offline }}
+      # The same install as the "Install offline" step's.
       run: |
         ls "$DIR"/*.deb > /dev/null 2>&1
         sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb

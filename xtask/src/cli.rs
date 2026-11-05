@@ -244,8 +244,8 @@ pub struct RunArgs
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
     /// devices behind it. `absent` boots the no-IOMMU variant of the release
     /// host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's
-    /// unconfined path covered once the attached IOMMU is programmed; today
-    /// none is, so both modes run every device unconfined.
+    /// unconfined path covered while the attached IOMMU confines every device
+    /// a driver binds.
     #[arg(long, default_value = "attached")]
     pub iommu: Iommu,
 
@@ -512,8 +512,8 @@ pub struct RunParallelArgs
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
     /// devices behind it. `absent` boots the no-IOMMU variant of the release
     /// host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's
-    /// unconfined path covered once the attached IOMMU is programmed; today
-    /// none is, so both modes run every device unconfined.
+    /// unconfined path covered while the attached IOMMU confines every device
+    /// a driver binds.
     #[arg(long, default_value = "attached")]
     pub iommu: Iommu,
 

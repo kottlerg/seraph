@@ -173,10 +173,10 @@ RAM is exhausted.
 ## Metadata Arena
 
 All of memmgr's bookkeeping — free runs, deferred runs, process records, and
-per-process frame and region descriptors — is nodes drawn from a self-hosted arena rather
-than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap a general
-heap against itself, but it *can* host fixed-size nodes in pages carved from
-its own pool:
+per-process frame and region descriptors — is nodes drawn from a self-hosted
+arena rather than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap
+a general heap against itself, but it *can* host fixed-size nodes in pages
+carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run/process/region/frame/free payload
   plus a `next` index) reached by a `u64` index, so the index never bounds the
@@ -218,8 +218,10 @@ This preserves the all-RAM-accounted identity: the page was counted in
 arena. Growth stops at the peak concurrent node count — freed nodes return to
 the arena's own free list and are reused — so spawn/grow/die churn leaks no
 pages. Refilling the free list can draw a pool frame and map it from inside a
-fault handler; this is bounded (one frame, plus its page-table funding, with no
-recursion into per-process accounting) and never breaks the identity.
+fault handler; this is bounded (one frame, plus its page-table funding, plus at
+most one deferred recheck per turn of the receive loop when a selection fails;
+see [Reclamation](#reclamation)), with no recursion into per-process
+accounting, and never breaks the identity.
 
 ---
 
@@ -232,8 +234,9 @@ buffers ([#254](https://github.com/kottlerg/seraph/issues/254)), is a
 service-internal change rather than a rewrite of this layer:
 
 - The arena, the free pool, the deferred list, and the process index are
-  plain values with no global state, mutated only through exclusive references, and held together
-  in one ledger; every growth path that needs a syscall sits outside them.
+  plain values with no global state, mutated only through exclusive
+  references, and held together in one ledger; every growth path that needs a
+  syscall sits outside them.
 - Several ledgers can coexist, each with its own arena and free pool, so a
   pool shard per CPU or NUMA node is one ledger per shard.
 
@@ -309,14 +312,17 @@ counted in `pool_total`, lent to no process, and never granted. Before every `PR
 fails (a `REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index,
 page-table, or `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run
 that has become quiescent joins the free pool (and the failed selection runs once more), and
-each that has not goes to the back of the list, so successive rechecks visit every run. One
-recheck takes at most `DEFERRED_RECHECK_BATCH` (64) runs from the list and spends at most
+each that has not goes to the back of the list, so successive rechecks visit every run. Only
+the first of these in a turn of the receive loop (the `CSpace` top-up before a receive and the
+handling of the message received) rechecks; the rest of the turn's find the recheck done. One
+recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
 `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of
-the run that crosses that budget; the runs of the batch left once the budget is spent go to the
-back unqueried. Its kernel queries are therefore bounded by two per run taken plus 256, plus
-the windows of the largest deferred run. No timer drives it; a run that becomes quiescent while
-no message arrives waits for the next one. A run whose reaching object or mapping never goes,
-held by a process that never drops it, stays deferred for the rest of the boot, and
+the run that crosses that budget, after which it stops and leaves the runs behind at the head
+for the next recheck. A turn's deferred kernel queries are therefore bounded by two per run
+checked plus 256, plus the windows of the largest deferred run. No timer drives it; a run that
+becomes quiescent while no message arrives waits for the next one. A run whose reaching object
+or mapping never goes, held by a process that never drops it, stays deferred for the rest of
+the boot, and
 `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 

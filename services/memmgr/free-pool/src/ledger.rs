@@ -21,7 +21,7 @@
 //! (`services/memmgr/docs/memory-pool.md` § Reclamation).
 
 use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, Slot, SlotStore};
-use crate::deferred::DeferredList;
+use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
 use crate::{DemandRegion, FreeRun, region_contains, regions_overlap};
@@ -408,13 +408,18 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.set_record(rec, r);
     }
 
-    /// Check at most `budget` deferred runs, moving each `quiescent` accepts
-    /// to the free pool ([`DeferredList::recheck`]). Returns the pages moved.
-    pub fn recheck_deferred(&mut self, budget: u64, quiescent: impl FnMut(&FreeRun) -> bool)
-    -> u64
+    /// Check deferred runs within `budget`, charging each `cost`, and move
+    /// each `quiescent` accepts to the free pool ([`DeferredList::recheck`]).
+    /// Returns the pages moved.
+    pub fn recheck_deferred(
+        &mut self,
+        budget: RecheckBudget,
+        cost: impl Fn(&FreeRun) -> u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> u64
     {
         self.deferred
-            .recheck(&mut self.arena, &mut self.pool, budget, quiescent)
+            .recheck(&mut self.arena, &mut self.pool, budget, cost, quiescent)
     }
 }
 
@@ -535,7 +540,10 @@ mod tests
         // Every frame slot became a run slot, pooled or parked; only the
         // record's slot was freed.
         assert_eq!(l.arena.free_count(), free - 3);
-        assert_eq!(l.recheck_deferred(u64::MAX, pool_all), 7);
+        assert_eq!(
+            l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all),
+            7
+        );
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (9, 3));
         assert_eq!(l.deferred.run_count(), 0);
     }

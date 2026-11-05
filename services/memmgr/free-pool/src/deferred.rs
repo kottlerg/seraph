@@ -105,26 +105,37 @@ impl DeferredList
         Some((idx, run))
     }
 
-    /// Check at most `budget` parked runs, oldest first: each run `quiescent`
-    /// accepts moves to `pool`, and each it refuses goes back to the end of
-    /// the list, so successive rechecks visit every run in turn. Returns the
-    /// pages moved to the pool.
+    /// Check at most `budget.runs` parked runs, oldest first, while
+    /// `budget.cost` lasts: each checked run is charged `cost(run)`, and a run
+    /// is checked whenever any of the cost budget remains, so the run that
+    /// crosses it is still checked whole; once it is spent the recheck stops,
+    /// leaving the unchecked runs at the head for the next one. Each run
+    /// `quiescent` accepts moves to `pool`, and each it refuses goes back to
+    /// the end of the list, so successive rechecks visit every run in turn.
+    /// Returns the pages moved to the pool.
     pub fn recheck<S: SlotStore>(
         &mut self,
         arena: &mut Arena<S>,
         pool: &mut FreePool,
-        budget: u64,
+        budget: RecheckBudget,
+        cost: impl Fn(&FreeRun) -> u64,
         mut quiescent: impl FnMut(&FreeRun) -> bool,
     ) -> u64
     {
         let mut moved = 0;
-        for _ in 0..budget.min(self.runs)
+        let mut left = budget.cost;
+        for _ in 0..budget.runs.min(self.runs)
         {
+            if left == 0
+            {
+                break;
+            }
             let Some((idx, run)) = self.pop(arena)
             else
             {
                 break;
             };
+            left = left.saturating_sub(cost(&run));
             if quiescent(&run)
             {
                 pool.push_node(arena, idx);
@@ -137,6 +148,25 @@ impl DeferredList
         }
         moved
     }
+}
+
+/// The limits of one [`DeferredList::recheck`]: the runs it takes from the
+/// list, and the cost its checks may spend (in the caller's unit, for memmgr
+/// the kernel's mapping-count windows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecheckBudget
+{
+    pub runs: u64,
+    pub cost: u64,
+}
+
+impl RecheckBudget
+{
+    /// A budget that bounds neither runs nor cost.
+    pub const UNBOUNDED: Self = Self {
+        runs: u64::MAX,
+        cost: u64::MAX,
+    };
 }
 
 #[cfg(test)]
@@ -152,6 +182,21 @@ mod tests
         // SAFETY: VecStore grows on write.
         unsafe { a.add_page() };
         a
+    }
+
+    /// Every run costs one unit.
+    fn unit(_: &FreeRun) -> u64
+    {
+        1
+    }
+
+    /// A budget of `n` runs and unbounded cost.
+    fn runs(n: u64) -> RecheckBudget
+    {
+        RecheckBudget {
+            runs: n,
+            cost: u64::MAX,
+        }
     }
 
     fn park_run(a: &mut Arena<VecStore>, d: &mut DeferredList, cap_slot: u64, pages: u64)
@@ -178,12 +223,17 @@ mod tests
         park_run(&mut a, &mut d, 1, 2);
         park_run(&mut a, &mut d, 2, 3);
         park_run(&mut a, &mut d, 3, 5);
-        let moved = d.recheck(&mut a, &mut pool, u64::MAX, |r| r.cap_slot != 2);
+        let moved = d.recheck(&mut a, &mut pool, RecheckBudget::UNBOUNDED, unit, |r| {
+            r.cap_slot != 2
+        });
         assert_eq!(moved, 7);
         assert_eq!((pool.free_pages(), pool.run_count()), (7, 2));
         assert_eq!((d.pages(), d.run_count()), (3, 1));
         // The refused run is still parked whole and pools once accepted.
-        assert_eq!(d.recheck(&mut a, &mut pool, u64::MAX, |_| true), 3);
+        assert_eq!(
+            d.recheck(&mut a, &mut pool, RecheckBudget::UNBOUNDED, unit, |_| true),
+            3
+        );
         assert_eq!((d.pages(), d.run_count()), (0, 0));
         assert_eq!(pool.free_pages(), 10);
     }
@@ -201,7 +251,7 @@ mod tests
         let mut seen = Vec::new();
         for _ in 0..2
         {
-            d.recheck(&mut a, &mut pool, 2, |r| {
+            d.recheck(&mut a, &mut pool, runs(2), unit, |r| {
                 seen.push(r.cap_slot);
                 false
             });
@@ -220,12 +270,67 @@ mod tests
         let mut a = arena();
         let mut pool = FreePool::new();
         let mut d = DeferredList::new();
-        assert_eq!(d.recheck(&mut a, &mut pool, 8, |_| true), 0);
+        assert_eq!(d.recheck(&mut a, &mut pool, runs(8), unit, |_| true), 0);
         // Once emptied, the list takes a new run at its head again.
         park_run(&mut a, &mut d, 1, 4);
-        assert_eq!(d.recheck(&mut a, &mut pool, 8, |_| true), 4);
+        assert_eq!(d.recheck(&mut a, &mut pool, runs(8), unit, |_| true), 4);
         park_run(&mut a, &mut d, 2, 1);
-        assert_eq!(d.recheck(&mut a, &mut pool, 8, |_| true), 1);
+        assert_eq!(d.recheck(&mut a, &mut pool, runs(8), unit, |_| true), 1);
         assert_eq!(pool.run_count(), 2);
+    }
+
+    #[test]
+    fn a_run_costlier_than_the_whole_budget_is_still_checked_at_the_head()
+    {
+        let mut a = arena();
+        let mut pool = FreePool::new();
+        let mut d = DeferredList::new();
+        park_run(&mut a, &mut d, 1, 40);
+        park_run(&mut a, &mut d, 2, 1);
+        let budget = RecheckBudget { runs: 8, cost: 4 };
+        // The 40-page head costs ten units against a budget of four, and is
+        // still checked and pooled; the run behind it stays at the head,
+        // unchecked.
+        let mut checked = Vec::new();
+        let moved = d.recheck(
+            &mut a,
+            &mut pool,
+            budget,
+            |r| r.page_count.div_ceil(4),
+            |r| {
+                checked.push(r.cap_slot);
+                true
+            },
+        );
+        assert_eq!((moved, checked), (40, vec![1]));
+        assert_eq!((d.run_count(), d.pages()), (1, 1));
+    }
+
+    #[test]
+    fn runs_past_a_spent_budget_stay_at_the_head_for_the_next_recheck()
+    {
+        let mut a = arena();
+        let mut pool = FreePool::new();
+        let mut d = DeferredList::new();
+        for cap in 1..=4
+        {
+            park_run(&mut a, &mut d, cap, 1);
+        }
+        let budget = RecheckBudget { runs: 4, cost: 2 };
+        let mut checked = Vec::new();
+        d.recheck(&mut a, &mut pool, budget, unit, |r| {
+            checked.push(r.cap_slot);
+            false
+        });
+        // Two units check the first two runs, which go to the back; the other
+        // two stay at the head unchecked, so the next recheck starts with them.
+        assert_eq!(checked, [1, 2]);
+        checked.clear();
+        d.recheck(&mut a, &mut pool, budget, unit, |r| {
+            checked.push(r.cap_slot);
+            false
+        });
+        assert_eq!(checked, [3, 4]);
+        assert_eq!(d.run_count(), 4);
     }
 }

@@ -18,7 +18,8 @@
 
 use free_pool::{
     ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NODE_NULL,
-    Node, NodeIdx, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk_for,
+    Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore, WordStore, arena::Slot,
+    chunk_for,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -327,9 +328,10 @@ fn coalesce(l: &mut MemLedger)
 /// Select runs for `want` pages (see `FreePool::select`), mapping a failure to
 /// its `memmgr_errors` code. Every pool draw comes through here (a grant, a
 /// demand fault, and memmgr's own arena, index, page-table and `CSpace`
-/// growth), so a failed selection first rechecks the deferred runs and, when
-/// one moved to the pool, selects once more
-/// (services/memmgr/docs/memory-pool.md § Reclamation).
+/// growth), so a failed selection first rechecks the deferred runs, unless
+/// this turn of the receive loop already has, and, when one moved to the
+/// pool, selects once more (services/memmgr/docs/memory-pool.md
+/// § Reclamation).
 fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 {
     select_pooled(l, want, fit).or_else(|code| {
@@ -356,19 +358,19 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 
 // ── Deferred reclamation ─────────────────────────────────────────────────────
 
-/// Deferred runs one recheck takes from the list ([`recheck_deferred`]). With
-/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work one message adds to the
-/// receive loop every process shares. A tuning value that bounds no
-/// capacity: a run not pooled goes to the back of the list, so successive
+/// Deferred runs one recheck checks ([`recheck_deferred`]). With
+/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work of the one recheck a turn
+/// of the receive loop every process shares runs. A tuning value that bounds
+/// no capacity: a run not pooled goes to the back of the list, so successive
 /// rechecks visit every run in turn.
 const DEFERRED_RECHECK_BATCH: u64 = 64;
 
 /// Mapping-count windows (`CAP_INFO_MEMORY_MAPPINGS`, up to
 /// `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages each) one recheck spends
-/// ([`recheck_deferred`]). Once they are spent, the batch's remaining runs go
-/// to the back of the list unqueried; the run that spends the last of them is
-/// still read whole, so a run larger than the budget is checked when it
-/// reaches the head. A tuning value that bounds no capacity.
+/// ([`recheck_deferred`]). Once they are spent the recheck stops, leaving the
+/// runs behind at the head for the next one; the run that spends the last of
+/// them is still read whole, so a run larger than the budget is checked when
+/// it reaches the head. A tuning value that bounds no capacity.
 const DEFERRED_RECHECK_WINDOWS: u64 = 256;
 
 /// Whether no process but memmgr can still reach the frame `run` names
@@ -408,24 +410,45 @@ fn unmapped(cap: u64, pages: u64) -> bool
     true
 }
 
-/// Move the deferred runs that have become [`quiescent`] to the free pool,
-/// taking at most [`DEFERRED_RECHECK_BATCH`] runs from the list and spending
-/// at most [`DEFERRED_RECHECK_WINDOWS`] mapping windows (plus the rest of
-/// the run that crosses it). Returns the pages moved; the caller coalesces.
+/// Whether this turn of the receive loop (the `CSpace` top-up before its
+/// receive, and the message it handles) has run its deferred recheck.
+/// Single-threaded memmgr: a plain static suffices.
+static mut RECHECKED_THIS_TURN: bool = false;
+
+/// Start a turn of the receive loop: its first [`recheck_deferred`] runs.
+fn begin_turn()
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    unsafe { RECHECKED_THIS_TURN = false };
+}
+
+/// Move the deferred runs that have become [`quiescent`] to the free pool:
+/// at most [`DEFERRED_RECHECK_BATCH`] runs and [`DEFERRED_RECHECK_WINDOWS`]
+/// mapping windows (plus the rest of the run that crosses them), and only
+/// the first time in a turn of the receive loop, so one turn's rechecks are
+/// bounded whatever number of its selections fail. Returns the pages moved;
+/// the caller coalesces.
 fn recheck_deferred(l: &mut MemLedger) -> u64
 {
-    let mut windows = DEFERRED_RECHECK_WINDOWS;
-    l.recheck_deferred(DEFERRED_RECHECK_BATCH, |run| {
-        if windows == 0
-        {
-            return false;
-        }
-        windows = windows.saturating_sub(
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    if unsafe { RECHECKED_THIS_TURN }
+    {
+        return 0;
+    }
+    // SAFETY: as above.
+    unsafe { RECHECKED_THIS_TURN = true };
+    let budget = RecheckBudget {
+        runs: DEFERRED_RECHECK_BATCH,
+        cost: DEFERRED_RECHECK_WINDOWS,
+    };
+    l.recheck_deferred(
+        budget,
+        |run| {
             run.page_count
-                .div_ceil(syscall::CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES),
-        );
-        quiescent(run)
-    })
+                .div_ceil(syscall::CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES)
+        },
+        quiescent,
+    )
 }
 
 /// Free arena slots held back from every allocation but the last-resort
@@ -1856,6 +1879,7 @@ fn main(startup: &StartupInfo) -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
+        begin_turn();
         hold_cspace_headroom(startup.self_cspace);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let req = match unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) }

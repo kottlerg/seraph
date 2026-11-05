@@ -29,7 +29,7 @@ pub use arena::{
     Arena, ArenaLayout, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, SLOTS_PER_PAGE,
     SlotStore,
 };
-pub use deferred::DeferredList;
+pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
 pub use ledger::{Ledger, RegionError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};

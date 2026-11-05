@@ -191,9 +191,9 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 For each `phys_base`, memmgr finds the matching caller-owned grant
 (`FRAME_VA_UNMAPPED`) in the per-process tracking entry, takes it off the
 entry, and returns its run to the free pool (coalescing where possible),
-the tracking node becoming the run's node. Bases that match no outstanding grant are ignored —
-release is idempotent, so a racing double-release (join plus reaper) is
-harmless. The caller MUST have already deleted every kernel object retyped
+the tracking node becoming the run's node. Bases that match no outstanding
+grant are ignored — release is idempotent, so a racing double-release (join
+plus reaper) is harmless. The caller MUST have already deleted every kernel object retyped
 from the region and unmapped it from every address space. A region released
 with a live retype or a mapping is held on memmgr's deferred list, granted
 to no one, until both are gone; the release still succeeds and the region

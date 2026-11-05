@@ -670,24 +670,34 @@ fn recheck_deferred()
 /// memmgr's deferred total once rechecks stop lowering it: a run already
 /// deferred that has become quiescent is pooled now, not by a recheck inside
 /// the phase's own later messages, which would lower the total the phase
-/// compares against its baseline.
+/// compares against its baseline. One recheck checks only the oldest runs
+/// within its budget (services/memmgr/docs/memory-pool.md § Reclamation), so
+/// the total counts as settled only after [`SETTLE_QUIET`] rechecks in a row
+/// leave it unlowered: enough to cycle a list of `SETTLE_QUIET` batches of
+/// runs, far past what a svctest boot defers.
 fn settled_deferred_bytes() -> u64
 {
     // A test wait bound: it limits only how many rechecks the settle takes.
-    const MAX_SETTLE: u32 = 64;
+    const MAX_SETTLE: u32 = 256;
     let mut last = deferred_bytes();
+    let mut quiet = 0;
     for _ in 0..MAX_SETTLE
     {
         recheck_deferred();
         let now = deferred_bytes();
-        if now >= last
-        {
-            return now;
-        }
+        quiet = if now < last { 0 } else { quiet + 1 };
         last = now;
+        if quiet == SETTLE_QUIET
+        {
+            break;
+        }
     }
     last
 }
+
+/// Rechecks in a row that must leave memmgr's deferred total unlowered before
+/// [`settled_deferred_bytes`] takes it as settled.
+const SETTLE_QUIET: u32 = 8;
 
 /// Trigger rechecks until memmgr's deferred total falls to `target` bytes or
 /// below; panics with `what` when it does not within the poll bound.

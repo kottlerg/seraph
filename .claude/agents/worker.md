@@ -34,7 +34,12 @@ the path in the report. The scratchpad is shared by every worker of one session,
 each file you put there with your PR number or branch slug (`pr581-body.md`, never a bare
 `pr-body.md`). Orchestrated, you end a turn only once your worktree differs from
 `origin/master` (a commit beyond it on your branch, or uncommitted edits to tracked files),
-since a turn that ends on an unchanged worktree loses the worktree and you with it. Before that
+since a turn that ends on an unchanged worktree loses the worktree and you with it. A worktree
+that has changed is not removed by the harness, which removes only an unchanged one (this
+sentence owns that rule; the other documents refer here): it persists, with its built `target/`,
+until the orchestrator removes it after your retirement (`.claude/skills/orchestrate/SKILL.md`
+§ Worktree removal), so a record survives that removal only once you have copied it out
+(§ Review). Before that
 point, while a question you raised is unanswered, all you do stays within the scope's files
 (apart from the forced expansions § Scope and branches allows) and provisional: you continue on
 the recommendation of each question you raise unless the orchestrator says otherwise; a question
@@ -250,9 +255,9 @@ the Validation report, the Acceptance ticks, and every claim the body makes.
 
 - Orchestrated, after every review run copy the PR's whole `target/xtask/review/pr<N>/` directory
   into the orchestrator's checkout at the same relative path (the spawn prompt names that
-  checkout), since this worktree and its records are removed when your session ends. When your
-  sandbox refuses that write, the gate report names this worktree's path and the orchestrator
-  copies.
+  checkout), since the orchestrator removes this worktree and its records once you retire and
+  the copy exists. When your sandbox refuses that write, the gate report names this worktree's
+  path and the orchestrator copies.
 - After every review run, `git status -sb` before committing: a reviewer can leave the worktree
   on a detached HEAD, and a push from there moves nothing; check out your branch again.
 - `BLOCKING ISSUES`: fix every surface finding in one batch; a batch that changes non-comment

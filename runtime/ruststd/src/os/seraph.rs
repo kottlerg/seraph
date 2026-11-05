@@ -45,8 +45,11 @@ use process_abi::{PROCESS_ABI_VERSION, process_info_ref};
 /// A std-local type rather than a re-export of `process_abi::StackNote`, for
 /// the reason the retype-constant block below gives: an item reached through
 /// the sysroot-private ABI crate is unstable (`rustc_private`) to std's
-/// users. The const asserts after it pin its layout to the ABI type's, field
-/// by field.
+/// users. svctest declares its own stack through this type
+/// (`std::os::seraph::stack_pages!`), and its `stack_note_refused` phase has
+/// the loader refuse that note patched past `MAX_PROCESS_STACK_PAGES` and
+/// accept it restored, so a copy that parts from the ABI layout or values
+/// fails that harness.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 #[repr(C)]
 pub struct StackNote {
@@ -74,39 +77,6 @@ impl StackNote {
         }
     }
 }
-
-// ABI contract: the loaders (init, procmgr) parse the note by
-// `process_abi::StackNote`'s layout, so std's copy must match it field by
-// field, and `new` must fill the fields the ABI type's `new` fills.
-// Exception to docs/coding-standards.md § D Layout and ABI Assertions, which
-// names a consolidated test for such a contract: this PAL overlay builds only
-// inside the sysroot's std and has no host test target, so no test can hold
-// these, and a build-time assertion fails that build instead.
-const _: () = {
-    use process_abi::{StackNote as Abi, StackNoteDesc as AbiDesc};
-
-    use crate::mem::{align_of, offset_of, size_of};
-    // Any page count serves: `new` copies it through unchanged.
-    let ours = StackNote::new(12);
-    let abi = Abi::new(12);
-    assert!(ours.namesz == abi.namesz && ours.descsz == abi.descsz && ours.ntype == abi.ntype);
-    assert!(ours.pages == abi.desc.pages && ours.reserved == abi.desc.reserved);
-    let mut i = 0;
-    while i < ours.name.len() {
-        assert!(ours.name[i] == abi.name[i]);
-        i += 1;
-    }
-    assert!(size_of::<StackNote>() == size_of::<Abi>());
-    assert!(align_of::<StackNote>() == align_of::<Abi>());
-    assert!(offset_of!(StackNote, namesz) == offset_of!(Abi, namesz));
-    assert!(offset_of!(StackNote, descsz) == offset_of!(Abi, descsz));
-    assert!(offset_of!(StackNote, ntype) == offset_of!(Abi, ntype));
-    assert!(offset_of!(StackNote, name) == offset_of!(Abi, name));
-    assert!(offset_of!(StackNote, pages) == offset_of!(Abi, desc) + offset_of!(AbiDesc, pages));
-    assert!(
-        offset_of!(StackNote, reserved) == offset_of!(Abi, desc) + offset_of!(AbiDesc, reserved)
-    );
-};
 
 /// Startup information the kernel+procmgr hand to a process at spawn time,
 /// materialised by `_start` from the read-only `ProcessInfo` page and made

@@ -240,11 +240,13 @@ The note expands to a `#[used] #[link_section = ".note.seraph.stack"]`
 static of type `StackNote`: this crate's for `process_abi::stack_pages!`,
 and `std::os::seraph::StackNote`, std's own copy of its layout, for the
 std macro, since an item std reaches through this sysroot-private crate is
-`rustc_private`-unstable to std's users. std const-asserts its copy's
-layout against this crate's field by field, and the fields its `new` fills
-against this crate's `StackNote::new`, so both macro paths emit identical
-bytes; the std macro lets std-using binaries declare a stack size without
-an extra Cargo dep on `process-abi`.
+`rustc_private`-unstable to std's users. Both macro paths emit the same
+bytes: svctest declares its stack through the std macro, and its
+`stack_note_refused` phase has the loader refuse that note patched past
+`MAX_PROCESS_STACK_PAGES` and accept it restored, so a std copy that parts
+from this crate's layout or values fails the harness. The std macro lets
+std-using binaries declare a stack size without an extra Cargo dep on
+`process-abi`.
 
 `MAX_PROCESS_STACK_PAGES` (2^18 - 1 pages, just under 1 GiB) is a loader-side hard cap: loaders
 refuse a binary whose note declares zero pages or more than it (`resolve_stack_pages`), rather

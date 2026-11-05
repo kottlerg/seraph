@@ -23,10 +23,11 @@ Label numbers, error codes, and query states are defined in
 [`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) (`procmgr_labels`,
 `procmgr_errors`, `procmgr_process_state`).
 
-`START_PROCESS`, `RELEASE_HOLD`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`,
-and `CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
-create call returns); procmgr identifies the target process by the badge
-`ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
+`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, and
+`CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
+create call returns), and `RELEASE_HOLD` on a **release token** (the third cap
+a `CREATE_DMA_HOLD` create returns); procmgr identifies the target process by
+the badge `ipc_recv` delivers. Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
 § `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
 § `QUERY_LIVE_PROCESSES` below. Labels 4–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
@@ -76,6 +77,7 @@ pages already allocated to the child return to memmgr's pool.
 | label | 0 (success) |
 | cap[0] | Process handle (badged endpoint identifying this process) |
 | cap[1] | Child `Thread` capability (Control and Observe rights, `RIGHTS_THREAD`) |
+| cap[2] | With `CREATE_DMA_HOLD` only: the release token (a SEND on procmgr's endpoint badged with the child's process badge and `procmgr_labels::HOLD_RELEASE_AUTHORITY`; **DMA hold flag** below) |
 
 The process handle is a badged endpoint capability. The caller uses it for the
 per-process operations — the badge identifies the process without a forgeable
@@ -84,8 +86,8 @@ stop/configure the thread.
 
 The reply's cap transfer is all-or-nothing
 ([docs/ipc-design.md](../../../docs/ipc-design.md#message-format) § Message Format). When the
-caller's `CSpace` cannot take both caps (or the caller is gone), the caller
-resumes with `IPC_REPLY_TRANSFER_FAILED` and no caps. procmgr then deletes both
+caller's `CSpace` cannot take every cap (or the caller is gone), the caller
+resumes with `IPC_REPLY_TRANSFER_FAILED` and no caps. procmgr then deletes the
 caps and destroys the suspended child as `DESTROY_PROCESS` does, since no one
 holds a handle to it.
 
@@ -100,7 +102,7 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
-| 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | Reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** below |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 
@@ -160,18 +162,23 @@ with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child
 has been started, its teardown, however it comes (its death, a death resync, or
 `DESTROY_PROCESS`), revokes and deletes its kernel objects as for any child but
 does not send memmgr `PROCESS_DIED`: procmgr parks the child's memmgr record
-until the creator sends `RELEASE_HOLD` (§ Label 3) on the child's process
-handle, and until then memmgr keeps the child's frames on that record, out of
+until the creator sends `RELEASE_HOLD` (§ Label 3) on the child's release
+token, and until then memmgr keeps the child's frames on that record, out of
 its free pool. Set it for a driver whose device may DMA into its frames after
 it dies: the creator releases the hold once it has confirmed the device's DMA
 stopped, and never when it cannot, which leaves the frames quarantined for the
 rest of the boot
 ([docs/device-management.md](../../../docs/device-management.md#dma-safe-teardown)
-§ DMA-Safe Teardown). A child destroyed before
-`START_PROCESS` never ran, so it touched no device, and its teardown sends
-`PROCESS_DIED` at once. procmgr reserves the room the child's parked record
-takes before it replies to the create, so no teardown frees a held child's
-pages for want of a record; when it cannot, the create fails with
+§ DMA-Safe Teardown). The release token is the create reply's cap[2], a SEND
+badged with the child's process badge and `procmgr_labels::HOLD_RELEASE_AUTHORITY`,
+a verb bit no process badge carries; procmgr mints it only here, so only the
+creator, or a process the creator hands it to, can release the hold. On any
+label but `RELEASE_HOLD` the token names no process: procmgr answers it as for
+a badge no process holds. A child destroyed before `START_PROCESS` never ran,
+so it touched no device, and its teardown sends `PROCESS_DIED` at once.
+procmgr reserves the room the child's parked record takes before it replies to
+the create, so no teardown frees a held child's pages for want of a record;
+when it cannot, or cannot derive the token, the create fails with
 `OUT_OF_MEMORY`.
 
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
@@ -241,21 +248,27 @@ embedded in the endpoint capability.
 ### Label 3: `RELEASE_HOLD`
 
 Release the held memory reclaim of a torn-down child created with
-`CREATE_DMA_HOLD` (§ Label 1, **DMA hold flag**). Sent on the process handle
-with no data words or caps. procmgr sends memmgr `PROCESS_DIED` for the child's
-memmgr badge, deletes its copy of the child's badged memmgr SEND, and drops the
-held record, so memmgr returns the child's frames to its free pool.
+`CREATE_DMA_HOLD` (§ Label 1, **DMA hold flag**). Sent on the child's release
+token, the create reply's cap[2], with no data words or caps. procmgr sends
+memmgr `PROCESS_DIED` for the child's memmgr badge, deletes its copy of the
+child's badged memmgr SEND, and drops the held record, so memmgr returns the
+child's frames to its free pool.
+
+procmgr serves the label only when the sender's badge carries
+`procmgr_labels::HOLD_RELEASE_AUTHORITY`, and looks the child up by the badge
+with every verb bit (`ipc::VERB_BIT_MASK`) cleared. Any other sender carrying
+the child's badge, its process handle and the child's own procmgr cap included,
+however the child granted a copy onward before it died, is refused
+`UNAUTHORIZED` and the hold stays. Like every badge-gated label, the token can
+be minted by a holder of an un-badged SEND on procmgr's endpoint, which only
+init and svcmgr hold (§ `REGISTER_INIT_TEARDOWN`).
 
 procmgr serves its requests in order, so a `DESTROY_PROCESS` the creator sends
 first has torn the child down, and parked its record, before the release is
 served, whether or not procmgr had reaped the child already. A release that
 finds no held record changes nothing: the child is live, was never started or
-never held, or was released already. procmgr cannot tell the creator's
-handle from any other SEND carrying the child's badge: the child's own procmgr
-cap carries it too, and the child may have granted a copy onward before it
-died, so any holder of such a copy can release the hold once the child is torn
-down. A dead child itself cannot. procmgr never hands a held record's badge to a
-new child.
+never held, or was released already. procmgr never hands a held record's badge
+to a new child.
 
 **Reply:**
 
@@ -267,7 +280,8 @@ new child.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_BADGE` | procmgr holds no reclaim for the handle's badge |
+| 4 | `INVALID_BADGE` | procmgr holds no reclaim for the token's child |
+| 13 | `UNAUTHORIZED` | The sender's badge lacks `HOLD_RELEASE_AUTHORITY`: it is not a release token; any hold stays |
 
 ### Label 8: `DESTROY_PROCESS`
 
@@ -393,16 +407,17 @@ fault class to the spawner's own death queue, then deletes its copy; a failed cr
 unbound. `CREATE_PROCESS` ignores bit 17.
 
 **Reply (success):** as for `CREATE_PROCESS` (cap[0] process handle, cap[1]
-child `Thread` cap), including the destruction of a child whose reply caps
-cannot be delivered. A failed creation releases what procmgr acquired for the
-child, its memmgr record included, as for `CREATE_PROCESS`.
+child `Thread` cap, and, with `CREATE_DMA_HOLD`, cap[2] the release token),
+including the destruction of a child whose reply caps cannot be delivered. A
+failed creation releases what procmgr acquired for the child, its memmgr record
+included, as for `CREATE_PROCESS`.
 
 **Error codes:**
 
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (the TLS block's checks aside; see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
@@ -434,9 +449,10 @@ caller-supplied file cap are treated the same way: procmgr deletes every reply
 cap it does not use.
 
 On a create reply, procmgr transfers a badged process handle endpoint (for
-subsequent per-process operations) and a derived copy of the child's `Thread`
-capability (Control and Observe rights, `RIGHTS_THREAD`) to the caller. procmgr
-retains the original caps for process lifecycle management.
+subsequent per-process operations), a derived copy of the child's `Thread`
+capability (Control and Observe rights, `RIGHTS_THREAD`), and, for a
+`CREATE_DMA_HOLD` child, its release token to the caller. procmgr retains the
+original caps for process lifecycle management.
 
 ---
 

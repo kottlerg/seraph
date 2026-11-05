@@ -250,7 +250,8 @@ impl Device
 }
 
 /// A device removed from the table: its confinement and the mappings that
-/// stood, whose caps the caller deletes once the device is blocked.
+/// stood, whose caps the caller deletes only once the device can no longer
+/// reach their frames ([`settle_withdrawal`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Withdrawn
 {
@@ -258,6 +259,47 @@ pub struct Withdrawn
     pub confinement: Confinement,
     /// Every standing mapping it held.
     pub mappings: Vec<Mapping>,
+}
+
+/// What becomes of the Memory caps a withdrawal took from a device's
+/// standing mappings ([`settle_withdrawal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithdrawnMappings
+{
+    /// The device can no longer reach the frames: delete the caps.
+    Release,
+    /// The device may still write the frames: keep the caps for the rest of
+    /// the boot, so memmgr keeps the frames out of its pool.
+    Quarantine,
+}
+
+/// Whether the IOMMU blocks a withdrawn device's DMA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IommuBlock
+{
+    /// The IOMMU driver completed the device's `BLOCK`: the device reaches
+    /// no frame.
+    Blocked,
+    /// The device is unconfined, its `BLOCK` did not complete, or it was
+    /// withdrawn already, so nothing is left to block.
+    NotBlocked,
+}
+
+/// Settle the withdrawal of a device whose DMA grant was withdrawn, `block`
+/// telling whether the IOMMU now blocks it: run `stop`, devmgr's stop of the
+/// device (Bus Master Enable cleared, its driver's BAR copies revoked, the
+/// device reset), which reports whether every step confirmed, whatever
+/// `block` is. Returns what becomes of the mappings' caps: deleted when the
+/// device can no longer reach its driver's frames, blocked or confirmed
+/// stopped, else kept (`docs/device-management.md` § DMA-Safe Teardown).
+pub fn settle_withdrawal(block: IommuBlock, stop: impl FnOnce() -> bool) -> WithdrawnMappings
+{
+    let stopped = stop();
+    match (block, stopped)
+    {
+        (IommuBlock::Blocked, _) | (IommuBlock::NotBlocked, true) => WithdrawnMappings::Release,
+        (IommuBlock::NotBlocked, false) => WithdrawnMappings::Quarantine,
+    }
 }
 
 /// Every device devmgr gives DMA, by badge, with its mappings.
@@ -492,6 +534,46 @@ mod tests
 {
     use super::*;
     use ipc::devmgr_dma_labels::ACCESS_DEVICE_READ;
+
+    #[test]
+    fn a_withdrawal_keeps_the_mapping_caps_of_a_device_neither_blocked_nor_stopped()
+    {
+        let mut stopped = false;
+        assert_eq!(
+            settle_withdrawal(IommuBlock::NotBlocked, || {
+                stopped = true;
+                false
+            }),
+            WithdrawnMappings::Quarantine
+        );
+        assert!(stopped, "the stop runs before the caps are settled");
+    }
+
+    #[test]
+    fn an_unblocked_device_confirmed_stopped_releases_its_mapping_caps()
+    {
+        assert_eq!(
+            settle_withdrawal(IommuBlock::NotBlocked, || true),
+            WithdrawnMappings::Release
+        );
+    }
+
+    #[test]
+    fn a_blocked_device_releases_its_mapping_caps_and_is_still_stopped()
+    {
+        let mut stopped = false;
+        assert_eq!(
+            settle_withdrawal(IommuBlock::Blocked, || {
+                stopped = true;
+                false
+            }),
+            WithdrawnMappings::Release
+        );
+        assert!(
+            stopped,
+            "a blocked device is stopped and reset all the same"
+        );
+    }
 
     const RW: u64 = ACCESS_DEVICE_READ | ACCESS_DEVICE_WRITE;
     const DOMAIN: Confinement = Confinement::Domain {

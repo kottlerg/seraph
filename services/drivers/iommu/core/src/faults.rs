@@ -24,8 +24,9 @@ pub struct Fault
     pub unit: usize,
     /// The requester's bus, device, and function (bus in bits 8..16).
     pub bdf: u16,
-    /// The unit's fault reason code.
-    pub reason: u8,
+    /// The unit's fault reason code: VT-d's 8-bit fault reason, or the
+    /// RISC-V IOMMU's 12-bit `CAUSE`.
+    pub reason: u16,
     /// The faulting IOVA, page-aligned.
     pub iova: u64,
 }

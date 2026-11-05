@@ -21,8 +21,9 @@
 //!   [`ROUND_ENDPOINTS`].
 //!
 //! devmgr parses the firmware's description of the units (the ACPI DMAR on
-//! x86-64) and resolves each scope entry against the PCI topology before it
-//! encodes it, so the driver reads no firmware table.
+//! x86-64, the ACPI RIMT on riscv64) and resolves each scope entry against
+//! the PCI topology before it encodes it, so the driver reads no firmware
+//! table.
 
 use alloc::vec::Vec;
 

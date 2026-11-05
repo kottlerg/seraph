@@ -10,15 +10,19 @@
 //! The entries are pure encodings, and [`SecondLevel`] builds and walks one
 //! domain's page tables over a [`TableStore`] that hands out zeroed 4 KiB
 //! table pages with their physical addresses. The driver backs the store
-//! with memmgr frames mapped into its own address space; the host tests
-//! back it with heap pages, so the encoding and the walk are host-tested.
+//! with memmgr frames mapped into its own address space (`iommu-store`); the
+//! host tests back it with heap pages, so the encoding and the walk are
+//! host-tested.
 
 #[cfg(test)]
 use alloc::vec::Vec;
 
-/// Entries in a root table (one per bus), a context table (one per device
-/// and function), or a page table (one per 9 bits of IOVA).
-pub const ENTRIES: usize = 512;
+pub use iommu_core::table::TableStore;
+
+/// Words in a root table (one two-word entry per bus), a context table (one
+/// two-word entry per device and function), or a page table (one entry per
+/// 9 bits of IOVA): one table page.
+pub const ENTRIES: usize = iommu_core::table::TABLE_WORDS;
 /// Bytes of one page and of one table.
 pub const PAGE: u64 = 0x1000;
 
@@ -61,25 +65,6 @@ pub const fn context_entry(table_phys: u64, levels: u32, did: u16) -> [u64; 2]
 pub const fn context_index(device: u8, function: u8) -> usize
 {
     (((device & 0x1f) as usize) << 3 | (function & 0x7) as usize) * 2
-}
-
-/// A source of zeroed page-table pages.
-pub trait TableStore
-{
-    /// A new zeroed table page: its physical address, or `None` when no
-    /// memory is left.
-    fn alloc(&mut self) -> Option<u64>;
-    /// The entries of the table page at `phys`, which `alloc` returned.
-    fn table(&mut self, phys: u64) -> &mut [u64; ENTRIES];
-    /// Entry `index` of the table page at `phys` was just written. A store
-    /// backing a unit's tables orders the write before every later one here,
-    /// so a unit never sees a parent entry before the table it points at, and
-    /// flushes it to memory when the unit does not snoop the caches. Does
-    /// nothing by default.
-    fn written(&mut self, phys: u64, index: usize)
-    {
-        let _ = (phys, index);
-    }
 }
 
 /// How [`SecondLevel`]'s walk treats a missing intermediate table.

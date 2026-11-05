@@ -27,6 +27,11 @@
 //!   when the memory it gates (e.g. a descriptor's length field) is about to
 //!   be read.
 //!
+//! - [`dma_read_to_mmio_barrier`] — order prior main-memory reads before a
+//!   subsequent MMIO write. Call this after reading the entries a device
+//!   produced into a queue and before writing the head register that hands
+//!   those slots back to it.
+//!
 //! # Why these are needed on RISC-V
 //!
 //! On RISC-V (RVWMO), the memory subsystem is permitted to reorder:
@@ -34,6 +39,7 @@
 //! - main-memory writes vs. I/O-region writes
 //! - two I/O-region writes relative to each other
 //! - I/O-region reads vs. subsequent main-memory reads
+//! - main-memory reads vs. subsequent I/O-region writes
 //!
 //! Raw `core::ptr::write_volatile` / `read_volatile` compiles to a bare
 //! `sw`/`sh`/`sb` / `lw`/`lh`/`lb`; it prevents compiler reordering but does
@@ -59,7 +65,7 @@
 //!
 //! # Adding a new architecture
 //!
-//! Create `src/arch/<name>/mod.rs` implementing all three barriers and add a
+//! Create `src/arch/<name>/mod.rs` implementing all four barriers and add a
 //! `#[cfg(target_arch = "<name>")] #[path = "<name>/mod.rs"] pub mod current;`
 //! arm to `src/arch/mod.rs`, following `docs/coding-standards.md` § C
 //! (every architecture implements the full surface; a no-op's rustdoc says
@@ -69,4 +75,6 @@
 
 mod arch;
 
-pub use arch::current::{dma_to_mmio_barrier, mmio_to_dma_barrier, mmio_to_mmio_barrier};
+pub use arch::current::{
+    dma_read_to_mmio_barrier, dma_to_mmio_barrier, mmio_to_dma_barrier, mmio_to_mmio_barrier,
+};

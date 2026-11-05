@@ -30,7 +30,7 @@
 use super::thread::ThreadControlBlock;
 use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // ── Queue map ─────────────────────────────────────────────────────────────────
 
@@ -49,6 +49,10 @@ const NUM_RUN_QUEUES: usize = FAIR_QUEUE + 1 + (NUM_PRIORITY_LEVELS - RT_PRIORIT
 
 // `non_empty` holds one bit per run queue in a `u32`.
 const _: () = assert!(NUM_RUN_QUEUES <= u32::BITS as usize);
+
+/// The `idle_pull_candidate` value that names no CPU; no CPU index reaches it,
+/// since every index is below `MAX_CPUS`.
+const NO_IDLE_PULL_CANDIDATE: usize = usize::MAX;
 
 /// The run queue threads at `level` link on. Monotone in `level`, so the
 /// highest non-empty queue holds the highest-class ready thread.
@@ -405,6 +409,14 @@ pub struct PerCpuScheduler
     /// `KERNEL_STACK_PAGES + 2` pages, so 2^32 threads would need 96 TiB.
     load: AtomicU32,
 
+    /// The other CPU this CPU found with a queued thread at its previous idle
+    /// balance tick, or [`NO_IDLE_PULL_CANDIDATE`]: the confirmation sample of
+    /// the idle pull (core/kernel/docs/scheduler.md § Load Balancing), which
+    /// pulls a backlog below the imbalance threshold only once it has outlived
+    /// one tick. Written and read only by this CPU's `timer_tick`, so Relaxed
+    /// suffices; atomic only so a shared reference can reach it.
+    idle_pull_candidate: AtomicUsize,
+
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
     /// while this CPU's lock is held as part of an all-CPU-locks operation
     /// (`commit_state_under_all_locks`, `relocate_ready_priority`'s walk
@@ -450,6 +462,7 @@ impl PerCpuScheduler
             current_level: AtomicU8::new(IDLE_PRIORITY),
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
+            idle_pull_candidate: AtomicUsize::new(NO_IDLE_PULL_CANDIDATE),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
         }
@@ -890,6 +903,36 @@ impl PerCpuScheduler
     pub fn current_load(&self) -> u32
     {
         self.load.load(Ordering::Relaxed)
+    }
+
+    /// The CPU recorded at this CPU's previous idle balance tick, if any (see
+    /// the `idle_pull_candidate` field).
+    #[cfg(not(test))]
+    pub fn idle_pull_candidate(&self) -> Option<usize>
+    {
+        let cpu = self.idle_pull_candidate.load(Ordering::Relaxed);
+        (cpu != NO_IDLE_PULL_CANDIDATE).then_some(cpu)
+    }
+
+    /// Record `cpu` as this CPU's idle-pull candidate, or clear it (`None`).
+    /// Called only by this CPU's `timer_tick`.
+    #[cfg(not(test))]
+    pub fn set_idle_pull_candidate(&self, cpu: Option<usize>)
+    {
+        self.idle_pull_candidate
+            .store(cpu.unwrap_or(NO_IDLE_PULL_CANDIDATE), Ordering::Relaxed);
+    }
+
+    /// Clear this CPU's idle-pull candidate, storing only when one is set, so
+    /// the busy tick that calls it writes nothing in the steady state.
+    #[cfg(not(test))]
+    pub fn forget_idle_pull_candidate(&self)
+    {
+        if self.idle_pull_candidate.load(Ordering::Relaxed) != NO_IDLE_PULL_CANDIDATE
+        {
+            self.idle_pull_candidate
+                .store(NO_IDLE_PULL_CANDIDATE, Ordering::Relaxed);
+        }
     }
 
     // Test stubs for host-side unit tests

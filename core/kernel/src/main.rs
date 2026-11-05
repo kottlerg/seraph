@@ -1564,7 +1564,8 @@ unsafe fn kernel_entry_post_rebase(
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
         // SAFETY: scheduler initialized in Phase 8. No other thread exists yet,
         // and the idle APs reach CPU 0's queue only through the load balancer,
-        // whose imbalance threshold skips a queue that holds only init.
+        // which runs from `timer_tick` and so not before `sched::enter` ends the
+        // boot transient (`BOOT_TRANSIENT_ACTIVE`), after its dequeue of init.
         unsafe {
             let sched = sched::scheduler_for(0);
             let linked = sched.enqueue(init_tcb, sched::INIT_PRIORITY);
@@ -1585,8 +1586,9 @@ unsafe fn kernel_entry_post_rebase(
         // docs/userspace-memory-model.md § Ownership Boundaries.
         // SAFETY: init_cspace_ptr is init's CSpace, held by init's self-cap
         // inside it. Init, though enqueued, cannot run before `sched::enter`
-        // below (the idle APs' load balancer skips a queue holding only init),
-        // so nothing can delete that cap or change the slots while this reads
+        // below (the idle APs' load balancer runs from `timer_tick`, which
+        // returns at once until `sched::enter` ends the boot transient), so
+        // nothing can delete that cap or change the slots while this reads
         // them.
         let cap_available_bytes = unsafe { cap::sum_memory_available_bytes(&*init_cspace_ptr) };
         let seed_available_bytes = cap::seed_memory_ref()

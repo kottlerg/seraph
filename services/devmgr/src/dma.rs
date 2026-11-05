@@ -178,9 +178,10 @@ impl DmaGrant
     /// block a confined device in the IOMMU (`BLOCK`). Returns the
     /// [`Withdrawal`]: whether the IOMMU now blocks the device's DMA, which
     /// lets its driver's frames be released without the device confirmed
-    /// quiet (`docs/device-management.md` § DMA-Safe Teardown), `false` for an
-    /// unconfined device, one already withdrawn, and one whose block the
-    /// IOMMU driver did not complete; and the Memory cap devmgr kept for each
+    /// quiet (`docs/device-management.md` § DMA-Safe Teardown),
+    /// [`IommuBlock::NotBlocked`] for an unconfined device, one already
+    /// withdrawn, and one whose block the IOMMU driver did not complete
+    /// ([`Withdrawal::block`]); and the Memory cap devmgr kept for each
     /// standing mapping, which keeps the mapped frames out of memmgr's pool
     /// until the caller settles it. A second withdrawal finds nothing.
     pub fn withdraw(&self) -> Withdrawal

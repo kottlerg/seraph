@@ -280,7 +280,8 @@ pub enum IommuBlock
     /// The IOMMU driver completed the device's `BLOCK`: the device reaches
     /// no frame.
     Blocked,
-    /// The device is unconfined, or its `BLOCK` did not complete.
+    /// The device is unconfined, its `BLOCK` did not complete, or it was
+    /// withdrawn already, so nothing is left to block.
     NotBlocked,
 }
 

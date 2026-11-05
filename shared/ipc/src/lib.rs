@@ -300,9 +300,9 @@ pub mod procmgr_labels
     /// child is torn down: procmgr sends memmgr `PROCESS_DIED` for it.
     /// Replies `SUCCESS`; `UNAUTHORIZED` when the sender's badge lacks
     /// [`HOLD_RELEASE_AUTHORITY`] (the process handle, or the child's own
-    /// procmgr cap), the hold staying; or
-    /// `INVALID_BADGE` when procmgr holds no reclaim for the token (the child
-    /// is live, was never held, or was released already). Specified in
+    /// procmgr cap), the hold staying; or `INVALID_BADGE` when procmgr holds
+    /// no reclaim for the token (the child is live, was never held, or was
+    /// released already). Specified in
     /// `services/procmgr/docs/ipc-interface.md` § Label 3: `RELEASE_HOLD`.
     pub const RELEASE_HOLD: u64 = 3;
 

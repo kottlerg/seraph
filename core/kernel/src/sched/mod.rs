@@ -6399,7 +6399,9 @@ pub unsafe fn post_aspace_death_notification(
 
 /// Timer interrupt handler: decrement current thread's time slice.
 ///
-/// When the slice expires, call `schedule(Requeue::Always)` unless preemption is disabled.
+/// When the slice expires, or a fair thread runs while an RT thread is queued
+/// on this CPU ([`run_queue::PerCpuScheduler::tick_outcome`]), call
+/// `schedule(Requeue::Always)` unless preemption is disabled.
 /// Also runs the BSP sleep-list and watchdog checks and the per-CPU load
 /// balancer. This function is called from the timer interrupt handler on each
 /// CPU independently.
@@ -6504,6 +6506,7 @@ pub unsafe fn timer_tick()
             return;
         }
         run_queue::TickOutcome::Continue { remaining } => (remaining, false),
+        run_queue::TickOutcome::PreemptForRt { remaining } => (remaining, true),
         run_queue::TickOutcome::Expired { quantum } => (quantum, true),
     };
     // SAFETY: current is a valid TCB; slice_remaining is written by this CPU's
@@ -6526,7 +6529,8 @@ pub unsafe fn timer_tick()
     }
     // If preemption is disabled (e.g., during TLB shootdown spin-wait with
     // interrupts temporarily enabled), skip the context switch. The thread will
-    // be rescheduled normally on its next timer expiry.
+    // be rescheduled at a later tick that decides a reschedule (its next slice
+    // expiry, or, for a fair thread with an RT thread queued, the next tick).
     if crate::percpu::preemption_disabled()
     {
         // A live, preemption-disabled `current` still counts as non-idle
@@ -6536,7 +6540,8 @@ pub unsafe fn timer_tick()
     else
     {
         // SAFETY: schedule() re-acquires the lock and performs a context switch.
-        // Requeue::Always: thread was preempted and should go back in queue.
+        // Requeue::Always: thread was preempted and should go back in queue
+        // (a fair thread preempted for an RT one keeps the rest of its slice).
         unsafe { schedule(Requeue::Always) };
     }
 }

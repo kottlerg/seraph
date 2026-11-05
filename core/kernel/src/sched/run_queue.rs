@@ -102,6 +102,13 @@ pub enum TickOutcome
         /// Ticks left in the slice.
         remaining: u32,
     },
+    /// The running thread is fair and an RT thread is queued on this CPU:
+    /// reschedule now, the slice keeping its `remaining` ticks.
+    PreemptForRt
+    {
+        /// Ticks left in the slice.
+        remaining: u32,
+    },
     /// The slice expired: refill it with `quantum` ticks and reschedule.
     Expired
     {
@@ -675,19 +682,29 @@ impl PerCpuScheduler
     /// `slice_remaining` ticks before the tick: a zero slice is the idle
     /// thread's; a slice that reaches zero expires and is refilled with the
     /// [`quantum_ticks`](super::quantum_ticks) of the level `current` was
-    /// dispatched at; any other slice goes on.
+    /// dispatched at; otherwise a fair thread is preempted while an RT thread
+    /// is queued on this CPU, and any other thread's slice goes on.
+    ///
+    /// Reads `non_empty` Relaxed: the caller, this CPU's `timer_tick`, holds
+    /// `lock`, which every queue change holds.
     pub fn tick_outcome(&self, slice_remaining: u32) -> TickOutcome
     {
         if slice_remaining == 0
         {
             return TickOutcome::Idle;
         }
+        let level = self.current_level.load(Ordering::Relaxed);
         let remaining = slice_remaining - 1;
         if remaining == 0
         {
-            TickOutcome::Expired {
-                quantum: super::quantum_ticks(self.current_level.load(Ordering::Relaxed)),
-            }
+            return TickOutcome::Expired {
+                quantum: super::quantum_ticks(level),
+            };
+        }
+        let rt_queued = self.non_empty.load(Ordering::Relaxed) >> (FAIR_QUEUE + 1) != 0;
+        if super::is_fair_level(level) && rt_queued
+        {
+            TickOutcome::PreemptForRt { remaining }
         }
         else
         {
@@ -1072,6 +1089,51 @@ mod tests
                 "level {level}"
             );
         }
+    }
+
+    // Defect caught: a fair thread left running out its quantum while an RT
+    // thread waits on its CPU.
+    #[test]
+    fn a_running_fair_thread_is_preempted_mid_slice_when_an_rt_thread_is_queued()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut rt = make_tcb();
+        let pr = &mut *rt as *mut _;
+        sched.set_current_level(RT_PRIORITY_MIN - 1);
+        assert_eq!(
+            sched.tick_outcome(5),
+            TickOutcome::Continue { remaining: 4 }
+        );
+        assert!(enq(&sched, pr, RT_PRIORITY_MIN));
+        assert_eq!(
+            sched.tick_outcome(5),
+            TickOutcome::PreemptForRt { remaining: 4 }
+        );
+    }
+
+    // Defect caught: the preemption extended to RT threads (an RT thread at a
+    // lower level preempted mid-slice, which the strict class's slice policy
+    // does not do) or to a fair thread over a fair arrival.
+    #[test]
+    fn only_a_fair_thread_with_an_rt_thread_queued_is_preempted_mid_slice()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut rt = make_tcb();
+        let mut fair = make_tcb();
+        let pr = &mut *rt as *mut _;
+        let pf = &mut *fair as *mut _;
+        assert!(enq(&sched, pf, RT_PRIORITY_MIN - 1));
+        sched.set_current_level(syscall::PRIORITY_MIN);
+        assert_eq!(
+            sched.tick_outcome(5),
+            TickOutcome::Continue { remaining: 4 }
+        );
+        assert!(enq(&sched, pr, 30));
+        sched.set_current_level(RT_PRIORITY_MIN);
+        assert_eq!(
+            sched.tick_outcome(5),
+            TickOutcome::Continue { remaining: 4 }
+        );
     }
 
     // ── RunQueue tests (exercised through PerCpuScheduler at priority 0) ──────

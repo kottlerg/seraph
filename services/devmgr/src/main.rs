@@ -19,11 +19,15 @@
 mod arch;
 mod caps;
 mod dma;
+mod iommu;
 mod pci;
 mod settle;
 mod spawn;
 mod tables;
 
+use std::sync::Arc;
+
+use firmware::dma::Confinement;
 use firmware::lines::{HeldLines, HoldError, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use firmware::roster::{DeathPost, DriverState, Roster};
@@ -120,7 +124,9 @@ fn main() -> !
         .filter(|d| pci::is_virtio_blk(d) || pci::is_virtio_input(d))
         .count()
         + SIMPLE_DEVICE_DRIVERS
-        + ipc::devmgr_labels::TEST_FAULT_DRIVERS;
+        + IOMMU_DRIVERS
+        + ipc::devmgr_labels::TEST_FAULT_DRIVERS
+        + TEST_DMA_DRIVERS;
     let Some(mut watch) = settle::DriverWatch::new(driver_count, caps.registry_ep)
     else
     {
@@ -141,6 +147,23 @@ fn main() -> !
     {
         std::os::seraph::log!("no DMA service, halting");
         halt_loop();
+    }
+
+    // The IOMMU driver, spawned and settled before any DMA-capable driver:
+    // once it reports ready every device behind a remapping unit is blocked
+    // until devmgr attaches it, which `carve_virtio_device` does before each
+    // DMA grant. `None` runs every device unconfined, logged once.
+    caps.iommu = iommu::bring_up(
+        &devices,
+        &mut caps,
+        &mut watch,
+        &mut catalog,
+        &mut served,
+        ipc_buf,
+    );
+    if let (Some(i), Some(d)) = (&caps.iommu, &caps.dma)
+    {
+        d.set_iommu(Arc::clone(i.client()));
     }
 
     // The boot batch: every virtio-blk driver, in BDF order, then the serial
@@ -191,6 +214,12 @@ fn main() -> !
     // batch has been spawned: at most once per boot, so the death queue's
     // reservation for it holds.
     let mut fault_spawn_attempted: bool = false;
+
+    // TODO(#165): remove with the test labels. Whether the DMA test device
+    // has been bound, at most once per boot, and the requester ID of the one
+    // bound, for TEST_DMA_FAULTS.
+    let mut dma_test_attempted: bool = false;
+    let mut dma_test_rid: Option<u64> = None;
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
     // last TEST_SPAWN_ORPHAN trigger, reported by TEST_ORPHAN_RESULT. 0=not
@@ -577,6 +606,88 @@ fn main() -> !
                 };
                 reply_deny_send(driver.map_or(0, |d| d.ep), ipc_buf);
             }
+            // TODO(#165): remove with the test labels. Bind the DMA test
+            // device after the ack, as TEST_SPAWN_FAULT_DRIVERS spawns after
+            // its reply: the attach and the spawn are nested calls.
+            ipc::devmgr_labels::TEST_SPAWN_DMA_DRIVER =>
+            {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
+                if dma_test_attempted || drivers_dir_cap == 0
+                {
+                    reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+                    continue;
+                }
+                let Some(edu) = devices.iter().find(|d| iommu::is_edu(d))
+                else
+                {
+                    reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+                    continue;
+                };
+                dma_test_attempted = true;
+                let confined = caps.iommu.as_ref().is_some_and(|i| i.would_confine(edu));
+                let mode = if confined
+                {
+                    ipc::devmgr_labels::TEST_DMA_CONFINED
+                }
+                else
+                {
+                    ipc::devmgr_labels::TEST_DMA_UNCONFINED
+                };
+                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .word(0, mode)
+                    .build();
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                dma_test_rid = Some(iommu::requester_id(edu));
+                spawn_test_dma_driver(
+                    edu,
+                    &mut caps,
+                    drivers_dir_cap,
+                    &mut watch,
+                    &mut catalog,
+                    &mut served,
+                    ipc_buf,
+                );
+            }
+            // TODO(#165): remove with the test labels. Do not `seraph::log!`
+            // here, as in the device queries it mirrors.
+            ipc::devmgr_labels::TEST_QUERY_DMA_DEVICE =>
+            {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
+                reply_served(
+                    served.test_dma.get(0),
+                    ipc::devmgr_labels::TEST_DENY_BADGE,
+                    ipc::devmgr_errors::NO_DEVICE,
+                    ipc_buf,
+                );
+            }
+            // TODO(#165): remove with the test labels.
+            ipc::devmgr_labels::TEST_DMA_FAULTS =>
+            {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
+                let Some(rid) = dma_test_rid
+                else
+                {
+                    reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+                    continue;
+                };
+                let (count, last) = caps.iommu.as_ref().map_or((0, 0), |i| i.log_faults(rid));
+                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .word(0, count)
+                    .word(1, last)
+                    .build();
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            }
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
             _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
@@ -587,6 +698,13 @@ fn main() -> !
 /// The simple-device drivers a boot can spawn beside the `VirtIO` PCI ones:
 /// serial, framebuffer, and the platform RTC.
 const SIMPLE_DEVICE_DRIVERS: usize = 3;
+
+/// The IOMMU drivers a boot can spawn: one, of the architecture's family.
+const IOMMU_DRIVERS: usize = 1;
+
+/// TODO(#165): remove with the test labels. The `test-dma` fixtures a boot
+/// can spawn: one, for the DMA test device.
+const TEST_DMA_DRIVERS: usize = 1;
 
 /// What the `QUERY_BLOCK_DEVICE` or `QUERY_INPUT_DEVICE` request `msg`
 /// selects in `class` by its instance ordinal ([`instance_ordinal`]).
@@ -623,7 +741,8 @@ fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, i
 
 /// TODO(#165): remove with the test labels. Admit a request on a test label
 /// (`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, `TEST_QUERY_DENY_DEVICE`,
-/// `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`): the badge
+/// `TEST_SPAWN_FAULT_DRIVERS`, `TEST_QUERY_FAULT_DEVICE`,
+/// `TEST_SPAWN_DMA_DRIVER`, `TEST_QUERY_DMA_DEVICE`, `TEST_DMA_FAULTS`): the badge
 /// carries `TEST_LABEL_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
 /// Otherwise reply the rejection and return `false`.
 fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
@@ -1407,6 +1526,29 @@ struct FunctionConfig
 
 impl FunctionConfig
 {
+    /// Turn on the function's Memory Space Enable and Bus Master Enable, so
+    /// it decodes its MMIO BARs and may issue DMA; for a device the firmware
+    /// left off whose driver needs both (the DMA test device). Returns
+    /// whether the configuration page could be mapped.
+    fn enable_memory_and_bus_master(&self) -> bool
+    {
+        with_mmio_mapped(self.aspace, self.cap, 1, "bus master", |va| {
+            let command = (va + u64::from(firmware::pci::COMMAND)) as *mut u16;
+            // SAFETY: the Command register lies in the configuration page
+            // mapped from `va` for this closure ([`with_mmio_mapped`]), and is
+            // a 16-bit register.
+            let current = unsafe { core::ptr::read_volatile(command) };
+            // SAFETY: as for the read above.
+            unsafe {
+                core::ptr::write_volatile(
+                    command,
+                    firmware::pci::command_with_memory_and_bus_master(current),
+                );
+            }
+        })
+        .is_some()
+    }
+
     /// Clear the function's Bus Master Enable and read the Command register
     /// back: once the bit is clear the function issues no memory request of
     /// its own, so it performs no DMA, and the read-back's completion arrives
@@ -1562,10 +1704,9 @@ fn carve_virtio_device(
         let _ = syscall::cap_delete(config.cap);
         return None;
     };
-    let Some(dma) = caps.dma.as_ref().and_then(|d| d.grant(device_badge))
+    let Some(dma) = grant_dma(name, pci_dev, caps, device_badge)
     else
     {
-        std::os::seraph::log!("{}: no DMA grant; not spawned", name);
         bars.release();
         let _ = syscall::cap_delete(config.cap);
         return None;
@@ -1588,6 +1729,39 @@ fn carve_virtio_device(
     })
 }
 
+/// Give the device `pci_dev`, catalogued as `device_badge`, its DMA grant:
+/// first attach it to an IOMMU domain of its own when a remapping unit
+/// translates it ([`iommu::Iommu::confine`]), so it reaches nothing its
+/// driver has not mapped. `None`, logged under `name`, when the device is
+/// refused (an RMRR names it, its unit is not programmed, or its `ATTACH`
+/// fails) or the grant fails; an attached device is blocked again then.
+fn grant_dma(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    caps: &caps::DevmgrCaps,
+    device_badge: u64,
+) -> Option<dma::DmaGrant>
+{
+    let confinement = match caps.iommu.as_ref()
+    {
+        Some(i) => i.confine(name, pci_dev).ok()?,
+        None => Confinement::Unconfined,
+    };
+    let grant = caps
+        .dma
+        .as_ref()
+        .and_then(|d| d.grant(device_badge, confinement));
+    if grant.is_none()
+    {
+        std::os::seraph::log!("{}: no DMA grant; not spawned", name);
+        if let (Confinement::Domain { handle, .. }, Some(i)) = (confinement, caps.iommu.as_ref())
+        {
+            i.client().block(handle);
+        }
+    }
+    grant
+}
+
 /// The registry class a driver serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DriverClass
@@ -1600,6 +1774,12 @@ enum DriverClass
     /// TODO(#165): remove with `TEST_SPAWN_FAULT_DRIVERS`. The `test-fault`
     /// fixtures of the test-only fault batch.
     TestFault,
+    /// The IOMMU driver, which no registry query serves: devmgr alone calls
+    /// it, through its `iommu::IommuClient`.
+    Iommu,
+    /// TODO(#165): remove with `TEST_SPAWN_DMA_DRIVER`. The `test-dma`
+    /// fixture bound to the DMA test device.
+    TestDma,
 }
 
 impl DriverClass
@@ -1615,6 +1795,8 @@ impl DriverClass
             Self::Framebuffer => "framebuffer",
             Self::Rtc => "rtc",
             Self::TestFault => "test-fault",
+            Self::Iommu => "iommu-vtd",
+            Self::TestDma => "test-dma",
         }
     }
 }
@@ -1737,6 +1919,14 @@ struct ServedDrivers
     framebuffer: Served<ServedDriver>,
     rtc: Served<ServedDriver>,
     test_fault: Served<ServedDriver>,
+    test_dma: Served<ServedDriver>,
+    /// The IOMMU driver once its batch settles, at ordinal 0. Its service
+    /// endpoint is the one the IOMMU client calls, so its record is never
+    /// released: a death fails the client closed instead
+    /// ([`Self::withdraw_dead`]).
+    iommu: Served<ServedDriver>,
+    /// The client the IOMMU driver is called through, once it is ready.
+    iommu_client: Option<Arc<iommu::IommuClient>>,
 }
 
 impl ServedDrivers
@@ -1751,6 +1941,53 @@ impl ServedDrivers
             DriverClass::Framebuffer => &mut self.framebuffer,
             DriverClass::Rtc => &mut self.rtc,
             DriverClass::TestFault => &mut self.test_fault,
+            DriverClass::TestDma => &mut self.test_dma,
+            DriverClass::Iommu => &mut self.iommu,
+        }
+    }
+
+    /// Record the client the ready IOMMU driver is called through, so its
+    /// death fails the client closed.
+    fn set_iommu(&mut self, client: Arc<iommu::IommuClient>)
+    {
+        self.iommu_client = Some(client);
+    }
+
+    /// The service endpoint of the IOMMU driver its batch served, if it
+    /// reported ready.
+    fn take_iommu_ep(&self) -> Option<u64>
+    {
+        self.iommu.first_live().map(|d| d.ep)
+    }
+
+    /// Whether the IOMMU driver has failed, so a confined device's driver
+    /// can no longer be served.
+    fn iommu_failed(&self) -> bool
+    {
+        self.iommu_client.as_ref().is_some_and(|c| c.failed())
+    }
+
+    /// The IOMMU driver died after it enabled translation: fail its client
+    /// closed ([`iommu::IommuClient::fail`]) and withdraw every served
+    /// driver of a device it confines, whose mappings can no longer change.
+    fn fail_iommu(&mut self, ipc_buf: *mut u64)
+    {
+        let Some(client) = self.iommu_client.as_ref()
+        else
+        {
+            return;
+        };
+        if !client.fail()
+        {
+            return;
+        }
+        let confined = |d: &ServedDriver| d.dev_caps.as_ref().is_some_and(|c| c.dma.confined());
+        for class in [DriverClass::Block, DriverClass::Input, DriverClass::TestDma]
+        {
+            self.class_mut(class).withdraw_matching(confined, |d| {
+                std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", class.name());
+                d.withdraw(ipc_buf);
+            });
         }
     }
 
@@ -1767,6 +2004,17 @@ impl ServedDrivers
             let name = spawned.class.name();
             match state
             {
+                DriverState::Ready
+                    if self.iommu_failed()
+                        && spawned
+                            .driver
+                            .dev_caps
+                            .as_ref()
+                            .is_some_and(|c| c.dma.confined()) =>
+                {
+                    std::os::seraph::log!("{}: its device's IOMMU is gone; withdrawn", name);
+                    spawned.driver.withdraw(ipc_buf);
+                }
                 DriverState::Ready =>
                 {
                     let class = self.class_mut(spawned.class);
@@ -1812,6 +2060,18 @@ impl ServedDrivers
     /// nothing.
     fn withdraw_dead(&mut self, post: DeathPost, ipc_buf: *mut u64)
     {
+        // The IOMMU driver's record is dropped, not released: its endpoint
+        // stays the client's, so no thread calls a reused slot.
+        if self.iommu.withdraw(post.badge).is_some()
+        {
+            std::os::seraph::log!(
+                "iommu-vtd: served driver of device {} died (reason={:#x})",
+                post.badge,
+                post.reason
+            );
+            self.fail_iommu(ipc_buf);
+            return;
+        }
         for class in [
             DriverClass::Block,
             DriverClass::Input,
@@ -1819,6 +2079,7 @@ impl ServedDrivers
             DriverClass::Framebuffer,
             DriverClass::Rtc,
             DriverClass::TestFault,
+            DriverClass::TestDma,
         ]
         {
             if let Some(driver) = self.class_mut(class).withdraw(post.badge)
@@ -2807,6 +3068,191 @@ fn spawn_test_fault_drivers(
     }
     let bound = core::time::Duration::from_millis(ipc::devmgr_labels::TEST_FAULT_SETTLE_TIMEOUT_MS);
     settle_batch(batch, roster, watch, catalog, served, bound, ipc_buf);
+}
+
+/// TODO(#165): remove with the test labels. Bind the DMA test device `edu`
+/// (QEMU's `edu`) to the on-disk `test-dma` fixture in a settle batch of its
+/// own, served as the `TestDma` class: carve the first page of its BAR 0
+/// (its identification and DMA registers) and its configuration page, give
+/// it its DMA grant, attaching it to its IOMMU domain where a unit
+/// translates it ([`grant_dma`]), turn on its memory decode and bus
+/// mastering, which the firmware leaves off for a device no firmware driver
+/// binds, and spawn the fixture through the PCI spawn path. Logged, and
+/// nothing served, on any failure.
+fn spawn_test_dma_driver(
+    edu: &pci::PciDevice,
+    caps: &mut caps::DevmgrCaps,
+    drivers_dir_cap: u64,
+    watch: &mut settle::DriverWatch,
+    catalog: &mut DeviceCatalog,
+    served: &mut ServedDrivers,
+    ipc_buf: *mut u64,
+)
+{
+    let name = "test-dma";
+    let Some(dev_caps) = carve_test_dma_device(name, edu, caps, catalog)
+    else
+    {
+        return;
+    };
+    let Some(batch) = settle::SettleBatch::new()
+    else
+    {
+        std::os::seraph::log!("{}: no settle batch; not spawned", name);
+        dev_caps.release();
+        return;
+    };
+    let mut roster = Roster::new();
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked =
+        unsafe { ns_client::walk_to_file(drivers_dir_cap, b"test-dma", requested_rights, ipc_buf) };
+    let (Some(walked), Ok(())) = (walked, roster.try_reserve_one())
+    else
+    {
+        std::os::seraph::log!(
+            "{}: binary missing on rootfs or no roster room; not spawned",
+            name
+        );
+        dev_caps.release();
+        return;
+    };
+    let Some(ep) = create_service_endpoint()
+    else
+    {
+        std::os::seraph::log!("{}: no service endpoint; not spawned", name);
+        let _ = syscall::cap_delete(walked.file_cap);
+        dev_caps.release();
+        return;
+    };
+    let config = spawn::DriverSpawnConfig {
+        procmgr_ep: caps.procmgr_ep,
+        bootstrap_ep: caps.self_bootstrap_ep,
+        source: spawn::CreateSource::File {
+            file_cap: walked.file_cap,
+            size: walked.size,
+        },
+        bars: dev_caps.bars.as_slice(),
+        dma_cap: dev_caps.dma.cap(),
+        irq_cap: None,
+        irq_mode: 0,
+        service_ep: ep,
+        query_ep: batch.driver_ep(),
+        death_eq: watch.death_eq(),
+        device_badge: dev_caps.device_badge,
+        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
+    };
+    match spawn::spawn_driver(&config, ipc_buf)
+    {
+        spawn::DriverSpawn::Bootstrapped(process_handle) =>
+        {
+            let spawned = SpawnedDriver {
+                class: DriverClass::TestDma,
+                badge: dev_caps.device_badge,
+                driver: ServedDriver {
+                    ep,
+                    dev_caps: Some(dev_caps),
+                    process_handle,
+                },
+            };
+            record_spawned(&mut roster, spawned, ipc_buf);
+        }
+        spawn::DriverSpawn::Unbootstrapped(process_handle) =>
+        {
+            withdraw_device(&dev_caps, process_handle, ipc_buf);
+            let _ = syscall::cap_delete(ep);
+            dev_caps.release();
+        }
+        spawn::DriverSpawn::Failed =>
+        {
+            let _ = syscall::cap_delete(ep);
+            dev_caps.release();
+        }
+    }
+    settle_batch(
+        batch,
+        roster,
+        watch,
+        catalog,
+        served,
+        settle::SETTLE_TIMEOUT,
+        ipc_buf,
+    );
+}
+
+/// TODO(#165): remove with [`spawn_test_dma_driver`]. Carve the DMA test
+/// device's caps, add its catalog entry, give it its DMA grant, and turn on
+/// its memory decode and bus mastering; `None`, logged and with what it
+/// carved released, on any failure. The device has no reset target, so its
+/// withdrawal releases the fixture's memory only when the IOMMU blocks it.
+fn carve_test_dma_device(
+    name: &str,
+    edu: &pci::PciDevice,
+    caps: &mut caps::DevmgrCaps,
+    catalog: &mut DeviceCatalog,
+) -> Option<VirtioDeviceCaps>
+{
+    let Some(b) = (0..edu.bar_count).find(|&b| edu.bar_pci_idx[b] == 0 && edu.bar_is_mmio[b])
+    else
+    {
+        std::os::seraph::log!("{}: the device has no MMIO BAR 0; not spawned", name);
+        return None;
+    };
+    let Some(bar_cap) = carve_subrange(caps, edu.bar_phys[b], PAGE_SIZE)
+    else
+    {
+        std::os::seraph::log!("{}: BAR 0 not covered by any aperture; not spawned", name);
+        return None;
+    };
+    let mut bars = VirtioBars {
+        bars: [spawn::BarSpec::default(); virtio_core::MAX_VIRTIO_BARS],
+        count: 1,
+    };
+    bars.bars[0] = spawn::BarSpec {
+        bar: 0,
+        cap: bar_cap,
+        bytes: PAGE_SIZE,
+    };
+    let Some(config) = carve_function_config(name, edu, caps)
+    else
+    {
+        bars.release();
+        return None;
+    };
+    let release = |bars: &VirtioBars| {
+        bars.release();
+        let _ = syscall::cap_delete(config.cap);
+    };
+    let Some(device_badge) = catalog.add_without_info()
+    else
+    {
+        std::os::seraph::log!("{}: catalog entry not added; not spawned", name);
+        release(&bars);
+        return None;
+    };
+    let Some(dma) = grant_dma(name, edu, caps, device_badge)
+    else
+    {
+        release(&bars);
+        return None;
+    };
+    let dev_caps = VirtioDeviceCaps {
+        bars,
+        dma,
+        config,
+        irq_cap: None,
+        irq_mode: 0,
+        device_badge,
+        reset: None,
+    };
+    if !dev_caps.config.enable_memory_and_bus_master()
+    {
+        std::os::seraph::log!("{}: configuration page not mapped; not spawned", name);
+        dev_caps.release();
+        return None;
+    }
+    Some(dev_caps)
 }
 
 /// TODO(#165): remove with [`spawn_test_fault_drivers`]. Spawn one

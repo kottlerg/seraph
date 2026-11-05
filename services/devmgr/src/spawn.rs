@@ -569,6 +569,186 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> DriverSpaw
     DriverSpawn::Bootstrapped(child_guard.keep_handle())
 }
 
+/// One remapping unit handed to the IOMMU driver: its register `Mmio` cap,
+/// which the spawn moves to the driver (devmgr keeps no copy), and its
+/// bootstrap round's data words (`iommu_core::bootstrap`).
+pub struct UnitRound
+{
+    pub cap: u64,
+    pub words: Vec<u64>,
+}
+
+/// Capabilities and identifiers for the IOMMU driver's spawn
+/// ([`spawn_iommu_driver`]).
+pub struct IommuSpawnConfig<'a>
+{
+    pub procmgr_ep: u64,
+    pub bootstrap_ep: u64,
+    /// The driver's boot-module Memory cap, consumed by `CREATE_PROCESS` or
+    /// deleted on a failure before it.
+    pub module_cap: u64,
+    /// The units, in unit-index order; every cap is moved to the driver or
+    /// deleted.
+    pub units: &'a [UnitRound],
+    /// devmgr-owned service endpoint; the driver receives on a copy.
+    pub service_ep: u64,
+    /// The private endpoint of the driver's settle batch.
+    pub query_ep: u64,
+    /// devmgr's driver death queue.
+    pub death_eq: u64,
+    pub device_badge: u64,
+    pub priority: u8,
+}
+
+/// Spawn the IOMMU driver and serve its bootstrap
+/// (`iommu_core::bootstrap`): one round per unit with its register cap, then
+/// the terminal round with a copy of `service_ep` and a SEND badged
+/// `device_badge` on `query_ep`. Created `CREATE_PINNED`, since the units
+/// walk its table pages and they must never fault, and `CREATE_DMA_HOLD`,
+/// since the units can walk those pages after it dies: devmgr never releases
+/// the hold, so they stay quarantined for the boot. Once the last round is
+/// served a death observer is bound to `death_eq`, correlator
+/// `device_badge`. Returns as [`spawn_driver`] does.
+// too_many_lines: one spawn transaction, as `spawn_driver`: every derived
+// cap owns a slot released on a later failure, and the rounds follow the
+// bootstrap protocol one to one.
+#[allow(clippy::too_many_lines)]
+pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
+{
+    let mut module_guard = ModuleCapGuard::new(config.module_cap);
+    let release_units = |from: usize| {
+        for u in &config.units[from..]
+        {
+            let _ = syscall::cap_delete(u.cap);
+        }
+    };
+    let Some(child_badge) = mint_bootstrap_badge()
+    else
+    {
+        std::os::seraph::log!("IOMMU driver spawn: entropy draw failed");
+        release_units(0);
+        return DriverSpawn::Failed;
+    };
+    let Ok(badged_creator) =
+        syscall::cap_derive_badge(config.bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
+    else
+    {
+        std::os::seraph::log!("IOMMU driver spawn: badged creator derivation failed");
+        release_units(0);
+        return DriverSpawn::Failed;
+    };
+    let flags = procmgr_labels::CREATE_PINNED | procmgr_labels::CREATE_DMA_HOLD;
+    let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | sched_bits)
+        .cap(config.module_cap)
+        .cap(badged_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) };
+    let Ok(reply) = reply
+    else
+    {
+        std::os::seraph::log!("IOMMU driver create ipc_call failed");
+        release_units(0);
+        return DriverSpawn::Failed;
+    };
+    // The call transferred the module cap to procmgr whatever its reply.
+    module_guard.disarm();
+    let reply_caps = reply.caps();
+    if reply.label != 0 || reply_caps.len() < 2
+    {
+        std::os::seraph::log!("IOMMU driver create failed");
+        for &c in reply_caps
+        {
+            let _ = syscall::cap_delete(c);
+        }
+        release_units(0);
+        return DriverSpawn::Failed;
+    }
+    let process_handle = reply_caps[0];
+    let thread_cap = reply_caps[1];
+    let child_guard = ChildGuard::new(process_handle, thread_cap, ipc_buf);
+    let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        std::os::seraph::log!("IOMMU driver service endpoint derivation failed");
+        release_units(0);
+        return DriverSpawn::Failed;
+    };
+    let Ok(query_copy) = syscall::cap_derive_badge(
+        config.query_ep,
+        syscall::RIGHTS_EP_SEND,
+        config.device_badge,
+    )
+    else
+    {
+        std::os::seraph::log!("IOMMU driver query cap derivation failed");
+        release_units(0);
+        let _ = syscall::cap_delete(service_copy);
+        return DriverSpawn::Failed;
+    };
+    // Deleting a slot a round already moved is a no-op.
+    let release_endpoints = || {
+        let _ = syscall::cap_delete(service_copy);
+        let _ = syscall::cap_delete(query_copy);
+    };
+    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let started = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
+    if !matches!(started, Ok(r) if r.label == 0)
+    {
+        std::os::seraph::log!("IOMMU driver START_PROCESS failed");
+        release_units(0);
+        release_endpoints();
+        return DriverSpawn::Failed;
+    }
+    for (i, unit) in config.units.iter().enumerate()
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let served = unsafe {
+            ipc::bootstrap::serve_round(
+                config.bootstrap_ep,
+                child_badge,
+                ipc_buf,
+                false,
+                &[unit.cap],
+                &unit.words,
+            )
+        };
+        if served.is_err()
+        {
+            std::os::seraph::log!("IOMMU driver bootstrap unit round failed");
+            release_units(i);
+            release_endpoints();
+            return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
+        }
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let served = unsafe {
+        ipc::bootstrap::serve_round(
+            config.bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            true,
+            &[service_copy, query_copy],
+            &[iommu_core::bootstrap::ROUND_ENDPOINTS],
+        )
+    };
+    if served.is_err()
+    {
+        std::os::seraph::log!("IOMMU driver bootstrap endpoint round failed");
+        release_endpoints();
+        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
+    }
+    if syscall::thread_bind_notification(thread_cap, config.death_eq, config.device_badge).is_err()
+    {
+        std::os::seraph::log!("IOMMU driver death observer bind failed");
+        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
+    }
+    std::os::seraph::log!("IOMMU driver started");
+    DriverSpawn::Bootstrapped(child_guard.keep_handle())
+}
+
 /// Capabilities and identifiers for one non-PCI platform device driver
 /// spawn ([`spawn_simple_device`]).
 pub struct SimpleSpawnConfig<'a>

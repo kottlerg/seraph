@@ -43,6 +43,20 @@ pub const COMMAND: u16 = 0x04;
 /// DMA and signals no MSI.
 pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
 
+/// Command register: Memory Space Enable, the function decodes its MMIO
+/// BARs.
+pub const COMMAND_MEMORY: u16 = 1 << 1;
+
+/// The Command register value that turns on Memory Space Enable and Bus
+/// Master Enable and keeps every other bit of `command`: the function then
+/// decodes its MMIO BARs and issues DMA. devmgr writes it for a device the
+/// firmware left off that its driver needs on.
+#[must_use]
+pub const fn command_with_memory_and_bus_master(command: u16) -> u16
+{
+    command | COMMAND_MEMORY | COMMAND_BUS_MASTER
+}
+
 /// The Command register value that clears Bus Master Enable and keeps every
 /// other bit of `command`, so the function still decodes its BARs.
 #[must_use]
@@ -183,6 +197,13 @@ mod tests
         assert_eq!(function_config_phys(&windows, 0, 0x40, 0, 0), None);
         assert_eq!(function_config_phys(&windows, 0, 1, 32, 0), None);
         assert_eq!(function_config_phys(&windows, 0, 1, 0, 8), None);
+    }
+
+    #[test]
+    fn enabling_memory_and_bus_master_keeps_every_other_command_bit()
+    {
+        assert_eq!(command_with_memory_and_bus_master(0x0400), 0x0406);
+        assert_eq!(command_with_memory_and_bus_master(0x0007), 0x0007);
     }
 
     #[test]

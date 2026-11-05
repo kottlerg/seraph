@@ -419,6 +419,51 @@ pub fn has_reserved_region(
     })
 }
 
+/// PCI functions one resolved device scope names: the function itself, or
+/// every function on a bridge's secondary through subordinate bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved
+{
+    /// One function.
+    Function(Bdf),
+    /// Every function on buses `.0..=.1`.
+    Buses(u8, u8),
+}
+
+impl DrhdUnit
+{
+    /// The unit's explicit scope resolved against the PCI topology, passing
+    /// each named function, and each sub-hierarchy's bus range, to `out`,
+    /// so a consumer that reads no configuration space can match functions
+    /// to the unit as [`unit_for`] does. A scope that does not resolve names
+    /// nothing, as in [`unit_for`]; a sub-hierarchy whose bridge's bus range
+    /// is unreadable names the bridge alone.
+    pub fn resolve_scopes(
+        &self,
+        dmar: &[u8],
+        mut secondary_bus: impl FnMut(Bdf) -> Option<u8>,
+        mut bus_range: impl FnMut(Bdf) -> Option<(u8, u8)>,
+        mut out: impl FnMut(Resolved),
+    )
+    {
+        for scope in self.scopes(dmar)
+        {
+            let Some(named) = scope.resolve(&mut secondary_bus)
+            else
+            {
+                continue;
+            };
+            out(Resolved::Function(named));
+            if scope.sub_hierarchy
+                && let Some((first, last)) = bus_range(named)
+                && first <= last
+            {
+                out(Resolved::Buses(first, last));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -678,6 +723,33 @@ mod tests
             no_bridges,
             no_ranges
         ));
+    }
+
+    #[test]
+    fn a_units_scope_resolves_to_its_functions_and_bridged_bus_ranges()
+    {
+        let ep = scope(SCOPE_PCI_ENDPOINT, 0, &[(4, 0)]);
+        let behind = scope(SCOPE_PCI_ENDPOINT, 0, &[(1, 0), (0, 0)]);
+        let sub = scope(SCOPE_PCI_SUB_HIERARCHY, 0, &[(2, 0)]);
+        let lost = scope(SCOPE_PCI_ENDPOINT, 0, &[(9, 0), (0, 0)]);
+        let table = dmar(39, &[drhd(0, 0, 0, 0xfed9_0000, &[ep, behind, sub, lost])]);
+        let unit = drhd_units(&table).next().unwrap();
+        let mut found = Vec::new();
+        unit.resolve_scopes(
+            &table,
+            |b| (b == bdf(0, 1, 0)).then_some(7),
+            |b| (b == bdf(0, 2, 0)).then_some((3, 5)),
+            |r| found.push(r),
+        );
+        assert_eq!(
+            found,
+            [
+                Resolved::Function(bdf(0, 4, 0)),
+                Resolved::Function(bdf(7, 0, 0)),
+                Resolved::Function(bdf(0, 2, 0)),
+                Resolved::Buses(3, 5),
+            ]
+        );
     }
 
     #[test]

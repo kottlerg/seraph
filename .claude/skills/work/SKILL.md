@@ -31,5 +31,19 @@ in **standalone** mode: the same authorities, planning report, branch and PR dis
   run's record, save `audit-<head>.md` and `audit-<head>.json` in the shape that section
   gives, and surface the reviewer verdict the audit states beside the audit line.
 
+This session's worktree, when the session runs in one, holds a built `target/` that nothing
+removes by itself, since the harness removes only an unchanged worktree
+(`.claude/agents/worker.md` § Reporting). The review records of the PR sit under
+`target/xtask/review/pr<N>/` in the checkout the session works in, which is the only copy.
+After the merge, and not before, the session copies the records into the main checkout at the
+same path (a later PR on the same surface takes them as its ledger context); when its sandbox
+refuses that write, the session tells the maintainer, who copies from the worktree path the
+gate report already names. Once the copy exists, and only when the worktree holds nothing
+unsaved or unpushed (the second check of `.claude/skills/orchestrate/SKILL.md` § Worktree
+removal, whose failure is reported to the maintainer and not forced), the maintainer removes
+the worktree (`git worktree remove --force --force <path>` from the main checkout, the doubled
+flag because the harness locks the worktree, then `git worktree prune`), or the session does
+so when the maintainer asks it to.
+
 At the gate, surface both verdict lines verbatim and prompt for the merge decision per
 `.claude/CLAUDE.md` § PR workflow operations; merge only on the maintainer's instruction.

@@ -1079,12 +1079,12 @@ pub(crate) unsafe fn drain_and_install_seed(counts: &DescriptorCounts) -> usize
 ///
 /// The buddy drain (`BuddyAllocator::drain_coalesced`) returns maximal
 /// contiguous extents in address order, so the lowest-address (possibly
-/// small) fragment would otherwise become `memory_base`. ktest (`frame_pool`
-/// and the retype-heavy stress tests) bump-allocates the kernel objects it
-/// creates from `memory_base`, so it must be the large cap. Strict `>` keeps
-/// the earliest extent on ties. Consumers that take the whole range (init,
-/// memmgr) read each cap's size/base individually and do not depend on the
-/// order.
+/// small) fragment would otherwise become `memory_base`. ktest's `frame_pool`
+/// splits its frames off `memory_base`'s tail and the retype-heavy cases
+/// retype their kernel objects from it, so it must be the large cap. Strict
+/// `>` keeps the earliest extent on ties. Consumers that take the whole range
+/// (init, memmgr) read each cap's size/base individually and do not depend on
+/// the order.
 fn promote_largest_extent<T>(extents: &mut [T], size: impl Fn(&T) -> u64) -> usize
 {
     let mut largest = 0usize;

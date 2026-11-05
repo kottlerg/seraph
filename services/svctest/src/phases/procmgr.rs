@@ -745,6 +745,26 @@ fn expect_reply(target: u64, msg: &ipc::IpcMessage, want: u64, what: &str)
     assert_eq!(reply.label, want, "{what}: procmgr replied {}", reply.label);
 }
 
+/// procmgr refuses a `CREATE_FROM_FILE` asking `CREATE_PHYS_ACCESS` from
+/// svctest, which is not phys-class, with `INVALID_ARGUMENT`
+/// (`services/procmgr/docs/ipc-interface.md` § Label 1, **Physical-address
+/// flag**).
+fn phys_access_refused(procmgr: u64)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let (file, size) = hello_file();
+    expect_reply(
+        procmgr,
+        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PHYS_ACCESS)
+            .word(0, size)
+            .cap(file)
+            .build(),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_FROM_FILE with CREATE_PHYS_ACCESS from a creator that is not phys-class",
+    );
+}
+
 /// Look up `/programs/hello` and return `(file_cap, size)`.
 fn hello_file() -> (u64, u64)
 {
@@ -844,18 +864,7 @@ pub fn procmgr_refusals_phase(_: &Caps)
             procmgr_errors::INVALID_ARGUMENT,
             "CREATE_FROM_FILE with the relay flag and only the file cap",
         );
-        let (file, size) = hello_file();
-        expect_reply(
-            procmgr,
-            &IpcMessage::builder(
-                procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PHYS_ACCESS,
-            )
-            .word(0, size)
-            .cap(file)
-            .build(),
-            procmgr_errors::INVALID_ARGUMENT,
-            "CREATE_FROM_FILE with CREATE_PHYS_ACCESS from a creator that is not phys-class",
-        );
+        phys_access_refused(procmgr);
     }
 
     configure_pipe_refusals();

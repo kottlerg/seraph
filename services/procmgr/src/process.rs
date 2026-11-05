@@ -191,7 +191,7 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 pub use process_table::{
     ArgvEnvRefusal, CreateTailCaps, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
     ReleaseRefusal, badge_is_acceptable, release_token_badge, resolve_spawn_sched,
-    split_create_caps,
+    resync_exit_reason, split_create_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────

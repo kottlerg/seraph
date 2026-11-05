@@ -503,6 +503,33 @@ pub fn resolve_spawn_sched(
     Some((priority, band_max))
 }
 
+// ── Death resync ────────────────────────────────────────────────────────────
+
+/// The exit reason procmgr's death resync reaps a live entry with, or `None`
+/// to leave it live. `main_thread` is the kernel's packed
+/// `CAP_INFO_THREAD_STATE` of the entry's main thread (the state above bit
+/// 32, the retained exit reason below), `exited` the state value meaning the
+/// thread exited, and `terminal_fault` the entry's AddressSpace
+/// `CAP_INFO_ASPACE_TERMINAL_FAULT` (`0` while no thread of it took a
+/// terminal fault, else the first such fault's reason); a read that failed is
+/// `None`. An exited main thread reaps with its own reason, as its post would
+/// have; otherwise a terminal fault in any thread reaps with the fault's
+/// reason, as the address space's post would have.
+#[must_use]
+pub fn resync_exit_reason(
+    main_thread: Option<u64>,
+    exited: u32,
+    terminal_fault: Option<u64>,
+) -> Option<u64>
+{
+    match (main_thread, terminal_fault)
+    {
+        (Some(packed), _) if (packed >> 32) as u32 == exited => Some(packed & 0xFFFF_FFFF),
+        (_, Some(fault)) if fault != 0 => Some(fault),
+        _ => None,
+    }
+}
+
 // ── Badge acceptance ─────────────────────────────────────────────────────────
 
 /// Whether a candidate badge may be handed out as a process badge.
@@ -534,6 +561,36 @@ pub fn badge_is_acceptable(badge: u64, min: u64, reserved: u64, verb_bits: u64) 
 mod tests
 {
     use super::*;
+
+    /// A thread-state value standing for "exited" in the resync tests; the
+    /// function compares against whatever value the caller passes.
+    const EXITED: u32 = 3;
+
+    #[test]
+    fn the_resync_reaps_an_exited_main_thread_with_its_own_reason()
+    {
+        let packed = (u64::from(EXITED) << 32) | 0x1007;
+        assert_eq!(resync_exit_reason(Some(packed), EXITED, Some(0)), Some(0x1007));
+        // The main thread's reason wins over a fault a worker took first.
+        assert_eq!(resync_exit_reason(Some(packed), EXITED, Some(0x100E)), Some(0x1007));
+    }
+
+    #[test]
+    fn the_resync_reaps_a_running_process_whose_worker_took_a_terminal_fault()
+    {
+        let running = u64::from(EXITED - 1) << 32;
+        assert_eq!(resync_exit_reason(Some(running), EXITED, Some(0x100E)), Some(0x100E));
+        assert_eq!(resync_exit_reason(None, EXITED, Some(0x100E)), Some(0x100E));
+    }
+
+    #[test]
+    fn the_resync_leaves_a_process_live_without_an_exit_or_a_fault()
+    {
+        let running = u64::from(EXITED - 1) << 32;
+        assert_eq!(resync_exit_reason(Some(running), EXITED, Some(0)), None);
+        assert_eq!(resync_exit_reason(Some(running), EXITED, None), None);
+        assert_eq!(resync_exit_reason(None, EXITED, None), None);
+    }
 
     fn entry_with_badge(badge: u64) -> ProcessEntry
     {

@@ -235,12 +235,11 @@ Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
 procmgr drains every queue on each death wakeup. The kernel drops a post to a
 full queue, so a drain that takes a full queue's worth of events or more from
 one queue rescans the table and reaps every entry whose main thread the kernel
-reports exited (`CAP_INFO_THREAD_STATE`). Any dropped post leaves a full queue of
-events behind it for that drain or the next, so the rescan runs after the
-drop. The rescan recovers main-thread deaths only: a dropped address-space
-terminal-fault post, for a worker thread's fault while the main thread runs, is
-not recovered, since the kernel exposes no address-space fault state to read
-back; that process is reaped when its main thread exits. A reaped or destroyed
+reports exited (`CAP_INFO_THREAD_STATE`), or whose address space it reports took
+a terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`, a worker thread's fault while
+the main thread runs). Any dropped post leaves a full queue of events behind it
+for that drain or the next, so the rescan runs after the drop and recovers
+either death. A reaped or destroyed
 (`DESTROY_PROCESS`) child stays in a recent-exits record for 30 s, so
 `QUERY_PROCESS` answers `EXITED` for it, unless heap exhaustion drops or evicts
 its record first (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9:

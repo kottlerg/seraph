@@ -482,9 +482,9 @@ The death-notification flow:
    address-space death notification for a terminal fault in any thread,
    or an explicit `DESTROY_PROCESS` teardown). When one of its death
    queues was full and a post was dropped, procmgr recovers the
-   main-thread deaths from the kernel's thread states; a dropped
-   address-space post is not recovered, and that process is reaped when
-   its main thread exits (see
+   main-thread deaths from the kernel's thread states, and the
+   address-space terminal faults from each address space's retained
+   terminal-fault reason (see
    [services/procmgr/README.md](../services/procmgr/README.md) § Process
    table and death queues).
 2. **Procmgr → memmgr.** Procmgr sends `PROCESS_DIED` to memmgr carrying

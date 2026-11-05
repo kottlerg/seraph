@@ -796,18 +796,15 @@ fn dispatch_death(
     }
 }
 
-/// Reap every live entry whose main thread the kernel reports exited: the
-/// recovery for main-thread death posts a full queue dropped. Reads each
-/// entry's thread state (`CAP_INFO_THREAD_STATE`), which the kernel records
-/// before it posts, so a process whose main-thread post was dropped is found
-/// here. A process that exits after the scan posts to a queue this drain has
-/// emptied.
-///
-/// An address-space terminal-fault post (a worker thread's fault, with the
-/// main thread still running) that the full queue dropped is not recovered:
-/// the kernel exposes no address-space fault state to read back, so that
-/// process keeps running with the faulted thread gone until its main thread
-/// exits, when this path or its own post reaps it.
+/// Reap every live entry whose main thread the kernel reports exited, or
+/// whose address space it reports took a terminal fault: the recovery for
+/// the death posts a full queue dropped. Reads each entry's main-thread state
+/// (`CAP_INFO_THREAD_STATE`) and its address space's terminal-fault reason
+/// (`CAP_INFO_ASPACE_TERMINAL_FAULT`), both of which the kernel records
+/// before it posts, so a process whose main-thread post, or whose
+/// address-space post for a worker thread's fault, was dropped is found here
+/// ([`process::resync_exit_reason`]). A process that exits or faults after
+/// the scan posts to a queue this drain has emptied.
 ///
 /// An init death the full queue dropped is not recovered here; init's reap
 /// then waits, the benign hold of a handover that never completes
@@ -822,21 +819,26 @@ fn resync_deaths(
     let mut exited: Vec<(u64, u64)> = Vec::new();
     let mut short = false;
     table.for_each(|entry| {
-        let Ok(packed) = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        let main_thread =
+            syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
+        let terminal_fault =
+            syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT).ok();
+        let Some(exit_reason) = process::resync_exit_reason(
+            main_thread,
+            syscall_abi::THREAD_STATE_EXITED,
+            terminal_fault,
+        )
         else
         {
             return;
         };
-        if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED
+        if exited.try_reserve(1).is_ok()
         {
-            if exited.try_reserve(1).is_ok()
-            {
-                exited.push((entry.badge(), packed & 0xFFFF_FFFF));
-            }
-            else
-            {
-                short = true;
-            }
+            exited.push((entry.badge(), exit_reason));
+        }
+        else
+        {
+            short = true;
         }
     });
     if short

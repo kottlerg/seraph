@@ -20,6 +20,7 @@
 use iommu_vtd::tables::{ENTRIES, PAGE, TableStore};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
+use std::sync::atomic::{Ordering, fence};
 
 use crate::arch;
 
@@ -120,12 +121,14 @@ impl Store
         else
         {
             std::os::seraph::log!("table pages: no physical base");
+            let _ = syscall::cap_delete(cap);
             return false;
         };
         let Ok(range) = reserve_pages(CHUNK_PAGES)
         else
         {
             std::os::seraph::log!("table pages: no VA");
+            let _ = syscall::cap_delete(cap);
             return false;
         };
         let va = range.va_start();
@@ -138,6 +141,9 @@ impl Store
         if mapped.is_err() || self.chunks.try_reserve(1).is_err()
         {
             std::os::seraph::log!("table pages: mapping failed");
+            // Deleting the cap removes its mapping too.
+            let _ = syscall::cap_delete(cap);
+            std::os::seraph::unreserve_pages(range);
             return false;
         }
         self.chunks.push(Chunk { phys, va, used: 0 });
@@ -160,6 +166,8 @@ impl TableStore for Store
         // SAFETY: `va` is a page of the chunk mapped writable in `grow`, and
         // no table has been handed out over it yet.
         unsafe { core::ptr::write_bytes(va as *mut u64, 0, ENTRIES) };
+        // The zeroed page reaches memory before any entry that points at it.
+        fence(Ordering::SeqCst);
         self.flush(phys, 0, PAGE);
         Some(phys)
     }
@@ -182,6 +190,9 @@ impl TableStore for Store
 
     fn written(&mut self, phys: u64, index: usize)
     {
+        // Every table store is ordered before the next one and before the
+        // register write that makes a unit read it, on a snooping unit too.
+        fence(Ordering::SeqCst);
         self.flush(phys, (index * 8) as u64, 8);
     }
 }

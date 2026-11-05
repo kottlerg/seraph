@@ -47,8 +47,6 @@ pub const G_ONE_SHOT: u32 = G_SRTP | (1 << 29) | (1 << 27) | (1 << 24);
 pub const CCMD_ICC: u64 = 1 << 63;
 /// `CCMD`: global invalidation request.
 pub const CCMD_GLOBAL: u64 = 1 << 61;
-/// `CCMD`: domain-selective invalidation request.
-pub const CCMD_DOMAIN: u64 = 2 << 61;
 
 /// `IOTLB` (at `ECAP.IRO * 16 + 8`): invalidate IOTLB.
 pub const IOTLB_IVT: u64 = 1 << 63;
@@ -86,13 +84,6 @@ pub const fn gcmd_set(gsts: u32, bit: u32) -> u32
 pub const fn gcmd_clear(gsts: u32, bit: u32) -> u32
 {
     gsts & !G_ONE_SHOT & !bit
-}
-
-/// The `CCMD` value that invalidates the context cache for domain `did`.
-#[must_use]
-pub const fn ccmd_domain(did: u16) -> u64
-{
-    CCMD_ICC | CCMD_DOMAIN | did as u64
 }
 
 /// The `CCMD` value that invalidates the whole context cache.
@@ -295,7 +286,7 @@ mod tests
     #[test]
     fn invalidation_commands_carry_their_granularity_and_domain()
     {
-        assert_eq!(ccmd_domain(5), (1 << 63) | (2 << 61) | 5);
+        assert_eq!(ccmd_global(), (1 << 63) | (1 << 61));
         assert_eq!(iotlb_domain(5) >> 32 & 0xffff, 5);
         assert_eq!(iotlb_domain(5) >> 60 & 0x3, 2);
         assert_eq!(iotlb_global() >> 60 & 0x3, 1);

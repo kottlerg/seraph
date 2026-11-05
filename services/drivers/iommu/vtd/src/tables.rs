@@ -13,6 +13,7 @@
 //! with memmgr frames mapped into its own address space; the host tests
 //! back it with heap pages, so the encoding and the walk are host-tested.
 
+#[cfg(test)]
 use alloc::vec::Vec;
 
 /// Entries in a root table (one per bus), a context table (one per device
@@ -70,13 +71,26 @@ pub trait TableStore
     fn alloc(&mut self) -> Option<u64>;
     /// The entries of the table page at `phys`, which `alloc` returned.
     fn table(&mut self, phys: u64) -> &mut [u64; ENTRIES];
-    /// Entry `index` of the table page at `phys` was just written; a store
-    /// whose unit does not snoop the caches flushes it to memory here. Does
+    /// Entry `index` of the table page at `phys` was just written. A store
+    /// backing a unit's tables orders the write before every later one here,
+    /// so a unit never sees a parent entry before the table it points at, and
+    /// flushes it to memory when the unit does not snoop the caches. Does
     /// nothing by default.
     fn written(&mut self, phys: u64, index: usize)
     {
         let _ = (phys, index);
     }
+}
+
+/// How [`SecondLevel`]'s walk treats a missing intermediate table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk
+{
+    /// Allocate it, so a mapping can be installed.
+    Create,
+    /// Stop with [`TableError::NotMapped`]: the walk reads or clears only
+    /// what is installed.
+    Existing,
 }
 
 /// Why a [`SecondLevel`] operation failed.
@@ -125,13 +139,6 @@ impl SecondLevel
         self.root
     }
 
-    /// Page-table depth.
-    #[must_use]
-    pub fn levels(&self) -> u32
-    {
-        self.levels
-    }
-
     /// The IOVAs the domain translates: `0..2^(12 + 9 * levels)`.
     #[must_use]
     pub fn width(&self) -> u64
@@ -160,12 +167,14 @@ impl SecondLevel
     }
 
     /// The leaf entry slot of `iova`: (the leaf table's physical address,
-    /// the index in it), creating intermediate tables when `create`.
+    /// the index in it), creating the intermediate tables it lacks under
+    /// [`Walk::Create`] and failing with [`TableError::NotMapped`] under
+    /// [`Walk::Existing`].
     fn leaf(
         &self,
         store: &mut impl TableStore,
         iova: u64,
-        create: bool,
+        walk: Walk,
     ) -> Result<(u64, usize), TableError>
     {
         let mut table = self.root;
@@ -177,7 +186,7 @@ impl SecondLevel
             {
                 entry & ADDR_MASK
             }
-            else if create
+            else if walk == Walk::Create
             {
                 let next = store.alloc().ok_or(TableError::OutOfMemory)?;
                 // A non-leaf entry grants both rights; the leaf narrows
@@ -218,7 +227,7 @@ impl SecondLevel
         let mut done = 0;
         while done < len
         {
-            let step = match self.leaf(store, iova + done, true)
+            let step = match self.leaf(store, iova + done, Walk::Create)
             {
                 Ok((table, i)) if store.table(table)[i] == 0 =>
                 {
@@ -259,7 +268,7 @@ impl SecondLevel
         let mut done = 0;
         while done < len
         {
-            let (table, i) = self.leaf(store, iova + done, false)?;
+            let (table, i) = self.leaf(store, iova + done, Walk::Existing)?;
             if store.table(table)[i] == 0
             {
                 return Err(TableError::NotMapped);
@@ -271,14 +280,16 @@ impl SecondLevel
         Ok(())
     }
 
-    /// The (physical address, rights) `iova` translates to, or `None`.
+    /// The (physical address, rights) `iova` translates to, or `None`; what
+    /// the host tests check a walk against.
+    #[cfg(test)]
     pub fn translate(&self, store: &mut impl TableStore, iova: u64) -> Option<(u64, u64)>
     {
         if iova >= self.width()
         {
             return None;
         }
-        let (table, i) = self.leaf(store, iova & !(PAGE - 1), false).ok()?;
+        let (table, i) = self.leaf(store, iova & !(PAGE - 1), Walk::Existing).ok()?;
         let e = store.table(table)[i];
         (e != 0).then_some((
             (e & ADDR_MASK) | (iova & (PAGE - 1)),
@@ -286,8 +297,9 @@ impl SecondLevel
         ))
     }
 
-    /// Every table page the domain holds, top level first, so the driver
-    /// can account for them.
+    /// Every table page the domain holds, top level first; what the host
+    /// tests check a walk's allocations against.
+    #[cfg(test)]
     pub fn pages(&self, store: &mut impl TableStore) -> Vec<u64>
     {
         let mut out = Vec::new();

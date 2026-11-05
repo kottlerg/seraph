@@ -20,7 +20,11 @@
 //! [`serve`] receives on the service endpoint for the rest of the driver's
 //! life and [`poll_faults`] polls the units' fault records on a thread of the
 //! driver's own; both reach the one [`Service`] through a [`Lock`] the
-//! driver supplies, held for one request or one poll and never across IPC.
+//! driver supplies, held for one request or one poll. The lock is held
+//! across one IPC only: a request that needs table pages the backend's store
+//! lacks takes them from memmgr under it. The one other thread the lock
+//! serializes against is the fault poll, which then waits out that one
+//! memmgr round trip; no call into devmgr is ever made under it.
 
 use alloc::vec::Vec;
 
@@ -178,8 +182,8 @@ impl<B: Backend, C: CapOps> Service<B, C>
 
     /// Program every unit empty and turn its translation on
     /// ([`Backend::init_unit`]). On a unit's failure every unit enabled
-    /// before it is turned off again ([`Backend::disable_all`]), so the
-    /// driver leaves no device blocked when it does not report ready.
+    /// before it is turned off again ([`Backend::disable_all`]), so a driver
+    /// whose setup fails leaves no device blocked.
     ///
     /// # Errors
     /// The index of the unit that failed and why.
@@ -969,6 +973,21 @@ mod tests
         }
         let next = 0x10_0000 + MAX_RANGES_PER_DOMAIN as u64 * 0x2000;
         assert_eq!(map(&mut s, d, next, RW, 3), iommu_errors::OUT_OF_RESOURCES);
+    }
+
+    #[test]
+    fn a_failed_unmap_leaves_the_range_and_its_cap_installed()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(map(&mut s, d, 0x10_0000, RW, 3), iommu_errors::SUCCESS);
+        s.backend.fail_next = Some(BackendError::OutOfMemory);
+        let unmap = req(iommu_labels::UNMAP, &[d, 0x10_0000], &[]);
+        assert_eq!(s.handle(&unmap).label, iommu_errors::OUT_OF_RESOURCES);
+        assert_eq!(s.domains[0].ranges.len(), 1);
+        assert!(deleted(&s).is_empty());
+        assert_eq!(s.handle(&unmap).label, iommu_errors::SUCCESS);
+        assert_eq!(deleted(&s), [3]);
     }
 
     #[test]

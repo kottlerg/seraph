@@ -47,8 +47,8 @@ pub const MAX_REGISTER_PAGES: u64 = 16;
 /// header. A unit whose firmware scope names more is not handed over.
 pub const MAX_SCOPES: usize = MSG_DATA_WORDS_MAX - UNIT_HEADER_WORDS;
 /// Units one IOMMU driver serves. A platform with more units of one family
-/// than this hands over the first ones and runs the functions of the rest
-/// unconfined; `docs/limits.md` classifies the bound.
+/// than this hands over the first ones and refuses the DMA-capable functions
+/// of the rest; `docs/limits.md` classifies the bound.
 pub const MAX_UNITS: usize = 16;
 
 /// [`Scope`] word: a bus range rather than one function.

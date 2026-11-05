@@ -22,7 +22,10 @@ use crate::acpi::{SDT_HDR_LEN, sdt_length, sdt_signature};
 /// First remapping structure: after the header, the host address width (u8),
 /// the flags (u8), and 10 reserved bytes (VT-d section 8.1).
 const DMAR_STRUCTURES_OFF: usize = SDT_HDR_LEN + 12;
-/// Offset of the host address width, encoded as the width minus one.
+/// Offset of the host address width, encoded as the width minus one; only
+/// the tests' table builder writes it, since devmgr reads no DMA width from
+/// the table (a unit's own `CAP` register gives its width).
+#[cfg(test)]
 const DMAR_OFF_HAW: usize = SDT_HDR_LEN;
 /// A remapping structure's header: type (u16), length (u16).
 const STRUCTURE_HDR_LEN: usize = 4;
@@ -179,19 +182,6 @@ enum Structure
 }
 
 // ── Walkers ───────────────────────────────────────────────────────────
-
-/// The host address width the table reports: the widest physical address a
-/// DMA can reach, in bits. `None` for a table that is not a DMAR or too
-/// short to hold it.
-#[must_use]
-pub fn host_address_width(dmar: &[u8]) -> Option<u8>
-{
-    if sdt_signature(dmar) != *b"DMAR" || dmar.len() <= DMAR_OFF_HAW
-    {
-        return None;
-    }
-    Some(read_u8(dmar, DMAR_OFF_HAW).saturating_add(1))
-}
 
 /// The remapping structures of a DMAR, bounded by its reported length and
 /// the slice. The walk ends at a structure shorter than its header or running
@@ -560,13 +550,6 @@ mod tests
     fn no_ranges(_: Bdf) -> Option<(u8, u8)>
     {
         None
-    }
-
-    #[test]
-    fn host_address_width_is_the_encoded_value_plus_one()
-    {
-        assert_eq!(host_address_width(&dmar(39, &[])), Some(39));
-        assert_eq!(host_address_width(b"APIC"), None);
     }
 
     #[test]

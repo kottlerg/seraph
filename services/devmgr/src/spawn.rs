@@ -596,6 +596,9 @@ pub struct IommuSpawnConfig<'a>
     pub query_ep: u64,
     /// devmgr's driver death queue.
     pub death_eq: u64,
+    /// The IOMMU death watch's queue, a second observer of the driver's
+    /// death that no registry-loop call can delay (`crate::iommu`).
+    pub watch_eq: u64,
     pub device_badge: u64,
     pub priority: u8,
 }
@@ -603,12 +606,12 @@ pub struct IommuSpawnConfig<'a>
 /// Spawn the IOMMU driver and serve its bootstrap
 /// (`iommu_core::bootstrap`): one round per unit with its register cap, then
 /// the terminal round with a copy of `service_ep` and a SEND badged
-/// `device_badge` on `query_ep`. Created `CREATE_PINNED`, since the units
+/// `device_badge` on `query_ep`; once that is served, two death observers,
+/// on `death_eq` and `watch_eq`. Created `CREATE_PINNED`, since the units
 /// walk its table pages and they must never fault, and `CREATE_DMA_HOLD`,
 /// since the units can walk those pages after it dies: devmgr never releases
-/// the hold, so they stay quarantined for the boot. Once the last round is
-/// served a death observer is bound to `death_eq`, correlator
-/// `device_badge`. Returns as [`spawn_driver`] does.
+/// the hold, so they stay quarantined for the boot. Both observers carry the
+/// correlator `device_badge`. Returns as [`spawn_driver`] does.
 // too_many_lines: one spawn transaction, as `spawn_driver`: every derived
 // cap owns a slot released on a later failure, and the rounds follow the
 // bootstrap protocol one to one.
@@ -741,6 +744,8 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
         return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
     }
     if syscall::thread_bind_notification(thread_cap, config.death_eq, config.device_badge).is_err()
+        || syscall::thread_bind_notification(thread_cap, config.watch_eq, config.device_badge)
+            .is_err()
     {
         std::os::seraph::log!("IOMMU driver death observer bind failed");
         return DriverSpawn::Unbootstrapped(child_guard.keep_handle());

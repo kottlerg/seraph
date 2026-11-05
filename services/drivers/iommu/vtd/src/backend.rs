@@ -11,6 +11,7 @@
 //! [`INVALIDATION_TIMEOUT`] before the request it serves is answered. Fault
 //! events stay masked; the fault recording registers are polled.
 
+use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
 use iommu_core::{Backend, BackendError, Fault, UnitInfo};
@@ -89,8 +90,12 @@ impl Unit
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
+    /// Write a 32-bit register. Every write the driver makes starts or
+    /// configures a unit operation that may read the translation structures,
+    /// so it is fenced after every table store the driver made before it.
     fn write32(&self, off: usize, value: u32)
     {
+        fence(Ordering::SeqCst);
         if let Some(addr) = self.checked(off, 4)
         {
             // SAFETY: as in `read32`.
@@ -109,8 +114,10 @@ impl Unit
         unsafe { core::ptr::read_volatile(addr as *const u64) }
     }
 
+    /// Write a 64-bit register, fenced as [`Self::write32`] is.
     fn write64(&self, off: usize, value: u64)
     {
+        fence(Ordering::SeqCst);
         if let Some(addr) = self.checked(off, 8)
         {
             // SAFETY: as in `read32`.
@@ -136,21 +143,20 @@ impl Unit
         }
     }
 
-    /// Set (`on`) or clear a persistent `GCMD` state and wait for `GSTS` to
-    /// report it.
-    fn set_state(&self, bit: u32, on: bool) -> Result<(), BackendError>
+    /// Set a persistent `GCMD` state and wait for `GSTS` to report it.
+    fn enable(&self, bit: u32) -> Result<(), BackendError>
     {
         let gsts = self.read32(regs::GSTS);
-        let gcmd = if on
-        {
-            regs::gcmd_set(gsts, bit)
-        }
-        else
-        {
-            regs::gcmd_clear(gsts, bit)
-        };
-        self.write32(regs::GCMD, gcmd);
-        self.wait(|u| (u.read32(regs::GSTS) & bit != 0) == on)
+        self.write32(regs::GCMD, regs::gcmd_set(gsts, bit));
+        self.wait(|u| u.read32(regs::GSTS) & bit != 0)
+    }
+
+    /// Clear a persistent `GCMD` state and wait for `GSTS` to report it.
+    fn disable(&self, bit: u32) -> Result<(), BackendError>
+    {
+        let gsts = self.read32(regs::GSTS);
+        self.write32(regs::GCMD, regs::gcmd_clear(gsts, bit));
+        self.wait(|u| u.read32(regs::GSTS) & bit == 0)
     }
 
     /// Set the root table pointer from `RTADDR`.
@@ -226,12 +232,16 @@ impl Vtd
 
     /// Write a two-word entry of the table page `table` at word `index`, the
     /// high word first, so the unit never reads a present low word beside a
-    /// stale high one, and flush it.
+    /// stale high one, and flush it. The stores are volatile, so they reach
+    /// memory in that order (x86-64 keeps stores in program order).
     fn write_entry(&mut self, table: u64, index: usize, words: [u64; 2])
     {
         let t = self.store.table(table);
-        t[index + 1] = words[1];
-        t[index] = words[0];
+        // SAFETY: both words lie in the table page `t` borrows exclusively.
+        unsafe {
+            core::ptr::write_volatile(&raw mut t[index + 1], words[1]);
+            core::ptr::write_volatile(&raw mut t[index], words[0]);
+        }
         self.store.flush(table, (index * 8) as u64, 16);
     }
 
@@ -265,11 +275,11 @@ impl Vtd
         let gsts = u.read32(regs::GSTS);
         if gsts & regs::G_TE != 0
         {
-            u.set_state(regs::G_TE, false)?;
+            u.disable(regs::G_TE)?;
         }
         if gsts & regs::G_QIE != 0
         {
-            u.set_state(regs::G_QIE, false)?;
+            u.disable(regs::G_QIE)?;
         }
         u.write32(regs::FECTL, regs::FECTL_IM);
         u.clear_faults();
@@ -281,7 +291,7 @@ impl Vtd
         u.flush_write_buffer()?;
         u.invalidate_context()?;
         u.invalidate_iotlb(regs::iotlb_global())?;
-        u.set_state(regs::G_TE, true)?;
+        u.enable(regs::G_TE)?;
         u.enabled = true;
         Ok(())
     }
@@ -310,7 +320,7 @@ impl Backend for Vtd
     {
         for u in &mut self.units
         {
-            if u.enabled && u.set_state(regs::G_TE, false).is_ok()
+            if u.enabled && u.disable(regs::G_TE).is_ok()
             {
                 u.enabled = false;
             }
@@ -354,19 +364,18 @@ impl Backend for Vtd
     ) -> Result<(), BackendError>
     {
         let rights = if write { SL_READ | SL_WRITE } else { SL_READ };
-        domain
-            .tables
-            .map(&mut self.store, iova, phys, len, rights)
-            .map_err(table_error)?;
+        let mapped = domain.tables.map(&mut self.store, iova, phys, len, rights);
         let u = &self.units[domain.unit];
         u.flush_write_buffer()?;
-        // A unit in caching mode may cache the not-present entries the range
-        // replaced.
-        if u.cap.caching_mode
+        // A map that failed part-way undid the entries it wrote, which the
+        // unit may have cached meanwhile; a unit in caching mode may cache
+        // the not-present entries a range replaced. Either needs the
+        // domain's IOTLB invalidated.
+        if mapped.is_err() || u.cap.caching_mode
         {
             u.invalidate_iotlb(regs::iotlb_domain(domain.did))?;
         }
-        Ok(())
+        mapped.map_err(table_error)
     }
 
     fn unmap(&mut self, domain: &mut VtdDomain, iova: u64, len: u64) -> Result<(), BackendError>
@@ -383,10 +392,14 @@ impl Backend for Vtd
     fn block(&mut self, domain: &mut VtdDomain) -> Result<(), BackendError>
     {
         let context = self.units[domain.unit].context[domain.bus];
-        // The low word, which holds the present bit, is cleared first.
+        // The low word, which holds the present bit, is cleared first; the
+        // stores are volatile, so they reach memory in that order.
         let t = self.store.table(context);
-        t[domain.entry] = 0;
-        t[domain.entry + 1] = 0;
+        // SAFETY: both words lie in the table page `t` borrows exclusively.
+        unsafe {
+            core::ptr::write_volatile(&raw mut t[domain.entry], 0);
+            core::ptr::write_volatile(&raw mut t[domain.entry + 1], 0);
+        }
         self.store.flush(context, (domain.entry * 8) as u64, 16);
         self.context_changed(domain.unit, domain.did)
     }

@@ -172,7 +172,9 @@ The bootloader's firmware parsing is deliberately narrow. It does not:
   beyond the PCI host-bridge ranges.
 - Enumerate PCI buses or read PCI configuration space.
 - Identify specific device models or driver requirements.
-- Enumerate IOMMU topology.
+- Enumerate IOMMU topology: of the ACPI DMAR it reads only each VT-d unit's register window, to
+  seed an aperture over it ([acpi.md](acpi.md)); the units' scopes, reserved regions, and
+  programming are devmgr's.
 - Produce per-device capabilities of any kind.
 
 All of these are `devmgr`'s responsibility. The bootloader produces the

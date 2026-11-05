@@ -1927,6 +1927,9 @@ struct ServedDrivers
     iommu: Served<ServedDriver>,
     /// The client the IOMMU driver is called through, once it is ready.
     iommu_client: Option<Arc<iommu::IommuClient>>,
+    /// Whether the IOMMU driver's death has withdrawn the confined
+    /// devices' drivers.
+    iommu_dependants_withdrawn: bool,
 }
 
 impl ServedDrivers
@@ -1953,11 +1956,10 @@ impl ServedDrivers
         self.iommu_client = Some(client);
     }
 
-    /// The service endpoint of the IOMMU driver its batch served, if it
-    /// reported ready.
-    fn take_iommu_ep(&self) -> Option<u64>
+    /// Whether the IOMMU driver's batch served it: it reported ready.
+    fn iommu_served(&self) -> bool
     {
-        self.iommu.first_live().map(|d| d.ep)
+        self.iommu.first_live().is_some()
     }
 
     /// Whether the IOMMU driver has failed, so a confined device's driver
@@ -1968,8 +1970,9 @@ impl ServedDrivers
     }
 
     /// The IOMMU driver died after it enabled translation: fail its client
-    /// closed ([`iommu::IommuClient::fail`]) and withdraw every served
-    /// driver of a device it confines, whose mappings can no longer change.
+    /// closed ([`iommu::IommuClient::fail`]; its death watch usually has
+    /// already) and, once, withdraw every served driver of a device it
+    /// confines, whose mappings can no longer change.
     fn fail_iommu(&mut self, ipc_buf: *mut u64)
     {
         let Some(client) = self.iommu_client.as_ref()
@@ -1977,7 +1980,8 @@ impl ServedDrivers
         {
             return;
         };
-        if !client.fail()
+        client.fail();
+        if core::mem::replace(&mut self.iommu_dependants_withdrawn, true)
         {
             return;
         }
@@ -2002,6 +2006,17 @@ impl ServedDrivers
         for (state, mut spawned) in roster.into_outcomes()
         {
             let name = spawned.class.name();
+            if spawned.class == DriverClass::Iommu && state != DriverState::Ready
+            {
+                // Destroyed but not released: its service endpoint is the
+                // IOMMU client's, which is never deleted.
+                std::os::seraph::log!(
+                    "{}: driver not ready when its batch settled; destroyed",
+                    name
+                );
+                spawn::destroy_child(spawned.driver.process_handle, ipc_buf);
+                continue;
+            }
             match state
             {
                 DriverState::Ready

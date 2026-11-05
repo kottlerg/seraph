@@ -15,25 +15,32 @@
 //! blocked until devmgr attaches it, so [`Iommu::confine`] attaches each
 //! DMA-capable device before its DMA grant, refusing a device the firmware
 //! reserves memory for (an RMRR names it; identity-mapping such regions is
-//! [#773](https://github.com/kottlerg/seraph/issues/773)) or whose `ATTACH`
-//! fails. When no unit is found, no driver module was delivered, or the
-//! driver does not report ready within the settle bound, devmgr logs once
-//! that DMA runs unconfined and every device runs so.
+//! [#773](https://github.com/kottlerg/seraph/issues/773)), one whose unit it
+//! could not hand over, or one whose `ATTACH` fails. When no unit is found,
+//! no driver module was delivered, or the driver does not report ready within
+//! the settle bound, devmgr logs once that DMA runs unconfined and every
+//! device runs so; a driver that fails its own setup turns translation off
+//! again first, but one that dies or hangs after it turned a unit's
+//! translation on leaves that unit blocking the devices behind it, which
+//! devmgr, holding no register cap, cannot undo, and logs as such.
 //!
 //! The [`IommuClient`] is shared by devmgr's registry thread (`ATTACH`,
 //! `BLOCK`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread
 //! (`TAKE_FAULTS`), each call made with no devmgr lock held. When the driver
-//! dies after it enabled translation, the hardware goes on translating, so
-//! devmgr cannot fall back to unconfined DMA: [`IommuClient::fail`] makes
-//! every later call fail at once, logged once, and starts a thread that
-//! answers any call still queued on the driver's endpoint with an error, and
-//! devmgr withdraws every confined device's driver. No restart is attempted;
+//! dies after it reported ready, the hardware goes on translating, so devmgr
+//! cannot fall back to unconfined DMA. A death watch thread of its own sees
+//! the death at once, independent of the registry loop, which may itself be
+//! blocked in a call to the dead driver: [`IommuClient::fail`] makes every
+//! later call fail at once, logged once, and starts a thread that answers any
+//! call still queued on the driver's endpoint with an error. When the
+//! registry loop takes the death, devmgr withdraws every confined device's
+//! driver. No restart is attempted;
 //! restartability is [#262](https://github.com/kottlerg/seraph/issues/262).
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
 use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use firmware::dma::{Confinement, EDU_ID, iova_limit};
 use firmware::dmar::{self, Bdf, Resolved};
@@ -62,12 +69,17 @@ fn bdf_word(bus: u8, device: u8, function: u8) -> u16
 pub struct IommuClient
 {
     /// The driver's service endpoint, the original devmgr created; the
-    /// driver receives on a copy. Never deleted, so no devmgr thread ever
-    /// calls a slot another cap has since taken.
+    /// driver receives on a copy. Never deleted, whatever becomes of the
+    /// driver, so no devmgr thread ever calls or drains a slot another cap
+    /// has since taken.
     ep: u64,
-    /// Each unit's IOVA width (`QUERY_UNIT`), by unit index.
-    widths: Vec<u8>,
+    /// Each unit's IOVA width (`QUERY_UNIT`), by unit index; set once the
+    /// driver is ready.
+    widths: OnceLock<Vec<u8>>,
     failed: AtomicBool,
+    /// Whether the driver reported ready, after which its death leaves the
+    /// units translating.
+    ready: AtomicBool,
 }
 
 impl IommuClient
@@ -162,7 +174,11 @@ impl IommuClient
     /// The IOVA width of unit `unit`; 0 when unknown.
     fn width(&self, unit: usize) -> u8
     {
-        self.widths.get(unit).copied().unwrap_or(0)
+        self.widths
+            .get()
+            .and_then(|w| w.get(unit))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Take the faults the driver recorded since the last take, passing each
@@ -193,21 +209,23 @@ impl IommuClient
         }
     }
 
-    /// The driver has died with translation enabled: refuse every later call,
-    /// log it once, and answer every call still queued on its endpoint with
-    /// an error from a thread of devmgr's own, so no devmgr thread waits on a
-    /// driver that will never receive. Returns whether this call was the
-    /// first, which withdraws the confined devices' drivers.
+    /// The driver has died: refuse every later call, log it once when the
+    /// driver had reported ready, and answer every call still queued on its
+    /// endpoint with an error from a thread of devmgr's own, so no devmgr
+    /// thread waits on a driver that will never receive. Called by the death
+    /// watch ([`start_death_watch`]) as soon as the death posts, and again,
+    /// to no effect, by the registry loop when it takes the death; returns
+    /// whether this call was the first.
     pub fn fail(&self) -> bool
     {
         if self.failed.swap(true, Ordering::AcqRel)
         {
             return false;
         }
-        std::os::seraph::log!(
-            "IOMMU driver died with translation enabled: every later DMA_MAP refused, \
-             confined devices withdrawn, no restart (#262)"
-        );
+        if self.ready.load(Ordering::Acquire)
+        {
+            Self::log_failed();
+        }
         let ep = self.ep;
         if std::thread::Builder::new()
             .name("iommu-drain".into())
@@ -217,6 +235,18 @@ impl IommuClient
             std::os::seraph::log!("IOMMU drain thread not started; a queued IOMMU call may hang");
         }
         true
+    }
+}
+
+impl IommuClient
+{
+    /// Log the fail-closed state a death after the ready report leaves.
+    fn log_failed()
+    {
+        std::os::seraph::log!(
+            "IOMMU driver died with translation enabled: every later DMA_MAP refused, \
+             confined devices withdrawn, no restart (#262)"
+        );
     }
 }
 
@@ -287,6 +317,19 @@ pub struct Iommu
 /// Why a device is not given DMA.
 pub struct Refused;
 
+/// Where a device stands against the remapping units.
+enum Placement
+{
+    /// The unit with this driver index translates it.
+    Unit(usize),
+    /// No unit translates it.
+    Untranslated,
+    /// An RMRR names it.
+    Reserved,
+    /// The unit that translates it was not handed over.
+    NotProgrammed,
+}
+
 impl Iommu
 {
     /// The client devmgr calls the driver through.
@@ -310,10 +353,8 @@ impl Iommu
         }
     }
 
-    /// The driver's unit index for `pci_dev`: `Ok(None)` when no unit
-    /// translates it, so it runs unconfined; `Err` when it must be refused
-    /// (an RMRR names it, or its unit was not handed over), logged.
-    fn unit_of(&self, name: &str, pci_dev: &pci::PciDevice) -> Result<Option<usize>, Refused>
+    /// Where `pci_dev` stands against the units, without IPC.
+    fn placement(&self, pci_dev: &pci::PciDevice) -> Placement
     {
         let target = Bdf {
             bus: pci_dev.bus,
@@ -329,11 +370,7 @@ impl Iommu
             self.bus_range(seg),
         )
         {
-            std::os::seraph::log!(
-                "{}: firmware reserves memory for the device (RMRR); refused (#773)",
-                name
-            );
-            return Err(Refused);
+            return Placement::Reserved;
         }
         let Some(drhd) = dmar::unit_for(
             &self.dmar,
@@ -344,38 +381,53 @@ impl Iommu
         )
         else
         {
-            std::os::seraph::log!(
-                "{}: no remapping unit translates the device; unconfined",
-                name
-            );
-            return Ok(None);
+            return Placement::Untranslated;
         };
-        if let Some(unit) = self.unit_index.get(drhd).copied().flatten()
-        {
-            return Ok(Some(unit));
-        }
-        std::os::seraph::log!("{}: its remapping unit is not programmed; refused", name);
-        Err(Refused)
+        self.unit_index
+            .get(drhd)
+            .copied()
+            .flatten()
+            .map_or(Placement::NotProgrammed, Placement::Unit)
     }
 
-    /// Whether `pci_dev` would be confined: a unit translates it and the
-    /// driver has not failed. No IPC; [`Self::confine`] decides.
+    /// The driver's unit index for `pci_dev`: `Ok(None)` when no unit
+    /// translates it, so it runs unconfined; `Err` when it must be refused
+    /// (an RMRR names it, or its unit was not handed over), logged.
+    fn unit_of(&self, name: &str, pci_dev: &pci::PciDevice) -> Result<Option<usize>, Refused>
+    {
+        match self.placement(pci_dev)
+        {
+            Placement::Unit(unit) => Ok(Some(unit)),
+            Placement::Untranslated =>
+            {
+                std::os::seraph::log!(
+                    "{}: no remapping unit translates the device; unconfined",
+                    name
+                );
+                Ok(None)
+            }
+            Placement::Reserved =>
+            {
+                std::os::seraph::log!(
+                    "{}: firmware reserves memory for the device (RMRR); refused (#773)",
+                    name
+                );
+                Err(Refused)
+            }
+            Placement::NotProgrammed =>
+            {
+                std::os::seraph::log!("{}: its remapping unit is not programmed; refused", name);
+                Err(Refused)
+            }
+        }
+    }
+
+    /// Whether `pci_dev` would be confined: a programmed unit translates it,
+    /// no RMRR names it, and the driver has not failed. No IPC;
+    /// [`Self::confine`] decides.
     pub fn would_confine(&self, pci_dev: &pci::PciDevice) -> bool
     {
-        let target = Bdf {
-            bus: pci_dev.bus,
-            device: pci_dev.dev,
-            function: pci_dev.func,
-        };
-        let seg = pci_dev.segment;
-        let drhd = dmar::unit_for(
-            &self.dmar,
-            seg,
-            target,
-            self.secondary_bus(seg),
-            self.bus_range(seg),
-        );
-        drhd.is_some() && !self.client.failed()
+        matches!(self.placement(pci_dev), Placement::Unit(_)) && !self.client.failed()
     }
 
     /// Attach `pci_dev` to a domain of its own before its DMA grant, so its
@@ -574,63 +626,62 @@ pub fn bring_up(
         unconfined("no IOMMU driver module");
         return None;
     }
-    let mut bridges = Vec::new();
-    for d in devices
-    {
-        if let Some(range) = d.bridge_buses
-            && bridges.try_reserve(1).is_ok()
-        {
-            let f = Bdf {
-                bus: d.bus,
-                device: d.dev,
-                function: d.func,
-            };
-            bridges.push((d.segment, f, range));
-        }
-    }
+    let bridges = bridges(devices);
     let units = unit_rounds(caps, &dmar_bytes, &bridges);
     if units.rounds.is_empty()
     {
         unconfined("no IOMMU unit can be programmed");
         return None;
     }
-    let ep = spawn_and_settle(
+    let Some((client, death_eq)) = start_death_watch()
+    else
+    {
+        release_rounds(&units.rounds);
+        unconfined("no IOMMU driver endpoint or death watch");
+        return None;
+    };
+    let settled = spawn_and_settle(
         caps,
         module_guard,
         &units.rounds,
+        &client,
+        death_eq,
         watch,
         catalog,
         served,
         ipc_buf,
     );
-    let Some(ep) = ep
-    else
+    match settled
     {
-        unconfined("IOMMU driver not ready");
-        return None;
-    };
-    let mut client = IommuClient {
-        ep,
-        widths: Vec::new(),
-        failed: AtomicBool::new(false),
-    };
+        Settled::Ready =>
+        {}
+        Settled::NotStarted =>
+        {
+            // Wake the death watch, whose observer was never bound, so it
+            // exits.
+            let _ = syscall::event_post(death_eq, 0);
+            unconfined("IOMMU driver not started");
+            return None;
+        }
+        Settled::NotReady =>
+        {
+            std::os::seraph::log!(
+                "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
+                 unconfined, except those behind a unit it turned translation on for \
+                 before it failed, which that unit blocks"
+            );
+            return None;
+        }
+    }
+    client.ready.store(true, Ordering::Release);
+    if client.failed()
+    {
+        // It died between its ready report and here: the death watch
+        // failed the client without the fail-closed line.
+        IommuClient::log_failed();
+    }
     let handed = units.unit_index.iter().flatten().count();
-    if client.widths.try_reserve(handed).is_err()
-    {
-        unconfined("no memory for the IOMMU units");
-        return None;
-    }
-    for unit in 0..handed
-    {
-        let msg = IommuClient::request(iommu_labels::QUERY_UNIT)
-            .word(1, unit as u64)
-            .build();
-        let width = client
-            .call(&msg)
-            .map_or(0, |r| u8::try_from(r.word(0)).unwrap_or(0));
-        client.widths.push(width);
-    }
-    let client = Arc::new(client);
+    let _ = client.widths.set(query_widths(&client, handed));
     served.set_iommu(Arc::clone(&client));
     let faults = Arc::new(Mutex::new(FaultCounts::default()));
     start_fault_log(&client, &faults);
@@ -644,36 +695,157 @@ pub fn bring_up(
     })
 }
 
+/// Every PCI-to-PCI bridge of `devices`: its segment, function, and bus
+/// range, against which the DMAR's scopes resolve.
+fn bridges(devices: &[pci::PciDevice]) -> Vec<(u16, Bdf, (u8, u8))>
+{
+    let mut out = Vec::new();
+    for d in devices
+    {
+        if let Some(range) = d.bridge_buses
+            && out.try_reserve(1).is_ok()
+        {
+            let f = Bdf {
+                bus: d.bus,
+                device: d.dev,
+                function: d.func,
+            };
+            out.push((d.segment, f, range));
+        }
+    }
+    out
+}
+
+/// The IOVA width of each of the driver's `units` units (`QUERY_UNIT`); 0
+/// for one it does not report, which then takes no mapping.
+fn query_widths(client: &IommuClient, units: usize) -> Vec<u8>
+{
+    let mut widths = Vec::new();
+    if widths.try_reserve(units).is_err()
+    {
+        return widths;
+    }
+    for unit in 0..units
+    {
+        let msg = IommuClient::request(iommu_labels::QUERY_UNIT)
+            .word(1, unit as u64)
+            .build();
+        let width = client
+            .call(&msg)
+            .map_or(0, |r| u8::try_from(r.word(0)).unwrap_or(0));
+        widths.push(width);
+    }
+    widths
+}
+
+/// Delete the register caps of `rounds`, which no driver was given.
+fn release_rounds(rounds: &[spawn::UnitRound])
+{
+    for r in rounds
+    {
+        let _ = syscall::cap_delete(r.cap);
+    }
+}
+
+/// Create the IOMMU driver's service endpoint and the client devmgr calls it
+/// through, and start the thread that watches for the driver's death: it
+/// waits on an event queue of its own, to which the driver's spawn binds a
+/// second death observer, and fails the client at once on a death post, so
+/// the failure never waits on devmgr's registry loop, which may itself be
+/// blocked in a call to the dead driver (directly, or through a read whose
+/// buffer the DMA thread is mapping). A post with tag 0, which no death post
+/// carries (the correlator is a nonzero device badge), only ends the thread.
+/// `None`, logged, when the endpoint, the queue, or the thread cannot be
+/// created.
+fn start_death_watch() -> Option<(Arc<IommuClient>, u64)>
+{
+    let ep = crate::create_service_endpoint()?;
+    let eq = std::os::seraph::object_slab_retype(
+        std::os::seraph::event_queue_retype_bytes(2, 1),
+        |slab| syscall::event_queue_create_observed(slab, 2, 1).ok(),
+    );
+    let Some(eq) = eq
+    else
+    {
+        let _ = syscall::cap_delete(ep);
+        return None;
+    };
+    let client = Arc::new(IommuClient {
+        ep,
+        widths: OnceLock::new(),
+        failed: AtomicBool::new(false),
+        ready: AtomicBool::new(false),
+    });
+    let watched = Arc::clone(&client);
+    let started = std::thread::Builder::new()
+        .name("iommu-watch".into())
+        .spawn(move || {
+            loop
+            {
+                match syscall::event_recv_entry(eq, 0)
+                {
+                    Ok(e) if e.tag != 0 =>
+                    {
+                        watched.fail();
+                        return;
+                    }
+                    Ok(_) => return,
+                    Err(_) =>
+                    {
+                        let _ = syscall::thread_yield();
+                    }
+                }
+            }
+        });
+    if started.is_err()
+    {
+        let _ = syscall::cap_delete(eq);
+        let _ = syscall::cap_delete(ep);
+        return None;
+    }
+    Some((client, eq))
+}
+
+/// How the IOMMU driver's spawn and settle ended.
+enum Settled
+{
+    /// It reported ready.
+    Ready,
+    /// It was never started, so it turned no translation on.
+    NotStarted,
+    /// It was started with every unit but did not report ready: dead, or
+    /// destroyed at the settle bound.
+    NotReady,
+}
+
 /// Spawn the IOMMU driver from its module, which `module_guard` holds, over
-/// `rounds` in a settle batch of its own and settle it; the driver's service
-/// endpoint when it reported ready.
+/// `rounds` with the client's endpoint as its service endpoint, in a settle
+/// batch of its own, its death watched on `death_eq` as well as devmgr's
+/// death queue, and settle it.
+// too_many_arguments: the spawn and its settle consume the client, the death
+// watch, the batch's death queue, the catalog, and the served classes.
+#[allow(clippy::too_many_arguments)]
 fn spawn_and_settle(
     caps: &caps::DevmgrCaps,
     mut module_guard: spawn::ModuleCapGuard,
     rounds: &[spawn::UnitRound],
+    client: &IommuClient,
+    death_eq: u64,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     served: &mut ServedDrivers,
     ipc_buf: *mut u64,
-) -> Option<u64>
+) -> Settled
 {
-    let release = |rounds: &[spawn::UnitRound]| {
-        for r in rounds
-        {
-            let _ = syscall::cap_delete(r.cap);
-        }
-    };
     let batch = settle::SettleBatch::new();
     let badge = catalog.add_without_info();
-    let ep = crate::create_service_endpoint();
     let mut roster = firmware::roster::Roster::new();
-    let (Some(batch), Some(device_badge), Some(ep), Ok(())) =
-        (batch, badge, ep, roster.try_reserve_one())
+    let (Some(batch), Some(device_badge), Ok(())) = (batch, badge, roster.try_reserve_one())
     else
     {
-        std::os::seraph::log!("IOMMU driver: no settle batch, badge, or endpoint; not spawned");
-        release(rounds);
-        return None;
+        std::os::seraph::log!("IOMMU driver: no settle batch or badge; not spawned");
+        release_rounds(rounds);
+        return Settled::NotStarted;
     };
     // `spawn_iommu_driver` owns the module cap's lifecycle from here
     // (consumed by CREATE_PROCESS, or released on failure).
@@ -683,9 +855,10 @@ fn spawn_and_settle(
         bootstrap_ep: caps.self_bootstrap_ep,
         module_cap: caps.module_cap_for_kind(caps::module_kind::IOMMU),
         units: rounds,
-        service_ep: ep,
+        service_ep: client.ep,
         query_ep: batch.driver_ep(),
         death_eq: watch.death_eq(),
+        watch_eq: death_eq,
         device_badge,
         // devmgr's DMA thread, at the boot drivers' level, calls the driver
         // on every map and unmap of the root-disk path.
@@ -696,21 +869,18 @@ fn spawn_and_settle(
         spawn::DriverSpawn::Bootstrapped(h) => h,
         spawn::DriverSpawn::Unbootstrapped(h) =>
         {
+            // Every unit round reached it only when the endpoint round or
+            // an observer bind failed; it may then be setting its units up.
             spawn::destroy_child(h, ipc_buf);
-            let _ = syscall::cap_delete(ep);
-            return None;
+            return Settled::NotReady;
         }
-        spawn::DriverSpawn::Failed =>
-        {
-            let _ = syscall::cap_delete(ep);
-            return None;
-        }
+        spawn::DriverSpawn::Failed => return Settled::NotStarted,
     };
     let spawned = SpawnedDriver {
         class: DriverClass::Iommu,
         badge: device_badge,
         driver: ServedDriver {
-            ep,
+            ep: client.ep,
             dev_caps: None,
             process_handle,
         },
@@ -725,7 +895,14 @@ fn spawn_and_settle(
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
-    served.take_iommu_ep()
+    if served.iommu_served()
+    {
+        Settled::Ready
+    }
+    else
+    {
+        Settled::NotReady
+    }
 }
 
 /// Start devmgr's fault-log thread: every [`FAULT_LOG_MS`] it takes the

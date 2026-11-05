@@ -2152,7 +2152,9 @@ pub mod devmgr_dma_labels
     /// returned. Reply: empty body, label `SUCCESS`,
     /// `devmgr_dma_errors::NO_MAPPING` (no mapping of the device at that
     /// address), `devmgr_dma_errors::UNAUTHORIZED` (the device is withdrawn
-    /// or was never given DMA), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
+    /// or was never given DMA), `devmgr_dma_errors::IOMMU_FAILED` (the IOMMU
+    /// driver that confines the device did not remove the mapping, which
+    /// stays standing), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
     pub const DMA_UNMAP: u64 = 2;
     /// [`DMA_MAP`] access bit: the device reads the frames.
     pub const ACCESS_DEVICE_READ: u64 = 1 << 0;
@@ -2254,7 +2256,8 @@ pub unsafe fn dma_map(
 /// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
 /// devmgr's reply label when devmgr refuses: `NO_MAPPING` when `device_addr`
 /// names no mapping of the device, `UNAUTHORIZED` when the device is
-/// withdrawn or was never given DMA, or `LABEL_VERSION_MISMATCH`
+/// withdrawn or was never given DMA, `IOMMU_FAILED` when the IOMMU driver did
+/// not remove the mapping, which stays standing, or `LABEL_VERSION_MISMATCH`
 /// ([`devmgr_dma_labels::DMA_UNMAP`]).
 pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Result<(), DmaError>
 {
@@ -2280,8 +2283,10 @@ pub const IOMMU_LABELS_VERSION: u32 = 1;
 /// IPC labels for an IOMMU driver's service endpoint, on which devmgr directs
 /// the IOMMU of one family (VT-d, the RISC-V IOMMU).
 ///
-/// devmgr holds the only SEND to the endpoint: it spawns the driver, hands it
-/// each unit's register cap, and drives it from its DMA thread and its
+/// devmgr and the driver hold the only caps to the endpoint (devmgr the
+/// original, the driver its receive copy), so no other process can send on
+/// it: devmgr spawns the driver, hands it each unit's register cap, and drives
+/// it from its DMA thread and its
 /// withdrawal path, keeping the drivers' `devmgr_dma_labels` contract unchanged
 /// whichever IOMMU, or none, sits behind it. devmgr chooses every IOVA; the
 /// IOMMU driver installs and withdraws what devmgr asks and reports faults.

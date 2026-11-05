@@ -271,19 +271,24 @@ DMA-capable device devmgr then decides, before it grants the device DMA:
   that domain.
 - **Refused.** An RMRR names the device, whose firmware expects it to keep reaching a reserved
   region: devmgr refuses it with a log line, since identity-mapping reserved regions is
-  [#773](https://github.com/kottlerg/seraph/issues/773). A device whose unit devmgr could not
-  hand over, or whose `ATTACH` fails, is refused too: the unit blocks it, so it cannot run
-  unconfined.
+  [#773](https://github.com/kottlerg/seraph/issues/773). A device whose `ATTACH` fails is
+  refused too, since its unit blocks it. So is a device whose unit devmgr could not hand over: that
+  unit is never programmed, so it does not block the device, but devmgr does not run a device
+  unconfined behind an IOMMU it found.
 - **Unconfined.** No unit translates the device: it runs DMA-unsafe.
 
 When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready
-within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so; the
-driver turns translation off before it gives up, so no device stays blocked. The one case that is
-not an absent IOMMU is a driver that dies after it reported ready: the units go on translating
-through the tables it left, so devmgr cannot fall back to unconfined DMA. It fails closed: it
-logs once, refuses every later `DMA_MAP` of every confined device, answers any of its own calls
-still queued on the dead driver's endpoint with an error, and withdraws the driver of every
-confined device; it restarts nothing, restartability being
+within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so. A
+driver that fails its own setup turns translation off again before it exits, so it leaves no device
+blocked. A driver that dies or hangs after it turned a unit's translation on, before it reported
+ready, leaves that unit blocking every device behind it, which devmgr cannot undo, since it keeps no
+register cap; its log line says so, and those devices' DMA fails. The case that is not an absent
+IOMMU is a driver that dies after it reported ready: the units go on translating through the tables
+it left, so devmgr cannot fall back to unconfined DMA. It fails closed. A death watch thread of
+devmgr's own sees the death at once, independent of the registry loop, which may be blocked in a
+call to the dead driver. devmgr then logs once, refuses every later `DMA_MAP` of every confined
+device, answers any of its own calls still queued on the dead driver's endpoint with an error, and
+withdraws the driver of every confined device; it restarts nothing, restartability being
 [#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous and
 register-based, two IPC hops per mapping; batching it is
 [#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, until

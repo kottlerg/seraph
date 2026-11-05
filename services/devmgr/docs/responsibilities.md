@@ -70,14 +70,17 @@ devmgr's responsibilities are:
   it could not hand over, and one whose `ATTACH` fails; a device no unit
   translates runs DMA-unsafe. With no DMAR, no driver module, or a driver not
   ready within the settle bound, devmgr logs once that DMA runs unconfined and
-  every DMA-capable driver runs DMA-unsafe, as on RISC-V, where no IOMMU is
+  every DMA-capable driver runs DMA-unsafe (a driver that died or hung after
+  it turned a unit's translation on leaves that unit blocking the devices
+  behind it, which the log line states), as on RISC-V, where no IOMMU is
   programmed yet (design intent; not yet implemented). A thread of devmgr's
   takes the driver's recorded faults every second (`TAKE_FAULTS`) and logs
-  each against its device. If the driver dies after it reported ready, devmgr
-  logs once, refuses every later `DMA_MAP` of every confined device, answers
-  any of its own calls still queued on the driver's endpoint from a drain
-  thread, and withdraws every confined device's driver; it restarts nothing
-  ([#262](https://github.com/kottlerg/seraph/issues/262)). See
+  each against its device. If the driver dies after it reported ready, a death
+  watch thread of devmgr's own, which no registry call can delay, fails the
+  IOMMU client at once; devmgr logs once, refuses every later `DMA_MAP` of
+  every confined device, answers any of its own calls still queued on the
+  driver's endpoint from a drain thread, and withdraws every confined device's
+  driver; it restarts nothing ([#262](https://github.com/kottlerg/seraph/issues/262)). See
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming).
 
   devmgr spawns one driver for every virtio-input device and for every

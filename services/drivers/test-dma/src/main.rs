@@ -116,11 +116,15 @@ impl Driver
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let reply = unsafe { ipc::ipc_call(self.memmgr_ep, &request, ipc_buf) }.ok()?;
-        let cap = *reply.caps().first()?;
-        if reply.label != memmgr_errors::SUCCESS
+        if reply.label != memmgr_errors::SUCCESS || reply.caps().len() != 1
         {
+            for &c in reply.caps()
+            {
+                let _ = syscall::cap_delete(c);
+            }
             return None;
         }
+        let cap = reply.caps()[0];
         let range = reserve_pages(1).ok()?;
         let va = range.va_start();
         // SAFETY: `range` is a fresh one-page reservation, kept for the

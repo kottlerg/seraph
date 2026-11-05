@@ -25,12 +25,13 @@ family's driver is its `main` and its `Backend`; VT-d's is
 - **Faults.** A thread of the driver's own polls the units' fault records every `FAULT_POLL_MS`
   into a bounded queue, and `TAKE_FAULTS` polls once more and hands devmgr the oldest.
 - **Setup.** The driver programs every unit empty and turns translation on before it reports
-  ready; a unit that fails turns every unit off again, so the driver that exits without reporting
-  leaves no device blocked.
+  ready; a unit that fails turns every unit off again, so a driver whose setup fails leaves no
+  device blocked. A driver that dies after a unit's translation is on leaves that unit blocking.
 
-The receive loop and the poll loop reach the one service through a lock the driver supplies,
-held for one request or one poll and never across IPC. Everything but the two loops is
-host-tested over a fake backend.
+The receive loop and the poll loop reach the one service through a lock the driver supplies, held
+for one request or one poll. A request that needs table pages the store lacks takes them from memmgr
+under it, the one IPC made under the lock, which the poll then waits out. Everything but the two
+loops is host-tested over a fake backend.
 
 ---
 

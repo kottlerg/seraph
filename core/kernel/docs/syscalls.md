@@ -727,8 +727,15 @@ kernel's higher-half mapping is shared into a newly created address space automa
 | 1 | `augment_cap` | `0` for create-mode; otherwise an AddressSpace cap (Map rights) whose PT growth pool receives the carved pages |
 | 2 | `init_pages` | Pages to carve (create-mode requires `>= 2`: wrapper + root PT, remainder seed the PT growth pool) |
 
-**Return:** `rax`/`a0`: create-mode — new address space capability (Map + Read + Control
-rights); augment-mode — `0`. `SyscallError` on failure.
+**Return:** `rax`/`a0`: create-mode — new address space capability (Map + Control rights,
+plus Read when `memory_cap` carries the Memory `Phys` right); augment-mode — `0`.
+`SyscallError` on failure.
+
+Read gates only `SYS_ASPACE_QUERY`, which returns physical addresses, so it is minted only
+from a source that already lets its holder read its frames' physical base
+(`CAP_INFO_MEMORY_PHYS_BASE`): an address space a process creates from memory without the
+`Phys` right cannot translate the pages it maps into it
+([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Physical-address surfaces).
 
 Augment-mode donations are unbounded in count. Once the target's inline donation
 records are full, the kernel keeps its bookkeeping in the donations themselves: once per
@@ -1014,7 +1021,7 @@ selected by a field code. Read-only inquiry.
 |---|---|---|
 | 0 | `cap` | Capability handle to inspect |
 | 1 | `field` | Field selector (`CAP_INFO_*` constant) |
-| 2 | `first_page` | `CAP_INFO_MEMORY_MAPPINGS` only: first page of the window, from the region's base |
+| 2 | `first_page` / `credential` | `CAP_INFO_MEMORY_MAPPINGS`: first page of the window, from the region's base. `CAP_INFO_MEMORY_PHYS_BASE`: a Memory cap of the caller's carrying the `Phys` right, presented for a `cap` that lacks it, or `0` for none |
 | 3 | `pages` | `CAP_INFO_MEMORY_MAPPINGS` only: window length in pages (1–`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`) |
 
 **Return:** `rax`/`a0`: the requested field value on success; `SyscallError` on failure.
@@ -1031,6 +1038,17 @@ snapshot, which stays current only while no one else holds a capability that can
 region. The kernel answers only through a Memory cap the caller holds, and counts only the
 window arguments 2 and 3 name, at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the
 walk stays bounded; a larger region is read window by window.
+
+`CAP_INFO_MEMORY_PHYS_BASE` (8) returns, for a Memory cap, the physical address of its region's
+first byte, and answers only a holder of the Memory `Phys` right
+([capability-model.md](../../../docs/capability-model.md#memory) § Memory): the queried cap carries
+it, or argument 2 names a Memory cap in the caller's `CSpace` that does, the credential, pinned for
+the check alone. A holder of any `Phys` cap therefore reads the base of every Memory cap it holds,
+those other processes send it included; memmgr grants `Phys` only to devmgr and the IOMMU drivers,
+which need the physical addresses of the frames they map for devices
+([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Physical-address surfaces).
+A queried cap without the right and no credential (`0`), or a credential without it, is refused
+`InsufficientRights`; a credential that is not a live Memory cap, `InvalidCapability`.
 
 `CAP_INFO_SOLE_REFERENCE` (13) returns, for a capability of any type, `1` when the queried slot is
 the only reference to the object it names and `0` otherwise. It reads the object's reference count,
@@ -1056,10 +1074,14 @@ It is the reason a `SYS_ASPACE_BIND_NOTIFICATION` observer of the space receives
 same lock that serialises the post and the bind, so a holder that missed the post reads the outcome
 back here.
 
-**Capability requirement:** None — `cap_info` reads the slot without a rights check.
+**Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
+needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads
+the slot without a rights check.
 
-**Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target
-object is gone), `InvalidArgument` (field requires a different capability type, the
+**Errors:** `InvalidCapability` (null/stale handle, empty slot, a referenced target
+object is gone, or a `CAP_INFO_MEMORY_PHYS_BASE` credential that is not a live Memory cap),
+`InsufficientRights` (`CAP_INFO_MEMORY_PHYS_BASE` with neither the queried cap nor the
+credential carrying `Phys`), `InvalidArgument` (field requires a different capability type, the
 selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
 `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region).
 
@@ -2310,7 +2332,9 @@ Translate a user virtual address to its mapped physical address.
 **Return:** `rax`/`a0`: the mapped physical address on success; negative
 `SyscallError` on failure.
 
-**Capability requirement:** `READ` right on the AddressSpace cap.
+**Capability requirement:** `READ` right on the AddressSpace cap, which
+`SYS_CAP_CREATE_ASPACE` mints only from a source Memory cap carrying the `Phys`
+right, so only a process that may read physical addresses translates its pages.
 
 **Errors:**
 - `InvalidAddress` — `virt` is not page-aligned, outside the user half

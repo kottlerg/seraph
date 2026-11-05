@@ -155,6 +155,10 @@ pub fn run_all(ctx: &TestContext)
         cap_info::ram_descriptors_match_caps(ctx)
     );
     run_test!(
+        "cap_info::phys_base_needs_the_right",
+        cap_info::phys_base_needs_the_right(ctx)
+    );
+    run_test!(
         "cap_info::creation_masks_match_abi",
         cap_info::creation_masks_match_abi(ctx)
     );

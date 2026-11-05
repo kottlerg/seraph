@@ -26,8 +26,8 @@ pub mod ledger;
 pub mod pool;
 
 pub use arena::{
-    Arena, ArenaLayout, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, SLOTS_PER_PAGE,
-    SlotStore,
+    Arena, ArenaLayout, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord,
+    SLOTS_PER_PAGE, SlotStore,
 };
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};

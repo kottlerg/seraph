@@ -302,6 +302,15 @@ directed by devmgr and programmed by an IOMMU driver: VT-d on x86-64 and the RIS
 on riscv64 confine each DMA-capable device a unit translates (see
 [device-management.md](device-management.md) § DMA Safety Model).
 
+Userspace reads physical addresses only through the Memory `Phys` right, which the kernel
+mints on every boot RAM cap and memmgr strips from every grant except to devmgr and the IOMMU
+drivers, the processes that program devices with physical addresses (see
+[capability-model.md](capability-model.md#memory) § Memory). No other process, no device driver
+included, learns where its frames lie in physical memory; the surfaces that still carry a
+physical address, and who holds each, are classified in
+[core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+§ Physical-address surfaces.
+
 Physical frame 0 (the zero page) is excluded from the allocator. The page-table and
 CSpace growth pools, and the allocator's own free lists, use a physical address of 0 as
 their free-list "empty" sentinel, so admitting frame 0 as a pool page or a free block would

@@ -113,11 +113,11 @@ struct SpawnArgs {
 /// [`ThreadResources::reclaim`].
 struct ThreadResources {
     thread_cap: u64,
-    /// Physical base of the Thread-retype slab's backing run, as reported by
+    /// Region id of the Thread-retype slab's backing run, as reported by
     /// memmgr at grant. Returned to memmgr's pool in `reclaim`, after the
     /// Thread cap is deleted, so a thread-churn loop holds a bounded
     /// memmgr-pool footprint (#274).
-    slab_phys: u64,
+    slab_region_id: u64,
     done_notification: u64,
     stack: StackAlloc,
     ipc_buf_base: *mut u8,
@@ -151,7 +151,7 @@ impl ThreadResources {
         // run back to memmgr's pool so the footprint stays bounded across a
         // thread-churn loop, rather than leaking a run per spawn until process
         // death (#274). Must follow the Thread cap delete above.
-        crate::sys::alloc::seraph::slab_release_fresh(self.slab_phys);
+        crate::sys::alloc::seraph::slab_release_fresh(self.slab_region_id);
         // SAFETY: the thread has left user-mode; these allocations are no longer
         // read or written from user space.
         unsafe {
@@ -315,10 +315,10 @@ impl Thread {
 
         // Dedicated slab for the Thread retype slot, sized to the kernel's
         // debit (guard page, kstack, wrapper and TCB, extended-state save area).
-        let (thread_slab, thread_slab_phys) =
+        let (thread_slab, thread_slab_region_id) =
             match thread_retype_bytes().and_then(crate::sys::alloc::seraph::object_slab_acquire_fresh)
             {
-                Some(g) => (g.cap, g.phys),
+                Some(g) => (g.cap, g.region_id),
                 None => {
                     // SAFETY: `args` was just leaked via `Box::into_raw`.
                     let args_owned = unsafe { Box::from_raw(args) };
@@ -360,7 +360,7 @@ impl Thread {
                     let _ = syscall::cap_delete(thread_slab);
                     // Retype failed, so the slab is virgin — return its run to
                     // memmgr's pool instead of leaking it until process death.
-                    crate::sys::alloc::seraph::slab_release_fresh(thread_slab_phys);
+                    crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
                     // SAFETY: `args` was just leaked via `Box::into_raw`.
                     let args_owned = unsafe { Box::from_raw(args) };
                     // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
@@ -403,7 +403,7 @@ impl Thread {
             let _ = syscall::cap_delete(thread_cap);
             // Thread destroyed → its retype bytes are back in the MemoryObject;
             // return the slab's run to memmgr's pool.
-            crate::sys::alloc::seraph::slab_release_fresh(thread_slab_phys);
+            crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
             // SAFETY: `args` was just leaked via `Box::into_raw`.
             let args_owned = unsafe { Box::from_raw(args) };
             // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
@@ -455,7 +455,7 @@ impl Thread {
             // Never started → safe to reclaim the Thread object immediately.
             let _ = syscall::cap_delete(thread_cap);
             // Thread destroyed → return the slab's run to memmgr's pool.
-            crate::sys::alloc::seraph::slab_release_fresh(thread_slab_phys);
+            crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
             // SAFETY: `args` was just leaked via `Box::into_raw`.
             let args_owned = unsafe { Box::from_raw(args) };
             // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
@@ -474,7 +474,7 @@ impl Thread {
         Ok(Thread {
             res: ThreadResources {
                 thread_cap,
-                slab_phys: thread_slab_phys,
+                slab_region_id: thread_slab_region_id,
                 done_notification,
                 stack,
                 ipc_buf_base,

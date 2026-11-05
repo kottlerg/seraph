@@ -397,10 +397,12 @@ fn map(msg: &IpcMessage, cap: u64, shared: &Shared) -> Result<u64, u64>
     };
     // Unconfined: with no IOMMU between the device and memory, the device
     // reaches the frames only at their physical address. A confined device's
-    // address is an IOVA, and devmgr reads no physical address for it.
+    // address is an IOVA, and devmgr reads no physical address for it. The
+    // driver's cap lacks RIGHTS_MEM_PHYS, so devmgr presents its own
+    // credential (`crate::phys`).
     let phys = if handle.is_none()
     {
-        Some(syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).map_err(|_| invalid)?)
+        Some(syscall::cap_info_phys_base(cap, crate::phys::credential()).map_err(|_| invalid)?)
     }
     else
     {

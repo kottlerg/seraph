@@ -14,7 +14,9 @@
 //! (`REQUIRE_CONTIGUOUS`), and the driver reads each chunk's physical base
 //! with `CAP_INFO_MEMORY_PHYS_BASE`, since a unit is programmed with
 //! physical addresses: the IOMMU driver is the one driver class that reads
-//! them (`docs/device-management.md` § IOMMU Discovery and Programming). No
+//! them, and devmgr spawns it phys-class, so its grants carry the
+//! `RIGHTS_MEM_PHYS` the read needs (`docs/device-management.md` § Physical
+//! Addresses). No
 //! page is ever returned: a unit may walk any table page for as long as
 //! translation stays on, so the pages stay with the driver for the boot, and
 //! past its death, since devmgr spawns it `CREATE_DMA_HOLD` and never

@@ -67,10 +67,13 @@ devmgr's responsibilities are:
   page of its BAR 0, carved once devmgr has turned on the function's memory
   decode and bus mastering, and whose scope is the RIMT's ID mappings: each
   bus they cover whole and each scanned function on a bus they cover in part.
-  The driver is created `CREATE_PINNED` and `CREATE_DMA_HOLD` at
-  `BOOT_DRIVER_PRIORITY`, and its hold is never released: devmgr deletes the
-  release token of its create reply at the spawn, so its table pages stay
-  quarantined for the boot. Once it is ready devmgr attaches every
+  The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
+  `CREATE_PHYS_ACCESS` at `BOOT_DRIVER_PRIORITY`, and its hold is never
+  released: devmgr deletes the release token of its create reply at the
+  spawn, so its table pages stay quarantined for the boot; devmgr and it are
+  the processes that read physical addresses
+  ([docs/device-management.md](../../../docs/device-management.md#physical-addresses)
+  § Physical Addresses). Once it is ready devmgr attaches every
   DMA-capable device it binds to a domain of its own (`iommu_labels::ATTACH`)
   before the device's DMA grant, refusing, with a log line, a device an RMRR
   names ([#773](https://github.com/kottlerg/seraph/issues/773)), one the RIMT

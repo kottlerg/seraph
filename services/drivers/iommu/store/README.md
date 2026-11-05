@@ -7,8 +7,10 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
 - **Pages.** Zeroed 4 KiB pages, taken from memmgr in physically contiguous chunks of
   `CHUNK_PAGES` (`REQUIRE_CONTIGUOUS`), mapped writable into the driver, with each chunk's physical
   base read through `CAP_INFO_MEMORY_PHYS_BASE`, since a unit is programmed with physical
-  addresses: the IOMMU driver is the one driver class that reads them
-  ([#767](https://github.com/kottlerg/seraph/issues/767)'s named exception).
+  addresses: the IOMMU driver is the one driver class that reads them. devmgr spawns it
+  phys-class, so its grants carry the Memory `Phys` right the read needs
+  ([docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
+  § Physical Addresses).
 - **Ordering.** A zeroed page is fenced before it is handed out, and every table store before the
   next one, so a unit never sees an entry before the table it points at. The driver's register
   write that makes a unit read them supplies the memory-to-device barrier (`mmio` on riscv64; the

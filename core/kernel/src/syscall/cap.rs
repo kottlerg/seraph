@@ -383,11 +383,14 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 ///   [`AddressSpace::map_page_pooled`](crate::mm::address_space::AddressSpace::map_page_pooled)
 ///   for intermediate PT levels.
 ///
-/// Inserts a cap with `MAP | READ | CONTROL` rights into the caller's
-/// `CSpace`. `CONTROL` lets the creator register terminal-fault death
-/// observers on the address space via `SYS_ASPACE_BIND_NOTIFICATION`;
-/// derived copies handed to other components (e.g. memmgr) drop it via
-/// the `cap_derive` rights mask. Returns the new cap handle.
+/// Inserts a cap with `MAP | CONTROL` rights into the caller's `CSpace`,
+/// plus `READ` when the source Memory cap carries `MemRights::PHYS`: `READ`
+/// gates `SYS_ASPACE_QUERY`, which returns physical addresses, so only a
+/// holder of the physical-address right mints it. `CONTROL` lets the creator
+/// register terminal-fault death observers on the address space via
+/// `SYS_ASPACE_BIND_NOTIFICATION`; derived copies handed to other components
+/// (e.g. memmgr) drop it via the `cap_derive` rights mask. Returns the new
+/// cap handle.
 ///
 /// Augment-mode: seeds the carved pages onto the target AS's PT growth pool
 /// and credits `pt_growth_budget_bytes` with the pages seeded (record-page
@@ -444,6 +447,7 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
+    let source_has_phys = memory_slot_ref.rights.contains(MemRights::PHYS.erase());
     // SAFETY: lookup_cap returned a live Memory slot.
     let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
@@ -602,11 +606,18 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: aso_ptr is in-place at offset 0; header at offset 0 of ASObject.
     let nonnull = unsafe { NonNull::new_unchecked(aso_ptr.cast::<KernelObjectHeader>()) };
 
+    let created_rights = if source_has_phys
+    {
+        AsRights::MAP | AsRights::READ | AsRights::CONTROL
+    }
+    else
+    {
+        AsRights::MAP | AsRights::CONTROL
+    };
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace)
-            .insert_cap_handle_typed(AsRights::MAP | AsRights::READ | AsRights::CONTROL, nonnull);
+        let r = (*cspace).insert_cap_handle_typed(created_rights, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
@@ -2750,8 +2761,10 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 /// `core/kernel/docs/syscalls.md` § `SYS_CAP_INFO` gives the call's contract
 /// and errors.
 ///
-/// This handler does not gate on rights — holding the slot is sufficient to
-/// inspect its state. No mutation occurs.
+/// Holding the slot is sufficient to inspect its state, except for
+/// `CAP_INFO_MEMORY_PHYS_BASE`, which answers only a holder of
+/// `MemRights::PHYS` (the queried cap's, or a credential cap's named in
+/// arg2). No mutation occurs.
 // too_many_lines: a single flat dispatch on the field selector is the clearest
 // shape for this read-only inquiry handler. Splitting it adds only indirection.
 #[allow(clippy::too_many_lines)]
@@ -2792,8 +2805,8 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Snapshot the slot's tag, rights, and object pointer, and pin the object
     // for the inquiry (a stale handle to a recycled slot is refused, #349).
-    // cap_info is a read-only inquiry: holding the slot is sufficient — no
-    // per-field rights check is required.
+    // cap_info is a read-only inquiry: holding the slot is sufficient for
+    // every selector but the physical base, which checks its right below.
     // SAFETY: caller_cspace is the running thread's bound CSpace; no lock held.
     let slot = unsafe { super::pin_slot(caller_cspace, slot_handle) }?;
     let tag = slot.tag;
@@ -2896,6 +2909,21 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             if tag != CapTag::Memory
             {
                 return Err(SyscallError::InvalidArgument);
+            }
+            // The physical base answers only a holder of `MemRights::PHYS`:
+            // the queried cap carries it, or the caller names in `arg2` a
+            // Memory cap of its own that does (core/kernel/docs/syscalls.md
+            // § `SYS_CAP_INFO`). The credential is pinned only for the check.
+            if !rights.contains(MemRights::PHYS.erase())
+            {
+                let credential = tf.arg(2);
+                if credential == 0
+                {
+                    return Err(SyscallError::InsufficientRights);
+                }
+                // SAFETY: caller_cspace is the running thread's bound CSpace;
+                // no lock held.
+                drop(unsafe { super::lookup_cap(caller_cspace, credential, MemRights::PHYS) }?);
             }
             // SAFETY: tag confirmed Memory.
             // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned

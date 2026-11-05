@@ -38,9 +38,9 @@ The worker is a `std` thread that publishes its own Thread capability
 syscall and never ends. The supervisor, the main thread:
 
 1. binds the worker's upcall class (`FAULT_CLASS_UPCALL`) to an endpoint it creates;
-2. lets the worker compute past the deadline, then posts it an upcall with
-   `UPCALL_ANY_INSTRUCTION`, which reaches a thread that makes no syscall at an interrupt's
-   return ([docs/fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls));
+2. lets the worker compute past the deadline, then posts it an upcall with `UPCALL_ANY_INSTRUCTION`,
+   which reaches a thread that makes no syscall at an interrupt's return
+   ([fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls));
 3. receives the upcall (`FAULT_KIND_UPCALL`, its cookie, the interrupt delivery point), rewrites
    the worker's instruction and stack pointers to enter the cancellation routine, and replies to
    resume it;

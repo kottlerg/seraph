@@ -137,13 +137,14 @@ account. procmgr deletes its copy of the cap before it replies, so the caller ca
 memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and the
 header for a std-built sender.
 
-**Pinned flag.** Demand paging is the default: at finalize procmgr binds every
-child's main thread fault handler to memmgr (the system pager) via
-`SYS_THREAD_SET_FAULT_HANDLER`, delegates the child `AddressSpace` to memmgr via
-`memmgr_labels::DELEGATE_ASPACE`, and then sets `ProcessInfo.pager_endpoint_cap` (the
-child's badged memmgr cap, whose derivation badge the kernel stamps on each fault)
-and `pager_badge` (that badge), which tell the runtime the process is demand-paged; the
-runtime copies the spawning thread's bindings, this one among them, onto each thread it
+**Pinned flag.** Demand paging is the default: at finalize procmgr binds every child's main thread
+fault handler to memmgr (the system pager) via `SYS_THREAD_SET_FAULT_HANDLER`, for the
+virtual-memory and exception classes (`FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION`; the upcall class
+stays unbound), delegates the child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`,
+and then sets `ProcessInfo.pager_endpoint_cap` (the child's badged memmgr cap, whose derivation
+badge the kernel stamps on each fault) and `pager_badge` (that badge), which tell the runtime the
+process is demand-paged; the runtime copies the spawning thread's bindings, this one among them,
+onto each thread it
 spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The
 child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,

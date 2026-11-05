@@ -1047,6 +1047,7 @@ note in full.
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/stdiotest/README.md](../programs/stdiotest/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
+[programs/deadline/README.md](../programs/deadline/README.md),
 [programs/threadchurn/README.md](../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [services/crasher/README.md](../services/crasher/README.md),

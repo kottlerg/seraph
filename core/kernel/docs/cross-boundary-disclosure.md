@@ -72,6 +72,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
 | Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for`, `syscall::deliver_copy_fault` | b/d |
+| Upcall message (`FAULT_KIND_UPCALL`) → the poster's cookie, the delivery point, and the thread's user instruction pointer, to the receiver of the thread's upcall binding; no kernel address, and nothing identifying the poster | `ipc::upcall::deliver`, `ipc::fault::FaultInfo` | b/d |
 | Exit / death reason encoding + death entry `(reason, correlator)` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
@@ -92,7 +93,9 @@ Notes on the non-obvious entries:
   (`CR2` on x86-64, `stval` on RISC-V), access flags in `d2`, and the user instruction
   pointer from the `TrapFrame` in `ip`; for `FAULT_KIND_EXCEPTION`, a normalized
   exception code in `d1` and an architecture code (x86-64 error code, RISC-V `stval`)
-  in `d2` ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message).
+  in `d2`; for `FAULT_KIND_UPCALL`, the cookie its poster chose in `d1` and the delivery
+  point in `d2`, a user word and a constant
+  ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message).
   On x86-64, `FAULT_ACCESS_PRESENT` in `d2` copies the hardware `#PF` P bit only when
   `CR2` is a user-half address (`page_fault_handler`): the kernel half is mapped
   supervisor-only in every user address space, so for a kernel-half `CR2` the bit would

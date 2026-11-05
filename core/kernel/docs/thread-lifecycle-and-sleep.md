@@ -23,7 +23,7 @@ invariants.
 | Doc | Owns |
 |---|---|
 | [scheduling-internals.md](scheduling-internals.md) | Lock hierarchy, cross-CPU TCB ownership table, wake protocol, BSP boot transient, IPI taxonomy, atomic ordering pairings. |
-| **This document** | Sleep-list invariants, storage, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_process_exit` state-machine table and the stop protocol (`commit_cancelling_park`); `dealloc_object(Thread)` cross-CPU drain protocol; the `BlockedOnReply` reply-slot claim protocol (every publisher and claimant of `reply_tcb`). |
+| **This document** | Sleep-list invariants, storage, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_process_exit` state-machine table and the stop protocol (`commit_cancelling_park`); the upcall cancel-and-wake protocol (`cancel_for_upcall`); `dealloc_object(Thread)` cross-CPU drain protocol; the `BlockedOnReply` reply-slot claim protocol (every publisher and claimant of `reply_tcb`). |
 | [scheduler.md](scheduler.md) | Scheduling algorithm (priority, FIFO, slice, affinity, idle role). |
 | [ipc-internals.md](ipc-internals.md) | IPC primitive object layouts and syscall paths. |
 
@@ -45,8 +45,10 @@ touches these):
 - `core/kernel/src/syscall/{thread,mod}.rs` — `sys_thread_configure`, `sys_thread_start` (and its
   suspended commit, `commit_suspended_start`), `sys_thread_stop`, `sys_thread_read_regs`,
   `sys_thread_write_regs`, `sys_thread_set_priority`, `sys_thread_set_affinity`, `sys_exit`,
-  `sys_process_exit`, `sys_thread_sleep`, `cancel_ipc_block`, and the self-teardown epilogue of
-  `syscall::dispatch`.
+  `sys_process_exit`, `sys_thread_sleep`, `cancel_ipc_block`, `cancel_for_upcall`, and the
+  self-teardown epilogue of `syscall::dispatch`.
+- `core/kernel/src/ipc/upcall.rs` — `post`, the post's cancel and wake (§ Upcall Cancel-and-Wake
+  Protocol).
 - `core/kernel/src/syscall/ipc.rs` — `sys_notification_wait`, `sys_event_recv`, `sys_ipc_reply`,
   `deposit_transfer_failed_reply`.
 - `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`
@@ -848,6 +850,78 @@ The handler then drains the target.
    new park holds (a reply binding, say). Without the gate the
    restarted thread could run, park again, and be linked `Ready` by that wake while still queued on
    its new source.
+
+---
+
+## Upcall Cancel-and-Wake Protocol
+
+A post (`SYS_THREAD_POST_UPCALL`, `ipc::upcall::post`) cancels the block of a thread blocked in a
+syscall and wakes it, so its syscall returns `Interrupted` and the upcall is delivered at that
+return
+([fault-handling.md § Asynchronous Upcalls](../../../docs/fault-handling.md#asynchronous-upcalls)).
+The cancel reuses the stop's (`cancel_ipc_block`, § `sys_thread_stop` Cross-CPU Stop Protocol
+sub-step 2.2). A stop's cancel leaves the claimed park to the `Stopped` commit and the later start.
+An upcall's cancel instead makes the wake the claim owes, and leaves the thread runnable.
+
+**Protocol (`ipc::upcall::post`, `syscall::thread::cancel_for_upcall`):**
+
+1. **Post.** Under the target's `sched_lock`:
+   - refuse a `Created` or `Exited` target, or one with no `FAULT_CLASS_UPCALL` binding
+     (`InvalidState`), and one with an upcall pending (`QueueFull`);
+   - otherwise write `upcall_cookie` and `upcall_any_instruction`, then set `upcall_pending`;
+   - read `upcall_masked`.
+
+   A masked target ends the post here.
+2. **Cancel.** `cancel_for_upcall(target)` runs `cancel_ipc_block`'s cancel with two differences.
+   - Its snapshot hold refuses the cancel unless the target is `Blocked`, has an upcall pending, has
+     no mask set, and is in no fault or upcall delivery (`in_fault_delivery`). A plain sleeper's
+     claim, the `sleep_list_remove` in that hold, is made only when none of these refuses.
+   - Every arm whose claim it wins stamps the episode `INTERRUPTED` and clears the park binding, as
+     for a stop, and also sets `wake_in_flight = 1` inside the claim's `sched_lock` hold. The
+     `BlockedOnReply` arm keeps the `wake_in_flight` that the reply binding set, where a stop's
+     cancel clears it. The `BlockedOnFault` arm and a fault sender's `BlockedOnSend` arm are never
+     reached, since the snapshot refuses a thread in a delivery.
+
+   It returns whether it won a claim.
+3. **Wake.** On a won claim, `enqueue_and_wake(target, select_target_cpu(target))` makes the
+   thread `Ready` and clears `wake_in_flight`. The resumed syscall consumes the `INTERRUPTED`
+   stamp and returns `Interrupted`, and `finish_syscall` delivers the upcall
+   (`ipc::upcall::deliver_at_syscall`).
+4. **Prod.** With no claim won and `UPCALL_ANY_INSTRUCTION` set, the post scans the CPUs for one
+   whose `current` is the target, under each CPU's lock, and prods it if it is not this CPU
+   (`prod_remote_cpu`). The forced interrupt's return to user mode delivers the upcall
+   (`ipc::upcall::deliver_at_interrupt`).
+
+**Park side.** `commit_blocked_under_local_lock` refuses a park with `ParkCommit::RefusedStop` when
+the parking thread has an upcall pending, no mask set, and no fault or upcall delivery in
+progress. The thread stays `Running`. Every caller's rollback treats the refusal as a stop's: it
+unregisters the waiter and stamps the episode `INTERRUPTED`, and the thread's `schedule()` is a
+requeue. The syscall then returns `Interrupted`.
+
+**Invariants:**
+
+1. **No missed block.** The post's write of `upcall_pending` and the park commit both run under the
+   target's `sched_lock`, so they are ordered one way or the other.
+   - The commit first: the cancel's later snapshot finds the target `Blocked`, unless a waker moved
+     it first, in which case it returns from its syscall and takes the upcall there.
+   - The write first: the commit sees the pending upcall and refuses the park.
+
+   Either way the block ends with an `Interrupted` return or a genuine wake, and the thread reaches
+   its syscall delivery point.
+2. **Fault parks are never cancelled.** A fault or upcall delivery sets `in_fault_delivery` under
+   the thread's `sched_lock` before its park commits. The cancel's snapshot and the park commit both
+   read it in that lock's hold. The upcall stays pending until the delivery resolves, and the first
+   delivery point after it takes the upcall.
+3. **A mask keeps its blocks.** The thread writes `upcall_masked` only for itself, under its
+   `sched_lock` (`SYS_THREAD_SET_UPCALL_MASK`), and never while it is blocked. The cancel's snapshot
+   and the park commit read it under that lock, so a block entered masked is never cancelled for an
+   upcall.
+4. **One wake per won claim.** A claim is exclusive (each arm's claim is the one a stop's cancel
+   takes), and the poster that won it makes the wake. `wake_in_flight`, set inside the claim's hold,
+   keeps `dealloc_object(Thread)` from freeing the thread before the wake. It also makes a restart
+   wait for the wake (§ `sys_thread_stop` invariant 4). A stop that commits `Stopped` over the
+   claimed park before the wake lands makes the wake abort on `Stopped`, leaving the `INTERRUPTED`
+   stamp for the restart, as for any waker.
 
 ---
 

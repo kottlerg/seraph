@@ -283,21 +283,28 @@ worktrees this batch spawned: the ones the record file lists, under `.claude/wor
 
 - **At a worker's retirement:** after its last PR merges (or its gate report, when it has no
   PR left to merge) and nothing is left for it (§ Merge order and the gate), remove its
-  worktree. Precondition, checked first: `target/xtask/review/pr<N>/` exists in your checkout
-  for each of the worker's PRs and holds the records of every run the worker reported, since
-  those records exist nowhere else once the worktree is gone (§ Failure modes); copy any that
-  are missing from the worktree, or ask the worker to, before removing. A worktree parked on a
-  `park/<name>` branch for a possible resume (§ Merge order and the gate) stays until
-  wind-down, when no worker is resumable.
+  worktree. A worktree parked on a `park/<name>` branch for a possible resume (§ Merge order
+  and the gate) stays until wind-down, when no worker is resumable.
 - **At wind-down:** sweep every worktree the record lists as spawned in this batch that is
-  still present (a parked one included), under the same precondition, after confirming no
-  worker the record lists as active owns it. Skip and report to the maintainer any worktree
-  with uncommitted tracked changes (`git -C <path> status --porcelain --untracked-files=no`)
-  or with commits that are not on `origin`. A worktree under `.claude/worktrees/` that the
-  record does not list (left by an earlier batch, or another session's) is reported to the
-  maintainer with its branch and lock, never removed on this sweep; it is removed only when
-  its branch is gone from `origin` (`git ls-remote --heads origin`), its lock names no running
-  process and the skip conditions above do not hold.
+  still present (a parked one included), after confirming no worker the record lists as
+  active owns it.
+
+Before removing a worktree in either place, check both conditions and skip and report to the
+maintainer any worktree that fails one:
+
+- The records precondition: `target/xtask/review/pr<N>/` exists in your checkout for each of
+  the worker's PRs and holds the records of every run the worker reported, since those records
+  exist nowhere else once the worktree is gone (§ Failure modes). Copy any that are missing
+  from the worktree, or ask the worker to, and then remove.
+- Nothing unsaved or unpushed: `git -C <path> status --porcelain` prints nothing (it lists
+  uncommitted tracked changes and untracked files that are not ignored, and not `target/`),
+  and, after `git fetch origin`, `git -C <path> rev-list HEAD --not --remotes=origin` prints
+  nothing.
+
+A worktree under `.claude/worktrees/` that the record does not list (left by an earlier
+batch, or another session's) is reported to the maintainer with its branch (or its detached
+state) and its lock, and is never removed by the retirement step or the sweep; you remove it
+only on the maintainer's word, after the two conditions above.
 
 Removal is `git worktree remove --force --force <path>`: the doubled flag is required because
 the harness locks agent worktrees and a locked worktree refuses a single `--force`; the

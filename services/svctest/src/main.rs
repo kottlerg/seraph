@@ -41,7 +41,10 @@ mod runner;
 /// (`phases::layout`) finds a note to patch in a copy of this image.
 pub(crate) const SVCTEST_STACK_PAGES: u32 = process_abi::DEFAULT_PROCESS_STACK_PAGES;
 
-process_abi::stack_pages!(SVCTEST_STACK_PAGES);
+// Declared through std's macro, not `process_abi::stack_pages!`, so every
+// build compiles the std surface a std-built binary declares its stack with,
+// and the layout phase reads the note std's `StackNote` emits.
+std::os::seraph::stack_pages!(SVCTEST_STACK_PAGES);
 
 fn main()
 {

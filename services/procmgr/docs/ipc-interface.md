@@ -194,7 +194,9 @@ success procmgr creates the child's initial thread at the resolved priority
 `cap_copy` of the baseline for a full-width band, copy-then-`SYS_SCHED_SPLIT`
 for a narrowed one — into `ProcessInfo.sched_control_cap`, and records the
 resolved priority in `ProcessInfo.initial_priority` so the runtime spawns
-further threads at the same level.
+further threads at the same level by default, unless
+`std::os::seraph::thread::BuilderExt::spawn_at_priority` places one
+elsewhere in the band.
 
 ### Label 2: `START_PROCESS`
 

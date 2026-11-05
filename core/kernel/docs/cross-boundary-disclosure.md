@@ -205,8 +205,9 @@ Who holds `Phys`, and why:
   § Physical Addresses).
 - **procmgr, transiently.** procmgr allocates a child's memory against the child's memmgr
   account, so while it builds devmgr or an IOMMU driver it holds those children's `Phys`
-  grants. procmgr's own grants lack `Phys`: init mints procmgr's memmgr badge without the
-  phys-class bit, and memmgr refuses a bootstrap that carries it.
+  grants, and at init's reap it holds init's reclaimable boot caps until it donates them
+  to memmgr. procmgr's own grants lack `Phys`: init mints procmgr's memmgr badge without
+  the phys-class bit, and memmgr refuses a bootstrap that carries it.
 
 Every other process, every device driver included, holds no `Phys` cap: its grants lack
 the right, its address spaces lack `READ`, and memmgr's grant reply names its runs by

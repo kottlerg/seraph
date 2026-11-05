@@ -57,7 +57,7 @@ iommu/core/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs           # Crate root: the Backend trait, its errors, a unit's limits
+    ├── lib.rs           # Crate root: the Backend trait, its errors, Access, a unit's limits
     ├── bootstrap.rs     # Unit and endpoint rounds, scope words, the unit lookup
     ├── faults.rs        # The bounded queue of polled faults
     ├── service.rs       # iommu_labels handling, domain records, the receive and poll loops

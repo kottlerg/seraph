@@ -1141,8 +1141,9 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     // so the slots free when they start are at most that funding (about twice
     // the slot ceiling) plus the few slot pages a funding rounds up to and the
     // release SEND and liveness parent of each of the opens earlier phases
-    // held and closed (2 x `fs_opens::HELD_FILES`). Four times the ceiling
-    // and 512 more clears that at every RAM size.
+    // held and closed (2 x (`fs_opens::HELD_FILES` + 2): the eviction phase
+    // holds two openers beside its Files). Four times the ceiling and 512
+    // more clears that at every RAM size.
     let requests = 4 * fatfs_slot_ceiling(ipc_buf) + 512;
 
     let svctest = svctest_dir_cap(ipc_buf);

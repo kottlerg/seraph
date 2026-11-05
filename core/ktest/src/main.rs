@@ -742,8 +742,23 @@ fn wait_us(target_us: u64)
 /// The failing syscall's error code.
 pub fn bind_fault_handler(thread: u64, endpoint: u64, badge: u64) -> Result<(), i64>
 {
+    bind_fault_handler_classes(thread, endpoint, badge, syscall_abi::FAULT_CLASS_ALL)
+}
+
+/// [`bind_fault_handler`] for the fault classes `classes` selects (a
+/// `fault_class_mask`), leaving the other classes' bindings as they are.
+///
+/// # Errors
+/// As for [`bind_fault_handler`]; `InvalidArgument` also for a refused mask.
+pub fn bind_fault_handler_classes(
+    thread: u64,
+    endpoint: u64,
+    badge: u64,
+    classes: u64,
+) -> Result<(), i64>
+{
     let badged = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_ALL, badge)?;
-    let bound = syscall::thread_set_fault_handler(thread, badged, syscall_abi::FAULT_CLASS_ALL);
+    let bound = syscall::thread_set_fault_handler(thread, badged, classes);
     let deleted = syscall::cap_delete(badged);
     bound.and(deleted)
 }

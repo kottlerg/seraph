@@ -298,6 +298,24 @@ pub fn current_ipc_buf() -> *mut u64 {
     IPC_BUF_TLS.get()
 }
 
+#[thread_local]
+static SELF_THREAD_TLS: Cell<u64> = Cell::new(0);
+
+/// Record the current thread's own Thread capability. Called by the thread
+/// trampoline of a spawned thread with the cap its spawner created.
+pub(crate) fn set_current_thread_cap(cap: u64) {
+    SELF_THREAD_TLS.set(cap);
+}
+
+/// The current thread's own Thread capability: the one recorded by
+/// [`set_current_thread_cap`] for a spawned thread, else the process's
+/// initial thread ([`StartupInfo::self_thread`]), or 0 before `_start` has
+/// read the startup info.
+pub(crate) fn current_thread_cap() -> u64 {
+    let cap = SELF_THREAD_TLS.get();
+    if cap != 0 { cap } else { try_startup_info().map_or(0, |info| info.self_thread) }
+}
+
 /// Register a process-global panic-output sink. When set, std's panic
 /// machinery routes panic bytes to `sink` instead of the system log
 /// endpoint — covering the default hook AND the non-unwinding

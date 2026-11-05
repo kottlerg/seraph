@@ -45,7 +45,8 @@ use syscall::{
     SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
     SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT,
     SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
     SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
@@ -320,7 +321,7 @@ unsafe fn deliver_copy_fault(tf: UserFrame, fault: UserCopyFault) -> SyscallExit
     let tcb = unsafe { current_tcb() };
     // SAFETY: tcb is the running thread; has_handler only reads its atomic
     // binding.
-    if tcb.is_null() || !unsafe { crate::ipc::fault::has_handler(tcb) }
+    if tcb.is_null() || !unsafe { crate::ipc::fault::has_handler(tcb, syscall::FAULT_KIND_VM) }
     {
         return SyscallExit::Complete;
     }
@@ -439,6 +440,8 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
         SYS_THREAD_READ_REGS => return thread::sys_thread_read_regs(tf),
         SYS_THREAD_WRITE_REGS => return thread::sys_thread_write_regs(tf),
         SYS_THREAD_SET_FAULT_HANDLER => thread::sys_thread_set_fault_handler(tf),
+        SYS_THREAD_GET_FAULT_HANDLER => thread::sys_thread_get_fault_handler(tf),
+        SYS_THREAD_INHERIT_FAULT_HANDLER => thread::sys_thread_inherit_fault_handler(tf),
         SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
         SYS_THREAD_YIELD => sys_yield(tf),
         SYS_THREAD_EXIT => sys_exit(tf),

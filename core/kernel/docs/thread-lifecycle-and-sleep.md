@@ -508,12 +508,12 @@ Registry).
    [BlockedOnReply Edge — Symmetry Rules](#blockedonreply-edge--symmetry-rules).
 
 8. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding
-   (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler`
-   EndpointObject. The drain swaps the field to null and dec_refs; if the endpoint's refcount
-   reaches 0 it is pushed onto the dealloc cascade stack (`CascadeStack`, step 20), not freed by a
-   nested `dealloc_object` call — the stack exists precisely to keep the cascade non-recursive.
-   Ordering after step 11 ensures a queued faulter is off the endpoint's send queue before the
-   endpoint can be torn down.
+   (independent of whether it is itself fault-blocked) owns one `inc_ref` on the EndpointObject of
+   each fault class it is bound for (`fault_handlers`). The drain swaps each class's field to null
+   and dec_refs; if an endpoint's refcount reaches 0 it is pushed onto the dealloc cascade stack
+   (`CascadeStack`, step 20), not freed by a nested `dealloc_object` call — the stack exists
+   precisely to keep the cascade non-recursive. Ordering after step 11 ensures a queued faulter is
+   off the endpoint's send queue before the endpoint can be torn down.
 
 9. **Step 17's poison precedes step 18's drop.** `magic = 0` and `priority = 0xFF` are the
    use-after-free traps — any later code that reads these fields and dereferences will fail loudly

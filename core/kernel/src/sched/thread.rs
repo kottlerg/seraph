@@ -731,18 +731,26 @@ pub struct ThreadControlBlock
     pub ipc_wait_queue: core::sync::atomic::AtomicPtr<crate::ipc::WaitQueue>,
 
     // === Fault-handler binding ===
-    /// Bound fault-handler endpoint object (`null` = none). Kernel-unresolvable
-    /// faults on this thread are delivered to this endpoint's receiver; with no
-    /// handler bound the fault is terminal. Stored as the `EndpointObject`
+    /// Bound fault-handler endpoint object per fault class (`null` = none).
+    /// Kernel-unresolvable faults of a class on this thread are delivered to
+    /// that class's endpoint's receiver; with no handler bound for its class a
+    /// fault is terminal. Stored as the `EndpointObject`
     /// (not the bare `EndpointState`) so the binding can hold an `inc_ref` on
     /// the object for its lifetime — closing the liveness gap where a
     /// fault-blocked thread (queued on neither the endpoint's send nor receive
     /// queue) could be stranded by the endpoint being freed. See
     /// `docs/fault-handling.md` § Liveness.
     ///
-    /// The binding is the pair (`fault_handler`, [`Self::fault_badge`]),
-    /// published as one unit: the binder (`SYS_THREAD_SET_FAULT_HANDLER`,
-    /// holding the thread's `CONTROL` cap) writes both under this thread's
+    /// Each fault class (`ipc::fault::CLASS_VM`, `ipc::fault::CLASS_EXCEPTION`)
+    /// has its own binding: a fault of a class is delivered through that
+    /// class's endpoint, and each class's binding holds its own reference on
+    /// its endpoint, the same endpoint bound for both classes holding two.
+    ///
+    /// A class's binding is the pair (`fault_handlers[class]`,
+    /// [`fault_badges[class]`](Self::fault_badges)), published as one unit: the
+    /// binder (`SYS_THREAD_SET_FAULT_HANDLER` or
+    /// `SYS_THREAD_INHERIT_FAULT_HANDLER`, holding the thread's `CONTROL` cap,
+    /// through `ipc::fault::publish_bindings`) writes both under this thread's
     /// [`sched_lock`](Self::sched_lock), and the faulter (`fault_dispatch`)
     /// reads both once under the same lock and takes its own reference on the
     /// endpoint there, so a concurrent rebind's release cannot free it during
@@ -750,15 +758,17 @@ pub struct ThreadControlBlock
     /// [`has_handler`](crate::ipc::fault::has_handler) pre-check, which decides
     /// nothing, and for the `dealloc_object(Thread)` release, which runs once
     /// no binder can pin the thread and the thread runs on no CPU.
-    pub fault_handler: core::sync::atomic::AtomicPtr<crate::cap::object::EndpointObject>,
+    pub fault_handlers: [core::sync::atomic::AtomicPtr<crate::cap::object::EndpointObject>;
+        crate::ipc::fault::FAULT_CLASSES],
 
-    /// Derivation badge of the Endpoint cap the binder passed to
-    /// `SYS_THREAD_SET_FAULT_HANDLER`, delivered as the fault message badge.
-    /// The binder cannot choose it: a badge is attached only by
-    /// `SYS_CAP_DERIVE_BADGE` and inherited unchanged by every cap derived
-    /// from the badged one (`docs/fault-handling.md` § Security). Published
-    /// with [`Self::fault_handler`] as one unit, under the same lock.
-    pub fault_badge: core::sync::atomic::AtomicU64,
+    /// Per class, the derivation badge of the Endpoint cap the binder bound,
+    /// delivered as the fault message badge. The binder cannot choose it: a
+    /// badge is attached only by `SYS_CAP_DERIVE_BADGE` and inherited unchanged
+    /// by every cap derived from the badged one, and an inherited binding
+    /// copies the source thread's (`docs/fault-handling.md` § Security).
+    /// Published with [`fault_handlers`](Self::fault_handlers) as one unit,
+    /// under the same lock.
+    pub fault_badges: [core::sync::atomic::AtomicU64; crate::ipc::fault::FAULT_CLASSES],
 
     /// Disposition of an in-flight fault delivery, read by the fault helper
     /// when the thread resumes from `BlockedOnFault`. One of
@@ -786,6 +796,14 @@ pub struct ThreadControlBlock
     /// [`fault_outcome`](Self::fault_outcome) `KILL` (the bare-field exception
     /// of docs/coding-standards.md § Concurrency).
     pub in_fault_delivery: bool,
+
+    /// The class index of the delivery [`in_fault_delivery`](Self::in_fault_delivery)
+    /// marks, written with it under [`sched_lock`](Self::sched_lock) by
+    /// `fault_dispatch`'s binding read and read under that lock by a binder's
+    /// in-flight check (`ipc::fault::delivery_in_flight`), so a change of one
+    /// class's binding cancels only a delivery of that class. Meaningful only
+    /// while `in_fault_delivery` is set.
+    pub fault_delivery_class: u8,
 
     // === Context ===
     /// Whether this thread executes in user mode (ring 3 / U-mode). Immutable

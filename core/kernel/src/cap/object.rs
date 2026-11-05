@@ -4047,27 +4047,29 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     }
                 }
 
-                // Release this thread's fault-handler binding, if any. The
-                // binding held an inc_ref on the endpoint object for its lifetime
-                // (see ThreadControlBlock::fault_handler); drop it, and if this
-                // was its last reference enqueue the orphaned endpoint on the
-                // cascade stack (rather than recursing into `dealloc_object`,
-                // which the cascade exists to avoid). Done
+                // Release this thread's fault-handler bindings, one per class.
+                // Each binding held an inc_ref on its endpoint object for its
+                // lifetime (see ThreadControlBlock::fault_handlers); drop it, and
+                // if this was its last reference enqueue the orphaned endpoint
+                // on the cascade stack (rather than recursing into
+                // `dealloc_object`, which the cascade exists to avoid). Done
                 // after the unlink above (which removed this thread from the
                 // endpoint's send queue if it was a queued faulter) so the
                 // endpoint dealloc cannot observe this thread still on its queue.
-                // SAFETY: tcb valid (not yet freed); fault_handler is atomic; no
-                // lock is held here; a binding's reference that was the
+                // SAFETY: tcb valid (not yet freed); the bindings are atomics;
+                // no lock is held here; a binding's reference that was the
                 // endpoint's last leaves it unreferenced for the push.
                 unsafe {
-                    let ep = (*tcb)
-                        .fault_handler
-                        .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
-                    if !ep.is_null() && (*ep).header.dec_ref() == 0
+                    for slot in &(*tcb).fault_handlers
                     {
-                        stack.push(core::ptr::NonNull::new_unchecked(
-                            ep.cast::<KernelObjectHeader>(),
-                        ));
+                        let ep =
+                            slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+                        if !ep.is_null() && (*ep).header.dec_ref() == 0
+                        {
+                            stack.push(core::ptr::NonNull::new_unchecked(
+                                ep.cast::<KernelObjectHeader>(),
+                            ));
+                        }
                     }
                 }
 

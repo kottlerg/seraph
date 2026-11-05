@@ -48,7 +48,8 @@ use syscall_abi::{
     SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
     SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
     SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
     SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
@@ -2240,7 +2241,10 @@ pub fn thread_set_affinity(thread_cap: u64, cpu_id: u32) -> Result<(), i64>
 /// the derivation badge of `endpoint_cap`, so a handler attributes a fault by
 /// which of its badged caps the binder bound (see [`syscall_abi::FAULT_LABEL`]
 /// and `docs/fault-handling.md` § Security). `fault_class_mask` selects the
-/// covered fault classes; pass [`syscall_abi::FAULT_CLASS_ALL`].
+/// covered fault classes: [`syscall_abi::FAULT_CLASS_ALL`], or a nonzero
+/// combination of [`syscall_abi::FAULT_CLASS_VM`] and
+/// [`syscall_abi::FAULT_CLASS_EXCEPTION`]; the classes it leaves out keep their
+/// bindings.
 ///
 /// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
 ///
@@ -2248,7 +2252,7 @@ pub fn thread_set_affinity(thread_cap: u64, cpu_id: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code: `InvalidCapability` (bad thread cap,
 /// or `endpoint_cap` non-zero but not an `Endpoint`), `InsufficientRights`
 /// (the thread cap lacks `CONTROL`), or `InvalidArgument` (`fault_class_mask`
-/// other than `FAULT_CLASS_ALL`).
+/// zero or with a bit no class defines).
 #[inline]
 pub fn thread_set_fault_handler(
     thread_cap: u64,
@@ -2265,6 +2269,68 @@ pub fn thread_set_fault_handler(
             thread_cap,
             endpoint_cap,
             0,
+            fault_class_mask,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Read `thread_cap`'s fault-handler binding for one fault class
+/// (`SYS_THREAD_GET_FAULT_HANDLER`): `Some(badge)` when the class is bound,
+/// with the badge bound with it, `None` when it is not.
+///
+/// `class` is exactly one class bit, [`syscall_abi::FAULT_CLASS_VM`] or
+/// [`syscall_abi::FAULT_CLASS_EXCEPTION`]. Requires `CONTROL` on
+/// `thread_cap`. See `docs/fault-handling.md` § Fault-Handler Binding.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` (`class` not one
+/// class bit), `InvalidCapability` (bad thread cap), or `InsufficientRights`
+/// (the thread cap lacks `CONTROL`).
+#[inline]
+pub fn thread_get_fault_handler(thread_cap: u64, class: u64) -> Result<Option<u64>, i64>
+{
+    // SAFETY: syscall5_ret2 issues a raw syscall; both arguments are scalars
+    // the kernel validates, and it writes the badge to the secondary return
+    // register.
+    let (ret, badge) =
+        unsafe { syscall5_ret2(SYS_THREAD_GET_FAULT_HANDLER, thread_cap, class, 0, 0, 0) };
+    match ret.cmp(&0)
+    {
+        core::cmp::Ordering::Less => Err(ret),
+        core::cmp::Ordering::Equal => Ok(None),
+        core::cmp::Ordering::Greater => Ok(Some(badge)),
+    }
+}
+
+/// Copy `src_thread`'s fault-handler bindings onto `dst_thread` for the
+/// classes `fault_class_mask` selects (`SYS_THREAD_INHERIT_FAULT_HANDLER`):
+/// each selected class of `dst_thread` is bound to `src_thread`'s endpoint
+/// with its badge, or unbound where `src_thread` has none. No capability to
+/// the endpoint is needed. A runtime binds a thread it spawns to the
+/// spawning thread's handlers this way.
+///
+/// Requires `CONTROL` on both thread caps. See `docs/fault-handling.md`
+/// § Inheritance is userspace policy.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` (`fault_class_mask`
+/// refused, as for [`thread_set_fault_handler`]), `InvalidCapability` (a bad
+/// thread cap), or `InsufficientRights` (a thread cap lacks `CONTROL`).
+#[inline]
+pub fn thread_inherit_fault_handler(
+    dst_thread: u64,
+    src_thread: u64,
+    fault_class_mask: u64,
+) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues a raw syscall; all arguments are scalars the
+    // kernel validates.
+    let ret = unsafe {
+        syscall3(
+            SYS_THREAD_INHERIT_FAULT_HANDLER,
+            dst_thread,
+            src_thread,
             fault_class_mask,
         )
     };

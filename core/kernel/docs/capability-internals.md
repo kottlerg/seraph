@@ -713,10 +713,13 @@ The principal kernel-internal owners:
   pinned: the root CSpace's creation reference, the kernel's hold on it through boot,
   passes to init's own CSpace capability in Phase 9
   ([§ Initial CSpace Population](#initial-cspace-population)).
-- **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
-  bound Endpoint, released on unbind, rebind, or thread destruction. The binder publishes the
-  endpoint and its badge as one unit under the target thread's `sched_lock` and releases the
-  previous binding's reference only after it unlocks (`release_ref`).
+- **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` and
+  `SYS_THREAD_INHERIT_FAULT_HANDLER` take a reference on the bound Endpoint for each fault class
+  they bind, released on that class's unbind or rebind, or on thread destruction. The binder
+  publishes each class's endpoint and badge as one unit under the target thread's `sched_lock`
+  and releases the replaced bindings' references only after it unlocks (`release_ref`); the
+  inheritance takes the source's references under the source thread's `sched_lock`, while the
+  source's bindings still hold the endpoints.
 - **Fault delivery.** `ipc::fault::fault_dispatch` reads the faulting thread's binding once,
   under that thread's own `sched_lock`, and takes its own reference on the endpoint in the same
   hold, while the binding's reference still holds it. It releases that reference after the

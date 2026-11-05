@@ -57,9 +57,9 @@ process's thread takes a page fault, the kernel synthesises an IPC to
 memmgr's endpoint with label `FAULT_LABEL` (`u64::MAX - 1`) and `badge`
 set to the derivation badge of the Endpoint cap bound by
 `SYS_THREAD_SET_FAULT_HANDLER`. The binding is installed by procmgr for a
-process's main thread and by the runtime for each thread it spawns, and
-both bind the process's own badged memmgr cap
-(`ProcessInfo.pager_endpoint_cap`), so the badge is the process's memmgr
+process's main thread, binding the process's own badged memmgr cap
+(`ProcessInfo.pager_endpoint_cap`), and copied by the runtime onto each thread
+it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`), so the badge is the process's memmgr
 badge. The fault endpoint is memmgr's client endpoint, so any holder of a
 badged SEND cap can also send a message labelled `FAULT_LABEL`; memmgr
 does not distinguish it from a kernel delivery, and either way the message

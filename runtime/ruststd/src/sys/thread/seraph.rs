@@ -101,6 +101,9 @@ fn hold_cspace_headroom(self_cspace: u64) {
 /// it over on entry (the child drops it after extracting the pieces).
 struct SpawnArgs {
     ipc_buffer_vaddr: u64,
+    /// The child's own Thread cap, recorded on entry so a thread it spawns
+    /// inherits its fault-handler bindings.
+    self_thread_cap: u64,
     init: *mut ThreadInit,
     done_notification: u64,
 }
@@ -316,6 +319,7 @@ impl Thread {
 
         let args = Box::into_raw(Box::new(SpawnArgs {
             ipc_buffer_vaddr: ipc_buf_base as u64,
+            self_thread_cap: 0,
             init: Box::into_raw(init),
             done_notification,
         }));
@@ -426,16 +430,19 @@ impl Thread {
             return Err(io::Error::other("seraph: thread_configure failed"));
         }
 
-        // Inherit the process's demand-paging pager onto this thread before it
-        // starts (the main thread is bound by procmgr at creation). Best-effort
-        // and a no-op for non-demand-paged processes (`pager_endpoint_cap == 0`).
-        if info.pager_endpoint_cap != 0 {
-            let _ = syscall::thread_set_fault_handler(
-                thread_cap,
-                info.pager_endpoint_cap,
-                FAULT_CLASS_ALL,
-            );
-        }
+        // Inherit the spawning thread's fault-handler bindings, every class,
+        // onto this thread before it starts: the process's demand-paging pager
+        // (procmgr binds it on the initial thread at creation, and each spawn
+        // passes it on), and any other handler bound there. Best-effort, and a
+        // copy of no binding for a process with none.
+        // SAFETY: `args` was leaked via `Box::into_raw` above and is consumed
+        // only by the child, which has not started.
+        unsafe { (*args).self_thread_cap = thread_cap };
+        let _ = syscall::thread_inherit_fault_handler(
+            thread_cap,
+            crate::os::seraph::current_thread_cap(),
+            FAULT_CLASS_ALL,
+        );
 
         // Bind a kernel death observer so a detached (un-joined) handle's
         // resources can be reclaimed by `reaper::sweep` once this thread leaves
@@ -859,6 +866,7 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // SAFETY: arg was produced via `Box::into_raw(Box::new(SpawnArgs {..}))`
     // in Thread::new; this is the sole consumer.
     let args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
+    crate::os::seraph::set_current_thread_cap(args.self_thread_cap);
     // SAFETY: `ipc_buffer_vaddr` is the page-aligned page Thread::new heap-
     // allocated for this thread alone; no Rust object lives in it, and std
     // reaches it only through the raw `current_ipc_buf` pointer, holding no

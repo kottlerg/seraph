@@ -24,6 +24,7 @@ pub mod cspace_nested_teardown;
 pub mod death_notification_late_bind;
 pub mod death_observer_outlives_queue_caps;
 pub mod destroyed_source_interrupts;
+pub mod fault_class_bindings;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
@@ -195,6 +196,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_handler_rebind",
         fault_handler_rebind::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_class_bindings",
+        fault_class_bindings::run(ctx)
     );
     run_integration_test!(
         "integration::fault_syscall_buffer",

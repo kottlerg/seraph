@@ -386,9 +386,11 @@ memmgr serves frame requests over IPC. The contract:
   `page_count` argument).
 - **Caller releases.** `RELEASE_MEMORY_CAPS` returns a granted region to the
   pool mid-life, named by the `phys_base` memmgr reported at grant (the caller
-  need not still hold the cap — it may have retyped the region and dropped its
-  copy). This keeps a per-unit-of-work retype loop (e.g. ruststd's Thread
-  slab per spawn) at a bounded pool footprint; ruststd's pooled object-slab
+  need not still hold the cap — it may have retyped the region, deleted the
+  objects, and dropped its copy; a region released with a live object or a
+  mapping is held out of the pool until both are gone). This keeps a
+  per-unit-of-work retype loop (e.g. ruststd's Thread slab per spawn) at a
+  bounded pool footprint; ruststd's pooled object-slab
   pages likewise recycle auto-reclaimed bytes in place and release a retired
   page's grant once every object retyped from it has died. Process death
   triggers automatic reclamation via procmgr's `PROCESS_DIED` notification to

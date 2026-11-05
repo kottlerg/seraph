@@ -533,7 +533,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 7;
+pub const MEMMGR_LABELS_VERSION: u32 = 8;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -586,16 +586,23 @@ pub mod memmgr_labels
     /// * `data[2]` — `pool_total_bytes`: every page memmgr owns, across free
     ///   runs, in-use bootstrap arenas, and reap donations.
     /// * `data[3]` — `free_bytes`: the subset of `pool_total_bytes` currently
-    ///   parked in free runs (owned by memmgr, lent to no process). Unlike
+    ///   in free runs (owned by memmgr, lent to no process, grantable). Unlike
     ///   `pool_total` it falls on allocation and rises on reclamation
-    ///   (`PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`), so a
-    ///   caller polls it to confirm a dead process's pages were reclaimed.
+    ///   (`PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`) of a
+    ///   frame no other process can still reach.
+    /// * `data[4]` — `deferred_bytes`: the subset of `pool_total_bytes`
+    ///   reclaimed from a process but held out of the free runs because
+    ///   another process can still reach it, through a kernel object retyped
+    ///   from it or a user mapping of it; it moves to `free_bytes` once a
+    ///   later reclamation's recheck finds it unreachable. A caller polls
+    ///   `free_bytes` and `deferred_bytes` together to confirm a dead
+    ///   process's pages were reclaimed.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory. `data[3]` is an appended field — readers needing only the
-    /// identity may ignore it.
+    /// "dark" memory. `data[3]` and `data[4]` are appended fields — readers
+    /// needing only the identity may ignore them.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.
     ///

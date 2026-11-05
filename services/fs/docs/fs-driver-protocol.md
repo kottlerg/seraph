@@ -162,8 +162,9 @@ whose client dies without `FS_CLOSE` keeps its record and release SEND until
 its node is freed; its pages are still reclaimed by eviction. Reclaiming
 such opens is tracked in [#742](https://github.com/kottlerg/seraph/issues/742).
 The SEND keeps the client's release endpoint alive past the client's death,
-which leaves a live kernel object in a frame memmgr returns to its pool,
-tracked in [#750](https://github.com/kottlerg/seraph/issues/750).
+so memmgr holds the frame the endpoint lives in out of its pool until the
+SEND goes ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#reclamation)
+§ Reclamation).
 
 ---
 

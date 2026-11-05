@@ -29,7 +29,7 @@ services/svctest/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding;
-        │                      # object-slab release; identity
+        │                      # object-slab release; deferred reclaim; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
@@ -160,8 +160,8 @@ reply to `SHUTDOWN`.
 
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
-its child body and exits (`park-child` parks until its spawner tears it down), and an unmatched
-token falls through to the normal run.
+its child body and exits (`park-child` and `reclaim-child` park until their spawner tears them
+down), and an unmatched token falls through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
 |-----------------------------|----------------|---------------------------------------------|
@@ -173,6 +173,7 @@ token falls through to the normal run.
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
+| `reclaim-child`             | `memmgr`       | `frame_reclaim_live_object` (held endpoint) |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

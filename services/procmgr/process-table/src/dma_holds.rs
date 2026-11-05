@@ -150,6 +150,7 @@ mod tests
             thread_cap: 0,
             pi_memory_cap: 0,
             tls_memory_cap: 0,
+            argv_env_memory_cap: 0,
             memmgr_send_cap: 41,
             memmgr_badge: badge ^ 0xFF,
             namespace_override: 0,

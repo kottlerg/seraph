@@ -99,10 +99,13 @@ pub const DEFAULT_PROCESS_INFO_VA: u64 = DEFAULT_IPC_BUFFER_VA + PAGE_SIZE;
 /// Default top of the main-thread user stack (degraded fallback).
 /// `stack_pages` pages are mapped immediately below this, with one unmapped
 /// guard page beneath them. The top lies a full stack reservation
-/// (`1 + MAX_PROCESS_STACK_PAGES` pages) above the page after the
-/// `ProcessInfo` default, so no accepted stack reaches the other defaults.
-pub const DEFAULT_STACK_TOP: u64 =
-    DEFAULT_PROCESS_INFO_VA + PAGE_SIZE + (1 + MAX_PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
+/// (`1 + MAX_PROCESS_STACK_PAGES` pages) above the end of the `ProcessInfo`
+/// default's region tail (the `ProcessInfo` page and its argv/env region,
+/// [`MAX_WINDOW_REGION_PAGES`] pages), so no accepted stack or argv/env
+/// region reaches another default.
+pub const DEFAULT_STACK_TOP: u64 = DEFAULT_PROCESS_INFO_VA
+    + MAX_WINDOW_REGION_PAGES * PAGE_SIZE
+    + (1 + MAX_PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
 
 /// A fixed randomisation window: `2^slots_log2` page-aligned candidate
 /// addresses starting at `base`.
@@ -214,10 +217,11 @@ pub const IMAGE_MAX_SPAN: u64 = image_max_span(FIXED_IMAGE_ZONE_END);
 
 /// Largest region, in pages, hanging off any window draw: the gap each
 /// window's 9 GiB stride leaves after its 8 GiB draw span (1 GiB). It bounds
-/// the main-thread stack reservation (`1 + MAX_PROCESS_STACK_PAGES`) and the
-/// main-thread TLS block (`PROCESS_MAIN_TLS_MAX_PAGES`), which the asserts
-/// below pin to it; both cost VA only, since a loader maps what the binary
-/// declares.
+/// the main-thread stack reservation (`1 + MAX_PROCESS_STACK_PAGES`), the
+/// main-thread TLS block (`PROCESS_MAIN_TLS_MAX_PAGES`), and the `ProcessInfo`
+/// page with its argv/env region (`1 + ARGV_ENV_MAX_PAGES`), which the asserts
+/// below pin to it; all three cost VA only, since a loader maps what the
+/// binary declares and a creator what the spawner's argv and env fill.
 pub const MAX_WINDOW_REGION_PAGES: u64 = 1 << 18;
 
 const fn window_zone_end(w: VaWindow) -> u64
@@ -360,9 +364,12 @@ pub const fn growth_zones(user_va_top: u64) -> AddressSpaceZones
 // fixed tier. Region ordering and stack-guard gaps then hold for all draws.
 const _: () = {
     // Region tails fit the stride gap they hang into: the stack reservation
-    // (`1 + MAX_PROCESS_STACK_PAGES`, guard page included) and the TLS block.
+    // (`1 + MAX_PROCESS_STACK_PAGES`, guard page included), the TLS block, and
+    // the `ProcessInfo` page with the argv/env region directly after it.
     assert!((MAX_PROCESS_STACK_PAGES as u64) < MAX_WINDOW_REGION_PAGES);
     assert!(process_abi::PROCESS_MAIN_TLS_MAX_PAGES <= MAX_WINDOW_REGION_PAGES);
+    assert!(process_abi::ARGV_ENV_REGION_OFFSET == PAGE_SIZE);
+    assert!(process_abi::ARGV_ENV_MAX_PAGES < MAX_WINDOW_REGION_PAGES);
     // Sv39 growth zones: heap below arena, arena below the bootstrap windows.
     assert!(SV39_ZONES.heap.end_bound() <= SV39_ZONES.arena.window.base);
     assert!(SV39_ZONES.arena.end_bound() <= MAIN_TLS_WINDOW.base);
@@ -441,6 +448,9 @@ pub struct ProcessLayout
     /// Virtual address of the read-only `ProcessInfo` handover page. Delivered
     /// to the new process in its entry register (`rdi`/`a0`), not stored in the
     /// struct (which would be circular — the process needs this to find it).
+    /// The argv/env region, when the creator maps one, follows the page
+    /// directly (`process_abi::ARGV_ENV_REGION_OFFSET`), inside the region
+    /// tail every layout leaves after it.
     pub process_info_va: u64,
     /// Top of the main-thread user stack; written to `ProcessInfo.stack_top_vaddr`
     /// and passed as the initial stack pointer.
@@ -585,7 +595,11 @@ mod tests
                 process_abi::PROCESS_MAIN_TLS_MAX_PAGES * PAGE_SIZE,
             ),
             (layout.ipc_buffer_va, PAGE_SIZE),
-            (layout.process_info_va, PAGE_SIZE),
+            // The `ProcessInfo` page and the largest argv/env region after it.
+            (
+                layout.process_info_va,
+                (1 + process_abi::ARGV_ENV_MAX_PAGES) * PAGE_SIZE,
+            ),
             // Includes the guard page below the stack base.
             (layout.stack_top - stack_reserve, stack_reserve),
         ]
@@ -609,9 +623,9 @@ mod tests
         }
     }
 
-    // Defect guarded: a degraded-fallback layout whose largest accepted stack
-    // or TLS block overlaps another default surface, or whose regions run
-    // into the image window.
+    // Defect guarded: a degraded-fallback layout whose largest accepted stack,
+    // TLS block, or argv/env region overlaps another default surface, or
+    // whose regions run into the image window.
     #[test]
     fn fallback_regions_hold_their_largest_tails_disjointly()
     {

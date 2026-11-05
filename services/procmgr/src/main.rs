@@ -950,6 +950,36 @@ fn handle_configure_namespace(
     reply_empty(ipc_buf, code);
 }
 
+/// The checks a create request passes before procmgr acquires anything for
+/// the child: its scheduling fields ([`resolve_create_sched`]) and, when the
+/// label sets `CREATE_ARGV_ENV`, the header of its argv and env, which starts
+/// at data word `first_word`, against the `argv_env_cap` that holds them
+/// (`process::check_argv_env`). Returns the resolved placement and the
+/// checked argv/env request (`None` without the flag); `None` in place of
+/// the pair means the request must be rejected with `INVALID_ARGUMENT`.
+fn check_create_request(
+    req: &IpcMessage,
+    first_word: usize,
+    argv_env_cap: u64,
+    table: &process::ProcessTable,
+) -> Option<(process::ChildSched, Option<process::ArgvEnvRequest>)>
+{
+    let sched = resolve_create_sched(req.label, req.badge, table)?;
+    if req.label & procmgr_labels::CREATE_ARGV_ENV == 0
+    {
+        return Some((sched, None));
+    }
+    match process::check_argv_env(req, first_word, argv_env_cap)
+    {
+        Ok(request) => Some((sched, Some(request))),
+        Err(refusal) =>
+        {
+            std::os::seraph::log!("create argv/env refused: {refusal:?}");
+            None
+        }
+    }
+}
+
 /// Resolve the scheduling fields of a create label against the caller's
 /// spawn ceiling. `None` means the request must be rejected with
 /// `INVALID_ARGUMENT`: still-reserved label bits are set, the requested
@@ -1058,22 +1088,15 @@ fn reply_create_result(
 ///   bits [18..23] = `CREATE_PRIORITY` (0 = default; see `resolve_create_sched`)
 ///   bits [23..28] = `CREATE_BAND_MAX` (0 = copy of the creator's band)
 ///   bit  28       = `CREATE_DMA_HOLD` (hold the reclaim for `RELEASE_HOLD`)
-///   bits [29..32] = reserved (must be zero)
-///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
-///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
-///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
-///                    strings; u8). Zero means "no env"; any value >0
-///                    requires an env header word + blob after argv.
+///   bit  29       = `CREATE_ARGV_ENV` (argv and env in a Memory cap)
+///   bits [30..64] = reserved (must be zero)
 ///
-/// IPC data words:
-///   word `0..argv_words`         = argv blob, `args_bytes.div_ceil(8)` words
-///   word `argv_words`            = `env_bytes` (low 16 bits; only present
-///                                  when `env_count > 0`)
-///   word `argv_words+1..`        = env blob, `env_bytes.div_ceil(8)` words
-///                                  (only present when `env_count > 0`)
+/// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
+/// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`.
 ///
-/// Expects `caps = [module_memory, creator_endpoint?]`; caps past those two
-/// are deleted. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
+/// Expects `caps = [module_memory, creator_endpoint?, argv_env?]`, the last
+/// only with `CREATE_ARGV_ENV`; caps between the creator endpoint and it are
+/// deleted. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
 /// IPCs (one per piped direction) on the returned badged `process_handle`
 /// between create and `START_PROCESS`; the create path itself stays
 /// stdio-agnostic.
@@ -1085,33 +1108,38 @@ fn handle_create(
 )
 {
     let label = req.label;
-    let caps = req.caps();
+    let all_caps = req.caps();
 
-    if caps.is_empty()
+    if all_caps.is_empty()
     {
         reply_empty(ipc_buf, procmgr_errors::INVALID_ELF);
         return;
     }
 
-    let module_cap = caps[0];
-    let creator_ep = if caps.len() >= 2 { caps[1] } else { 0 };
-    release_caps(caps.get(2..).unwrap_or(&[]));
-
-    // Resolve the scheduling fields before any resource acquisition. The
-    // transferred caps are procmgr's to release on the reject path.
-    let Some(sched) = resolve_create_sched(label, req.badge, table)
+    // `CREATE_PROCESS` ignores `CREATE_DEATH_RELAY`, so only the argv/env
+    // cap is peeled off the tail.
+    let Some(caps) =
+        process::split_create_caps(all_caps, process::CreateTailCaps::of_create_process(label))
     else
     {
-        let _ = syscall::cap_delete(module_cap);
-        if creator_ep != 0
-        {
-            let _ = syscall::cap_delete(creator_ep);
-        }
+        release_caps(all_caps);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    release_caps(caps.extra);
+    let module_cap = caps.source;
+    let creator_ep = caps.creator;
 
-    let blobs = process::CreateBlobs::extract(req, 0);
+    // Resolve the scheduling fields and check the argv/env before any
+    // resource acquisition. The transferred caps are procmgr's to release on
+    // the reject path.
+    let Some((sched, argv_env)) = check_create_request(req, 0, caps.argv_env, table)
+    else
+    {
+        release_caps(&[module_cap, creator_ep, caps.argv_env]);
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
 
     // Register this child with memmgr. memmgr replies with a badged SEND
     // cap on its endpoint plus the memmgr-side process badge. Procmgr:
@@ -1123,9 +1151,32 @@ fn handle_create(
     //   - sends the badge in `PROCESS_DIED` at child teardown.
     // The guard owns the registration until the child's table entry does:
     // on a failed create it retires memmgr's record (PROCESS_DIED, which
-    // returns every page already billed to the child) and drops the slot.
+    // returns every page already billed to the child) and drops the slot,
+    // except after an argv/env copy window that would not unmap, whose
+    // record `settle_failed_argv_env` withholds.
     let (memmgr_send, memmgr_badge) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
     let mms = process::MemmgrSendGuard::new(memmgr_send, memmgr_badge, ctx.memmgr_ep, ipc_buf);
+
+    // The child's checked copy of the argv and env, on its account. The
+    // caller's cap is no longer needed once it is taken (or refused), so it
+    // is deleted before any reply.
+    let argv_env = match argv_env
+    {
+        Some(request) => process::copy_argv_env(ctx.self_aspace, mms.cap(), ipc_buf, &request),
+        None => Ok(process::ChildArgvEnv::empty()),
+    };
+    release_caps(&[caps.argv_env]);
+    let argv_env = match argv_env
+    {
+        Ok(argv_env) => argv_env,
+        Err(e) =>
+        {
+            process::settle_failed_argv_env(mms, e);
+            release_caps(&[module_cap, creator_ep]);
+            reply_empty(ipc_buf, e.code());
+            return;
+        }
+    };
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
@@ -1147,8 +1198,7 @@ fn handle_create(
         ctx.self_endpoint,
         creator_ep,
         &universals,
-        &blobs.args(),
-        &blobs.env(),
+        argv_env,
         &ctx.deaths,
         sched,
     );
@@ -1279,13 +1329,14 @@ fn handle_create_from_file(
     let all_caps = req.caps();
 
     // The death-relay POST cap, when present, is the LAST cap in the message
-    // (see `CREATE_DEATH_RELAY`), peeled off the tail so the
-    // `creator_endpoint` slot stays positionally fixed at caps[1]. A relay
-    // request whose only cap is the file cap is malformed: taking that cap
-    // as the relay too would release one slot twice.
-    let Some(caps) = process::split_create_from_file_caps(
+    // (see `CREATE_DEATH_RELAY`), and the argv/env cap the one before it,
+    // both peeled off the tail so the `creator_endpoint` slot stays
+    // positionally fixed at caps[1]. A request that flags a tail cap its caps
+    // cannot supply apart from the file cap is malformed: taking that cap as
+    // a tail cap too would release one slot twice.
+    let Some(caps) = process::split_create_caps(
         all_caps,
-        label & procmgr_labels::CREATE_DEATH_RELAY != 0,
+        process::CreateTailCaps::of_create_from_file(label),
     )
     else
     {
@@ -1295,40 +1346,39 @@ fn handle_create_from_file(
     };
     release_caps(caps.extra);
 
-    // Resolve the scheduling fields before any resource acquisition. The
-    // transferred caps are procmgr's to release on the reject path; the
-    // file cap is not opened yet, so the fs driver holds no state for it.
-    let Some(sched) = resolve_create_sched(label, req.badge, table)
+    // Resolve the scheduling fields and check the argv/env before any
+    // resource acquisition. The transferred caps are procmgr's to release on
+    // the reject path; the file cap is not opened yet, so the fs driver holds
+    // no state for it.
+    let Some((sched, argv_env)) = check_create_request(req, 1, caps.argv_env, table)
     else
     {
-        release_caps(&[caps.file, caps.creator, caps.relay]);
+        release_caps(&[caps.source, caps.creator, caps.argv_env, caps.relay]);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
 
     let file_size = req.word(0);
 
-    let blobs = process::CreateBlobs::extract(req, 1);
-
     let result = process::create_process_from_file(
         ctx,
-        caps.file,
+        caps.source,
         file_size,
         table,
         ipc_buf,
         caps.creator,
-        &blobs.args(),
-        &blobs.env(),
+        argv_env.as_ref(),
         &ctx.deaths,
         label & procmgr_labels::CREATE_PINNED == 0,
         caps.relay,
         sched,
     );
 
-    // The child holds its own copy of the creator endpoint (populate_child_info
-    // cap_copies it), so procmgr's slot is released on both arms, as
-    // handle_create does.
-    release_caps(&[caps.creator]);
+    // The child holds its own copies of the creator endpoint
+    // (populate_child_info cap_copies it) and of the argv and env, or no
+    // child exists, so procmgr's slots are released on both arms, as
+    // handle_create does, before the reply.
+    release_caps(&[caps.creator, caps.argv_env]);
 
     match result
     {

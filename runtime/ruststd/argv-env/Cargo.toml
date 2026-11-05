@@ -9,10 +9,12 @@ publish.workspace = true
 
 # Dual-mode: a host-tested workspace member AND a `rustc-dep-of-std`
 # dependency of the seraph std overlay. Holds the pure argv/env blob
-# parsers extracted from `runtime/ruststd/src/sys/{args,env}/seraph.rs`
-# so they get host unit-test coverage. The parsers are pure `&[u8]`
-# walks — no IPC, no syscalls — so the only dep is the build-std core
-# facade, activated under the `rustc-dep-of-std` feature.
+# parsers extracted from `runtime/ruststd/src/sys/{args,env}/seraph.rs`,
+# and the spawner's argv/env window fill (`fill_window`, used by
+# `std::os::seraph::process::ArgvEnvCap`), so they get host unit-test
+# coverage. Both are pure `&[u8]` work — no IPC, no syscalls — so the
+# only dep is the build-std core facade, activated under the
+# `rustc-dep-of-std` feature.
 [lib]
 test = true
 doctest = false

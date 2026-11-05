@@ -30,6 +30,14 @@ services/drivers/
 │   ├── README.md
 │   └── src/
 │       └── main.rs
+├── iommu/
+│   └── vtd/                        # VT-d IOMMU driver for devmgr (library)
+│       ├── Cargo.toml
+│       ├── README.md
+│       └── src/
+│           ├── lib.rs              # Register and table logic (host-tested)
+│           ├── regs.rs             # Register offsets and fields
+│           └── tables.rs           # Root, context, and second-level tables
 ├── serial/                         # Serial (UART) device driver (binary)
 │   ├── Cargo.toml
 │   ├── README.md                   # Serial-driver IPC interface (SERIAL_WRITE_BYTES)

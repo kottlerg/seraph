@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "iommu-vtd"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Host-testable register and table encodings.
+[lib]
+name = "iommu_vtd"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

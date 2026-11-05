@@ -18,6 +18,12 @@
 //! syscall) or to take the unhandled outcome: a kill for a trap, the
 //! syscall's `InvalidAddress` for a copy.
 //!
+//! A change of the binding while a delivery is in flight
+//! ([`redeliver_in_flight`], run by `SYS_THREAD_SET_FAULT_HANDLER`) cancels
+//! that delivery, and [`fault_dispatch`] makes it again under the binding
+//! current when the faulting thread next runs; with none bound then, the fault
+//! takes the unhandled outcome.
+//!
 //! Delivery reuses the synchronous-IPC machinery: the faulting thread takes the
 //! caller role (parked in [`IpcThreadState::BlockedOnFault`] rather than
 //! `BlockedOnReply`) and the handler services it with the ordinary receive /
@@ -39,6 +45,11 @@ pub const FAULT_OUTCOME_RESUME: u8 = 1;
 /// handler thread destroyed, binding severed, or thread cancelled): the
 /// faulting thread is killed, or its restartable syscall fails.
 pub const FAULT_OUTCOME_KILL: u8 = 2;
+/// [`ThreadControlBlock::fault_outcome`] value: the binding changed while the
+/// delivery was in flight; [`fault_dispatch`] delivers the fault again under
+/// the binding current then (docs/fault-handling.md § Delivery, Resume, and
+/// Kill).
+pub const FAULT_OUTCOME_REDELIVER: u8 = 3;
 
 /// Architecture-neutral description of a fault, marshalled into the fault
 /// message's data words `[kind, d1, d2, ip]`.
@@ -85,7 +96,8 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
     !unsafe { (*tcb).fault_handler.load(Ordering::Acquire) }.is_null()
 }
 
-/// Read `tcb`'s fault-handler binding once and pin its endpoint for a delivery.
+/// Read `tcb`'s fault-handler binding once, pin its endpoint, and open a
+/// delivery through it.
 ///
 /// Returns the bound `EndpointObject`, with a reference the caller owns and
 /// MUST release, and the badge bound with it; `None` when no handler is bound.
@@ -94,6 +106,14 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
 /// bound with this endpoint, and the reference is taken while the binding's
 /// own reference still holds the object: the binder releases the old binding's
 /// reference only after it unlocks.
+///
+/// With a binding found, the same hold arms the in-flight markers:
+/// `fault_outcome = Pending`, so a stale prior disposition cannot be mistaken
+/// for this fault's (the single wake-claim winner overwrites it), and
+/// `in_fault_delivery`, so a dequeuing `endpoint_recv` parks the thread
+/// `BlockedOnFault` (not `BlockedOnReply`). Both are written under the lock
+/// the binding is, so a binder finds in its own hold whether a delivery
+/// through the binding it replaces is in flight ([`delivery_in_flight`]).
 ///
 /// # Safety
 /// `tcb` must be the current CPU's running thread, with no lock held.
@@ -105,6 +125,8 @@ unsafe fn pin_binding(
     // SAFETY: tcb is the running thread (contract); lock_raw is paired with
     // the unlock_raw below. A non-null fault_handler read under sched_lock
     // names an endpoint the binding references, so it is live for inc_ref.
+    // The markers are this thread's own until its delivery makes it
+    // wakeable.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
         let ep = core::ptr::NonNull::new((*tcb).fault_handler.load(Ordering::Acquire));
@@ -112,27 +134,43 @@ unsafe fn pin_binding(
         if let Some(ep) = ep
         {
             ep.as_ref().header.inc_ref();
+            (*tcb)
+                .fault_outcome
+                .store(FAULT_OUTCOME_PENDING, Ordering::Release);
+            (*tcb).in_fault_delivery = true;
         }
         (*tcb).sched_lock.unlock_raw(saved);
         ep.map(|ep| (ep, badge))
     }
 }
 
+/// Whether a fault delivery through `tcb`'s binding is in flight: opened by
+/// [`pin_binding`] and given no disposition yet by a wake claim.
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
+#[cfg(not(test))]
+pub unsafe fn delivery_in_flight(tcb: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: the caller holds tcb.sched_lock, under which in_fault_delivery
+    // is written; fault_outcome is atomic.
+    unsafe {
+        (*tcb).in_fault_delivery
+            && (*tcb).fault_outcome.load(Ordering::Acquire) == FAULT_OUTCOME_PENDING
+    }
+}
+
 /// Deliver `info` to `tcb`'s bound fault-handler endpoint and block until the
-/// handler replies or the binding is severed. Returns the disposition.
+/// handler replies or the delivery is cancelled. Returns the disposition.
 ///
-/// Mirrors [`crate::syscall::ipc::sys_ipc_call`] but commits the
-/// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from
-/// `tcb.fault_outcome` on resume rather than writing a syscall return value.
-///
-/// The binding is read once, under `tcb`'s `sched_lock`, and its endpoint is
-/// pinned for the delivery ([`pin_binding`]); a binding a concurrent unbind
-/// cleared returns [`FaultOutcome::Kill`], the unhandled-fault path. The pin
-/// is released after the delivery and before the park's `schedule()` (the
-/// pin-before-park rule, core/kernel/docs/scheduling-internals.md § Lock
-/// Hierarchy rule 10): a release that drops the endpoint's last reference
-/// runs its teardown, whose send-queue drain claims this thread with a kill
-/// outcome when it is still queued there.
+/// Each delivery reads the binding once ([`deliver_once`]). A delivery that a
+/// binding change cancelled ([`FAULT_OUTCOME_REDELIVER`]) is made again under
+/// the binding current then, in this loop rather than by a return to user
+/// mode, so a trap-type exception whose saved instruction pointer is already
+/// past the trapping instruction is not lost; a binding found cleared returns
+/// [`FaultOutcome::Kill`], the unhandled-fault path. Every pass parks, and
+/// only a binding change re-runs one, so the loop is iterative and bounded by
+/// the binder's changes.
 ///
 /// # Preconditions
 /// - `tcb.trap_frame` already points at the canonical register frame the handler
@@ -145,32 +183,57 @@ unsafe fn pin_binding(
 #[cfg(not(test))]
 pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> FaultOutcome
 {
+    loop
+    {
+        // SAFETY: this fn's contract and preconditions are deliver_once's.
+        match unsafe { deliver_once(tcb, info) }
+        {
+            FAULT_OUTCOME_RESUME => return FaultOutcome::Resume,
+            FAULT_OUTCOME_REDELIVER =>
+            {}
+            _ => return FaultOutcome::Kill,
+        }
+    }
+}
+
+/// Make one delivery of `info` through `tcb`'s binding and block until it is
+/// given a disposition, which is returned as a `fault_outcome` value.
+///
+/// Mirrors [`crate::syscall::ipc::sys_ipc_call`] but commits the
+/// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from
+/// `tcb.fault_outcome` on resume rather than writing a syscall return value.
+///
+/// The binding is read once, under `tcb`'s `sched_lock`, and its endpoint is
+/// pinned for the delivery ([`pin_binding`]); with none bound the result is
+/// [`FAULT_OUTCOME_KILL`] and nothing is delivered. The pin is released after
+/// the delivery and before the park's `schedule()` (the pin-before-park rule,
+/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 10): a
+/// release that drops the endpoint's last reference runs its teardown, whose
+/// send-queue drain claims this thread with a kill outcome when it is still
+/// queued there.
+///
+/// # Safety
+/// As for [`fault_dispatch`].
+#[cfg(not(test))]
+unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
+{
     // SAFETY: tcb is the current CPU's running thread; no lock is held.
     let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb) })
     else
     {
-        return FaultOutcome::Kill;
+        return FAULT_OUTCOME_KILL;
     };
     // SAFETY: ep_obj is pinned by the reference pin_binding took.
     let ep_state = unsafe { ep_obj.as_ref().state };
 
-    // Arm the in-flight markers BEFORE delivery: `in_fault_delivery` so a
-    // dequeuing `endpoint_recv` parks us `BlockedOnFault` (not `BlockedOnReply`),
-    // and `fault_outcome = Pending` so a stale prior disposition cannot be
-    // mistaken for this fault's. The single wake-claim winner overwrites the
-    // outcome with `Resume`/`Kill`.
-    // SAFETY: tcb is the running thread; these fields are owned by it until the
+    // Open the park episode (the fault protocol's disposition stays in
+    // fault_outcome, which pin_binding armed; the episode counter is the
+    // shared debug spurious-resume tripwire; see
+    // core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes).
+    #[cfg(debug_assertions)]
+    // SAFETY: tcb is the running thread; the counter is its own until the
     // delivery below makes it wakeable.
     unsafe {
-        (*tcb)
-            .fault_outcome
-            .store(FAULT_OUTCOME_PENDING, Ordering::Release);
-        (*tcb).in_fault_delivery = true;
-        // Open the park episode (the fault protocol's disposition stays in
-        // fault_outcome; the episode counter is the shared debug
-        // spurious-resume tripwire; see core/kernel/docs/ipc-internals.md
-        // § Park Dispositions and Episodes).
-        #[cfg(debug_assertions)]
         (*tcb).park_episode.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -219,15 +282,16 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
         crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
-    // Resumed. Read the disposition the wake-claim winner committed. Anything
-    // other than an explicit Resume is treated as Kill — this defensively
-    // covers a spurious wake leaving the outcome at `Pending`.
+    // Resumed. Read the disposition the wake-claim winner committed. A value
+    // other than an explicit Resume or Redeliver is treated as Kill by the
+    // caller — this defensively covers a spurious wake leaving the outcome at
+    // `Pending`.
     // SAFETY: tcb still valid after resume.
     let outcome = unsafe { (*tcb).fault_outcome.load(Ordering::Acquire) };
     // Spurious-resume tripwire: every legitimate fault wake stamps the
     // episode at its claim site; a mismatch means this resume was produced by
     // nothing that owed it (the #352-class leaked wake). The Kill fallback
-    // above keeps release behavior fail-closed.
+    // keeps release behavior fail-closed.
     #[cfg(debug_assertions)]
     // SAFETY: tcb still valid after resume.
     unsafe {
@@ -240,17 +304,224 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
             (*tcb).thread_id,
         );
     }
-    // SAFETY: tcb still valid; clear the in-flight marker now the delivery is done.
+    // Close the delivery under the lock pin_binding opened it under, so a
+    // binder's in-flight check never reads a torn marker.
+    // SAFETY: tcb still valid; lock_raw paired with the unlock_raw.
     unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
         (*tcb).in_fault_delivery = false;
+        (*tcb).sched_lock.unlock_raw(saved);
     }
+    outcome
+}
 
-    if outcome == FAULT_OUTCOME_RESUME
+/// Cancel the fault delivery in flight on `tcb` for a binding change, so the
+/// faulting thread delivers it again under the binding current when it next
+/// runs ([`FAULT_OUTCOME_REDELIVER`]); `SYS_THREAD_SET_FAULT_HANDLER` calls it
+/// after a change whose own hold found a delivery in flight
+/// ([`delivery_in_flight`]).
+///
+/// Each pass re-reads the delivery under `tcb`'s `sched_lock` and ends when
+/// none is in flight: a wake claim gave it a disposition first (a handler's
+/// reply, a stop, a teardown, or a cancel), which stands. A delivery whose
+/// park has committed is claimed with the claim every other canceller takes
+/// ([`claim_fault_park`]); a won claim stamps the redelivery and wakes the
+/// thread. A faulting thread that has opened its delivery but not yet
+/// committed its park is running on another CPU with interrupts disabled,
+/// inside a delivery that blocks on nothing, so the pass waits for that
+/// commit (interrupts enabled, preemption disabled; spin site
+/// `fault:rebind`).
+///
+/// A delivery opened under the new binding after the change's hold can be
+/// the one cancelled here, when the old delivery's disposition and a second
+/// fault land between that hold and the claim; it is then made again under
+/// the same binding, a duplicate message and no change of outcome.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins, other than the calling
+/// thread's; the caller holds no lock.
+#[cfg(not(test))]
+pub unsafe fn redeliver_in_flight(tcb: *mut ThreadControlBlock)
+{
+    use crate::sched::thread::ThreadState;
+    let mut spinning: Option<u64> = None;
+    loop
     {
-        FaultOutcome::Resume
+        // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw;
+        // the Scheduling fields are read under sched_lock, their owner.
+        let (in_flight, state, ipc_state, blocked_on, park_seq) = unsafe {
+            let saved = (*tcb).sched_lock.lock_raw();
+            let snap = (
+                delivery_in_flight(tcb),
+                (*tcb).state,
+                (*tcb).ipc_state,
+                (*tcb).blocked_on_object,
+                (*tcb).park_seq.load(Ordering::Relaxed),
+            );
+            (*tcb).sched_lock.unlock_raw(saved);
+            snap
+        };
+        let done = !in_flight
+            || match state
+            {
+                ThreadState::Blocked =>
+                {
+                    // SAFETY: tcb valid; no lock held.
+                    unsafe { claim_fault_park(tcb, ipc_state, blocked_on, park_seq) }
+                }
+                // Opened but not yet parked: wait for the park's commit.
+                ThreadState::Running => false,
+                _ => true,
+            };
+        if done
+        {
+            break;
+        }
+        if spinning.is_none()
+        {
+            crate::percpu::preempt_disable();
+            // SAFETY: ring 0; restored below.
+            spinning = Some(unsafe { crate::arch::current::cpu::save_and_disable_interrupts() });
+            // SAFETY: ring 0; IDT loaded; preempt disabled.
+            unsafe { crate::arch::current::interrupts::enable() };
+            crate::sched::spin_site_enter(crate::sched::SPIN_SITE_FAULT_REBIND);
+        }
+        core::hint::spin_loop();
     }
-    else
+    if let Some(saved_int) = spinning
     {
-        FaultOutcome::Kill
+        crate::sched::spin_site_exit();
+        // SAFETY: saved_int from save_and_disable_interrupts above.
+        unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+        crate::percpu::preempt_enable();
+    }
+}
+
+/// Claim `tcb`'s fault park, snapshotted as `(ipc_state, blocked_on,
+/// park_seq)`, for a redelivery, and wake the thread on a win. Returns `true`
+/// when the claim was won, or when the park is not one this claim can take
+/// (nothing to cancel); `false` when the park changed or the claim was lost,
+/// for the caller's next pass to re-read.
+///
+/// A queued delivery (`BlockedOnSend`) is claimed by its send-queue unlink
+/// under the endpoint's lock, reached through [`crate::ipc::lock_bound_source`]
+/// gated on `park_seq`; a received one (`BlockedOnFault`) by the CAS of the
+/// handler's `reply_tcb`, under this thread's `sched_lock` with a
+/// `blocked_on_object` re-read (the CLOSURE LEMMA of
+/// core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership). Both
+/// are the claims `cancel_ipc_block` takes, so this claim and every other
+/// claimant of the park exclude one another. A won claim stamps
+/// [`FAULT_OUTCOME_REDELIVER`] and the episode, clears the park binding inside
+/// the same hold (rule 7 of § Lock Hierarchy: no later reader of the binding
+/// may reach the endpoint or the handler once neither holds the thread), and
+/// wakes the thread through its `wake_in_flight` pin: the one the reply
+/// binding set, or, for a queued delivery, one taken here inside the claim.
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
+#[cfg(not(test))]
+unsafe fn claim_fault_park(
+    tcb: *mut ThreadControlBlock,
+    ipc_state: IpcThreadState,
+    blocked_on: *mut u8,
+    park_seq: u32,
+) -> bool
+{
+    let won = match ipc_state
+    {
+        IpcThreadState::BlockedOnSend =>
+        {
+            // SAFETY: tcb valid; no lock held (contract).
+            let held = unsafe {
+                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
+            };
+            let Some(held) = held
+            else
+            {
+                return false;
+            };
+            // cast_ptr_alignment: blocked_on_object stores a type-erased
+            // pointer; the original allocation guarantees alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+            // SAFETY: `held` holds ep.lock on the live endpoint the binding
+            // names, and tcb's sched_lock.
+            unsafe {
+                let unlinked = crate::ipc::endpoint::unlink_from_wait_queue(
+                    tcb,
+                    &mut (*ep).send_head,
+                    &mut (*ep).send_tail,
+                );
+                if unlinked
+                {
+                    (*ep).refresh_send_ready();
+                    stamp_redeliver(tcb);
+                    (*tcb).wake_in_flight.store(1, Ordering::Release);
+                }
+                held.unlock();
+                unlinked
+            }
+        }
+        IpcThreadState::BlockedOnFault if !blocked_on.is_null() =>
+        {
+            // cast_ptr_alignment: blocked_on_object stores a type-erased
+            // pointer; the original allocation guarantees alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let server = blocked_on.cast::<ThreadControlBlock>();
+            // SAFETY: tcb valid; lock_raw paired with unlock_raw. The server
+            // is live for the CAS by the CLOSURE LEMMA, behind the re-read of
+            // the binding under this client's sched_lock.
+            unsafe {
+                let saved = (*tcb).sched_lock.lock_raw();
+                let won = (*tcb).state == crate::sched::thread::ThreadState::Blocked
+                    && (*tcb).ipc_state == IpcThreadState::BlockedOnFault
+                    && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
+                    && (*server)
+                        .reply_tcb
+                        .compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok();
+                if won
+                {
+                    stamp_redeliver(tcb);
+                }
+                (*tcb).sched_lock.unlock_raw(saved);
+                won
+            }
+        }
+        // Not a fault park: nothing to cancel.
+        _ => return true,
+    };
+    if won
+    {
+        // SAFETY: the claim is won and the wake_in_flight pin keeps tcb
+        // allocated until enqueue_and_wake clears it; no lock is held.
+        unsafe {
+            let target_cpu = crate::sched::select_target_cpu(tcb);
+            crate::sched::enqueue_and_wake(tcb, target_cpu);
+        }
+    }
+    won
+}
+
+/// Stamp a won fault-park claim for redelivery and retire the park binding.
+///
+/// # Safety
+/// The caller holds `tcb`'s `sched_lock` and the park's exclusive claim.
+#[cfg(not(test))]
+unsafe fn stamp_redeliver(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: caller contract; the binding pair is written under sched_lock.
+    unsafe {
+        (*tcb)
+            .fault_outcome
+            .store(FAULT_OUTCOME_REDELIVER, Ordering::Release);
+        crate::sched::thread::stamp_deposit_episode(tcb);
+        (*tcb).ipc_state = IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
     }
 }

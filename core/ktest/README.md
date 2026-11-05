@@ -87,13 +87,12 @@ cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
 ### Tier 1 — `src/unit/`
 
 Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,
-`SYS_PROCESS_EXIT`, and `SYS_THREAD_SET_FAULT_HANDLER` has at least one positive-path
-test and the most important negative paths (wrong rights, invalid arguments,
-wrong object state). Those three are exercised in Tier 2, by
-`aspace_fault_notification_late_bind.rs`, by `death_notification_late_bind.rs`, and by
-`fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`, `fault_handler_declines_kills.rs`,
-and `fault_exception_redirect.rs` respectively. Files are grouped by kernel subsystem,
-mirroring the kernel's own source layout.
+`SYS_PROCESS_EXIT`, and `SYS_THREAD_SET_FAULT_HANDLER` has at least one positive-path test and the
+most important negative paths (wrong rights, invalid arguments, wrong object state). Those three are
+exercised in Tier 2, by `aspace_fault_notification_late_bind.rs`, by
+`death_notification_late_bind.rs`, and by `fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`,
+`fault_handler_declines_kills.rs`, `fault_handler_rebind.rs`, and `fault_exception_redirect.rs`
+respectively. Files are grouped by kernel subsystem, mirroring the kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
@@ -106,7 +105,7 @@ mirroring the kernel's own source layout.
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState` and a ready-ring entry skipped once its endpoint's only sender is stopped, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
-| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
+| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; the suspended start (`THREAD_START_SUSPENDED`: a configured thread left `Stopped`, unrun, its entry in its register file, then resumed); the reserved badge word of `SYS_THREAD_SET_FAULT_HANDLER`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT` (`SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` and `SYS_SBI_CALL` are under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO`, including each `StackHighWater` class and the `LiveCSpaceCount` id count across a `CSpace` create and delete |
@@ -176,6 +175,7 @@ concurrent notification and queue events.
 | `fault_pager_roundtrip.rs` | A userspace pager resolves a page fault and resumes the thread |
 | `fault_resume_modifies_pc.rs` | A fault handler edits the fault-blocked thread's registers and resumes it at a new instruction pointer |
 | `fault_handler_declines_kills.rs` | A fault handler replying `FAULT_REPLY_KILL` terminates the faulting thread as an unhandled fault |
+| `fault_handler_rebind.rs` | A binding change while a fault is in flight cancels the delivery, as [docs/fault-handling.md § Delivery, Resume, and Kill](../../docs/fault-handling.md#delivery-resume-and-kill) defines: a clear kills the faulter whether its fault was received or still queued, a rebind delivers the fault again to the new endpoint with its badge, the old handler's late reply finding no pending reply, and a rebind to the same endpoint and badge cancels nothing |
 | `fault_syscall_buffer.rs` | A restartable syscall's copy to (`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`) or from (`SYS_THREAD_WRITE_REGS`) an unbacked buffer faults to the caller's handler with the first unmapped byte (a straddling span names its second page), the copy's access, the present bit where the architecture reports it, and the frame's instruction pointer, and the syscall re-executes on resume; a declined fault (unmapped or read-only page) fails the call with `InvalidAddress` and the caller lives; a handler-written instruction pointer stands on a decline and on a resume, as [docs/fault-handling.md § Kernel Copies](../../docs/fault-handling.md#kernel-copies) defines |
 | `fault_exception_redirect.rs` | A non-page-fault CPU exception is redirected to a bound fault handler, which resumes the thread at a new instruction pointer |
 | `fault_exception_no_handler_kills.rs` | A non-page-fault CPU exception with no handler bound is terminal |
@@ -264,8 +264,10 @@ and exit bounds of `retype::pool_seeding_takes_interrupts`,
 phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of
-`thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`, the
-convergence polls of `thread::load_balancer_redistributes_skewed`, the exit wait of
+`thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued` and
+`thread::start_suspended_resume`, the exit and recovery waits of
+`integration::fault_handler_rebind`, the convergence polls of
+`thread::load_balancer_redistributes_skewed`, the exit wait of
 `thread::bind_notification_nodes_come_from_the_queue`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, the

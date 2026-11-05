@@ -57,6 +57,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of the frames in a window of a Memory region | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `CAP_INFO_SOLE_REFERENCE` → whether the queried slot is the only reference to its object (a boolean of `KernelObjectHeader::ref_count`) | `cap::sys_cap_info`, `cap::object::KernelObjectHeader` | d |
+| `CAP_INFO_ASPACE_TERMINAL_FAULT` → an address space's retained terminal-fault reason (`EXIT_FAULT_BASE` + vector or cause), or `0` | `cap::sys_cap_info`, `AddressSpace::retained_terminal_fault` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
 | `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
@@ -151,6 +152,11 @@ Notes on the non-obvious entries:
   or notification, whether any other party still holds it. memmgr needs exactly that answer
   before it reuses a frame. It reveals neither which process holds the other reference nor how
   many there are.
+- **`CAP_INFO_ASPACE_TERMINAL_FAULT`** returns an exit-reason value fixed by ABI contract (**d**):
+  `0`, or `EXIT_FAULT_BASE` plus the architectural fault vector or cause of the first terminal
+  fault a thread of the queried address space took. It carries no address, and it is the value a
+  `SYS_ASPACE_BIND_NOTIFICATION` observer of that space already receives, so it discloses nothing
+  a holder of the address-space capability could not learn by binding one.
 
 ## Physical-address surfaces
 

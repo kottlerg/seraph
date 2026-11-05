@@ -623,7 +623,7 @@ pub struct MemmgrBootstrap
     /// Slot in init's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that init will install in procmgr's `ProcessInfo`.
     pub procmgr_send_cap: u64,
-    /// Memmgr's `CSpace` cap (in init's `CSpace`). Init copies RAM
+    /// Memmgr's `CSpace` cap (in init's `CSpace`). Init moves RAM
     /// Memory caps into here at [`finalize_memmgr`] time.
     pub mm_cspace: u64,
     /// Memmgr's main `Thread` cap (in init's `CSpace`). Init invokes
@@ -672,7 +672,7 @@ pub struct InUseArena
 /// the bootstrap reply).
 pub struct MemmgrFinalize
 {
-    /// First slot of the RAM Memory caps init copied into memmgr's
+    /// First slot of the RAM Memory caps init moved into memmgr's
     /// `CSpace` during finalization.
     pub mm_memory_base: u64,
     /// Number of RAM memory caps delegated to memmgr.
@@ -975,12 +975,13 @@ pub fn bootstrap_memmgr(
 }
 
 /// Copy one in-use bootstrap arena cap into memmgr's `CSpace` and build its
-/// [`InUseArena`] descriptor. Mirrors the free-run forward: derive a
-/// full-rights intermediary, copy it into `mm_cspace`, and read the arena's
-/// physical base + size from the cap. The arena is exact-sized (no free
-/// tail), so it is never `memory_split`; the copy gives memmgr the accounting
-/// anchor while the original cap and the retypes keep the `MemoryObject`
-/// pinned for the immortal service's life.
+/// [`InUseArena`] descriptor: derive a full-rights intermediary, copy it into
+/// `mm_cspace`, and read the arena's physical base + size from the cap. Unlike
+/// a free run the arena is copied, not moved, since init's own cap carries
+/// the arena's retypes. The arena is exact-sized (no free tail), so it is
+/// never `memory_split`; the copy gives memmgr the accounting anchor while the
+/// original cap and the retypes keep the `MemoryObject` pinned for the
+/// immortal service's life.
 fn forward_arena(arena_cap: u64, mm_cspace: u64, kind: u64) -> Option<InUseArena>
 {
     let phys_base = syscall::cap_info(arena_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).ok()?;
@@ -995,18 +996,18 @@ fn forward_arena(arena_cap: u64, mm_cspace: u64, kind: u64) -> Option<InUseArena
     })
 }
 
-/// Forward a single Memory cap into memmgr's `CSpace` as a free run: derive a
-/// full-rights intermediary, copy it into `mm_cspace`, and count it
-/// (advancing `count`, recording `base` on the first run). Used for the
-/// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
-/// products with no `InitInfo` descriptor, which the reap donation walk does
-/// not reach, so unforwarded they would stay in init's `CSpace` until the reap
-/// frees it and then free into the sealed post-handoff buddy, tripping the
-/// kernel's post-seal `debug_assert` in a debug build.
+/// Forward a single Memory cap into memmgr's `CSpace` as a free run: move it
+/// into `mm_cspace`, so that once any derivation init took from it is gone
+/// memmgr's slot is the only one naming the run and memmgr can split and
+/// merge it. Count the run in `count`, recording `base` on the first. Used
+/// for the `MemoryAlloc` tail and the transient phys-table page — both
+/// `memory_split` products with no `InitInfo` descriptor, which the reap
+/// donation walk does not reach, so unforwarded they would stay in init's
+/// `CSpace` until the reap frees it and then free into the sealed post-handoff
+/// buddy, tripping the kernel's post-seal `debug_assert` in a debug build.
 fn push_free_run(src_cap: u64, mm_cspace: u64, base: &mut u64, count: &mut u64)
 {
-    if let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
-        && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL)
+    if let Ok(dst_slot) = syscall::cap_move(src_cap, mm_cspace, 0)
     {
         if *count == 0
         {
@@ -1022,16 +1023,6 @@ fn push_free_run(src_cap: u64, mm_cspace: u64, base: &mut u64, count: &mut u64)
 /// ingests the pool, before its first receive tops its `CSpace` up from its
 /// own pool. A few dozen slots cover those; the margin is deliberate.
 const MEMMGR_FORWARD_HEADROOM: u64 = 512;
-
-/// General slots of init's own root `CSpace` the bootstrap forwarding leaves
-/// free. Each forwarded RAM cap keeps its full-rights intermediary in init's
-/// `CSpace`, which init never augments, so the forward stops here and the
-/// remaining caps reach memmgr at init's reap. The reserve covers what init
-/// still mints after the loop: the `MemoryAlloc` tail and phys-table page
-/// forwards, the in-use arena forwards, the phys-table read-only derive, and
-/// the rest of init's bootstrap (procmgr's and svcmgr's endowments, the reap
-/// hand-off).
-const INIT_FORWARD_HEADROOM: u64 = 512;
 
 /// Free slots of `cspace` a general allocation may take: capacity less
 /// populated slots less the IPC receive reserve. Zero when the queries fail.
@@ -1068,8 +1059,8 @@ fn assert_init_arena_front_bounded(init_arena_cap: u64)
 
 /// Delegate the remaining RAM Memory caps from init's pool into memmgr's
 /// `CSpace` up to the forwarding stop (the first cap that has no `InitInfo`
-/// descriptor, that comes once memmgr's or init's `CSpace` headroom is already
-/// below its limit, or whose derive or copy is refused), forward the in-use
+/// descriptor, that comes once memmgr's `CSpace` headroom is already below its
+/// limit, or whose move is refused), forward the in-use
 /// bootstrap arenas (memmgr's, procmgr's, and init's own backing), then
 /// `thread_configure` + `thread_start` memmgr. The descriptor-bearing caps from
 /// the stop on reach memmgr's pool through the reap donation
@@ -1081,16 +1072,24 @@ fn assert_init_arena_front_bounded(init_arena_cap: u64)
 /// allocates nothing more from its pool; subsequent allocations route through
 /// memmgr like any other process.
 ///
+/// Every free run is moved, not copied, so memmgr's slot is the only one that
+/// names it: the kernel splits and merges a Memory object only through its
+/// sole slot (core/kernel/docs/syscalls.md § `SYS_MEMORY_SPLIT`). A moved
+/// cap leaves no slot in init's `CSpace`, so the forward needs no headroom
+/// there.
+///
 /// `pm_arena_cap` is procmgr's backing arena and `init_arena_cap` is init's own
 /// (from [`ProcmgrBootstrap`] and [`crate::run`]); both are forwarded alongside
 /// memmgr's own arena (`mm.arena_cap`) so memmgr's `pool_total` spans every page
 /// of bootstrap-consumed RAM, not only the free runs.
 ///
 /// `phys_table_memory` is the auxiliary phys-table page (written after this
-/// call). It is a transient bootstrap artifact, so it is forwarded as a free
-/// run — its keep-alive moves to memmgr's pool copy, and after memmgr reads it
-/// through the read-only `caps[1]` derivation the page becomes allocatable like
-/// any other.
+/// call, through the mapping init made before it). It is a transient
+/// bootstrap artifact, so it is forwarded as a free run, and the read-only
+/// `caps[1]` derivation the caller took from it before this call stays in
+/// init's `CSpace` for the bootstrap round. Once memmgr has read the page and
+/// deleted `caps[1]`, its run is named by memmgr's slot alone and allocatable
+/// like any other.
 pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
@@ -1103,10 +1102,9 @@ pub fn finalize_memmgr(
     // The bootstrap round names the forwarded RAM caps by slot range only
     // (memmgr reads each cap's size and physical base from the kernel), so it
     // carries every remaining RAM cap while memmgr's `CSpace` keeps
-    // [`MEMMGR_FORWARD_HEADROOM`] general slots and init's own keeps
-    // [`INIT_FORWARD_HEADROOM`]. The first cap that has no `InitInfo`
-    // descriptor, that comes once either headroom is already below its limit,
-    // or whose derive or copy is refused ends the forwarded prefix; the
+    // [`MEMMGR_FORWARD_HEADROOM`] general slots. The first cap that has no
+    // `InitInfo` descriptor, that comes once that headroom is already below
+    // its limit, or whose move is refused ends the forwarded prefix; the
     // descriptor-bearing caps from there on reach memmgr's pool through the
     // reap donation (`finish_init_reap_handoff` → procmgr →
     // `DONATE_MEMORY_CAPS`) instead.
@@ -1124,7 +1122,6 @@ pub fn finalize_memmgr(
         // an `InitInfo` descriptor (a cap with none is not donated).
         if descriptor_for(info, src_slot).is_none()
             || cspace_general_headroom(mm.mm_cspace) < MEMMGR_FORWARD_HEADROOM
-            || cspace_general_headroom(info.cspace_cap) < INIT_FORWARD_HEADROOM
         {
             break;
         }
@@ -1147,12 +1144,7 @@ pub fn finalize_memmgr(
             packed & syscall::RIGHTS_MEM_RETYPE != 0,
             "init: RAM Memory cap missing RIGHTS_MEM_RETYPE before memmgr forward",
         );
-        let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
-        else
-        {
-            break;
-        };
-        let Ok(dst_slot) = syscall::cap_copy(intermediary, mm.mm_cspace, syscall::RIGHTS_ALL)
+        let Ok(dst_slot) = syscall::cap_move(src_slot, mm.mm_cspace, 0)
         else
         {
             break;
@@ -1194,7 +1186,7 @@ pub fn finalize_memmgr(
     // Forward the transient phys-table page as a free run too (same rationale
     // as the tail: a descriptor-less `memory_split` product). Its content is
     // written after this call and read once by memmgr through the read-only
-    // `caps[1]` derivation; the free-run copy is the page's keep-alive, and
+    // `caps[1]` derivation; memmgr's moved slot is the page's keep-alive, and
     // after the read the page is allocatable like any other.
     push_free_run(
         phys_table_memory,

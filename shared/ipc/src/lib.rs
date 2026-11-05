@@ -755,7 +755,7 @@ pub mod memmgr_errors
 /// * `caps[0]` — memmgr's own service endpoint (full rights; its RECV side).
 /// * `caps[1]` — read-only Memory cap covering the phys-table page (below).
 /// * `data[0]` — `memory_base`: first `CSpace` slot of the free RAM Memory caps
-///   init copied into memmgr's `CSpace`.
+///   init moved into memmgr's `CSpace`.
 /// * `data[1]` — `memory_count`: number of consecutive free RAM Memory caps.
 ///   No protocol bound applies: memmgr reads each cap's size and physical base
 ///   from the kernel (`cap_info`), so the round carries slot numbers only.

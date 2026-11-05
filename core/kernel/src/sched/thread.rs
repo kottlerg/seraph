@@ -765,22 +765,28 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_PENDING`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`] /
-    /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`]. Set by the single
-    /// wake-claim winner: `RESUME` or `DECLINED` by a genuine reply, `KILL`
-    /// by handler-thread destruction or cancellation, so
+    /// [`crate::ipc::fault::FAULT_OUTCOME_REDELIVER`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`]. Set to `PENDING` with
+    /// the binding read that opens a delivery (under `sched_lock`), and by the
+    /// single wake-claim winner: `RESUME` or `DECLINED` by a genuine reply,
+    /// `KILL` by handler-thread destruction or cancellation, `REDELIVER` by a
+    /// binding change, so
     /// resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 
     /// True while this thread is delivering / blocked on a fault. Written only
-    /// by this thread, outside any park: `fault_dispatch` sets it before the
-    /// fault park commits and clears it after the park resumes. Owned, for
-    /// every other reader, by the claim on that park (the `ep.lock` dequeue in
-    /// `endpoint_recv`, a won `reply_tcb` CAS or swap, a won send-queue unlink
-    /// in `cancel_ipc_block`, the endpoint dealloc drain's detach), which the
-    /// park's commit orders after the write; those readers transition a
-    /// dequeued fault sender to `BlockedOnFault` (rather than `BlockedOnReply`)
-    /// or mark the [`fault_outcome`](Self::fault_outcome) `KILL` (the
-    /// bare-field exception of docs/coding-standards.md § Concurrency).
+    /// by this thread, outside any park and under its `sched_lock`:
+    /// `fault_dispatch` sets it with the binding read that opens a delivery,
+    /// before the fault park commits, and clears it after the park resumes.
+    /// Read from another thread under that `sched_lock` (a binder's in-flight
+    /// check, `ipc::fault::delivery_in_flight`), or by the claim on that park
+    /// (the `ep.lock` dequeue in `endpoint_recv`, a won `reply_tcb` CAS or
+    /// swap, a won send-queue unlink in `cancel_ipc_block`, the endpoint
+    /// dealloc drain's detach), which the park's commit orders after the
+    /// write; the claimants transition a dequeued fault sender to
+    /// `BlockedOnFault` (rather than `BlockedOnReply`) or mark the
+    /// [`fault_outcome`](Self::fault_outcome) `KILL` (the bare-field exception
+    /// of docs/coding-standards.md § Concurrency).
     pub in_fault_delivery: bool,
 
     // === Context ===

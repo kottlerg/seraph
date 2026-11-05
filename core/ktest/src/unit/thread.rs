@@ -5,7 +5,8 @@
 
 //! Tier 1 tests for thread management syscalls.
 //!
-//! Covers: `SYS_THREAD_CONFIGURE`, `SYS_THREAD_START`, `SYS_THREAD_STOP`,
+//! Covers: `SYS_THREAD_CONFIGURE`, `SYS_THREAD_START` (plain and suspended),
+//! `SYS_THREAD_STOP`,
 //! `SYS_THREAD_YIELD`, `SYS_THREAD_EXIT`, `SYS_THREAD_READ_REGS`,
 //! `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_SET_PRIORITY`,
 //! `SYS_THREAD_SET_AFFINITY`, `SYS_THREAD_SLEEP`,
@@ -54,6 +55,7 @@ const _: () = assert!(BUF_SIZE as u64 >= TRAP_FRAME_BYTES);
 static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
+static mut STACK_START_SUSPENDED: ChildStack = ChildStack::ZERO;
 static mut STACK_DOUBLE_STOP: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_ERR: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_NON_USER: ChildStack = ChildStack::ZERO;
@@ -365,6 +367,176 @@ pub fn start_self_invalid_argument(ctx: &TestContext) -> TestResult
         return Err("thread_start on the caller's own Thread cap did not return InvalidArgument");
     }
     Ok(())
+}
+
+// ── SYS_THREAD_START (suspended) ─────────────────────────────────────────────
+
+/// Bound, in milliseconds, on `start_suspended_resume`'s wait for the resumed
+/// child's report. Applied through [`crate::scaled_bound`].
+const SUSPENDED_REPORT_MS: u64 = 5_000;
+
+/// Bits the suspended child sends if it runs from its configured entry, and
+/// from the entry the parent writes into its frame.
+const SUSPENDED_RAN_BITS: u64 = 0x5EED;
+const SUSPENDED_REDIRECT_BITS: u64 = 0xD1CE;
+
+/// Set by [`suspended_entry`] and [`suspended_redirect_entry`] as their first
+/// act: a nonzero value before the resume means the suspended child executed
+/// user code.
+static SUSPENDED_RAN: AtomicU32 = AtomicU32::new(0);
+
+/// A suspended start leaves a configured `Created` thread `Stopped` without
+/// running it, and a plain start then resumes it from its register file.
+///
+/// Before the configure, a suspended start is refused (`InvalidArgument`: not
+/// configured); a reserved flag bit is refused (`InvalidArgument`) and leaves
+/// the thread `Created`. While suspended, the thread is `Stopped`
+/// (`thread_stop` returns `InvalidState`), no longer `Created` (a configure and
+/// a second suspended start are refused), its register file holds the entry
+/// as its instruction pointer, and it has run no user instruction across the
+/// parent's sleep. A register write then points the never-run frame at a
+/// second entry, and the resume runs it once there.
+pub fn start_suspended_resume(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for start_suspended_resume failed")?;
+    let mut child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::start_suspended_resume: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
+        .map_err(|_| "cap_copy for start_suspended_resume failed")?;
+    let result = start_suspended_resume_body(&child, sig, child_sig);
+    child.delete_thread().ok();
+    cap_delete(sig).ok();
+    child.delete_cspace().ok();
+    result
+}
+
+fn start_suspended_resume_body(
+    child: &crate::spawn::SpawnedChild,
+    sig: u64,
+    child_sig: u64,
+) -> TestResult
+{
+    if syscall::thread_start_suspended(child.th) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("suspended start of an unconfigured thread was not refused");
+    }
+    let entry = suspended_entry as *const () as u64;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_START_SUSPENDED));
+    SUSPENDED_RAN.store(0, Ordering::Release);
+    // SAFETY: `suspended_entry` is an `extern "C" fn(u64) -> !`, and the stack
+    // is `STACK_START_SUSPENDED`, this test's own `ChildStack`, on which no
+    // other live thread runs (`ChildStack`'s rule).
+    unsafe { thread_configure(child.th, entry, stack_top, child_sig) }
+        .map_err(|_| "thread_configure for start_suspended_resume failed")?;
+
+    // SAFETY: raw_syscall3's four conditions hold. SYS_THREAD_START takes no
+    // pointer and uses no IPC buffer; it changes no mapping; the only thread
+    // it could change is the child, which has not started; and it changes no
+    // CSpace slot.
+    let reserved = unsafe {
+        syscall::raw_syscall3(
+            syscall_abi::SYS_THREAD_START,
+            child.th,
+            syscall_abi::THREAD_START_SUSPENDED << 1,
+            0,
+        )
+    };
+    if reserved != SyscallError::InvalidArgument as i64
+    {
+        return Err("thread_start with a reserved flag bit was not refused");
+    }
+
+    syscall::thread_start_suspended(child.th)
+        .map_err(|_| "thread_start_suspended of a configured thread failed")?;
+    check_suspended(child.th, entry, child_sig)?;
+
+    // Point the never-run frame at a second entry: the edit must take effect
+    // on resume, the debugger's use of the suspended state. The frame's first
+    // argument register still holds the configured argument, `child_sig`.
+    let mut reg_buf = [0u8; BUF_SIZE];
+    thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
+        .map_err(|_| "thread_read_regs for the suspended redirect failed")?;
+    crate::spawn::redirect_to_entry(
+        &mut reg_buf[..],
+        suspended_redirect_entry as *const () as u64,
+    );
+    // SAFETY: the frame was read from this child, so its stack pointer lies on
+    // the child's own `ChildStack`; `redirect_to_entry` pointed it at
+    // `suspended_redirect_entry`, an `extern "C"` entry that never returns,
+    // with the stack pointer moved down to the entry ABI's alignment on that
+    // same stack.
+    unsafe { thread_write_regs(child.th, &reg_buf[..BUF_SIZE]) }
+        .map_err(|_| "thread_write_regs of a suspended thread failed")?;
+
+    thread_start(child.th).map_err(|_| "thread_start (resume) of a suspended thread failed")?;
+    let bits = notification_wait_timeout(sig, crate::scaled_bound(SUSPENDED_REPORT_MS))
+        .map_err(|_| "notification_wait for start_suspended_resume failed")?;
+    if bits != SUSPENDED_REDIRECT_BITS
+    {
+        return Err("resumed suspended thread did not run from its written instruction pointer");
+    }
+    Ok(())
+}
+
+/// Check that `th`, just started suspended at `entry`, is `Stopped`, no
+/// longer `Created`, and has run nothing.
+fn check_suspended(th: u64, entry: u64, child_sig: u64) -> TestResult
+{
+    if thread_stop(th) != Err(SyscallError::InvalidState as i64)
+    {
+        return Err("suspended thread is not Stopped (thread_stop did not return InvalidState)");
+    }
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_START_SUSPENDED));
+    // SAFETY: the call is expected to be refused; were it accepted, it would
+    // rewrite the frame of the child this test owns with the same entry and
+    // its own stack.
+    if unsafe { thread_configure(th, entry, stack_top, child_sig) }
+        != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("thread_configure of a suspended thread was not refused");
+    }
+    if syscall::thread_start_suspended(th) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("second suspended start was not refused");
+    }
+    let mut reg_buf = [0u8; BUF_SIZE];
+    thread_read_regs(th, &mut reg_buf[..BUF_SIZE])
+        .map_err(|_| "thread_read_regs of a suspended thread failed")?;
+    let ip = u64::from_le_bytes(
+        reg_buf[IP_OFFSET..IP_OFFSET + 8]
+            .try_into()
+            .unwrap_or([0u8; 8]),
+    );
+    if ip != entry
+    {
+        return Err("suspended thread's instruction pointer is not its configured entry");
+    }
+    // Give a dispatchable thread every chance to run before the check.
+    thread_sleep(10).map_err(|_| "thread_sleep in start_suspended_resume failed")?;
+    if SUSPENDED_RAN.load(Ordering::Acquire) != 0
+    {
+        return Err("suspended thread executed before its resume");
+    }
+    Ok(())
+}
+
+/// Entry of [`start_suspended_resume`]'s child: records that it ran and sends
+/// [`SUSPENDED_RAN_BITS`].
+extern "C" fn suspended_entry(sig_slot: u64) -> !
+{
+    SUSPENDED_RAN.store(1, Ordering::Release);
+    notification_send(sig_slot, SUSPENDED_RAN_BITS).ok();
+    thread_exit()
+}
+
+/// Entry the parent writes into the suspended child's frame before its
+/// resume: records that it ran and sends [`SUSPENDED_REDIRECT_BITS`].
+extern "C" fn suspended_redirect_entry(sig_slot: u64) -> !
+{
+    SUSPENDED_RAN.store(1, Ordering::Release);
+    notification_send(sig_slot, SUSPENDED_REDIRECT_BITS).ok();
+    thread_exit()
 }
 
 // ── SYS_THREAD_WRITE_REGS + SYS_THREAD_START (resume) ────────────────────────

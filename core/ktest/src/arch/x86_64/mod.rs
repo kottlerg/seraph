@@ -44,6 +44,7 @@ mod page_fault_present_bit;
 mod sbi_call;
 pub mod serial;
 mod syscall_rflags_hardening;
+mod trap_redelivery;
 mod umip;
 mod user_half_top;
 
@@ -241,4 +242,5 @@ pub fn run_integration(ctx: &TestContext)
     );
     crate::run_integration_test!("integration::ioport_revoke", ioport_revoke::run(ctx));
     crate::run_integration_test!("integration::umip_descriptor_reads_fault", umip::run(ctx));
+    crate::run_integration_test!("integration::trap_redelivery", trap_redelivery::run(ctx));
 }

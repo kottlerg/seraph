@@ -568,6 +568,17 @@ pub const PRIORITY_MIN: u8 = 1;
 /// level 31 is reserved above this one.
 pub const PRIORITY_MAX: u8 = 30;
 
+// ── Thread start flags (SYS_THREAD_START arg1) ────────────────────────────────
+
+/// `SYS_THREAD_START` flag: leave a configured `Created` thread `Stopped`
+/// instead of `Ready`. The thread is linked on no run queue and executes
+/// nothing until a later `SYS_THREAD_START` without the flag resumes it at
+/// its configured entry; meanwhile its register file is readable and
+/// writable with `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`. Valid only
+/// for a configured `Created` target. Every other bit of the flags word is reserved and
+/// MUST be clear. See `core/kernel/docs/syscalls.md` § `SYS_THREAD_START`.
+pub const THREAD_START_SUSPENDED: u64 = 1 << 0;
+
 // ── Event Queue constants ─────────────────────────────────────────────────────
 
 /// Maximum capacity (entry count), and maximum death-observer node count, for

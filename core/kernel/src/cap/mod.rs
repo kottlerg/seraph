@@ -312,9 +312,10 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// what userspace init mints, copies, and derives into it during memmgr /
 /// procmgr bootstrap (kernel-object inserts and derivations; the RAM caps
 /// `finalize_memmgr` moves to memmgr take none), at most about 700 caps
-/// observed. Set at about 1.8× that, per the seeding policy in docs/capability-model.md
-/// (growth budgets), so realistic growth of init's own use (more services,
-/// more derivations per RAM extent) does not revisit it.
+/// observed. Set at about 1.8× that, per the seeding policy in
+/// docs/capability-model.md (growth budgets), so realistic growth of init's
+/// own use (more services, more derivations per RAM extent) does not revisit
+/// it.
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_HEADROOM_SLOTS: u64 = 1280;
 

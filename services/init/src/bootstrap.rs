@@ -997,9 +997,10 @@ fn forward_arena(arena_cap: u64, mm_cspace: u64, kind: u64) -> Option<InUseArena
 }
 
 /// Forward a single Memory cap into memmgr's `CSpace` as a free run: move it
-/// into `mm_cspace`, so memmgr's slot is the only one naming the run and
-/// memmgr can split and merge it, and count it (advancing `count`, recording
-/// `base` on the first run). Used for the
+/// into `mm_cspace`, so that once any derivation init took from it is gone
+/// memmgr's slot is the only one naming the run and memmgr can split and
+/// merge it, and count it (advancing `count`, recording `base` on the first
+/// run). Used for the
 /// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
 /// products with no `InitInfo` descriptor, which the reap donation walk does
 /// not reach, so unforwarded they would stay in init's `CSpace` until the reap
@@ -1186,7 +1187,7 @@ pub fn finalize_memmgr(
     // Forward the transient phys-table page as a free run too (same rationale
     // as the tail: a descriptor-less `memory_split` product). Its content is
     // written after this call and read once by memmgr through the read-only
-    // `caps[1]` derivation; the free-run copy is the page's keep-alive, and
+    // `caps[1]` derivation; memmgr's moved slot is the page's keep-alive, and
     // after the read the page is allocatable like any other.
     push_free_run(
         phys_table_memory,

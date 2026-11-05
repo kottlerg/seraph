@@ -1202,8 +1202,8 @@ A Memory object is split only through the one capability slot that names it. A d
 copy of a Memory cap names the source's object, so shrinking that object in place would shrink
 what every other slot naming it reaches; the call refuses `memory_cap` while any other slot, in
 any `CSpace`, names its object: a derivation parent, a sibling, a child, or a slot that still
-shares the object once the derivation edge between them is gone (a deleted parent leaves its
-children as unlinked roots). The kernel counts the slots that name each Memory object
+shares the object once the derivation edge between them is gone (deleting a parentless root
+leaves its children as unlinked roots). The kernel counts the slots that name each Memory object
 (`MemoryObject::slot_count`, exact under the derivation lock the call holds). Retype leases,
 donations, and other syscalls' pins are not slots and do not refuse the split.
 

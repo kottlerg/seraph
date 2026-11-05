@@ -34,8 +34,8 @@
 //! maps segment caps read-only through `mem_map`.
 
 use syscall::{
-    MAP_READ, MAP_WRITABLE, RIGHTS_ALL, aspace_query, cap_delete, cap_derive, cap_info, mem_map,
-    mem_unmap,
+    MAP_READ, MAP_WRITABLE, RIGHTS_ALL, aspace_query, cap_copy, cap_create_cspace, cap_delete,
+    cap_derive, cap_info, mem_map, mem_unmap,
 };
 use syscall_abi::{CAP_INFO_MEMORY_SIZE, PAGE_SIZE};
 
@@ -164,6 +164,57 @@ pub fn memory_split_shared_object_refused(ctx: &TestContext) -> TestResult
     if size_after != full || unlinked_size != full
     {
         return Err("mm::memory_split_shared_object_refused: a refused split changed the size");
+    }
+    Ok(())
+}
+
+/// Split attempts, a yield apart, that wait for a dead `CSpace`'s deferred
+/// teardown to release its slots; stretched past [`crate::UNSCALED_CPUS`] CPUs
+/// through [`crate::scaled_polls`].
+const CSPACE_RELEASE_POLLS: u32 = 1000;
+
+/// A `CSpace`'s teardown stops counting the slots it held: a piece copied into
+/// a fresh `CSpace` is refused a split while the copy lives, and splits again
+/// once the last capability to that `CSpace` is deleted and its teardown has
+/// released the copy (core/kernel/docs/syscalls.md § `SYS_MEMORY_SPLIT`). The
+/// teardown is deferred, so the split is retried, a yield apart, within
+/// [`CSPACE_RELEASE_POLLS`].
+pub fn memory_split_after_cspace_teardown(ctx: &TestContext) -> TestResult
+{
+    const CASE: &str = "mm::memory_split_after_cspace_teardown: setup failed";
+    let piece = split_shared_piece(ctx, CASE)?;
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| CASE)?;
+    let copied = cap_copy(piece, cs, RIGHTS_ALL);
+    let shared = copied.is_ok() && syscall::memory_split(piece, PAGE_SIZE).is_ok();
+    cap_delete(cs).map_err(|_| CASE)?;
+
+    let mut tail = None;
+    for _ in 0..crate::scaled_polls(CSPACE_RELEASE_POLLS)
+    {
+        if let Ok(t) = syscall::memory_split(piece, PAGE_SIZE)
+        {
+            tail = Some(t);
+            break;
+        }
+        syscall::thread_yield().ok();
+    }
+    if let Some(t) = tail
+    {
+        syscall::memory_merge(piece, t).map_err(|_| CASE)?;
+    }
+    syscall::memory_merge(ctx.memory_base, piece).map_err(|_| CASE)?;
+
+    copied.map_err(|_| CASE)?;
+    if shared
+    {
+        return Err("mm::memory_split_after_cspace_teardown: a piece with a live copy was split");
+    }
+    if tail.is_none()
+    {
+        return Err(
+            "mm::memory_split_after_cspace_teardown: the split stayed refused after the copy's \
+             CSpace was torn down",
+        );
     }
     Ok(())
 }

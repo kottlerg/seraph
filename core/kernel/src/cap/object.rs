@@ -4490,11 +4490,11 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration;
                 // each slot's object is live until its reference is released,
                 // so a Memory object is uncounted while live and once, as its
-                // fill counted it; each slot's reference is released once, and one that was
-                // its object's last leaves the object referenced by no slot,
-                // pin, or kernel owner and on no stack; a nested `CSpace`
-                // wrapper among them stays reachable only through its arena
-                // pages' `owner`, which `CascadeStack::push` allows.
+                // fill counted it; each slot's reference is released once, and
+                // one that was its object's last leaves the object referenced
+                // by no slot, pin, or kernel owner and on no stack; a nested
+                // `CSpace` wrapper among them stays reachable only through its
+                // arena pages' `owner`, which `CascadeStack::push` allows.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
                         // The slot stops naming its object here, as a freed

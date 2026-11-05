@@ -310,9 +310,12 @@ Memory object of every derivation it granted. The frame is **quiescent** when al
    no kernel-internal reference such as a retype lease or a page-pool donation. memmgr reads this
    first: once it holds it keeps holding, since no other process has a capability through which to
    add a reference or a mapping, so the reads after it cannot be raced.
-2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. A
-   grantee that split its grant shrank the object the intermediary names, so the record no longer
-   describes it.
+2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. The
+   kernel refuses a grantee's split or merge of its grant, since memmgr's intermediary names the
+   same object
+   ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
+   §"`SYS_MEMORY_SPLIT`"), so the size cannot change while memmgr holds the intermediary; memmgr
+   reads it as a backstop.
 3. Its available bytes (`CAP_INFO_MEMORY_AVAILABLE`) equal its size: no byte of the region is
    retyped into a live kernel object, donated to a page pool, or held by a kept body-arena page
    (the kernel credits the last such byte back and resets the region's retype allocator to virgin
@@ -417,7 +420,8 @@ cap. Eligibility:
   [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
   §"`SYS_MEMORY_MERGE`"): the caps must be derivation siblings with identical
   rights, the tail must be virgin (never retyped or sub-allocated), and no
-  other slot may name either cap's object (no derivation of either is live).
+  other slot may name either cap's object (no derivation or copy of either
+  object, linked to it or not).
 
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins

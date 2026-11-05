@@ -260,6 +260,10 @@ pub fn run_all(ctx: &TestContext)
         "mm::memory_merge_shared_object_refused",
         mm::memory_merge_shared_object_refused(ctx)
     );
+    run_test!(
+        "mm::memory_split_after_cspace_teardown",
+        mm::memory_split_after_cspace_teardown(ctx)
+    );
     run_test!("mm::mem_map_unmap", mm::mem_map_unmap(ctx));
     run_test!("mm::mem_protect", mm::mem_protect(ctx));
     run_test!(

@@ -670,9 +670,10 @@ fn run(info_ptr: u64) -> !
     };
 
     // Populate the phys-table page: the kernel's immutable RAM-accounting
-    // facts and the in-use bootstrap arenas. The
-    // page is mapped writable at TEMP_MAP_BASE (the mapping outlives the move
-    // of its cap); memmgr reads it back via the RO cap derived above. See `bootstrap::write_memmgr_aux_memory`.
+    // facts and the in-use bootstrap arenas. The page is mapped writable at
+    // TEMP_MAP_BASE (the mapping outlives the move of its cap); memmgr reads
+    // it back via the RO cap derived above. See
+    // `bootstrap::write_memmgr_aux_memory`.
     // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;

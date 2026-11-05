@@ -13,6 +13,8 @@ test = false
 boot-protocol = { path = "../../abi/boot-protocol" }
 # ACPI / DTB table parsers, extracted so they are host-testable.
 firmware = { path = "firmware", package = "devmgr-firmware" }
+# The IOMMU driver's bootstrap layout and scope encoding.
+iommu-core = { path = "../drivers/iommu/core" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 ns-client = { path = "../../shared/ns-client" }

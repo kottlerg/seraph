@@ -102,7 +102,8 @@ The bootloader does not inspect module content; what each module does
 and in what order init spawns them is init's concern
 ([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)). Typical
 modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer,
-fatfs (the authoritative list is `xtask/src/bundle.rs::MODULES`).
+fatfs, and on x86-64 iommu-vtd (the authoritative lists are
+`xtask/src/bundle.rs::MODULES` and `ARCH_MODULES`).
 
 Only the whole bundle allocation is identity-mapped; module bodies are
 slices of it (see step 6).
@@ -135,12 +136,13 @@ the kernel's own consumption:
 
 A third extraction, run in step 9, produces **seed entries** for `mmio_apertures` — coarse
 `{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed covers LAPIC / IOAPIC
-/ PLIC / CLINT / UART / ECAM / BAR windows / `virtio,mmio` transports from the firmware tables, the
-arch's platform-default MMIO apertures the ACPI seeder appends ([acpi.md](acpi.md) § Tables
-Consumed), and the GOP framebuffer. Each seed is clipped to the memory map (named seeds lose the
-RAM-class and firmware-exclusive ranges, heuristic PCI windows every non-MMIO range) and merged
-there with the UEFI memory map's `MemoryMappedIO` regions (firmware-parsing.md
-§ [`mmio_apertures` construction](firmware-parsing.md#mmio_apertures-construction)).
+/ PLIC / CLINT / UART / ECAM / BAR windows / VT-d remapping units / `virtio,mmio` transports from
+the firmware tables, the arch's platform-default MMIO apertures the ACPI seeder appends
+([acpi.md](acpi.md) § Tables Consumed), and the GOP framebuffer. Each seed is clipped to the memory
+map (named seeds lose the RAM-class and firmware-exclusive ranges, heuristic PCI windows every
+non-MMIO range) and merged there with the UEFI memory map's `MemoryMappedIO` regions
+(firmware-parsing.md § [`mmio_apertures`
+construction](firmware-parsing.md#mmio_apertures-construction)).
 
 The paging depth is negotiated here, before step 6 fixes the table hierarchy depth: on
 RISC-V from the DTB `mmu-type` claim and a `satp` probe (see
@@ -250,7 +252,8 @@ sized (the buffer bounds step 8's re-query too), the bootloader frees every allo
 of steps 6 and 7 (the page-table frame pool included) and runs both again with twice
 the slack, up to `MEM_MAP_ATTEMPTS` (3) times; a buffer that still outgrows the array
 fails the boot with `BootError::MemoryMapKeptGrowing`
-([memory-map.md](memory-map.md#sizing-the-entry-array)).
+([memory-map.md](memory-map.md#sizing-the-entry-array)). The presence-only
+`\EFI\seraph\mapredo` test knob makes the first attempt redo whatever its map's size.
 
 Detail: [uefi-environment.md](uefi-environment.md)
 

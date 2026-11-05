@@ -198,8 +198,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `devmgr.test` — the same SEND with `TEST_LABEL_AUTHORITY` added,
     gating devmgr's test labels, the `TEST_SPAWN_ORPHAN` /
     `TEST_ORPHAN_RESULT` shim, the `TEST_SPAWN_FAULT_DRIVERS` /
-    `TEST_QUERY_FAULT_DEVICE` shim, and `TEST_QUERY_DENY_DEVICE`
-    (TODO(#165)); svctest is the only recipe seeding it.
+    `TEST_QUERY_FAULT_DEVICE` shim, the `TEST_SPAWN_DMA_DRIVER` /
+    `TEST_QUERY_DMA_DEVICE` / `TEST_DMA_FAULTS` shim, and
+    `TEST_QUERY_DENY_DEVICE` (TODO(#165)); svctest is the only recipe seeding it.
   - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
     they arrive; svctest is the only recipe seeding them.

@@ -26,7 +26,7 @@ is a fatal error (init at load time, the kernel when its page tables are built; 
 ## File Paths
 
 Files are opened via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` on the ESP volume. The
-bootloader carries three hardcoded ESP path constants in
+bootloader carries four hardcoded ESP path constants in
 [`core/boot/src/main.rs`](../src/main.rs) (see
 [uefi-environment.md](uefi-environment.md)):
 
@@ -35,6 +35,7 @@ bootloader carries three hardcoded ESP path constants in
 | Kernel | `\EFI\seraph\kernel` |
 | Bootstrap bundle | `\EFI\seraph\bootstrap.bundle` |
 | KASLR override knob | `\EFI\seraph\nokaslr` (presence-only) |
+| Steps 6 and 7 redo test knob | `\EFI\seraph\mapredo` (presence-only; [memory-map.md](memory-map.md#sizing-the-entry-array)) |
 
 All paths use backslash separators as required by the UEFI file
 protocol. There is no per-file extension mechanism: the bundle is a

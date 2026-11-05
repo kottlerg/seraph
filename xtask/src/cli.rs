@@ -101,6 +101,12 @@ pub enum CliCommand
     /// through `run-parallel` and reads the log it saves (see xtask/README.md).
     TestLogdReclaim(TestLogdReclaimArgs),
 
+    /// Check that a boot whose bootloader redoes its steps 6 and 7 completes:
+    /// stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot
+    /// once through `run-parallel`, assert the bootloader's knob line and the
+    /// pass marker, and remove the knob again (see xtask/README.md).
+    TestMapRedo(TestMapRedoArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape and forward
     /// links, and document reachability from the root README. Runs in CI's
@@ -402,6 +408,36 @@ pub struct TestLogdReclaimArgs
     pub riscv_mmu: RiscvMmu,
 
     /// Guest x86-64 paging depth (`x86_64` only; ignored with `--log`).
+    #[arg(long, default_value = "4")]
+    pub x86_paging: X86Paging,
+}
+
+// ── TestMapRedo ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestMapRedoArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Boot timeout, in seconds, for HANG classification.
+    #[arg(long, default_value = "900")]
+    pub timeout: u64,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+
+    /// riscv64 paging mode to negotiate (ignored on x86-64).
+    #[arg(long, default_value = "sv48")]
+    pub riscv_mmu: RiscvMmu,
+
+    /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
 }

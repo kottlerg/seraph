@@ -128,10 +128,10 @@ Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
 firmware-exclusive state. Step 1 collects only MMIO descriptors, and step 2
 clips each seed by its class:
 
-- **Named seeds** are LAPIC, IOAPIC, PLIC, ECAM, UART, RTC, `virtio,mmio` and other
-  DTB nodes, and the framebuffer. They are windows a firmware table, the DTB, or GOP
-  names as a device's registers or frame buffer, or that the arch defaults fix at a
-  platform-defined register address (`default_mmio_apertures`).
+- **Named seeds** are LAPIC, IOAPIC, PLIC, ECAM, VT-d remapping units (DMAR), UART, RTC,
+  `virtio,mmio` and other DTB nodes, and the framebuffer. They are windows a firmware
+  table, the DTB, or GOP names as a device's registers or frame buffer, or that the arch
+  defaults fix at a platform-defined register address (`default_mmio_apertures`).
   - Every range of the RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
     `EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
     `EfiPersistentMemory`) and of the firmware-exclusive types (`EfiRuntimeServicesCode`,
@@ -172,7 +172,9 @@ The bootloader's firmware parsing is deliberately narrow. It does not:
   beyond the PCI host-bridge ranges.
 - Enumerate PCI buses or read PCI configuration space.
 - Identify specific device models or driver requirements.
-- Enumerate IOMMU topology.
+- Enumerate IOMMU topology: of the ACPI DMAR it reads only each VT-d unit's register window, to
+  seed an aperture over it ([acpi.md](acpi.md)); the units' scopes, reserved regions, and
+  programming are devmgr's.
 - Produce per-device capabilities of any kind.
 
 All of these are `devmgr`'s responsibility. The bootloader produces the

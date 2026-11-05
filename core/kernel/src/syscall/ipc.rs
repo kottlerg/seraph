@@ -1078,21 +1078,36 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     };
 
     // Fault reply: the caller is a thread the kernel parked BlockedOnFault by
-    // fault redirection, not a SYS_IPC_CALL caller. Its data words and caps
-    // are ignored — the reply label alone carries the disposition (RESUME
-    // default, KILL declines) — so they are neither validated nor moved, and
-    // the faulter's CSpace is not grown. Record the outcome for the fault
-    // helper and wake the faulter, which resumes by re-executing its faulting
-    // instruction (or continuing from a handler-modified PC) rather than
-    // returning a syscall value. We won the reply_tcb CAS, so no canceller
-    // will also wake this faulter — recording the outcome here is race-free.
+    // fault redirection, not a SYS_IPC_CALL caller. The reply label alone
+    // carries the disposition (RESUME default, KILL declines); its caps are
+    // neither validated nor moved, and the faulter's CSpace is not grown. A
+    // KILL reply's data word 0, when sent, is the handler's decline reason:
+    // it is deposited in the faulter's ipc_msg, which this won claim owns,
+    // for the kill diagnostic (docs/fault-handling.md § Reply); an unreadable
+    // word deposits no reason rather than failing the reply. Record the
+    // outcome for the fault helper and wake the faulter, which resumes by
+    // re-executing its faulting instruction (or continuing from a
+    // handler-modified PC) rather than returning a syscall value. We won the
+    // reply_tcb CAS, so no canceller will also wake this faulter — recording
+    // the outcome here is race-free.
     // SAFETY: caller is pinned by the won claim (see above); its ipc_state is
     // stable until enqueue_and_wake clears it.
     if unsafe { (*caller).ipc_state } == crate::sched::thread::IpcThreadState::BlockedOnFault
     {
         let outcome = if label == syscall::FAULT_REPLY_KILL
         {
-            crate::ipc::fault::FAULT_OUTCOME_KILL
+            let mut reply = Message::new(label);
+            // SAFETY: tcb is the calling thread's valid TCB; its IPC buffer
+            // is read through copy_from_user.
+            if data_count > 0
+                && unsafe { read_ipc_buf((*tcb).ipc_buffer, 1, &mut reply.data) }.is_ok()
+            {
+                reply.data_count = 1;
+            }
+            // SAFETY: caller pinned by the won claim, which owns its ipc_msg
+            // until the wake below.
+            unsafe { (*caller).ipc_msg = reply };
+            crate::ipc::fault::FAULT_OUTCOME_DECLINED
         }
         else
         {

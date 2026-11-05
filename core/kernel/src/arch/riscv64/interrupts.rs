@@ -963,7 +963,8 @@ fn normalize_riscv_exception(cause: u64) -> u64
 /// handler. Returns `true` if the handler resolved the fault and the thread
 /// should resume (re-execute the faulting instruction, or continue from a
 /// handler-modified sepc), `false` if the fault is terminal (the handler declined
-/// or the binding was severed).
+/// or the binding was severed), after printing its cause
+/// (`ipc::fault::report_user_kill`) ahead of the kill path's diagnostic.
 ///
 /// As on x86-64 (`x86_64/idt.rs::redirect_user_fault`), no frame copy is
 /// needed: `(*tcb).trap_frame` is pointed at the live trap `frame` for the
@@ -1009,7 +1010,16 @@ unsafe fn redirect_user_fault(
             .store(saved_tf, core::sync::atomic::Ordering::Relaxed);
     }
 
-    matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)
+    match outcome
+    {
+        crate::ipc::fault::FaultOutcome::Resume => true,
+        crate::ipc::fault::FaultOutcome::Kill(cause) =>
+        {
+            // SAFETY: tcb valid (this fn's contract).
+            unsafe { crate::ipc::fault::report_user_kill(tcb, cause) };
+            false
+        }
+    }
 }
 
 /// Enable PLIC `source` on its target hart's S-mode context; an unrouted source is left

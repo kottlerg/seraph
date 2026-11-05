@@ -427,14 +427,37 @@ impl Thread {
         }
 
         // Inherit the process's demand-paging pager onto this thread before it
-        // starts (the main thread is bound by procmgr at creation). Best-effort
-        // and a no-op for non-demand-paged processes (`pager_endpoint_cap == 0`).
+        // starts (the main thread is bound by procmgr at creation); a no-op for
+        // non-demand-paged processes (`pager_endpoint_cap == 0`). A failed bind
+        // fails the spawn: the thread's stack is demand-paged, so a thread
+        // started without its pager would die on its first stack write with a
+        // bare unhandled page fault instead of returning this error.
         if info.pager_endpoint_cap != 0 {
-            let _ = syscall::thread_set_fault_handler(
+            if let Err(e) = syscall::thread_set_fault_handler(
                 thread_cap,
                 info.pager_endpoint_cap,
                 FAULT_CLASS_ALL,
-            );
+            ) {
+                // Never started: deleting its cap reclaims the Thread object,
+                // and the slab's run goes back to memmgr's pool.
+                let _ = syscall::cap_delete(thread_cap);
+                crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
+                // SAFETY: `args` was just leaked via `Box::into_raw`.
+                let args_owned = unsafe { Box::from_raw(args) };
+                // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
+                let _init = unsafe { Box::from_raw(args_owned.init) };
+                // SAFETY: heap allocations owned by this function.
+                unsafe {
+                    if let Some(l) = tls_layout {
+                        dealloc(tls_block, l);
+                    }
+                    dealloc(ipc_buf_base, ipc_buf_layout);
+                }
+                free_stack(stack);
+                return Err(io::Error::other(format!(
+                    "seraph: thread_set_fault_handler failed (error {e})"
+                )));
+            }
         }
 
         // Bind a kernel death observer so a detached (un-joined) handle's

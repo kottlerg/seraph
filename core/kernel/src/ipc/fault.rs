@@ -35,10 +35,15 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 pub const FAULT_OUTCOME_PENDING: u8 = 0;
 /// [`ThreadControlBlock::fault_outcome`] value: resume (re-execute / continue).
 pub const FAULT_OUTCOME_RESUME: u8 = 1;
-/// [`ThreadControlBlock::fault_outcome`] value: unhandled (handler declined,
-/// handler thread destroyed, binding severed, or thread cancelled): the
+/// [`ThreadControlBlock::fault_outcome`] value: unhandled with no reply
+/// (handler thread destroyed, binding severed, or thread cancelled): the
 /// faulting thread is killed, or its restartable syscall fails.
 pub const FAULT_OUTCOME_KILL: u8 = 2;
+/// [`ThreadControlBlock::fault_outcome`] value: unhandled because the handler
+/// replied [`syscall::FAULT_REPLY_KILL`]. Taken as [`FAULT_OUTCOME_KILL`] is;
+/// the reply deposited its label and decline-reason word in the faulting
+/// thread's `ipc_msg`, which [`fault_dispatch`] reads for [`KillCause::Declined`].
+pub const FAULT_OUTCOME_DECLINED: u8 = 3;
 
 /// Architecture-neutral description of a fault, marshalled into the fault
 /// message's data words `[kind, d1, d2, ip]`.
@@ -66,7 +71,58 @@ pub enum FaultOutcome
     /// The fault is unhandled: the architecture handler kills the faulting
     /// thread, and the syscall dispatcher fails the restartable syscall with
     /// `InvalidAddress` (docs/fault-handling.md § Reply).
-    Kill,
+    Kill(KillCause),
+}
+
+/// Why a delivered fault took the unhandled outcome, for the kill diagnostic
+/// [`report_user_kill`] prints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KillCause
+{
+    /// The binding was found cleared when the delivery read it.
+    BindingCleared,
+    /// The delivery was cancelled before any reply claimed it (handler thread
+    /// destroyed, handler endpoint destroyed, a later receive on the handler
+    /// thread, or a stop of the faulting thread).
+    Cancelled,
+    /// The handler replied [`syscall::FAULT_REPLY_KILL`], with the reason its
+    /// reply's data word 0 carried, if it sent one.
+    Declined(Option<u64>),
+}
+
+/// Print, on the kernel serial console, why `tcb`'s user-mode fault went
+/// unhandled; the architecture kill path's `USERSPACE FAULT` diagnostic
+/// follows it. The decline reason is the handler's own value, printed
+/// verbatim; it is not interpreted here.
+///
+/// # Safety
+/// `tcb` must be a valid TCB pointer.
+#[cfg(not(test))]
+pub unsafe fn report_user_kill(tcb: *mut ThreadControlBlock, cause: KillCause)
+{
+    // SAFETY: tcb validated by caller; thread_id is fixed at creation.
+    let tid = unsafe { (*tcb).thread_id };
+    match cause
+    {
+        KillCause::BindingCleared =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} binding cleared before delivery");
+        }
+        KillCause::Cancelled =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} delivery cancelled before a reply");
+        }
+        KillCause::Declined(None) =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} handler declined");
+        }
+        KillCause::Declined(Some(reason)) =>
+        {
+            crate::kprintln_serial!(
+                "fault unhandled: tid={tid} handler declined, reason={reason:#x}"
+            );
+        }
+    }
 }
 
 /// True iff `tcb` has a fault handler bound at the moment of the load.
@@ -149,7 +205,7 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb) })
     else
     {
-        return FaultOutcome::Kill;
+        return FaultOutcome::Kill(KillCause::BindingCleared);
     };
     // SAFETY: ep_obj is pinned by the reference pin_binding took.
     let ep_state = unsafe { ep_obj.as_ref().state };
@@ -221,7 +277,8 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
 
     // Resumed. Read the disposition the wake-claim winner committed. Anything
     // other than an explicit Resume is treated as Kill — this defensively
-    // covers a spurious wake leaving the outcome at `Pending`.
+    // covers a spurious wake leaving the outcome at `Pending` (reported as a
+    // cancelled delivery).
     // SAFETY: tcb still valid after resume.
     let outcome = unsafe { (*tcb).fault_outcome.load(Ordering::Acquire) };
     // Spurious-resume tripwire: every legitimate fault wake stamps the
@@ -245,12 +302,19 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
         (*tcb).in_fault_delivery = false;
     }
 
-    if outcome == FAULT_OUTCOME_RESUME
+    match outcome
     {
-        FaultOutcome::Resume
-    }
-    else
-    {
-        FaultOutcome::Kill
+        FAULT_OUTCOME_RESUME => FaultOutcome::Resume,
+        FAULT_OUTCOME_DECLINED =>
+        {
+            // SAFETY: tcb still valid; the declining reply wrote ipc_msg as the
+            // winner of this episode's reply claim, before the wake that
+            // resumed this thread, and nothing writes it after that claim.
+            let reply = unsafe { &(*tcb).ipc_msg };
+            FaultOutcome::Kill(KillCause::Declined(
+                (reply.data_count > 0).then(|| reply.data[0]),
+            ))
+        }
+        _ => FaultOutcome::Kill(KillCause::Cancelled),
     }
 }

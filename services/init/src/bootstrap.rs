@@ -1352,7 +1352,16 @@ unsafe fn populate_procmgr_info(
 {
     let pm_thread_in_pm =
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
-    let pm_aspace_in_pm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
+    // procmgr's own address space without `RIGHTS_AS_READ`: init retyped it
+    // from a `PHYS` arena, so it was minted with READ, which would let procmgr
+    // translate every page it maps (its children's frames included) with
+    // `SYS_ASPACE_QUERY`. procmgr never queries a mapping.
+    let pm_aspace_in_pm = syscall::cap_copy(
+        caps.aspace,
+        caps.cspace,
+        syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_READ,
+    )
+    .ok()?;
     let pm_cspace_in_pm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CS_ALL).ok()?;
     // Baseline SchedControl: procmgr's own scheduling authority and the

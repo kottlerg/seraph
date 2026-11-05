@@ -1597,7 +1597,9 @@ pub fn user_va_top() -> Result<u64, i64>
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle is
 /// null, out of range, or stale, the slot is empty, or the object the slot
 /// references is gone; `InvalidArgument` if the selector is unknown,
-/// requires a different capability tag, or is `CAP_INFO_MEMORY_MAPPINGS`.
+/// requires a different capability tag, or is `CAP_INFO_MEMORY_MAPPINGS`;
+/// `InsufficientRights` for `CAP_INFO_MEMORY_PHYS_BASE` on a cap without
+/// `RIGHTS_MEM_PHYS` (present a credential with [`cap_info_phys_base`]).
 // cast_sign_loss: ret is proven non-negative in the Ok branch.
 #[allow(clippy::cast_sign_loss)]
 #[inline]

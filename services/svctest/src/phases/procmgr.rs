@@ -765,9 +765,10 @@ fn hello_file() -> (u64, u64)
 /// process handles) from a sender without the `DEATH_EQ_AUTHORITY` badge,
 /// the init-reap labels (`REGISTER_INIT_TEARDOWN`, `INIT_TEARDOWN_DONE`) from
 /// any badged sender, an unknown opcode, a `CREATE_FROM_FILE` that sets
-/// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap, and a
-/// `CONFIGURE_PIPE` with an unknown direction or for a direction already
-/// configured. Each refused request carries caps. procmgr's slot count is not
+/// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap, a
+/// `CREATE_FROM_FILE` asking `CREATE_PHYS_ACCESS` (a phys-class child) from
+/// svctest, which is not phys-class, and a `CONFIGURE_PIPE` with an unknown
+/// direction or for a direction already configured. Each refused request carries caps. procmgr's slot count is not
 /// observable from a client, so each cell asserts the refusal reply, and a
 /// spawn afterwards shows procmgr still serves. The phase then checks that
 /// procmgr destroys a child whose create reply it cannot deliver
@@ -842,6 +843,18 @@ pub fn procmgr_refusals_phase(_: &Caps)
             .build(),
             procmgr_errors::INVALID_ARGUMENT,
             "CREATE_FROM_FILE with the relay flag and only the file cap",
+        );
+        let (file, size) = hello_file();
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(
+                procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PHYS_ACCESS,
+            )
+            .word(0, size)
+            .cap(file)
+            .build(),
+            procmgr_errors::INVALID_ARGUMENT,
+            "CREATE_FROM_FILE with CREATE_PHYS_ACCESS from a creator that is not phys-class",
         );
     }
 

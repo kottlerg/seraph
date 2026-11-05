@@ -176,8 +176,8 @@ pages for want of a record; when it cannot, the create fails with
 
 **Physical-address flag.** The label's bit 30 (`CREATE_PHYS_ACCESS`, in the window shared with
 `CREATE_FROM_FILE`) creates the child phys-class: procmgr registers it with memmgr with
-`REGISTER_PHYS_CLASS`, so memmgr's grants to it, and the address spaces retyped from them, keep
-`RIGHTS_MEM_PHYS` and the child can read physical addresses
+`REGISTER_PHYS_CLASS`, so memmgr's grants to it keep `RIGHTS_MEM_PHYS`, the address spaces
+retyped from them carry `RIGHTS_AS_READ`, and the child can read physical addresses
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 3).
 procmgr honours it only from a creator that is phys-class itself: an un-badged one
 (badge 0: init, or svcmgr's mint source) or one whose memmgr badge carries
@@ -415,7 +415,7 @@ child, its memmgr record included, as for `CREATE_PROCESS`.
 |---|---|---|
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (the TLS block's checks aside; see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[31..64]` set, the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
+| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[31..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
@@ -639,6 +639,7 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
 ## Summarized By
 
+[Kernel Cross-Boundary Disclosure Inventory](../../../core/kernel/docs/cross-boundary-disclosure.md),
 [Scheduler Internals](../../../core/kernel/docs/scheduler.md),
 [Capability Model](../../../docs/capability-model.md),
 [Device Management](../../../docs/device-management.md),

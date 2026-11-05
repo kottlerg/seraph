@@ -101,8 +101,9 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 /// only narrows), so the outer must hold `RIGHTS_MEM_WRITE` and
 /// `RIGHTS_MEM_EXECUTE`, plus RETYPE so a consumer can still retype the frame,
 /// and PHYS so memmgr can read the run's physical base and a phys-class
-/// consumer's grant keeps it (`grant_rights`). MAP is omitted from the check: the kernel grants read at every map
-/// (`sys_mem_map`) and the bulk usable-RAM caps carry it anyway. Enforced
+/// consumer's grant keeps it (`grant_rights`). MAP is omitted from the check:
+/// the kernel grants read at every map (`sys_mem_map`) and the bulk usable-RAM
+/// caps carry it anyway. Enforced
 /// at both pool entry points (`ingest_pool`, `handle_donate_memory_caps`) so a
 /// kernel mint-rights regression fails loudly instead of surfacing as an
 /// intermittent consumer fault.
@@ -1295,7 +1296,7 @@ fn handle_donate_memory_caps(badge: u64, caps: &[u64], ipc_buf: *mut u64, procmg
 fn pool_run_of(slot: u64) -> Option<FreeRun>
 {
     // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
-    // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE). An
+    // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE|PHYS). An
     // under-rights frame cannot yield the R/RW/RX inner a demand fault or
     // REQUEST_MEMORY_CAPS consumer needs (cap_derive only narrows); it is
     // rejected rather than poisoning the pool, where it would surface later as

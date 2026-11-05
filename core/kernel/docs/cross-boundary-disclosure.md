@@ -63,7 +63,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
 | `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
 | `SYS_SYSTEM_INFO(LiveCSpaceCount)` → the number of `CSpace` registry ids in use system-wide, every process's `CSpace`s included; a count that names no id, epoch, or kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `cap::live_cspace_count` | d |
-| `SYS_ASPACE_QUERY` → leaf physical address of a user page, to a holder of `AsRights::READ`, which an address space retyped from a `PHYS` source alone carries | `sysinfo::sys_aspace_query`, `AddressSpace::query_page`, `cap::sys_cap_create_aspace` | **e** |
+| `SYS_ASPACE_QUERY` → leaf physical address of a user page, to a holder of `AsRights::READ`, which init's kernel-created address space and an address space retyped from a `PHYS` source alone carry | `sysinfo::sys_aspace_query`, `AddressSpace::query_page`, `cap::sys_cap_create_aspace` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
@@ -176,9 +176,10 @@ the two a process can reach answer only a holder of the Memory `Phys` right
   backing a *user* page, gated on an `AddressSpace` capability with the `READ` right
   ([syscalls.md](syscalls.md) § `SYS_ASPACE_QUERY` (41)). The intermediate page-table
   addresses traversed during the walk are not returned. `SYS_CAP_CREATE_ASPACE` mints
-  `READ` only when its retype source carries `Phys`, and `READ` gates nothing else, so the
-  query answers only a process that could read the frames' bases through the selector
-  above.
+  `READ` only when its retype source carries `Phys` (init's kernel-created address space
+  carries it too), and `READ` gates nothing else, so the query answers only a process that
+  could read the frames' bases through the selector above. init hands procmgr its own
+  address space without `READ`.
 - The `InitInfo` handover publishes physical bases for the resources it hands init:
   `CapDescriptor::aux0` (Memory / Mmio physical base) and
   `InitFramebufferInfo::physical_base`. Each describes a resource init receives a
@@ -194,11 +195,13 @@ Who holds `Phys`, and why:
   `Phys` cap: the boot-module copies it gives procmgr, devmgr, and vfsd drop the right.
 - **devmgr and the IOMMU drivers.** memmgr strips `Phys` from every grant except to a
   process registered phys-class, and procmgr registers a child phys-class only when an
-  un-badged or phys-class creator asks for it (`CREATE_PHYS_ACCESS`): init does so for
-  devmgr, and devmgr for the IOMMU driver. devmgr reads the base of a driver's frames to
-  map them for an unconfined device, whose device address is the physical address by
-  necessity, and the IOMMU driver reads the bases of its own table pages and of every
-  frame it maps for a device, since the units are programmed with physical addresses.
+  un-badged or phys-class creator asks for it (`CREATE_PHYS_ACCESS`,
+  [services/procmgr/docs/ipc-interface.md](../../../services/procmgr/docs/ipc-interface.md)
+  § Label 1): init does so for devmgr, and devmgr for the IOMMU driver. devmgr reads the
+  base of a driver's frames to map them for an unconfined device, whose device address is
+  the physical address by necessity, and the IOMMU driver reads the bases of its own table
+  pages and of every frame it maps for a device, since the units are programmed with
+  physical addresses.
   Each presents a `Phys` page of its own as the credential for a driver's cap, which
   lacks the right
   ([docs/device-management.md](../../../docs/device-management.md#physical-addresses)

@@ -335,8 +335,9 @@ pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 /// without the right and no credential returns
 /// [`SyscallError::InsufficientRights`], as does a credential without it; a
 /// credential that is not a live Memory cap returns
-/// [`SyscallError::InvalidCapability`]. memmgr reads it to track contiguity,
-/// devmgr and the IOMMU driver to program devices with physical addresses.
+/// [`SyscallError::InvalidCapability`]. init reads it for its arena, memmgr
+/// to track contiguity, devmgr and the IOMMU driver to program devices with
+/// physical addresses.
 pub const CAP_INFO_MEMORY_PHYS_BASE: u64 = 8;
 
 /// `Thread` only — kernel-authoritative lifecycle snapshot.

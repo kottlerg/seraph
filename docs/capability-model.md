@@ -156,8 +156,8 @@ follow a separate flow through devmgr; see
 A capability to a process's virtual address space. Rights:
 - **Map** — may install and remove mappings in this address space
 - **Read** — may inspect current mappings (`SYS_ASPACE_QUERY`, which returns
-  their physical addresses); minted only when the address space is retyped from
-  a Memory cap carrying `Phys`
+  their physical addresses); minted on init's kernel-created address space and,
+  for an address space retyped later, only when its Memory cap carries `Phys`
 - **Control** — may register terminal-fault death observers
   (`aspace_bind_notification`); held by the space's creator and masked out of
   copies handed to components that only map into the space
@@ -619,7 +619,7 @@ SYS_CAP_CREATE_ENDPOINT(memory)               → endpoint_cap     (Send + Recei
 SYS_CAP_CREATE_NOTIFICATION(memory)           → notification_cap (Notify + Wait)
 SYS_CAP_CREATE_EVENT_Q(memory, capacity)      → queue_cap        (Post + Recv)
 SYS_CAP_CREATE_THREAD(memory, aspace, cspace, sched, priority) → thread_cap (Control + Observe)
-SYS_CAP_CREATE_ASPACE(memory, augment, pages) → aspace_cap       (Map + Read + Control)
+SYS_CAP_CREATE_ASPACE(memory, augment, pages) → aspace_cap       (Map + Control [+ Read])
 SYS_CAP_CREATE_CSPACE(memory, augment, pages) → cspace_cap       (Insert + Delete + Derive)
 SYS_CAP_CREATE_WAIT_SET(memory)               → wait_set_cap     (Modify + Wait)
 ```
@@ -627,8 +627,10 @@ SYS_CAP_CREATE_WAIT_SET(memory)               → wait_set_cap     (Modify + Wai
 The kernel rejects creation if the Memory cap lacks `Retype` rights or
 if its available-bytes ledger has insufficient room for the requested
 object. The returned capability is placed in a free slot in the caller's
-CSpace. The caller receives the rights listed above; a freshly created CSpace
-capability carries no Revoke right.
+CSpace. The caller receives the rights listed above: an address space carries
+the bracketed Read only when the Memory cap it is retyped from carries `Phys`
+(§ Address Space),
+and a freshly created CSpace capability carries no Revoke right.
 
 The kernel records capability lineage in the derivation tree and object lifetime in a
 per-object reference count over capabilities and kernel-internal references (see

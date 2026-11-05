@@ -192,11 +192,14 @@ left AC set in ring 0); `src/arch/x86_64/page_fault_present_bit.rs` checks that 
 `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and never for a
 load from any 2 MiB slot of the kernel image window, every one of which is delivered;
 `src/arch/x86_64/umip.rs` checks that, on a CPU reporting UMIP, a ring-3 `SIDT` or `SGDT` raises
-`#GP` instead of returning a kernel address; `src/arch/x86_64/ioport_revoke.rs` checks that
-revoking an `IoPort` cap withdraws the port access bound through its descendant from a reader on
-another CPU, whose next port read raises `#GP`. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks
-that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
-right for.
+`#GP` instead of returning a kernel address; `src/arch/x86_64/ioport_revoke.rs` checks that revoking
+an `IoPort` cap withdraws the port access bound through its descendant from a reader on another CPU,
+whose next port read raises `#GP`. `src/arch/x86_64/trap_redelivery.rs` checks that a fault-handler
+rebind redelivers a single-step `#DB`, a trap whose saved instruction pointer is past the stepped
+instruction, from the kernel: the second endpoint's message names the same instruction pointer, and
+the thread, its TF cleared, resumes into a recovery routine. On RISC-V,
+`src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions
+and sanctioned ones the cap lacks the right for.
 
 ### Tier S — `src/stress/`
 
@@ -265,8 +268,8 @@ phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of
 `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued` and
-`thread::start_suspended_resume`, the exit and report waits of
-`integration::fault_handler_rebind`, the convergence polls of
+`thread::start_suspended_resume`, the exit and report waits of `integration::fault_handler_rebind`,
+the report wait of `integration::trap_redelivery`, the convergence polls of
 `thread::load_balancer_redistributes_skewed`, the exit wait of
 `thread::bind_notification_nodes_come_from_the_queue`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,

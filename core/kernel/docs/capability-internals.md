@@ -637,7 +637,10 @@ pub struct KernelObjectHeader
 {
     ref_count: AtomicU32,
     obj_type: ObjectType,
-    _pad: [u8; 3],
+    /// The high 24 bits of the dealloc-cascade link while the object is
+    /// queued on one (its low 32 bits sit in `ref_count`, then 0); zero
+    /// at every other time.
+    cascade_link_hi: [u8; 3],
     /// The Memory object this object's bytes were retyped from.
     ancestor: AtomicPtr<KernelObjectHeader>,
 }
@@ -652,6 +655,15 @@ kernel objects are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim). A holder reads
 whether the count holds anything beyond its own slot with `SYS_CAP_INFO`'s
 `CAP_INFO_SOLE_REFERENCE` ([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO`).
+
+A Memory object also counts, apart from its reference count, the capability slots that name it
+(`MemoryObject::slot_count`): `CSpace::fill_slot`, the one fill every insert goes through, raises
+it, and `CSpace::free_slot` and a dying `CSpace`'s object drop (§ Teardown) lower it. A slot that
+names an existing object is filled, and an occupied slot freed, only under the derivation lock
+(§ Global Derivation Lock), so the count is exact for a holder of that lock; the dying `CSpace`'s
+drop runs outside it but only lowers the count. `SYS_MEMORY_SPLIT` and `SYS_MEMORY_MERGE` read it
+to refuse an object another slot names
+([syscalls.md](syscalls.md#sys_memory_split-33) § `SYS_MEMORY_SPLIT`).
 
 The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound of
 their own, new capability slots, retype leases, and death-observer bindings, are refused at

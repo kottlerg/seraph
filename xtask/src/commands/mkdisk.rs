@@ -39,7 +39,17 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
     {
         sysroot::install_rootfs(ctx)?;
     }
-    stage_nokaslr_knob(ctx, args.no_kaslr)?;
+    if args.no_kaslr
+    {
+        stage_knob(ctx, Knob::NoKaslr)?;
+    }
+    else
+    {
+        remove_knob(ctx, Knob::NoKaslr)?;
+    }
+    // The mapredo knob is `test-map-redo`'s alone, which removes it after its
+    // boot; mkdisk's repack never keeps one a stopped run left behind.
+    remove_knob(ctx, Knob::MapRedo)?;
     let layout = disk::DiskLayout {
         block_size: args.block_size,
         data: if args.split_data
@@ -56,18 +66,48 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
     Ok(())
 }
 
-/// Stage or remove the `\EFI\seraph\nokaslr` override knob in the ESP tree so
-/// the next `disk.img` reflects the requested KASLR state. Idempotent: an
-/// absent file re-enables randomization, a present (empty) file disables it.
-pub fn stage_nokaslr_knob(ctx: &BuildContext, disable: bool) -> Result<()>
+/// A presence-only bootloader knob: an empty file in the ESP tree's
+/// `\EFI\seraph\` directory, read by the next boot of the `disk.img` packed
+/// with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Knob
 {
-    let path = ctx.sysroot_efi_seraph().join("nokaslr");
-    if disable
+    /// `\EFI\seraph\nokaslr`: the bootloader boots the kernel at its
+    /// deterministic (un-randomized) layout.
+    NoKaslr,
+    /// `\EFI\seraph\mapredo`: the bootloader redoes the first attempt of its
+    /// steps 6 and 7 whatever its memory map's size.
+    MapRedo,
+}
+
+impl Knob
+{
+    /// The knob's file name in `\EFI\seraph\`.
+    fn file_name(self) -> &'static str
     {
-        std::fs::create_dir_all(ctx.sysroot_efi_seraph())?;
-        std::fs::write(&path, b"")?;
+        match self
+        {
+            Knob::NoKaslr => "nokaslr",
+            Knob::MapRedo => "mapredo",
+        }
     }
-    else if path.exists()
+}
+
+/// Stage `knob` in the ESP tree so the next `disk.img` carries it.
+/// Idempotent.
+pub fn stage_knob(ctx: &BuildContext, knob: Knob) -> Result<()>
+{
+    std::fs::create_dir_all(ctx.sysroot_efi_seraph())?;
+    std::fs::write(ctx.sysroot_efi_seraph().join(knob.file_name()), b"")?;
+    Ok(())
+}
+
+/// Remove `knob` from the ESP tree so the next `disk.img` lacks it.
+/// Idempotent: an absent knob is left absent.
+pub fn remove_knob(ctx: &BuildContext, knob: Knob) -> Result<()>
+{
+    let path = ctx.sysroot_efi_seraph().join(knob.file_name());
+    if path.exists()
     {
         std::fs::remove_file(&path)?;
     }

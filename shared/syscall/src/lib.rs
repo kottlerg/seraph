@@ -55,20 +55,20 @@ use syscall_abi::{
 };
 
 pub use syscall_abi::{
-    CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
-    CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
-    CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
-    CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
-    EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, IRQ_MODE_ACTIVE_LOW,
-    IRQ_MODE_LEVEL, IRQ_MODE_MASK, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ, MAP_WRITABLE,
-    MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL,
-    RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_EP_GRANT,
-    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV,
-    RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RW,
-    RIGHTS_MEM_MAP_RX, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE,
-    RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN,
-    RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL,
-    RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
+    CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
+    CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE,
+    CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES,
+    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS,
+    CAP_TAG_MEMORY, EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED,
+    IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, IRQ_MODE_MASK, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ,
+    MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ,
+    RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
+    RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
+    RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
+    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP,
+    RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC,
+    RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD,
+    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -837,11 +837,14 @@ pub unsafe fn mem_protect(
 /// child cap covering `[base + split_offset, base + orig_size)` is
 /// inserted in the caller's `CSpace` as a derivation sibling of the
 /// parent. Returns the tail's capability handle (slot index plus generation).
+/// The parent's object must be named by `memory_cap`'s slot alone: no
+/// derivation or copy of it, in any `CSpace`, may be live
+/// (core/kernel/docs/syscalls.md § `SYS_MEMORY_SPLIT`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (`split_offset`
-/// not page-aligned, out of range, inside the cap's bump region, or the
-/// parent has derivation children), `InvalidCapability` (also a parent a
+/// not page-aligned, out of range, inside the cap's bump region, or another
+/// slot names the parent's object), `InvalidCapability` (also a parent a
 /// concurrent delete freed before the tail was linked), `InvalidState` (a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (the caller's
@@ -865,8 +868,9 @@ pub fn memory_split(memory_cap: u64, split_offset: u64) -> Result<u64, i64>
 /// Inverse of [`memory_split`]. `parent_cap` covers the
 /// physically-lower half and `tail_cap` the upper;
 /// `parent.base + parent.size == tail.base` is required. Both caps must
-/// share the same rights, `owns_memory` state, derivation parent, and
-/// have no derivation children. The tail must be virgin (no live
+/// share the same rights, `owns_memory` state, and derivation parent, and
+/// each object must be named by its own slot alone (no live derivation or
+/// copy of either, in any `CSpace`). The tail must be virgin (no live
 /// retypes against it).
 ///
 /// `parent_cap`'s slot stays valid; its `size` and `available_bytes`
@@ -880,8 +884,9 @@ pub fn memory_split(memory_cap: u64, split_offset: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (same slot or
 /// object, rights or ownership-flag mismatch, not contiguous, tail not
-/// virgin, not siblings, or either has children), `InvalidCapability` (also a
-/// cap a concurrent delete freed before the merge took the derivation lock),
+/// virgin, not siblings, or another slot names either object),
+/// `InvalidCapability` (also a cap a concurrent delete freed before the
+/// merge took the derivation lock),
 /// `InvalidState` (a `cap_revoke`, `cap_move`, or IPC capability transfer is
 /// in flight on either cap), or `InsufficientRights` (either cap lacks Map).
 #[inline]

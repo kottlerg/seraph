@@ -557,6 +557,28 @@ impl AddressSpace
         }
     }
 
+    /// The retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), or
+    /// `None` while no thread of this address space has taken a terminal
+    /// fault. Read under `death_lock`, so it never sees the flag without its
+    /// reason. Backs `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT`.
+    ///
+    /// # Safety
+    /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
+    /// `death_lock`.
+    #[cfg(not(test))]
+    pub unsafe fn retained_terminal_fault(this: *const Self) -> Option<u64>
+    {
+        // SAFETY: this validated by caller; fields read under death_lock.
+        unsafe {
+            let saved = (*this).death_lock.lock_raw();
+            let retained = (*this)
+                .terminal_faulted
+                .then_some((*this).terminal_fault_reason);
+            (*this).death_lock.unlock_raw(saved);
+            retained
+        }
+    }
+
     /// Empty the observer chain for the address space's teardown, returning
     /// its first node; the caller now owns every node reachable from it and
     /// the `EventQueueObject` reference each holds, and MUST return each node

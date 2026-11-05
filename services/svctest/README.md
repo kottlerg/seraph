@@ -47,7 +47,7 @@ services/svctest/
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
-        ├── fs_opens.rs        # Per-open fatfs state: close isolation, eviction routing
+        ├── fs_opens.rs        # Per-open fatfs state: dead-open reclaim, close, eviction routing
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
@@ -164,8 +164,8 @@ no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAU
 
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
-its child body and exits (`park-child` and `reclaim-child` park until their spawner tears them
-down), and an unmatched token falls through to the normal run.
+its child body and exits (`park-child`, `reclaim-child`, and `open-reclaim-child` park until their
+spawner tears them down), and an unmatched token falls through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
 |-----------------------------|----------------|---------------------------------------------|
@@ -177,6 +177,8 @@ down), and an unmatched token falls through to the normal run.
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
+| `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
+| `open-undeliverable-child`  | `fs_opens`     | `fs_reclaims_dead_opens` (failed reply)     |
 | `reclaim-child`             | `memmgr`       | `frame_reclaim_live_object` (held endpoint) |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |

@@ -41,9 +41,9 @@ see there for the authoritative statement.
 
 Three hidden tooling directories sit beside these. [`.cargo/`](.cargo/) holds the Cargo
 configuration: the `cargo xtask` alias, the custom-target search path, and the workspace
-rustflags. [`.github/`](.github/) holds the CI workflows, their scripts, and the Issue and PR
-templates (outside the documentation hierarchy). [`.claude/`](.claude/) holds the assistant
-operating instructions, agents, and workflows (outside the documentation hierarchy).
+rustflags. [`.github/`](.github/) holds the CI workflows, their composite actions, and the
+Issue and PR templates (outside the documentation hierarchy). [`.claude/`](.claude/) holds the
+assistant operating instructions, agents, and workflows (outside the documentation hierarchy).
 
 ## Usage
 
@@ -67,7 +67,7 @@ cargo xtask clean [--all]                    # remove sysroot/ and disk images (
 
 Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses
 (`ktest`, `svctest`, `usertest`), host-driven boot tests (`test-kaslr`,
-`test-vmgenid`, `test-terminal`), and `test-logd-reclaim`, a host-side check
+`test-map-redo`, `test-vmgenid`, `test-terminal`), and `test-logd-reclaim`, a host-side check
 of svctest's serial log; the default boot is interactive and runs no harness.
 See [docs/testing.md](docs/testing.md) for the full model.
 

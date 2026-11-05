@@ -124,7 +124,7 @@ transfer table.
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init/memmgr/procmgr/svcmgr roles |
 | [docs/bootstrap.md](../../docs/bootstrap.md) | System-scope end-to-end boot lifecycle |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, ProcessInfo/InitInfo handover, authority transfer |
-| [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution, derive-twice pattern |
+| [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution |
 | [docs/namespace-model.md](../../docs/namespace-model.md) | Namespace-cap distribution invariants |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | `BootInfo`, `bootstrap.bundle`, initial CSpace |
 | [abi/init-protocol/](../../abi/init-protocol/) | Kernel-to-init handover (`InitInfo`, module-name table) |

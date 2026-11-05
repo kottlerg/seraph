@@ -30,8 +30,8 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # One module per subcommand (build, run, run_parallel,
 │   │                           #   ktest_timing, mkdisk, compose_bundle, clean, test,
-│   │                           #   test_kaslr, test_logd_reclaim, test_terminal,
-│   │                           #   test_vmgenid, lint_docs)
+│   │                           #   test_kaslr, test_logd_reclaim, test_map_redo,
+│   │                           #   test_terminal, test_vmgenid, lint_docs)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -193,7 +193,8 @@ prune the hand-added recipe). The mirror rules are owned by
 fails if the bundle is missing. The bundle is composed by
 `cargo xtask build` (default-init) or by
 [`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
-harness).
+harness). `mkdisk` always removes the `\EFI\seraph\mapredo` test knob, which
+only [`test-map-redo`](#cargo-xtask-test-map-redo) stages, for its own boot.
 
 `disk.img` carries three GPT partitions: the EFI System Partition
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
@@ -211,8 +212,8 @@ uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID D
 The images' logical block size, the unit of their GPT LBAs and the sector
 size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
-author the partitions above; `build`, `compose-bundle`, and `test-kaslr`
-author them at 512 bytes on a single image, so a 4Kn or split boot runs
+author the partitions above; `build`, `compose-bundle`, `test-kaslr`, and
+`test-map-redo` author them at 512 bytes on a single image, so a 4Kn or split boot runs
 `mkdisk` after them.
 
 ```
@@ -612,6 +613,35 @@ before the check, as it fails `run-parallel`. A `QEMU-CRASH` boot, a host-emulat
 the outcome from the log's `[run-parallel]` trailer, its last line, and reports itself skipped,
 which passes the command, for a saved log given with `--log` as well. Stage svctest first, as
 [docs/testing.md](../docs/testing.md) § Gating describes.
+
+See [docs/testing.md](../docs/testing.md) for the harness model.
+
+---
+
+### `cargo xtask test-map-redo`
+
+Check that a boot whose bootloader redoes its steps 6 and 7 completes, on either arch. Stages the
+`\EFI\seraph\mapredo` test knob, which makes the first attempt of the bootloader's steps 6 and 7
+redo whatever its memory map's size
+([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array),
+repacks `disk.img`, boots the current sysroot once, and always removes the knob and repacks again
+afterwards. It passes when the boot reaches its pass marker and its log holds the bootloader's
+line `boot: memory map: mapredo knob present; redoing steps 6 and 7` exactly once.
+
+A pure runner; requires a harness staged (CI runs it on the ktest bundle):
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask compose-bundle --harness ktest [--arch x86_64|riscv64]
+cargo xtask test-map-redo [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
+    [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5]
+```
+
+The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass and fail markers,
+`--timeout` defaulting to 900 s) with `--save-logs` into `target/xtask/test-map-redo/`, and the
+check reads the log saved there (a log an earlier boot left there is removed first). A boot that
+ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run-parallel`;
+a `QEMU-CRASH` boot is reported skipped, as `test-logd-reclaim` reports it.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
 

@@ -411,13 +411,14 @@ fn unmapped(cap: u64, pages: u64) -> bool
 }
 
 /// Whether this turn of the receive loop has run its deferred recheck. A
-/// turn starts when a message is received: it is that message's handling,
-/// then the `CSpace` top-up before the next receive. The handler's own
-/// recheck therefore comes first in its turn. Single-threaded memmgr: a plain
-/// static suffices.
+/// turn starts when a receive returns, received or failed: it is the
+/// message's handling, if any, then the `CSpace` top-up before the next
+/// receive. A handler's own recheck therefore comes first in its turn, and
+/// the top-up before a failed receive's retry can recheck. Single-threaded
+/// memmgr: a plain static suffices.
 static mut RECHECKED_THIS_TURN: bool = false;
 
-/// Start a turn of the receive loop, on a received message: its first
+/// Start a turn of the receive loop, when a receive returns: its first
 /// [`recheck_deferred`] runs.
 fn begin_turn()
 {
@@ -1890,6 +1891,10 @@ fn main(startup: &StartupInfo) -> !
             Err(e) =>
             {
                 guard.on_failure(e);
+                // A failed receive ends its turn, so the top-up before the
+                // retry can recheck the deferred list: that top-up is what
+                // refills a spent receive reserve.
+                begin_turn();
                 continue;
             }
         };

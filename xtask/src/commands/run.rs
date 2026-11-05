@@ -95,6 +95,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         incoming: None,
         riscv_mmu: args.riscv_mmu,
         x86_paging: args.x86_paging,
+        iommu: args.iommu,
     };
     let qemu_args = build_qemu_argv(&spec)?;
 

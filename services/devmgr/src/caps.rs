@@ -144,6 +144,11 @@ pub struct DevmgrCaps
     /// framebuffer is present. Populated from init's
     /// [`kind::FRAMEBUFFER_INFO`] bootstrap round.
     pub fb_info: Option<FbInfoRaw>,
+
+    /// devmgr's DMA endpoint and the thread serving it, from which each
+    /// DMA-capable device's driver is given its DMA capability; `None` until
+    /// `main` starts it, before the first driver spawn.
+    pub dma: Option<crate::dma::DmaService>,
 }
 
 impl DevmgrCaps
@@ -169,6 +174,7 @@ impl DevmgrCaps
             svcmgr_publish_cap: 0,
             arch: crate::arch::current::ArchCaps::empty(),
             fb_info: None,
+            dma: None,
         }
     }
 

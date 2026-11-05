@@ -294,11 +294,12 @@ Properties:
 
 The allocator manages a single zone covering all usable RAM. Physical-address-range
 constraints (e.g. DMA-accessible memory below a certain physical address) are not a
-kernel concern: DMA placement and isolation belong to devmgr and the memory authority
-in userspace (see [architecture.md](architecture.md)). Physical-range (DMA-reachable)
+kernel concern: DMA placement and isolation belong to devmgr and the memory authority in
+userspace (see [architecture.md](architecture.md)). Physical-range (DMA-reachable)
 placement by the userspace memory authority is design intent; not yet implemented:
-memmgr's only allocation flag is `REQUIRE_CONTIGUOUS`. IOMMU-based DMA isolation by
-devmgr is design intent; not yet implemented, so DMA currently runs unconfined (see
+memmgr's only allocation flag is `REQUIRE_CONTIGUOUS`. IOMMU-based DMA isolation,
+directed by devmgr and programmed by an IOMMU driver, is design intent; not yet
+implemented, so DMA currently runs unconfined (see
 [device-management.md](device-management.md) § DMA Safety Model).
 
 Physical frame 0 (the zero page) is excluded from the allocator. The page-table and

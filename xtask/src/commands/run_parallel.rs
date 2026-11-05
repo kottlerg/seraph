@@ -214,6 +214,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let mem_mib = args.mem;
             let riscv_mmu = args.riscv_mmu;
             let x86_paging = args.x86_paging;
+            let iommu = args.iommu;
             let debug_listen = args.debug_listen;
             let hold_on_hang = args.hold_on_hang;
             let timeout = Duration::from_secs(args.timeout);
@@ -290,6 +291,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     incoming: None,
                     riscv_mmu,
                     x86_paging,
+                    iommu,
                 };
                 let qemu_args = build_qemu_argv(&spec)?;
 

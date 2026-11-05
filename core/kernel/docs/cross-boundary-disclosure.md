@@ -153,7 +153,14 @@ Three surfaces emit real addresses. All are **physical**, not kernel virtual:
   addresses traversed during the walk are not returned.
 - `CAP_INFO_MEMORY_PHYS_BASE` (`cap::sys_cap_info`) returns `MemoryObject::base`, the
   physical base of a Memory object the caller holds a capability to. memmgr depends
-  on it to track region contiguity.
+  on it to track region contiguity, and devmgr to map a driver's Memory cap for the
+  driver's device. No driver reads it: a DMA-capable driver programs its device only with
+  the device addresses devmgr's `DMA_MAP` returns
+  ([docs/device-management.md](../../../docs/device-management.md#dma-authorisation)
+  § DMA Authorisation), which are the physical addresses themselves only while no IOMMU
+  confines the device. memmgr's `REQUEST_MEMORY_CAPS` reply likewise still carries each
+  granted cap's physical base, unread by any driver. Withdrawing both from drivers is
+  [#767](https://github.com/kottlerg/seraph/issues/767).
 - The `InitInfo` handover publishes physical bases for the resources it hands init:
   `CapDescriptor::aux0` (Memory / Mmio physical base) and
   `InitFramebufferInfo::physical_base`. Each describes a resource init receives a

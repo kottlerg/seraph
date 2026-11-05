@@ -21,9 +21,11 @@
 //! NamespaceRights)`); per-node ops look the node up in `NodeTable`. Per-open
 //! badges are minted by `FS_OPEN` (badge = `(open id, NamespaceRights)` with
 //! `namespace_protocol::OPEN_INSTANCE` set): each names one `OpenFile` in the
-//! `OpenTable`, which holds that open's read-side memory caps and release
-//! SEND, and resolves to its node for the stateless file ops. Write-side
-//! metadata patching uses the node's cached `DirEntryLocation`.
+//! `OpenTable`, which holds that open's read-side memory caps, release SEND,
+//! and liveness Notification, and resolves to its node for the stateless file
+//! ops. An open whose client holds no copy of its liveness cap any more is
+//! swept out of the table (`sweep_dead_opens`). Write-side metadata patching
+//! uses the node's cached `DirEntryLocation`.
 //!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding
@@ -55,6 +57,7 @@ use dir::{
 };
 use eviction::{EvictReq, EvictionState};
 use fat::{chain_next, next_cluster, read_file_data};
+use fat_parse::open_slab::SweepSchedule;
 use file::{OpenFile, OpenTable, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{
@@ -262,8 +265,8 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   `FS_CLOSE`, and the stateless file ops on the open's node.
 ///
 /// The open table is shared with the eviction worker via a `Mutex`. Main
-/// takes the lock to resolve an open cap, `FS_OPEN` takes it only around its
-/// table update, and `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
+/// takes the lock to resolve an open cap, `FS_OPEN` takes it only around a
+/// sweep and its table update, and `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
 /// hold it for the whole dispatch. Lock contention with the worker is only material during
 /// cache-pressure releases.
 // too_many_lines: the loop is one dispatch over every label the driver serves,
@@ -281,6 +284,7 @@ fn service_loop(
 ) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut sweeps = SweepSchedule::new();
     loop
     {
         // The last request may have met a full cache on a path that does
@@ -434,14 +438,16 @@ fn service_loop(
         {
             fs_labels::FS_OPEN =>
             {
-                // Takes the open table's lock itself, only around the
-                // table update: its CSpace top-up may call memmgr.
+                // Takes the open table's lock itself, only around a sweep
+                // and the table update: its CSpace top-up and its liveness
+                // object's retype may call memmgr.
                 handle_open_node_cap(
                     node_id,
                     parent_rights,
                     &msg,
                     nodes,
                     files,
+                    &mut sweeps,
                     caps,
                     cache,
                     ipc_buf,
@@ -886,15 +892,22 @@ fn pick_eviction_candidate(files: &mut OpenTable) -> Option<EvictReq>
 
 /// `FS_OPEN` against a file node cap: insert a new [`OpenFile`] for the
 /// node, recording the release SEND `caps[0]` carries (any further cap is
-/// deleted), and reply with an open cap whose badge names it
+/// deleted) and the parent of a new liveness cap, and reply with an open cap
+/// whose badge names it and the liveness cap
 /// (services/fs/docs/fs-driver-protocol.md § Label 18). The open cap
 /// carries the node cap's rights and `SEND_GRANT`, as a node cap does, so
 /// `FS_WRITE_MEMORY` can carry its source page on it. Before recording the
 /// SEND it tops the `CSpace` up ([`PageCache::fund_run_time_headroom`]),
 /// with the open table unlocked, since the top-up may call memmgr; the lock
-/// is held only to insert the open, and to remove it if the mint fails.
+/// is held only to sweep, to insert the open, and to remove it if the mint
+/// or the reply fails. The open table is swept for opens whose client is gone
+/// ([`sweep_dead_opens`]) when `sweeps` says a sweep is due, and when the
+/// `CSpace` cannot grow or the table is full, before that step is retried
+/// once. A reply the client cannot take (it died mid-call, or its `CSpace` is
+/// full) moves no cap, so the open is released at once.
 // too_many_arguments: the request, its node and rights, and the driver state
-// an open touches (node table, open table, endpoint caps, cache, IPC buffer).
+// an open touches (node table, open table and its sweep schedule, endpoint
+// caps, cache, IPC buffer).
 #[allow(clippy::too_many_arguments)]
 fn handle_open_node_cap(
     node_id: NodeId,
@@ -902,6 +915,7 @@ fn handle_open_node_cap(
     msg: &IpcMessage,
     nodes: &NodeTable,
     files: &Mutex<OpenTable>,
+    sweeps: &mut SweepSchedule,
     caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
@@ -926,21 +940,24 @@ fn handle_open_node_cap(
         }
         reply_err(code, ipc_buf);
     };
-    // The SEND holds a slot for the open's lifetime, so the CSpace grows
-    // with the opens rather than leaving a later read no slot for its
-    // page's caps.
-    if !cache.fund_run_time_headroom(startup_info().self_cspace)
+    if !fund_open_slots(files, sweeps, cache)
     {
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
         return;
     }
-    let inserted = files
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(OpenFile::new(node_id, release_send));
+    let Some(liveness) = Liveness::create()
+    else
+    {
+        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        return;
+    };
+    let inserted = insert_open(files, sweeps, cache, || {
+        OpenFile::new(node_id, release_send, liveness.parent)
+    });
     let Some(open_id) = inserted
     else
     {
+        liveness.discard();
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
         return;
     };
@@ -954,14 +971,139 @@ fn handle_open_node_cap(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(open_id);
+        liveness.discard();
         refuse(ipc::fs_errors::IO_ERROR);
         return;
     };
+    reply_open(open_id, open_cap, liveness.child, files, cache, ipc_buf);
+}
+
+/// Count an `FS_OPEN` on `sweeps`, sweeping when one is due, and top the
+/// `CSpace` up for the open ([`PageCache::fund_run_time_headroom`]), sweeping
+/// and retrying once when it cannot grow. The release SEND and the liveness
+/// parent hold slots for the open's lifetime, so the `CSpace` grows with the
+/// opens rather than leaving a later read no slot for its page's caps.
+/// `false` when the `CSpace` still cannot grow.
+fn fund_open_slots(files: &Mutex<OpenTable>, sweeps: &mut SweepSchedule, cache: &PageCache)
+-> bool
+{
+    let sweep = |sweeps: &mut SweepSchedule| {
+        let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+        sweep_dead_opens(&mut files_g, sweeps, cache);
+    };
+    if sweeps.note_open()
+    {
+        sweep(sweeps);
+    }
+    let cspace = startup_info().self_cspace;
+    if cache.fund_run_time_headroom(cspace)
+    {
+        return true;
+    }
+    sweep(sweeps);
+    cache.fund_run_time_headroom(cspace)
+}
+
+/// Insert the open `open` builds into the table, sweeping and retrying once
+/// when the table is full. Returns its identifier, or `None` when the table
+/// is still full or the heap cannot grow it.
+fn insert_open(
+    files: &Mutex<OpenTable>,
+    sweeps: &mut SweepSchedule,
+    cache: &PageCache,
+    open: impl Fn() -> OpenFile,
+) -> Option<u64>
+{
+    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+    files_g.insert(open()).or_else(|| {
+        sweep_dead_opens(&mut files_g, sweeps, cache);
+        files_g.insert(open())
+    })
+}
+
+/// Reply to an `FS_OPEN` with the open cap and the liveness child. A reply
+/// the client cannot take moves none of its caps, so both are still fatfs's:
+/// the open is then removed and released, which revokes the liveness child
+/// with its parent, and the open cap is deleted.
+fn reply_open(
+    open_id: u64,
+    open_cap: u64,
+    liveness_child: u64,
+    files: &Mutex<OpenTable>,
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
+{
     let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .cap(open_cap)
+        .cap(liveness_child)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_ok()
+    {
+        return;
+    }
+    let _ = syscall::cap_delete(open_cap);
+    let removed = files
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(open_id);
+    if let Some(file) = removed
+    {
+        release_open_file(&file, cache);
+    }
+}
+
+/// The two caps of a new open's liveness Notification: the parent fatfs keeps
+/// on the open, and the zero-rights child the `FS_OPEN` reply hands the
+/// client (services/fs/docs/fs-driver-protocol.md § Label 18).
+struct Liveness
+{
+    parent: u64,
+    child: u64,
+}
+
+impl Liveness
+{
+    /// Retype a Notification from fatfs's own object slab and derive the
+    /// client's copy. `None` when memmgr cannot fund the retype or the
+    /// `CSpace` has no slot for either cap.
+    fn create() -> Option<Self>
+    {
+        let parent = std::os::seraph::object_slab_retype(
+            std::os::seraph::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )?;
+        // Zero rights: the copy can neither signal nor wait; holding it is
+        // its only use.
+        if let Ok(child) = syscall::cap_derive(parent, 0)
+        {
+            Some(Self { parent, child })
+        }
+        else
+        {
+            let _ = syscall::cap_delete(parent);
+            None
+        }
+    }
+
+    /// Delete both caps of a liveness object no open kept, which frees the
+    /// Notification.
+    fn discard(self)
+    {
+        let _ = syscall::cap_delete(self.child);
+        let _ = syscall::cap_delete(self.parent);
+    }
+}
+
+/// Release every open whose client holds no copy of its liveness cap any more
+/// ([`OpenFile::client_gone`]), as `FS_CLOSE` would, and restart `sweeps`
+/// from the opens left. Called with the open-table lock held, which the
+/// eviction worker shares.
+fn sweep_dead_opens(files: &mut OpenTable, sweeps: &mut SweepSchedule, cache: &PageCache)
+{
+    files.remove_where(OpenFile::client_gone, |f| release_open_file(&f, cache));
+    sweeps.swept(files.len());
 }
 
 /// `FS_READ_MEMORY` against an open cap: the page is tracked on that open
@@ -1091,10 +1233,18 @@ fn handle_close_open_cap(open_id: u64, files: &mut OpenTable, cache: &PageCache,
 }
 
 /// Release an open taken out of the table: revoke and drop each outstanding
-/// page, and delete the recorded release SEND (leaving it in the `CSpace`
-/// would accumulate a stale SEND per open across the fs's lifetime).
+/// page, delete the recorded release SEND (leaving it in the `CSpace`
+/// would accumulate a stale SEND per open across the fs's lifetime), and
+/// revoke the copies of the liveness cap before deleting its parent, so the
+/// client's copy dies with the open and the Notification's bytes return to
+/// fatfs's object slab. A copy derived from another holder's copy is out of
+/// the revoke's reach once a `CSpace` holding a copy on its derivation path
+/// is torn down, and holds the bytes until its holder deletes it
+/// (services/fs/docs/fs-driver-protocol.md § Label 18).
 fn release_open_file(file: &OpenFile, cache: &PageCache)
 {
+    let _ = syscall::cap_revoke_all(file.liveness_cap);
+    let _ = syscall::cap_delete(file.liveness_cap);
     for entry in file.outstanding.iter().flatten()
     {
         let _ = syscall::cap_revoke_all(entry.ancestor_cap);

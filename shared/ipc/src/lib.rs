@@ -1411,7 +1411,7 @@ pub mod ns_labels
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const FS_LABELS_VERSION: u32 = 4;
+pub const FS_LABELS_VERSION: u32 = 5;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
@@ -1421,11 +1421,11 @@ pub mod fs_labels
     pub const FS_READ: u64 = 2;
     /// Close an open cap ([`FS_OPEN`]): the driver revokes that open's
     /// outstanding [`FS_READ_MEMORY`] pages, deletes its recorded release
-    /// SEND, and retires the open, so the open cap answers
-    /// `fs_errors::INVALID_BADGE` from then on. Other opens of the file are
-    /// untouched. A node cap is answered `fs_errors::INVALID_BADGE`. The
-    /// caller still cap-deletes the open cap to drop the kernel-side
-    /// reference. Specified in `services/fs/docs/fs-driver-protocol.md`
+    /// SEND, revokes the copies of its liveness cap, and retires the open,
+    /// so the open cap answers `fs_errors::INVALID_BADGE` from then on.
+    /// Other opens of the file are untouched. A node cap is answered
+    /// `fs_errors::INVALID_BADGE`. The caller still cap-deletes the open cap
+    /// to drop the kernel-side reference. Specified in `services/fs/docs/fs-driver-protocol.md`
     /// § Label 3: `FS_CLOSE`.
     pub const FS_CLOSE: u64 = 3;
     /// Inline write to a file node cap.
@@ -1577,12 +1577,21 @@ pub mod fs_labels
     /// [`FS_RELEASE_MEMORY`] (omitted to opt out). Reply (label
     /// `fs_errors::SUCCESS`): `caps[0]` = the open cap, carrying the node
     /// cap's rights; its badge names the open
-    /// (`namespace_protocol::OPEN_INSTANCE`). [`FS_READ_MEMORY`],
-    /// [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the open cap; the
-    /// stateless file labels accept either cap. Errors: `INVALID_BADGE` (no
-    /// such node, a directory, or an open cap), `PERMISSION_DENIED`,
-    /// `TOO_MANY_OPEN` (the driver's open table is full, or its heap or
-    /// `CSpace` cannot grow), `IO_ERROR` (the driver could not mint the open
+    /// (`namespace_protocol::OPEN_INSTANCE`). `caps[1]` = the open's liveness
+    /// cap, a zero-rights Notification cap: the open lives while a copy of
+    /// it lives outside the driver, and once every copy is gone (deleted, or
+    /// with its holder's `CSpace`) the driver may release the open as
+    /// [`FS_CLOSE`] would; a release revokes the copies still in the
+    /// driver's derivation subtree, which a copy derived from another
+    /// holder's copy leaves once a `CSpace` holding a copy on its derivation
+    /// path is torn down. The holder keeps it for the open's life and
+    /// deletes it after [`FS_CLOSE`].
+    /// [`FS_READ_MEMORY`], [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the
+    /// open cap; the stateless file labels accept either cap. Errors:
+    /// `INVALID_BADGE` (no such node, a directory, or an open cap),
+    /// `PERMISSION_DENIED`, `TOO_MANY_OPEN` (the driver's open table is
+    /// full, or its heap or `CSpace` cannot grow, or it cannot create the
+    /// liveness object), `IO_ERROR` (the driver could not mint the open
     /// cap). Every refusal deletes the carried SEND. Specified in
     /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
     pub const FS_OPEN: u64 = 18;

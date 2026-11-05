@@ -1,0 +1,124 @@
+name: QEMU packages
+description: >-
+  QEMU and firmware packages for the CI jobs that boot under QEMU: the
+  install list, the cache key, the bounded download, and the offline
+  install with its network fallback. The mechanism is specified in
+  docs/build-system.md § Continuous Integration.
+
+inputs:
+  mode:
+    description: >-
+      `key` outputs the cache key; `download` fetches the packages into
+      `dir`; `install` installs them from `dir`, downloading them into
+      `dir` first when the offline install fails.
+    required: true
+  dir:
+    description: Directory of the downloaded `.deb` set (`download` and `install`).
+    required: false
+    default: ''
+
+outputs:
+  key:
+    description: Cache key of the downloaded packages (`key` mode).
+    value: ${{ steps.key.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs
+      if: >-
+        !contains(fromJSON('["key", "download", "install"]'), inputs.mode)
+        || (inputs.mode != 'key' && inputs.dir == '')
+      shell: sh
+      env:
+        MODE: ${{ inputs.mode }}
+        DIR: ${{ inputs.dir }}
+      run: |
+        echo "::error::usage: mode key | download (with dir) | install (with dir); got mode '$MODE', dir '$DIR'"
+        exit 2
+
+    - name: Compute the cache key
+      id: key
+      if: inputs.mode == 'key'
+      shell: sh
+      env:
+        # This file holds the install list and the apt flags; its hash
+        # covers both.
+        ACTION_HASH: ${{ hashFiles('.github/actions/qemu-packages/action.yml') }}
+      run: |
+        : "${ImageOS:?}" "${ImageVersion:?}" "${ACTION_HASH:?}"
+        echo "key=qemu-debs-$ImageOS-$ImageVersion-$(echo "$ACTION_HASH" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+    - name: Name the packages and the apt flags
+      id: apt
+      if: inputs.mode != 'key'
+      shell: sh
+      run: |
+        {
+          echo 'packages=qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64'
+          echo 'flags=-y --no-install-recommends'
+          echo 'offline=-o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=-'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Install offline
+      id: offline
+      if: inputs.mode == 'install'
+      shell: sh
+      env:
+        DIR: ${{ inputs.dir }}
+        FLAGS: ${{ steps.apt.outputs.flags }}
+        OFFLINE: ${{ steps.apt.outputs.offline }}
+      # The same install as the last step's, which must stay in step with
+      # it. Its failure is recorded in the `ok` output, not as a failed step,
+      # so a run the fallback recovers carries only the warning.
+      run: |
+        if ls "$DIR"/*.deb > /dev/null 2>&1 &&
+            sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb; then
+            echo ok=true >> "$GITHUB_OUTPUT"
+        else
+            echo ok=false >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Fall back to the network
+      if: inputs.mode == 'install' && steps.offline.outputs.ok == 'false'
+      shell: sh
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        echo "::warning::offline install from $DIR failed; downloading from the network"
+        sudo rm -rf "$DIR"
+
+    - name: Download
+      if: inputs.mode == 'download' || steps.offline.outputs.ok == 'false'
+      shell: sh
+      env:
+        DIR: ${{ inputs.dir }}
+        PACKAGES: ${{ steps.apt.outputs.packages }}
+        FLAGS: ${{ steps.apt.outputs.flags }}
+      run: |
+        mkdir -p "$DIR/partial"
+        debs=$(realpath "$DIR")
+        fetch="apt-get update && apt-get install $FLAGS --download-only \
+            -o Dir::Cache::Archives=$debs $PACKAGES"
+        # Download-only under the timeout: killing apt mid-dpkg would leave
+        # the package database half-configured.
+        if ! sudo timeout 120 sh -c "$fetch"; then
+            echo "::warning::mirror fetch failed or exceeded 120 s; retrying on archive.ubuntu.com"
+            sudo grep -rlI 'azure\.archive\.ubuntu\.com' /etc/apt |
+                xargs -r sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g'
+            sudo timeout 1200 sh -c "$fetch"
+        fi
+        sudo rm -rf "$debs/partial" "$debs/lock"
+        ls -l "$debs"/*.deb
+
+    - name: Install offline after the download
+      if: steps.offline.outputs.ok == 'false'
+      shell: sh
+      env:
+        DIR: ${{ inputs.dir }}
+        FLAGS: ${{ steps.apt.outputs.flags }}
+        OFFLINE: ${{ steps.apt.outputs.offline }}
+      # The same install as the "Install offline" step's.
+      run: |
+        ls "$DIR"/*.deb > /dev/null 2>&1
+        sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb

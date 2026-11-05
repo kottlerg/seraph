@@ -120,7 +120,8 @@ communicates them via `ProcessInfo` / `InitInfo`.
   since a spawned thread's IPC buffer is a heap page and the kernel's
   IPC-buffer copies fail on an unbacked page instead of faulting to the
   pager (a restartable syscall's copy faults to it;
-  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)). A process with no pager maps the floor eagerly through
+  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
+  A process with no pager maps the floor eagerly through
   `REQUEST_MEMORY_CAPS`. The floor's size is a `std::sys::seraph`
   implementation detail.
 - **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`

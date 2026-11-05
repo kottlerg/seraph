@@ -15,7 +15,9 @@
 //! client uses to reference the page, the cache slot the page lives in (so
 //! the slot's refcount can be decremented on release), and an ancestor cap
 //! interposed between the slot's parent cap and the caller-side child cap so
-//! per-cookie revocation is possible.
+//! per-cookie revocation is possible. Each open also keeps the parent of its
+//! liveness cap, whose sole remaining reference marks an open whose client is
+//! gone ([`OpenFile::client_gone`]).
 
 use fat_parse::open_slab::OpenSlab;
 use namespace_protocol::NodeId;
@@ -23,7 +25,9 @@ use namespace_protocol::NodeId;
 /// The driver's open instances, keyed by the open id an open cap's badge
 /// carries. At most `node_slab::MAX_ENTRIES` (2^24 - 1) live opens, the
 /// identifier's index field; no per-client bound applies, since the driver
-/// has no client identity and an open cap can be delegated.
+/// has no client identity and an open cap can be delegated. Opens whose
+/// client is gone are swept out on the schedule `open_slab::SweepSchedule`
+/// sets.
 pub type OpenTable = OpenSlab<OpenFile>;
 
 /// One outstanding page handed to a client via `FS_READ_MEMORY`.
@@ -67,19 +71,37 @@ pub struct OpenFile
     /// `FS_RELEASE_MEMORY` requests for this open's pages to it. Zero when
     /// the open carried none; eviction then skips the cooperative
     /// round-trip and goes straight to the revoke. Deleted from the fs's
-    /// `CSpace` when the open is closed or its node freed.
+    /// `CSpace` when the open is released.
     pub release_endpoint_cap: u64,
+    /// The driver's own cap on the open's liveness Notification, the parent
+    /// of the zero-rights liveness cap the `FS_OPEN` reply handed the client
+    /// (services/fs/docs/fs-driver-protocol.md § Label 18). Revoked, which
+    /// kills the client's copy and every copy still in this cap's derivation
+    /// subtree, and deleted when the open is released.
+    pub liveness_cap: u64,
 }
 
 impl OpenFile
 {
-    pub const fn new(node_id: NodeId, release_endpoint_cap: u64) -> Self
+    pub const fn new(node_id: NodeId, release_endpoint_cap: u64, liveness_cap: u64) -> Self
     {
         Self {
             node_id,
             outstanding: Vec::new(),
             release_endpoint_cap,
+            liveness_cap,
         }
+    }
+
+    /// Whether every copy of the open's liveness cap outside the driver is
+    /// gone, so no holder keeps the open alive: the driver's own cap is the
+    /// only reference left to the Notification (`CAP_INFO_SOLE_REFERENCE`).
+    /// Once it answers so it keeps answering so, since only the driver could
+    /// take a new reference through its cap. A failed inquiry answers `false`,
+    /// keeping the open.
+    pub fn client_gone(&self) -> bool
+    {
+        syscall::cap_info(self.liveness_cap, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
     }
 
     /// Insert `entry` into a free outstanding slot, growing the table while

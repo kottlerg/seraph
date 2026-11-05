@@ -612,8 +612,9 @@ fn release_child_main() -> !
 
 /// Serve the fake fs on `ep` until the spawner's stop message: each
 /// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order, and each
-/// node's `FS_OPEN` an open SEND badged [`FAKE_FS_OPEN_BASE`] plus the node,
-/// keeping the release SEND it carries. `/b`'s `FS_READ_MEMORY` is answered,
+/// node's `FS_OPEN` an open SEND badged [`FAKE_FS_OPEN_BASE`] plus the node
+/// and a liveness cap (a zero-rights copy of the endpoint, which nothing
+/// sweeps), keeping the release SEND it carries. `/b`'s `FS_READ_MEMORY` is answered,
 /// after one release of its cookie on `/a`'s release SEND and two on
 /// `/b`'s, with a one-page frame (a read-only derivation of a page from
 /// memmgr). Each open's `FS_CLOSE` is counted and answered. Anything else is
@@ -667,8 +668,10 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
                 FAKE_FS_OPEN_BASE + msg.badge,
             )
             .expect("fake fs: open SEND derive failed");
+            let liveness = syscall::cap_derive(ep, 0).expect("fake fs: liveness cap derive failed");
             ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
                 .cap(open)
+                .cap(liveness)
                 .build()
         }
         else if opcode == ipc::fs_labels::FS_CLOSE

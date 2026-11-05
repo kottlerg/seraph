@@ -141,7 +141,7 @@ concurrent notification and queue events.
 | `thread_lifecycle.rs` | Full thread lifecycle: create → configure → start → stop → read\_regs → write\_regs → resume → exit |
 | `stop_read_regs_remote.rs` | A thread spinning in user mode on another CPU is stopped, then its registers are read at once (never refused with `InvalidState`, since the stop returns only once that CPU has descheduled it and published its register save, as [core/kernel/docs/syscalls.md § `SYS_THREAD_READ_REGS`](../kernel/docs/syscalls.md#sys_thread_read_regs-39) defines), its saved instruction pointer lies in its spin code, and a register write redirecting it takes effect on restart, every round (≥ 2 CPUs) |
 | `death_notification_late_bind.rs` | A death observer bound after the thread already died still receives the retained exit reason |
-| `aspace_fault_notification_late_bind.rs` | An address-space terminal-fault observer bound after a thread in that space already faulted still receives the retained fault reason |
+| `aspace_fault_notification_late_bind.rs` | An address-space terminal-fault observer bound after a thread in that space already faulted still receives the retained fault reason, which `CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (`0` before the fault) |
 | `death_observer_outlives_queue_caps.rs` | An event queue bound as a thread's death observer and one bound as its address space's terminal-fault observer stay allocated after their last caps are deleted and through the thread's terminal fault, which posts to both, and are freed when the thread and the address space are torn down (each binding holds a reference on its queue) |
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
@@ -254,7 +254,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,
 `integration::umip_descriptor_reads_fault`, `cap::cspace_self_delete_stops_caller` and
-`retype::aspace_self_delete_stops_caller`; the probe-wait bound and the worker's readiness, call
+`retype::aspace_self_delete_stops_caller`; the teardown polls of
+`mm::memory_split_after_cspace_teardown`; the probe-wait bound and the worker's readiness, call
 and exit bounds of `retype::pool_seeding_takes_interrupts`,
 `retype::cspace_teardown_takes_interrupts` and `retype::aspace_teardown_takes_interrupts`; the
 phase polls, the child's spin bound and the cleanup

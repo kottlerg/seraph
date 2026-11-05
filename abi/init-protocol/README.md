@@ -20,8 +20,8 @@ dependencies outside `core`. Changes that alter the `InitInfo` layout, field sem
 `CSpace` population order MUST increment `INIT_PROTOCOL_VERSION`.
 
 `InitInfo` delivers the full RAM Memory cap range (`memory_base`/`memory_count`) to init's
-CSpace. init copies the RAM Memory caps left after its own bootstrap allocations to memmgr
-(derive-twice; one bootstrap round, the remainder at the init reap) before starting procmgr; see
+CSpace. init moves the RAM Memory caps left after its own bootstrap allocations to memmgr
+(one bootstrap round, the remainder at the init reap) before starting procmgr; see
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) § Init → memmgr, which is the
 authoritative description of the userspace boot order.
 

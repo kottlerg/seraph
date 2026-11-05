@@ -646,6 +646,15 @@ fn run(info_ptr: u64) -> !
         logging::log("FATAL: phys-table page alloc failed");
         syscall::thread_exit();
     };
+    // The read-only cap memmgr reads the page through is derived before
+    // `finalize_memmgr` moves the page's own cap into memmgr's `CSpace`;
+    // it stays here, a child of memmgr's slot, for the bootstrap round.
+    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP)
+    else
+    {
+        logging::log("FATAL: phys-table RO derive failed");
+        syscall::thread_exit();
+    };
     let Some(mm_final) = bootstrap::finalize_memmgr(
         info,
         &mut alloc,
@@ -661,9 +670,10 @@ fn run(info_ptr: u64) -> !
     };
 
     // Populate the phys-table page: the kernel's immutable RAM-accounting
-    // facts and the in-use bootstrap arenas. The
-    // page is mapped writable at TEMP_MAP_BASE; memmgr reads it back via the
-    // RO cap derived below. See `bootstrap::write_memmgr_aux_memory`.
+    // facts and the in-use bootstrap arenas. The page is mapped writable at
+    // TEMP_MAP_BASE (the mapping outlives the move of its cap); memmgr reads
+    // it back via the RO cap derived above. See
+    // `bootstrap::write_memmgr_aux_memory`.
     // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;
@@ -672,12 +682,6 @@ fn run(info_ptr: u64) -> !
     // SAFETY: the phys-table scratch page, written above only through the raw
     // `phys_dst` pointer; no Rust reference into it is live.
     let _ = unsafe { syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1) };
-    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP)
-    else
-    {
-        logging::log("FATAL: phys-table RO derive failed");
-        syscall::thread_exit();
-    };
 
     // Serve memmgr's bootstrap round.
     //

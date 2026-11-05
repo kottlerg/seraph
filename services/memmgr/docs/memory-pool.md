@@ -18,10 +18,15 @@ total RAM (see
 Capability Distribution" and
 [`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#ownership-boundaries)
 §"Ownership Boundaries"). Memory cap sizes vary — they reflect the firmware
-memory map and may span many MiB each. Init copies the RAM caps left after its
-own bootstrap allocations into memmgr's CSpace via the derive-twice pattern
-(every one while both memmgr's CSpace and init's own keep the headroom init
-reserves in each), forwards
+memory map and may span many MiB each. Init moves the RAM caps left after its
+own bootstrap allocations into memmgr's CSpace (every one while memmgr's CSpace
+keeps the headroom init reserves in it), so from the handover memmgr's slot is
+the only one naming each run, which the kernel requires of a run memmgr splits
+or merges (see
+[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
+§"`SYS_MEMORY_SPLIT`"). The phys-table page is one of these runs: memmgr reads it
+through the read-only derivation the bootstrap round carries, and once memmgr
+deletes that derivation the page is a splittable run like any other. Init forwards
 the memmgr/procmgr/init bootstrap arenas as in-use runs, and transfers the slot
 range `(memory_base, memory_count)` to memmgr in its bootstrap IPC round; any
 RAM caps init did not forward join the pool through the init-reap donation
@@ -295,9 +300,7 @@ another in three ways:
   process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
   out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
   map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
-  device still writing it. Init's own derive-twice intermediaries of the RAM caps it forwarded at
-  boot count too: a frame of such a bootstrap extent's original object that memmgr reclaims before
-  init's reap waits until the reap frees them.
+  device still writing it.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
 Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
@@ -307,9 +310,11 @@ Memory object of every derivation it granted. The frame is **quiescent** when al
    no kernel-internal reference such as a retype lease or a page-pool donation. memmgr reads this
    first: once it holds it keeps holding, since no other process has a capability through which to
    add a reference or a mapping, so the reads after it cannot be raced.
-2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. A
-   grantee that split its grant shrank the object the intermediary names, so the record no longer
-   describes it.
+2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. The
+   kernel refuses a grantee's split or merge of its grant, since memmgr's intermediary names the
+   same object ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md)
+   §"`SYS_MEMORY_SPLIT`" and §"`SYS_MEMORY_MERGE`"), so the size cannot change while memmgr holds
+   the intermediary; memmgr reads it as a backstop.
 3. Its available bytes (`CAP_INFO_MEMORY_AVAILABLE`) equal its size: no byte of the region is
    retyped into a live kernel object, donated to a page pool, or held by a kept body-arena page
    (the kernel credits the last such byte back and resets the region's retype allocator to virgin
@@ -413,8 +418,9 @@ cap. Eligibility:
 - The kernel's `memory_merge` accepts the operation (see
   [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
   §"`SYS_MEMORY_MERGE`"): the caps must be derivation siblings with identical
-  rights, the tail must be virgin (never retyped or sub-allocated), and neither
-  may have derivation children.
+  rights, the tail must be virgin (never retyped or sub-allocated), and no
+  other slot may name either cap's object (no derivation or copy of either
+  object, linked to it or not).
 
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins

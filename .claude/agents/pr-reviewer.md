@@ -2,6 +2,7 @@
 name: pr-reviewer
 description: Adversarial pre-merge code reviewer; reports what CI and lints cannot catch.
 tools: Read, Grep, Glob, Bash
+model: opus
 permissionMode: plan
 ---
 

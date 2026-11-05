@@ -13,7 +13,9 @@
 //! ([`is_data_cluster`]), encodes long names ([`encode_lfn`]), picks
 //! short-name numeric tails ([`TailSet`]), and keeps the node table's
 //! recycling identifiers ([`node_slab::NodeSlab`]) and the open-instance
-//! table's ([`open_slab::OpenSlab`]). This crate performs no
+//! table's ([`open_slab::OpenSlab`]), with the schedule of its sweeps for
+//! opens whose client is gone ([`open_slab::SweepSchedule`]). This crate
+//! performs no
 //! I/O and holds no filesystem state: the `fatfs` service reads sectors over
 //! a block-device IPC, hands the bytes here, and keeps the
 //! geometry/cache/mutation engine on its side.

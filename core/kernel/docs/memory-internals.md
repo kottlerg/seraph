@@ -261,7 +261,8 @@ The terminal-fault observer state (the `death_observers` chain of observer nodes
 (`sys_aspace_bind_notification`) pushes a node, drawn from the observing queue's pool, under it, and
 the terminal-fault post reads the chain head and records the first fault under it before walking the
 chain and posting outside it (a linked node's links never change until the teardown takes the
-chain).
+chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads the retained reason under it
+(`AddressSpace::retained_terminal_fault`).
 
 ### Lifecycle
 

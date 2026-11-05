@@ -16,5 +16,6 @@ pub mod run_parallel;
 pub mod test;
 pub mod test_kaslr;
 pub mod test_logd_reclaim;
+pub mod test_map_redo;
 pub mod test_terminal;
 pub mod test_vmgenid;

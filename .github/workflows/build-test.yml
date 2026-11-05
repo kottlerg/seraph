@@ -71,7 +71,10 @@ jobs:
 
       - name: Install QEMU and firmware
         # See docs/build-system.md § Continuous Integration.
-        run: .github/scripts/qemu-packages.sh install qemu-debs
+        uses: ./.github/actions/qemu-packages
+        with:
+          mode: install
+          dir: qemu-debs
 
       - name: Log QEMU versions
         # A missing binary fails here rather than at the first boot. The
@@ -147,13 +150,15 @@ jobs:
         # docs/build-system.md § Continuous Integration states from each
         # cell's worst pass over the 28 build-test runs of 2026-11-03 (the
         # latest attempt of each); the worst passes are beside the values.
-        # riscv64 debug svctest's worst pass is 179.0 s, against its former
-        # 180 s budget, because its fsbench phase runs about 3x slower on
-        # 4-core TCG than before #679 (#666) and runner-queue contention
-        # adds on top.
+        # riscv64 debug svctest's is re-derived from its worst pass over the
+        # 144 build-test runs from 2026-11-04 03:21 to 2026-11-05 01:36 UTC
+        # that ran the cell to a pass: 89.5 s, against the 179.0 s of
+        # 2026-11-03, when its fsbench phase ran up to about 3x slower on a
+        # contended 4-core runner, as the fs client and server's CPU
+        # placement allows (#762).
         run: |
           case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
-            riscv64-debug-svctest)    budget=540 ;;  # worst pass 179.0 s
+            riscv64-debug-svctest)    budget=300 ;;  # worst pass 89.5 s
             riscv64-debug-usertest)   budget=360 ;;  # worst pass 108.2 s
             riscv64-debug-ktest)      budget=300 ;;  # worst pass 97.9 s
             riscv64-release-svctest)  budget=300 ;;  # worst pass 89.5 s
@@ -189,6 +194,11 @@ jobs:
             # (it must observe the layout differing across separate boots),
             # so it cannot ride run-parallel; both arches.
             cargo xtask test-kaslr --arch ${{ matrix.arch }}
+            # Extra boot: the steps 6 and 7 redo test (#754). Stages the
+            # mapredo knob, so the bootloader redoes its first page-table and
+            # memory-map attempt, and boots the ktest bundle to its pass
+            # marker under the cell's budget; the knob is removed afterwards.
+            cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
           fi
           if [ "${{ matrix.tester }}" = "usertest" ]; then
             # Second boot: the terminal interactive test (keyboard input

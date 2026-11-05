@@ -2518,29 +2518,44 @@ fn vfs_read(
 /// no release SEND: procmgr releases each page itself right after its copy,
 /// so it opts out of cooperative release), and delete the node cap. Returns
 /// the open cap every later read and the closing `FS_CLOSE` go to, so
-/// procmgr's pages and close touch no other opener's state
-/// (`fs/docs/fs-driver-protocol.md` § Label 18). `None` when the call fails
-/// or the reply carries no open cap; every other reply cap is deleted.
-fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<u64>
+/// procmgr's pages and close touch no other opener's state, and the open's
+/// liveness cap, which keeps the driver from releasing the open until
+/// [`vfs_close`] deletes it (`fs/docs/fs-driver-protocol.md` § Label 18).
+/// `None` when the call fails or the reply carries no open cap and liveness
+/// cap; every other reply cap is deleted.
+fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<OpenedFile>
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) };
     let _ = syscall::cap_delete(node_cap);
     let reply = reply.ok()?;
-    let (open_cap, surplus) = match reply.caps().split_first()
+    let (opened, surplus) = match *reply.caps()
     {
-        Some((&cap, rest)) if reply.label == 0 => (Some(cap), rest),
+        [cap, liveness, ref rest @ ..] if reply.label == 0 =>
+        {
+            (Some(OpenedFile { cap, liveness }), rest)
+        }
         _ => (None, reply.caps()),
     };
     // The file cap is client-supplied, so its server is untrusted.
     crate::release_caps(surplus);
-    open_cap
+    opened
 }
 
-/// Close an open file via its open cap and delete the cap.
-fn vfs_close(file_cap: u64, ipc_buf: *mut u64)
+/// An open [`vfs_open`] made: its open cap and its liveness cap.
+#[derive(Clone, Copy)]
+struct OpenedFile
 {
+    cap: u64,
+    liveness: u64,
+}
+
+/// Close an open file via its open cap, then delete the open cap and the
+/// liveness cap.
+fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
+{
+    let file_cap = file.cap;
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
@@ -2549,6 +2564,7 @@ fn vfs_close(file_cap: u64, ipc_buf: *mut u64)
         crate::release_caps(reply.caps());
     }
     let _ = syscall::cap_delete(file_cap);
+    let _ = syscall::cap_delete(file.liveness);
 }
 
 // ── Per-creation resource guards ────────────────────────────────────────────
@@ -2564,27 +2580,27 @@ fn vfs_close(file_cap: u64, ipc_buf: *mut u64)
 /// path consumes it.
 struct FileCapGuard
 {
-    cap: u64,
+    file: OpenedFile,
     ipc_buf: *mut u64,
 }
 
 impl FileCapGuard
 {
-    fn new(cap: u64, ipc_buf: *mut u64) -> Self
+    fn new(file: OpenedFile, ipc_buf: *mut u64) -> Self
     {
-        Self { cap, ipc_buf }
+        Self { file, ipc_buf }
     }
 
     fn cap(&self) -> u64
     {
-        self.cap
+        self.file.cap
     }
 
-    fn disarm(mut self) -> u64
+    fn disarm(mut self) -> OpenedFile
     {
-        let c = self.cap;
-        self.cap = 0;
-        c
+        let f = self.file;
+        self.file.cap = 0;
+        f
     }
 }
 
@@ -2592,9 +2608,9 @@ impl Drop for FileCapGuard
 {
     fn drop(&mut self)
     {
-        if self.cap != 0
+        if self.file.cap != 0
         {
-            vfs_close(self.cap, self.ipc_buf);
+            vfs_close(self.file, self.ipc_buf);
         }
     }
 }
@@ -3299,10 +3315,10 @@ pub fn create_process_from_file(
     let main_tls_memory_guard = CapGuard::new(main_tls.memory_cap);
 
     // Disarm and consume the file cap: success-path `vfs_close` issues
-    // FS_CLOSE and deletes the slot. From here on `file_cap` is no longer
+    // FS_CLOSE and deletes the slots. From here on `file_cap` is no longer
     // available; any subsequent failure must not depend on it.
-    let raw_file_cap = file_cap.disarm();
-    vfs_close(raw_file_cap, ipc_buf);
+    let raw_file = file_cap.disarm();
+    vfs_close(raw_file, ipc_buf);
 
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,

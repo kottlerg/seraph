@@ -68,6 +68,18 @@ static NOKASLR_PATH: [u16; 20] = [
     b'a' as u16, b's' as u16, b'l' as u16, b'r' as u16, 0u16,
 ];
 
+/// `\EFI\seraph\mapredo` as a NUL-terminated UTF-16 path — the presence of
+/// this file makes the first attempt of steps 6 and 7 redo whatever its
+/// map's size, so a boot runs the redo path ([`MapRedo`]; staged by
+/// `cargo xtask test-map-redo`).
+#[rustfmt::skip]
+static MAPREDO_PATH: [u16; 20] = [
+    b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
+    b's' as u16, b'e' as u16, b'r' as u16, b'a' as u16, b'p' as u16,
+    b'h' as u16, b'\\' as u16, b'm' as u16, b'a' as u16, b'p' as u16,
+    b'r' as u16, b'e' as u16, b'd' as u16, b'o' as u16, 0u16,
+];
+
 /// `\EFI\seraph\bootstrap.bundle` as a NUL-terminated UTF-16 path.
 #[rustfmt::skip]
 static BUNDLE_PATH: [u16; 29] = [
@@ -257,6 +269,17 @@ enum KaslrOverride
     DisabledByKnob,
 }
 
+/// Whether the `\EFI\seraph\mapredo` test knob is present on the ESP.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapRedo
+{
+    /// No knob: an attempt of steps 6 and 7 stands when its map fits.
+    Absent,
+    /// The knob is present: the first attempt is redone even when its map
+    /// fits, so the boot runs the redo path.
+    ForcedByKnob,
+}
+
 /// The KASLR layout the bootloader chose, threaded from
 /// [`step5d_apply_kaslr_slide`] (which biases the kernel image) to
 /// [`step9_populate_boot_info`] (which selects the direct-map base and
@@ -404,8 +427,9 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // live and identity-mapped; virtual addresses are still unbiased link VAs;
     // ctx.esp_root is valid until ExitBootServices.
     let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
-    // SAFETY: all prior unsafe outputs remain valid; steps 6 and 7 allocate
-    // via bs, and step 7 is the last pre-exit allocation.
+    // SAFETY: all prior unsafe outputs remain valid; ctx.esp_root is valid
+    // until ExitBootServices; steps 6 and 7 allocate via bs, and step 7 is the
+    // last pre-exit allocation.
     let (allocs, mut page_table, mut uefi_map) = unsafe {
         steps6_and_7_sized_to_the_map(
             &ctx,
@@ -1123,14 +1147,28 @@ fn choose_kaslr_layout(
 /// `ctx.esp_root` must be a valid ESP root directory handle.
 unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 {
-    // SAFETY: esp_root is a valid directory handle; path is NUL-terminated UTF-16.
-    match unsafe {
-        open_file(
-            ctx.esp_root,
-            NOKASLR_PATH.as_ptr(),
-            "\\EFI\\seraph\\nokaslr",
-        )
+    // SAFETY: caller contract; the path is NUL-terminated UTF-16.
+    if unsafe { knob_present(ctx, &NOKASLR_PATH, "\\EFI\\seraph\\nokaslr") }
+    {
+        KaslrOverride::DisabledByKnob
     }
+    else
+    {
+        KaslrOverride::Absent
+    }
+}
+
+/// Whether the presence-only knob file at `path` (NUL-terminated UTF-16,
+/// named `name` in logs) exists on the ESP. A failed open reads as an absent
+/// knob; the handle of a successful one is closed at once.
+///
+/// # Safety
+/// `ctx.esp_root` must be a valid ESP root directory handle and `path` must
+/// end in a NUL.
+unsafe fn knob_present(ctx: &UefiContext, path: &[u16], name: &'static str) -> bool
+{
+    // SAFETY: esp_root is a valid directory handle; path is NUL-terminated UTF-16.
+    match unsafe { open_file(ctx.esp_root, path.as_ptr(), name) }
     {
         Ok(file) =>
         {
@@ -1138,9 +1176,9 @@ unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
             unsafe {
                 ((*file).close)(file);
             }
-            KaslrOverride::DisabledByKnob
+            true
         }
-        Err(_) => KaslrOverride::Absent,
+        Err(_) => false,
     }
 }
 
@@ -1474,15 +1512,19 @@ fn map_buffer_fits(buffer_bytes: usize, pages: usize) -> bool
 /// into the same buffer too): a buffer past the array frees both steps' allocations
 /// ([`release_step6_and_7`]) and redoes them with twice the slack, from
 /// [`MEM_MAP_SLACK_ENTRIES`], up to [`MEM_MAP_ATTEMPTS`] times
-/// (`core/boot/docs/memory-map.md` § Sizing the Entry Array).
+/// (`core/boot/docs/memory-map.md` § Sizing the Entry Array). The
+/// `\EFI\seraph\mapredo` test knob, read before step 6's first allocation,
+/// redoes the first attempt as if its buffer were past the array
+/// ([`attempt_stands`]).
 ///
 /// # Errors
 /// [`BootError::MemoryMapKeptGrowing`] when the last attempt's buffer still
 /// reaches past its array, and any error of steps 6 and 7 or of the frees.
 ///
 /// # Safety
-/// As [`step6_allocate_and_build_page_tables`]; nothing between the returned
-/// map and `ExitBootServices` may allocate.
+/// As [`step6_allocate_and_build_page_tables`], and `ctx.esp_root` must be a
+/// valid ESP root directory handle; nothing between the returned map and
+/// `ExitBootServices` may allocate.
 unsafe fn steps6_and_7_sized_to_the_map(
     ctx: &UefiContext,
     bundle: &BundleLoad,
@@ -1500,6 +1542,18 @@ unsafe fn steps6_and_7_sized_to_the_map(
     BootError,
 >
 {
+    // Read before step 6's size query, so the knob's open is not one of the
+    // firmware allocations the first attempt's slack absorbs.
+    // SAFETY: ctx.esp_root is valid until ExitBootServices; the path is
+    // NUL-terminated UTF-16.
+    let knob = if unsafe { knob_present(ctx, &MAPREDO_PATH, "\\EFI\\seraph\\mapredo") }
+    {
+        MapRedo::ForcedByKnob
+    }
+    else
+    {
+        MapRedo::Absent
+    };
     let mut slack = MEM_MAP_SLACK_ENTRIES;
     let mut attempt = 1;
     loop
@@ -1519,7 +1573,8 @@ unsafe fn steps6_and_7_sized_to_the_map(
         };
         // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
         let uefi_map = unsafe { step7_query_memory_map(ctx)? };
-        if map_buffer_fits(uefi_map.buffer_size, allocs.mem_entries_pages)
+        let fits = map_buffer_fits(uefi_map.buffer_size, allocs.mem_entries_pages);
+        if attempt_stands(fits, attempt, knob)
         {
             return Ok((allocs, page_table, uefi_map));
         }
@@ -1529,16 +1584,40 @@ unsafe fn steps6_and_7_sized_to_the_map(
         {
             return Err(BootError::MemoryMapKeptGrowing(reach));
         }
-        bprintln!(
-            "[--------] boot: memory map: a buffer of {reach} descriptors past the \
-             {capacity}-entry array; redoing steps 6 and 7"
-        );
+        if knob_redoes(attempt, knob)
+        {
+            bprintln!("[--------] boot: memory map: mapredo knob present; redoing steps 6 and 7");
+        }
+        else
+        {
+            bprintln!(
+                "[--------] boot: memory map: a buffer of {reach} descriptors past the \
+                 {capacity}-entry array; redoing steps 6 and 7"
+            );
+        }
         // SAFETY: bs is valid pre-exit; the spans are the allocations steps 6
         // and 7 just made, which nothing else references.
         unsafe { release_step6_and_7(ctx, &allocs, &page_table, &uefi_map)? };
         slack *= 2;
         attempt += 1;
     }
+}
+
+/// Whether attempt `attempt` (from 1) of steps 6 and 7 stands, its map
+/// buffer fitting the entry array or not (`fits`): one that fits stands,
+/// except the first while the `mapredo` knob is present ([`MapRedo`]), which
+/// is redone so the boot runs the redo path.
+fn attempt_stands(fits: bool, attempt: usize, knob: MapRedo) -> bool
+{
+    fits && !knob_redoes(attempt, knob)
+}
+
+/// Whether the `mapredo` knob ([`MapRedo`]) redoes attempt `attempt` (from 1)
+/// of steps 6 and 7 whatever its map's size: the first attempt alone, while
+/// the knob is present.
+fn knob_redoes(attempt: usize, knob: MapRedo) -> bool
+{
+    knob == MapRedo::ForcedByKnob && attempt == 1
 }
 
 /// The `(physical base, page count)` spans of every allocation steps 6 and 7
@@ -2078,9 +2157,10 @@ mod tests
 {
     use super::{
         BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
-        KERNEL_STACK_PAGES, KaslrOverride, ReclaimRange, allocation_regions,
-        aperture_array_capacity, choose_kaslr_layout, entry_array_pages, handoff_stack_span,
-        map_buffer_fits, memory_map, push_reclaim_range, scrub, step6_and_7_spans, uefi,
+        KERNEL_STACK_PAGES, KaslrOverride, MEM_MAP_ATTEMPTS, MapRedo, ReclaimRange,
+        allocation_regions, aperture_array_capacity, attempt_stands, choose_kaslr_layout,
+        entry_array_pages, handoff_stack_span, knob_redoes, map_buffer_fits, memory_map,
+        push_reclaim_range, scrub, step6_and_7_spans, uefi,
     };
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
@@ -2229,6 +2309,30 @@ mod tests
                     .all(|&(base, pages)| kept < base || kept >= base + pages as u64 * 4096),
                 "{kept:#x} is an earlier step's allocation"
             );
+        }
+    }
+
+    // Defect caught: a mapredo knob that is ignored (the first attempt stands
+    // although the knob is present), that redoes a later attempt too (the boot
+    // would end in MemoryMapKeptGrowing), or that makes an attempt whose map
+    // does not fit stand; or a knob line logged for an attempt the knob does
+    // not redo, or missing from the one it does.
+    #[test]
+    fn the_mapredo_knob_redoes_the_first_attempt_alone()
+    {
+        assert!(!attempt_stands(true, 1, MapRedo::ForcedByKnob));
+        assert!(knob_redoes(1, MapRedo::ForcedByKnob));
+        for attempt in 2..=MEM_MAP_ATTEMPTS
+        {
+            assert!(attempt_stands(true, attempt, MapRedo::ForcedByKnob));
+            assert!(!knob_redoes(attempt, MapRedo::ForcedByKnob));
+        }
+        for attempt in 1..=MEM_MAP_ATTEMPTS
+        {
+            assert!(!knob_redoes(attempt, MapRedo::Absent));
+            assert!(attempt_stands(true, attempt, MapRedo::Absent));
+            assert!(!attempt_stands(false, attempt, MapRedo::Absent));
+            assert!(!attempt_stands(false, attempt, MapRedo::ForcedByKnob));
         }
     }
 

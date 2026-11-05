@@ -97,8 +97,8 @@ struct ScratchMemory
 /// General capability slots the fs keeps free for the caps it takes at run
 /// time beyond the cache's own: a read's transient child derivation,
 /// block-device replies, the eviction worker's release-SEND copies, and the
-/// release SENDs `FS_OPEN` records until [`PageCache::fund_run_time_headroom`]
-/// next tops the `CSpace` up.
+/// release SENDs and liveness caps `FS_OPEN` records until
+/// [`PageCache::fund_run_time_headroom`] next tops the `CSpace` up.
 const RUN_TIME_CSPACE_HEADROOM: usize = 64;
 
 /// General capability slots [`PageCache::init`] funds in the fs process's
@@ -345,9 +345,9 @@ impl PageCache
     /// provisioned, a per-read ancestor for every slot, the quarantine's
     /// replacements, and [`RUN_TIME_CSPACE_HEADROOM`] (the init funding,
     /// less the slot pages and the scratch page already held). Called before
-    /// `FS_OPEN` records a release SEND, which holds a slot for the open's
-    /// lifetime, so the `CSpace` grows with the opens instead of starving
-    /// reads. A no-op
+    /// `FS_OPEN` records a release SEND and a liveness cap, which hold slots
+    /// for the open's lifetime, so the `CSpace` grows with the opens instead
+    /// of starving reads. A no-op
     /// beyond reading the `CSpace`'s headroom while it suffices; `false`
     /// when memmgr cannot fund it.
     pub fn fund_run_time_headroom(&self, cspace: u64) -> bool

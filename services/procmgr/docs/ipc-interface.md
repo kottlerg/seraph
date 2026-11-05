@@ -76,7 +76,7 @@ pages already allocated to the child return to memmgr's pool.
 |---|---|
 | label | 0 (success) |
 | cap[0] | Process handle (badged endpoint identifying this process) |
-| cap[1] | Child `Thread` capability (Control and Observe rights, `RIGHTS_THREAD`) |
+| cap[1] | Child `Thread` capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`) |
 | cap[2] | With `CREATE_DMA_HOLD` only: the release token (a SEND on procmgr's endpoint badged with the child's process badge and `procmgr_labels::HOLD_RELEASE_AUTHORITY`; **DMA hold flag** below) |
 
 The process handle is a badged endpoint capability. The caller uses it for the
@@ -137,13 +137,14 @@ account. procmgr deletes its copy of the cap before it replies, so the caller ca
 memmgr as soon as the call returns. `std::os::seraph::process::ArgvEnvCap` builds the cap and the
 header for a std-built sender.
 
-**Pinned flag.** Demand paging is the default: at finalize procmgr binds every
-child's main thread fault handler to memmgr (the system pager) via
-`SYS_THREAD_SET_FAULT_HANDLER`, delegates the child `AddressSpace` to memmgr via
-`memmgr_labels::DELEGATE_ASPACE`, and then sets `ProcessInfo.pager_endpoint_cap` (the
-child's badged memmgr cap, whose derivation badge the kernel stamps on each fault)
-and `pager_badge` (that badge), which tell the runtime the process is demand-paged; the
-runtime copies the spawning thread's bindings, this one among them, onto each thread it
+**Pinned flag.** Demand paging is the default: at finalize procmgr binds every child's main thread
+fault handler to memmgr (the system pager) via `SYS_THREAD_SET_FAULT_HANDLER`, for the
+virtual-memory and exception classes (`FAULT_CLASS_VM | FAULT_CLASS_EXCEPTION`; the upcall class
+stays unbound), delegates the child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`,
+and then sets `ProcessInfo.pager_endpoint_cap` (the child's badged memmgr cap, whose derivation
+badge the kernel stamps on each fault) and `pager_badge` (that badge), which tell the runtime the
+process is demand-paged; the runtime copies the spawning thread's bindings, this one among them,
+onto each thread it
 spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The
 child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
@@ -469,7 +470,7 @@ cap it does not use.
 
 On a create reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations), a derived copy of the child's `Thread`
-capability (Control and Observe rights, `RIGHTS_THREAD`), and, for a
+capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`), and, for a
 `CREATE_DMA_HOLD` child, its release token to the caller. procmgr retains the
 original caps for process lifecycle management.
 

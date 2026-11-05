@@ -119,7 +119,7 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 | Slot | Content |
 |---|---|
 | 0 | Null (permanently invalid, per [capability model](../../docs/capability-model.md)) |
-| `self_thread_cap` | Thread capability (Control) |
+| `self_thread_cap` | Thread capability (`RIGHTS_THREAD`: Control, Observe, and Upcall) |
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
 | `sched_control_cap` | Baseline `SchedControl` cap, band `[1, band_max]` chosen by the creator (default a copy of the creator's band; if nonzero) |

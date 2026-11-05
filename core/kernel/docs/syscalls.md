@@ -198,9 +198,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  55  SYS_GETRANDOM
                                  56  SYS_THREAD_GET_FAULT_HANDLER
                                  57  SYS_THREAD_INHERIT_FAULT_HANDLER
+                                 58  SYS_THREAD_POST_UPCALL
+                                 59  SYS_THREAD_SET_UPCALL_MASK
 ```
 
-**Implementation status.** Every number 0–57 has a handler; unallocated numbers
+**Implementation status.** Every number 0–59 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -263,15 +265,15 @@ pub enum SyscallError
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
     /// another thread already waits on).
     InvalidState = -15,
-    /// A blocking operation was cancelled: the thread was stopped, the object
-    /// it was blocked on was destroyed, or, for a call, the server received
-    /// again, or was destroyed, before replying. The thread sees this as the
-    /// return value of its blocked syscall. `SYS_THREAD_START` also returns it
-    /// when its caller is stopped while the start waits for the target to
-    /// settle (nothing is started). Batched capability operations (revoke,
-    /// delete, move, a range split) also return it at their liveness backstop;
-    /// each syscall's entry in core/kernel/docs/syscalls.md gives the state the
-    /// backstop leaves.
+    /// A blocking operation was cancelled: the thread was stopped or
+    /// interrupted by an upcall, the object it was blocked on was destroyed,
+    /// or, for a call, the server received again, or was destroyed, before
+    /// replying. The thread sees this as the return value of its blocked
+    /// syscall. `SYS_THREAD_START` also returns it when its caller is stopped
+    /// while the start waits for the target to settle (nothing is started).
+    /// Batched capability operations (revoke, delete, move, a range split)
+    /// also return it at their liveness backstop; each syscall's entry in
+    /// core/kernel/docs/syscalls.md gives the state the backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full, or the object a new capability or a retype would
@@ -510,8 +512,8 @@ full 64-bit bitmask range is usable.
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, or the
-notification was destroyed while the caller waited).
+**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped or
+interrupted by an upcall, or the notification was destroyed while the caller waited).
 
 Several threads may wait on one notification. They queue in arrival order, and each delivery wakes
 the longest-waiting one with every pending bit. A wait that enters while bits are pending takes
@@ -570,7 +572,7 @@ is specific to `SYS_EVENT_RECV`):
 **Capability requirement:** `queue_cap` must have Recv rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted` (the caller was
-stopped, or the queue was destroyed while the caller was parked).
+stopped or interrupted by an upcall, or the queue was destroyed while the caller was parked).
 
 Blocked receivers queue in arrival order; each post wakes the longest-waiting one.
 
@@ -711,7 +713,7 @@ CSpace.
 | 3 | `sched_cap` | `SchedControl` capability governing the creation priority, or 0 |
 | 4 | `priority` | Initial priority, or 0 |
 
-**Return:** `rax`/`a0`: new thread capability (Control + Observe rights) on success;
+**Return:** `rax`/`a0`: new thread capability (Control + Observe + Upcall rights) on success;
 `SyscallError` on failure.
 
 The thread is created in the `Created` state; it does not begin execution until
@@ -1822,7 +1824,7 @@ no handler bound for its class the fault is terminal. See
 | 0 | `thread_cap` | Thread capability (Control rights) — the thread whose handler is set |
 | 1 | `endpoint_cap` | `Endpoint` capability, or `0` to unbind |
 | 2 | `reserved` | MUST be `0` |
-| 3 | `fault_class_mask` | Fault classes bound or unbound: `FAULT_CLASS_ALL`, or a nonzero combination of `FAULT_CLASS_VM` and `FAULT_CLASS_EXCEPTION`; the classes left out keep their bindings |
+| 3 | `fault_class_mask` | Fault classes bound or unbound: `FAULT_CLASS_ALL`, or a nonzero combination of `FAULT_CLASS_VM`, `FAULT_CLASS_EXCEPTION`, and `FAULT_CLASS_UPCALL`; the classes left out keep their bindings |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -1861,8 +1863,9 @@ endpoint attributes the message by badge, with the guarantees of an ordinary sen
 Page faults (`FAULT_KIND_VM`), the faults of a restartable syscall's user copy among them
 (§ Restartable Syscalls), are routed to the handler of `FAULT_CLASS_VM`, and other
 kernel-unresolvable ring-3 exceptions (`FAULT_KIND_EXCEPTION`) to the handler of
-`FAULT_CLASS_EXCEPTION`; a handler bound for both classes dispatches on the fault kind and replies
-`FAULT_REPLY_KILL` for kinds it does not handle (see
+`FAULT_CLASS_EXCEPTION`, and posted upcalls (`FAULT_KIND_UPCALL`) to the handler of
+`FAULT_CLASS_UPCALL` (§ `SYS_THREAD_POST_UPCALL`); a handler bound for several classes dispatches on
+the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle (see
 [fault-handling.md](../../../docs/fault-handling.md) § Fault-Handler Binding and
 § Implementation Status).
 
@@ -1885,7 +1888,7 @@ Read a thread's fault-handler binding for one fault class (see
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
-| 1 | `class` | Exactly one class bit: `FAULT_CLASS_VM` or `FAULT_CLASS_EXCEPTION` |
+| 1 | `class` | Exactly one class bit: `FAULT_CLASS_VM`, `FAULT_CLASS_EXCEPTION`, or `FAULT_CLASS_UPCALL` |
 
 **Return:** `rax`/`a0`: `1` when the class is bound, `0` when it is not, or a `SyscallError`;
 on success `rdx`/`a1` carries the bound badge (`0` when unbound).
@@ -1933,6 +1936,67 @@ thread onto itself changes nothing. The binder needs no capability to the endpoi
 
 ---
 
+### `SYS_THREAD_POST_UPCALL` (58)
+
+Post an asynchronous upcall to a thread, delivered to the receiver of its `FAULT_CLASS_UPCALL`
+binding at the thread's next delivery point (see
+[fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Upcall rights; Control rights too for `UPCALL_ANY_INSTRUCTION`) |
+| 1 | `cookie` | Delivered uninterpreted as the upcall message's data word 1 |
+| 2 | `flags` | `0`, or `UPCALL_ANY_INSTRUCTION` to deliver at an interrupt's return to user mode as well as at a syscall's return |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+The post makes the upcall pending on the thread, written under the thread's `sched_lock` with its
+cookie and flag. Unless the thread masks upcalls (§ `SYS_THREAD_SET_UPCALL_MASK`), a block of the
+thread in a blocking syscall is cancelled as `SYS_THREAD_STOP` cancels it, and the thread is woken:
+the syscall returns `Interrupted` and the upcall is delivered at its return. A park the thread
+commits after the post is refused the same way, and a fault or upcall delivery in progress is left
+to resolve (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall
+Cancel-and-Wake Protocol). Otherwise an `UPCALL_ANY_INSTRUCTION` post prods a CPU that runs the
+thread, so the thread reaches an interrupt's return. The delivery is a fault delivery of
+`FAULT_KIND_UPCALL`, data words `[kind, cookie, point, ip]`, with `point` `UPCALL_POINT_SYSCALL` or
+`UPCALL_POINT_INTERRUPT`; any reply resumes the thread, and a decline or a cancellation drops the
+upcall.
+
+**Capability requirement:** `thread_cap` MUST have Upcall rights, and Control rights as well for
+`UPCALL_ANY_INSTRUCTION`.
+
+**Errors:** `InvalidArgument` (a `flags` bit other than `UPCALL_ANY_INSTRUCTION`; checked first),
+`InvalidCapability` (bad thread cap), `InsufficientRights` (a right above is missing),
+`InvalidState` (the thread is `Created` or `Exited`, or has no handler bound for
+`FAULT_CLASS_UPCALL`), `QueueFull` (an upcall is already pending on the thread).
+
+---
+
+### `SYS_THREAD_SET_UPCALL_MASK` (59)
+
+Set or clear the calling thread's upcall mask (see
+[fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `masked` | `1` to mask upcalls, `0` to unmask them |
+
+**Return:** `rax`/`a0`: the previous mask (`0` or `1`); `SyscallError` on failure.
+
+While the mask is set a posted upcall stays pending, is not delivered, and cancels no block of the
+thread. Clearing the mask delivers a pending upcall at this syscall's return. The mask is written
+under the thread's own `sched_lock`, where a post and a park commit read it.
+
+No capability is required — this syscall acts on the calling thread implicitly.
+
+**Errors:** `InvalidArgument` (`masked` is neither `0` nor `1`).
+
+---
+
 ### `SYS_THREAD_SLEEP` (46)
 
 Block the calling thread for a bounded duration. The timer wakes it at the deadline.
@@ -1951,9 +2015,10 @@ Plain-Sleep Path), so a caller that needs the full duration re-checks elapsed ti
 
 No capability is required — this syscall acts on the calling thread implicitly.
 
-**Errors:** `InvalidCapability` (no current thread), `Interrupted` (the thread was stopped before or
-during the sleep, unless the timer had already claimed its elapsed deadline). The kernel's sleep
-list has no capacity to exhaust, so a sleep never fails for room ([thread-lifecycle-and-sleep.md §
+**Errors:** `InvalidCapability` (no current thread), `Interrupted` (the thread was stopped, or
+interrupted by an upcall, before or during the sleep, unless the timer had already claimed its
+elapsed deadline). The kernel's sleep list has no capacity to exhaust, so a sleep never fails for
+room ([thread-lifecycle-and-sleep.md §
 Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4).
 
 ---
@@ -2075,8 +2140,8 @@ on the source, so that receive can find nothing (see
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `InvalidState` (another
 thread already waits on the set; the caller does not wait — a wait set takes one waiter at a
-time), `Interrupted` (the caller was stopped, or the wait set was destroyed while the
-caller waited).
+time), `Interrupted` (the caller was stopped or interrupted by an upcall, or the wait set was
+destroyed while the caller waited).
 
 ---
 
@@ -2797,7 +2862,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
-  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
+  or is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`), unless its wake (a delivery,
+  or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
   `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or

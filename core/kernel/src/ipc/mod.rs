@@ -465,6 +465,7 @@ pub mod event_queue;
 pub mod fault;
 pub mod message;
 pub mod notification;
+pub mod upcall;
 pub mod wait_set;
 
 #[cfg(test)]

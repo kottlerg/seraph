@@ -468,6 +468,8 @@ define_typed_rights! {
         CONTROL = syscall::RIGHTS_THREAD_CONTROL;
         /// May read thread register state.
         OBSERVE = syscall::RIGHTS_THREAD_OBSERVE;
+        /// May post an upcall to the thread.
+        UPCALL = syscall::RIGHTS_THREAD_UPCALL;
     }
 }
 

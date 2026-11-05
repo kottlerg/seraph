@@ -12,6 +12,8 @@
 
 #[cfg(not(test))]
 use super::UserFrame;
+#[cfg(not(test))]
+use crate::uaccess::RestartableError;
 use syscall::{MAX_GETRANDOM_LEN, SyscallError};
 
 /// `SYS_GETRANDOM` (55): fill `[buf, buf+len)` with CSPRNG bytes.
@@ -21,17 +23,23 @@ use syscall::{MAX_GETRANDOM_LEN, SyscallError};
 /// Returns the number of bytes written (always `len` on success — the kernel
 /// never blocks for entropy once the pool is seeded). `len == 0` is a no-op.
 ///
+/// Restartable (core/kernel/docs/syscalls.md § Restartable Syscalls): the draw
+/// changes nothing visible outside the call, so a fault on the buffer is
+/// delivered to the caller's fault handler and the call re-executes on resume.
+///
 /// # Errors
 /// - `InvalidArgument` — `len > MAX_GETRANDOM_LEN`.
 /// - `InvalidAddress` — null buffer, or the span is not wholly in the user half.
 /// - `WouldBlock` — the entropy pool is not yet seeded (unreachable in practice:
 ///   the pool is seeded in Phase 5, before any userspace process runs).
+/// - A [`RestartableError::Faulted`] copy, which the dispatcher delivers or
+///   fails with `InvalidAddress`.
 #[cfg(not(test))]
 // cast_possible_truncation: the kernel targets 64-bit only, so `usize == u64`
 // and `tf.arg(1) as usize` is lossless; the length is range-checked against
 // MAX_GETRANDOM_LEN immediately below.
 #[allow(clippy::cast_possible_truncation)]
-pub fn sys_getrandom(tf: UserFrame) -> Result<u64, SyscallError>
+pub fn sys_getrandom(tf: UserFrame) -> Result<u64, RestartableError>
 {
     let buf_ptr = tf.arg(0);
     let len = tf.arg(1) as usize;
@@ -45,7 +53,7 @@ pub fn sys_getrandom(tf: UserFrame) -> Result<u64, SyscallError>
     // window; userspace loops for larger buffers.
     if len > MAX_GETRANDOM_LEN
     {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     // The whole span must be non-null and lie within the user half (no wrap
     // into kernel/non-canonical territory). `len <= MAX_GETRANDOM_LEN` and
@@ -53,28 +61,28 @@ pub fn sys_getrandom(tf: UserFrame) -> Result<u64, SyscallError>
     let user_va_top = crate::mm::user_va_top();
     if buf_ptr == 0 || buf_ptr >= user_va_top || buf_ptr + len as u64 > user_va_top
     {
-        return Err(SyscallError::InvalidAddress);
+        return Err(SyscallError::InvalidAddress.into());
     }
     // Defensive: turn the kernel-internal "draw before seeded" invariant into an
     // enforced error on this userspace entry point rather than relying on a
     // debug-only assert inside `fill_bytes`.
     if !crate::entropy::is_seeded()
     {
-        return Err(SyscallError::WouldBlock);
+        return Err(SyscallError::WouldBlock.into());
     }
 
     // Draw into a kernel buffer *before* the user copy: the draw disables/
     // re-enables interrupts internally, which must not happen inside the SMAP/SUM
-    // access window that `copy_to_user` opens.
+    // access window that `copy_to_user_restartable` opens.
     let mut scratch = [0u8; MAX_GETRANDOM_LEN];
     crate::entropy::fill_bytes(&mut scratch[..len]);
 
     // The span was range-validated above; the copy is additionally fault-recovered,
-    // so an in-range-but-unmapped/read-only buffer returns InvalidAddress rather
-    // than faulting the kernel.
+    // so an in-range-but-unbacked or read-only buffer reaches the dispatcher as a
+    // restartable fault rather than faulting the kernel.
     // SAFETY: scratch is valid for `len` reads; buf_ptr is the validated user span.
     unsafe {
-        crate::uaccess::copy_to_user(buf_ptr, scratch.as_ptr(), len)?;
+        crate::uaccess::copy_to_user_restartable(buf_ptr, scratch.as_ptr(), len)?;
     }
 
     Ok(len as u64)

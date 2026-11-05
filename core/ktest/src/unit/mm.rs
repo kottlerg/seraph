@@ -184,10 +184,8 @@ pub fn memory_split_after_cspace_teardown(ctx: &TestContext) -> TestResult
     const CASE: &str = "mm::memory_split_after_cspace_teardown: setup failed";
     let piece = split_shared_piece(ctx, CASE)?;
     let cs = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| CASE)?;
-    let copied = cap_copy(piece, cs, RIGHTS_ALL);
-    let shared_split = copied
-        .as_ref()
-        .map(|_| syscall::memory_split(piece, PAGE_SIZE));
+    let shared_split =
+        cap_copy(piece, cs, RIGHTS_ALL).map(|_| syscall::memory_split(piece, PAGE_SIZE));
     cap_delete(cs).map_err(|_| CASE)?;
     match shared_split
     {

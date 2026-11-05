@@ -857,7 +857,8 @@ still using is freed only once that syscall is done with it (see
 § `dealloc_object(Thread)` Drain Protocol, step 11).
 
 Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace` carries a
-death-observer set (mirroring the per-thread death observers). A fault is terminal when:
+death-observer set (mirroring the per-thread death observers). A fault of a thread's own access is
+terminal when:
 
 - no fault handler is bound;
 - the handler replies `KILL`;
@@ -872,7 +873,10 @@ On a terminal fault by any thread in the address space, the kernel posts the fau
 and exits the faulting thread. A stopped faulting thread is the exception in timing only: whether
 the stop cancelled the episode or a `KILL` reply had already claimed it, the terminal fault takes
 effect, and is posted, only if the thread is started again (see
-[Fault Handling](fault-handling.md#delivery-resume-and-kill)).
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable syscall's
+copy of a user buffer is never terminal: in each of the cases above it fails that syscall with
+`InvalidAddress`, the thread runs on, and nothing is posted (see
+[Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
 
 procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
 just the main thread — drives procmgr's teardown of the whole process. A worker's fault fails to

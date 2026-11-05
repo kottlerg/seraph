@@ -17,8 +17,8 @@
 //!
 //! # Ready ring
 //! `ready_ring` is a circular buffer of member indices. Notifications push to
-//! it; `waitset_wait` pops from it. Stale entries (for removed members) are
-//! silently skipped on pop.
+//! it; `waitset_wait` pops from it. An entry is a hint: one whose member was
+//! removed, or whose source is no longer ready when it is popped, is skipped.
 //!
 //! # One wait set per source
 //! A source can be in at most one wait set at a time. `sys_wait_set_add`
@@ -192,7 +192,8 @@ pub struct WaitSetState
     members: *mut WaitSetMember,
     /// Inline circular buffer of `capacity + 1` pending member indices; one
     /// slot stays empty to tell full from empty, so it holds up to `capacity`
-    /// entries. Stale entries (after removal) are silently skipped during pop.
+    /// entries. Stale entries (a removed member, or a source no longer ready)
+    /// are skipped during pop.
     /// Fixed at construction.
     ready_ring: *mut u16,
     /// Member capacity, chosen by the creator. Fixed at construction.
@@ -309,11 +310,14 @@ impl WaitSetState
         }
     }
 
-    /// Pop from the ready ring, skipping stale (removed) entries.
+    /// Pop from the ready ring, skipping stale entries: those of a removed
+    /// member, and those of a member whose source `ready` reports no longer
+    /// ready (an endpoint whose queued sender was stopped or destroyed after
+    /// its call pushed the entry, or a notification a direct waiter drained).
     ///
-    /// Returns `Some(badge)` for the first live member found, `None` if empty
-    /// or all remaining entries are stale.
-    fn pop_ready(&mut self) -> Option<u64>
+    /// Returns `Some(badge)` for the first entry whose member is present and
+    /// ready, `None` if the ring is empty or every remaining entry is stale.
+    fn pop_ready(&mut self, ready: impl Fn(&WaitSetMember) -> bool) -> Option<u64>
     {
         while self.has_ready()
         {
@@ -321,11 +325,10 @@ impl WaitSetState
             let idx = usize::from(unsafe { *self.ready_ring.add(usize::from(self.ready_head)) });
             self.ready_head = (self.ready_head + 1) % self.ring_len();
             let m = &self.members()[idx];
-            if m.is_occupied()
+            if m.is_occupied() && ready(m)
             {
                 return Some(m.badge);
             }
-            // Entry is stale (member was removed) — skip.
         }
         None
     }
@@ -439,7 +442,13 @@ pub unsafe fn waitset_wait(
         return Err(WaitSetPending::Occupied);
     }
 
-    if let Some(badge) = ws.pop_ready()
+    // An entry is a hint: the member's source is re-checked as it is popped,
+    // so a readiness that lapsed since the push is skipped; see
+    // core/kernel/docs/ipc-internals.md § Wait Path (Wait Set) step 2.
+    // SAFETY: an occupied member's source is pinned alive by the +1 reference
+    // the member holds on its header (module docs); the reads are lock-free
+    // atomic loads.
+    if let Some(badge) = ws.pop_ready(|m| unsafe { source_is_ready(m.source_ptr, m.source_tag) })
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
@@ -882,18 +891,24 @@ mod tests
             ws.push_ready(idx);
         }
         ws.push_ready(0);
-        assert_eq!(ws.pop_ready(), Some(100));
-        assert_eq!(ws.pop_ready(), Some(101));
-        assert_eq!(ws.pop_ready(), Some(102));
-        assert_eq!(ws.pop_ready(), None);
+        assert_eq!(ws.pop_ready(always_ready), Some(100));
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        assert_eq!(ws.pop_ready(always_ready), Some(102));
+        assert_eq!(ws.pop_ready(always_ready), None);
         // The indices now wrap past the ring's end.
         ws.push_ready(2);
         ws.push_ready(0);
         ws.push_ready(1);
-        assert_eq!(ws.pop_ready(), Some(102));
-        assert_eq!(ws.pop_ready(), Some(100));
-        assert_eq!(ws.pop_ready(), Some(101));
-        assert_eq!(ws.pop_ready(), None);
+        assert_eq!(ws.pop_ready(always_ready), Some(102));
+        assert_eq!(ws.pop_ready(always_ready), Some(100));
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        assert_eq!(ws.pop_ready(always_ready), None);
+    }
+
+    /// The readiness predicate of a set whose every source is ready.
+    fn always_ready(_: &WaitSetMember) -> bool
+    {
+        true
     }
 
     // Defect guarded: a pop that returned a removed member's badge would wake
@@ -906,8 +921,29 @@ mod tests
         ws.push_ready(0);
         ws.push_ready(1);
         ws.members_mut()[0] = WaitSetMember::vacant();
-        assert_eq!(ws.pop_ready(), Some(101));
-        assert_eq!(ws.pop_ready(), None);
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        assert_eq!(ws.pop_ready(always_ready), None);
+    }
+
+    // Defect guarded: a pop that returned the badge of a member whose source
+    // stopped being ready after its entry was pushed (an endpoint whose queued
+    // sender was stopped) would send the waiter to a receive that blocks, past
+    // a member that is ready.
+    #[test]
+    fn pop_skips_entries_whose_source_is_no_longer_ready()
+    {
+        let mut fx = Fixture::<3, 4>::new();
+        let mut ws = fx.set();
+        ws.push_ready(0);
+        ws.push_ready(1);
+        ws.push_ready(2);
+        let ready = |m: &WaitSetMember| m.badge != 100;
+        assert_eq!(ws.pop_ready(ready), Some(101));
+        assert_eq!(ws.pop_ready(ready), Some(102));
+        assert_eq!(ws.pop_ready(ready), None);
+        ws.push_ready(0);
+        assert_eq!(ws.pop_ready(|_| false), None);
+        assert_eq!(ws.pop_ready(always_ready), None);
     }
 
     // Defect guarded: a set constructed with leftover member contents would
@@ -924,7 +960,7 @@ mod tests
         // SAFETY: the arrays hold 4 members and 5 ring slots and outlive ws.
         let mut ws = unsafe { WaitSetState::new(4, stale.as_mut_ptr(), ring.as_mut_ptr()) };
         assert!(ws.members().iter().all(|m| !m.is_occupied()));
-        assert_eq!(ws.pop_ready(), None);
+        assert_eq!(ws.pop_ready(always_ready), None);
         assert_eq!(ws.capacity(), 4);
     }
 }

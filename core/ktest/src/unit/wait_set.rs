@@ -12,15 +12,16 @@
 //! cross-thread return (a child thread signals the source; the parent blocks
 //! unless the unpinned child signals first), and the refusal of a second
 //! concurrent waiter. The remove test verifies that only the remaining member
-//! can wake the wait set after removal.
+//! can wake the wait set after removal, and the stale-entry test that a member
+//! whose source stopped being ready after it was queued is not returned.
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
-    event_queue_create, event_recv, notification_send, notification_wait,
-    notification_wait_timeout, thread_exit, wait_set_add, wait_set_create, wait_set_remove,
-    wait_set_wait,
+    event_queue_create, event_recv, ipc_buffer_set, notification_send, notification_wait,
+    notification_wait_timeout, thread_exit, thread_sleep, thread_start, thread_stop, wait_set_add,
+    wait_set_create, wait_set_remove, wait_set_wait,
 };
-use syscall_abi::SyscallError;
+use syscall_abi::{RIGHTS_EP_SEND_GRANT, SyscallError};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -379,6 +380,191 @@ fn collect(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
         acc |= bits;
     }
     Ok(acc)
+}
+
+// ── wait_set_wait (stale ready-ring entry) ────────────────────────────────────
+
+/// Badges of `stale_endpoint_entry_skipped`'s endpoint and notification.
+const STALE_EP_BADGE: u64 = 21;
+const STALE_SIG_BADGE: u64 = 22;
+/// `stale_endpoint_entry_skipped`'s `done` bits: the caller is about to call,
+/// its call returned `Interrupted`, or it returned otherwise.
+const STALE_READY: u64 = 1 << 0;
+const STALE_OK: u64 = 1 << 1;
+const STALE_BAD: u64 = 1 << 2;
+
+// Child stack and IPC page for `stale_endpoint_entry_skipped`'s caller, which
+// the test deletes on every path.
+static mut STALE_STACK: ChildStack = ChildStack::ZERO;
+static mut STALE_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// `(ep, done)` for the caller, by address.
+static STALE_ARGS: crate::spawn::ArgBlock<(u64, u64), 1> = crate::spawn::ArgBlock::new((0, 0));
+
+/// The caps and child `stale_endpoint_entry_skipped` creates; each is deleted
+/// on every path.
+#[derive(Default)]
+struct Stale
+{
+    ws: Option<u64>,
+    ep: Option<u64>,
+    sig: Option<u64>,
+    done: Option<u64>,
+    caller: Option<crate::spawn::SpawnedChild>,
+}
+
+/// A ready-ring entry whose source stopped being ready is skipped: a caller
+/// queued on a member endpoint while no thread waits pushes the endpoint's
+/// entry, a stop of the caller cancels its call and empties the send queue,
+/// and a later wait, with a member notification signalled since, returns the
+/// notification's badge. Fails if the wait returns the endpoint's badge for
+/// a send queue nothing is left on, which sends the waiter to a receive that
+/// blocks (core/kernel/docs/ipc-internals.md § Wait Path).
+pub fn stale_endpoint_entry_skipped(ctx: &TestContext) -> TestResult
+{
+    let mut s = Stale::default();
+    let result = stale_run(ctx, &mut s);
+    // Deleting the caller's thread tears it down wherever it is, so its stack
+    // and IPC page are free even when the test failed with it parked.
+    let mut ok = true;
+    if let Some(mut caller) = s.caller.take()
+    {
+        ok &= caller.delete_thread().is_ok();
+        ok &= caller.delete_cspace().is_ok();
+    }
+    for cap in [s.ws, s.ep, s.sig, s.done].into_iter().flatten()
+    {
+        ok &= cap_delete(cap).is_ok();
+    }
+    result?;
+    if ok
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("wait_set::stale_endpoint_entry_skipped: cap_delete in cleanup failed")
+    }
+}
+
+/// Build the set of an endpoint and a notification, queue the caller on the
+/// endpoint, stop it, signal the notification, and wait once; then restart the
+/// caller and require that its call was the cancelled one.
+fn stale_run(ctx: &TestContext, s: &mut Stale) -> TestResult
+{
+    let ws = *s.ws.insert(
+        wait_set_create(ctx.memory_base, crate::WS_CAPACITY)
+            .map_err(|_| "wait_set::stale_endpoint_entry_skipped: wait_set_create failed")?,
+    );
+    let ep = *s.ep.insert(
+        cap_create_endpoint(ctx.memory_base)
+            .map_err(|_| "wait_set::stale_endpoint_entry_skipped: cap_create_endpoint failed")?,
+    );
+    let sig = *s
+        .sig
+        .insert(cap_create_notification(ctx.memory_base).map_err(
+            |_| "wait_set::stale_endpoint_entry_skipped: cap_create_notification (member) failed",
+        )?);
+    let done = *s
+        .done
+        .insert(cap_create_notification(ctx.memory_base).map_err(
+            |_| "wait_set::stale_endpoint_entry_skipped: cap_create_notification (done) failed",
+        )?);
+    wait_set_add(ws, ep, STALE_EP_BADGE)
+        .and_then(|()| wait_set_add(ws, sig, STALE_SIG_BADGE))
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: wait_set_add failed")?;
+
+    let caller = s.caller.insert(
+        crate::spawn::new_child(ctx)
+            .map_err(|_| "wait_set::stale_endpoint_entry_skipped: spawn::new_child failed")?,
+    );
+    let c_ep = cap_copy(ep, caller.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: cap_copy(ep) failed")?;
+    let c_done = cap_copy(done, caller.cs, RIGHTS_NOTIFY)
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: cap_copy(done) failed")?;
+    // SAFETY: the caller has not been started, and no other thread reads the
+    // entry.
+    let arg = unsafe { STALE_ARGS.publish(0, (c_ep, c_done)) };
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_STACK));
+    // SAFETY: the stack is `STALE_STACK`, this test's own `ChildStack`, on
+    // which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(caller, stale_caller, stack_top, arg) }
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: configure_and_start failed")?;
+
+    let mut acc = stale_collect(done, 0, STALE_READY)?;
+    // Let the caller reach its park on the send queue; whether it did is
+    // checked after the wait, from its call's result.
+    let _ = thread_sleep(SETTLE_SLEEP_MS);
+    thread_stop(caller.th)
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: thread_stop failed")?;
+    notification_send(sig, 0x1)
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: notification_send failed")?;
+    let badge = wait_set_wait(ws)
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: wait_set_wait failed")?;
+    thread_start(caller.th)
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: thread_start failed")?;
+    acc = stale_collect(done, acc, STALE_OK | STALE_BAD)?;
+    if acc & STALE_OK == 0
+    {
+        return Err("wait_set::stale_endpoint_entry_skipped: the caller's call was not cancelled");
+    }
+    if badge != STALE_SIG_BADGE
+    {
+        return Err(
+            "wait_set::stale_endpoint_entry_skipped: wait_set_wait returned the endpoint whose \
+             only sender was stopped, not the signalled notification",
+        );
+    }
+    notification_wait(sig)
+        .map(|_| ())
+        .map_err(|_| "wait_set::stale_endpoint_entry_skipped: draining the notification failed")
+}
+
+/// Accumulate `done` bits into `acc` until any bit of `mask` is present. A
+/// caller stopped before it parked parks once restarted, with no canceller,
+/// and so never reports: that run fails here rather than hanging.
+fn stale_collect(done: u64, mut acc: u64, mask: u64) -> Result<u64, &'static str>
+{
+    while acc & mask == 0
+    {
+        let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS))
+            .map_err(|_| "wait_set::stale_endpoint_entry_skipped: waiting on done failed")?;
+        if bits == 0
+        {
+            return Err(
+                "wait_set::stale_endpoint_entry_skipped: the caller did not report (stopped \
+                 before it parked in ipc_call)",
+            );
+        }
+        acc |= bits;
+    }
+    Ok(acc)
+}
+
+/// `stale_endpoint_entry_skipped`'s caller: register its IPC page, announce
+/// the call, then call the endpoint, which no thread receives on; report
+/// whether the call returned `Interrupted`.
+extern "C" fn stale_caller(arg: u64) -> !
+{
+    // SAFETY: `arg` is the `STALE_ARGS` entry `stale_run` published.
+    let (ep, done): (u64, u64) = unsafe { crate::spawn::child_args(arg) };
+    let buf = core::ptr::addr_of_mut!(STALE_IPC_PAGE).cast::<u64>();
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static
+    // above), registered by one thread at a time; no Rust object lives in it,
+    // and the thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    {
+        thread_exit()
+    }
+    notification_send(done, STALE_READY).ok();
+    // SAFETY: `buf` was registered as this thread's IPC buffer above.
+    let bit = match unsafe { ipc::ipc_call(ep, &ipc::IpcMessage::new(0), buf) }
+    {
+        Err(e) if e == SyscallError::Interrupted as i64 => STALE_OK,
+        _ => STALE_BAD,
+    };
+    notification_send(done, bit).ok();
+    thread_exit()
 }
 
 // ── SYS_WAIT_SET_REMOVE ───────────────────────────────────────────────────────

@@ -279,7 +279,7 @@ memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
 
 Reclamation takes frames back from a process and returns each one to the free pool only when no
 other process can still reach it. A frame reclaimed from one process can still be reachable from
-another in two ways:
+another in three ways:
 
 - **A kernel object retyped from it is alive.** An object's bytes return to its source Memory
   object only when the object's last reference goes
@@ -291,48 +291,58 @@ another in two ways:
   was made through ([`docs/capability-model.md`](../../../docs/capability-model.md#memory)
   §"Memory"), so a process that still maps a frame keeps reading and writing it whoever owns it
   next.
+- **Another process holds a Memory capability to it.** A capability the grantee moved to another
+  process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
+  out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
+  map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
+  device still writing it. Init's own derive-twice intermediaries of the RAM caps it forwarded at
+  boot count too: a frame of such a bootstrap extent's original object that memmgr reclaims before
+  init's reap waits until the reap frees them.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
-Memory object of every derivation it granted. The frame is **quiescent** when all three hold:
+Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
 
-1. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. A
+1. The intermediary is the only reference to that Memory object (`CAP_INFO_SOLE_REFERENCE`): no
+   other capability to it in any `CSpace`, moved, derived, or orphaned into a derivation root, and
+   no kernel-internal reference such as a retype lease or a page-pool donation. memmgr reads this
+   first: once it holds it keeps holding, since no other process has a capability through which to
+   add a reference or a mapping, so the reads after it cannot be raced.
+2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. A
    grantee that split its grant shrank the object the intermediary names, so the record no longer
    describes it.
-2. Its available bytes (`CAP_INFO_MEMORY_AVAILABLE`) equal its size: no byte of the region is
+3. Its available bytes (`CAP_INFO_MEMORY_AVAILABLE`) equal its size: no byte of the region is
    retyped into a live kernel object, donated to a page pool, or held by a kept body-arena page
    (the kernel credits the last such byte back and resets the region's retype allocator to virgin
    at the same point).
-3. No address space maps any page of it (`CAP_INFO_MEMORY_MAPPINGS`, read window by window).
+4. No address space maps any page of it (`CAP_INFO_MEMORY_MAPPINGS`, read window by window).
 
 A query that fails answers no. A quiescent frame joins the free pool. Any other frame joins the
 **deferred list**: its descriptor node is rewritten into a run node in place, as a pooled frame's
 is, so reclamation still never allocates and cannot fail. A deferred run is owned by memmgr and
 counted in `pool_total`, lent to no process, and never granted. Before every `PROCESS_DIED`,
-`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool
-fails (a `REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index,
-page-table, or `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run
-that has become quiescent joins the free pool (and the failed selection runs once more), and
-each that has not goes to the back of the list, so successive rechecks visit every run. Only
-the first of these in a turn of the receive loop rechecks; later ones in the same turn find the
-recheck done. A turn starts when a receive returns, with a message or with an error: it is the
-message's handling, if any, then the `CSpace` top-up before the next receive. A handler's
-recheck at entry therefore always runs, and so does the top-up's before a failed receive's retry,
-which is what refills a spent receive reserve. One recheck checks at most `DEFERRED_RECHECK_BATCH`
-(64) runs and spends at most `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512
-pages each, plus the rest of the run that crosses that budget, after which it stops and leaves the
-runs behind at the head for the next recheck. A turn's deferred kernel queries are therefore
-bounded by two per run checked plus 256, plus the windows of the largest deferred run. No timer
-drives it; a run that becomes quiescent while no message arrives waits for the next one, or for
-the next retry of a failed receive. A run whose reaching object or mapping never goes, held by a
-process that never drops it, stays deferred for the rest of the boot, and `QUERY_POOL_STATUS`
-reports the deferred total (see
+`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool fails (a
+`REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index, page-table, or
+`CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run that has become
+quiescent joins the free pool (and the failed selection runs once more), and each that has not goes
+to the back of the list, so successive rechecks visit every run. Only the first of these in a turn
+of the receive loop rechecks; later ones in the same turn find the recheck done. A turn starts when
+a receive returns, with a message or with an error: it is the message's handling, if any, then the
+`CSpace` top-up before the next receive. A handler's recheck at entry therefore always runs, and so
+does the top-up's before a failed receive's retry, which is what refills a spent receive reserve.
+One recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
+`DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of the
+run that crosses that budget, after which it stops and leaves the runs behind at the head for the
+next recheck. A turn's deferred kernel queries are therefore bounded by three per run checked plus
+256, plus the windows of the largest deferred run. No timer drives it; a run that becomes quiescent
+while no message arrives waits for the next one, or for the next retry of a failed receive. A run
+whose reaching capability, object, or mapping never goes, held by a process that never drops it,
+stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
-The check does not see a capability: a process that holds an unmapped Memory capability to a
-reclaimed frame (one the frame's grantee moved or derived to it) is not detected, and can map the
-frame after memmgr grants it again. memmgr does not revoke its intermediary's derivations before
-pooling either: a revoke reaches neither a derivation the grantee made and handed out, which its
-`CSpace`'s teardown leaves a derivation root, nor any mapping already made.
+memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches neither a
+derivation the grantee made and handed out, which its `CSpace`'s teardown leaves a derivation
+root, nor any mapping already made, and it would drop the reference a driver holds on a frame its
+device may still write. The frame waits instead, until its holder drops the capability.
 
 On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
 `CREATE_DMA_HOLD` process until its creator releases it, the frames staying on
@@ -357,8 +367,9 @@ No unmap is performed: the dead process's CSpace is torn down by procmgr
 process pattern"), which already tore down the child's mappings. The
 caller-side derivation copies of the Memory caps that stayed in the dead
 process's CSpace are freed with it; a copy the process moved or derived into
-another CSpace outlives it, unseen by the check above. memmgr's intermediary
-copies remain valid and are what the free-pool insertion uses.
+another CSpace outlives it, and its reference keeps the frame on the deferred
+list until it goes (check 1 above). memmgr's intermediary copies remain valid
+and are what the free-pool insertion uses.
 
 `RELEASE_MEMORY_CAPS` from a live process is the mid-life counterpart for a
 caller-owned grant. The caller usually cannot transfer the cap back — having
@@ -371,11 +382,11 @@ when it is quiescent and to the deferred list otherwise (the node becomes
 the run's node in either case), and coalesces the freed runs with their
 physical neighbours, leaving the entry's other records untouched. Unmatched
 bases are ignored, so release is idempotent (a racing join-plus-reaper
-double-release is harmless). The caller must have
-deleted every object retyped from the region and unmapped it first; a region
-released with a live retype or a mapping waits on the deferred list until both
-are gone, so the next grantee of a pooled run can always split it, map it
-whole, and retype it.
+double-release is harmless). The caller must have deleted every capability
+to the region and every object retyped from it, and unmapped it, first; a
+region released while any of them remains waits on the deferred list until
+all are gone, so no other process reaches a pooled run and its next grantee
+can always split it, map it whole, and retype it.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
 demand-paged region: memmgr removes the region node and **actively unmaps** the
@@ -479,10 +490,12 @@ terminal fault tears down the whole process (see
 
 [abi/process-abi/README.md](../../../abi/process-abi/README.md),
 [Capability Model](../../../docs/capability-model.md),
+[Device Management](../../../docs/device-management.md),
 [Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[devmgr Responsibilities](../../devmgr/docs/responsibilities.md),
 [FS Driver Protocol](../../fs/docs/fs-driver-protocol.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

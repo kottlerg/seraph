@@ -161,8 +161,14 @@ confines a device with an IOMMU needs a release only the creator can send
 
 The hold covers the driver's own frames only. A frame a client lends a driver for one transfer
 (the memory capability a virtio-blk caller supplies) is on the client's memmgr record, which no
-hold covers, so it returns to the pool when the client releases it or dies, whatever the device's
-state ([#749](https://github.com/kottlerg/seraph/issues/749)).
+hold covers. memmgr pools it only once no other process holds a capability to it
+([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
+§ Reclamation), so while the driver holds the lent capability for the transfer, and devmgr holds
+one for the frame's DMA mapping, the frame stays out of the pool even after the client releases
+it or dies. devmgr deletes its own when it withdraws the device, before the device is confirmed
+stopped, and a dead driver's capabilities go with its `CSpace`, so a lent frame can still return
+to the pool while the device may write it
+([#749](https://github.com/kottlerg/seraph/issues/749)).
 
 Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to withdraw
 the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the IOMMU before

@@ -593,11 +593,11 @@ pub mod memmgr_labels
     ///   frame no other process can still reach.
     /// * `data[4]` — `deferred_bytes`: the subset of `pool_total_bytes`
     ///   reclaimed from a process but held out of the free runs because
-    ///   another process can still reach it, through a kernel object retyped
-    ///   from it or a user mapping of it; it moves to `free_bytes` once a
-    ///   later reclamation's recheck finds it unreachable. A caller polls
-    ///   `free_bytes` and `deferred_bytes` together to confirm a dead
-    ///   process's pages were reclaimed.
+    ///   another process can still reach it, through a capability to it, a
+    ///   kernel object retyped from it, or a user mapping of it; it moves to
+    ///   `free_bytes` once a later reclamation's recheck finds it
+    ///   unreachable. A caller polls `free_bytes` and `deferred_bytes`
+    ///   together to confirm a dead process's pages were reclaimed.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no

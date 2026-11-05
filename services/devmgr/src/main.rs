@@ -1795,7 +1795,7 @@ impl DriverClass
             Self::Framebuffer => "framebuffer",
             Self::Rtc => "rtc",
             Self::TestFault => "test-fault",
-            Self::Iommu => "iommu-vtd",
+            Self::Iommu => "iommu",
             Self::TestDma => "test-dma",
         }
     }
@@ -2080,7 +2080,7 @@ impl ServedDrivers
         if self.iommu.withdraw(post.badge).is_some()
         {
             std::os::seraph::log!(
-                "iommu-vtd: served driver of device {} died (reason={:#x})",
+                "iommu: served driver of device {} died (reason={:#x})",
                 post.badge,
                 post.reason
             );

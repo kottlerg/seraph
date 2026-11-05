@@ -56,6 +56,10 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
 /// #165 (manifest-driven discovery).
 pub const RTC_DRIVER_NAME: &[u8] = b"cmos-rtc";
 
+/// The IOMMU family of x86-64 platforms: Intel VT-d, its units described by
+/// the ACPI DMAR and programmed by `iommu-vtd`.
+pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Vtd;
+
 /// ISA IRQ line of COM1, the serial driver's UART. Platform-static and
 /// hardcoded on the same basis as [`carve_uart_authority`], pending #165
 /// (data-driven device binding).

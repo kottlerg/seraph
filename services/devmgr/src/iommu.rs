@@ -7,16 +7,23 @@
 //! IOMMU driver that programs them, deciding each DMA-capable device's
 //! confinement, and calling the driver over `ipc::iommu_labels`.
 //!
-//! At boot, before the boot batch, [`bring_up`] reads the ACPI DMAR, carves
-//! each VT-d unit's register `Mmio` cap from the apertures, and spawns
-//! `iommu-vtd` from its boot module in a settle batch of its own, handing it
-//! every unit (`iommu_core::bootstrap`); devmgr keeps no copy of a register
-//! cap. Once the driver reports ready every function a unit translates is
-//! blocked until devmgr attaches it, so [`Iommu::confine`] attaches each
-//! DMA-capable device before its DMA grant, refusing a device the firmware
-//! reserves memory for (an RMRR names it; identity-mapping such regions is
-//! [#773](https://github.com/kottlerg/seraph/issues/773)), one whose unit it
-//! could not hand over, or one whose `ATTACH` fails. When no unit is found,
+//! At boot, before the boot batch, [`bring_up`] reads the firmware table of
+//! the architecture's IOMMU family (`arch::current::IOMMU_FAMILY`): on
+//! x86-64 the ACPI DMAR, whose VT-d units' register `Mmio` caps it carves
+//! from the apertures; on riscv64 the ACPI RIMT, whose RISC-V IOMMUs are PCI
+//! functions, each unit's register cap being its BAR 0, carved after devmgr
+//! turns on the function's memory decode and bus mastering. It spawns the
+//! family's driver (`iommu-vtd`, `iommu-riscv`) from its boot module in a
+//! settle batch of its own, handing it every unit (`iommu_core::bootstrap`);
+//! devmgr keeps no copy of a register cap. Once the driver reports ready
+//! every function a unit translates is blocked until devmgr attaches it, so
+//! [`Iommu::confine`] attaches each DMA-capable device before its DMA grant,
+//! refusing a device the firmware reserves memory for (a DMAR RMRR names it;
+//! identity-mapping such regions is
+//! [#773](https://github.com/kottlerg/seraph/issues/773); the RIMT describes
+//! none), one the RIMT gives a device ID other than its requester ID, one
+//! whose unit it could not hand over, or one whose `ATTACH` fails. When no
+//! unit is found,
 //! no driver module was delivered, or the driver does not report ready within
 //! the settle bound, devmgr logs once that DMA runs unconfined and every
 //! device runs so; a driver that fails its own setup turns translation off
@@ -44,12 +51,44 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use firmware::dma::{Confinement, EDU_ID, iova_limit};
 use firmware::dmar::{self, Bdf, Resolved};
+use firmware::rimt;
 use iommu_core::Scope;
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::PAGE_SIZE;
 
 use crate::{DeviceCatalog, DriverClass, ServedDriver, ServedDrivers, SpawnedDriver};
-use crate::{caps, pci, settle, spawn};
+use crate::{arch, caps, pci, settle, spawn};
+
+/// The IOMMU family an architecture's platforms carry, which decides the
+/// firmware table devmgr discovers the units in and the driver module it
+/// spawns over them (`arch::current::IOMMU_FAMILY`).
+// dead_code: each architecture's build constructs only its own family
+// (`arch::current::IOMMU_FAMILY`), so the other variant is never constructed
+// there; both stay, since devmgr's discovery handles each family on either
+// build.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family
+{
+    /// Intel VT-d, described by the ACPI DMAR (`iommu-vtd`).
+    Vtd,
+    /// The RISC-V IOMMU as a PCI function, described by the ACPI RIMT
+    /// (`iommu-riscv`).
+    Riscv,
+}
+
+impl Family
+{
+    /// The units' name in devmgr's log lines.
+    fn units(self) -> &'static str
+    {
+        match self
+        {
+            Self::Vtd => "VT-d units",
+            Self::Riscv => "RISC-V IOMMUs",
+        }
+    }
+}
 
 /// How often, in milliseconds, devmgr's fault-log thread takes the IOMMU
 /// driver's recorded faults and logs them. A tuning value that bounds no
@@ -211,7 +250,7 @@ impl IommuClient
     /// Take the faults the driver recorded since the last take, passing each
     /// as (requester ID, reason, IOVA) to `each`; `false` when the driver
     /// refused or has failed.
-    pub fn take_faults(&self, mut each: impl FnMut(u64, u8, u64)) -> bool
+    pub fn take_faults(&self, mut each: impl FnMut(u64, u16, u64)) -> bool
     {
         loop
         {
@@ -226,7 +265,7 @@ impl IommuClient
             for i in 0..count
             {
                 let word = reply.word(1 + 2 * i);
-                let reason = u8::try_from((word >> 32) & 0xff).unwrap_or(0);
+                let reason = u16::try_from((word >> 32) & 0xffff).unwrap_or(0);
                 each(word & 0xFFFF_FFFF, reason, reply.word(2 + 2 * i));
             }
             if count < iommu_labels::MAX_FAULTS_PER_REPLY
@@ -316,18 +355,100 @@ impl FaultCounts
     }
 }
 
-/// The units devmgr discovered and handed to the IOMMU driver, the DMAR they
-/// came from, and the client devmgr calls the driver through.
+/// The firmware's description of the units devmgr discovered, against which
+/// it places each device.
+enum Topology
+{
+    /// VT-d units, from the DMAR.
+    Dmar
+    {
+        /// The DMAR's bytes, for the RMRR and unit lookups of each device.
+        dmar: Vec<u8>,
+        /// For each DRHD in table order, its unit index in the driver;
+        /// `None` for a unit devmgr could not hand over.
+        unit_index: Vec<Option<usize>>,
+        /// Every PCI-to-PCI bridge: its segment, function, and bus range.
+        bridges: Vec<(u16, Bdf, (u8, u8))>,
+    },
+    /// RISC-V IOMMUs, from the RIMT.
+    Rimt
+    {
+        /// The RIMT's bytes, for the ID-mapping lookup of each device.
+        rimt: Vec<u8>,
+        /// For each PCI IOMMU node in table order, its node offset and its
+        /// unit index in the driver; `None` for a unit devmgr could not
+        /// hand over.
+        unit_index: Vec<(u32, Option<usize>)>,
+    },
+}
+
+/// The bus range of the bridge `b` of `segment` among `bridges`.
+fn bridge_range(bridges: &[(u16, Bdf, (u8, u8))], segment: u16, b: Bdf) -> Option<(u8, u8)>
+{
+    bridges
+        .iter()
+        .find(|(s, f, _)| *s == segment && *f == b)
+        .map(|e| e.2)
+}
+
+impl Topology
+{
+    /// Where the function `target` of `segment` stands against the units.
+    fn placement(&self, segment: u16, target: Bdf) -> Placement
+    {
+        match self
+        {
+            Self::Dmar {
+                dmar,
+                unit_index,
+                bridges,
+            } =>
+            {
+                let range = |b| bridge_range(bridges, segment, b);
+                let secondary = |b| range(b).map(|r: (u8, u8)| r.0);
+                if dmar::has_reserved_region(dmar, segment, target, secondary, range)
+                {
+                    return Placement::Reserved;
+                }
+                let Some(drhd) = dmar::unit_for(dmar, segment, target, secondary, range)
+                else
+                {
+                    return Placement::Untranslated;
+                };
+                unit_index
+                    .get(drhd)
+                    .copied()
+                    .flatten()
+                    .map_or(Placement::NotProgrammed, Placement::Unit)
+            }
+            Self::Rimt { rimt, unit_index } =>
+            {
+                let Some(mapping) = rimt::mapping_for(rimt, segment, target)
+                else
+                {
+                    return Placement::Untranslated;
+                };
+                if !mapping.is_identity()
+                {
+                    return Placement::Renamed;
+                }
+                unit_index
+                    .iter()
+                    .find(|(node, _)| *node == mapping.iommu)
+                    .and_then(|(_, unit)| *unit)
+                    .map_or(Placement::NotProgrammed, Placement::Unit)
+            }
+        }
+    }
+}
+
+/// The units devmgr discovered and handed to the IOMMU driver, the firmware
+/// description they came from, and the client devmgr calls the driver
+/// through.
 pub struct Iommu
 {
     client: Arc<IommuClient>,
-    /// The DMAR's bytes, for the RMRR and unit lookups of each device.
-    dmar: Vec<u8>,
-    /// For each DRHD in table order, its unit index in the driver; `None`
-    /// for a unit devmgr could not hand over.
-    unit_index: Vec<Option<usize>>,
-    /// Every PCI-to-PCI bridge: its segment, function, and bus range.
-    bridges: Vec<(u16, Bdf, (u8, u8))>,
+    topology: Topology,
     faults: Arc<Mutex<FaultCounts>>,
 }
 
@@ -343,6 +464,9 @@ enum Placement
     Untranslated,
     /// An RMRR names it.
     Reserved,
+    /// The RIMT gives it a device ID other than its requester ID, which the
+    /// driver's units are not told.
+    Renamed,
     /// The unit that translates it was not handed over.
     NotProgrammed,
 }
@@ -355,21 +479,6 @@ impl Iommu
         &self.client
     }
 
-    fn secondary_bus(&self, segment: u16) -> impl FnMut(Bdf) -> Option<u8> + '_
-    {
-        move |b| self.bus_range(segment)(b).map(|r| r.0)
-    }
-
-    fn bus_range(&self, segment: u16) -> impl FnMut(Bdf) -> Option<(u8, u8)> + '_
-    {
-        move |b| {
-            self.bridges
-                .iter()
-                .find(|(s, f, _)| *s == segment && *f == b)
-                .map(|e| e.2)
-        }
-    }
-
     /// Where `pci_dev` stands against the units, without IPC.
     fn placement(&self, pci_dev: &pci::PciDevice) -> Placement
     {
@@ -378,38 +487,13 @@ impl Iommu
             device: pci_dev.dev,
             function: pci_dev.func,
         };
-        let seg = pci_dev.segment;
-        if dmar::has_reserved_region(
-            &self.dmar,
-            seg,
-            target,
-            self.secondary_bus(seg),
-            self.bus_range(seg),
-        )
-        {
-            return Placement::Reserved;
-        }
-        let Some(drhd) = dmar::unit_for(
-            &self.dmar,
-            seg,
-            target,
-            self.secondary_bus(seg),
-            self.bus_range(seg),
-        )
-        else
-        {
-            return Placement::Untranslated;
-        };
-        self.unit_index
-            .get(drhd)
-            .copied()
-            .flatten()
-            .map_or(Placement::NotProgrammed, Placement::Unit)
+        self.topology.placement(pci_dev.segment, target)
     }
 
     /// The driver's unit index for `pci_dev`: `Ok(None)` when no unit
     /// translates it, so it runs unconfined; `Err` when it must be refused
-    /// (an RMRR names it, or its unit was not handed over), logged.
+    /// (an RMRR names it, the RIMT renames its device ID, or its unit was not
+    /// handed over), logged.
     fn unit_of(&self, name: &str, pci_dev: &pci::PciDevice) -> Result<Option<usize>, Refused>
     {
         match self.placement(pci_dev)
@@ -427,6 +511,14 @@ impl Iommu
             {
                 std::os::seraph::log!(
                     "{}: firmware reserves memory for the device (RMRR); refused (#773)",
+                    name
+                );
+                Err(Refused)
+            }
+            Placement::Renamed =>
+            {
+                std::os::seraph::log!(
+                    "{}: the firmware gives the device another IOMMU device ID; refused",
                     name
                 );
                 Err(Refused)
@@ -520,10 +612,11 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
     }
 }
 
-/// Copy the DMAR out of the firmware tables; `None` when there is none.
-fn read_dmar(caps: &caps::DevmgrCaps) -> Option<Vec<u8>>
+/// Copy the ACPI table of signature `sig` out of the firmware tables; `None`
+/// when there is none.
+fn read_acpi(caps: &caps::DevmgrCaps, sig: [u8; 4]) -> Option<Vec<u8>>
 {
-    let phys = crate::tables::locate_table_by_sig(caps, *b"DMAR")?;
+    let phys = crate::tables::locate_table_by_sig(caps, sig)?;
     crate::tables::with_acpi_table(caps, phys, |t| {
         let mut v = Vec::new();
         v.try_reserve(t.len()).ok()?;
@@ -532,57 +625,58 @@ fn read_dmar(caps: &caps::DevmgrCaps) -> Option<Vec<u8>>
     })
 }
 
-/// The units devmgr hands the driver, built from the DMAR: each unit's
-/// carved register cap and bootstrap words, and each DRHD's unit index.
-struct UnitRounds
+/// The firmware table that describes `family`'s units: the DMAR for VT-d,
+/// the RIMT for the RISC-V IOMMU. `None` when there is none.
+fn read_units_table(caps: &caps::DevmgrCaps, family: Family) -> Option<Vec<u8>>
 {
-    rounds: Vec<spawn::UnitRound>,
-    unit_index: Vec<Option<usize>>,
+    match family
+    {
+        Family::Vtd => read_acpi(caps, *b"DMAR"),
+        Family::Riscv => read_acpi(caps, *b"RIMT"),
+    }
 }
 
-/// Carve each DRHD's register cap and encode its unit round; a DRHD whose
+/// A resolved scope entry in the IOMMU driver's encoding.
+fn scope_word(r: Resolved) -> Scope
+{
+    match r
+    {
+        Resolved::Function(f) => Scope::Function(bdf_word(f.bus, f.device, f.function)),
+        Resolved::Buses(first, last) => Scope::Buses { first, last },
+    }
+}
+
+/// Carve each DRHD's register cap and encode its unit round: the rounds,
+/// and the DMAR topology devmgr places devices against. A DRHD whose
 /// register range no aperture covers, whose scope or register span exceeds
 /// what a round carries, or past the driver's unit bound is not handed over
 /// and its functions are refused.
-fn unit_rounds(
+fn vtd_rounds(
     caps: &mut caps::DevmgrCaps,
-    dmar_bytes: &[u8],
-    bridges: &[(u16, Bdf, (u8, u8))],
-) -> UnitRounds
+    dmar_bytes: Vec<u8>,
+    devices: &[pci::PciDevice],
+) -> (Vec<spawn::UnitRound>, Topology)
 {
-    let mut out = UnitRounds {
-        rounds: Vec::new(),
-        unit_index: Vec::new(),
-    };
-    for unit in dmar::drhd_units(dmar_bytes)
+    let bridges = bridges(devices);
+    let mut rounds = Vec::new();
+    let mut unit_index = Vec::new();
+    for unit in dmar::drhd_units(&dmar_bytes)
     {
-        if out.unit_index.try_reserve(1).is_err() || out.rounds.try_reserve(1).is_err()
+        if unit_index.try_reserve(1).is_err() || rounds.try_reserve(1).is_err()
         {
             break;
         }
         let seg = unit.segment;
         let mut scopes = Vec::new();
-        let range = |b: Bdf| {
-            bridges
-                .iter()
-                .find(|(s, f, _)| *s == seg && *f == b)
-                .map(|e| e.2)
-        };
+        let range = |b: Bdf| bridge_range(&bridges, seg, b);
         unit.resolve_scopes(
-            dmar_bytes,
+            &dmar_bytes,
             |b| range(b).map(|r| r.0),
             range,
             |r| {
                 if scopes.try_reserve(1).is_ok()
                 {
-                    scopes.push(match r
-                    {
-                        Resolved::Function(f) =>
-                        {
-                            Scope::Function(bdf_word(f.bus, f.device, f.function))
-                        }
-                        Resolved::Buses(first, last) => Scope::Buses { first, last },
-                    });
+                    scopes.push(scope_word(r));
                 }
             },
         );
@@ -592,14 +686,14 @@ fn unit_rounds(
             unit.register_pages,
             &scopes,
         );
-        let handed = out.rounds.len() < iommu_core::bootstrap::MAX_UNITS;
+        let handed = rounds.len() < iommu_core::bootstrap::MAX_UNITS;
         let cap = words.as_ref().filter(|_| handed).and_then(|_| {
             crate::carve_subrange(caps, unit.register_base, unit.register_pages * PAGE_SIZE)
         });
         if let (Some(words), Some(cap)) = (words, cap)
         {
-            out.unit_index.push(Some(out.rounds.len()));
-            out.rounds.push(spawn::UnitRound { cap, words });
+            unit_index.push(Some(rounds.len()));
+            rounds.push(spawn::UnitRound { cap, words });
         }
         else
         {
@@ -607,10 +701,109 @@ fn unit_rounds(
                 "VT-d unit at {:#x} not handed over; its devices are refused",
                 unit.register_base
             );
-            out.unit_index.push(None);
+            unit_index.push(None);
         }
     }
-    out
+    let topology = Topology::Dmar {
+        dmar: dmar_bytes,
+        unit_index,
+        bridges,
+    };
+    (rounds, topology)
+}
+
+/// Encode each RIMT PCI IOMMU's unit round and carve its register cap: the
+/// rounds, and the RIMT topology devmgr places devices against. An IOMMU
+/// the PCI scan did not find, without a memory BAR 0 of at least a page,
+/// whose scope exceeds what a round carries, whose memory decode and bus
+/// mastering devmgr cannot turn on, whose BAR no aperture covers, or past
+/// the driver's unit bound is not handed over and its functions are refused.
+fn riscv_rounds(
+    caps: &mut caps::DevmgrCaps,
+    rimt_bytes: Vec<u8>,
+    devices: &[pci::PciDevice],
+) -> (Vec<spawn::UnitRound>, Topology)
+{
+    let mut rounds = Vec::new();
+    let mut unit_index = Vec::new();
+    for iommu in rimt::pci_iommus(&rimt_bytes)
+    {
+        if unit_index.try_reserve(1).is_err() || rounds.try_reserve(1).is_err()
+        {
+            break;
+        }
+        let round = (rounds.len() < iommu_core::bootstrap::MAX_UNITS)
+            .then(|| riscv_round(caps, &rimt_bytes, iommu, devices))
+            .flatten();
+        if let Some(round) = round
+        {
+            unit_index.push((iommu.node, Some(rounds.len())));
+            rounds.push(round);
+        }
+        else
+        {
+            let f = iommu.function;
+            std::os::seraph::log!(
+                "RISC-V IOMMU {}:{}:{}.{} not handed over; its devices are refused",
+                iommu.segment,
+                f.bus,
+                f.device,
+                f.function
+            );
+            unit_index.push((iommu.node, None));
+        }
+    }
+    let topology = Topology::Rimt {
+        rimt: rimt_bytes,
+        unit_index,
+    };
+    (rounds, topology)
+}
+
+/// The unit round of the PCI IOMMU `iommu`: its scope resolved against the
+/// scanned `devices`, and its BAR 0's first page, which holds every register,
+/// carved once devmgr has turned on the function's memory decode (for the
+/// registers) and bus mastering (the IOMMU reads its tables and queues by
+/// DMA); `None`, logged where the step logs, when any step fails.
+fn riscv_round(
+    caps: &mut caps::DevmgrCaps,
+    rimt_bytes: &[u8],
+    iommu: rimt::PciIommu,
+    devices: &[pci::PciDevice],
+) -> Option<spawn::UnitRound>
+{
+    let f = iommu.function;
+    let dev = devices.iter().find(|d| {
+        (d.segment, d.bus, d.dev, d.func) == (iommu.segment, f.bus, f.device, f.function)
+    })?;
+    let bar = (0..dev.bar_count)
+        .find(|&b| dev.bar_pci_idx[b] == 0 && dev.bar_is_mmio[b] && dev.bar_size[b] >= PAGE_SIZE)?;
+    let mut scopes = Vec::new();
+    let functions = devices
+        .iter()
+        .filter(|d| d.segment == iommu.segment)
+        .map(|d| Bdf {
+            bus: d.bus,
+            device: d.dev,
+            function: d.func,
+        });
+    rimt::resolve_scope(rimt_bytes, iommu.node, iommu.segment, &functions, |r| {
+        if scopes.try_reserve(1).is_ok()
+        {
+            scopes.push(scope_word(r));
+        }
+    });
+    let words = iommu_core::bootstrap::unit_round_words(iommu.segment, false, 1, &scopes)?;
+    let config = crate::carve_function_config("RISC-V IOMMU", dev, caps)?;
+    let enabled = config.enable_memory_and_bus_master();
+    // devmgr needs the function's configuration no further.
+    let _ = syscall::cap_delete(config.cap);
+    if !enabled
+    {
+        return None;
+    }
+    let cap = crate::carve_subrange(caps, dev.bar_phys[bar], PAGE_SIZE)?;
+    Some(spawn::UnitRound { cap, words })
 }
 
 /// Discover the remapping units, spawn the IOMMU driver over them, and
@@ -634,7 +827,8 @@ pub fn bring_up(
     let unconfined = |why: &str| {
         std::os::seraph::log!("{}: DMA-capable devices run unconfined", why);
     };
-    let Some(dmar_bytes) = read_dmar(caps)
+    let family = arch::current::IOMMU_FAMILY;
+    let Some(table) = read_units_table(caps, family)
     else
     {
         unconfined("no IOMMU found");
@@ -645,9 +839,12 @@ pub fn bring_up(
         unconfined("no IOMMU driver module");
         return None;
     }
-    let bridges = bridges(devices);
-    let units = unit_rounds(caps, &dmar_bytes, &bridges);
-    if units.rounds.is_empty()
+    let (rounds, topology) = match family
+    {
+        Family::Vtd => vtd_rounds(caps, table, devices),
+        Family::Riscv => riscv_rounds(caps, table, devices),
+    };
+    if rounds.is_empty()
     {
         unconfined("no IOMMU unit can be programmed");
         return None;
@@ -655,14 +852,14 @@ pub fn bring_up(
     let Some((client, death_eq)) = start_death_watch()
     else
     {
-        release_rounds(&units.rounds);
+        release_rounds(&rounds);
         unconfined("no IOMMU driver endpoint or death watch");
         return None;
     };
     let settled = spawn_and_settle(
         caps,
         module_guard,
-        &units.rounds,
+        &rounds,
         &client,
         death_eq,
         watch,
@@ -697,17 +894,15 @@ pub fn bring_up(
         }
     }
     client.mark_ready();
-    let handed = units.unit_index.iter().flatten().count();
+    let handed = rounds.len();
     let _ = client.widths.set(query_widths(&client, handed));
     served.set_iommu(Arc::clone(&client));
     let faults = Arc::new(Mutex::new(FaultCounts::default()));
     start_fault_log(&client, &faults);
-    std::os::seraph::log!("IOMMU: {} VT-d units translating", handed as u64);
+    std::os::seraph::log!("IOMMU: {} {} translating", handed as u64, family.units());
     Some(Iommu {
         client,
-        dmar: dmar_bytes,
-        unit_index: units.unit_index,
-        bridges,
+        topology,
         faults,
     })
 }

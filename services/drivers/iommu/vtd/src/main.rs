@@ -19,18 +19,17 @@
 
 mod arch;
 mod backend;
-mod store;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iommu_core::bootstrap::Registers;
 use iommu_core::service::{self, KernelCaps, Lock, Service};
+use iommu_store::{Flush, Store};
 use iommu_vtd::regs;
 use std::os::seraph::{reserve_pages, startup_info};
 use syscall_abi::PAGE_SIZE;
 
 use backend::{Unit, Vtd};
-use store::Store;
 
 /// The driver's one [`Service`], shared by the service loop and the fault
 /// poll thread.
@@ -76,17 +75,28 @@ fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
     Some(va)
 }
 
-/// Whether every unit's page walks snoop the processor caches, read from
-/// each unit's `ECAP` through its mapping at `regs`.
-fn all_coherent(regs: &[u64]) -> bool
+/// How table writes reach the units whose registers are mapped at `regs`:
+/// with no write-back when every unit's page walks snoop the processor
+/// caches, read from each unit's `ECAP` (the store's fence and the fence
+/// before each register write order them), and written back with
+/// [`arch::current::flush`] otherwise.
+fn table_flush(regs: &[u64]) -> Flush
 {
-    regs.iter().all(|&va| {
+    let coherent = regs.iter().all(|&va| {
         // SAFETY: `va` maps a unit's register set, whose `ECAP` (8 bytes at
         // 0x10) lies in its first page; reached only through a raw volatile
         // access.
         let ecap = unsafe { core::ptr::read_volatile((va + regs::ECAP as u64) as *const u64) };
         regs::coherent(ecap)
-    })
+    });
+    if coherent
+    {
+        Flush::Coherent
+    }
+    else
+    {
+        Flush::Writeback(arch::current::flush)
+    }
 }
 
 fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
@@ -133,11 +143,7 @@ fn main() -> !
         .zip(&mapped)
         .map(|(r, &va)| Unit::new(va, r.pages * PAGE_SIZE))
         .collect();
-    let store = Store::new(
-        info.memmgr_endpoint,
-        info.self_aspace,
-        all_coherent(&mapped),
-    );
+    let store = Store::new(info.memmgr_endpoint, info.self_aspace, table_flush(&mapped));
     let Some(mut svc) = Service::new(Vtd::new(units, store), KernelCaps, boot.units)
     else
     {

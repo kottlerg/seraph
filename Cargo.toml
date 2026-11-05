@@ -30,6 +30,8 @@ members = [
     "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",
     "services/drivers/iommu/core",
+    "services/drivers/iommu/riscv",
+    "services/drivers/iommu/store",
     "services/drivers/iommu/vtd",
     "services/drivers/serial",
     "services/drivers/test-dma",

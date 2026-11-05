@@ -40,7 +40,7 @@ pub mod init_reap;
 pub mod request_caps;
 
 pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
-pub use dma_holds::{DmaHolds, HeldReclaim};
+pub use dma_holds::{DmaHolds, HeldReclaim, ReleaseRefusal, release_target, release_token_badge};
 pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{CreateCaps, CreateTailCaps, split_create_caps};
 
@@ -76,11 +76,25 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 /// serialisation to keep the install-once contract.
 pub struct ProcessEntry
 {
+    /// The child's process badge: the table key, the correlator of its death
+    /// observers, the badge of its process handle and of the procmgr,
+    /// registry, and log SENDs procmgr mints for it, and the source badge
+    /// logd keys its stream by. Minted at random and accepted only by
+    /// [`badge_is_acceptable`], so it carries no verb bit.
     pub badge: u64,
+    /// Slot in procmgr's `CSpace` of the child's `AddressSpace` cap, the
+    /// root its self-cap and memmgr's delegation derive from.
     pub aspace_cap: u64,
+    /// Slot in procmgr's `CSpace` of the child's `CSpace` cap, the root its
+    /// self-cap derives from.
     pub cspace_cap: u64,
+    /// Slot in procmgr's `CSpace` of the child's main-thread cap.
     pub thread_cap: u64,
+    /// Slot in procmgr's `CSpace` of the Memory cap behind the child's
+    /// `ProcessInfo` page.
     pub pi_memory_cap: u64,
+    /// Slot in procmgr's `CSpace` of the Memory cap behind the main thread's
+    /// TLS block. Zero when the child's ELF has no TLS segment.
     pub tls_memory_cap: u64,
     /// Slot in procmgr's `CSpace` of the Memory cap behind the child's
     /// argv/env region, the pages mapped after its `ProcessInfo` page. Zero
@@ -114,7 +128,11 @@ pub struct ProcessEntry
     /// request's scheduling fields against this value (see
     /// [`resolve_spawn_sched`]).
     pub band_max: u8,
+    /// The child's entry point, its ELF entry relocated by the load bias,
+    /// where `start_process` starts the main thread.
     pub entry_point: u64,
+    /// The main thread's TLS base (its thread pointer) in the child, passed
+    /// to `thread_configure_with_tls` at start; zero without a TLS block.
     pub tls_base_va: u64,
     /// Top of the main-thread stack (SP at entry) the loader chose and mapped
     /// for this child. Passed to `thread_configure_with_tls` at start so the
@@ -124,6 +142,8 @@ pub struct ProcessEntry
     /// Delivered to the child in its entry register at start, so the child reads
     /// its handover struct from the address the loader chose.
     pub process_info_va: u64,
+    /// Set by `start_process` once the main thread has started; a held
+    /// reclaim is parked only for a started child ([`DmaHolds::park`]).
     pub started: bool,
     /// Set by `CREATE_DMA_HOLD`: once started, the child's teardown holds
     /// its memmgr reclaim back until its creator's `RELEASE_HOLD`
@@ -133,6 +153,7 @@ pub struct ProcessEntry
 
 impl ProcessEntry
 {
+    /// The child's process badge, the `badge` field.
     #[must_use]
     pub fn badge(&self) -> u64
     {
@@ -482,6 +503,33 @@ pub fn resolve_spawn_sched(
     Some((priority, band_max))
 }
 
+// ── Death resync ────────────────────────────────────────────────────────────
+
+/// The exit reason procmgr's death resync reaps a live entry with, or `None`
+/// to leave it live. `main_thread` is the kernel's packed
+/// `CAP_INFO_THREAD_STATE` of the entry's main thread (the state above bit
+/// 32, the retained exit reason below), `exited` the state value meaning the
+/// thread exited, and `terminal_fault` the entry's `AddressSpace`
+/// `CAP_INFO_ASPACE_TERMINAL_FAULT` (`0` while no thread of it took a
+/// terminal fault, else the first such fault's reason); a read that failed is
+/// `None`. An exited main thread reaps with its own reason, as its post would
+/// have; otherwise a terminal fault in any thread reaps with the fault's
+/// reason, as the address space's post would have.
+#[must_use]
+pub fn resync_exit_reason(
+    main_thread: Option<u64>,
+    exited: u32,
+    terminal_fault: Option<u64>,
+) -> Option<u64>
+{
+    match (main_thread, terminal_fault)
+    {
+        (Some(packed), _) if (packed >> 32) as u32 == exited => Some(packed & 0xFFFF_FFFF),
+        (_, Some(fault)) if fault != 0 => Some(fault),
+        _ => None,
+    }
+}
+
 // ── Badge acceptance ─────────────────────────────────────────────────────────
 
 /// Whether a candidate badge may be handed out as a process badge.
@@ -513,6 +561,45 @@ pub fn badge_is_acceptable(badge: u64, min: u64, reserved: u64, verb_bits: u64) 
 mod tests
 {
     use super::*;
+
+    /// A thread-state value standing for "exited" in the resync tests; the
+    /// function compares against whatever value the caller passes.
+    const EXITED: u32 = 3;
+
+    #[test]
+    fn the_resync_reaps_an_exited_main_thread_with_its_own_reason()
+    {
+        let packed = (u64::from(EXITED) << 32) | 0x1007;
+        assert_eq!(
+            resync_exit_reason(Some(packed), EXITED, Some(0)),
+            Some(0x1007)
+        );
+        // The main thread's reason wins over a fault a worker took first.
+        assert_eq!(
+            resync_exit_reason(Some(packed), EXITED, Some(0x100E)),
+            Some(0x1007)
+        );
+    }
+
+    #[test]
+    fn the_resync_reaps_a_running_process_whose_worker_took_a_terminal_fault()
+    {
+        let running = u64::from(EXITED - 1) << 32;
+        assert_eq!(
+            resync_exit_reason(Some(running), EXITED, Some(0x100E)),
+            Some(0x100E)
+        );
+        assert_eq!(resync_exit_reason(None, EXITED, Some(0x100E)), Some(0x100E));
+    }
+
+    #[test]
+    fn the_resync_leaves_a_process_live_without_an_exit_or_a_fault()
+    {
+        let running = u64::from(EXITED - 1) << 32;
+        assert_eq!(resync_exit_reason(Some(running), EXITED, Some(0)), None);
+        assert_eq!(resync_exit_reason(Some(running), EXITED, None), None);
+        assert_eq!(resync_exit_reason(None, EXITED, None), None);
+    }
 
     fn entry_with_badge(badge: u64) -> ProcessEntry
     {
@@ -849,7 +936,7 @@ mod tests
         taken.started = true;
         assert!(table.holds_mut().park(&taken));
         assert!(table.badge_in_use(16));
-        assert!(table.holds_mut().release(16).is_some());
+        assert!(table.holds_mut().release(release_token_badge(16)).is_ok());
         assert!(!table.badge_in_use(16));
     }
 }

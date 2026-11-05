@@ -67,7 +67,8 @@ spawn target:
   that procmgr still serves after the refusals.
 - `procmgr_dma_hold_phase` creates it through raw `CREATE_FROM_FILE` with `CREATE_DMA_HOLD`,
   destroys one child before its start and starts another to its exit, and checks that procmgr
-  holds the started child's pages until `RELEASE_HOLD`.
+  holds the started child's pages until `RELEASE_HOLD` on the child's release token, which its
+  process handle cannot send.
 - `pipes_phase` (`services/svctest/src/phases/pipes.rs`) captures its stdout through a pipe
   and through `Command::output()`, and expects bytes and a clean exit.
 

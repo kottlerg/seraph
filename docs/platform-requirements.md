@@ -236,8 +236,7 @@ disable it, fuse it off, or omit it on consumer boards and handhelds — so requ
 in-envelope hardware.
 
 The IOMMU is discovered by the userspace device manager and programmed by a userspace IOMMU
-driver it directs, not by the kernel: VT-d on x86-64; the RISC-V IOMMU is design intent; not yet
-implemented, so DMA runs unconfined on RISC-V. When an
+driver it directs, not by the kernel: VT-d on x86-64, the RISC-V IOMMU on riscv64. When an
 IOMMU is present and configured, device DMA is confined to explicitly mapped frames; when it is
 absent or unconfigured, DMA is unconfined (a degraded mode). The authoritative DMA safety model is
 in [device-management.md](device-management.md).

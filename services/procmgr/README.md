@@ -57,8 +57,8 @@ procmgr/
   spawning a child to obtain the child's `memmgr_endpoint_cap`; call
   `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim, or, for a
   started child created with `CREATE_DMA_HOLD`, only once its creator sends
-  `RELEASE_HOLD` (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 3:
-  `RELEASE_HOLD`). See
+  `RELEASE_HOLD` on the child's release token (see
+  [docs/ipc-interface.md](docs/ipc-interface.md) § Label 3: `RELEASE_HOLD`). See
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Steady-State
   Process Creation and § Process Death.
 - **Process teardown** — on exit or crash, revoke the process's
@@ -235,24 +235,24 @@ Each death queue has a fixed tuning capacity (`DEATH_EQ_CAPACITY`, 256), and
 procmgr drains every queue on each death wakeup. The kernel drops a post to a
 full queue, so a drain that takes a full queue's worth of events or more from
 one queue rescans the table and reaps every entry whose main thread the kernel
-reports exited (`CAP_INFO_THREAD_STATE`). Any dropped post leaves a full queue of
-events behind it for that drain or the next, so the rescan runs after the
-drop. The rescan recovers main-thread deaths only: a dropped address-space
-terminal-fault post, for a worker thread's fault while the main thread runs, is
-not recovered, since the kernel exposes no address-space fault state to read
-back; that process is reaped when its main thread exits. A reaped or destroyed
-(`DESTROY_PROCESS`) child stays in a recent-exits record for 30 s, so
-`QUERY_PROCESS` answers `EXITED` for it, unless heap exhaustion drops or evicts
-its record first (see [docs/ipc-interface.md](docs/ipc-interface.md) § Label 9:
-`QUERY_PROCESS`).
+reports exited (`CAP_INFO_THREAD_STATE`), or whose address space it reports took
+a terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`, a worker thread's fault
+while the main thread runs). Any dropped post leaves a full queue of events
+behind it for that drain or the next, so the rescan runs after the drop and
+recovers either death. A reaped or destroyed (`DESTROY_PROCESS`) child stays in
+a recent-exits record for 30 s, so `QUERY_PROCESS` answers `EXITED` for it,
+unless heap exhaustion drops or evicts its record first (see
+[docs/ipc-interface.md](docs/ipc-interface.md) § Label 9: `QUERY_PROCESS`).
 
-The teardown of a started child created with `CREATE_DMA_HOLD` parks the child's memmgr record
-(its memmgr badge and procmgr's badged memmgr SEND) in a held list (`DmaHolds`) instead of sending
-`PROCESS_DIED`; the creator's `RELEASE_HOLD` takes the record and sends it. The room each record
-takes is reserved when the create arms the hold, so a create the heap cannot reserve it for fails
-with `OUT_OF_MEMORY`, and a teardown never has to free a held child's frames for want of a record.
-A held record keeps its badge in use, so badge minting never hands it to a new child, whose
-process handle could otherwise release it.
+The teardown of a started child created with `CREATE_DMA_HOLD` parks the child's memmgr record (its
+memmgr badge and procmgr's badged memmgr SEND) in a held list (`DmaHolds`) instead of sending
+`PROCESS_DIED`; the creator's `RELEASE_HOLD` on the release token takes the record and sends it. The
+token is the create reply's third cap, badged with the child's badge and `HOLD_RELEASE_AUTHORITY`;
+`release_target` in the process-table crate is the check that refuses any other sender. The room
+each record takes is reserved when the create arms the hold, so a create the heap cannot reserve it
+for fails with `OUT_OF_MEMORY`, and a teardown never has to free a held child's frames for want of a
+record. A held record keeps its badge in use, so badge minting never hands it to a new child, whose
+release token would otherwise release it.
 
 ---
 

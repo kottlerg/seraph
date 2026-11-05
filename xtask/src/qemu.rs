@@ -105,9 +105,19 @@ impl X86Paging
     }
 }
 
-/// The DMA test device every x86-64 launch attaches: QEMU's `edu`
-/// (PCI `1234:11e8`), with its default 28-bit DMA mask.
+/// The DMA test device every launch attaches: QEMU's `edu` (PCI
+/// `1234:11e8`), with its default 28-bit DMA mask.
 const EDU_DEVICE: &str = "edu";
+
+/// The RISC-V IOMMU as a PCI function, pinned at 00:01.0, the lowest slot
+/// past the host bridge. `off=off` leaves it in Bare mode out of reset,
+/// passing DMA through untranslated until it is programmed; its default, Off
+/// mode, blocks all DMA, so the firmware could not read the boot disk. QEMU's
+/// ACPI RIMT describes the IOMMU as translating only the requester IDs above
+/// its own, while QEMU translates every function of the bus, so a device on
+/// a lower slot would be translated with no firmware description devmgr
+/// could confine it by; at 00:01.0 every other function lies above it.
+const RISCV_IOMMU_DEVICE: &str = "riscv-iommu-pci,off=off,addr=0x01";
 
 /// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -197,6 +207,22 @@ pub struct QemuLaunchSpec<'a>
     pub iommu: Iommu,
 }
 
+/// The device arguments a launch passes before every other device: the
+/// RISC-V IOMMU when attached, so it takes its pinned slot before any
+/// auto-placed device can (`RISCV_IOMMU_DEVICE`); none on q35, whose
+/// `intel-iommu` is no PCI function (`extend_x86` adds it).
+fn leading_devices(spec: &QemuLaunchSpec) -> Vec<String>
+{
+    if spec.arch == Arch::Riscv64 && spec.iommu == Iommu::Attached
+    {
+        vec!["-device".into(), RISCV_IOMMU_DEVICE.into()]
+    }
+    else
+    {
+        Vec::new()
+    }
+}
+
 /// Construct the full QEMU argv for a launch spec.
 ///
 /// Pairs with `Arch::qemu_binary()` for the binary name. The returned vector
@@ -225,6 +251,9 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         format!("{}M", spec.mem_mib),
         "-smp".into(),
         spec.cpus.to_string(),
+    ];
+    args.extend(leading_devices(spec));
+    args.extend([
         "-drive".into(),
         format!(
             "if=none,id=hd0,format=raw,file={}",
@@ -237,7 +266,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
             spec.iommu,
         ),
-    ];
+    ]);
 
     if let Some(second) = &spec.second_disk
     {
@@ -547,15 +576,11 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
         format!("if=pflash,format=raw,file={}", vars_path.display()),
     ]);
 
-    // The RISC-V IOMMU as a PCI function. `off=off` leaves it in Bare mode out
-    // of reset, passing DMA through untranslated until it is programmed;
-    // its default, Off mode, blocks all DMA, so the firmware could not read
-    // the boot disk. Placed after the shared devices, so it takes the next
-    // free slot and moves none of theirs.
-    if spec.iommu == Iommu::Attached
-    {
-        args.extend(["-device".into(), "riscv-iommu-pci,off=off".into()]);
-    }
+    // QEMU's `edu` device, whose DMA engine svctest's DMA confinement phase
+    // drives through the test-only `test-dma` driver: behind the IOMMU when
+    // one is attached (`RISCV_IOMMU_DEVICE`, added first), unconfined
+    // otherwise. No production driver binds it.
+    args.extend(["-device".into(), EDU_DEVICE.into()]);
 
     if !spec.headless
     {
@@ -1053,7 +1078,7 @@ mod tests
                 .collect()
         };
         for (mut spec, iommu_device) in [
-            (riscv_spec(4, 512), "riscv-iommu-pci,off=off"),
+            (riscv_spec(4, 512), RISCV_IOMMU_DEVICE),
             (x86_spec(X86Paging::Four), "intel-iommu,intremap=off"),
         ]
         {
@@ -1064,10 +1089,16 @@ mod tests
             });
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(argv.iter().any(|a| a == iommu_device));
-            // The DMA test device sits on x86_64 only, with or without the
-            // IOMMU.
-            let x86 = iommu_device.starts_with("intel");
-            assert_eq!(argv.iter().any(|a| a == EDU_DEVICE), x86);
+            // The RISC-V IOMMU precedes every other device, so no
+            // auto-placed one takes its slot.
+            let first_device = argv.iter().position(|a| a == "-device").unwrap();
+            assert_eq!(
+                argv[first_device + 1] == RISCV_IOMMU_DEVICE,
+                iommu_device == RISCV_IOMMU_DEVICE
+            );
+            // The DMA test device sits on both machines, with or without
+            // the IOMMU.
+            assert!(argv.iter().any(|a| a == EDU_DEVICE));
             // Both disks and the keyboard; the firmware-only RNG stays out.
             let devices = virtio(&argv);
             assert_eq!(devices.len(), 4);
@@ -1078,7 +1109,7 @@ mod tests
             spec.iommu = Iommu::Absent;
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(!argv.iter().any(|a| a.contains("iommu")));
-            assert_eq!(argv.iter().any(|a| a == EDU_DEVICE), x86);
+            assert!(argv.iter().any(|a| a == EDU_DEVICE));
             assert_eq!(virtio(&argv).len(), 4);
         }
     }

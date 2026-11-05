@@ -38,7 +38,22 @@ services/drivers/
 │   │       ├── lib.rs              # The Backend trait each family implements
 │   │       ├── bootstrap.rs        # Unit rounds and scopes (host-tested)
 │   │       ├── faults.rs           # Polled fault queue (host-tested)
-│   │       └── service.rs          # iommu_labels service, domain records (host-tested)
+│   │       ├── service.rs          # iommu_labels service, domain records (host-tested)
+│   │       └── table.rs            # The TableStore the family tables are built in
+│   ├── riscv/                      # RISC-V IOMMU driver for devmgr (binary + lib; riscv64)
+│   │   ├── Cargo.toml
+│   │   ├── README.md
+│   │   └── src/
+│   │       ├── lib.rs              # Register, command, and table logic (host-tested)
+│   │       ├── regs.rs             # Registers, commands, fault records
+│   │       ├── tables.rs           # Device directory, device context, first-stage tables
+│   │       ├── main.rs
+│   │       └── backend.rs          # The RISC-V IOMMU Backend
+│   ├── store/                      # Table pages from memmgr, for both drivers (library)
+│   │   ├── Cargo.toml
+│   │   ├── README.md
+│   │   └── src/
+│   │       └── lib.rs
 │   └── vtd/                        # VT-d IOMMU driver for devmgr (binary + lib; x86-64)
 │       ├── Cargo.toml
 │       ├── README.md
@@ -48,7 +63,6 @@ services/drivers/
 │           ├── tables.rs           # Root, context, and second-level tables
 │           ├── main.rs
 │           ├── backend.rs          # The VT-d Backend
-│           ├── store.rs            # Table pages from memmgr
 │           └── arch/               # Cache-line flushing (x86_64)
 ├── serial/                         # Serial (UART) device driver (binary)
 │   ├── Cargo.toml
@@ -146,8 +160,9 @@ The full driver lifecycle is specified in
   `CREATE_DMA_HOLD`, so its memory is freed only once devmgr has confirmed its
   device's DMA stopped
   ([docs/device-management.md](../../docs/device-management.md#dma-safe-teardown)
-  § DMA-Safe Teardown). On x86-64 devmgr attaches each such device to a VT-d
-  domain of its own before its grant, through the `iommu-vtd` driver (below). The
+  § DMA-Safe Teardown). devmgr attaches each such device to an IOMMU domain of
+  its own before its grant, through the IOMMU driver of the architecture's
+  family, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64 (below). The
   IOMMU-isolated vs DMA-unsafe model is
   specified in [docs/device-management.md](../../docs/device-management.md#dma-safety-model)
   § DMA Safety Model.
@@ -166,6 +181,8 @@ The full driver lifecycle is specified in
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`iommu/core/`](iommu/core/README.md) | Library | Family-independent IOMMU driver logic: the bootstrap devmgr serves, the `iommu_labels` service and its per-domain checks, the polled fault queue, and the `Backend` trait |
+| [`iommu/riscv/`](iommu/riscv/README.md) | Binary + library | RISC-V IOMMU driver (riscv64) — devmgr-spawned at boot; programs each IOMMU's queues, device directory, and first-stage tables and confines each DMA-capable device to its own domain |
+| [`iommu/store/`](iommu/store/README.md) | Library | The table-page store both IOMMU drivers build their translation structures in: zeroed pages from memmgr, mapped, with their physical addresses |
 | [`iommu/vtd/`](iommu/vtd/README.md) | Binary + library | VT-d IOMMU driver (x86-64) — devmgr-spawned at boot; programs the remapping units' tables and confines each DMA-capable device to its own domain |
 | [`test-dma/`](test-dma/README.md) | Binary | Test-only driver for QEMU's `edu` device — svctest checks a mapped DMA copy arrives and one to an unmapped IOVA is stopped |
 | [`test-fault/`](test-fault/README.md) | Binary | Test-only fault-injection driver — reports ready and dies on request, or never reports ready, so svctest exercises devmgr's settle bound and driver withdrawal |

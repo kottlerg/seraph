@@ -484,9 +484,9 @@ The death-notification flow:
    address-space death notification for a terminal fault in any thread,
    or an explicit `DESTROY_PROCESS` teardown). When one of its death
    queues was full and a post was dropped, procmgr recovers the
-   main-thread deaths from the kernel's thread states; a dropped
-   address-space post is not recovered, and that process is reaped when
-   its main thread exits (see
+   main-thread deaths from the kernel's thread states, and the
+   address-space terminal faults from each address space's retained
+   terminal-fault reason (see
    [services/procmgr/README.md](../services/procmgr/README.md) § Process
    table and death queues).
 2. **Procmgr → memmgr.** Procmgr sends `PROCESS_DIED` to memmgr carrying
@@ -496,7 +496,8 @@ The death-notification flow:
    [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)
    § Label 4). For a child created with `CREATE_DMA_HOLD` that was started,
    procmgr holds this step back after the teardown, however the child died,
-   until the creator sends `RELEASE_HOLD` on the child's process handle; until
+   until the creator sends `RELEASE_HOLD` on the child's release token, the
+   third cap of the create reply and the only cap procmgr serves it on; until
    then memmgr keeps the child's frames on its record, out of the free pool,
    and a creator that never releases leaves them there for the rest of the
    boot. devmgr creates every DMA-capable driver so, and releases the hold only

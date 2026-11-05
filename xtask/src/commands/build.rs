@@ -233,15 +233,15 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     // TODO(#165): remove with the devmgr enumeration redesign. Test-only
-    // driver for QEMU's `edu` DMA device, which only the x86-64 machine
-    // attaches; it ships on the rootfs and is spawned only by devmgr's
+    // driver for QEMU's `edu` DMA device, which every launch attaches; it
+    // ships on the rootfs and is spawned only by devmgr's
     // TEST_SPAWN_DMA_DRIVER shim under svctest.
     Spec {
         name: "test-dma",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::ServicesDrivers,
-        arch_only: Some(Arch::X86_64),
+        arch_only: None,
     },
     // The VT-d IOMMU driver: a boot-bundle module (`bundle::ARCH_MODULES`)
     // devmgr spawns before any DMA-capable driver.
@@ -251,6 +251,14 @@ const SPECS: &[Spec] = &[
         profile: BuildProfile::StdUser,
         dest: InstallDest::ServicesDrivers,
         arch_only: Some(Arch::X86_64),
+    },
+    // The RISC-V IOMMU driver: a boot-bundle module, as `iommu-vtd` is.
+    Spec {
+        name: "iommu-riscv",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: Some(Arch::Riscv64),
     },
     Spec {
         name: "fatfs",

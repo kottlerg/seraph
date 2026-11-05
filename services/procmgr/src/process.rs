@@ -40,14 +40,18 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// counter held structurally by starting at 16 — and avoids the reserved
 /// init-reap correlator, and until no verb bit (`ipc::VERB_BIT_MASK`) is set;
 /// see [`badge_is_acceptable`]. It also redraws a badge a live process
-/// already holds, so the death correlator names one live process. Returns
-/// `None` if the entropy draw fails (a kernel-contract violation), failing
-/// the spawn rather than minting a weak badge.
-fn next_process_badge(table: &ProcessTable) -> Option<u64>
+/// already holds, so the death correlator names one live process.
+///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY`, the code § Label 1 and § Label 13 of
+/// `services/procmgr/docs/ipc-interface.md` give a failed badge allocation,
+/// when the entropy draw fails (a kernel-contract violation), failing the
+/// spawn rather than minting a weak badge.
+fn next_process_badge(table: &ProcessTable) -> Result<u64, u64>
 {
     loop
     {
-        let t = syscall::random_u64().ok()?;
+        let t = syscall::random_u64().map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         if badge_is_acceptable(
             t,
             ipc::log_badges::LOG_BADGE_FIRST_CHILD,
@@ -55,7 +59,7 @@ fn next_process_badge(table: &ProcessTable) -> Option<u64>
             ipc::VERB_BIT_MASK,
         ) && !table.badge_in_use(t)
         {
-            return Some(t);
+            return Ok(t);
         }
     }
 }
@@ -186,7 +190,8 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 // handlers, resolve through this module.
 pub use process_table::{
     ArgvEnvRefusal, CreateTailCaps, DmaHolds, ProcessEntry, ProcessTable, RecentExits,
-    badge_is_acceptable, resolve_spawn_sched, split_create_caps,
+    ReleaseRefusal, badge_is_acceptable, release_token_badge, resolve_spawn_sched,
+    resync_exit_reason, split_create_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -1514,6 +1519,11 @@ fn alloc_main_tls_memory(
 /// the scratch mapping from procmgr's aspace, derive an RW cap, and map
 /// the block into the child at the chosen TLS block base.
 ///
+/// # Errors
+/// `procmgr_errors::INSUFFICIENT_RIGHTS` when the RW cap cannot be derived;
+/// `procmgr_errors::MAP_FAILED` when the block cannot be mapped into the
+/// child.
+///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
@@ -1522,7 +1532,7 @@ unsafe fn finalize_main_tls(
     alloc: MainTlsAlloc,
     _self_aspace: u64,
     child_aspace: u64,
-) -> Option<MainTls>
+) -> Result<MainTls, u64>
 {
     // SAFETY: scratch_va is mapped writable for the whole block, which holds
     // the TCB at `tls_base_offset`.
@@ -1536,8 +1546,10 @@ unsafe fn finalize_main_tls(
 
     drop(alloc.scratch);
 
-    let tls_rw =
-        CapGuard::new(syscall::cap_derive(alloc.memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
+    let tls_rw = CapGuard::new(
+        syscall::cap_derive(alloc.memory.cap(), syscall::RIGHTS_MEM_MAP_RW)
+            .map_err(|_| procmgr_errors::INSUFFICIENT_RIGHTS)?,
+    );
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
     unsafe {
@@ -1550,10 +1562,10 @@ unsafe fn finalize_main_tls(
             syscall::MAP_FROM_CAP,
         )
     }
-    .ok()?;
+    .map_err(|_| procmgr_errors::MAP_FAILED)?;
     // The memory cap stays as the teardown handle; tls_rw is transient and
     // its guard deletes it on return.
-    Some(MainTls {
+    Ok(MainTls {
         memory_cap: alloc.memory.disarm(),
         base_va: alloc.tls_base_va,
     })
@@ -1570,8 +1582,8 @@ unsafe fn finalize_main_tls(
 ///
 /// # Errors
 /// [`alloc_main_tls_memory`]'s codes; `INVALID_ELF` when the template is
-/// larger than the block; `OUT_OF_MEMORY` when the block cannot be mapped
-/// into the child.
+/// larger than the block; [`finalize_main_tls`]'s when the block cannot be
+/// mapped into the child.
 ///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
@@ -1616,7 +1628,6 @@ unsafe fn prepare_main_tls_from_bytes(
     relocate(template);
     // SAFETY: the caller's contract covers `child_aspace`.
     unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
-        .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
 
 /// Allocate, populate by streaming `.tdata` from an open VFS file handle,
@@ -1628,8 +1639,8 @@ unsafe fn prepare_main_tls_from_bytes(
 /// # Errors
 /// [`alloc_main_tls_memory`]'s codes; `INVALID_ELF` when the template's file
 /// size is larger than the block; `IO_ERROR` when the template's bytes do not
-/// all arrive; `OUT_OF_MEMORY` when the block cannot be mapped into the
-/// child.
+/// all arrive; [`finalize_main_tls`]'s when the block cannot be mapped into
+/// the child.
 ///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
@@ -1677,7 +1688,6 @@ unsafe fn prepare_main_tls_from_vfs(
     relocate(template);
     // SAFETY: the caller's contract covers `child_aspace`.
     unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
-        .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
 
 /// Map stack and IPC buffer pages into a child address space.
@@ -1687,6 +1697,9 @@ unsafe fn prepare_main_tls_from_vfs(
 /// construction — `process-layout` chooses disjoint VAs for the stack and the
 /// other bootstrap surfaces so the gap is always present. Stack overflow faults
 /// on the guard VA instead of silently writing into adjacent mappings.
+///
+/// # Errors
+/// [`map_fresh_child_page`]'s, for the first page that fails.
 ///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
@@ -1698,7 +1711,7 @@ unsafe fn map_child_stack_and_ipc(
     ipc_buf: *mut u64,
     stack_pages: u32,
     layout: &ProcessLayout,
-) -> Option<()>
+) -> Result<(), u64>
 {
     let stack_base = layout.stack_top - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
@@ -1729,6 +1742,11 @@ unsafe fn map_child_stack_and_ipc(
 /// owns no cap reference, and memmgr's record pins the page until
 /// `PROCESS_DIED`.
 ///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY` when memmgr grants no page;
+/// `procmgr_errors::INSUFFICIENT_RIGHTS` when its RW cap cannot be derived;
+/// `procmgr_errors::MAP_FAILED` when it cannot be mapped into the child.
+///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
@@ -1738,13 +1756,20 @@ unsafe fn map_fresh_child_page(
     child_memmgr_send: u64,
     ipc_buf: *mut u64,
     va: u64,
-) -> Option<()>
+) -> Result<(), u64>
 {
-    let memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
-    let rw = CapGuard::new(syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
+    let memory = CapGuard::new(
+        crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
+    );
+    let rw = CapGuard::new(
+        syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW)
+            .map_err(|_| procmgr_errors::INSUFFICIENT_RIGHTS)?,
+    );
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, syscall::MAP_FROM_CAP) }.ok()
+    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, syscall::MAP_FROM_CAP) }
+        .map_err(|_| procmgr_errors::MAP_FAILED)
 }
 
 /// Determine protection flags for an ELF segment.
@@ -1830,6 +1855,11 @@ fn vfs_read_exact(file_cap: u64, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) ->
 }
 
 /// Derive caller-facing caps and record the process in the table.
+///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY` when a death observer cannot be bound,
+/// a caller-facing cap cannot be derived, or the table cannot grow: each is
+/// procmgr's own memory or slots running out.
 // similar_names: child_aspace/child_cspace are intentionally parallel.
 // too_many_arguments: grouping these into a struct would add complexity without
 // reducing call sites — this helper is called from exactly two places.
@@ -1854,7 +1884,7 @@ fn finalize_creation(
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     self_aspace: u64,
-) -> Option<CreateResult>
+) -> Result<CreateResult, u64>
 {
     let badge = process_badge;
     let pi_memory_cap = info_caps.pi_memory.cap();
@@ -1866,7 +1896,7 @@ fn finalize_creation(
     if let Err(e) = deaths.bind_thread(child_thread, badge)
     {
         std::os::seraph::log!("main-thread death bind failed (err={e}); spawn refused");
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
     // Also bind an address-space observer with the SAME correlator, so a
@@ -1881,18 +1911,19 @@ fn finalize_creation(
     if let Err(e) = deaths.bind_aspace(child_aspace, badge)
     {
         std::os::seraph::log!("address-space death bind failed (err={e}); spawn refused");
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
     // Derive a badged endpoint cap for the caller. The badge identifies this
     // process on subsequent START_PROCESS / REQUEST_MEMORY_CAPS calls.
     let process_handle =
-        syscall::cap_derive_badge(self_endpoint, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()?;
+        syscall::cap_derive_badge(self_endpoint, syscall::RIGHTS_EP_SEND_GRANT, badge)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let Ok(thread_for_caller) = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD)
     else
     {
         let _ = syscall::cap_delete(process_handle);
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     };
 
     if table
@@ -1921,10 +1952,10 @@ fn finalize_creation(
         // Heap exhausted (the badge was checked free when it was minted, and
         // nothing ran since): drop the caps we minted for the caller; the caller's
         // guards still own the child kernel objects and per-child memory caps
-        // and will release them when finalize returns None.
+        // and will release them when finalize returns an error.
         let _ = syscall::cap_delete(thread_for_caller);
         let _ = syscall::cap_delete(process_handle);
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
     // If the spawner supplied a death-relay POST cap, bind it as a second
@@ -1933,7 +1964,7 @@ fn finalize_creation(
     // `Child::wait()` returns. The kernel captures the EventQueue state at
     // bind time, so procmgr drops its copy afterwards (mirrors how the
     // main-thread death binding leaves no procmgr-side ownership concern).
-    // Consumed only here, after the last failure return, so on every `None`
+    // Consumed only here, after the last failure return, so on every `Err`
     // the caller still owns the cap and releases it.
     if parent_relay_cap != 0
     {
@@ -1971,7 +2002,7 @@ fn finalize_creation(
         advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
     }
 
-    Some(CreateResult {
+    Ok(CreateResult {
         process_handle,
         thread_for_caller,
         badge,
@@ -2149,8 +2180,7 @@ fn create_process_from_bytes(
         universals.sched_baseline,
         sched.priority,
         ipc_buf,
-    )
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    )?;
     let (child_aspace, child_cspace, child_thread) = (
         child_objs.aspace(),
         child_objs.cspace(),
@@ -2270,7 +2300,7 @@ fn create_process_from_bytes(
 
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
-    let process_badge = next_process_badge(table).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let process_badge = next_process_badge(table)?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let info_caps = unsafe {
@@ -2301,7 +2331,9 @@ fn create_process_from_bytes(
             &layout,
         )
     }
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    // § Label 1 and § Label 13 answer a failed stack or IPC-buffer page
+    // `OUT_OF_MEMORY`, whatever cause the helper reports.
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
 
     // The guards stay armed across `finalize_creation`, so its failure
     // releases every resource; on success the table entry owns them.
@@ -2327,8 +2359,7 @@ fn create_process_from_bytes(
         ipc_buf,
         &layout,
         self_aspace,
-    )
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    )?;
     let _ = child_objs.disarm();
     info_caps.disarm();
     let _ = main_tls_memory.disarm();
@@ -2720,35 +2751,45 @@ impl Drop for ChildKernelObjects
 /// Every slab and kernel-object cap is guarded from the moment it exists,
 /// so a failure at any step leaves nothing in procmgr's `CSpace`; the
 /// returned guard owns the three kernel objects until disarmed.
+///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY` when memmgr grants no retype slab, the
+/// thread-retype size cannot be read, or a retype fails: § Label 1 and
+/// § Label 13 of `services/procmgr/docs/ipc-interface.md` name every
+/// kernel-object allocation failure so.
 fn create_child_kernel_objects(
     memmgr_send: u64,
     sched_baseline: u64,
     priority: u8,
     ipc_buf: *mut u64,
-) -> Option<ChildKernelObjects>
+) -> Result<ChildKernelObjects, u64>
 {
-    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
-        memmgr_send,
-        crate::ASPACE_RETYPE_PAGES,
-        ipc_buf,
-    )?);
-    let aspace =
-        CapGuard::new(syscall::cap_create_aspace(slab.cap(), 0, crate::ASPACE_RETYPE_PAGES).ok()?);
+    let oom = procmgr_errors::OUT_OF_MEMORY;
+    let slab = CapGuard::new(
+        crate::memmgr_alloc_pages_contig(memmgr_send, crate::ASPACE_RETYPE_PAGES, ipc_buf)
+            .ok_or(oom)?,
+    );
+    let aspace = CapGuard::new(
+        syscall::cap_create_aspace(slab.cap(), 0, crate::ASPACE_RETYPE_PAGES).map_err(|_| oom)?,
+    );
     // The retype keeps its own reference on the region; drop the slab slot.
     drop(slab);
-    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
-        memmgr_send,
-        crate::CSPACE_RETYPE_PAGES,
-        ipc_buf,
-    )?);
-    let cspace =
-        CapGuard::new(syscall::cap_create_cspace(slab.cap(), 0, crate::CSPACE_RETYPE_PAGES).ok()?);
+    let slab = CapGuard::new(
+        crate::memmgr_alloc_pages_contig(memmgr_send, crate::CSPACE_RETYPE_PAGES, ipc_buf)
+            .ok_or(oom)?,
+    );
+    let cspace = CapGuard::new(
+        syscall::cap_create_cspace(slab.cap(), 0, crate::CSPACE_RETYPE_PAGES).map_err(|_| oom)?,
+    );
     drop(slab);
-    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
-        memmgr_send,
-        crate::thread_retype_pages()?,
-        ipc_buf,
-    )?);
+    let slab = CapGuard::new(
+        crate::memmgr_alloc_pages_contig(
+            memmgr_send,
+            crate::thread_retype_pages().ok_or(oom)?,
+            ipc_buf,
+        )
+        .ok_or(oom)?,
+    );
     let (sched_cap, create_priority) = if sched_baseline != 0
     {
         (sched_baseline, priority)
@@ -2764,9 +2805,9 @@ fn create_child_kernel_objects(
         sched_cap,
         create_priority,
     )
-    .ok()?;
+    .map_err(|_| oom)?;
     drop(slab);
-    Some(ChildKernelObjects::new(
+    Ok(ChildKernelObjects::new(
         aspace.disarm(),
         cspace.disarm(),
         thread,
@@ -2938,6 +2979,27 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
 /// `parent_relay_cap` is consumed only on `Ok`, so on `Err` the caller
 /// releases it. Every resource acquired for the child, including memmgr's
 /// record for it, is released on every `Err`.
+///
+/// # Errors
+/// The `CREATE_FROM_FILE` reply code § Label 13 of
+/// `services/procmgr/docs/ipc-interface.md` names for the failure:
+/// - `procmgr_errors::IO_ERROR` (10) — the `FS_OPEN` of `file_cap` failed, the
+///   ELF header could not be read, or a segment's file bytes did not all
+///   arrive;
+/// - `procmgr_errors::INVALID_ELF` (1) — `file_size` is zero, or ELF
+///   validation or relocation failed;
+/// - `procmgr_errors::OUT_OF_MEMORY` (2) — a memory-cap, kernel-object, or
+///   badge allocation failed, the main thread's TLS block could not be built,
+///   or the stack or IPC-buffer pages could not be mapped;
+/// - `procmgr_errors::MAP_FAILED` (11) — mapping failed during segment load;
+/// - `procmgr_errors::INSUFFICIENT_RIGHTS` (12) — a rights derivation failed
+///   during segment load;
+/// - `procmgr_errors::INVALID_ARGUMENT` (7) — the copy of `argv_env` refused
+///   it: the caller's cap could not be mapped, or a blob's NULs disagree with
+///   its count or a nonempty blob does not end in a NUL ([`copy_argv_env`]);
+/// - `procmgr_errors::ARGV_ENV_STILL_MAPPED` (14) — a window the argv and env
+///   were copied through would not unmap, so the child's memmgr record is
+///   withheld.
 // clippy::too_many_lines: file-cap-based process creation is one transaction
 // that owns the lifetime of the ELF-header scratch memory cap, the child's kernel
 // objects, and the per-page streaming loop.
@@ -3115,8 +3177,7 @@ pub fn create_process_from_file(
     // The three child kernel-object caps, guarded from creation so
     // subsequent `?` returns release them in the correct order.
     let child_objs =
-        create_child_kernel_objects(mms.cap(), ctx.sched_baseline, sched.priority, ipc_buf)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        create_child_kernel_objects(mms.cap(), ctx.sched_baseline, sched.priority, ipc_buf)?;
 
     // Stream each LOAD segment from VFS at segment granularity.
     let mut applied_relocs = 0u64;
@@ -3269,7 +3330,7 @@ pub fn create_process_from_file(
         demand_paged,
         self_memmgr_ep: ctx.memmgr_ep,
     };
-    let process_badge = next_process_badge(table).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let process_badge = next_process_badge(table)?;
     // SAFETY: `child_objs.aspace()` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     let info_caps = unsafe {
@@ -3301,7 +3362,9 @@ pub fn create_process_from_file(
             &layout,
         )
     }
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    // § Label 1 and § Label 13 answer a failed stack or IPC-buffer page
+    // `OUT_OF_MEMORY`, whatever cause the helper reports.
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
 
     // Commit point: hand the accumulated cap values to `finalize_creation`,
     // which records them in the process table on success. The guards stay
@@ -3334,8 +3397,7 @@ pub fn create_process_from_file(
         ipc_buf,
         &layout,
         self_aspace,
-    )
-    .ok_or(procmgr_errors::OUT_OF_MEMORY);
+    );
     if result.is_ok()
     {
         let _ = child_objs.disarm();
@@ -3398,22 +3460,27 @@ pub fn destroy_process(
 }
 
 /// Send memmgr the held-back `PROCESS_DIED` of the torn-down
-/// `CREATE_DMA_HOLD` child `badge` (`RELEASE_HOLD`), then drop procmgr's
-/// badged memmgr SEND for it. Returns `false` when `holds` keeps no reclaim
-/// for the badge.
-pub fn release_hold(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, holds: &mut DmaHolds) -> bool
+/// `CREATE_DMA_HOLD` child the release token `sender` names (`RELEASE_HOLD`),
+/// then drop procmgr's badged memmgr SEND for it.
+///
+/// # Errors
+/// [`ReleaseRefusal::Unauthorized`] when `sender` is not a release token, the
+/// hold staying; [`ReleaseRefusal::NotHeld`] when `holds` keeps no reclaim for
+/// the token's child.
+pub fn release_hold(
+    sender: u64,
+    memmgr_ep: u64,
+    ipc_buf: *mut u64,
+    holds: &mut DmaHolds,
+) -> Result<(), ReleaseRefusal>
 {
-    let Some(held) = holds.release(badge)
-    else
-    {
-        return false;
-    };
+    let held = holds.release(sender)?;
     notify_memmgr_died(memmgr_ep, held.memmgr_badge, ipc_buf);
     if held.memmgr_send_cap != 0
     {
         let _ = syscall::cap_delete(held.memmgr_send_cap);
     }
-    true
+    Ok(())
 }
 
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed
@@ -3440,8 +3507,11 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 /// The memmgr reclaim of a started child created with `CREATE_DMA_HOLD` is
 /// parked in `holds` instead of sent: a device the child drove may still be
 /// writing its frames, so they return to memmgr only on the creator's
-/// `RELEASE_HOLD` ([`release_hold`]; docs/process-lifecycle.md § Process
-/// Death).
+/// `RELEASE_HOLD` on the child's release token ([`release_hold`];
+/// docs/process-lifecycle.md § Process Death). Its `CSpace` goes as any
+/// child's: a frame a client lent the child for its device stays out of
+/// memmgr's pool through devmgr's DMA-mapping capability instead
+/// (docs/device-management.md § DMA-Safe Teardown).
 ///
 /// Note: the bound death-notification observers in the child thread's TCB
 /// and address space are released automatically when the objects are torn

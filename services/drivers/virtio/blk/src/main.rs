@@ -679,7 +679,9 @@ fn drop_caps(caps: &[u64])
 /// past `caps[0]`. The driver maps the data segment for the device itself,
 /// for the request's duration (`virtio_core::dma`). Every reply moves the
 /// Memory cap back to the caller in `caps[0]`; leaving it in the driver's
-/// `CSpace` would leak it. A request the device loses (see
+/// `CSpace` would leak it and keep the frame out of memmgr's pool, so a reply
+/// the caller cannot take (it died, or its `CSpace` is full) deletes it. A
+/// request the device loses (see
 /// [`io::submit_and_wait`]) is answered only after [`quiesce_device`] has
 /// stopped the device, so the returned cap is free of device DMA.
 fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir: io::IoDirection)
@@ -695,7 +697,15 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         }
         let reply = builder.build();
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err() && mem_cap != 0
+        {
+            // The caller is gone, or its `CSpace` cannot take the cap, so the
+            // cap stayed here. Every reply follows the transfer's completion
+            // or the device's acknowledged reset, so the device no longer
+            // reaches the frame: drop the reference, which would otherwise
+            // keep the frame out of memmgr's pool for the boot.
+            let _ = syscall::cap_delete(mem_cap);
+        }
     };
 
     if rt.device_faulted

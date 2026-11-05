@@ -3,8 +3,10 @@
 Architecture-specific MMIO ordering barriers for device drivers and the kernel's own MMIO
 accesses. Callers use
 `dma_to_mmio_barrier` (prior DMA-memory writes before a following MMIO write, e.g. a doorbell),
-`mmio_to_mmio_barrier` (MMIO writes the device must observe in program order), and
-`mmio_to_dma_barrier` (an MMIO status read before a following read of the memory it gates). The
+`mmio_to_mmio_barrier` (MMIO writes the device must observe in program order),
+`mmio_to_dma_barrier` (an MMIO status read before a following read of the memory it gates), and
+`dma_read_to_mmio_barrier` (reads of memory a device produced before a following MMIO write that
+hands it back, e.g. a queue head). The
 per-architecture implementation is selected at compile time behind the `arch` module, so callers
 carry no `#[cfg(target_arch)]`. On x86-64 the barriers are empty; on RISC-V they emit `fence`
 instructions.

@@ -266,7 +266,8 @@ per-IOMMU state.
 
 At boot devmgr spawns the IOMMU driver from its boot module before any DMA-capable driver, in a
 settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
-pages, and `CREATE_DMA_HOLD`, at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
+pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programmed with physical
+addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
 every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
 functions no driver binds included. devmgr never releases the driver's hold: a unit may walk any
@@ -308,18 +309,25 @@ capability (§ DMA Authorisation). With no IOMMU confining the device the physic
 isolation is absent, and devmgr runs the device unconfined (§ DMA Safety
 Model); the kernel is agnostic to both outcomes.
 
-No DMA-capable driver reads a physical address: every address it programs comes from `DMA_MAP`
-(§ DMA Authorisation). Two surfaces still hand any process physical addresses: memmgr's
-`REQUEST_MEMORY_CAPS` reply carries each granted cap's physical base (see
-[`services/memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)), and
-`SYS_CAP_INFO`'s `CAP_INFO_MEMORY_PHYS_BASE` selector returns a Memory cap's physical base to its
-holder (see
+### Physical Addresses
+
+No DMA-capable driver reads a physical address, and none can: every address it programs comes from
+`DMA_MAP` (§ DMA Authorisation), and the only address of its own memory any reply gives it is the
+device address `DMA_MAP` returns for an unconfined device, which is the frames' physical address by
+necessity. Two processes read physical addresses, devmgr and the IOMMU driver, the phys-class
+processes: devmgr turns a driver's cap into a device mapping, reading the frames' physical base for
+an unconfined device, and the IOMMU driver programs its units with the physical addresses of its own
+table pages and of every frame `MAP` installs. init creates devmgr, and devmgr the IOMMU driver,
+with `procmgr_labels::CREATE_PHYS_ACCESS`, so memmgr's grants to them keep the Memory `Phys` right
+([capability-model.md](capability-model.md#memory) § Memory); every other process's grants, every
+device driver's included, lack it, and memmgr's grant reply names its runs by opaque region ids,
+carrying no physical address (see
+[`services/memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md#label-1-request_memory_caps)
+§ Label 1). A driver's cap lacks `Phys`, so the two read its frames' base by presenting a `Phys`
+cap of their own as the credential `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_PHYS_BASE` takes (see
 [`core/kernel/docs/cross-boundary-disclosure.md`](../core/kernel/docs/cross-boundary-disclosure.md)
-§ Physical-address surfaces). devmgr reads the second to map an unconfined device's cap, and the
-IOMMU driver reads it for its own table pages and for every frame `MAP` installs, since the units
-are programmed with physical addresses: the IOMMU driver is the one driver class that legitimately
-reads them. Withdrawing both surfaces from every other driver is
-[#767](https://github.com/kottlerg/seraph/issues/767), with the IOMMU driver its named exception.
+§ Physical-address surfaces, which classifies every surface that still carries a physical
+address).
 
 ---
 
@@ -504,7 +512,7 @@ specified in [`docs/storage.md`](storage.md).
 [Device Tree Parsing](../core/boot/docs/dtb.md),
 [Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
-[Architecture Overview](architecture.md),
+[Architecture Overview](architecture.md), [Capability Model](capability-model.md),
 [Memory Model](memory-model.md), [Platform Requirements](platform-requirements.md),
 [Storage](storage.md), [services/devmgr/README.md](../services/devmgr/README.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),

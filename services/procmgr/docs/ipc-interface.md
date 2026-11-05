@@ -52,7 +52,7 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 1 |
-| label bits `[16..31]` | Create flags and scheduling fields (see **Pinned flag**, **Scheduling fields**, and **argv and env** below) |
+| label bits `[16..31]` | Create flags and scheduling fields (see **Pinned flag**, **Scheduling fields**, **argv and env**, and **Physical-address flag** below) |
 | label bits `[31..64]` | Reserved, zero |
 | data[0..4] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, `args_bytes`, `args_count`, `env_bytes`, `env_count`, one `u64` each |
 | cap[0] | Memory capability for the ELF module image |
@@ -101,7 +101,7 @@ holds a handle to it.
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
 | 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | Reserved label bits `[31..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** below |
+| 7 | `INVALID_ARGUMENT` | Reserved label bits `[31..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, or `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below) |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
@@ -173,6 +173,18 @@ rest of the boot
 takes before it replies to the create, so no teardown frees a held child's
 pages for want of a record; when it cannot, the create fails with
 `OUT_OF_MEMORY`.
+
+**Physical-address flag.** The label's bit 30 (`CREATE_PHYS_ACCESS`, in the window shared with
+`CREATE_FROM_FILE`) creates the child phys-class: procmgr registers it with memmgr with
+`REGISTER_PHYS_CLASS`, so memmgr's grants to it, and the address spaces retyped from them, keep
+`RIGHTS_MEM_PHYS` and the child can read physical addresses
+([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 3).
+procmgr honours it only from a creator that is phys-class itself: an un-badged one
+(badge 0: init, or svcmgr's mint source) or one whose memmgr badge carries
+`memmgr_labels::PHYS_CLASS_BADGE_BIT`; from any other it replies `INVALID_ARGUMENT` before any
+resource is acquired. init sets it for devmgr and devmgr for the IOMMU driver, the processes
+[docs/device-management.md](../../../docs/device-management.md#dma-authorisation) § DMA
+Authorisation names; every other process, every device driver included, is created without it.
 
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and
@@ -629,6 +641,7 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
 [Scheduler Internals](../../../core/kernel/docs/scheduler.md),
 [Capability Model](../../../docs/capability-model.md),
+[Device Management](../../../docs/device-management.md),
 [Fault Handling](../../../docs/fault-handling.md),
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),

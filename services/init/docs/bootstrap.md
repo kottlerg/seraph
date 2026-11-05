@@ -78,7 +78,8 @@ process creation to procmgr IPC.
   it the log endpoint SEND and svcmgr's service endpoint SEND
   (`bootstrap::start_procmgr`, `../src/main.rs`).
 - Request procmgr to create devmgr via boot-module
-  `CREATE_PROCESS` and serve devmgr's multi-round bootstrap
+  `CREATE_PROCESS` (phys-class, `CREATE_PHYS_ACCESS`, so its grants keep the
+  Memory `Phys` right) and serve devmgr's multi-round bootstrap
   (hardware caps: MMIO apertures, Interrupt range, ACPI Memory caps,
   DTB Memory cap on riscv64, and a `FRAMEBUFFER_INFO` round carrying
   the bootloader-discovered `boot_protocol::FramebufferInfo` so devmgr

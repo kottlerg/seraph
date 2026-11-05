@@ -38,7 +38,8 @@ Each surface is classified as one of:
 - **(d) fixed-by-contract** — an enum discriminant, constant, count, or
   firmware-originated value defined by the ABI.
 - **(e) physical address** — a physical address exposed by ABI contract, gated by a
-  capability the caller holds. Not a kernel VA. See "Physical-address surfaces".
+  capability the caller holds and, for the surfaces a process can reach, by the Memory
+  `Phys` right. Not a kernel VA. See "Physical-address surfaces".
 
 ## Surface inventory
 
@@ -54,7 +55,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 |---|---|---|
 | Syscall return convention; no raw-pointer return path | `syscall::dispatch`, `TrapFrame::set_return` | b/c/d |
 | `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory / address-space page-table budget counts, memory has-retype flag | `cap::sys_cap_info` | c/d |
-| `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
+| `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base`, to a holder of `MemRights::PHYS` (the queried cap's, or a credential's in arg2) | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of the frames in a window of a Memory region | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `CAP_INFO_SOLE_REFERENCE` → whether the queried slot is the only reference to its object (a boolean of `KernelObjectHeader::ref_count`) | `cap::sys_cap_info`, `cap::object::KernelObjectHeader` | d |
 | `CAP_INFO_ASPACE_TERMINAL_FAULT` → an address space's retained terminal-fault reason (`EXIT_FAULT_BASE` + vector or cause), or `0` | `cap::sys_cap_info`, `AddressSpace::retained_terminal_fault` | d |
@@ -62,7 +63,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
 | `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
 | `SYS_SYSTEM_INFO(LiveCSpaceCount)` → the number of `CSpace` registry ids in use system-wide, every process's `CSpace`s included; a count that names no id, epoch, or kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `cap::live_cspace_count` | d |
-| `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
+| `SYS_ASPACE_QUERY` → leaf physical address of a user page, to a holder of `AsRights::READ`, which an address space retyped from a `PHYS` source alone carries | `sysinfo::sys_aspace_query`, `AddressSpace::query_page`, `cap::sys_cap_create_aspace` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
@@ -160,29 +161,64 @@ Notes on the non-obvious entries:
 
 ## Physical-address surfaces
 
-Three surfaces emit real addresses. All are **physical**, not kernel virtual:
+Three kernel surfaces emit real addresses. All are **physical**, not kernel virtual, and
+the two a process can reach answer only a holder of the Memory `Phys` right
+(`MemRights::PHYS`; [docs/capability-model.md](../../../docs/capability-model.md#memory)
+§ Memory):
 
+- `CAP_INFO_MEMORY_PHYS_BASE` (`cap::sys_cap_info`) returns `MemoryObject::base`, the
+  physical base of a Memory object the caller holds a capability to, when that capability
+  carries `Phys` or the caller presents, in argument 2, a Memory capability of its own that
+  does ([syscalls.md](syscalls.md) § `SYS_CAP_INFO` (36)); any other caller gets
+  `InsufficientRights`. A process that holds any `Phys` cap can therefore read the
+  physical base of every Memory cap it holds, those other processes send it included.
 - `SYS_ASPACE_QUERY` (`sysinfo::sys_aspace_query`) returns the leaf physical address
   backing a *user* page, gated on an `AddressSpace` capability with the `READ` right
   ([syscalls.md](syscalls.md) § `SYS_ASPACE_QUERY` (41)). The intermediate page-table
-  addresses traversed during the walk are not returned.
-- `CAP_INFO_MEMORY_PHYS_BASE` (`cap::sys_cap_info`) returns `MemoryObject::base`, the
-  physical base of a Memory object the caller holds a capability to. memmgr depends
-  on it to track region contiguity, devmgr to map an unconfined device's Memory cap
-  for it, and the IOMMU driver to program its units with the physical addresses of its
-  table pages and of every frame it maps for a device. No device driver reads it: a
-  DMA-capable driver programs its device only with the device addresses devmgr's
-  `DMA_MAP` returns
-  ([docs/device-management.md](../../../docs/device-management.md#dma-authorisation)
-  § DMA Authorisation), which are the physical addresses themselves only while no IOMMU
-  confines the device. memmgr's `REQUEST_MEMORY_CAPS` reply likewise still carries each
-  granted cap's physical base, unread by any device driver. Withdrawing both from every
-  driver but the IOMMU driver, their named exception, is
-  [#767](https://github.com/kottlerg/seraph/issues/767).
+  addresses traversed during the walk are not returned. `SYS_CAP_CREATE_ASPACE` mints
+  `READ` only when its retype source carries `Phys`, and `READ` gates nothing else, so the
+  query answers only a process that could read the frames' bases through the selector
+  above.
 - The `InitInfo` handover publishes physical bases for the resources it hands init:
   `CapDescriptor::aux0` (Memory / Mmio physical base) and
   `InitFramebufferInfo::physical_base`. Each describes a resource init receives a
-  capability to.
+  capability to, and init alone reads the handover.
+
+Who holds `Phys`, and why:
+
+- **The kernel's boot caps, init, and memmgr.** The kernel mints `Phys` on every boot RAM
+  cap (usable RAM, boot modules, init's segments, `InitInfo` pages and stack, reclaimed
+  boot scratch; `MemRights::BOOT_RAM`), so init reads its arena's base and memmgr, which
+  receives those caps, tracks its runs' contiguity. Firmware-table caps (ACPI, RSDP, DTB)
+  carry no `Phys`; their bases are already in `InitInfo`. init hands no other process a
+  `Phys` cap: the boot-module copies it gives procmgr, devmgr, and vfsd drop the right.
+- **devmgr and the IOMMU drivers.** memmgr strips `Phys` from every grant except to a
+  process registered phys-class, and procmgr registers a child phys-class only when an
+  un-badged or phys-class creator asks for it (`CREATE_PHYS_ACCESS`): init does so for
+  devmgr, and devmgr for the IOMMU driver. devmgr reads the base of a driver's frames to
+  map them for an unconfined device, whose device address is the physical address by
+  necessity, and the IOMMU driver reads the bases of its own table pages and of every
+  frame it maps for a device, since the units are programmed with physical addresses.
+  Each presents a `Phys` page of its own as the credential for a driver's cap, which
+  lacks the right
+  ([docs/device-management.md](../../../docs/device-management.md#physical-addresses)
+  § Physical Addresses).
+- **procmgr, transiently.** procmgr allocates a child's memory against the child's memmgr
+  account, so while it builds devmgr or an IOMMU driver it holds those children's `Phys`
+  grants. procmgr's own grants lack `Phys`: init mints procmgr's memmgr badge without the
+  phys-class bit, and memmgr refuses a bootstrap that carries it.
+
+Every other process, every device driver included, holds no `Phys` cap: its grants lack
+the right, its address spaces lack `READ`, and memmgr's grant reply names its runs by
+opaque region ids
+([services/memmgr/docs/ipc-interface.md](../../../services/memmgr/docs/ipc-interface.md)
+§ Label 1). The one address of its own memory such a process is told is the device
+address devmgr's `DMA_MAP` returns for an unconfined device
+([docs/device-management.md](../../../docs/device-management.md#dma-authorisation)
+§ DMA Authorisation), which is the frames' physical address because no IOMMU stands
+between the device and memory. A compromised driver therefore cannot learn the physical
+layout of its memory to aim a device at, except for the frames it lends an unconfined
+device, which that device reaches anyway.
 
 A physical address does not reveal the kernel's randomized virtual base, and each is
 gated behind a capability the caller already holds, so none defeats KASLR. They

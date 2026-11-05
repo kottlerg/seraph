@@ -10,8 +10,11 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
   addresses: the IOMMU driver is the one driver class that reads them
   ([#767](https://github.com/kottlerg/seraph/issues/767)'s named exception).
 - **Ordering.** A zeroed page is fenced before it is handed out, and every table store before the
-  next one and before the register write that makes a unit read it, so a unit never sees an entry
-  before the table it points at.
+  next one, so a unit never sees an entry before the table it points at. The driver's register
+  write that makes a unit read them supplies the memory-to-device barrier (`mmio` on riscv64; the
+  fence before each VT-d register write on x86-64).
+- **Device-written pages.** A page the unit itself writes (the RISC-V IOMMU's fault queue) is read
+  only through a raw pointer (`Store::page_ptr`), never through a reference.
 - **Caches.** A driver whose units read memory past the processor caches gives the store a
   write-back function (`Flush::Writeback`; VT-d's `CLFLUSH` for a unit with `ECAP.C` clear), which
   every zeroed page and table store is written back with; for coherent units

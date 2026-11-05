@@ -20,6 +20,7 @@ test = false
 [dependencies]
 iommu-core = { path = "../core" }
 ipc = { path = "../../../../shared/ipc" }
+mmio = { path = "../../../../shared/mmio" }
 syscall = { path = "../../../../shared/syscall" }
 syscall-abi = { path = "../../../../abi/syscall" }
 

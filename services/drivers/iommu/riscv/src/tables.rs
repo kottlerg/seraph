@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 
 use iommu_core::table::TableStore;
 
-use crate::regs::{FirstStageMode, device_id_bits};
+use crate::regs::{ContextFormat, FirstStageMode, device_id_bits};
 
 /// Bytes of one page and of one table.
 pub const PAGE: u64 = 0x1000;
@@ -91,21 +91,20 @@ pub struct DeviceDirectory
 {
     root: u64,
     levels: u32,
-    extended: bool,
+    format: ContextFormat,
 }
 
 impl DeviceDirectory
 {
     /// A directory rooted at the zeroed page `root`, `levels` (1 to 3) deep,
-    /// holding 64-byte extended-format device contexts when `extended` and
-    /// 32-byte base-format ones otherwise. `None` for another depth.
+    /// holding device contexts of `format`. `None` for another depth.
     #[must_use]
-    pub fn new(root: u64, levels: u32, extended: bool) -> Option<Self>
+    pub fn new(root: u64, levels: u32, format: ContextFormat) -> Option<Self>
     {
         (1..=3).contains(&levels).then_some(Self {
             root,
             levels,
-            extended,
+            format,
         })
     }
 
@@ -113,21 +112,21 @@ impl DeviceDirectory
     #[must_use]
     pub const fn context_words(&self) -> usize
     {
-        if self.extended { 8 } else { 4 }
+        self.format.words()
     }
 
     /// Whether the directory holds the device ID `id`.
     #[must_use]
     pub const fn holds(&self, id: u32) -> bool
     {
-        id >> device_id_bits(self.levels, self.extended) == 0
+        id >> device_id_bits(self.levels, self.format) == 0
     }
 
     /// The directory index of `id` at `level` (0 for the leaf page, whose
     /// index counts device contexts).
     fn index(&self, id: u32, level: u32) -> usize
     {
-        let leaf_bits = if self.extended { 6 } else { 7 };
+        let leaf_bits = self.format.leaf_bits();
         let (shift, bits) = match level
         {
             0 => (0, leaf_bits),
@@ -460,7 +459,7 @@ mod tests
     {
         let mut s = Heap::default();
         let root = s.alloc().unwrap();
-        let d = DeviceDirectory::new(root, 3, true).unwrap();
+        let d = DeviceDirectory::new(root, 3, ContextFormat::Extended).unwrap();
         // Device 0x0128: DDI[2] = 0, DDI[1] = 4, DDI[0] = 0x28.
         let (leaf, word) = d.context(&mut s, 0x0128).unwrap();
         assert_eq!(word, 0x28 * 8);
@@ -478,7 +477,7 @@ mod tests
     {
         let mut s = Heap::default();
         let root = s.alloc().unwrap();
-        let d = DeviceDirectory::new(root, 2, false).unwrap();
+        let d = DeviceDirectory::new(root, 2, ContextFormat::Base).unwrap();
         // Device 0xffff: DDI[1] = 0x1ff, DDI[0] = 0x7f.
         let (leaf, word) = d.context(&mut s, 0xffff).unwrap();
         assert_eq!(word, 0x7f * 4);
@@ -490,7 +489,7 @@ mod tests
     {
         let mut s = Heap::default();
         let root = s.alloc().unwrap();
-        let d = DeviceDirectory::new(root, 1, false).unwrap();
+        let d = DeviceDirectory::new(root, 1, ContextFormat::Base).unwrap();
         assert_eq!(d.context(&mut s, 0x7f), Ok((root, 0x7f * 4)));
     }
 
@@ -499,12 +498,12 @@ mod tests
     {
         let mut s = Heap::default();
         let root = s.alloc().unwrap();
-        let d = DeviceDirectory::new(root, 2, true).unwrap();
+        let d = DeviceDirectory::new(root, 2, ContextFormat::Extended).unwrap();
         assert_eq!(d.context(&mut s, 0x8000), Err(TableError::Invalid));
         while s.alloc().is_some()
         {}
         assert_eq!(d.context(&mut s, 0x10), Err(TableError::OutOfMemory));
-        assert!(DeviceDirectory::new(root, 4, true).is_none());
+        assert!(DeviceDirectory::new(root, 4, ContextFormat::Extended).is_none());
     }
 
     #[test]
@@ -550,6 +549,41 @@ mod tests
         );
         assert_eq!(d.translate(&mut s, 0), None);
         assert_eq!(d.translate(&mut s, 0x1000).map(|t| t.0), Some(0x9000_0000));
+    }
+
+    #[test]
+    fn an_empty_store_builds_no_domain()
+    {
+        let mut s = Heap::default();
+        while s.alloc().is_some()
+        {}
+        assert!(FirstStage::new(&mut s, FirstStageMode::Sv39).is_none());
+    }
+
+    #[test]
+    fn a_frame_reaches_the_highest_page_an_entry_names_and_no_further()
+    {
+        let mut s = Heap::default();
+        let mut d = FirstStage::new(&mut s, FirstStageMode::Sv39).unwrap();
+        assert_eq!(
+            d.map(&mut s, 0, PHYS_LIMIT - PAGE, PAGE, Access::Read),
+            Ok(())
+        );
+        assert_eq!(
+            d.map(&mut s, PAGE, PHYS_LIMIT, PAGE, Access::Read),
+            Err(TableError::Invalid)
+        );
+    }
+
+    #[test]
+    fn an_unaligned_or_empty_unmap_is_invalid()
+    {
+        let mut s = Heap::default();
+        let mut d = FirstStage::new(&mut s, FirstStageMode::Sv39).unwrap();
+        d.map(&mut s, 0, 0x9000_0000, PAGE, Access::Read).unwrap();
+        assert_eq!(d.unmap(&mut s, 0x10, PAGE), Err(TableError::Invalid));
+        assert_eq!(d.unmap(&mut s, 0, 0), Err(TableError::Invalid));
+        assert!(d.translate(&mut s, 0).is_some());
     }
 
     #[test]

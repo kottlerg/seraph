@@ -288,7 +288,7 @@ DMA-capable device devmgr then decides, before it grants the device DMA:
   refused too, since its unit blocks it. So is a device whose unit devmgr could not hand over: that
   unit is never programmed, so it does not block the device, but devmgr does not run a device
   unconfined behind an IOMMU it found. So is a device the RIMT gives an IOMMU device ID other than
-  its requester ID, since the IOMMU driver indexes its units by requester ID.
+  its requester ID, since the IOMMU driver addresses each device's context by its requester ID.
 - **Unconfined.** No unit translates the device: it runs DMA-unsafe.
 
 When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready

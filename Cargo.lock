@@ -575,6 +575,7 @@ dependencies = [
  "iommu-core",
  "iommu-store",
  "ipc",
+ "mmio",
  "syscall",
  "syscall-abi",
 ]

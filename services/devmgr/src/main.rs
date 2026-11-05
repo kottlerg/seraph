@@ -1109,7 +1109,7 @@ fn carve_function_config(
     else
     {
         std::os::seraph::log!(
-            "{}: no configuration-space cap for the device; not spawned",
+            "{}: no configuration-space cap for the device; refused",
             name
         );
         return None;
@@ -1527,8 +1527,9 @@ struct FunctionConfig
 impl FunctionConfig
 {
     /// Turn on the function's Memory Space Enable and Bus Master Enable, so
-    /// it decodes its MMIO BARs and may issue DMA; for a device the firmware
-    /// left off whose driver needs both (the DMA test device). Returns
+    /// it decodes its MMIO BARs and may issue DMA; for a function the firmware
+    /// left off that needs both: the DMA test device, for its driver, and the
+    /// RISC-V IOMMU, which reads its tables by DMA (`iommu::riscv_round`). Returns
     /// whether the configuration page could be mapped.
     fn enable_memory_and_bus_master(&self) -> bool
     {

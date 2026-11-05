@@ -12,6 +12,12 @@
 //! serves is answered. The queues' interrupts stay disabled; the fault queue
 //! is polled.
 //!
+//! On RISC-V a memory fence orders no device access, so the `mmio` barriers
+//! order the two: each register write after every structure store before it
+//! (`fence w,o`), the fault records after the tail register that publishes
+//! them (`fence i,r`), and the head register write that frees their slots
+//! after the record reads (`fence r,o`).
+//!
 //! The IOMMU reads the device directory, the page tables, and the queues
 //! from memory coherently with the processor caches, as the platform's PCI
 //! host declares (`dma-coherent`) and QEMU's `riscv-iommu-pci` does; the
@@ -19,7 +25,6 @@
 //! past the caches would need its table writes cleaned from them, which the
 //! store does not do on riscv64.
 
-use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
 use iommu_core::table::TableStore;
@@ -86,11 +91,13 @@ impl Unit
     }
 
     /// Write a 32-bit register. A write starts or configures an IOMMU
-    /// operation that may read the in-memory structures, so it is fenced
-    /// after every store the driver made to them before it.
+    /// operation that may read the in-memory structures, so every store the
+    /// driver made to them before it is ordered before it: on RISC-V a
+    /// memory fence orders no device access, so the memory-to-device barrier
+    /// (`fence w,o`) does it.
     fn write32(&self, off: usize, value: u32)
     {
-        fence(Ordering::SeqCst);
+        mmio::dma_to_mmio_barrier();
         // SAFETY: as in `read32`.
         unsafe { core::ptr::write_volatile((self.regs + off as u64) as *mut u32, value) };
     }
@@ -101,10 +108,10 @@ impl Unit
         unsafe { core::ptr::read_volatile((self.regs + off as u64) as *const u64) }
     }
 
-    /// Write a 64-bit register, fenced as [`Self::write32`] is.
+    /// Write a 64-bit register, ordered as [`Self::write32`] is.
     fn write64(&self, off: usize, value: u64)
     {
-        fence(Ordering::SeqCst);
+        mmio::dma_to_mmio_barrier();
         // SAFETY: as in `read32`.
         unsafe { core::ptr::write_volatile((self.regs + off as u64) as *mut u64, value) };
     }
@@ -212,8 +219,8 @@ impl Riscv
     }
 
     /// Store `value` volatile at word `index` of the table page `page`, then
-    /// order it before every later store and register write
-    /// ([`TableStore::written`]).
+    /// order it before every later store ([`TableStore::written`]); the
+    /// register write that follows orders it before itself ([`Unit::write32`]).
     fn write_word(&mut self, page: u64, index: usize, value: u64)
     {
         let t = self.store.table(page);
@@ -263,37 +270,11 @@ impl Riscv
             return Err(BackendError::Invalid);
         }
         u.mode = u.cap.first_stage().ok_or(BackendError::Invalid)?;
-        // The features and the queues change only with the IOMMU Off or
-        // Bare and the queues stopped; a mode left translating goes Off
-        // first, and a feature to clear needs it Off.
-        let ddtp = u.read64(regs::DDTP);
-        let fctl = u.read32(regs::FCTL);
-        let features = fctl & (regs::FCTL_BE | regs::FCTL_GXL);
-        if regs::translating(ddtp) || features != 0
-        {
-            u.set_ddtp(regs::ddtp_off(ddtp))?;
-        }
-        u.stop_queue(regs::CQCSR, regs::CQCSR_CQON)?;
-        u.stop_queue(regs::FQCSR, regs::FQCSR_FQON)?;
-        if features != 0
-        {
-            u.write32(regs::FCTL, fctl & !features);
-            if u.read32(regs::FCTL) & features != 0
-            {
-                return Err(BackendError::Invalid);
-            }
-        }
+        u.quiesce()?;
         let cq = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let fq = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let root = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        let u = &mut self.units[unit];
-        (u.cq, u.fq, u.cq_tail) = (cq, fq, 0);
-        u.write64(regs::CQB, regs::queue_base(cq, CQ_ENTRIES));
-        u.write32(regs::CQT, 0);
-        u.start_queue(regs::CQCSR, regs::CQCSR_CQEN, regs::CQCSR_CQON)?;
-        u.write64(regs::FQB, regs::queue_base(fq, FQ_ENTRIES));
-        u.write32(regs::FQH, 0);
-        u.start_queue(regs::FQCSR, regs::FQCSR_FQEN, regs::FQCSR_FQON)?;
+        self.units[unit].start_queues(cq, fq)?;
         // Whatever the IOMMU cached under an earlier mode is dropped before
         // the new directory is used.
         self.submit(
@@ -304,14 +285,74 @@ impl Riscv
                 regs::iofence_c(Fence::Commands),
             ],
         )?;
-        let u = &mut self.units[unit];
-        let extended = u.cap.extended_context;
-        for mode in regs::directory_modes(extended)
+        self.units[unit].select_directory(root)
+    }
+}
+
+impl Unit
+{
+    /// Bring the IOMMU to a state its features and queues may be changed in:
+    /// Off or Bare, with both queues stopped and the features the driver
+    /// needs clear. A mode left translating goes Off first, and a feature to
+    /// clear needs it Off.
+    ///
+    /// # Errors
+    /// [`BackendError::Timeout`] when a step does not complete;
+    /// [`BackendError::Invalid`] when a feature does not clear.
+    fn quiesce(&self) -> Result<(), BackendError>
+    {
+        let ddtp = self.read64(regs::DDTP);
+        let fctl = self.read32(regs::FCTL);
+        let features = fctl & (regs::FCTL_BE | regs::FCTL_GXL);
+        if regs::translating(ddtp) || features != 0
         {
-            u.set_ddtp(regs::ddtp(mode, root))?;
-            if regs::ddtp_mode(u.read64(regs::DDTP)) == mode as u64
+            self.set_ddtp(regs::ddtp_off(ddtp))?;
+        }
+        self.stop_queue(regs::CQCSR, regs::CQCSR_CQON)?;
+        self.stop_queue(regs::FQCSR, regs::FQCSR_FQON)?;
+        if features != 0
+        {
+            self.write32(regs::FCTL, fctl & !features);
+            if self.read32(regs::FCTL) & features != 0
             {
-                u.ddt = DeviceDirectory::new(root, mode.levels(), extended);
+                return Err(BackendError::Invalid);
+            }
+        }
+        Ok(())
+    }
+
+    /// Program and enable the command queue in the zeroed page `cq` and the
+    /// fault queue in the zeroed page `fq`, each empty, its interrupt off.
+    ///
+    /// # Errors
+    /// [`BackendError::Timeout`] when a queue does not come on.
+    fn start_queues(&mut self, cq: u64, fq: u64) -> Result<(), BackendError>
+    {
+        (self.cq, self.fq, self.cq_tail) = (cq, fq, 0);
+        self.write64(regs::CQB, regs::queue_base(cq, CQ_ENTRIES));
+        self.write32(regs::CQT, 0);
+        self.start_queue(regs::CQCSR, regs::CQCSR_CQEN, regs::CQCSR_CQON)?;
+        self.write64(regs::FQB, regs::queue_base(fq, FQ_ENTRIES));
+        self.write32(regs::FQH, 0);
+        self.start_queue(regs::FQCSR, regs::FQCSR_FQEN, regs::FQCSR_FQON)
+    }
+
+    /// Point `ddtp` at the empty directory rooted at the zeroed page `root`
+    /// in the first mode of [`regs::directory_modes`] the IOMMU retains,
+    /// which turns translation on.
+    ///
+    /// # Errors
+    /// [`BackendError::Timeout`] when a write does not complete;
+    /// [`BackendError::Invalid`] when the IOMMU retains no directory mode.
+    fn select_directory(&mut self, root: u64) -> Result<(), BackendError>
+    {
+        let format = self.cap.context_format;
+        for mode in regs::directory_modes(format)
+        {
+            self.set_ddtp(regs::ddtp(mode, root))?;
+            if regs::ddtp_mode(self.read64(regs::DDTP)) == mode as u64
+            {
+                self.ddt = DeviceDirectory::new(root, mode.levels(), format);
                 return Ok(());
             }
         }
@@ -477,21 +518,28 @@ impl Backend for Riscv
             {
                 continue;
             }
+            let Some(queue) = store.page_ptr(u.fq)
+            else
+            {
+                continue;
+            };
             let csr = u.read32(regs::FQCSR);
             let tail = u.read32(regs::FQT) % FQ_ENTRIES;
             let mut head = u.read32(regs::FQH) % FQ_ENTRIES;
             // The records are read after the tail that publishes them.
-            fence(Ordering::SeqCst);
+            mmio::mmio_to_dma_barrier();
             while head != tail
             {
                 let at = head as usize * FAULT_RECORD_WORDS;
-                let page = store.table(u.fq);
                 let mut words = [0u64; FAULT_RECORD_WORDS];
                 for (i, w) in words.iter_mut().enumerate()
                 {
-                    // SAFETY: the record lies in the fault-queue page `page`
-                    // borrows; the IOMMU wrote it before advancing the tail.
-                    *w = unsafe { core::ptr::read_volatile(&raw const page[at + i]) };
+                    // SAFETY: `queue` is the fault-queue page, mapped for the
+                    // driver's life; `head` is below `FQ_ENTRIES`, so the
+                    // record's words lie in the page's 512. The IOMMU writes
+                    // the page, so it is read through the raw pointer alone,
+                    // with no reference to it formed.
+                    *w = unsafe { core::ptr::read_volatile(queue.add(at + i)) };
                 }
                 if let Some(f) = regs::decode_fault(words)
                     && let Ok(bdf) = u16::try_from(f.device_id)
@@ -505,6 +553,8 @@ impl Backend for Riscv
                 }
                 head = (head + 1) % FQ_ENTRIES;
             }
+            // The records are read before the head hands their slots back.
+            mmio::dma_read_to_mmio_barrier();
             u.write32(regs::FQH, head);
             // An overflow or a record-store fault stops the queue's
             // recording until it is cleared (write 1), the queue kept on.

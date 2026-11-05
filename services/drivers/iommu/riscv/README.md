@@ -35,6 +35,10 @@ system runs no guests:
 - every command batch ends in an `IOFENCE.C` and is polled to completion within
   `COMMAND_TIMEOUT`, so the reply follows the hardware; a command error stops the queue and fails
   the IOMMU, as a timeout does; batching is [#772](https://github.com/kottlerg/seraph/issues/772);
+- each register write is ordered after every structure store before it, and the fault records
+  after the tail that publishes them and before the head that frees their slots, with the
+  [`mmio`](../../../../shared/mmio/README.md) barriers, since on RISC-V a memory fence orders no
+  device access; the fault queue, which the IOMMU writes, is read through a raw pointer only;
 - faults are polled from the fault queue, since the IOMMU's interrupts are message-signalled
   ([#325](https://github.com/kottlerg/seraph/issues/325)), and reported with their 12-bit `CAUSE`
   and the faulting page;

@@ -51,8 +51,46 @@ pub struct Capability
     pub sv39: bool,
     /// Sv48 first-stage tables are supported.
     pub sv48: bool,
-    /// Device contexts take the 64-byte extended format (`MSI_FLAT`).
-    pub extended_context: bool,
+    /// The device-context format the IOMMU reads.
+    pub context_format: ContextFormat,
+}
+
+/// The device-context format an IOMMU reads, which sets a context's size and
+/// so how a device ID splits into directory indexes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextFormat
+{
+    /// 32-byte contexts, for an IOMMU without `MSI_FLAT`.
+    Base,
+    /// 64-byte contexts, which add the MSI translation fields, for an IOMMU
+    /// with `MSI_FLAT`.
+    Extended,
+}
+
+impl ContextFormat
+{
+    /// 64-bit words of one device context.
+    #[must_use]
+    pub const fn words(self) -> usize
+    {
+        match self
+        {
+            Self::Base => 4,
+            Self::Extended => 8,
+        }
+    }
+
+    /// Bits of a device ID that index a leaf directory page (`DDI[0]`): a
+    /// page holds 128 base or 64 extended contexts.
+    #[must_use]
+    pub const fn leaf_bits(self) -> u32
+    {
+        match self
+        {
+            Self::Base => 7,
+            Self::Extended => 6,
+        }
+    }
 }
 
 impl Capability
@@ -65,7 +103,14 @@ impl Capability
             version: (cap & 0xff) as u8,
             sv39: cap & (1 << 9) != 0,
             sv48: cap & (1 << 10) != 0,
-            extended_context: cap & (1 << 22) != 0,
+            context_format: if cap & (1 << 22) != 0
+            {
+                ContextFormat::Extended
+            }
+            else
+            {
+                ContextFormat::Base
+            },
         }
     }
 
@@ -235,20 +280,14 @@ pub const fn ddtp_off(ddtp: u64) -> u64
     ddtp & !DDTP_MODE_MASK & !DDTP_BUSY
 }
 
-/// The width of the device IDs a device directory `levels` deep holds, in
-/// bits, for base-format (32-byte) or extended-format (64-byte) device
-/// contexts.
+/// The width of the device IDs a device directory `levels` (1 to 3) deep
+/// holds, in bits, for contexts of `format`: the leaf index, then 9 bits a
+/// level, up to the 24-bit device ID.
 #[must_use]
-pub const fn device_id_bits(levels: u32, extended: bool) -> u32
+pub const fn device_id_bits(levels: u32, format: ContextFormat) -> u32
 {
-    match (levels, extended)
-    {
-        (1, false) => 7,
-        (1, true) => 6,
-        (2, false) => 16,
-        (2, true) => 15,
-        _ => 24,
-    }
+    let bits = format.leaf_bits() + 9 * (levels - 1);
+    if bits > 24 { 24 } else { bits }
 }
 
 /// Bits of a PCI requester ID: the device IDs a directory must hold for
@@ -260,13 +299,13 @@ pub const PCI_DEVICE_ID_BITS: u32 = 16;
 /// ones that hold only part of them, deepest first. The mode field is WARL,
 /// so the driver keeps the first one the IOMMU retains.
 #[must_use]
-pub fn directory_modes(extended: bool) -> [DdtMode; 3]
+pub fn directory_modes(format: ContextFormat) -> [DdtMode; 3]
 {
     let mut out = [DdtMode::OneLevel; 3];
     let mut n = 0;
     for levels in 1..=3
     {
-        if device_id_bits(levels, extended) >= PCI_DEVICE_ID_BITS
+        if device_id_bits(levels, format) >= PCI_DEVICE_ID_BITS
         {
             out[n] = DdtMode::with_levels(levels);
             n += 1;
@@ -274,7 +313,7 @@ pub fn directory_modes(extended: bool) -> [DdtMode; 3]
     }
     for levels in (1..=3).rev()
     {
-        if device_id_bits(levels, extended) < PCI_DEVICE_ID_BITS
+        if device_id_bits(levels, format) < PCI_DEVICE_ID_BITS
         {
             out[n] = DdtMode::with_levels(levels);
             n += 1;
@@ -465,10 +504,10 @@ mod tests
         let c = Capability::decode(cap);
         assert!(c.version_supported());
         assert_eq!(c.first_stage(), Some(FirstStageMode::Sv48));
-        assert!(c.extended_context);
+        assert_eq!(c.context_format, ContextFormat::Extended);
         let sv39_only = Capability::decode(0x10 | (1 << 9));
         assert_eq!(sv39_only.first_stage(), Some(FirstStageMode::Sv39));
-        assert!(!sv39_only.extended_context);
+        assert_eq!(sv39_only.context_format, ContextFormat::Base);
     }
 
     #[test]
@@ -484,20 +523,43 @@ mod tests
         let v = ddtp(DdtMode::ThreeLevel, 0x8020_3000);
         assert_eq!(v, (0x80203 << 10) | 4);
         assert_eq!(ddtp_mode(v), 4);
-        assert!(translating(v));
+    }
+
+    #[test]
+    fn only_a_directory_mode_translates()
+    {
+        assert!(translating(ddtp(DdtMode::OneLevel, 0)));
+        assert!(translating(ddtp(DdtMode::ThreeLevel, 0)));
         assert!(!translating(ddtp(DdtMode::Bare, 0x8020_3000)));
-        assert_eq!(ddtp_off(v | DDTP_BUSY), 0x80203 << 10);
+        assert!(!translating(ddtp(DdtMode::Off, 0x8020_3000)));
+    }
+
+    #[test]
+    fn turning_off_keeps_the_directory_pointer_and_drops_busy()
+    {
+        let v = ddtp(DdtMode::TwoLevel, 0x8020_3000) | DDTP_BUSY;
+        assert_eq!(ddtp_off(v), 0x80203 << 10);
+    }
+
+    #[test]
+    fn a_directory_holds_its_leaf_bits_then_nine_a_level_up_to_24()
+    {
+        assert_eq!(device_id_bits(1, ContextFormat::Base), 7);
+        assert_eq!(device_id_bits(2, ContextFormat::Base), 16);
+        assert_eq!(device_id_bits(2, ContextFormat::Extended), 15);
+        assert_eq!(device_id_bits(3, ContextFormat::Base), 24);
+        assert_eq!(device_id_bits(3, ContextFormat::Extended), 24);
     }
 
     #[test]
     fn the_first_mode_tried_holds_every_pci_requester_id()
     {
         assert_eq!(
-            directory_modes(false),
+            directory_modes(ContextFormat::Base),
             [DdtMode::TwoLevel, DdtMode::ThreeLevel, DdtMode::OneLevel]
         );
         assert_eq!(
-            directory_modes(true),
+            directory_modes(ContextFormat::Extended),
             [DdtMode::ThreeLevel, DdtMode::TwoLevel, DdtMode::OneLevel]
         );
     }
@@ -510,7 +572,7 @@ mod tests
     }
 
     #[test]
-    fn invalidation_commands_carry_their_scope()
+    fn a_translation_invalidation_carries_its_scope()
     {
         assert_eq!(iotinval_vma(Translations::All), [1, 0]);
         assert_eq!(
@@ -524,6 +586,11 @@ mod tests
             }),
             [1 | (1 << 10) | (1 << 32) | (5 << 12), 0x123 << 10]
         );
+    }
+
+    #[test]
+    fn a_directory_invalidation_names_its_device_when_it_has_one()
+    {
         assert_eq!(iodir_inval_ddt(Directory::All), [3, 0]);
         assert_eq!(
             iodir_inval_ddt(Directory::Device(0x28)),

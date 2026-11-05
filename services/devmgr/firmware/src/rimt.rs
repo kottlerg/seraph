@@ -118,6 +118,13 @@ impl IdMapping
         (start, end)
     }
 
+    /// Whether the range names any requester ID of `bus` on `segment`.
+    fn touches_bus(&self, segment: u16, bus: u32) -> bool
+    {
+        let (start, end) = self.rids();
+        segment == self.segment && start < (bus + 1) * 256 && bus * 256 < end
+    }
+
     /// Whether the range names the function `f` of `segment`.
     #[must_use]
     pub fn covers(&self, segment: u16, f: Bdf) -> bool
@@ -240,11 +247,13 @@ pub fn mapping_for(rimt: &[u8], segment: u16, f: Bdf) -> Option<IdMapping>
 }
 
 /// The scope of the IOMMU whose node is at `node`, for its PCI segment
-/// `segment`, resolved against the functions the PCI scan found: each bus
-/// the IOMMU's identity mappings cover whole, as a bus range, and each
-/// function of `functions` on a bus they cover in part, passed to `out`. A
-/// mapping that renames requester IDs, or that an earlier mapping shadows
-/// for a function, names nothing here, as in [`mapping_for`].
+/// `segment`, resolved against the functions the PCI scan found, passed to
+/// `out`: each run of buses the IOMMU's identity mappings cover whole and no
+/// earlier mapping touches, as a bus range, and each function of
+/// `functions` on any other bus they cover, by itself. A mapping that
+/// renames requester IDs, or that an earlier mapping shadows for a
+/// function, names nothing here, as in [`mapping_for`], so the scope names
+/// exactly the functions [`mapping_for`] places on the IOMMU.
 pub fn resolve_scope(
     rimt: &[u8],
     node: u32,
@@ -253,33 +262,64 @@ pub fn resolve_scope(
     mut out: impl FnMut(Resolved),
 )
 {
-    for m in pci_id_mappings(rimt)
+    for (index, m) in pci_id_mappings(rimt).enumerate()
     {
         if m.iommu != node || m.segment != segment || !m.is_identity()
         {
             continue;
         }
-        let (start, end) = m.rids();
-        // Buses whose 256 requester IDs all lie in the range.
-        let first_whole = start.div_ceil(256);
-        let last_whole = (end / 256).checked_sub(1);
-        let whole = last_whole
-            .filter(|&last| first_whole <= last)
-            .map(|last| (first_whole, last));
-        if let Some((first, last)) = whole
-            && let (Ok(first), Ok(last)) = (u8::try_from(first), u8::try_from(last))
-        {
-            out(Resolved::Buses(first, last));
-        }
+        let whole = whole_buses(rimt, index, m, &mut out);
         for f in functions.clone()
         {
-            let in_whole = whole.is_some_and(|(a, b)| (a..=b).contains(&u32::from(f.bus)));
-            if !in_whole && mapping_for(rimt, segment, f) == Some(m)
+            if !whole[usize::from(f.bus)] && mapping_for(rimt, segment, f) == Some(m)
             {
                 out(Resolved::Function(f));
             }
         }
     }
+}
+
+/// Pass to `out` each run of buses the mapping `m`, the `index`th of the
+/// table, covers whole and no earlier mapping touches, as a bus range; the
+/// buses passed, by bus number.
+fn whole_buses(
+    rimt: &[u8],
+    index: usize,
+    m: IdMapping,
+    out: &mut impl FnMut(Resolved),
+) -> [bool; 256]
+{
+    let mut whole = [false; 256];
+    let (start, end) = m.rids();
+    let mut run: Option<(u8, u8)> = None;
+    // Buses whose 256 requester IDs all lie in the range; the range ends at
+    // 0x10000, so each is below 256.
+    for bus in start.div_ceil(256)..end / 256
+    {
+        let shadowed = pci_id_mappings(rimt)
+            .take(index)
+            .any(|e| e.touches_bus(m.segment, bus));
+        let Ok(b) = u8::try_from(bus)
+        else
+        {
+            break;
+        };
+        if shadowed
+        {
+            if let Some((first, last)) = run.take()
+            {
+                out(Resolved::Buses(first, last));
+            }
+            continue;
+        }
+        whole[usize::from(b)] = true;
+        run = Some(run.map_or((b, b), |(first, _)| (first, b)));
+    }
+    if let Some((first, last)) = run
+    {
+        out(Resolved::Buses(first, last));
+    }
+    whole
 }
 
 #[cfg(test)]
@@ -313,17 +353,29 @@ mod tests
         t
     }
 
-    /// An IOMMU node: a PCI function at `rid` of `segment` when `pcie`.
-    fn iommu(pcie: bool, segment: u16, rid: u16) -> Vec<u8>
+    /// An IOMMU node with `flags`, its function `rid` of `segment`.
+    fn iommu_node(flags: u32, segment: u16, rid: u16) -> Vec<u8>
     {
         let mut n = vec![0u8; 40];
         n[0] = TYPE_IOMMU;
         n[1] = 1;
         n[2..4].copy_from_slice(&40u16.to_le_bytes());
-        n[24..28].copy_from_slice(&u32::from(pcie).to_le_bytes());
+        n[24..28].copy_from_slice(&flags.to_le_bytes());
         n[32..34].copy_from_slice(&segment.to_le_bytes());
         n[34..36].copy_from_slice(&rid.to_le_bytes());
         n
+    }
+
+    /// An IOMMU node for the PCI function `rid` of `segment`.
+    fn pci_iommu(segment: u16, rid: u16) -> Vec<u8>
+    {
+        iommu_node(IOMMU_FLAG_PCIE, segment, rid)
+    }
+
+    /// An IOMMU node for a platform IOMMU.
+    fn platform_iommu() -> Vec<u8>
+    {
+        iommu_node(0, 0, 0)
     }
 
     /// A root complex node of `segment` with `(source, count, device,
@@ -354,7 +406,7 @@ mod tests
     fn qemu_virt() -> Vec<u8>
     {
         rimt(&[
-            iommu(true, 0, 0x0008),
+            pci_iommu(0, 0x0008),
             root_complex(0, &[(0x9, 0xfff7, 0x9, 48)]),
         ])
     }
@@ -377,7 +429,7 @@ mod tests
     #[test]
     fn a_platform_iommu_node_is_not_a_pci_iommu()
     {
-        let t = rimt(&[iommu(false, 0, 0)]);
+        let t = rimt(&[platform_iommu()]);
         assert_eq!(pci_iommus(&t).count(), 0);
     }
 
@@ -399,7 +451,7 @@ mod tests
     fn a_mapping_that_renames_requester_ids_is_not_identity()
     {
         let t = rimt(&[
-            iommu(true, 0, 0x0008),
+            pci_iommu(0, 0x0008),
             root_complex(0, &[(0x100, 0x100, 0x2000, 48)]),
         ]);
         let m = mapping_for(&t, 0, bdf(1, 0, 0)).unwrap();
@@ -433,8 +485,8 @@ mod tests
     fn a_scope_skips_renaming_mappings_and_other_iommus_and_segments()
     {
         let t = rimt(&[
-            iommu(true, 0, 0x0008),
-            iommu(true, 0, 0x0010),
+            pci_iommu(0, 0x0008),
+            pci_iommu(0, 0x0010),
             root_complex(
                 0,
                 &[(0x0100, 0x100, 0x0100, 88), (0x0200, 0x100, 0x5000, 48)],
@@ -452,8 +504,8 @@ mod tests
     fn a_function_an_earlier_mapping_shadows_is_not_in_the_later_scope()
     {
         let t = rimt(&[
-            iommu(true, 0, 0x0008),
-            iommu(true, 0, 0x0010),
+            pci_iommu(0, 0x0008),
+            pci_iommu(0, 0x0010),
             root_complex(
                 0,
                 &[(0x0011, 0x10, 0x0011, 88), (0x0009, 0xfff7, 0x0009, 48)],
@@ -474,7 +526,7 @@ mod tests
     #[test]
     fn a_range_past_the_segment_is_clipped_to_it()
     {
-        let t = rimt(&[iommu(true, 0, 0), root_complex(0, &[(0, u32::MAX, 0, 48)])]);
+        let t = rimt(&[pci_iommu(0, 0), root_complex(0, &[(0, u32::MAX, 0, 48)])]);
         let mut out = Vec::new();
         resolve_scope(&t, 48, 0, &core::iter::empty(), |r| out.push(r));
         assert_eq!(out, [Resolved::Buses(0, 255)]);
@@ -504,7 +556,7 @@ mod tests
     {
         let mut rc = root_complex(0, &[(0x9, 0x10, 0x9, 48)]);
         rc[18..20].copy_from_slice(&5u16.to_le_bytes());
-        let t = rimt(&[iommu(true, 0, 8), rc]);
+        let t = rimt(&[pci_iommu(0, 8), rc]);
         assert_eq!(pci_id_mappings(&t).count(), 1);
     }
 
@@ -515,5 +567,55 @@ mod tests
         t[..4].copy_from_slice(b"DMAR");
         assert_eq!(pci_iommus(&t).count(), 0);
         assert_eq!(pci_id_mappings(&t).count(), 0);
+    }
+
+    #[test]
+    fn a_whole_bus_an_earlier_mapping_touches_is_named_by_function()
+    {
+        // The second IOMMU owns 01:02.0-01:03.7; the first's mapping covers
+        // buses 1-255 whole but for that part of bus 1.
+        let t = rimt(&[
+            pci_iommu(0, 0x0008),
+            pci_iommu(0, 0x0010),
+            root_complex(
+                0,
+                &[(0x0110, 0x10, 0x0110, 88), (0x0009, 0xfff7, 0x0009, 48)],
+            ),
+        ]);
+        let scanned = [bdf(1, 0, 0), bdf(1, 2, 0), bdf(2, 0, 0)];
+        let mut out = Vec::new();
+        resolve_scope(&t, 48, 0, &scanned.iter().copied(), |r| out.push(r));
+        assert_eq!(
+            out,
+            [Resolved::Buses(2, 255), Resolved::Function(bdf(1, 0, 0))]
+        );
+        let mut out = Vec::new();
+        resolve_scope(&t, 88, 0, &scanned.iter().copied(), |r| out.push(r));
+        assert_eq!(out, [Resolved::Function(bdf(1, 2, 0))]);
+    }
+
+    #[test]
+    fn an_iommu_node_too_short_for_its_fields_is_skipped()
+    {
+        let mut short = pci_iommu(0, 0x0008);
+        short.truncate(36);
+        short[2..4].copy_from_slice(&36u16.to_le_bytes());
+        let t = rimt(&[short, pci_iommu(0, 0x0010)]);
+        let found: Vec<_> = pci_iommus(&t).map(|i| i.function).collect();
+        assert_eq!(found, [bdf(0, 2, 0)]);
+    }
+
+    #[test]
+    fn a_root_complex_node_too_short_for_its_fields_is_skipped()
+    {
+        let mut short = root_complex(0, &[]);
+        short.truncate(16);
+        short[2..4].copy_from_slice(&16u16.to_le_bytes());
+        let t = rimt(&[
+            pci_iommu(0, 0x0008),
+            short,
+            root_complex(0, &[(0x9, 0x10, 0x9, 48)]),
+        ]);
+        assert_eq!(pci_id_mappings(&t).count(), 1);
     }
 }

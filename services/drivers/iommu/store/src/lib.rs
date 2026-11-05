@@ -7,6 +7,9 @@
 //! zeroed 4 KiB pages from memmgr, mapped into the driver, with their
 //! physical addresses.
 //!
+//! A page a unit only reads is reached through [`TableStore::table`]; one it
+//! writes (a queue it produces into) only through [`Store::page_ptr`].
+//!
 //! Pages come from memmgr in physically contiguous chunks
 //! (`REQUIRE_CONTIGUOUS`), and the driver reads each chunk's physical base
 //! with `CAP_INFO_MEMORY_PHYS_BASE`, since a unit is programmed with
@@ -80,7 +83,8 @@ impl Store
 
     /// Write `len` bytes from the table page `phys` (at byte `offset`) back
     /// to memory when a unit does not snoop the caches
-    /// ([`Flush::Writeback`]); nothing when every unit does.
+    /// ([`Flush::Writeback`]); nothing when every unit does. A span past the
+    /// end of the page is refused, logged, and nothing is written back.
     pub fn flush(&self, phys: u64, offset: u64, len: u64)
     {
         let Flush::Writeback(write_back) = self.flush
@@ -88,12 +92,28 @@ impl Store
         {
             return;
         };
+        if offset.checked_add(len).is_none_or(|end| end > PAGE_SIZE)
+        {
+            std::os::seraph::log!("table pages: flush past the end of {:#x} refused", phys);
+            return;
+        }
         if let Some(va) = self.va(phys)
         {
-            // SAFETY: `va` maps the page `phys`, and `offset + len` stays in
-            // it (every caller flushes inside one page).
+            // SAFETY: `va` maps the page `phys` for the driver's life, and
+            // `offset + len` stays inside it (checked above).
             unsafe { write_back(va + offset, len) };
         }
+    }
+
+    /// The mapped address of the page at `phys`, for a page a unit itself
+    /// writes (a queue the unit produces into): such a page may be reached
+    /// only through raw accesses, never through a reference, since the unit
+    /// writes it behind the compiler's back. `None` for an address no chunk
+    /// holds.
+    #[must_use]
+    pub fn page_ptr(&self, phys: u64) -> Option<*const u64>
+    {
+        self.va(phys).map(|va| va as *const u64)
     }
 
     fn va(&self, phys: u64) -> Option<u64>
@@ -220,8 +240,10 @@ impl TableStore for Store
 
     fn written(&mut self, phys: u64, index: usize)
     {
-        // Every table store is ordered before the next one and before the
-        // register write that makes a unit read it, on a snooping unit too.
+        // Every table store is ordered before the next one, on a snooping
+        // unit too. The register write that makes a unit read the tables
+        // orders them before itself with the memory-to-device barrier the
+        // driver's register accessor supplies.
         fence(Ordering::SeqCst);
         self.flush(phys, (index * 8) as u64, 8);
     }

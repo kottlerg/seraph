@@ -10,8 +10,8 @@ publish.workspace = true
 # The table-page store every IOMMU driver binary builds its translation
 # structures in. It calls memmgr and maps pages through the Seraph std
 # runtime, so it builds for the Seraph targets only, as a dependency of the
-# driver binaries, and has no host tests (the walks over it are host-tested
-# against heap stores in iommu-core's TableStore).
+# driver binaries, and has no host tests (each family's library host-tests its
+# walks over an iommu_core::TableStore of heap pages).
 [lib]
 name = "iommu_store"
 path = "src/lib.rs"

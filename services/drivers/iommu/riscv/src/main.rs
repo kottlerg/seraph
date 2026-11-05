@@ -117,8 +117,8 @@ fn main() -> !
         units.push(Unit::new(va));
     }
     let count = units.len() as u64;
-    // The IOMMU reads its structures coherently with the caches
-    // (`backend` § coherence): the store's fences suffice.
+    // The IOMMU reads its structures coherently with the caches (the
+    // `backend` module doc): no table write needs writing back.
     let store = Store::new(info.memmgr_endpoint, info.self_aspace, Flush::Coherent);
     let Some(mut svc) = Service::new(Riscv::new(units, store), KernelCaps, boot.units)
     else

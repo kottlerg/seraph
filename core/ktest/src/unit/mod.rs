@@ -418,6 +418,10 @@ pub fn run_all(ctx: &TestContext)
         "wait_set::occupied_wait_refused",
         wait_set::occupied_wait_refused(ctx)
     );
+    run_test!(
+        "wait_set::stale_endpoint_entry_skipped",
+        wait_set::stale_endpoint_entry_skipped(ctx)
+    );
     run_test!("wait_set::remove", wait_set::remove(ctx));
     run_test!(
         "wait_set::source_notification_pinned_by_member",

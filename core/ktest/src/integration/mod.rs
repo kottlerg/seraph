@@ -30,6 +30,7 @@ pub mod fault_handler_declines_kills;
 pub mod fault_kills_thread;
 pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
+pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
 pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
@@ -189,6 +190,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_handler_declines_kills",
         fault_handler_declines_kills::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_syscall_buffer",
+        fault_syscall_buffer::run(ctx)
     );
     run_integration_test!(
         "integration::fault_exception_redirect",

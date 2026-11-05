@@ -55,15 +55,17 @@ The EFI System Partition is accessed as follows:
 4. root->Open("\EFI\seraph\bootstrap.bundle") → bundle file handle (step 2)
 5. root->Open("\EFI\seraph\kernel") → kernel file handle (step 3)
 6. root->Open("\EFI\seraph\nokaslr") → presence probe only; the handle is closed at once (step 5d)
+7. root->Open("\EFI\seraph\mapredo") → presence probe only; the handle is closed at once (step 6)
 ```
 
 All files are opened as read-only. Sizes are determined via `EFI_FILE_INFO` before
 reading. Files are read into physical memory allocated by `AllocatePages`; see
 [elf-loading.md](elf-loading.md) for how segment placement works.
 
-The bootloader carries three ESP path constants — `\EFI\seraph\kernel`,
-`\EFI\seraph\bootstrap.bundle`, and the presence-only KASLR override knob
-`\EFI\seraph\nokaslr` — all hardcoded in [`core/boot/src/main.rs`](../src/main.rs) (see
+The bootloader carries four ESP path constants — `\EFI\seraph\kernel`,
+`\EFI\seraph\bootstrap.bundle`, the presence-only KASLR override knob
+`\EFI\seraph\nokaslr`, and the presence-only steps 6 and 7 redo test knob
+`\EFI\seraph\mapredo` — all hardcoded in [`core/boot/src/main.rs`](../src/main.rs) (see
 [elf-loading.md](elf-loading.md) § File Paths). There is no on-disk
 boot configuration file; the bundle is the single composed artifact
 that carries init plus every userspace module the system needs (see
@@ -217,9 +219,11 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 
 ## Error Handling Strategy
 
-Every `BootError` that reaches `efi_main` is fatal. Two sites consume a `BootError` instead of
+Every `BootError` that reaches `efi_main` is fatal. Three sites consume a `BootError` instead of
 returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob
-([boot-flow.md § Step 5d](boot-flow.md#step-5d-apply-the-kaslr-slide)), and a failed
+([boot-flow.md § Step 5d](boot-flow.md#step-5d-apply-the-kaslr-slide)), as does a failed open of
+`\EFI\seraph\mapredo`
+([memory-map.md § Sizing the Entry Array](memory-map.md#sizing-the-entry-array)), and a failed
 AP-trampoline allocation is logged as a warning and records zero
 ([boot-flow.md § Step 5b](boot-flow.md#step-5b-allocate-the-ap-trampoline-page)). Optional
 resources degrade instead of failing: an absent GOP leaves the system headless, and an absent or

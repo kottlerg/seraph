@@ -252,7 +252,8 @@ sized (the buffer bounds step 8's re-query too), the bootloader frees every allo
 of steps 6 and 7 (the page-table frame pool included) and runs both again with twice
 the slack, up to `MEM_MAP_ATTEMPTS` (3) times; a buffer that still outgrows the array
 fails the boot with `BootError::MemoryMapKeptGrowing`
-([memory-map.md](memory-map.md#sizing-the-entry-array)).
+([memory-map.md](memory-map.md#sizing-the-entry-array)). The presence-only
+`\EFI\seraph\mapredo` test knob makes the first attempt redo whatever its map's size.
 
 Detail: [uefi-environment.md](uefi-environment.md)
 

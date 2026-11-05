@@ -49,12 +49,14 @@ sources, reclaim scratch, AP trampoline; see
 §"Handover"). Both entry points feed the same free
 pool, so every pool frame is uniform anonymous RAM: a consumer may map any of
 it read-only, read-write, or read-execute (W^X still enforced at map time).
-This requires each pool frame's Memory cap to carry **WRITE, EXECUTE, and
-RETYPE** rights — memmgr derives the R/RW/RX inner from the pooled outer on
-demand and `cap_derive` only narrows rights, so a frame whose outer lacks WRITE
-(or EXECUTE) cannot satisfy a writable (or executable) map and would fail the
-consumer's fault. The kernel mints every donatable RAM cap with these rights
-(rights gate derivation, not the live mapping; see
+This requires each pool frame's Memory cap to carry **WRITE, EXECUTE,
+RETYPE, and PHYS** rights — memmgr derives the R/RW/RX inner from the pooled
+outer on demand and `cap_derive` only narrows rights, so a frame whose outer
+lacks WRITE (or EXECUTE) cannot satisfy a writable (or executable) map and would
+fail the consumer's fault, and PHYS lets memmgr read each run's physical base,
+the right it strips from every grant but a phys-class caller's (see
+[Allocation](#allocation)). The kernel mints every donatable RAM cap with these
+rights; rights gate derivation, not the live mapping (see
 [`docs/capability-model.md`](../../../docs/capability-model.md#memory) §"Memory");
 memmgr enforces the invariant at
 both ingest and donation, rejecting a donated frame that lacks them and panicking if the first
@@ -133,7 +135,14 @@ selects once more before memmgr returns the out-of-memory code.
 Each Memory cap returned to the caller is a derive-twice copy: memmgr
 retains an intermediary in its own CSpace and hands the second derivation
 to the caller. The intermediary lets memmgr reclaim the cap on
-`PROCESS_DIED` even if the caller's CSpace has been torn down.
+`PROCESS_DIED` even if the caller's CSpace has been torn down. The second
+derivation passes every right but `RIGHTS_MEM_PHYS`, which it passes only to
+a caller whose badge marks it phys-class (devmgr and the IOMMU drivers; see
+[`ipc-interface.md`](ipc-interface.md#label-3-register_process) § Label 3), so
+no other caller can read where its frames lie. Each grant run is recorded on
+the caller's entry under the next id of the entry's region-id sequence, which
+the reply returns in place of a physical address and `RELEASE_MEMORY_CAPS`
+takes back (see [Per-Process Tracking](#per-process-tracking)).
 
 ---
 
@@ -152,6 +161,9 @@ and never reclaims them. Each entry records:
 - The head of an intrusive list of the demand-paged regions the process has
   registered (`REGISTER_REGION`).
 - The delegated child `AddressSpace` cap, when demand-paged.
+- The next region id: a sequence from 1 that numbers the process's grants.
+  Each grant's frame node keeps its id, which no later grant of the process
+  reuses; bootstrap arenas and demand-paged chunks carry none.
 
 The frame and region list nodes live in a self-hosted metadata arena (below),
 not in the record, so per-process frame and region counts are bounded by RAM —
@@ -379,15 +391,16 @@ and are what the free-pool insertion uses.
 `RELEASE_MEMORY_CAPS` from a live process is the mid-life counterpart for a
 caller-owned grant. The caller usually cannot transfer the cap back — having
 retyped the region (e.g. into a Thread) and dropped its inner copy, it no
-longer holds one — so it names each region by the `phys_base` memmgr reported
-at grant. memmgr matches that base against the entry's frame list
-(`FRAME_VA_UNMAPPED` grants only; demand-mapped chunks are reclaimed by
+longer holds one — so it names each region by the region id memmgr reported
+at grant. memmgr matches that id against the entry's frame list (grants only;
+demand-mapped chunks, which carry no id, are reclaimed by
 `UNREGISTER_REGION`), takes the frame off the record, returns it to the pool
 when it is quiescent and to the deferred list otherwise (the node becomes
 the run's node in either case), and coalesces the freed runs with their
 physical neighbours, leaving the entry's other records untouched. Unmatched
-bases are ignored, so release is idempotent (a racing join-plus-reaper
-double-release is harmless). The caller must have deleted every capability
+ids are ignored, so release is idempotent (a racing join-plus-reaper
+double-release is harmless), and an id the entry never reissues cannot take a
+later grant of the same run. The caller must have deleted every capability
 to the region and every object retyped from it, and unmapped it, first; a
 region released while any of them remains waits on the deferred list until
 all are gone, so no other process reaches a pooled run and its next grantee

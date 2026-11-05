@@ -123,7 +123,8 @@ procmgr's ELF identically to memmgr. Before starting procmgr's thread,
 init:
 
 1. Mints a badged `SEND|GRANT` cap on memmgr's endpoint (`cap_derive_badge`
-   with a bootstrap badge) identifying procmgr, and passes that badge to
+   with a bootstrap badge, its phys-class bit clear so procmgr's own grants
+   lack the Memory `Phys` right) identifying procmgr, and passes that badge to
    memmgr in memmgr's bootstrap round so memmgr gates the procmgr-only
    labels on it.
 2. Installs that cap into procmgr's `ProcessInfo.memmgr_endpoint_cap`

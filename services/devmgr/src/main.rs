@@ -21,6 +21,7 @@ mod caps;
 mod dma;
 mod iommu;
 mod pci;
+mod phys;
 mod settle;
 mod spawn;
 mod tables;

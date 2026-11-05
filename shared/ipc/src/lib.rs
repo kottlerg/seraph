@@ -81,7 +81,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 8;
+pub const PROCMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -119,7 +119,8 @@ pub mod procmgr_labels
     /// * bits `[23..28]` — `CREATE_BAND_MAX` (see [`CREATE_BAND_MAX_SHIFT`])
     /// * bit `28` — [`CREATE_DMA_HOLD`]
     /// * bit `29` — [`CREATE_ARGV_ENV`]
-    /// * bits `[30..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `30` — [`CREATE_PHYS_ACCESS`]
+    /// * bits `[31..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
@@ -151,7 +152,7 @@ pub mod procmgr_labels
     /// inherits it onto spawned threads. Set this flag only for a process
     /// that cannot depend on the fault path — a driver doing DMA, whose
     /// memory a device may write before a demand fault could back it.
-    /// Occupies bit 16 of the `[16..30]` label window. init,
+    /// Occupies bit 16 of the `[16..31]` label window. init,
     /// memmgr, and procmgr are pre-pager and never routed through this
     /// binding path, so they are pinned by construction regardless.
     pub const CREATE_PINNED: u64 = 1 << 16;
@@ -164,7 +165,7 @@ pub mod procmgr_labels
     /// spawner's own death queue, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
     /// `EventQueue` state at bind time). Occupies bit 17 of the
-    /// `[16..30]` label window.
+    /// `[16..31]` label window.
     pub const CREATE_DEATH_RELAY: u64 = 1 << 17;
     /// Bit offset of the `CREATE_PRIORITY` field (bits `[18..23]`) in a
     /// [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] label: the priority level
@@ -174,7 +175,7 @@ pub mod procmgr_labels
     /// child's band. A nonzero value must satisfy
     /// `1 <= priority <= band_max <= creator's band ceiling`; violations
     /// reply `INVALID_ARGUMENT`. Occupies bits 18–22 of the
-    /// `[16..30]` label window.
+    /// `[16..31]` label window.
     pub const CREATE_PRIORITY_SHIFT: u32 = 18;
     /// Bit offset of the `CREATE_BAND_MAX` field (bits `[23..28]`): the
     /// upper bound of the baseline `SchedControl` band procmgr mints into
@@ -182,7 +183,7 @@ pub mod procmgr_labels
     /// `ProcessInfo.sched_control_cap`). `0` = unspecified — the child
     /// receives a copy of its creator's band. A nonzero value must not
     /// exceed the creator's band ceiling. Occupies bits 23–27 of the
-    /// `[16..30]` label window.
+    /// `[16..31]` label window.
     pub const CREATE_BAND_MAX_SHIFT: u32 = 23;
     /// Width mask of each 5-bit scheduling field in the create label. Five
     /// bits hold every level of the kernel's 32-level priority space
@@ -200,7 +201,7 @@ pub mod procmgr_labels
     /// cannot. A child destroyed before [`START_PROCESS`] never ran and is
     /// reclaimed at once. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
-    /// (**DMA hold flag**). Occupies bit 28 of the `[16..30]` label window.
+    /// (**DMA hold flag**). Occupies bit 28 of the `[16..31]` label window.
     pub const CREATE_DMA_HOLD: u64 = 1 << 28;
     /// Label flag (bit 29) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
     /// request carries the child's argv and env in a Memory cap the caller
@@ -221,11 +222,21 @@ pub mod procmgr_labels
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
     /// `CREATE_PROCESS` (**argv and env**).
     pub const CREATE_ARGV_ENV: u64 = 1 << 29;
-    /// Still-reserved bits `[30..64]` of a create label. Procmgr rejects
+    /// Label flag (bit 30) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// create the child phys-class, so memmgr's grants to it keep
+    /// `RIGHTS_MEM_PHYS` and it can read physical addresses
+    /// (`CAP_INFO_MEMORY_PHYS_BASE`, `SYS_ASPACE_QUERY`). Honoured only from
+    /// an un-badged creator (init, svcmgr) or a phys-class one; procmgr
+    /// refuses it from any other creator (`INVALID_ARGUMENT`). init sets it
+    /// for devmgr and devmgr for the IOMMU driver. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+    /// (**physical-address flag**).
+    pub const CREATE_PHYS_ACCESS: u64 = 1 << 30;
+    /// Still-reserved bits `[31..64]` of a create label. Procmgr rejects
     /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
     /// addition is provably additive: existing senders are known to send
     /// zeros.
-    pub const CREATE_RESERVED_MASK: u64 = !((1 << 30) - 1);
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 31) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 
@@ -553,7 +564,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 8;
+pub const MEMMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -574,15 +585,28 @@ pub mod memmgr_labels
     /// `REQUEST_MEMORY_CAPS`.
     pub const REQUEST_MEMORY_CAPS: u64 = 1;
     /// Return previously granted regions to the pool mid-life, named by the
-    /// `phys_base` the grant reply reported, from any badged cap. Specified in
+    /// opaque region id the grant reply reported, from any badged cap.
+    /// Specified in
     /// `services/memmgr/docs/ipc-interface.md` § Label 2:
     /// `RELEASE_MEMORY_CAPS`.
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process and receive the badged SEND cap
     /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
-    /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 3:
+    /// `data[1]` carries the flags ([`REGISTER_PHYS_CLASS`]). Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 0): register the process
+    /// phys-class, so its grants keep `RIGHTS_MEM_PHYS`. procmgr sets it only
+    /// for a child created with
+    /// [`CREATE_PHYS_ACCESS`](super::procmgr_labels::CREATE_PHYS_ACCESS)
+    /// (devmgr and the IOMMU drivers).
+    pub const REGISTER_PHYS_CLASS: u64 = 1 << 0;
+    /// The bit of a memmgr process badge that marks a phys-class process
+    /// ([`REGISTER_PHYS_CLASS`]); memmgr draws the other 63 bits at random.
+    /// init clears it in the badge it mints for procmgr on memmgr's endpoint,
+    /// so procmgr's own grants lack `RIGHTS_MEM_PHYS`.
+    pub const PHYS_CLASS_BADGE_BIT: u64 = 1 << 63;
     /// Procmgr-only: notify process death. `data[0]` carries the dead process's
     /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
     /// it had issued to that badge, runs coalescing, and clears the
@@ -696,15 +720,16 @@ pub mod memmgr_labels
 }
 
 /// Split a `memmgr_labels::REQUEST_MEMORY_CAPS` success reply into its page
-/// counts and phys bases, one of each per transferred cap: `data[1 + i]` and
+/// counts and region ids, one of each per transferred cap: `data[1 + i]` and
 /// `data[1 + count + i]` for `i` below the declared `count` in `data[0]`
-/// (services/memmgr/docs/ipc-interface.md § Label 1).
+/// (services/memmgr/docs/ipc-interface.md § Label 1). A region id is the
+/// opaque name `memmgr_labels::RELEASE_MEMORY_CAPS` takes for its cap's run.
 ///
 /// The reply is wire input, so nothing is indexed until it passes these
 /// checks. Returns `None` for an error label, a reply with no data words, a
 /// declared count of zero or other than the number of caps transferred, or
-/// data words too few to cover the declared count; the phys words of such a
-/// reply sit at an offset its count does not establish, so no base is read.
+/// data words too few to cover the declared count; the id words of such a
+/// reply sit at an offset its count does not establish, so no id is read.
 #[must_use]
 pub fn memmgr_grant_layout(reply: &IpcMessage) -> Option<(&[u64], &[u64])>
 {
@@ -3804,12 +3829,12 @@ mod tests
     }
 
     #[test]
-    fn grant_layout_splits_page_counts_and_bases_per_cap()
+    fn grant_layout_splits_page_counts_and_region_ids_per_cap()
     {
-        let reply = grant_reply(0, &[2, 3, 5, 0x1000, 0x8000], &[11, 12]);
-        let (pages, bases) = memmgr_grant_layout(&reply).expect("well-formed reply");
+        let reply = grant_reply(0, &[2, 3, 5, 7, 8], &[11, 12]);
+        let (pages, ids) = memmgr_grant_layout(&reply).expect("well-formed reply");
         assert_eq!(pages, &[3, 5]);
-        assert_eq!(bases, &[0x1000, 0x8000]);
+        assert_eq!(ids, &[7, 8]);
     }
 
     #[test]
@@ -3838,7 +3863,7 @@ mod tests
     #[test]
     fn grant_layout_refuses_a_count_other_than_the_caps_transferred()
     {
-        // Declaring more caps than arrived would put the phys words at an
+        // Declaring more caps than arrived would put the id words at an
         // offset the transferred count does not establish.
         let reply = grant_reply(0, &[2, 1, 1, 0x1000, 0x2000], &[11]);
         assert_eq!(memmgr_grant_layout(&reply), None);

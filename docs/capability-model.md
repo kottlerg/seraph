@@ -101,6 +101,10 @@ A capability to one or more contiguous physical frames. Rights:
 - **Retype** — authority to consume bytes of this Memory's region as the
   backing storage for a newly created kernel object (see
   [Typed Memory](#typed-memory))
+- **Phys** — authority to read physical addresses: the physical base of this
+  region, and of any other Memory cap its holder presents it beside
+  (`CAP_INFO_MEMORY_PHYS_BASE`), and the Read right on an address space retyped
+  from it (below)
 
 A capability may carry both Write and Execute rights, representing independent
 authorities over the same physical memory. W^X is enforced at mapping time: the
@@ -108,14 +112,24 @@ kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
 The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
-Execute | Retype` and places them in init's CSpace. Boot-module, init-segment,
+Execute | Retype | Phys` and places them in init's CSpace. Boot-module, init-segment,
 and reclaimed boot-scratch Memory caps carry the same full rights: cap rights
 gate derivation, not existing mappings (init's segments are already mapped at
 their true protection, and loaders map boot-module ELF sources read-only), and
 full rights let the caps donate into memmgr's pool as general RAM at init's
 reap. Only firmware-table Memory caps (ACPI regions, RSDP, DTB)
-mint without `Retype` — mappable references to fixed-purpose memory that
-cannot be consumed for kernel-object creation.
+mint with `Map` alone — mappable references to fixed-purpose memory that
+cannot be consumed for kernel-object creation, whose physical bases init's
+`InitInfo` descriptors already carry.
+
+memmgr strips `Phys` from every grant except to devmgr and the IOMMU drivers, the
+processes that program devices with physical addresses
+([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation),
+so no other process reads where its frames lie
+([services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)
+§ Label 1; the remaining physical-address surfaces are classified in
+[core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+§ Physical-address surfaces).
 
 Revoking a Memory capability invalidates its descendants but does not unmap the
 pages they mapped: a mapping established through a revoked descendant stays in
@@ -141,7 +155,9 @@ follow a separate flow through devmgr; see
 
 A capability to a process's virtual address space. Rights:
 - **Map** — may install and remove mappings in this address space
-- **Read** — may inspect current mappings
+- **Read** — may inspect current mappings (`SYS_ASPACE_QUERY`, which returns
+  their physical addresses); minted on init's kernel-created address space and,
+  for an address space retyped later, only when its Memory cap carries `Phys`
 - **Control** — may register terminal-fault death observers
   (`aspace_bind_notification`); held by the space's creator and masked out of
   copies handed to components that only map into the space
@@ -603,7 +619,7 @@ SYS_CAP_CREATE_ENDPOINT(memory)               → endpoint_cap     (Send + Recei
 SYS_CAP_CREATE_NOTIFICATION(memory)           → notification_cap (Notify + Wait)
 SYS_CAP_CREATE_EVENT_Q(memory, capacity)      → queue_cap        (Post + Recv)
 SYS_CAP_CREATE_THREAD(memory, aspace, cspace, sched, priority) → thread_cap (Control + Observe)
-SYS_CAP_CREATE_ASPACE(memory, augment, pages) → aspace_cap       (Map + Read + Control)
+SYS_CAP_CREATE_ASPACE(memory, augment, pages) → aspace_cap       (Map + Control [+ Read])
 SYS_CAP_CREATE_CSPACE(memory, augment, pages) → cspace_cap       (Insert + Delete + Derive)
 SYS_CAP_CREATE_WAIT_SET(memory)               → wait_set_cap     (Modify + Wait)
 ```
@@ -611,8 +627,10 @@ SYS_CAP_CREATE_WAIT_SET(memory)               → wait_set_cap     (Modify + Wai
 The kernel rejects creation if the Memory cap lacks `Retype` rights or
 if its available-bytes ledger has insufficient room for the requested
 object. The returned capability is placed in a free slot in the caller's
-CSpace. The caller receives the rights listed above; a freshly created CSpace
-capability carries no Revoke right.
+CSpace. The caller receives the rights listed above: an address space carries
+the bracketed Read only when the Memory cap it is retyped from carries `Phys`
+(§ Address Space),
+and a freshly created CSpace capability carries no Revoke right.
 
 The kernel records capability lineage in the derivation tree and object lifetime in a
 per-object reference count over capabilities and kernel-internal references (see
@@ -773,7 +791,8 @@ kernel growth path.
 
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
-retype-rights flag, physical base, and the number of user mappings of its pages (for a
+retype-rights flag, physical base (to a holder of the `Phys` right only, see
+[Memory](#memory)), and the number of user mappings of its pages (for a
 window of at most 512 pages per query) for Memory caps; lifecycle state and
 exit reason for Thread caps; PT growth budget for AddressSpace caps; backed
 slot capacity, slots used, and growth budget for CSpace caps; whether the
@@ -888,6 +907,7 @@ The kernel does not provide:
 [abi/process-abi/README.md](../abi/process-abi/README.md),
 [Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),

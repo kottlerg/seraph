@@ -1240,7 +1240,7 @@ fn bridge_main(h: BridgeHandles) {
         for sig in h.pipe_notifications.iter().flatten() {
             if let Some(rr) = &sig.ring_release {
                 if rr.on_peer_death() {
-                    crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+                    crate::sys::alloc::seraph::slab_release_fresh(rr.region_id());
                 }
             }
         }

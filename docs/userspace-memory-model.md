@@ -375,7 +375,8 @@ memmgr serves frame requests over IPC. The contract:
   `want_pages`, or a `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS` error.
 - **Best-effort reply.** One or more Memory caps whose page counts sum
   to at most `want_pages`. The reply carries each returned cap's page count
-  alongside it. memmgr prefers fewer caps over many.
+  and its region id alongside it, and no physical address. memmgr prefers
+  fewer caps over many.
 - **Reply cap-count bound.** A reply carries at most `MSG_CAP_SLOTS_MAX`
   (4) Memory caps, the IPC reply-side cap-slot capacity; a best-effort
   request no single free run covers is served largest-first across at
@@ -390,7 +391,7 @@ memmgr serves frame requests over IPC. The contract:
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
 - **Caller releases.** `RELEASE_MEMORY_CAPS` returns a granted region to the
-  pool mid-life, named by the `phys_base` memmgr reported at grant (the caller
+  pool mid-life, named by the opaque region id memmgr reported at grant (the caller
   need not still hold the cap — it may have retyped the region, deleted the
   objects, and dropped its copy; a region released while a capability to it, a
   live object, or a mapping remains is held out of the pool until all are gone).

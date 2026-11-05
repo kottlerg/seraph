@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
-use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_PHYS_BASE, MSG_CAP_SLOTS_MAX};
+use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, MSG_CAP_SLOTS_MAX};
 
 /// Whether the reap has run, for `QUERY_INIT_REAP`.
 static REAPED: AtomicBool = AtomicBool::new(false);
@@ -70,8 +70,8 @@ struct ReleaseProbe
 {
     /// procmgr's slot for the one-page grant the endpoint is retyped from.
     page: u64,
-    /// The grant's physical base, naming it to `RELEASE_MEMORY_CAPS`.
-    phys_base: u64,
+    /// The grant's region id, naming it to `RELEASE_MEMORY_CAPS`.
+    region_id: u64,
     /// The page's `available_bytes` with the endpoint alive.
     available_before: u64,
 }
@@ -83,17 +83,11 @@ impl ReleaseProbe
     /// steps that succeeded; the reap then reports no probe result.
     fn place(memmgr_ep: u64, cspace: u64, ipc_buf: *mut u64) -> Option<Self>
     {
-        let page = crate::memmgr_alloc_pages_contig(memmgr_ep, 1, ipc_buf)?;
-        let Ok(phys_base) = syscall::cap_info(page, CAP_INFO_MEMORY_PHYS_BASE)
-        else
-        {
-            let _ = syscall::cap_delete(page);
-            return None;
-        };
+        let (page, region_id) = crate::memmgr_alloc_contig_grant(memmgr_ep, 1, ipc_buf)?;
         let Ok(endpoint) = syscall::cap_create_endpoint(page)
         else
         {
-            release_page(memmgr_ep, page, phys_base, ipc_buf);
+            release_page(memmgr_ep, page, region_id, ipc_buf);
             return None;
         };
         // Read before the move, while a failure can still be undone; the
@@ -102,18 +96,18 @@ impl ReleaseProbe
         else
         {
             let _ = syscall::cap_delete(endpoint);
-            release_page(memmgr_ep, page, phys_base, ipc_buf);
+            release_page(memmgr_ep, page, region_id, ipc_buf);
             return None;
         };
         if syscall::cap_move(endpoint, cspace, 0).is_err()
         {
             let _ = syscall::cap_delete(endpoint);
-            release_page(memmgr_ep, page, phys_base, ipc_buf);
+            release_page(memmgr_ep, page, region_id, ipc_buf);
             return None;
         }
         Some(Self {
             page,
-            phys_base,
+            region_id,
             available_before,
         })
     }
@@ -138,7 +132,7 @@ impl ReleaseProbe
         );
         if released
         {
-            release_page(memmgr_ep, self.page, self.phys_base, ipc_buf);
+            release_page(memmgr_ep, self.page, self.region_id, ipc_buf);
             return procmgr_labels::INIT_REAP_PROBE_RELEASED;
         }
         let _ = syscall::cap_delete(self.page);
@@ -147,13 +141,13 @@ impl ReleaseProbe
 }
 
 /// Drop procmgr's cap on a one-page grant and return the page to memmgr's
-/// pool by its physical base (`RELEASE_MEMORY_CAPS`).
-fn release_page(memmgr_ep: u64, page: u64, phys_base: u64, ipc_buf: *mut u64)
+/// pool by its region id (`RELEASE_MEMORY_CAPS`).
+fn release_page(memmgr_ep: u64, page: u64, region_id: u64, ipc_buf: *mut u64)
 {
     let _ = syscall::cap_delete(page);
     let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
         .word(0, 1)
-        .word(1, phys_base)
+        .word(1, region_id)
         .build();
     // SAFETY: ipc_buf is procmgr's registered IPC buffer.
     let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };

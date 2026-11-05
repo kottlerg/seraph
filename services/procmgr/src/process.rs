@@ -460,6 +460,9 @@ pub struct ChildSched
     /// Upper bound of the baseline `SchedControl` band minted into the
     /// child (`[1, band_max]`).
     pub band_max: u8,
+    /// The `memmgr_labels::REGISTER_PROCESS` flags the child registers with
+    /// (`process_table::child_memmgr_flags`): its physical-address class.
+    pub memmgr_flags: u64,
 }
 
 // ── Child setup helpers ─────────────────────────────────────────────────────
@@ -2754,6 +2757,7 @@ impl Drop for ChildKernelObjects
 ///
 /// # Errors
 /// `procmgr_errors::OUT_OF_MEMORY` when memmgr grants no retype slab, the
+/// address-space slab's derivation without `RIGHTS_MEM_PHYS` fails, the
 /// thread-retype size cannot be read, or a retype fails: § Label 1 and
 /// § Label 13 of `services/procmgr/docs/ipc-interface.md` name every
 /// kernel-object allocation failure so.
@@ -2769,10 +2773,20 @@ fn create_child_kernel_objects(
         crate::memmgr_alloc_pages_contig(memmgr_send, crate::ASPACE_RETYPE_PAGES, ipc_buf)
             .ok_or(oom)?,
     );
-    let aspace = CapGuard::new(
-        syscall::cap_create_aspace(slab.cap(), 0, crate::ASPACE_RETYPE_PAGES).map_err(|_| oom)?,
+    // Retype through a derivation without `RIGHTS_MEM_PHYS`, so the address
+    // space is minted without `RIGHTS_AS_READ` even for a phys-class child,
+    // whose slab carries `PHYS`: procmgr keeps this cap for the child's life,
+    // and no process translates a child's pages (`SYS_ASPACE_QUERY`).
+    let narrowed = CapGuard::new(
+        syscall::cap_derive(slab.cap(), syscall::RIGHTS_ALL & !syscall::RIGHTS_MEM_PHYS)
+            .map_err(|_| oom)?,
     );
-    // The retype keeps its own reference on the region; drop the slab slot.
+    let aspace = CapGuard::new(
+        syscall::cap_create_aspace(narrowed.cap(), 0, crate::ASPACE_RETYPE_PAGES)
+            .map_err(|_| oom)?,
+    );
+    // The retype keeps its own reference on the region; drop the slab slots.
+    drop(narrowed);
     drop(slab);
     let slab = CapGuard::new(
         crate::memmgr_alloc_pages_contig(memmgr_send, crate::CSPACE_RETYPE_PAGES, ipc_buf)
@@ -3043,7 +3057,8 @@ pub fn create_process_from_file(
     // front; the header scratch memory cap, the per-segment memory caps, and all
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
-    let (mms_cap, mms_badge) = crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    let (mms_cap, mms_badge) =
+        crate::register_with_memmgr(ctx.memmgr_ep, sched.memmgr_flags, ipc_buf);
     let mms = MemmgrSendGuard::new(mms_cap, mms_badge, ctx.memmgr_ep, ipc_buf);
     if mms.cap() == 0
     {

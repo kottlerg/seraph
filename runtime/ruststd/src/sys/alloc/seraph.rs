@@ -458,7 +458,7 @@ impl Heap {
                 break false;
             };
             let caps = reply.caps();
-            let Some((page_counts, bases)) = ipc::memmgr_grant_layout(&reply) else {
+            let Some((page_counts, region_ids)) = ipc::memmgr_grant_layout(&reply) else {
                 release_reply_caps(self.memmgr_ep, ipc_buf, caps, &[], |_| false);
                 break false;
             };
@@ -487,7 +487,7 @@ impl Heap {
             }
             if kept < caps.len() {
                 let keep = |i| i < kept || (keep_failed && i == kept);
-                release_reply_caps(self.memmgr_ep, ipc_buf, caps, bases, keep);
+                release_reply_caps(self.memmgr_ep, ipc_buf, caps, region_ids, keep);
                 break false;
             }
         };
@@ -712,13 +712,13 @@ pub fn heap_is_initialized() -> bool {
 /// Retired pool pages a pool can park before evicting (per pool).
 const SLAB_SHELF_SIZE: usize = 4;
 
-/// One displaced pool page: the Memory-cap slot, the grant's physical base
+/// One displaced pool page: the Memory-cap slot, the grant's region id
 /// (memmgr's `RELEASE_MEMORY_CAPS` identity), and the cap's total byte size
 /// (fully drained ⇔ kernel `available_bytes == size`).
 #[derive(Clone, Copy)]
 struct ShelfEntry {
     cap: u64,
-    phys: u64,
+    region_id: u64,
     size: u64,
 }
 
@@ -729,7 +729,7 @@ struct SlabPool {
     cap: u64,
     /// The ledger mirror of `cap`'s `available_bytes`.
     local_avail: u64,
-    cur_phys: u64,
+    cur_region_id: u64,
     cur_size: u64,
     shelf: [ShelfEntry; SLAB_SHELF_SIZE],
     shelf_len: usize,
@@ -742,9 +742,9 @@ const fn empty_slab() -> ObjectSlab {
     SpinMutex::new(SlabPool {
         cap: 0,
         local_avail: 0,
-        cur_phys: 0,
+        cur_region_id: 0,
         cur_size: 0,
-        shelf: [ShelfEntry { cap: 0, phys: 0, size: 0 }; SLAB_SHELF_SIZE],
+        shelf: [ShelfEntry { cap: 0, region_id: 0, size: 0 }; SLAB_SHELF_SIZE],
         shelf_len: 0,
     })
 }
@@ -791,12 +791,12 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// reply carries is deleted and its run returned to memmgr (see
 /// [`release_reply_caps`]).
 ///
-/// Returns `Some((slot, pages, phys))` on success. `phys` is the kept cap's
-/// physical base, which memmgr reports at `data[1 + count + i]`; the caller
-/// passes it to [`slab_release_fresh`] to return the run to memmgr's pool
-/// mid-life. Also used by the pipe machinery (`sys::pipe`) for ring pages,
-/// which need the phys base so the grant can be returned when the pipe ends
-/// its life.
+/// Returns `Some((slot, pages, region_id))` on success. `region_id` is the
+/// kept cap's grant id, which memmgr reports at `data[1 + count + i]`; the
+/// caller passes it to [`slab_release_fresh`] to return the run to memmgr's
+/// pool mid-life. Also used by the pipe machinery (`sys::pipe`) for ring
+/// pages, which need the region id so the grant can be returned when the pipe
+/// ends its life.
 ///
 /// Returns `None` on IPC failure, a memmgr error label, a `min_pages` that
 /// does not fit the request's 32-bit page-count field, a reply
@@ -818,29 +818,29 @@ pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u
     let caps = reply.caps();
     let layout = ipc::memmgr_grant_layout(&reply);
     let keep = layout.and_then(|(page_counts, _)| page_counts.iter().position(|&p| p >= min_pages));
-    let bases = layout.map_or(&[][..], |(_, bases)| bases);
-    release_reply_caps(memmgr_ep, ipc_buf, caps, bases, |i| keep == Some(i));
-    let (page_counts, bases) = layout?;
+    let region_ids = layout.map_or(&[][..], |(_, ids)| ids);
+    release_reply_caps(memmgr_ep, ipc_buf, caps, region_ids, |i| keep == Some(i));
+    let (page_counts, region_ids) = layout?;
     let i = keep?;
-    Some((caps[i], page_counts[i], bases[i]))
+    Some((caps[i], page_counts[i], region_ids[i]))
 }
 
 /// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except those
 /// `keep` selects by index, and return each deleted cap's run to memmgr's
-/// pool with one `RELEASE_MEMORY_CAPS` naming the phys base `bases` holds at
-/// the same index.
+/// pool with one `RELEASE_MEMORY_CAPS` naming the region id `region_ids`
+/// holds at the same index.
 ///
-/// `bases` is the reply's phys-base words as [`ipc::memmgr_grant_layout`]
-/// split them, or empty for a reply it refused. A deleted cap without a base
-/// still has its slot freed, and its run stays accounted to this process
-/// until it dies.
-/// The release is best-effort: memmgr ignores a base that matches no
+/// `region_ids` is the reply's region-id words as
+/// [`ipc::memmgr_grant_layout`] split them, or empty for a reply it refused.
+/// A deleted cap without an id still has its slot freed, and its run stays
+/// accounted to this process until it dies.
+/// The release is best-effort: memmgr ignores an id that matches no
 /// outstanding grant, and a failed IPC leaves the runs accounted the same way.
 fn release_reply_caps(
     memmgr_ep: u64,
     ipc_buf: *mut u64,
     caps: &[u64],
-    bases: &[u64],
+    region_ids: &[u64],
     keep: impl Fn(usize) -> bool,
 ) {
     let mut released = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
@@ -852,8 +852,8 @@ fn release_reply_caps(
         let _ = syscall::cap_delete(cap);
         // `n` stays below `caps.len()`, which the kernel bounds by
         // `MSG_CAP_SLOTS_MAX`, so the store is in bounds.
-        if let Some(&base) = bases.get(i) {
-            released[n] = base;
+        if let Some(&id) = region_ids.get(i) {
+            released[n] = id;
             n += 1;
         }
     }
@@ -956,7 +956,7 @@ fn slab_retype_pooled<T>(
             // back to memmgr's pool. Delete the cap first per the
             // RELEASE_MEMORY_CAPS contract.
             let _ = syscall::cap_delete(entry.cap);
-            slab_release_fresh(entry.phys);
+            slab_release_fresh(entry.region_id);
             continue;
         }
         pool.shelf[keep] = entry;
@@ -971,11 +971,11 @@ fn slab_retype_pooled<T>(
         // promoted page.
         if cur != 0 {
             pool.shelf[pool.shelf_len] =
-                ShelfEntry { cap: cur, phys: pool.cur_phys, size: pool.cur_size };
+                ShelfEntry { cap: cur, region_id: pool.cur_region_id, size: pool.cur_size };
             pool.shelf_len += 1;
         }
         pool.cap = entry.cap;
-        pool.cur_phys = entry.phys;
+        pool.cur_region_id = entry.region_id;
         pool.cur_size = entry.size;
         pool.local_avail = entry_avail;
         let out = retype(entry.cap)?;
@@ -989,7 +989,7 @@ fn slab_retype_pooled<T>(
     if ep == 0 {
         return None;
     }
-    let (new_cap, cap_pages, new_phys) = slab_request_pages(ep, want_pages)?;
+    let (new_cap, cap_pages, new_region_id) = slab_request_pages(ep, want_pages)?;
     let total = cap_pages.saturating_mul(PAGE_SIZE);
     let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
     if usable < need {
@@ -997,7 +997,7 @@ fn slab_retype_pooled<T>(
         // virgin — reclaim the slot and return the run rather than
         // stranding it in memmgr's per-process accounting.
         let _ = syscall::cap_delete(new_cap);
-        slab_release_fresh(new_phys);
+        slab_release_fresh(new_region_id);
         return None;
     }
     // Retire the displaced current page. It is pinned by live retypes
@@ -1013,11 +1013,11 @@ fn slab_retype_pooled<T>(
             pool.shelf_len -= 1;
         }
         pool.shelf[pool.shelf_len] =
-            ShelfEntry { cap: cur, phys: pool.cur_phys, size: pool.cur_size };
+            ShelfEntry { cap: cur, region_id: pool.cur_region_id, size: pool.cur_size };
         pool.shelf_len += 1;
     }
     pool.cap = new_cap;
-    pool.cur_phys = new_phys;
+    pool.cur_region_id = new_region_id;
     pool.cur_size = total;
     pool.local_avail = usable;
     let out = retype(new_cap)?;
@@ -1026,13 +1026,13 @@ fn slab_retype_pooled<T>(
 }
 
 /// A freshly-acquired dedicated Memory cap plus the identity memmgr needs to
-/// reclaim its backing run mid-life. `phys` is the physical base memmgr
-/// reported in the grant reply; pass it to [`slab_release_fresh`] once every
+/// reclaim its backing run mid-life. `region_id` is the id memmgr reported
+/// in the grant reply; pass it to [`slab_release_fresh`] once every
 /// kernel object retyped from `cap` has been deleted.
 #[derive(Clone, Copy)]
 pub struct SlabGrant {
     pub cap: u64,
-    pub phys: u64,
+    pub region_id: u64,
 }
 
 /// Acquire a fresh, dedicated Memory cap for a page-aligned retype. No
@@ -1047,7 +1047,7 @@ fn slab_acquire_fresh(need: u64, want_pages: u64, withheld: u64) -> Option<SlabG
     if ep == 0 {
         return None;
     }
-    let (new_cap, cap_pages, phys) = slab_request_pages(ep, want_pages)?;
+    let (new_cap, cap_pages, region_id) = slab_request_pages(ep, want_pages)?;
     let total = cap_pages.saturating_mul(PAGE_SIZE);
     if total.saturating_sub(withheld) < need {
         // Too small for this request. Delete the inner cap and return the run
@@ -1055,14 +1055,14 @@ fn slab_acquire_fresh(need: u64, want_pages: u64, withheld: u64) -> Option<SlabG
         // deleting the inner alone would strand the run in memmgr's
         // per-process accounting until process death.
         let _ = syscall::cap_delete(new_cap);
-        slab_release_fresh(phys);
+        slab_release_fresh(region_id);
         return None;
     }
-    Some(SlabGrant { cap: new_cap, phys })
+    Some(SlabGrant { cap: new_cap, region_id })
 }
 
-/// Return a fresh slab's backing run to memmgr's pool, naming it by the `phys`
-/// base recorded in its [`SlabGrant`]. Best-effort: a failed IPC just leaves
+/// Return a fresh slab's backing run to memmgr's pool, naming it by the
+/// `region_id` recorded in its [`SlabGrant`]. Best-effort: a failed IPC just leaves
 /// the run accounted to this process until it dies.
 ///
 /// The caller MUST have already deleted its capability to the slab and every
@@ -1070,7 +1070,7 @@ fn slab_acquire_fresh(need: u64, want_pages: u64, withheld: u64) -> Option<SlabG
 /// succeeds, but memmgr holds the run on its deferred list, granted to no
 /// one, until both are gone (`services/memmgr/docs/memory-pool.md`
 /// § Reclamation).
-pub fn slab_release_fresh(phys: u64) {
+pub fn slab_release_fresh(region_id: u64) {
     let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
     if ep == 0 {
         return;
@@ -1079,7 +1079,7 @@ pub fn slab_release_fresh(phys: u64) {
     if ipc_buf.is_null() {
         return;
     }
-    let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS).word(0, 1).word(1, phys).build();
+    let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS).word(0, 1).word(1, region_id).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let _ = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
 }
@@ -1117,7 +1117,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u64) -> Option<
     object_slab_retype_reclaimable(min_bytes, retype).map(|(out, _)| out)
 }
 
-/// [`object_slab_retype`], also returning the `phys` base of the dedicated
+/// [`object_slab_retype`], also returning the `region_id` of the dedicated
 /// grant a page-aligned class draws, so the caller can return that grant's
 /// run to memmgr's pool with [`slab_release_fresh`] once the object is
 /// deleted. `None` in its place for a sub-page class, whose pooled page the
@@ -1141,13 +1141,13 @@ pub fn object_slab_retype_reclaimable<T>(
                 // The retyped object holds its own ancestor ref on the
                 // grant's MemoryObject; the source slot is dead weight.
                 let _ = syscall::cap_delete(grant.cap);
-                Some((out, Some(grant.phys)))
+                Some((out, Some(grant.region_id)))
             }
             None => {
                 // Retype failed without consuming the grant — the slab is
                 // virgin; reclaim the slot and return the run to memmgr.
                 let _ = syscall::cap_delete(grant.cap);
-                slab_release_fresh(grant.phys);
+                slab_release_fresh(grant.region_id);
                 None
             }
         }

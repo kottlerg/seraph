@@ -464,9 +464,9 @@ pub mod procmgr_labels
 /// | 30 | init (kernel-assigned `INIT_PRIORITY`) |
 /// | 28 | memmgr |
 /// | 27 | procmgr |
-/// | 26 | init-logd, serial, virtio-blk |
+/// | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
 /// | 25 | framebuffer, rtc, virtio-input |
-/// | 24 | devmgr |
+/// | 24 | devmgr, every thread but its DMA thread |
 /// | 23 | vfsd, fs drivers (fatfs) |
 /// | 21 | svcmgr |
 /// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
@@ -516,7 +516,8 @@ pub mod sched_policy
 
     /// devmgr's band ceiling. Deliberately above its own level so it can
     /// place the drivers it spawns at [`BOOT_DRIVER_PRIORITY`] /
-    /// [`AUX_DRIVER_PRIORITY`].
+    /// [`AUX_DRIVER_PRIORITY`], and its own DMA thread, which virtio-blk
+    /// blocks on, at [`BOOT_DRIVER_PRIORITY`].
     pub const DEVMGR_BAND_MAX: u8 = 26;
 
     /// vfsd — the namespace/VFS authority.

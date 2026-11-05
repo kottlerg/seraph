@@ -160,6 +160,7 @@ pub struct RecheckBudget
     pub cost: u64,
 }
 
+#[cfg(test)]
 impl RecheckBudget
 {
     /// A budget that bounds neither runs nor cost.

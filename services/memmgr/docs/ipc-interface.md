@@ -190,15 +190,15 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 
 For each `phys_base`, memmgr finds the matching caller-owned grant
 (`FRAME_VA_UNMAPPED`) in the per-process tracking entry, takes it off the
-entry, and returns its run to the free pool (coalescing where possible),
-the tracking node becoming the run's node. Bases that match no outstanding
-grant are ignored — release is idempotent, so a racing double-release (join
-plus reaper) is harmless. The caller MUST have already deleted every kernel object retyped
-from the region and unmapped it from every address space. A region released
-with a live retype or a mapping is held on memmgr's deferred list, granted
-to no one, until both are gone; the release still succeeds and the region
-is no longer the caller's. Every release first rechecks the deferred list,
-so a release naming no grant (`count` 0) only rechecks. See
+entry, and returns its run to the free pool (coalescing where possible), the
+tracking node becoming the run's node. Bases that match no outstanding grant
+are ignored — release is idempotent, so a racing double-release (join plus
+reaper) is harmless. The caller MUST have already deleted every kernel object
+retyped from the region and unmapped it from every address space. A region
+released with a live retype or a mapping is held on memmgr's deferred list,
+granted to no one, until both are gone; the release still succeeds and the
+region is no longer the caller's. Every release first rechecks the deferred
+list, so a release naming no grant (`count` 0) only rechecks. See
 [`memory-pool.md`](memory-pool.md) §"Reclamation".
 
 ### Label 3: `REGISTER_PROCESS`

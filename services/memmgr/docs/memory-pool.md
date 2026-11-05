@@ -313,8 +313,9 @@ fails (a `REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own ar
 page-table, or `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run
 that has become quiescent joins the free pool (and the failed selection runs once more), and
 each that has not goes to the back of the list, so successive rechecks visit every run. Only
-the first of these in a turn of the receive loop (the `CSpace` top-up before a receive and the
-handling of the message received) rechecks; the rest of the turn's find the recheck done. One
+the first of these in a turn of the receive loop rechecks; later ones in the same turn find the
+recheck done. A turn starts when a message is received: it is that message's handling, then the
+`CSpace` top-up before the next receive, so a handler's recheck at entry always runs. One
 recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
 `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of
 the run that crosses that budget, after which it stops and leaves the runs behind at the head
@@ -322,8 +323,7 @@ for the next recheck. A turn's deferred kernel queries are therefore bounded by 
 checked plus 256, plus the windows of the largest deferred run. No timer drives it; a run that
 becomes quiescent while no message arrives waits for the next one. A run whose reaching object
 or mapping never goes, held by a process that never drops it, stays deferred for the rest of
-the boot, and
-`QUERY_POOL_STATUS` reports the deferred total (see
+the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
 The check does not see a capability: a process that holds an unmapped Memory capability to a

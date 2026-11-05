@@ -359,9 +359,9 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 // ── Deferred reclamation ─────────────────────────────────────────────────────
 
 /// Deferred runs one recheck checks ([`recheck_deferred`]). With
-/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work of the one recheck a turn
-/// of the receive loop every process shares runs. A tuning value that bounds
-/// no capacity: a run not pooled goes to the back of the list, so successive
+/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work of a turn's one recheck in
+/// the receive loop every process shares. A tuning value that bounds no
+/// capacity: a run not pooled goes to the back of the list, so successive
 /// rechecks visit every run in turn.
 const DEFERRED_RECHECK_BATCH: u64 = 64;
 
@@ -410,12 +410,15 @@ fn unmapped(cap: u64, pages: u64) -> bool
     true
 }
 
-/// Whether this turn of the receive loop (the `CSpace` top-up before its
-/// receive, and the message it handles) has run its deferred recheck.
-/// Single-threaded memmgr: a plain static suffices.
+/// Whether this turn of the receive loop has run its deferred recheck. A
+/// turn starts when a message is received: it is that message's handling,
+/// then the `CSpace` top-up before the next receive. The handler's own
+/// recheck therefore comes first in its turn. Single-threaded memmgr: a plain
+/// static suffices.
 static mut RECHECKED_THIS_TURN: bool = false;
 
-/// Start a turn of the receive loop: its first [`recheck_deferred`] runs.
+/// Start a turn of the receive loop, on a received message: its first
+/// [`recheck_deferred`] runs.
 fn begin_turn()
 {
     // SAFETY: memmgr is single-threaded; no concurrent access.
@@ -1879,7 +1882,6 @@ fn main(startup: &StartupInfo) -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
-        begin_turn();
         hold_cspace_headroom(startup.self_cspace);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let req = match unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) }
@@ -1892,6 +1894,7 @@ fn main(startup: &StartupInfo) -> !
             }
         };
         guard.on_success();
+        begin_turn();
         dispatch(&req, ipc_buf, &boot);
     }
 }

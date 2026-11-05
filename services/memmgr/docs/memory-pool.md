@@ -332,7 +332,7 @@ does the top-up's before a failed receive's retry, which is what refills a spent
 One recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
 `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of the
 run that crosses that budget, after which it stops and leaves the runs behind at the head for the
-next recheck. A turn's deferred kernel queries are therefore bounded by two per run checked plus
+next recheck. A turn's deferred kernel queries are therefore bounded by three per run checked plus
 256, plus the windows of the largest deferred run. No timer drives it; a run that becomes quiescent
 while no message arrives waits for the next one, or for the next retry of a failed receive. A run
 whose reaching capability, object, or mapping never goes, held by a process that never drops it,

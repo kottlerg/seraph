@@ -21,6 +21,7 @@ use crate::cli::RunArgs;
 use crate::context::Context as BuildContext;
 use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::firmware::find_ovmf_code;
+use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
     validate_sysroot_for_launch,
@@ -81,7 +82,14 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,
         mem_mib: args.mem,
-        headless: args.headless,
+        display: if args.headless
+        {
+            QemuDisplay::Headless
+        }
+        else
+        {
+            QemuDisplay::Window
+        },
         gdb: if args.gdb
         {
             GdbMode::Freeze

@@ -37,6 +37,7 @@ use crate::arch::Arch;
 use crate::cli::TestTerminalArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
+use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, X86Paging, build_qemu_argv, prepare_riscv_firmware,
     validate_sysroot_for_launch,
@@ -130,7 +131,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,
         mem_mib: args.mem,
-        headless: true,
+        display: QemuDisplay::Headless,
         gdb: GdbMode::Off,
         qmp_socket: Some(&sock_path),
         vmgenid_guid: Some("auto"),

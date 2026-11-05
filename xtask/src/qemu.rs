@@ -148,6 +148,49 @@ impl Iommu
     }
 }
 
+/// What a QEMU launch presents for display: QEMU std VGA (the adapter whose
+/// UEFI GOP the bootloader hands the kernel as its framebuffer) with or
+/// without a window, or no adapter at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QemuDisplay
+{
+    /// The adapter and a display window: on `x86_64` q35's default adapter
+    /// with QEMU's default display; on riscv64 `-device VGA` with a
+    /// `qemu-xhci`/`usb-kbd` pair and the `gtk` or `sdl` backend, added only
+    /// when one is available (with no graphical backend QEMU would fall back
+    /// to VNC).
+    Window,
+    /// The adapter with no window (`-display none`), so a headless host still
+    /// boots with a GOP framebuffer and devmgr spawns the framebuffer driver:
+    /// the framebuffer device cell (docs/testing.md "Coverage tiers").
+    Framebuffer,
+    /// No adapter and no window: no GOP, so no framebuffer driver runs.
+    Headless,
+}
+
+/// The display of a `run-parallel` launch (`--display`): never a window, since
+/// its guests run unattended and in parallel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BatchDisplay
+{
+    /// No display adapter, the default ([`QemuDisplay::Headless`]).
+    Headless,
+    /// The adapter with no window ([`QemuDisplay::Framebuffer`]).
+    Framebuffer,
+}
+
+impl From<BatchDisplay> for QemuDisplay
+{
+    fn from(display: BatchDisplay) -> Self
+    {
+        match display
+        {
+            BatchDisplay::Headless => Self::Headless,
+            BatchDisplay::Framebuffer => Self::Framebuffer,
+        }
+    }
+}
+
 /// A second disk for a QEMU launch: its image, the logical block size its
 /// device presents, and whether it shares the first disk's `INTx` line.
 pub struct SecondDisk<'a>
@@ -183,7 +226,7 @@ pub struct QemuLaunchSpec<'a>
     pub cpus: u32,
     /// Guest memory size in MiB.
     pub mem_mib: u32,
-    pub headless: bool,
+    pub display: QemuDisplay,
     pub gdb: GdbMode,
     /// When set, expose a QMP control socket at this path
     /// (`-qmp unix:<path>,server,nowait`) so a host harness can drive the
@@ -317,11 +360,6 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         "stdio".into(),
         "-no-reboot".into(),
     ]);
-
-    if spec.headless
-    {
-        args.extend(["-display".into(), "none".into()]);
-    }
 
     if let Some(sock) = spec.qmp_socket
     {
@@ -525,13 +563,7 @@ fn extend_x86(
         ),
     ]);
 
-    // Non-headless x86-64 uses the q35 default adapter (QEMU std VGA) — the
-    // same device riscv64 selects explicitly via `-device VGA`. Headless drops
-    // it so no framebuffer is advertised.
-    if spec.headless
-    {
-        args.extend(["-vga".into(), "none".into()]);
-    }
+    args.extend(display_args(spec));
     Ok(())
 }
 
@@ -582,29 +614,58 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // otherwise. No production driver binds it.
     args.extend(["-device".into(), EDU_DEVICE.into()]);
 
-    if !spec.headless
-    {
-        // The virt machine has no built-in display. Use QEMU std VGA — the
-        // same adapter q35 gives x86-64 by default — so both arches present an
-        // identical UEFI GOP (`QemuVideoDxe`, same mode table). Without a
-        // graphical display backend QEMU falls back to VNC, so only add the
-        // display devices when a backend is available.
-        if let Some(backend) = preferred_display_backend(spec.arch.qemu_binary())
-        {
-            args.extend([
-                "-device".into(),
-                "VGA".into(),
-                "-device".into(),
-                "qemu-xhci".into(),
-                "-device".into(),
-                "usb-kbd".into(),
-                "-display".into(),
-                backend,
-            ]);
-        }
-    }
+    // After the `edu` device, so the adapter's auto-placed PCI slot follows
+    // the devices above.
+    args.extend(display_args(spec));
 
     Ok(())
+}
+
+/// The display adapter and display arguments of a launch, for the
+/// framebuffer device cell's surface (docs/testing.md "Coverage tiers").
+///
+/// Both machines present QEMU std VGA, so both arches show an identical
+/// UEFI GOP (`QemuVideoDxe`, same mode table): q35's default adapter on
+/// `x86_64`, which a headless launch drops with `-vga none`, and on riscv64,
+/// whose `virt` machine has no built-in display, `-device VGA`. Every launch
+/// without a window passes `-display none`, which needs no graphical
+/// backend. A riscv64 window adds the adapter only with the `gtk` or `sdl`
+/// backend, since with neither QEMU falls back to VNC.
+fn display_args(spec: &QemuLaunchSpec) -> Vec<String>
+{
+    let mut args: Vec<String> = Vec::new();
+    if spec.display != QemuDisplay::Window
+    {
+        args.extend(["-display".into(), "none".into()]);
+    }
+    match (spec.arch, spec.display)
+    {
+        (Arch::X86_64, QemuDisplay::Headless) => args.extend(["-vga".into(), "none".into()]),
+        (Arch::X86_64, QemuDisplay::Window | QemuDisplay::Framebuffer)
+        | (Arch::Riscv64, QemuDisplay::Headless) =>
+        {}
+        (Arch::Riscv64, QemuDisplay::Framebuffer) =>
+        {
+            args.extend(["-device".into(), "VGA".into()]);
+        }
+        (Arch::Riscv64, QemuDisplay::Window) =>
+        {
+            if let Some(backend) = preferred_display_backend(spec.arch.qemu_binary())
+            {
+                args.extend([
+                    "-device".into(),
+                    "VGA".into(),
+                    "-device".into(),
+                    "qemu-xhci".into(),
+                    "-device".into(),
+                    "usb-kbd".into(),
+                    "-display".into(),
+                    backend,
+                ]);
+            }
+        }
+    }
+    args
 }
 
 /// Resolve and cache riscv64 firmware.
@@ -790,7 +851,7 @@ mod tests
             firmware_vars_path: Some(Path::new("vars.fd")),
             cpus,
             mem_mib,
-            headless: true,
+            display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: None,
             vmgenid_guid: None,
@@ -877,7 +938,7 @@ mod tests
             firmware_vars_path: None,
             cpus: 4,
             mem_mib: 512,
-            headless: true,
+            display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: None,
             vmgenid_guid: Some("auto"),
@@ -903,7 +964,7 @@ mod tests
             firmware_vars_path: None,
             cpus: 4,
             mem_mib: 512,
-            headless: true,
+            display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: None,
             vmgenid_guid: None,
@@ -1123,5 +1184,44 @@ mod tests
         spec.vmgenid_guid = Some("auto");
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(!argv.iter().any(|a| a.starts_with("vmgenid")));
+    }
+
+    /// Whether `argv` passes `flag` followed by `value`.
+    fn has_pair(argv: &[String], flag: &str, value: &str) -> bool
+    {
+        argv.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[test]
+    fn a_framebuffer_launch_keeps_the_adapter_and_opens_no_window()
+    {
+        // The framebuffer cell needs the GOP the adapter gives the
+        // bootloader; dropping the adapter would skip the framebuffer case,
+        // and a missing `-display none` would open a window, or fall back to
+        // VNC, on the host.
+        let mut riscv = riscv_spec(4, 512);
+        riscv.display = QemuDisplay::Framebuffer;
+        let argv = build_qemu_argv(&riscv).unwrap();
+        assert!(has_pair(&argv, "-device", "VGA"));
+        assert!(has_pair(&argv, "-display", "none"));
+        assert!(!argv.iter().any(|a| a == "usb-kbd"));
+
+        let mut x86 = x86_spec(X86Paging::Four);
+        x86.display = QemuDisplay::Framebuffer;
+        let argv = build_qemu_argv(&x86).unwrap();
+        assert!(!has_pair(&argv, "-vga", "none"));
+        assert!(has_pair(&argv, "-display", "none"));
+    }
+
+    #[test]
+    fn a_headless_launch_drops_the_adapter_on_both_machines()
+    {
+        let argv = build_qemu_argv(&riscv_spec(4, 512)).unwrap();
+        assert!(!has_pair(&argv, "-device", "VGA"));
+        assert!(has_pair(&argv, "-display", "none"));
+
+        let argv = build_qemu_argv(&x86_spec(X86Paging::Four)).unwrap();
+        assert!(has_pair(&argv, "-vga", "none"));
+        assert!(has_pair(&argv, "-display", "none"));
     }
 }

@@ -11,9 +11,9 @@
 //! check only what a script can decide: column widths, header layout, the
 //! `## Summarized By` section's shape and forward links, document
 //! reachability, and that every name docs/testing.md § Coverage tiers lists
-//! for its surface screens still names code or a file in the tree. Whether a
-//! passage is a summary, or any other statement matches the code, stays with
-//! the pre-merge review.
+//! for its surface screens still names code, a file, or a directory in the
+//! tree. Whether a passage is a summary, or any other statement matches the
+//! code, stays with the pre-merge review.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;

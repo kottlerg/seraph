@@ -382,12 +382,12 @@ not on every push.
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
-(virtio-blk + virtio-keyboard + virtio-rng + serial, the machine's IOMMU with the
-virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` at
-00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA confinement phase
-drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no framebuffer; this is the
-main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`, is a device cell, see
-Device surfaces and Release host runs below),
+(virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
+with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64,
+`riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
+confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
+framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`, is
+a device cell, see Device surfaces and Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
@@ -425,13 +425,15 @@ surface.
 
 - **Main set.** The devices of the QEMU machine the canonical and boundary boots use (`q35` on
   x86_64, `virt` on riscv64), one per device type a boot needs, each the device of that type with
-  the broadest QEMU support on both machines that the system drives (a VirtIO PCI device where the
-  system has a VirtIO driver of the type, else the machine's built-in device), and the filesystem
-  the boots mount. Each entry names the cells that exercise it, all of them canonical:
+  the broadest QEMU support on both machines that the system or its firmware drives (a VirtIO PCI
+  device where the system or the firmware has a VirtIO driver of the type, else the machine's
+  built-in device), and the filesystem the boots mount. Each entry names the cells that exercise
+  it, all of them canonical:
   - block: `virtio-blk-pci`, through the virtio-blk driver, which every svctest and usertest cell
     reads its disk through;
   - console: the machine's 16550-compatible UART (COM1 on `q35`, the NS16550 on `virt`), through
-    the serial driver: every boot's output, and the serial receive round of `test-terminal`;
+    the serial driver: the output of every svctest and usertest boot, and the serial receive round
+    of `test-terminal`;
   - input: `virtio-keyboard-pci`, through the virtio-input driver: the keyboard round of
     `test-terminal`, and svctest's input checks (the drivers phase's input case and the devmgr
     phase's input ordinal);
@@ -548,9 +550,9 @@ changed line that names one of these items as a whole identifier or lies within 
 A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
 that adds an item of the kinds above that names none of the listed items MUST add it to this list.
 `cargo xtask lint-docs` fails when a name this list, the memory and device surfaces' lists, or
-their screens state no longer names code or a tracked file (its `md-coverage-symbols` rule,
-[xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR that renames or deletes a
-listed item updates the list in the same change.
+their screens state no longer names code, a tracked file, or a tracked directory (its
+`md-coverage-symbols` rule, [xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR
+that renames or deletes a listed item updates the list in the same change.
 The commands below screen a diff for the surface. The first lists the whole-surface files the diff
 changes. The second prints every file header of the diff and every line, changed or context, that
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
@@ -738,40 +740,51 @@ driver's device surface is that driver's code, the storage-wide surface is the c
 cell runs beside its drivers, and the shared surface is what every driver shares. Each surface is
 the files and directories its row lists, as a whole, and, in any other file, a changed line that
 names one of its listed items as a whole identifier or lies within one's definition; a protocol
-module of `shared/ipc` is on a surface only by a changed line within the module's definition. A
-PR owes the cells of every surface a non-inert line of its own diff is on.
+module of `shared/ipc`, and an item the row lists by its definition alone, is on a surface only by
+a changed line within that definition. A PR owes the cells of every surface a non-inert line of its
+own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
-| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, and `core/kernel/src/arch/x86_64/ioapic.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the riscv64 PLIC (`plic_*`, `PLIC_*`, `DEFAULT_PLIC_*`, `CACHED_PLIC_*`, and `require_plic_context`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, and `devmgr_dma_errors`) | every device cell |
-| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `fs_labels`, and `blk_labels`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_shared_line`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
-| virtio-blk | `services/drivers/virtio/blk/` | every storage cell |
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, and `core/kernel/src/arch/x86_64/ioapic.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, and `sys_irq_split`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, and `select_ioapics`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 PLIC and its external-interrupt dispatch (`plic_*`, `PLIC_*`, `DEFAULT_PLIC_*`, `CACHED_PLIC_*`, `require_plic_context`, `dispatch_external`, `SOURCE_TARGET`, and `source_target`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`) | every device cell |
+| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_shared_line`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
+| virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
-| virtio-input, serial, framebuffer, the RTC drivers, the IOMMU drivers, and the test-only drivers | `services/drivers/virtio/input/`, `services/drivers/serial/`, `services/drivers/framebuffer/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-dma/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), and the framebuffer has no cell |
+| virtio-input and test-dma | `services/drivers/virtio/input/` and `services/drivers/test-dma/` | no-iommu |
+| The launchers' IOMMU attachment | `Iommu`, `virtio_property`, and `RISCV_IOMMU_DEVICE` | no-iommu |
+| serial, framebuffer, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/framebuffer/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), the no-iommu cell runs no IOMMU driver, and the framebuffer has no cell |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies
-what fatfs reads. The no-iommu cell varies only what devmgr does without an IOMMU, so only the
-shared surface owes it. A PR that adds a driver adds its row, with its directory and the cells
-that exercise its device, and a PR that adds a cell names the surfaces that owe it. `cargo xtask
-lint-docs` checks this list as it checks the two above, its directories (written with a trailing
-`/`) included, and resolves its items in xtask's own sources too. The screen works as the boundary
-one does: the first command lists the changed files on a surface as a whole, and the second prints
-every candidate, which the PR owes the surface's cells for when a non-inert changed line names the
-item or lies within its definition, read in that file's hunk.
+what fatfs reads. The no-iommu cell boots devmgr and the test-dma driver unconfined and every
+VirtIO driver without `VIRTIO_F_ACCESS_PLATFORM`, which the launchers have a device offer only
+with the IOMMU attached, so the shared surface, virtio-blk, virtio-input, test-dma, and the
+launchers' IOMMU attachment owe it. A PR that adds a driver adds its row, with its directory and
+the cells that exercise its device, and a PR that adds a cell names the surfaces that owe it.
+`cargo xtask lint-docs` checks this list as it checks the two above, its directories (written with
+a trailing `/`) included, and resolves its items in xtask's own sources too. The screen works as
+the boundary one does: the first command lists the changed files on a surface as a whole, and the
+other two print every candidate, which the PR owes the surface's cells for when a non-inert changed
+line names the item or lies within its definition (within it alone for a protocol module and for
+an item listed by definition alone), read in that file's hunk.
 
 ```sh
 git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs services/vfsd/ \
-    xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/
+    xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
+    services/drivers/virtio/input/ services/drivers/test-dma/
 D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
+D="$D|InterruptObject|dispatch_external|SOURCE_TARGET|source_target"
 D="$D|plic_[a-z_]+|[A-Z_]*PLIC_[A-Z_]+|require_plic_context|devmgr_(dma_)?(labels|errors)"
-D="$D|vfsd_labels|fs_labels|blk_labels|blk_device|check_block_size|SecondDisk|disk_block_size"
-D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)|BlockSize|split_data"
+D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
+D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
+D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($D)\b"
+git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
+    grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
 ```
 
 **Repeat count.** Every owed run runs once (`--runs 1`). A PR states a concurrency-fix purpose when

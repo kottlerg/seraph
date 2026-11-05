@@ -89,6 +89,7 @@ members = [
     "programs/threadstack/tester",
     "runtime/ruststd/argv-env",
     "runtime/ruststd/death-queues",
+    "runtime/ruststd/spin-wait",
     "xtask",
     "xtask/wrapper-shim",
 ]

@@ -39,7 +39,7 @@ service.
 # /tests/svctest — services-surface test harness.
 binary    = /tests/svctest
 priority  = 10
-sched_max = 10
+sched_max = 21
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never

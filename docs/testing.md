@@ -98,8 +98,9 @@ sysroot/
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
-│   │                         # and the test-only test-orphan and
-│   │                         # test-fault)
+│   │                         # iommu-vtd on x86_64, and the test-only
+│   │                         # test-orphan, test-fault, and, on x86_64,
+│   │                         # test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn
@@ -125,7 +126,8 @@ give a non-test distro, because test-only artifacts also install under
 Under `/services/drivers/` are
 [`test-orphan`](../services/drivers/test-orphan/README.md) and
 [`test-fault`](../services/drivers/test-fault/README.md), test-only
-fault-injection drivers installed there until the devmgr enumeration
+fault-injection drivers, and [`test-dma`](../services/drivers/test-dma/README.md), the test-only
+driver of the `edu` DMA test device, installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
 them. Under `/programs/` are the test fixtures the harnesses and per-program
 testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
@@ -364,7 +366,8 @@ riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial, the machine's IOMMU with the
 virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64, `riscv-iommu-pci` on
-riscv64 — plus `vmgenid,guid=auto` on x86_64; CI boots headless, so no framebuffer; the
+riscv64 — plus, on x86_64, `vmgenid,guid=auto` and QEMU's `edu` DMA test device, which svctest's
+DMA confinement phase drives; CI boots headless, so no framebuffer; the
 no-IOMMU boot, `--iommu absent`, runs in the release host runs, see Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`

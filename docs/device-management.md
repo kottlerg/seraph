@@ -109,8 +109,12 @@ the IOMMU itself is programmed by a separate IOMMU driver devmgr directs (§ IOM
 Programming). The IOMMU is preferred but not required
 ([platform-requirements.md](platform-requirements.md#iommu-and-dma-confinement)): when none is
 present, or the one present cannot be programmed, devmgr logs once that DMA runs unconfined and
-spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. No IOMMU
-is programmed yet (design intent; not yet implemented), so every boot runs in that mode.
+spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. On x86-64
+devmgr programs VT-d through the `iommu-vtd` driver, and every device a remapping unit translates
+runs IOMMU-isolated; a device no unit translates runs DMA-unsafe. On RISC-V no IOMMU is programmed
+yet (design intent; not yet implemented, the RISC-V IOMMU driver being
+[#37](https://github.com/kottlerg/seraph/issues/37)'s remaining work), so every RISC-V boot runs
+DMA-unsafe.
 
 The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
@@ -166,11 +170,11 @@ state ([#749](https://github.com/kottlerg/seraph/issues/749)).
 
 Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to
 withdraw the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the
-IOMMU before Bus Master Enable is cleared. A device the IOMMU blocks can no longer reach the
-driver's frames, so devmgr releases the hold once the block is in place, whether or not the Bus
-Master Enable read-back and the reset confirm; with no IOMMU confining the device, the release
-waits on both confirmations as step 3 states. No IOMMU is programmed yet (design intent; not
-yet implemented), so today every release waits on both.
+IOMMU (the IOMMU driver's `BLOCK`) before Bus Master Enable is cleared. A device the IOMMU blocks
+can no longer reach the driver's frames, so devmgr releases the hold once the block is in place,
+whether or not the Bus Master Enable read-back and the reset confirm; with no IOMMU confining the
+device, or a block the IOMMU driver did not complete, the release waits on both confirmations as
+step 3 states.
 
 The steps, their owners, and their bounds are specified in
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
@@ -202,12 +206,14 @@ A driver maps its own rings and buffers once at setup; a block driver maps each 
 buffer for the duration of the one request that uses it.
 
 devmgr returns every device address; no driver chooses one. With an IOMMU confining the device,
-the address is an IOVA in the device's domain and the mapping is installed in the IOMMU's tables,
-through the IOMMU driver (§ IOMMU Discovery and Programming), so
-the device reaches exactly the frames mapped for it (design intent; not yet implemented). With
-none, the device can reach memory only at physical addresses, so the address devmgr returns is
-the frames' physical address and the mapping is bookkeeping alone. The protocol and the
-driver's code are the same in both modes.
+the address is an IOVA in the device's domain, which devmgr allocates first fit from 1 MiB below
+the device's limit (the width the device's remapping unit translates, narrowed for a device whose
+DMA reaches fewer address bits; [limits.md](limits.md)), and the mapping is installed in the
+IOMMU's tables, through the IOMMU driver (§ IOMMU Discovery and Programming), before devmgr
+replies, and withdrawn from them before devmgr deletes its cap at `DMA_UNMAP`, so the device
+reaches exactly the frames mapped for it. With none, the device can reach memory only at physical
+addresses, so the address devmgr returns is the frames' physical address and the mapping is
+bookkeeping alone. The protocol and the driver's code are the same in both modes.
 
 devmgr serves the DMA endpoint on a thread of its own, placed at the boot drivers' level
 (`ipc::sched_policy::BOOT_DRIVER_PRIORITY`, above devmgr's own) because the block driver blocks
@@ -215,9 +221,12 @@ on it, so a mapping never waits on its registry loop, which makes nested calls (
 from the root filesystem reads the binary through the block driver, which maps the read's buffer)
 and settles batches whose drivers map their rings before they report ready. The two threads share
 the table of devices and mappings under one lock, held only around table operations and never
-across IPC. A device holds at most `MAX_MAPPINGS_PER_DEVICE` mappings ([limits.md](limits.md)).
-When devmgr withdraws a driver it revokes every copy of the device's DMA capability and drops the
-device's mappings, so a request still queued is refused.
+across IPC: a mapping whose IOMMU `MAP` or `UNMAP` is in flight is pending in the table, so a
+withdrawal meanwhile neither races its commit nor deletes the cap the call carries. A device holds
+at most `MAX_MAPPINGS_PER_DEVICE` mappings ([limits.md](limits.md)). When devmgr withdraws a
+driver it revokes every copy of the device's DMA capability, drops the device's mappings, and
+blocks a confined device in the IOMMU, so a request still queued is refused and the device reaches
+nothing.
 
 ---
 
@@ -227,37 +236,79 @@ IOMMU topology is a userspace concern. The bootloader emits no IOMMU
 descriptor; ACPI and DTB reach userspace only as the opaque
 `BootInfo.acpi_rsdp` / `BootInfo.device_tree` physical addresses (see Raw
 Firmware Passthrough), over which the kernel mints read-only Memory caps,
-and `devmgr` is to perform the IOMMU-topology walk itself.
+and `devmgr` performs the IOMMU-topology walk itself: on x86-64 it reads the ACPI DMAR's VT-d
+remapping units (DRHDs), their device scopes, and the reserved memory regions (RMRRs). The one
+boot-side concession is an MMIO aperture the bootloader seeds over each DRHD's register range, so
+the kernel mints a cap devmgr can carve the unit's registers from
+([core/boot/docs/acpi.md](../core/boot/docs/acpi.md)).
 
 The IOMMU's arch-specific logic (its registers, translation tables, cache invalidation, and fault
-reporting) runs in a separate IOMMU driver process, one per IOMMU family (VT-d on x86-64, the
-RISC-V IOMMU), not in devmgr. For each IOMMU it discovers, devmgr acquires an `Mmio` cap for the
-unit's register range through the same aperture-carving flow as any other device and delegates
-it to that family's IOMMU driver, as it delegates a device to its driver. devmgr keeps the DMA
-endpoint, its `devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver
-over IPC to install and withdraw mappings and to block a device, so drivers see the same protocol
-whichever IOMMU, or none, sits behind it. This is design intent; not yet implemented: no IOMMU
-support exists today, and the driver's design is specified with
-[#37](https://github.com/kottlerg/seraph/issues/37). The kernel does not read or write IOMMU
-registers and holds no per-IOMMU state.
+reporting) runs in a separate IOMMU driver process, one per IOMMU family, not in devmgr: VT-d's
+is `iommu-vtd` ([services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md)),
+over the family-independent `iommu-core`
+([services/drivers/iommu/core/README.md](../services/drivers/iommu/core/README.md)); the RISC-V
+IOMMU's is design intent; not yet implemented
+([#37](https://github.com/kottlerg/seraph/issues/37)). For each unit it discovers, devmgr carves
+an `Mmio` cap for the unit's register range through the same aperture-carving flow as any other
+device and moves it to that family's IOMMU driver, keeping no copy, with the unit's PCI segment
+and its scope resolved against the PCI topology. devmgr keeps the DMA endpoint, its
+`devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
+`ipc::iommu_labels` to attach a device to a domain of its own, install and withdraw mappings,
+block a device, and take the faults the units recorded, so drivers see the same protocol whichever
+IOMMU, or none, sits behind it. The kernel does not read or write IOMMU registers and holds no
+per-IOMMU state.
+
+At boot devmgr spawns the IOMMU driver from its boot module before any DMA-capable driver, in a
+settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
+pages, and `CREATE_DMA_HOLD`, at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
+every mapping). The driver programs each unit with empty tables and turns translation on, so from
+its ready report every function a unit translates reaches nothing until devmgr attaches it, the
+functions no driver binds included. devmgr never releases the driver's hold: a unit may walk any
+of its table pages while translation is on, so they stay quarantined for the boot. For each
+DMA-capable device devmgr then decides, before it grants the device DMA:
+
+- **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`) and grants it DMA in
+  that domain.
+- **Refused.** An RMRR names the device, whose firmware expects it to keep reaching a reserved
+  region: devmgr refuses it with a log line, since identity-mapping reserved regions is
+  [#773](https://github.com/kottlerg/seraph/issues/773). A device whose unit devmgr could not
+  hand over, or whose `ATTACH` fails, is refused too: the unit blocks it, so it cannot run
+  unconfined.
+- **Unconfined.** No unit translates the device: it runs DMA-unsafe.
+
+When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready
+within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so; the
+driver turns translation off before it gives up, so no device stays blocked. The one case that is
+not an absent IOMMU is a driver that dies after it reported ready: the units go on translating
+through the tables it left, so devmgr cannot fall back to unconfined DMA. It fails closed: it
+logs once, refuses every later `DMA_MAP` of every confined device, answers any of its own calls
+still queued on the dead driver's endpoint with an error, and withdraws the driver of every
+confined device; it restarts nothing, restartability being
+[#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous and
+register-based, two IPC hops per mapping; batching it is
+[#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, until
+message-signalled interrupts exist ([#325](https://github.com/kottlerg/seraph/issues/325)), and
+devmgr logs each one against its device.
 
 When devmgr binds a DMA-capable (PCI BAR + IRQ) driver, it spawns the driver
 with `procmgr_labels::CREATE_PINNED`, so the driver's memory is eager-mapped,
 and delivers its BAR `Mmio` caps, optional IRQ, endpoint caps, and DMA
-capability (§ DMA Authorisation). With no IOMMU programmed the physical
+capability (§ DMA Authorisation). With no IOMMU confining the device the physical
 isolation is absent, and devmgr runs the device unconfined (§ DMA Safety
 Model); the kernel is agnostic to both outcomes.
 
 No DMA-capable driver reads a physical address: every address it programs comes from `DMA_MAP`
-(§ DMA Authorisation). Two surfaces still hand any process physical addresses, and devmgr
-reads the second to map a driver's cap: memmgr's `REQUEST_MEMORY_CAPS` reply carries each
-granted cap's physical base (see
+(§ DMA Authorisation). Two surfaces still hand any process physical addresses: memmgr's
+`REQUEST_MEMORY_CAPS` reply carries each granted cap's physical base (see
 [`services/memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)), and
 `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_PHYS_BASE` selector returns a Memory cap's physical base to its
 holder (see
 [`core/kernel/docs/cross-boundary-disclosure.md`](../core/kernel/docs/cross-boundary-disclosure.md)
-§ Physical-address surfaces). Withdrawing both from drivers is
-[#767](https://github.com/kottlerg/seraph/issues/767).
+§ Physical-address surfaces). devmgr reads the second to map an unconfined device's cap, and the
+IOMMU driver reads it for its own table pages and for every frame `MAP` installs, since the units
+are programmed with physical addresses: the IOMMU driver is the one driver class that legitimately
+reads them. Withdrawing both surfaces from every other driver is
+[#767](https://github.com/kottlerg/seraph/issues/767), with the IOMMU driver its named exception.
 
 ---
 
@@ -347,6 +398,7 @@ in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) �
 ```
 init
  ├── devmgr  (platform caps + firmware table caps)
+ │    ├── driver/iommu-vtd         (VT-d unit MMIO caps; iommu_labels, devmgr only; x86-64)
  │    ├── driver/virtio-blk        (MMIO + IRQ caps; QUERY_BLOCK_DEVICE)
  │    ├── driver/virtio-input      (MMIO + opt. IRQ; QUERY_INPUT_DEVICE; on-disk)
  │    ├── driver/serial            (UART hw + IRQ caps; QUERY_SERIAL_DEVICE)
@@ -394,15 +446,17 @@ every live disk; the terminal sends none, so it binds the first input instance.
 devmgr loads driver binaries from one of two places:
 
 - **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
-  framebuffer) ship in the bundle and arrive as Memory caps in devmgr's
-  MODULE bootstrap round. devmgr spawns them via
-  `procmgr_labels::CREATE_PROCESS` during initial enumeration.
+  framebuffer, and on x86-64 the VT-d IOMMU driver `iommu-vtd`, which must
+  confine the disk before its driver maps a ring) ship in the bundle and
+  arrive as Memory caps in devmgr's MODULE bootstrap round. devmgr spawns
+  them via `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
   driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` and `test-fault` binaries also
-  live there; devmgr spawns them only on `devmgr_labels::TEST_SPAWN_ORPHAN` and
-  `TEST_SPAWN_FAULT_DRIVERS` (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only
-  `devmgr.test` cap carries), so a boot without svctest spawns neither. virtio-input is
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan`, `test-fault`, and
+  `test-dma` binaries also live there; devmgr spawns them only on
+  `devmgr_labels::TEST_SPAWN_ORPHAN`, `TEST_SPAWN_FAULT_DRIVERS`, and `TEST_SPAWN_DMA_DRIVER`
+  (gated on `TEST_LABEL_AUTHORITY`, which only svctest's seed-only `devmgr.test` cap carries), so
+  a boot without svctest spawns none. virtio-input is
   PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed then — but its
   spawn is deferred to this path, since a keyboard is not on the read-the-disk critical path. A PCI
   device devmgr can give no IRQ cap (for instance, its line lies outside the Interrupt range devmgr
@@ -447,6 +501,9 @@ specified in [`docs/storage.md`](storage.md).
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),
 [Driver Model](../services/drivers/docs/driver-model.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
+[services/drivers/iommu/core/README.md](../services/drivers/iommu/core/README.md),
+[services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md),
+[services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md),
 [services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),
 [services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),

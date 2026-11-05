@@ -14,8 +14,9 @@ devmgr/
 ├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI scan,
 │                                   #   aperture / IRQ range-cap table, driver-settle roster,
 │                                   #   served-driver ordinal table (tombstones),
-│                                   #   held interrupt-line table, DMA mapping table,
-│                                   #   DMA Remapping table (VT-d units, RMRRs)
+│                                   #   held interrupt-line table, DMA mapping table and
+│                                   #   IOVA allocator, DMA Remapping table (VT-d units,
+│                                   #   scopes, RMRRs)
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown
@@ -24,6 +25,7 @@ devmgr/
 │   │   └── riscv64/mod.rs          # QEMU virt windows (ECAM, NS16550, goldfish-RTC); SbiControl
 │   ├── caps.rs                     # Bootstrap-round capability absorbers and DevmgrCaps
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
+│   ├── iommu.rs                    # IOMMU units, driver spawn, device attach, fail-closed client
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
 │   ├── settle.rs                   # Driver death watch; batch settle: ready, deaths, bound
 │   ├── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)

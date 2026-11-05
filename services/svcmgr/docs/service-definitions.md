@@ -184,8 +184,10 @@ The service's scheduling placement, forwarded as the `CREATE_PRIORITY` /
 replayed byte-for-byte on every restart:
 
 * `priority` — the level the service's initial thread is created at; the
-  runtime spawns its further threads at the same level. Unset: procmgr's
-  default, `sched_policy::DEFAULT_SPAWN_PRIORITY` clamped to the band.
+  runtime spawns its further threads at the same level by default, unless
+  `std::os::seraph::thread::BuilderExt::spawn_at_priority` places one
+  elsewhere in the band. Unset: procmgr's default,
+  `sched_policy::DEFAULT_SPAWN_PRIORITY` clamped to the band.
 * `sched_max` — the ceiling of the `SchedControl` band the service
   receives (`[1, sched_max]`), which is also its own spawn ceiling for
   `std::process::Command` children. Unset: a copy of svcmgr's band.

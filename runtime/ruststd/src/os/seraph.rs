@@ -36,12 +36,44 @@ use crate::sys::stdio::seraph as pal_stdio;
 
 use process_abi::{PROCESS_ABI_VERSION, process_info_ref};
 
-/// Re-export of [`process_abi::StackNote`]. Lets the [`stack_pages!`]
-/// macro emit a typed static through `std::os::seraph::StackNote`,
-/// keeping std-using binaries free of a direct `process-abi` Cargo
-/// dependency.
+/// The `.note.seraph.stack` ELF note a binary's [`stack_pages!`] emits, in
+/// the on-disk layout of `process_abi::StackNote`: the note header
+/// (`namesz` 7, `descsz` 8, `ntype` `NT_SERAPH_STACK`), the vendor name
+/// `b"seraph\0\0"`, and the descriptor (the page count, then a reserved zero
+/// word). The loaders read it before mapping the main-thread stack.
+///
+/// A std-local type rather than a re-export of `process_abi::StackNote`, for
+/// the reason the retype-constant block below gives: an item reached through
+/// the sysroot-private ABI crate is unstable (`rustc_private`) to std's
+/// users. svctest's `stack_note_refused` phase guards this copy's layout
+/// (`abi/process-abi/README.md` § Stack-size note).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub use process_abi::StackNote;
+#[repr(C)]
+pub struct StackNote {
+    namesz: u32,
+    descsz: u32,
+    ntype: u32,
+    name: [u8; 8],
+    pages: u32,
+    reserved: u32,
+}
+
+impl StackNote {
+    /// Build a stack-size note declaring `pages` 4 KiB pages.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[rustc_const_stable(feature = "seraph_ext", since = "1.0.0")]
+    #[must_use]
+    pub const fn new(pages: u32) -> Self {
+        Self {
+            namesz: 7,
+            descsz: 8,
+            ntype: process_abi::NT_SERAPH_STACK,
+            name: process_abi::SERAPH_NOTE_NAME,
+            pages,
+            reserved: 0,
+        }
+    }
+}
 
 /// Startup information the kernel+procmgr hand to a process at spawn time,
 /// materialised by `_start` from the read-only `ProcessInfo` page and made
@@ -1318,9 +1350,9 @@ pub use crate::__seraph_log as log;
 // ── Stack-size declaration macro ────────────────────────────────────────────
 //
 // Mirrors `process_abi::stack_pages!` but expands to a static typed via
-// `std::os::seraph::StackNote` (a re-export of `process_abi::StackNote`),
-// so std-using binaries can declare a custom main-thread stack without
-// adding `process-abi` to their Cargo manifest.
+// `std::os::seraph::StackNote` (std's copy of the `process_abi::StackNote`
+// layout), so std-using binaries can declare a custom main-thread stack
+// without adding `process-abi` to their Cargo manifest.
 
 /// Declare the main-thread stack size for this binary as `$pages` 4 KiB
 /// pages. Expands to a `#[used]` static placed in

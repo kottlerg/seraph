@@ -1026,21 +1026,33 @@ fn resolve_create_sched(
 
 /// Arm the held reclaim of a child created with `CREATE_DMA_HOLD`, reserving
 /// its record's room, so its teardown never has to free its frames for want
-/// of a record. Returns `false` when the heap cannot reserve the room: the
-/// child, which has not run, is then destroyed with both reply caps deleted,
-/// and the create is answered `OUT_OF_MEMORY`.
-fn arm_dma_hold(
+/// of a record, or refuse the create. Returns `true` when the hold is armed.
+/// Returns `false` when [`process::ProcessTable::arm_dma_hold`] refuses: with
+/// `ArmError::OutOfMemory` when the heap cannot reserve the room, or with
+/// `ArmError::NotFound`, which the child's insertion just before rules out
+/// unless the table lost it. Either way both reply caps are deleted and the
+/// create is answered `OUT_OF_MEMORY`; on `OutOfMemory` the child, which has
+/// not run, is also destroyed, while on `NotFound` the table holds no entry
+/// for the teardown to take, so nothing more is released.
+fn arm_held_reclaim_or_refuse(
     result: &process::CreateResult,
     ipc_buf: *mut u64,
     memmgr_ep: u64,
     table: &mut process::ProcessTable,
 ) -> bool
 {
-    if table.arm_dma_hold(result.badge).is_ok()
+    match table.arm_dma_hold(result.badge)
     {
-        return true;
+        Ok(()) => return true,
+        Err(process_table::ArmError::OutOfMemory) =>
+        {
+            std::os::seraph::log!("no room for a held reclaim; destroying the child");
+        }
+        Err(process_table::ArmError::NotFound) =>
+        {
+            std::os::seraph::log!("held-reclaim child missing from the table; refusing the create");
+        }
     }
-    std::os::seraph::log!("no room for a held reclaim; destroying the child");
     let _ = syscall::cap_delete(result.thread_for_caller);
     let _ = syscall::cap_delete(result.process_handle);
     let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
@@ -1211,7 +1223,7 @@ fn handle_create(
     // PROCESS_DIED and deletes the slot; create_process has already
     // released the child's kernel objects, so memmgr reclaims pages no
     // kernel object still uses.
-    if result.is_some()
+    if result.is_ok()
     {
         let _ = mms.disarm();
     }
@@ -1236,16 +1248,18 @@ fn handle_create(
 
     match result
     {
-        Some(result) =>
+        Ok(result) =>
         {
             log_spawn_sched(sched);
             if label & procmgr_labels::CREATE_DMA_HOLD == 0
-                || arm_dma_hold(&result, ipc_buf, ctx.memmgr_ep, table)
+                || arm_held_reclaim_or_refuse(&result, ipc_buf, ctx.memmgr_ep, table)
             {
                 reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
             }
         }
-        None =>
+        // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
+        // request's own checks, whatever the cause `create_process` reports.
+        Err(_) =>
         {
             reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
         }
@@ -1386,7 +1400,7 @@ fn handle_create_from_file(
         {
             log_spawn_sched(sched);
             if label & procmgr_labels::CREATE_DMA_HOLD == 0
-                || arm_dma_hold(&result, ipc_buf, ctx.memmgr_ep, table)
+                || arm_held_reclaim_or_refuse(&result, ipc_buf, ctx.memmgr_ep, table)
             {
                 reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
             }

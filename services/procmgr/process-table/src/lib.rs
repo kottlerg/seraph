@@ -509,7 +509,7 @@ pub fn resolve_spawn_sched(
 /// to leave it live. `main_thread` is the kernel's packed
 /// `CAP_INFO_THREAD_STATE` of the entry's main thread (the state above bit
 /// 32, the retained exit reason below), `exited` the state value meaning the
-/// thread exited, and `terminal_fault` the entry's AddressSpace
+/// thread exited, and `terminal_fault` the entry's `AddressSpace`
 /// `CAP_INFO_ASPACE_TERMINAL_FAULT` (`0` while no thread of it took a
 /// terminal fault, else the first such fault's reason); a read that failed is
 /// `None`. An exited main thread reaps with its own reason, as its post would
@@ -570,16 +570,25 @@ mod tests
     fn the_resync_reaps_an_exited_main_thread_with_its_own_reason()
     {
         let packed = (u64::from(EXITED) << 32) | 0x1007;
-        assert_eq!(resync_exit_reason(Some(packed), EXITED, Some(0)), Some(0x1007));
+        assert_eq!(
+            resync_exit_reason(Some(packed), EXITED, Some(0)),
+            Some(0x1007)
+        );
         // The main thread's reason wins over a fault a worker took first.
-        assert_eq!(resync_exit_reason(Some(packed), EXITED, Some(0x100E)), Some(0x1007));
+        assert_eq!(
+            resync_exit_reason(Some(packed), EXITED, Some(0x100E)),
+            Some(0x1007)
+        );
     }
 
     #[test]
     fn the_resync_reaps_a_running_process_whose_worker_took_a_terminal_fault()
     {
         let running = u64::from(EXITED - 1) << 32;
-        assert_eq!(resync_exit_reason(Some(running), EXITED, Some(0x100E)), Some(0x100E));
+        assert_eq!(
+            resync_exit_reason(Some(running), EXITED, Some(0x100E)),
+            Some(0x100E)
+        );
         assert_eq!(resync_exit_reason(None, EXITED, Some(0x100E)), Some(0x100E));
     }
 

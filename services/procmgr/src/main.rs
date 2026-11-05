@@ -821,8 +821,11 @@ fn resync_deaths(
     table.for_each(|entry| {
         let main_thread =
             syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-        let terminal_fault =
-            syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT).ok();
+        let terminal_fault = syscall::cap_info(
+            entry.aspace_cap,
+            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+        )
+        .ok();
         let Some(exit_reason) = process::resync_exit_reason(
             main_thread,
             syscall_abi::THREAD_STATE_EXITED,

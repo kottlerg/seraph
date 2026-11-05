@@ -110,6 +110,7 @@ const _: () = {
     assert!(core::mem::size_of::<TrapFrame>() == syscall::REGS_X86_64_SIZE);
     assert!(core::mem::offset_of!(TrapFrame, rip) == syscall::REGS_X86_64_IP_OFFSET);
     assert!(core::mem::offset_of!(TrapFrame, rsp) == syscall::REGS_X86_64_SP_OFFSET);
+    assert!(core::mem::offset_of!(TrapFrame, rflags) == syscall::REGS_X86_64_FLAGS_OFFSET);
 };
 
 /// Length of the `syscall` instruction (`0F 05`).

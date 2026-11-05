@@ -193,6 +193,39 @@ pub fn software_breakpoint() -> u64
     addr
 }
 
+/// Instructions [`single_step_target`] runs after its breakpoint: three
+/// one-byte `nop`s, each a single-step of its own.
+pub const SINGLE_STEP_NOPS: u64 = 3;
+
+/// Execute a software breakpoint followed by [`SINGLE_STEP_NOPS`] one-byte
+/// `nop`s, and return the address of the first `nop`, the pointer the
+/// breakpoint's fault reports. A handler that resumes the thread with the trap
+/// flag set takes one `#DB` per `nop`, each reporting the next instruction:
+/// the first `nop` plus 1, 2, and 3.
+#[must_use]
+pub fn single_step_target() -> u64
+{
+    let first: u64;
+    // SAFETY: `lea` writes only `first`; `int3` raises #BP and the `nop`s do
+    // nothing. The traps are the intended effect, and a resuming handler
+    // returns the thread to the next instruction with its registers as they
+    // were, so nothing is clobbered beyond `first`. The trap flag a handler
+    // sets is cleared by the handler before the last resume, so it does not
+    // outlive this block.
+    unsafe {
+        core::arch::asm!(
+            "lea {first}, [rip + 2f]",
+            "int3",
+            "2: nop",
+            "nop",
+            "nop",
+            first = out(reg) first,
+            options(nostack, preserves_flags),
+        );
+    }
+    first
+}
+
 /// A fresh range-capability lineage root for `integration::range_copy_lineage`:
 /// an `IoPort` cap for two otherwise unused ports, split off the wide cap.
 ///

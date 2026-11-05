@@ -1148,9 +1148,16 @@ pub const FAULT_EXC_UNKNOWN: u64 = 0;
 /// illegal instruction).
 pub const FAULT_EXC_ILLEGAL_INSTRUCTION: u64 = 1;
 /// Normalized exception: software breakpoint (x86-64 `#BP`; RISC-V `ebreak`).
+/// The reported instruction pointer is the hardware's: on x86-64 the
+/// instruction after `int3` (`#BP` is a trap), on RISC-V the `ebreak` itself,
+/// which a resuming handler steps past (2 bytes for `c.ebreak`, 4 for
+/// `ebreak`).
 pub const FAULT_EXC_BREAKPOINT: u64 = 2;
 /// Normalized exception: debug trap — single-step or hardware breakpoint
-/// (x86-64 `#DB`). No RISC-V mapping (debug is an external-debugger facility).
+/// (x86-64 `#DB`; a single-step reports the next instruction to execute, and
+/// [`X86_64_RFLAGS_TF`] requests one). No RISC-V mapping: RISC-V has no
+/// user-mode single-step without a debug trigger, which the kernel does not
+/// program.
 pub const FAULT_EXC_DEBUG: u64 = 3;
 /// Normalized exception: integer divide error (x86-64 `#DE`). RISC-V has no
 /// hardware divide trap.
@@ -1220,6 +1227,13 @@ pub const REGS_X86_64_SIZE: usize = 168;
 pub const REGS_X86_64_IP_OFFSET: usize = 120;
 /// Byte offset of the stack pointer (`rsp`) in the x86-64 register file.
 pub const REGS_X86_64_SP_OFFSET: usize = 136;
+/// Byte offset of the flags register (`rflags`) in the x86-64 register file.
+pub const REGS_X86_64_FLAGS_OFFSET: usize = 128;
+/// The x86-64 trap flag in `rflags`. A thread resumed with it set takes `#DB`
+/// after its next instruction, delivered to its exception handler as
+/// [`FAULT_EXC_DEBUG`], so a debugger single-steps a stopped thread by setting
+/// it with `SYS_THREAD_WRITE_REGS` (`docs/fault-handling.md` § Debugging).
+pub const X86_64_RFLAGS_TF: u64 = 1 << 8;
 
 /// riscv64 register-file size in bytes.
 pub const REGS_RISCV64_SIZE: usize = 280;

@@ -32,3 +32,5 @@ pub use current::{
     code_stub, cycles_now, entry_stack_pointer, fpu, fresh_range_root, illegal_instruction,
     init_io_ports, run_integration, run_unit, serial, shutdown, software_breakpoint,
 };
+#[cfg(target_arch = "x86_64")]
+pub use current::{SINGLE_STEP_NOPS, single_step_target};

@@ -921,8 +921,7 @@ pub const RIGHTS_THREAD_OBSERVE: u64 = 1 << 1;
 pub const RIGHTS_THREAD_UPCALL: u64 = 1 << 2;
 
 /// Thread: full control (start, stop, configure, observe, post an upcall).
-pub const RIGHTS_THREAD: u64 =
-    RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_UPCALL;
+pub const RIGHTS_THREAD: u64 = RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE | RIGHTS_THREAD_UPCALL;
 
 // CSpace ──
 

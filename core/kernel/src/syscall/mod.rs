@@ -46,10 +46,11 @@ use syscall::{
     SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT,
     SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
 };
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
@@ -392,6 +393,10 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
             crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             crate::arch::current::cpu::halt_loop();
         }
+        // The syscall delivery point of a pending upcall
+        // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds what
+        // the thread returns with, and the thread is live.
+        crate::ipc::upcall::deliver_at_syscall();
         let tcb = current_tcb();
         if !tcb.is_null()
         {
@@ -442,6 +447,8 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
         SYS_THREAD_SET_FAULT_HANDLER => thread::sys_thread_set_fault_handler(tf),
         SYS_THREAD_GET_FAULT_HANDLER => thread::sys_thread_get_fault_handler(tf),
         SYS_THREAD_INHERIT_FAULT_HANDLER => thread::sys_thread_inherit_fault_handler(tf),
+        SYS_THREAD_POST_UPCALL => thread::sys_thread_post_upcall(tf),
+        SYS_THREAD_SET_UPCALL_MASK => thread::sys_thread_set_upcall_mask(tf),
         SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
         SYS_THREAD_YIELD => sys_yield(tf),
         SYS_THREAD_EXIT => sys_exit(tf),

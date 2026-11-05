@@ -886,7 +886,9 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
 /// Called from [`common_irq_trampoline`] with the stub-pushed vector and, for an
 /// interrupt taken from user mode, the live user frame (null otherwise), which
 /// it publishes as the thread's `trap_frame` first ([`publish_user_frame`]).
-/// Each handler performs its own EOI; this only dispatches. A device vector is
+/// Each handler performs its own EOI; this only dispatches, then, for an
+/// interrupt from user mode, makes the interrupt delivery point of a pending
+/// upcall (`ipc::upcall::deliver_at_interrupt`). A device vector is
 /// mapped to the GSI the I/O APIC routing assigned it (`ioapic::gsi_for_vector`),
 /// which indexes the `irq` routing table; a device vector with no GSI (an
 /// interrupt latched before its route was cleared) is acknowledged and dropped.
@@ -927,6 +929,16 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
         // No routed vector falls here; matches the spurious vector's no-EOI policy.
         _ =>
         {}
+    }
+    if !user_frame.is_null()
+    {
+        // The interrupt delivery point of an upcall posted with
+        // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
+        // Upcalls): each handler above has sent its EOI, and the thread the
+        // interrupt preempted is about to return to ring 3.
+        // SAFETY: ring-3 origin, so user_frame is the interrupted thread's
+        // live frame on its kernel stack; no lock is held, IF=0.
+        unsafe { crate::ipc::upcall::deliver_at_interrupt(user_frame) };
     }
 }
 

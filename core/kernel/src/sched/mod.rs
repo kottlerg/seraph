@@ -2563,6 +2563,10 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     fault_outcome: core::sync::atomic::AtomicU8::new(0),
                     in_fault_delivery: false,
                     fault_delivery_class: 0,
+                    upcall_pending: core::sync::atomic::AtomicBool::new(false),
+                    upcall_cookie: core::sync::atomic::AtomicU64::new(0),
+                    upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
+                    upcall_masked: core::sync::atomic::AtomicBool::new(false),
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,
@@ -4143,9 +4147,12 @@ pub enum ParkCommit
     /// is refused and the deposited payload must reach the resume path
     /// untouched.
     RefusedWake,
-    /// A concurrent stop/exit already moved the thread off `Running`/`Ready`;
-    /// the park is refused and the caller's rollback owns the episode (no
-    /// waker ever saw the registration).
+    /// A concurrent stop/exit already moved the thread off `Running`/`Ready`,
+    /// or an upcall is pending that the thread does not mask outside a fault
+    /// or upcall delivery; the park is refused and the caller's rollback owns
+    /// the episode (no waker ever saw the registration), stamping it
+    /// interrupted as for a stop, so the syscall returns `Interrupted` and the
+    /// upcall is delivered at its return.
     RefusedStop,
 }
 
@@ -4157,7 +4164,13 @@ pub enum ParkCommit
 /// post-`schedule()` outcome remains state-driven — see
 /// core/kernel/docs/sched-ipc-redesign.md § 2.1):
 /// - [`ParkCommit::RefusedStop`]: a concurrent stop/exit already won (`state`
-///   is `Stopped`/`Exited`/…); the thread is then drained by `schedule()`.
+///   is `Stopped`/`Exited`/…), and the thread is then drained by
+///   `schedule()`; or an unmasked upcall is pending on a thread in no fault
+///   or upcall delivery (`upcall_pending`, written by the post under this
+///   lock), and the thread stays `Running`, its `schedule()` a requeue, so a
+///   post that finds the thread not yet `Blocked` loses no wake
+///   (core/kernel/docs/thread-lifecycle-and-sleep.md § Upcall Cancel-and-Wake
+///   Protocol).
 /// - [`ParkCommit::RefusedWake`]: `wake_pending` is set — a waker raced ahead,
 ///   found this thread still live, coalesced its link, and recorded the wake
 ///   under `sched_lock`. Parking now would lose it, so we REFUSE to park
@@ -4204,6 +4217,20 @@ pub unsafe fn commit_blocked_under_local_lock(
                     // core/kernel/docs/sched-ipc-redesign.md § 2.1).
                     (*tcb).wake_pending = false;
                     ParkCommit::RefusedWake
+                }
+                else if !(*tcb).in_fault_delivery
+                    && (*tcb)
+                        .upcall_pending
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                    && !(*tcb)
+                        .upcall_masked
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    // A posted upcall interrupts the block before it begins,
+                    // as its cancel would interrupt it after (the post wrote
+                    // upcall_pending under this lock, before its cancel read
+                    // the state).
+                    ParkCommit::RefusedStop
                 }
                 else
                 {

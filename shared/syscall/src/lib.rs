@@ -49,10 +49,11 @@ use syscall_abi::{
     SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
     SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -69,7 +70,8 @@ pub use syscall_abi::{
     RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
     RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
     RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
-    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
+    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL,
+    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -2335,6 +2337,47 @@ pub fn thread_inherit_fault_handler(
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Post an asynchronous upcall carrying `cookie` to `thread`
+/// (`SYS_THREAD_POST_UPCALL`). The thread's `FAULT_CLASS_UPCALL` handler
+/// receives a `FAULT_KIND_UPCALL` message at the thread's next syscall return,
+/// or, with `flags` = `UPCALL_ANY_INSTRUCTION`, at any return to user mode; a
+/// thread blocked in a syscall has it return `Interrupted` first. See
+/// `docs/fault-handling.md` § Asynchronous Upcalls.
+///
+/// Requires `UPCALL` on the thread cap, and `CONTROL` beside it for
+/// `UPCALL_ANY_INSTRUCTION`.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` (an undefined flag
+/// bit), `InvalidCapability` (a bad thread cap), `InsufficientRights` (a
+/// right missing), `InvalidState` (the thread is not yet started or has
+/// exited, or has no upcall handler bound), or `QueueFull` (an upcall is
+/// already pending on the thread).
+#[inline]
+pub fn thread_post_upcall(thread: u64, cookie: u64, flags: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues a raw syscall; all arguments are scalars the
+    // kernel validates.
+    let ret = unsafe { syscall3(SYS_THREAD_POST_UPCALL, thread, cookie, flags) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Mask (`true`) or unmask (`false`) upcalls to the calling thread
+/// (`SYS_THREAD_SET_UPCALL_MASK`); returns whether they were masked before.
+/// While masked, a posted upcall stays pending and does not interrupt a
+/// blocking syscall; unmasking delivers it at this call's return.
+///
+/// # Errors
+/// Returns a negative `i64` error code; none is expected for a valid call.
+#[inline]
+pub fn thread_set_upcall_mask(masked: bool) -> Result<bool, i64>
+{
+    // SAFETY: syscall2 issues a raw syscall; the argument is a scalar the
+    // kernel validates.
+    let ret = unsafe { syscall2(SYS_THREAD_SET_UPCALL_MASK, u64::from(masked), 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret != 0) }
 }
 
 /// Copy the register state of a stopped or fault-blocked thread into `buf`.

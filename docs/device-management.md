@@ -145,10 +145,10 @@ its own or devmgr withdrew it:
    device, waiting for the reset to be confirmed for at most `RESET_TIMEOUT` (5 s).
 3. **Memory freed.** procmgr holds back the `PROCESS_DIED` of a driver devmgr created with
    `CREATE_DMA_HOLD`, however the driver died, so memmgr keeps its frames on the driver's record,
-   out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only once the Bus Master Enable
-   read-back and the reset both confirm the device stopped; a device that does not confirm both
-   leaves the frames quarantined on that record, counted and never handed out again, for the
-   rest of the boot.
+   out of the pool. devmgr releases the hold (`RELEASE_HOLD`) only when the IOMMU blocked the
+   device, or when the Bus Master Enable read-back is clear, every BAR copy is revoked and the
+   reset is confirmed; a device that meets neither leaves the frames quarantined on that record,
+   counted and never handed out again, for the rest of the boot.
 
 The hold rests on the driver not having handed its procmgr capability onward. procmgr cannot tell
 devmgr's `RELEASE_HOLD` from one sent on a copy of the driver's own procmgr capability, which
@@ -164,13 +164,13 @@ The hold covers the driver's own frames only. A frame a client lends a driver fo
 hold covers, so it returns to the pool when the client releases it or dies, whatever the device's
 state ([#749](https://github.com/kottlerg/seraph/issues/749)).
 
-Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to
-withdraw the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the
-IOMMU before Bus Master Enable is cleared. A device the IOMMU blocks can no longer reach the
-driver's frames, so devmgr releases the hold once the block is in place, whether or not the Bus
-Master Enable read-back and the reset confirm; with no IOMMU confining the device, the release
-waits on both confirmations as step 3 states. No IOMMU is programmed yet (design intent; not
-yet implemented), so today every release waits on both.
+Where an IOMMU confines the device, devmgr's first act on taking it from its driver is to withdraw
+the device's DMA authorisation (§ DMA Authorisation), which blocks the device in the IOMMU before
+Bus Master Enable is cleared. A device the IOMMU blocks can no longer reach the driver's frames,
+so devmgr releases the hold once the block is in place, whether or not the Bus Master Enable
+read-back, the BAR revocation and the reset confirm; with no IOMMU confining the device, the
+release waits on all three as step 3 states. No IOMMU is programmed yet (design intent; not yet
+implemented), so today every release waits on all three.
 
 The steps, their owners, and their bounds are specified in
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)

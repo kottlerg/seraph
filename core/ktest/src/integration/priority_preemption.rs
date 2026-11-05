@@ -12,8 +12,8 @@
 //! - Both children pinned to CPU 0 so the test measures preemption, not
 //!   parallelism. Both are created at explicit levels via the
 //!   `SYS_CAP_CREATE_THREAD` priority args.
-//! - Child A (fair class, level 5): tight spin loop, posts a "finished" bit
-//!   only at the end.
+//! - Child A (fair class, the highest fair level, whose slice is the longest):
+//!   tight spin loop, posts a "finished" bit only at the end.
 //! - Child B (RT class, the lowest RT level): signals "ran" immediately and
 //!   exits.
 //!
@@ -22,6 +22,13 @@
 //! time of being made runnable, stretched past 16 CPUs by the width's
 //! oversubscription factor ([`crate::scaled_bound`]). Skipped if no
 //! `SchedControl` cap exists in the initial cap set (no elevation path).
+//!
+//! The cell guards the ordering: an RT thread runs ahead of a CPU-bound fair
+//! one within a bounded wait. Its wall-clock budget does not tell the one-tick
+//! preemption apart from the fair thread's slice expiring (20 ms at most), a
+//! difference an emulated boot's timing cannot resolve; the tick decision is
+//! host-tested instead (`PerCpuScheduler::tick_outcome` and
+//! `TickOutcome::slice_and_reschedule` in `core/kernel/src/sched/run_queue.rs`).
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
@@ -34,8 +41,9 @@ use crate::{ChildStack, TestContext, TestResult};
 /// NOTIFY right (send) only.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
-/// Fair-class level of the hog.
-const HOG_PRIORITY: u8 = 5;
+/// Fair-class level of the hog: the highest fair level (one below the kernel's
+/// `sched::RT_PRIORITY_MIN`), whose 20-tick slice is the longest.
+const HOG_PRIORITY: u8 = 20;
 
 /// Level of the elevated child: the lowest RT level (the kernel's
 /// `sched::RT_PRIORITY_MIN`), so the test fails if any fair level ran first.

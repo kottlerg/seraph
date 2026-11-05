@@ -333,7 +333,7 @@ each change; the binding statement of the resulting invariants is
     `idle` (`set_current(idle)` under a re-taken CPU lock) and dispatch idle this
     cycle; the next tick re-schedules. A `Ready` `next` whose `context_saved` is
     still `0` while `current` is not idle is deferred instead: re-linked `Ready`
-    at the head of its level under a re-taken CPU lock (nested in
+    at the head of its run queue under a re-taken CPU lock (nested in
     `next.sched_lock`), `idle` claimed, and this CPU's reschedule flag set, so
     idle dispatches it and only an idle outgoing thread waits in the
     `context_saved` spin (scheduling-internals.md § Cross-CPU TCB Ownership,

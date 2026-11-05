@@ -15,7 +15,7 @@ concurrency claims any of them makes:
 
 | Doc | Owns |
 |---|---|
-| [scheduler.md](scheduler.md) | Scheduling algorithm: priority levels, FIFO-within-priority, time-slice policy, SMT topology preference, hard/soft affinity, idle-thread role, preemption decisions. |
+| [scheduler.md](scheduler.md) | Scheduling algorithm: priority levels, the strict-priority (RT) and fair classes, FIFO-within-run-queue, time-slice policy, SMT topology preference, hard/soft affinity, idle-thread role, preemption decisions. |
 | [ipc-internals.md](ipc-internals.md) | IPC primitive object layouts, syscall paths (call/reply/recv/send/wait/post), message copy mechanism, recipient wake via `enqueue_and_wake` (no direct switch). |
 | [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) | Sleep-list storage and BSP-servicing model, `timed_out` cross-CPU protocol, lifecycle-syscall state-machine table, `dealloc_object(Thread)` cross-CPU drain protocol, the `BlockedOnReply` reply-slot claim protocol (every publisher and claimant of `reply_tcb`). |
 | **This document** | Lock hierarchy, cross-CPU TCB ownership, wake protocol invariants, BSP boot transient, IPI taxonomy, atomic ordering invariants, ThreadState transition table, process-death and parked-thread protocol. |
@@ -364,7 +364,8 @@ skipping levels, risks deadlock.
 
 **Per-CPU scheduler fields (`core/kernel/src/sched/run_queue.rs`).** Every CPU reaches every
 `PerCpuScheduler` through a shared reference (`sched::scheduler_for`); none is reached through a
-`&mut` another CPU could alias. Its `lock` owns the run queues (the per-priority head/tail lists),
+`&mut` another CPU could alias. Its `lock` owns the run queues (the head/tail lists of each RT
+level, of the fair queue, and of the idle level),
 which are its one non-atomic state and are touched only by the methods whose contract is that the
 caller holds that lock (`enqueue`, `enqueue_at_head`, `dequeue_highest`, `remove_from_queue`,
 `find_runnable`; the
@@ -373,7 +374,12 @@ TCB Ownership names). `current` is atomic: written by `init` on the boot CPU bef
 schedules, and by `sched::enter` for CPU 0 without `lock` (its boot dispatch of init, before CPU
 0 first schedules), then only by its own CPU, under `lock`, and read by any CPU under `lock` or
 as a lock-free snapshot that a later check re-decides or another edge (`context_saved`) orders.
-`idle` is written once by `init` before the CPU schedules. `saved_lock_flags` is the interrupt word
+`idle` is written once by `init` before the CPU schedules. `current_level`, the level `current` was
+dispatched at, is written and read only by its own CPU with interrupts masked: written at each
+dispatch (`schedule()`'s dispatch flip under the incoming thread's `sched_lock`, its same-thread
+re-mark under the running thread's, the idle level when it switches to idle, and `sched::enter`'s
+boot dispatch of init), and read by its `timer_tick`, which may not read the running thread's
+`priority` without that thread's `sched_lock`. `saved_lock_flags` is the interrupt word
 an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
 `unlock_saved_flags`). `non_empty`, `load` and the deferred-reclaim head are atomics with their own
 orderings (§ Atomic Ordering Invariants).
@@ -762,7 +768,7 @@ Outgoing CPU (in schedule()):
   3.5. if out is idle or null:
          while next.context_saved.load(Acquire) == 0 { spin_loop() }  // LOCKLESS
        else if next.context_saved.load(Acquire) == 0:                 // under next.sched_lock
-         re-link next Ready at the head of its level; next = idle     // no wait
+         re-link next Ready at the head of its queue; next = idle     // no wait
   4. arch::current::context::switch(&out.saved_state, &in.saved_state)
   5. context_saved.store(1, Release)               // after switch completes
 
@@ -799,7 +805,7 @@ links a still-`current` thread (`context_saved == 0`) on another CPU's queue, so
 hand their outgoing thread to the other and dispatch the one handed over would each wait for a
 publication only the other's `switch()` makes, forever, with interrupts masked (#529). Instead, a
 CPU with a non-idle outgoing thread reads `next.context_saved` under `next.sched_lock` at the
-dispatch flip; on `0` it leaves `next` `Ready`, re-links it at the head of its level on its own
+dispatch flip; on `0` it leaves `next` `Ready`, re-links it at the head of its run queue on its own
 queue (so it keeps the round-robin turn it was dequeued in), sets its own reschedule-pending flag,
 and switches to idle. Idle's next pass of its loop (after its deferred-reclaim drain) calls
 `schedule()`, which dispatches the highest queued thread, through the wait: `next` when nothing of
@@ -961,9 +967,10 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
    wake_pending = false; read priority under the held sched_lock (so a
    concurrent sys_thread_set_priority's priority write — taken under the same
    per-TCB sched_lock — serialises against the link).
-5. Enqueue tcb in target's priority queue; the enqueue reports whether it
-   created the link (false = the release-mode single-link skip).
-   (Inside enqueue: non_empty.fetch_or(1 << prio, Release); queued_on = prio.)
+5. Enqueue tcb in target's run queue for its priority; the enqueue reports
+   whether it created the link (false = the release-mode single-link skip).
+   (Inside enqueue: non_empty.fetch_or(1 << queue_index(prio), Release);
+   queued_on = prio.)
 5a. iff the link was created: preferred_cpu = target_cpu. preferred_cpu is
    retargeted only by the writer that actually created the link, under the
    same sched_lock → run-queue lock pair, so on a release skip the field

@@ -588,7 +588,7 @@ pub struct ThreadControlBlock
     /// [`sched_lock`](Self::sched_lock), which each of those writers holds.
     pub preferred_cpu: u32,
 
-    /// Intrusive run-queue link — next TCB at the same priority.
+    /// Intrusive run-queue link — next TCB in the same run queue.
     /// `None` when not on any run queue. Owned by the `scheduler.lock` of the
     /// CPU whose queue links this TCB (see the struct-level invariant).
     pub run_queue_next: Option<*mut ThreadControlBlock>,

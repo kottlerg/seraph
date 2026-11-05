@@ -1,10 +1,13 @@
 # Scheduler Internals
 
-The Seraph kernel scheduler is preemptive, priority-based, and SMP-aware. Scheduling
-policy is minimal: whenever a CPU schedules (block, yield, slice expiry, or idle wake), it
-selects its highest-priority runnable thread. A wake does not preempt a running thread, so a
-newly runnable higher-priority thread waits until the running thread blocks or yields or its
-slice expires. Using SMT topology to spread threads across physical cores rather than
+The Seraph kernel scheduler is preemptive, priority-based, and SMP-aware, with two scheduling
+classes (§ Scheduling Classes): the top levels are scheduled by strict fixed priority (RT), the
+lower ones fairly, by weight. Whenever a CPU schedules (block, yield, slice expiry, or idle
+wake), it selects the highest-level runnable RT thread, else the next thread of its fair queue. A
+wake does not preempt a running thread, with one exception: a running fair thread is preempted at
+the next timer tick while an RT thread is queued on its CPU. Otherwise a newly runnable thread
+waits until the running thread blocks or yields or its slice expires. Using SMT topology to
+spread threads across physical cores rather than
 packing them onto one is design intent, not yet implemented
 ([#267](https://github.com/kottlerg/seraph/issues/267)).
 
@@ -27,7 +30,8 @@ There are `NUM_PRIORITY_LEVELS` = 32 priority levels, numbered 0 (lowest) throug
 31 (highest):
 
 - **Priority 0** — reserved for idle threads (one per CPU; never preempted).
-- **Priorities 1–30** — available to userspace. `PRIORITY_MAX` = 30.
+- **Priorities 1–30** — available to userspace. `PRIORITY_MAX` = 30. Levels 1–20 are the fair
+  class and levels 21–30 the strict-priority (RT) class (§ Scheduling Classes).
 - **Priority 31** — reserved; cannot be requested by userspace.
 
 Threads are created at an explicit priority stated at `SYS_CAP_CREATE_THREAD`
@@ -87,20 +91,61 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
 cap shape, `SYS_SCHED_SPLIT`-based band splitting, and delegation. `cap_derive`
 cannot shrink a band — it attenuates rights only ([syscalls.md](syscalls.md) § `SYS_CAP_DERIVE`).
 
+### Scheduling Classes
+
+A level has two meanings. On the authority axis it is what a `SchedControl` band must cover
+for a thread to be placed there (§ Priority Authority). On the discipline axis it also says how
+the thread is scheduled once it is there, and here the kernel splits the settable levels at
+`sched::RT_PRIORITY_MIN` (21) into two classes. That constant is a discipline boundary only: it
+grants nothing, and which threads reach the RT levels is decided wholly by how `SchedControl`
+bands are distributed. Userspace's level map places core services in the RT class and
+applications in the fair one (`shared/ipc`'s `sched_policy`).
+
+- **RT class, levels 21–30.** Strict fixed priority. A ready thread at a higher level always runs
+  before one at a lower level, and threads at one level share the CPU round-robin, each with a
+  slice of `TIME_SLICE_TICKS`. A thread that never blocks keeps every lower level on its CPU
+  from running.
+- **Fair class, levels 1–20.** Weighted round-robin. Every fair thread on a CPU is queued on one
+  shared FIFO, whatever its level, and the level is its weight: its slice is its level in timer
+  ticks (`sched::quantum_ticks`; 1 to 20 ticks). A turn of the queue gives each CPU-bound fair
+  thread its level's worth of ticks, so CPU-bound fair threads on one CPU share it in proportion
+  to their levels, and, while no RT thread is ready on its CPU, no fair thread waits more than
+  one turn of the queue, however many threads sit at higher fair levels. The default spawn
+  level, 10, has the same slice as an RT thread. A fair thread's level grants no precedence
+  over another fair thread's.
+
+Between the classes, RT always wins. Every scheduling decision takes a ready RT thread before
+any fair one. A fair thread that is running when an RT thread is queued on its CPU is preempted
+at the next timer tick (§ Timer-Driven Preemption), and goes back to the tail of the fair queue
+with the rest of its slice. A wake itself does not preempt: an RT thread woken onto a CPU that
+runs a fair thread waits for the next tick, or, when that tick finds preemption disabled
+(§ Kernel-Mode Preemption Points), for the first later tick that finds it enabled. Immediate
+preemption at the wake is not implemented.
+
+The fair accounting is per CPU: each thread's remaining slice in its TCB, and its place in its
+CPU's fair queue. There is no global virtual time to keep in step across CPUs, and a migrated
+thread carries its remaining slice with it. The load balancer and wake placement count queued
+threads without weighing them (§ Load Balancing), so the proportional share holds between the
+threads of one CPU. Across CPUs it holds only as far as the balancer evens out the counts.
+
+Two refinements are not implemented: run-to-block scheduling within an RT level (`SCHED_FIFO`
+semantics, a possible flag on the RT class) and CPU-time budgets on `SchedControl`.
+
 ### Run Queue Structure
 
-Each CPU has a set of 32 run queues, one per priority level. The excerpt below is abridged to
-the fields this document discusses; `core/kernel/src/sched/run_queue.rs` holds the full
-definition:
+Each CPU has 13 run queues (`NUM_RUN_QUEUES`): one per RT level (21 to the reserved 31), one
+that every fair level shares, and one for the idle level. The excerpt below is abridged to the
+fields this document discusses; `core/kernel/src/sched/run_queue.rs` holds the full definition:
 
 ```rust
 pub struct PerCpuScheduler
 {
-    /// Per-priority run queues. Each is an intrusive FIFO of ready TCBs; owned by `lock`.
-    queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
+    /// The run queues, indexed by `queue_index` of a level: the idle queue, the fair
+    /// queue, then one per RT level. Each is an intrusive FIFO of ready TCBs; owned by `lock`.
+    queues: UnsafeCell<[RunQueue; NUM_RUN_QUEUES]>,
 
-    /// Bitmask with one bit set per non-empty priority level.
-    /// Allows O(1) selection of the highest non-empty priority.
+    /// Bitmask with one bit set per non-empty run queue.
+    /// Allows O(1) selection of the highest non-empty queue.
     non_empty: AtomicU32,
 
     /// Currently running TCB on this CPU.
@@ -108,6 +153,10 @@ pub struct PerCpuScheduler
 
     /// The idle TCB for this CPU.
     idle: AtomicPtr<ThreadControlBlock>,
+
+    /// Level of `current` as of its dispatch, which `timer_tick` reads for the slice
+    /// refill and the RT-over-fair preemption.
+    current_level: AtomicU8,
 
     /// Lock protecting the run queues. Held briefly during enqueue/dequeue.
     pub lock: Spinlock,
@@ -123,38 +172,44 @@ struct RunQueue
 }
 ```
 
-The `non_empty` bitmask enables O(1) selection of the highest-priority non-empty
-queue: `31 - non_empty.leading_zeros()` (`PerCpuScheduler::dequeue_highest`), the same
-expression on both architectures. Enqueue sets the corresponding bit;
-dequeue clears it if the queue becomes empty.
+The queue index of a level (`queue_index`) is monotone in the level, so the highest non-empty
+queue is the highest RT level with a ready thread, else the fair queue. The `non_empty` bitmask
+enables O(1) selection of it: `31 - non_empty.leading_zeros()`
+(`PerCpuScheduler::dequeue_highest`), the same expression on both architectures. Enqueue sets
+the queue's bit; dequeue clears it if the queue becomes empty. A queue found by the load
+balancer's scan (`find_runnable`) is reported as a level of that queue, the lowest fair level
+for the fair queue, so the balancer's unlink and relink resolve to the same queue.
 
 ### Time Slice Policy
 
-Each thread receives a configurable time slice. The preemption timer fires
-periodically at a configurable interval; each timer interrupt decrements a per-thread
-slice counter. When the counter reaches zero, the thread is preempted. The time
-slice duration and timer period are implementation constants, not part of the ABI.
+Each thread receives a time slice in ticks of the preemption timer; each timer interrupt
+decrements a per-thread slice counter, and when the counter reaches zero the thread is
+preempted and its counter refilled. The slice of an RT thread is `TIME_SLICE_TICKS` (10); that of
+a fair thread is its level (§ Scheduling Classes), so the longest slice is 20 ticks, at fair level
+20. With the 1 ms tick, an RT slice is 10 ms. The slice lengths and the timer period are
+implementation constants, not part of the ABI.
 
-Time slices are equal across all priority levels. Priority determines which thread
-runs next, not how much time each thread gets relative to others. Slice expiry never hands
-the CPU to a lower level: the expiring thread is requeued at its level's tail and the highest
-non-empty level runs next. A thread that never blocks keeps any lower-priority thread on its
-CPU from running until the higher-priority thread blocks or the load balancer moves the
-lower-priority thread elsewhere.
+`timer_tick` takes the refill from the level the running thread was dispatched at, which the CPU
+records at each dispatch (`PerCpuScheduler::current_level`): it may not read the running
+thread's `priority` without that thread's `sched_lock`. A priority change of a running thread
+therefore reaches its slice length and its class at its next dispatch. A new thread's first
+slice is its creation level's.
 
-Within a priority level, threads share the CPU in round-robin order (FIFO queue
-drained cyclically).
+Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
+expiring thread is requeued at its run queue's tail and the highest non-empty queue runs next.
+Within an RT level, and within the fair queue, threads share the CPU in round-robin order (FIFO
+queue drained cyclically).
 
 ### Selection
 
 ```
 pick_next(cpu):
-    // non_empty is a bitmask; find highest set bit
+    // non_empty is a bitmask over the run queues; find highest set bit
     if non_empty == 0: return idle_tcb
-    priority = highest_set_bit(non_empty)
-    tcb = queues[priority].dequeue()
-    if queues[priority].is_empty():
-        non_empty &= ~(1 << priority)
+    q = highest_set_bit(non_empty)       // highest RT level, else the fair queue
+    tcb = queues[q].dequeue()
+    if queues[q].is_empty():
+        non_empty &= ~(1 << q)
     return tcb
 ```
 
@@ -190,7 +245,7 @@ pub struct ThreadControlBlock
     /// Soft affinity: preferred CPU (hint only; overridden by load balancing).
     preferred_cpu: u32,
 
-    /// Intrusive run-queue link (next TCB in the same priority queue).
+    /// Intrusive run-queue link (next TCB in the same run queue).
     run_queue_next: Option<*mut ThreadControlBlock>,
 
     // === IPC state ===
@@ -369,6 +424,10 @@ A pull-based balancer runs on every CPU's `timer_tick` (see
 (`PerCpuScheduler::current_load()`, maintained by `enqueue` / `dequeue_highest` /
 `remove_from_queue`) and migrates at most one `Ready` thread per tick per CPU.
 
+The balancer counts queued threads without weighing them by class or level (§ Scheduling
+Classes): it evens out the number of queued threads per CPU, and `find_runnable` scans the
+victim's queues from the highest, so an RT thread is pulled before a fair one.
+
 Victim selection is mode-dependent:
 
 - **Loaded CPU (`my_load > 0`)** — pick a pseudo-random victim
@@ -496,37 +555,47 @@ the configured periodic interval on each CPU. The tick handler, `timer_tick`, ru
 timer_tick():
     if cpu == 0:                              // BSP only
         sleep_check_wakeups(); watchdog_tick_and_check()
-    if current.slice_remaining == 0:          // idle thread
-        try_pull_balance(cpu); return
-    current.slice_remaining -= 1
-    if current.slice_remaining == 0:
-        current.slice_remaining = TIME_SLICE_TICKS
-        try_pull_balance(cpu)
-        if preemption_disabled(): return      // see § Kernel-Mode Preemption Points
-        schedule(Requeue::Always)             // requeue at its level's tail, then dequeue_highest
-    else:
-        try_pull_balance(cpu)
+    match tick_outcome(current.slice_remaining):   // PerCpuScheduler::tick_outcome
+        Idle:                                 // zero slice: the idle thread
+            try_pull_balance(cpu); return
+        Continue(remaining):
+            current.slice_remaining = remaining; reschedule = false
+        PreemptForRt(remaining):              // fair current, RT thread queued here
+            current.slice_remaining = remaining; reschedule = true
+        Expired:
+            current.slice_remaining = quantum_ticks(current_level); reschedule = true
+    try_pull_balance(cpu)
+    if !reschedule: return
+    if preemption_disabled(): return          // see § Kernel-Mode Preemption Points
+    schedule(Requeue::Always)                 // requeue at its queue's tail, then dequeue_highest
 ```
 
 Only CPU 0's tick services the sleep list (`sleep_check_wakeups`) and runs the softlockup
 watchdog (`watchdog_tick_and_check`), so no other CPU's tick wakes a timed-out sleeper (see
 [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
 
-On slice expiry the current thread goes back to the tail of its priority's FIFO, and
-`dequeue_highest` picks the next thread. If no other thread at its priority or higher is
-queued, the current thread is reselected and keeps running with no context switch, even
-though its slice expired.
+On slice expiry the current thread goes back to the tail of its run queue (its RT level's, or
+the fair queue), and `dequeue_highest` picks the next thread. If no other thread is queued in
+its run queue or a higher one, the current thread is reselected and keeps running with no
+context switch, even though its slice expired.
 
-This ensures that a thread at a unique highest priority is never preempted needlessly
+This ensures that a thread alone at the highest non-empty queue is never preempted needlessly
 — only when a peer or superior competitor exists.
+
+A fair thread is also preempted before its slice expires, at any tick that finds an RT thread
+queued on its CPU (`PreemptForRt`). It goes back to the fair queue's tail keeping the rest of its
+slice, and the RT thread runs. RT threads are not preempted mid-slice: among them a newly
+runnable higher level waits for the running thread to block, yield or expire, as above.
 
 ### Kernel-Mode Preemption Points
 
 Syscall context is not preemptible. Syscall entry masks interrupts, and they stay masked
 for the whole syscall except in bounded preempt-disabled, interrupt-enabled windows. When
 `timer_tick` reaches a slice expiry while `percpu::preemption_disabled()` holds, it resets
-the slice and skips the switch, and the thread is rescheduled at its next slice expiry.
-Kernel-mode preemption therefore happens only at a slice expiry with preemption enabled.
+the slice and skips the switch, and the thread is rescheduled at its next slice expiry (a fair
+thread with an RT thread queued, at the next tick that finds preemption enabled). Kernel-mode
+preemption therefore happens only at a tick that decides a reschedule, a slice expiry or a fair
+thread's preemption for RT, with preemption enabled.
 The model, the spinlock hold-time bound, and lock ordering are specified in
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) (its
 numbered ordering rules and the "Lock primitive" and "Bare spin locks" paragraphs).
@@ -612,8 +681,9 @@ Otherwise, by target state:
   linking the thread directly on the destination's run queue, setting its
   reschedule-pending flag, and IPIing it — instead of doing a local enqueue
   (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
-  Worst-case latency is therefore one time slice
-  (`TIME_SLICE_TICKS` × tick period), not one tick.
+  Worst-case latency is therefore one time slice of the thread (its slice
+  length × tick period: `TIME_SLICE_TICKS` for an RT thread, its level, at
+  most 20, for a fair one), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next enqueue (a wake, or `SYS_THREAD_START` on start or resume) via
   `select_target_cpu`; no migration work is needed.
@@ -648,5 +718,6 @@ optimisation.
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
+[Architecture Overview](../../../docs/architecture.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md)

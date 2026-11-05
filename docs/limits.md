@@ -240,8 +240,10 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state 40 B | encoding artefact | none | correct as is | Keep |
 | Bound-source backoff | `core/kernel/src/ipc/mod.rs` | 64 spins | tuning (a backoff, not a bound) | none | correct as is | None |
 | `SLEEP_LIST` (deadline heap) | `core/kernel/src/sched/mod.rs` | unbounded, one node per TCB | none (intrusive through the TCB) | about 72 B per TCB (heap node and expiry snapshot) | correct as is | One global heap under `SLEEP_LIST_LOCK`, popped on the BSP |
-| `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`u32` `non_empty` mask; `PRIORITY_MAX` 30) | 32 run queues per CPU | correct as is | None (#215) |
-| `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning | none | correct as is | None |
+| `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`PRIORITY_MAX` 30, the reserved level 31 above it) | none | correct as is | None |
+| `NUM_RUN_QUEUES` | `core/kernel/src/sched/run_queue.rs` | 13 | derived from `NUM_PRIORITY_LEVELS` and `RT_PRIORITY_MIN` (one queue per RT level, one fair, one idle; a `u32` `non_empty` mask, asserted at build time) | 13 run queues per CPU | correct as is | None |
+| `RT_PRIORITY_MIN` | `core/kernel/src/sched/mod.rs` | 21 | design choice (the RT/fair discipline boundary) | none | correct as is | None |
+| `TIME_SLICE_TICKS` | `core/kernel/src/sched/mod.rs` | 10 | tuning (the RT slice; a fair slice is its level, at most 20 ticks) | none | correct as is | None |
 | `KERNEL_STACK_PAGES` | `core/kernel/src/sched/mod.rs` | 4 (16 KiB) | stack budget, measured (the bound at the constant; ktest after Tier S, both arches): debug at 4, 16 and 128 CPUs peaks at 3784 B (thread) and 1664 B (idle), and release at 4, 16 and 128 CPUs at 4304 B and 2080 B; a path past it faults on the unmapped guard page below the stack and halts by name (core/kernel/docs/memory-internals.md § Kernel Stack Guards) | 4 pages plus a guard page per thread, caller-funded; per CPU for the idle stacks | correct as is | None |
 | `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 8192 (`boot_protocol::MAX_CPUS`) | current peak plus headroom (a sanity ceiling no structure is sized from) | none | correct as is | None; see the boot section |
 | Watchdog breadcrumbs (`CpuDiag`, `CPU_DIAG_PTR`) | `core/kernel/src/sched/mod.rs` | `cpu_count`-sized slab | derived from `cpu_count` (`MAX_CPUS` the sanity ceiling) | `cpu_count` x 32 B | correct as is | Already pay-as-you-go |
@@ -252,7 +254,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `WATCHDOG_SLEEP_ENTRIES` | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | about 128 B stack | correct as is | None |
 | `CS_SPIN_WARN_US` | `core/kernel/src/sched/mod.rs` | 100 000 us | diagnostic threshold | none | correct as is | None |
 | `LOAD_BALANCE_IMBALANCE_THRESHOLD` | `core/kernel/src/sched/mod.rs` | 2 | tuning | none | correct as is | None |
-| `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits) | per CPU | correct as is | None |
+| `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits for 13 queues) | per CPU | correct as is | None |
 | `ThreadControlBlock.death_observers` | `core/kernel/src/sched/thread.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per TCB | correct as is | None |
 | `EventQueueState.observer_count` | `core/kernel/src/ipc/event_queue.rs` | caller-chosen, at most `EVENT_QUEUE_MAX_CAPACITY` | caller-funded per queue (24 B per node) | none up front | correct as is | Bindings past the pool return `OutOfMemory` until a bound owner is destroyed |
 | `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u64` correlator, full `u64` reason (one two-word EQ entry) | ABI width | embedded | correct as is | None: procmgr, svcmgr and devmgr pass the full badge or table index |

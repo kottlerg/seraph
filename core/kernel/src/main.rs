@@ -602,7 +602,8 @@ unsafe fn kernel_entry_post_rebase(
     }
     kprintln!("syscall ok");
     // Enable preemption timer at 1 ms period (both architectures).
-    // With TIME_SLICE_TICKS=10, this gives a 10 ms scheduling quantum.
+    // With TIME_SLICE_TICKS=10, this gives an RT thread a 10 ms scheduling
+    // quantum, and a fair thread one of its level in ms.
     // The period is a tuning value; it bounds no capacity.
     // timer::init() enables interrupts as its final step.
     // SAFETY: IDT/GDT/interrupts initialized above; percpu initialized;

@@ -581,8 +581,9 @@ The scratch pages and bundle layout are described in
 
 ```
 1. Use the per-CPU run queues initialised with the scheduler slab in Phase 4:
-   NUM_PRIORITY_LEVELS (32) queues per CPU, each an intrusive singly-linked FIFO of TCBs
-   (head/tail, linked through run_queue_next)
+   NUM_RUN_QUEUES (13) queues per CPU (one per RT level, one the fair levels share, one
+   for the idle level), each an intrusive singly-linked FIFO of TCBs (head/tail, linked
+   through run_queue_next)
 2. For each CPU (including the BSP):
    a. Use the idle kernel stack pre-allocated at per-CPU storage init
       (Phase 4); read its top from the IDLE_STACK_TOPS slab

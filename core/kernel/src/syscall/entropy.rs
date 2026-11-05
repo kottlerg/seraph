@@ -73,7 +73,7 @@ pub fn sys_getrandom(tf: UserFrame) -> Result<u64, RestartableError>
 
     // Draw into a kernel buffer *before* the user copy: the draw disables/
     // re-enables interrupts internally, which must not happen inside the SMAP/SUM
-    // access window that `copy_to_user` opens.
+    // access window that `copy_to_user_restartable` opens.
     let mut scratch = [0u8; MAX_GETRANDOM_LEN];
     crate::entropy::fill_bytes(&mut scratch[..len]);
 

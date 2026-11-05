@@ -602,6 +602,16 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 crate::fatal("unhandled interrupt");
             }
         }
+        if sstatus_at_entry & (1 << 8) == 0
+        {
+            // The interrupt delivery point of an upcall posted with
+            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
+            // Upcalls): the interrupt is handled and completed, and the thread
+            // it preempted (SPP = 0, U-mode) is about to return to U-mode.
+            // SAFETY: U-mode origin, so frame is the interrupted thread's live
+            // frame on its kernel stack; no lock is held, SIE = 0.
+            unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
+        }
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0

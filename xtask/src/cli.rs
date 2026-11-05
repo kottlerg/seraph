@@ -187,6 +187,8 @@ pub enum BuildComponent
     StdiotestTester,
     Threadstack,
     ThreadstackTester,
+    Deadline,
+    DeadlineTester,
     Threadchurn,
     ThreadchurnTester,
     Pipestress,

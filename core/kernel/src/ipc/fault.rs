@@ -64,7 +64,7 @@ const DELIVERY_UNBOUND: u8 = u8::MAX;
 /// Number of fault classes a thread binds separately
 /// (docs/fault-handling.md § Fault-Handler Binding), and the length of the
 /// per-class binding arrays of [`ThreadControlBlock`].
-pub const FAULT_CLASSES: usize = 2;
+pub const FAULT_CLASSES: usize = 3;
 
 /// Class index of virtual-memory faults ([`syscall::FAULT_CLASS_VM`]).
 pub const CLASS_VM: usize = 0;
@@ -73,21 +73,28 @@ pub const CLASS_VM: usize = 0;
 /// ([`syscall::FAULT_CLASS_EXCEPTION`]).
 pub const CLASS_EXCEPTION: usize = 1;
 
-/// The ABI class bit of each class index.
-const CLASS_BITS: [u64; FAULT_CLASSES] = [syscall::FAULT_CLASS_VM, syscall::FAULT_CLASS_EXCEPTION];
+/// Class index of asynchronous upcalls ([`syscall::FAULT_CLASS_UPCALL`]),
+/// delivered through the fault machinery by [`crate::ipc::upcall`].
+pub const CLASS_UPCALL: usize = 2;
 
-/// The class index a fault of `kind` is delivered through: `FAULT_KIND_VM`
-/// through [`CLASS_VM`], every other kind through [`CLASS_EXCEPTION`].
+/// The ABI class bit of each class index.
+const CLASS_BITS: [u64; FAULT_CLASSES] = [
+    syscall::FAULT_CLASS_VM,
+    syscall::FAULT_CLASS_EXCEPTION,
+    syscall::FAULT_CLASS_UPCALL,
+];
+
+/// The class index a message of `kind` is delivered through: `FAULT_KIND_VM`
+/// through [`CLASS_VM`], `FAULT_KIND_UPCALL` through [`CLASS_UPCALL`], every
+/// other kind through [`CLASS_EXCEPTION`].
 #[must_use]
 pub fn class_of_kind(kind: u64) -> usize
 {
-    if kind == syscall::FAULT_KIND_VM
+    match kind
     {
-        CLASS_VM
-    }
-    else
-    {
-        CLASS_EXCEPTION
+        syscall::FAULT_KIND_VM => CLASS_VM,
+        syscall::FAULT_KIND_UPCALL => CLASS_UPCALL,
+        _ => CLASS_EXCEPTION,
     }
 }
 
@@ -263,7 +270,7 @@ unsafe fn pin_binding(
                 .fault_outcome
                 .store(FAULT_OUTCOME_PENDING, Ordering::Release);
             (*tcb).in_fault_delivery = true;
-            // cast_possible_truncation: class < FAULT_CLASSES (2).
+            // cast_possible_truncation: class < FAULT_CLASSES (3).
             #[allow(clippy::cast_possible_truncation)]
             {
                 (*tcb).fault_delivery_class = class as u8;
@@ -849,15 +856,27 @@ mod tests
     {
         assert_eq!(
             classes_of_mask(syscall::FAULT_CLASS_VM),
-            Some([true, false])
+            Some([true, false, false])
         );
         assert_eq!(
             classes_of_mask(syscall::FAULT_CLASS_EXCEPTION),
-            Some([false, true])
+            Some([false, true, false])
+        );
+        assert_eq!(
+            classes_of_mask(syscall::FAULT_CLASS_UPCALL),
+            Some([false, false, true])
         );
         assert_eq!(
             classes_of_mask(syscall::FAULT_CLASS_VM | syscall::FAULT_CLASS_EXCEPTION),
-            Some([true, true])
+            Some([true, true, false])
+        );
+        assert_eq!(
+            classes_of_mask(
+                syscall::FAULT_CLASS_VM
+                    | syscall::FAULT_CLASS_EXCEPTION
+                    | syscall::FAULT_CLASS_UPCALL
+            ),
+            Some([true; FAULT_CLASSES])
         );
     }
 
@@ -865,7 +884,7 @@ mod tests
     fn empty_and_undefined_masks_are_refused()
     {
         assert_eq!(classes_of_mask(0), None);
-        assert_eq!(classes_of_mask(1 << 2), None);
+        assert_eq!(classes_of_mask(1 << 3), None);
         assert_eq!(classes_of_mask(syscall::FAULT_CLASS_VM | (1 << 63)), None);
     }
 
@@ -876,6 +895,10 @@ mod tests
         assert_eq!(
             class_of_bit(syscall::FAULT_CLASS_EXCEPTION),
             Some(CLASS_EXCEPTION)
+        );
+        assert_eq!(
+            class_of_bit(syscall::FAULT_CLASS_UPCALL),
+            Some(CLASS_UPCALL)
         );
         assert_eq!(class_of_bit(0), None);
         assert_eq!(
@@ -893,5 +916,12 @@ mod tests
             class_of_kind(syscall::FAULT_KIND_EXCEPTION),
             CLASS_EXCEPTION
         );
+        assert_eq!(class_of_kind(u64::MAX), CLASS_EXCEPTION);
+    }
+
+    #[test]
+    fn upcalls_use_the_upcall_class()
+    {
+        assert_eq!(class_of_kind(syscall::FAULT_KIND_UPCALL), CLASS_UPCALL);
     }
 }

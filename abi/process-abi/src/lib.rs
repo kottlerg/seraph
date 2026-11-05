@@ -282,7 +282,8 @@ pub struct ProcessInfo
     /// Protocol version. Must equal [`PROCESS_ABI_VERSION`].
     pub version: u32,
 
-    /// `CSpace` slot of the process's own Thread capability (Control right).
+    /// `CSpace` slot of the process's own Thread capability (`RIGHTS_THREAD`:
+    /// Control, Observe, and Upcall).
     pub self_thread_cap: u64,
 
     /// `CSpace` slot of the process's own `AddressSpace` capability.

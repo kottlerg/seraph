@@ -5,6 +5,7 @@ General-purpose userspace applications, utilities, and the test fixtures the har
 | Crate | Purpose |
 |---|---|
 | [`capexhaust/`](capexhaust/README.md) | CSpace-exhaustion fixture for the recv-wedge regression test |
+| [`deadline/`](deadline/README.md) | Deadline-cancel fixture for the usertest `deadline` tester: an upcall cancels a spinning worker |
 | [`demandpaged/`](demandpaged/README.md) | Demand-paging fixture for the svctest pager phase |
 | [`fb-charset/`](fb-charset/README.md) | Framebuffer character-set demo program |
 | [`fsbench/`](fsbench/README.md) | `FS_READ` vs `FS_READ_MEMORY` crossover benchmark |

@@ -259,6 +259,9 @@ wrappers stay safe functions ([shared/syscall/README.md](../shared/syscall/READM
 A capability to a thread. Rights:
 - **Control** — may start, stop, and configure the thread
 - **Observe** — may read the thread's register state (for debugging)
+- **Upcall** — may post an asynchronous upcall to the thread
+  ([Fault Handling § Asynchronous Upcalls](fault-handling.md#asynchronous-upcalls)); a post that
+  may be delivered at any instruction also needs Control
 
 ### CSpace
 
@@ -618,7 +621,8 @@ backing region, debiting bytes from the Memory's available-bytes ledger.
 SYS_CAP_CREATE_ENDPOINT(memory)               → endpoint_cap     (Send + Receive + Grant)
 SYS_CAP_CREATE_NOTIFICATION(memory)           → notification_cap (Notify + Wait)
 SYS_CAP_CREATE_EVENT_Q(memory, capacity)      → queue_cap        (Post + Recv)
-SYS_CAP_CREATE_THREAD(memory, aspace, cspace, sched, priority) → thread_cap (Control + Observe)
+SYS_CAP_CREATE_THREAD(memory, aspace, cspace, sched, priority)
+                                              → thread_cap       (Control + Observe + Upcall)
 SYS_CAP_CREATE_ASPACE(memory, augment, pages) → aspace_cap       (Map + Control [+ Read])
 SYS_CAP_CREATE_CSPACE(memory, augment, pages) → cspace_cap       (Insert + Delete + Derive)
 SYS_CAP_CREATE_WAIT_SET(memory)               → wait_set_cap     (Modify + Wait)

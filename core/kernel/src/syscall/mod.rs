@@ -46,10 +46,11 @@ use syscall::{
     SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT,
     SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
 };
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
@@ -392,6 +393,15 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
             crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             crate::arch::current::cpu::halt_loop();
         }
+        // The syscall delivery point of a pending upcall
+        // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds the
+        // syscall's result, and the thread is live. A restarted syscall is not
+        // a delivery point: its frame holds its arguments for the
+        // re-execution, whose own return delivers.
+        if exit == SyscallExit::Complete
+        {
+            crate::ipc::upcall::deliver_at_syscall();
+        }
         let tcb = current_tcb();
         if !tcb.is_null()
         {
@@ -442,6 +452,8 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
         SYS_THREAD_SET_FAULT_HANDLER => thread::sys_thread_set_fault_handler(tf),
         SYS_THREAD_GET_FAULT_HANDLER => thread::sys_thread_get_fault_handler(tf),
         SYS_THREAD_INHERIT_FAULT_HANDLER => thread::sys_thread_inherit_fault_handler(tf),
+        SYS_THREAD_POST_UPCALL => thread::sys_thread_post_upcall(tf),
+        SYS_THREAD_SET_UPCALL_MASK => thread::sys_thread_set_upcall_mask(tf),
         SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
         SYS_THREAD_YIELD => sys_yield(tf),
         SYS_THREAD_EXIT => sys_exit(tf),
@@ -633,8 +645,9 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Commit Running→Blocked under the per-TCB sched_lock (the authoritative
     // serializer for the Scheduling field group). A sleep has no IPC source, so
-    // ipc_state stays None. A refusal means a concurrent stop/exit won or a
-    // wake was deposited (refuse-to-park): abandon the sleep.
+    // ipc_state stays None. A refusal means a concurrent stop/exit won, a
+    // pending upcall the thread does not mask refused the park, or a wake was
+    // deposited (refuse-to-park): abandon the sleep.
     // SAFETY: tcb is this CPU's current (running) thread.
     let committed = unsafe {
         crate::sched::commit_blocked_under_local_lock(
@@ -661,10 +674,12 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
         }
         crate::sched::ParkCommit::RefusedStop =>
         {
-            // A stop won against the park. Deschedule in place (the requeue
-            // denylist drops a Stopped thread); on restart the continuation
-            // completes and nothing rewrites the trap frame afterwards, so
-            // the direct error return survives to userspace.
+            // A stop won against the park, or a pending upcall refused it.
+            // Deschedule in place (the requeue denylist drops a Stopped
+            // thread; a thread the upcall left Running is requeued); on
+            // restart the continuation completes and nothing rewrites the trap
+            // frame afterwards, so the direct error return survives to
+            // userspace, and the upcall is delivered at that return.
             // SAFETY: tcb valid; no sleep-list entry was added. schedule is
             // called from syscall context on a valid kernel stack.
             unsafe {
@@ -679,8 +694,10 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 
     // A refusal means a stop or teardown cancelled the park between the
     // commit and the add, stamped it INTERRUPTED, and commits Stopped or
-    // Exited; schedule() below deschedules the thread and the resume takes
-    // that stamp. The list has no capacity, so no other refusal exists.
+    // Exited, or an upcall's cancel did, whose poster then wakes the thread
+    // Ready; schedule() below deschedules the thread (or finds it woken) and
+    // the resume takes that stamp. The list has no capacity, so no other
+    // refusal exists.
     // SAFETY: tcb is this CPU's running thread.
     let _ = unsafe { crate::sched::sleep_list_add(tcb) };
 

@@ -3747,8 +3747,8 @@ pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 ///   refused because this thread's `CSpace` directory is structurally full.
 /// - `OutOfMemory` — the cap-slot pre-allocation was refused because the
 ///   `CSpace`'s slot-page pool is exhausted.
-/// - `Interrupted` — this thread was stopped, or the endpoint was destroyed,
-///   while the receive was blocked.
+/// - `Interrupted` — this thread was stopped or interrupted by an upcall, or
+///   the endpoint was destroyed, while the receive was blocked.
 ///
 /// The first four refuse the receive before any pending reply is released,
 /// so a pending caller stays bound.

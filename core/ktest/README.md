@@ -87,14 +87,15 @@ cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
 ### Tier 1 — `src/unit/`
 
 Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,
-`SYS_PROCESS_EXIT`, and the fault-handler binding syscalls (`SYS_THREAD_SET_FAULT_HANDLER`,
-`SYS_THREAD_GET_FAULT_HANDLER`, and `SYS_THREAD_INHERIT_FAULT_HANDLER`) has at least one
-positive-path test and the most important negative paths (wrong rights, invalid arguments, wrong
-object state). Those are exercised in Tier 2, by `aspace_fault_notification_late_bind.rs`, by
-`death_notification_late_bind.rs`, and by `fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`,
+`SYS_PROCESS_EXIT`, the fault-handler binding syscalls (`SYS_THREAD_SET_FAULT_HANDLER`,
+`SYS_THREAD_GET_FAULT_HANDLER`, and `SYS_THREAD_INHERIT_FAULT_HANDLER`), and the upcall syscalls
+(`SYS_THREAD_POST_UPCALL` and `SYS_THREAD_SET_UPCALL_MASK`) has at least one positive-path test and
+the most important negative paths (wrong rights, invalid arguments, wrong object state). Those are
+exercised in Tier 2, by `aspace_fault_notification_late_bind.rs`, by
+`death_notification_late_bind.rs`, by `fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`,
 `fault_handler_declines_kills.rs`, `fault_handler_rebind.rs`, `fault_class_bindings.rs`, and
-`fault_exception_redirect.rs` respectively. Files are grouped by kernel subsystem, mirroring the
-kernel's own source layout.
+`fault_exception_redirect.rs`, and by `thread_upcall.rs`, respectively. Files are grouped by kernel
+subsystem, mirroring the kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
@@ -141,6 +142,7 @@ concurrent notification and queue events.
 | File | Scenario |
 |---|---|
 | `thread_lifecycle.rs` | Full thread lifecycle: create → configure → start → stop → read\_regs → write\_regs → resume → exit |
+| `thread_upcall.rs` | Asynchronous upcalls, as [docs/fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls) defines: a post to an unstarted thread or one with no upcall handler is refused (`InvalidState`); a yielding thread takes the upcall at a syscall's return with its badge, cookie, and point, and resumes; a post during a delivery is delivered after the reply, and a post to a stopped thread is kept (a second is `QueueFull`) until the start; a syscall-point upcall stays pending on a thread that makes no syscall, refusing a second post (`QueueFull`); an `UPCALL_ANY_INSTRUCTION` upcall reaches a spinning thread at an interrupt's return and redirects it; a masked thread sleeps through a post and takes it at the unmask; a notification wait and a sleep return `Interrupted` and take the upcall; an upcall waits for a held page fault; a stop during a delivery drops it; a call queued on an endpoint and a call awaiting its reply return `Interrupted` and take the upcall, the awaited reply then failing; a post that finds the thread spinning refuses its next park, a notification wait that returns `Interrupted` at once; a cap without `UPCALL` (`InsufficientRights`), an `UPCALL`-only cap's any-instruction post (`InsufficientRights`), an undefined flag (`InvalidArgument`), and a mask argument other than 0 or 1 (`InvalidArgument`) are refused |
 | `stop_read_regs_remote.rs` | A thread spinning in user mode on another CPU is stopped, then its registers are read at once (never refused with `InvalidState`, since the stop returns only once that CPU has descheduled it and published its register save, as [core/kernel/docs/syscalls.md § `SYS_THREAD_READ_REGS`](../kernel/docs/syscalls.md#sys_thread_read_regs-39) defines), its saved instruction pointer lies in its spin code, and a register write redirecting it takes effect on restart, every round (≥ 2 CPUs) |
 | `death_notification_late_bind.rs` | A death observer bound after the thread already died still receives the retained exit reason |
 | `aspace_fault_notification_late_bind.rs` | An address-space terminal-fault observer bound after a thread in that space already faulted still receives the retained fault reason, which `CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (`0` before the fault) |

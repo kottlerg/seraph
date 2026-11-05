@@ -184,7 +184,7 @@ unsafe fn dequeue(
 // ── Endpoint operations ───────────────────────────────────────────────────────
 
 /// Tear down a rendezvous reply linkage whose park commit was refused
-/// (`ParkCommit::RefusedStop`: a concurrent stop or exit; or
+/// (`ParkCommit::RefusedStop`: a concurrent stop or exit, or a pending upcall; or
 /// `ParkCommit::RefusedWake`: a coalesced wake; either refusal cancels the
 /// call): CAS the server's `reply_tcb` back to null (the caller's own dealloc
 /// may have beaten us; if so it owns the teardown). On the CAS win (the
@@ -343,8 +343,9 @@ pub unsafe fn endpoint_call(
         };
         if committed != crate::sched::ParkCommit::Committed
         {
-            // Refused park (stop won, or a stray coalesced wake); tear down
-            // the reply linkage. Either refusal cancels the call.
+            // Refused park (stop won, a pending upcall, or a stray coalesced
+            // wake); tear down the reply linkage. Every refusal cancels the
+            // call.
             // SAFETY: caller / server validated; ep.lock held.
             unsafe { rollback_uncommitted_call(server, caller, parked_state) };
         }
@@ -386,8 +387,8 @@ pub unsafe fn endpoint_call(
     };
     if committed != crate::sched::ParkCommit::Committed
     {
-        // Refused park (stop won, or a stray coalesced wake — either cancels
-        // the call); unlink from the send queue.
+        // Refused park (stop won, a pending upcall, or a stray coalesced wake
+        // — each cancels the call); unlink from the send queue.
         // SAFETY: ep.lock held.
         unsafe {
             let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
@@ -462,7 +463,8 @@ unsafe fn release_unreplied_caller(server: *mut ThreadControlBlock)
 /// waiting (server continues running; sender remains blocked on reply).
 /// Returns `Err(())` if no sender was available (the server is committed
 /// `BlockedOnRecv` on the recv queue, unless the park is refused, in which case
-/// it is unlinked and, on a stop-won refusal, its park is stamped INTERRUPTED).
+/// it is unlinked and, on a stop-won or upcall refusal, its park is stamped
+/// INTERRUPTED).
 ///
 /// # Safety
 /// `ep` and `server` must be valid, and `server` must be the running thread.
@@ -622,7 +624,7 @@ pub unsafe fn endpoint_recv(
     {
         // Refused park; unlink from the recv queue. ep.lock has been held
         // across enqueue/commit/rollback, so the rollback owns the episode.
-        // A stop-won refusal stamps INTERRUPTED so the restarted server's
+        // A stop-won or upcall refusal stamps INTERRUPTED so the server's
         // resume reports the cancellation instead of publishing a stale
         // ipc_msg; a coalesced-wake refusal leaves the deposit standing.
         // SAFETY: ep.lock held.

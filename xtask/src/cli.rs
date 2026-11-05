@@ -248,10 +248,10 @@ pub struct RunArgs
     pub x86_paging: X86Paging,
 
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
-    /// devices behind it. `absent` boots the no-IOMMU variant of the release
-    /// host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's
-    /// unconfined path covered while the attached IOMMU confines every device
-    /// a driver binds.
+    /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu
+    /// device cell of the local and release host runs (docs/testing.md
+    /// "Coverage tiers"), which keeps devmgr's unconfined path covered while
+    /// the attached IOMMU confines every device a driver binds.
     #[arg(long, default_value = "attached")]
     pub iommu: Iommu,
 
@@ -546,10 +546,10 @@ pub struct RunParallelArgs
     pub x86_paging: X86Paging,
 
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
-    /// devices behind it. `absent` boots the no-IOMMU variant of the release
-    /// host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's
-    /// unconfined path covered while the attached IOMMU confines every device
-    /// a driver binds.
+    /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu
+    /// device cell of the local and release host runs (docs/testing.md
+    /// "Coverage tiers"), which keeps devmgr's unconfined path covered while
+    /// the attached IOMMU confines every device a driver binds.
     #[arg(long, default_value = "attached")]
     pub iommu: Iommu,
 

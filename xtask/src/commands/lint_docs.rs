@@ -11,9 +11,9 @@
 //! check only what a script can decide: column widths, header layout, the
 //! `## Summarized By` section's shape and forward links, document
 //! reachability, and that every name docs/testing.md § Coverage tiers lists
-//! for its surface screens still names code or a file in the tree. Whether a
-//! passage is a summary, or any other statement matches the code, stays with
-//! the pre-merge review.
+//! for its surface screens still names code, a file, or a directory in the
+//! tree. Whether a passage is a summary, or any other statement matches the
+//! code, stays with the pre-merge review.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -779,16 +779,24 @@ fn check_direct_links(
 
 // ── md-coverage-symbols ───────────────────────────────────────────────────────
 
-/// The document whose § Coverage tiers lists the CPU-count and memory surfaces
-/// by name (docs/testing.md § Coverage tiers).
+/// The document whose § Coverage tiers lists the CPU-count, memory, and device
+/// surfaces by name (docs/testing.md § Coverage tiers).
 const COVERAGE_DOC: &str = "docs/testing.md";
 
 /// The section heading and the paragraph leads that bound the surface list: from
-/// the Boundary surface paragraph through the Memory surface screen, up to the
+/// the Boundary surface paragraph through the Device surfaces screen, up to the
 /// Repeat count paragraph.
 const COVERAGE_HEADING: &str = "## Coverage tiers";
 const SURFACE_START: &str = "**Boundary surface.**";
 const SURFACE_END: &str = "**Repeat count.**";
+
+/// The lead of the paragraph from which on the list names xtask's own items (the
+/// launcher's disk options), which resolve in `xtask/` sources too.
+const DEVICE_START: &str = "**Device surfaces.**";
+
+/// This rule's own source, whose fixtures name items that exist nowhere else, so
+/// no listed name resolves in it.
+const LINT_SOURCE: &str = "xtask/src/commands/lint_docs.rs";
 
 /// What a listed name must resolve to.
 #[derive(Debug, PartialEq, Eq)]
@@ -798,6 +806,9 @@ enum NameKind
     Symbol,
     /// A tracked file path, `*` matching within one path component.
     Path,
+    /// A tracked directory, written with a trailing `/`, `*` matching within one
+    /// path component: some tracked file lies beneath it.
+    Dir,
 }
 
 /// One name the surface list states.
@@ -808,10 +819,13 @@ struct ListedName
     line: usize,
     /// The name as the diagnostic shows it.
     shown: String,
-    /// For a symbol, the regular expression the name stands for; for a path,
-    /// the path pattern.
+    /// For a symbol, the regular expression the name stands for; for a path or
+    /// a directory, the path pattern.
     pattern: String,
     kind: NameKind,
+    /// Whether the name is stated from the Device surfaces paragraph on, so a
+    /// symbol also resolves in `xtask/` sources other than `LINT_SOURCE`.
+    xtask: bool,
 }
 
 /// The 0-based line range `[start, end)` of the surface list in `text`, or a
@@ -930,11 +944,11 @@ fn expand_groups(alt: &str) -> Vec<String>
 }
 
 /// The names a screen-variable line (`S='a|b'`, `S="$S|c"`, and the same for
-/// `M`) lists, or `None` when the line assigns no screen variable.
+/// `M` and `D`) lists, or `None` when the line assigns no screen variable.
 fn screen_names(line: &str) -> Option<Vec<String>>
 {
     let (var, rest) = line.trim().split_once('=')?;
-    if var != "S" && var != "M"
+    if !["S", "M", "D"].contains(&var)
     {
         return None;
     }
@@ -974,6 +988,18 @@ fn is_path_span(s: &str) -> bool
             .all(|c| c.is_ascii_alphanumeric() || "_-./*".contains(c))
 }
 
+/// Whether `s` is a repository directory, possibly with `*`, written with a
+/// trailing `/` (`services/vfsd/`); a leading `/` is a guest path, not one.
+fn is_dir_span(s: &str) -> bool
+{
+    s.len() > 1
+        && s.ends_with('/')
+        && !s.starts_with('/')
+        && !s.contains("//")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./*".contains(c))
+}
+
 /// The regular expression a prose symbol span stands for.
 fn prose_symbol_pattern(s: &str) -> String
 {
@@ -985,38 +1011,49 @@ fn prose_symbol_pattern(s: &str) -> String
 }
 
 /// Every name the surface list of `text` states, from the prose code spans,
-/// the screen variables, and the whole-surface file paths inside the screens.
+/// the screen variables, and the whole-surface file and directory paths inside
+/// the screens. A name stated from the `DEVICE_START` paragraph on is marked
+/// `xtask`.
 fn listed_names(text: &str) -> std::result::Result<Vec<ListedName>, String>
 {
     let (start, end) = surface_range(text)?;
     let mut names = Vec::new();
     let mut in_fence = false;
+    let mut in_devices = false;
     let mut spans = CodeSpans::default();
     for (idx, line) in text.lines().enumerate().take(end).skip(start)
     {
-        if line.trim_start().starts_with("```")
+        if !in_fence && line.starts_with(DEVICE_START)
+        {
+            in_devices = true;
+        }
+        let found = if line.trim_start().starts_with("```")
         {
             in_fence = !in_fence;
+            Vec::new()
         }
         else if in_fence
         {
-            names.extend(fenced_names(idx + 1, line));
+            fenced_names(idx + 1, line)
         }
         else
         {
-            names.extend(
-                spans
-                    .read(idx + 1, line)
-                    .into_iter()
-                    .filter_map(|(at, content)| prose_name(at, &content)),
-            );
-        }
+            spans
+                .read(idx + 1, line)
+                .into_iter()
+                .filter_map(|(at, content)| prose_name(at, &content))
+                .collect()
+        };
+        names.extend(found.into_iter().map(|name| ListedName {
+            xtask: in_devices,
+            ..name
+        }));
     }
     Ok(names)
 }
 
 /// The names one line inside a screen fence states: a screen variable's
-/// alternatives, or the `.rs` paths among its words.
+/// alternatives, or the `.rs` paths and the directories among its words.
 fn fenced_names(line_no: usize, line: &str) -> Vec<ListedName>
 {
     if let Some(found) = screen_names(line)
@@ -1028,17 +1065,32 @@ fn fenced_names(line_no: usize, line: &str) -> Vec<ListedName>
                 shown: p.clone(),
                 pattern: p,
                 kind: NameKind::Symbol,
+                xtask: false,
             })
             .collect();
     }
     line.split_whitespace()
         .map(|token| token.trim_matches(|c| c == '\'' || c == '"'))
-        .filter(|token| is_path_span(token))
-        .map(|token| ListedName {
-            line: line_no,
-            shown: token.to_owned(),
-            pattern: token.to_owned(),
-            kind: NameKind::Path,
+        .filter_map(|token| {
+            let kind = if is_path_span(token)
+            {
+                NameKind::Path
+            }
+            else if is_dir_span(token)
+            {
+                NameKind::Dir
+            }
+            else
+            {
+                return None;
+            };
+            Some(ListedName {
+                line: line_no,
+                shown: token.to_owned(),
+                pattern: token.to_owned(),
+                kind,
+                xtask: false,
+            })
         })
         .collect()
 }
@@ -1095,6 +1147,10 @@ fn prose_name(line: usize, content: &str) -> Option<ListedName>
     {
         (NameKind::Path, content.to_owned())
     }
+    else if is_dir_span(content)
+    {
+        (NameKind::Dir, content.to_owned())
+    }
     else if is_symbol_span(content)
     {
         (NameKind::Symbol, prose_symbol_pattern(content))
@@ -1108,6 +1164,7 @@ fn prose_name(line: usize, content: &str) -> Option<ListedName>
         shown: content.to_owned(),
         pattern,
         kind,
+        xtask: false,
     })
 }
 
@@ -1143,6 +1200,17 @@ fn path_resolves(pattern: &str, tracked: &[String]) -> bool
     })
 }
 
+/// Whether the directory pattern `pattern` (a trailing `/`, `*` within one
+/// component) names a tracked directory: some tracked file lies beneath it.
+fn dir_resolves(pattern: &str, tracked: &[String]) -> bool
+{
+    let want: Vec<&str> = pattern.trim_end_matches('/').split('/').collect();
+    tracked.iter().any(|path| {
+        let have: Vec<&str> = path.split('/').collect();
+        have.len() > want.len() && want.iter().zip(&have).all(|(w, h)| glob_matches(w, h))
+    })
+}
+
 /// Whether `name` matches `glob`, where `*` matches any run of characters and
 /// every other character matches itself.
 fn glob_matches(glob: &str, name: &str) -> bool
@@ -1166,7 +1234,7 @@ fn symbol_resolves(pattern: &str, code: &str) -> std::result::Result<bool, regex
 }
 
 /// Why `name` fails to resolve, or `None` when it resolves.
-fn unresolved(name: &ListedName, code: &str, tracked: &[String]) -> Option<String>
+fn unresolved(name: &ListedName, code: &Code, tracked: &[String]) -> Option<String>
 {
     match name.kind
     {
@@ -1174,25 +1242,56 @@ fn unresolved(name: &ListedName, code: &str, tracked: &[String]) -> Option<Strin
         {
             (!path_resolves(&name.pattern, tracked)).then(|| "names no tracked file".to_owned())
         }
-        NameKind::Symbol => match symbol_resolves(&name.pattern, code)
+        NameKind::Dir =>
         {
-            Ok(true) => None,
-            Ok(false) => Some("names nothing in the code of a tracked Rust source".to_owned()),
-            // A syntax error renders as the pattern, a caret line, and the
-            // reason; the reason is the last line.
-            Err(err) => Some(format!(
-                "is not a valid regular expression ({})",
-                err.to_string().lines().last().unwrap_or_default().trim()
-            )),
-        },
+            (!dir_resolves(&name.pattern, tracked)).then(|| "names no tracked directory".to_owned())
+        }
+        NameKind::Symbol =>
+        {
+            match symbol_resolves(&name.pattern, &code.outside_xtask).and_then(|found| {
+                if found || !name.xtask
+                {
+                    Ok(found)
+                }
+                else
+                {
+                    symbol_resolves(&name.pattern, &code.xtask)
+                }
+            })
+            {
+                Ok(true) => None,
+                Ok(false) if name.xtask => Some(
+                    "names nothing in the code of a tracked Rust source (xtask's included)"
+                        .to_owned(),
+                ),
+                Ok(false) => Some("names nothing in the code of a tracked Rust source".to_owned()),
+                // A syntax error renders as the pattern, a caret line, and the
+                // reason; the reason is the last line.
+                Err(err) => Some(format!(
+                    "is not a valid regular expression ({})",
+                    err.to_string().lines().last().unwrap_or_default().trim()
+                )),
+            }
+        }
     }
+}
+
+/// The Rust code a listed symbol resolves in, `//` comments stripped.
+struct Code
+{
+    /// Every tracked Rust source outside `xtask/`.
+    outside_xtask: String,
+    /// Every tracked Rust source in `xtask/` but `LINT_SOURCE`.
+    xtask: String,
 }
 
 /// The listed names of docs/testing.md § Coverage tiers resolve: every symbol
 /// the surface list names matches, as a whole word, the code of a tracked Rust
-/// source outside `xtask/` with `//` comments stripped, and every listed path
-/// names a tracked file. A name left only in a `//` comment, or in a file that
-/// is gone, is one the screen can no longer find.
+/// source outside `xtask/` with `//` comments stripped, or, for a name stated
+/// from the Device surfaces paragraph on, that of one in `xtask/` other than
+/// this rule's own; every listed path names a tracked file, and every listed
+/// directory a tracked directory. A name left only in a `//` comment, or in a
+/// file that is gone, is one the screen can no longer find.
 fn check_coverage_symbols(
     markdown: &[&SourceFile],
     sources: &[&SourceFile],
@@ -1215,11 +1314,21 @@ fn check_coverage_symbols(
         Ok(names) => names,
         Err(message) => return vec![Diagnostic::new(rule, COVERAGE_DOC, 1, message)],
     };
-    let code: String = sources
-        .iter()
-        .filter(|f| has_ext(&f.path, "rs") && !f.path.starts_with("xtask/"))
-        .map(|f| strip_line_comments(&f.text))
-        .collect();
+    let rust = |in_xtask: bool| -> String {
+        sources
+            .iter()
+            .filter(|f| {
+                has_ext(&f.path, "rs")
+                    && f.path.starts_with("xtask/") == in_xtask
+                    && f.path != LINT_SOURCE
+            })
+            .map(|f| strip_line_comments(&f.text))
+            .collect()
+    };
+    let code = Code {
+        outside_xtask: rust(false),
+        xtask: rust(true),
+    };
     names
         .iter()
         .filter_map(|name| {
@@ -1618,6 +1727,7 @@ mod tests
                  // only_in_a_comment is named here and nowhere else.\n",
             ),
             md("xtask/src/x.rs", "fn only_in_xtask() {}\n"),
+            md(LINT_SOURCE, "fn only_in_the_lint() {}\n"),
         ]
     }
 
@@ -1632,6 +1742,8 @@ mod tests
             "core/b/x86_tramp_entry.rs",
             "core/b/x86_trampoline.S",
             "xtask/src/x.rs",
+            LINT_SOURCE,
+            "services/blk/src/main.rs",
         ]
         .map(str::to_owned)
         .to_vec();
@@ -1797,5 +1909,73 @@ mod tests
         let diags = coverage_check(&doc);
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(diags[0].1.contains("**Repeat count.**"), "{}", diags[0].1);
+    }
+
+    /// `coverage_doc` with a Device surfaces paragraph naming `prose` and a
+    /// screen naming `screen` before its Repeat count paragraph.
+    fn device_doc(prose: &str, screen: &str) -> SourceFile
+    {
+        let doc = coverage_doc("", "");
+        md(
+            COVERAGE_DOC,
+            &doc.text.replace(
+                "**Repeat count.**",
+                &format!(
+                    "**Device surfaces.** The surface is{prose}.\n\n```sh\n{screen}\n```\n\n\
+                     **Repeat count.**"
+                ),
+            ),
+        )
+    }
+
+    #[test]
+    fn coverage_xtask_name_resolves_only_from_the_device_surfaces_paragraph_on()
+    {
+        assert!(coverage_check(&device_doc(" `only_in_xtask`", "D='only_in_xtask'")).is_empty());
+        let diags = coverage_check(&coverage_doc(" `only_in_xtask`,", ""));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].1.contains("`only_in_xtask`"), "{}", diags[0].1);
+    }
+
+    #[test]
+    fn coverage_device_name_only_in_the_lint_source_or_gone_is_reported()
+    {
+        let diags = coverage_check(&device_doc(
+            " `only_in_the_lint`",
+            "D='MAX_WIDTH|renamed_away'",
+        ));
+        let shown: Vec<&str> = diags.iter().map(|d| d.1.as_str()).collect();
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown[0].contains("`only_in_the_lint`"), "{}", shown[0]);
+        assert!(
+            shown[1].contains("`renamed_away`") && shown[1].contains("xtask's included"),
+            "{}",
+            shown[1]
+        );
+    }
+
+    #[test]
+    fn coverage_directory_resolves_when_a_tracked_file_lies_beneath_it()
+    {
+        let doc = device_doc(
+            " `services/blk/`, `services/*/src/`, `services/gone/`, `services/blk/src/main.rs/`, \
+             `/config/guest/`",
+            "git diff --stat \"$B\" <head> -- services/blk/ core/moved/",
+        );
+        let diags = coverage_check(&doc);
+        let shown: Vec<&str> = diags.iter().map(|d| d.1.as_str()).collect();
+        assert_eq!(shown.len(), 3, "{shown:?}");
+        assert!(
+            shown[0].contains("`services/gone/`")
+                && shown[0].contains("names no tracked directory"),
+            "{}",
+            shown[0]
+        );
+        assert!(
+            shown[1].contains("`services/blk/src/main.rs/`"),
+            "{}",
+            shown[1]
+        );
+        assert!(shown[2].contains("`core/moved/`"), "{}", shown[2]);
     }
 }

@@ -188,7 +188,9 @@ the physical bases of the Memory caps it holds
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 3).
 procmgr retypes every child's address space, a phys-class child's included, through a
 derivation of its slab without `RIGHTS_MEM_PHYS`, so no child's address space carries
-`RIGHTS_AS_READ` and procmgr, which keeps it for the child's life, cannot translate its pages.
+`RIGHTS_AS_READ` and procmgr, which keeps it for the child's life, cannot translate its pages;
+devmgr, the phys-class child every boot creates, checks its own at startup and halts when it
+carries the right.
 procmgr honours it only from a creator that is phys-class itself: an un-badged one
 (badge 0: init, or svcmgr's mint source) or one whose memmgr badge carries
 `memmgr_labels::PHYS_CLASS_BADGE_BIT`; from any other it replies `INVALID_ARGUMENT` before any

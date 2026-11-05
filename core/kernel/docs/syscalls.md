@@ -996,8 +996,8 @@ with such a thread bound (see [scheduling-internals.md](scheduling-internals.md)
 the call does not return, or, when the deleter is itself stopped and the teardown is deferred, the
 deferred drain on its CPU never completes. An object another thread's syscall is still using is not
 freed under it: the syscall holds a pin on it until it drops it (see
-[capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
-Two-Level Radix), and a stopped thread's teardown reaches the IPC source it was parked on only
+[capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage: Hybrid
+Radix Directory), and a stopped thread's teardown reaches the IPC source it was parked on only
 through a binding that proves the source live (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
 `dealloc_object(Thread)` Drain Protocol, step 11); a waker that claimed the thread holds the source
@@ -1674,8 +1674,8 @@ If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 The call writes `cpu_affinity`, reads the target's `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, so the decision cannot race another CPU's scheduler
 path. The target Thread is pinned for the call
-([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix), so a concurrent delete of its last capability frees it only after the call
+([capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage:
+Hybrid Radix Directory), so a concurrent delete of its last capability frees it only after the call
 returns.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
@@ -1796,8 +1796,8 @@ handler bound the fault is terminal. See
 Binding takes a reference on the endpoint object for the binding's lifetime; rebinding, unbinding,
 or thread destruction releases it (see [fault-handling.md](../../../docs/fault-handling.md) §
 Liveness). The target Thread and the endpoint are pinned for the call
-([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix), so a concurrent delete of either one's last capability frees it only
+([capability-internals.md](capability-internals.md#storage-hybrid-radix-directory) § Storage:
+Hybrid Radix Directory), so a concurrent delete of either one's last capability frees it only
 after the binding is published. The endpoint and its badge are published as one unit under the
 target thread's `sched_lock`; fault delivery reads them once under the same lock and pins the
 endpoint until the faulting thread parks, so a concurrent rebind or unbind neither pairs one
@@ -2267,7 +2267,7 @@ pool page. Leaves grown for a placement that then fails — the target slot
 turns out to be occupied, or a concurrent pool consumer starves the final
 grow — stay behind as ordinary free capacity, and the pool pages they
 consumed stay spent (see [capability-internals.md](capability-internals.md) § Storage:
-Hybrid Two-Level Radix).
+Hybrid Radix Directory).
 
 **Capability requirements:** `src_cap` (any non-null capability; no right is checked),
 `dst_cspace_cap` (Insert).

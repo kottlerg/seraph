@@ -621,7 +621,7 @@ Otherwise, by target state:
 The syscall writes `cpu_affinity`, reads `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, and prods the acting CPU after releasing it.
 `lookup_cap` pins the target Thread for the call (see
-[capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix), so a
+[capability-internals.md](capability-internals.md) § Storage: Hybrid Radix Directory), so a
 concurrent delete of its last capability frees it only after the call returns.
 
 ### Soft Affinity

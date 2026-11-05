@@ -9,7 +9,7 @@
 //!
 //! The kernel keeps these private (`L1_DIRECT`, `L1_INDIRECT` and `DIR_FANOUT`
 //! in core/kernel/src/cap/cspace.rs; core/kernel/docs/capability-internals.md
-//! § Storage: Hybrid Two-Level Radix), so ktest holds this one copy, listed
+//! § Storage: Hybrid Radix Directory), so ktest holds this one copy, listed
 //! under docs/limits.md § Cross-Cutting Findings, Unpinned couplings. Each leaf
 //! holds `syscall_abi::CSPACE_SLOTS_PER_PAGE` slots, the ABI's asserted copy of
 //! the kernel's `L2_SIZE`.

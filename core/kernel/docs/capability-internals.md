@@ -32,7 +32,7 @@ From [docs/capability-model.md](../../../docs/capability-model.md) § Capability
   with its own Memory caps, so per-process kernel memory is bounded by
   what the process paid for
 
-### Storage: Hybrid Two-Level Radix
+### Storage: Hybrid Radix Directory
 
 The CSpace is a hybrid radix: an inline root of leaf pointers plus
 pool-allocated directory pages fanning out to further leaves (similar to a
@@ -1017,7 +1017,7 @@ Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with the
 **in-flight pin** (`CapabilitySlot::pinned`, stored in the slot's `pin` byte, written only under
 the derivation write lock and read under it by every path that acts on it; the advisory
-pre-checks of [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix) read it
+pre-checks of [§ Storage: Hybrid Radix Directory](#storage-hybrid-radix-directory) read it
 without that lock, and their locked path re-decides; a move pins its source and destination
 the same way — see [Move](#move)). `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
@@ -1046,7 +1046,7 @@ nothing below runs now: the object is queued for off-CPU reclaim and the whole a
 deferred drain once the thread has been scheduled away. The same discipline applies to an
 `AddressSpace` reaching refcount zero. A syscall on another thread that still uses a `Thread`,
 `CSpace`, or `AddressSpace` it resolved holds a syscall pin on it, so the count cannot reach zero
-under that syscall (see [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)); and
+under that syscall (see [§ Storage: Hybrid Radix Directory](#storage-hybrid-radix-directory)); and
 the stops' cancellations, like a dying thread's own drain, reach the IPC source a stopped thread
 was parked on only through its binding, re-read under the thread's `sched_lock`, which proves the
 source not yet freed (see
@@ -1234,7 +1234,7 @@ recycle slot indices, that freed index would then alias an unrelated live object
 Per-slot generation handles keep a stale handle from aliasing a recycled slot after a
 cross-`CSpace` revoke, and a syscall already in flight on the object holds a pin that keeps
 the object live until the syscall drops it (see
-[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)). Both forms
+[§ Storage: Hybrid Radix Directory](#storage-hybrid-radix-directory)). Both forms
 of cross-`CSpace` sharing keep a derivation edge across the boundary:
 
 - **IPC capability transfer / `SYS_CAP_MOVE`** hand the cap to the recipient and

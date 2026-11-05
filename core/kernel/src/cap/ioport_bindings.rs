@@ -72,6 +72,11 @@ const _: () = assert!(core::mem::size_of::<IoPortBindings>() <= crate::mm::PAGE_
 /// parts.
 pub const TABLE_PAGES: usize = 1 + IOPB_PARTS;
 
+// The ABI publishes the most pages a table takes for userspace funding
+// arithmetic (`IOPORT_BINDING_TABLE_PAGES`); no architecture's table may take
+// more.
+const _: () = assert!(TABLE_PAGES as u64 <= syscall::IOPORT_BINDING_TABLE_PAGES);
+
 /// A bind the table cannot record.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TableFull;

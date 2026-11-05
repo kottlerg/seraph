@@ -630,6 +630,20 @@ pub const CSPACE_IPC_RECV_RESERVE: u64 = MSG_CAP_SLOTS_MAX as u64;
 /// directory page past the direct region).
 pub const CSPACE_SLOTS_PER_PAGE: u64 = 56;
 
+/// Capability bodies one page of a `CSpace`'s body arena holds: the objects a
+/// split, an `Mmio`, `IoPort`, or `Interrupt` copy or derivation, or a spilled
+/// `Mmio` mapping record funded by the `CSpace` needs, one 128-byte chunk
+/// each, past the page's header chunk. Each arena page spends one page of
+/// [`CAP_INFO_CSPACE_BUDGET`]; a funder that knows how many bodies it will
+/// make sizes its donation with this.
+pub const CSPACE_BODIES_PER_PAGE: u64 = 31;
+
+/// Most pages of a `CSpace`'s growth budget ([`CAP_INFO_CSPACE_BUDGET`]) a
+/// thread's first `ioport_bind` takes for its port-binding table: the table's
+/// page and the two pages of the x86-64 I/O permission bitmap. No thread binds
+/// on RISC-V.
+pub const IOPORT_BINDING_TABLE_PAGES: u64 = 3;
+
 /// Pages to donate to a `CSpace` (augment-mode `cap_create_cspace`) so that it
 /// holds `slots` general slots of headroom and, beyond them, one page of growth
 /// budget for its body arena; zero when it already does.

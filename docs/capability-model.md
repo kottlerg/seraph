@@ -65,7 +65,7 @@ index, when the wrapped generation matches again.
 The index field is wider than any `CSpace` the kernel builds: the structural slot
 ceiling is the kernel's directory geometry
 ([capability-internals.md](../core/kernel/docs/capability-internals.md) § Storage:
-Hybrid Two-Level Radix), which the kernel asserts fits the field, so a deeper
+Hybrid Radix Directory), which the kernel asserts fits the field, so a deeper
 directory raises the ceiling with no handle change.
 
 A never-recycled slot has generation 0, so its handle is numerically identical to
@@ -602,8 +602,8 @@ hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.m
 § Capability Transfer in IPC. A syscall already in flight on the object holds a reference on it
 until the syscall stops using it, so the revoke frees the object only after that syscall is done
 with it (see
-[capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix).
+[capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
+§ Storage: Hybrid Radix Directory).
 
 ---
 
@@ -745,7 +745,7 @@ code at the failure site:
 - **Structural ceiling** — the slot directory is full. Returns
   `QuotaExceeded` (-17); a shape-derived bound (see
   [capability-internals.md](../core/kernel/docs/capability-internals.md)
-  § Storage: Hybrid Two-Level Radix) that no memory donation can lift.
+  § Storage: Hybrid Radix Directory) that no memory donation can lift.
 
 Both bounds meet general allocations first: every `CSpace` keeps its
 last `CSPACE_IPC_RECV_RESERVE` free slots (one message's
@@ -851,8 +851,8 @@ records a mapping into that `AddressSpace`, in which case the stop follows when 
 freed; see [Mmio](#mmio)). The process's resources are
 reclaimed as their capability reference counts reach zero; an object another thread's syscall is
 still using is freed only once that syscall is done with it (see
-[capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix and
+[capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
+§ Storage: Hybrid Radix Directory and
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
 § `dealloc_object(Thread)` Drain Protocol, step 11).
 

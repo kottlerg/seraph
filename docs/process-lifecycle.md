@@ -441,8 +441,8 @@ A process dies when:
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent
 syscall is still using is freed only once that syscall is done with it, and a stopped thread's
 teardown reaches the IPC source it was parked on only while that source is live (see
-[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix and
+[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
+§ Storage: Hybrid Radix Directory and
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
 § `dealloc_object(Thread)` Drain Protocol, step 11); a waker that claimed the thread (device IRQ
 delivery, fault delivery, a death post) keeps that source live until its wake completes.

@@ -755,7 +755,7 @@ removes the member, clears the back-pointer, and `dec_ref`s the source's
 prevents a concurrent notification from referencing a removed member. Both handlers
 resolve the source capability through `syscall::pin_slot`, which pins the source for
 the call (see
-[capability-internals.md § Storage: Hybrid Two-Level Radix](capability-internals.md#storage-hybrid-two-level-radix)),
+[capability-internals.md § Storage: Hybrid Radix Directory](capability-internals.md#storage-hybrid-radix-directory)),
 so a concurrent delete or ancestor revoke of that capability mid-call never makes the
 membership's `dec_ref` the last: the source is freed, if at all, when the handler drops
 its pin after releasing the locks.

@@ -36,13 +36,15 @@ The fixture samples two quantities: its populated slot count, read with
 free-bytes word and returns `None` when memmgr is unreachable. It runs in three phases:
 
 1. **Warm-up.** Eight spawn-and-join iterations bring the reaper's first death queue, the
-   pooled object slabs, and the page-table budget to steady state. A held burst follows: the
-   fixture funds its `CSpace` with `BURST_SLOTS_PER_THREAD` (8) slots per burst thread (thread
-   spawn does not grow the `CSpace`), then `HELD_BURST` (128) detached threads each wait on
-   one barrier until all are spawned, so all are bound at once, past the reaper's first
-   99-node death queue and past 64 slots. Once released, a 100 ms sleep and 16 spawn-and-join
-   iterations reap them, and the slot count must be within `BURST_SLACK` (8) of its value
-   before the burst. Then the baseline slot count and free pool are sampled.
+   pooled object slabs, and the page-table budget to steady state. A held burst follows:
+   `HELD_BURST` (128) detached threads each wait on one barrier until all are spawned, so all
+   are bound at once, past the reaper's first 99-node death queue and past 64 slots. The
+   fixture does not fund its `CSpace` first: the burst's caps outgrow the `CSpace` procmgr
+   seeds, so a spawn is refused unless thread spawn tops the `CSpace` up itself
+   ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § CSpace slot headroom).
+   Once released, a 100 ms sleep and 16 spawn-and-join iterations reap them, and the slot
+   count must be within `BURST_SLACK` (8) of its value before the burst. Then the baseline
+   slot count and free pool are sampled.
 2. **Join churn.** `JOIN_CHURN` (600) spawn-and-join iterations, logging a progress line every
    25, then a slot sample.
 3. **Detach churn.** `DETACH_BATCH` (128) threads are spawned and their handles dropped at once,
@@ -78,7 +80,6 @@ failed bound or a refused burst:
 | Line | When |
 |---|---|
 | `threadchurn: PASS slot growth <g> within slack 4` | Every bound held |
-| `threadchurn: FAIL CSpace funding for the held burst` | The `CSpace` could not be funded for the held burst; no bound is checked |
 | `threadchurn: FAIL held-burst spawn <n> refused` | The held burst's `n`th spawn failed; no bound is checked |
 | `threadchurn: FAIL held-burst slot growth <g> exceeds 8` | The held-burst bound failed; the later bounds are not checked |
 | `threadchurn: FAIL slot growth <g> exceeds slack 4` | The held-burst bound held and the slot bound failed; the pool bound is not checked |

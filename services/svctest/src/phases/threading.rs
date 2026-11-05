@@ -9,10 +9,12 @@
 //! spawned thread's identity and park/unpark through its handle, `RwLock`
 //! wakes for several queued readers and its non-blocking paths, `Condvar`
 //! `notify_all` and `Once` completion waking every queued waiter, a timed
-//! `Condvar` waiter leaving the middle of the queue, and
-//! `Condvar::wait_timeout`.
+//! `Condvar` waiter leaving the middle of the queue, `Condvar::wait_timeout`,
+//! and spawn-time placement through `BuilderExt::spawn_at_priority`.
 
 use std::cell::Cell;
+use std::io;
+use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
@@ -68,6 +70,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "timeout",
             run: timeout_phase,
+        },
+        Phase {
+            name: "spawn_at_priority",
+            run: spawn_at_priority_phase,
         },
     ]
 }
@@ -567,6 +573,56 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
         w.join().expect("condvar untimed waiter panicked");
     }
     std::os::seraph::log!("condvar_timed_middle_waiter phase passed");
+}
+
+/// `BuilderExt::spawn_at_priority` refuses a level of 0 before any spawn and
+/// fails a level above the band at the kernel's refusal, and neither leaves
+/// the thread-local spawn level behind: a plain `Builder::spawn` after both
+/// places its child at the process's own level and runs, where a stale level
+/// above the band would make the kernel refuse it too. A level within the
+/// band spawns and runs.
+pub fn spawn_at_priority_phase(_: &Caps)
+{
+    // svctest.svc gives svctest `priority = 10` and `sched_max = 10`: the band
+    // is [1, 10] and its initial thread runs at its top.
+    const BAND_MAX: u8 = 10;
+    let info = std::os::seraph::startup_info();
+    assert_ne!(
+        info.sched_control_cap, 0,
+        "svctest holds no SchedControl cap"
+    );
+    assert_eq!(
+        info.initial_priority, BAND_MAX,
+        "svctest's initial level is not its recipe's"
+    );
+
+    match thread::Builder::new().spawn_at_priority(0, || ())
+    {
+        Err(e) => assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidInput,
+            "level 0 refused with the wrong kind: {e}"
+        ),
+        Ok(_) => panic!("spawn_at_priority(0) spawned a thread"),
+    }
+    assert!(
+        thread::Builder::new()
+            .spawn_at_priority(BAND_MAX + 1, || ())
+            .is_err(),
+        "spawn_at_priority({}) above the band spawned a thread",
+        BAND_MAX + 1
+    );
+
+    let plain = thread::Builder::new()
+        .spawn(|| 7u32)
+        .expect("plain spawn after the refusals failed: stale spawn level");
+    assert_eq!(plain.join().expect("plain child panicked"), 7);
+
+    let within = thread::Builder::new()
+        .spawn_at_priority(5, || 5u32)
+        .expect("spawn_at_priority(5) within the band failed");
+    assert_eq!(within.join().expect("level-5 child panicked"), 5);
+    std::os::seraph::log!("spawn_at_priority phase passed");
 }
 
 pub fn timeout_phase(_: &Caps)

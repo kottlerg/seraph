@@ -31,7 +31,8 @@ services/svctest/
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding;
         │                      # object-slab release; deferred reclaim; identity
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
-        ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives
+        ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
+        │                      # spawn priority
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
         │                      # death queues; logd death forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults

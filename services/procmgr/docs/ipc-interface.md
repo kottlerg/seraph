@@ -194,7 +194,9 @@ success procmgr creates the child's initial thread at the resolved priority
 `cap_copy` of the baseline for a full-width band, copy-then-`SYS_SCHED_SPLIT`
 for a narrowed one — into `ProcessInfo.sched_control_cap`, and records the
 resolved priority in `ProcessInfo.initial_priority` so the runtime spawns
-further threads at the same level.
+further threads at the same level by default, unless
+`std::os::seraph::thread::BuilderExt::spawn_at_priority` places one
+elsewhere in the band.
 
 ### Label 2: `START_PROCESS`
 
@@ -399,8 +401,8 @@ child, its memmgr record included, as for `CREATE_PROCESS`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
+| 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed (the TLS block's checks aside; see `OUT_OF_MEMORY`) |
+| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the main thread's TLS block could not be built (whatever the cause: an oversized or overaligned `PT_TLS`, a short `.tdata` read, or a mapping), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` or `CREATE_ARGV_ENV` set without a cap of its own, reserved label bits `[30..64]` set, the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed, an `FS_READ` of the ELF header against procmgr's open failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |

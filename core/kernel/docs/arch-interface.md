@@ -50,7 +50,7 @@ core/kernel/src/arch/
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-    └── encoding.rs # PLIC map, SBI hart mask, F/D/V opcode decode; no arch-module deps
+    └── encoding.rs # PLIC, SBI mask, F/D/V, page rounding, PTE permissions; no arch-module deps
 ```
 
 `arch/mod.rs` performs the conditional compilation, and also defines the one type it holds
@@ -330,19 +330,23 @@ pub unsafe fn unmap_identity_page(pa: u64);
 /// that maps it into a leaf table of the same translation built in the frame
 /// `take_table` returns. `NotMapped` when the direct map does not map `virt`,
 /// `OutOfFrames` when a split finds no frame. The caller serialises every
-/// direct-map edit and flushes the TLB.
+/// direct-map edit and makes stale translations of the page harmless before
+/// the guard's thread runs: a local flush while only the boot CPU runs, or the
+/// guard epoch after SMP bringup (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn hole_direct_map_page(
     virt: u64,
     take_table: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(), PagingError>;
 
-/// Map the direct-map page at `virt` to `phys` again, closing a hole. The
-/// caller flushes every CPU before the page is reused when
-/// `CACHES_NOT_PRESENT_ENTRIES` holds.
+/// Map the direct-map page at `virt` to `phys` again, closing a hole. When
+/// `CACHES_NOT_PRESENT_ENTRIES` holds, the caller flushes this CPU; another
+/// CPU that kept the not-present entry flushes before it runs a thread whose
+/// stack the page becomes, or takes the riscv64 S-mode spurious-fault retry
+/// on any other use (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64);
 
 /// Whether a CPU may cache a not-present entry, so that a page made present
-/// again needs a flush on every CPU before another reaches it: `false` on
+/// again can fault on a CPU that kept it until that CPU flushes: `false` on
 /// x86-64, `true` on RISC-V (no Svvptc requirement).
 pub const CACHES_NOT_PRESENT_ENTRIES: bool;
 

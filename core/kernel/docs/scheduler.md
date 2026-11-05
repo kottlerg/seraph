@@ -320,8 +320,9 @@ context_switch(current_tcb, next_tcb):
 
     // 1b. Flush this CPU's whole TLB when next_tcb's kernel-stack guard was
     //     holed after this CPU's last guard flush, so no stale translation of
-    //     the guard page outlives the switch (memory-internals.md § Kernel
-    //     Stack Guards).
+    //     the guard page outlives the switch, nor a stale not-present entry
+    //     of a page filled before the hole, such as next_tcb's own kernel
+    //     stack (memory-internals.md § Kernel Stack Guards).
     mm::stack_guard::flush_before_run(next_tcb.guard_epoch)
 
     // 2. Switch address space if different.

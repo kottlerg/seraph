@@ -36,6 +36,7 @@ use crate::cli::TestKaslrArgs;
 use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
+use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, Iommu, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware,
     validate_sysroot_for_launch,
@@ -90,7 +91,7 @@ impl Guest
             firmware_vars_path: firmware_vars,
             cpus: args.cpus,
             mem_mib: args.mem,
-            headless: true,
+            display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: None,
             // x86-64 launches exercise the snapshot-reseed consumer by default;

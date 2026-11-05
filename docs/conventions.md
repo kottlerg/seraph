@@ -378,8 +378,8 @@ gives the PR-level linear view.
   it MUST say so (see [testing.md](testing.md#coverage-tiers)).
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
-  boundary run, the memory variation, and each device cell: the storage cells
-  and the no-IOMMU variant, per architecture), with its `--runs` count, its
+  boundary run, the memory variation, and each device cell: the storage cells,
+  the no-IOMMU variant, and the framebuffer cell, per architecture), with its `--runs` count, its
   outcome, and the head it ran at (a run the PR does not owe that HANGs or
   fails as that section allows, with the link to its record), or state that
   none is owed and why (that the PR's changes outside Markdown are all inert,
@@ -410,9 +410,10 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    128 harts, x86_64 16 and 128 vCPUs) three times each in the debug profile
    and once each in the release profile, and the memory
    variation, the disk variations (a 4Kn disk and three second-disk boots,
-   on both architectures), and the no-IOMMU variant (`--iommu absent`,
-   svctest, on both architectures) once each. When they pass, tag it and push the
-   tag:
+   on both architectures), the no-IOMMU variant (`--iommu absent`, svctest,
+   on both architectures), and the framebuffer cell (`--display framebuffer`,
+   svctest, on both architectures) once each. When they pass, tag it and push
+   the tag:
    `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
 5. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
    `release.yml` aborts the run before any image is built if the workspace

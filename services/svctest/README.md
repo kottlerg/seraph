@@ -143,9 +143,11 @@ framebuffer driver's endpoint badged with none of the driver's verb bits. That p
 `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
 `INPUT_READ_EVENTS` (at once, without blocking for a key), and to `FB_WRITE_BYTES` and
 `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr runs none and the
-framebuffer case logs a skip. The input case also logs a skip when `terminal.svc` is staged: the
-input driver serves one request at a time and the terminal keeps a blocking read pending, so the
-deny would wait behind it for a keypress. `caps[4]` and `caps[5]` are SENDs on vfsd's service
+framebuffer case logs a skip, which the framebuffer device cell
+([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The input
+case also logs a skip when `terminal.svc` is staged: the input driver serves one request at a time
+and the terminal keeps a blocking read pending, so the deny would wait behind it for a keypress.
+`caps[4]` and `caps[5]` are SENDs on vfsd's service
 endpoint, badged `MOUNT_AUTHORITY` and the no-authority `DENY_BADGE`
 (services/vfsd/docs/vfs-ipc-interface.md § Endpoint). The vfsd phases require an `UNAUTHORIZED`
 reply to `MOUNT` on `caps[5]` with nothing mounted; a `TABLE_FULL` reply on `caps[4]` to `MOUNT` of

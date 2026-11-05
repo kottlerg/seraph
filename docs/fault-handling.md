@@ -239,8 +239,8 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   when next started, the thread resumes on a `FAULT_REPLY_RESUME` reply, and the fault is unhandled
   on a `FAULT_REPLY_KILL` reply. Destroying it while stopped ends it as for any stopped
   thread. A cancelled fault-blocked thread is never resumed at its faulting instruction: a thread
-  whose own access faulted is killed when next started, and one whose kernel copy faulted has
-  that syscall fail.
+  whose own access faulted is killed (a stopped one when next started), and one whose kernel
+  copy faulted has that syscall fail.
 
 ### Modifying the faulting thread
 
@@ -323,11 +323,10 @@ the handler.
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
    releases any fault-blocked thread awaiting that handler, leaving its fault unhandled (the
    [Kill](#delivery-resume-and-kill) path: the thread is killed, or its kernel copy's syscall
-   fails), as does a later receive on the handler thread while
-   the fault-blocked thread's reply is still pending (a receive that passes its capability and
-   headroom checks; see [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that
-   only exits, or is stopped `Exited` by an object teardown, keeps its pending fault reply until
-   it is destroyed.
+   fails), as does a later receive on the handler thread while the fault-blocked thread's reply
+   is still pending (a receive that passes its capability and headroom checks; see
+   [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that only exits, or is
+   stopped `Exited` by an object teardown, keeps its pending fault reply until it is destroyed.
 3. A faulting thread blocked on a handler endpoint that has not yet received is released if
    that endpoint is destroyed.
 4. Handler death is a system-level failure. Clients block on their next fault until a
@@ -340,11 +339,10 @@ the handler.
 
 Fault delivery for a thread is itself an operation that may fault — a handler thread can
 take a fault while servicing one. Resolution is per-thread chaining: a handler's own faults
-go to *its* handler, and a fault of a thread with no handler is unhandled ([Reply](#reply)), which
-terminates the chain. A
-handler-bearing subsystem (e.g. a pager) MUST be reachable without itself depending on the
-fault path — its own threads have no handler bound, or are eager-mapped — so the chain is
-finite.
+go to *its* handler, and a fault of a thread with no handler is unhandled ([Reply](#reply)),
+which terminates the chain. A handler-bearing subsystem (e.g. a pager) MUST be reachable without
+itself depending on the fault path — its own threads have no handler bound, or are eager-mapped —
+so the chain is finite.
 
 A thread MUST NOT be bound to a fault-handler endpoint that only it receives on; such a
 thread would block on its own fault endpoint indefinitely.

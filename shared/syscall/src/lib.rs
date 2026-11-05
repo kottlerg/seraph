@@ -1938,11 +1938,12 @@ pub fn wait_set_remove(ws_cap: u64, source_cap: u64) -> Result<(), i64>
 /// Block until any registered source in `ws_cap` becomes ready.
 ///
 /// Returns the opaque badge chosen at `wait_set_add` time for a source that
-/// was ready when the call returned, or when its readiness woke the caller. The badge is delivered in the secondary
-/// return register (rdx / a1). If multiple sources are ready, each call returns
-/// one badge without re-blocking. The source's readiness can lapse before the
-/// caller receives on it (a queued sender stopped or destroyed), so that
-/// receive can find nothing.
+/// was ready when the call returned, or when its readiness woke the caller.
+/// The badge is delivered in the secondary return register (rdx / a1). If
+/// multiple sources are ready, each call returns one badge without
+/// re-blocking. The source's readiness can lapse before the caller receives on
+/// it (a queued sender stopped or destroyed), so that receive can find
+/// nothing.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid or lacks
@@ -2535,7 +2536,8 @@ pub fn thread_bind_notification(
 /// kernel posts the two-word entry `(exit_reason, correlator)` to
 /// `event_queue_cap` (see [`DeathEvent`]), where `exit_reason` is the fault class
 /// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
-/// riscv64). A terminal fault is any kill outcome of the fault protocol:
+/// riscv64). A fault of a thread's own access is terminal on any kill outcome
+/// of the fault protocol:
 ///
 /// - no fault handler bound;
 /// - a `KILL` reply;
@@ -2549,7 +2551,10 @@ pub fn thread_bind_notification(
 /// A stop of the faulting thread defers the terminal fault: it cancels the
 /// episode before any reply claims it, or keeps a claimed `KILL`, and the
 /// fault takes effect, and is posted, only if the thread is started again
-/// (docs/fault-handling.md § Delivery, Resume, and Kill).
+/// (docs/fault-handling.md § Delivery, Resume, and Kill). The fault of a
+/// restartable syscall's copy of a user buffer is never terminal: in each of
+/// these cases it fails that syscall with `InvalidAddress` and posts nothing
+/// (docs/fault-handling.md § Kernel Copies).
 ///
 /// Normal `thread_exit` does NOT post to these observers. If the address
 /// space has already faulted terminally, the kernel

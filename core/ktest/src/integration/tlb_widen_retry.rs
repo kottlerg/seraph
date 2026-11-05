@@ -57,7 +57,7 @@ const SENTINEL: u64 = 0xCAFE_F00D;
 const PHASE_MAPPED: u32 = 1; // parent: page mapped read-only
 const PHASE_CACHED: u32 = 2; // child: read the page, TLB entry now cached
 const PHASE_WIDENED: u32 = 3; // parent: widened to read-write (shootdown elided)
-const PHASE_WROTE: u32 = 4; // child: store completed (retry succeeded)
+const PHASE_WROTE: u32 = 4; // child: store or copy completed (retry succeeded)
 
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static RESULT: AtomicU64 = AtomicU64::new(0);
@@ -283,9 +283,11 @@ fn cleanup(ctx: &TestContext, child: Option<&mut crate::spawn::SpawnedChild>, me
 }
 
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then
-/// store through it. The store completes via the kernel's spurious-fault retry
-/// when a hardware TLB faults on the stale read-only entry. `spin_bound` is the
-/// stretched [`SPIN_BOUND`] each wait spins at most.
+/// write through it, by a store or by the kernel's `SYS_GETRANDOM` copy as
+/// [`WRITE_MODE`] says. The write completes via the kernel's spurious-fault
+/// retry (the user-mode one, or the copy-region one) when a hardware TLB faults
+/// on the stale read-only entry. `spin_bound` is the stretched [`SPIN_BOUND`]
+/// each wait spins at most.
 extern "C" fn widen_child(spin_bound: u64) -> !
 {
     let p = WIDEN_VA as *mut u64;

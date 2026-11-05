@@ -200,8 +200,7 @@ the same way (severing by clearing the binding mid-fault: design intent; not yet
 after a reply claims it leaves that reply's disposition; in both cases the thread is resumed, or
 its fault left unhandled, only if it is started again. This reuses the call/reply machinery
 above — the suspended thread occupies the caller's role and the handler services it with the
-ordinary receive/reply cycle. See
-[Fault Handling](fault-handling.md).
+ordinary receive/reply cycle. See [Fault Handling](fault-handling.md).
 
 ---
 

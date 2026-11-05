@@ -63,6 +63,11 @@ const RANDOM_LEN: usize = 32;
 #[allow(clippy::cast_possible_truncation)]
 const FRAME_BYTES: usize = crate::arch::TRAP_FRAME_BYTES as usize;
 
+/// Bytes of a page, for zeroing a mapped one.
+// cast_possible_truncation: a page is 4 KiB.
+#[allow(clippy::cast_possible_truncation)]
+const PAGE_BYTES: usize = PAGE_SIZE as usize;
+
 /// Wait-set badges of the endpoint and the report notification.
 const WS_FAULT: u64 = 1;
 const WS_REPORT: u64 = 2;
@@ -306,7 +311,9 @@ impl Case
         Ok(case)
     }
 
-    /// Map a pool frame at `va` with `flags`, holding it for the drop.
+    /// Map a pool frame at `va` with `flags`, holding it for the drop. A
+    /// writable page is zeroed, since pool frames are reused unscrubbed and
+    /// [`landed`] reads a call's writes against zeroes.
     fn map(&mut self, slot: usize, va: u64, flags: u64) -> Result<u64, &'static str>
     {
         let mem =
@@ -320,6 +327,12 @@ impl Case
             return Err("fault_syscall_buffer: mem_map failed");
         }
         self.frames[slot] = Some((va, mem));
+        if flags & MAP_WRITABLE != 0
+        {
+            // SAFETY: the page at `va` is mapped writable just above and holds
+            // no Rust object; no other thread reaches it until the reply.
+            unsafe { core::ptr::write_bytes(va as *mut u8, 0, PAGE_BYTES) };
+        }
         Ok(mem)
     }
 }
@@ -613,8 +626,9 @@ extern "C" fn landing(_: u64) -> !
     thread_exit()
 }
 
-/// Whether the `len` bytes at `va` hold something other than the zeroes a
-/// fresh frame starts with (all zero has probability 2^-256 for 32 bytes).
+/// Whether the `len` bytes at `va` hold something other than the zeroes the
+/// case wrote when it mapped the page (all zero has probability 2^-256 for 32
+/// random bytes).
 fn landed(va: u64, len: usize) -> bool
 {
     (0..len).any(|i| {

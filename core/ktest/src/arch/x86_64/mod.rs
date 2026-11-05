@@ -99,7 +99,9 @@ pub const IP_OFFSET: usize = syscall_abi::REGS_X86_64_IP_OFFSET;
 
 /// Whether a `FAULT_KIND_VM` message reports a fault on a present page with
 /// `FAULT_ACCESS_PRESENT` (docs/fault-handling.md § Fault Message): x86-64
-/// copies the `#PF` P bit for a user-half address.
+/// copies the `#PF` P bit for a user access to a user-half address, and sets
+/// it from a walk of the caller's tables for a restartable syscall's copy
+/// fault (docs/fault-handling.md § Kernel Copies).
 pub const FAULT_REPORTS_PRESENT: bool = true;
 
 /// End of the window the framebuffer is mapped into from `FB_VA`: the low

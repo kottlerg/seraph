@@ -864,9 +864,11 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
 /// the kernel posts the entry `(terminal-fault reason, correlator)` to each
-/// bound observer. The kernel only notifies; it
-/// never enumerates or terminates threads, and normal `thread_exit` does NOT
-/// fire these observers.
+/// bound observer. Only a fault of a thread's own access is terminal: a
+/// restartable syscall's copy fault in any of these cases fails that syscall
+/// with `InvalidAddress` and posts nothing (docs/fault-handling.md § Kernel
+/// Copies). The kernel only notifies; it never enumerates or terminates
+/// threads, and normal `thread_exit` does NOT fire these observers.
 ///
 /// A binding holds a reference on the `EventQueue` object until the address
 /// space's teardown releases it (core/kernel/docs/syscalls.md

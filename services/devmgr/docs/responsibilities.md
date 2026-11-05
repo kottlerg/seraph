@@ -72,18 +72,19 @@ devmgr's responsibilities are:
 
   The DMA capability is a SEND, badged with the device badge, on devmgr's DMA
   endpoint, which devmgr creates before its first spawn and serves on a thread
-  of its own for the rest of the boot: `DMA_MAP` records a mapping of the
-  Memory cap a driver sends, which devmgr keeps while the mapping stands, and
-  replies its device address, and `DMA_UNMAP` removes one
-  (`ipc::devmgr_dma_labels`). The thread serves it apart from the registry
+  of its own for the rest of the boot, placed at `BOOT_DRIVER_PRIORITY` (26,
+  above devmgr's 24) since virtio-blk blocks on it twice per transfer: `DMA_MAP`
+  records a mapping of the Memory cap a driver sends, which devmgr keeps while
+  the mapping stands, and replies its device address, and `DMA_UNMAP` removes
+  one (`ipc::devmgr_dma_labels`). The thread serves it apart from the registry
   loop because that loop makes nested calls and settles batches during which
-  drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary
-  through virtio-blk, which maps the read's buffer, and every `VirtIO` driver
-  maps its rings before it reports ready. The two threads share the device
-  and mapping table (`devmgr_firmware::dma::DmaTable`) under one lock, taken
-  only around table operations and never across IPC. A device that cannot be
-  given a DMA capability is not spawned; devmgr halts when it cannot start the
-  DMA endpoint, since no DMA-capable driver could set its device up.
+  drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
+  virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
+  rings before it reports ready. The two threads share the device and mapping
+  table (`devmgr_firmware::dma::DmaTable`) under one lock, taken only around
+  table operations and never across IPC. A device that cannot be given a DMA
+  capability is not spawned; devmgr halts when it cannot start the DMA endpoint,
+  since no DMA-capable driver could set its device up.
 
   devmgr serves a driver's endpoint only once the driver has set its device
   up. It spawns its drivers in two production settle batches: the boot batch
@@ -355,7 +356,7 @@ how devmgr uses them.
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE`. Parsing IOMMU topology (DMAR on x86-64, `iommu` / `iommu-map` on RISC-V) is design intent; not yet implemented |
 | Memory (driver modules, MODULE round) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer), one per `module_kind`, spawned via `procmgr_labels::CREATE_PROCESS`; a module of an unknown kind or a second of one kind is logged and released |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
-| SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (serial/virtio-blk at 26, framebuffer/RTC/virtio-input at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities. Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
+| SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (serial/virtio-blk at 26, framebuffer/RTC/virtio-input at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 
 IOMMU register regions are not pre-minted as distinct capabilities.
 Design intent; not yet implemented: `devmgr` will discover IOMMU units

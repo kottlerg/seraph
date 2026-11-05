@@ -421,7 +421,8 @@ pub mod sched_policy
     pub const INIT_LOGD_PRIORITY: u8 = 26;
 
     /// Boot-critical device drivers: serial (console path) and
-    /// virtio-blk (root-disk path).
+    /// virtio-blk (root-disk path); also devmgr's DMA thread, which
+    /// virtio-blk blocks on for every transfer.
     pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
     /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input.

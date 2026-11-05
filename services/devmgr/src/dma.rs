@@ -12,7 +12,8 @@
 //! endpoint badged with the device's badge, which devmgr keeps and from
 //! which it derives the driver's copy (`virtio_core::bootstrap::SLOT_DMA`).
 //! The thread serves `DMA_MAP` and `DMA_UNMAP` (`ipc::devmgr_dma_labels`) on
-//! its own, so a driver's mapping never waits for the registry loop: that
+//! its own, at the boot drivers' level (`BOOT_DRIVER_PRIORITY`, above
+//! devmgr's), so a driver's mapping never waits for the registry loop: that
 //! loop makes nested calls (a `CREATE_FROM_FILE` reads the driver binary
 //! through virtio-blk, which maps the read's buffer) and settles a batch
 //! whose drivers map their rings before they report ready.
@@ -24,6 +25,7 @@
 //! operations, never across IPC. See `docs/device-management.md`
 //! § DMA Authorisation.
 
+use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use firmware::dma::{DmaTable, MapError, Mapping, UnmapError, check_access};
@@ -61,9 +63,15 @@ impl DmaService
         };
         let table = Arc::new(Mutex::new(DmaTable::new()));
         let served = Arc::clone(&table);
+        // At the boot drivers' level, above devmgr's own: virtio-blk, the
+        // root-disk path, blocks on this thread twice per transfer, so a
+        // thread below it would let any runnable thread between the two
+        // levels delay that path (`ipc::sched_policy`).
         if std::thread::Builder::new()
             .name("dma".into())
-            .spawn(move || serve(ep, &served))
+            .spawn_at_priority(ipc::sched_policy::BOOT_DRIVER_PRIORITY, move || {
+                serve(ep, &served);
+            })
             .is_err()
         {
             std::os::seraph::log!("DMA thread not started");

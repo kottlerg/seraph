@@ -208,14 +208,15 @@ none, the device can reach memory only at physical addresses, so the address dev
 the frames' physical address and the mapping is bookkeeping alone. The protocol and the
 driver's code are the same in both modes.
 
-devmgr serves the DMA endpoint on a thread of its own, so a mapping never waits on its registry
-loop, which makes nested calls (a driver spawn from the root filesystem reads the binary through
-the block driver, which maps the read's buffer) and settles batches whose drivers map their
-rings before they report ready. The two threads share the table of devices and mappings under
-one lock, held only around table operations and never across IPC. A device holds at most
-`MAX_MAPPINGS_PER_DEVICE` mappings ([limits.md](limits.md)). When devmgr withdraws a driver
-it revokes every copy of the device's DMA capability and drops the device's mappings, so a
-request still queued is refused.
+devmgr serves the DMA endpoint on a thread of its own, placed at the boot drivers' level
+(`ipc::sched_policy::BOOT_DRIVER_PRIORITY`, above devmgr's own) because the block driver blocks
+on it, so a mapping never waits on its registry loop, which makes nested calls (a driver spawn
+from the root filesystem reads the binary through the block driver, which maps the read's buffer)
+and settles batches whose drivers map their rings before they report ready. The two threads share
+the table of devices and mappings under one lock, held only around table operations and never
+across IPC. A device holds at most `MAX_MAPPINGS_PER_DEVICE` mappings ([limits.md](limits.md)).
+When devmgr withdraws a driver it revokes every copy of the device's DMA capability and drops the
+device's mappings, so a request still queued is refused.
 
 ---
 

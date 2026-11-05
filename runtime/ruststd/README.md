@@ -48,7 +48,7 @@ ruststd/
         ├── reserve/            # page-reservation surface
         ├── stdio/              # stdout/stderr
         ├── sync/               # mutex / rwlock / once / condvar / thread parking
-        ├── thread/             # thread spawn and join
+        ├── thread/             # thread spawn, join, and spawn-time priority
         └── time/               # monotonic and system clocks
 ```
 
@@ -312,6 +312,19 @@ listing's names through the extension (svcmgr's recipe scan does).
 procmgr process-handle cap as the full `u64` capability handle, for the procmgr
 labels that take one. `Child::id` returns only the handle's slot index, since
 upstream fixes its width at `u32` and the handle's generation sits above that.
+
+---
+
+## Spawned-thread priority
+
+`std::thread::spawn` places each new thread at the process's `initial_priority`, the level its
+spawner gave its initial thread. `std::os::seraph::thread::BuilderExt::spawn_at_priority`
+places the thread at another level within the band of the process's `SchedControl` cap
+(`StartupInfo::sched_control_cap`) instead, so a server thread that a higher-level client blocks
+on runs at that client's level
+([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Priority Inversion
+Mitigation); devmgr's DMA thread runs at the boot drivers' level this way. A level of 0, a
+process with no `SchedControl` cap, or a level outside the band fails the spawn.
 
 ---
 

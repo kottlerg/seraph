@@ -90,14 +90,15 @@
 //! the kernel, not by this test.
 //!
 //! The offset sweep crosses zero offset on any host, so the check does not
-//! depend on the host's speed. The controller starts its stop only after it
-//! has seen the stopper's handshake. At an offset that does not delay the
-//! stopper, the stopper therefore enters `thread_stop` no later than the
-//! controller does. Both run the same path to `thread_stop`'s state precheck,
-//! and past that precheck the controller must still cancel the client's park
-//! and take every CPU's scheduler lock before it commits `Stopped`. So in
-//! those cycles the stopper's precheck reads the client still reply-blocked
-//! unless its CPU is descheduled in that span, and its stop returns `Ok`.
+//! depend on the host's speed. The controller starts its stop only once it
+//! has seen the stopper's handshake, unless [`SEEN_PROBES`] runs out first.
+//! In a stop-first cycle at an offset that does not delay the stopper, the
+//! stopper therefore enters `thread_stop` no later than the controller does.
+//! Both run the same path to `thread_stop`'s state precheck, and past that
+//! precheck the controller must still cancel the client's park and take every
+//! CPU's scheduler lock before it commits `Stopped`. So in those cycles the
+//! stopper's precheck reads the client still reply-blocked unless its CPU is
+//! descheduled in that span, and its stop returns `Ok`.
 //! The ordering is relative between the two threads, not a matter of
 //! absolute timing. A one-sided delay, by contrast, arms only when its range
 //! happens to fit inside that span on the host at hand. The delayed half
@@ -435,13 +436,12 @@ fn arm_and_race(
     )?;
     probe_exited(server_th)?;
 
-    let stopper = parts.stopper.is_some();
     let server = parts
         .server
         .as_mut()
         .ok_or("stress::stop_reply_race: the cycle holds no server")?;
-    race(cycle, client_th, server, stopper)?;
-    if stopper
+    race(cycle, client_th, server, stops)?;
+    if parts.stopper.is_some()
     {
         await_report(
             done,
@@ -563,14 +563,14 @@ fn check_second_stops() -> TestResult
 /// claim-CAS → gates → deferred client wake → `retype_free` of the server
 /// TCB. Client and server are pinned to different CPUs, so A's CAS and B's
 /// free execute on different cores; the issue order alternates by cycle
-/// parity to cover both interleavings. A second stopper, when `stopper` says
-/// one runs, is released first and races A with a second cancel at the
-/// cycle's offset ([`controller_lead_in`]). B deletes the Thread cap through
+/// parity to cover both interleavings. With [`Stops::Double`], the second
+/// stopper is released first and races A with a second cancel at the cycle's
+/// offset ([`controller_lead_in`]). B deletes the Thread cap through
 /// `server`, its guard.
-fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stopper: bool) -> TestResult
+fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stops: Stops) -> TestResult
 {
     STOPPER_GO.store(cycle + 1, Ordering::Release);
-    if stopper
+    if stops == Stops::Double
     {
         controller_lead_in(cycle);
     }
@@ -830,11 +830,12 @@ extern "C" fn stopper_entry(arg: u64) -> !
     {
         core::hint::spin_loop();
     }
-    // Ok: this stop reached the client first, or, in a delete-first cycle,
-    // stopped a client the server's death already woke and that has not yet
-    // exited. InvalidState: the controller's stop reached the client first.
-    // Another error: the client was already woken and exited. Only an Ok in a
-    // stop-first cycle (`race` stops before it deletes on even cycles, the
+    // Ok: this stop's unlocked state precheck read the client before any
+    // `Stopped` commit landed (two stops past that precheck both commit
+    // `Stopped` and both return Ok), or, in a delete-first cycle, read a
+    // client the server's death already woke and that had not yet exited.
+    // InvalidState: a `Stopped` commit, or the client's exit, came before
+    // this stop's precheck. Only an Ok in a stop-first cycle (`race` stops before it deletes on even cycles, the
     // odd rounds), where the client is reply-blocked until a stop cancels it,
     // is tallied.
     if thread_stop(target).is_ok() && round % 2 == 1

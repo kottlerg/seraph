@@ -130,7 +130,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,
         mem_mib: args.mem,
-        headless: true,
+        display: crate::qemu::QemuDisplay::Headless,
         gdb: GdbMode::Off,
         qmp_socket: Some(&sock_path),
         vmgenid_guid: Some("auto"),

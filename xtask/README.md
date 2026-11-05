@@ -128,7 +128,9 @@ attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
 (VMGENID)); QEMU's riscv64 `virt` machine has no VMGENID. A non-headless run adds QEMU std VGA:
 the q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair,
 added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
-adapter, so no framebuffer is advertised.
+adapter, so no framebuffer is advertised. `run-parallel --display framebuffer` keeps the adapter
+with no display window (`-display none`): the q35 default adapter on x86-64 and `-device VGA`
+alone on riscv64, whatever display backends QEMU has.
 
 The disk device presents the logical block size of the image it boots, 512 or 4096 bytes
 (`logical_block_size` and `physical_block_size`), read from the LBA its GPT header sits at, so a
@@ -351,9 +353,11 @@ cargo xtask run-parallel \
     [--riscv-mmu sv39|sv48|sv57] \
     [--x86-paging 4|5] \
     [--iommu attached|absent] \
+    [--display headless|framebuffer] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
     [--pass REGEX] \
     [--fail REGEX] \
+    [--fail-also REGEX] \
     [--fail-grace-secs SECONDS] \
     [--debug-listen] \
     [--hold-on-hang] \
@@ -371,11 +375,13 @@ cargo xtask run-parallel \
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
 | `--iommu` | `attached` | Whether the machine's IOMMU is attached; same semantics as `cargo xtask run --iommu` |
+| `--display` | `headless` | What each guest presents for display, never a window. `headless` drops the display adapter, as `cargo xtask run --headless` does, so devmgr spawns no framebuffer driver. `framebuffer` keeps QEMU std VGA (see Attached devices) with no display window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
 | `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
 | `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
 | `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
+| `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--debug-listen` | off | Expose each guest's gdbstub without pausing it (QEMU `-s`, tcp::1234) so a wedged guest can be attached post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port) |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |

@@ -31,6 +31,7 @@ use crate::cli::RunParallelArgs;
 use crate::context::Context as BuildContext;
 use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::firmware::find_ovmf_code;
+use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
     validate_sysroot_for_launch,
@@ -140,8 +141,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     validate_args(args)?;
     let pass_re =
         Regex::new(&args.pass).with_context(|| format!("invalid --pass regex {:?}", args.pass))?;
-    let fail_re =
-        Regex::new(&args.fail).with_context(|| format!("invalid --fail regex {:?}", args.fail))?;
+    let fail_re = fail_regex(&args.fail, args.fail_also.as_deref())?;
 
     validate_sysroot_for_launch(ctx, args.arch)?;
 
@@ -215,6 +215,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let riscv_mmu = args.riscv_mmu;
             let x86_paging = args.x86_paging;
             let iommu = args.iommu;
+            let display = QemuDisplay::from(args.display);
             let debug_listen = args.debug_listen;
             let hold_on_hang = args.hold_on_hang;
             let timeout = Duration::from_secs(args.timeout);
@@ -277,7 +278,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     firmware_vars_path: vars_path_for_qemu.as_deref(),
                     cpus,
                     mem_mib,
-                    headless: true,
+                    display,
                     gdb: if debug_listen
                     {
                         GdbMode::Listen
@@ -430,6 +431,23 @@ fn validate_args(args: &RunParallelArgs) -> Result<()>
         bail!("--debug-listen / --hold-on-hang require --parallel 1 (one gdbstub port)");
     }
     Ok(())
+}
+
+/// The regex that marks a failed run: `--fail`, or, with `--fail-also`, a
+/// line matching either, so the extra pattern adds to `--fail` (its default
+/// death markers included) rather than replacing it.
+fn fail_regex(fail: &str, fail_also: Option<&str>) -> Result<Regex>
+{
+    let fail_re = Regex::new(fail).with_context(|| format!("invalid --fail regex {fail:?}"))?;
+    let Some(also) = fail_also
+    else
+    {
+        return Ok(fail_re);
+    };
+    Regex::new(also).with_context(|| format!("invalid --fail-also regex {also:?}"))?;
+    // The groups keep each side's own alternations, and any flags it sets,
+    // to that side.
+    Ok(Regex::new(&format!("(?:{fail})|(?:{also})"))?)
 }
 
 fn resolve_firmware(ctx: &BuildContext, arch: Arch) -> Result<FirmwareSet>
@@ -1207,5 +1225,38 @@ mod tests
             classify(128 + 9, false, log, &pass, &fail).0,
             Status::Err(c) if c == 128 + 9
         ));
+    }
+
+    #[test]
+    fn fail_also_adds_to_the_fail_markers_instead_of_replacing_them()
+    {
+        // The framebuffer cell's pass condition: a passing svctest log that
+        // shows the framebuffer case skipped is a failure, and a kernel death
+        // marker still fails the run beside the extra pattern.
+        let pass = Regex::new("ALL TESTS PASSED").unwrap();
+        let fail = fail_regex(DEFAULT_FAIL_REGEX, Some("framebuffer case skipped")).unwrap();
+        let skipped = "drivers deny: framebuffer case skipped: no framebuffer driver\n\
+                       [svctest] ALL TESTS PASSED\n";
+        assert!(matches!(
+            classify(0, false, skipped, &pass, &fail).0,
+            Status::Fail
+        ));
+        let panicked = "\nPANIC: explicit halt\n";
+        assert!(matches!(
+            classify(0, false, panicked, &pass, &fail).0,
+            Status::Fail
+        ));
+        let ran = "[svctest] ALL TESTS PASSED\n";
+        assert!(matches!(
+            classify(0, false, ran, &pass, &fail).0,
+            Status::Pass
+        ));
+    }
+
+    #[test]
+    fn an_invalid_fail_also_regex_is_refused()
+    {
+        let err = fail_regex(DEFAULT_FAIL_REGEX, Some("(")).unwrap_err();
+        assert!(err.to_string().contains("--fail-also"), "{err}");
     }
 }

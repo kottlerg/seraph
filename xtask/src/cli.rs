@@ -553,6 +553,15 @@ pub struct RunParallelArgs
     #[arg(long, default_value = "attached")]
     pub iommu: Iommu,
 
+    /// What each guest presents for display. `headless` attaches no display
+    /// adapter, so the bootloader finds no GOP and devmgr spawns no
+    /// framebuffer driver; `framebuffer` keeps QEMU std VGA with no display
+    /// window (`-display none`), so the framebuffer driver runs on a host
+    /// without a graphical backend: the framebuffer device cell of the local
+    /// and release host runs (docs/testing.md "Coverage tiers").
+    #[arg(long, default_value = "headless")]
+    pub display: crate::qemu::BatchDisplay,
+
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the cross-harness
     /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
@@ -577,6 +586,15 @@ pub struct RunParallelArgs
     /// `'$.^'`) to disable.
     #[arg(long, default_value = DEFAULT_FAIL_REGEX)]
     pub fail: String,
+
+    /// A further regex marking a failed run, matched beside `--fail` rather
+    /// than in its place, so the default's death markers still apply: a run
+    /// whose log matches either is FAIL, with the same precedence and
+    /// `--fail-grace-secs` kill. The framebuffer device cell passes
+    /// `'framebuffer case skipped'`, the line svctest logs when no
+    /// framebuffer driver runs.
+    #[arg(long, value_name = "REGEX")]
+    pub fail_also: Option<String>,
 
     /// Expose each guest's gdbstub without pausing it (QEMU `-s`,
     /// `tcp::1234`), so a wedged guest can be attached to post-hoc:

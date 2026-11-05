@@ -386,8 +386,9 @@ Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64,
 `riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
 confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
-framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`, is
-a device cell, see Device surfaces and Release host runs below),
+framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`, and
+the framebuffer boot, `--display framebuffer`, are device cells, see Device surfaces, Framebuffer
+cell, and Release host runs below),
 filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
@@ -411,7 +412,7 @@ its own device surface, and variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose runs the boundary set three times), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations and the no-IOMMU variant) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) three times in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, and the framebuffer cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -456,10 +457,9 @@ surface.
   driver adds cells to its own device surface (Device surfaces below), not to the main set.
 - **Tag set.** The main set and every driver with a QEMU-testable device, filesystem drivers
   included, each through its cells: the release host runs boot every device cell before each tag
-  (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver has a
-  QEMU-testable device, the standard VGA adapter `cargo xtask run` attaches to a boot that is not
-  headless, but no cell: every harness boot is headless, so svctest's framebuffer case skips
-  ([#798](https://github.com/kottlerg/seraph/issues/798) tracks the cell).
+  (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver's
+  device, QEMU std VGA, is outside the main set because the canonical boots are headless; the
+  framebuffer cell (Framebuffer cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.
@@ -736,7 +736,8 @@ do not make, are owed when, and only when, the PR's own diff makes a non-inert c
 surface that owes them. They are the storage cells of Disk variations below, each on each
 architecture (4kn, the 4Kn disk; second-disk, the data partition on a second disk; shared-line,
 that disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second
-disk), and no-iommu, the no-IOMMU variant of Release host runs below, on each architecture. A
+disk), no-iommu, the no-IOMMU variant of Release host runs below, and framebuffer, the boot of
+Framebuffer cell below, each on each architecture. A
 driver's device surface is that driver's code, with the harness check that drives that driver
 alone where its row names one; the storage-wide surface is the code every storage cell runs beside
 its drivers; and the shared surface is what every driver shares, the launchers' attachment of the
@@ -755,7 +756,8 @@ own diff is on.
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
-| serial, framebuffer, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/framebuffer/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), the no-iommu cell runs no IOMMU driver, and the framebuffer has no cell |
+| framebuffer | `services/drivers/framebuffer/`, and the launchers' display attachment (`QemuDisplay` and `BatchDisplay`) | framebuffer |
+| serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
@@ -777,13 +779,13 @@ an item listed by definition alone), read in that file's hunk.
 git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs services/vfsd/ \
     xtask/src/disk.rs xtask/src/commands/mkdisk.rs services/drivers/virtio/blk/ services/fs/fat/ \
-    services/drivers/virtio/input/ services/drivers/test-dma/
+    services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/
 D='sys_irq_(register|ack|split)|(un)?route_device_irq|irq_line_count|dispatch_device_irq'
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
 D="$D|InterruptObject|dispatch_external|SOURCE_TARGET|source_target"
 D="$D|plic_[a-z_]+|[A-Z_]*PLIC_[A-Z_]+|require_plic_context|devmgr_(dma_)?(labels|errors)"
 D="$D|device_info_kind|(vfsd|fs|blk)_(labels|errors)|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
-D="$D|test_dma_labels|dma_confinement_phase"
+D="$D|test_dma_labels|dma_confinement_phase|QemuDisplay|BatchDisplay"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|shared_line)"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
@@ -868,6 +870,25 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
     --second-disk target/xtask/second-disk.img --second-disk-block-size 8192
 ```
 
+**Framebuffer cell.** One svctest boot, on each architecture, keeps QEMU std VGA with no display
+window (`run-parallel --display framebuffer`,
+[xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)), so the bootloader hands the
+kernel the adapter's GOP framebuffer, devmgr spawns the framebuffer driver, and svctest's drivers
+phase runs its framebuffer case ([services/svctest/README.md](../services/svctest/README.md))
+instead of logging `framebuffer case skipped`. The boot passes on svctest's pass marker with no
+such line: its `--fail-also 'framebuffer case skipped'` makes a boot that logs the skip a `FAIL`.
+svctest is staged as the disk variations stage it. Its budget, 360 s, is the larger of three times
+the slower of the two boots on the reference host (the riscv64 boot, 103 s) and that boot plus
+100 s, rounded up to a minute, the rule the disk variations' budget follows; a change to these
+boots' times re-derives it. The boot is the framebuffer device cell (Device surfaces above).
+
+```sh
+# Framebuffer cell, per architecture (clean between architectures; svctest
+# staged as for the disk variations above):
+cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
+    --display framebuffer --fail-also 'framebuffer case skipped'
+```
+
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), the maintainer MUST run, on the commit to be tagged, the whole boundary set
@@ -875,10 +896,11 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
 (`--runs 3`) in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command at
 `--runs 1`, per the boundary commands above), and the memory variation and every device cell (the
-disk variations and the no-IOMMU variant) once each, so every tag boots at each boundary CPU count
-in both profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, and
-with no IOMMU, and runs the timing report on the boundary logs, which is reported and blocks
-nothing. The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
+disk variations, the no-IOMMU variant, and the framebuffer cell) once each, so every tag boots at
+each boundary CPU count in both profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk,
+from two disks, with no IOMMU, and with a framebuffer, and runs the timing report on the boundary
+logs, which is reported and blocks nothing.
+The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
 with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
 staged as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a
 pass, as When the runs are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and

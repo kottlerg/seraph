@@ -186,7 +186,7 @@ impl Guest
             firmware_vars_path: None,
             cpus: args.cpus,
             mem_mib: args.mem,
-            headless: true,
+            display: crate::qemu::QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: Some(sock_path),
             vmgenid_guid: Some(guid),

@@ -90,7 +90,7 @@ impl Guest
             firmware_vars_path: firmware_vars,
             cpus: args.cpus,
             mem_mib: args.mem,
-            headless: true,
+            display: crate::qemu::QemuDisplay::Headless,
             gdb: GdbMode::Off,
             qmp_socket: None,
             // x86-64 launches exercise the snapshot-reseed consumer by default;

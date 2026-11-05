@@ -636,7 +636,7 @@ pub fn spawn_at_priority_phase(_: &Caps)
 /// the caller goes on (a running thread moves at its next schedule).
 fn pin_self(cpu: u32)
 {
-    let cap = std::os::seraph::current_thread_cap();
+    let cap = std::os::seraph::thread::current_thread_cap();
     assert_ne!(cap, 0, "no Thread cap for the calling thread");
     syscall::thread_set_affinity(cap, cpu)
         .unwrap_or_else(|e| panic!("thread_set_affinity({cpu}) failed: {e}"));

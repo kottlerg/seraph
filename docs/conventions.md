@@ -377,13 +377,15 @@ gives the PR-level linear view.
   section; for a documentation-only or comment-only delta since that head,
   it MUST say so (see [testing.md](testing.md#coverage-tiers)).
 - Every PR body MUST report, in its `## Validation` section, each local host
-  run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes, with its
-  `--runs` count, its outcome, and the head it ran at (a run the PR does not
-  owe that HANGs or fails as that section allows, with the link to its
-  record), or state that none is owed and why (that the PR's changes outside
-  Markdown are all inert, or that its non-inert lines change neither surface
-  that section names and it states no concurrency-fix purpose as that section
-  defines it).
+  run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
+  boundary run, the memory variation, and each device cell: the storage cells
+  and the no-IOMMU variant, per architecture), with its `--runs` count, its
+  outcome, and the head it ran at (a run the PR does not owe that HANGs or
+  fails as that section allows, with the link to its record), or state that
+  none is owed and why (that the PR's changes outside Markdown are all inert,
+  or that its non-inert lines change none of the CPU-count, memory, and device
+  surfaces that section names and it states no concurrency-fix purpose as that
+  section defines it).
 
 ## CI Gating
 

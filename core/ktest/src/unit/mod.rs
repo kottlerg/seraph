@@ -236,6 +236,18 @@ pub fn run_all(ctx: &TestContext)
         "retype::aspace_augment_many",
         retype::aspace_augment_many(ctx)
     );
+    run_test!(
+        "retype::pool_seeding_takes_interrupts",
+        retype::pool_seeding_takes_interrupts(ctx)
+    );
+    run_test!(
+        "retype::cspace_teardown_takes_interrupts",
+        retype::cspace_teardown_takes_interrupts(ctx)
+    );
+    run_test!(
+        "retype::aspace_teardown_takes_interrupts",
+        retype::aspace_teardown_takes_interrupts(ctx)
+    );
 
     // ── Memory management syscalls ────────────────────────────────────────────
     run_test!("mm::memory_split_merge", mm::memory_split_merge(ctx));

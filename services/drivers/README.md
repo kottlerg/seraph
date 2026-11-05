@@ -142,7 +142,9 @@ The full driver lifecycle is specified in
   maps every buffer its device reaches through it (`DMA_MAP`) and programs the
   device only with the device addresses it returns, never with a physical
   address ([docs/device-management.md](../../docs/device-management.md#dma-authorisation)
-  § DMA Authorisation). devmgr spawns each such driver `CREATE_PINNED` and
+  § DMA Authorisation), which it cannot read: its grants lack the Memory `Phys`
+  right ([docs/device-management.md](../../docs/device-management.md#physical-addresses)
+  § Physical Addresses). devmgr spawns each such driver `CREATE_PINNED` and
   `CREATE_DMA_HOLD`, so its memory is freed only once devmgr has confirmed its
   device's DMA stopped
   ([docs/device-management.md](../../docs/device-management.md#dma-safe-teardown)

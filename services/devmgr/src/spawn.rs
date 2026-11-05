@@ -608,10 +608,12 @@ pub struct IommuSpawnConfig<'a>
 /// the terminal round with a copy of `service_ep` and a SEND badged
 /// `device_badge` on `query_ep`; once that is served, two death observers,
 /// on `death_eq` and `watch_eq`. Created `CREATE_PINNED`, since the units
-/// walk its table pages and they must never fault, and `CREATE_DMA_HOLD`,
+/// walk its table pages and they must never fault, `CREATE_DMA_HOLD`,
 /// since the units can walk those pages after it dies: devmgr never releases
-/// the hold, so they stay quarantined for the boot. Both observers carry the
-/// correlator `device_badge`. Returns as [`spawn_driver`] does.
+/// the hold, so they stay quarantined for the boot, and `CREATE_PHYS_ACCESS`,
+/// since the units are programmed with physical addresses, of its table pages
+/// and of every frame `MAP` installs. Both observers carry the correlator
+/// `device_badge`. Returns as [`spawn_driver`] does.
 // too_many_lines: one spawn transaction, as `spawn_driver`: every derived
 // cap owns a slot released on a later failure, and the rounds follow the
 // bootstrap protocol one to one.
@@ -640,7 +642,9 @@ pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> Drive
         release_units(0);
         return DriverSpawn::Failed;
     };
-    let flags = procmgr_labels::CREATE_PINNED | procmgr_labels::CREATE_DMA_HOLD;
+    let flags = procmgr_labels::CREATE_PINNED
+        | procmgr_labels::CREATE_DMA_HOLD
+        | procmgr_labels::CREATE_PHYS_ACCESS;
     let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | sched_bits)
         .cap(config.module_cap)

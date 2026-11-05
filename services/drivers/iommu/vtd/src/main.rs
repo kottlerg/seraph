@@ -138,7 +138,14 @@ fn main() -> !
         info.self_aspace,
         all_coherent(&mapped),
     );
-    let Some(mut svc) = Service::new(Vtd::new(units, store), KernelCaps, boot.units)
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    let Some(caps) = (unsafe { KernelCaps::new(info.memmgr_endpoint, ipc_buf) })
+    else
+    {
+        std::os::seraph::log!("no physical-address credential");
+        syscall::thread_exit();
+    };
+    let Some(mut svc) = Service::new(Vtd::new(units, store), caps, boot.units)
     else
     {
         std::os::seraph::log!("no memory for the service");

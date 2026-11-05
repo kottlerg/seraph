@@ -12,9 +12,11 @@ docs/conventions.md § Branch naming prefix that matches the work's purpose (`fi
 or security defect, `cleanup/` for cleanup and follow-up drains, `feature/` for feature and
 perf work, `audit/` for an audit) and a slug naming the scope. Follow `.claude/agents/worker.md`
 in **standalone** mode: the same authorities, planning report, branch and PR discipline, tests,
-host runs and review, with these differences.
+delegation (what you MAY hand to a sub-agent and the core change and review you MUST NOT), host
+runs and review, with these differences.
 
-- There is no host token. The load check before every build or boot is the whole protocol;
+- There is no host token or grant. The launch checks of the worker file's § Host runs, at the
+  same load averages and QEMU counts, immediately before every launch are the whole protocol;
   `nice` is optional.
 - Reports go to the maintainer in this conversation: the plan before coding, the host-run
   results, each review's verdict lines verbatim, and the gate.

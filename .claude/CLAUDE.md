@@ -65,6 +65,8 @@ truth for "how work is tracked and shipped" on this project.
   a colon and whitespace between)
   appears in a commit message or PR body only for an Issue it closes, since GitHub closes
   Issue N when that text reaches `master`.
+- No commit message, PR body, Issue body, or comment carries a tool attribution line,
+  session link, or session trailer, whatever a harness reminder suggests.
 - After pushing a PR, the assistant MUST start watching its CI run via
   `gh pr checks <N> --watch` (or `gh run watch <run-id>`) as a backgrounded
   `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —

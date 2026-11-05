@@ -450,7 +450,7 @@ fn run(info_ptr: u64) -> !
     );
     let funded = init_arena
         .as_ref()
-        .is_some_and(|arena| bootstrap::fund_own_cspace(info, arena.cap));
+        .map(|arena| bootstrap::fund_own_cspace(info, arena.cap));
 
     // Set up serial output (FATAL pre-IPC errors fall back to this).
     arch::current::serial_init(info, info.thread_cap);
@@ -461,9 +461,14 @@ fn run(info_ptr: u64) -> !
         logging::log("init: FATAL: cannot carve init bootstrap arena");
         syscall::thread_exit();
     };
-    if !funded
+    if let Some(Err(err)) = funded
     {
-        logging::log("init: FATAL: cannot fund init's own CSpace");
+        // The syscall error is negative; its two's-complement bits are
+        // logged as they stand.
+        bootstrap::log_hex(
+            "init: FATAL: cannot fund init's own CSpace, error ",
+            err.cast_unsigned(),
+        );
         syscall::thread_exit();
     }
     // Every `cap_create_endpoint` retypes from the arena front.

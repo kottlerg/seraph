@@ -358,7 +358,9 @@ fn root_cspace_init_slot_capacity() -> u64
 /// donate part of that arena to this `CSpace`, sized from its `InitInfo` for
 /// every body and port-binding table it makes after
 /// (`init_cspace_fund_pages`, services/init/src/bootstrap.rs), so the seed
-/// holds only that one page whatever the hardware.
+/// holds only that one page whatever the hardware. ktest, the other root
+/// task, funds its own `CSpace` before its first body the same way
+/// (`CSPACE_FUND_PAGES`, core/ktest/src/main.rs).
 #[cfg(not(test))]
 const ROOT_CSPACE_BODY_PAGES: u64 = 1;
 

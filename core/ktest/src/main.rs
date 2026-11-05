@@ -361,6 +361,50 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
     }
 }
 
+/// Pool pages ktest donates to its own `CSpace`, the root `CSpace` it inherits
+/// as init, before it makes any capability body: the kernel seeds that
+/// `CSpace` only with the slots init uses and the one arena page init spends
+/// before it funds itself (`ROOT_CSPACE_BODY_PAGES`, core/kernel/src/cap/mod.rs).
+/// ktest's bodies are `frame_pool`'s 64 permanent splits, the I/O-port
+/// subdivider's splits and the serial port's binding table on x86-64
+/// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES`), and each case's own splits
+/// and copies, which it deletes again. 16 pages hold the binding table and 13
+/// arena pages, 403 bodies (`syscall_abi::CSPACE_BODIES_PER_PAGE` a page), far
+/// above that peak; a shortfall fails the case that meets it with
+/// `OutOfMemory`.
+const CSPACE_FUND_PAGES: u64 = 16;
+
+/// Donate [`CSPACE_FUND_PAGES`] to ktest's own `CSpace` (augment-mode
+/// `cap_create_cspace`) from spare RAM caps, as [`fund_boot_aspace_pt`] funds
+/// the address space and for the same reason: every inherited RAM cap except
+/// `memory_base`, which `frame_pool` splits and the retype-heavy cases draw
+/// on. Best-effort, accumulating across several caps; a short fund surfaces
+/// in the cases.
+fn fund_own_cspace(info: &init_protocol::InitInfo)
+{
+    let mut left = CSPACE_FUND_PAGES;
+    for slot in (info.memory_base + 1)..(info.memory_base + info.memory_count)
+    {
+        if left == 0
+        {
+            break;
+        }
+        let avail_pages =
+            syscall::cap_info(slot, syscall_abi::CAP_INFO_MEMORY_AVAILABLE).map_or(0, |a| a / 4096);
+        let want = avail_pages.min(left);
+        if want == 0
+        {
+            continue;
+        }
+        // Best-effort: a refused donation leaves the fund short, and the loop
+        // moves on to the next spare cap.
+        if syscall::cap_create_cspace(slot, info.cspace_cap, want).is_ok()
+        {
+            left -= want;
+        }
+    }
+}
+
 extern "C" fn run(info_ptr: u64) -> !
 {
     // Read InitInfo from the kernel-mapped page.
@@ -379,6 +423,10 @@ extern "C" fn run(info_ptr: u64) -> !
     // anything maps MMIO into it (serial/framebuffer below, the hw::mmio_map
     // aperture later). Must precede `serial::init`/`framebuffer::init`.
     fund_boot_aspace_pt(info);
+
+    // Fund ktest's own CSpace's body arena before the first split or port
+    // binding (the I/O-port subdivider and `serial::init` below).
+    fund_own_cspace(info);
 
     // Seed the I/O port subdivider (x86-64) with the root IoPort cap so
     // `serial::init` and `arch::shutdown` can each carve only the ports

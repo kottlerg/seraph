@@ -255,7 +255,7 @@ The surfaces above are values the kernel emits. A distinct surface is kernel
 state the kernel keeps in memory retyped from a user-held Memory capability:
 every object the retype dispatch carves there — wrapper pages, capability slot
 pages (each slot holds an object pointer) and the directory pages that index
-them (each a page of leaf pointers), page tables, page-pool record pages (each
+them (each a page of leaf or directory-page pointers), page tables, page-pool record pages (each
 record holds a raw `KernelObjectHeader` pointer to its donation's ancestor;
 see [capability-internals.md](capability-internals.md) § Page Pools), thread
 slabs (the kernel stack with its saved kernel pointers and return addresses,

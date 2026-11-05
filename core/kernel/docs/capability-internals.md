@@ -451,11 +451,12 @@ debits the growth budget like a slot page, so `CAP_INFO_CSPACE_CAPACITY` and
 for its body when slot headroom is ample, a funder holds a page of budget beyond the slots it funds
 (`syscall_abi::cspace_topup_pages`); a funder that knows its bodies in advance sizes its donation
 with `CSPACE_BODIES_PER_PAGE` and `IOPORT_BINDING_TABLE_PAGES`, which the ABI publishes and the
-kernel asserts, as init funds its own `CSpace` (services/init/docs/bootstrap.md). A port-binding
-table takes three whole pool pages instead, and
-never outlives its pool: the thread's dealloc returns it, or, when the thread's `CSpace` dies
-first, that teardown does, under the thread's `sched_lock` in both cases, and a bind allocates and
-installs it under the same lock only while the thread is not `Exited`. The kernel's SEED reserve
+kernel asserts, as init funds its own `CSpace`
+([init Bootstrap Stages](../../../services/init/docs/bootstrap.md)). A port-binding table takes
+three whole pool pages instead, and never outlives its pool: the thread's dealloc returns it, or,
+when the thread's `CSpace` dies first, that teardown does, under the thread's `sched_lock` in both
+cases, and a bind allocates and installs it under the same lock only while the thread is not
+`Exited`. The kernel's SEED reserve
 holds only the boot footprint (initialization.md § Phase 7); the one runtime body page it backs is
 the root `CSpace`'s arena page for init's first split, before init funds its `CSpace` itself.
 

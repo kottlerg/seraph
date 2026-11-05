@@ -478,7 +478,7 @@ Phase 7.
    boot whose capabilities outnumber the slots halts by name in Phase 7 or 8 ("cap: boot
    capabilities exceed the InitInfo descriptor capacity"). Phase 9's capabilities reach init
    through InitInfo header fields instead. seed_reserve_bytes() is the boot footprint, sized with
-   the region (about 320 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's
+   the region (about 250 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's
    address-space and thread slabs (the thread slab sized from the boot CPU's save area, so it grows
    with a wider vector length), and one 128-byte body for each descriptor slot and for each Memory
    capability Phase 9 mints (init segments, InitInfo pages, init stack pages), plus alignment

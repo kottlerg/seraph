@@ -89,7 +89,7 @@ fn choose_image_bias_or_default() -> u64
 /// plain `&str`; no `core::fmt` in the `no_std` bootstrap path). The 96-byte
 /// buffer is a diagnostic output cap: a longer prefix truncates and nothing
 /// else is bounded.
-fn log_hex(prefix: &str, value: u64)
+pub(crate) fn log_hex(prefix: &str, value: u64)
 {
     let mut buf = [0u8; 96];
     let prefix_len = prefix.len().min(buf.len() - 18);
@@ -196,9 +196,14 @@ pub(crate) fn init_cspace_fund_pages(info: &InitInfo) -> u64
 /// other donation source would be: a split-off run donated here would reach
 /// memmgr's pool through the reap donation while its pages were still retyped
 /// into this `CSpace`.
-pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> bool
+///
+/// # Errors
+/// The kernel's refusal of the augment, as `cap_create_cspace` returns it:
+/// `OutOfMemory` when the arena's front cannot back the pages (a reserve too
+/// small for them), or the error of a bad cap or `CSpace` handle.
+pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> Result<(), i64>
 {
-    syscall::cap_create_cspace(arena_cap, info.cspace_cap, init_cspace_fund_pages(info)).is_ok()
+    syscall::cap_create_cspace(arena_cap, info.cspace_cap, init_cspace_fund_pages(info)).map(|_| ())
 }
 
 /// Front region of init's own arena reserved for its kernel-object retypes.

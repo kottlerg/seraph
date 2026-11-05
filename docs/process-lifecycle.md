@@ -206,8 +206,9 @@ boot-module ELF sources) in further `REGISTER_INIT_TEARDOWN` rounds, sends
 (RSDP/ACPI/DTB) are excluded; the usable-RAM tail init did not forward in
 memmgr's bootstrap round and the free remainders `MemoryAlloc` abandoned while
 carving bootstrap arenas are donated with the set above. init's own
-bootstrap backing — its endpoint and log-thread retype slabs plus the
-offset-mapped IPC buffer and log-thread stack/IPC — is not in this set:
+bootstrap backing — its own `CSpace`'s fund, its endpoint and log-thread
+retype slabs, and the offset-mapped IPC buffer and log-thread stack/IPC — is
+not in this set:
 it lives in a single contiguous arena Memory cap that init forwards to
 memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
 are already accounted in memmgr's pool and never reach the reap route.

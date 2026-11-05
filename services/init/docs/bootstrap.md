@@ -364,6 +364,8 @@ enumerates init's side of it.
 ## Summarized By
 
 [ELF Loading](../../../core/boot/docs/elf-loading.md),
+[Capability Subsystem Internals](../../../core/kernel/docs/capability-internals.md),
+[Kernel Initialization Sequence](../../../core/kernel/docs/initialization.md),
 [System Bootstrap](../../../docs/bootstrap.md),
 [Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),

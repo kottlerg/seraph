@@ -1891,7 +1891,7 @@ mod tests
     #[test]
     fn structural_ceiling_returns_out_of_slots()
     {
-        // Filling all 3.6M slots is not host-viable (~257 MiB of pages);
+        // Filling all 4.29G slots is not host-viable (~290 GiB of pages);
         // force the grow cursor to the ceiling instead — with an empty free
         // list, the next allocation's grow must fail with the structural
         // OutOfSlots, not PoolExhausted.
@@ -2441,6 +2441,32 @@ mod tests
         while cs.allocate_transfer_slot().is_ok()
         {}
         assert_eq!(cs.allocate_transfer_slot(), Err(CapError::OutOfSlots));
+    }
+
+    #[test]
+    fn pages_to_cover_counts_published_double_region_directories_once()
+    {
+        // A grow at the double region's first leaf that runs out after the
+        // level-2 page leaves it published: the next cover counts only the
+        // level-1 page and the leaf.
+        let mut cs = CSpace::new(0);
+        cs.next_leaf = DOUBLE_BASE as u32;
+        let index = (DOUBLE_BASE * L2_SIZE) as u32;
+        assert_eq!(cs.pages_to_cover(index), 3);
+        cs.set_test_page_budget(1);
+        assert_eq!(cs.grow_toward(index, 1), Err(CapError::PoolExhausted));
+        assert_eq!(cs.pages_to_cover(index), 2);
+        cs.set_test_page_budget(2);
+        assert_eq!(cs.grow_toward(index, 1), Ok(true));
+        // From under live level-1 and level-2 pages, a span into the next
+        // level-1 page counts its leaves and that one page, as the grow spends.
+        let far = ((DOUBLE_BASE + DIR_FANOUT + 1) * L2_SIZE) as u32;
+        let predicted = cs.pages_to_cover(far);
+        assert_eq!(predicted, (DIR_FANOUT + 2) as u64);
+        let budget = 1 << 20;
+        cs.set_test_page_budget(budget);
+        assert_eq!(cs.grow_toward(far, usize::MAX), Ok(true));
+        assert_eq!(predicted, (budget - cs.test_page_budget.unwrap()) as u64);
     }
 
     #[test]

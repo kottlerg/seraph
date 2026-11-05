@@ -2711,6 +2711,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
 | `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
+| `CSPACE_BODIES_PER_PAGE` | 31 | Capability bodies one page of a CSpace's body arena holds |
+| `IOPORT_BINDING_TABLE_PAGES` | 3 | Most CSpace growth-budget pages a thread's first `ioport_bind` takes for its port-binding table |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |

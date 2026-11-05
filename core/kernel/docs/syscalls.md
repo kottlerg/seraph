@@ -1411,7 +1411,8 @@ object),
 
 ### `SYS_THREAD_START` (19)
 
-Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
+Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling,
+or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
 handler's claiming reply was `FAULT_REPLY_KILL`, kills it as an unhandled fault, which posts its
 death and address-space observers, or, for the fault of a restartable syscall's user copy, fails
@@ -1428,16 +1429,31 @@ Protocol, invariant 4).
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `flags` | `THREAD_START_SUSPENDED`, or `0`; every other bit is reserved and MUST be clear |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
+**Suspended start.** With `THREAD_START_SUSPENDED`, a configured `Created` thread becomes `Stopped`
+instead of `Ready`: it is linked on no run queue and executes no user instruction. Its register
+file is the one `SYS_THREAD_CONFIGURE` built (the entry as its instruction pointer), which
+`SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` read and write as for any `Stopped` thread, and
+a later `SYS_THREAD_START` without the flag resumes it; `SYS_THREAD_STOP` of it returns
+`InvalidState`, as for any `Stopped` thread. The flag is valid only for a `Created` target: the
+state and the configured frame are decided under the target's `sched_lock`, which
+`SYS_THREAD_CONFIGURE` and every start and teardown commit also take, so a start or teardown that
+lands first leaves the target other than `Created` and the suspended start is refused (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Lifecycle State Machine).
+
 **Capability requirement:** `thread_cap` must have Control rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
+**Errors:** `InvalidArgument` (`flags` sets a reserved bit; checked before the capability),
+`InvalidCapability`, `InsufficientRights` (cap lacks Control),
 `InvalidArgument` (the target is the caller, is not yet configured, or is not in Created/Stopped
 state under the locked commit — including one a concurrent start already resumed, or one that
-exited or was killed by an object teardown after the first check), `Interrupted` (the caller was
-itself stopped while the start waited for the target to leave its CPU or for an owed wake). Each
+exited or was killed by an object teardown after the first check — or, for a suspended start, is
+not `Created` when it commits), `Interrupted` (the caller was itself stopped while the start waited
+for the target to leave its CPU or for an owed wake; never for a suspended start, which waits for
+nothing). Each
 stop admits at most one start commit: absent an intervening stop, exactly one of several
 concurrent starts of one stopped thread succeeds. A start that a concurrent `SYS_THREAD_STOP`
 overtakes after its commit succeeds and leaves the thread `Stopped`, and a later start can then
@@ -1805,12 +1821,21 @@ binding's endpoint with another's badge nor frees the endpoint mid-delivery, and
 finds the binding cleared leaves the fault unhandled (the thread is killed, or a restartable
 syscall's copy fault fails the syscall with `InvalidAddress`; § Restartable Syscalls)
 ([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
-Object Reference Counting). Binding requires only a valid `Endpoint` cap — `Control` on the
-thread is the authority; the endpoint cap names where the thread's faults are delivered and, by
-its derivation badge (`0` for an unbadged cap), how they are attributed: the fault message
-carries that badge, which the binder cannot choose. The kernel synthesizes fault delivery via the
-binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND`
-to it receives `FAULT_LABEL` only from the kernel; a handler that also serves clients on that
+Object Reference Counting). A change of the binding (an unbind, or a bind to another endpoint or
+with another badge) cancels the fault delivery in flight through the binding it replaces, unless a
+reply or another cancellation claimed it first: a queued fault message is withdrawn, a handler that
+received it finds no pending reply (`SYS_IPC_REPLY` fails with `InvalidCapability`), and the
+faulting thread delivers the fault again under the binding current when it next runs, the fault
+being unhandled when none is bound. The call returns once the delivery is cancelled, waiting, with
+interrupts enabled, for a faulting thread that read the old binding to commit its park. A bind to
+the same endpoint with the same badge cancels nothing (see
+[fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). Binding requires
+only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap names where
+the thread's faults are delivered and, by its derivation badge (`0` for an unbadged cap), how they
+are attributed: the fault message carries that badge, which the binder cannot choose. The kernel
+synthesizes fault delivery via the binding and distributes no send capability to the endpoint, so a
+handler that hands out no `SEND` to it receives `FAULT_LABEL` only from the kernel; a handler that
+also serves clients on that
 endpoint attributes the message by badge, with the guarantees of an ordinary send's badge (see
 [fault-handling.md](../../../docs/fault-handling.md) § Security).
 

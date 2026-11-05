@@ -1194,6 +1194,34 @@ pub fn thread_start(thread_cap: u64) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
+/// Move a configured `Created` thread to `Stopped` without running it
+/// (`SYS_THREAD_START` with `THREAD_START_SUSPENDED`).
+///
+/// The thread is linked on no run queue and executes no user instruction: its
+/// register file, read with [`thread_read_regs`], holds the configured entry,
+/// stack, and argument, and [`thread_write_regs`] may change it. A later
+/// [`thread_start`] resumes it as for any `Stopped` thread.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the thread cap is invalid
+/// (`InvalidCapability`) or lacks Control rights (`InsufficientRights`), or if
+/// the thread has not been configured yet, is the calling thread itself, or is
+/// not `Created` when the call commits (`InvalidArgument`).
+#[inline]
+pub fn thread_start_suspended(thread_cap: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall2 issues the raw syscall instruction; both arguments are
+    // scalars the kernel validates (cap index, flags word).
+    let ret = unsafe {
+        syscall2(
+            SYS_THREAD_START,
+            thread_cap,
+            syscall_abi::THREAD_START_SUSPENDED,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
 /// Copy a capability slot from the calling thread's `CSpace` into another `CSpace`.
 ///
 /// - `src_slot`: capability handle (slot index plus generation) of the source

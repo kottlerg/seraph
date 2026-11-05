@@ -208,6 +208,7 @@ fn boot(ctx: &Context, args: &TestLogdReclaimArgs) -> Result<PathBuf>
         mem: args.mem,
         riscv_mmu: args.riscv_mmu,
         x86_paging: args.x86_paging,
+        iommu: crate::qemu::Iommu::Attached,
         pass: DEFAULT_PASS_REGEX.to_string(),
         fail: DEFAULT_FAIL_REGEX.to_string(),
         debug_listen: false,

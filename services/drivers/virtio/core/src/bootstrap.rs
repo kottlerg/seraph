@@ -13,7 +13,7 @@
 //!   [`RegisterLayout::bars`](crate::RegisterLayout::bars)), and one data
 //!   word per cap: `data[i]` is the PCI BAR index of `caps[i]`.
 //! - Round 2 (terminal) carries the positional slots [`SLOT_SERVICE`],
-//!   [`SLOT_IRQ`], and [`SLOT_DEVMGR_QUERY`], packed with
+//!   [`SLOT_IRQ`], [`SLOT_DEVMGR_QUERY`], and [`SLOT_DMA`], packed with
 //!   [`ipc::bootstrap::pack_slots`] and its presence word in `data[0]`
 //!   ([`DATA_PRESENCE`]), and the IRQ line's mode in `data[1]`
 //!   ([`DATA_IRQ_MODE`]): the trigger and polarity word the driver passes to
@@ -43,8 +43,13 @@ pub const SLOT_IRQ: usize = 1;
 /// driver's service endpoint only after that report, and revokes this cap
 /// once its batch has settled.
 pub const SLOT_DEVMGR_QUERY: usize = 2;
+/// Round-2 slot of the device's DMA capability: a SEND on devmgr's DMA
+/// endpoint badged with the device's badge, for `DMA_MAP` and `DMA_UNMAP`
+/// (`ipc::devmgr_dma_labels`). It lives as long as the driver serves the
+/// device; devmgr revokes it when it withdraws the driver.
+pub const SLOT_DMA: usize = 3;
 /// Slots round 2 carries.
-pub const ROUND2_SLOTS: usize = 3;
+pub const ROUND2_SLOTS: usize = 4;
 /// Round-2 data word holding the presence word of the slots.
 pub const DATA_PRESENCE: usize = 0;
 /// Round-2 data word holding the IRQ line's `SYS_IRQ_REGISTER` mode.
@@ -52,8 +57,9 @@ pub const DATA_IRQ_MODE: usize = 1;
 /// Data words round 2 carries.
 pub const ROUND2_DATA_WORDS: usize = 2;
 
-// Round 2 is one positional-slot round.
-const _: () = assert!(ROUND2_SLOTS <= MSG_CAP_SLOTS_MAX);
+// Round 2 is one positional-slot round, and its slots fill every cap slot a
+// message has, so `spread_slots` refuses a presence bit past them.
+const _: () = assert!(ROUND2_SLOTS == MSG_CAP_SLOTS_MAX);
 
 /// The BAR caps a driver received in round 1, each with its PCI BAR index.
 pub struct DeliveredBars
@@ -116,15 +122,16 @@ pub struct DriverEndpoints
     /// devmgr's per-device query and ready-report endpoint
     /// ([`SLOT_DEVMGR_QUERY`]).
     pub devmgr_query: u64,
+    /// The device's DMA capability ([`SLOT_DMA`]).
+    pub dma: u64,
 }
 
 impl DriverEndpoints
 {
     /// Decode round 2. Returns `None` when the round is not terminal, it
     /// carries other than [`ROUND2_DATA_WORDS`] data words, its presence word
-    /// disagrees with its caps ([`ipc::bootstrap::spread_slots`]), it fills a
-    /// slot past [`ROUND2_SLOTS`], or its mode word sets a bit outside
-    /// `IRQ_MODE_MASK`.
+    /// disagrees with its caps ([`ipc::bootstrap::spread_slots`]), or its mode
+    /// word sets a bit outside `IRQ_MODE_MASK`.
     #[must_use]
     pub fn from_round(round: &BootstrapRound) -> Option<Self>
     {
@@ -136,8 +143,7 @@ impl DriverEndpoints
             ipc::bootstrap::spread_slots(&round.caps[..round.cap_count], round.data[DATA_PRESENCE])
                 .ok()?;
         let irq_mode = round.data[DATA_IRQ_MODE];
-        if slots[ROUND2_SLOTS..].iter().any(|&s| s != 0)
-            || irq_mode & !syscall_abi::IRQ_MODE_MASK != 0
+        if irq_mode & !syscall_abi::IRQ_MODE_MASK != 0
         {
             return None;
         }
@@ -146,6 +152,7 @@ impl DriverEndpoints
             irq: slots[SLOT_IRQ],
             irq_mode,
             devmgr_query: slots[SLOT_DEVMGR_QUERY],
+            dma: slots[SLOT_DMA],
         })
     }
 }
@@ -196,10 +203,13 @@ mod tests
     #[test]
     fn round_two_spreads_present_caps_over_their_slots()
     {
-        // No IRQ: service and devmgr query present (slots 0 and 2).
-        let eps = DriverEndpoints::from_round(&round(true, &[20, 22], &[0b101, 0]))
+        // No IRQ: service, devmgr query, and DMA present (slots 0, 2, 3).
+        let eps = DriverEndpoints::from_round(&round(true, &[20, 22, 23], &[0b1101, 0]))
             .expect("well-formed round 2");
-        assert_eq!((eps.service, eps.irq, eps.devmgr_query), (20, 0, 22));
+        assert_eq!(
+            (eps.service, eps.irq, eps.devmgr_query, eps.dma),
+            (20, 0, 22, 23)
+        );
     }
 
     #[test]
@@ -220,10 +230,6 @@ mod tests
         assert!(DriverEndpoints::from_round(&round(true, &[20], &[])).is_none());
         // No mode word: the shape before the mode word.
         assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111])).is_none());
-        // A slot past the three round 2 defines.
-        assert!(
-            DriverEndpoints::from_round(&round(true, &[20, 21, 22, 23], &[0b1111, 0])).is_none()
-        );
         // A mode bit outside IRQ_MODE_MASK.
         let bad = syscall_abi::IRQ_MODE_MASK + 1;
         assert!(DriverEndpoints::from_round(&round(true, &[20, 21, 22], &[0b111, bad])).is_none());

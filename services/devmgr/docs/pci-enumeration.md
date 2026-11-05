@@ -147,7 +147,12 @@ For each matched device, devmgr:
    Enable through it before it takes the BAR caps (see
    [responsibilities.md](responsibilities.md#responsibilities)
    § Responsibilities). A function no kept window decodes, or whose carve
-   fails, refuses the device, logged, with its BAR caps released.
+   fails, refuses the device, logged, with its BAR caps released. devmgr
+   then gives the device DMA: it registers the device in its DMA table and
+   derives the device's DMA capability, a SEND badged with the device badge
+   on its DMA endpoint ([responsibilities.md](responsibilities.md)
+   § Responsibilities). A device that cannot be given DMA is refused, logged,
+   with its BAR and configuration-page caps released.
 4. Gives the device its own single-line `Interrupt` cap for its GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
@@ -184,17 +189,17 @@ For each matched device, devmgr:
    this step is withdrawn from its device as a live driver.
 7. Serves the driver's bootstrap rounds over `ipc::bootstrap`, in the shape
    `virtio_core::bootstrap` specifies: round 1 carries the BAR `Mmio` caps in
-   the order of step 1, with each cap's PCI BAR index as the matching data
-   word; round 2 carries the positional slots service endpoint, IRQ, and a
-   SEND badged with the device's badge on the private driver endpoint of the
-   driver's settle batch, packed with `ipc::bootstrap::pack_slots` (presence
-   word in `data[0]`), with the IRQ line's mode of step 4 in `data[1]` (0 with
-   no IRQ), which the driver passes to `SYS_IRQ_REGISTER`, and ends the
-   bootstrap. The IRQ slot is absent when the
-   device got no IRQ cap in step 4; virtio-input then polls, and virtio-blk,
-   which requires the IRQ, is not spawned. A driver checks the delivered BAR indices
-   against the layout it computes from its `QUERY_DEVICE_INFO` reply and exits
-   on a mismatch.
+   the order of step 1, with each cap's PCI BAR index as the matching data word;
+   round 2 carries the positional slots service endpoint, IRQ, a SEND badged
+   with the device's badge on the private driver endpoint of the driver's settle
+   batch, and a copy of the device's DMA capability, packed with
+   `ipc::bootstrap::pack_slots` (presence word in `data[0]`), with the IRQ
+   line's mode of step 4 in `data[1]` (0 with no IRQ), which the driver passes
+   to `SYS_IRQ_REGISTER`, and ends the bootstrap. The IRQ slot is absent when
+   the device got no IRQ cap in step 4; virtio-input then polls, and virtio-blk,
+   which requires the IRQ, is not spawned. A driver checks the delivered BAR
+   indices against the layout it computes from its `QUERY_DEVICE_INFO` reply and
+   exits on a mismatch.
 8. Binds a death observer on the driver's thread to devmgr's driver death
    queue, with the device badge as the correlator, and keeps the driver's
    process handle for the rest of the boot.

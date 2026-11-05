@@ -14,8 +14,10 @@
 //! there permanently. The data segment, `count * block_size` bytes for a
 //! request of `count` logical blocks, is supplied per-request by the caller
 //! as a Memory cap; [`IoLayout::read_chain`] / [`IoLayout::write_chain`] parameterise
-//! the data segment's physical address and length. The driver's own page
-//! never holds bulk data.
+//! the data segment's device address and length. Every address a chain
+//! carries is a device address devmgr returned for the frames
+//! (`virtio_core::dma`), never a physical one. The driver's own page never
+//! holds bulk data.
 
 use std::time::{Duration, Instant};
 
@@ -47,7 +49,7 @@ pub struct VirtioBlkReqHeader
     pub sector: u64,
 }
 
-/// Physical/virtual layout for the driver's permanent DMA page.
+/// Device-address/virtual layout for the driver's permanent DMA page.
 ///
 /// Hosts the request header (offset 0, 16 bytes) and status byte (offset
 /// 1024, 1 byte). The data segment, `count * block_size` bytes for a request
@@ -58,8 +60,8 @@ pub struct IoLayout
 {
     /// Virtual address of the mapped page.
     pub data_va: u64,
-    /// Physical address of the mapped page.
-    pub data_phys: u64,
+    /// Device address of the mapped page, as devmgr returned it.
+    pub data_addr: u64,
 }
 
 impl IoLayout
@@ -75,40 +77,40 @@ impl IoLayout
     }
 
     /// Descriptor chain for a block read request whose data segment lands at
-    /// `data_phys` and is `data_len` bytes long (`data_len` must be a
+    /// `data_addr` and is `data_len` bytes long (`data_len` must be a
     /// non-zero multiple of the logical block size).
     ///
     /// Three-element chain: header (readable), data (writable, at the
-    /// caller-supplied physical address), status (writable). The header and
+    /// data segment's device address), status (writable). The header and
     /// status segments stay in the driver's own DMA page.
-    pub fn read_chain(&self, data_phys: u64, data_len: u32) -> [(u64, u32, bool); 3]
+    pub fn read_chain(&self, data_addr: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
-        let header_phys = self.data_phys;
-        let status_phys = self.data_phys + 1024;
+        let header_addr = self.data_addr;
+        let status_addr = self.data_addr + 1024;
 
         [
-            (header_phys, 16, false),    // request header
-            (data_phys, data_len, true), // data buffer (device writes)
-            (status_phys, 1, true),      // status byte (device writes)
+            (header_addr, 16, false),    // request header
+            (data_addr, data_len, true), // data buffer (device writes)
+            (status_addr, 1, true),      // status byte (device writes)
         ]
     }
 
     /// Descriptor chain for a block write request whose data segment is
-    /// sourced from `data_phys` and is `data_len` bytes long (`data_len`
+    /// sourced from `data_addr` and is `data_len` bytes long (`data_len`
     /// must be a non-zero multiple of the logical block size).
     ///
     /// Mirror of [`Self::read_chain`] with the data segment's writable
     /// flag flipped: the device reads from the caller-supplied memory cap and
     /// writes only the completion status byte in the driver's page.
-    pub fn write_chain(&self, data_phys: u64, data_len: u32) -> [(u64, u32, bool); 3]
+    pub fn write_chain(&self, data_addr: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
-        let header_phys = self.data_phys;
-        let status_phys = self.data_phys + 1024;
+        let header_addr = self.data_addr;
+        let status_addr = self.data_addr + 1024;
 
         [
-            (header_phys, 16, false),     // request header
-            (data_phys, data_len, false), // data buffer (device reads)
-            (status_phys, 1, true),       // status byte (device writes)
+            (header_addr, 16, false),     // request header
+            (data_addr, data_len, false), // data buffer (device reads)
+            (status_addr, 1, true),       // status byte (device writes)
         ]
     }
 
@@ -182,7 +184,7 @@ const POLL_BURST: Duration = Duration::from_micros(500);
 /// in flight, and the caller must quiesce the device before it gives the data
 /// segment's Memory cap back.
 ///
-/// `data_phys` is the physical address of the caller-supplied memory cap's
+/// `data_addr` is the device address devmgr returned for the caller-supplied memory cap's
 /// data segment (offset 0 of the memory cap per the `BLK_READ_INTO_MEMORY` /
 /// `BLK_WRITE_FROM_MEMORY` contract). `data_len` is `count * block_size`
 /// for `count` consecutive logical blocks starting at `VirtIO` sector
@@ -194,17 +196,17 @@ const POLL_BURST: Duration = Duration::from_micros(500);
 /// timeout elapses, then re-polls the used ring. The bounded wait ensures
 /// that a lost PLIC external interrupt on QEMU virt RISC-V cannot park this
 /// thread indefinitely — see the wait loop body for details.
-// too_many_arguments: layout + direction + sector + data_phys + data_len
+// too_many_arguments: layout + direction + sector + data_addr + data_len
 // + three hardware handles (virtqueue, transport, completion notification) is
 // the minimal set this path needs; bundling for the lint would obscure
-// the per-call inputs (direction, sector, data_phys, data_len) that vary
+// the per-call inputs (direction, sector, data_addr, data_len) that vary
 // per request.
 #[allow(clippy::too_many_arguments)]
 pub fn submit_and_wait(
     layout: &IoLayout,
     dir: IoDirection,
     sector: u64,
-    data_phys: u64,
+    data_addr: u64,
     data_len: u32,
     vq: &mut SplitVirtqueue,
     transport: &PciTransport,
@@ -216,8 +218,8 @@ pub fn submit_and_wait(
 
     let chain = match dir
     {
-        IoDirection::Read => layout.read_chain(data_phys, data_len),
-        IoDirection::Write => layout.write_chain(data_phys, data_len),
+        IoDirection::Read => layout.read_chain(data_addr, data_len),
+        IoDirection::Write => layout.write_chain(data_addr, data_len),
     };
     let Some(head) = vq.add_chain(&chain)
     else

@@ -43,7 +43,8 @@ pub struct VirtioInputEvent
 pub struct EventRing
 {
     base_va: u64,
-    base_phys: u64,
+    /// Device address of the page, as devmgr returned it.
+    base_addr: u64,
     buf_count: u16,
     /// Descriptor-head index → buffer slot. Indexed by the head returned from
     /// `add_chain`/`poll_used` (always `< queue_size <= EVENT_QUEUE_SIZE`).
@@ -52,16 +53,17 @@ pub struct EventRing
 
 impl EventRing
 {
-    /// Create a ring over a mapped DMA page. `buf_count` buffers of
-    /// `EVENT_SIZE` bytes are carved from `[base_va, base_phys)`; the caller
+    /// Create a ring over a mapped DMA page whose virtual address is `base_va`
+    /// and whose device address is `base_addr`. `buf_count` buffers of
+    /// `EVENT_SIZE` bytes are carved from it; the caller
     /// guarantees the page holds `buf_count * EVENT_SIZE` bytes and that
     /// `buf_count <= EVENT_QUEUE_SIZE`.
     #[must_use]
-    pub fn new(base_va: u64, base_phys: u64, buf_count: u16) -> Self
+    pub fn new(base_va: u64, base_addr: u64, buf_count: u16) -> Self
     {
         Self {
             base_va,
-            base_phys,
+            base_addr,
             buf_count,
             slot_for_head: [0; EVENT_QUEUE_SIZE as usize],
         }
@@ -110,8 +112,8 @@ impl EventRing
     /// device serviceable.
     fn post(&mut self, vq: &mut SplitVirtqueue, slot: u16)
     {
-        let phys = self.base_phys + u64::from(slot) * u64::from(EVENT_SIZE);
-        if let Some(head) = vq.add_chain(&[(phys, EVENT_SIZE, true)])
+        let addr = self.base_addr + u64::from(slot) * u64::from(EVENT_SIZE);
+        if let Some(head) = vq.add_chain(&[(addr, EVENT_SIZE, true)])
         {
             self.slot_for_head[head as usize] = slot;
         }

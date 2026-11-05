@@ -18,6 +18,7 @@
 
 mod arch;
 mod caps;
+mod dma;
 mod pci;
 mod settle;
 mod spawn;
@@ -131,6 +132,16 @@ fn main() -> !
     // filled when its batch settles. devmgr owns each served driver's
     // service endpoint and mints client SEND caps on query.
     let mut served = ServedDrivers::default();
+
+    // The DMA endpoint every DMA-capable driver maps its device's buffers
+    // through, served on its own thread from before the first spawn: a boot
+    // driver maps its rings before it reports ready.
+    caps.dma = dma::DmaService::start();
+    if caps.dma.is_none()
+    {
+        std::os::seraph::log!("no DMA service, halting");
+        halt_loop();
+    }
 
     // The boot batch: every virtio-blk driver, in BDF order, then the serial
     // and framebuffer drivers, from boot modules, settled before the
@@ -1273,11 +1284,15 @@ impl VirtioBars
 
 /// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio` caps,
 /// its optional single-IRQ cap with the line's `SYS_IRQ_REGISTER` mode, the
-/// badge of its catalog entry, the function's configuration page, and where
-/// devmgr resets the device when it withdraws its driver.
+/// badge of its catalog entry, the device's DMA grant, the function's
+/// configuration page, and where devmgr resets the device when it withdraws
+/// its driver.
 struct VirtioDeviceCaps
 {
     bars: VirtioBars,
+    /// The device's DMA capability, kept by devmgr, and its mappings
+    /// ([`dma::DmaGrant`]).
+    dma: dma::DmaGrant,
     /// The function's configuration page, kept by devmgr alone, through
     /// which it clears Bus Master Enable before it takes the device.
     config: FunctionConfig,
@@ -1437,10 +1452,11 @@ impl FunctionConfig
 
 impl VirtioDeviceCaps
 {
-    /// Release the BAR, configuration-page, and IRQ caps of the device.
+    /// Release the BAR, DMA, configuration-page, and IRQ caps of the device.
     fn release(&self)
     {
         self.bars.release();
+        self.dma.release();
         let _ = syscall::cap_delete(self.config.cap);
         if let Some(irq) = self.irq_cap
         {
@@ -1449,19 +1465,23 @@ impl VirtioDeviceCaps
     }
 
     /// Take the device from its driver, live or dead, so its DMA is stopped
-    /// before the driver's frames are freed: clear the function's Bus Master
-    /// Enable ([`FunctionConfig::clear_bus_master`]), so the device issues no
-    /// further DMA whatever its driver does; then revoke every cap derived from
-    /// the BAR caps devmgr keeps (the driver's copies, whose mappings the
-    /// revocation removes before it returns), so the driver can no longer
-    /// reach the device; then reset the device and wait, bounded by
-    /// `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
-    /// ([`DeviceReset::reset`]). Returns whether the device is known to be
-    /// quiet: Bus Master Enable read back clear, every BAR copy revoked, and
-    /// the reset confirmed. `false`, logged, means the device may still be
+    /// before the driver's frames are freed: withdraw its DMA grant
+    /// ([`dma::DmaGrant::withdraw`]), so the driver maps nothing more and an
+    /// IOMMU, where one confines the device, blocks it; clear the function's
+    /// Bus Master Enable ([`FunctionConfig::clear_bus_master`]), so the
+    /// device issues no further DMA whatever its driver does; then revoke
+    /// every cap derived from the BAR caps devmgr keeps (the driver's copies,
+    /// whose mappings the revocation removes before it returns), so the
+    /// driver can no longer reach the device; then reset the device and wait,
+    /// bounded by `virtio_core::pci::RESET_TIMEOUT`, for it to confirm
+    /// ([`DeviceReset::reset`]). Returns whether the device can no longer
+    /// reach the driver's memory: an IOMMU blocks it, or it is known to be
+    /// quiet (Bus Master Enable read back clear, every BAR copy revoked, and
+    /// the reset confirmed). `false`, logged, means the device may still be
     /// accessing the driver's memory.
     fn take_from_driver(&self) -> bool
     {
+        let blocked = self.dma.withdraw();
         let bus_master_clear = self.config.clear_bus_master();
         let mut revoked = true;
         for bar in self.bars.as_slice()
@@ -1484,7 +1504,7 @@ impl VirtioDeviceCaps
             std::os::seraph::log!("device reset: the device has no reset target; not reset");
             false
         };
-        bus_master_clear && revoked && reset
+        blocked || (bus_master_clear && revoked && reset)
     }
 }
 
@@ -1542,6 +1562,14 @@ fn carve_virtio_device(
         let _ = syscall::cap_delete(config.cap);
         return None;
     };
+    let Some(dma) = caps.dma.as_ref().and_then(|d| d.grant(device_badge))
+    else
+    {
+        std::os::seraph::log!("{}: no DMA grant; not spawned", name);
+        bars.release();
+        let _ = syscall::cap_delete(config.cap);
+        return None;
+    };
     let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
     let irq_mode = match (irq_cap, device_gsi(pci_dev))
     {
@@ -1551,6 +1579,7 @@ fn carve_virtio_device(
     let reset = DeviceReset::for_device(&pci_dev.virtio_info, bars.as_slice(), caps.self_aspace);
     Some(VirtioDeviceCaps {
         bars,
+        dma,
         config,
         irq_cap,
         irq_mode,
@@ -2026,6 +2055,7 @@ fn spawn_one_virtio_blk(
         bootstrap_ep: caps.self_bootstrap_ep,
         source: spawn::CreateSource::Module(module_copy),
         bars: dev_caps.bars.as_slice(),
+        dma_cap: dev_caps.dma.cap(),
         irq_cap: Some(irq_cap),
         irq_mode: dev_caps.irq_mode,
         service_ep: blk_ep,
@@ -2350,6 +2380,7 @@ fn spawn_virtio_input_from_disk(
             size: walked.size,
         },
         bars: pending.bars.as_slice(),
+        dma_cap: pending.dma.cap(),
         irq_cap: pending.irq_cap,
         irq_mode: pending.irq_mode,
         service_ep: input_ep,

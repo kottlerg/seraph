@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::arch::Arch;
 use crate::bundle::Harness;
 use crate::disk::BlockSize;
-use crate::qemu::{RiscvMmu, X86Paging};
+use crate::qemu::{Iommu, RiscvMmu, X86Paging};
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -240,6 +240,14 @@ pub struct RunArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
+    /// devices behind it. `absent` boots the no-IOMMU variant of the release
+    /// host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's
+    /// unconfined path covered once the attached IOMMU is programmed; today
+    /// none is, so both modes run every device unconfined.
+    #[arg(long, default_value = "attached")]
+    pub iommu: Iommu,
 
     /// Attach this image as a second disk: its own `virtio-blk-pci` device
     /// (drive `hd1`) beside `disk.img`, presenting the logical block size of
@@ -500,6 +508,14 @@ pub struct RunParallelArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
+    /// devices behind it. `absent` boots the no-IOMMU variant of the release
+    /// host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's
+    /// unconfined path covered once the attached IOMMU is programmed; today
+    /// none is, so both modes run every device unconfined.
+    #[arg(long, default_value = "attached")]
+    pub iommu: Iommu,
 
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the cross-harness

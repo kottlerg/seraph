@@ -9,8 +9,9 @@
 //! the startup message format used by devmgr to pass PCI capability info
 //! to `VirtIO` drivers, the register layout by which a driver maps every BAR
 //! the register regions name ([`RegisterLayout`]), the devmgr-to-driver
-//! bootstrap rounds ([`bootstrap`]), and the interrupt-service loop each driver
-//! runs on a thread of its own ([`isr`]).
+//! bootstrap rounds ([`bootstrap`]), the mapping of a driver's buffers for its
+//! device ([`dma`]), and the interrupt-service loop each driver runs on a
+//! thread of its own ([`isr`]).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -19,9 +20,21 @@ extern crate alloc;
 use syscall_abi::PAGE_SIZE;
 
 pub mod bootstrap;
+pub mod dma;
 pub mod isr;
 pub mod pci;
 pub mod virtqueue;
+
+// ── Reserved feature bits (VirtIO 1.2 §6) ──────────────────────────────────
+
+/// `VIRTIO_F_VERSION_1`: the device is a modern (`VirtIO` 1.x) device.
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// `VIRTIO_F_ACCESS_PLATFORM`: the device reaches memory through the
+/// platform's address translation (an IOMMU), so the driver programs it with
+/// device addresses rather than physical ones. A driver accepts it whenever
+/// offered, since it programs only the device addresses devmgr returns
+/// ([`dma`]).
+pub const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
 
 // ── Device status bits (VirtIO 1.2 §2.1) ───────────────────────────────────
 

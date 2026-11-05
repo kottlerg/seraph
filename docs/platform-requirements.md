@@ -235,8 +235,9 @@ is a platform/chipset feature whose presence and usability vary across the envel
 disable it, fuse it off, or omit it on consumer boards and handhelds — so requiring it would exclude
 in-envelope hardware.
 
-The IOMMU is discovered and programmed by the userspace device manager, not the kernel (design
-intent; not yet implemented, so DMA currently runs unconfined). When an
+The IOMMU is discovered by the userspace device manager and programmed by a userspace IOMMU
+driver it directs, not by the kernel (design intent; not yet implemented, so DMA currently runs
+unconfined). When an
 IOMMU is present and configured, device DMA is confined to explicitly mapped frames; when it is
 absent or unconfigured, DMA is unconfined (a degraded mode). The authoritative DMA safety model is
 in [device-management.md](device-management.md).

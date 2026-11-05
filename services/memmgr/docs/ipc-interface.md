@@ -121,12 +121,16 @@ with `want_pages` and request the remainder (see
 [`memory-pool.md`](memory-pool.md) §"Allocation").
 
 The `phys_base_for_cap_i` field is the host physical address of the
-first page of the i-th returned cap. It is what DMA-issuing drivers
-program into device transports (VirtIO PCI rings, e.g.). DMA isolation,
+first page of the i-th returned cap, and the name `RELEASE_MEMORY_CAPS`
+takes for the region. No DMA-issuing driver programs it into its device:
+drivers program the device addresses devmgr returns when it maps a cap for
+the driver's device (see
+[docs/device-management.md](../../../docs/device-management.md#dma-authorisation)
+§ DMA Authorisation), and withdrawing the field from drivers is
+[#767](https://github.com/kottlerg/seraph/issues/767). DMA isolation,
 when present, is established through devmgr-managed IOMMU policy
-outside the kernel surface (see
-[docs/device-management.md](../../../docs/device-management.md) §"DMA Safety Model");
-memmgr exposes only the addresses, not the isolation policy.
+outside the kernel surface; memmgr exposes only the addresses, not the
+isolation policy.
 
 There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).

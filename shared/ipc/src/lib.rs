@@ -55,7 +55,8 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //                             in `data[1]` after the round kind (init ↔ svcmgr)
 //
 //   Checked on every request (`data[0]`):
-//     DEVMGR_LABELS_VERSION — every devmgr_labels request
+//     DEVMGR_LABELS_VERSION     — every devmgr_labels request
+//     DEVMGR_DMA_LABELS_VERSION — every devmgr_dma_labels request
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -499,7 +500,8 @@ pub mod sched_policy
     pub const INIT_LOGD_PRIORITY: u8 = 26;
 
     /// Boot-critical device drivers: serial (console path) and
-    /// virtio-blk (root-disk path).
+    /// virtio-blk (root-disk path); also devmgr's DMA thread, which
+    /// virtio-blk blocks on for every transfer.
     pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
     /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input.
@@ -2025,6 +2027,160 @@ pub mod device_info_kind
     pub const FRAMEBUFFER: u32 = 2;
 }
 
+/// Wire-protocol version of [`devmgr_dma_labels`]; bumped as the block comment
+/// above the label modules describes, which also lists its runtime check.
+pub const DEVMGR_DMA_LABELS_VERSION: u32 = 1;
+/// IPC labels for devmgr's DMA endpoint: the DMA-authorising capability of a
+/// DMA-capable driver.
+///
+/// devmgr gives each driver of a DMA-capable device a SEND on its DMA
+/// endpoint badged with the device's badge, and serves it on a thread of its
+/// own. A driver programs its device only with the device addresses
+/// [`DMA_MAP`] returns, never with a physical address: devmgr chooses the
+/// address, an IOVA in the device's IOMMU domain when an IOMMU confines the
+/// device and the frames' physical address when none does. Every request
+/// carries the caller's compiled [`DEVMGR_DMA_LABELS_VERSION`] in `data[0]`;
+/// devmgr replies [`devmgr_dma_errors::LABEL_VERSION_MISMATCH`] when it
+/// differs. Specified in `docs/device-management.md` § DMA Authorisation.
+pub mod devmgr_dma_labels
+{
+    /// Make the frames of a Memory cap reachable by the caller's device.
+    ///
+    /// Request: `data[1]` = the access the device needs, a nonzero
+    /// combination of [`ACCESS_DEVICE_READ`] and [`ACCESS_DEVICE_WRITE`];
+    /// `caps[0]` = a Memory cap over the frames, which the request moves to
+    /// devmgr: a driver sends a derivation of its own cap and keeps the
+    /// original. The cap must carry `MAP` rights, and `MAP|WRITE` when the
+    /// device writes. The whole cap is made reachable. devmgr keeps the cap
+    /// while the mapping stands and deletes it at the mapping's
+    /// [`DMA_UNMAP`], at the device's withdrawal, or at once when it refuses
+    /// the request. Reply: label `SUCCESS` with `data[0]` = the device
+    /// address of the cap's first byte, the cap's frames lying contiguous
+    /// from it; or an error code. A reply the caller cannot take undoes the
+    /// mapping.
+    pub const DMA_MAP: u64 = 1;
+    /// Withdraw a mapping [`DMA_MAP`] made: the device can no longer reach
+    /// its frames through it.
+    ///
+    /// Request: `data[1]` = the device address a `DMA_MAP` of this device
+    /// returned. Reply: empty body, label `SUCCESS`,
+    /// `devmgr_dma_errors::NO_MAPPING` (no mapping of the device at that
+    /// address), `devmgr_dma_errors::UNAUTHORIZED` (the device is withdrawn
+    /// or was never given DMA), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
+    pub const DMA_UNMAP: u64 = 2;
+    /// [`DMA_MAP`] access bit: the device reads the frames.
+    pub const ACCESS_DEVICE_READ: u64 = 1 << 0;
+    /// [`DMA_MAP`] access bit: the device writes the frames.
+    pub const ACCESS_DEVICE_WRITE: u64 = 1 << 1;
+    /// Every [`DMA_MAP`] access bit.
+    pub const ACCESS_MASK: u64 = ACCESS_DEVICE_READ | ACCESS_DEVICE_WRITE;
+}
+
+/// Error replies on devmgr's DMA endpoint ([`devmgr_dma_labels`]).
+pub mod devmgr_dma_errors
+{
+    /// Request handled.
+    pub const SUCCESS: u64 = 0;
+    /// The request is malformed: no Memory cap, a cap that is not a Memory
+    /// cap or lacks the rights the access needs, or an access word that is
+    /// zero or sets a bit outside `devmgr_dma_labels::ACCESS_MASK`.
+    pub const INVALID_REQUEST: u64 = 1;
+    /// The badge names no device devmgr gives DMA: its driver was withdrawn,
+    /// or the SEND was never one devmgr minted.
+    pub const UNAUTHORIZED: u64 = 2;
+    /// Caller's compiled `DEVMGR_DMA_LABELS_VERSION`, carried in `data[0]`,
+    /// does not match devmgr's.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// `DMA_UNMAP` names no mapping of the caller's device.
+    pub const NO_MAPPING: u64 = 4;
+    /// The device already holds its bound of mappings
+    /// (`devmgr_firmware::dma::MAX_MAPPINGS_PER_DEVICE`).
+    pub const TOO_MANY_MAPPINGS: u64 = 5;
+    /// The device address devmgr would give the frames is in use by another
+    /// mapping of the device: with no IOMMU, the same frames mapped twice.
+    pub const ADDRESS_IN_USE: u64 = 6;
+    /// devmgr could not make the frames reachable (an allocation failed).
+    pub const OUT_OF_RESOURCES: u64 = 7;
+    /// Unknown opcode on the DMA endpoint.
+    pub const UNKNOWN_OPCODE: u64 = 0xFF;
+}
+
+/// Why [`dma_map`] or [`dma_unmap`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaError
+{
+    /// The `ipc_call` itself failed, with this syscall error.
+    Call(i64),
+    /// devmgr replied this non-`SUCCESS` label ([`devmgr_dma_errors`]).
+    Refused(u64),
+}
+
+/// Map the frames of `memory_cap` for the device whose DMA capability
+/// `dma_ep` is ([`devmgr_dma_labels::DMA_MAP`]) with `access`, and return the
+/// device address of their first byte. The call moves `memory_cap` to
+/// devmgr, which keeps it while the mapping stands, so a caller passes a
+/// derivation of the cap it goes on using.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
+/// devmgr's reply label when devmgr refuses the mapping.
+pub unsafe fn dma_map(
+    dma_ep: u64,
+    memory_cap: u64,
+    access: u64,
+    ipc_buf: *mut u64,
+) -> Result<u64, DmaError>
+{
+    let request = IpcMessage::builder(devmgr_dma_labels::DMA_MAP)
+        .word(0, u64::from(DEVMGR_DMA_LABELS_VERSION))
+        .word(1, access)
+        .cap(memory_cap)
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(dma_ep, &request, ipc_buf) }.map_err(DmaError::Call)?;
+    if reply.label == devmgr_dma_errors::SUCCESS
+    {
+        Ok(reply.word(0))
+    }
+    else
+    {
+        Err(DmaError::Refused(reply.label))
+    }
+}
+
+/// Withdraw the mapping at `device_addr` of the device whose DMA capability
+/// `dma_ep` is ([`devmgr_dma_labels::DMA_UNMAP`]).
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
+/// devmgr's reply label when devmgr refuses: `NO_MAPPING` when `device_addr`
+/// names no mapping of the device, `UNAUTHORIZED` when the device is
+/// withdrawn or was never given DMA, or `LABEL_VERSION_MISMATCH`
+/// ([`devmgr_dma_labels::DMA_UNMAP`]).
+pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Result<(), DmaError>
+{
+    let request = IpcMessage::builder(devmgr_dma_labels::DMA_UNMAP)
+        .word(0, u64::from(DEVMGR_DMA_LABELS_VERSION))
+        .word(1, device_addr)
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(dma_ep, &request, ipc_buf) }.map_err(DmaError::Call)?;
+    if reply.label == devmgr_dma_errors::SUCCESS
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(DmaError::Refused(reply.label))
+    }
+}
+
 /// Wire-protocol version of [`blk_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
 pub const BLK_LABELS_VERSION: u32 = 3;
@@ -2075,8 +2231,9 @@ pub mod blk_labels
     /// least `count * block_size` bytes; the driver rejects with
     /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
-    /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
-    /// see [`BLK_READ_INTO_MEMORY`] for the userspace-IOMMU framing.
+    /// reserved IPC-shape slot, null today: the driver maps the source cap
+    /// for its device itself, for the request's duration
+    /// ([`crate::devmgr_dma_labels::DMA_MAP`]).
     /// Reply: empty body, label is the success or error code; the source
     /// Memory cap is moved back to the caller in `caps[0]` of the reply (same
     /// discipline as the read path).
@@ -2855,9 +3012,10 @@ pub mod blk_errors
     /// `length_lba` to `data[2]`); mismatch here means the caller was built
     /// against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 6;
-    /// The request got no usable completion: the device did not complete it
-    /// within the driver's timeout, published a malformed completion, wrote a
-    /// status byte outside `VirtIO`'s set, or the chain could not be queued.
+    /// The request got no usable completion: devmgr refused to map its
+    /// Memory cap for the device, the device did not complete it within the
+    /// driver's timeout, published a malformed completion, wrote a status
+    /// byte outside `VirtIO`'s set, or the chain could not be queued.
     /// After a lost request the driver resets the device, so the reply's
     /// Memory cap is free of device DMA, and answers every later
     /// `BLK_READ_INTO_MEMORY` / `BLK_WRITE_FROM_MEMORY` with this code

@@ -48,7 +48,7 @@ ruststd/
         ├── reserve/            # page-reservation surface
         ├── stdio/              # stdout/stderr
         ├── sync/               # mutex / rwlock / once / condvar / thread parking
-        ├── thread/             # thread spawn and join
+        ├── thread/             # thread spawn, join, and spawn-time priority
         └── time/               # monotonic and system clocks
 ```
 
@@ -327,6 +327,19 @@ and env together exceed `process_abi::ARGV_ENV_MAX_BYTES` or memmgr refuses the 
 they fill. In the child, `_start` reads both blobs from the argv/env region after the
 `ProcessInfo` page ([abi/process-abi/README.md](../../abi/process-abi/README.md) § argv / env
 region), confined to that region by `argv_env::blob_span`.
+
+---
+
+## Spawned-thread priority
+
+`std::thread::spawn` places each new thread at the process's `initial_priority`, the level its
+spawner gave its initial thread. `std::os::seraph::thread::BuilderExt::spawn_at_priority`
+places the thread at another level within the band of the process's `SchedControl` cap
+(`StartupInfo::sched_control_cap`) instead, so a server thread that a higher-level client blocks
+on runs at that client's level
+([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Priority Inversion
+Mitigation); devmgr's DMA thread runs at the boot drivers' level this way. A level of 0, a
+process with no `SchedControl` cap, or a level outside the band fails the spawn.
 
 ---
 

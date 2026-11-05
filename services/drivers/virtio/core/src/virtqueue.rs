@@ -7,7 +7,8 @@
 //!
 //! Manages the descriptor table, available ring, and used ring for a single
 //! split virtqueue. The caller is responsible for allocating DMA-capable
-//! memory and providing physical addresses.
+//! memory and providing the device addresses devmgr returned when it mapped
+//! that memory for the device ([`crate::dma`]), never physical addresses.
 
 use alloc::vec::Vec;
 
@@ -45,7 +46,7 @@ pub const VRING_DESC_F_WRITE: u16 = 2;
 #[derive(Clone, Copy, Default)]
 pub struct VirtqDesc
 {
-    /// Physical address of the buffer.
+    /// Device address of the buffer ([`crate::dma`]).
     pub addr: u64,
     /// Length of the buffer in bytes.
     pub len: u32,
@@ -216,7 +217,7 @@ impl SplitVirtqueue
 
     /// Submit a descriptor chain to the available ring.
     ///
-    /// `bufs` is a slice of (`physical_addr`, `length`, `device_writable`) tuples.
+    /// `bufs` is a slice of (`device_addr`, `length`, `device_writable`) tuples.
     /// Returns the head descriptor index for tracking completion, or `None`
     /// if `bufs` is empty or longer than the number of free descriptors;
     /// a refused chain allocates nothing.

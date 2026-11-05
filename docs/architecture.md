@@ -214,13 +214,15 @@ RISC‑V does not support port I/O.
 
 **DMA**
 DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
-hardware (via firmware-table passthrough), programs the translation tables
-itself, and authorises DMA on a per-device basis (design intent; no IOMMU
-support is implemented yet, so DMA is unconfined). The kernel reads no
-IOMMU registers, holds no per-device DMA state, and exposes no DMA-grant
-syscall. Memory physical-base addresses (which DMA-issuing drivers program
-into device transports) reach drivers through memmgr's `REQUEST_MEMORY_CAPS`
-reply. See [device-management.md](device-management.md#dma-safety-model).
+hardware (via firmware-table passthrough), has a separate IOMMU driver process
+per IOMMU family program the translation tables (design intent), and authorises
+DMA on a per-device basis: each DMA-capable driver maps
+the buffers its device reaches through a DMA capability devmgr gives it and
+programs the device only with the device addresses devmgr returns. No IOMMU
+programming is implemented yet (design intent), so DMA is unconfined and those
+addresses are physical. The kernel reads no IOMMU registers, holds no
+per-device DMA state, and exposes no DMA-grant syscall. See
+[device-management.md](device-management.md#dma-authorisation).
 
 **Interrupts**
 Hardware interrupts are received by the kernel and delivered to drivers as

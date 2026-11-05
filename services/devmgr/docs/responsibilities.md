@@ -473,5 +473,6 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/drivers/virtio/input/README.md](../../drivers/virtio/input/README.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md),
 [Restart Protocol](../../svcmgr/docs/restart-protocol.md)

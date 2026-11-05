@@ -669,6 +669,7 @@ endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md),

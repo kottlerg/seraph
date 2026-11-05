@@ -1582,8 +1582,9 @@ pub mod fs_labels
     /// it lives outside the driver, and once every copy is gone (deleted, or
     /// with its holder's `CSpace`) the driver may release the open as
     /// [`FS_CLOSE`] would; a release revokes the copies still in the
-    /// driver's derivation subtree, which a copy derived from a dead
-    /// client's copy has left. The holder keeps it for the open's life and
+    /// driver's derivation subtree, which a copy derived from another
+    /// holder's copy leaves once a `CSpace` holding a copy on its derivation
+    /// path is torn down. The holder keeps it for the open's life and
     /// deletes it after [`FS_CLOSE`].
     /// [`FS_READ_MEMORY`], [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the
     /// open cap; the stateless file labels accept either cap. Errors:

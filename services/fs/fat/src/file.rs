@@ -76,8 +76,8 @@ pub struct OpenFile
     /// The driver's own cap on the open's liveness Notification, the parent
     /// of the zero-rights liveness cap the `FS_OPEN` reply handed the client
     /// (services/fs/docs/fs-driver-protocol.md § Label 18). Revoked, which
-    /// kills the client's copy and every copy still derived beneath it, and
-    /// deleted when the open is released.
+    /// kills the client's copy and every copy still in this cap's derivation
+    /// subtree, and deleted when the open is released.
     pub liveness_cap: u64,
 }
 

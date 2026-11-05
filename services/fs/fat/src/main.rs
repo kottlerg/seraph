@@ -1237,9 +1237,9 @@ fn handle_close_open_cap(open_id: u64, files: &mut OpenTable, cache: &PageCache,
 /// would accumulate a stale SEND per open across the fs's lifetime), and
 /// revoke the copies of the liveness cap before deleting its parent, so the
 /// client's copy dies with the open and the Notification's bytes return to
-/// fatfs's object slab. A copy derived from the client's copy is out of the
-/// revoke's reach once the client's `CSpace` is torn down, and holds the
-/// bytes until its holder deletes it
+/// fatfs's object slab. A copy derived from another holder's copy is out of
+/// the revoke's reach once a `CSpace` holding a copy on its derivation path
+/// is torn down, and holds the bytes until its holder deletes it
 /// (services/fs/docs/fs-driver-protocol.md § Label 18).
 fn release_open_file(file: &OpenFile, cache: &PageCache)
 {

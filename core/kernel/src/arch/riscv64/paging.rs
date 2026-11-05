@@ -139,7 +139,7 @@ const READ: u64 = super::encoding::PTE_READ;
 /// Write permission.
 const WRITE: u64 = super::encoding::PTE_WRITE;
 /// Execute permission.
-const EXECUTE: u64 = 1 << 3;
+const EXECUTE: u64 = super::encoding::PTE_EXECUTE;
 /// Accessed — must be pre-set in leaf PTEs.
 ///
 /// Per RISC-V Privileged Spec §5.4.1, an implementation may either update

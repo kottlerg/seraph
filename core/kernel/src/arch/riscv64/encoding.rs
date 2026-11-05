@@ -173,6 +173,8 @@ pub(super) const PTE_VALID: u64 = 1 << 0;
 pub(super) const PTE_READ: u64 = 1 << 1;
 /// PTE bit W: write permission.
 pub(super) const PTE_WRITE: u64 = 1 << 2;
+/// PTE bit X: execute permission.
+pub(super) const PTE_EXECUTE: u64 = 1 << 3;
 
 /// The access an S-mode page fault made, for the kernel's spurious-fault
 /// retry (`paging::kernel_fault_is_spurious`).
@@ -205,9 +207,6 @@ pub(super) fn kernel_leaf_permits(pte: u64, access: KernelAccess) -> bool
 mod tests
 {
     use super::*;
-
-    /// PTE bit X: execute permission, for an execute-only leaf.
-    const PTE_EXECUTE: u64 = 1 << 3;
 
     #[test]
     fn plic_context_registers_follow_the_hart_id()

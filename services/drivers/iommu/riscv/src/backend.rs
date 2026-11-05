@@ -14,9 +14,10 @@
 //!
 //! On RISC-V a memory fence orders no device access, so the `mmio` barriers
 //! order the two: each register write after every structure store before it
-//! (`fence w,o`), the fault records after the tail register that publishes
-//! them (`fence i,r`), and the head register write that frees their slots
-//! after the record reads (`fence r,o`).
+//! (`fence w,o`) and before the next register write (`fence o,o`), the fault
+//! records after the tail register that publishes them (`fence i,r`), and
+//! the head register write that frees their slots after the record reads
+//! (`fence r,o`).
 //!
 //! The IOMMU reads the device directory, the page tables, and the queues
 //! from memory coherently with the processor caches, as the platform's PCI
@@ -92,14 +93,17 @@ impl Unit
 
     /// Write a 32-bit register. A write starts or configures an IOMMU
     /// operation that may read the in-memory structures, so every store the
-    /// driver made to them before it is ordered before it: on RISC-V a
-    /// memory fence orders no device access, so the memory-to-device barrier
-    /// (`fence w,o`) does it.
+    /// driver made to them before it is ordered before it, and the register
+    /// writes of a sequence (a queue's base, then its index, then its enable)
+    /// reach the IOMMU in program order: on RISC-V a memory fence orders no
+    /// device access, so the memory-to-device barrier (`fence w,o`) precedes
+    /// the write and the device-to-device one (`fence o,o`) follows it.
     fn write32(&self, off: usize, value: u32)
     {
         mmio::dma_to_mmio_barrier();
         // SAFETY: as in `read32`.
         unsafe { core::ptr::write_volatile((self.regs + off as u64) as *mut u32, value) };
+        mmio::mmio_to_mmio_barrier();
     }
 
     fn read64(&self, off: usize) -> u64
@@ -114,6 +118,7 @@ impl Unit
         mmio::dma_to_mmio_barrier();
         // SAFETY: as in `read32`.
         unsafe { core::ptr::write_volatile((self.regs + off as u64) as *mut u64, value) };
+        mmio::mmio_to_mmio_barrier();
     }
 
     /// Poll until `done` holds, at most [`COMMAND_TIMEOUT`].

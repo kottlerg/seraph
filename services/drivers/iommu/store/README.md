@@ -18,7 +18,8 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
 - **Caches.** A driver whose units read memory past the processor caches gives the store a
   write-back function (`Flush::Writeback`; VT-d's `CLFLUSH` for a unit with `ECAP.C` clear), which
   every zeroed page and table store is written back with; for coherent units
-  (`Flush::Coherent`) the fences alone suffice.
+  (`Flush::Coherent`) no write-back is needed, the store's fences and the driver's register
+  barriers ordering the writes.
 - **Lifetime.** No page is ever returned: a unit may walk any of them while translation stays on,
   so they stay with the driver for the boot, and past its death, since devmgr spawns the driver
   `CREATE_DMA_HOLD` and never releases the hold (docs/device-management.md

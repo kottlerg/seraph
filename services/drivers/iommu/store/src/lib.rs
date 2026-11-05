@@ -36,8 +36,9 @@ pub const CHUNK_PAGES: u64 = 16;
 #[derive(Clone, Copy)]
 pub enum Flush
 {
-    /// Every unit's table reads snoop the processor caches: a write needs
-    /// only the store's fence.
+    /// Every unit's table reads snoop the processor caches: a write needs no
+    /// write-back; the store's fence orders it before the next table store,
+    /// and the driver's barrier on its register write before that write.
     Coherent,
     /// A unit reads memory past the caches: every write is written back
     /// with this function, which takes a mapped virtual address and a byte
@@ -116,8 +117,14 @@ impl Store
         self.va(phys).map(|va| va as *const u64)
     }
 
+    /// The mapped address of the page at `phys`; `None` for an address that
+    /// is not page-aligned or that no chunk's handed-out pages hold.
     fn va(&self, phys: u64) -> Option<u64>
     {
+        if phys % PAGE_SIZE != 0
+        {
+            return None;
+        }
         self.chunks
             .iter()
             .find(|c| phys >= c.phys && phys < c.phys + c.used * PAGE_SIZE)

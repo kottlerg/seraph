@@ -595,6 +595,41 @@ mod tests
     }
 
     #[test]
+    fn a_bus_an_earlier_mapping_touches_splits_the_whole_range_around_it()
+    {
+        // The second IOMMU owns 05:00.0-05:00.7, inside the first's range.
+        let t = rimt(&[
+            pci_iommu(0, 0x0008),
+            pci_iommu(0, 0x0010),
+            root_complex(0, &[(0x0500, 0x8, 0x0500, 88), (0x0009, 0xfff7, 0x0009, 48)]),
+        ]);
+        let scanned = [bdf(5, 0, 1), bdf(5, 1, 0)];
+        let mut out = Vec::new();
+        resolve_scope(&t, 48, 0, &scanned.iter().copied(), |r| out.push(r));
+        assert_eq!(
+            out,
+            [
+                Resolved::Buses(1, 4),
+                Resolved::Buses(6, 255),
+                Resolved::Function(bdf(5, 1, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_earlier_mapping_of_another_segment_shadows_no_bus()
+    {
+        let t = rimt(&[
+            pci_iommu(0, 0x0008),
+            root_complex(1, &[(0x0500, 0x8, 0x0500, 48)]),
+            root_complex(0, &[(0x0009, 0xfff7, 0x0009, 48)]),
+        ]);
+        let mut out = Vec::new();
+        resolve_scope(&t, 48, 0, &core::iter::empty(), |r| out.push(r));
+        assert_eq!(out, [Resolved::Buses(1, 255)]);
+    }
+
+    #[test]
     fn an_iommu_node_too_short_for_its_fields_is_skipped()
     {
         let mut short = pci_iommu(0, 0x0008);

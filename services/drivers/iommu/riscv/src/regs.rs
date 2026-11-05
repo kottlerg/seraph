@@ -286,7 +286,7 @@ pub const fn ddtp_off(ddtp: u64) -> u64
 #[must_use]
 pub const fn device_id_bits(levels: u32, format: ContextFormat) -> u32
 {
-    let bits = format.leaf_bits() + 9 * (levels - 1);
+    let bits = format.leaf_bits() + 9 * levels.saturating_sub(1);
     if bits > 24 { 24 } else { bits }
 }
 

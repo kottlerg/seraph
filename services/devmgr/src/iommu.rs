@@ -25,10 +25,11 @@
 //! whose unit it could not hand over, or one whose `ATTACH` fails. When no
 //! unit is found, no driver module was delivered, or the driver does not
 //! report ready within the settle bound, devmgr logs once that DMA runs
-//! unconfined and every device runs so; a driver that fails its own setup turns translation off
-//! again first, but one that dies or hangs after it turned a unit's
-//! translation on leaves that unit blocking the devices behind it, which
-//! devmgr, holding no register cap, cannot undo, and logs as such.
+//! unconfined and every device runs so; a driver that fails its own setup
+//! turns translation off again first, but one that dies or hangs after it
+//! turned a unit's translation on leaves that unit blocking the devices
+//! behind it, which devmgr, holding no register cap, cannot undo, and logs
+//! as such.
 //!
 //! The [`IommuClient`] is shared by devmgr's registry thread (`ATTACH`,
 //! `BLOCK`), its DMA thread (`MAP`, `UNMAP`), and its fault-log thread

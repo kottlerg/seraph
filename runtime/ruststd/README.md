@@ -180,8 +180,8 @@ demand-paged, the stack is instead an eager byte-heap allocation of the requeste
 64 KiB, rounded up to whole pages) with no guard page. In a demand-paged process the spawn binds
 the pager as the thread's fault handler before starting it, and a refused bind fails the spawn
 with the error rather than starting a thread whose demand faults (its stack's, when the stack is
-demand-backed) no pager would serve. `join`
-frees the stack once the thread has left user mode: a demand stack through
+demand-backed) no pager would serve. `join` frees the stack once the thread has left user mode:
+a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and
 release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or that
 of a joined thread whose join wait failed with an error other than `Interrupted` (its private

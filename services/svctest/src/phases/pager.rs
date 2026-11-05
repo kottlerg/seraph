@@ -40,6 +40,8 @@
 //! A fifth phase, **refused access**, shows memmgr declines a fault whose
 //! access the region's protection refuses, whether or not the page is backed:
 //! no backing satisfies such an access, so a resume would fault again forever.
+//! Each decline is checked for memmgr's reason code: a refused access, then,
+//! once the region is unregistered, no region.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;

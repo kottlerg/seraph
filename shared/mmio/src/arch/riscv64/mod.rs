@@ -5,7 +5,7 @@
 
 //! RISC-V MMIO ordering barriers.
 //!
-//! All three primitives emit a single `fence` instruction with no operands
+//! All four primitives emit a single `fence` instruction with no operands
 //! beyond the predecessor/successor set. Inline assembly uses
 //! `options(nostack, preserves_flags)` — the fence touches no registers and
 //! has no stack side effects — but intentionally omits `nomem` so the
@@ -54,5 +54,20 @@ pub fn mmio_to_dma_barrier()
     // effects beyond the ordering it imposes; safe from any privilege level.
     unsafe {
         core::arch::asm!("fence i,r", options(nostack, preserves_flags));
+    }
+}
+
+/// RISC-V `fence r,o`: prior main-memory reads ordered before subsequent
+/// I/O-region writes.
+// inline_always: a barrier is one fence (or nothing) that must sit inline at the
+// access it orders; an out-of-line call would cost more than the fence itself.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub fn dma_read_to_mmio_barrier()
+{
+    // SAFETY: the fence instruction has no operands and no register side
+    // effects beyond the ordering it imposes; safe from any privilege level.
+    unsafe {
+        core::arch::asm!("fence r,o", options(nostack, preserves_flags));
     }
 }

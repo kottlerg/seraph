@@ -12,7 +12,8 @@
 //!
 //! - [`Harness::Init`] — default. Pulls `init`, `procmgr`, `memmgr`,
 //!   `devmgr`, `vfsd`, `virtio-blk`, `serial`, `framebuffer`, `fatfs`
-//!   into the bundle, and on x86-64 the VT-d IOMMU driver `iommu-vtd`.
+//!   into the bundle, and the IOMMU driver of the architecture's IOMMU
+//!   family: `iommu-vtd` on x86-64, `iommu-riscv` on riscv64.
 //!   `init` is named `"init"`; modules carry their service name. Sources span
 //!   `sysroot/services/`, `sysroot/services/drivers/`, and
 //!   `sysroot/services/fs/` per each component's install destination.
@@ -99,8 +100,10 @@ const MODULES: &[(&str, &str)] = &[
 /// the same rules as [`MODULES`]: the IOMMU driver of the architecture's
 /// IOMMU family, which devmgr spawns before the first DMA-capable driver
 /// maps a ring, so before the root filesystem can be read.
-const ARCH_MODULES: &[(Arch, &str, &str)] =
-    &[(Arch::X86_64, "iommu-vtd", "services/drivers/iommu-vtd")];
+const ARCH_MODULES: &[(Arch, &str, &str)] = &[
+    (Arch::X86_64, "iommu-vtd", "services/drivers/iommu-vtd"),
+    (Arch::Riscv64, "iommu-riscv", "services/drivers/iommu-riscv"),
+];
 
 /// Compose a bundle for the chosen harness and write it to
 /// `sysroot/esp/EFI/seraph/bootstrap.bundle`, overwriting any existing

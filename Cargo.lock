@@ -569,10 +569,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "iommu-riscv"
+version = "0.1.1"
+dependencies = [
+ "iommu-core",
+ "iommu-store",
+ "ipc",
+ "mmio",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "iommu-store"
+version = "0.1.1"
+dependencies = [
+ "iommu-core",
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "iommu-vtd"
 version = "0.1.1"
 dependencies = [
  "iommu-core",
+ "iommu-store",
  "ipc",
  "syscall",
  "syscall-abi",

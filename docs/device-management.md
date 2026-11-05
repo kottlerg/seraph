@@ -109,12 +109,10 @@ the IOMMU itself is programmed by a separate IOMMU driver devmgr directs (§ IOM
 Programming). The IOMMU is preferred but not required
 ([platform-requirements.md](platform-requirements.md#iommu-and-dma-confinement)): when none is
 present, or the one present cannot be programmed, devmgr logs once that DMA runs unconfined and
-spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. On x86-64
-devmgr programs VT-d through the `iommu-vtd` driver, and every device a remapping unit translates
-runs IOMMU-isolated; a device no unit translates runs DMA-unsafe. On RISC-V no IOMMU is programmed
-yet (design intent; not yet implemented, the RISC-V IOMMU driver being
-[#37](https://github.com/kottlerg/seraph/issues/37)'s remaining work), so every RISC-V boot runs
-DMA-unsafe.
+spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. devmgr
+programs VT-d on x86-64 through the `iommu-vtd` driver and the RISC-V IOMMU on riscv64 through the
+`iommu-riscv` driver; every device a remapping unit translates runs IOMMU-isolated, and a device
+no unit translates runs DMA-unsafe.
 
 The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
@@ -242,22 +240,31 @@ IOMMU topology is a userspace concern. The bootloader emits no IOMMU
 descriptor; ACPI and DTB reach userspace only as the opaque
 `BootInfo.acpi_rsdp` / `BootInfo.device_tree` physical addresses (see Raw
 Firmware Passthrough), over which the kernel mints read-only Memory caps,
-and `devmgr` performs the IOMMU-topology walk itself: on x86-64 it reads the ACPI DMAR's VT-d
-remapping units (DRHDs), their device scopes, and the reserved memory regions (RMRRs). The one
-boot-side concession is an MMIO aperture the bootloader seeds over each DRHD's register range, so
-the kernel mints a cap devmgr can carve the unit's registers from
-([core/boot/docs/acpi.md](../core/boot/docs/acpi.md)).
+and `devmgr` performs the IOMMU-topology walk itself, from the table of its architecture's IOMMU
+family. On x86-64 it reads the ACPI DMAR's VT-d remapping units (DRHDs), their device scopes, and
+the reserved memory regions (RMRRs). The one boot-side concession is an MMIO aperture the
+bootloader seeds over each DRHD's register range, so the kernel mints a cap devmgr can carve the
+unit's registers from ([core/boot/docs/acpi.md](../core/boot/docs/acpi.md)). On riscv64 it reads
+the ACPI RISC-V IO Mapping Table (RIMT, specification v1.0): each RISC-V IOMMU that is a PCI
+function, whose registers are its BAR 0 inside a PCI window the bootloader already seeds, and each
+root complex's ID mappings, the requester-ID ranges each IOMMU translates. The firmware the
+riscv64 boot targets hands the bootloader ACPI only, so no Device Tree `iommu-map` is read. The
+RIMT describes no reserved memory region.
 
 The IOMMU's arch-specific logic (its registers, translation tables, cache invalidation, and fault
 reporting) runs in a separate IOMMU driver process, one per IOMMU family, not in devmgr: VT-d's
-is `iommu-vtd` ([services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md)),
-over the family-independent `iommu-core`
-([services/drivers/iommu/core/README.md](../services/drivers/iommu/core/README.md)); the RISC-V
-IOMMU's is design intent; not yet implemented
-([#37](https://github.com/kottlerg/seraph/issues/37)). For each unit it discovers, devmgr carves
-an `Mmio` cap for the unit's register range through the same aperture-carving flow as any other
-device and moves it to that family's IOMMU driver, keeping no copy, with the unit's PCI segment
-and its scope resolved against the PCI topology. devmgr keeps the DMA endpoint, its
+is `iommu-vtd` ([services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md))
+and the RISC-V IOMMU's is `iommu-riscv`
+([services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md)), both over
+the family-independent `iommu-core`
+([services/drivers/iommu/core/README.md](../services/drivers/iommu/core/README.md)) and the shared
+table-page store `iommu-store`
+([services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md)). For each
+unit it discovers, devmgr carves an `Mmio` cap for the unit's register range through the same
+aperture-carving flow as any other device (for a RISC-V IOMMU, after turning on the function's
+memory decode and bus mastering through its configuration page) and moves it to that family's
+IOMMU driver, keeping no copy, with the unit's PCI segment and its scope resolved against the PCI
+topology. devmgr keeps the DMA endpoint, its
 `devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
 `ipc::iommu_labels` to attach a device to a domain of its own, install and withdraw mappings,
 block a device, and take the faults the units recorded, so drivers see the same protocol whichever
@@ -280,7 +287,8 @@ DMA-capable device devmgr then decides, before it grants the device DMA:
   [#773](https://github.com/kottlerg/seraph/issues/773). A device whose `ATTACH` fails is
   refused too, since its unit blocks it. So is a device whose unit devmgr could not hand over: that
   unit is never programmed, so it does not block the device, but devmgr does not run a device
-  unconfined behind an IOMMU it found.
+  unconfined behind an IOMMU it found. So is a device the RIMT gives an IOMMU device ID other than
+  its requester ID, since the IOMMU driver addresses each device's context by its requester ID.
 - **Unconfined.** No unit translates the device: it runs DMA-unsafe.
 
 When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready
@@ -295,8 +303,9 @@ devmgr's own sees the death at once, independent of the registry loop, which may
 call to the dead driver. devmgr then logs once, refuses every later `DMA_MAP` of every confined
 device, answers any of its own calls still queued on the dead driver's endpoint with an error, and
 withdraws the driver of every confined device; it restarts nothing, restartability being
-[#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous and
-register-based, two IPC hops per mapping; batching it is
+[#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous, through VT-d's
+invalidation registers and through the RISC-V IOMMU's command queue, each polled to completion,
+two IPC hops per mapping; batching it is
 [#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, until
 message-signalled interrupts exist ([#325](https://github.com/kottlerg/seraph/issues/325)), and
 devmgr logs each one against its device.
@@ -410,6 +419,7 @@ in [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) �
 init
  ├── devmgr  (platform caps + firmware table caps)
  │    ├── driver/iommu-vtd         (VT-d unit MMIO caps; iommu_labels, devmgr only; x86-64)
+ │    ├── driver/iommu-riscv       (IOMMU BAR 0 MMIO caps; iommu_labels, devmgr only; riscv64)
  │    ├── driver/virtio-blk        (MMIO + IRQ caps; QUERY_BLOCK_DEVICE)
  │    ├── driver/virtio-input      (MMIO + opt. IRQ; QUERY_INPUT_DEVICE; on-disk)
  │    ├── driver/serial            (UART hw + IRQ caps; QUERY_SERIAL_DEVICE)
@@ -457,8 +467,9 @@ every live disk; the terminal sends none, so it binds the first input instance.
 devmgr loads driver binaries from one of two places:
 
 - **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
-  framebuffer, and on x86-64 the VT-d IOMMU driver `iommu-vtd`, which must
-  confine the disk before its driver maps a ring) ship in the bundle and
+  framebuffer, and the IOMMU driver of the architecture's family, `iommu-vtd`
+  on x86-64 and `iommu-riscv` on riscv64, which must confine the disk before
+  its driver maps a ring) ship in the bundle and
   arrive as Memory caps in devmgr's MODULE bootstrap round. devmgr spawns
   them via `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
@@ -513,6 +524,8 @@ specified in [`docs/storage.md`](storage.md).
 [Driver Model](../services/drivers/docs/driver-model.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
 [services/drivers/iommu/core/README.md](../services/drivers/iommu/core/README.md),
+[services/drivers/iommu/riscv/README.md](../services/drivers/iommu/riscv/README.md),
+[services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md),
 [services/drivers/iommu/vtd/README.md](../services/drivers/iommu/vtd/README.md),
 [services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md),
 [services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md),

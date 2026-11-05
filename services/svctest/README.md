@@ -195,12 +195,12 @@ guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardow
 spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver, and the driver-withdrawal phase
 three [`test-fault`](../drivers/test-fault/README.md) drivers, one of which never reports ready, so
 the phase waits the fault batch's settle bound (`TEST_FAULT_SETTLE_TIMEOUT_MS`, 1 s). The DMA
-confinement phase has devmgr bind QEMU's `edu` device, which xtask attaches on x86_64 only, to the
-[`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a mapped
-page must arrive, and where an IOMMU confines the device a copy to the page's device address after
-its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at that
-address. Without an IOMMU it checks the mapped copies only, and a machine without the device
-(riscv64) skips it. The
+confinement phase has devmgr bind QEMU's `edu` device, which xtask attaches on both architectures,
+to the [`test-dma`](../drivers/test-dma/README.md) driver and asks it to probe: a copy through a
+mapped page must arrive, and where an IOMMU confines the device a copy to the page's device address
+after its unmap must not reach the page, and devmgr must have taken an IOMMU fault for the device at
+that address. Without an IOMMU it checks the mapped copies only, and a machine without the device
+skips it. The
 `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
 with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS phases

@@ -69,6 +69,11 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
 /// #165 (manifest-driven discovery).
 pub const RTC_DRIVER_NAME: &[u8] = b"goldfish-rtc";
 
+/// The IOMMU family of riscv64 platforms: the RISC-V IOMMU as a PCI
+/// function, its units described by the ACPI RIMT and programmed by
+/// `iommu-riscv`.
+pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Riscv;
+
 /// PLIC source of the QEMU `virt` NS16550, the serial driver's UART.
 /// Platform-static and hardcoded on the same basis as
 /// [`carve_uart_authority`], pending #165 (data-driven device binding).

@@ -430,9 +430,10 @@ and used for subsequent wakeups.
 ### Load Balancing
 
 A pull-based balancer runs on every CPU's `timer_tick`: `sched::try_pull_idle` on a CPU
-running its idle thread, `sched::try_pull_balance` on any other. Both architectures re-arm
-the timer in its interrupt handler whatever the CPU runs, so a halted idle CPU keeps
-ticking. The balancer consumes each CPU's run-queue load counter
+running its idle thread, `sched::try_pull_balance` on any other. The timer keeps firing
+whatever the CPU runs, so a halted idle CPU keeps ticking: riscv64 re-arms `stimecmp` in its
+interrupt handler, and x86_64 re-arms the TSC deadline there or, in periodic APIC mode,
+reloads in hardware. The balancer consumes each CPU's run-queue load counter
 (`PerCpuScheduler::current_load()`, maintained by `enqueue` / `dequeue_highest` /
 `remove_from_queue`) and migrates at most one `Ready` thread per tick per CPU. The load is
 the number of threads linked on the CPU's run queues. The running thread is not counted,
@@ -479,7 +480,8 @@ below the threshold, and a pull leaves it busy, so two busy CPUs never trade thr
 steady state the threshold protects); a busy CPU with nothing queued but its idle thread
 draws no attempt; a backlog that clears between two idle ticks stays with the CPU whose
 caches hold it; and a backlog of pinned threads, which no pull can take, draws at most one
-try-lock attempt per idle CPU every two ticks.
+try-lock attempt per idle CPU every two ticks while its load is at or below the threshold
+(above it, one per idle CPU every tick).
 
 Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu)`, which shares the
 validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:
@@ -550,8 +552,9 @@ multiple logical CPUs share physical execution resources on the same core.
 
 SMT topology awareness is design intent, not yet implemented
 ([#267](https://github.com/kottlerg/seraph/issues/267)). The kernel records no physical-core
-or sibling topology, and `try_pull_balance` and `select_target_cpu` place threads by per-CPU
-`current_load()` alone. The subsections below describe the intended design.
+or sibling topology, and `try_pull_balance`, `try_pull_idle` and `select_target_cpu` place
+threads by per-CPU `current_load()` and, for the idle pull, the run-queue mask alone. The
+subsections below describe the intended design.
 
 ### Topology Detection
 
@@ -603,7 +606,7 @@ timer_tick():
         sleep_check_wakeups(); watchdog_tick_and_check()
     match tick_outcome(current.slice_remaining):   // PerCpuScheduler::tick_outcome
         Idle:                                 // zero slice: the idle thread
-            try_pull_balance(cpu); return
+            try_pull_idle(cpu); return
         Continue(remaining):
             current.slice_remaining = remaining; reschedule = false
         PreemptForRt(remaining):              // fair current, RT thread queued here

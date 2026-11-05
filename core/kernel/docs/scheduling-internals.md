@@ -1135,12 +1135,17 @@ The window during which the BSP is live but SMP state is not yet steady. Begins 
 3. Idle threads run with `slice_remaining = 0`; `timer_tick` treats this as "do not preempt".
 
 4. `BOOT_TRANSIENT_ACTIVE: AtomicBool` is the gate `timer_tick` consults. Set true in
-   `init_storage`, cleared in `sched::enter` immediately before `first_entry_to_user`. The implicit
+   `init_storage`, cleared (Release) in `sched::enter` after its dequeue of init and immediately
+   before `first_entry_to_user`. Every CPU's `timer_tick`, an AP's included, loads it (Acquire)
+   first and returns before it touches any scheduler state, so no CPU's load balancer runs before
+   the clear. That is what keeps the idle APs off CPU 0's run queue while it holds init without
+   the lock (Phase 9's link of init and `sched::enter`'s dequeue). The implicit
    `slice_remaining == 0` short-circuit is retained as a backstop.
 
-5. APs do not enter the transient. They come up in Phase 8 (after `sched::init` initialises the
-   idle TCBs (slab allocated in Phase 4) and before Phase 9 begins) via `kernel_entry_ap`; by the
-   time an AP arms its own timer, all SMP-related state is live. Phase 8 bring-up is specified in
+5. The APs' bring-up does not depend on the transient, though their ticks return at the gate
+   (invariant 4) until it ends. They come up in Phase 8 (after `sched::init` initialises the idle
+   TCBs (slab allocated in Phase 4) and before Phase 9 begins) via `kernel_entry_ap`; by the time
+   an AP arms its own timer, all SMP-related state is live. Phase 8 bring-up is specified in
    [initialization.md](initialization.md#phase-8-scheduler-and-smp-bringup).
 
 ---

@@ -812,7 +812,6 @@ impl PerCpuScheduler
     /// other than the idle thread is queued. Lockless and Relaxed, a snapshot
     /// for the idle pull (`sched::try_pull_idle`), which decides only whether
     /// to try a pull; the pull itself re-finds a thread under the lock.
-    #[cfg(not(test))]
     pub fn has_queued_thread(&self) -> bool
     {
         self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE) != 0
@@ -1342,6 +1341,26 @@ mod tests
         sched.set_idle(pa);
         deq(&sched);
         assert!(!sched.has_runnable());
+    }
+
+    // The defect caught: a queue that links only the idle thread read as a
+    // backlog (every busy CPU then draws idle CPUs' try-lock attempts for a
+    // pull that finds nothing), or a queued thread at the lowest fair level,
+    // whose queue sits just above the idle queue, read as none.
+    #[test]
+    fn only_a_thread_other_than_the_idle_one_counts_as_queued()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb();
+        let mut fair = make_tcb();
+        let p_idle = &mut *idle as *mut _;
+        let p_fair = &mut *fair as *mut _;
+
+        assert!(enq(&sched, p_idle, IDLE_PRIORITY));
+        assert!(sched.has_runnable());
+        assert!(!sched.has_queued_thread());
+        assert!(enq(&sched, p_fair, syscall::PRIORITY_MIN));
+        assert!(sched.has_queued_thread());
     }
 
     #[test]

@@ -1478,6 +1478,49 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
+/// Why [`handle_fault`] declined a fault: the low 32 bits of the decline-reason
+/// word its `FAULT_REPLY_KILL` reply carries in data word 0, which the kernel
+/// prints in its kill diagnostic (docs/fault-handling.md § Reply). The values
+/// are memmgr's wire contract, tabled in
+/// `services/memmgr/docs/ipc-interface.md` § Kernel-origin fault message.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum FaultDecline
+{
+    /// The fault is not a `FAULT_KIND_VM` fault.
+    NotVm = 1,
+    /// No process record carries the fault's badge.
+    UnknownProcess = 2,
+    /// The faulting address lies in no registered region of the process.
+    NoRegion = 3,
+    /// The region's protection refuses the faulting access.
+    AccessRefused = 4,
+    /// procmgr has delegated no address space for the process.
+    NoAspace = 5,
+    /// The metadata arena could not grow for the chunk's frame descriptor.
+    NoArenaSlot = 6,
+    /// The free pool holds no contiguous run of the chunk's size.
+    NoContiguousRun = 7,
+    /// The chunk's frame descriptor could not be recorded.
+    FrameRecord = 8,
+    /// `mem_map` of the chunk into the process failed; the high 32 bits of
+    /// the reason word carry the magnitude of its `SyscallError`.
+    MapFailed = 9,
+}
+
+/// Reply `FAULT_REPLY_KILL` to the faulting thread, with data word 0 the
+/// reason word: `reason` in its low 32 bits and `detail` (the failed
+/// syscall's error magnitude, or 0) in its high 32.
+fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
+{
+    let word = (detail << 32) | u64::from(reason as u32);
+    let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_KILL)
+        .word(0, word)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 /// Service a kernel-synthesized page fault for a demand-paged process.
 ///
 /// `req.badge` is the derivation badge of the Endpoint cap bound by
@@ -1498,7 +1541,8 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
 /// non-VM fault, unknown process, address outside every region, an access
 /// the region's protection does not grant ([`region_grants`]), no delegated
 /// AS, or any allocation/map failure — replies
-/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics.
+/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics,
+/// with the [`FaultDecline`] that refused it in data word 0 ([`decline_fault`]).
 ///
 /// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /
 /// `UNREGISTER_REGION` like any issued cap); `pool_total` is unchanged because
@@ -1507,7 +1551,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::NotVm, 0);
         return;
     }
     let va = req.word(1);
@@ -1517,26 +1561,26 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     let Some(rec) = l.find(req.badge)
     else
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::UnknownProcess, 0);
         return;
     };
     let Some(region) = l.region_for(rec, va)
     else
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::NoRegion, 0);
         return;
     };
     // A write or fetch the region's protection refuses faults again on every
     // resume, backed or not: decline it.
     if !region_grants(&region, req.word(2))
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::AccessRefused, 0);
         return;
     }
     let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
     if aspace_cap == 0
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::NoAspace, 0);
         return;
     }
     // Already backed by an earlier chunk: another thread's fault on the same
@@ -1553,13 +1597,13 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
     if !ensure_slots(l, 1)
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
     }
     let Ok(grant) = select(l, chunk_pages, Fit::Contiguous)
     else
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::NoContiguousRun, 0);
         return;
     };
     let (outer, pages, phys) = grant.entries[0];
@@ -1582,7 +1626,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     if !l.push_frame(rec, frame)
     {
         insert_run(l, run);
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
         return;
     }
 
@@ -1604,11 +1648,11 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
             region.prot,
         )
     };
-    if mapped.is_err()
+    if let Err(e) = mapped
     {
         let _ = l.pop_frame(rec);
         insert_run(l, run);
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs());
         return;
     }
     reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);

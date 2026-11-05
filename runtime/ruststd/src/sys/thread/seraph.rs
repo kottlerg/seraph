@@ -249,6 +249,38 @@ fn free_stack(stack: StackAlloc) {
     }
 }
 
+/// Unwind a spawn that failed after its `SpawnArgs` was built and before any
+/// thread started with it: delete the done notification, drop the boxed
+/// init, free the TLS block and IPC buffer, and release the stack.
+///
+/// # Safety
+/// `args` MUST come from `Box::into_raw` in [`Thread::new`], with no thread
+/// started on it; `tls_block`/`tls_layout` and `ipc_buf_base`/`ipc_buf_layout`
+/// MUST be that spawn's own allocations, which nothing else references.
+unsafe fn unwind_unstarted_spawn(
+    args: *mut SpawnArgs,
+    tls_block: *mut u8,
+    tls_layout: Option<Layout>,
+    ipc_buf_base: *mut u8,
+    ipc_buf_layout: Layout,
+    stack: StackAlloc,
+) {
+    // SAFETY: the caller's contract makes `args` an unshared `Box::into_raw`.
+    let args = unsafe { Box::from_raw(args) };
+    // SAFETY: `args.init` came from `Box::into_raw` in `Thread::new`, and no
+    // started thread took it over.
+    drop(unsafe { Box::from_raw(args.init) });
+    let _ = syscall::cap_delete(args.done_notification);
+    // SAFETY: the caller's contract makes these this spawn's own allocations.
+    unsafe {
+        if let Some(l) = tls_layout {
+            dealloc(tls_block, l);
+        }
+        dealloc(ipc_buf_base, ipc_buf_layout);
+    }
+    free_stack(stack);
+}
+
 impl Thread {
     /// # Safety
     /// See `std::thread::Builder::spawn_unchecked` for the caller-side
@@ -331,18 +363,11 @@ impl Thread {
             {
                 Some(g) => (g.cap, g.region_id),
                 None => {
-                    // SAFETY: `args` was just leaked via `Box::into_raw`.
-                    let args_owned = unsafe { Box::from_raw(args) };
-                    // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
-                    let _init = unsafe { Box::from_raw(args_owned.init) };
-                    // SAFETY: heap allocations owned by this function.
+                    // SAFETY: `args` came from `Box::into_raw` above and no thread started
+                    // with it; the TLS block, IPC buffer, and stack are this spawn's own.
                     unsafe {
-                        if let Some(l) = tls_layout {
-                            dealloc(tls_block, l);
-                        }
-                        dealloc(ipc_buf_base, ipc_buf_layout);
-                    }
-                    free_stack(stack);
+                        unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
+                    };
                     return Err(io::Error::other("seraph: thread retype slab alloc failed"));
                 }
             };
@@ -372,18 +397,11 @@ impl Thread {
                     // Retype failed, so the slab is virgin — return its run to
                     // memmgr's pool instead of leaking it until process death.
                     crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
-                    // SAFETY: `args` was just leaked via `Box::into_raw`.
-                    let args_owned = unsafe { Box::from_raw(args) };
-                    // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
-                    let _init = unsafe { Box::from_raw(args_owned.init) };
-                    // SAFETY: heap allocations owned by this function.
+                    // SAFETY: `args` came from `Box::into_raw` above and no thread started
+                    // with it; the TLS block, IPC buffer, and stack are this spawn's own.
                     unsafe {
-                        if let Some(l) = tls_layout {
-                            dealloc(tls_block, l);
-                        }
-                        dealloc(ipc_buf_base, ipc_buf_layout);
-                    }
-                    free_stack(stack);
+                        unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
+                    };
                     return Err(io::Error::other("seraph: thread cap alloc failed"));
                 }
             };
@@ -415,34 +433,43 @@ impl Thread {
             // Thread destroyed → its retype bytes are back in the MemoryObject;
             // return the slab's run to memmgr's pool.
             crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
-            // SAFETY: `args` was just leaked via `Box::into_raw`.
-            let args_owned = unsafe { Box::from_raw(args) };
-            // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
-            let _init = unsafe { Box::from_raw(args_owned.init) };
-            // SAFETY: heap allocations owned by this function.
+            // SAFETY: `args` came from `Box::into_raw` above and no thread started
+            // with it; the TLS block, IPC buffer, and stack are this spawn's own.
             unsafe {
-                if let Some(l) = tls_layout {
-                    dealloc(tls_block, l);
-                }
-                dealloc(ipc_buf_base, ipc_buf_layout);
-            }
-            free_stack(stack);
+                unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
+            };
             return Err(io::Error::other("seraph: thread_configure failed"));
         }
 
         // Inherit the spawning thread's fault-handler bindings, every class,
         // onto this thread before it starts: the process's demand-paging pager
         // (procmgr binds it on the initial thread at creation, and each spawn
-        // passes it on), and any other handler bound there. Best-effort, and a
-        // copy of no binding for a process with none.
+        // passes it on), and any other handler bound there; a copy of no
+        // binding for a process with none. A failed copy fails the spawn: a
+        // thread started without its pager would die on its first touch of an
+        // unbacked demand page (its stack's, when the stack is demand-backed)
+        // with a bare unhandled page fault instead of returning this error.
         // SAFETY: `args` was leaked via `Box::into_raw` above and is consumed
         // only by the child, which has not started.
         unsafe { (*args).self_thread_cap = thread_cap };
-        let _ = syscall::thread_inherit_fault_handler(
+        if let Err(e) = syscall::thread_inherit_fault_handler(
             thread_cap,
             crate::os::seraph::current_thread_cap(),
             FAULT_CLASS_ALL,
-        );
+        ) {
+            // Never started: deleting its cap reclaims the Thread object, and
+            // the slab's run goes back to memmgr's pool.
+            let _ = syscall::cap_delete(thread_cap);
+            crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
+            // SAFETY: `args` came from `Box::into_raw` above and no thread started
+            // with it; the TLS block, IPC buffer, and stack are this spawn's own.
+            unsafe {
+                unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
+            };
+            return Err(io::Error::other(format!(
+                "seraph: thread_inherit_fault_handler failed (error {e})"
+            )));
+        }
 
         // Bind a kernel death observer so a detached (un-joined) handle's
         // resources can be reclaimed by `reaper::sweep` once this thread leaves
@@ -470,18 +497,11 @@ impl Thread {
             let _ = syscall::cap_delete(thread_cap);
             // Thread destroyed → return the slab's run to memmgr's pool.
             crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
-            // SAFETY: `args` was just leaked via `Box::into_raw`.
-            let args_owned = unsafe { Box::from_raw(args) };
-            // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
-            let _init = unsafe { Box::from_raw(args_owned.init) };
-            // SAFETY: heap allocations owned by this function.
+            // SAFETY: `args` came from `Box::into_raw` above and no thread started
+            // with it; the TLS block, IPC buffer, and stack are this spawn's own.
             unsafe {
-                if let Some(l) = tls_layout {
-                    dealloc(tls_block, l);
-                }
-                dealloc(ipc_buf_base, ipc_buf_layout);
-            }
-            free_stack(stack);
+                unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
+            };
             return Err(io::Error::other("seraph: thread_start failed"));
         }
 

@@ -1475,7 +1475,8 @@ fn normalize_x86_exception(vector: u64) -> u64
 /// Deliver `info` to `tcb`'s bound handler and block until it resolves the fault
 /// or the binding is severed. Returns `true` if the thread should resume
 /// (re-execute the faulting instruction, or continue from a handler-modified PC),
-/// `false` if the fault is terminal.
+/// `false` if the fault is terminal, after printing its cause
+/// (`ipc::fault::report_user_kill`) ahead of the kill path's diagnostic.
 ///
 /// `frame` is the live canonical [`TrapFrame`] the entry trampoline built on the
 /// kernel stack — the same layout the register syscalls operate on — so
@@ -1523,7 +1524,17 @@ unsafe fn redirect_user_fault(
             .store(saved_tf, core::sync::atomic::Ordering::Relaxed);
     }
 
-    matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)
+    match outcome
+    {
+        crate::ipc::fault::FaultOutcome::Resume => true,
+        crate::ipc::fault::FaultOutcome::Kill(cause) =>
+        {
+            // SAFETY: tcb valid (this fn's contract); thread_id is fixed at
+            // creation.
+            crate::ipc::fault::report_user_kill(unsafe { (*tcb).thread_id }, cause);
+            false
+        }
+    }
 }
 
 /// TLB shootdown IPI handler stub (vector 250).

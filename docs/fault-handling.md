@@ -295,10 +295,20 @@ take effect on resume. A handler that cannot make progress replies
 
 ## Reply
 
-The kernel ignores reply data words. The reply **label** conveys disposition:
+The reply **label** conveys disposition:
 
 - `FAULT_REPLY_RESUME` — resume the faulting thread (the default).
 - `FAULT_REPLY_KILL` — the handler declines.
+
+The kernel ignores reply capabilities, and every data word but one: data word 0 of a
+`FAULT_REPLY_KILL` reply, when the reply carries data words, is the handler's decline reason. The
+kernel does not interpret it. When the decline kills a thread whose user-mode access faulted, the
+kernel prints it on its serial console, on a `fault unhandled` line ahead of the `USERSPACE FAULT`
+diagnostic; that line also names the kernel's own unhandled causes (the binding found cleared at
+delivery, or the delivery cancelled before a reply), and its absence before a `USERSPACE FAULT`
+line means no handler was bound. A decline with no data words prints no reason. memmgr's reasons
+are tabled in
+[services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label).
 
 A declined fault, like every other unhandled one (the binding cleared before delivery, or the
 delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the outcome it

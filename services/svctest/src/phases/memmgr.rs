@@ -508,6 +508,10 @@ const STRAY_CAP_CASES: [StrayCapCase; 11] = [
     },
 ];
 
+/// memmgr's decline code for a fault that is not a VM fault
+/// (services/memmgr/docs/ipc-interface.md § Kernel-origin fault message).
+const DECLINE_NOT_VM: u64 = 1;
+
 /// Stray caps one case must leave behind to overflow memmgr's `CSpace`: more
 /// than the slots it is seeded with (init's `CSPACE_RETYPE_PAGES` slot pages,
 /// about 8 Ki slots), with margin.
@@ -560,6 +564,16 @@ pub fn stray_cap_flood_phase(_: &Caps)
             let what = format!("stray-cap call {call} with label {label:#x}");
             let reply = memmgr_call(&builder.build(), &what);
             assert_eq!(reply.label, case.expected, "memmgr reply to {what}");
+            // The forged non-VM fault's decline carries memmgr's not-VM code
+            // in the low half of data word 0.
+            if label == syscall_abi::FAULT_LABEL
+            {
+                assert_eq!(
+                    reply.word(0) & 0xFFFF_FFFF,
+                    DECLINE_NOT_VM,
+                    "decline code in memmgr reply to {what}"
+                );
+            }
             total_calls += 1;
         }
     }

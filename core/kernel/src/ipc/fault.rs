@@ -42,8 +42,8 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 pub const FAULT_OUTCOME_PENDING: u8 = 0;
 /// [`ThreadControlBlock::fault_outcome`] value: resume (re-execute / continue).
 pub const FAULT_OUTCOME_RESUME: u8 = 1;
-/// [`ThreadControlBlock::fault_outcome`] value: unhandled (handler declined,
-/// handler thread destroyed, binding severed, or thread cancelled): the
+/// [`ThreadControlBlock::fault_outcome`] value: unhandled with no reply
+/// (handler thread destroyed, binding severed, or thread cancelled): the
 /// faulting thread is killed, or its restartable syscall fails.
 pub const FAULT_OUTCOME_KILL: u8 = 2;
 /// [`ThreadControlBlock::fault_outcome`] value: the binding changed while the
@@ -51,6 +51,15 @@ pub const FAULT_OUTCOME_KILL: u8 = 2;
 /// the binding current then (docs/fault-handling.md § Delivery, Resume, and
 /// Kill).
 pub const FAULT_OUTCOME_REDELIVER: u8 = 3;
+/// [`ThreadControlBlock::fault_outcome`] value: unhandled because the handler
+/// replied [`syscall::FAULT_REPLY_KILL`]. Taken as [`FAULT_OUTCOME_KILL`] is;
+/// the reply deposited its label and decline-reason word in the faulting
+/// thread's `ipc_msg`, which [`fault_dispatch`] reads for [`KillCause::Declined`].
+pub const FAULT_OUTCOME_DECLINED: u8 = 4;
+
+/// [`deliver_once`]'s result when no binding was found: never a
+/// `fault_outcome` value, it reports [`KillCause::BindingCleared`].
+const DELIVERY_UNBOUND: u8 = u8::MAX;
 
 /// Number of fault classes a thread binds separately
 /// (docs/fault-handling.md § Fault-Handler Binding), and the length of the
@@ -139,7 +148,53 @@ pub enum FaultOutcome
     /// The fault is unhandled: the architecture handler kills the faulting
     /// thread, and the syscall dispatcher fails the restartable syscall with
     /// `InvalidAddress` (docs/fault-handling.md § Reply).
-    Kill,
+    Kill(KillCause),
+}
+
+/// Why a delivered fault took the unhandled outcome, for the kill diagnostic
+/// [`report_user_kill`] prints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KillCause
+{
+    /// The binding was found cleared when the delivery read it.
+    BindingCleared,
+    /// The delivery was cancelled before any reply claimed it (handler thread
+    /// destroyed, handler endpoint destroyed, a later receive on the handler
+    /// thread, or a stop of the faulting thread).
+    Cancelled,
+    /// The handler replied [`syscall::FAULT_REPLY_KILL`], with the reason its
+    /// reply's data word 0 carried, if it sent one.
+    Declined(Option<u64>),
+}
+
+/// Print, on the kernel serial console, why the user-mode fault of the thread
+/// whose id is `tid` went unhandled; the architecture kill path's
+/// `USERSPACE FAULT` diagnostic follows it. The decline reason is the
+/// handler's own value, printed verbatim; it is not interpreted here.
+#[cfg(not(test))]
+pub fn report_user_kill(tid: u32, cause: KillCause)
+{
+    match cause
+    {
+        KillCause::BindingCleared =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} binding cleared before delivery");
+        }
+        KillCause::Cancelled =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} delivery cancelled before a reply");
+        }
+        KillCause::Declined(None) =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} handler declined");
+        }
+        KillCause::Declined(Some(reason)) =>
+        {
+            crate::kprintln_serial!(
+                "fault unhandled: tid={tid} handler declined, reason={reason:#x}"
+            );
+        }
+    }
 }
 
 /// True iff `tcb` has a fault handler bound for the class of a fault of
@@ -367,13 +422,27 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
             FAULT_OUTCOME_RESUME => return FaultOutcome::Resume,
             FAULT_OUTCOME_REDELIVER =>
             {}
-            _ => return FaultOutcome::Kill,
+            FAULT_OUTCOME_DECLINED =>
+            {
+                // SAFETY: tcb still valid; the declining reply wrote ipc_msg as
+                // the winner of this episode's reply claim, before the wake
+                // that resumed this thread, and nothing writes it after that
+                // claim.
+                let reply = unsafe { &(*tcb).ipc_msg };
+                return FaultOutcome::Kill(KillCause::Declined(
+                    (reply.data_count > 0).then(|| reply.data[0]),
+                ));
+            }
+            DELIVERY_UNBOUND => return FaultOutcome::Kill(KillCause::BindingCleared),
+            // KILL, or a PENDING a spurious wake left: a cancelled delivery.
+            _ => return FaultOutcome::Kill(KillCause::Cancelled),
         }
     }
 }
 
 /// Make one delivery of `info` through `tcb`'s binding and block until it is
-/// given a disposition, which is returned as a `fault_outcome` value.
+/// given a disposition, which is returned as its `fault_outcome` value, or
+/// return [`DELIVERY_UNBOUND`] when no binding was found.
 ///
 /// Mirrors [`crate::syscall::ipc::sys_ipc_call`] but commits the
 /// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from
@@ -381,7 +450,7 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
 ///
 /// The binding is read once, under `tcb`'s `sched_lock`, and its endpoint is
 /// pinned for the delivery ([`pin_binding`]); with none bound the result is
-/// [`FAULT_OUTCOME_KILL`] and nothing is delivered. The pin is released after
+/// [`DELIVERY_UNBOUND`] and nothing is delivered. The pin is released after
 /// the delivery and before the park's `schedule()` (the pin-before-park rule,
 /// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 10): a
 /// release that drops the endpoint's last reference runs its teardown, whose
@@ -398,7 +467,7 @@ unsafe fn deliver_once(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> u8
     let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb, class_of_kind(info.kind)) })
     else
     {
-        return FAULT_OUTCOME_KILL;
+        return DELIVERY_UNBOUND;
     };
     // SAFETY: ep_obj is pinned by the reference pin_binding took.
     let ep_state = unsafe { ep_obj.as_ref().state };

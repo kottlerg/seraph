@@ -558,7 +558,24 @@ stacks grow contiguously, so a chunk's pages are consumed as the stack
 descends. Every other case — non-VM fault, unknown process, address outside
 every region, a write to a region without `MAP_WRITABLE` or an instruction
 fetch from one without `MAP_EXECUTABLE` (which no backing satisfies), no
-delegated AS, or any allocation/map failure — replies `FAULT_REPLY_KILL`.
+delegated AS, or any allocation/map failure — replies `FAULT_REPLY_KILL`,
+with data word 0 the decline reason: the code below in its low 32 bits, and
+in its high 32 the magnitude of the failed syscall's error for code 9, else
+zero. The kernel prints the word on the kill diagnostic of a user-mode access
+([docs/fault-handling.md § Reply](../../../docs/fault-handling.md#reply)).
+
+| Code | Decline |
+|---|---|
+| 1 | Not a `FAULT_KIND_VM` fault |
+| 2 | No process record carries the badge |
+| 3 | `faulting_va` lies in no registered region |
+| 4 | The region's protection refuses the access |
+| 5 | No delegated address space |
+| 6 | The metadata arena cannot grow for the chunk's frame descriptor |
+| 7 | No contiguous free run of the chunk's size |
+| 8 | The chunk's frame descriptor cannot be recorded |
+| 9 | `mem_map` of the chunk into the process failed |
+
 Demand chunks are tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim them and the all-RAM-accounted
 identity is unaffected (the pages move from a free run to the process record;

@@ -775,10 +775,12 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_PENDING`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`] /
-    /// [`crate::ipc::fault::FAULT_OUTCOME_REDELIVER`]. Set to `PENDING` with
-    /// the binding read that opens a delivery (under `sched_lock`), and to
-    /// `RESUME`/`KILL`/`REDELIVER` by the single wake-claim winner (genuine
-    /// reply, handler-thread destruction, cancellation, a binding change), so
+    /// [`crate::ipc::fault::FAULT_OUTCOME_REDELIVER`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`]. Set to `PENDING` with
+    /// the binding read that opens a delivery (under `sched_lock`), and by the
+    /// single wake-claim winner: `RESUME` or `DECLINED` by a genuine reply,
+    /// `KILL` by handler-thread destruction or cancellation, `REDELIVER` by a
+    /// binding change, so
     /// resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 

@@ -1032,6 +1032,25 @@ region. The kernel answers only through a Memory cap the caller holds, and count
 window arguments 2 and 3 name, at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the
 walk stays bounded; a larger region is read window by window.
 
+`CAP_INFO_SOLE_REFERENCE` (13) returns, for a capability of any type, `1` when the queried slot is
+the only reference to the object it names and `0` otherwise. It reads the object's reference count,
+which holds every capability slot naming the object in every `CSpace` and every kernel-internal
+reference to it (a retype lease, a page-pool donation, a wait-set membership, a fault-handler or
+death-observer binding, a syscall in flight; see [capability-internals.md § Kernel Object Reference
+Counting](capability-internals.md#kernel-object-reference-counting)), and answers `1` when the count
+is the queried slot's reference plus the inquiry's own pin. The count is read under the caller's
+`CSpace` lock with the slot re-checked, so a delete or revoke of the queried slot racing the inquiry
+answers `InvalidCapability`, never a false `1`. The derivations of a Memory capability name one
+object, so a Memory cap is sole only when no derivation of it, no object retyped from it, and no
+donation of it remains; a split child or a range-capability copy is an object of its own. Once `1`,
+the answer stays `1` until the caller itself takes a further reference through the slot (a
+derivation, copy, retype, donation, binding, wait-set add, or a syscall of its own in flight), since
+no other process holds a capability through which to add one. A user mapping is not a reference
+(`CAP_INFO_MEMORY_MAPPINGS` counts those). memmgr reads it before it returns a reclaimed frame to
+its pool
+([services/memmgr/docs/memory-pool.md](../../../services/memmgr/docs/memory-pool.md#reclamation) §
+Reclamation).
+
 **Capability requirement:** None — `cap_info` reads the slot without a rights check.
 
 **Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target

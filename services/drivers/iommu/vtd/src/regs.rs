@@ -21,11 +21,20 @@ pub const RTADDR: usize = 0x20;
 pub const CCMD: usize = 0x28;
 /// Fault status register (32-bit).
 pub const FSTS: usize = 0x34;
+/// Fault event control register (32-bit).
+pub const FECTL: usize = 0x38;
+
+/// `FECTL`: interrupt mask. The driver keeps fault events masked and polls
+/// the fault recording registers instead.
+pub const FECTL_IM: u32 = 1 << 31;
 
 /// `GCMD` / `GSTS`: translation enable / status.
 pub const G_TE: u32 = 1 << 31;
 /// `GCMD` / `GSTS`: set root table pointer / its status.
 pub const G_SRTP: u32 = 1 << 30;
+/// `GCMD` / `GSTS`: write buffer flush / its status (set while the flush is
+/// in progress).
+pub const G_WBF: u32 = 1 << 27;
 /// `GCMD` / `GSTS`: queued invalidation enable; the driver never sets it,
 /// since it invalidates through the registers.
 pub const G_QIE: u32 = 1 << 26;
@@ -55,12 +64,28 @@ pub const FSTS_PPF: u32 = 1 << 1;
 /// `FSTS`: primary fault overflow, cleared by writing 1.
 pub const FSTS_PFO: u32 = 1 << 0;
 
+/// The index of the first fault recording register holding a fault, from
+/// `FSTS`'s `FRI` field (bits 15:8); meaningful while [`FSTS_PPF`] is set.
+#[must_use]
+pub const fn fault_record_index(fsts: u32) -> usize
+{
+    ((fsts >> 8) & 0xff) as usize
+}
+
 /// The value written to `GCMD` to set `bit` while keeping every persistent
 /// state `gsts` reports.
 #[must_use]
 pub const fn gcmd_set(gsts: u32, bit: u32) -> u32
 {
     (gsts & !G_ONE_SHOT) | bit
+}
+
+/// The value written to `GCMD` to clear `bit` while keeping every other
+/// persistent state `gsts` reports.
+#[must_use]
+pub const fn gcmd_clear(gsts: u32, bit: u32) -> u32
+{
+    gsts & !G_ONE_SHOT & !bit
 }
 
 /// The `CCMD` value that invalidates the context cache for domain `did`.
@@ -110,11 +135,18 @@ pub struct Capability
     /// Caching mode: the unit may cache not-present entries, so making an
     /// entry present needs an invalidation too.
     pub caching_mode: bool,
+    /// Required write-buffer flushing: the unit may buffer writes to the
+    /// translation structures until software flushes them (`GCMD.WBF`).
+    pub write_buffer_flush: bool,
 }
 
 impl Capability
 {
     /// Decode a `CAP` value.
+    // cast_possible_truncation: every field is masked to at most 10 bits
+    // before its cast, so each value fits its target type (and `usize` is
+    // 64-bit on every target the driver builds for).
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub const fn decode(cap: u64) -> Self
     {
@@ -126,6 +158,7 @@ impl Capability
             fault_offset: (((cap >> 24) & 0x3ff) * 16) as usize,
             fault_count: (((cap >> 40) & 0xff) + 1) as usize,
             caching_mode: (cap >> 7) & 1 != 0,
+            write_buffer_flush: (cap >> 4) & 1 != 0,
         }
     }
 
@@ -153,10 +186,22 @@ impl Capability
 /// The byte offset of the `IOTLB` register for an `ECAP` value: its
 /// `IRO` field (bits 17:8) counts 16-byte units, and the register sits 8
 /// bytes past them.
+// cast_possible_truncation: the field is masked to 10 bits, so the offset is
+// below 2^15 and fits `usize` on every target.
+#[allow(clippy::cast_possible_truncation)]
 #[must_use]
 pub const fn iotlb_offset(ecap: u64) -> usize
 {
     (((ecap >> 8) & 0x3ff) * 16 + 8) as usize
+}
+
+/// Whether the unit's page walks snoop the processor caches (`ECAP.C`, bit
+/// 0). A unit that does not reads the translation structures from memory,
+/// so every write to them is flushed from the caches before it is used.
+#[must_use]
+pub const fn coherent(ecap: u64) -> bool
+{
+    ecap & 1 != 0
 }
 
 /// One fault recording register's two words, decoded.
@@ -210,7 +255,25 @@ mod tests
         assert_eq!(c.fault_offset, 0x220);
         assert_eq!(c.fault_count, 16);
         assert!(!c.caching_mode);
+        assert!(!c.write_buffer_flush);
         assert_eq!(c.table_depth(), Some((3, 39)));
+    }
+
+    #[test]
+    fn caching_mode_and_write_buffer_flushing_decode_from_their_bits()
+    {
+        let c = Capability::decode((1 << 7) | (1 << 4));
+        assert!(c.caching_mode);
+        assert!(c.write_buffer_flush);
+        assert!(coherent(1));
+        assert!(!coherent(0x10 << 8));
+    }
+
+    #[test]
+    fn the_first_pending_fault_record_index_decodes_from_fsts()
+    {
+        assert_eq!(fault_record_index((5 << 8) | FSTS_PPF), 5);
+        assert_eq!(fault_record_index(0xff00), 0xff);
     }
 
     #[test]
@@ -226,6 +289,7 @@ mod tests
         let gsts = G_TE | G_SRTP;
         assert_eq!(gcmd_set(gsts, G_SRTP), G_TE | G_SRTP);
         assert_eq!(gcmd_set(G_SRTP, G_TE), G_TE);
+        assert_eq!(gcmd_clear(G_TE | G_QIE | G_SRTP, G_QIE), G_TE);
     }
 
     #[test]

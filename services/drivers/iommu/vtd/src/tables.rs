@@ -70,6 +70,13 @@ pub trait TableStore
     fn alloc(&mut self) -> Option<u64>;
     /// The entries of the table page at `phys`, which `alloc` returned.
     fn table(&mut self, phys: u64) -> &mut [u64; ENTRIES];
+    /// Entry `index` of the table page at `phys` was just written; a store
+    /// whose unit does not snoop the caches flushes it to memory here. Does
+    /// nothing by default.
+    fn written(&mut self, phys: u64, index: usize)
+    {
+        let _ = (phys, index);
+    }
 }
 
 /// Why a [`SecondLevel`] operation failed.
@@ -132,7 +139,7 @@ impl SecondLevel
         1u64 << (12 + 9 * self.levels)
     }
 
-    fn index(&self, iova: u64, level: u32) -> usize
+    fn index(iova: u64, level: u32) -> usize
     {
         ((iova >> (12 + 9 * (level - 1))) & 0x1ff) as usize
     }
@@ -164,7 +171,7 @@ impl SecondLevel
         let mut table = self.root;
         for level in (2..=self.levels).rev()
         {
-            let i = self.index(iova, level);
+            let i = Self::index(iova, level);
             let entry = store.table(table)[i];
             table = if entry & (SL_READ | SL_WRITE) != 0
             {
@@ -176,6 +183,7 @@ impl SecondLevel
                 // A non-leaf entry grants both rights; the leaf narrows
                 // them.
                 store.table(table)[i] = next | SL_READ | SL_WRITE;
+                store.written(table, i);
                 next
             }
             else
@@ -183,7 +191,7 @@ impl SecondLevel
                 return Err(TableError::NotMapped);
             };
         }
-        Ok((table, self.index(iova, 1)))
+        Ok((table, Self::index(iova, 1)))
     }
 
     /// Map `len` bytes at `iova` to the physical frames from `phys`, with
@@ -215,6 +223,7 @@ impl SecondLevel
                 Ok((table, i)) if store.table(table)[i] == 0 =>
                 {
                     store.table(table)[i] = ((phys + done) & ADDR_MASK) | rights;
+                    store.written(table, i);
                     Ok(())
                 }
                 Ok(_) => Err(TableError::InUse),
@@ -256,6 +265,7 @@ impl SecondLevel
                 return Err(TableError::NotMapped);
             }
             store.table(table)[i] = 0;
+            store.written(table, i);
             done += PAGE;
         }
         Ok(())
@@ -437,6 +447,50 @@ mod tests
         assert_eq!(d.pages(&mut s).len(), 1);
         d.map(&mut s, 0, 0x1000, PAGE, SL_READ).unwrap();
         assert_eq!(d.pages(&mut s).len(), 3);
+    }
+
+    /// A heap store that records every entry the walk reports written.
+    #[derive(Default)]
+    struct Recording
+    {
+        heap: Heap,
+        written: Vec<(u64, usize)>,
+    }
+
+    impl TableStore for Recording
+    {
+        fn alloc(&mut self) -> Option<u64>
+        {
+            self.heap.alloc()
+        }
+
+        fn table(&mut self, phys: u64) -> &mut [u64; ENTRIES]
+        {
+            self.heap.table(phys)
+        }
+
+        fn written(&mut self, phys: u64, index: usize)
+        {
+            self.written.push((phys, index));
+        }
+    }
+
+    #[test]
+    fn every_entry_a_map_or_unmap_writes_is_reported_to_the_store()
+    {
+        let mut s = Recording::default();
+        let mut d = SecondLevel::new(&mut s, 3).unwrap();
+        d.map(&mut s, 0, 0x1000, 2 * PAGE, SL_READ).unwrap();
+        // Two intermediate entries (levels 3 and 2), then the two leaves.
+        let pages = d.pages(&mut s);
+        let leaf = pages[2];
+        assert_eq!(
+            s.written,
+            [(d.root(), 0), (pages[1], 0), (leaf, 0), (leaf, 1)]
+        );
+        s.written.clear();
+        d.unmap(&mut s, PAGE, PAGE).unwrap();
+        assert_eq!(s.written, [(leaf, 1)]);
     }
 
     #[test]

@@ -412,7 +412,8 @@ window that enables interrupts — shootdown ack-waits, the teardown gates,
 the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
 path, the `sys_thread_stop` drain and save wait (`await_stopped_save`), the `sys_thread_start`
 settle loop, the register-access wait (`with_held_frame`), the idle-stack depth sample
-(`stack_depth::idle_used_bytes`) — runs
+(`stack_depth::idle_used_bytes`), the page-pool seeding and teardown windows between batches
+(`interrupt_window` in `cap/object.rs`) — runs
 preempt-disabled and returns to the saved interrupt state through
 `restore_interrupts`, which writes that state whatever the current one; the
 contract is stated in [arch-interface.md](arch-interface.md). A window that

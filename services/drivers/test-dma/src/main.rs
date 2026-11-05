@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// services/drivers/test-dma/src/main.rs
+
+//! Test-only driver for QEMU's `edu` device (PCI `1234:11e8`), whose DMA
+//! engine copies between a 4 KiB buffer inside the device, at device offset
+//! `0x40000`, and a device address the driver programs.
+//!
+//! devmgr binds it on svctest's `TEST_SPAWN_DMA_DRIVER` through the PCI
+//! spawn path: round 1 carries the cap of the first page of BAR 0 (the
+//! identification and DMA registers), round 2 the service endpoint, the
+//! devmgr query cap, and the device's DMA capability. It checks the
+//! device's identification register, reports ready, and answers
+//! `ipc::test_dma_labels::DMA_PROBE`: it maps one page of its memory for the
+//! device, copies a pattern from the page into the device's buffer and back
+//! to the page's second half, unmaps the page, and copies the buffer to the
+//! same device address once more, reporting whether the mapped copies arrived
+//! and whether the copy after the unmap reached the page. Behind an IOMMU it
+//! does not, and the IOMMU records a fault for it.
+//!
+//! TODO(#165): remove with the devmgr enumeration redesign.
+
+use std::time::{Duration, Instant};
+
+use ipc::{IpcMessage, memmgr_errors, memmgr_labels, test_dma_labels};
+use std::os::seraph::{reserve_pages, startup_info};
+use syscall_abi::PAGE_SIZE;
+
+/// The identification register and the value an `edu` device reads there
+/// (major version 1, minor 0).
+const IDENT: u64 = 0x00;
+const IDENT_EDU: u32 = 0x0100_00ed;
+/// DMA source, destination, byte count, and command registers (64-bit).
+const DMA_SRC: u64 = 0x80;
+const DMA_DST: u64 = 0x88;
+const DMA_CNT: u64 = 0x90;
+const DMA_CMD: u64 = 0x98;
+/// Command bits: start the transfer (clear once it completed), and copy from
+/// the device's buffer to memory rather than from memory to the buffer.
+const CMD_RUN: u64 = 1 << 0;
+const CMD_TO_MEMORY: u64 = 1 << 1;
+/// The device address of the device's DMA buffer.
+const DEVICE_BUFFER: u64 = 0x4_0000;
+/// The DMA reach of the device: its default DMA mask is 28 bits, and it
+/// truncates a wider address.
+const DMA_REACH: u64 = 1 << 28;
+/// Bytes of the probe page.
+const PAGE_BYTES: usize = 4096;
+/// Bytes each probe transfer copies.
+const PROBE_LEN: usize = 256;
+/// Where in the page the copies back to memory land.
+const BACK_OFFSET: usize = 0x800;
+/// How long one transfer may take: the device starts a transfer on a 100 ms
+/// timer, so a transfer that has not completed in 2 s never will.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct Driver
+{
+    regs: u64,
+    dma_ep: u64,
+    memmgr_ep: u64,
+    aspace: u64,
+}
+
+impl Driver
+{
+    fn read32(&self, off: u64) -> u32
+    {
+        // SAFETY: `regs` maps the device's first BAR page for the driver's
+        // life, `off` lies in it, and the register is 32-bit aligned; reached
+        // only through raw volatile accesses.
+        unsafe { core::ptr::read_volatile((self.regs + off) as *const u32) }
+    }
+
+    fn read64(&self, off: u64) -> u64
+    {
+        // SAFETY: as in `read32`, for a 64-bit register.
+        unsafe { core::ptr::read_volatile((self.regs + off) as *const u64) }
+    }
+
+    fn write64(&self, off: u64, value: u64)
+    {
+        // SAFETY: as in `read64`.
+        unsafe { core::ptr::write_volatile((self.regs + off) as *mut u64, value) };
+    }
+
+    /// Copy `PROBE_LEN` bytes from `src` to `dst` with `cmd`'s direction and
+    /// wait for the device to complete it; `false` when it does not within
+    /// [`TRANSFER_TIMEOUT`].
+    fn transfer(&self, src: u64, dst: u64, to_memory: bool) -> bool
+    {
+        self.write64(DMA_SRC, src);
+        self.write64(DMA_DST, dst);
+        self.write64(DMA_CNT, PROBE_LEN as u64);
+        let dir = if to_memory { CMD_TO_MEMORY } else { 0 };
+        self.write64(DMA_CMD, CMD_RUN | dir);
+        let start = Instant::now();
+        while self.read64(DMA_CMD) & CMD_RUN != 0
+        {
+            if start.elapsed() > TRANSFER_TIMEOUT
+            {
+                return false;
+            }
+            let _ = syscall::thread_yield();
+        }
+        true
+    }
+
+    /// One page of memory from memmgr, mapped writable: its cap and address.
+    fn page(&self, ipc_buf: *mut u64) -> Option<(u64, u64)>
+    {
+        let arg = 1 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+        let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, arg)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(self.memmgr_ep, &request, ipc_buf) }.ok()?;
+        let cap = *reply.caps().first()?;
+        if reply.label != memmgr_errors::SUCCESS
+        {
+            return None;
+        }
+        let range = reserve_pages(1).ok()?;
+        let va = range.va_start();
+        // SAFETY: `range` is a fresh one-page reservation, kept for the
+        // driver's life: VA no Rust object or IPC page occupies.
+        unsafe { syscall::mem_map(cap, self.aspace, va, 0, 1, syscall::MAP_WRITABLE) }.ok()?;
+        Some((cap, va))
+    }
+
+    /// Run the probe; the reply's outcome, whether the copy after the unmap
+    /// reached the page, and the device address the page was mapped at.
+    fn probe(&self, ipc_buf: *mut u64) -> Option<(u64, u64, u64)>
+    {
+        let (cap, va) = self.page(ipc_buf)?;
+        let byte = |i: usize| (va + i as u64) as *mut u8;
+        for i in 0..PAGE_BYTES
+        {
+            let v = if i < PROBE_LEN { pattern(i) } else { 0 };
+            // SAFETY: `va` maps one writable page and `i` is inside it.
+            unsafe { core::ptr::write_volatile(byte(i), v) };
+        }
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let iova = unsafe {
+            virtio_core::dma::map(
+                self.dma_ep,
+                cap,
+                virtio_core::dma::DEVICE_READS_WRITES,
+                ipc_buf,
+            )
+        }
+        .ok()?;
+        let back = |i: usize| {
+            // SAFETY: `va` maps one writable page and `BACK_OFFSET + i` is
+            // inside it; the device writes it, so it is read volatile.
+            unsafe { core::ptr::read_volatile(byte(BACK_OFFSET + i)) }
+        };
+        if iova + PAGE_SIZE > DMA_REACH
+        {
+            // SAFETY: as above.
+            let _ = unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) };
+            return Some((test_dma_labels::PROBE_SKIPPED, 0, iova));
+        }
+        let dst = iova + BACK_OFFSET as u64;
+        let copied = self.transfer(iova, DEVICE_BUFFER, false)
+            && self.transfer(DEVICE_BUFFER, dst, true)
+            && (0..PROBE_LEN).all(|i| back(i) == pattern(i));
+        // SAFETY: as above.
+        unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) }.ok()?;
+        for i in 0..PROBE_LEN
+        {
+            // SAFETY: as above.
+            unsafe { core::ptr::write_volatile(byte(BACK_OFFSET + i), 0) };
+        }
+        let completed = self.transfer(DEVICE_BUFFER, dst, true);
+        let landed = (0..PROBE_LEN).any(|i| back(i) != 0);
+        let outcome = if copied && completed
+        {
+            test_dma_labels::PROBE_PASSED
+        }
+        else
+        {
+            test_dma_labels::PROBE_FAILED
+        };
+        Some((outcome, u64::from(landed), iova))
+    }
+}
+
+/// The probe pattern's byte at `i`: none zero.
+fn pattern(i: usize) -> u8
+{
+    i.to_le_bytes()[0].wrapping_mul(7) | 0x80
+}
+
+fn main() -> !
+{
+    std::os::seraph::log::register_name(b"test-dma");
+    let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let rounds = unsafe {
+        ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf).and_then(|r1| {
+            ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf).map(|r2| (r1, r2))
+        })
+    };
+    let caps = rounds.ok().and_then(|(r1, r2)| {
+        let bars = virtio_core::bootstrap::DeliveredBars::from_round(&r1)?;
+        let eps = virtio_core::bootstrap::DriverEndpoints::from_round(&r2)?;
+        Some((*bars.caps().first()?, eps))
+    });
+    let Some((bar_cap, eps)) = caps
+    else
+    {
+        std::os::seraph::log!("test-dma: bootstrap caps missing");
+        syscall::thread_exit();
+    };
+    let Ok(range) = reserve_pages(1)
+    else
+    {
+        syscall::thread_exit();
+    };
+    let regs = range.va_start();
+    let funded = std::os::seraph::fund_aspace_pt_budget(info.self_aspace, 1);
+    // SAFETY: `range` is a fresh one-page reservation, kept for the driver's
+    // life, and the BAR cap spans one page; the registers are reached only
+    // through raw volatile accesses (`mmio_map` § Safety).
+    if !funded || unsafe { syscall::mmio_map(info.self_aspace, bar_cap, regs, 0) }.is_err()
+    {
+        std::os::seraph::log!("test-dma: BAR 0 not mapped");
+        syscall::thread_exit();
+    }
+    let driver = Driver {
+        regs,
+        dma_ep: eps.dma,
+        memmgr_ep: info.memmgr_endpoint,
+        aspace: info.self_aspace,
+    };
+    if driver.read32(IDENT) != IDENT_EDU
+    {
+        std::os::seraph::log!("test-dma: the device is not an edu device");
+        syscall::thread_exit();
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::report_driver_ready(eps.devmgr_query, ipc_buf) }.is_err()
+    {
+        syscall::thread_exit();
+    }
+    serve(&driver, eps.service, ipc_buf);
+}
+
+/// Answer `DMA_PROBE` for the rest of the driver's life.
+fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
+{
+    let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
+    loop
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        {
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
+        };
+        guard.on_success();
+        for &c in msg.caps()
+        {
+            let _ = syscall::cap_delete(c);
+        }
+        let reply = match msg.label
+        {
+            test_dma_labels::DMA_PROBE => match driver.probe(ipc_buf)
+            {
+                Some((outcome, landed, iova)) =>
+                {
+                    std::os::seraph::log!(
+                        "test-dma: probe outcome {} at device address {:#x}, copy after unmap landed={}",
+                        outcome,
+                        iova,
+                        landed
+                    );
+                    IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                        .word(0, outcome)
+                        .word(1, landed)
+                        .word(2, iova)
+                        .build()
+                }
+                None => IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST),
+            },
+            _ => IpcMessage::new(ipc::devmgr_errors::UNKNOWN_OPCODE),
+        };
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    }
+}

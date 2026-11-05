@@ -105,6 +105,10 @@ impl X86Paging
     }
 }
 
+/// The DMA test device every x86-64 launch attaches: QEMU's `edu`
+/// (PCI `1234:11e8`), with its default 28-bit DMA mask.
+const EDU_DEVICE: &str = "edu";
+
 /// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Iommu
@@ -418,6 +422,10 @@ fn extend_x86(
     {
         args.extend(["-device".into(), "intel-iommu,intremap=off".into()]);
     }
+    // QEMU's `edu` device, whose DMA engine svctest's DMA confinement phase
+    // drives through the test-only `test-dma` driver: behind the IOMMU when
+    // one is attached, unconfined otherwise. No production driver binds it.
+    args.extend(["-device".into(), EDU_DEVICE.into()]);
 
     if let Some(guid) = spec.vmgenid_guid
     {
@@ -1056,6 +1064,10 @@ mod tests
             });
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(argv.iter().any(|a| a == iommu_device));
+            // The DMA test device sits on x86_64 only, with or without the
+            // IOMMU.
+            let x86 = iommu_device.starts_with("intel");
+            assert_eq!(argv.iter().any(|a| a == EDU_DEVICE), x86);
             // Both disks and the keyboard; the firmware-only RNG stays out.
             let devices = virtio(&argv);
             assert_eq!(devices.len(), 4);
@@ -1066,6 +1078,7 @@ mod tests
             spec.iommu = Iommu::Absent;
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(!argv.iter().any(|a| a.contains("iommu")));
+            assert_eq!(argv.iter().any(|a| a == EDU_DEVICE), x86);
             assert_eq!(virtio(&argv).len(), 4);
         }
     }

@@ -36,8 +36,18 @@
 //! replies `WITHDRAWN`, that ordinal 1 still names its live fixture, and,
 //! once every fixture is gone, that memmgr's free pool recovers the memory
 //! the hung fixture held, which only its destruction returns.
-//! TODO(#165): retire the teardown, withdrawal, and test-label deny phases
-//! with the devmgr enumeration redesign and its shims.
+//!
+//! The DMA confinement phase drives devmgr's `TEST_SPAWN_DMA_DRIVER` shim,
+//! which binds QEMU's `edu` device (attached on `x86_64` only) to the
+//! `test-dma` fixture, and asks the fixture to probe: a copy through a page
+//! its driver mapped (`DMA_MAP`) must arrive, and, where an IOMMU confines
+//! the device, a copy to the same device address after its `DMA_UNMAP` must
+//! not reach the page, and devmgr must have taken an IOMMU fault for the
+//! device at that address. Without an IOMMU the phase checks the mapped
+//! copies only; a machine without the device skips it.
+//! TODO(#165): retire the teardown, withdrawal, DMA confinement, and
+//! test-label deny phases with the devmgr enumeration redesign and its
+//! shims.
 
 use std::os::seraph::startup_info;
 use std::time::Duration;
@@ -68,6 +78,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_driver_withdrawal",
             run: driver_withdrawal_phase,
+        },
+        Phase {
+            name: "devmgr_dma_confinement",
+            run: dma_confinement_phase,
         },
         Phase {
             name: "devmgr_test_label_deny",
@@ -447,6 +461,92 @@ fn driver_withdrawal_phase(caps: &Caps)
     );
 }
 
+/// A copy through a mapped page arrives; behind an IOMMU, a copy to the
+/// page's device address after its unmap does not, and devmgr takes a fault
+/// for it.
+fn dma_confinement_phase(caps: &Caps)
+{
+    use ipc::devmgr_labels::{
+        TEST_DMA_CONFINED, TEST_DMA_FAULTS, TEST_QUERY_DMA_DEVICE, TEST_SPAWN_DMA_DRIVER,
+    };
+    use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
+
+    let devmgr = caps.devmgr_test;
+    assert!(devmgr != 0, "devmgr_dma: no devmgr.test cap seeded");
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let call = |label: u64| {
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        unsafe { ipc::ipc_call(devmgr, &versioned(label), ipc_buf) }
+            .unwrap_or_else(|_| panic!("devmgr_dma: label {label} ipc_call failed"))
+    };
+
+    let bind = call(TEST_SPAWN_DMA_DRIVER);
+    if bind.label == ipc::devmgr_errors::NO_DEVICE
+    {
+        std::os::seraph::log!("devmgr_dma_confinement skipped: the machine has no DMA test device");
+        return;
+    }
+    assert_eq!(
+        bind.label,
+        ipc::devmgr_errors::SUCCESS,
+        "TEST_SPAWN_DMA_DRIVER ack"
+    );
+    let confined = bind.word(0) == TEST_DMA_CONFINED;
+
+    // Served once devmgr returns to its registry loop, after the bind's
+    // settle.
+    let query = call(TEST_QUERY_DMA_DEVICE);
+    assert_eq!(
+        query.label,
+        ipc::devmgr_errors::SUCCESS,
+        "the test-dma fixture must be served"
+    );
+    let fixture = query.caps().first().copied().unwrap_or(0);
+    assert!(fixture != 0, "TEST_QUERY_DMA_DEVICE carried no cap");
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let probe = unsafe { ipc::ipc_call(fixture, &ipc::IpcMessage::new(DMA_PROBE), ipc_buf) }
+        .expect("DMA_PROBE ipc_call failed");
+    let _ = syscall::cap_delete(fixture);
+    assert_eq!(probe.label, ipc::devmgr_errors::SUCCESS, "DMA_PROBE setup");
+    let (outcome, landed, iova) = (probe.word(0), probe.word(1) != 0, probe.word(2));
+
+    if !confined
+    {
+        assert!(
+            outcome == PROBE_PASSED || outcome == PROBE_SKIPPED,
+            "devmgr_dma: a mapped copy did not arrive (outcome {outcome})"
+        );
+        std::os::seraph::log!(
+            "devmgr_dma_confinement passed unconfined: outcome {outcome}, device address {iova:#x}"
+        );
+        return;
+    }
+    assert_eq!(
+        outcome, PROBE_PASSED,
+        "devmgr_dma: a copy through a mapped IOVA did not arrive"
+    );
+    assert!(
+        !landed,
+        "devmgr_dma: a copy to IOVA {iova:#x} after its unmap reached the page"
+    );
+    let faults = call(TEST_DMA_FAULTS);
+    assert_eq!(faults.label, ipc::devmgr_errors::SUCCESS, "TEST_DMA_FAULTS");
+    assert!(
+        faults.word(0) >= 1,
+        "devmgr_dma: no IOMMU fault taken for the device after the unmapped copy"
+    );
+    assert_eq!(
+        faults.word(1),
+        iova & !0xfff,
+        "devmgr_dma: the latest fault names another IOVA"
+    );
+    std::os::seraph::log!(
+        "devmgr_dma_confinement passed: mapped copy arrived at IOVA {iova:#x}, \
+         the copy after its unmap faulted ({} faults)",
+        faults.word(0)
+    );
+}
+
 /// The test labels on `devmgr.registry` (no `TEST_LABEL_AUTHORITY`) reply
 /// `UNAUTHORIZED`.
 fn test_label_deny_phase(caps: &Caps)
@@ -481,4 +581,18 @@ fn test_label_deny_phase(caps: &Caps)
         "TEST_QUERY_DENY_DEVICE",
         "TEST_LABEL_AUTHORITY",
     );
+    for (label, name) in [
+        (
+            ipc::devmgr_labels::TEST_SPAWN_DMA_DRIVER,
+            "TEST_SPAWN_DMA_DRIVER",
+        ),
+        (
+            ipc::devmgr_labels::TEST_QUERY_DMA_DEVICE,
+            "TEST_QUERY_DMA_DEVICE",
+        ),
+        (ipc::devmgr_labels::TEST_DMA_FAULTS, "TEST_DMA_FAULTS"),
+    ]
+    {
+        assert_registry_denies(caps, label, name, "TEST_LABEL_AUTHORITY");
+    }
 }

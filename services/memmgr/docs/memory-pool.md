@@ -295,7 +295,9 @@ another in three ways:
   process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
   out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
   map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
-  device still writing it.
+  device still writing it. Init's own derive-twice intermediaries of the RAM caps it forwarded at
+  boot count too: a frame of such a bootstrap extent's original object that memmgr reclaims before
+  init's reap waits until the reap frees them.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
 Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
@@ -318,24 +320,23 @@ A query that fails answers no. A quiescent frame joins the free pool. Any other 
 **deferred list**: its descriptor node is rewritten into a run node in place, as a pooled frame's
 is, so reclamation still never allocates and cannot fail. A deferred run is owned by memmgr and
 counted in `pool_total`, lent to no process, and never granted. Before every `PROCESS_DIED`,
-`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool
-fails (a `REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index,
-page-table, or `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run
-that has become quiescent joins the free pool (and the failed selection runs once more), and
-each that has not goes to the back of the list, so successive rechecks visit every run. Only
-the first of these in a turn of the receive loop rechecks; later ones in the same turn find the
-recheck done. A turn starts when a receive returns, with a message or with an error: it is the
-message's handling, if any, then the `CSpace` top-up before the next receive. A handler's
-recheck at entry therefore always runs, and so does the top-up's before a failed receive's retry,
-which is what refills a spent receive reserve. One recheck checks at most
-`DEFERRED_RECHECK_BATCH` (64) runs and spends at most `DEFERRED_RECHECK_WINDOWS` (256)
-mapping-count queries of up to 512 pages each, plus the rest of the run that crosses that
-budget, after which it stops and leaves the runs behind at the head for the next recheck. A
-turn's deferred kernel queries are therefore bounded by two per run checked plus 256, plus the
-windows of the largest deferred run. No timer drives it; a run that becomes quiescent while no
-message arrives waits for the next one, or for the next retry of a failed receive. A run whose
-reaching object or mapping never goes, held by a process that never drops it, stays deferred for
-the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
+`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool fails (a
+`REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index, page-table, or
+`CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run that has become
+quiescent joins the free pool (and the failed selection runs once more), and each that has not goes
+to the back of the list, so successive rechecks visit every run. Only the first of these in a turn
+of the receive loop rechecks; later ones in the same turn find the recheck done. A turn starts when
+a receive returns, with a message or with an error: it is the message's handling, if any, then the
+`CSpace` top-up before the next receive. A handler's recheck at entry therefore always runs, and so
+does the top-up's before a failed receive's retry, which is what refills a spent receive reserve.
+One recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
+`DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of the
+run that crosses that budget, after which it stops and leaves the runs behind at the head for the
+next recheck. A turn's deferred kernel queries are therefore bounded by two per run checked plus
+256, plus the windows of the largest deferred run. No timer drives it; a run that becomes quiescent
+while no message arrives waits for the next one, or for the next retry of a failed receive. A run
+whose reaching capability, object, or mapping never goes, held by a process that never drops it,
+stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
 memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches neither a
@@ -366,8 +367,9 @@ No unmap is performed: the dead process's CSpace is torn down by procmgr
 process pattern"), which already tore down the child's mappings. The
 caller-side derivation copies of the Memory caps that stayed in the dead
 process's CSpace are freed with it; a copy the process moved or derived into
-another CSpace outlives it, unseen by the check above. memmgr's intermediary
-copies remain valid and are what the free-pool insertion uses.
+another CSpace outlives it, and its reference keeps the frame on the deferred
+list until it goes (check 1 above). memmgr's intermediary copies remain valid
+and are what the free-pool insertion uses.
 
 `RELEASE_MEMORY_CAPS` from a live process is the mid-life counterpart for a
 caller-owned grant. The caller usually cannot transfer the cap back — having
@@ -493,6 +495,7 @@ terminal fault tears down the whole process (see
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[devmgr Responsibilities](../../devmgr/docs/responsibilities.md),
 [FS Driver Protocol](../../fs/docs/fs-driver-protocol.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

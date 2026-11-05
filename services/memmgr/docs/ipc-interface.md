@@ -199,11 +199,11 @@ tracking node becoming the run's node. Bases that match no outstanding grant
 are ignored — release is idempotent, so a racing double-release (join plus
 reaper) is harmless. The caller MUST have already deleted every capability to
 the region and every kernel object retyped from it, and unmapped it from every
-address space. A region released while any of them remains is held on
-memmgr's deferred list, granted to no one, until all are gone; the release
-still succeeds and the region is no longer the caller's. Every release first rechecks the deferred
-list, so a release naming no grant (`count` 0) only rechecks. See
-[`memory-pool.md`](memory-pool.md) §"Reclamation".
+address space. A region released while any of them remains is held on memmgr's
+deferred list, granted to no one, until all are gone; the release still
+succeeds and the region is no longer the caller's. Every release first
+rechecks the deferred list, so a release naming no grant (`count` 0) only
+rechecks. See [`memory-pool.md`](memory-pool.md) §"Reclamation".
 
 ### Label 3: `REGISTER_PROCESS`
 
@@ -252,14 +252,13 @@ the eventual `PROCESS_DIED`.
 
 ### Label 4: `PROCESS_DIED`
 
-Procmgr signals process death. memmgr looks up the per-process tracking
-entry by badge, takes back every Memory cap memmgr has issued to that
-process, and runs coalescing (see [`memory-pool.md`](memory-pool.md) §"Reclamation").
-A frame another process can still reach, through a capability to it, a
-kernel object retyped from it, or a user mapping of it, waits on memmgr's
-deferred list rather than joining the free pool, until a later recheck finds
-it unreachable.
-Privilege: procmgr-only.
+Procmgr signals process death. memmgr looks up the per-process tracking entry
+by badge, takes back every Memory cap memmgr has issued to that process, and
+runs coalescing (see [`memory-pool.md`](memory-pool.md) §"Reclamation"). A
+frame another process can still reach, through a capability to it, a kernel
+object retyped from it, or a user mapping of it, waits on memmgr's deferred
+list rather than joining the free pool, until a later recheck finds it
+unreachable. Privilege: procmgr-only.
 
 **Request:**
 
@@ -316,8 +315,8 @@ the pool while the driver, or devmgr's DMA mapping of it, still holds a
 capability to it, but devmgr deletes its own when it withdraws the device and
 a dead driver's go with its `CSpace`, so the frame can return to the pool
 before the device is confirmed stopped
-([#749](https://github.com/kottlerg/seraph/issues/749)). memmgr itself treats a
-held-back `PROCESS_DIED` like any other.
+([#749](https://github.com/kottlerg/seraph/issues/749)). memmgr itself treats
+a held-back `PROCESS_DIED` like any other.
 
 ### Label 5: `DONATE_MEMORY_CAPS`
 

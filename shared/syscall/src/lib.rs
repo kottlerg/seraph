@@ -1574,6 +1574,8 @@ pub fn user_va_top() -> Result<u64, i64>
 ///   `((tag as u8 as u64) << 32) | (rights as u32 as u64)`.
 /// - `CAP_INFO_TLB_ELIDED` and `CAP_INFO_TLB_PERFORMED` are system-wide
 ///   counters: they accept any live slot, whatever its tag.
+/// - `CAP_INFO_SOLE_REFERENCE` is valid for any non-null slot and returns
+///   `1` or `0` (see its rustdoc in `syscall_abi`).
 /// - All other selectors are tag-specific:
 ///   - `CAP_INFO_MEMORY_*` require `CapTag::Memory`. `CAP_INFO_MEMORY_MAPPINGS`
 ///     is always refused through this wrapper, which passes an empty window;

@@ -400,9 +400,13 @@ pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
 /// derivation, a live retyped object, or a donation is never sole; a split
 /// child or a range-capability copy is an object of its own.
 ///
-/// Once `1`, the answer stays `1` until the caller itself derives, copies, or
-/// retypes from the slot: no other process holds a capability through which
-/// to add a reference. A user mapping is not a reference; read it with
+/// Once `1`, the answer stays `1` until the caller itself takes a further
+/// reference through the slot (a derivation, copy, retype, page-pool
+/// donation, binding, wait-set add, or a syscall of its own in flight): no
+/// other process holds a capability through which to add one. The count is
+/// read with the slot re-checked under its `CSpace` lock, so a concurrent
+/// delete or revoke of the queried slot answers `InvalidCapability`, never a
+/// false `1`. A user mapping is not a reference; read it with
 /// [`CAP_INFO_MEMORY_MAPPINGS`]. Used by memmgr before it returns a reclaimed
 /// frame to its pool (services/memmgr/docs/memory-pool.md § Reclamation).
 pub const CAP_INFO_SOLE_REFERENCE: u64 = 13;

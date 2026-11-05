@@ -1153,9 +1153,9 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // back to the `MemoryObject` memmgr's outer cap shares) and the child's
     // mappings are gone. An object another process still references, a
     // capability to the frame another process holds, or a mapping another
-    // address space holds, outlives the child: `quiescent`
-    // checks each frame, and `remove_process` pools the frames it accepts and
-    // parks the rest on the deferred list (services/memmgr/docs/memory-pool.md
+    // address space holds, outlives the child: `quiescent` checks each
+    // frame, and `remove_process` pools the frames it accepts and parks the
+    // rest on the deferred list (services/memmgr/docs/memory-pool.md
     // § Reclamation). Each descriptor slot becomes the run's slot, so neither
     // move can fail. Reachability-only for the identity: these pages were
     // already counted in pool_total at acquisition. No unmap is performed.

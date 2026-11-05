@@ -2824,11 +2824,31 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // one for this inquiry's pin (`pin_slot` above); any further
             // reference is another slot or a kernel-internal owner
             // (core/kernel/docs/capability-internals.md § Kernel Object
-            // Reference Counting). The pin keeps the count from reaching 0
-            // while it is read.
+            // Reference Counting). The count is read under the `CSpace` lock
+            // with the slot re-checked: every path that frees an occupied slot
+            // clears it under that lock before releasing its reference, so a
+            // slot still holding the object here still holds its reference,
+            // and a concurrent delete or revoke cannot leave the pin and
+            // another holder's reference counted as "slot plus pin".
             let header = slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: `header` is the object the pin holds live.
-            let count = unsafe { header.as_ref() }.ref_count.load(Ordering::Acquire);
+            let index = syscall::cap_handle_index(slot_handle);
+            let generation = syscall::cap_handle_gen(slot_handle);
+            // SAFETY: caller_cspace is the running thread's bound CSpace, live
+            // for the call; lock_raw and unlock_raw are paired, and nothing
+            // between them takes another lock. `header` is the object the pin
+            // holds live.
+            let count = unsafe {
+                let saved = (*caller_cspace).lock.lock_raw();
+                let held = (*caller_cspace).slot(index).is_some_and(|s| {
+                    s.tag != CapTag::Null
+                        && s.generation() == generation
+                        && s.object == Some(header)
+                });
+                let count = held.then(|| header.as_ref().ref_count.load(Ordering::Acquire));
+                (*caller_cspace).lock.unlock_raw(saved);
+                count
+            };
+            let count = count.ok_or(SyscallError::InvalidCapability)?;
             Ok(u64::from(count == 2))
         }
         CAP_INFO_TLB_ELIDED =>

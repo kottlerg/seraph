@@ -155,7 +155,9 @@ devmgr's responsibilities are:
      memory only: the frames a client lends a virtio-blk driver for a transfer
      are on the client's memmgr record, which no hold covers. memmgr keeps them
      out of the pool while the driver or devmgr's DMA mapping still holds a
-     capability to them, but devmgr deletes its own at the withdrawal and the
+     capability to them
+     ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#reclamation)
+     § Reclamation), but devmgr deletes its own at the withdrawal and the
      driver's go with its `CSpace`, so they can return to the pool before the
      device is confirmed stopped
      ([#749](https://github.com/kottlerg/seraph/issues/749)). A status

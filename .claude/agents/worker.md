@@ -35,10 +35,11 @@ each file you put there with your PR number or branch slug (`pr581-body.md`, nev
 `pr-body.md`). Orchestrated, you end a turn only once your worktree differs from
 `origin/master` (a commit beyond it on your branch, or uncommitted edits to tracked files),
 since a turn that ends on an unchanged worktree loses the worktree and you with it. A worktree
-that differs from `origin/master` is never removed by the harness: it persists, with its built
-`target/`, until the orchestrator removes it after your retirement (the orchestrator's
-`.claude/skills/orchestrate/SKILL.md` § Worktree removal), so the only records of value in it
-are those you have copied out (§ Review). Before that
+that has changed is not removed by the harness, which removes only an unchanged one (this
+sentence owns that rule; the other documents refer here): it persists, with its built `target/`,
+until the orchestrator removes it after your retirement (`.claude/skills/orchestrate/SKILL.md`
+§ Worktree removal), so a record survives that removal only once you have copied it out
+(§ Review). Before that
 point, while a question you raised is unanswered, all you do stays within the scope's files
 (apart from the forced expansions § Scope and branches allows) and provisional: you continue on
 the recommendation of each question you raise unless the orchestrator says otherwise; a question

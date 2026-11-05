@@ -276,9 +276,10 @@ evidence in the closing comment).
 
 ## Worktree removal
 
-A worker's worktree carries a built `target/` (several GiB), and the harness removes only a
-worktree that never changed (§ Failure modes), so every other worktree persists until you
-remove it. Removal is the orchestrator's mechanic, in two places.
+A worker's worktree carries a built `target/` (several GiB), and the harness removes only an
+unchanged worktree (`.claude/agents/worker.md` § Reporting), so every other worktree persists
+until you remove it. Removal is the orchestrator's mechanic, in two places, and only for
+worktrees this batch spawned: the ones the record file lists, under `.claude/worktrees/`.
 
 - **At a worker's retirement:** after its last PR merges (or its gate report, when it has no
   PR left to merge) and nothing is left for it (§ Merge order and the gate), remove its
@@ -286,19 +287,25 @@ remove it. Removal is the orchestrator's mechanic, in two places.
   for each of the worker's PRs and holds the records of every run the worker reported, since
   those records exist nowhere else once the worktree is gone (§ Failure modes); copy any that
   are missing from the worktree, or ask the worker to, before removing. A worktree parked on a
-  `park/<name>` branch for a possible resume (§ Merge order and the gate) is removed when the
-  worker is no longer resumable, not before.
-- **At wind-down:** sweep every worktree whose branch no longer exists on `origin`
-  (`git fetch --prune origin`, then compare `git worktree list --porcelain` against
-  `git ls-remote --heads origin`), under the same precondition, and also any detached
-  worktree. Never remove the worktree of a worker the record lists as active.
+  `park/<name>` branch for a possible resume (§ Merge order and the gate) stays until
+  wind-down, when no worker is resumable.
+- **At wind-down:** sweep every worktree the record lists as spawned in this batch that is
+  still present (a parked one included), under the same precondition, after confirming no
+  worker the record lists as active owns it. Skip and report to the maintainer any worktree
+  with uncommitted tracked changes (`git -C <path> status --porcelain --untracked-files=no`)
+  or with commits that are not on `origin`. A worktree under `.claude/worktrees/` that the
+  record does not list (left by an earlier batch, or another session's) is reported to the
+  maintainer with its branch and lock, never removed on this sweep; it is removed only when
+  its branch is gone from `origin` (`git ls-remote --heads origin`), its lock names no running
+  process and the skip conditions above do not hold.
 
-Removal is `git worktree remove --force <path>` (`--force` because the build tree is untracked;
-the harness locks agent worktrees, and a locked one needs `--force` given twice), followed by
-`git worktree prune` once the sweep is done; record each removal in the record file with the
-worktree's size (`du -sh <path>`, taken before it). This is a documented `git worktree`
-procedure, not an `xtask` command: the worktrees sit under `.claude/`, outside the sysroot and
-`target/` that `cargo xtask clean` owns, and no script is added for it.
+Removal is `git worktree remove --force --force <path>`: the doubled flag is required because
+the harness locks agent worktrees and a locked worktree refuses a single `--force`; the
+gitignored `target/` never blocks removal. Run `git worktree prune` once after the sweep, and
+record each removal in the record file with the worktree's size (`du -sh <path>`, taken before
+it). It is a `git worktree` procedure and not an `xtask` command, since the worktrees sit under
+`.claude/`, outside the sysroot and `target/` that `cargo xtask clean` removes
+(`xtask/README.md` § `cargo xtask clean`).
 
 ## Hand-off and wind-down
 
@@ -311,8 +318,7 @@ with the open-Issue count by class.
 ## Failure modes
 
 - A worker that ends its turn on an unchanged worktree is gone: the harness removes the
-  worktree (it removes only such a worktree, § Worktree removal), and a later message does not
-  resume it. The worker's turn-ending rule
+  worktree, and a later message does not resume it. The worker's turn-ending rule
   (`.claude/agents/worker.md` § Reporting) prevents it; the watchdog's liveness check (§ Plan
   step 4) and the respawn prompt (§ Spawn) recover from it.
 - A finished worker's worktree persists until you remove it (§ Worktree removal), and its

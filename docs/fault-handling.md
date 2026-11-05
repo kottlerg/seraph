@@ -304,16 +304,16 @@ The kernel ignores reply capabilities, and every data word but one: data word 0 
 `FAULT_REPLY_KILL` reply, when the reply carries data words, is the handler's decline reason. The
 kernel does not interpret it. When the decline kills a thread whose user-mode access faulted, the
 kernel prints it on its serial console, on a `fault unhandled` line ahead of the `USERSPACE FAULT`
-diagnostic; that line also names the kernel's own unhandled causes (the binding found cleared at
-delivery, or the delivery cancelled before a reply), and its absence before a `USERSPACE FAULT`
-line means no handler was bound. A decline with no data words prints no reason. memmgr's reasons
-are tabled in
+diagnostic; that line also names the kernel's own unhandled causes (the binding of the fault's class
+found cleared at delivery, or the delivery cancelled before a reply), and its absence before a
+`USERSPACE FAULT` line means no handler was bound for the fault's class. A decline with no data
+words prints no reason. memmgr's reasons are tabled in
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label).
 
-A declined fault, like every other unhandled one (the binding cleared before delivery, or the
-delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the outcome it
-has with no handler bound: a fault of a user-mode access kills the thread, and a fault of a
-kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
+A declined fault, like every other unhandled one (the binding of its class cleared before delivery,
+or the delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the
+outcome it has with no handler bound: a fault of a user-mode access kills the thread, and a fault of
+a kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
 has this one meaning whatever raised the fault. The message is the same for both, and the handler
 never chooses between the outcomes; binding a handler never changes the outcome of a fault it
 declines. A handler that wants a thread ended whose kernel-copy fault it declines stops or

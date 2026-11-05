@@ -2065,10 +2065,9 @@ fn bind_pager(
 /// (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The child's badged memmgr endpoint is
 /// the pager endpoint: the kernel stamps each fault with that cap's derivation
 /// badge, `memmgr_badge`, so the fault is attributed to the right memmgr
-/// record, and `pager_badge` records the same value for the
-/// runtime's information. When the page cannot be mapped the fields stay
-/// zero and the child runs as if it had no pager, which is safe: its memory
-/// stays eager.
+/// record, and `pager_badge` records the same value for the runtime's
+/// information. When the page cannot be mapped the fields stay zero and the
+/// child runs as if it had no pager, which is safe: its memory stays eager.
 fn advertise_pager(self_aspace: u64, pi_memory_cap: u64, memmgr_badge: u64)
 {
     let Ok(scratch) = ScratchMapping::map(self_aspace, pi_memory_cap, 1, syscall::MAP_WRITABLE)

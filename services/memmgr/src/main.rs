@@ -1530,14 +1530,13 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// rests on the derivation-locked badge
 /// (`services/memmgr/docs/ipc-interface.md` § Badge Discipline). Words are
 /// `[kind, faulting_va, access, ip]` (same document, § Kernel-origin fault
-/// message (`FAULT_LABEL`)). On a VM
-/// fault whose address lies in a registered region of a process with a
-/// delegated address space, memmgr backs the [`chunk_for`] chunk containing
-/// the faulting page — one contiguous Memory cap mapped across up to
-/// `DEMAND_CHUNK_PAGES` pages — and replies
+/// message (`FAULT_LABEL`)). On a VM fault whose address lies in a registered
+/// region of a process with a delegated address space, memmgr backs the
+/// [`chunk_for`] chunk containing the faulting page — one contiguous Memory cap
+/// mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]; a fault on a page an earlier chunk
-/// backed is resumed without backing. Backing a chunk rather than a single
-/// page bounds cap-slot consumption (one cap per chunk). Every other case —
+/// backed is resumed without backing. Backing a chunk rather than a single page
+/// bounds cap-slot consumption (one cap per chunk). Every other case —
 /// non-VM fault, unknown process, address outside every region, an access
 /// the region's protection does not grant ([`region_grants`]), no delegated
 /// AS, or any allocation/map failure — replies

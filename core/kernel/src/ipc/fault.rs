@@ -156,7 +156,8 @@ pub enum FaultOutcome
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KillCause
 {
-    /// The binding was found cleared when the delivery read it.
+    /// The binding of the fault's class was found cleared when the delivery
+    /// read it.
     BindingCleared,
     /// The delivery was cancelled before any reply claimed it (handler thread
     /// destroyed, handler endpoint destroyed, a later receive on the handler
@@ -178,7 +179,9 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
     {
         KillCause::BindingCleared =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} binding cleared before delivery");
+            crate::kprintln_serial!(
+                "fault unhandled: tid={tid} class binding cleared before delivery"
+            );
         }
         KillCause::Cancelled =>
         {

@@ -154,9 +154,9 @@ pub mod procmgr_labels
     /// (`SYS_THREAD_INHERIT_FAULT_HANDLER`). Set this flag only for a process
     /// that cannot depend on the fault path — a driver doing DMA, whose memory
     /// a device may write before a demand fault could back it. Occupies bit 16
-    /// of the `[16..31]` label window. init,
-    /// memmgr, and procmgr are pre-pager and never routed through this
-    /// binding path, so they are pinned by construction regardless.
+    /// of the `[16..31]` label window. init, memmgr, and procmgr are pre-pager
+    /// and never routed through this binding path, so they are pinned by
+    /// construction regardless.
     pub const CREATE_PINNED: u64 = 1 << 16;
     /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
     /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the

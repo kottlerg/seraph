@@ -317,15 +317,15 @@ the first of these in a turn of the receive loop rechecks; later ones in the sam
 recheck done. A turn starts when a receive returns, with a message or with an error: it is the
 message's handling, if any, then the `CSpace` top-up before the next receive. A handler's
 recheck at entry therefore always runs, and so does the top-up's before a failed receive's retry,
-which is what refills a spent receive reserve. One recheck checks at most
-`DEFERRED_RECHECK_BATCH` (64) runs and spends at most `DEFERRED_RECHECK_WINDOWS` (256)
-mapping-count queries of up to 512 pages each, plus the rest of the run that crosses that
-budget, after which it stops and leaves the runs behind at the head for the next recheck. A
-turn's deferred kernel queries are therefore bounded by two per run checked plus 256, plus the
-windows of the largest deferred run. No timer drives it; a run that becomes quiescent while no
-message arrives waits for the next one, or for the next retry of a failed receive. A run whose
-reaching object or mapping never goes, held by a process that never drops it, stays deferred for
-the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
+which is what refills a spent receive reserve. One recheck checks at most `DEFERRED_RECHECK_BATCH`
+(64) runs and spends at most `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512
+pages each, plus the rest of the run that crosses that budget, after which it stops and leaves the
+runs behind at the head for the next recheck. A turn's deferred kernel queries are therefore
+bounded by two per run checked plus 256, plus the windows of the largest deferred run. No timer
+drives it; a run that becomes quiescent while no message arrives waits for the next one, or for
+the next retry of a failed receive. A run whose reaching object or mapping never goes, held by a
+process that never drops it, stays deferred for the rest of the boot, and `QUERY_POOL_STATUS`
+reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
 The check does not see a capability: a process that holds an unmapped Memory capability to a

@@ -33,6 +33,7 @@
 
 use crate::alloc::{GlobalAlloc, Layout, System};
 use crate::cell::UnsafeCell;
+use crate::marker::PhantomData;
 use crate::mem::{align_of, size_of};
 use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
@@ -87,9 +88,10 @@ const CSPACE_FUND_ROUNDS: u32 = 2;
 /// through the [`SpinGuard`] [`Self::lock`] returns, and the guard releases
 /// the lock when it drops, so the type system keeps every access under the
 /// lock (docs/coding-standards.md § Concurrency). The byte heap, the object
-/// slabs, and the page-reservation arena (`sys::reserve`) use it rather than
+/// slabs, the page-reservation arena (`sys::reserve`), and the thread
+/// reaper's slot table and death queues (`sys::thread`) use it rather than
 /// std's `Mutex`, which may park and allocate: the allocator runs beneath
-/// both.
+/// both, and the reaper runs inside a spawn.
 pub(crate) struct SpinMutex<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -114,13 +116,23 @@ impl<T> SpinMutex<T> {
         {
             core::hint::spin_loop();
         }
-        SpinGuard { mutex: self }
+        SpinGuard { mutex: self, _exclusive: PhantomData }
+    }
+
+    /// Run `f` on the value under the lock, released when `f` returns.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut self.lock())
     }
 }
 
 /// Exclusive access to a [`SpinMutex`]'s value; dropping it releases the lock.
+///
+/// The marker gives the guard the auto traits of `&mut T`: it is `Sync` only
+/// when `T` is, as std's `MutexGuard` is, so a guard shared by reference
+/// never hands two threads a `&T` of a value that is `Send` but not `Sync`.
 pub(crate) struct SpinGuard<'a, T> {
     mutex: &'a SpinMutex<T>,
+    _exclusive: PhantomData<&'a mut T>,
 }
 
 impl<T> crate::ops::Deref for SpinGuard<'_, T> {

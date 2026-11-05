@@ -75,11 +75,27 @@ impl StackNote {
     }
 }
 
-// The loaders parse the note by the ABI type's layout.
+// ABI contract: the loaders (init, procmgr) parse the note by
+// `process_abi::StackNote`'s layout, so std's copy must match it field by
+// field, and `new` must fill the fields the ABI type's `new` fills.
+// Exception to docs/coding-standards.md § D Layout and ABI Assertions, which
+// names a consolidated test for such a contract: this PAL overlay builds only
+// inside the sysroot's std and has no host test target, so no test can hold
+// these, and a build-time assertion fails that build instead.
 const _: () = {
     use process_abi::{StackNote as Abi, StackNoteDesc as AbiDesc};
 
     use crate::mem::{align_of, offset_of, size_of};
+    // Any page count serves: `new` copies it through unchanged.
+    let ours = StackNote::new(12);
+    let abi = Abi::new(12);
+    assert!(ours.namesz == abi.namesz && ours.descsz == abi.descsz && ours.ntype == abi.ntype);
+    assert!(ours.pages == abi.desc.pages && ours.reserved == abi.desc.reserved);
+    let mut i = 0;
+    while i < ours.name.len() {
+        assert!(ours.name[i] == abi.name[i]);
+        i += 1;
+    }
     assert!(size_of::<StackNote>() == size_of::<Abi>());
     assert!(align_of::<StackNote>() == align_of::<Abi>());
     assert!(offset_of!(StackNote, namesz) == offset_of!(Abi, namesz));

@@ -62,10 +62,13 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// adjacent memory.
 const GUARD_PAGES: u64 = 1;
 
-/// General-allocation headroom of the process's `CSpace` below which a spawn
-/// first tops it up. One spawn takes a few slots for good (the Thread cap and
-/// its done notification) and a few more while it runs (the Thread slab, a
-/// pool-page refill, a further death queue and its grant, a heap grow's at
+/// General-allocation headroom of the process's `CSpace` a spawn keeps: a
+/// spawn first tops the `CSpace` up when its headroom is below this plus a
+/// page's slots (`CSPACE_SLOTS_PER_PAGE`, which
+/// `syscall_abi::cspace_topup_pages` holds for the body arena), or its growth
+/// budget below a page. One spawn takes a few slots for good (the Thread cap
+/// and its done notification) and a few more while it runs (the Thread slab,
+/// a pool-page refill, a further death queue and its grant, a heap grow's at
 /// most `MSG_CAP_SLOTS_MAX` caps), about ten in all, so the mark leaves room
 /// for a whole spawn with margin.
 const SPAWN_CSPACE_LOW_WATER: u64 = 32;
@@ -612,8 +615,7 @@ impl Drop for Thread {
 /// for an already-joined or reused slot a no-op.
 mod reaper {
     use super::ThreadResources;
-    use crate::cell::UnsafeCell;
-    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sys::alloc::seraph::SpinMutex;
     use crate::vec::Vec;
     use death_queues::DeathQueues;
     use death_queues::slots::{Detached, Registry, correlator};
@@ -646,33 +648,6 @@ mod reaper {
         event_queue_retype_bytes(FIRST_POOL_OBSERVERS as u64 + 1, FIRST_POOL_OBSERVERS as u64)
             <= PAGE_SIZE
     );
-
-    /// A value its spin lock serialises; the only access is [`SpinMutex::with`].
-    struct SpinMutex<T> {
-        locked: AtomicBool,
-        value: UnsafeCell<T>,
-    }
-    // SAFETY: `value` is reached only through `with`, under `locked`.
-    unsafe impl<T: Send> Sync for SpinMutex<T> {}
-    impl<T> SpinMutex<T> {
-        const fn new(value: T) -> Self {
-            Self { locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
-        }
-        /// Run `f` on the value under the lock.
-        fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-            while self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            // SAFETY: the lock is held, so this is the only reference.
-            let out = f(unsafe { &mut *self.value.get() });
-            self.locked.store(false, Ordering::Release);
-            out
-        }
-    }
 
     // Lock order: `QUEUES` before `SLOTS`. A drain holds `QUEUES` and takes
     // `SLOTS` per post; nothing takes `QUEUES` while holding `SLOTS`. The

@@ -22,8 +22,9 @@
 //! driver's own; both reach the one [`Service`] through a [`Lock`] the
 //! driver supplies, held for one request or one poll. Three kinds of IPC
 //! can be made under it: a request that needs table pages the backend's
-//! store lacks takes them from memmgr; a heap allocation under it (a domain,
-//! range, or chunk record) may grow the heap, which calls memmgr too; and a
+//! store lacks takes them from memmgr; any heap allocation under it (a
+//! domain, range, or chunk record, or the run table of the VA arena a new
+//! chunk is reserved from) may grow the heap, which calls memmgr too; and a
 //! backend failure path may log (a call to the log service). The one other
 //! thread the lock serializes against is the fault poll, which then waits
 //! those calls out; no call into devmgr is ever made under it.

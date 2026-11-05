@@ -184,9 +184,11 @@ syscall on either side. Nothing is allocated on the path.
    caller's wake) means no caller: still read the data words and
    pre-validate the reply cap slots, return the first error they raise,
    else InvalidCapability
-2. If caller_tcb is BlockedOnFault (a fault reply, whose data words and
-   caps the kernel ignores): record RESUME/KILL from the label in
-   caller_tcb.fault_outcome, stamp the episode, and go to step 6
+2. If caller_tcb is BlockedOnFault (a fault reply, whose caps the kernel
+   ignores): record RESUME, or DECLINED for a FAULT_REPLY_KILL label, in
+   caller_tcb.fault_outcome; for DECLINED, deposit the label and data
+   word 0 (the decline reason, when sent and readable) in caller_tcb's
+   ipc_msg; stamp the episode, and go to step 6
 3. Read the data words and pre-validate the reply cap slots; when caps are
    attached, pre-allocate the slots in the caller's CSpace (resolved
    through the registry from caller_tcb's cspace_id/epoch); on any of these
@@ -239,7 +241,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 |---|---|---|
 | `sys_ipc_reply` normal arm | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
 | `sys_ipc_reply` payload, cap-validation, pre-allocation, or cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message, with no reply staged; the server receives the error) |
-| `sys_ipc_reply` fault-RESUME arm | same CAS | episode only (`fault_outcome` carries RESUME/KILL) |
+| `sys_ipc_reply` fault arm | same CAS | episode only (`fault_outcome` carries RESUME or DECLINED; a DECLINED reply's label and reason word go to `ipc_msg`) |
 | `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `ipc::fault::claim_fault_park` (a fault-handler binding change, `redeliver_in_flight`), received arm | `reply_tcb` CAS under the faulter's `sched_lock` behind a `blocked_on_object` re-read | episode only (`fault_outcome` carries REDELIVER) |

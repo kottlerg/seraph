@@ -165,7 +165,7 @@ pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
     matches!(insn & 0x3, 0b00 | 0b10) && matches!((insn >> 13) & 0x7, 0b001 | 0b101)
 }
 
-// ── Kernel spurious-fault permission test ────────────────────────────────────
+// ── PTE permission bits and the kernel spurious-fault test ───────────────────
 
 /// Sv39/Sv48/Sv57 PTE bit V: the entry is valid.
 pub(super) const PTE_VALID: u64 = 1 << 0;
